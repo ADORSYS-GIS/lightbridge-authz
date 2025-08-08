@@ -8,4 +8,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("YAML parse error")]
     Yaml(#[from] serde_yaml::Error),
+
+    /// Error originating from I/O operations.
+    #[error("Any: {0}")]
+    Any(#[from] anyhow::Error),
 }

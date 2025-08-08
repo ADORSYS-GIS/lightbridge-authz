@@ -3,6 +3,8 @@ members = [
     "crates/lightbridge-authz-proto",
     "crates/lightbridge-authz-core",
     "crates/lightbridge-authz-grpc",
+    "crates/lightbridge-authz-rest",
+    "crates/lightbridge-authz-cli",
 ]
 resolver = "3"
 
@@ -10,6 +12,8 @@ resolver = "3"
 lightbridge-authz-core = { path = "./crates/lightbridge-authz-core" }
 lightbridge-authz-proto = { path = "./crates/lightbridge-authz-proto" }
 lightbridge-authz-grpc = { path = "./crates/lightbridge-authz-grpc" }
+lightbridge-authz-rest = { path = "./crates/lightbridge-authz-rest" }
+lightbridge-authz-cli = { path = "./crates/lightbridge-authz-cli" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
@@ -18,7 +22,9 @@ tonic = "0.12"
 tonic-build = "0.12"
 prost = "0.13"
 prost-types = "0.13"
-thiserror = "1"
+thiserror = "2"
+anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 axum = "0.7"
+clap = { version = "4", features = ["derive"] }

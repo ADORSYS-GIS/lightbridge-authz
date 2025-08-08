@@ -1,0 +1,16 @@
+[package]
+name = "lightbridge-authz-rest"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+description = "REST server crate for Lightbridge Authz"
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
+lightbridge-authz-core.workspace = true
