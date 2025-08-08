@@ -6,6 +6,8 @@ pub struct Config {
     pub server: Server,
     pub logging: Logging,
     pub auth: Auth,
+    pub database: Database,
+    pub oauth2: Oauth2,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -22,6 +24,23 @@ pub struct Grpc {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Logging {
     pub level: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Database {
+    pub url: String,
+    pub pool_size: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Oauth2 {
+    pub introspection: Introspection,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Introspection {
+    pub url: String,
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -6,6 +6,14 @@ edition = "2024"
 [dependencies]
 serde.workspace = true
 serde_yaml.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+diesel.workspace = true
+diesel-async.workspace = true
+diesel_migrations.workspace = true
+argon2.workspace = true
+rand_core.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

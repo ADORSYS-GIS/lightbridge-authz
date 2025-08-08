@@ -9,4 +9,11 @@ auth:
   api_keys:
     - "dev-key-1"
     - "dev-key-2"
+database:
+  url: "postgres://postgres:postgres@localhost:5432/lightbridge_authz"
+  pool_size: 10
+oauth2:
+  introspection:
+    url: "https://issuer.example.com/oauth2/introspect"
+    timeout_ms: 2000
 ---
