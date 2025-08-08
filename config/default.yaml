@@ -1,0 +1,12 @@
+---
+server:
+  grpc:
+    address: "127.0.0.1"
+    port: 50051
+logging:
+  level: "info"
+auth:
+  api_keys:
+    - "dev-key-1"
+    - "dev-key-2"
+---
