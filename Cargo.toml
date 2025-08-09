@@ -5,6 +5,7 @@ members = [
     "crates/lightbridge-authz-grpc",
     "crates/lightbridge-authz-rest",
     "crates/lightbridge-authz-cli",
+    "crates/lightbridge-authz-api",
 ]
 resolver = "3"
 
