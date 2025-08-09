@@ -4,6 +4,9 @@ use lightbridge_authz_proto::*;
 use std::net::AddrParseError;
 use tonic::{Request, Response, Status, transport::Server};
 
+mod echo;
+use echo::EchoServiceImpl;
+
 // Implementation of the API key service
 #[derive(Debug, Default)]
 pub struct ApiKeyService {}
@@ -46,12 +49,16 @@ pub async fn start_grpc_server(grpc: &Grpc, _db: &Database) -> Result<()> {
         .parse()
         .map_err(|e: AddrParseError| Error::AddrParseError(e))?;
 
-    let service = ApiKeyService::default();
+    let api_key_service = ApiKeyService::default();
+    let echo_service = EchoServiceImpl::default();
 
     tracing::info!("Starting gRPC server on {}", addr);
 
     Server::builder()
-        .add_service(api_key_service_server::ApiKeyServiceServer::new(service))
+        .add_service(api_key_service_server::ApiKeyServiceServer::new(
+            api_key_service,
+        ))
+        .add_service(echo_service_server::EchoServiceServer::new(echo_service))
         .serve(addr)
         .await
         .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;

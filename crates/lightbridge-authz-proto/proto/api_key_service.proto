@@ -8,6 +8,12 @@ service ApiKeyService {
   rpc ValidateApiKey(ValidateApiKeyRequest) returns (ValidateApiKeyResponse);
 }
 
+// Echo service for testing
+service EchoService {
+  // Echo method that returns the same message
+  rpc Echo(EchoRequest) returns (EchoResponse);
+}
+
 // Request to validate an API key
 message ValidateApiKeyRequest {
   string api_key = 1;
@@ -17,4 +23,14 @@ message ValidateApiKeyRequest {
 message ValidateApiKeyResponse {
   bool valid = 1;
   string error_message = 2;
+}
+
+// Request for echo service
+message EchoRequest {
+  string message = 1;
+}
+
+// Response for echo service
+message EchoResponse {
+  string message = 1;
 }

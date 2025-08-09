@@ -134,9 +134,9 @@ struct PatchApiKeyChanges {
 
 impl ApiKeyRow {
     pub async fn into_api_key(self, pool: &DbPool) -> Result<ApiKey> {
-        let status = match self.status.as_str() {
-            "Active" | "active" => ApiKeyStatus::Active,
-            "Revoked" | "revoked" => ApiKeyStatus::Revoked,
+        let status = match self.status.to_lowercase().as_str() {
+            "active" => ApiKeyStatus::Active,
+            "revoked" => ApiKeyStatus::Revoked,
             _ => ApiKeyStatus::Active,
         };
 
