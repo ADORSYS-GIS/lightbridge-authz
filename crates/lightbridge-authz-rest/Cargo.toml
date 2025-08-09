@@ -13,4 +13,7 @@ tokio.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
 tracing.workspace = true
+lightbridge-authz-api.workspace = true
+async-trait.workspace = true
 lightbridge-authz-core.workspace = true
+uuid.workspace = true

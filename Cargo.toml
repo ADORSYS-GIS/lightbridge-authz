@@ -14,6 +14,7 @@ lightbridge-authz-core = { path = "./crates/lightbridge-authz-core" }
 lightbridge-authz-proto = { path = "./crates/lightbridge-authz-proto" }
 lightbridge-authz-grpc = { path = "./crates/lightbridge-authz-grpc" }
 lightbridge-authz-rest = { path = "./crates/lightbridge-authz-rest" }
+lightbridge-authz-api = { path = "./crates/lightbridge-authz-api" }
 lightbridge-authz-cli = { path = "./crates/lightbridge-authz-cli" }
 
 serde = { version = "1.0", features = ["derive"] }
@@ -28,7 +29,8 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-axum = "0.7"
+axum = { version = "0.7", features = ["macros"] }
+async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 
 diesel = { version = "2.2", features = ["postgres","chrono","serde_json","uuid"] }

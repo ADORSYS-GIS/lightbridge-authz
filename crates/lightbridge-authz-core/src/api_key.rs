@@ -10,11 +10,16 @@ pub enum ApiKeyStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NewApiKey {
-    // Plain API key value (will be hashed and stored)
-    pub key_plain: String,
+pub struct CreateApiKey {
     pub expires_at: Option<DateTime<Utc>>,
     pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchApiKey {
+    pub expires_at: Option<DateTime<Utc>>,
+    pub metadata: Option<Value>,
+    pub status: Option<ApiKeyStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -162,6 +162,7 @@ checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
 dependencies = [
  "async-trait",
  "axum-core",
+ "axum-macros",
  "bytes",
  "futures-util",
  "http",
@@ -207,6 +208,17 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "axum-macros"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57d123550fa8d071b7255cb0cc04dc302baa6c8c4a79f55701552684d8399bce"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -917,11 +929,20 @@ checksum = "1171693293099992e19cddea4e8b849964e9846f4acee11b3948bcc337be8776"
 [[package]]
 name = "lightbridge-authz-api"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "lightbridge-authz-core",
+ "serde",
+ "serde_json",
+ "tracing",
+]
 
 [[package]]
 name = "lightbridge-authz-cli"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "clap",
  "lightbridge-authz-core",
  "lightbridge-authz-grpc",
@@ -937,6 +958,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "argon2",
+ "axum",
  "chrono",
  "diesel",
  "diesel-async",
@@ -976,12 +998,15 @@ dependencies = [
 name = "lightbridge-authz-rest"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "lightbridge-authz-api",
  "lightbridge-authz-core",
  "serde",
  "serde_yaml",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

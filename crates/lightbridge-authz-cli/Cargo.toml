@@ -13,3 +13,4 @@ tracing-subscriber.workspace = true
 lightbridge-authz-core.workspace = true
 lightbridge-authz-rest.workspace = true
 lightbridge-authz-grpc.workspace = true
+axum.workspace = true

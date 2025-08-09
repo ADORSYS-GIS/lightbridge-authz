@@ -17,3 +17,4 @@ rand_core.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+axum = { workspace = true, optional = true }
