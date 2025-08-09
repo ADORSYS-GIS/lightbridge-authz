@@ -3,6 +3,7 @@
 - Documentations shall be done using markdown and mermaid.
 - All docs shall be found inside the /docs folder.
 - Documentation should have the same format of:
+
   ```markdown
   # <What?>
 
