@@ -1,0 +1,9 @@
+[package]
+name = "lightbridge-authz-api-key"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lightbridge-authz-core = { path = "../lightbridge-authz-core" }
+uuid.workspace = true
+anyhow.workspace = true

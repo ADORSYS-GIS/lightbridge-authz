@@ -8,3 +8,4 @@
   to add the error case to the enum.
 - Never keep all logic in a single file. Files shouldn't be too long. The same way, check other files to see if
   something you want to do wasn't implemented already.
+- Always write comment to document the code directly.

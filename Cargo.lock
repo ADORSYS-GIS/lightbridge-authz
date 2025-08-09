@@ -932,10 +932,20 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "lightbridge-authz-api-key",
  "lightbridge-authz-core",
  "serde",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "lightbridge-authz-api-key"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lightbridge-authz-core",
+ "uuid",
 ]
 
 [[package]]

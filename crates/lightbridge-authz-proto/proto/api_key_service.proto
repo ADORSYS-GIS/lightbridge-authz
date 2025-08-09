@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package lightbridge.authz;
+
+// API Key service for validation
+service ApiKeyService {
+  // Validate an API key
+  rpc ValidateApiKey(ValidateApiKeyRequest) returns (ValidateApiKeyResponse);
+}
+
+// Request to validate an API key
+message ValidateApiKeyRequest {
+  string api_key = 1;
+}
+
+// Response for API key validation
+message ValidateApiKeyResponse {
+  bool valid = 1;
+  string error_message = 2;
+}

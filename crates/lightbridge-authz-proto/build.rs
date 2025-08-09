@@ -1,3 +1,3 @@
 fn main() {
-    // Minimal build script to satisfy cargo when no codegen is required yet.
+    tonic_build::compile_protos("proto/api_key_service.proto").unwrap();
 }

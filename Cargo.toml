@@ -5,7 +5,7 @@ members = [
     "crates/lightbridge-authz-grpc",
     "crates/lightbridge-authz-rest",
     "crates/lightbridge-authz-cli",
-    "crates/lightbridge-authz-api",
+    "crates/lightbridge-authz-api", "crates/lightbridge-authz-api-key",
 ]
 resolver = "3"
 
@@ -47,3 +47,12 @@ uuid = { version = "1.8", features = ["serde","v4"] }
 url = "2.5"
 argon2 = "0.5"
 rand_core = "0.6"
+
+
+[profile.prod]
+inherits = "release"
+lto = true
+opt-level = "z"
+codegen-units = 1
+incremental = false
+strip = true

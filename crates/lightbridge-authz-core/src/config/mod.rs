@@ -5,14 +5,20 @@ use serde::Deserialize;
 pub struct Config {
     pub server: Server,
     pub logging: Logging,
-    pub auth: Auth,
     pub database: Database,
     pub oauth2: Oauth2,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Server {
-    pub grpc: Grpc,
+    pub rest: Option<Rest>,
+    pub grpc: Option<Grpc>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Rest {
+    pub address: String,
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,11 +47,6 @@ pub struct Oauth2 {
 pub struct Introspection {
     pub url: String,
     pub timeout_ms: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Auth {
-    pub api_keys: Vec<String>,
 }
 
 pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<Config> {

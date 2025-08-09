@@ -14,3 +14,12 @@ lightbridge-authz-core.workspace = true
 lightbridge-authz-rest.workspace = true
 lightbridge-authz-grpc.workspace = true
 axum.workspace = true
+
+
+[[bin]]
+name = "lightbridge-authz"
+path = "src/main.rs"
+
+[[bin]]
+name = "lightbridge-authz-healthcheck"
+path = "src/healthcheck.rs"

@@ -18,3 +18,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 axum = { workspace = true, optional = true }
+
+[features]
+default = []
+axum = ["dep:axum"]
