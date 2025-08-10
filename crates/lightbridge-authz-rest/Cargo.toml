@@ -18,3 +18,4 @@ lightbridge-authz-api.workspace = true
 lightbridge-authz-core.workspace = true
 lightbridge-authz-api-key.workspace = true
 cuid.workspace = true
+lightbridge-authz-bearer.workspace = true

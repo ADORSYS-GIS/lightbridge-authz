@@ -10,6 +10,7 @@ use lightbridge_authz_core::error::Result;
 pub async fn create_api_key(pool: &DbPool, _user_id: &str, acl: Acl) -> Result<ApiKey> {
     let repo = db::ApiKeyRepo;
     let create_api_key = lightbridge_authz_core::api_key::CreateApiKey {
+        user_id: _user_id.to_string(),
         expires_at: None,
         metadata: None,
         acl: Some(acl),

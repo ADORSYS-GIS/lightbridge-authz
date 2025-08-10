@@ -11,6 +11,7 @@ pub enum ApiKeyStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateApiKey {
+    pub user_id: String,
     pub expires_at: Option<DateTime<Utc>>,
     pub metadata: Option<Value>,
     pub acl: Option<Acl>, // Add ACL to CreateApiKey

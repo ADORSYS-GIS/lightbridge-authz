@@ -40,13 +40,7 @@ pub struct Database {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Oauth2 {
-    pub introspection: Introspection,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Introspection {
-    pub url: String,
-    pub timeout_ms: u64,
+    pub jwks_url: String,
 }
 
 pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<Config> {

@@ -47,7 +47,9 @@ async fn main() -> Result<(), lightbridge_authz_core::error::Error> {
                 let config_clone = config.clone();
                 let tx_clone = tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = start_rest_server(&rest, &config_clone.database).await {
+                    if let Err(e) =
+                        start_rest_server(&rest, &config_clone.database, &config_clone.oauth2).await
+                    {
                         let _ = tx_clone
                             .send(format!("REST server failed to start: {}", e))
                             .await;

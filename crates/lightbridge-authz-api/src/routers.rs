@@ -1,3 +1,4 @@
+use crate::AppState;
 use std::sync::Arc;
 
 use axum::{
@@ -5,16 +6,9 @@ use axum::{
     routing::{get, post},
 };
 
-use crate::{
-    APIKeyService,
-    controllers::{create_api_key, delete_api_key, get_api_key, list_api_keys, patch_api_key},
-};
-
 use crate::controllers::{
-    create_api_key_via_crate, delete_api_key_via_crate, get_api_key_via_crate,
-    update_api_key_via_crate,
+    create_api_key, delete_api_key, get_api_key, list_api_keys, patch_api_key,
 };
-use lightbridge_authz_core::db::DbPool;
 
 /// Creates an Axum router for API key management.
 ///
@@ -30,37 +24,11 @@ use lightbridge_authz_core::db::DbPool;
 /// # Returns
 ///
 /// An `Axum` `Router` configured with the API key routes.
-pub fn api_key_router(handler: Arc<dyn APIKeyService>) -> Router {
+pub fn api_key_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api-keys", post(create_api_key).get(list_api_keys))
         .route(
-            "/api-keys/:key",
+            "/api-keys/{key}",
             get(get_api_key).put(patch_api_key).delete(delete_api_key),
         )
-        .with_state(handler)
-}
-
-/// Creates an Axum router for API key management using the lightbridge-authz-api-key crate.
-///
-/// This function sets up the routes for creating, retrieving, updating,
-/// and deleting API keys using functions from the lightbridge-authz-api-key crate.
-/// It takes a `DbPool` for database operations.
-///
-/// # Arguments
-///
-/// * `pool` - A `DbPool` for database operations.
-///
-/// # Returns
-///
-/// An `Axum` `Router` configured with the API key routes.
-pub fn api_key_router_via_crate(pool: Arc<DbPool>) -> Router {
-    Router::new()
-        .route("/api-keys", post(create_api_key_via_crate))
-        .route(
-            "/api-keys/:key",
-            get(get_api_key_via_crate)
-                .put(update_api_key_via_crate)
-                .delete(delete_api_key_via_crate),
-        )
-        .with_state(pool)
 }

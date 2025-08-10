@@ -11,12 +11,42 @@ services:
       ALLOW_EMPTY_PASSWORD: 'yes'
       POSTGRESQL_DATABASE: 'lightbridge_authz'
 
+  adminer:
+    image: adminer
+    ports:
+      - "18080:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+      ADMINER_DEFAULT_USERNAME: ${POSTGRES_USER:-postgres}
+      ADMINER_DEFAULT_PASSWORD: ${POSTGRES_PASSWORD:-postgres-password}
+      ADMINER_DESIGN: ${ADMINER_DESIGN:-dracula}
+      ADMINER_PLUGINS: ${ADMINER_PLUGINS:-tables-filter tinymce}
+
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.2.3
+    ports:
+      - '9100:9100'
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: password
+      KC_LOG_CONSOLE_COLOR: 'true'
+      KC_HTTP_PORT: 9100
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -ex
+
+        /opt/keycloak/bin/kc.sh start-dev --import-realm # Start Keycloak in dev mode and import the realm
+    volumes:
+      - ./.docker/keycloak_config/:/opt/keycloak/data/import/:ro
 
   app:
     deploy:
       replicas: 1
       resources:
-        limits: &limits
+        limits:
           memory: 1G
           cpus: "1"
     entrypoint: lightbridge-authz

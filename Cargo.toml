@@ -7,6 +7,7 @@ members = [
     "crates/lightbridge-authz-cli",
     "crates/lightbridge-authz-api",
     "crates/lightbridge-authz-api-key",
+    "crates/lightbridge-authz-bearer",
 ]
 resolver = "3"
 
@@ -16,12 +17,14 @@ lightbridge-authz-proto = { path = "./crates/lightbridge-authz-proto" }
 lightbridge-authz-grpc = { path = "./crates/lightbridge-authz-grpc" }
 lightbridge-authz-rest = { path = "./crates/lightbridge-authz-rest" }
 lightbridge-authz-api = { path = "./crates/lightbridge-authz-api" }
-lightbridge-authz-cli = { path = "./crates/lightbridge-authz-cli" }
 lightbridge-authz-api-key = { path = "./crates/lightbridge-authz-api-key" }
+lightbridge-authz-bearer = { path = "./crates/lightbridge-authz-bearer" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1.0"
+jsonwebtoken = { version = "9" }
+jwks = "0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tonic = "0"
 tonic-build = "0"
@@ -30,8 +33,8 @@ prost-types = "0.14"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-axum = { version = "0.7", features = ["macros"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "serde", "serde_json"] }
+axum = { version = "0.8", features = ["macros"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 

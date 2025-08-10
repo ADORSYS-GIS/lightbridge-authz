@@ -11,6 +11,4 @@ database:
   url: "postgres://postgres:postgres@postgresql:5432/lightbridge_authz"
   pool_size: 10
 oauth2:
-  introspection:
-    url: "https://issuer.example.com/oauth2/introspect"
-    timeout_ms: 2000
+  jwks_url: "http://host.mac.internal:9100/realms/dev/protocol/openid-connect/certs"

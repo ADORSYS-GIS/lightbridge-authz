@@ -1,0 +1,39 @@
+{
+  "id": "dev",
+  "realm": "dev",
+  "displayName": "Dev",
+  "displayNameHtml": "<b>Dev</b> Denv",
+  "registrationAllowed": true,
+  "registrationEmailAsUsername": true,
+  "rememberMe": true,
+  "loginWithEmailAllowed": true,
+  "resetPasswordAllowed": true,
+  "enabled": true,
+  "eventsEnabled": true,
+  "eventsExpiration": 86400,
+  "eventsListeners": [
+    "jboss-logging"
+  ],
+  "adminEventsEnabled": true,
+  "adminEventsDetailsEnabled": true,
+  "attributes": {
+    "adminEventsExpiration": "864000"
+  },
+  "users": [
+    {
+      "email": "test@admin",
+      "username": "test",
+      "firstName": "DevOps",
+      "lastName": "SRE",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        {
+          "temporary": false,
+          "type": "password",
+          "value": "test"
+        }
+      ]
+    }
+  ]
+}

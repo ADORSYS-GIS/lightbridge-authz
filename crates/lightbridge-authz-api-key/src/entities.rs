@@ -7,6 +7,7 @@ pub mod schema {
         use diesel::sql_types::*;
         api_keys (id) {
             id -> Text,
+            user_id -> Text,
             key_hash -> Text,
             created_at -> Timestamptz,
             expires_at -> Nullable<Timestamptz>,
@@ -48,6 +49,7 @@ use crate::entities::schema::{acl_models, acls, api_keys};
 #[diesel(table_name = api_keys)]
 pub struct ApiKeyRow {
     pub id: String,
+    pub user_id: String,
     pub key_hash: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
@@ -60,6 +62,7 @@ pub struct ApiKeyRow {
 #[diesel(table_name = api_keys)]
 pub struct NewApiKeyRow {
     pub id: String,
+    pub user_id: String,
     pub key_hash: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
