@@ -86,11 +86,11 @@ pub async fn get_api_key(
 #[axum::debug_handler]
 pub async fn patch_api_key(
     State(state): State<Arc<crate::AppState>>,
-    Extension(token_info): Extension<TokenInfo>,
+    Extension(TokenInfo { sub: user_id, .. }): Extension<TokenInfo>,
     Path(key): Path<String>,
     Json(input): Json<PatchApiKey>,
 ) -> Result<impl IntoResponse, Error> {
-    let api_key = state.handler.patch_api_key(key, input).await?;
+    let api_key = state.handler.patch_api_key(user_id, key, input).await?;
     Ok((StatusCode::OK, Json(api_key)))
 }
 
@@ -112,10 +112,10 @@ pub async fn patch_api_key(
 #[axum::debug_handler]
 pub async fn delete_api_key(
     State(state): State<Arc<crate::AppState>>,
-    Extension(token_info): Extension<TokenInfo>,
+    Extension(TokenInfo { sub: user_id, .. }): Extension<TokenInfo>,
     Path(key): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    state.handler.delete_api_key(key).await?;
+    state.handler.delete_api_key(user_id, key).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -136,8 +136,8 @@ pub async fn delete_api_key(
 #[axum::debug_handler]
 pub async fn list_api_keys(
     State(state): State<Arc<crate::AppState>>,
-    Extension(token_info): Extension<TokenInfo>,
+    Extension(TokenInfo { sub: user_id, .. }): Extension<TokenInfo>,
 ) -> Result<impl IntoResponse, Error> {
-    let api_keys = state.handler.list_api_keys().await?;
+    let api_keys = state.handler.list_api_keys(user_id).await?;
     Ok((StatusCode::OK, Json(api_keys)))
 }

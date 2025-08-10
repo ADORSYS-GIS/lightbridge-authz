@@ -246,6 +246,44 @@ impl ApiKeyRepo {
 
         Ok(out)
     }
+
+    pub async fn list_by_user(
+        &self,
+        pool: &DbPool,
+        user: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ApiKey>> {
+        let mut conn = pool.get().await?;
+
+        let rows: Vec<ApiKeyRow> = api_keys::table
+            .filter(api_keys::user_id.eq(user))
+            .order(api_keys::created_at.desc())
+            .limit(limit)
+            .offset(offset)
+            .load::<ApiKeyRow>(&mut conn)
+            .await
+            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let acl_row: AclRow = acls::table
+                .find(&row.acl_id)
+                .first::<AclRow>(&mut conn)
+                .await
+                .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
+
+            let model_rows: Vec<AclModelRow> = acl_models::table
+                .filter(acl_models::acl_id.eq(&row.acl_id))
+                .load::<AclModelRow>(&mut conn)
+                .await
+                .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
+
+            out.push(to_api_key(&row, &acl_row, &model_rows));
+        }
+
+        Ok(out)
+    }
 }
 
 impl AclRepo {

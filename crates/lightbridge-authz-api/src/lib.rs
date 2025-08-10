@@ -40,5 +40,5 @@ impl fmt::Debug for AppState {
 
 /// API contracts shared between REST and gRPC.
 pub mod contract {
-    pub use crate::handlers::{APIKeyCrud, APIKeyHandler};
+    pub use crate::handlers::{APIKeyCrud, APIKeyHandler, APIKeyReader};
 }

@@ -40,8 +40,8 @@ pub async fn delete_api_key(pool: &DbPool, key_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn list_api_keys(pool: &DbPool) -> Result<Vec<ApiKey>> {
+pub async fn list_api_keys(pool: &DbPool, user_id: &str) -> Result<Vec<ApiKey>> {
     let repo = db::ApiKeyRepo;
-    // use default pagination for now
-    repo.list(pool, 100, 0).await
+    // use default pagination for now and filter by user
+    repo.list_by_user(pool, user_id, 100, 0).await
 }
