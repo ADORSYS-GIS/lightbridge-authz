@@ -1,20 +1,20 @@
 diesel::table! {
     use diesel::sql_types::*;
     api_keys (id) {
-        id -> Uuid,
+        id -> Text,
         key_hash -> Text,
         created_at -> Timestamptz,
         expires_at -> Nullable<Timestamptz>,
         metadata -> Nullable<Jsonb>,
         status -> Text,
-        acl_id -> Uuid,
+        acl_id -> Text,
     }
 }
 
 diesel::table! {
     use diesel::sql_types::*;
     acls (id) {
-        id -> Uuid,
+        id -> Text,
         rate_limit_requests -> Integer,
         rate_limit_window -> Integer,
         created_at -> Timestamptz,
@@ -25,7 +25,7 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
     acl_models (acl_id, model_name) {
-        acl_id -> Uuid,
+        acl_id -> Text,
         model_name -> Text,
         token_limit -> BigInt,
     }

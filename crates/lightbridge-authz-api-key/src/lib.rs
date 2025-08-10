@@ -1,7 +1,6 @@
 use lightbridge_authz_core::api_key::{Acl, ApiKey};
 use lightbridge_authz_core::db::{ApiKeyRepo, DbPool};
 use lightbridge_authz_core::error::Result;
-use uuid::Uuid;
 
 /// Create a new API key with the specified user ID and ACL.
 ///
@@ -39,14 +38,10 @@ pub async fn create_api_key(pool: &DbPool, _user_id: &str, acl: Acl) -> Result<A
 /// # Returns
 ///
 /// The API key if found, or None if not found
-pub async fn get_api_key(pool: &DbPool, key: &str) -> Result<Option<ApiKey>> {
+pub async fn get_api_key(pool: &DbPool, key_id: &str) -> Result<Option<ApiKey>> {
     let api_key_repo = ApiKeyRepo;
     // TODO: Implement key lookup by key string
     // For now, we'll assume the key is a UUID
-    let key_id = match Uuid::parse_str(key) {
-        Ok(id) => id,
-        Err(_) => return Ok(None),
-    };
 
     api_key_repo.get_by_id(pool, key_id).await
 }
@@ -62,13 +57,9 @@ pub async fn get_api_key(pool: &DbPool, key: &str) -> Result<Option<ApiKey>> {
 /// # Returns
 ///
 /// The updated API key
-pub async fn update_api_key(pool: &DbPool, key: &str, acl: Acl) -> Result<ApiKey> {
+pub async fn update_api_key(pool: &DbPool, key_id: &str, acl: Acl) -> Result<ApiKey> {
     let api_key_repo = ApiKeyRepo;
     // TODO: Implement key lookup and update by key string
-    // For now, we'll assume the key is a UUID
-    let key_id = Uuid::parse_str(key).map_err(|_| {
-        lightbridge_authz_core::error::Error::Any(anyhow::anyhow!("Invalid key format"))
-    })?;
 
     let patch_api_key = lightbridge_authz_core::api_key::PatchApiKey {
         expires_at: None,
@@ -90,13 +81,9 @@ pub async fn update_api_key(pool: &DbPool, key: &str, acl: Acl) -> Result<ApiKey
 /// # Returns
 ///
 /// A result indicating success or failure
-pub async fn delete_api_key(pool: &DbPool, key: &str) -> Result<()> {
+pub async fn delete_api_key(pool: &DbPool, key_id: &str) -> Result<()> {
     let api_key_repo = ApiKeyRepo;
     // TODO: Implement key lookup and deletion by key string
-    // For now, we'll assume the key is a UUID
-    let key_id = Uuid::parse_str(key).map_err(|_| {
-        lightbridge_authz_core::error::Error::Any(anyhow::anyhow!("Invalid key format"))
-    })?;
 
     // For now, we'll just revoke the key instead of deleting it
     let _ = api_key_repo.revoke(pool, key_id).await;
@@ -105,8 +92,6 @@ pub async fn delete_api_key(pool: &DbPool, key: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn it_works() {
         // TODO: Add tests

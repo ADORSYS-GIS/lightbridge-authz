@@ -1,2 +1,2 @@
-// Re-export the generated protobuf code
-tonic::include_proto!("lightbridge.authz");
+pub use envoy_types;
+pub use prost_types;

@@ -19,6 +19,10 @@ pub enum Error {
     Any(#[from] anyhow::Error),
 
     /// Error originating from I/O operations.
+    #[error("Rand: {0}")]
+    RandError(#[from] rand_core::OsError),
+
+    /// Error originating from I/O operations.
     #[error("Address parse error error: {0}")]
     AddrParseError(#[from] std::net::AddrParseError),
 }
@@ -32,6 +36,7 @@ mod axum_impl {
         fn into_response(self) -> axum::response::Response {
             let status_code = match self {
                 Error::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                Error::RandError(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::Yaml(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::NotFound => StatusCode::NOT_FOUND,
                 Error::Any(_) => StatusCode::INTERNAL_SERVER_ERROR,

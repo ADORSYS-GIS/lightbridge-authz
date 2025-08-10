@@ -17,4 +17,4 @@ Please review this code for:
 ## Actions
 
 - Switch the mode if action required.
-- Write your findinds into a file (override the file) REVIEW.md
+- Write your findinds into a file (override the file) REVIEW.md.

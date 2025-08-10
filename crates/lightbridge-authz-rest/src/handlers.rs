@@ -6,7 +6,6 @@ use lightbridge_authz_core::{
     error::Result,
 };
 use std::sync::Arc;
-use uuid::Uuid;
 
 #[derive(Clone, Debug)]
 pub struct APIKeyHandlerImpl {
@@ -29,25 +28,19 @@ impl APIKeyHandler for APIKeyHandlerImpl {
 
     async fn get_api_key(&self, api_key_id: String) -> Result<ApiKey> {
         let repo = lightbridge_authz_core::db::ApiKeyRepo;
-        let uuid = Uuid::parse_str(&api_key_id)
-            .map_err(|_| lightbridge_authz_core::error::Error::NotFound)?;
-        repo.get_by_id(&self.pool, uuid)
+        repo.get_by_id(&self.pool, &api_key_id)
             .await?
             .ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)
     }
 
     async fn patch_api_key(&self, api_key_id: String, input: PatchApiKey) -> Result<ApiKey> {
         let repo = lightbridge_authz_core::db::ApiKeyRepo;
-        let uuid = Uuid::parse_str(&api_key_id)
-            .map_err(|_| lightbridge_authz_core::error::Error::NotFound)?;
-        repo.patch(&self.pool, uuid, input).await
+        repo.patch(&self.pool, &api_key_id, input).await
     }
 
     async fn delete_api_key(&self, api_key_id: String) -> Result<()> {
         let repo = lightbridge_authz_core::db::ApiKeyRepo;
-        let uuid = Uuid::parse_str(&api_key_id)
-            .map_err(|_| lightbridge_authz_core::error::Error::NotFound)?;
-        repo.revoke(&self.pool, uuid).await?;
+        repo.revoke(&self.pool, &api_key_id).await?;
         Ok(())
     }
 }

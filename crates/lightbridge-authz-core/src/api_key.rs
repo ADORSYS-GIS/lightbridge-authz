@@ -2,7 +2,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ApiKeyStatus {
@@ -27,7 +26,7 @@ pub struct PatchApiKey {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKey {
-    pub id: Uuid,
+    pub id: String,
     pub key_hash: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,

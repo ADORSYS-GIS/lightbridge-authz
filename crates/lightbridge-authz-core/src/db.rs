@@ -4,16 +4,16 @@ use crate::schema::{acl_models, acls, api_keys};
 use anyhow::anyhow;
 use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 use chrono::{DateTime, Utc};
+use cuid::cuid2;
 use diesel::SelectableHelper;
 use diesel::prelude::*;
-use diesel::sql_types::{Jsonb, Nullable, Text, Timestamptz, Uuid as DieselUuid};
+use diesel::sql_types::{Jsonb, Nullable, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::{Pool, PooledConnection};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use rand_core::OsRng;
 use serde_json::Value;
 use std::collections::HashMap;
-use uuid::Uuid;
 
 #[derive(Clone, Debug)]
 pub struct DbPool {
@@ -44,8 +44,8 @@ pub struct AclRepo;
 #[derive(Queryable, Identifiable, Selectable, diesel::QueryableByName)]
 #[diesel(table_name = api_keys)]
 pub struct ApiKeyRow {
-    #[diesel(sql_type = DieselUuid)]
-    pub id: Uuid,
+    #[diesel(sql_type = Text)]
+    pub id: String,
     #[diesel(sql_type = Text)]
     pub key_hash: String,
     #[diesel(sql_type = Timestamptz)]
@@ -56,26 +56,26 @@ pub struct ApiKeyRow {
     pub metadata: Option<Value>,
     #[diesel(sql_type = Text)]
     pub status: String,
-    #[diesel(sql_type = DieselUuid)]
-    pub acl_id: Uuid,
+    #[diesel(sql_type = Text)]
+    pub acl_id: String,
 }
 
 #[derive(Insertable)]
 #[diesel(table_name = api_keys)]
 pub struct NewApiKeyRow {
-    pub id: Uuid,
+    pub id: String,
     pub key_hash: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
     pub metadata: Option<Value>,
     pub status: String,
-    pub acl_id: Uuid,
+    pub acl_id: String,
 }
 
 #[derive(Queryable, Identifiable, Selectable)]
 #[diesel(table_name = acls)]
 pub struct AclRow {
-    pub id: Uuid,
+    pub id: String,
     pub rate_limit_requests: i32,
     pub rate_limit_window: i32,
     pub created_at: DateTime<Utc>,
@@ -85,7 +85,7 @@ pub struct AclRow {
 #[derive(Insertable)]
 #[diesel(table_name = acls)]
 pub struct NewAclRow {
-    pub id: Uuid,
+    pub id: String,
     pub rate_limit_requests: i32,
     pub rate_limit_window: i32,
     pub created_at: DateTime<Utc>,
@@ -104,7 +104,7 @@ pub struct PatchAclRow {
 #[diesel(table_name = acl_models)]
 #[diesel(primary_key(acl_id, model_name))]
 pub struct AclModelRow {
-    pub acl_id: Uuid,
+    pub acl_id: String,
     pub model_name: String,
     pub token_limit: i64,
 }
@@ -112,7 +112,7 @@ pub struct AclModelRow {
 #[derive(Insertable)]
 #[diesel(table_name = acl_models)]
 pub struct NewAclModelRow {
-    pub acl_id: Uuid,
+    pub acl_id: String,
     pub model_name: String,
     pub token_limit: i64,
 }
@@ -143,7 +143,7 @@ impl ApiKeyRow {
         // Fetch ACL data from database
         let acl_repo = AclRepo;
         let acl = acl_repo
-            .get(pool, self.acl_id)
+            .get(pool, &self.acl_id)
             .await?
             .unwrap_or_else(Acl::default); // Use default ACL if not found
 
@@ -167,10 +167,11 @@ impl ApiKeyRepo {
         key_plain: String,
     ) -> Result<ApiKey> {
         let conn = &mut pool.get().await?;
-        let id_v = Uuid::new_v4();
+        let id_v = cuid2();
         let now = Utc::now();
 
-        let salt = SaltString::generate(&mut OsRng);
+        let mut rng = OsRng;
+        let salt = SaltString::try_from_rng(&mut rng)?;
         let hash = Argon2::default()
             .hash_password(key_plain.as_bytes(), &salt)
             .map_err(|e| anyhow!(e.to_string()))?
@@ -194,7 +195,7 @@ impl ApiKeyRepo {
             expires_at: new.expires_at,
             metadata: new.metadata,
             status: "Active".to_string(),
-            acl_id,
+            acl_id: acl_id.to_string(),
         };
 
         let api_key_row = diesel::insert_into(crate::schema::api_keys::table)
@@ -208,7 +209,7 @@ impl ApiKeyRepo {
         api_key_row.into_api_key(pool).await
     }
 
-    pub async fn patch(&self, pool: &DbPool, key_id: Uuid, patch: PatchApiKey) -> Result<ApiKey> {
+    pub async fn patch(&self, pool: &DbPool, key_id: &str, patch: PatchApiKey) -> Result<ApiKey> {
         let conn = &mut pool.get().await?;
 
         let mut changes = Vec::new();
@@ -253,7 +254,7 @@ impl ApiKeyRepo {
         api_key_row.into_api_key(pool).await
     }
 
-    pub async fn get_by_id(&self, pool: &DbPool, key_id: Uuid) -> Result<Option<ApiKey>> {
+    pub async fn get_by_id(&self, pool: &DbPool, key_id: &str) -> Result<Option<ApiKey>> {
         use crate::schema::api_keys::dsl::{api_keys, id};
         let conn = &mut pool.get().await?;
         let api_key_row = api_keys
@@ -296,7 +297,7 @@ impl ApiKeyRepo {
         Ok(api_key_list)
     }
 
-    pub async fn revoke(&self, pool: &DbPool, key_id: Uuid) -> Result<bool> {
+    pub async fn revoke(&self, pool: &DbPool, key_id: &str) -> Result<bool> {
         use crate::schema::api_keys::dsl::{api_keys, id, status};
         let conn = &mut pool.get().await?;
         let updated = diesel::update(api_keys.filter(id.eq(key_id)))
@@ -310,14 +311,14 @@ impl ApiKeyRepo {
 }
 
 impl AclRepo {
-    pub async fn create(&self, pool: &DbPool, acl: &Acl) -> Result<Uuid> {
+    pub async fn create(&self, pool: &DbPool, acl: &Acl) -> Result<String> {
         let conn = &mut pool.get().await?;
-        let id = Uuid::new_v4();
+        let id = cuid2();
         let now = Utc::now();
 
         // Create the ACL record
         let new_acl = NewAclRow {
-            id,
+            id: id.clone(),
             rate_limit_requests: acl.rate_limit.requests as i32,
             rate_limit_window: acl.rate_limit.window_seconds as i32,
             created_at: now,
@@ -334,7 +335,7 @@ impl AclRepo {
         // Create ACL model records
         for (model_name, token_limit) in &acl.tokens_per_model {
             let new_acl_model = NewAclModelRow {
-                acl_id: id,
+                acl_id: id.clone(),
                 model_name: model_name.clone(),
                 token_limit: *token_limit as i64,
             };
@@ -350,7 +351,7 @@ impl AclRepo {
         Ok(id)
     }
 
-    pub async fn get(&self, pool: &DbPool, acl_id: Uuid) -> Result<Option<Acl>> {
+    pub async fn get(&self, pool: &DbPool, acl_id: &str) -> Result<Option<Acl>> {
         let conn = &mut pool.get().await?;
 
         // Get the ACL record
@@ -398,7 +399,7 @@ impl AclRepo {
         }
     }
 
-    pub async fn update(&self, pool: &DbPool, acl_id: Uuid, acl: &Acl) -> Result<()> {
+    pub async fn update(&self, pool: &DbPool, acl_id: &str, acl: &Acl) -> Result<()> {
         let conn = &mut pool.get().await?;
         let now = Utc::now();
 
@@ -426,7 +427,7 @@ impl AclRepo {
         // Create new ACL model records
         for (model_name, token_limit) in &acl.tokens_per_model {
             let new_acl_model = NewAclModelRow {
-                acl_id,
+                acl_id: acl_id.to_string(),
                 model_name: model_name.clone(),
                 token_limit: *token_limit as i64,
             };
@@ -442,7 +443,7 @@ impl AclRepo {
         Ok(())
     }
 
-    pub async fn delete(&self, pool: &DbPool, acl_id: Uuid) -> Result<()> {
+    pub async fn delete(&self, pool: &DbPool, acl_id: &str) -> Result<()> {
         let conn = &mut pool.get().await?;
 
         // Delete ACL model records

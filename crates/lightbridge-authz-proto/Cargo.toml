@@ -2,12 +2,12 @@
 name = "lightbridge-authz-proto"
 version = "0.1.0"
 edition = "2024"
-build = "build.rs"
 
 [dependencies]
 prost.workspace = true
 prost-types.workspace = true
 tonic.workspace = true
+envoy-types.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true

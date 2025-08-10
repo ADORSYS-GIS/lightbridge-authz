@@ -12,3 +12,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 lightbridge-authz-core.workspace = true
 lightbridge-authz-proto.workspace = true
+chrono.workspace = true
