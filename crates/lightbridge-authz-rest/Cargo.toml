@@ -17,4 +17,4 @@ async-trait.workspace = true
 lightbridge-authz-api.workspace = true
 lightbridge-authz-core.workspace = true
 lightbridge-authz-api-key.workspace = true
-uuid.workspace = true
+cuid.workspace = true

@@ -8,7 +8,6 @@ serde.workspace = true
 serde_yaml.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
-uuid.workspace = true
 cuid.workspace = true
 diesel.workspace = true
 diesel-async.workspace = true

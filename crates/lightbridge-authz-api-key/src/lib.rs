@@ -14,7 +14,7 @@ pub async fn create_api_key(pool: &DbPool, _user_id: &str, acl: Acl) -> Result<A
         metadata: None,
         acl: Some(acl),
     };
-    let key_plain = format!("sk-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let key_plain = format!("sk-{}", cuid::cuid2());
     repo.create(pool, create_api_key, key_plain).await
 }
 

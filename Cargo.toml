@@ -41,7 +41,6 @@ diesel = { version = "2", features = ["postgres","chrono","serde_json"] }
 diesel-async = { version = "0", features = ["postgres","bb8"] }
 diesel_migrations = "2"
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["serde","v4"] }
 cuid = { version = "1" }
 argon2 = "0.6.0-rc.0"
 rand_core = "0"

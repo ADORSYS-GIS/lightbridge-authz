@@ -10,7 +10,6 @@ use lightbridge_authz_core::api_key::{
 };
 use lightbridge_authz_core::db::DbPool;
 use lightbridge_authz_core::error::{Error, Result};
-use uuid::Uuid;
 
 use crate::entities::*;
 use crate::mappers::*;
@@ -28,8 +27,8 @@ impl ApiKeyRepo {
         let mut conn = pool.get().await?;
         let now = Utc::now();
 
-        let key_id = Uuid::new_v4().to_string();
-        let acl_id = Uuid::new_v4().to_string();
+        let key_id = cuid::cuid2();
+        let acl_id = cuid::cuid2();
 
         let key_hash = key_plain;
 
