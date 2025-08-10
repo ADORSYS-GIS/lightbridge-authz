@@ -58,10 +58,10 @@ pub async fn create_api_key(
 #[axum::debug_handler]
 pub async fn get_api_key(
     State(state): State<Arc<crate::AppState>>,
-    Extension(token_info): Extension<TokenInfo>,
+    Extension(TokenInfo { sub: user_id, .. }): Extension<TokenInfo>,
     Path(key): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    let api_key = state.handler.get_api_key(key).await?;
+    let api_key = state.handler.get_api_key(user_id, key).await?;
     Ok((StatusCode::OK, Json(api_key)))
 }
 

@@ -18,12 +18,17 @@ pub async fn create_api_key(pool: &DbPool, user_id: &str, acl: Acl) -> Result<Ap
     repo.create(pool, user_id, create_api_key, key_plain).await
 }
 
-pub async fn get_api_key(pool: &DbPool, key_id: &str) -> Result<Option<ApiKey>> {
+pub async fn get_api_key(pool: &DbPool, user_id: &str, key_id: &str) -> Result<Option<ApiKey>> {
     let repo = db::ApiKeyRepo;
-    repo.get_by_id(pool, key_id).await
+    repo.find_by_id(pool, user_id, key_id).await
 }
 
-pub async fn update_api_key(pool: &DbPool, key_id: &str, acl: Acl) -> Result<ApiKey> {
+pub async fn update_api_key(
+    pool: &DbPool,
+    user_id: &str,
+    key_id: &str,
+    acl: Acl,
+) -> Result<ApiKey> {
     let repo = db::ApiKeyRepo;
     let patch_api_key = PatchApiKey {
         expires_at: None,
@@ -31,17 +36,17 @@ pub async fn update_api_key(pool: &DbPool, key_id: &str, acl: Acl) -> Result<Api
         status: None,
         acl: Some(acl),
     };
-    repo.patch(pool, key_id, patch_api_key).await
+    repo.update(pool, user_id, key_id, patch_api_key).await
 }
 
-pub async fn delete_api_key(pool: &DbPool, key_id: &str) -> Result<()> {
+pub async fn delete_api_key(pool: &DbPool, user_id: &str, key_id: &str) -> Result<()> {
     let repo = db::ApiKeyRepo;
-    let _ = repo.revoke(pool, key_id).await;
+    let _ = repo.delete(pool, user_id, key_id).await;
     Ok(())
 }
 
 pub async fn list_api_keys(pool: &DbPool, user_id: &str) -> Result<Vec<ApiKey>> {
     let repo = db::ApiKeyRepo;
     // use default pagination for now and filter by user
-    repo.list_by_user(pool, user_id, 100, 0).await
+    repo.find_all(pool, user_id, 100, 0).await
 }

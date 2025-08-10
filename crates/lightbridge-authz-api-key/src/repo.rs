@@ -94,11 +94,16 @@ impl ApiKeyRepo {
         .map_err(|e| Error::Any(anyhow::anyhow!(e)))
     }
 
-    pub async fn get_by_id(&self, pool: &DbPool, id: &str) -> Result<Option<ApiKey>> {
+    pub async fn find_by_id(
+        &self,
+        pool: &DbPool,
+        user_id: &str,
+        id: &str,
+    ) -> Result<Option<ApiKey>> {
         let mut conn = pool.get().await?;
 
         let maybe_row = api_keys::table
-            .find(id)
+            .filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id)))
             .first::<ApiKeyRow>(&mut conn)
             .await
             .optional()
@@ -124,33 +129,79 @@ impl ApiKeyRepo {
         Ok(Some(dto))
     }
 
-    pub async fn patch(&self, pool: &DbPool, id: &str, input: PatchApiKey) -> Result<ApiKey> {
+    pub async fn find_by_token(&self, pool: &DbPool, token: &str) -> Result<Option<ApiKey>> {
+        let mut conn = pool.get().await?;
+
+        let maybe_row = api_keys::table
+            .filter(api_keys::key_hash.eq(token))
+            .first::<ApiKeyRow>(&mut conn)
+            .await
+            .optional()
+            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
+
+        let Some(api_key_row) = maybe_row else {
+            return Ok(None);
+        };
+
+        let acl_row: AclRow = acls::table
+            .find(&api_key_row.acl_id)
+            .first::<AclRow>(&mut conn)
+            .await
+            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
+
+        let model_rows: Vec<AclModelRow> = acl_models::table
+            .filter(acl_models::acl_id.eq(&api_key_row.acl_id))
+            .load::<AclModelRow>(&mut conn)
+            .await
+            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
+
+        let dto = to_api_key(&api_key_row, &acl_row, &model_rows);
+        Ok(Some(dto))
+    }
+    pub async fn update(
+        &self,
+        pool: &DbPool,
+        user_id: &str,
+        id: &str,
+        input: PatchApiKey,
+    ) -> Result<ApiKey> {
         let mut conn = pool.get().await?;
 
         conn.transaction(|tx| {
             async move {
-                let api_key_row: ApiKeyRow =
-                    api_keys::table.find(id).first::<ApiKeyRow>(tx).await?;
+                let api_key_row: ApiKeyRow = api_keys::table
+                    .filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id)))
+                    .first::<ApiKeyRow>(tx)
+                    .await?;
 
                 if let Some(status) = input.status {
-                    diesel::update(api_keys::table.find(id))
-                        .set(api_keys::status.eq(api_key_status_to_str(&status)))
-                        .execute(tx)
-                        .await?;
+                    diesel::update(
+                        api_keys::table
+                            .filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id))),
+                    )
+                    .set(api_keys::status.eq(api_key_status_to_str(&status)))
+                    .execute(tx)
+                    .await?;
                 }
 
                 if let Some(expires_at) = input.expires_at {
-                    diesel::update(api_keys::table.find(id))
-                        .set(api_keys::expires_at.eq(expires_at))
-                        .execute(tx)
-                        .await?;
+                    diesel::update(
+                        api_keys::table
+                            .filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id))),
+                    )
+                    .set(api_keys::expires_at.eq(expires_at))
+                    .execute(tx)
+                    .await?;
                 }
 
                 if let Some(metadata) = input.metadata {
-                    diesel::update(api_keys::table.find(id))
-                        .set(api_keys::metadata.eq(metadata))
-                        .execute(tx)
-                        .await?;
+                    diesel::update(
+                        api_keys::table
+                            .filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id))),
+                    )
+                    .set(api_keys::metadata.eq(metadata))
+                    .execute(tx)
+                    .await?;
                 }
 
                 if let Some(acl) = input.acl {
@@ -184,8 +235,10 @@ impl ApiKeyRepo {
                     }
                 }
 
-                let api_key_row: ApiKeyRow =
-                    api_keys::table.find(id).first::<ApiKeyRow>(tx).await?;
+                let api_key_row: ApiKeyRow = api_keys::table
+                    .filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id)))
+                    .first::<ApiKeyRow>(tx)
+                    .await?;
 
                 let acl_row: AclRow = acls::table
                     .find(&api_key_row.acl_id)
@@ -206,13 +259,15 @@ impl ApiKeyRepo {
         .map_err(|e| Error::Any(anyhow::anyhow!(e)))
     }
 
-    pub async fn revoke(&self, pool: &DbPool, id: &str) -> Result<()> {
+    pub async fn delete(&self, pool: &DbPool, user_id: &str, id: &str) -> Result<()> {
         let mut conn = pool.get().await?;
-        diesel::update(api_keys::table.find(id))
-            .set(api_keys::status.eq(api_key_status_to_str(&ApiKeyStatus::Revoked)))
-            .execute(&mut conn)
-            .await
-            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
+        diesel::update(
+            api_keys::table.filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id))),
+        )
+        .set(api_keys::status.eq(api_key_status_to_str(&ApiKeyStatus::Revoked)))
+        .execute(&mut conn)
+        .await
+        .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
         Ok(())
     }
 
@@ -247,17 +302,17 @@ impl ApiKeyRepo {
         Ok(out)
     }
 
-    pub async fn list_by_user(
+    pub async fn find_all(
         &self,
         pool: &DbPool,
-        user: &str,
+        user_id: &str,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<ApiKey>> {
         let mut conn = pool.get().await?;
 
         let rows: Vec<ApiKeyRow> = api_keys::table
-            .filter(api_keys::user_id.eq(user))
+            .filter(api_keys::user_id.eq(user_id))
             .order(api_keys::created_at.desc())
             .limit(limit)
             .offset(offset)

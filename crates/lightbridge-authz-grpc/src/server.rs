@@ -28,17 +28,20 @@ impl AuthServer {
         Self { pool }
     }
 
-    async fn resolve_acls(&self, key_id: &str) -> Result<Vec<String>, CoreError> {
+    async fn resolve_acls(&self, token: &str) -> Result<Vec<String>, CoreError> {
         let repo = ApiKeyRepo;
-        let maybe = repo.get_by_id(&self.pool, key_id).await?;
+        // Find the ApiKey by its token (key_hash) first
+        let maybe = repo.find_by_token(&self.pool, token).await?;
         let api_key = maybe.ok_or(CoreError::NotFound)?;
 
+        // Check expiration
         if let Some(expires_at) = api_key.expires_at {
             if expires_at < Utc::now() {
                 return Err(CoreError::NotFound);
             }
         }
 
+        // Build ACL list based on key's ACL and status
         match api_key.status {
             ApiKeyStatus::Active => {
                 let mut acls = Vec::new();
