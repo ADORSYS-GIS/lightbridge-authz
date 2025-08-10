@@ -5,7 +5,8 @@ members = [
     "crates/lightbridge-authz-grpc",
     "crates/lightbridge-authz-rest",
     "crates/lightbridge-authz-cli",
-    "crates/lightbridge-authz-api", "crates/lightbridge-authz-api-key",
+    "crates/lightbridge-authz-api",
+    "crates/lightbridge-authz-api-key",
 ]
 resolver = "3"
 
@@ -16,6 +17,7 @@ lightbridge-authz-grpc = { path = "./crates/lightbridge-authz-grpc" }
 lightbridge-authz-rest = { path = "./crates/lightbridge-authz-rest" }
 lightbridge-authz-api = { path = "./crates/lightbridge-authz-api" }
 lightbridge-authz-cli = { path = "./crates/lightbridge-authz-cli" }
+lightbridge-authz-api-key = { path = "./crates/lightbridge-authz-api-key" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
@@ -33,7 +35,9 @@ axum = { version = "0.7", features = ["macros"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 
-diesel = { version = "2", features = ["postgres","chrono","serde_json","uuid"] }
+deadpool = { version = "0" }
+deadpool-diesel = { version = "0" }
+diesel = { version = "2", features = ["postgres","chrono","serde_json"] }
 diesel-async = { version = "0", features = ["postgres","bb8"] }
 diesel_migrations = "2"
 chrono = { version = "0.4", features = ["serde"] }

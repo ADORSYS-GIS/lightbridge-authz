@@ -15,17 +15,17 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Serve {
-        #[arg(long)]
+        #[arg(long, short)]
         config: String,
     },
     Config {
-        #[arg(long)]
+        #[arg(long, short)]
         config: String,
     },
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), lightbridge_authz_core::error::Error> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
@@ -34,10 +34,8 @@ async fn main() {
         Some(Commands::Serve { config }) => {
             let config = lightbridge_authz_core::config::load_from_path(&config).unwrap();
 
-            // Create a channel for error signaling
             let (tx, mut rx) = mpsc::channel::<String>(32);
 
-            // Spawn a task to listen for errors and terminate the process if any occur
             let error_listener = tokio::spawn(async move {
                 if let Some(error_msg) = rx.recv().await {
                     eprintln!("Server error: {}", error_msg);
@@ -45,7 +43,6 @@ async fn main() {
                 }
             });
 
-            // Start REST server if requested
             if let Some(rest) = config.clone().server.rest {
                 let config_clone = config.clone();
                 let tx_clone = tx.clone();
@@ -58,7 +55,6 @@ async fn main() {
                 });
             }
 
-            // Start gRPC server if requested
             if let Some(grpc) = config.clone().server.grpc {
                 let config_clone = config.clone();
                 let tx_clone = tx.clone();
@@ -71,7 +67,6 @@ async fn main() {
                 });
             }
 
-            // Wait for the error listener to complete (which only happens on error)
             let _ = error_listener.await;
         }
         Some(Commands::Config { config }) => {
@@ -82,4 +77,5 @@ async fn main() {
             info!("No command provided. Use --help for more information.");
         }
     }
+    Ok(())
 }

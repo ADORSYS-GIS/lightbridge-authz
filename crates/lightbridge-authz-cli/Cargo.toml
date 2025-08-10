@@ -14,6 +14,8 @@ lightbridge-authz-core.workspace = true
 lightbridge-authz-rest.workspace = true
 lightbridge-authz-grpc.workspace = true
 axum.workspace = true
+diesel.workspace = true
+diesel_migrations.workspace = true
 
 
 [[bin]]
@@ -22,4 +24,8 @@ path = "src/main.rs"
 
 [[bin]]
 name = "lightbridge-authz-healthcheck"
-path = "src/healthcheck.rs"
+path = "src/bin/healthcheck.rs"
+
+[[bin]]
+name = "lightbridge-authz-migrate"
+path = "src/bin/migrate.rs"

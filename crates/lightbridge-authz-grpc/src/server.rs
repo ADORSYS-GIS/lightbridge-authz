@@ -2,8 +2,9 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use lightbridge_authz_api_key::db::ApiKeyRepo;
 use lightbridge_authz_core::api_key::ApiKeyStatus;
-use lightbridge_authz_core::db::{ApiKeyRepo, DbPool};
+use lightbridge_authz_core::db::DbPool;
 use lightbridge_authz_core::error::Error as CoreError;
 
 use lightbridge_authz_proto::envoy_types::ext_authz::v3::pb::{

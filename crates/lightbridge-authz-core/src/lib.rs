@@ -1,8 +1,8 @@
 pub mod api_key;
 pub mod config;
 pub mod db;
+pub mod dto;
 pub mod error;
-pub mod schema;
 
 pub use crate::api_key::{ApiKey, ApiKeyStatus, CreateApiKey, PatchApiKey};
 pub use crate::config::{Config, load_from_path};

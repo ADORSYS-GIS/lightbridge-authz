@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use lightbridge_authz_api_key::db::ApiKeyRepo;
 use lightbridge_authz_core::CreateApiKey;
 use lightbridge_authz_core::api_key::{Acl, ApiKey};
 use lightbridge_authz_core::db::DbPool;
@@ -52,7 +53,7 @@ pub trait APIKeyHandlerViaCrate:
     /// or an `Error` if the operation fails.
     async fn update_api_key(&self, pool: Arc<DbPool>, key: String, acl: Acl) -> Result<ApiKey>;
 
-    /// Deletes an API key by its key string.
+    /// Deletes (revokes) an API key by its key string.
     ///
     /// # Arguments
     ///
@@ -69,7 +70,13 @@ pub trait APIKeyHandlerViaCrate:
 /// This trait provides a more granular contract for specific API key management actions.
 #[async_trait]
 pub trait APIKeyCrudViaCrate: Send + Sync + 'static + std::fmt::Debug {
-    // Currently no list operation in the api-key crate, so we'll leave this empty for now
+    /// Lists API keys with pagination.
+    async fn list_api_keys(
+        &self,
+        pool: Arc<DbPool>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ApiKey>>;
 }
 
 /// Implementation of APIKeyHandlerViaCrate that uses the lightbridge-authz-api-key crate.
@@ -99,11 +106,21 @@ impl APIKeyHandlerViaCrate for APIKeyHandlerViaCrateImpl {
     }
 
     async fn delete_api_key(&self, pool: Arc<DbPool>, key: String) -> Result<()> {
-        lightbridge_authz_api_key::delete_api_key(&pool, &key).await
+        // Use the repository revoke method directly
+        let repo = ApiKeyRepo;
+        repo.revoke(&pool, &key).await
     }
 }
 
 #[async_trait]
 impl APIKeyCrudViaCrate for APIKeyHandlerViaCrateImpl {
-    // No CRUD operations needed for now
+    async fn list_api_keys(
+        &self,
+        pool: Arc<DbPool>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ApiKey>> {
+        let repo = ApiKeyRepo;
+        repo.list(&pool, limit, offset).await
+    }
 }

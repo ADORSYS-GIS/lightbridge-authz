@@ -1,0 +1,16 @@
+server:
+  rest:
+    address: "0.0.0.0"
+    port: 3000
+  grpc:
+    address: "0.0.0.0"
+    port: 3001
+logging:
+  level: "info"
+database:
+  url: "postgres://postgres:postgres@postgresql:5432/lightbridge_authz"
+  pool_size: 10
+oauth2:
+  introspection:
+    url: "https://issuer.example.com/oauth2/introspect"
+    timeout_ms: 2000

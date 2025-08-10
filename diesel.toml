@@ -1,0 +1,3 @@
+# diesel.toml
+[migrations_directory]
+dir = "migrations"

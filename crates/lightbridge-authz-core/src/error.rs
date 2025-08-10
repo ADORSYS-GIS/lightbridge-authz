@@ -4,7 +4,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    /// Error originating from I/O operations.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -14,17 +13,20 @@ pub enum Error {
     #[error("Not found")]
     NotFound,
 
-    /// Error originating from I/O operations.
     #[error("Any: {0}")]
     Any(#[from] anyhow::Error),
 
-    /// Error originating from I/O operations.
     #[error("Rand: {0}")]
     RandError(#[from] rand_core::OsError),
 
-    /// Error originating from I/O operations.
     #[error("Address parse error error: {0}")]
     AddrParseError(#[from] std::net::AddrParseError),
+
+    #[error("Database error: {0}")]
+    Database(String),
+
+    #[error("Migration error: {0}")]
+    Migration(String),
 }
 
 #[cfg(feature = "axum")]
@@ -41,6 +43,8 @@ mod axum_impl {
                 Error::NotFound => StatusCode::NOT_FOUND,
                 Error::Any(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::AddrParseError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                Error::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                Error::Migration(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
 
             (status_code, self.to_string()).into_response()

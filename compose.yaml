@@ -11,6 +11,32 @@ services:
       ALLOW_EMPTY_PASSWORD: 'yes'
       POSTGRESQL_DATABASE: 'lightbridge_authz'
 
+
+  app:
+    deploy:
+      replicas: 1
+      resources:
+        limits: &limits
+          memory: 1G
+          cpus: "1"
+    entrypoint: lightbridge-authz
+    command:
+      - serve
+      - --config
+      - /tmp/config.yaml
+    build:
+      context: .
+    volumes:
+      - ./config/container.yaml:/tmp/config.yaml
+    ports:
+      - "3000"
+      - "3001"
+    healthcheck:
+      test:
+      - "CMD"
+      - "/usr/local/bin/lightbridge-authz-healthcheck"
+
+
 volumes:
   postgresql_data:
     driver: local

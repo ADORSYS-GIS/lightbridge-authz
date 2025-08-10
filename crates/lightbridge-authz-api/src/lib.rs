@@ -2,8 +2,10 @@
 
 pub mod api_key_handlers;
 pub mod controllers;
+pub mod db;
 pub mod handlers;
 pub mod routers;
+pub mod schema;
 
 pub trait APIKeyService:
     handlers::APIKeyHandler + handlers::APIKeyCrud + Send + Sync + 'static
