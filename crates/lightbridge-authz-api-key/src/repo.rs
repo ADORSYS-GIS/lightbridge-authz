@@ -21,6 +21,7 @@ impl ApiKeyRepo {
     pub async fn create(
         &self,
         pool: &DbPool,
+        user_id: &str,
         input: CreateApiKey,
         key_plain: String,
     ) -> Result<ApiKey> {
@@ -46,7 +47,7 @@ impl ApiKeyRepo {
 
         let new_api_key = NewApiKeyRow {
             id: key_id.clone(),
-            user_id: input.user_id.clone(),
+            user_id: user_id.to_string(),
             key_hash,
             created_at: now,
             expires_at: input.expires_at,

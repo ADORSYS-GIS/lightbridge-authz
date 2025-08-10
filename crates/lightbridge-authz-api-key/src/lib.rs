@@ -7,16 +7,15 @@ use lightbridge_authz_core::api_key::{Acl, ApiKey, PatchApiKey};
 use lightbridge_authz_core::db::DbPool;
 use lightbridge_authz_core::error::Result;
 
-pub async fn create_api_key(pool: &DbPool, _user_id: &str, acl: Acl) -> Result<ApiKey> {
+pub async fn create_api_key(pool: &DbPool, user_id: &str, acl: Acl) -> Result<ApiKey> {
     let repo = db::ApiKeyRepo;
     let create_api_key = lightbridge_authz_core::api_key::CreateApiKey {
-        user_id: _user_id.to_string(),
         expires_at: None,
         metadata: None,
         acl: Some(acl),
     };
-    let key_plain = format!("sk-{}", cuid::cuid2());
-    repo.create(pool, create_api_key, key_plain).await
+    let key_plain = format!("sk-{}-{}", cuid::cuid2_slug(), cuid::cuid2());
+    repo.create(pool, user_id, create_api_key, key_plain).await
 }
 
 pub async fn get_api_key(pool: &DbPool, key_id: &str) -> Result<Option<ApiKey>> {
@@ -39,4 +38,10 @@ pub async fn delete_api_key(pool: &DbPool, key_id: &str) -> Result<()> {
     let repo = db::ApiKeyRepo;
     let _ = repo.revoke(pool, key_id).await;
     Ok(())
+}
+
+pub async fn list_api_keys(pool: &DbPool) -> Result<Vec<ApiKey>> {
+    let repo = db::ApiKeyRepo;
+    // use default pagination for now
+    repo.list(pool, 100, 0).await
 }

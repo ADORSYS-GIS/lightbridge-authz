@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use jsonwebtoken::{Algorithm, Validation, decode, decode_header};
+use jsonwebtoken::{Validation, decode, decode_header};
 use jwks::Jwks;
 use lightbridge_authz_core::config::Oauth2;
 use serde::Deserialize;
@@ -8,16 +8,14 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 pub struct TokenInfo {
     pub active: bool,
-    pub sub: Option<String>,
-    pub exp: Option<u64>,
-    pub client_id: Option<String>,
+    pub sub: String,
+    pub exp: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct Claims {
-    sub: Option<String>,
-    exp: Option<u64>,
-    client_id: Option<String>,
+    sub: String,
+    exp: u64,
 }
 
 /// Service responsible for validating bearer tokens.
@@ -37,12 +35,7 @@ impl BearerTokenService {
     /// which should be translated to HTTP 401 by the caller.
     pub async fn validate_bearer_token(&self, token: &str) -> anyhow::Result<TokenInfo> {
         if token.trim().is_empty() {
-            return Ok(TokenInfo {
-                active: false,
-                sub: None,
-                exp: None,
-                client_id: None,
-            });
+            return Err(anyhow!("empty token"));
         }
 
         // Require JWKS URL to be configured.
@@ -60,7 +53,7 @@ impl BearerTokenService {
         let jwk = jwks.keys.get(kid).ok_or_else(|| anyhow!("unauthorized"))?;
 
         // Validate the token using the JWK decoding key.
-        let validation = Validation::new(Algorithm::RS256);
+        let validation = Validation::new(header.alg);
         let token_data = decode::<Claims>(token, &jwk.decoding_key, &validation).map_err(|e| {
             tracing::error!("Some error {e}");
             anyhow!("unauthorized")
@@ -71,7 +64,6 @@ impl BearerTokenService {
             active: true,
             sub: claims.sub,
             exp: claims.exp,
-            client_id: claims.client_id,
         })
     }
 }

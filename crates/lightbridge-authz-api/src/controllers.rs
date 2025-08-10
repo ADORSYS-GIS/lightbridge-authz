@@ -7,6 +7,7 @@ use axum::{
     response::IntoResponse,
 };
 
+use lightbridge_authz_bearer::TokenInfo;
 use lightbridge_authz_core::error::Error;
 use lightbridge_authz_core::{CreateApiKey, PatchApiKey};
 use tracing::instrument;
@@ -30,22 +31,11 @@ use tracing::instrument;
 #[axum::debug_handler]
 pub async fn create_api_key(
     State(state): State<Arc<crate::AppState>>,
-    Extension(token_info): Extension<lightbridge_authz_bearer::TokenInfo>,
-    Json(mut input): Json<CreateApiKey>,
+    Extension(TokenInfo { sub: user_id, .. }): Extension<TokenInfo>,
+    Json(input): Json<CreateApiKey>,
 ) -> Result<impl IntoResponse, Error> {
-    // Ensure token contains a subject (user id)
-    let user_id = token_info.sub.ok_or_else(|| {
-        // Translate into an Unauthorized response for axum via core Error -> IntoResponse
-        // Using Any to wrap an anyhow::Error so it becomes 500/UNAUTHORIZED mapping is handled by caller.
-        // Instead construct an Io error with simple message to keep Error variants limited.
-        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Missing sub in token")
-    })?;
-
-    // Populate the DTO's user_id so downstream handlers/repos receive it.
-    input.user_id = user_id.clone();
-
     // Call the handler with the updated input.
-    let api_key = state.handler.create_api_key(input).await?;
+    let api_key = state.handler.create_api_key(user_id, input).await?;
     Ok((StatusCode::CREATED, Json(api_key)))
 }
 
@@ -68,6 +58,7 @@ pub async fn create_api_key(
 #[axum::debug_handler]
 pub async fn get_api_key(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(key): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
     let api_key = state.handler.get_api_key(key).await?;
@@ -95,6 +86,7 @@ pub async fn get_api_key(
 #[axum::debug_handler]
 pub async fn patch_api_key(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(key): Path<String>,
     Json(input): Json<PatchApiKey>,
 ) -> Result<impl IntoResponse, Error> {
@@ -120,6 +112,7 @@ pub async fn patch_api_key(
 #[axum::debug_handler]
 pub async fn delete_api_key(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(key): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
     state.handler.delete_api_key(key).await?;
@@ -143,6 +136,7 @@ pub async fn delete_api_key(
 #[axum::debug_handler]
 pub async fn list_api_keys(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
 ) -> Result<impl IntoResponse, Error> {
     let api_keys = state.handler.list_api_keys().await?;
     Ok((StatusCode::OK, Json(api_keys)))

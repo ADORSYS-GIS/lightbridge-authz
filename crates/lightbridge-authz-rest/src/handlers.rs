@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use lightbridge_authz_api::contract::{APIKeyCrud, APIKeyHandler};
 use lightbridge_authz_core::{
-    api_key::{ApiKey, CreateApiKey, PatchApiKey},
+    api_key::{Acl, ApiKey, CreateApiKey, PatchApiKey},
     db::DbPool,
     error::Result,
 };
@@ -20,35 +20,30 @@ impl APIKeyHandlerImpl {
 
 #[async_trait]
 impl APIKeyHandler for APIKeyHandlerImpl {
-    async fn create_api_key(&self, input: CreateApiKey) -> Result<ApiKey> {
-        let repo = lightbridge_authz_api_key::db::ApiKeyRepo;
-        // TODO: generate a real key
-        repo.create(&self.pool, input, "some_key".to_string()).await
+    async fn create_api_key(&self, user_id: String, input: CreateApiKey) -> Result<ApiKey> {
+        // Use the api-key service which generates the key and persists it.
+        let acl: Acl = input.acl.unwrap_or_default();
+        lightbridge_authz_api_key::create_api_key(&self.pool, &user_id, acl).await
     }
 
     async fn get_api_key(&self, api_key_id: String) -> Result<ApiKey> {
-        let repo = lightbridge_authz_api_key::db::ApiKeyRepo;
-        repo.get_by_id(&self.pool, &api_key_id)
-            .await?
-            .ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)
+        let opt = lightbridge_authz_api_key::get_api_key(&self.pool, &api_key_id).await?;
+        opt.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)
     }
 
     async fn patch_api_key(&self, api_key_id: String, input: PatchApiKey) -> Result<ApiKey> {
-        let repo = lightbridge_authz_api_key::db::ApiKeyRepo;
-        repo.patch(&self.pool, &api_key_id, input).await
+        let acl = input.acl.unwrap_or_default();
+        lightbridge_authz_api_key::update_api_key(&self.pool, &api_key_id, acl).await
     }
 
     async fn delete_api_key(&self, api_key_id: String) -> Result<()> {
-        let repo = lightbridge_authz_api_key::db::ApiKeyRepo;
-        repo.revoke(&self.pool, &api_key_id).await?;
-        Ok(())
+        lightbridge_authz_api_key::delete_api_key(&self.pool, &api_key_id).await
     }
 }
 
 #[async_trait]
 impl APIKeyCrud for APIKeyHandlerImpl {
     async fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
-        let repo = lightbridge_authz_api_key::db::ApiKeyRepo;
-        repo.list(&self.pool, 100, 0).await
+        lightbridge_authz_api_key::list_api_keys(&self.pool).await
     }
 }

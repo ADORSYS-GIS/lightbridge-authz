@@ -17,7 +17,7 @@ pub trait APIKeyHandler: APIKeyCrud + Send + Sync + 'static + std::fmt::Debug {
     ///
     /// A `Result` containing the newly created `ApiKey` on success,
     /// or an `Error` if the operation fails.
-    async fn create_api_key(&self, input: CreateApiKey) -> Result<ApiKey>;
+    async fn create_api_key(&self, user_id: String, input: CreateApiKey) -> Result<ApiKey>;
 
     /// Retrieves an API key by its ID.
     ///
