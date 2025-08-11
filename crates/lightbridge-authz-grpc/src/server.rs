@@ -15,7 +15,7 @@ use lightbridge_authz_proto::envoy_types::ext_authz::v3::{
 };
 
 use tonic::{Request, Response, Status};
-use tracing::info;
+use tracing::debug;
 
 /// AuthorizationServer handles Envoy external authorization requests.
 #[derive(Debug, Clone)]
@@ -130,14 +130,17 @@ impl Authorization for AuthServer {
         }
 
         if let Some(key) = api_key {
-            info!(api_key = key.as_str(), "extracted api key");
             return match self.resolve_acls(&key).await {
                 Ok(acls) => {
                     let mut builder = OkHttpResponseBuilder::default();
 
-                    for acl in acls {
-                        builder.add_response_header(
-                            "x-custom-lightbridge-authz-acl",
+                    // let joined = acls.join(";"); // or ";" if you prefer
+                    // builder.add_header("x-custom-lightbridge-authz-acl", joined, None, false);
+
+                    for (idx, acl) in acls.into_iter().enumerate() {
+                        debug!(acl, "found single acl");
+                        builder.add_header(
+                            format!("x-custom-lightbridge-authz-acl-{idx}"),
                             acl,
                             None,
                             false,
@@ -152,9 +155,8 @@ impl Authorization for AuthServer {
                     Ok(Response::new(response))
                 }
                 Err(_) => {
-                    let response = CheckResponse::default()
-                        .set_status(Status::permission_denied("Invalid API key"))
-                        .to_owned();
+                    let response =
+                        CheckResponse::with_status(Status::permission_denied("Invalid API key"));
 
                     Ok(Response::new(response))
                 }

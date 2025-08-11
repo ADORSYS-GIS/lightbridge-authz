@@ -22,6 +22,19 @@ services:
       ADMINER_DESIGN: ${ADMINER_DESIGN:-dracula}
       ADMINER_PLUGINS: ${ADMINER_PLUGINS:-tables-filter tinymce}
 
+  envoy:
+    image: envoyproxy/envoy:v1.33-latest
+    command: [ "-c", "/etc/envoy/envoy.yaml", "--log-level", "info" ]
+    volumes:
+      - ./.docker/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - "8080:8080"
+      - "9901:9901"
+    depends_on: [ httpbin ]
+
+  httpbin:
+    image: ghcr.io/mccutchen/go-httpbin
+    expose: [ "8080" ]
 
   keycloak:
     image: quay.io/keycloak/keycloak:26.2.3
@@ -42,7 +55,7 @@ services:
     volumes:
       - ./.docker/keycloak_config/:/opt/keycloak/data/import/:ro
 
-  app:
+  authz:
     deploy:
       replicas: 1
       resources:
@@ -57,14 +70,14 @@ services:
     build:
       context: .
     volumes:
-      - ./config/container.yaml:/tmp/config.yaml
+      - ./.docker/authz/container.yaml:/tmp/config.yaml:ro
+    environment:
+      RUST_LOG: debug
     ports:
       - "3000"
       - "3001"
     healthcheck:
-      test:
-      - "CMD"
-      - "/usr/local/bin/lightbridge-authz-healthcheck"
+      test: [ "CMD", "/usr/local/bin/lightbridge-authz-healthcheck" ]
 
 
 volumes:

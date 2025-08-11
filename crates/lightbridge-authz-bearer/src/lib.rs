@@ -53,7 +53,9 @@ impl BearerTokenService {
         let jwk = jwks.keys.get(kid).ok_or_else(|| anyhow!("unauthorized"))?;
 
         // Validate the token using the JWK decoding key.
-        let validation = Validation::new(header.alg);
+        let mut validation = Validation::new(header.alg);
+        validation.validate_aud = false;
+
         let token_data = decode::<Claims>(token, &jwk.decoding_key, &validation).map_err(|e| {
             tracing::error!("Some error {e}");
             anyhow!("unauthorized")

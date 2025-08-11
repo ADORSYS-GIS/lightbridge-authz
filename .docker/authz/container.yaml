@@ -11,4 +11,4 @@ database:
   url: "postgres://postgres:postgres@postgresql:5432/lightbridge_authz"
   pool_size: 10
 oauth2:
-  jwks_url: "http://host.mac.internal:9100/realms/dev/protocol/openid-connect/certs"
+  jwks_url: "http://host.docker.internal:9100/realms/dev/protocol/openid-connect/certs"

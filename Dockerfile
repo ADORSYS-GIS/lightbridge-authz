@@ -13,7 +13,9 @@ WORKDIR /app
 
 # Copy manifests
 COPY Cargo.toml Cargo.lock ./
+COPY diesel.toml diesel.toml ./
 COPY crates/ ./crates/
+COPY migrations/ ./migrations/
 
 # Build dependencies (this is cached if dependencies don't change)
 RUN cargo build --profile prod --locked
@@ -25,8 +27,8 @@ RUN rm -f /etc/apt/apt.conf.d/docker-clean; echo 'Binary::apt::APT::Keep-Downloa
 RUN \
   --mount=type=cache,target=/var/cache/apt,sharing=locked \
   --mount=type=cache,target=/var/lib/apt,sharing=locked \
-  apt-get update \
-  && apt-get install -y libpq5 ca-certificates libssl3 --no-install-recommends
+  apt update \
+  && apt install -y libpq5 ca-certificates libssl3 --no-install-recommends
 
 # Dependencies for libpq (used by diesel)
 RUN \
@@ -49,7 +51,7 @@ COPY --from=builder /app/target/prod/lightbridge-authz-healthcheck /usr/local/bi
 COPY --from=dep /deps /usr/lib/
 
 # Expose port
-EXPOSE 3000 3001
+EXPOSE 3000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
