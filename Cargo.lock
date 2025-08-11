@@ -1208,6 +1208,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1171693293099992e19cddea4e8b849964e9846f4acee11b3948bcc337be8776"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.43"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88cd67e9de251c1781dbe2f641a1a3ad66eaae831b8a2c38fbdc5ddae16d4d"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
 name = "lightbridge-authz-api"
 version = "0.1.0"
 dependencies = [
@@ -1258,6 +1268,7 @@ dependencies = [
  "lightbridge-authz-core",
  "lightbridge-authz-grpc",
  "lightbridge-authz-rest",
+ "mimalloc",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1403,6 +1414,15 @@ dependencies = [
  "migrations_internals",
  "proc-macro2",
  "quote",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1791cbe101e95af5764f06f20f6760521f7158f69dbf9d6baf941ee1bf6bc40"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]

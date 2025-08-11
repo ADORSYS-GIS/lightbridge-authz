@@ -16,6 +16,7 @@ lightbridge-authz-grpc.workspace = true
 axum.workspace = true
 diesel.workspace = true
 diesel_migrations.workspace = true
+mimalloc.workspace = true
 
 
 [[bin]]
@@ -29,3 +30,11 @@ path = "src/bin/healthcheck.rs"
 [[bin]]
 name = "lightbridge-authz-migrate"
 path = "src/bin/migrate.rs"
+
+[[bin]]
+name = "lightbridge-authz-grpc"
+path = "src/bin/server-grpc.rs"
+
+[[bin]]
+name = "lightbridge-authz-rest"
+path = "src/bin/server-rest.rs"

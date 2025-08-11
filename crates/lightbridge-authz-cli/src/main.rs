@@ -1,8 +1,16 @@
 use clap::{Parser, Subcommand};
+use lightbridge_authz_core::Result;
 use lightbridge_authz_grpc::start_grpc_server;
 use lightbridge_authz_rest::start_rest_server;
+use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{error, info};
+
+use lightbridge_authz_core::db::DbPool;
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser)]
 #[command(name = "lightbridge-authz")]
@@ -25,20 +33,23 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), lightbridge_authz_core::error::Error> {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
 
     match cli.command {
         Some(Commands::Serve { config }) => {
-            let config = lightbridge_authz_core::config::load_from_path(&config).unwrap();
+            let config = lightbridge_authz_core::config::load_from_path(&config)?;
+
+            info!("Connecting to DB...");
+            let pool = Arc::new(DbPool::new(&config.database).await?);
 
             let (tx, mut rx) = mpsc::channel::<String>(32);
 
             let error_listener = tokio::spawn(async move {
                 if let Some(error_msg) = rx.recv().await {
-                    eprintln!("Server error: {}", error_msg);
+                    error!("Server error: {}", error_msg);
                     std::process::exit(1);
                 }
             });
@@ -46,9 +57,9 @@ async fn main() -> Result<(), lightbridge_authz_core::error::Error> {
             if let Some(rest) = config.clone().server.rest {
                 let config_clone = config.clone();
                 let tx_clone = tx.clone();
+                let pool_clone = pool.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        start_rest_server(&rest, &config_clone.database, &config_clone.oauth2).await
+                    if let Err(e) = start_rest_server(&rest, pool_clone, &config_clone.oauth2).await
                     {
                         let _ = tx_clone
                             .send(format!("REST server failed to start: {}", e))
@@ -58,10 +69,10 @@ async fn main() -> Result<(), lightbridge_authz_core::error::Error> {
             }
 
             if let Some(grpc) = config.clone().server.grpc {
-                let config_clone = config.clone();
                 let tx_clone = tx.clone();
+                let pool_clone = pool.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = start_grpc_server(&grpc, &config_clone.database).await {
+                    if let Err(e) = start_grpc_server(&grpc, pool_clone).await {
                         let _ = tx_clone
                             .send(format!("gRPC server failed to start: {}", e))
                             .await;
@@ -72,8 +83,7 @@ async fn main() -> Result<(), lightbridge_authz_core::error::Error> {
             let _ = error_listener.await;
         }
         Some(Commands::Config { config }) => {
-            info!("Config command not yet implemented.");
-            let _ = lightbridge_authz_core::config::load_from_path(&config).unwrap();
+            let _ = lightbridge_authz_core::config::load_from_path(&config)?;
         }
         None => {
             info!("No command provided. Use --help for more information.");

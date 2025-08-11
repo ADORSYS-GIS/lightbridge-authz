@@ -16,6 +16,9 @@ pub enum Error {
     #[error("Any: {0}")]
     Any(#[from] anyhow::Error),
 
+    #[error("Server Error: {0}")]
+    Server(String),
+
     #[error("Rand: {0}")]
     RandError(#[from] rand_core::OsError),
 
@@ -45,6 +48,7 @@ mod axum_impl {
                 Error::AddrParseError(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::Migration(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                Error::Server(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
 
             (status_code, self.to_string()).into_response()

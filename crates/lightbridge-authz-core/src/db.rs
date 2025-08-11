@@ -1,3 +1,4 @@
+use crate::config::Database;
 use crate::error::{Error, Result};
 use anyhow::anyhow;
 use diesel_async::AsyncPgConnection;
@@ -10,10 +11,12 @@ pub struct DbPool {
 }
 
 impl DbPool {
-    pub async fn new(database_url: &str) -> Result<Self> {
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
+    pub async fn new(database: &Database) -> Result<Self> {
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database.url);
+        let max_size = database.pool_size.unwrap_or(10);
+
         let pool = Pool::builder()
-            .max_size(20) // Increase maximum connections
+            .max_size(max_size) // Increase maximum connections
             .min_idle(Some(5)) // Maintain minimum idle connections
             .connection_timeout(std::time::Duration::from_secs(30)) // Increase connection timeout
             .build(manager)

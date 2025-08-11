@@ -81,7 +81,6 @@ Base config example: [config/default.yaml](config/default.yaml:1)
 - logging.level: log level string, see [level](config/default.yaml:7).
 - auth.api_keys: list of allowed API keys, see [api_keys](config/default.yaml:9).
 - database.url: Postgres connection string, see [url](config/default.yaml:13).
-- database.pool_size: connection pool size, see [pool_size](config/default.yaml:14).
 - oauth2.introspection.url: OAuth2 introspection endpoint, see [url](config/default.yaml:17).
 - oauth2.introspection.timeout_ms: request timeout, see [timeout_ms](config/default.yaml:18).
 

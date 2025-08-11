@@ -4,7 +4,7 @@ use std::net::AddrParseError;
 use std::sync::Arc;
 
 use crate::server::AuthServer;
-use lightbridge_authz_core::config::{Database, Grpc};
+use lightbridge_authz_core::config::Grpc;
 use lightbridge_authz_core::db::DbPool;
 use lightbridge_authz_core::error::{Error, Result};
 use lightbridge_authz_proto::envoy_types::ext_authz::v3::pb::AuthorizationServer;
@@ -14,17 +14,16 @@ use tonic::transport::Server;
 ///
 /// # Arguments
 /// - `grpc`: gRPC server configuration
-/// - `db`: database configuration
+/// - `pool`: database pool
 ///
 /// # Returns
 /// - `Ok(())` on success
 /// - `Err(Error)` on failure
-pub async fn start_grpc_server(grpc: &Grpc, db: &Database) -> Result<()> {
+pub async fn start_grpc_server(grpc: &Grpc, pool: Arc<DbPool>) -> Result<()> {
     let addr = format!("{}:{}", grpc.address, grpc.port)
         .parse()
         .map_err(|e: AddrParseError| Error::AddrParseError(e))?;
 
-    let pool = Arc::new(DbPool::new(&db.url).await?);
     let authz_service = AuthServer::new(pool);
 
     tracing::info!("Starting gRPC server on {}", addr);
