@@ -23,7 +23,7 @@ services:
       ADMINER_PLUGINS: ${ADMINER_PLUGINS:-tables-filter tinymce}
 
   envoy:
-    image: envoyproxy/envoy:v1.33-latest
+    image: envoyproxy/envoy:v1.35-latest
     command: [ "-c", "/etc/envoy/envoy.yaml", "--log-level", "info" ]
     volumes:
       - ./.docker/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro

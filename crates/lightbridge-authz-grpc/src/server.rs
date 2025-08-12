@@ -71,59 +71,59 @@ impl Authorization for AuthServer {
         let req = request.into_inner();
         let mut api_key: Option<String> = None;
 
-        if let Some(attrs) = req.attributes {
-            if let Some(req_ctx) = attrs.request {
-                if let Some(http) = req_ctx.http {
-                    if !http.headers.is_empty() {
-                        if let Some(auth) = http.headers.get("authorization") {
-                            let a = auth.as_str();
-                            if let Some(stripped) = a
-                                .strip_prefix("Bearer ")
-                                .or_else(|| a.strip_prefix("bearer "))
-                            {
-                                if !stripped.is_empty() {
-                                    api_key = Some(stripped.to_string());
-                                }
-                            }
+        if let Some(http) = req
+            .attributes
+            .and_then(|attrs| attrs.request)
+            .and_then(|req_ctx| req_ctx.http)
+        {
+            if !http.headers.is_empty() {
+                if let Some(auth) = http.headers.get("authorization") {
+                    let a = auth.as_str();
+                    if let Some(stripped) = a
+                        .strip_prefix("Bearer ")
+                        .or_else(|| a.strip_prefix("bearer "))
+                    {
+                        if !stripped.is_empty() {
+                            api_key = Some(stripped.to_string());
                         }
+                    }
+                }
 
-                        if api_key.is_none() {
-                            if let Some(val) = http
-                                .headers
-                                .get("x-api-key")
-                                .or_else(|| http.headers.get("x-api_key"))
-                                .or_else(|| http.headers.get("x-api-token"))
-                                .or_else(|| http.headers.get("x-api_token"))
-                            {
-                                if !val.is_empty() {
-                                    api_key = Some(val.clone());
-                                }
-                            }
+                if api_key.is_none() {
+                    if let Some(val) = http
+                        .headers
+                        .get("x-api-key")
+                        .or_else(|| http.headers.get("x-api_key"))
+                        .or_else(|| http.headers.get("x-api-token"))
+                        .or_else(|| http.headers.get("x-api_token"))
+                    {
+                        if !val.is_empty() {
+                            api_key = Some(val.clone());
                         }
-                    } else if let Some(header_map) = http.header_map {
-                        for hv in header_map.headers {
-                            let key = hv.key.to_ascii_lowercase();
-                            let val = String::from_utf8(hv.raw_value).unwrap_or_default();
-                            if key == "authorization" {
-                                if let Some(stripped) = val
-                                    .strip_prefix("Bearer ")
-                                    .or_else(|| val.strip_prefix("bearer "))
-                                {
-                                    if !stripped.is_empty() {
-                                        api_key = Some(stripped.to_string());
-                                        break;
-                                    }
-                                }
-                            } else if (key == "x-api-key"
-                                || key == "x-api_key"
-                                || key == "x-api-token"
-                                || key == "x-api_token")
-                                && !val.is_empty()
-                            {
-                                api_key = Some(val);
+                    }
+                }
+            } else if let Some(header_map) = http.header_map {
+                for hv in header_map.headers {
+                    let key = hv.key.to_ascii_lowercase();
+                    let val = String::from_utf8(hv.raw_value).unwrap_or_default();
+                    if key == "authorization" {
+                        if let Some(stripped) = val
+                            .strip_prefix("Bearer ")
+                            .or_else(|| val.strip_prefix("bearer "))
+                        {
+                            if !stripped.is_empty() {
+                                api_key = Some(stripped.to_string());
                                 break;
                             }
                         }
+                    } else if (key == "x-api-key"
+                        || key == "x-api_key"
+                        || key == "x-api-token"
+                        || key == "x-api_token")
+                        && !val.is_empty()
+                    {
+                        api_key = Some(val);
+                        break;
                     }
                 }
             }

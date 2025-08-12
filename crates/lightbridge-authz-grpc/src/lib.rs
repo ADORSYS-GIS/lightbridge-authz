@@ -71,7 +71,7 @@ pub async fn start_grpc_server(grpc: &Grpc, pool: Arc<DbPool>) -> Result<()> {
     server_builder
         .serve(addr)
         .await
-        .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        .map_err(|e| Error::Io(std::io::Error::other(e)))?;
 
     Ok(())
 }
