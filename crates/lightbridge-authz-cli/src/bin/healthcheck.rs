@@ -1,20 +1,17 @@
 use clap::Parser;
 use lightbridge_authz_core::error::Result;
-use std::net::{SocketAddr, TcpStream};
+use std::net::TcpStream;
 use std::time::Duration;
 
 #[derive(Parser, Clone)]
 pub struct HealthCheckCli {
-    #[arg(value_name = "HOST", short = 'g', long, default_value = "0.0.0.0")]
-    pub grpc_host: String,
+    #[arg(value_name = "HOST", short = 's', long, default_value = "0.0.0.0")]
+    pub server_host: String,
 
-    #[arg(value_name = "PORT", short = 'p', long, default_value = "3001")]
+    #[arg(value_name = "PORT", short = 'g', long, default_value = "3001")]
     pub grpc_port: u16,
 
-    #[arg(value_name = "HOST", short = 'r', long, default_value = "0.0.0.0")]
-    pub rest_host: String,
-
-    #[arg(value_name = "PORT", short = 'P', long, default_value = "3000")]
+    #[arg(value_name = "PORT", short = 'r', long, default_value = "3000")]
     pub rest_port: u16,
 
     #[arg(value_name = "TIMEOUT", short = 't', long, default_value = "5")]
@@ -23,7 +20,7 @@ pub struct HealthCheckCli {
 
 fn check_endpoint(host: &str, port: u16, timeout_secs: u64, name: &str) -> Result<bool> {
     let address = format!("{}:{}", host, port);
-    let socket_addr: SocketAddr = address.parse()?;
+    let socket_addr = address.parse()?;
     match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(timeout_secs)) {
         Ok(_) => {
             println!("{} health check successful on {}", name, address);
@@ -37,10 +34,15 @@ fn check_endpoint(host: &str, port: u16, timeout_secs: u64, name: &str) -> Resul
 }
 
 fn main() -> Result<()> {
-    let cli = HealthCheckCli::parse();
+    let HealthCheckCli {
+        timeout,
+        rest_port,
+        grpc_port,
+        server_host,
+    } = HealthCheckCli::parse();
 
-    let grpc_ok = check_endpoint(&cli.grpc_host, cli.grpc_port, cli.timeout, "gRPC")?;
-    let rest_ok = check_endpoint(&cli.rest_host, cli.rest_port, cli.timeout, "REST")?;
+    let grpc_ok = check_endpoint(&server_host, grpc_port, timeout, "gRPC")?;
+    let rest_ok = check_endpoint(&server_host, rest_port, timeout, "REST")?;
 
     if grpc_ok && rest_ok {
         std::process::exit(0);

@@ -14,6 +14,9 @@ use lightbridge_authz_proto::envoy_types::ext_authz::v3::{
     CheckResponseExt, OkHttpResponseBuilder,
 };
 
+use crate::types::{
+    AclRule, AclRuleRequests, AclRuleTokenLimit, AclRuleTokenModel, AclRuleWindowSeconds,
+};
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
@@ -28,7 +31,7 @@ impl AuthServer {
         Self { pool }
     }
 
-    async fn resolve_acls(&self, token: &str) -> Result<Vec<String>, CoreError> {
+    async fn resolve_acls(&self, token: &str) -> Result<Vec<AclRule>, CoreError> {
         let repo = ApiKeyRepo;
         // Find the ApiKey by its token (key_hash) first
         let maybe = repo.find_by_token(&self.pool, token).await?;
@@ -46,15 +49,12 @@ impl AuthServer {
             ApiKeyStatus::Active => {
                 let mut acls = Vec::new();
                 for model in api_key.acl.allowed_models {
-                    acls.push(format!("model:{}", model));
+                    acls.push(AclRule::from(model));
                 }
-                for (model, limit) in api_key.acl.tokens_per_model {
-                    acls.push(format!("token_limit:{}:{}", model, limit));
+                for tpm in api_key.acl.tokens_per_model {
+                    acls.push(AclRule::from(tpm));
                 }
-                acls.push(format!(
-                    "rate_limit:{}/{}",
-                    api_key.acl.rate_limit.requests, api_key.acl.rate_limit.window_seconds
-                ));
+                acls.push(AclRule::from(api_key.acl.rate_limit));
                 Ok(acls)
             }
             ApiKeyStatus::Revoked => Err(CoreError::NotFound),
@@ -134,17 +134,46 @@ impl Authorization for AuthServer {
                 Ok(acls) => {
                     let mut builder = OkHttpResponseBuilder::default();
 
-                    // let joined = acls.join(";"); // or ";" if you prefer
-                    // builder.add_header("x-custom-lightbridge-authz-acl", joined, None, false);
-
-                    for (idx, acl) in acls.into_iter().enumerate() {
-                        debug!(acl, "found single acl");
-                        builder.add_header(
-                            format!("x-custom-lightbridge-authz-acl-{idx}"),
-                            acl,
-                            None,
-                            false,
-                        );
+                    for acl in acls {
+                        debug!(acl = acl.to_string(), "found single acl");
+                        match acl {
+                            AclRule::Model(AclRuleTokenModel(model)) => {
+                                builder.add_header(
+                                    format!("x-custom-lightbridge-authz-model-{model}"),
+                                    "access",
+                                    None,
+                                    true,
+                                );
+                            }
+                            AclRule::TokenLimit(
+                                AclRuleTokenModel(model),
+                                AclRuleTokenLimit(limit),
+                            ) => {
+                                builder.add_header(
+                                    format!("x-custom-lightbridge-authz-model-{model}-limit"),
+                                    format!("{}", limit),
+                                    None,
+                                    true,
+                                );
+                            }
+                            AclRule::RateLimit(
+                                AclRuleRequests(requests),
+                                AclRuleWindowSeconds(window_seconds),
+                            ) => {
+                                builder.add_header(
+                                    "x-custom-lightbridge-authz-requests".to_string(),
+                                    requests.to_string(),
+                                    None,
+                                    true,
+                                );
+                                builder.add_header(
+                                    "x-custom-lightbridge-authz-window-seconds".to_string(),
+                                    window_seconds.to_string(),
+                                    None,
+                                    true,
+                                );
+                            }
+                        }
                     }
 
                     let response = CheckResponse::default()

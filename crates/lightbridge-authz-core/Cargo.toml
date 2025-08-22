@@ -1,22 +1,20 @@
 [package]
 name = "lightbridge-authz-core"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
 
 [dependencies]
 serde.workspace = true
 serde_yaml.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
-cuid.workspace = true
-diesel.workspace = true
 diesel-async.workspace = true
-diesel_migrations.workspace = true
-argon2.workspace = true
 rand_core.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
-tracing.workspace = true
 axum = { workspace = true, optional = true }
 
 [features]

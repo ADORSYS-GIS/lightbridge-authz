@@ -55,29 +55,47 @@ services:
     volumes:
       - ./.docker/keycloak_config/:/opt/keycloak/data/import/:ro
 
-  authz:
+  authz-migrate:
     deploy:
       replicas: 1
       resources:
         limits:
           memory: 1G
-          cpus: "1"
-    entrypoint: lightbridge-authz
-    command:
-      - serve
-      - --config
-      - /tmp/config.yaml
+          cpus: "0.5"
     build:
       context: .
     volumes:
       - ./.docker/authz/container.yaml:/tmp/config.yaml:ro
     environment:
-      RUST_LOG: debug
+      RUST_LOG: "debug"
+      CONFIG_PATH: "/tmp/config.yaml"
+    restart: on-failure
+    command:
+      - migrate
+    depends_on:
+      postgresql:
+        condition: service_started
+
+  authz:
+    depends_on:
+      authz-migrate:
+        condition: service_completed_successfully
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 1G
+          cpus: "0.5"
+    build:
+      context: .
+    volumes:
+      - ./.docker/authz/container.yaml:/tmp/config.yaml:ro
+    environment:
+      RUST_LOG: "debug"
+      CONFIG_PATH: "/tmp/config.yaml"
     ports:
       - "3000"
       - "3001"
-    healthcheck:
-      test: [ "CMD", "/usr/local/bin/lightbridge-authz-healthcheck" ]
 
 
 volumes:

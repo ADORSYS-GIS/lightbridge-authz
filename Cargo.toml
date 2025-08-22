@@ -8,6 +8,7 @@ members = [
     "crates/lightbridge-authz-api",
     "crates/lightbridge-authz-api-key",
     "crates/lightbridge-authz-bearer",
+    "crates/lightbridge-authz-migrate",
 ]
 resolver = "3"
 
@@ -19,32 +20,30 @@ lightbridge-authz-rest = { path = "./crates/lightbridge-authz-rest" }
 lightbridge-authz-api = { path = "./crates/lightbridge-authz-api" }
 lightbridge-authz-api-key = { path = "./crates/lightbridge-authz-api-key" }
 lightbridge-authz-bearer = { path = "./crates/lightbridge-authz-bearer" }
+lightbridge-authz-migrate = { path = "./crates/lightbridge-authz-migrate" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1.0"
 jsonwebtoken = { version = "9" }
 jwks = "0"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "tracing", "net"] }
 tonic = "0"
-tonic-reflection = "0"
-tonic-build = "0"
 prost = "0"
 prost-types = "0.14"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "serde", "serde_json"] }
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "tracing"] }
 async-trait = "0.1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 diesel = { version = "2", features = ["postgres", "chrono", "serde_json"] }
 diesel-async = { version = "0", features = ["postgres", "bb8"] }
 diesel_migrations = "2"
 chrono = { version = "0.4", features = ["serde"] }
 cuid = { version = "1" }
-argon2 = "0.6.0-rc.0"
 rand_core = "0"
 envoy-types = "0.7.0"
 
@@ -57,3 +56,12 @@ opt-level = "z"
 codegen-units = 1
 incremental = false
 strip = true
+
+[workspace.package]
+version = "0.5.0"
+edition = "2024"
+license = "MIT"
+publish = false
+authors = [
+    "Stephane Segning <selastlambou@gmail.com>"
+]

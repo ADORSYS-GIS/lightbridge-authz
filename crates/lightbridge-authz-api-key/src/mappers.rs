@@ -73,7 +73,7 @@ pub fn acl_to_rows(
             acl.tokens_per_model.keys().cloned().collect()
         };
         for name in model_names {
-            let limit = acl.tokens_per_model.get(&name).copied().unwrap_or(0);
+            let limit = acl.tokens_per_model.get(&name).copied().unwrap_or(10_000);
             out.push(NewAclModelRow {
                 acl_id: acl_id.to_string(),
                 model_name: name,

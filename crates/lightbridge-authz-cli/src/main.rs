@@ -1,4 +1,6 @@
-use clap::{Parser, Subcommand};
+mod utils;
+
+use clap::Parser;
 use lightbridge_authz_core::Result;
 use lightbridge_authz_grpc::start_grpc_server;
 use lightbridge_authz_rest::start_rest_server;
@@ -6,41 +8,24 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+use crate::utils::banner::BANNER;
+use crate::utils::cli::{Cli, Commands};
+use lightbridge_authz_core::config::load_from_path;
 use lightbridge_authz_core::db::DbPool;
 use mimalloc::MiMalloc;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-#[derive(Parser)]
-#[command(name = "lightbridge-authz")]
-#[command(about = "Lightbridge Authz CLI", long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    Serve {
-        #[arg(long, short)]
-        config: String,
-    },
-    Config {
-        #[arg(long, short)]
-        config: String,
-    },
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let cli = Cli::parse();
+    match Cli::parse().command {
+        Some(Commands::Serve { config_path }) => {
+            info!("{}", BANNER);
 
-    match cli.command {
-        Some(Commands::Serve { config }) => {
-            let config = lightbridge_authz_core::config::load_from_path(&config)?;
+            let config = load_from_path(&config_path)?;
 
             info!("Connecting to DB...");
             let pool = Arc::new(DbPool::new(&config.database).await?);
@@ -82,8 +67,12 @@ async fn main() -> Result<()> {
 
             let _ = error_listener.await;
         }
-        Some(Commands::Config { config }) => {
-            let _ = lightbridge_authz_core::config::load_from_path(&config)?;
+        Some(Commands::Migrate { config_path }) => {
+            let config = load_from_path(&config_path)?;
+            lightbridge_authz_migrate::migrate(&config.database.url)?;
+        }
+        Some(Commands::Config { config_path }) => {
+            let _ = load_from_path(&config_path)?;
         }
         None => {
             info!("No command provided. Use --help for more information.");

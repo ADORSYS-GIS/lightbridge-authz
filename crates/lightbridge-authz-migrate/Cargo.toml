@@ -1,5 +1,5 @@
 [package]
-name = "lightbridge-authz-grpc"
+name = "lightbridge-authz-migrate"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -7,9 +7,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-tonic.workspace = true
+diesel.workspace = true
+diesel_migrations.workspace = true
 tracing.workspace = true
 lightbridge-authz-core.workspace = true
-lightbridge-authz-proto.workspace = true
-lightbridge-authz-api-key.workspace = true
-chrono.workspace = true

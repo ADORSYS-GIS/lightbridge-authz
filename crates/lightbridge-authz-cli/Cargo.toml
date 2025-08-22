@@ -1,9 +1,10 @@
 [package]
 name = "lightbridge-authz-cli"
-version = "0.1.0"
-edition = "2024"
-publish = false
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
 
 [dependencies]
 clap.workspace = true
@@ -13,11 +14,11 @@ tracing-subscriber.workspace = true
 lightbridge-authz-core.workspace = true
 lightbridge-authz-rest.workspace = true
 lightbridge-authz-grpc.workspace = true
-axum.workspace = true
-diesel.workspace = true
-diesel_migrations.workspace = true
+lightbridge-authz-migrate.workspace = true
 mimalloc.workspace = true
 
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+avx2,+fma"]
 
 [[bin]]
 name = "lightbridge-authz"

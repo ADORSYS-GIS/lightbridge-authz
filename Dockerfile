@@ -37,10 +37,29 @@ RUN \
   cp /usr/lib/*-linux-gnu/*.so* /deps
 
 # Runtime stage
+FROM gcr.io/distroless/base-debian12:nonroot as migrate
+
+LABEL maintainer="stephane-segning <selastlambou@gmail.com>"
+LABEL org.opencontainers.image.description="Backend for LightBridge Authz"
+
+# Set working directory
+WORKDIR /app
+
+# Copy binary from builder stage
+COPY --from=builder /app/target/prod/lightbridge-authz-migrate /usr/local/bin/lightbridge-authz-migrate
+COPY --from=dep /deps /usr/lib/
+
+# Set environment variables
+ENV RUST_LOG=info
+
+# Run the binary
+ENTRYPOINT ["lightbridge-authz-migrate"]
+
+# Runtime stage
 FROM gcr.io/distroless/base-debian12:nonroot
 
 LABEL maintainer="stephane-segning <selastlambou@gmail.com>"
-LABEL org.opencontainers.image.description="Backend for Adorsys's LightBridge Authz"
+LABEL org.opencontainers.image.description="Backend for LightBridge Authz"
 
 # Set working directory
 WORKDIR /app
@@ -51,14 +70,16 @@ COPY --from=builder /app/target/prod/lightbridge-authz-healthcheck /usr/local/bi
 COPY --from=dep /deps /usr/lib/
 
 # Expose port
-EXPOSE 3000
+EXPOSE 3000 3001
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD (/usr/local/bin/lightbridge-authz-healthcheck -p 3000 && /usr/local/bin/lightbridge-authz-healthcheck -p 3001) || exit 1
+HEALTHCHECK --interval=30s --timeout=3s --start-period=1s --retries=3 \
+    CMD ["/usr/local/bin/lightbridge-authz-healthcheck", "-r", "3000", "-g", "3001"]
 
 # Set environment variables
 ENV RUST_LOG=info
 
 # Run the binary
 ENTRYPOINT ["lightbridge-authz"]
+
+CMD ["serve"]

@@ -1,8 +1,10 @@
 [package]
 name = "lightbridge-authz-rest"
-version = "0.1.0"
-edition = "2024"
-publish = false
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
 
 [package.metadata]
 description = "REST server crate for Lightbridge Authz"
@@ -11,11 +13,9 @@ description = "REST server crate for Lightbridge Authz"
 axum.workspace = true
 tokio.workspace = true
 serde.workspace = true
-serde_yaml.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
 lightbridge-authz-api.workspace = true
 lightbridge-authz-core.workspace = true
 lightbridge-authz-api-key.workspace = true
-cuid.workspace = true
 lightbridge-authz-bearer.workspace = true
