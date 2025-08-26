@@ -1150,6 +1150,7 @@ dependencies = [
  "diesel",
  "diesel-async",
  "lightbridge-authz-core",
+ "serde",
  "serde_json",
 ]
 

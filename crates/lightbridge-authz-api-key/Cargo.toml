@@ -10,6 +10,7 @@ authors.workspace = true
 lightbridge-authz-core.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 diesel.workspace = true
 diesel-async.workspace = true

@@ -1,8 +1,10 @@
 //! Shared public API types and traits across REST and gRPC.
 
+pub mod api_key_crud;
+pub mod api_key_handler;
+pub mod api_key_reader;
 pub mod controllers;
 pub mod db;
-pub mod handlers;
 pub mod routers;
 pub mod schema;
 
@@ -10,12 +12,12 @@ use std::fmt;
 use std::sync::Arc;
 
 pub trait APIKeyService:
-    handlers::APIKeyHandler + handlers::APIKeyCrud + Send + Sync + 'static
+    api_key_handler::APIKeyHandler + api_key_crud::APIKeyCrud + Send + Sync + 'static
 {
 }
 
 impl<T> APIKeyService for T where
-    T: handlers::APIKeyHandler + handlers::APIKeyCrud + Send + Sync + 'static
+    T: api_key_handler::APIKeyHandler + api_key_crud::APIKeyCrud + Send + Sync + 'static
 {
 }
 
@@ -39,5 +41,7 @@ impl fmt::Debug for AppState {
 
 /// API contracts shared between REST and gRPC.
 pub mod contract {
-    pub use crate::handlers::{APIKeyCrud, APIKeyHandler, APIKeyReader};
+    pub use crate::api_key_crud::APIKeyCrud;
+    pub use crate::api_key_handler::APIKeyHandler;
+    pub use crate::api_key_reader::APIKeyReader;
 }

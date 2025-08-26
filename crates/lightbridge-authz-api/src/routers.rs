@@ -7,7 +7,8 @@ use axum::{
 };
 
 use crate::controllers::{
-    create_api_key, delete_api_key, get_api_key, list_api_keys, patch_api_key,
+    create::create_api_key, delete::delete_api_key, get::get_api_key, list::list_api_keys,
+    patch::patch_api_key,
 };
 
 /// Creates an Axum router for API key management.
