@@ -16,6 +16,7 @@ diesel-async.workspace = true
 rand_core.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 axum = { workspace = true, optional = true }
 
 [features]

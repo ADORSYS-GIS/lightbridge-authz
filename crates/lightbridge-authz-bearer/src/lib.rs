@@ -1,6 +1,7 @@
 use anyhow::anyhow;
 use jsonwebtoken::{Validation, decode, decode_header};
 use jwks::Jwks;
+use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::config::Oauth2;
 use serde::Deserialize;
 
@@ -18,7 +19,18 @@ struct Claims {
     exp: u64,
 }
 
+/// Trait for validating bearer tokens.
+#[async_trait]
+pub trait BearerTokenServiceTrait: Send + Sync {
+    /// Validate a bearer token string by validating it as a JWT using the configured JWKS.
+    ///
+    /// If JWKS validation fails (including missing jwks_url), this function returns an error
+    /// which should be translated to HTTP 401 by the caller.
+    async fn validate_bearer_token(&self, token: &str) -> anyhow::Result<TokenInfo>;
+}
+
 /// Service responsible for validating bearer tokens.
+#[derive(Debug, Clone)]
 pub struct BearerTokenService {
     config: Oauth2,
 }
@@ -28,12 +40,15 @@ impl BearerTokenService {
     pub fn new(config: Oauth2) -> Self {
         BearerTokenService { config }
     }
+}
 
+#[async_trait]
+impl BearerTokenServiceTrait for BearerTokenService {
     /// Validate a bearer token string by validating it as a JWT using the configured JWKS.
     ///
     /// If JWKS validation fails (including missing jwks_url), this function returns an error
     /// which should be translated to HTTP 401 by the caller.
-    pub async fn validate_bearer_token(&self, token: &str) -> anyhow::Result<TokenInfo> {
+    async fn validate_bearer_token(&self, token: &str) -> anyhow::Result<TokenInfo> {
         if token.trim().is_empty() {
             return Err(anyhow!("empty token"));
         }

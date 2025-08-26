@@ -4,7 +4,7 @@ use lightbridge_authz_core::{Error, Result};
 use lightbridge_authz_grpc::start_grpc_server;
 use std::sync::Arc;
 
-use lightbridge_authz_core::db::DbPool;
+use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use mimalloc::MiMalloc;
 use tracing::info;
 
@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
     let config = load_from_path(&config)?;
 
     info!("Connecting to DB...");
-    let pool = Arc::new(DbPool::new(&config.database).await?);
+    let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(&config.database).await?);
 
     if let Some(grpc) = config.server.grpc {
         start_grpc_server(&grpc, pool).await?

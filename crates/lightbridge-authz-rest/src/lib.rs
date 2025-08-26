@@ -2,7 +2,7 @@ use axum::{Json, Router, http::StatusCode, routing::get};
 use lightbridge_authz_api::routers::api_key_router;
 use lightbridge_authz_core::{
     config::{Oauth2, Rest},
-    db::DbPool,
+    db::DbPoolTrait,
     error::Result,
 };
 
@@ -25,11 +25,16 @@ struct RootResponse {
 ///
 /// This function now takes the `oauth2` configuration so the BearerTokenService can be
 /// instantiated using the application's OAuth2 settings (jwks_url etc).
-pub async fn start_rest_server(rest: &Rest, pool: Arc<DbPool>, oauth2: &Oauth2) -> Result<()> {
+pub async fn start_rest_server(
+    rest: &Rest,
+    pool: Arc<dyn DbPoolTrait>,
+    oauth2: &Oauth2,
+) -> Result<()> {
     let api_key_handler = Arc::new(APIKeyHandlerImpl::with_pool(pool));
 
     // Instantiate BearerTokenService using oauth2 configuration passed from the caller.
-    let bearer_service = Arc::new(BearerTokenService::new(oauth2.clone()));
+    let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
+        Arc::new(BearerTokenService::new(oauth2.clone()));
 
     // Build shared application state containing both the API key handler and the bearer service.
     let app_state = Arc::new(lightbridge_authz_api::AppState {

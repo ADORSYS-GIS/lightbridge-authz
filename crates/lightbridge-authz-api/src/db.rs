@@ -1,1 +1,1 @@
-pub use lightbridge_authz_core::db::DbPool;
+pub use lightbridge_authz_core::db::{DbPool, DbPoolTrait};

@@ -9,5 +9,6 @@ pub use crate::config::{Config, load_from_path};
 pub use crate::error::{Error, Result};
 
 pub use anyhow;
+pub use async_trait::async_trait;
 pub use cuid;
 pub use rand_core;

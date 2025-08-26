@@ -1,10 +1,38 @@
+use anyhow::anyhow;
+use diesel_async::AsyncPgConnection;
+use diesel_async::pooled_connection::bb8::PooledConnection;
 use lightbridge_authz_core::api_key::ApiKey;
+use lightbridge_authz_core::async_trait;
+use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_core::dto::{Acl, RateLimit};
-use lightbridge_authz_grpc::server::AuthServer;
+use lightbridge_authz_core::error::{Error, Result};
+use lightbridge_authz_grpc::server::{AuthServer, AuthServerTrait};
 use serde_json::json;
+use std::sync::Arc;
+
+#[derive(Debug)]
+struct MockDbPool;
+
+#[async_trait]
+impl DbPoolTrait for MockDbPool {
+    async fn get(&self) -> Result<PooledConnection<'_, AsyncPgConnection>> {
+        Err(Error::Any(anyhow!(
+            "MockDbPool::get is not implemented for tests that require database access."
+        )))
+    }
+}
+
+// Mock DbPool for testing purposes.
+fn mock_db_pool() -> Arc<dyn DbPoolTrait> {
+    Arc::new(MockDbPool)
+}
 
 #[tokio::test]
 async fn test_json_value_to_prost_value() {
+    // Create a mock AuthServer for testing
+    // For helper functions that don't require database access, we can create a minimal instance
+    let auth_server = AuthServer::new(crate::mock_db_pool());
+
     let test_json = json!({
         "string_field": "value",
         "number_field": 42.5,
@@ -16,7 +44,7 @@ async fn test_json_value_to_prost_value() {
         }
     });
 
-    let prost_value = AuthServer::json_value_to_prost_value(test_json);
+    let prost_value = auth_server.json_value_to_prost_value(test_json);
 
     // Assert the structure of the converted prost_value
     let struct_value = match prost_value.kind {
@@ -114,6 +142,9 @@ async fn test_json_value_to_prost_value() {
 
 #[tokio::test]
 async fn test_api_key_to_dynamic_metadata() {
+    // Create a mock AuthServer for testing
+    let auth_server = AuthServer::new(crate::mock_db_pool());
+
     let api_key = ApiKey {
         id: "test_api_key_id".to_string(),
         user_id: "test_user_id".to_string(),
@@ -132,7 +163,7 @@ async fn test_api_key_to_dynamic_metadata() {
         },
     };
 
-    let result = AuthServer::api_key_to_dynamic_metadata(api_key);
+    let result = auth_server.api_key_to_dynamic_metadata(api_key);
     assert!(result.is_ok());
     let dynamic_metadata = result.unwrap();
 

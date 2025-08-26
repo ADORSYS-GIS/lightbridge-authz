@@ -1,23 +1,30 @@
-use async_trait::async_trait;
 use lightbridge_authz_api::contract::{APIKeyCrud, APIKeyHandler, APIKeyReader};
-use lightbridge_authz_api_key::db::ApiKeyRepo;
+use lightbridge_authz_api_key::db::{ApiKeyRepo, ApiKeyRepository};
+use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::cuid::{cuid2, cuid2_slug};
 use lightbridge_authz_core::{
     api_key::{Acl, ApiKey, CreateApiKey, PatchApiKey},
-    db::DbPool,
+    db::DbPoolTrait,
     error::Result,
 };
 use std::sync::Arc;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct APIKeyHandlerImpl {
-    repo: Arc<ApiKeyRepo>,
+    repo: Arc<dyn ApiKeyRepository>,
+}
+
+impl std::fmt::Debug for APIKeyHandlerImpl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("APIKeyHandlerImpl").finish()
+    }
 }
 
 impl APIKeyHandlerImpl {
-    pub fn with_pool(pool: Arc<DbPool>) -> Self {
+    pub fn with_pool(pool: Arc<dyn DbPoolTrait>) -> Self {
+        let repo = ApiKeyRepo::new(pool);
         Self {
-            repo: Arc::new(ApiKeyRepo::new(pool)),
+            repo: Arc::new(repo),
         }
     }
 }

@@ -2,9 +2,10 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use lightbridge_authz_api_key::db::ApiKeyRepo;
+use lightbridge_authz_api_key::db::{ApiKeyRepo, ApiKeyRepository};
 use lightbridge_authz_core::api_key::ApiKeyStatus;
-use lightbridge_authz_core::db::DbPool;
+use lightbridge_authz_core::async_trait;
+use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_core::error::{Error as CoreError, Result};
 
 use lightbridge_authz_proto::envoy_types::ext_authz::v3::pb::{
@@ -19,37 +20,34 @@ use lightbridge_authz_proto::envoy_types::pb::google::protobuf::{Struct, Value};
 use serde_json::json;
 use tonic::{Request, Response, Status};
 
+/// Trait for AuthorizationServer functionality
+#[async_trait]
+pub trait AuthServerTrait: Send + Sync {
+    /// Convert an ApiKey to a dynamic metadata Struct
+    fn api_key_to_dynamic_metadata(&self, api_key: ApiKey) -> Result<Struct>;
+
+    /// Build dynamic metadata from a token
+    async fn build_dynamic_metadata(&self, token: &str) -> Result<Struct>;
+
+    /// Resolve an API key from a token
+    async fn resolve_api_key(&self, token: &str) -> Result<ApiKey>;
+
+    /// Convert a JSON value to a protobuf Value
+    fn json_value_to_prost_value(&self, json_val: serde_json::Value) -> Value;
+}
+
 /// AuthorizationServer handles Envoy external authorization requests.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthServer {
-    repo: Arc<ApiKeyRepo>,
+    repo: Arc<dyn ApiKeyRepository>,
 }
 
 impl AuthServer {
-    pub fn new(pool: Arc<DbPool>) -> Self {
+    pub fn new(pool: Arc<dyn DbPoolTrait>) -> Self {
         let repo = ApiKeyRepo::new(pool);
         Self {
             repo: Arc::new(repo),
         }
-    }
-
-    async fn resolve_api_key(&self, token: &str) -> Result<ApiKey> {
-        // Find the ApiKey by its token (key_hash) first
-        let maybe = self.repo.find_api_key_for_authz(token).await?;
-        let api_key = maybe.ok_or(CoreError::NotFound)?;
-
-        // Check expiration
-        if let Some(expires_at) = api_key.expires_at
-            && expires_at < Utc::now()
-        {
-            return Err(CoreError::NotFound);
-        }
-
-        if let ApiKeyStatus::Revoked = api_key.status {
-            return Err(CoreError::NotFound);
-        }
-
-        Ok(api_key)
     }
 
     #[inline]
@@ -112,10 +110,12 @@ impl AuthServer {
 
         None
     }
+}
 
-    /// Convert an ApiKey to a dynamic metadata Struct.
-    /// This function is the core logic for building dynamic metadata and is unit-testable.
-    pub fn api_key_to_dynamic_metadata(api_key: ApiKey) -> Result<Struct> {
+#[async_trait]
+impl AuthServerTrait for AuthServer {
+    fn api_key_to_dynamic_metadata(&self, api_key: ApiKey) -> Result<Struct> {
+        // This function is the core logic for building dynamic metadata and is unit-testable.
         let metadata = json!({
             "user_id": api_key.user_id,
             "api_key_id": api_key.id,
@@ -124,7 +124,7 @@ impl AuthServer {
         });
 
         let metadata_struct = Struct {
-            fields: match Self::json_value_to_prost_value(metadata).kind {
+            fields: match self.json_value_to_prost_value(metadata).kind {
                 Some(lightbridge_authz_proto::envoy_types::pb::google::protobuf::value::Kind::StructValue(s)) => s.fields,
                 _ => {
                     return Err(CoreError::Server(
@@ -137,12 +137,31 @@ impl AuthServer {
         Ok(metadata_struct)
     }
 
-    pub async fn build_dynamic_metadata(&self, token: &str) -> Result<Struct> {
+    async fn build_dynamic_metadata(&self, token: &str) -> Result<Struct> {
         let api_key = self.resolve_api_key(token).await?;
-        Self::api_key_to_dynamic_metadata(api_key)
+        self.api_key_to_dynamic_metadata(api_key)
     }
 
-    pub fn json_value_to_prost_value(json_val: serde_json::Value) -> Value {
+    async fn resolve_api_key(&self, token: &str) -> Result<ApiKey> {
+        // Find the ApiKey by its token (key_hash) first
+        let maybe = self.repo.find_api_key_for_authz(token).await?;
+        let api_key = maybe.ok_or(CoreError::NotFound)?;
+
+        // Check expiration
+        if let Some(expires_at) = api_key.expires_at
+            && expires_at < Utc::now()
+        {
+            return Err(CoreError::NotFound);
+        }
+
+        if let ApiKeyStatus::Revoked = api_key.status {
+            return Err(CoreError::NotFound);
+        }
+
+        Ok(api_key)
+    }
+
+    fn json_value_to_prost_value(&self, json_val: serde_json::Value) -> Value {
         use lightbridge_authz_proto::envoy_types::pb::google::protobuf::value::Kind;
         match json_val {
             serde_json::Value::Null => Value {
@@ -162,7 +181,7 @@ impl AuthServer {
                     lightbridge_authz_proto::envoy_types::pb::google::protobuf::ListValue {
                         values: arr
                             .into_iter()
-                            .map(Self::json_value_to_prost_value)
+                            .map(|v| self.json_value_to_prost_value(v))
                             .collect(),
                     },
                 )),
@@ -171,7 +190,7 @@ impl AuthServer {
                 kind: Some(Kind::StructValue(Struct {
                     fields: obj
                         .into_iter()
-                        .map(|(k, v)| (k, Self::json_value_to_prost_value(v)))
+                        .map(|(k, v)| (k, self.json_value_to_prost_value(v)))
                         .collect(),
                 })),
             },
@@ -179,7 +198,7 @@ impl AuthServer {
     }
 }
 
-#[tonic::async_trait]
+#[async_trait]
 impl Authorization for AuthServer {
     async fn check(
         &self,

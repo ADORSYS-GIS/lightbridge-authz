@@ -11,7 +11,7 @@ use tracing::{error, info};
 use crate::utils::banner::BANNER;
 use crate::utils::cli::{Cli, Commands};
 use lightbridge_authz_core::config::load_from_path;
-use lightbridge_authz_core::db::DbPool;
+use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use mimalloc::MiMalloc;
 
 #[global_allocator]
@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
             let config = load_from_path(&config_path)?;
 
             info!("Connecting to DB...");
-            let pool = Arc::new(DbPool::new(&config.database).await?);
+            let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(&config.database).await?);
 
             let (tx, mut rx) = mpsc::channel::<String>(32);
 

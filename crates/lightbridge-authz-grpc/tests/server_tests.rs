@@ -1,7 +1,7 @@
 use lightbridge_authz_core::api_key::{ApiKey, ApiKeyStatus};
-use lightbridge_authz_core::db::DbPool;
+use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_core::dto::Acl;
-use lightbridge_authz_grpc::server::AuthServer;
+use lightbridge_authz_grpc::server::{AuthServer, AuthServerTrait};
 use lightbridge_authz_proto::envoy_types::pb::google::protobuf::value::Kind;
 use serde_json::json;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 // The core logic of building dynamic metadata from an ApiKey is tested in helper_tests.rs.
 // To run this test, implement DbPool::new_for_test() or refactor to use a mockable repo.
 // See also: https://github.com/rust-lang/chalk/issues/923 (example issue for trait mocking)
-fn mock_db_pool() -> Arc<DbPool> {
+fn mock_db_pool() -> Arc<dyn DbPoolTrait> {
     unimplemented!(
         "See comment above. To run this test, implement DbPool::new_for_test() or refactor to use a mockable repo."
     )

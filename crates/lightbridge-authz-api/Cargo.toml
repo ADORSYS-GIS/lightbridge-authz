@@ -8,8 +8,6 @@ authors.workspace = true
 
 [dependencies]
 axum.workspace = true
-async-trait.workspace = true
-lightbridge-authz-api-key = { workspace = true }
 lightbridge-authz-core = { workspace = true, features = ["axum"] }
 tracing.workspace = true
 diesel = { workspace = true, features = ["postgres"] }

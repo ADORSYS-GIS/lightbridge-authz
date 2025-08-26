@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::server::AuthServer;
 use lightbridge_authz_core::config::Grpc;
-use lightbridge_authz_core::db::DbPool;
+use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_core::error::{Error, Result};
 use lightbridge_authz_proto::envoy_types::ext_authz::v3::pb::AuthorizationServer;
 use tonic::transport::Server;
@@ -19,7 +19,7 @@ use tonic::transport::Server;
 /// # Returns
 /// - `Ok(())` on success
 /// - `Err(lightbridge_authz_core::error::Error)` on failure
-pub async fn start_grpc_server(grpc: &Grpc, pool: Arc<DbPool>) -> Result<()> {
+pub async fn start_grpc_server(grpc: &Grpc, pool: Arc<dyn DbPoolTrait>) -> Result<()> {
     let addr = format!("{}:{}", grpc.address, grpc.port)
         .parse()
         .map_err(|e: AddrParseError| Error::AddrParseError(e))?;

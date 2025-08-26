@@ -1134,10 +1134,8 @@ dependencies = [
 name = "lightbridge-authz-api"
 version = "0.5.0"
 dependencies = [
- "async-trait",
  "axum",
  "diesel",
- "lightbridge-authz-api-key",
  "lightbridge-authz-bearer",
  "lightbridge-authz-core",
  "tracing",
@@ -1187,6 +1185,7 @@ name = "lightbridge-authz-core"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "cuid",
@@ -1202,11 +1201,12 @@ dependencies = [
 name = "lightbridge-authz-grpc"
 version = "0.5.0"
 dependencies = [
+ "anyhow",
  "chrono",
+ "diesel-async",
  "lightbridge-authz-api-key",
  "lightbridge-authz-core",
  "lightbridge-authz-proto",
- "prost-types",
  "serde_json",
  "tokio",
  "tonic",
@@ -1235,7 +1235,6 @@ dependencies = [
 name = "lightbridge-authz-rest"
 version = "0.5.0"
 dependencies = [
- "async-trait",
  "axum",
  "lightbridge-authz-api",
  "lightbridge-authz-api-key",

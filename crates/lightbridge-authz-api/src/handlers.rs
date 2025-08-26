@@ -1,4 +1,4 @@
-use async_trait::async_trait;
+use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::error::Result;
 use lightbridge_authz_core::{ApiKey, CreateApiKey, PatchApiKey};
 

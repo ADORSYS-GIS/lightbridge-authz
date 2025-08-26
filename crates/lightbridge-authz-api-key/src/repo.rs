@@ -6,8 +6,9 @@ use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt
 use lightbridge_authz_core::api_key::{
     Acl, ApiKey, ApiKeyStatus, CreateApiKey, PatchApiKey, RateLimit,
 };
+use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::cuid::cuid2;
-use lightbridge_authz_core::db::DbPool;
+use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_core::error::{Error, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,18 +16,94 @@ use std::sync::Arc;
 use crate::entities::*;
 use crate::mappers::*;
 
+/// Trait for API key repository operations
+#[async_trait]
+pub trait ApiKeyRepository: Send + Sync {
+    /// Create a new API key
+    async fn create(&self, user_id: &str, input: CreateApiKey, key_hash: String) -> Result<ApiKey>;
+
+    /// Find an API key by its ID and user ID
+    async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<ApiKey>>;
+
+    /// Find an API key by its token
+    async fn find_by_token(&self, token: &str) -> Result<Option<ApiKey>>;
+
+    /// Find an API key for authorization purposes
+    async fn find_api_key_for_authz(&self, token: &str) -> Result<Option<ApiKey>>;
+
+    /// Update an API key
+    async fn update(&self, user_id: &str, id: &str, input: PatchApiKey) -> Result<ApiKey>;
+
+    /// Delete (revoke) an API key
+    async fn delete(&self, user_id: &str, id: &str) -> Result<()>;
+
+    /// List all API keys with pagination
+    async fn list(&self, limit: i64, offset: i64) -> Result<Vec<ApiKey>>;
+
+    /// Find all API keys for a user with pagination
+    async fn find_all(&self, user_id: &str, limit: i64, offset: i64) -> Result<Vec<ApiKey>>;
+}
+
 #[derive(Debug, Clone)]
 pub struct ApiKeyRepo {
-    pool: Arc<DbPool>,
+    pool: Arc<dyn DbPoolTrait>,
 }
 
 #[derive(Debug, Clone)]
 pub struct AclRepo {
-    pool: Arc<DbPool>,
+    pool: Arc<dyn DbPoolTrait>,
+}
+
+impl AclRepo {
+    pub fn new(pool: Arc<dyn DbPoolTrait>) -> Self {
+        Self { pool }
+    }
+}
+
+/// Trait for ACL repository operations
+#[async_trait]
+pub trait AclRepository: Send + Sync {
+    /// Get an ACL by its ID
+    async fn get(&self, id: &str) -> Result<Acl>;
+}
+
+#[async_trait]
+impl ApiKeyRepository for ApiKeyRepo {
+    async fn create(&self, user_id: &str, input: CreateApiKey, key_hash: String) -> Result<ApiKey> {
+        self.create_impl(user_id, input, key_hash).await
+    }
+
+    async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<ApiKey>> {
+        self.find_by_id_impl(user_id, id).await
+    }
+
+    async fn find_by_token(&self, token: &str) -> Result<Option<ApiKey>> {
+        self.find_by_token_impl(token).await
+    }
+
+    async fn find_api_key_for_authz(&self, token: &str) -> Result<Option<ApiKey>> {
+        self.find_api_key_for_authz_impl(token).await
+    }
+
+    async fn update(&self, user_id: &str, id: &str, input: PatchApiKey) -> Result<ApiKey> {
+        self.update_impl(user_id, id, input).await
+    }
+
+    async fn delete(&self, user_id: &str, id: &str) -> Result<()> {
+        self.delete_impl(user_id, id).await
+    }
+
+    async fn list(&self, limit: i64, offset: i64) -> Result<Vec<ApiKey>> {
+        self.list_impl(limit, offset).await
+    }
+
+    async fn find_all(&self, user_id: &str, limit: i64, offset: i64) -> Result<Vec<ApiKey>> {
+        self.find_all_impl(user_id, limit, offset).await
+    }
 }
 
 impl ApiKeyRepo {
-    pub fn new(pool: Arc<DbPool>) -> Self {
+    pub fn new(pool: Arc<dyn DbPoolTrait>) -> Self {
         Self { pool }
     }
 
@@ -35,7 +112,7 @@ impl ApiKeyRepo {
         Error::Any(anyhow::anyhow!(e))
     }
 
-    pub async fn create(
+    pub async fn create_impl(
         &self,
         user_id: &str,
         input: CreateApiKey,
@@ -117,7 +194,7 @@ impl ApiKeyRepo {
         Ok(to_api_key(&api_key_row, &acl_row, &model_rows).await)
     }
 
-    pub async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<ApiKey>> {
+    pub async fn find_by_id_impl(&self, user_id: &str, id: &str) -> Result<Option<ApiKey>> {
         let mut conn = self
             .pool
             .get()
@@ -141,7 +218,7 @@ impl ApiKeyRepo {
         }
     }
 
-    pub async fn find_by_token(&self, token: &str) -> Result<Option<ApiKey>> {
+    pub async fn find_by_token_impl(&self, token: &str) -> Result<Option<ApiKey>> {
         let mut conn = self
             .pool
             .get()
@@ -165,7 +242,7 @@ impl ApiKeyRepo {
         }
     }
 
-    pub async fn find_api_key_for_authz(&self, token: &str) -> Result<Option<ApiKey>> {
+    pub async fn find_api_key_for_authz_impl(&self, token: &str) -> Result<Option<ApiKey>> {
         let mut conn = self
             .pool
             .get()
@@ -190,7 +267,7 @@ impl ApiKeyRepo {
         }
     }
 
-    pub async fn update(&self, user_id: &str, id: &str, input: PatchApiKey) -> Result<ApiKey> {
+    pub async fn update_impl(&self, user_id: &str, id: &str, input: PatchApiKey) -> Result<ApiKey> {
         let mut conn = self.pool.get().await?;
 
         conn.transaction(|tx| {
@@ -269,7 +346,7 @@ impl ApiKeyRepo {
         .map_err(|e| Error::Any(anyhow::anyhow!(e)))
     }
 
-    pub async fn delete(&self, user_id: &str, id: &str) -> Result<()> {
+    pub async fn delete_impl(&self, user_id: &str, id: &str) -> Result<()> {
         let mut conn = self.pool.get().await?;
 
         diesel::update(
@@ -282,7 +359,7 @@ impl ApiKeyRepo {
         Ok(())
     }
 
-    pub async fn list(&self, limit: i64, offset: i64) -> Result<Vec<ApiKey>> {
+    pub async fn list_impl(&self, limit: i64, offset: i64) -> Result<Vec<ApiKey>> {
         let mut conn = self
             .pool
             .get()
@@ -308,7 +385,12 @@ impl ApiKeyRepo {
         Ok(out)
     }
 
-    pub async fn find_all(&self, user_id: &str, limit: i64, offset: i64) -> Result<Vec<ApiKey>> {
+    pub async fn find_all_impl(
+        &self,
+        user_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ApiKey>> {
         let mut conn = self
             .pool
             .get()
@@ -336,8 +418,9 @@ impl ApiKeyRepo {
     }
 }
 
-impl AclRepo {
-    pub async fn get(&self, id: &str) -> Result<Acl> {
+#[async_trait]
+impl AclRepository for AclRepo {
+    async fn get(&self, id: &str) -> Result<Acl> {
         let mut conn = self
             .pool
             .get()

@@ -3,7 +3,7 @@ use lightbridge_authz_core::{Error, Result, load_from_path};
 use lightbridge_authz_rest::start_rest_server;
 use std::sync::Arc;
 
-use lightbridge_authz_core::db::DbPool;
+use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use mimalloc::MiMalloc;
 use tracing::info;
 
@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
     let config = load_from_path(&config)?;
 
     info!("Connecting to DB...");
-    let pool = Arc::new(DbPool::new(&config.database).await?);
+    let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(&config.database).await?);
 
     if let Some(rest) = config.server.rest {
         start_rest_server(&rest, pool, &config.oauth2).await?

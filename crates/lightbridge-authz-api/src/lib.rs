@@ -24,7 +24,7 @@ impl<T> APIKeyService for T where
 /// It is wrapped by an Arc when inserted as router state.
 pub struct AppState {
     pub handler: Arc<dyn APIKeyService>,
-    pub bearer: Arc<lightbridge_authz_bearer::BearerTokenService>,
+    pub bearer: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait>,
 }
 
 // Implement a lightweight Debug for AppState so it can be used with tracing/instrument
