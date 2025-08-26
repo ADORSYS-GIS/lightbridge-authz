@@ -1206,6 +1206,9 @@ dependencies = [
  "lightbridge-authz-api-key",
  "lightbridge-authz-core",
  "lightbridge-authz-proto",
+ "prost-types",
+ "serde_json",
+ "tokio",
  "tonic",
  "tracing",
 ]

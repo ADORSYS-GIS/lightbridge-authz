@@ -15,7 +15,8 @@ use lightbridge_authz_proto::envoy_types::ext_authz::v3::{
 };
 
 use lightbridge_authz_core::ApiKey;
-use lightbridge_authz_proto::envoy_types::pb::google::protobuf::Struct;
+use lightbridge_authz_proto::envoy_types::pb::google::protobuf::{Struct, Value}; // Import Struct and Value from envoy_types
+use serde_json::json;
 use tonic::{Request, Response, Status};
 
 /// AuthorizationServer handles Envoy external authorization requests.
@@ -112,8 +113,69 @@ impl AuthServer {
         None
     }
 
-    async fn build_dynamic_metadata(&self, _token: &str) -> Result<Struct> {
-        todo!()
+    /// Convert an ApiKey to a dynamic metadata Struct.
+    /// This function is the core logic for building dynamic metadata and is unit-testable.
+    pub fn api_key_to_dynamic_metadata(api_key: ApiKey) -> Result<Struct> {
+        let metadata = json!({
+            "user_id": api_key.user_id,
+            "api_key_id": api_key.id,
+            "api_key_name": api_key.id, // Use api_key.id as name for now
+            "permissions": api_key.acl,
+        });
+
+        let metadata_struct = Struct {
+            fields: match Self::json_value_to_prost_value(metadata).kind {
+                Some(lightbridge_authz_proto::envoy_types::pb::google::protobuf::value::Kind::StructValue(s)) => s.fields,
+                _ => {
+                    return Err(CoreError::Server(
+                        "Failed to convert metadata to Struct".to_string(),
+                    ))
+                }
+            },
+        };
+
+        Ok(metadata_struct)
+    }
+
+    pub async fn build_dynamic_metadata(&self, token: &str) -> Result<Struct> {
+        let api_key = self.resolve_api_key(token).await?;
+        Self::api_key_to_dynamic_metadata(api_key)
+    }
+
+    pub fn json_value_to_prost_value(json_val: serde_json::Value) -> Value {
+        use lightbridge_authz_proto::envoy_types::pb::google::protobuf::value::Kind;
+        match json_val {
+            serde_json::Value::Null => Value {
+                kind: Some(Kind::NullValue(0)),
+            },
+            serde_json::Value::Bool(b) => Value {
+                kind: Some(Kind::BoolValue(b)),
+            },
+            serde_json::Value::Number(n) => Value {
+                kind: Some(Kind::NumberValue(n.as_f64().unwrap_or_default())),
+            },
+            serde_json::Value::String(s) => Value {
+                kind: Some(Kind::StringValue(s)),
+            },
+            serde_json::Value::Array(arr) => Value {
+                kind: Some(Kind::ListValue(
+                    lightbridge_authz_proto::envoy_types::pb::google::protobuf::ListValue {
+                        values: arr
+                            .into_iter()
+                            .map(Self::json_value_to_prost_value)
+                            .collect(),
+                    },
+                )),
+            },
+            serde_json::Value::Object(obj) => Value {
+                kind: Some(Kind::StructValue(Struct {
+                    fields: obj
+                        .into_iter()
+                        .map(|(k, v)| (k, Self::json_value_to_prost_value(v)))
+                        .collect(),
+                })),
+            },
+        }
     }
 }
 
@@ -164,7 +226,7 @@ impl Authorization for AuthServer {
 
                 Ok(Response::new(response))
             }
-            _ => {
+            None => {
                 let response = CheckResponse::default()
                     .set_status(Status::permission_denied("API key missing"))
                     .to_owned();

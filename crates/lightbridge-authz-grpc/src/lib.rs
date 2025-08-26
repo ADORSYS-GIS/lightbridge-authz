@@ -1,4 +1,4 @@
-mod server;
+pub mod server;
 
 use std::net::AddrParseError;
 use std::sync::Arc;
