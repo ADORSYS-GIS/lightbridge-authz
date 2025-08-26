@@ -1,6 +1,5 @@
 //! Shared public API types and traits across REST and gRPC.
 
-pub mod api_key_handlers;
 pub mod controllers;
 pub mod db;
 pub mod handlers;

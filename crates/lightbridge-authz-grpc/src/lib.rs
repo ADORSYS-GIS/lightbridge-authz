@@ -1,5 +1,4 @@
 mod server;
-mod types;
 
 use std::net::AddrParseError;
 use std::sync::Arc;
@@ -19,7 +18,7 @@ use tonic::transport::Server;
 ///
 /// # Returns
 /// - `Ok(())` on success
-/// - `Err(Error)` on failure
+/// - `Err(lightbridge_authz_core::error::Error)` on failure
 pub async fn start_grpc_server(grpc: &Grpc, pool: Arc<DbPool>) -> Result<()> {
     let addr = format!("{}:{}", grpc.address, grpc.port)
         .parse()

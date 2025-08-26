@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::entities::schema::{acl_models, acls, api_keys};
 use chrono::Utc;
 use diesel::QueryDsl;
@@ -8,30 +6,41 @@ use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt
 use lightbridge_authz_core::api_key::{
     Acl, ApiKey, ApiKeyStatus, CreateApiKey, PatchApiKey, RateLimit,
 };
+use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::DbPool;
 use lightbridge_authz_core::error::{Error, Result};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::entities::*;
 use crate::mappers::*;
 
-pub struct ApiKeyRepo;
-pub struct AclRepo;
+#[derive(Debug, Clone)]
+pub struct ApiKeyRepo {
+    pool: Arc<DbPool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AclRepo {
+    pool: Arc<DbPool>,
+}
 
 impl ApiKeyRepo {
+    pub fn new(pool: Arc<DbPool>) -> Self {
+        Self { pool }
+    }
+
     pub async fn create(
         &self,
-        pool: &DbPool,
         user_id: &str,
         input: CreateApiKey,
-        key_plain: String,
+        key_hash: String,
     ) -> Result<ApiKey> {
-        let mut conn = pool.get().await?;
+        let mut conn = self.pool.get().await?;
         let now = Utc::now();
 
-        let key_id = cuid::cuid2();
-        let acl_id = cuid::cuid2();
-
-        let key_hash = key_plain;
+        let key_id = cuid2();
+        let acl_id = cuid2();
 
         let (new_acl, models): (NewAclRow, Vec<NewAclModelRow>) = match input.acl.clone() {
             Some(acl) => acl_to_rows(&acl, &acl_id, now, now),
@@ -52,7 +61,7 @@ impl ApiKeyRepo {
             created_at: now,
             expires_at: input.expires_at,
             metadata: input.metadata,
-            status: api_key_status_to_str(&ApiKeyStatus::Active).to_string(),
+            status: ApiKeyStatus::Active.to_string(),
             acl_id: acl_id.clone(),
         };
 
@@ -85,7 +94,7 @@ impl ApiKeyRepo {
                     .load::<AclModelRow>(tx)
                     .await?;
 
-                let api_key = to_api_key(&api_key_row, &acl_row, &model_rows);
+                let api_key = to_api_key(&api_key_row, &acl_row, &model_rows).await;
                 Ok::<ApiKey, diesel::result::Error>(api_key)
             }
             .scope_boxed()
@@ -94,13 +103,8 @@ impl ApiKeyRepo {
         .map_err(|e| Error::Any(anyhow::anyhow!(e)))
     }
 
-    pub async fn find_by_id(
-        &self,
-        pool: &DbPool,
-        user_id: &str,
-        id: &str,
-    ) -> Result<Option<ApiKey>> {
-        let mut conn = pool.get().await?;
+    pub async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<ApiKey>> {
+        let mut conn = self.pool.get().await?;
 
         let maybe_row = api_keys::table
             .filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id)))
@@ -125,12 +129,12 @@ impl ApiKeyRepo {
             .await
             .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
 
-        let dto = to_api_key(&api_key_row, &acl_row, &model_rows);
+        let dto = to_api_key(&api_key_row, &acl_row, &model_rows).await;
         Ok(Some(dto))
     }
 
-    pub async fn find_by_token(&self, pool: &DbPool, token: &str) -> Result<Option<ApiKey>> {
-        let mut conn = pool.get().await?;
+    pub async fn find_by_token(&self, token: &str) -> Result<Option<ApiKey>> {
+        let mut conn = self.pool.get().await?;
 
         let maybe_row = api_keys::table
             .filter(api_keys::key_hash.eq(token))
@@ -155,17 +159,43 @@ impl ApiKeyRepo {
             .await
             .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
 
-        let dto = to_api_key(&api_key_row, &acl_row, &model_rows);
+        let dto = to_api_key(&api_key_row, &acl_row, &model_rows).await;
         Ok(Some(dto))
     }
-    pub async fn update(
-        &self,
-        pool: &DbPool,
-        user_id: &str,
-        id: &str,
-        input: PatchApiKey,
-    ) -> Result<ApiKey> {
-        let mut conn = pool.get().await?;
+
+    pub async fn find_api_key_for_authz(&self, token: &str) -> Result<Option<ApiKey>> {
+        let mut conn = self.pool.get().await?;
+
+        let maybe_row = api_keys::table
+            .filter(api_keys::key_hash.eq(token))
+            .filter(api_keys::status.eq(ApiKeyStatus::Active.to_string()))
+            .first::<ApiKeyRow>(&mut conn)
+            .await
+            .optional()
+            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
+
+        let Some(api_key_row) = maybe_row else {
+            return Ok(None);
+        };
+
+        let acl_row: AclRow = acls::table
+            .find(&api_key_row.acl_id)
+            .first::<AclRow>(&mut conn)
+            .await
+            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
+
+        let model_rows: Vec<AclModelRow> = acl_models::table
+            .filter(acl_models::acl_id.eq(&api_key_row.acl_id))
+            .load::<AclModelRow>(&mut conn)
+            .await
+            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
+
+        let dto = to_api_key(&api_key_row, &acl_row, &model_rows).await;
+        Ok(Some(dto))
+    }
+
+    pub async fn update(&self, user_id: &str, id: &str, input: PatchApiKey) -> Result<ApiKey> {
+        let mut conn = self.pool.get().await?;
 
         conn.transaction(|tx| {
             async move {
@@ -179,7 +209,7 @@ impl ApiKeyRepo {
                         api_keys::table
                             .filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id))),
                     )
-                    .set(api_keys::status.eq(api_key_status_to_str(&status)))
+                    .set(api_keys::status.eq(status.to_string()))
                     .execute(tx)
                     .await?;
                 }
@@ -250,7 +280,7 @@ impl ApiKeyRepo {
                     .load::<AclModelRow>(tx)
                     .await?;
 
-                let dto = to_api_key(&api_key_row, &acl_row, &model_rows);
+                let dto = to_api_key(&api_key_row, &acl_row, &model_rows).await;
                 Ok::<ApiKey, diesel::result::Error>(dto)
             }
             .scope_boxed()
@@ -259,20 +289,21 @@ impl ApiKeyRepo {
         .map_err(|e| Error::Any(anyhow::anyhow!(e)))
     }
 
-    pub async fn delete(&self, pool: &DbPool, user_id: &str, id: &str) -> Result<()> {
-        let mut conn = pool.get().await?;
+    pub async fn delete(&self, user_id: &str, id: &str) -> Result<()> {
+        let mut conn = self.pool.get().await?;
+
         diesel::update(
             api_keys::table.filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id))),
         )
-        .set(api_keys::status.eq(api_key_status_to_str(&ApiKeyStatus::Revoked)))
+        .set(api_keys::status.eq(&ApiKeyStatus::Revoked.to_string()))
         .execute(&mut conn)
         .await
         .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
         Ok(())
     }
 
-    pub async fn list(&self, pool: &DbPool, limit: i64, offset: i64) -> Result<Vec<ApiKey>> {
-        let mut conn = pool.get().await?;
+    pub async fn list(&self, limit: i64, offset: i64) -> Result<Vec<ApiKey>> {
+        let mut conn = self.pool.get().await?;
 
         let rows: Vec<ApiKeyRow> = api_keys::table
             .order(api_keys::created_at.desc())
@@ -296,20 +327,14 @@ impl ApiKeyRepo {
                 .await
                 .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
 
-            out.push(to_api_key(&row, &acl_row, &model_rows));
+            out.push(to_api_key(&row, &acl_row, &model_rows).await);
         }
 
         Ok(out)
     }
 
-    pub async fn find_all(
-        &self,
-        pool: &DbPool,
-        user_id: &str,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<ApiKey>> {
-        let mut conn = pool.get().await?;
+    pub async fn find_all(&self, user_id: &str, limit: i64, offset: i64) -> Result<Vec<ApiKey>> {
+        let mut conn = self.pool.get().await?;
 
         let rows: Vec<ApiKeyRow> = api_keys::table
             .filter(api_keys::user_id.eq(user_id))
@@ -334,7 +359,7 @@ impl ApiKeyRepo {
                 .await
                 .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
 
-            out.push(to_api_key(&row, &acl_row, &model_rows));
+            out.push(to_api_key(&row, &acl_row, &model_rows).await);
         }
 
         Ok(out)
@@ -342,8 +367,8 @@ impl ApiKeyRepo {
 }
 
 impl AclRepo {
-    pub async fn get(&self, pool: &DbPool, id: &str) -> Result<Acl> {
-        let mut conn = pool.get().await?;
+    pub async fn get(&self, id: &str) -> Result<Acl> {
+        let mut conn = self.pool.get().await?;
 
         let acl_row: AclRow = acls::table
             .find(id)
@@ -357,6 +382,6 @@ impl AclRepo {
             .await
             .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
 
-        Ok(rows_to_acl(&acl_row, &model_rows))
+        Ok(rows_to_acl(&acl_row, &model_rows).await)
     }
 }

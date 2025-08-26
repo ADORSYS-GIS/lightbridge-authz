@@ -2,11 +2,35 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Display;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+const ACTIVE: &str = "active";
+const REVOKED: &str = "REVOKED";
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub enum ApiKeyStatus {
     Active,
+    #[default]
     Revoked,
+}
+
+impl Display for ApiKeyStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let r = match self {
+            ApiKeyStatus::Active => ACTIVE,
+            ApiKeyStatus::Revoked => REVOKED,
+        };
+        write!(f, "{}", r)
+    }
+}
+
+impl From<String> for ApiKeyStatus {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            REVOKED => ApiKeyStatus::Revoked,
+            _ => ApiKeyStatus::Active,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,12 +51,13 @@ pub struct PatchApiKey {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKey {
     pub id: String,
+    pub user_id: String,
     pub key_hash: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
     pub metadata: Option<Value>,
     pub status: ApiKeyStatus,
-    pub acl: Acl, // Add ACL to ApiKey
+    pub acl: Acl,
 }
 
 /// Defines the Access Control List (ACL) for an API Key.

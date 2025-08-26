@@ -1,38 +1,25 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use lightbridge_authz_core::api_key::{Acl, ApiKey, ApiKeyStatus, RateLimit};
+use lightbridge_authz_core::api_key::{Acl, ApiKey, RateLimit};
 
 use crate::entities::{AclModelRow, AclRow, ApiKeyRow, NewAclModelRow, NewAclRow};
 
-pub fn api_key_status_to_str(status: &ApiKeyStatus) -> &'static str {
-    match status {
-        ApiKeyStatus::Active => "active",
-        ApiKeyStatus::Revoked => "revoked",
-    }
-}
-
-pub fn api_key_status_from_str(s: &str) -> ApiKeyStatus {
-    match s {
-        "revoked" => ApiKeyStatus::Revoked,
-        _ => ApiKeyStatus::Active,
-    }
-}
-
-pub fn to_api_key(api_key: &ApiKeyRow, acl: &AclRow, models: &[AclModelRow]) -> ApiKey {
-    let acl_dto = rows_to_acl(acl, models);
+pub async fn to_api_key(api_key: &ApiKeyRow, acl: &AclRow, models: &[AclModelRow]) -> ApiKey {
+    let acl_dto = rows_to_acl(acl, models).await;
     ApiKey {
         id: api_key.id.clone(),
+        user_id: api_key.user_id.clone(),
         key_hash: api_key.key_hash.clone(),
         created_at: api_key.created_at,
         expires_at: api_key.expires_at,
         metadata: api_key.metadata.clone(),
-        status: api_key_status_from_str(&api_key.status),
+        status: api_key.status.clone().into(),
         acl: acl_dto,
     }
 }
 
-pub fn rows_to_acl(acl: &AclRow, models: &[AclModelRow]) -> Acl {
+pub async fn rows_to_acl(acl: &AclRow, models: &[AclModelRow]) -> Acl {
     let mut allowed_models = Vec::with_capacity(models.len());
     let mut tokens_per_model: HashMap<String, u64> = HashMap::with_capacity(models.len());
     for m in models {

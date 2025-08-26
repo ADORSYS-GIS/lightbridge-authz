@@ -1149,7 +1149,6 @@ version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
- "cuid",
  "diesel",
  "diesel-async",
  "lightbridge-authz-core",
@@ -1190,6 +1189,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "cuid",
  "diesel-async",
  "rand_core 0.9.3",
  "serde",

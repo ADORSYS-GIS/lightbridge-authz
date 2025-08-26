@@ -1,5 +1,7 @@
 use crate::error::Result;
 use serde::Deserialize;
+use serde_yaml::from_str;
+use std::fs::read_to_string;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -44,7 +46,7 @@ pub struct Oauth2 {
 }
 
 pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<Config> {
-    let content = std::fs::read_to_string(path)?;
-    let cfg: Config = serde_yaml::from_str(&content)?;
+    let content = read_to_string(path)?;
+    let cfg: Config = from_str(&content)?;
     Ok(cfg)
 }

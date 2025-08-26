@@ -1,6 +1,7 @@
 # Postgres Persistence and OAuth2 Introspection Architecture
 
 ## Why?
+
 We need a secure, scalable foundation for two credential types:
 - API keys: persist and manage lifecycle in Postgres with server-side hashing, enabling revocation, expiration, and metadata-driven policy.
 - OAuth2 Bearer tokens: validate online via an Introspection endpoint to support resource server authorization without managing an IdP locally.
