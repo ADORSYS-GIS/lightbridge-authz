@@ -30,6 +30,11 @@ impl ApiKeyRepo {
         Self { pool }
     }
 
+    /// Helper method to convert diesel errors to our error type
+    fn convert_diesel_error(e: diesel::result::Error) -> Error {
+        Error::Any(anyhow::anyhow!(e))
+    }
+
     pub async fn create(
         &self,
         user_id: &str,
@@ -86,15 +91,7 @@ impl ApiKeyRepo {
 
                 let api_key_row: ApiKeyRow =
                     api_keys::table.find(&key_id).first::<ApiKeyRow>(tx).await?;
-
-                let acl_row: AclRow = acls::table.find(&acl_id).first::<AclRow>(tx).await?;
-
-                let model_rows: Vec<AclModelRow> = acl_models::table
-                    .filter(acl_models::acl_id.eq(&acl_id))
-                    .load::<AclModelRow>(tx)
-                    .await?;
-
-                let api_key = to_api_key(&api_key_row, &acl_row, &model_rows).await;
+                let api_key = Self::get_api_key_dto(tx, api_key_row).await?;
                 Ok::<ApiKey, diesel::result::Error>(api_key)
             }
             .scope_boxed()
@@ -103,95 +100,94 @@ impl ApiKeyRepo {
         .map_err(|e| Error::Any(anyhow::anyhow!(e)))
     }
 
-    pub async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<ApiKey>> {
-        let mut conn = self.pool.get().await?;
+    async fn get_api_key_dto(
+        conn: &mut diesel_async::AsyncPgConnection,
+        api_key_row: ApiKeyRow,
+    ) -> std::result::Result<ApiKey, diesel::result::Error> {
+        let acl_row: AclRow = acls::table
+            .find(&api_key_row.acl_id)
+            .first::<AclRow>(conn)
+            .await?;
 
+        let model_rows: Vec<AclModelRow> = acl_models::table
+            .filter(acl_models::acl_id.eq(&api_key_row.acl_id))
+            .load::<AclModelRow>(conn)
+            .await?;
+
+        Ok(to_api_key(&api_key_row, &acl_row, &model_rows).await)
+    }
+
+    pub async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<ApiKey>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
         let maybe_row = api_keys::table
             .filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id)))
             .first::<ApiKeyRow>(&mut conn)
             .await
             .optional()
-            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
+            .map_err(Self::convert_diesel_error)?;
 
-        let Some(api_key_row) = maybe_row else {
-            return Ok(None);
-        };
-
-        let acl_row: AclRow = acls::table
-            .find(&api_key_row.acl_id)
-            .first::<AclRow>(&mut conn)
-            .await
-            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
-
-        let model_rows: Vec<AclModelRow> = acl_models::table
-            .filter(acl_models::acl_id.eq(&api_key_row.acl_id))
-            .load::<AclModelRow>(&mut conn)
-            .await
-            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
-
-        let dto = to_api_key(&api_key_row, &acl_row, &model_rows).await;
-        Ok(Some(dto))
+        match maybe_row {
+            Some(api_key_row) => {
+                let dto = Self::get_api_key_dto(&mut conn, api_key_row)
+                    .await
+                    .map_err(Self::convert_diesel_error)?;
+                Ok(Some(dto))
+            }
+            None => Ok(None),
+        }
     }
 
     pub async fn find_by_token(&self, token: &str) -> Result<Option<ApiKey>> {
-        let mut conn = self.pool.get().await?;
-
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
         let maybe_row = api_keys::table
             .filter(api_keys::key_hash.eq(token))
             .first::<ApiKeyRow>(&mut conn)
             .await
             .optional()
-            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
+            .map_err(Self::convert_diesel_error)?;
 
-        let Some(api_key_row) = maybe_row else {
-            return Ok(None);
-        };
-
-        let acl_row: AclRow = acls::table
-            .find(&api_key_row.acl_id)
-            .first::<AclRow>(&mut conn)
-            .await
-            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
-
-        let model_rows: Vec<AclModelRow> = acl_models::table
-            .filter(acl_models::acl_id.eq(&api_key_row.acl_id))
-            .load::<AclModelRow>(&mut conn)
-            .await
-            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
-
-        let dto = to_api_key(&api_key_row, &acl_row, &model_rows).await;
-        Ok(Some(dto))
+        match maybe_row {
+            Some(api_key_row) => {
+                let dto = Self::get_api_key_dto(&mut conn, api_key_row)
+                    .await
+                    .map_err(Self::convert_diesel_error)?;
+                Ok(Some(dto))
+            }
+            None => Ok(None),
+        }
     }
 
     pub async fn find_api_key_for_authz(&self, token: &str) -> Result<Option<ApiKey>> {
-        let mut conn = self.pool.get().await?;
-
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
         let maybe_row = api_keys::table
             .filter(api_keys::key_hash.eq(token))
             .filter(api_keys::status.eq(ApiKeyStatus::Active.to_string()))
             .first::<ApiKeyRow>(&mut conn)
             .await
             .optional()
-            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
+            .map_err(Self::convert_diesel_error)?;
 
-        let Some(api_key_row) = maybe_row else {
-            return Ok(None);
-        };
-
-        let acl_row: AclRow = acls::table
-            .find(&api_key_row.acl_id)
-            .first::<AclRow>(&mut conn)
-            .await
-            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
-
-        let model_rows: Vec<AclModelRow> = acl_models::table
-            .filter(acl_models::acl_id.eq(&api_key_row.acl_id))
-            .load::<AclModelRow>(&mut conn)
-            .await
-            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
-
-        let dto = to_api_key(&api_key_row, &acl_row, &model_rows).await;
-        Ok(Some(dto))
+        match maybe_row {
+            Some(api_key_row) => {
+                let dto = Self::get_api_key_dto(&mut conn, api_key_row)
+                    .await
+                    .map_err(Self::convert_diesel_error)?;
+                Ok(Some(dto))
+            }
+            None => Ok(None),
+        }
     }
 
     pub async fn update(&self, user_id: &str, id: &str, input: PatchApiKey) -> Result<ApiKey> {
@@ -204,34 +200,28 @@ impl ApiKeyRepo {
                     .first::<ApiKeyRow>(tx)
                     .await?;
 
+                let api_key_filter =
+                    api_keys::table.filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id)));
+
                 if let Some(status) = input.status {
-                    diesel::update(
-                        api_keys::table
-                            .filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id))),
-                    )
-                    .set(api_keys::status.eq(status.to_string()))
-                    .execute(tx)
-                    .await?;
+                    diesel::update(api_key_filter)
+                        .set(api_keys::status.eq(status.to_string()))
+                        .execute(tx)
+                        .await?;
                 }
 
                 if let Some(expires_at) = input.expires_at {
-                    diesel::update(
-                        api_keys::table
-                            .filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id))),
-                    )
-                    .set(api_keys::expires_at.eq(expires_at))
-                    .execute(tx)
-                    .await?;
+                    diesel::update(api_key_filter)
+                        .set(api_keys::expires_at.eq(expires_at))
+                        .execute(tx)
+                        .await?;
                 }
 
                 if let Some(metadata) = input.metadata {
-                    diesel::update(
-                        api_keys::table
-                            .filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id))),
-                    )
-                    .set(api_keys::metadata.eq(metadata))
-                    .execute(tx)
-                    .await?;
+                    diesel::update(api_key_filter)
+                        .set(api_keys::metadata.eq(metadata))
+                        .execute(tx)
+                        .await?;
                 }
 
                 if let Some(acl) = input.acl {
@@ -270,17 +260,7 @@ impl ApiKeyRepo {
                     .first::<ApiKeyRow>(tx)
                     .await?;
 
-                let acl_row: AclRow = acls::table
-                    .find(&api_key_row.acl_id)
-                    .first::<AclRow>(tx)
-                    .await?;
-
-                let model_rows: Vec<AclModelRow> = acl_models::table
-                    .filter(acl_models::acl_id.eq(&api_key_row.acl_id))
-                    .load::<AclModelRow>(tx)
-                    .await?;
-
-                let dto = to_api_key(&api_key_row, &acl_row, &model_rows).await;
+                let dto = Self::get_api_key_dto(tx, api_key_row).await?;
                 Ok::<ApiKey, diesel::result::Error>(dto)
             }
             .scope_boxed()
@@ -303,7 +283,11 @@ impl ApiKeyRepo {
     }
 
     pub async fn list(&self, limit: i64, offset: i64) -> Result<Vec<ApiKey>> {
-        let mut conn = self.pool.get().await?;
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
 
         let rows: Vec<ApiKeyRow> = api_keys::table
             .order(api_keys::created_at.desc())
@@ -311,30 +295,25 @@ impl ApiKeyRepo {
             .offset(offset)
             .load::<ApiKeyRow>(&mut conn)
             .await
-            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
+            .map_err(Self::convert_diesel_error)?;
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            let acl_row: AclRow = acls::table
-                .find(&row.acl_id)
-                .first::<AclRow>(&mut conn)
+            let dto = Self::get_api_key_dto(&mut conn, row)
                 .await
-                .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
-
-            let model_rows: Vec<AclModelRow> = acl_models::table
-                .filter(acl_models::acl_id.eq(&row.acl_id))
-                .load::<AclModelRow>(&mut conn)
-                .await
-                .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
-
-            out.push(to_api_key(&row, &acl_row, &model_rows).await);
+                .map_err(Self::convert_diesel_error)?;
+            out.push(dto);
         }
 
         Ok(out)
     }
 
     pub async fn find_all(&self, user_id: &str, limit: i64, offset: i64) -> Result<Vec<ApiKey>> {
-        let mut conn = self.pool.get().await?;
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
 
         let rows: Vec<ApiKeyRow> = api_keys::table
             .filter(api_keys::user_id.eq(user_id))
@@ -343,23 +322,14 @@ impl ApiKeyRepo {
             .offset(offset)
             .load::<ApiKeyRow>(&mut conn)
             .await
-            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
+            .map_err(Self::convert_diesel_error)?;
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            let acl_row: AclRow = acls::table
-                .find(&row.acl_id)
-                .first::<AclRow>(&mut conn)
+            let dto = Self::get_api_key_dto(&mut conn, row)
                 .await
-                .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
-
-            let model_rows: Vec<AclModelRow> = acl_models::table
-                .filter(acl_models::acl_id.eq(&row.acl_id))
-                .load::<AclModelRow>(&mut conn)
-                .await
-                .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
-
-            out.push(to_api_key(&row, &acl_row, &model_rows).await);
+                .map_err(Self::convert_diesel_error)?;
+            out.push(dto);
         }
 
         Ok(out)
@@ -368,19 +338,23 @@ impl ApiKeyRepo {
 
 impl AclRepo {
     pub async fn get(&self, id: &str) -> Result<Acl> {
-        let mut conn = self.pool.get().await?;
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
 
         let acl_row: AclRow = acls::table
             .find(id)
             .first::<AclRow>(&mut conn)
             .await
-            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
+            .map_err(ApiKeyRepo::convert_diesel_error)?;
 
         let model_rows: Vec<AclModelRow> = acl_models::table
             .filter(acl_models::acl_id.eq(id))
             .load::<AclModelRow>(&mut conn)
             .await
-            .map_err(|e| Error::Any(anyhow::anyhow!(e)))?;
+            .map_err(ApiKeyRepo::convert_diesel_error)?;
 
         Ok(rows_to_acl(&acl_row, &model_rows).await)
     }
