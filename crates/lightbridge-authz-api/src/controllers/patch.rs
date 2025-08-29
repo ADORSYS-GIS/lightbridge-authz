@@ -15,14 +15,14 @@ use tracing::instrument;
 /// Handles the update of an existing API key.
 ///
 /// This function extracts the `APIKeyHandler` from the application state,
-/// the `key` from the request path, and the `PatchApiKey` payload
+/// the `key` (API key ID) from the request path, and the `PatchApiKey` payload
 /// from the request body. It then calls the `patch_api_key` method on the handler
 /// to update the API key.
 ///
 /// # Arguments
 ///
 /// * `State(state)` - The application state containing the `APIKeyHandler` implementation.
-/// * `Path(key)` - The API key string extracted from the request path.
+/// * `Path(key)` - The API key ID extracted from the request path.
 /// * `Json(input)` - The JSON payload containing the data to patch the API key with.
 ///
 /// # Returns

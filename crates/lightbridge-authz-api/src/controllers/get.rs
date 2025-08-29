@@ -11,16 +11,16 @@ use lightbridge_authz_bearer::TokenInfo;
 use lightbridge_authz_core::error::Error;
 use tracing::instrument;
 
-/// Handles the retrieval of an API key by its key string.
+/// Handles the retrieval of an API key by its ID.
 ///
 /// This function extracts the `APIKeyHandler` from the application state
-/// and the `key` from the request path. It then calls the `get_api_key`
-/// method on the handler to retrieve the API key.
+/// and the `key` (API key ID) from the request path. It then calls the
+/// `get_api_key` method on the handler to retrieve the API key.
 ///
 /// # Arguments
 ///
 /// * `State(state)` - The application state containing the `APIKeyHandler` implementation.
-/// * `Path(key)` - The API key string extracted from the request path.
+/// * `Path(key)` - The API key ID extracted from the request path.
 ///
 /// # Returns
 ///
