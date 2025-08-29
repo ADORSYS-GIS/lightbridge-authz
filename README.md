@@ -95,7 +95,7 @@ Core config loader is exposed from [load_from_path()](crates/lightbridge-authz-c
   - Proto: [crates/lightbridge-authz-proto](crates/lightbridge-authz-proto/src/lib.rs:1)
 
 - Testing:
-  - Integration tests live in tests/ folders like [crates/lightbridge-authz-api/tests/basic.rs](crates/lightbridge-authz-api/tests/basic.rs:1).
+  - Integration tests live in tests/ folders like [crates/lightbridge-authz-rest/tests/api_tests.rs](crates/lightbridge-authz-rest/tests/api_tests.rs:1).
   - Run all: cargo test
 
 - Logging:

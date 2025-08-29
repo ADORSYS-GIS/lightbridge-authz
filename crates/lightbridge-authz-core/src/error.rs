@@ -22,7 +22,7 @@ pub enum Error {
     #[error("Rand: {0}")]
     RandError(#[from] rand_core::OsError),
 
-    #[error("Address parse error error: {0}")]
+    #[error("Address parse error: {0}")]
     AddrParseError(#[from] std::net::AddrParseError),
 
     #[error("Database error: {0}")]
