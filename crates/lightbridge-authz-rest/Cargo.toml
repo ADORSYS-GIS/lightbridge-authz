@@ -18,3 +18,9 @@ lightbridge-authz-api.workspace = true
 lightbridge-authz-core.workspace = true
 lightbridge-authz-api-key.workspace = true
 lightbridge-authz-bearer.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true

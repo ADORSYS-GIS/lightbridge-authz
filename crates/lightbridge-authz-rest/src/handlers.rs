@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct APIKeyHandlerImpl {
-    repo: Arc<dyn ApiKeyRepository>,
+    pub repo: Arc<dyn ApiKeyRepository>,
 }
 
 impl std::fmt::Debug for APIKeyHandlerImpl {

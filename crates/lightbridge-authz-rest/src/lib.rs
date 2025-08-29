@@ -6,7 +6,7 @@ use lightbridge_authz_core::{
     error::Result,
 };
 
-mod handlers;
+pub mod handlers;
 mod middleware;
 use handlers::APIKeyHandlerImpl;
 use middleware::bearer_auth;

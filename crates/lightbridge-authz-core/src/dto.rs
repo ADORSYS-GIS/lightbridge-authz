@@ -7,7 +7,7 @@ use std::fmt::Display;
 const ACTIVE: &str = "active";
 const REVOKED: &str = "REVOKED";
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ApiKeyStatus {
     Active,
     #[default]

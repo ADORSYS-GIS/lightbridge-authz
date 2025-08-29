@@ -1236,12 +1236,15 @@ dependencies = [
 name = "lightbridge-authz-rest"
 version = "0.5.0"
 dependencies = [
+ "anyhow",
  "axum",
+ "chrono",
  "lightbridge-authz-api",
  "lightbridge-authz-api-key",
  "lightbridge-authz-bearer",
  "lightbridge-authz-core",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
