@@ -36,8 +36,8 @@ impl APIKeyHandler for APIKeyHandlerImpl {
         let acl: Acl = input.acl.unwrap_or_default();
 
         let create_api_key = CreateApiKey {
-            expires_at: None,
-            metadata: None,
+            expires_at: input.expires_at,
+            metadata: input.metadata,
             acl: Some(acl),
         };
         let key_plain = format!("sk-{}-{}", cuid2_slug(), cuid2());
@@ -53,9 +53,9 @@ impl APIKeyHandler for APIKeyHandlerImpl {
         // User authorization/ownership can be enforced at a higher layer or here when needed.
         let acl = input.acl.unwrap_or_default();
         let patch_api_key = PatchApiKey {
-            expires_at: None,
-            metadata: None,
-            status: None,
+            expires_at: input.expires_at,
+            metadata: input.metadata,
+            status: input.status,
             acl: Some(acl),
         };
         self.repo.update(&user_id, &api_key_id, patch_api_key).await
