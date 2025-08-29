@@ -4,7 +4,7 @@
 
 To provide a flexible and performant way to authorize requests at the edge using Envoy's external authorization feature. This service will centralize API key validation and ACL management, allowing for consistent policy enforcement across all services behind the gateway.
 
-## Actual
+## Architecture
 
 The gRPC external authorization service will be a standalone component that integrates with Envoy. It will expose a gRPC endpoint that Envoy can call for each incoming request to determine if it's authorized.
 
