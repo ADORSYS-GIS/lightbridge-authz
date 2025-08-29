@@ -10,16 +10,16 @@ use lightbridge_authz_bearer::TokenInfo;
 use lightbridge_authz_core::error::Error;
 use tracing::instrument;
 
-/// Handles the deletion of an API key by its key string.
+/// Handles the deletion of an API key by its ID.
 ///
 /// This function extracts the `APIKeyHandler` from the application state
-/// and the `key` from the request path. It then calls the `delete_api_key`
-/// method on the handler to delete the API key.
+/// and the `key` (API key ID) from the request path. It then calls the
+/// `delete_api_key` method on the handler to delete the API key.
 ///
 /// # Arguments
 ///
 /// * `State(state)` - The application state containing the `APIKeyHandler` implementation.
-/// * `Path(key)` - The API key string extracted from the request path.
+/// * `Path(key)` - The API key ID extracted from the request path.
 ///
 /// # Returns
 ///
