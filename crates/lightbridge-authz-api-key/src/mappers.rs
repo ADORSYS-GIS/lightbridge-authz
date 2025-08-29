@@ -57,10 +57,10 @@ pub fn acl_to_rows(
         Vec::new()
     } else {
         let mut out = Vec::new();
-        let model_names: Vec<String> = if !acl.allowed_models.is_empty() {
-            acl.allowed_models.clone()
-        } else {
+        let model_names: Vec<String> = if acl.allowed_models.is_empty() {
             acl.tokens_per_model.keys().cloned().collect()
+        } else {
+            acl.allowed_models.clone()
         };
         for name in model_names {
             let limit = acl.tokens_per_model.get(&name).copied().unwrap_or(10_000);

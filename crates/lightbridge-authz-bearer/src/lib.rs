@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use anyhow::{anyhow, ensure};
 use jsonwebtoken::{Validation, decode, decode_header};
 use jwks::Jwks;
 use lightbridge_authz_core::async_trait;
@@ -49,9 +49,7 @@ impl BearerTokenServiceTrait for BearerTokenService {
     /// If JWKS validation fails (including missing jwks_url), this function returns an error
     /// which should be translated to HTTP 401 by the caller.
     async fn validate_bearer_token(&self, token: &str) -> anyhow::Result<TokenInfo> {
-        if token.trim().is_empty() {
-            return Err(anyhow!("empty token"));
-        }
+        ensure!(!token.trim().is_empty(), anyhow!("empty token"));
 
         // Require JWKS URL to be configured.
         let jwks_url = self.config.jwks_url.as_str();
@@ -61,7 +59,7 @@ impl BearerTokenServiceTrait for BearerTokenService {
         let kid = header.kid.as_ref().ok_or_else(|| anyhow!("unauthorized"))?;
 
         // Load JWKS and find JWK by kid
-        let jwks: Jwks = Jwks::from_jwks_url(jwks_url).await.map_err(|e| {
+        let jwks = Jwks::from_jwks_url(jwks_url).await.map_err(|e| {
             tracing::error!("Some error {e}");
             anyhow!("unauthorized")
         })?;

@@ -45,36 +45,35 @@ impl ApiKeyRepository for MockApiKeyRepository {
         input: lightbridge_authz_core::api_key::PatchApiKey,
     ) -> Result<ApiKey> {
         let mut api_keys = self.api_keys.lock().unwrap();
-        if let Some(api_key) = api_keys.get_mut(api_key_id) {
-            if api_key.user_id != user_id {
-                return Err(lightbridge_authz_core::error::Error::Any(anyhow::anyhow!(
-                    "Forbidden"
-                )));
-            }
-            if let Some(status) = input.status {
-                api_key.status = status;
-            }
-            api_key.expires_at = input.expires_at.or(api_key.expires_at);
-            api_key.metadata = input.metadata.or(api_key.metadata.clone());
-            api_key.acl = input.acl.unwrap_or_default();
-            Ok(api_key.clone())
-        } else {
-            Err(lightbridge_authz_core::error::Error::NotFound)
-        }
+        api_keys
+            .get_mut(api_key_id)
+            .filter(|api_key| api_key.user_id == user_id)
+            .map(|api_key| {
+                if let Some(status) = input.status {
+                    api_key.status = status;
+                }
+                api_key.expires_at = input.expires_at.or(api_key.expires_at);
+                api_key.metadata = input.metadata.or(api_key.metadata.clone());
+                api_key.acl = input.acl.unwrap_or_default();
+                Ok(api_key.clone())
+            })
+            .unwrap_or(Err(lightbridge_authz_core::error::Error::Any(
+                anyhow::anyhow!("Forbidden"),
+            )))
+            .map_err(|_| lightbridge_authz_core::error::Error::NotFound)
     }
 
     async fn delete(&self, user_id: &str, api_key_id: &str) -> Result<()> {
         let mut api_keys = self.api_keys.lock().unwrap();
-        if let Some(api_key) = api_keys.get(api_key_id) {
-            if api_key.user_id != user_id {
-                return Err(lightbridge_authz_core::error::Error::Any(anyhow::anyhow!(
-                    "Forbidden"
-                )));
+        match api_keys.get(api_key_id) {
+            Some(api_key) if api_key.user_id == user_id => {
+                api_keys.remove(api_key_id);
+                Ok(())
             }
-            api_keys.remove(api_key_id);
-            Ok(())
-        } else {
-            Err(lightbridge_authz_core::error::Error::NotFound)
+            Some(_) => Err(lightbridge_authz_core::error::Error::Any(anyhow::anyhow!(
+                "Forbidden"
+            ))),
+            None => Err(lightbridge_authz_core::error::Error::NotFound),
         }
     }
 

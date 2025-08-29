@@ -44,9 +44,5 @@ fn main() -> Result<()> {
     let grpc_ok = check_endpoint(&server_host, grpc_port, timeout, "gRPC")?;
     let rest_ok = check_endpoint(&server_host, rest_port, timeout, "REST")?;
 
-    if grpc_ok && rest_ok {
-        std::process::exit(0);
-    } else {
-        std::process::exit(1);
-    }
+    std::process::exit(if grpc_ok && rest_ok { 0 } else { 1 });
 }

@@ -29,20 +29,22 @@ pub async fn bearer_auth(
         res
     };
 
-    let token = match auth_header {
-        Some(h) if !h.is_empty() => {
-            let lower = h.to_ascii_lowercase();
-            if let Some(rest) = h.strip_prefix("Bearer ") {
-                rest.trim().to_string()
-            } else if let Some(rest) = h.strip_prefix("bearer ") {
-                rest.trim().to_string()
-            } else if lower.starts_with("bearer ") {
-                h[7..].trim().to_string()
-            } else {
-                return unauthorized_response();
-            }
-        }
-        _ => return unauthorized_response(),
+    let token = auth_header.filter(|h| !h.is_empty()).and_then(|h| {
+        let lower = h.to_ascii_lowercase();
+        h.strip_prefix("Bearer ")
+            .or_else(|| h.strip_prefix("bearer "))
+            .map(|s| s.trim().to_string())
+            .or_else(|| {
+                if lower.starts_with("bearer ") {
+                    Some(h[7..].trim().to_string())
+                } else {
+                    None
+                }
+            })
+    });
+
+    let Some(token) = token else {
+        return unauthorized_response();
     };
 
     // Use the BearerTokenService stored in the shared state

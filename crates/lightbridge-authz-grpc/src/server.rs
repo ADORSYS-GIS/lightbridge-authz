@@ -34,6 +34,12 @@ pub trait AuthServerTrait: Send + Sync {
 
     /// Convert a JSON value to a protobuf Value
     fn json_value_to_prost_value(&self, json_val: serde_json::Value) -> Value;
+
+    /// Convert a JSON map to a protobuf Struct
+    fn json_map_to_prost_struct(
+        &self,
+        json_map: serde_json::Map<String, serde_json::Value>,
+    ) -> Struct;
 }
 
 /// AuthorizationServer handles Envoy external authorization requests.
@@ -51,14 +57,15 @@ impl AuthServer {
     }
 
     #[inline]
-    fn map_bearer(option: Option<&String>) -> Option<String> {
-        match option {
-            Some(a) => a
+    fn extract_api_key_from_header(key: &str, value: &str) -> Option<String> {
+        match key.to_ascii_lowercase().as_str() {
+            "authorization" => value
                 .strip_prefix("Bearer ")
-                .or_else(|| a.strip_prefix("bearer "))
+                .or_else(|| value.strip_prefix("bearer "))
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_owned()),
-            None => None,
+            "x-api-key" | "x-api_key" | "x-api-token" | "x-api_token" => value.to_owned().into(),
+            _ => None,
         }
     }
 
@@ -69,40 +76,33 @@ impl AuthServer {
             .and_then(|attrs| attrs.request)
             .and_then(|req_ctx| req_ctx.http)
         {
+            // Try to extract from the simpler http.headers map first
             if !http.headers.is_empty() {
-                if let Some(clean_bearer) = Self::map_bearer(http.headers.get("authorization")) {
-                    return Some(clean_bearer);
+                if let Some(auth_value) = http.headers.get("authorization")
+                    && let Some(api_key) =
+                        Self::extract_api_key_from_header("authorization", auth_value)
+                {
+                    return Some(api_key);
                 }
 
-                if let Some(val) = http
-                    .headers
-                    .get("x-api-key")
-                    .or_else(|| http.headers.get("x-api_key"))
-                    .or_else(|| http.headers.get("x-api-token"))
-                    .or_else(|| http.headers.get("x-api_token"))
-                    .filter(|s| !s.is_empty())
-                {
-                    return Some(val.clone());
+                for key_name in ["x-api-key", "x-api_key", "x-api-token", "x-api_token"].iter() {
+                    if let Some(value) = http.headers.get(*key_name)
+                        && let Some(api_key) = Self::extract_api_key_from_header(key_name, value)
+                    {
+                        return Some(api_key);
+                    }
                 }
-            } else if let Some(header_map) = http.header_map {
+            }
+            // Fallback to http.header_map if http.headers is empty or doesn't contain the key
+            else if let Some(header_map) = http.header_map {
                 for hv in header_map.headers {
                     let key = hv.key.to_ascii_lowercase();
-                    let val = String::from_utf8(hv.raw_value).unwrap_or_default();
-                    if key == "authorization" {
-                        if let Some(stripped) = val
-                            .strip_prefix("Bearer ")
-                            .or_else(|| val.strip_prefix("bearer "))
-                            .filter(|a| !a.is_empty())
-                        {
-                            return Some(stripped.to_string());
-                        }
-                    } else if (key == "x-api-key"
-                        || key == "x-api_key"
-                        || key == "x-api-token"
-                        || key == "x-api_token")
-                        && !val.is_empty()
-                    {
-                        return Some(val);
+                    let val = match String::from_utf8(hv.raw_value) {
+                        Ok(s) => s,
+                        Err(_) => return None, // Treat non-UTF8 header values as if no key was found
+                    };
+                    if let Some(api_key) = Self::extract_api_key_from_header(&key, &val) {
+                        return Some(api_key);
                     }
                 }
             }
@@ -116,23 +116,38 @@ impl AuthServer {
 impl AuthServerTrait for AuthServer {
     fn api_key_to_dynamic_metadata(&self, api_key: ApiKey) -> Result<Struct> {
         // This function is the core logic for building dynamic metadata and is unit-testable.
-        let metadata = json!({
-            "user_id": api_key.user_id,
-            "api_key_id": api_key.id,
-            "api_key_name": api_key.id, // Use api_key.id as name for now
-            "permissions": api_key.acl,
-        });
+        let mut metadata_map = serde_json::Map::new();
+        metadata_map.insert("user_id".to_string(), json!(api_key.user_id));
+        metadata_map.insert("api_key_id".to_string(), json!(api_key.id));
+        metadata_map.insert("api_key_name".to_string(), json!(api_key.id)); // Using api_key.id as name for now
+        metadata_map.insert(
+            "allowed_models".to_string(),
+            json!(api_key.acl.allowed_models),
+        );
+        metadata_map.insert(
+            "tokens_per_model".to_string(),
+            json!(api_key.acl.tokens_per_model),
+        );
+        metadata_map.insert(
+            "rate_limit_requests".to_string(),
+            json!(api_key.acl.rate_limit.requests),
+        );
+        metadata_map.insert(
+            "rate_limit_window_seconds".to_string(),
+            json!(api_key.acl.rate_limit.window_seconds),
+        );
 
-        let metadata_struct = Struct {
-            fields: match self.json_value_to_prost_value(metadata).kind {
-                Some(lightbridge_authz_proto::envoy_types::pb::google::protobuf::value::Kind::StructValue(s)) => s.fields,
-                _ => {
-                    return Err(CoreError::Server(
-                        "Failed to convert metadata to Struct".to_string(),
-                    ))
-                }
-            },
-        };
+        // Merge custom metadata if present
+        if let Some(custom_metadata_map) = api_key
+            .metadata
+            .and_then(|custom_metadata| custom_metadata.as_object().map(|m| m.to_owned()))
+        {
+            for (key, value) in custom_metadata_map {
+                metadata_map.insert(key.clone(), value.clone());
+            }
+        }
+
+        let metadata_struct = self.json_map_to_prost_struct(metadata_map);
 
         Ok(metadata_struct)
     }
@@ -194,6 +209,18 @@ impl AuthServerTrait for AuthServer {
                         .collect(),
                 })),
             },
+        }
+    }
+
+    fn json_map_to_prost_struct(
+        &self,
+        json_map: serde_json::Map<String, serde_json::Value>,
+    ) -> Struct {
+        Struct {
+            fields: json_map
+                .into_iter()
+                .map(|(k, v)| (k, self.json_value_to_prost_value(v)))
+                .collect(),
         }
     }
 }
