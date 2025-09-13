@@ -46,6 +46,8 @@ chrono = { version = "0.4", features = ["serde"] }
 cuid = { version = "1" }
 rand_core = "0.9.3"
 envoy-types = "0.7.0"
+goose = "0.17"
+reqwest = { version = "0.12", features = ["json"] }
 
 mimalloc = "0"
 
