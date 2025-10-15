@@ -1,14 +1,9 @@
 ---
 apiVersion: v1
-kind: Namespace
-metadata:
-  name: test
----
-apiVersion: v1
 kind: ConfigMap
 metadata:
   name: lightbridge-authz-config
-  namespace: test
+  namespace: self-service
 data:
   config.yaml: |
     server:
@@ -89,7 +84,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: lightbridge-authz
-  namespace: test
+  namespace: self-service
   labels:
     app: lightbridge-authz
 spec:
