@@ -4,6 +4,7 @@ use anyhow::anyhow;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::{Pool, PooledConnection};
+use tracing;
 
 #[derive(Clone, Debug)]
 pub struct DbPool {
@@ -20,13 +21,17 @@ impl DbPool {
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database.url);
         let max_size = database.pool_size.unwrap_or(10);
 
+        tracing::debug!("Building connection pool with max_size={}", max_size);
+        
         let pool = Pool::builder()
-            .max_size(max_size) // Increase maximum connections
-            .min_idle(Some(5)) // Maintain minimum idle connections
-            .connection_timeout(std::time::Duration::from_secs(30)) // Increase connection timeout
+            .max_size(max_size)
+            .test_on_check_out(false)
+            .connection_timeout(std::time::Duration::from_secs(30))
             .build(manager)
             .await
             .map_err(anyhow::Error::from)?;
+        
+        tracing::debug!("Connection pool built successfully");
         Ok(Self { pool })
     }
 }

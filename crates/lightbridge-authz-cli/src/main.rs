@@ -27,6 +27,10 @@ async fn main() -> Result<()> {
 
             let config = load_from_path(&config_path)?;
 
+            info!("Running database migrations...");
+            lightbridge_authz_migrate::migrate(&config.database.url)?;
+            info!("Database migrations completed.");
+
             info!("Connecting to DB...");
             let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(&config.database).await?);
 
