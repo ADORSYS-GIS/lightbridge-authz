@@ -1,0 +1,38 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: model
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-backend
+  namespace: model
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ai-backend
+  template:
+    metadata:
+      labels:
+        app: ai-backend
+    spec:
+      containers:
+      - name: ai-backend
+        image: nginx:alpine  # Replace with your AI model service
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-backend
+  namespace: model
+spec:
+  selector:
+    app: ai-backend
+  ports:
+  - port: 80
+    targetPort: 80

@@ -1,0 +1,59 @@
+# deployment/auth-adapter.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-adapter
+  namespace: envoy-gateway-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: auth-adapter
+  template:
+    metadata:
+      labels:
+        app: auth-adapter
+    spec:
+      containers:
+      - name: adapter
+        image: nginx:alpine
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: config
+          mountPath: /etc/nginx/conf.d
+      volumes:
+      - name: config
+        configMap:
+          name: auth-adapter-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-adapter
+  namespace: envoy-gateway-system
+spec:
+  selector:
+    app: auth-adapter
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auth-adapter-config
+  namespace: envoy-gateway-system
+data:
+  default.conf: |
+    server {
+        listen 8080;
+        location / {
+            proxy_pass http://self-service-svc:3000;
+            proxy_intercept_errors on;
+            error_page 401 = @deny;
+        }
+        location @deny {
+            return 403 "Forbidden";
+        }
+    }

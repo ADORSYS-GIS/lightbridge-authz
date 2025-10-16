@@ -1,0 +1,20 @@
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: self-service-authz-http
+  namespace: model
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: ai-http-route
+  extAuth:
+    http:
+      backendRefs:
+        - group: ""
+          kind: Service
+          name: auth-adapter  # Use adapter instead
+          namespace: envoy-gateway-system
+          port: 8080
+      headersToBackend:
+        - "authorization"
