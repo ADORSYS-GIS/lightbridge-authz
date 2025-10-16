@@ -16,3 +16,4 @@ spec:
     backendRefs:
     - name: ai-backend
       port: 80
+      

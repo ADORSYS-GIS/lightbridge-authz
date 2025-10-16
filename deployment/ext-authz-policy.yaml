@@ -13,7 +13,7 @@ spec:
       backendRefs:
         - group: ""
           kind: Service
-          name: auth-adapter  # Use adapter instead
+          name: auth-adapter
           namespace: envoy-gateway-system
           port: 8080
       headersToBackend:

@@ -21,7 +21,7 @@ spec:
     spec:
       containers:
       - name: ai-backend
-        image: nginx:alpine  # Replace with your AI model service
+        image: nginx:alpine 
         ports:
         - containerPort: 80
 ---

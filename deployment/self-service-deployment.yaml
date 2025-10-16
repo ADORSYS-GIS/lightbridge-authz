@@ -106,3 +106,4 @@ spec:
     appProtocol: grpc
   selector:
     app: self-service-app
+    
