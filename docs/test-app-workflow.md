@@ -17,20 +17,20 @@ Prerequisites
 ```bash
 # Download and install k3s
 curl -sfL https://get.k3s.io | sh -
-``
+```
 ## Verify installation: this may fail with connect: connection refused
 ```bash
 sudo kubectl get nodes
 sudo kubectl get pods --all-namespaces
 ```
 This should fail with 
-`text
+```output
 # sudo kubectl get nodes
 E1016 10:58:29.705017  605007 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"http://localhost:8080/api?timeout=32s\": dial tcp 127.0.0.1:8080: connect: connection refused"
 
 #sudo kubectl get pods --all-namespaces
 E1016 10:57:06.955436  602883 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"http://localhost:8080/api?timeout=32s\": dial tcp 127.0.0.1:8080: connect: connection refused"
-`
+```
 ## Configure kubectl access
 ```bash
 mkdir -p ~/.kube
@@ -43,10 +43,10 @@ export KUBECONFIG=~/.kube/config
 kubectl get nodes
 ```
 You should get something similar to this
-`text
+```output
 NAME        STATUS   ROLES                  AGE     VERSION
 derick-ws   Ready    control-plane,master   3m29s   v1.33.5+k3s1
-`
+```
 # Step 2: Deploy the Self-Service Application
 
 ## Create Namespace
@@ -188,7 +188,7 @@ echo "Test JWT Token: $USER_TOKEN"
 curl -v -H "Host: ai.local.dev" http://$K3S_NODE_IP:$GATEWAY_PORT/
 ```
 Expected Result: 403 Forbidden from your Rust auth service
-`text
+```output
 ...
 * Mark bundle as not supporting multiuse
 < HTTP/1.1 403 Forbidden
@@ -201,13 +201,13 @@ Expected Result: 403 Forbidden from your Rust auth service
 < 
 * Connection #0 to host 192.168.4.35 left intact
 Forbidden%                                       
-`
+```
 Test 2: Request with valid JWT auth header
 ```bash
 curl -v -H "Host: ai.local.dev" -H "authorization: Bearer $USER_TOKEN" http://$K3S_NODE_IP:$GATEWAY_PORT/
 ```
 Expected Result: 200 OK from the AI backend service
-`text
+```output
 ...
 Mark bundle as not supporting multiuse
 < HTTP/1.1 200 OK
@@ -219,7 +219,7 @@ Mark bundle as not supporting multiuse
 < etag: "68e5584b-267"
 < accept-ranges: bytes
 ...
-`
+```
 # Monitor Logs for Verification
 Check Rust Self-Service Logs
 ```bash
@@ -236,18 +236,18 @@ Check Envoy Gateway Logs
 kubectl logs -f -n envoy-gateway-system -l app.kubernetes.io/component=proxy -c envoy
 ```
 Expected Log Output:
-`text
+```output
 [info] External auth check completed, status: OK
 [info] Routing authorized request to backend
-`
+```
 Check AI Backend Logs
 ```bash
 kubectl logs -f -n model deployment/ai-backend
 ```
 Expected Log Output:
-`text
+```output
 10.42.X.X - - [timestamp] "GET / HTTP/1.1" 200 -
-`
+```
 # Step 7: Troubleshooting
 Verify All Components
 ```bash
@@ -305,22 +305,28 @@ go install github.com/rakyll/hey@latest
 hey -n 100 -c 10 -H "Host: ai.local.dev" -H "authorization: Bearer $USER_TOKEN" http://$K3S_NODE_IP:$GATEWAY_PORT/
 ```
 Expected Architecture Diagram
-`text
-
-┌─────────────────┐    ┌─────────────────────┐    ┌──────────────────┐    ┌──────────────────┐
-│   Client        │ ──▶│ Envoy AI Gateway    │ ──▶│ Rust Auth Service│ ──▶│   Keycloak       │
-│                 │    │                     │    │ (Self-Service)   │    │   JWKS Validation│
-└─────────────────┘    └─────────────────────┘    └──────────────────┘    └──────────────────┘
-                              │                           │                         │
-                              │                           │                         │
-                              ▼                           │                         │
-                    ┌──────────────────┐                 │                         │
-                    │   AI Backend     │ ◀────────────────┘                         │
-                    │   Services       │                                            │
-                    └──────────────────┘                                            │
-                                                                                    │
-                              JWT Token Validation ◀────────────────────────────────┘
-`
+```mermaid
+flowchart TD
+    Client["Client"] --> Envoy["Envoy AI Gateway"]
+    Envoy --> RustAuth["Rust Auth Service<br/>(Self-Service)"]
+    RustAuth --> Keycloak["Keycloak<br/>JWKS Validation"]
+    
+    Envoy --> AIBackend["AI Backend Services"]
+    
+    RustAuth -.-> JWTValidation["JWT Token Validation"]
+    Keycloak -.-> JWTValidation
+    
+    %% Styling for better visualization
+    classDef gateway fill:#e1f5fe
+    classDef auth fill:#f3e5f5
+    classDef security fill:#fff3e0
+    classDef backend fill:#e8f5e8
+    
+    class Envoy,AIBackend gateway
+    class RustAuth auth
+    class Keycloak,JWTValidation security
+    class Client backend
+```
 Success Criteria
 
     ✅ k3s cluster running
