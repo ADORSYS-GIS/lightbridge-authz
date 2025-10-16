@@ -1,0 +1,41 @@
+[package]
+name = "lightbridge-authz-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+lightbridge-authz-core.workspace = true
+lightbridge-authz-rest.workspace = true
+lightbridge-authz-grpc.workspace = true
+lightbridge-authz-migrate.workspace = true
+mimalloc.workspace = true
+
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+avx2,+fma"]
+
+[[bin]]
+name = "lightbridge-authz"
+path = "src/main.rs"
+
+[[bin]]
+name = "lightbridge-authz-healthcheck"
+path = "src/bin/healthcheck.rs"
+
+[[bin]]
+name = "lightbridge-authz-migrate"
+path = "src/bin/migrate.rs"
+
+[[bin]]
+name = "lightbridge-authz-grpc"
+path = "src/bin/server-grpc.rs"
+
+[[bin]]
+name = "lightbridge-authz-rest"
+path = "src/bin/server-rest.rs"

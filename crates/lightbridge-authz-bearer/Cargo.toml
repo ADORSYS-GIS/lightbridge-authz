@@ -1,0 +1,16 @@
+[package]
+name = "lightbridge-authz-bearer"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+lightbridge-authz-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde.features = ["derive"]
+jwks.workspace = true
+jsonwebtoken.workspace = true
+tracing.workspace = true
