@@ -30,7 +30,7 @@ async fn test_build_dynamic_metadata_success() {
         id: "test_api_key_id".to_string(),
         user_id: "test_user_id".to_string(),
         key_hash: "hashed_token".to_string(),
-        created_at: chrono::Utc::now(),
+        created_at: None,
         expires_at: None,
         metadata: Some(json!({"custom_data": "value"})),
         status: ApiKeyStatus::Active,

@@ -1,15 +1,14 @@
 ---
-
 services:
   postgresql:
-    image: docker.io/bitnami/postgresql:17
-    ports:
-      - '5432:5432'
+    image: docker.io/bitnamilegacy/postgresql:17
+    #ports:
+    #  - '5432:5432'
     volumes:
-      - 'postgresql_data:/bitnami/postgresql'
+      - "postgresql_data:/bitnami/postgresql"
     environment:
-      ALLOW_EMPTY_PASSWORD: 'yes'
-      POSTGRESQL_DATABASE: 'lightbridge_authz'
+      ALLOW_EMPTY_PASSWORD: "yes"
+      POSTGRESQL_DATABASE: "lightbridge_authz"
 
   adminer:
     image: adminer
@@ -24,26 +23,26 @@ services:
 
   envoy:
     image: envoyproxy/envoy:v1.35-latest
-    command: [ "-c", "/etc/envoy/envoy.yaml", "--log-level", "info" ]
+    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
     volumes:
       - ./.docker/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
     ports:
       - "8080:8080"
       - "9901:9901"
-    depends_on: [ httpbin ]
+    depends_on: [httpbin]
 
   httpbin:
     image: ghcr.io/mccutchen/go-httpbin
-    expose: [ "8080" ]
+    expose: ["8080"]
 
   keycloak:
     image: quay.io/keycloak/keycloak:26.2.3
     ports:
-      - '9100:9100'
+      - "9100:9100"
     environment:
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: password
-      KC_LOG_CONSOLE_COLOR: 'true'
+      KC_LOG_CONSOLE_COLOR: "true"
       KC_HTTP_PORT: 9100
     entrypoint: /bin/sh
     command:
@@ -94,8 +93,8 @@ services:
       RUST_LOG: "debug"
       CONFIG_PATH: "/tmp/config.yaml"
     ports:
-      - "3000"
-      - "3001"
+      - "13000:3000"
+      - "13001:3001"
 
   qdrant:
     image: qdrant/qdrant:latest

@@ -9,7 +9,6 @@ pub mod schema {
     diesel::table! {
         acl_models (id) {
             id -> Text,
-            name -> Text,
             model -> Text,
         }
     }
@@ -28,7 +27,7 @@ pub mod schema {
             user_id -> Text,
             name -> Text,
             key_hash -> Text,
-            created_at -> Timestamptz,
+            created_at -> Nullable<Timestamptz>,
             expires_at -> Nullable<Timestamptz>,
             last_used_at -> Nullable<Timestamptz>,
             revoked_at -> Nullable<Timestamptz>,

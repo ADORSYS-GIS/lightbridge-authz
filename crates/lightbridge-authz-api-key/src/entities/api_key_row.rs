@@ -23,7 +23,7 @@ pub struct ApiKeyRow {
     pub user_id: String,
     pub name: String,
     pub key_hash: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,

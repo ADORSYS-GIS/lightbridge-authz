@@ -17,14 +17,11 @@ impl ApiKeyRepo {
             .limit(limit)
             .offset(offset)
             .load::<ApiKeyRow>(&mut conn)
-            .await
-            .map_err(Self::convert_diesel_error)?;
+            .await?;
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            let dto = ApiKeyRepo::get_api_key_dto(&mut conn, row)
-                .await
-                .map_err(Self::convert_diesel_error)?;
+            let dto = ApiKeyRepo::get_api_key_dto(&mut conn, row).await?;
             out.push(dto);
         }
 
@@ -45,14 +42,11 @@ impl ApiKeyRepo {
             .limit(limit)
             .offset(offset)
             .load::<ApiKeyRow>(&mut conn)
-            .await
-            .map_err(Self::convert_diesel_error)?;
+            .await?;
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            let dto = ApiKeyRepo::get_api_key_dto(&mut conn, row)
-                .await
-                .map_err(Self::convert_diesel_error)?;
+            let dto = ApiKeyRepo::get_api_key_dto(&mut conn, row).await?;
             out.push(dto);
         }
 

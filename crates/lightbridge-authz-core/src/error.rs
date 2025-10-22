@@ -28,8 +28,13 @@ pub enum Error {
     #[error("Database error: {0}")]
     Database(String),
 
-    #[error("Migration error: {0}")]
-    Migration(String),
+    #[cfg(feature = "db")]
+    #[error("DieselError error: {0}")]
+    DieselError(#[from] diesel::result::Error),
+
+    #[cfg(feature = "db")]
+    #[error("ConnectionError error: {0}")]
+    ConnectionError(#[from] diesel::result::ConnectionError),
 }
 
 #[cfg(feature = "axum")]
@@ -47,8 +52,12 @@ mod axum_impl {
                 Error::Any(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::AddrParseError(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
-                Error::Migration(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::Server(_) => StatusCode::INTERNAL_SERVER_ERROR,
+
+                #[cfg(feature = "db")]
+                Error::DieselError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                #[cfg(feature = "db")]
+                Error::ConnectionError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
 
             (status_code, self.to_string()).into_response()

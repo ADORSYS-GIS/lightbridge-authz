@@ -60,15 +60,15 @@ impl ApiKeyRepo {
     }
 
     pub fn convert_diesel_error(e: diesel::result::Error) -> Error {
-        Error::Any(anyhow::anyhow!(e))
+        Error::from(e)
     }
 
     pub async fn get_api_key_dto(
         conn: &mut diesel_async::AsyncPgConnection,
         api_key_row: ApiKeyRow,
-    ) -> std::result::Result<ApiKey, diesel::result::Error> {
+    ) -> Result<ApiKey> {
         let acl_row: AclRow = acls::table
-            .find(&api_key_row.id)
+            .filter(acls::api_key_id.eq(&api_key_row.id))
             .first::<AclRow>(conn)
             .await?;
 

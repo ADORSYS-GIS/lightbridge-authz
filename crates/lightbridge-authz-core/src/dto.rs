@@ -9,8 +9,8 @@ const REVOKED: &str = "REVOKED";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ApiKeyStatus {
-    Active,
     #[default]
+    Active,
     Revoked,
 }
 
@@ -53,7 +53,7 @@ pub struct ApiKey {
     pub id: String,
     pub user_id: String,
     pub key_hash: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
     pub metadata: Option<Value>,
     pub status: ApiKeyStatus,

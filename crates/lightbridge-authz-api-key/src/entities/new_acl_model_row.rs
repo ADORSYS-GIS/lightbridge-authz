@@ -8,6 +8,5 @@ use super::schema::acl_models;
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct NewAclModelRow {
     pub id: String,
-    pub name: String,
     pub model: String,
 }

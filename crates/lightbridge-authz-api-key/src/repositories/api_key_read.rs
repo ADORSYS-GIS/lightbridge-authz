@@ -14,14 +14,11 @@ impl ApiKeyRepo {
             .filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id)))
             .first::<ApiKeyRow>(&mut conn)
             .await
-            .optional()
-            .map_err(Self::convert_diesel_error)?;
+            .optional()?;
 
         match maybe_row {
             Some(api_key_row) => {
-                let dto = ApiKeyRepo::get_api_key_dto(&mut conn, api_key_row)
-                    .await
-                    .map_err(Self::convert_diesel_error)?;
+                let dto = ApiKeyRepo::get_api_key_dto(&mut conn, api_key_row).await?;
                 Ok(Some(dto))
             }
             None => Ok(None),
@@ -34,14 +31,11 @@ impl ApiKeyRepo {
             .filter(api_keys::key_hash.eq(token))
             .first::<ApiKeyRow>(&mut conn)
             .await
-            .optional()
-            .map_err(Self::convert_diesel_error)?;
+            .optional()?;
 
         match maybe_row {
             Some(api_key_row) => {
-                let dto = ApiKeyRepo::get_api_key_dto(&mut conn, api_key_row)
-                    .await
-                    .map_err(Self::convert_diesel_error)?;
+                let dto = ApiKeyRepo::get_api_key_dto(&mut conn, api_key_row).await?;
                 Ok(Some(dto))
             }
             None => Ok(None),
@@ -54,14 +48,11 @@ impl ApiKeyRepo {
             .filter(api_keys::key_hash.eq(token))
             .first::<ApiKeyRow>(&mut conn)
             .await
-            .optional()
-            .map_err(Self::convert_diesel_error)?;
+            .optional()?;
 
         match maybe_row {
             Some(api_key_row) => {
-                let dto = ApiKeyRepo::get_api_key_dto(&mut conn, api_key_row)
-                    .await
-                    .map_err(Self::convert_diesel_error)?;
+                let dto = ApiKeyRepo::get_api_key_dto(&mut conn, api_key_row).await?;
                 Ok(Some(dto))
             }
             None => Ok(None),

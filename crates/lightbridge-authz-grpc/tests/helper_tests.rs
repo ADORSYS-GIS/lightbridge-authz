@@ -149,7 +149,7 @@ async fn test_api_key_to_dynamic_metadata() {
         id: "test_api_key_id".to_string(),
         user_id: "test_user_id".to_string(),
         key_hash: "hashed_token".to_string(),
-        created_at: chrono::Utc::now(),
+        created_at: None,
         expires_at: None,
         metadata: None,
         status: lightbridge_authz_core::api_key::ApiKeyStatus::Active,

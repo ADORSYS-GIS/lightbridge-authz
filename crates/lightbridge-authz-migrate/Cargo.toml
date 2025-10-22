@@ -10,4 +10,7 @@ authors.workspace = true
 diesel.workspace = true
 diesel_migrations.workspace = true
 tracing.workspace = true
-lightbridge-authz-core.workspace = true
+
+[dependencies.lightbridge-authz-core]
+workspace = true
+features = ["db"]

@@ -9,6 +9,7 @@ members = [
     "crates/lightbridge-authz-api-key",
     "crates/lightbridge-authz-bearer",
     "crates/lightbridge-authz-migrate",
+    "crates/lightbridge-authz-test-utils",
 ]
 resolver = "3"
 
@@ -38,6 +39,8 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "serde"
 axum = { version = "0.8", features = ["macros", "tracing"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+r2d2 = "0.8"
 
 diesel = { version = "2", features = ["postgres", "chrono", "serde_json"] }
 diesel-async = { version = "0", features = ["postgres", "bb8"] }

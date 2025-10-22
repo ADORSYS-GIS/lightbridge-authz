@@ -51,17 +51,19 @@ impl ApiKeyRepo {
                     .await?;
                 }
 
-                let api_key_row_after_update: ApiKeyRow = api_keys::table
-                    .filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id)))
-                    .first::<ApiKeyRow>(tx)
-                    .await?;
-
-                let dto = ApiKeyRepo::get_api_key_dto(tx, api_key_row_after_update).await?;
-                Ok::<ApiKey, diesel::result::Error>(dto)
+                Ok::<(), Error>(())
             }
             .scope_boxed()
         })
         .await
-        .map_err(|e| Error::Any(anyhow!(e)))
+        .map_err(|e| Error::Any(anyhow!(e)))?;
+
+        let api_key_row: ApiKeyRow = api_keys::table
+            .filter(api_keys::id.eq(id).and(api_keys::user_id.eq(user_id)))
+            .first::<ApiKeyRow>(&mut conn)
+            .await?;
+
+        let api_key = ApiKeyRepo::get_api_key_dto(&mut conn, api_key_row).await?;
+        Ok(api_key)
     }
 }

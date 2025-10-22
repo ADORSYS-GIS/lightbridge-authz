@@ -7,7 +7,7 @@ use crate::mappers::*;
 use crate::repositories::api_key_repository::ApiKeyRepo;
 use anyhow::anyhow;
 use chrono::Utc;
-use diesel::QueryDsl;
+use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
 use lightbridge_authz_core::api_key::{Acl, ApiKey, CreateApiKey, RateLimit};
 use lightbridge_authz_core::cuid::cuid2;
@@ -28,14 +28,14 @@ impl ApiKeyRepo {
         let acl_id = cuid2();
 
         let (new_acl, models): (NewAclRow, Vec<NewAclModelRow>) = match input.acl.clone() {
-            Some(acl) => acl_to_rows(&acl, &acl_id, now, now),
+            Some(acl) => acl_to_rows(&acl, &acl_id, &key_id, now, now),
             None => {
                 let default_acl = Acl {
                     allowed_models: vec![],
                     tokens_per_model: HashMap::new(),
                     rate_limit: RateLimit::default(),
                 };
-                acl_to_rows(&default_acl, &acl_id, now, now)
+                acl_to_rows(&default_acl, &acl_id, &key_id, now, now)
             }
         };
 
@@ -66,14 +66,19 @@ impl ApiKeyRepo {
                     .execute(tx)
                     .await?;
 
-                let api_key_row: ApiKeyRow =
-                    api_keys::table.find(&key_id).first::<ApiKeyRow>(tx).await?;
-                let api_key = ApiKeyRepo::get_api_key_dto(tx, api_key_row).await?;
-                Ok::<ApiKey, diesel::result::Error>(api_key)
+                Ok::<(), Error>(())
             }
             .scope_boxed()
         })
         .await
-        .map_err(|e| Error::Any(anyhow!(e)))
+        .map_err(|e| Error::Any(anyhow!(e)))?;
+
+        let api_key_row: ApiKeyRow = api_keys::table
+            .filter(api_keys::id.eq(key_id))
+            .first::<ApiKeyRow>(&mut conn)
+            .await?;
+
+        let api_key = ApiKeyRepo::get_api_key_dto(&mut conn, api_key_row).await?;
+        Ok(api_key)
     }
 }

@@ -18,7 +18,9 @@ thiserror.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum = { workspace = true, optional = true }
+diesel = { workspace = true, optional = true }
 
 [features]
 default = []
 axum = ["dep:axum"]
+db = ["diesel"]

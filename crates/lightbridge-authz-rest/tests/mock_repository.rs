@@ -1,4 +1,3 @@
-use chrono::Utc;
 use lightbridge_authz_api_key::db::ApiKeyRepository;
 use lightbridge_authz_core::{
     api_key::{ApiKey, ApiKeyStatus, CreateApiKey},
@@ -28,7 +27,7 @@ impl ApiKeyRepository for MockApiKeyRepository {
             id: cuid2(),
             user_id: user_id.to_string(),
             key_hash,
-            created_at: Utc::now(),
+            created_at: None,
             expires_at: input.expires_at,
             metadata: input.metadata,
             status: ApiKeyStatus::Active,

@@ -6,7 +6,6 @@ pub mod api_key_reader;
 pub mod controllers;
 pub mod db;
 pub mod routers;
-pub mod schema;
 
 use std::fmt;
 use std::sync::Arc;
