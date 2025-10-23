@@ -193,14 +193,7 @@ async fn test_api_key_to_dynamic_metadata() {
         Some(&"test_api_key_id".to_string())
     );
 
-    let permissions = fields.get("permissions").and_then(|v| v.kind.as_ref()).and_then(|k| match k {
-        lightbridge_authz_proto::envoy_types::pb::google::protobuf::value::Kind::StructValue(s) => Some(s),
-        _ => None,
-    });
-    assert!(permissions.is_some());
-
-    let permissions_fields = &permissions.unwrap().fields;
-    let allowed_models = permissions_fields
+    let allowed_models = fields
         .get("allowed_models")
         .and_then(|v| v.kind.as_ref())
         .and_then(|k| match k {
