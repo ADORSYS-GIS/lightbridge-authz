@@ -1,0 +1,19 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ai-http-route
+  namespace: model
+spec:
+  parentRefs:
+  - name: ai-gateway
+    namespace: envoy-gateway-system
+  hostnames: ["ai.local.dev"]
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: ai-backend
+      port: 80
+      
