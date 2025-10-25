@@ -36,8 +36,8 @@ impl APIKeyHandler for APIKeyHandlerImpl {
         let acl: Acl = input.acl.unwrap_or_default();
 
         let create_api_key = CreateApiKey {
-            expires_at: None,
-            metadata: None,
+            expires_at: input.expires_at,
+            metadata: input.metadata,
             acl: Some(acl),
         };
         let key_plain = format!("sk-{}-{}", cuid2_slug(), cuid2());

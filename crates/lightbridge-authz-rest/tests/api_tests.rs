@@ -5,6 +5,8 @@ use lightbridge_authz_core::error::Error;
 use lightbridge_authz_rest::handlers::APIKeyHandlerImpl;
 use std::collections::HashMap;
 use std::sync::Arc;
+use chrono::{Duration, Utc};
+use serde_json::json;
 
 // Inlined mock_repository module for integration tests
 mod mock_repository {
@@ -142,9 +144,11 @@ async fn test_create_api_key_success() {
     };
 
     let user_id = "user123".to_string();
+    let expires_at = Utc::now() + Duration::days(30);
+    let metadata = json!({"purpose": "test"});
     let create_input = CreateApiKey {
-        expires_at: None,
-        metadata: None,
+        expires_at: Some(expires_at),
+        metadata: Some(metadata.clone()),
         acl: Some(Acl::default()),
     };
 
@@ -155,6 +159,8 @@ async fn test_create_api_key_success() {
 
     assert_eq!(api_key.user_id, user_id);
     assert_eq!(api_key.status, ApiKeyStatus::Active);
+    assert_eq!(api_key.expires_at, Some(expires_at));
+    assert_eq!(api_key.metadata, Some(metadata.clone()));
 
     let fetched_key = mock_repo
         .find_by_id(&user_id, &api_key.id)
@@ -162,6 +168,8 @@ async fn test_create_api_key_success() {
         .unwrap()
         .unwrap();
     assert_eq!(fetched_key.id, api_key.id);
+    assert_eq!(fetched_key.expires_at, Some(expires_at));
+    assert_eq!(fetched_key.metadata, Some(metadata));
 }
 
 #[tokio::test]
