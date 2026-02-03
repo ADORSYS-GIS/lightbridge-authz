@@ -89,6 +89,7 @@ services:
       context: .
     volumes:
       - ./.docker/authz/container.yaml:/tmp/config.yaml:ro
+      - ./.docker/authz/tls:/tmp/tls:ro
     environment:
       RUST_LOG: "debug"
       CONFIG_PATH: "/tmp/config.yaml"

@@ -1,8 +1,6 @@
 [workspace]
 members = [
-    "crates/lightbridge-authz-proto",
     "crates/lightbridge-authz-core",
-    "crates/lightbridge-authz-grpc",
     "crates/lightbridge-authz-rest",
     "crates/lightbridge-authz-cli",
     "crates/lightbridge-authz-api",
@@ -15,8 +13,6 @@ resolver = "3"
 
 [workspace.dependencies]
 lightbridge-authz-core = { path = "./crates/lightbridge-authz-core" }
-lightbridge-authz-proto = { path = "./crates/lightbridge-authz-proto" }
-lightbridge-authz-grpc = { path = "./crates/lightbridge-authz-grpc" }
 lightbridge-authz-rest = { path = "./crates/lightbridge-authz-rest" }
 lightbridge-authz-api = { path = "./crates/lightbridge-authz-api" }
 lightbridge-authz-api-key = { path = "./crates/lightbridge-authz-api-key" }
@@ -26,17 +22,18 @@ lightbridge-authz-migrate = { path = "./crates/lightbridge-authz-migrate" }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1.0"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
 jsonwebtoken = { version = "9" }
 jwks = "0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "tracing", "net"] }
-tonic = "0"
-prost = "0"
-prost-types = "0.14"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "serde", "serde_json"] }
 axum = { version = "0.8", features = ["macros", "tracing"] }
+axum-server = { version = "0.6", features = ["tls-rustls"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
@@ -48,7 +45,6 @@ diesel_migrations = "2"
 chrono = { version = "0.4", features = ["serde"] }
 cuid = { version = "1" }
 rand_core = "0.9.3"
-envoy-types = "0.7.0"
 goose = "0.17"
 reqwest = { version = "0.12", features = ["json"] }
 

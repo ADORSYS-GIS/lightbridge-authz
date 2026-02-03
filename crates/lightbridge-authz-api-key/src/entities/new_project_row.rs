@@ -1,0 +1,19 @@
+use chrono::{DateTime, Utc};
+use diesel::Insertable;
+use serde::{Deserialize, Serialize};
+
+use super::schema::projects;
+
+#[derive(Debug, Clone, Insertable, Serialize, Deserialize)]
+#[diesel(table_name = projects)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct NewProjectRow {
+    pub id: String,
+    pub account_id: String,
+    pub name: String,
+    pub allowed_models: serde_json::Value,
+    pub default_limits: serde_json::Value,
+    pub billing_plan: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}

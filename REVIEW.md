@@ -27,7 +27,6 @@ The code review identified several critical issues spanning security, performanc
 *   **Silent fallback for unknown status:** `into_api_key()` maps unknown status to `Active`. Should error or use a robust enum mapping; storing canonical strings consistently.
 *   **Unwrap on `serde_json::to_string` in SQL builder:** `unwrap()`. Can panic. Avoid unwraps and do not build SQL strings.
 *   **Inconsistent deletion semantics:** `delete_api_key()` revokes then returns `Ok` ignoring errors. Return actual result and error on failure.
-*   **gRPC placeholder validation:** `ApiKeyService::validate_api_key()` constant check. Document as stub or implement DB check; currently misleading.
 *   **Misclassified client errors:** controllers UUID parse mapped to `NotFound` and (`crates/lightbridge-authz-rest/src/handlers.rs:41`). Should be 400 Bad Request, not 404.
 
 ### Code style and API design

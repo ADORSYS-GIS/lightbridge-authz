@@ -13,7 +13,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 lightbridge-authz-core.workspace = true
 lightbridge-authz-rest.workspace = true
-lightbridge-authz-grpc.workspace = true
 lightbridge-authz-migrate.workspace = true
 mimalloc.workspace = true
 
@@ -31,10 +30,6 @@ path = "src/bin/healthcheck.rs"
 [[bin]]
 name = "lightbridge-authz-migrate"
 path = "src/bin/migrate.rs"
-
-[[bin]]
-name = "lightbridge-authz-grpc"
-path = "src/bin/server-grpc.rs"
 
 [[bin]]
 name = "lightbridge-authz-rest"

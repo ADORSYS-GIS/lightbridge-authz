@@ -1,5 +1,7 @@
 # Postgres Persistence and OAuth2 Introspection Architecture
 
+> Note: The gRPC ext_authz flow has been removed. Use the OPA HTTP server (basic auth + TLS) for runtime validation. Sections mentioning gRPC are historical.
+
 ## Why?
 
 We need a secure, scalable foundation for two credential types:

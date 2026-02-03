@@ -35,7 +35,7 @@ Integration tests are designed to test the interactions between different compon
 
 - **`lightbridge-authz-api`**: The API controllers should be tested with integration tests that simulate HTTP requests and verify the responses. These tests should cover all API endpoints and HTTP methods.
 
-- **`lightbridge-authz-rest`** & **`lightbridge-authz-grpc`**: The REST and gRPC servers should be tested with integration tests to ensure that they are correctly handling requests and responses.
+- **`lightbridge-authz-rest`**: The HTTP API and OPA servers should be tested with integration tests to ensure that they are correctly handling requests and responses.
 
 ### End-to-End (E2E) Tests
 

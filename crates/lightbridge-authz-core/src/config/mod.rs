@@ -13,20 +13,35 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Server {
-    pub rest: Option<Rest>,
-    pub grpc: Option<Grpc>,
+    pub api: ApiServer,
+    pub opa: OpaServer,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct Rest {
+pub struct ApiServer {
     pub address: String,
     pub port: u16,
+    pub tls: Tls,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct Grpc {
+pub struct OpaServer {
     pub address: String,
     pub port: u16,
+    pub tls: Tls,
+    pub basic_auth: BasicAuth,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Tls {
+    pub cert_path: String,
+    pub key_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BasicAuth {
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

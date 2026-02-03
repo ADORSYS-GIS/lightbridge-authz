@@ -2,8 +2,7 @@ mod utils;
 
 use clap::Parser;
 use lightbridge_authz_core::Result;
-use lightbridge_authz_grpc::start_grpc_server;
-use lightbridge_authz_rest::start_rest_server;
+use lightbridge_authz_rest::{start_api_server, start_opa_server};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
@@ -39,31 +38,29 @@ async fn main() -> Result<()> {
                 }
             });
 
-            if let Some(rest) = config.clone().server.rest {
-                let config_clone = config.clone();
-                let tx_clone = tx.clone();
-                let pool_clone = pool.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = start_rest_server(&rest, pool_clone, &config_clone.oauth2).await
-                    {
-                        let _ = tx_clone
-                            .send(format!("REST server failed to start: {}", e))
-                            .await;
-                    }
-                });
-            }
+            let api = config.clone().server.api;
+            let opa = config.clone().server.opa;
 
-            if let Some(grpc) = config.clone().server.grpc {
-                let tx_clone = tx.clone();
-                let pool_clone = pool.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = start_grpc_server(&grpc, pool_clone).await {
-                        let _ = tx_clone
-                            .send(format!("gRPC server failed to start: {}", e))
-                            .await;
-                    }
-                });
-            }
+            let config_clone = config.clone();
+            let tx_clone = tx.clone();
+            let pool_clone = pool.clone();
+            tokio::spawn(async move {
+                if let Err(e) = start_api_server(&api, pool_clone, &config_clone.oauth2).await {
+                    let _ = tx_clone
+                        .send(format!("API server failed to start: {}", e))
+                        .await;
+                }
+            });
+
+            let tx_clone = tx.clone();
+            let pool_clone = pool.clone();
+            tokio::spawn(async move {
+                if let Err(e) = start_opa_server(&opa, pool_clone).await {
+                    let _ = tx_clone
+                        .send(format!("OPA server failed to start: {}", e))
+                        .await;
+                }
+            });
 
             let _ = error_listener.await;
         }

@@ -8,11 +8,11 @@ pub struct HealthCheckCli {
     #[arg(value_name = "HOST", short = 's', long, default_value = "0.0.0.0")]
     pub server_host: String,
 
-    #[arg(value_name = "PORT", short = 'g', long, default_value = "3001")]
-    pub grpc_port: u16,
-
     #[arg(value_name = "PORT", short = 'r', long, default_value = "3000")]
-    pub rest_port: u16,
+    pub api_port: u16,
+
+    #[arg(value_name = "PORT", short = 'o', long, default_value = "3001")]
+    pub opa_port: u16,
 
     #[arg(value_name = "TIMEOUT", short = 't', long, default_value = "5")]
     pub timeout: u64,
@@ -36,13 +36,13 @@ fn check_endpoint(host: &str, port: u16, timeout_secs: u64, name: &str) -> Resul
 fn main() -> Result<()> {
     let HealthCheckCli {
         timeout,
-        rest_port,
-        grpc_port,
+        api_port,
+        opa_port,
         server_host,
     } = HealthCheckCli::parse();
 
-    let grpc_ok = check_endpoint(&server_host, grpc_port, timeout, "gRPC")?;
-    let rest_ok = check_endpoint(&server_host, rest_port, timeout, "REST")?;
+    let api_ok = check_endpoint(&server_host, api_port, timeout, "API")?;
+    let opa_ok = check_endpoint(&server_host, opa_port, timeout, "OPA")?;
 
-    std::process::exit(if grpc_ok && rest_ok { 0 } else { 1 });
+    std::process::exit(if api_ok && opa_ok { 0 } else { 1 });
 }

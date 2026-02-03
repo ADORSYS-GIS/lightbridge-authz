@@ -4,8 +4,11 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use base64::Engine;
 use lightbridge_authz_api::AppState;
 use std::sync::Arc;
+
+use crate::OpaState;
 
 /// Middleware that validates the bearer token using the application's shared AppState.
 ///
@@ -55,4 +58,54 @@ pub async fn bearer_auth(
         }
         _ => unauthorized_response(),
     }
+}
+
+/// Middleware that validates HTTP Basic authentication for OPA server.
+pub async fn basic_auth(
+    State(state): State<Arc<OpaState>>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let unauthorized_response = || {
+        let mut res = (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        res.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Basic"),
+        );
+        res
+    };
+
+    let auth_header = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string());
+
+    let Some(auth_header) = auth_header else {
+        return unauthorized_response();
+    };
+
+    let prefix = "Basic ";
+    if !auth_header.starts_with(prefix) {
+        return unauthorized_response();
+    }
+
+    let encoded = auth_header.trim_start_matches(prefix);
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(encoded) {
+        Ok(bytes) => bytes,
+        Err(_) => return unauthorized_response(),
+    };
+    let decoded = match String::from_utf8(decoded) {
+        Ok(value) => value,
+        Err(_) => return unauthorized_response(),
+    };
+    let mut parts = decoded.splitn(2, ':');
+    let username = parts.next().unwrap_or("");
+    let password = parts.next().unwrap_or("");
+
+    if username != state.basic_auth.username || password != state.basic_auth.password {
+        return unauthorized_response();
+    }
+
+    next.run(req).await
 }

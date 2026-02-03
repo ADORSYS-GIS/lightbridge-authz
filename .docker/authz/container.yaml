@@ -1,10 +1,19 @@
 server:
-  rest:
+  api:
     address: "0.0.0.0"
     port: 3000
-  grpc:
+    tls:
+      cert_path: "/tmp/tls/api.crt"
+      key_path: "/tmp/tls/api.key"
+  opa:
     address: "0.0.0.0"
     port: 3001
+    tls:
+      cert_path: "/tmp/tls/opa.crt"
+      key_path: "/tmp/tls/opa.key"
+    basic_auth:
+      username: "authorino"
+      password: "change-me"
 logging:
   level: "info"
 database:

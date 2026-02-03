@@ -1,6 +1,6 @@
 use clap::Parser;
-use lightbridge_authz_core::{Error, Result, load_from_path};
-use lightbridge_authz_rest::start_rest_server;
+use lightbridge_authz_core::{Result, load_from_path};
+use lightbridge_authz_rest::{start_api_server, start_opa_server};
 use std::sync::Arc;
 
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
@@ -29,11 +29,15 @@ async fn main() -> Result<()> {
     info!("Connecting to DB...");
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(&config.database).await?);
 
-    if let Some(rest) = config.server.rest {
-        start_rest_server(&rest, pool, &config.oauth2).await?
-    } else {
-        return Err(Error::Server("no server Rest was configured".to_string()));
-    }
+    let api = config.server.api.clone();
+    let opa = config.server.opa.clone();
+    let pool_api = pool.clone();
+    let pool_opa = pool.clone();
+
+    tokio::try_join!(
+        start_api_server(&api, pool_api, &config.oauth2),
+        start_opa_server(&opa, pool_opa)
+    )?;
 
     Ok(())
 }
