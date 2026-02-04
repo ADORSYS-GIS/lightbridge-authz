@@ -97,7 +97,7 @@ Core config loader is exposed from [load_from_path()](crates/lightbridge-authz-c
   - HTTP servers: [crates/lightbridge-authz-rest](crates/lightbridge-authz-rest/src/lib.rs:1)
   - CLI: [app/lightbridge-authz](app/lightbridge-authz/src/main.rs:1)
   - Healthcheck: [app/lightbridge-authz-healthcheck](app/lightbridge-authz-healthcheck/src/main.rs:1)
-  - Migrate runner: [app/lightbridge-authz-migrate](app/lightbridge-authz-migrate/src/main.rs:1)
+  - Migrate runner: [app/lightbridge-authz-migrate](app/lightbridge-authz-migrate-bin/src/main.rs:1)
   - API facade: [crates/lightbridge-authz-api](crates/lightbridge-authz-api/src/lib.rs:1)
 
 - Testing:

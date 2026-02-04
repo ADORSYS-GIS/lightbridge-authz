@@ -19,6 +19,8 @@ services:
             -keyout /tls/opa.key -out /tls/opa.crt \
             -subj "/CN=lightbridge-authz-opa"
         fi
+        chmod 644 /tls/api.crt /tls/opa.crt
+        chmod 644 /tls/api.key /tls/opa.key
     volumes:
       - "authz_tls:/tls"
 
@@ -74,13 +76,12 @@ services:
       context: .
       target: migrate
     volumes:
-      - ./.docker/authz/container.yaml:/tmp/config.yaml:ro
+      - "./.docker/authz/container.yaml:/tmp/config.yaml:ro"
+      - "authz_tls:/tls"
     environment:
       RUST_LOG: "debug"
       CONFIG_PATH: "/tmp/config.yaml"
     restart: on-failure
-    command:
-      - migrate
     depends_on:
       postgresql:
         condition: service_started
@@ -91,7 +92,7 @@ services:
       authz-migrate:
         condition: service_completed_successfully
       authz-tls:
-        condition: service_completed_successfully
+        condition: service_started
     deploy:
       replicas: 1
       resources:
@@ -118,7 +119,7 @@ services:
       authz-migrate:
         condition: service_completed_successfully
       authz-tls:
-        condition: service_completed_successfully
+        condition: service_started
     deploy:
       replicas: 1
       resources:

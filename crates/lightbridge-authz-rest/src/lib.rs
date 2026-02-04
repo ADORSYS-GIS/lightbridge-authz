@@ -7,6 +7,7 @@ use lightbridge_authz_core::{
     hash_api_key,
     ApiKeyStatus,
 };
+use std::sync::Once;
 
 pub mod handlers;
 mod middleware;
@@ -45,15 +46,19 @@ pub async fn start_api_server(
         bearer: bearer_service,
     });
 
-    let app = Router::new()
+    let public = Router::new()
         .route("/", get(root_handler))
-        .route("/health", get(health_handler))
+        .route("/health", get(health_handler));
+
+    let protected = Router::new()
         .nest("/api/v1", api_router())
         .with_state(app_state.clone())
         .layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             bearer_auth,
         ));
+
+    let app = public.merge(protected).with_state(app_state.clone());
 
     serve_tls("API", &api.address, api.port, &api.tls, app).await
 }
@@ -78,6 +83,13 @@ pub async fn start_opa_server(
     serve_tls("OPA", &opa.address, opa.port, &opa.tls, app).await
 }
 
+fn ensure_rustls_provider() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 async fn serve_tls(
     name: &str,
     address: &str,
@@ -85,6 +97,7 @@ async fn serve_tls(
     tls: &Tls,
     app: Router,
 ) -> Result<()> {
+    ensure_rustls_provider();
     let addr: SocketAddr = format!("{}:{}", address, port).parse()?;
     let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
         &tls.cert_path,

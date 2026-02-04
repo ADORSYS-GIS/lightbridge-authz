@@ -11,7 +11,7 @@ use lightbridge_authz_core::{
     CreateProject, Project, RotateApiKey, UpdateAccount, UpdateApiKey, UpdateProject,
 };
 use lightbridge_authz_core::{db::DbPoolTrait, error::Result};
-use rand::RngCore;
+use getrandom::fill;
 
 #[derive(Clone)]
 pub struct AuthzStoreImpl {
@@ -32,12 +32,12 @@ impl AuthzStoreImpl {
         }
     }
 
-    fn generate_secret() -> String {
+    fn generate_secret() -> Result<String> {
         let mut bytes = [0u8; 32];
-        let mut rng = rand::rngs::OsRng;
-        rng.fill_bytes(&mut bytes);
+        fill(&mut bytes)
+            .map_err(|e| lightbridge_authz_core::error::Error::Database(e.to_string()))?;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-        format!("lbk_{}", encoded)
+        Ok(format!("lbk_secret_{}", encoded))
     }
 
     fn key_prefix(secret: &str) -> String {
@@ -94,7 +94,7 @@ impl AuthzStore for AuthzStoreImpl {
     }
 
     async fn create_api_key(&self, project_id: &str, input: CreateApiKey) -> Result<ApiKeySecret> {
-        let secret = Self::generate_secret();
+        let secret = Self::generate_secret()?;
         let key_hash = hash_api_key(&secret);
         let key_prefix = Self::key_prefix(&secret);
         let now = Utc::now();
@@ -166,7 +166,7 @@ impl AuthzStore for AuthzStoreImpl {
                 .await?;
         }
 
-        let secret = Self::generate_secret();
+        let secret = Self::generate_secret()?;
         let key_hash = hash_api_key(&secret);
         let key_prefix = Self::key_prefix(&secret);
         let row = lightbridge_authz_api_key::entities::new_api_key_row::NewApiKeyRow {
