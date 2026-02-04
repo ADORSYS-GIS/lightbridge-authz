@@ -10,12 +10,13 @@ struct Cli {
     config: String,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
     let config = load_from_path(&cli.config)?;
-    migrate(&config.database.url)?;
+    migrate(&config.database.url).await?;
 
     Ok(())
 }

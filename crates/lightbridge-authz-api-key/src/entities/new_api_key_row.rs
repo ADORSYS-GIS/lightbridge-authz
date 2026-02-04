@@ -1,12 +1,7 @@
 use chrono::{DateTime, Utc};
-use diesel::Insertable;
 use serde::{Deserialize, Serialize};
 
-use super::schema::api_keys;
-
-#[derive(Debug, Clone, Insertable, Serialize, Deserialize)]
-#[diesel(table_name = api_keys)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewApiKeyRow {
     pub id: String,
     pub project_id: String,

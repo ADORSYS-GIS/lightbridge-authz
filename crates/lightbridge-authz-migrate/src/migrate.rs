@@ -1,20 +1,18 @@
-use diesel::{Connection, PgConnection};
-use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
+use lightbridge_authz_core::error::Error;
 use lightbridge_authz_core::Result;
+use sqlx::postgres::PgPoolOptions;
 use tracing::info;
 
-// embed migrations from the workspace migrations/ folder
-// path is relative to this crate root
-pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("../../migrations");
+pub async fn migrate(database_url: &str) -> Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
+        .await?;
 
-pub fn migrate(database_url: &str) -> Result<()> {
-    // Establish a direct PgConnection for running migrations
-    let mut conn = PgConnection::establish(database_url)?;
-
-    if let Err(e) = conn.run_pending_migrations(MIGRATIONS) {
-        panic!("Failed to run database migrations: {}", e);
-    }
-
+    sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .map_err(|e| Error::Database(e.to_string()))?;
     info!("Database migrations completed successfully.");
     Ok(())
 }

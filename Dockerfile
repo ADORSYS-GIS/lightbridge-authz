@@ -13,7 +13,6 @@ WORKDIR /app
 
 # Copy manifests
 COPY Cargo.toml Cargo.lock ./
-COPY diesel.toml diesel.toml ./
 COPY crates/ ./crates/
 COPY app/ ./app/
 COPY migrations/ ./migrations/
@@ -29,9 +28,8 @@ RUN \
   --mount=type=cache,target=/var/cache/apt,sharing=locked \
   --mount=type=cache,target=/var/lib/apt,sharing=locked \
   apt update \
-  && apt install -y libpq5 ca-certificates libssl3 --no-install-recommends
+  && apt install -y ca-certificates libssl3 --no-install-recommends
 
-# Dependencies for libpq (used by diesel)
 RUN \
   --mount=type=cache,target=/usr/lib/*-linux-gnu \
   mkdir /deps && \

@@ -19,8 +19,6 @@ pub enum Error {
     #[error("Server Error: {0}")]
     Server(String),
 
-    #[error("Rand: {0}")]
-    RandError(#[from] rand_core::OsError),
 
     #[error("Address parse error: {0}")]
     AddrParseError(#[from] std::net::AddrParseError),
@@ -28,13 +26,8 @@ pub enum Error {
     #[error("Database error: {0}")]
     Database(String),
 
-    #[cfg(feature = "db")]
-    #[error("DieselError error: {0}")]
-    DieselError(#[from] diesel::result::Error),
-
-    #[cfg(feature = "db")]
-    #[error("ConnectionError error: {0}")]
-    ConnectionError(#[from] diesel::result::ConnectionError),
+    #[error("SQLx error: {0}")]
+    SqlxError(#[from] sqlx::Error),
 }
 
 #[cfg(feature = "axum")]
@@ -46,7 +39,6 @@ mod axum_impl {
         fn into_response(self) -> axum::response::Response {
             let status_code = match self {
                 Error::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
-                Error::RandError(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::Yaml(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::NotFound => StatusCode::NOT_FOUND,
                 Error::Any(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -54,10 +46,7 @@ mod axum_impl {
                 Error::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::Server(_) => StatusCode::INTERNAL_SERVER_ERROR,
 
-                #[cfg(feature = "db")]
-                Error::DieselError(_) => StatusCode::INTERNAL_SERVER_ERROR,
-                #[cfg(feature = "db")]
-                Error::ConnectionError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                Error::SqlxError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
 
             (status_code, self.to_string()).into_response()

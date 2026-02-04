@@ -7,8 +7,7 @@ publish.workspace = true
 authors.workspace = true
 
 [dependencies]
-diesel = { workspace = true, features = ["r2d2", "postgres"] }
-diesel_migrations = { workspace = true }
+sqlx.workspace = true
 clap = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

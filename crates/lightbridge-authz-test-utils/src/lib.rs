@@ -1,10 +1,7 @@
 pub mod api;
 
 use clap::Parser;
-use diesel::{Connection, PgConnection};
-use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
-
-pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("../../migrations");
+use sqlx::{PgPool, postgres::PgPoolOptions};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -16,22 +13,28 @@ struct Cli {
 
 /// Establishes a connection to the test database.
 /// The database URL is read from the `DATABASE_URL` environment variable or CLI argument.
-pub fn establish_connection() -> PgConnection {
+pub async fn establish_pool() -> PgPool {
     let cli = Cli::parse();
-    PgConnection::establish(&cli.database_url)
+    PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&cli.database_url)
+        .await
         .unwrap_or_else(|_| panic!("Error connecting to {}", cli.database_url))
 }
 
 /// Runs all pending database migrations.
-pub fn run_migrations(connection: &mut PgConnection) {
-    connection.run_pending_migrations(MIGRATIONS).unwrap();
+pub async fn run_migrations(pool: &PgPool) {
+    sqlx::migrate!("../../migrations")
+        .run(pool)
+        .await
+        .unwrap();
 }
 
 /// Sets up a clean database state for testing.
 /// This function establishes a new connection, runs migrations, and returns the connection.
 /// It's intended to be used at the beginning of each test to ensure isolation.
-pub fn setup_test_db() -> PgConnection {
-    let mut connection = establish_connection();
-    run_migrations(&mut connection);
-    connection
+pub async fn setup_test_db() -> PgPool {
+    let pool = establish_pool().await;
+    run_migrations(&pool).await;
+    pool
 }

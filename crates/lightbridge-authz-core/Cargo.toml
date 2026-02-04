@@ -12,7 +12,7 @@ serde.workspace = true
 serde_yaml.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
-diesel-async.workspace = true
+sqlx.workspace = true
 rand_core.workspace = true
 sha2.workspace = true
 hex.workspace = true
@@ -20,9 +20,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum = { workspace = true, optional = true }
-diesel = { workspace = true, optional = true }
 
 [features]
 default = []
 axum = ["dep:axum"]
-db = ["diesel"]

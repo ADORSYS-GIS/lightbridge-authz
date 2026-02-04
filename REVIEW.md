@@ -10,7 +10,7 @@ The code review identified several critical issues spanning security, performanc
 
 ### Security vulnerabilities
 
-*   **SQL injection via string-built UPDATE:** `ApiKeyRepo::patch()` builds SQL with `format!` including `expires_at`, `metadata` (serialized with `unwrap`), and `status`, then executes via `diesel::sql_query`. Risk: injection and invalid quoting. Use Diesel changesets instead.
+*   **SQL injection via string-built UPDATE:** `ApiKeyRepo::patch()` builds SQL with `format!` including `expires_at`, `metadata` (serialized with `unwrap`), and `status`. Risk: injection and invalid quoting. Use parameterized SQLx queries instead.
 *   **Sensitive data exposure in API responses:** `ApiKey` struct (includes `key_hash`) and returned directly by controllers, e.g. `create_api_key()`, `get_api_key()`. Do not expose `key_hash`; create a response DTO without sensitive fields.
 *   **Panic and uncontrolled error disclosure:** `start_rest_server()` bind/serve unwraps and (`crates/lightbridge-authz-rest/src/lib.rs:32`). Replace `unwrap` with proper error propagation using core `Error`. `IntoResponse` for `Error` returns `self.to_string()`. Leaks internal error details. Return generic message; log detailed errors server-side.
 *   **Weak API key generation and handling:** `APIKeyHandlerImpl::create_api_key()` uses "some_key". Must generate cryptographically secure secrets and return only once; store only hash. `create_api_key()`: Uses UUID string; prefer 32+ bytes from a CSPRNG (e.g., `rand::rngs::OsRng`) and a restricted alphabet. Never log or store plaintext.
@@ -18,7 +18,7 @@ The code review identified several critical issues spanning security, performanc
 ### Performance issues
 
 *   **N+1 queries fetching ACL per API key:** `ApiKeyRow::into_api_key()` fetches ACL and used within `list()` loop. Join or batch-load ACL and models to avoid N+1.
-*   **Missing transactions for multi-statement updates:** `AclRepo::create()` multi-inserts, `AclRepo::update()` delete+insert and `AclRepo::delete()` multi-deletes are not wrapped in a transaction. Use `diesel_async` transaction to ensure consistency.
+*   **Missing transactions for multi-statement updates:** `AclRepo::create()` multi-inserts, `AclRepo::update()` delete+insert and `AclRepo::delete()` multi-deletes are not wrapped in a transaction. Use SQLx transactions to ensure consistency.
 *   **Connection pool settings hard-coded:** `DbPool::new()` ignores configured `pool_size`. Wire to `Database::pool_size`.
 *   **Repeated allocation in list():** `Vec` push in loop. Reserve capacity with `rows.len()` or `map/collect`.
 

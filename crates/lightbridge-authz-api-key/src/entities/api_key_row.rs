@@ -1,12 +1,8 @@
 use chrono::{DateTime, Utc};
-use diesel::{AsChangeset, Identifiable, Queryable};
 use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 
-use super::schema::api_keys;
-
-#[derive(Debug, Clone, Queryable, Identifiable, Serialize, Deserialize)]
-#[diesel(table_name = api_keys)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ApiKeyRow {
     pub id: String,
     pub project_id: String,
@@ -22,9 +18,7 @@ pub struct ApiKeyRow {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, AsChangeset)]
-#[diesel(table_name = api_keys)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
+#[derive(Debug, Clone)]
 pub struct ApiKeyChangeset {
     pub name: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,

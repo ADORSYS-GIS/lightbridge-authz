@@ -48,7 +48,7 @@ E2E tests are designed to test the entire application from the user's perspectiv
 To implement this testing strategy, we will use the following tools and techniques:
 
 - **Unit Tests**: We will use the built-in Rust testing framework (`#[test]`) to write unit tests.
-- **Integration Tests**: For integration tests, we will use a combination of the `reqwest` crate for making HTTP requests and the `diesel` crate for interacting with the test database.
+- **Integration Tests**: For integration tests, we will use a combination of the `reqwest` crate for making HTTP requests and the `sqlx` crate for interacting with the test database.
 - **E2E Tests**: We will use the `assert_cmd` crate to write E2E tests for the CLI.
 
 All tests will be run as part of the CI/CD pipeline to ensure that no regressions are introduced.

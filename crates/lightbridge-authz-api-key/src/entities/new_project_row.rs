@@ -1,12 +1,7 @@
 use chrono::{DateTime, Utc};
-use diesel::Insertable;
 use serde::{Deserialize, Serialize};
 
-use super::schema::projects;
-
-#[derive(Debug, Clone, Insertable, Serialize, Deserialize)]
-#[diesel(table_name = projects)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewProjectRow {
     pub id: String,
     pub account_id: String,

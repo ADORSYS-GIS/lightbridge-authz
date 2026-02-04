@@ -1,12 +1,7 @@
 use chrono::{DateTime, Utc};
-use diesel::Insertable;
 use serde::{Deserialize, Serialize};
 
-use super::schema::accounts;
-
-#[derive(Debug, Clone, Insertable, Serialize, Deserialize)]
-#[diesel(table_name = accounts)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewAccountRow {
     pub id: String,
     pub billing_identity: String,

@@ -1,12 +1,8 @@
 use chrono::{DateTime, Utc};
-use diesel::{AsChangeset, Identifiable, Queryable};
 use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 
-use super::schema::accounts;
-
-#[derive(Debug, Clone, Queryable, Identifiable, Serialize, Deserialize)]
-#[diesel(table_name = accounts)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct AccountRow {
     pub id: String,
     pub billing_identity: String,
@@ -15,9 +11,7 @@ pub struct AccountRow {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, AsChangeset)]
-#[diesel(table_name = accounts)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
+#[derive(Debug, Clone)]
 pub struct AccountChangeset {
     pub billing_identity: Option<String>,
     pub owners_admins: Option<serde_json::Value>,

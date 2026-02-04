@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Migrate { config_path }) => {
             let config = load_from_path(&config_path)?;
-            lightbridge_authz_migrate::migrate(&config.database.url)?;
+            lightbridge_authz_migrate::migrate(&config.database.url).await?;
         }
         Some(Commands::Config { config_path }) => {
             let _ = load_from_path(&config_path)?;
