@@ -41,7 +41,7 @@ Integration tests are designed to test the interactions between different compon
 
 E2E tests are designed to test the entire application from the user's perspective. They are most suitable for testing the command-line interface.
 
-- **`lightbridge-authz-cli`**: The CLI should be tested with E2E tests that execute the compiled binary with different arguments and assert that the output is correct.
+- **`lightbridge-authz`**, **`lightbridge-authz-healthcheck`**, **`lightbridge-authz-migrate`**: The CLI binaries should be tested with E2E tests that execute the compiled binaries with different arguments and assert that the output is correct.
 
 ## How to?
 

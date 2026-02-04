@@ -5,7 +5,7 @@ Lightbridge Authz is an API-key storage and validation service with two HTTP ser
 - Workspace layout is defined in [Cargo.toml](Cargo.toml:1).
 - Core exports are in [crates/lightbridge-authz-core/src/lib.rs](crates/lightbridge-authz-core/src/lib.rs:1).
 - HTTP server entry points are [start_api_server()](crates/lightbridge-authz-rest/src/lib.rs:32) and [start_opa_server()](crates/lightbridge-authz-rest/src/lib.rs:57).
-- CLI entry is [main()](crates/lightbridge-authz-cli/src/main.rs:37), with subcommands declared at [enum Commands](crates/lightbridge-authz-cli/src/main.rs:11).
+- CLI entry is [main()](app/lightbridge-authz/src/main.rs:37), with subcommands declared at [enum Commands](app/lightbridge-authz/src/utils/cli.rs:11).
 
 ## Why?
 
@@ -17,7 +17,7 @@ Lightbridge Authz is an API-key storage and validation service with two HTTP ser
 
 - Core library exposes config loading, error types, DB primitives, and API key models, see re-exports in [lib.rs](crates/lightbridge-authz-core/src/lib.rs:7).
 - REST crate exposes async server start functions: [start_api_server()](crates/lightbridge-authz-rest/src/lib.rs:32) and [start_opa_server()](crates/lightbridge-authz-rest/src/lib.rs:57).
-- CLI parses commands and flags using clap, see [Cli](crates/lightbridge-authz-cli/src/main.rs:6), [Commands](crates/lightbridge-authz-cli/src/main.rs:11), and [main()](crates/lightbridge-authz-cli/src/main.rs:37).
+- CLI parses commands and flags using clap, see [Cli](app/lightbridge-authz/src/utils/cli.rs:4), [Commands](app/lightbridge-authz/src/utils/cli.rs:11), and [main()](app/lightbridge-authz/src/main.rs:20).
 - Configuration lives in [config/default.yaml](config/default.yaml:1).
 
 ## Constraints
@@ -43,14 +43,16 @@ Workspace crates are listed in [Cargo.toml](Cargo.toml:2).
 
 - Prepare a config file patterned after [config/default.yaml](config/default.yaml:1).
 
-Example run commands (CLI parsing defined at [crates/lightbridge-authz-cli/src/main.rs](crates/lightbridge-authz-cli/src/main.rs:1)):
+Example run commands (CLI parsing defined at [app/lightbridge-authz/src/main.rs](app/lightbridge-authz/src/main.rs:1)):
 
-- Run API + OPA servers:
-  - cargo run -p lightbridge-authz-cli -- serve --config ./config/default.yaml
+- Run API server:
+  - cargo run -p lightbridge-authz -- api --config ./config/default.yaml
+- Run OPA server:
+  - cargo run -p lightbridge-authz -- opa --config ./config/default.yaml
 - Validate config:
-  - cargo run -p lightbridge-authz-cli -- config --config ./config/default.yaml --check_config
-- Client health (transport argument parsed at [transport](crates/lightbridge-authz-cli/src/main.rs:30) and health flag at [health](crates/lightbridge-authz-cli/src/main.rs:33)):
-  - cargo run -p lightbridge-authz-cli -- client --config ./config/default.yaml --transport rest --health
+  - cargo run -p lightbridge-authz -- config --config ./config/default.yaml --check_config
+- Healthcheck:
+  - cargo run -p lightbridge-authz-healthcheck -- -r 3000
 
 ## API Documentation
 
@@ -79,7 +81,9 @@ Base config example: [config/default.yaml](config/default.yaml:1)
 - server.opa.tls.cert_path / key_path: TLS certificate + key.
 - server.opa.basic_auth.username/password: Basic auth for Authorino OPA.
 
-TLS is required for both servers. Provide PEM-encoded cert/key pairs at the paths configured in the YAML files (e.g., `/tmp/tls/api.crt` and `/tmp/tls/api.key`).
+TLS is required for both servers. Provide PEM-encoded cert/key pairs at the paths configured in the YAML files (e.g., `/tls/api.crt` and `/tls/api.key`).
+
+When using `compose.yaml`, the `authz-tls` service generates self-signed certs and stores them in the `authz_tls` volume, which is mounted into the `authz-api` and `authz-opa` containers at `/tls`.
 - logging.level: log level string, see [level](config/default.yaml:7).
 - auth.api_keys: list of allowed API keys, see [api_keys](config/default.yaml:9).
 - database.url: Postgres connection string, see [url](config/default.yaml:13).
@@ -91,7 +95,9 @@ Core config loader is exposed from [load_from_path()](crates/lightbridge-authz-c
 - Primary crates:
   - Core: [crates/lightbridge-authz-core](crates/lightbridge-authz-core/src/lib.rs:1)
   - HTTP servers: [crates/lightbridge-authz-rest](crates/lightbridge-authz-rest/src/lib.rs:1)
-  - CLI: [crates/lightbridge-authz-cli](crates/lightbridge-authz-cli/src/main.rs:1)
+  - CLI: [app/lightbridge-authz](app/lightbridge-authz/src/main.rs:1)
+  - Healthcheck: [app/lightbridge-authz-healthcheck](app/lightbridge-authz-healthcheck/src/main.rs:1)
+  - Migrate runner: [app/lightbridge-authz-migrate](app/lightbridge-authz-migrate/src/main.rs:1)
   - API facade: [crates/lightbridge-authz-api](crates/lightbridge-authz-api/src/lib.rs:1)
 
 - Testing:
@@ -107,7 +113,7 @@ Core config loader is exposed from [load_from_path()](crates/lightbridge-authz-c
 - Add tests in the respective crate's tests/ directory.
 - Open a PR with a clear description and link relevant code areas:
   - Core changes around [Error, Result](crates/lightbridge-authz-core/src/lib.rs:9).
-  - CLI surface at [Commands](crates/lightbridge-authz-cli/src/main.rs:11).
+  - CLI surface at [Commands](app/lightbridge-authz/src/utils/cli.rs:11).
   - HTTP servers at [start_api_server()](crates/lightbridge-authz-rest/src/lib.rs:32) and [start_opa_server()](crates/lightbridge-authz-rest/src/lib.rs:57).
 
 ## License

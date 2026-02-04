@@ -11,7 +11,7 @@ use lightbridge_authz_core::{
     CreateProject, Project, RotateApiKey, UpdateAccount, UpdateApiKey, UpdateProject,
 };
 use lightbridge_authz_core::{db::DbPoolTrait, error::Result};
-use rand_core::RngCore;
+use rand::RngCore;
 
 #[derive(Clone)]
 pub struct AuthzStoreImpl {
@@ -34,7 +34,8 @@ impl AuthzStoreImpl {
 
     fn generate_secret() -> String {
         let mut bytes = [0u8; 32];
-        rand_core::OsRng.fill_bytes(&mut bytes);
+        let mut rng = rand::rngs::OsRng;
+        rng.fill_bytes(&mut bytes);
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
         format!("lbk_{}", encoded)
     }

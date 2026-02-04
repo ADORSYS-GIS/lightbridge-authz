@@ -154,7 +154,7 @@ security:
   extAuth:
     http:
       backendRefs:
-        - name: grpc-ext-auth
+        - name: authz-opa
           port: 3001
       headersToBackend: ["x-current-user"]
 

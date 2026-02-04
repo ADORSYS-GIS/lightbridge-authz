@@ -1,5 +1,27 @@
 ---
 services:
+  authz-tls:
+    image: alpine:3.20
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        apk add --no-cache openssl
+        mkdir -p /tls
+        if [ ! -f /tls/api.key ]; then
+          openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -keyout /tls/api.key -out /tls/api.crt \
+            -subj "/CN=lightbridge-authz-api"
+        fi
+        if [ ! -f /tls/opa.key ]; then
+          openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -keyout /tls/opa.key -out /tls/opa.crt \
+            -subj "/CN=lightbridge-authz-opa"
+        fi
+    volumes:
+      - "authz_tls:/tls"
+
   postgresql:
     image: docker.io/bitnamilegacy/postgresql:17
     #ports:
@@ -21,20 +43,6 @@ services:
       ADMINER_DESIGN: ${ADMINER_DESIGN:-dracula}
       ADMINER_PLUGINS: ${ADMINER_PLUGINS:-tables-filter tinymce}
 
-  envoy:
-    image: envoyproxy/envoy:v1.35-latest
-    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
-    volumes:
-      - ./.docker/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
-    ports:
-      - "8080:8080"
-      - "9901:9901"
-    depends_on: [httpbin]
-
-  httpbin:
-    image: ghcr.io/mccutchen/go-httpbin
-    expose: ["8080"]
-
   keycloak:
     image: quay.io/keycloak/keycloak:26.2.3
     ports:
@@ -55,6 +63,7 @@ services:
       - ./.docker/keycloak_config/:/opt/keycloak/data/import/:ro
 
   authz-migrate:
+    image: lightbridge-authz-migrate
     deploy:
       replicas: 1
       resources:
@@ -63,6 +72,7 @@ services:
           cpus: "0.5"
     build:
       context: .
+      target: migrate
     volumes:
       - ./.docker/authz/container.yaml:/tmp/config.yaml:ro
     environment:
@@ -75,9 +85,12 @@ services:
       postgresql:
         condition: service_started
 
-  authz:
+  authz-api:
+    image: lightbridge-authz
     depends_on:
       authz-migrate:
+        condition: service_completed_successfully
+      authz-tls:
         condition: service_completed_successfully
     deploy:
       replicas: 1
@@ -87,36 +100,50 @@ services:
           cpus: "0.5"
     build:
       context: .
+      target: runtime
     volumes:
       - ./.docker/authz/container.yaml:/tmp/config.yaml:ro
-      - ./.docker/authz/tls:/tmp/tls:ro
+      - "authz_tls:/tls:ro"
     environment:
       RUST_LOG: "debug"
       CONFIG_PATH: "/tmp/config.yaml"
     ports:
       - "13000:3000"
-      - "13001:3001"
+    command:
+      - api
 
-  qdrant:
-    image: qdrant/qdrant:latest
-    restart: always
-    container_name: qdrant
+  authz-opa:
+    image: lightbridge-authz
+    depends_on:
+      authz-migrate:
+        condition: service_completed_successfully
+      authz-tls:
+        condition: service_completed_successfully
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 1G
+          cpus: "0.5"
+    volumes:
+      - ./.docker/authz/container.yaml:/tmp/config.yaml:ro
+      - "authz_tls:/tls:ro"
+    environment:
+      RUST_LOG: "debug"
+      CONFIG_PATH: "/tmp/config.yaml"
     ports:
-      - 6333:6333
-      - 6334:6334
-    expose:
-      - 6333
-      - 6334
-      - 6335
-    configs:
-      - source: qdrant_config
-        target: /qdrant/config/production.yaml
-
-configs:
-  qdrant_config:
-    content: |
-      log_level: INFO
+      - "13001:3001"
+    command:
+      - opa
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/lightbridge-authz-healthcheck", "-r", "3001"]
+      interval: 30s
+      timeout: 3s
+      start_period: 1s
+      retries: 3
 
 volumes:
   postgresql_data:
+    driver: local
+  authz_tls:
     driver: local

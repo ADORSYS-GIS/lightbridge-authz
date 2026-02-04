@@ -1,4 +1,4 @@
-use axum::{Json, Router, http::StatusCode, routing::get};
+use axum::{Json, Router, http::StatusCode, routing::get, response::IntoResponse};
 use lightbridge_authz_api::routers::api_router;
 use lightbridge_authz_core::{
     config::{ApiServer, BasicAuth, Oauth2, OpaServer, Tls},
@@ -25,10 +25,7 @@ struct RootResponse {
     message: String,
 }
 
-/// Start the REST server.
-///
-/// This function now takes the `oauth2` configuration so the BearerTokenService can be
-/// instantiated using the application's OAuth2 settings (jwks_url etc).
+/// Shared state for the OPA server.
 pub struct OpaState {
     pub repo: Arc<StoreRepo>,
     pub basic_auth: BasicAuth,
@@ -137,7 +134,7 @@ struct OpaErrorResponse {
 async fn validate_api_key(
     axum::extract::State(state): axum::extract::State<Arc<OpaState>>,
     Json(input): Json<OpaCheckRequest>,
-) -> Result<impl axum::response::IntoResponse> {
+) -> Result<axum::response::Response> {
     let unauthorized = || {
         (
             StatusCode::UNAUTHORIZED,
@@ -145,6 +142,7 @@ async fn validate_api_key(
                 error: "unauthorized".to_string(),
             }),
         )
+            .into_response()
     };
 
     let key_hash = hash_api_key(&input.api_key);
@@ -186,5 +184,6 @@ async fn validate_api_key(
             project,
             account,
         }),
-    ))
+    )
+        .into_response())
 }

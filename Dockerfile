@@ -15,6 +15,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY diesel.toml diesel.toml ./
 COPY crates/ ./crates/
+COPY app/ ./app/
 COPY migrations/ ./migrations/
 
 # Build dependencies (this is cached if dependencies don't change)
@@ -56,7 +57,7 @@ ENV RUST_LOG=info
 ENTRYPOINT ["lightbridge-authz-migrate"]
 
 # Runtime stage
-FROM gcr.io/distroless/base-debian12:nonroot
+FROM gcr.io/distroless/base-debian12:nonroot as runtime
 
 LABEL maintainer="stephane-segning <selastlambou@gmail.com>"
 LABEL org.opencontainers.image.description="Backend for LightBridge Authz"
@@ -72,14 +73,13 @@ COPY --from=dep /deps /usr/lib/
 # Expose port
 EXPOSE 3000 3001
 
-# Health check
+# Health check (API server)
 HEALTHCHECK --interval=30s --timeout=3s --start-period=1s --retries=3 \
-    CMD ["/usr/local/bin/lightbridge-authz-healthcheck", "-r", "3000", "-g", "3001"]
+    CMD ["/usr/local/bin/lightbridge-authz-healthcheck", "-r", "3000"]
 
 # Set environment variables
 ENV RUST_LOG=info
 
 # Run the binary
 ENTRYPOINT ["lightbridge-authz"]
-
-CMD ["serve"]
+CMD ["api"]

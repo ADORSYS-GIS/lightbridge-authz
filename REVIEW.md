@@ -34,5 +34,5 @@ The code review identified several critical issues spanning security, performanc
 *   **Error typing:** controllers map invalid UUID to `NotFound`. Prefer a specific error variant for invalid input and map to 400. `api-key` crate uses `Error::Any` for invalid key. Add a dedicated error variant.
 *   **DTO boundaries:** Expose response types separate from DB models to prevent accidental leakage of fields like `key_hash`; add response structs in the API crate.
 *   **Pagination:** `list_api_keys` fixed 100,0. Add limit/offset parameters with sane bounds.
-*   **Blocking I/O and shutdown:** REST server lacks graceful shutdown. `axum::serve(...)`. Add signal handling and `with_graceful_shutdown`. CLI unwraps config load `unwrap()` on `load_from_path` and (`crates/lightbridge-authz-cli/src/main.rs:79`). Return errors instead of panicking.
+*   **Blocking I/O and shutdown:** REST server lacks graceful shutdown. `axum::serve(...)`. Add signal handling and `with_graceful_shutdown`. CLI unwraps config load `unwrap()` on `load_from_path` and (`app/lightbridge-authz/src/main.rs:79`). Return errors instead of panicking.
 *   **Missing tests and docs coverage:** Placeholder tests. `tests` module placeholder. Add tests for create/get/patch/revoke paths, including ACL persistence and error cases.

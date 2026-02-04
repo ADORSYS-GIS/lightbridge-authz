@@ -11,8 +11,8 @@ pub struct HealthCheckCli {
     #[arg(value_name = "PORT", short = 'r', long, default_value = "3000")]
     pub api_port: u16,
 
-    #[arg(value_name = "PORT", short = 'o', long, default_value = "3001")]
-    pub opa_port: u16,
+    #[arg(value_name = "PORT", short = 'o', long)]
+    pub opa_port: Option<u16>,
 
     #[arg(value_name = "TIMEOUT", short = 't', long, default_value = "5")]
     pub timeout: u64,
@@ -42,7 +42,11 @@ fn main() -> Result<()> {
     } = HealthCheckCli::parse();
 
     let api_ok = check_endpoint(&server_host, api_port, timeout, "API")?;
-    let opa_ok = check_endpoint(&server_host, opa_port, timeout, "OPA")?;
+    let opa_ok = if let Some(port) = opa_port {
+        check_endpoint(&server_host, port, timeout, "OPA")?
+    } else {
+        true
+    };
 
     std::process::exit(if api_ok && opa_ok { 0 } else { 1 });
 }

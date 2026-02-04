@@ -3,14 +3,14 @@ server:
     address: "0.0.0.0"
     port: 3000
     tls:
-      cert_path: "/tmp/tls/api.crt"
-      key_path: "/tmp/tls/api.key"
+      cert_path: "/tls/api.crt"
+      key_path: "/tls/api.key"
   opa:
     address: "0.0.0.0"
     port: 3001
     tls:
-      cert_path: "/tmp/tls/opa.crt"
-      key_path: "/tmp/tls/opa.key"
+      cert_path: "/tls/opa.crt"
+      key_path: "/tls/opa.key"
     basic_auth:
       username: "authorino"
       password: "change-me"
@@ -20,4 +20,4 @@ database:
   url: "postgres://postgres:postgres@postgresql:5432/lightbridge_authz"
   pool_size: 10
 oauth2:
-  jwks_url: "http://host.docker.internal:9100/realms/dev/protocol/openid-connect/certs"
+  jwks_url: "http://keycloak:9100/realms/dev/protocol/openid-connect/certs"

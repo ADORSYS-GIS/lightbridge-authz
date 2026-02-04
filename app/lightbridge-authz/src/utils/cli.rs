@@ -13,6 +13,14 @@ pub enum Commands {
         #[arg(long, short, env = "CONFIG_PATH")]
         config_path: String,
     },
+    Api {
+        #[arg(long, short, env = "CONFIG_PATH")]
+        config_path: String,
+    },
+    Opa {
+        #[arg(long, short, env = "CONFIG_PATH")]
+        config_path: String,
+    },
     Config {
         #[arg(long, short, env = "CONFIG_PATH")]
         config_path: String,
