@@ -73,12 +73,19 @@ pub async fn start_opa_server(
         basic_auth: opa.basic_auth.clone(),
     });
 
-    let app = Router::new()
+    let public = Router::new()
         .route("/", get(root_handler))
-        .route("/health", get(health_handler))
+        .route("/health", get(health_handler));
+
+    let protected = Router::new()
         .route("/v1/opa/validate", axum::routing::post(validate_api_key))
         .with_state(state.clone())
-        .layer(axum::middleware::from_fn_with_state(state, basic_auth));
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            basic_auth,
+        ));
+
+    let app = public.merge(protected).with_state(state.clone());
 
     serve_tls("OPA", &opa.address, opa.port, &opa.tls, app).await
 }

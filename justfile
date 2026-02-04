@@ -23,7 +23,7 @@ c := ""
 
 # Initialize the project
 init:
-	docker compose -p lightbridge-authz build {{c}}
+	docker compose -p lightbridge-authz -f compose.yaml build {{c}}
 
 # Show this help
 help:
@@ -34,23 +34,27 @@ pull:
 	docker compose -p lightbridge-authz -f compose.yaml pull {{c}}
 
 # Build the project
-build: init
+build:
 	docker compose -p lightbridge-authz -f compose.yaml build {{c}}
 
 # Start the project
-up: init
+up:
 	docker compose -p lightbridge-authz -f compose.yaml up -d --remove-orphans --build {{c}}
 
-# Start app
-up-single app: init
+# Start a single service
+up-single app:
 	docker compose -p lightbridge-authz -f compose.yaml up -d --remove-orphans --build {{app}} {{c}}
 
 # Start the project (without rebuild)
-img: init
+up-no-build:
+	docker compose -p lightbridge-authz -f compose.yaml up -d --remove-orphans {{c}}
+
+# Show images
+img:
 	docker compose -p lightbridge-authz -f compose.yaml images {{c}}
 
 # Start the project (without rebuild)
-start: init
+start:
 	docker compose -p lightbridge-authz -f compose.yaml start {{c}}
 
 # Stop the project
@@ -66,7 +70,7 @@ stop:
 	docker compose -p lightbridge-authz -f compose.yaml stop {{c}}
 
 # Restart the project
-restart: init
+restart:
 	docker compose -p lightbridge-authz -f compose.yaml stop {{c}}
 	docker compose -p lightbridge-authz -f compose.yaml up -d {{c}}
 
@@ -74,13 +78,25 @@ restart: init
 logs:
 	docker compose -p lightbridge-authz -f compose.yaml logs --tail=100 -f {{c}}
 
-# Show app logs
-logs-app:
-	docker compose -p lightbridge-authz -f compose.yaml logs --tail=100 -f app {{c}}
+# Show API logs
+logs-api:
+	docker compose -p lightbridge-authz -f compose.yaml logs --tail=100 -f authz-api {{c}}
+
+# Show OPA logs
+logs-opa:
+	docker compose -p lightbridge-authz -f compose.yaml logs --tail=100 -f authz-opa {{c}}
 
 # Show status
 ps:
 	docker compose -p lightbridge-authz -f compose.yaml ps {{c}}
+
+# Show all containers
+ps-all:
+	docker compose -p lightbridge-authz -f compose.yaml ps --all {{c}}
+
+# Run migrations once
+migrate:
+	docker compose -p lightbridge-authz -f compose.yaml run --rm authz-migrate
 
 # Show stats
 stats:

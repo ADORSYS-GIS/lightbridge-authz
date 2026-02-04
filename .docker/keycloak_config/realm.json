@@ -10,20 +10,12 @@
   "resetPasswordAllowed": true,
   "enabled": true,
   "sslRequired": "none",
-  "eventsEnabled": true,
-  "eventsExpiration": 86400,
-  "eventsListeners": [
-    "jboss-logging"
-  ],
   "adminEventsEnabled": true,
   "adminEventsDetailsEnabled": true,
-  "attributes": {
-    "adminEventsExpiration": "864000"
-  },
   "users": [
     {
       "email": "test@admin",
-      "username": "test",
+      "username": "test@admin",
       "firstName": "DevOps",
       "lastName": "SRE",
       "enabled": true,
@@ -60,7 +52,7 @@
       "consentRequired": false,
       "standardFlowEnabled": true,
       "implicitFlowEnabled": false,
-      "directAccessGrantsEnabled": false,
+      "directAccessGrantsEnabled": true,
       "serviceAccountsEnabled": false,
       "publicClient": true,
       "frontchannelLogout": true,
