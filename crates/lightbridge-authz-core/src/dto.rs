@@ -105,7 +105,6 @@ pub struct ApiKey {
     pub status: ApiKeyStatus,
     pub last_used_at: Option<DateTime<Utc>>,
     pub last_ip: Option<String>,
-    pub last_region: Option<String>,
     pub revoked_at: Option<DateTime<Utc>>,
 }
 

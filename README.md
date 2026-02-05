@@ -50,13 +50,15 @@ Default container config is mounted from `.docker/authz/container.yaml`:
 **OPA API (Basic Auth)**
 - `POST /v1/opa/validate`
 
+Use this endpoint from Authorino’s OPA external authz policy to validate API keys; send the presented API key and optional client IP.
+
 Example:
 
 ```bash
 curl -k -u authorino:change-me \
   https://localhost:13001/v1/opa/validate \
   -H 'Content-Type: application/json' \
-  -d '{"api_key":"<plain_api_key>","ip":"203.0.113.10","region":"eu-west-1"}'
+  -d '{"api_key":"<plain_api_key>","ip":"203.0.113.10"}'
 ```
 
 ## Testing with Keycloak (OAuth2)

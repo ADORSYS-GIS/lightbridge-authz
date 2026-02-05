@@ -28,7 +28,6 @@ CREATE TABLE api_keys (
     status TEXT NOT NULL,
     last_used_at TIMESTAMPTZ,
     last_ip TEXT,
-    last_region TEXT,
     revoked_at TIMESTAMPTZ
 );
 

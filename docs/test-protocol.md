@@ -92,7 +92,7 @@ SECRET=$(echo "$KEY_JSON" | /usr/bin/python3 -c "import sys, json; print(json.lo
 ```bash
 curl -k -u authorino:change-me https://localhost:13001/v1/opa/validate \
   -H 'Content-Type: application/json' \
-  -d "{\"api_key\":\"$SECRET\",\"ip\":\"203.0.113.10\",\"region\":\"eu-west-1\"}"
+  -d "{\"api_key\":\"$SECRET\",\"ip\":\"203.0.113.10\"}"
 ```
 
 Expected: `200` with `api_key`, `project`, and `account` fields, and `last_used_at` populated.

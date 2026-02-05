@@ -136,7 +136,6 @@ async fn health_handler() -> StatusCode {
 struct OpaCheckRequest {
     api_key: String,
     ip: Option<String>,
-    region: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,7 +181,7 @@ async fn validate_api_key(
 
     let api_key = state
         .repo
-        .record_api_key_usage(&api_key.id, input.ip, input.region)
+        .record_api_key_usage(&api_key.id, input.ip)
         .await?;
 
     let project = state

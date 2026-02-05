@@ -81,7 +81,6 @@ impl StoreRepo {
             status: ApiKeyStatus::from(row.status),
             last_used_at: row.last_used_at,
             last_ip: row.last_ip,
-            last_region: row.last_region,
             revoked_at: row.revoked_at,
         }
     }
@@ -297,12 +296,12 @@ impl StoreRepo {
             r#"
             INSERT INTO api_keys (
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, last_region, revoked_at
+              last_used_at, last_ip, revoked_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, last_region, revoked_at
+              last_used_at, last_ip, revoked_at
             "#,
         )
         .bind(input.id)
@@ -315,7 +314,6 @@ impl StoreRepo {
         .bind(input.status)
         .bind(input.last_used_at)
         .bind(input.last_ip)
-        .bind(input.last_region)
         .bind(input.revoked_at)
         .fetch_one(self.pool())
         .await?;
@@ -327,7 +325,7 @@ impl StoreRepo {
             r#"
             SELECT
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, last_region, revoked_at
+              last_used_at, last_ip, revoked_at
             FROM api_keys
             WHERE project_id = $1
             ORDER BY created_at DESC
@@ -344,7 +342,7 @@ impl StoreRepo {
             r#"
             SELECT
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, last_region, revoked_at
+              last_used_at, last_ip, revoked_at
             FROM api_keys
             WHERE id = $1
             "#,
@@ -362,7 +360,6 @@ impl StoreRepo {
             status: None,
             last_used_at: None,
             last_ip: None,
-            last_region: None,
             revoked_at: None,
         };
         let row: ApiKeyRow = sqlx::query_as(
@@ -374,7 +371,7 @@ impl StoreRepo {
             WHERE id = $3
             RETURNING
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, last_region, revoked_at
+              last_used_at, last_ip, revoked_at
             "#,
         )
         .bind(changes.name)
@@ -398,7 +395,6 @@ impl StoreRepo {
             status: Some(status.to_string()),
             last_used_at: None,
             last_ip: None,
-            last_region: None,
             revoked_at,
         };
         let row: ApiKeyRow = sqlx::query_as(
@@ -411,7 +407,7 @@ impl StoreRepo {
             WHERE id = $4
             RETURNING
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, last_region, revoked_at
+              last_used_at, last_ip, revoked_at
             "#,
         )
         .bind(changes.status)
@@ -436,7 +432,7 @@ impl StoreRepo {
             r#"
             SELECT
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, last_region, revoked_at
+              last_used_at, last_ip, revoked_at
             FROM api_keys
             WHERE key_hash = $1
             "#,
@@ -451,7 +447,6 @@ impl StoreRepo {
         &self,
         key_id: &str,
         last_ip: Option<String>,
-        last_region: Option<String>,
     ) -> Result<ApiKey> {
         let changes = ApiKeyChangeset {
             name: None,
@@ -459,7 +454,6 @@ impl StoreRepo {
             status: None,
             last_used_at: Some(Utc::now()),
             last_ip,
-            last_region,
             revoked_at: None,
         };
         let row: ApiKeyRow = sqlx::query_as(
@@ -467,17 +461,15 @@ impl StoreRepo {
             UPDATE api_keys
             SET
               last_used_at = $1,
-              last_ip = $2,
-              last_region = $3
-            WHERE id = $4
+              last_ip = $2
+            WHERE id = $3
             RETURNING
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, last_region, revoked_at
+              last_used_at, last_ip, revoked_at
             "#,
         )
         .bind(changes.last_used_at)
         .bind(changes.last_ip)
-        .bind(changes.last_region)
         .bind(key_id)
         .fetch_one(self.pool())
         .await?;

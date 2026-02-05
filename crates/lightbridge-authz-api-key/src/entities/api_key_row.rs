@@ -14,7 +14,6 @@ pub struct ApiKeyRow {
     pub status: String,
     pub last_used_at: Option<DateTime<Utc>>,
     pub last_ip: Option<String>,
-    pub last_region: Option<String>,
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
@@ -25,6 +24,5 @@ pub struct ApiKeyChangeset {
     pub status: Option<String>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub last_ip: Option<String>,
-    pub last_region: Option<String>,
     pub revoked_at: Option<DateTime<Utc>>,
 }

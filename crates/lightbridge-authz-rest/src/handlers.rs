@@ -109,7 +109,6 @@ impl AuthzStore for AuthzStoreImpl {
             status: ApiKeyStatus::Active.to_string(),
             last_used_at: None,
             last_ip: None,
-            last_region: None,
             revoked_at: None,
         };
         let api_key = self.repo.create_api_key(row).await?;
@@ -180,7 +179,6 @@ impl AuthzStore for AuthzStoreImpl {
             status: ApiKeyStatus::Active.to_string(),
             last_used_at: None,
             last_ip: None,
-            last_region: None,
             revoked_at: None,
         };
         let api_key = self.repo.create_api_key(row).await?;
