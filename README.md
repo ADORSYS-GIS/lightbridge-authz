@@ -46,9 +46,11 @@ Default container config is mounted from `.docker/authz/container.yaml`:
 - Projects: `POST/GET /accounts/{account_id}/projects`, `GET/PATCH/DELETE /projects/{project_id}`
 - API keys: `POST/GET /projects/{project_id}/api-keys`, `GET/PATCH/DELETE /api-keys/{key_id}`
 - Lifecycle: `POST /api-keys/{key_id}/revoke`, `POST /api-keys/{key_id}/rotate`
+- OpenAPI docs: `https://localhost:13000/api/v1/docs`
 
 **OPA API (Basic Auth)**
 - `POST /v1/opa/validate`
+- OpenAPI docs: `https://localhost:13001/v1/opa/docs`
 
 Use this endpoint from Authorino’s OPA external authz policy to validate API keys; send the presented API key and optional client IP.
 

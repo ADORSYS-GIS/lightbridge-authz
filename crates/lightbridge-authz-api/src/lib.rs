@@ -2,6 +2,7 @@
 
 pub mod controllers;
 pub mod db;
+pub mod openapi;
 pub mod routers;
 pub mod store;
 

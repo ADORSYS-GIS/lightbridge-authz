@@ -11,3 +11,4 @@ axum.workspace = true
 lightbridge-authz-core = { workspace = true, features = ["axum"] }
 tracing.workspace = true
 lightbridge-authz-bearer = { workspace = true }
+utoipa.workspace = true

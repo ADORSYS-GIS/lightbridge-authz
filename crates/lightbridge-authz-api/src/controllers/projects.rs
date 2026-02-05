@@ -6,11 +6,23 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use lightbridge_authz_core::{CreateProject, UpdateProject};
+use lightbridge_authz_core::{CreateProject, Project, UpdateProject};
 use lightbridge_authz_core::error::Error;
 use tracing::instrument;
 
 #[instrument]
+#[utoipa::path(
+    post,
+    path = "/api/v1/accounts/{account_id}/projects",
+    request_body = CreateProject,
+    params(
+        ("account_id" = String, Path, description = "Account ID")
+    ),
+    responses(
+        (status = 201, body = Project)
+    ),
+    tag = "projects"
+)]
 pub async fn create_project(
     State(state): State<Arc<crate::AppState>>,
     Path(account_id): Path<String>,
@@ -21,6 +33,17 @@ pub async fn create_project(
 }
 
 #[instrument]
+#[utoipa::path(
+    get,
+    path = "/api/v1/accounts/{account_id}/projects",
+    params(
+        ("account_id" = String, Path, description = "Account ID")
+    ),
+    responses(
+        (status = 200, body = Vec<Project>)
+    ),
+    tag = "projects"
+)]
 pub async fn list_projects(
     State(state): State<Arc<crate::AppState>>,
     Path(account_id): Path<String>,
@@ -30,6 +53,17 @@ pub async fn list_projects(
 }
 
 #[instrument]
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{project_id}",
+    params(
+        ("project_id" = String, Path, description = "Project ID")
+    ),
+    responses(
+        (status = 200, body = Project)
+    ),
+    tag = "projects"
+)]
 pub async fn get_project(
     State(state): State<Arc<crate::AppState>>,
     Path(project_id): Path<String>,
@@ -39,6 +73,18 @@ pub async fn get_project(
 }
 
 #[instrument]
+#[utoipa::path(
+    patch,
+    path = "/api/v1/projects/{project_id}",
+    request_body = UpdateProject,
+    params(
+        ("project_id" = String, Path, description = "Project ID")
+    ),
+    responses(
+        (status = 200, body = Project)
+    ),
+    tag = "projects"
+)]
 pub async fn update_project(
     State(state): State<Arc<crate::AppState>>,
     Path(project_id): Path<String>,
@@ -49,6 +95,17 @@ pub async fn update_project(
 }
 
 #[instrument]
+#[utoipa::path(
+    delete,
+    path = "/api/v1/projects/{project_id}",
+    params(
+        ("project_id" = String, Path, description = "Project ID")
+    ),
+    responses(
+        (status = 204, description = "No Content")
+    ),
+    tag = "projects"
+)]
 pub async fn delete_project(
     State(state): State<Arc<crate::AppState>>,
     Path(project_id): Path<String>,

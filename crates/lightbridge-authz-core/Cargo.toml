@@ -19,6 +19,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum = { workspace = true, optional = true }
+utoipa.workspace = true
 
 [features]
 default = []

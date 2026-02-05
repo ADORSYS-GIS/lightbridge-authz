@@ -81,7 +81,6 @@ services:
     environment:
       RUST_LOG: "debug"
       CONFIG_PATH: "/tmp/config.yaml"
-    restart: on-failure
     depends_on:
       postgresql:
         condition: service_started

@@ -19,6 +19,8 @@ use lightbridge_authz_bearer::BearerTokenService;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 #[derive(Serialize, Deserialize)]
 struct RootResponse {
@@ -48,7 +50,11 @@ pub async fn start_api_server(
 
     let public = Router::new()
         .route("/", get(root_handler))
-        .route("/health", get(health_handler));
+        .route("/health", get(health_handler))
+        .merge(
+            SwaggerUi::new("/api/v1/docs")
+                .url("/api/v1/openapi.json", lightbridge_authz_api::openapi::ApiDoc::openapi()),
+        );
 
     let protected = Router::new()
         .nest("/api/v1", api_router())
@@ -75,7 +81,11 @@ pub async fn start_opa_server(
 
     let public = Router::new()
         .route("/", get(root_handler))
-        .route("/health", get(health_handler));
+        .route("/health", get(health_handler))
+        .merge(
+            SwaggerUi::new("/v1/opa/docs")
+                .url("/v1/opa/openapi.json", OpaDoc::openapi()),
+        );
 
     let protected = Router::new()
         .route("/v1/opa/validate", axum::routing::post(validate_api_key))
@@ -132,24 +142,53 @@ async fn health_handler() -> StatusCode {
     StatusCode::OK
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 struct OpaCheckRequest {
     api_key: String,
     ip: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 struct OpaCheckResponse {
     api_key: lightbridge_authz_core::ApiKey,
     project: lightbridge_authz_core::Project,
     account: lightbridge_authz_core::Account,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 struct OpaErrorResponse {
     error: String,
 }
 
+#[derive(OpenApi)]
+#[openapi(
+    paths(validate_api_key),
+    components(
+        schemas(
+            OpaCheckRequest,
+            OpaCheckResponse,
+            OpaErrorResponse,
+            lightbridge_authz_core::ApiKey,
+            lightbridge_authz_core::Project,
+            lightbridge_authz_core::Account
+        )
+    ),
+    tags(
+        (name = "opa", description = "OPA validation")
+    )
+)]
+struct OpaDoc;
+
+#[utoipa::path(
+    post,
+    path = "/v1/opa/validate",
+    request_body = OpaCheckRequest,
+    responses(
+        (status = 200, body = OpaCheckResponse),
+        (status = 401, body = OpaErrorResponse)
+    ),
+    tag = "opa"
+)]
 async fn validate_api_key(
     axum::extract::State(state): axum::extract::State<Arc<OpaState>>,
     Json(input): Json<OpaCheckRequest>,

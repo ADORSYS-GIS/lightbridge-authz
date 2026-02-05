@@ -23,6 +23,8 @@ lightbridge-authz-api.workspace = true
 lightbridge-authz-core.workspace = true
 lightbridge-authz-api-key.workspace = true
 lightbridge-authz-bearer.workspace = true
+utoipa.workspace = true
+utoipa-swagger-ui.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
