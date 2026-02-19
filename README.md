@@ -50,6 +50,7 @@ Default container config is mounted from `.docker/authz/container.yaml`:
 
 **OPA API (Basic Auth)**
 - `POST /v1/opa/validate`
+- `POST /v1/authorino/validate` (supports dynamic metadata passthrough/enrichment)
 - OpenAPI docs: `https://localhost:13001/v1/opa/docs`
 
 Use this endpoint from Authorino’s OPA external authz policy to validate API keys; send the presented API key and optional client IP.
@@ -61,6 +62,15 @@ curl -k -u authorino:change-me \
   https://localhost:13001/v1/opa/validate \
   -H 'Content-Type: application/json' \
   -d '{"api_key":"<plain_api_key>","ip":"203.0.113.10"}'
+```
+
+Authorino-oriented example with metadata:
+
+```bash
+curl -k -u authorino:change-me \
+  https://localhost:13001/v1/authorino/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"api_key":"<plain_api_key>","ip":"203.0.113.10","metadata":{"tenant":"acme"}}'
 ```
 
 ## Testing with Keycloak (OAuth2)

@@ -140,11 +140,7 @@ impl StoreRepo {
         Ok(row.map(Self::to_account))
     }
 
-    pub async fn update_account(
-        &self,
-        account_id: &str,
-        input: UpdateAccount,
-    ) -> Result<Account> {
+    pub async fn update_account(&self, account_id: &str, input: UpdateAccount) -> Result<Account> {
         let changes = AccountChangeset {
             billing_identity: input.billing_identity,
             owners_admins: input.owners_admins.map(|v| Self::vec_to_json(&v)),
@@ -247,11 +243,7 @@ impl StoreRepo {
         Ok(row.map(Self::to_project))
     }
 
-    pub async fn update_project(
-        &self,
-        project_id: &str,
-        input: UpdateProject,
-    ) -> Result<Project> {
+    pub async fn update_project(&self, project_id: &str, input: UpdateProject) -> Result<Project> {
         let changes = ProjectChangeset {
             name: input.name,
             allowed_models: input.allowed_models.map(|v| Self::vec_to_json(&v)),

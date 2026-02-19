@@ -68,10 +68,8 @@ pub async fn basic_auth(
 ) -> Response {
     let unauthorized_response = || {
         let mut res = (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
-        res.headers_mut().insert(
-            header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("Basic"),
-        );
+        res.headers_mut()
+            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Basic"));
         res
     };
 

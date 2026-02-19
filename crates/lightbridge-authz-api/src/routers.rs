@@ -7,9 +7,7 @@ use axum::{
 };
 
 use crate::controllers::{
-    accounts::{
-        create_account, delete_account, get_account, list_accounts, update_account,
-    },
+    accounts::{create_account, delete_account, get_account, list_accounts, update_account},
     api_keys::{
         create_api_key, delete_api_key, get_api_key, list_api_keys, revoke_api_key, rotate_api_key,
         update_api_key,
@@ -23,7 +21,9 @@ pub fn api_router() -> Router<Arc<AppState>> {
         .route("/accounts", post(create_account).get(list_accounts))
         .route(
             "/accounts/{account_id}",
-            get(get_account).patch(update_account).delete(delete_account),
+            get(get_account)
+                .patch(update_account)
+                .delete(delete_account),
         )
         .route(
             "/accounts/{account_id}/projects",
@@ -31,7 +31,9 @@ pub fn api_router() -> Router<Arc<AppState>> {
         )
         .route(
             "/projects/{project_id}",
-            get(get_project).patch(update_project).delete(delete_project),
+            get(get_project)
+                .patch(update_project)
+                .delete(delete_project),
         )
         .route(
             "/projects/{project_id}/api-keys",

@@ -4,7 +4,10 @@ use lightbridge_authz_core::error::Result;
 use lightbridge_authz_migrate::migrate;
 
 #[derive(Parser)]
-#[command(name = "lightbridge-authz-migrate-bin", about = "Runs database migrations")]
+#[command(
+    name = "lightbridge-authz-migrate-bin",
+    about = "Runs database migrations"
+)]
 struct Cli {
     #[arg(long, short, env = "CONFIG_PATH")]
     config: String,

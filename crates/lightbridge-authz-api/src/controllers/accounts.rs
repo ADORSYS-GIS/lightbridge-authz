@@ -6,8 +6,8 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use lightbridge_authz_core::{Account, CreateAccount, UpdateAccount};
 use lightbridge_authz_core::error::Error;
+use lightbridge_authz_core::{Account, CreateAccount, UpdateAccount};
 use tracing::instrument;
 
 #[instrument]

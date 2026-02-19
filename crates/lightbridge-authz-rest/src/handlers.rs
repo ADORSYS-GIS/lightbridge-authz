@@ -2,16 +2,16 @@ use std::sync::Arc;
 
 use base64::Engine;
 use chrono::{Duration, Utc};
+use getrandom::fill;
 use lightbridge_authz_api::contract::AuthzStore;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::{
-    hash_api_key, Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey,
-    CreateProject, Project, RotateApiKey, UpdateAccount, UpdateApiKey, UpdateProject,
+    Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey, CreateProject,
+    Project, RotateApiKey, UpdateAccount, UpdateApiKey, UpdateProject, hash_api_key,
 };
 use lightbridge_authz_core::{db::DbPoolTrait, error::Result};
-use getrandom::fill;
 
 #[derive(Clone)]
 pub struct AuthzStoreImpl {

@@ -24,10 +24,7 @@ pub async fn establish_pool() -> PgPool {
 
 /// Runs all pending database migrations.
 pub async fn run_migrations(pool: &PgPool) {
-    sqlx::migrate!("../../migrations")
-        .run(pool)
-        .await
-        .unwrap();
+    sqlx::migrate!("../../migrations").run(pool).await.unwrap();
 }
 
 /// Sets up a clean database state for testing.

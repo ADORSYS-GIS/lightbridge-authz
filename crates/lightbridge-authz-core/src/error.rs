@@ -19,7 +19,6 @@ pub enum Error {
     #[error("Server Error: {0}")]
     Server(String),
 
-
     #[error("Address parse error: {0}")]
     AddrParseError(#[from] std::net::AddrParseError),
 

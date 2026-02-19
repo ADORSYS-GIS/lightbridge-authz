@@ -37,11 +37,7 @@ pub trait AuthzStore: Send + Sync + 'static + std::fmt::Debug {
     ) -> Result<ApiKeySecret, Error>;
     async fn list_api_keys(&self, project_id: &str) -> Result<Vec<ApiKey>, Error>;
     async fn get_api_key(&self, key_id: &str) -> Result<ApiKey, Error>;
-    async fn update_api_key(
-        &self,
-        key_id: &str,
-        input: UpdateApiKey,
-    ) -> Result<ApiKey, Error>;
+    async fn update_api_key(&self, key_id: &str, input: UpdateApiKey) -> Result<ApiKey, Error>;
     async fn delete_api_key(&self, key_id: &str) -> Result<(), Error>;
     async fn revoke_api_key(&self, key_id: &str) -> Result<ApiKey, Error>;
     async fn rotate_api_key(

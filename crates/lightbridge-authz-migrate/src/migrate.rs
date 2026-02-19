@@ -1,5 +1,5 @@
-use lightbridge_authz_core::error::Error;
 use lightbridge_authz_core::Result;
+use lightbridge_authz_core::error::Error;
 use sqlx::postgres::PgPoolOptions;
 use tracing::info;
 

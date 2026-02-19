@@ -6,14 +6,8 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use lightbridge_authz_core::{
-    ApiKey,
-    ApiKeySecret,
-    CreateApiKey,
-    RotateApiKey,
-    UpdateApiKey,
-};
 use lightbridge_authz_core::error::Error;
+use lightbridge_authz_core::{ApiKey, ApiKeySecret, CreateApiKey, RotateApiKey, UpdateApiKey};
 use tracing::instrument;
 
 #[instrument]
