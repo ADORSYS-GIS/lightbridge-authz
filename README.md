@@ -73,6 +73,9 @@ curl -k -u authorino:change-me \
   -d '{"api_key":"<plain_api_key>","ip":"203.0.113.10","metadata":{"tenant":"acme"}}'
 ```
 
+Detailed usage + integration test guide:
+- `docs/authorino-usage.md`
+
 ## Testing with Keycloak (OAuth2)
 
 Keycloak is preloaded with:

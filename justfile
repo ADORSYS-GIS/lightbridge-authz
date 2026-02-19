@@ -98,6 +98,15 @@ ps-all:
 migrate:
 	docker compose -p lightbridge-authz -f compose.yaml run --rm authz-migrate
 
+# Run Authorino integration test setup
+it-authorino:
+	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml up -d --build
+	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml run --rm it-authorino
+
+# Cleanup Authorino integration test setup
+it-authorino-down:
+	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml down -v
+
 # Show stats
 stats:
 	docker compose -p lightbridge-authz -f compose.yaml stats {{c}}
