@@ -49,7 +49,11 @@ async fn test_project_limits_persistence(pool: PgPool) {
     assert_eq!(project.default_limits, Some(limits));
 
     // 3. Retrieve and verify
-    let retrieved = repo.get_project(subject, &project.id).await.unwrap().unwrap();
+    let retrieved = repo
+        .get_project(subject, &project.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(retrieved.default_limits, project.default_limits);
 
     // 4. Update limits
@@ -76,6 +80,10 @@ async fn test_project_limits_persistence(pool: PgPool) {
     assert_eq!(updated.default_limits, Some(new_limits.clone()));
 
     // 5. Verify persistence of update
-    let retrieved_updated = repo.get_project(subject, &project.id).await.unwrap().unwrap();
+    let retrieved_updated = repo
+        .get_project(subject, &project.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(retrieved_updated.default_limits, Some(new_limits));
 }
