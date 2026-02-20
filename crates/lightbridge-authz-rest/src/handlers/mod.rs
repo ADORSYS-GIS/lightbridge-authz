@@ -44,7 +44,12 @@ impl AuthzStoreImpl {
     }
 
     fn key_prefix(secret: &str) -> String {
-        secret.chars().take(8).collect()
+        const SECRET_PREFIX: &str = "lbk_secret_";
+        if let Some(after_prefix) = secret.strip_prefix(SECRET_PREFIX) {
+            after_prefix.chars().take(8).collect()
+        } else {
+            secret.chars().take(8).collect()
+        }
     }
 }
 

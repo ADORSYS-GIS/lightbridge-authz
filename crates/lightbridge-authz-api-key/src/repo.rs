@@ -308,12 +308,20 @@ impl StoreRepo {
     pub async fn list_projects(&self, subject: &str, account_id: &str) -> Result<Vec<Project>> {
         let rows: Vec<ProjectRow> = sqlx::query_as(
             r#"
-            SELECT id, account_id, name, allowed_models, default_limits, billing_plan, created_at, updated_at
+            SELECT
+              projects.id,
+              projects.account_id,
+              projects.name,
+              projects.allowed_models,
+              projects.default_limits,
+              projects.billing_plan,
+              projects.created_at,
+              projects.updated_at
             FROM projects
             JOIN accounts ON accounts.id = projects.account_id
-            WHERE account_id = $1
+            WHERE projects.account_id = $1
               AND accounts.owners_admins ? $2
-            ORDER BY created_at ASC
+            ORDER BY projects.created_at ASC
             "#,
         )
         .bind(account_id)
@@ -327,7 +335,15 @@ impl StoreRepo {
     pub async fn get_project(&self, subject: &str, project_id: &str) -> Result<Option<Project>> {
         let row = sqlx::query_as(
             r#"
-            SELECT id, account_id, name, allowed_models, default_limits, billing_plan, created_at, updated_at
+            SELECT
+              projects.id,
+              projects.account_id,
+              projects.name,
+              projects.allowed_models,
+              projects.default_limits,
+              projects.billing_plan,
+              projects.created_at,
+              projects.updated_at
             FROM projects
             JOIN accounts ON accounts.id = projects.account_id
             WHERE projects.id = $1
@@ -450,14 +466,23 @@ impl StoreRepo {
         let rows: Vec<ApiKeyRow> = sqlx::query_as(
             r#"
             SELECT
-              id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, revoked_at
+              api_keys.id,
+              api_keys.project_id,
+              api_keys.name,
+              api_keys.key_prefix,
+              api_keys.key_hash,
+              api_keys.created_at,
+              api_keys.expires_at,
+              api_keys.status,
+              api_keys.last_used_at,
+              api_keys.last_ip,
+              api_keys.revoked_at
             FROM api_keys
             JOIN projects ON projects.id = api_keys.project_id
             JOIN accounts ON accounts.id = projects.account_id
             WHERE api_keys.project_id = $1
               AND accounts.owners_admins ? $2
-            ORDER BY created_at DESC
+            ORDER BY api_keys.created_at DESC
             "#,
         )
         .bind(project_id)
@@ -472,8 +497,17 @@ impl StoreRepo {
         let row = sqlx::query_as(
             r#"
             SELECT
-              id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, revoked_at
+              api_keys.id,
+              api_keys.project_id,
+              api_keys.name,
+              api_keys.key_prefix,
+              api_keys.key_hash,
+              api_keys.created_at,
+              api_keys.expires_at,
+              api_keys.status,
+              api_keys.last_used_at,
+              api_keys.last_ip,
+              api_keys.revoked_at
             FROM api_keys
             JOIN projects ON projects.id = api_keys.project_id
             JOIN accounts ON accounts.id = projects.account_id
