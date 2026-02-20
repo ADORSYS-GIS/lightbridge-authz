@@ -30,10 +30,10 @@ pub async fn validate_api_key_context(
     if api_key.status != ApiKeyStatus::Active {
         return Ok(None);
     }
-    if let Some(expires_at) = api_key.expires_at {
-        if expires_at <= now {
-            return Ok(None);
-        }
+    if let Some(expires_at) = api_key.expires_at
+        && expires_at <= now
+    {
+        return Ok(None);
     }
 
     let api_key = state.repo.record_api_key_usage(&api_key.id, ip).await?;

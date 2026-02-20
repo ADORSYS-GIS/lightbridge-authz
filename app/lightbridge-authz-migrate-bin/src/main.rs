@@ -24,5 +24,5 @@ async fn main() -> Result<()> {
 
     lightbridge_authz_core::tracing::shutdown_tracing();
 
-    result.map_err(|e| e.into())
+    result
 }

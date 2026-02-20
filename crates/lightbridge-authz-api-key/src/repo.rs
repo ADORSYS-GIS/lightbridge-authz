@@ -144,13 +144,13 @@ impl StoreRepo {
         .fetch_one(self.pool())
         .await
         .map_err(|e| {
-            if let sqlx::Error::Database(db_err) = &e {
-                if db_err.code().as_deref() == Some("23505") {
-                    return lightbridge_authz_core::error::Error::Conflict(format!(
-                        "Account with billing identity '{}' already exists",
-                        new_account.billing_identity
-                    ));
-                }
+            if let sqlx::Error::Database(db_err) = &e
+                && db_err.code().as_deref() == Some("23505")
+            {
+                return lightbridge_authz_core::error::Error::Conflict(format!(
+                    "Account with billing identity '{}' already exists",
+                    new_account.billing_identity
+                ));
             }
             e.into()
         })?;

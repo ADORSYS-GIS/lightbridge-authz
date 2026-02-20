@@ -19,7 +19,7 @@ impl DbPool {
     }
 
     pub async fn new(database: &Database) -> Result<Self> {
-        let max_size = database.pool_size.unwrap_or(10) as u32;
+        let max_size = database.pool_size.unwrap_or(10);
         let pool = PgPoolOptions::new()
             .max_connections(max_size)
             .min_connections(5)
