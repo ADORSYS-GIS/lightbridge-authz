@@ -1886,7 +1886,6 @@ name = "lightbridge-authz-healthcheck"
 version = "0.5.0"
 dependencies = [
  "clap",
- "lightbridge-authz-core",
 ]
 
 [[package]]
@@ -2680,7 +2679,9 @@ dependencies = [
  "bytes",
  "cookie",
  "cookie_store",
+ "futures-channel",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -4026,6 +4027,7 @@ dependencies = [
  "base64",
  "mime_guess",
  "regex",
+ "reqwest 0.12.28",
  "rust-embed",
  "serde",
  "serde_json",

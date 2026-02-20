@@ -39,6 +39,14 @@ Default container config is mounted from `.docker/authz/container.yaml`:
 - OPA basic auth: `authorino / change-me`
 - OAuth2 JWKS: `http://keycloak:9100/realms/dev/protocol/openid-connect/certs`
 
+## Helm deployment
+
+- Use the `charts/lightbridge` umbrella chart for Helm installations. It renders a shared config map from `global.config`, mounts it at `/etc/lightbridge/config.yaml`, and ensures both the API and OPA subcharts reuse the same TLS secret.
+- A pre-install `global-tls` job generates the TLS secret (`global.tlsSecretName`) so the services can mount `/etc/lightbridge/tls`. Disable this job when another component provisions certificates by setting `--set global.tls.job.enabled=false`.
+- Keep overrides aligned with `config/default.yaml` so the shared config map contains `server.api`, `server.opa`, `database`, `oauth2`, and `logging` sections that the charts expect.
+- Validate the charts with `helm lint charts/lightbridge-authz` and `helm lint charts/lightbridge`, and run `helm test <release>` to exercise the rendered service probes after deployment.
+
+
 ## API overview
 
 **CRUD API (OAuth2, `/api/v1`)**

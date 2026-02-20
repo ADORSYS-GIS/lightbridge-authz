@@ -8,4 +8,3 @@ authors.workspace = true
 
 [dependencies]
 clap.workspace = true
-lightbridge-authz-core.workspace = true

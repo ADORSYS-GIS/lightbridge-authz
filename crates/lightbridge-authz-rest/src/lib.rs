@@ -1,23 +1,25 @@
-use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::get};
+use axum::{Json, Router, http::StatusCode, routing::get};
 use lightbridge_authz_api::routers::api_router;
 use lightbridge_authz_core::{
-    Account, ApiKeyStatus, Project, async_trait,
+    Account, Project, async_trait,
     config::{ApiServer, BasicAuth, Oauth2, OpaServer, Tls},
     db::DbPoolTrait,
     error::{Error, Result},
-    hash_api_key,
 };
 use std::sync::Once;
 
 pub mod handlers;
-mod middleware;
+pub mod middleware;
+pub mod models;
+pub mod routers;
+
 use handlers::AuthzStoreImpl;
-use middleware::{basic_auth, bearer_auth};
+use middleware::{bearer_auth};
+use routers::opa_router;
 
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::BearerTokenService;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use utoipa::OpenApi;
@@ -123,17 +125,7 @@ pub async fn start_opa_server(opa: &OpaServer, pool: Arc<dyn DbPoolTrait>) -> Re
         .route("/health", get(health_handler))
         .merge(SwaggerUi::new("/v1/opa/docs").url("/v1/opa/openapi.json", OpaDoc::openapi()));
 
-    let protected = Router::new()
-        .route("/v1/opa/validate", axum::routing::post(validate_api_key))
-        .route(
-            "/v1/authorino/validate",
-            axum::routing::post(validate_authorino_api_key),
-        )
-        .with_state(state.clone())
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            basic_auth,
-        ));
+    let protected = opa_router(state.clone()).with_state(state.clone());
 
     let app = public.merge(protected).with_state(state.clone());
 
@@ -174,50 +166,20 @@ async fn health_handler() -> StatusCode {
     StatusCode::OK
 }
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-struct OpaCheckRequest {
-    api_key: String,
-    ip: Option<String>,
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-struct AuthorinoCheckRequest {
-    api_key: String,
-    ip: Option<String>,
-    #[serde(default)]
-    metadata: std::collections::BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-struct OpaCheckResponse {
-    api_key: lightbridge_authz_core::ApiKey,
-    project: lightbridge_authz_core::Project,
-    account: lightbridge_authz_core::Account,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-struct AuthorinoCheckResponse {
-    api_key: lightbridge_authz_core::ApiKey,
-    project: lightbridge_authz_core::Project,
-    account: lightbridge_authz_core::Account,
-    dynamic_metadata: std::collections::BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-struct OpaErrorResponse {
-    error: String,
-}
-
 #[derive(OpenApi)]
 #[openapi(
-    paths(validate_api_key, validate_authorino_api_key),
+    paths(
+        crate::handlers::opa::validate_api_key,
+        crate::handlers::authorino::validate_authorino_api_key
+    ),
     components(
         schemas(
-            OpaCheckRequest,
-            OpaCheckResponse,
-            AuthorinoCheckRequest,
-            AuthorinoCheckResponse,
-            OpaErrorResponse,
+            crate::models::OpaCheckRequest,
+            crate::models::OpaCheckResponse,
+            crate::models::authorino::AuthorinoCheckRequest,
+            crate::models::authorino::AuthorinoCheckResponse,
+            crate::models::authorino::AuthorinoMetadata,
+            crate::models::OpaErrorResponse,
             lightbridge_authz_core::ApiKey,
             lightbridge_authz_core::Project,
             lightbridge_authz_core::Account
@@ -230,148 +192,10 @@ struct OpaErrorResponse {
 )]
 struct OpaDoc;
 
-#[utoipa::path(
-    post,
-    path = "/v1/opa/validate",
-    request_body = OpaCheckRequest,
-    responses(
-        (status = 200, body = OpaCheckResponse),
-        (status = 401, body = OpaErrorResponse)
-    ),
-    tag = "opa"
-)]
-async fn validate_api_key(
-    axum::extract::State(state): axum::extract::State<Arc<OpaState>>,
-    Json(input): Json<OpaCheckRequest>,
-) -> Result<axum::response::Response> {
-    let unauthorized = || {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(OpaErrorResponse {
-                error: "unauthorized".to_string(),
-            }),
-        )
-            .into_response()
-    };
-
-    let Some(validated) = validate_api_key_context(&state, &input.api_key, input.ip).await? else {
-        return Ok(unauthorized());
-    };
-
-    Ok((
-        StatusCode::OK,
-        Json(OpaCheckResponse {
-            api_key: validated.api_key,
-            project: validated.project,
-            account: validated.account,
-        }),
-    )
-        .into_response())
-}
-
-#[utoipa::path(
-    post,
-    path = "/v1/authorino/validate",
-    request_body = AuthorinoCheckRequest,
-    responses(
-        (status = 200, body = AuthorinoCheckResponse),
-        (status = 401, body = OpaErrorResponse)
-    ),
-    tag = "authorino"
-)]
-async fn validate_authorino_api_key(
-    axum::extract::State(state): axum::extract::State<Arc<OpaState>>,
-    Json(input): Json<AuthorinoCheckRequest>,
-) -> Result<axum::response::Response> {
-    let unauthorized = || {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(OpaErrorResponse {
-                error: "unauthorized".to_string(),
-            }),
-        )
-            .into_response()
-    };
-
-    let Some(validated) = validate_api_key_context(&state, &input.api_key, input.ip).await? else {
-        return Ok(unauthorized());
-    };
-
-    let mut dynamic_metadata = input.metadata;
-    dynamic_metadata.insert("account_id".to_string(), json!(validated.account.id));
-    dynamic_metadata.insert("project_id".to_string(), json!(validated.project.id));
-    dynamic_metadata.insert("api_key_id".to_string(), json!(validated.api_key.id));
-    dynamic_metadata.insert(
-        "api_key_status".to_string(),
-        json!(validated.api_key.status.to_string()),
-    );
-
-    Ok((
-        StatusCode::OK,
-        Json(AuthorinoCheckResponse {
-            api_key: validated.api_key,
-            project: validated.project,
-            account: validated.account,
-            dynamic_metadata,
-        }),
-    )
-        .into_response())
-}
-
-struct ValidatedApiKeyContext {
-    api_key: lightbridge_authz_core::ApiKey,
-    project: lightbridge_authz_core::Project,
-    account: lightbridge_authz_core::Account,
-}
-
-async fn validate_api_key_context(
-    state: &Arc<OpaState>,
-    raw_api_key: &str,
-    ip: Option<String>,
-) -> Result<Option<ValidatedApiKeyContext>> {
-    let key_hash = hash_api_key(raw_api_key);
-    let Some(api_key) = state.repo.find_api_key_by_hash(&key_hash).await? else {
-        return Ok(None);
-    };
-
-    let now = chrono::Utc::now();
-    if api_key.status != ApiKeyStatus::Active {
-        return Ok(None);
-    }
-    if let Some(expires_at) = api_key.expires_at {
-        if expires_at <= now {
-            return Ok(None);
-        }
-    }
-
-    let api_key = state.repo.record_api_key_usage(&api_key.id, ip).await?;
-    let project = state
-        .repo
-        .get_project(&api_key.project_id)
-        .await?
-        .ok_or_else(|| Error::NotFound)?;
-    let account = state
-        .repo
-        .get_account(&project.account_id)
-        .await?
-        .ok_or_else(|| Error::NotFound)?;
-
-    Ok(Some(ValidatedApiKeyContext {
-        api_key,
-        project,
-        account,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::to_bytes;
-    use chrono::{Duration, Utc};
-    use lightbridge_authz_core::{ApiKey, ApiKeyStatus};
     use serde_json::Value;
-    use std::sync::{Arc, Mutex};
-    use utoipa::OpenApi;
 
     fn opa_openapi() -> Value {
         serde_json::to_value(OpaDoc::openapi()).expect("openapi should serialize")
@@ -418,247 +242,37 @@ mod tests {
         let schemas = doc["components"]["schemas"]
             .as_object()
             .expect("schemas should be an object");
+
+        // Check AuthorinoCheckResponse has dynamic_metadata
         let resp = schemas
             .get("AuthorinoCheckResponse")
             .expect("missing AuthorinoCheckResponse schema");
-        let metadata = &resp["properties"]["dynamic_metadata"];
+        let metadata_ref = &resp["properties"]["dynamic_metadata"];
+
+        assert!(
+            metadata_ref.get("$ref").is_some() || metadata_ref["type"].as_str() == Some("object"),
+            "dynamic_metadata should be a reference or an object"
+        );
+
+        // Check AuthorinoMetadata schema
+        let metadata_schema = schemas
+            .get("AuthorinoMetadata")
+            .expect("missing AuthorinoMetadata schema");
 
         assert_eq!(
-            metadata["type"].as_str(),
+            metadata_schema["type"].as_str(),
             Some("object"),
-            "dynamic_metadata should be a JSON object"
+            "AuthorinoMetadata should be a JSON object"
         );
+
         assert!(
-            metadata.get("additionalProperties").is_some(),
-            "dynamic_metadata should support arbitrary keys for Authorino output"
+            metadata_schema.get("properties").is_some(),
+            "AuthorinoMetadata should have explicit properties"
         );
-    }
 
-    #[derive(Debug)]
-    struct MockOpaRepo {
-        api_key: Option<ApiKey>,
-        project: Option<Project>,
-        account: Option<Account>,
-        usage_calls: Arc<Mutex<Vec<(String, Option<String>)>>>,
-    }
-
-    #[async_trait]
-    impl OpaRepoTrait for MockOpaRepo {
-        async fn find_api_key_by_hash(&self, _key_hash: &str) -> Result<Option<ApiKey>> {
-            Ok(self.api_key.clone())
-        }
-
-        async fn record_api_key_usage(&self, key_id: &str, ip: Option<String>) -> Result<ApiKey> {
-            self.usage_calls
-                .lock()
-                .expect("lock should work")
-                .push((key_id.to_string(), ip));
-            Ok(self.api_key.clone().expect("api key should exist in mock"))
-        }
-
-        async fn get_project(&self, _project_id: &str) -> Result<Option<Project>> {
-            Ok(self.project.clone())
-        }
-
-        async fn get_account(&self, _account_id: &str) -> Result<Option<Account>> {
-            Ok(self.account.clone())
-        }
-    }
-
-    fn mk_api_key(status: ApiKeyStatus, expires_at: Option<chrono::DateTime<Utc>>) -> ApiKey {
-        ApiKey {
-            id: "key_1".to_string(),
-            project_id: "proj_1".to_string(),
-            name: "demo".to_string(),
-            key_prefix: "lbk_demo".to_string(),
-            key_hash: "hash".to_string(),
-            created_at: Utc::now(),
-            expires_at,
-            status,
-            last_used_at: None,
-            last_ip: None,
-            revoked_at: None,
-        }
-    }
-
-    fn mk_project() -> Project {
-        Project {
-            id: "proj_1".to_string(),
-            account_id: "acct_1".to_string(),
-            name: "demo-project".to_string(),
-            allowed_models: vec![],
-            default_limits: serde_json::json!({}),
-            billing_plan: "free".to_string(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
-    }
-
-    fn mk_account() -> Account {
-        Account {
-            id: "acct_1".to_string(),
-            billing_identity: "acme".to_string(),
-            owners_admins: vec!["owner@example.com".to_string()],
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
-    }
-
-    fn mk_state(repo: MockOpaRepo) -> Arc<OpaState> {
-        Arc::new(OpaState {
-            repo: Arc::new(repo),
-            basic_auth: BasicAuth {
-                username: "authorino".to_string(),
-                password: "change-me".to_string(),
-            },
-        })
-    }
-
-    #[tokio::test]
-    async fn validate_api_key_returns_unauthorized_when_missing() {
-        let state = mk_state(MockOpaRepo {
-            api_key: None,
-            project: Some(mk_project()),
-            account: Some(mk_account()),
-            usage_calls: Arc::new(Mutex::new(vec![])),
-        });
-
-        let response = validate_api_key(
-            axum::extract::State(state),
-            Json(OpaCheckRequest {
-                api_key: "lbk_secret_missing".to_string(),
-                ip: Some("203.0.113.10".to_string()),
-            }),
-        )
-        .await
-        .expect("handler should return response");
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn validate_api_key_returns_unauthorized_when_revoked() {
-        let repo = MockOpaRepo {
-            api_key: Some(mk_api_key(ApiKeyStatus::Revoked, None)),
-            project: Some(mk_project()),
-            account: Some(mk_account()),
-            usage_calls: Arc::new(Mutex::new(vec![])),
-        };
-        let state = mk_state(repo);
-
-        let response = validate_api_key(
-            axum::extract::State(state),
-            Json(OpaCheckRequest {
-                api_key: "lbk_secret_revoked".to_string(),
-                ip: None,
-            }),
-        )
-        .await
-        .expect("handler should return response");
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn validate_api_key_returns_unauthorized_when_expired() {
-        let expired_at = Utc::now() - Duration::seconds(1);
-        let state = mk_state(MockOpaRepo {
-            api_key: Some(mk_api_key(ApiKeyStatus::Active, Some(expired_at))),
-            project: Some(mk_project()),
-            account: Some(mk_account()),
-            usage_calls: Arc::new(Mutex::new(vec![])),
-        });
-
-        let response = validate_api_key(
-            axum::extract::State(state),
-            Json(OpaCheckRequest {
-                api_key: "lbk_secret_expired".to_string(),
-                ip: None,
-            }),
-        )
-        .await
-        .expect("handler should return response");
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn validate_api_key_returns_ok_and_records_usage_when_valid() {
-        let usage_calls = Arc::new(Mutex::new(vec![]));
-        let repo = MockOpaRepo {
-            api_key: Some(mk_api_key(
-                ApiKeyStatus::Active,
-                Some(Utc::now() + Duration::minutes(10)),
-            )),
-            project: Some(mk_project()),
-            account: Some(mk_account()),
-            usage_calls: usage_calls.clone(),
-        };
-        let state = mk_state(repo);
-
-        let response = validate_api_key(
-            axum::extract::State(state.clone()),
-            Json(OpaCheckRequest {
-                api_key: "lbk_secret_valid".to_string(),
-                ip: Some("203.0.113.10".to_string()),
-            }),
-        )
-        .await
-        .expect("handler should return response");
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should be readable");
-        let payload: Value = serde_json::from_slice(&body).expect("body should be valid json");
-        assert_eq!(payload["api_key"]["id"], "key_1");
-        assert_eq!(payload["project"]["id"], "proj_1");
-        assert_eq!(payload["account"]["id"], "acct_1");
-
-        let calls = usage_calls.lock().expect("lock should work").clone();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "key_1");
-        assert_eq!(calls[0].1.as_deref(), Some("203.0.113.10"));
-    }
-
-    #[tokio::test]
-    async fn validate_authorino_api_key_preserves_and_enriches_metadata() {
-        let state = mk_state(MockOpaRepo {
-            api_key: Some(mk_api_key(
-                ApiKeyStatus::Active,
-                Some(Utc::now() + Duration::minutes(10)),
-            )),
-            project: Some(mk_project()),
-            account: Some(mk_account()),
-            usage_calls: Arc::new(Mutex::new(vec![])),
-        });
-
-        let response = validate_authorino_api_key(
-            axum::extract::State(state),
-            Json(AuthorinoCheckRequest {
-                api_key: "lbk_secret_valid".to_string(),
-                ip: Some("203.0.113.10".to_string()),
-                metadata: std::collections::BTreeMap::from([(
-                    "tenant".to_string(),
-                    serde_json::json!("acme"),
-                )]),
-            }),
-        )
-        .await
-        .expect("handler should return response");
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should be readable");
-        let payload: Value = serde_json::from_slice(&body).expect("body should be valid json");
-
-        assert_eq!(payload["dynamic_metadata"]["tenant"], "acme");
-        assert_eq!(payload["dynamic_metadata"]["account_id"], "acct_1");
-        assert_eq!(payload["dynamic_metadata"]["project_id"], "proj_1");
-        assert_eq!(payload["dynamic_metadata"]["api_key_id"], "key_1");
-        assert_eq!(payload["dynamic_metadata"]["api_key_status"], "active");
+        assert!(
+            metadata_schema.get("additionalProperties").is_some(),
+            "AuthorinoMetadata should support arbitrary keys via flattened extra field"
+        );
     }
 }

@@ -1,5 +1,4 @@
 use clap::Parser;
-use lightbridge_authz_core::error::Result;
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -18,9 +17,9 @@ pub struct HealthCheckCli {
     pub timeout: u64,
 }
 
-fn check_endpoint(host: &str, port: u16, timeout_secs: u64, name: &str) -> Result<bool> {
+fn check_endpoint(host: &str, port: u16, timeout_secs: u64, name: &str) -> Result<bool, ()> {
     let address = format!("{}:{}", host, port);
-    let socket_addr = address.parse()?;
+    let socket_addr = address.parse().expect("Wrong address provided");
     match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(timeout_secs)) {
         Ok(_) => {
             println!("{} health check successful on {}", name, address);
@@ -33,7 +32,7 @@ fn check_endpoint(host: &str, port: u16, timeout_secs: u64, name: &str) -> Resul
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<(), ()> {
     let HealthCheckCli {
         timeout,
         api_port,
