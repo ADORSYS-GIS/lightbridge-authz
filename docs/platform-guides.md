@@ -17,7 +17,7 @@ This document collects the concrete commands that worked when we tested the Helm
     --wait --timeout 5m
   docker build -t lightbridge-authz:0.5.0 .
   ```
-- Generate the TLS secrets that the umbrella chart consumes (create the certs once and store them in Kubernetes):
+- Generate the TLS secrets manually (optional unless you prefer full control or the built-in job/tag fails):
   ```bash
   TMPDIR=$(mktemp -d)
   openssl req -x509 -newkey rsa:2048 -nodes -days 365 -keyout "$TMPDIR/api.key" -out "$TMPDIR/api.crt" -subj "/CN=lightbridge-authz-api"
@@ -25,6 +25,8 @@ This document collects the concrete commands that worked when we tested the Helm
   kubectl create secret generic lightbridge-lightbridge-api-tls ...
   kubectl create secret generic lightbridge-lightbridge-opa-tls ...
   ```
+
+  The chart already bundles a pre-install hook job (`global.tls.job`) that can generate a secret containing these certs in-cluster. Manual TLS generation is only needed when you want a different certificate authority, need to target hosts outside the default service FQDNs, or if the job hook cannot run (e.g., permissions or webhook issues).
 
 ## Linux (configure)
 
@@ -52,7 +54,7 @@ This document collects the concrete commands that worked when we tested the Helm
         key_path: /etc/lightbridge/tls/api.key
     opa:
       address: 0.0.0.0
-      port: 3001
+      port: 3000
       tls:
         cert_path: /etc/lightbridge/tls/opa.crt
         key_path: /etc/lightbridge/tls/opa.key
@@ -61,8 +63,14 @@ This document collects the concrete commands that worked when we tested the Helm
         password: "${OPA_PASSWORD}"
   EOF
   kubectl create configmap lightbridge-lightbridge-api-config --from-file=config.yaml=/tmp/lightbridge-config.yaml --dry-run=client -o yaml | kubectl apply -f -
-  kubectl create configmap lightbridge-lightbridge-opa-config ...
-  ```
+  kubectl create configmap lightbridge-lightbridge-opa-config --from-file=config.yaml=/tmp/lightbridge-config.yaml --dry-run=client -o yaml | kubectl apply -f -
+
+Tips:
+  - Keep `lightbridge-api.ingress.main.enabled=true` so external consumers can reach the CRUD API and the chart renders the matching rules for you.
+  - Leave `lightbridge-opa.ingress.main.enabled=false`, because the OPA validation API is intended to be called internally (Authorino or other gateways) and should stay internal only.
+
+Since the API and OPA workloads are never deployed together in this guide, we keep `server.api.port` and `server.opa.port` synced (3000) and mirror that value on the `lightbridge-opa.service.port` override. This keeps the TLS job, shared config, and the resulting `Service` objects consistent without worrying about different ports for each pod.
+
 - Create the secrets the chart references, keeping the same connection string as the Postgres service names:
   ```bash
   kubectl create secret generic lightbridge-lightbridge-api-secrets \
@@ -85,11 +93,7 @@ This document collects the concrete commands that worked when we tested the Helm
     --set 'lightbridge-api.ingress.main.hosts[0].paths[0].path'=/ \
     --set 'lightbridge-api.ingress.main.hosts[0].paths[0].service.name'=lightbridge-lightbridge-api \
     --set 'lightbridge-api.ingress.main.hosts[0].paths[0].service.port'=3000 \
-    --set lightbridge-opa.ingress.main.enabled=true \
-    --set 'lightbridge-opa.ingress.main.hosts[0].host'=opa.local \
-    --set 'lightbridge-opa.ingress.main.hosts[0].paths[0].path'=/ \
-    --set 'lightbridge-opa.ingress.main.hosts[0].paths[0].service.name'=lightbridge-lightbridge-opa \
-    --set 'lightbridge-opa.ingress.main.hosts[0].paths[0].service.port'=3000 \
+    --set lightbridge-opa.ingress.main.enabled=false \
     --set lightbridge-api.ingress.annotations.enabled=false \
     --set lightbridge-opa.ingress.annotations.enabled=false \
     --set lightbridge-api.controllers.main.containers.main.env[0].name=CONFIG_PATH \
@@ -154,4 +158,13 @@ LightBridge Authz only exposes TLS-secured ports, so you need a certificate in K
       - server auth
       - client auth
   ```
-  Once the cert-manager resource emits a TLS secret, the chart mounts it and pods get valid certificates for the internal FQDNs.
+Once the cert-manager resource emits a TLS secret, the chart mounts it and pods get valid certificates for the internal FQDNs.
+
+### Live cert-manager example
+1. Install cert-manager from the official release, then create the `lightbridge-selfsigned` `Issuer` and the `lightbridge-authz-tls` `Certificate` that covers both `lightbridge-lightbridge-api` and `lightbridge-lightbridge-opa` service names (the `Secret` name must match what `global.tls.tlsSecretName` expects).
+2. Run `helm upgrade lightbridge charts/lightbridge --reuse-values --set global.tls.job.enabled=false --wait` so the release relies on the cert-manager secret instead of the built-in job.
+3. Launch an Ubuntu pod, install `curl`, and call the API health endpoint over the service FQDN:
+   ```bash
+   kubectl run curl-ubuntu --image=ubuntu:22.04 --restart=Never -- bash -lc 'apt-get update >/tmp/apt.log && apt-get install -y curl >/tmp/curl.log && curl -k -s -o /tmp/health.out -w "HTTP %{http_code}\n" https://lightbridge-lightbridge-api.default.svc.cluster.local:3000/health && cat /tmp/health.out'
+   ```
+   The pod prints `HTTP 200`, proving the cluster-internal TLS cert is trusted by clients that skip verification (`-k`) and the API endpoint is reachable. Delete the test pod after reading the logs.
