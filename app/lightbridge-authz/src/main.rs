@@ -79,6 +79,7 @@ async fn main() -> Result<()> {
             });
 
             let _ = error_listener.await;
+            Ok(())
         }
         Some(Commands::Api { config_path }) => {
             info!("{}", BANNER);
@@ -89,6 +90,7 @@ async fn main() -> Result<()> {
             let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(&config.database).await?);
 
             start_api_server(&config.server.api, pool, &config.oauth2).await?;
+            Ok(())
         }
         Some(Commands::Opa { config_path }) => {
             info!("{}", BANNER);
@@ -99,16 +101,20 @@ async fn main() -> Result<()> {
             let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(&config.database).await?);
 
             start_opa_server(&config.server.opa, pool).await?;
+            Ok(())
         }
         Some(Commands::Migrate { config_path }) => {
             let config = load_from_path(&config_path)?;
             lightbridge_authz_migrate::migrate(&config.database.url).await?;
+            Ok(())
         }
         Some(Commands::Config { config_path }) => {
             let _ = load_from_path(&config_path)?;
+            Ok(())
         }
         None => {
             info!("No command provided. Use --help for more information.");
+            Ok(())
         }
     };
 

@@ -111,3 +111,29 @@ app.kubernetes.io/controller: {{ include "lightbridge-authz.controllerName" . }}
 {{- define "lightbridge-authz.shouldUseKnative" -}}
 {{- and (include "lightbridge-authz.useKnative" .) .Values.knative.enabled -}}
 {{- end }}
+
+{{- define "lightbridge-authz.mergeEnv" -}}
+{{- $configPath := .configPath -}}
+{{- $configFile := .configFile -}}
+{{- $extra := .extra -}}
+{{- $default := list (dict "name" "CONFIG_PATH" "value" (printf "%s/%s" $configPath $configFile)) -}}
+{{- $envList := $default -}}
+{{- if $extra -}}
+  {{- if kindIs "slice" $extra -}}
+    {{- range $item := $extra -}}
+      {{- $envList = append $envList $item -}}
+    {{- end -}}
+  {{- else if kindIs "map" $extra -}}
+    {{- range $name, $value := $extra -}}
+      {{- $entry := dict "name" $name -}}
+      {{- if kindIs "map" $value -}}
+        {{- $entry = merge $entry $value -}}
+      {{- else -}}
+        {{- $entry = merge $entry (dict "value" $value) -}}
+      {{- end -}}
+      {{- $envList = append $envList $entry -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- $envList -}}
+{{- end }}
