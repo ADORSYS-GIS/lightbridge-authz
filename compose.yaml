@@ -22,7 +22,7 @@ services:
         chmod 644 /tls/api.crt /tls/opa.crt
         chmod 644 /tls/api.key /tls/opa.key
     volumes:
-      - "authz_tls:/tls"
+      - "./config/tls:/tls"
 
   postgresql:
     image: docker.io/bitnamilegacy/postgresql:17
