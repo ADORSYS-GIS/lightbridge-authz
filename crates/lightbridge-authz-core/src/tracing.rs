@@ -22,12 +22,11 @@ pub fn init_tracing(config: &Config) {
                     .tonic()
                     .with_endpoint(&config.otel.otlp_endpoint),
             )
-            .with_trace_config(opentelemetry_sdk::trace::config().with_resource(
-                Resource::new(vec![KeyValue::new(
-                    "service.name",
-                    config.otel.service_name.clone(),
-                )]),
-            ))
+            .with_trace_config(
+                opentelemetry_sdk::trace::config().with_resource(Resource::new(vec![
+                    KeyValue::new("service.name", config.otel.service_name.clone()),
+                ])),
+            )
             .install_batch(opentelemetry_sdk::runtime::Tokio)
             .expect("Failed to install OpenTelemetry tracer");
 

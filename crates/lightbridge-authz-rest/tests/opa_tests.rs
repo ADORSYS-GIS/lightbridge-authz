@@ -2,7 +2,9 @@ use axum::Json;
 use axum::body::to_bytes;
 use axum::http::StatusCode;
 use chrono::{Duration, Utc};
-use lightbridge_authz_core::{Account, ApiKey, ApiKeyStatus, Project, async_trait, config::BasicAuth, error::Result};
+use lightbridge_authz_core::{
+    Account, ApiKey, ApiKeyStatus, Project, async_trait, config::BasicAuth, error::Result,
+};
 use lightbridge_authz_rest::OpaState;
 use lightbridge_authz_rest::handlers::authorino::validate_authorino_api_key;
 use lightbridge_authz_rest::handlers::opa::validate_api_key;
@@ -266,7 +268,7 @@ async fn validate_authorino_api_key_with_null_allowed_models() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let payload: Value = serde_json::from_slice(&body).unwrap();
-    
+
     // Verify allowed_models is null in JSON
     assert!(payload["project"]["allowed_models"].is_null());
 }
@@ -298,8 +300,14 @@ async fn validate_authorino_api_key_with_empty_allowed_models() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let payload: Value = serde_json::from_slice(&body).unwrap();
-    
+
     // Verify allowed_models is [] in JSON
     assert!(payload["project"]["allowed_models"].is_array());
-    assert_eq!(payload["project"]["allowed_models"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        payload["project"]["allowed_models"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
 }

@@ -14,7 +14,7 @@ pub mod models;
 pub mod routers;
 
 use handlers::AuthzStoreImpl;
-use middleware::{bearer_auth};
+use middleware::bearer_auth;
 use routers::opa_router;
 
 use lightbridge_authz_api_key::repo::StoreRepo;

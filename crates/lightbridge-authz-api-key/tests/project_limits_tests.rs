@@ -1,8 +1,8 @@
-use std::sync::Arc;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::db::DbPool;
 use lightbridge_authz_core::{CreateAccount, CreateProject, DefaultLimits, UpdateProject};
 use sqlx::PgPool;
+use std::sync::Arc;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_project_limits_persistence(pool: PgPool) {

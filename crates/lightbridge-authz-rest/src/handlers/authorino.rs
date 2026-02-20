@@ -7,9 +7,7 @@ use tracing::instrument;
 use crate::OpaState;
 use crate::handlers::opa::validate_api_key_context;
 use crate::models::OpaErrorResponse;
-use crate::models::authorino::{
-    AuthorinoCheckRequest, AuthorinoCheckResponse, AuthorinoMetadata,
-};
+use crate::models::authorino::{AuthorinoCheckRequest, AuthorinoCheckResponse, AuthorinoMetadata};
 
 /// Authorino validation handler.
 #[utoipa::path(

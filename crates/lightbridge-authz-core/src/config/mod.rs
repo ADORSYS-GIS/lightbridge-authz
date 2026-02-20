@@ -91,7 +91,8 @@ fn interpolate_env_vars(content: &str) -> String {
     RE.replace_all(content, |caps: &Captures| {
         if let Some(var_name) = caps.get(1) {
             // $VAR
-            env::var(var_name.as_str()).unwrap_or_else(|_| caps.get(0).unwrap().as_str().to_string())
+            env::var(var_name.as_str())
+                .unwrap_or_else(|_| caps.get(0).unwrap().as_str().to_string())
         } else if let Some(var_name) = caps.get(2) {
             // ${VAR} or ${VAR:default}
             let name = var_name.as_str();
@@ -123,11 +124,17 @@ mod tests {
 
         // $VAR
         assert_eq!(interpolate_env_vars("$TEST_VAR"), "foo");
-        assert_eq!(interpolate_env_vars("prefix_$TEST_VAR.suffix"), "prefix_foo.suffix");
+        assert_eq!(
+            interpolate_env_vars("prefix_$TEST_VAR.suffix"),
+            "prefix_foo.suffix"
+        );
 
         // ${VAR}
         assert_eq!(interpolate_env_vars("${TEST_VAR}"), "foo");
-        assert_eq!(interpolate_env_vars("prefix_${TEST_VAR}_suffix"), "prefix_foo_suffix");
+        assert_eq!(
+            interpolate_env_vars("prefix_${TEST_VAR}_suffix"),
+            "prefix_foo_suffix"
+        );
 
         // ${VAR:default}
         assert_eq!(interpolate_env_vars("${TEST_VAR:default}"), "foo");
