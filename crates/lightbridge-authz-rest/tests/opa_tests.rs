@@ -13,12 +13,14 @@ use lightbridge_authz_rest::models::authorino::AuthorinoCheckRequest;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
+type UsageCalls = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
 #[derive(Debug)]
 struct MockOpaRepo {
     api_key: Option<ApiKey>,
     project: Option<Project>,
     account: Option<Account>,
-    usage_calls: Arc<Mutex<Vec<(String, Option<String>)>>>,
+    usage_calls: UsageCalls,
 }
 
 #[async_trait]
