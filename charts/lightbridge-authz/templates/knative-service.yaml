@@ -1,36 +1,43 @@
-{{- if not (include "lightbridge-authz.shouldUseKnative" .) }}
-apiVersion: apps/v1
-kind: Deployment
+{{- if include "lightbridge-authz.shouldUseKnative" . }}
+apiVersion: serving.knative.dev/v1
+kind: Service
 metadata:
   name: {{ include "lightbridge-authz.fullname" . }}
   labels:
     {{- include "lightbridge-authz.labels" . | nindent 4 }}
-spec:
-  {{- if not .Values.autoscaling.enabled }}
-  replicas: {{ .Values.replicaCount }}
+  {{- with .Values.knative.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
   {{- end }}
-  selector:
-    matchLabels:
-      {{- include "lightbridge-authz.selectorLabels" . | nindent 6 }}
+spec:
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
+      labels:
+        {{- include "lightbridge-authz.labels" . | nindent 8 }}
+        {{- include "lightbridge-authz.selectorLabels" . | nindent 8 }}
+        {{- with .Values.knative.template.labels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.knative.template.annotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      labels:
-        {{- include "lightbridge-authz.labels" . | nindent 8 }}
-        {{- with .Values.podLabels }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
     spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.knative.template.timeoutSeconds }}
+      timeoutSeconds: {{ . }}
+      {{- end }}
+      {{- with .Values.knative.template.containerConcurrency }}
+      containerConcurrency: {{ . }}
+      {{- end }}
+      serviceAccountName: {{ include "lightbridge-authz.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      serviceAccountName: {{ include "lightbridge-authz.serviceAccountName" . }}
-      securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
@@ -45,20 +52,12 @@ spec:
           args:
             {{- toYaml .Values.args | nindent 12 }}
           {{- end }}
-          ports:
-            - name: http
-              containerPort: {{ .Values.service.port }}
-              protocol: TCP
           env:
             - name: CONFIG_PATH
               value: "{{ .Values.configMap.mountPath }}/{{ .Values.configMap.fileName }}"
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          livenessProbe:
-            {{- toYaml .Values.livenessProbe | nindent 12 }}
-          readinessProbe:
-            {{- toYaml .Values.readinessProbe | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:

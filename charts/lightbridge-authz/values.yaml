@@ -27,10 +27,13 @@ serviceAccount:
 
 podAnnotations: {}
 podLabels: {}
+podSecurityContext: {}
 
 command: []
 args: []
 env: []
+
+securityContext: {}
 
 config:
   logging:
@@ -115,3 +118,14 @@ tolerations: []
 affinity: {}
 volumeMounts: []
 volumes: []
+
+knative:
+  enabled: true
+  service:
+    annotations: {}
+    labels: {}
+  template:
+    annotations: {}
+    labels: {}
+    timeoutSeconds: 300
+    containerConcurrency: 0

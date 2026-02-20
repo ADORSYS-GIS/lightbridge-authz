@@ -41,6 +41,11 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- define "lightbridge-authz.selectorLabels" -}}
 app.kubernetes.io/name: {{ include "lightbridge-authz.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/controller: {{ include "lightbridge-authz.controllerName" . }}
+{{- end }}
+
+{{- define "lightbridge-authz.controllerName" -}}
+{{- printf "%s-controller" (include "lightbridge-authz.fullname" .) | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{- define "lightbridge-authz.serviceAccountName" -}}
@@ -97,4 +102,12 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 
 {{- define "lightbridge-authz.tlsJobRoleBindingName" -}}
 {{- printf "%s-tls-job-rolebinding" (include "lightbridge-authz.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{- define "lightbridge-authz.useKnative" -}}
+{{- .Capabilities.APIVersions.Has "serving.knative.dev/v1" -}}
+{{- end }}
+
+{{- define "lightbridge-authz.shouldUseKnative" -}}
+{{- and (include "lightbridge-authz.useKnative" .) .Values.knative.enabled -}}
 {{- end }}
