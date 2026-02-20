@@ -1,14 +1,19 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::fmt::Display;
 use utoipa::ToSchema;
 
 const ACTIVE: &str = "active";
 const REVOKED: &str = "revoked";
 
-fn default_limits() -> Value {
-    serde_json::json!({})
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default, PartialEq, Eq)]
+pub struct DefaultLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests_per_second: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests_per_day: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrent_requests: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -41,9 +46,8 @@ pub struct Project {
     pub name: String,
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
-    #[serde(default = "default_limits")]
-    #[schema(value_type = Object)]
-    pub default_limits: Value,
+    #[serde(default)]
+    pub default_limits: Option<DefaultLimits>,
     pub billing_plan: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -54,9 +58,8 @@ pub struct CreateProject {
     pub name: String,
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
-    #[serde(default = "default_limits")]
-    #[schema(value_type = Object)]
-    pub default_limits: Value,
+    #[serde(default)]
+    pub default_limits: Option<DefaultLimits>,
     pub billing_plan: String,
 }
 
@@ -64,8 +67,7 @@ pub struct CreateProject {
 pub struct UpdateProject {
     pub name: Option<String>,
     pub allowed_models: Option<Option<Vec<String>>>,
-    #[schema(value_type = Object)]
-    pub default_limits: Option<Value>,
+    pub default_limits: Option<DefaultLimits>,
     pub billing_plan: Option<String>,
 }
 

@@ -110,3 +110,11 @@ it-authorino-down:
 # Show stats
 stats:
 	docker compose -p lightbridge-authz -f compose.yaml stats {{c}}
+
+# Run load tests against the OPA endpoint
+load-test:
+	@echo "Starting load tests..."
+	@# We need a valid API key. For simplicity in this environment, we'll try to use one if provided via AUTHZ_API_KEY
+	@# or we can try to extract one from the DB if it exists.
+	@# For now, we'll assume the user might have run the test-protocol or we'll use a default.
+	cargo test -p lightbridge-authz-rest --test load_tests -- --host https://localhost:13001 -u 10 -r 2 -t 30s --accept-invalid-certs

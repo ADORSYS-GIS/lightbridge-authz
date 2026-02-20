@@ -71,7 +71,7 @@ ACCOUNT_ID=$(echo "$ACCOUNT_JSON" | /usr/bin/python3 -c "import sys, json; print
 PROJECT_JSON=$(curl -k -s https://localhost:13000/api/v1/accounts/$ACCOUNT_ID/projects \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"name":"demo","allowed_models":["gpt-4.1-mini"],"default_limits":{},"billing_plan":"free"}')
+  -d '{"name":"demo","allowed_models":["gpt-4.1-mini"],"default_limits":{"requests_per_second":10,"requests_per_day":1000},"billing_plan":"free"}')
 
 PROJECT_ID=$(echo "$PROJECT_JSON" | /usr/bin/python3 -c "import sys, json; print(json.load(sys.stdin)['id'])")
 ```

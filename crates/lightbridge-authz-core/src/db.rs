@@ -14,6 +14,10 @@ pub trait DbPoolTrait: Send + Sync + std::fmt::Debug {
 }
 
 impl DbPool {
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
     pub async fn new(database: &Database) -> Result<Self> {
         let max_size = database.pool_size.unwrap_or(10) as u32;
         let pool = PgPoolOptions::new()

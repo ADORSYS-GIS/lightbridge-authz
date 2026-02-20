@@ -12,7 +12,7 @@ pub use crate::api_key::{
 pub use crate::config::{Config, load_from_path};
 pub use crate::crypto::hash_api_key;
 pub use crate::dto::{
-    Account, CreateAccount, CreateProject, Project, UpdateAccount, UpdateProject,
+    Account, CreateAccount, CreateProject, DefaultLimits, Project, UpdateAccount, UpdateProject,
 };
 pub use crate::error::{Error, Result};
 

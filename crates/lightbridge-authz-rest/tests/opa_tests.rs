@@ -64,7 +64,7 @@ fn mk_project() -> Project {
         account_id: "acct_1".to_string(),
         name: "demo-project".to_string(),
         allowed_models: Some(vec![]),
-        default_limits: serde_json::json!({}),
+        default_limits: None,
         billing_plan: "free".to_string(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -243,6 +243,7 @@ async fn validate_authorino_api_key_preserves_and_enriches_metadata() {
 async fn validate_authorino_api_key_with_null_allowed_models() {
     let mut project = mk_project();
     project.allowed_models = None; // NULL in DB
+    project.default_limits = None;
 
     let state = mk_state(MockOpaRepo {
         api_key: Some(mk_api_key(ApiKeyStatus::Active, None)),
@@ -274,6 +275,7 @@ async fn validate_authorino_api_key_with_null_allowed_models() {
 async fn validate_authorino_api_key_with_empty_allowed_models() {
     let mut project = mk_project();
     project.allowed_models = Some(vec![]); // [] in DB
+    project.default_limits = None;
 
     let state = mk_state(MockOpaRepo {
         api_key: Some(mk_api_key(ApiKeyStatus::Active, None)),

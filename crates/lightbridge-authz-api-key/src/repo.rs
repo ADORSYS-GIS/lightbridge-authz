@@ -4,8 +4,8 @@ use chrono::{DateTime, Utc};
 use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_core::error::Result;
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeyStatus, CreateAccount, CreateProject, Project, UpdateAccount,
-    UpdateApiKey, UpdateProject,
+    Account, ApiKey, ApiKeyStatus, CreateAccount, CreateProject, DefaultLimits, Project,
+    UpdateAccount, UpdateApiKey, UpdateProject,
 };
 use serde_json::Value;
 use sqlx::PgPool;
@@ -53,6 +53,21 @@ impl StoreRepo {
         })
     }
 
+    fn limits_to_json(limits: &Option<DefaultLimits>) -> Value {
+        match limits {
+            Some(l) => serde_json::to_value(l).unwrap_or(Value::Null),
+            None => Value::Null,
+        }
+    }
+
+    fn json_to_limits(value: &Value) -> Option<DefaultLimits> {
+        if value.is_null() {
+            None
+        } else {
+            serde_json::from_value(value.clone()).ok()
+        }
+    }
+
     fn to_account(row: AccountRow) -> Account {
         Account {
             id: row.id,
@@ -69,7 +84,7 @@ impl StoreRepo {
             account_id: row.account_id,
             name: row.name,
             allowed_models: Self::json_to_vec(&row.allowed_models),
-            default_limits: row.default_limits,
+            default_limits: Self::json_to_limits(&row.default_limits),
             billing_plan: row.billing_plan,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -211,7 +226,7 @@ impl StoreRepo {
             account_id: account_id.to_string(),
             name: input.name,
             allowed_models: Some(Self::vec_to_json(&input.allowed_models)),
-            default_limits: input.default_limits,
+            default_limits: Self::limits_to_json(&input.default_limits),
             billing_plan: input.billing_plan,
             created_at: now,
             updated_at: now,
@@ -274,7 +289,7 @@ impl StoreRepo {
         let changes = ProjectChangeset {
             name: input.name,
             allowed_models: input.allowed_models.map(|v| Self::vec_to_json(&v)),
-            default_limits: input.default_limits,
+            default_limits: input.default_limits.map(|l| Self::limits_to_json(&Some(l))),
             billing_plan: input.billing_plan,
             updated_at: Utc::now(),
         };
