@@ -101,3 +101,57 @@ This document collects the concrete commands that worked when we tested the Helm
 - Monitor the workloads with `kubectl get pods` and `kubectl logs` to ensure both `lightbridge-lightbridge-api` and `lightbridge-lightbridge-opa` transition to `Running`. If TLS certs, secrets, or the config map change, delete the pods so new ones mount the updated assets.
 
 With this file you have a repeatable recipe per platform: macOS for installing chart prerequisites, Linux for configuring the shared YAML/secrets, and Windows/WSL for deploying the Helm release that wires everything into `/etc/lightbridge` volumes.
+
+## TLS certificate generation paths
+
+LightBridge Authz only exposes TLS-secured ports, so you need a certificate in Kubernetes for the service FQDNs (`lightbridge-lightbridge-api.default.svc.cluster.local` and `lightbridge-lightbridge-opa.default.svc.cluster.local`). Two production-style workflows have been exercised:
+
+- **Manual job within the umbrella chart** – the chart already includes a pre-install hook job (`global.tls.job`) that runs in-cluster, generates OpenSSL certs, and writes a `lightbridge-authz-tls` secret with `api.*` and `opa.*` files. To target the service FQDNs, override the common names and keep the job enabled:
+  ```yaml
+  global:
+    tls:
+      enabled: true
+      tlsSecretName: lightbridge-authz-tls
+      apiCommonName: lightbridge-lightbridge-api.default.svc.cluster.local
+      opaCommonName: lightbridge-lightbridge-opa.default.svc.cluster.local
+      job:
+        enabled: true
+  ```
+  Run `helm upgrade --install lightbridge charts/lightbridge ...` with that snippet merged into your values; the job will create the secret in the same namespace before the API/OPA pods start.
+
+- **Cert-manager certificate** – install cert-manager (`kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml`), then provision a `Certificate` that writes to the same secret name and covers the service FQDNs. The chart can skip its job once cert-manager owns the secret:
+  ```yaml
+  global:
+    tls:
+      enabled: true
+      tlsSecretName: lightbridge-authz-tls
+      job:
+        enabled: false
+  ```
+  Then apply an Issuer and Certificate such as:
+  ```yaml
+  apiVersion: cert-manager.io/v1
+  kind: Issuer
+  metadata:
+    name: lightbridge-selfsigned
+  spec:
+    selfSigned: {}
+
+  apiVersion: cert-manager.io/v1
+  kind: Certificate
+  metadata:
+    name: lightbridge-authz-tls
+  spec:
+    secretName: lightbridge-authz-tls
+    issuerRef:
+      name: lightbridge-selfsigned
+      kind: Issuer
+    commonName: lightbridge-lightbridge-api.default.svc.cluster.local
+    dnsNames:
+      - lightbridge-lightbridge-api.default.svc.cluster.local
+      - lightbridge-lightbridge-opa.default.svc.cluster.local
+    usages:
+      - server auth
+      - client auth
+  ```
+  Once the cert-manager resource emits a TLS secret, the chart mounts it and pods get valid certificates for the internal FQDNs.
