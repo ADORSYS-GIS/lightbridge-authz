@@ -18,9 +18,25 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let cli = Cli::parse();
 
-    match Cli::parse().command {
+    let config_path = match &cli.command {
+        Some(Commands::Serve { config_path }) => Some(config_path),
+        Some(Commands::Api { config_path }) => Some(config_path),
+        Some(Commands::Opa { config_path }) => Some(config_path),
+        Some(Commands::Migrate { config_path }) => Some(config_path),
+        Some(Commands::Config { config_path }) => Some(config_path),
+        None => None,
+    };
+
+    if let Some(path) = config_path {
+        let config = load_from_path(path)?;
+        lightbridge_authz_core::tracing::init_tracing(&config);
+    } else {
+        tracing_subscriber::fmt::init();
+    }
+
+    let result = match cli.command {
         Some(Commands::Serve { config_path }) => {
             info!("{}", BANNER);
 
@@ -94,6 +110,9 @@ async fn main() -> Result<()> {
         None => {
             info!("No command provided. Use --help for more information.");
         }
-    }
-    Ok(())
+    };
+
+    lightbridge_authz_core::tracing::shutdown_tracing();
+
+    result
 }

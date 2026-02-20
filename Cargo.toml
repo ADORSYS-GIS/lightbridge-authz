@@ -34,6 +34,10 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "serde", "serde_json"] }
+opentelemetry = { version = "0.21", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.14", features = ["grpc-tonic", "rt-tokio"] }
+tracing-opentelemetry = "0.22"
+opentelemetry_sdk = { version = "0.21", features = ["rt-tokio"] }
 axum = { version = "0.8", features = ["macros", "tracing"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 async-trait = "0.1"

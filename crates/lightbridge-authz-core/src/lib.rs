@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod db;
 pub mod dto;
 pub mod error;
+pub mod tracing;
 
 pub use crate::api_key::{
     ApiKey, ApiKeySecret, ApiKeyStatus, CreateApiKey, RotateApiKey, UpdateApiKey,

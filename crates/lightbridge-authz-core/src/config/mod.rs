@@ -9,6 +9,14 @@ pub struct Config {
     pub logging: Logging,
     pub database: Database,
     pub oauth2: Oauth2,
+    pub otel: Otel,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Otel {
+    pub enabled: bool,
+    pub otlp_endpoint: String,
+    pub service_name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
