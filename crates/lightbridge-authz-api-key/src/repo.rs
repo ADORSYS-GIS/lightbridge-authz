@@ -148,14 +148,16 @@ impl StoreRepo {
     }
 
     #[instrument(skip(self))]
-    pub async fn list_accounts(&self) -> Result<Vec<Account>> {
+    pub async fn list_accounts(&self, subject: &str) -> Result<Vec<Account>> {
         let rows: Vec<AccountRow> = sqlx::query_as(
             r#"
             SELECT id, billing_identity, owners_admins, created_at, updated_at
             FROM accounts
+            WHERE owners_admins ? $1
             ORDER BY created_at ASC
             "#,
         )
+        .bind(subject)
         .fetch_all(self.pool())
         .await?;
         Ok(rows.into_iter().map(Self::to_account).collect())

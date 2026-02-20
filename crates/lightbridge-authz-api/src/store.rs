@@ -7,7 +7,7 @@ use lightbridge_authz_core::{async_trait, error::Error};
 #[async_trait]
 pub trait AuthzStore: Send + Sync + 'static + std::fmt::Debug {
     async fn create_account(&self, input: CreateAccount) -> Result<Account, Error>;
-    async fn list_accounts(&self) -> Result<Vec<Account>, Error>;
+    async fn list_accounts(&self, subject: &str) -> Result<Vec<Account>, Error>;
     async fn get_account(&self, account_id: &str) -> Result<Account, Error>;
     async fn update_account(
         &self,

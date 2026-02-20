@@ -54,8 +54,8 @@ impl AuthzStore for AuthzStoreImpl {
         self.repo.create_account(input, cuid2()).await
     }
 
-    async fn list_accounts(&self) -> Result<Vec<Account>> {
-        self.repo.list_accounts().await
+    async fn list_accounts(&self, subject: &str) -> Result<Vec<Account>> {
+        self.repo.list_accounts(subject).await
     }
 
     async fn get_account(&self, account_id: &str) -> Result<Account> {

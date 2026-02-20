@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::IntoResponse,
 };
+use lightbridge_authz_bearer::TokenInfo;
 use lightbridge_authz_core::error::Error;
 use lightbridge_authz_core::{Account, CreateAccount, UpdateAccount};
 use tracing::instrument;
@@ -39,8 +40,10 @@ pub async fn create_account(
 )]
 pub async fn list_accounts(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
 ) -> Result<impl IntoResponse, Error> {
-    let accounts = state.store.list_accounts().await?;
+    let subject = token_info.sub.clone();
+    let accounts = state.store.list_accounts(&subject).await?;
     Ok((StatusCode::OK, Json(accounts)))
 }
 
