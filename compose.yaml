@@ -125,13 +125,6 @@ services:
         limits:
           memory: 1G
           cpus: "0.5"
-      jaeger:
-        image: jaegertracing/all-in-one:latest
-        ports:
-          - "16686:16686" # UI
-          - "4317:4317"   # OTLP gRPC
-          - "4318:4318"   # OTLP HTTP
-    
     volumes:
       - ./.docker/authz/container.yaml:/tmp/config.yaml:ro
       - "authz_tls:/tls:ro"
@@ -148,6 +141,13 @@ services:
       timeout: 3s
       start_period: 1s
       retries: 3
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686" # UI
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
 
 volumes:
   postgresql_data:
