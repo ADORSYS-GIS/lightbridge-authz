@@ -192,6 +192,21 @@ impl StoreRepo {
     }
 
     #[instrument(skip(self))]
+    pub async fn get_account_by_id(&self, account_id: &str) -> Result<Option<Account>> {
+        let row = sqlx::query_as(
+            r#"
+            SELECT id, billing_identity, owners_admins, created_at, updated_at
+            FROM accounts
+            WHERE id = $1
+            "#,
+        )
+        .bind(account_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(Self::to_account))
+    }
+
+    #[instrument(skip(self))]
     pub async fn update_account(
         &self,
         subject: &str,
@@ -352,6 +367,29 @@ impl StoreRepo {
         )
         .bind(project_id)
         .bind(subject)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(Self::to_project))
+    }
+
+    #[instrument(skip(self))]
+    pub async fn get_project_by_id(&self, project_id: &str) -> Result<Option<Project>> {
+        let row = sqlx::query_as(
+            r#"
+            SELECT
+              id,
+              account_id,
+              name,
+              allowed_models,
+              default_limits,
+              billing_plan,
+              created_at,
+              updated_at
+            FROM projects
+            WHERE id = $1
+            "#,
+        )
+        .bind(project_id)
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(Self::to_project))

@@ -9,9 +9,12 @@ async fn test_project_limits_persistence(pool: PgPool) {
     let db_pool = Arc::new(DbPool::from_pool(pool));
     let repo = StoreRepo::new(db_pool);
 
+    let subject = "test-subject";
+
     // 1. Create Account
     let account = repo
         .create_account(
+            subject,
             CreateAccount {
                 billing_identity: "test-limits-acct".to_string(),
                 owners_admins: vec![],
@@ -30,6 +33,7 @@ async fn test_project_limits_persistence(pool: PgPool) {
 
     let project = repo
         .create_project(
+            subject,
             &account.id,
             CreateProject {
                 name: "test-project".to_string(),
@@ -45,7 +49,7 @@ async fn test_project_limits_persistence(pool: PgPool) {
     assert_eq!(project.default_limits, Some(limits));
 
     // 3. Retrieve and verify
-    let retrieved = repo.get_project(&project.id).await.unwrap().unwrap();
+    let retrieved = repo.get_project(subject, &project.id).await.unwrap().unwrap();
     assert_eq!(retrieved.default_limits, project.default_limits);
 
     // 4. Update limits
@@ -57,6 +61,7 @@ async fn test_project_limits_persistence(pool: PgPool) {
 
     let updated = repo
         .update_project(
+            subject,
             &project.id,
             UpdateProject {
                 name: None,
@@ -71,6 +76,6 @@ async fn test_project_limits_persistence(pool: PgPool) {
     assert_eq!(updated.default_limits, Some(new_limits.clone()));
 
     // 5. Verify persistence of update
-    let retrieved_updated = repo.get_project(&project.id).await.unwrap().unwrap();
+    let retrieved_updated = repo.get_project(subject, &project.id).await.unwrap().unwrap();
     assert_eq!(retrieved_updated.default_limits, Some(new_limits));
 }

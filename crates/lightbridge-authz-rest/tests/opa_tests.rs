@@ -35,11 +35,19 @@ impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
         Ok(self.api_key.clone().expect("api key should exist in mock"))
     }
 
-    async fn get_project(&self, _project_id: &str) -> Result<Option<Project>> {
+    async fn get_project(&self, _subject: &str, _project_id: &str) -> Result<Option<Project>> {
         Ok(self.project.clone())
     }
 
-    async fn get_account(&self, _account_id: &str) -> Result<Option<Account>> {
+    async fn get_account(&self, _subject: &str, _account_id: &str) -> Result<Option<Account>> {
+        Ok(self.account.clone())
+    }
+
+    async fn get_project_by_id(&self, _project_id: &str) -> Result<Option<Project>> {
+        Ok(self.project.clone())
+    }
+
+    async fn get_account_by_id(&self, _account_id: &str) -> Result<Option<Account>> {
         Ok(self.account.clone())
     }
 }

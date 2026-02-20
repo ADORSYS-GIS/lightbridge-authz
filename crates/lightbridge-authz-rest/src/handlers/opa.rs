@@ -39,12 +39,12 @@ pub async fn validate_api_key_context(
     let api_key = state.repo.record_api_key_usage(&api_key.id, ip).await?;
     let project = state
         .repo
-        .get_project(&api_key.project_id)
+        .get_project_by_id(&api_key.project_id)
         .await?
         .ok_or_else(|| Error::NotFound)?;
     let account = state
         .repo
-        .get_account(&project.account_id)
+        .get_account_by_id(&project.account_id)
         .await?
         .ok_or_else(|| Error::NotFound)?;
 

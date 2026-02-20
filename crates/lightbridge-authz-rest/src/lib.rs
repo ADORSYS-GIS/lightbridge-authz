@@ -48,8 +48,10 @@ pub trait OpaRepoTrait: Send + Sync {
         key_id: &str,
         ip: Option<String>,
     ) -> Result<lightbridge_authz_core::ApiKey>;
-    async fn get_project(&self, project_id: &str) -> Result<Option<Project>>;
-    async fn get_account(&self, account_id: &str) -> Result<Option<Account>>;
+    async fn get_project(&self, subject: &str, project_id: &str) -> Result<Option<Project>>;
+    async fn get_account(&self, subject: &str, account_id: &str) -> Result<Option<Account>>;
+    async fn get_project_by_id(&self, project_id: &str) -> Result<Option<Project>>;
+    async fn get_account_by_id(&self, account_id: &str) -> Result<Option<Account>>;
 }
 
 #[async_trait]
@@ -69,12 +71,20 @@ impl OpaRepoTrait for StoreRepo {
         StoreRepo::record_api_key_usage(self, key_id, ip).await
     }
 
-    async fn get_project(&self, project_id: &str) -> Result<Option<Project>> {
-        StoreRepo::get_project(self, project_id).await
+    async fn get_project(&self, subject: &str, project_id: &str) -> Result<Option<Project>> {
+        StoreRepo::get_project(self, subject, project_id).await
     }
 
-    async fn get_account(&self, account_id: &str) -> Result<Option<Account>> {
-        StoreRepo::get_account(self, account_id).await
+    async fn get_account(&self, subject: &str, account_id: &str) -> Result<Option<Account>> {
+        StoreRepo::get_account(self, subject, account_id).await
+    }
+
+    async fn get_project_by_id(&self, project_id: &str) -> Result<Option<Project>> {
+        StoreRepo::get_project_by_id(self, project_id).await
+    }
+
+    async fn get_account_by_id(&self, account_id: &str) -> Result<Option<Account>> {
+        StoreRepo::get_account_by_id(self, account_id).await
     }
 }
 

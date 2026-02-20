@@ -14,3 +14,9 @@ serde.features = ["derive"]
 jwks.workspace = true
 jsonwebtoken.workspace = true
 tracing.workspace = true
+tokio.workspace = true
+tokio.features = ["macros", "rt-multi-thread", "sync"]
+
+[dev-dependencies]
+httpmock = "0.7"
+serde_json.workspace = true

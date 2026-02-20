@@ -1,45 +1,103 @@
-replicaCount: 1
+# Default values for lightbridge-authz.
 
-image:
-  repository: lightbridge-authz
-  pullPolicy: IfNotPresent
-  tag: 
+# bjw-s/common v4 configuration
+controllers:
+  main:
+    containers:
+      main:
+        image:
+          repository: lightbridge-authz
+          tag: 0.5.0
+        env:
+          DATABASE_URL:
+            valueFrom:
+              secretKeyRef:
+                name: '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}-secrets'
+                key: DATABASE_URL
+          OPA_PASSWORD:
+            valueFrom:
+              secretKeyRef:
+                name: '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}-secrets'
+                key: OPA_PASSWORD
 
-imagePullSecrets: []
+configMaps:
+  config:
+    enabled: true
+    data:
+      config.yaml: |
+        logging:
+          level: info
+        database:
+          url: "${DATABASE_URL}"
+          pool_size: 10
+        oauth2:
+          jwks_url: http://keycloak:9100/realms/dev/protocol/openid-connect/certs
+        server:
+          api:
+            address: 0.0.0.0
+            port: 3000
+            tls:
+              cert_path: /etc/lightbridge/tls/api.crt
+              key_path: /etc/lightbridge/tls/api.key
+          opa:
+            address: 0.0.0.0
+            port: 3001
+            tls:
+              cert_path: /etc/lightbridge/tls/opa.crt
+              key_path: /etc/lightbridge/tls/opa.key
+            basic_auth:
+              username: authorino
+              password: "${OPA_PASSWORD}"
+
+secrets:
+  secrets:
+    enabled: true
+    stringData:
+      DATABASE_URL: postgres://postgres:postgres@postgresql:5432/lightbridge_authz
+      OPA_PASSWORD: change-me
 
 service:
-  type: ClusterIP
-  port: 3000
-  annotations: {}
+  main:
+    controller: main
+    ports:
+      http:
+        port: 3000
 
-ingress:
-  enabled: false
-  className: 
-  annotations: {}
-  hosts: []
-  tls: []
+persistence:
+  config:
+    enabled: true
+    type: configMap
+    name: '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}-config'
+    mountPath: /etc/lightbridge
+    readOnly: true
+  tls:
+    enabled: true
+    type: secret
+    name: '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}-tls'
+    mountPath: /etc/lightbridge/tls
+    readOnly: true
+
+# Global values required by bjw-s/common and custom templates
+global: {}
+
+# Legacy/Custom template support values
+image:
+  repository: lightbridge-authz
+  tag: 0.5.0
+  pullPolicy: IfNotPresent
 
 serviceAccount:
   create: true
-  name: 
+  name: ""
   automount: true
   annotations: {}
 
-podAnnotations: {}
-podLabels: {}
-podSecurityContext: {}
-
-command: []
-args: []
-env: []
-
-securityContext: {}
-
+# This "config" section is used by migrate-job.yaml
 config:
   logging:
     level: info
   database:
-    url: postgres://postgres:postgres@postgresql:5432/lightbridge_authz
+    url: "${DATABASE_URL}"
     pool_size: 10
   oauth2:
     jwks_url: http://keycloak:9100/realms/dev/protocol/openid-connect/certs
@@ -58,11 +116,12 @@ config:
         key_path: /etc/lightbridge/tls/opa.key
       basic_auth:
         username: authorino
-        password: change-me
+        password: "${OPA_PASSWORD}"
 
+# This "configMap" section is used by migrate-job.yaml and others
 configMap:
   enabled: true
-  name: 
+  name: ""
   mountPath: /etc/lightbridge
   fileName: config.yaml
   annotations: {}
@@ -70,10 +129,8 @@ configMap:
 
 tls:
   enabled: true
-  secretName: 
+  secretName: ""
   mountPath: /etc/lightbridge/tls
-  annotations: {}
-  labels: {}
   apiCommonName: lightbridge-authz-api
   opaCommonName: lightbridge-authz-opa
   job:
@@ -88,53 +145,12 @@ tls:
     labels: {}
     serviceAccount:
       create: true
-      name: 
-      automount: true
+      name: ""
       annotations: {}
     role:
       create: true
-      name: 
+      name: ""
     addKubectlOpenssl: true
-
-autoscaling:
-  enabled: false
-  minReplicas: 1
-  maxReplicas: 3
-  targetCPUUtilizationPercentage: 80
-
-resources: {}
-
-livenessProbe:
-  httpGet:
-    path: /health
-    port: http
-readinessProbe:
-  httpGet:
-    path: /health
-    port: http
-
-nodeSelector: {}
-tolerations: []
-affinity: {}
-volumeMounts: []
-volumes: []
-
-knative:
-  enabled: true
-  service:
-    annotations: {}
-    labels: {}
-  template:
-    annotations: {}
-    labels: {}
-    timeoutSeconds: 300
-    containerConcurrency: 0
-
-global:
-  configMapName: ""
-  configMapNameTemplate: ""
-  tlsSecretName: ""
-  tlsSecretNameTemplate: ""
 
 migrateJob:
   enabled: true
@@ -147,5 +163,39 @@ migrateJob:
   ttlSecondsAfterFinished: 300
   annotations: {}
   labels: {}
-  imagePullSecrets: []
   env: []
+  imagePullSecrets: []
+
+knative:
+  enabled: false
+  service:
+    annotations: {}
+    labels: {}
+  template:
+    annotations: {}
+    labels: {}
+    timeoutSeconds: 300
+    containerConcurrency: 0
+
+# Other expected keys to avoid nil pointer errors in custom templates
+env: []
+volumeMounts: []
+volumes: []
+resources: {}
+livenessProbe: {}
+readinessProbe: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+autoscaling:
+  enabled: false
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []
+  tls: []
