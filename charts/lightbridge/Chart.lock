@@ -1,0 +1,6 @@
+dependencies:
+- name: lightbridge-authz
+  repository: file://../lightbridge-authz
+  version: 0.5.0
+digest: sha256:00c88bd178ff5118ba37d6f2bd41d039ee4300fcbe77aa2662abb9ef6d992165
+generated: "2026-02-20T02:02:34.739837+01:00"

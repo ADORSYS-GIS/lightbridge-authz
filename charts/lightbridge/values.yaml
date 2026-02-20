@@ -1,0 +1,5 @@
+lightbridge-api:
+  enabled: true
+
+lightbridge-opa:
+  enabled: true

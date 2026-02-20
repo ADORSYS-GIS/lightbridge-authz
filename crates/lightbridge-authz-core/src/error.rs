@@ -13,6 +13,9 @@ pub enum Error {
     #[error("Not found")]
     NotFound,
 
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
     #[error("Any: {0}")]
     Any(#[from] anyhow::Error),
 
@@ -40,6 +43,7 @@ mod axum_impl {
                 Error::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::Yaml(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::NotFound => StatusCode::NOT_FOUND,
+                Error::Conflict(_) => StatusCode::CONFLICT,
                 Error::Any(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::AddrParseError(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,

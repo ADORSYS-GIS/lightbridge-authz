@@ -40,7 +40,7 @@ pub struct Project {
     pub account_id: String,
     pub name: String,
     #[serde(default)]
-    pub allowed_models: Vec<String>,
+    pub allowed_models: Option<Vec<String>>,
     #[serde(default = "default_limits")]
     #[schema(value_type = Object)]
     pub default_limits: Value,
@@ -53,7 +53,7 @@ pub struct Project {
 pub struct CreateProject {
     pub name: String,
     #[serde(default)]
-    pub allowed_models: Vec<String>,
+    pub allowed_models: Option<Vec<String>>,
     #[serde(default = "default_limits")]
     #[schema(value_type = Object)]
     pub default_limits: Value,
@@ -63,7 +63,7 @@ pub struct CreateProject {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpdateProject {
     pub name: Option<String>,
-    pub allowed_models: Option<Vec<String>>,
+    pub allowed_models: Option<Option<Vec<String>>>,
     #[schema(value_type = Object)]
     pub default_limits: Option<Value>,
     pub billing_plan: Option<String>,

@@ -31,26 +31,32 @@ impl StoreRepo {
         self.pool.pool()
     }
 
-    fn vec_to_json(values: &[String]) -> Value {
-        serde_json::json!(values)
+    fn vec_to_json(values: &Option<Vec<String>>) -> Value {
+        match values {
+            Some(v) => serde_json::json!(v),
+            None => Value::Null,
+        }
     }
 
-    fn json_to_vec(value: &Value) -> Vec<String> {
-        value
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|item| item.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn json_to_vec(value: &Option<Value>) -> Option<Vec<String>> {
+        value.as_ref().and_then(|v| {
+            if v.is_null() {
+                None
+            } else {
+                v.as_array().map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+            }
+        })
     }
 
     fn to_account(row: AccountRow) -> Account {
         Account {
             id: row.id,
             billing_identity: row.billing_identity,
-            owners_admins: Self::json_to_vec(&row.owners_admins),
+            owners_admins: Self::json_to_vec(&Some(row.owners_admins)).unwrap_or_default(),
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -90,7 +96,7 @@ impl StoreRepo {
         let new_account = NewAccountRow {
             id,
             billing_identity: input.billing_identity,
-            owners_admins: Self::vec_to_json(&input.owners_admins),
+            owners_admins: Self::vec_to_json(&Some(input.owners_admins)),
             created_at: now,
             updated_at: now,
         };
@@ -103,12 +109,23 @@ impl StoreRepo {
             "#,
         )
         .bind(new_account.id)
-        .bind(new_account.billing_identity)
+        .bind(new_account.billing_identity.clone())
         .bind(new_account.owners_admins)
         .bind(new_account.created_at)
         .bind(new_account.updated_at)
         .fetch_one(self.pool())
-        .await?;
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(db_err) = &e {
+                if db_err.code().as_deref() == Some("23505") {
+                    return lightbridge_authz_core::error::Error::Conflict(format!(
+                        "Account with billing identity '{}' already exists",
+                        new_account.billing_identity
+                    ));
+                }
+            }
+            e.into()
+        })?;
 
         Ok(Self::to_account(row))
     }
@@ -143,7 +160,7 @@ impl StoreRepo {
     pub async fn update_account(&self, account_id: &str, input: UpdateAccount) -> Result<Account> {
         let changes = AccountChangeset {
             billing_identity: input.billing_identity,
-            owners_admins: input.owners_admins.map(|v| Self::vec_to_json(&v)),
+            owners_admins: input.owners_admins.map(|v| Self::vec_to_json(&Some(v))),
             updated_at: Utc::now(),
         };
 
@@ -186,7 +203,7 @@ impl StoreRepo {
             id,
             account_id: account_id.to_string(),
             name: input.name,
-            allowed_models: Self::vec_to_json(&input.allowed_models),
+            allowed_models: Some(Self::vec_to_json(&input.allowed_models)),
             default_limits: input.default_limits,
             billing_plan: input.billing_plan,
             created_at: now,
