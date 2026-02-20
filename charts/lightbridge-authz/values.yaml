@@ -68,29 +68,31 @@ persistence:
     enabled: true
     type: configMap
     name: '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}-config'
-    mountPath: /etc/lightbridge
-    readOnly: true
+    advancedMounts:
+      main:
+        main:
+          - path: /etc/lightbridge/config.yaml
+            subPath: config.yaml
+            readOnly: true
   tls:
     enabled: true
     type: secret
     name: '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}-tls'
-    mountPath: /etc/lightbridge/tls
-    readOnly: true
+    globalMounts:
+      - path: /etc/lightbridge/tls
+        readOnly: true
 
-# Global values required by bjw-s/common and custom templates
+serviceAccount:
+  create: true
+
+# Global values required by bjw-s/common
 global: {}
 
-# Legacy/Custom template support values
+# Legacy/Custom template support values (if any remain)
 image:
   repository: lightbridge-authz
   tag: 0.5.0
   pullPolicy: IfNotPresent
-
-serviceAccount:
-  create: true
-  name: ""
-  automount: true
-  annotations: {}
 
 # This "config" section is used by migrate-job.yaml
 config:
@@ -141,8 +143,6 @@ tls:
     restartPolicy: OnFailure
     backoffLimit: 3
     ttlSecondsAfterFinished: 300
-    annotations: {}
-    labels: {}
     serviceAccount:
       create: true
       name: ""
