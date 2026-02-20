@@ -1,0 +1,117 @@
+replicaCount: 1
+
+image:
+  repository: lightbridge-authz
+  pullPolicy: IfNotPresent
+  tag: 
+
+imagePullSecrets: []
+
+service:
+  type: ClusterIP
+  port: 3000
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: 
+  annotations: {}
+  hosts: []
+  tls: []
+
+serviceAccount:
+  create: true
+  name: 
+  automount: true
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+command: []
+args: []
+env: []
+
+config:
+  logging:
+    level: info
+  database:
+    url: postgres://postgres:postgres@postgresql:5432/lightbridge_authz
+    pool_size: 10
+  oauth2:
+    jwks_url: http://keycloak:9100/realms/dev/protocol/openid-connect/certs
+  server:
+    api:
+      address: 0.0.0.0
+      port: 3000
+      tls:
+        cert_path: /etc/lightbridge/tls/api.crt
+        key_path: /etc/lightbridge/tls/api.key
+    opa:
+      address: 0.0.0.0
+      port: 3001
+      tls:
+        cert_path: /etc/lightbridge/tls/opa.crt
+        key_path: /etc/lightbridge/tls/opa.key
+      basic_auth:
+        username: authorino
+        password: change-me
+
+configMap:
+  enabled: true
+  name: 
+  mountPath: /etc/lightbridge
+  fileName: config.yaml
+  annotations: {}
+  labels: {}
+
+tls:
+  enabled: true
+  secretName: 
+  mountPath: /etc/lightbridge/tls
+  annotations: {}
+  labels: {}
+  apiCommonName: lightbridge-authz-api
+  opaCommonName: lightbridge-authz-opa
+  job:
+    enabled: true
+    image:
+      repository: docker.io/bitnami/kubectl
+      tag: 1.29.4
+    restartPolicy: OnFailure
+    backoffLimit: 3
+    ttlSecondsAfterFinished: 300
+    annotations: {}
+    labels: {}
+    serviceAccount:
+      create: true
+      name: 
+      automount: true
+      annotations: {}
+    role:
+      create: true
+      name: 
+    addKubectlOpenssl: true
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+
+resources: {}
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+volumeMounts: []
+volumes: []
