@@ -4,7 +4,7 @@ use lightbridge_authz_core::db::DbPool;
 use lightbridge_authz_core::{CreateAccount, CreateProject, DefaultLimits, UpdateProject};
 use sqlx::PgPool;
 
-#[sqlx::test]
+#[sqlx::test(migrations = "../../migrations")]
 async fn test_project_limits_persistence(pool: PgPool) {
     let db_pool = Arc::new(DbPool::from_pool(pool));
     let repo = StoreRepo::new(db_pool);

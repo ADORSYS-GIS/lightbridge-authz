@@ -4,14 +4,14 @@ kind: Deployment
 metadata:
   name: {{ include "lightbridge-authz.fullname" . }}
   labels:
-    {{- include "lightbridge-authz.labels" . | nindent 4 }}
+    {{ include "lightbridge-authz.labels" . | nindent 4 }}
 spec:
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
   selector:
     matchLabels:
-      {{- include "lightbridge-authz.selectorLabels" . | nindent 6 }}
+      {{ include "lightbridge-authz.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       {{- with .Values.podAnnotations }}
@@ -19,7 +19,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       labels:
-        {{- include "lightbridge-authz.labels" . | nindent 8 }}
+        {{ include "lightbridge-authz.labels" . | nindent 8 }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -50,11 +50,7 @@ spec:
               containerPort: {{ .Values.service.port }}
               protocol: TCP
           env:
-            - name: CONFIG_PATH
-              value: "{{ .Values.configMap.mountPath }}/{{ .Values.configMap.fileName }}"
-            {{- with .Values.env }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
+            {{ include "lightbridge-authz.mergeEnv" (dict "configPath" .Values.configMap.mountPath "configFile" .Values.configMap.fileName "extra" .Values.env) | toYaml | nindent 12 }}
           livenessProbe:
             {{- toYaml .Values.livenessProbe | nindent 12 }}
           readinessProbe:

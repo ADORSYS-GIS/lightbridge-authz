@@ -41,10 +41,11 @@ Default container config is mounted from `.docker/authz/container.yaml`:
 
 ## Helm deployment
 
-- Use the `charts/lightbridge` umbrella chart for Helm installations. It renders a shared config map from `global.config`, mounts it at `/etc/lightbridge/config.yaml`, and ensures both the API and OPA subcharts reuse the same TLS secret.
-- A pre-install `global-tls` job generates the TLS secret (`global.tlsSecretName`) so the services can mount `/etc/lightbridge/tls`. Disable this job when another component provisions certificates by setting `--set global.tls.job.enabled=false`.
-- Keep overrides aligned with `config/default.yaml` so the shared config map contains `server.api`, `server.opa`, `database`, `oauth2`, and `logging` sections that the charts expect.
-- Validate the charts with `helm lint charts/lightbridge-authz` and `helm lint charts/lightbridge`, and run `helm test <release>` to exercise the rendered service probes after deployment.
+- Install the `charts/lightbridge` umbrella chart—the shared `global.config` block is rendered into a single config map (`global.configMapName`, defaults to `lightbridge-authz-config`) that both `lightbridge-api` and `lightbridge-opa` mount at `/etc/lightbridge/config.yaml`. Use YAML anchors (see `charts/lightbridge/values.yaml`) to keep the base `logging`, `database`, `oauth2`, and `server` sections in sync while overriding the API/OPA ports or service-specific knobs.
+- The same umbrella chart also owns the TLS secret (`global.tlsSecretName`, defaults to `lightbridge-authz-tls`) via a pre-install/pre-upgrade `global-tls` job. The job skips generation if the secret already exists, so reruns are safe; disable it (e.g., when cert-manager manages certs) with `--set global.tls.job.enabled=false`.
+- Every dependency still renders its own hooks locally, but the umbrella chart disables the per-service TLS job/configmap so the shared resources are reused. Each `lightbridge-authz` release now also has a pre-install/pre-upgrade `migrate` job that writes the templated config to `/tmp/lightbridge-config/config.yaml` and runs `lightbridge-authz migrate --config-path ...`, keeping the schema ready before the servers start.
+- Override TLS paths, service types, image tags, etc., via the per-release `lightbridge-api` and `lightbridge-opa` value blocks; for example, bump `lightbridge-api.service.type` to `LoadBalancer` or tweak `lightbridge-opa.image.tag` while relying on the shared `global.config`.
+- Validate the charts before deployment with `helm lint charts/lightbridge-authz` and `helm lint charts/lightbridge`. You can preview the combined output (config map, TLS secret job, migrations job, and services) with `helm template charts/lightbridge`. After installing, run `helm test <release>` to exercise the `lightbridge-authz` test pod that hits the rendered service port.
 
 
 ## API overview

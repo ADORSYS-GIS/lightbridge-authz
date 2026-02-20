@@ -16,12 +16,7 @@ keywords:
   - api
 sources:
   - https://github.com/ADORSYS-GIS/lightbridge-authz
-tags:
-  - authz
-  - opa
-  - tls
-  - postgres
-  - api
+tags: "authz, opa, tls, postgres, api"
 
 dependencies:
   - name: common

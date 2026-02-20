@@ -31,11 +31,7 @@ Create chart name and version as used by the chart label.
 {{- end }}
 
 {{- define "lightbridge-authz.labels" -}}
-helm.sh/chart: {{ include "lightbridge-authz.chart" . }}
-{{- if .Chart.AppVersion }}
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
-{{- end }}
-app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- include "bjw-s.common.lib.metadata.allLabels" . -}}
 {{- end }}
 
 {{- define "lightbridge-authz.selectorLabels" -}}
@@ -136,4 +132,15 @@ app.kubernetes.io/controller: {{ include "lightbridge-authz.controllerName" . }}
   {{- end -}}
 {{- end -}}
 {{- $envList -}}
+{{- end }}
+
+{{- define "lightbridge-authz.migrateJobImage" -}}
+{{- $jobImage := .Values.migrateJob.image -}}
+{{- $repository := default .Values.image.repository $jobImage.repository -}}
+{{- $tag := default (default .Values.image.tag .Chart.AppVersion) $jobImage.tag -}}
+{{- printf "%s:%s" $repository $tag -}}
+{{- end }}
+
+{{- define "lightbridge-authz.migrateJobPullPolicy" -}}
+{{- default .Values.image.pullPolicy .Values.migrateJob.image.pullPolicy -}}
 {{- end }}

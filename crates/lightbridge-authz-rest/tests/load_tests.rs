@@ -30,6 +30,7 @@ async fn main() -> Result<(), GooseError> {
         .register_scenario(scenario!("ValidateApiKey")
             .register_transaction(transaction!(validate_api_key))
         )
+        .set_default(GooseDefault::Host, "https://127.0.0.1:13001")?
         .execute()
         .await?;
 

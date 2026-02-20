@@ -4,40 +4,39 @@ kind: Service
 metadata:
   name: {{ include "lightbridge-authz.fullname" . }}
   labels:
-    {{- include "lightbridge-authz.labels" . | nindent 4 }}
-  {{- with .Values.knative.service.annotations }}
+    {{ include "lightbridge-authz.labels" . | nindent 4 }}
+  {{ with .Values.knative.service.annotations }}
   annotations:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
+    {{ toYaml . | nindent 4 }}
+  {{ end }}
 spec:
   template:
     metadata:
       labels:
-        {{- include "lightbridge-authz.labels" . | nindent 8 }}
-        {{- include "lightbridge-authz.selectorLabels" . | nindent 8 }}
-        {{- with .Values.knative.template.labels }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
-      {{- with .Values.knative.template.annotations }}
+        {{ include "lightbridge-authz.labels" . | nindent 8 }}
+        {{ with .Values.knative.template.labels }}
+        {{ toYaml . | nindent 8 }}
+        {{ end }}
+      {{ with .Values.knative.template.annotations }}
       annotations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{ toYaml . | nindent 8 }}
+      {{ end }}
     spec:
-      {{- with .Values.podSecurityContext }}
+      {{ with .Values.podSecurityContext }}
       securityContext:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{ toYaml . | nindent 8 }}
+      {{ end }}
       {{- with .Values.knative.template.timeoutSeconds }}
       timeoutSeconds: {{ . }}
-      {{- end }}
+      {{ end }}
       {{- with .Values.knative.template.containerConcurrency }}
       containerConcurrency: {{ . }}
-      {{- end }}
+      {{ end }}
       serviceAccountName: {{ include "lightbridge-authz.serviceAccountName" . }}
-      {{- with .Values.imagePullSecrets }}
+      {{ with .Values.imagePullSecrets }}
       imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{ toYaml . | nindent 8 }}
+      {{ end }}
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
@@ -53,11 +52,7 @@ spec:
             {{- toYaml .Values.args | nindent 12 }}
           {{- end }}
           env:
-            - name: CONFIG_PATH
-              value: "{{ .Values.configMap.mountPath }}/{{ .Values.configMap.fileName }}"
-            {{- with .Values.env }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
+            {{ include "lightbridge-authz.mergeEnv" (dict "configPath" .Values.configMap.mountPath "configFile" .Values.configMap.fileName "extra" .Values.env) | toYaml | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
@@ -69,9 +64,9 @@ spec:
               mountPath: {{ .Values.tls.mountPath }}
               readOnly: true
             {{- end }}
-            {{- with .Values.volumeMounts }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
+            {{ with .Values.volumeMounts }}
+            {{ toYaml . | nindent 12 }}
+            {{ end }}
       volumes:
         - name: config
           configMap:
@@ -81,19 +76,19 @@ spec:
           secret:
             secretName: {{ include "lightbridge-authz.tlsSecretName" . }}
         {{- end }}
-        {{- with .Values.volumes }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
-      {{- with .Values.nodeSelector }}
+      {{ with .Values.volumes }}
+      {{ toYaml . | nindent 8 }}
+      {{ end }}
+      {{ with .Values.nodeSelector }}
       nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.affinity }}
+        {{ toYaml . | nindent 8 }}
+      {{ end }}
+      {{ with .Values.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.tolerations }}
+        {{ toYaml . | nindent 8 }}
+      {{ end }}
+      {{ with .Values.tolerations }}
       tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{ toYaml . | nindent 8 }}
+      {{ end }}
 {{- end }}

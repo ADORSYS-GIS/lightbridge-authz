@@ -129,3 +129,23 @@ knative:
     labels: {}
     timeoutSeconds: 300
     containerConcurrency: 0
+
+global:
+  configMapName: ""
+  configMapNameTemplate: ""
+  tlsSecretName: ""
+  tlsSecretNameTemplate: ""
+
+migrateJob:
+  enabled: true
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: IfNotPresent
+  restartPolicy: OnFailure
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  annotations: {}
+  labels: {}
+  imagePullSecrets: []
+  env: []
