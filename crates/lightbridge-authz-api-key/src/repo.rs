@@ -108,12 +108,23 @@ impl StoreRepo {
     }
 
     #[instrument(skip(self))]
-    pub async fn create_account(&self, input: CreateAccount, id: String) -> Result<Account> {
+    pub async fn create_account(
+        &self,
+        subject: &str,
+        input: CreateAccount,
+        id: String,
+    ) -> Result<Account> {
         let now = Utc::now();
+        let mut owners = input.owners_admins;
+        if !owners.iter().any(|owner| owner == subject) {
+            owners.push(subject.to_string());
+        }
+        owners.sort_unstable();
+        owners.dedup();
         let new_account = NewAccountRow {
             id,
             billing_identity: input.billing_identity,
-            owners_admins: Self::vec_to_json(&Some(input.owners_admins)),
+            owners_admins: Self::vec_to_json(&Some(owners)),
             created_at: now,
             updated_at: now,
         };
@@ -164,29 +175,44 @@ impl StoreRepo {
     }
 
     #[instrument(skip(self))]
-    pub async fn get_account(&self, account_id: &str) -> Result<Option<Account>> {
+    pub async fn get_account(&self, subject: &str, account_id: &str) -> Result<Option<Account>> {
         let row = sqlx::query_as(
             r#"
             SELECT id, billing_identity, owners_admins, created_at, updated_at
             FROM accounts
             WHERE id = $1
+              AND owners_admins ? $2
             "#,
         )
         .bind(account_id)
+        .bind(subject)
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(Self::to_account))
     }
 
     #[instrument(skip(self))]
-    pub async fn update_account(&self, account_id: &str, input: UpdateAccount) -> Result<Account> {
+    pub async fn update_account(
+        &self,
+        subject: &str,
+        account_id: &str,
+        input: UpdateAccount,
+    ) -> Result<Account> {
+        let mut updated_owners = input.owners_admins;
+        if let Some(ref mut owners) = updated_owners {
+            if !owners.iter().any(|owner| owner == subject) {
+                owners.push(subject.to_string());
+            }
+            owners.sort_unstable();
+            owners.dedup();
+        }
         let changes = AccountChangeset {
             billing_identity: input.billing_identity,
-            owners_admins: input.owners_admins.map(|v| Self::vec_to_json(&Some(v))),
+            owners_admins: updated_owners.map(|v| Self::vec_to_json(&Some(v))),
             updated_at: Utc::now(),
         };
 
-        let row: AccountRow = sqlx::query_as(
+        let row: Option<AccountRow> = sqlx::query_as(
             r#"
             UPDATE accounts
             SET
@@ -194,6 +220,7 @@ impl StoreRepo {
               owners_admins = COALESCE($2, owners_admins),
               updated_at = $3
             WHERE id = $4
+              AND owners_admins ? $5
             RETURNING id, billing_identity, owners_admins, created_at, updated_at
             "#,
         )
@@ -201,23 +228,36 @@ impl StoreRepo {
         .bind(changes.owners_admins)
         .bind(changes.updated_at)
         .bind(account_id)
-        .fetch_one(self.pool())
+        .bind(subject)
+        .fetch_optional(self.pool())
         .await?;
+        let row = row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
         Ok(Self::to_account(row))
     }
 
     #[instrument(skip(self))]
-    pub async fn delete_account(&self, account_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM accounts WHERE id = $1")
-            .bind(account_id)
-            .execute(self.pool())
-            .await?;
+    pub async fn delete_account(&self, subject: &str, account_id: &str) -> Result<()> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM accounts
+            WHERE id = $1
+              AND owners_admins ? $2
+            "#,
+        )
+        .bind(account_id)
+        .bind(subject)
+        .execute(self.pool())
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(lightbridge_authz_core::error::Error::NotFound);
+        }
         Ok(())
     }
 
     #[instrument(skip(self))]
     pub async fn create_project(
         &self,
+        subject: &str,
         account_id: &str,
         input: CreateProject,
         id: String,
@@ -233,61 +273,81 @@ impl StoreRepo {
             created_at: now,
             updated_at: now,
         };
-        let row: ProjectRow = sqlx::query_as(
+        let row: Option<ProjectRow> = sqlx::query_as(
             r#"
+            WITH account_auth AS (
+                SELECT id
+                FROM accounts
+                WHERE id = $1
+                  AND owners_admins ? $2
+            )
             INSERT INTO projects (
               id, account_id, name, allowed_models, default_limits, billing_plan, created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            SELECT $3, account_auth.id, $4, $5, $6, $7, $8, $9
+            FROM account_auth
             RETURNING id, account_id, name, allowed_models, default_limits, billing_plan, created_at, updated_at
             "#,
         )
+        .bind(account_id)
+        .bind(subject)
         .bind(new_project.id)
-        .bind(new_project.account_id)
         .bind(new_project.name)
         .bind(new_project.allowed_models)
         .bind(new_project.default_limits)
         .bind(new_project.billing_plan)
         .bind(new_project.created_at)
         .bind(new_project.updated_at)
-        .fetch_one(self.pool())
+        .fetch_optional(self.pool())
         .await?;
+        let row = row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
         Ok(Self::to_project(row))
     }
 
     #[instrument(skip(self))]
-    pub async fn list_projects(&self, account_id: &str) -> Result<Vec<Project>> {
+    pub async fn list_projects(&self, subject: &str, account_id: &str) -> Result<Vec<Project>> {
         let rows: Vec<ProjectRow> = sqlx::query_as(
             r#"
             SELECT id, account_id, name, allowed_models, default_limits, billing_plan, created_at, updated_at
             FROM projects
+            JOIN accounts ON accounts.id = projects.account_id
             WHERE account_id = $1
+              AND accounts.owners_admins ? $2
             ORDER BY created_at ASC
             "#,
         )
         .bind(account_id)
+        .bind(subject)
         .fetch_all(self.pool())
         .await?;
         Ok(rows.into_iter().map(Self::to_project).collect())
     }
 
     #[instrument(skip(self))]
-    pub async fn get_project(&self, project_id: &str) -> Result<Option<Project>> {
+    pub async fn get_project(&self, subject: &str, project_id: &str) -> Result<Option<Project>> {
         let row = sqlx::query_as(
             r#"
             SELECT id, account_id, name, allowed_models, default_limits, billing_plan, created_at, updated_at
             FROM projects
-            WHERE id = $1
+            JOIN accounts ON accounts.id = projects.account_id
+            WHERE projects.id = $1
+              AND accounts.owners_admins ? $2
             "#,
         )
         .bind(project_id)
+        .bind(subject)
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(Self::to_project))
     }
 
     #[instrument(skip(self))]
-    pub async fn update_project(&self, project_id: &str, input: UpdateProject) -> Result<Project> {
+    pub async fn update_project(
+        &self,
+        subject: &str,
+        project_id: &str,
+        input: UpdateProject,
+    ) -> Result<Project> {
         let changes = ProjectChangeset {
             name: input.name,
             allowed_models: input.allowed_models.map(|v| Self::vec_to_json(&v)),
@@ -295,7 +355,7 @@ impl StoreRepo {
             billing_plan: input.billing_plan,
             updated_at: Utc::now(),
         };
-        let row: ProjectRow = sqlx::query_as(
+        let row: Option<ProjectRow> = sqlx::query_as(
             r#"
             UPDATE projects
             SET
@@ -304,7 +364,10 @@ impl StoreRepo {
               default_limits = COALESCE($3, default_limits),
               billing_plan = COALESCE($4, billing_plan),
               updated_at = $5
-            WHERE id = $6
+            FROM accounts
+            WHERE projects.account_id = accounts.id
+              AND projects.id = $6
+              AND accounts.owners_admins ? $7
             RETURNING id, account_id, name, allowed_models, default_limits, billing_plan, created_at, updated_at
             "#,
         )
@@ -314,36 +377,59 @@ impl StoreRepo {
         .bind(changes.billing_plan)
         .bind(changes.updated_at)
         .bind(project_id)
-        .fetch_one(self.pool())
+        .bind(subject)
+        .fetch_optional(self.pool())
         .await?;
+        let row = row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
         Ok(Self::to_project(row))
     }
 
     #[instrument(skip(self))]
-    pub async fn delete_project(&self, project_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM projects WHERE id = $1")
-            .bind(project_id)
-            .execute(self.pool())
-            .await?;
+    pub async fn delete_project(&self, subject: &str, project_id: &str) -> Result<()> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM projects
+            USING accounts
+            WHERE projects.account_id = accounts.id
+              AND projects.id = $1
+              AND accounts.owners_admins ? $2
+            "#,
+        )
+        .bind(project_id)
+        .bind(subject)
+        .execute(self.pool())
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(lightbridge_authz_core::error::Error::NotFound);
+        }
         Ok(())
     }
 
     #[instrument(skip(self))]
-    pub async fn create_api_key(&self, input: NewApiKeyRow) -> Result<ApiKey> {
-        let row: ApiKeyRow = sqlx::query_as(
+    pub async fn create_api_key(&self, subject: &str, input: NewApiKeyRow) -> Result<ApiKey> {
+        let row: Option<ApiKeyRow> = sqlx::query_as(
             r#"
+            WITH project_auth AS (
+                SELECT projects.id
+                FROM projects
+                JOIN accounts ON accounts.id = projects.account_id
+                WHERE projects.id = $1
+                  AND accounts.owners_admins ? $2
+            )
             INSERT INTO api_keys (
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
               last_used_at, last_ip, revoked_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            SELECT $3, project_auth.id, $4, $5, $6, $7, $8, $9, $10, $11, $12
+            FROM project_auth
             RETURNING
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
               last_used_at, last_ip, revoked_at
             "#,
         )
-        .bind(input.id)
         .bind(input.project_id)
+        .bind(subject)
+        .bind(input.id)
         .bind(input.name)
         .bind(input.key_prefix)
         .bind(input.key_hash)
@@ -353,48 +439,62 @@ impl StoreRepo {
         .bind(input.last_used_at)
         .bind(input.last_ip)
         .bind(input.revoked_at)
-        .fetch_one(self.pool())
+        .fetch_optional(self.pool())
         .await?;
+        let row = row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
         Ok(Self::to_api_key(row))
     }
 
     #[instrument(skip(self))]
-    pub async fn list_api_keys(&self, project_id: &str) -> Result<Vec<ApiKey>> {
+    pub async fn list_api_keys(&self, subject: &str, project_id: &str) -> Result<Vec<ApiKey>> {
         let rows: Vec<ApiKeyRow> = sqlx::query_as(
             r#"
             SELECT
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
               last_used_at, last_ip, revoked_at
             FROM api_keys
-            WHERE project_id = $1
+            JOIN projects ON projects.id = api_keys.project_id
+            JOIN accounts ON accounts.id = projects.account_id
+            WHERE api_keys.project_id = $1
+              AND accounts.owners_admins ? $2
             ORDER BY created_at DESC
             "#,
         )
         .bind(project_id)
+        .bind(subject)
         .fetch_all(self.pool())
         .await?;
         Ok(rows.into_iter().map(Self::to_api_key).collect())
     }
 
     #[instrument(skip(self))]
-    pub async fn get_api_key(&self, key_id: &str) -> Result<Option<ApiKey>> {
+    pub async fn get_api_key(&self, subject: &str, key_id: &str) -> Result<Option<ApiKey>> {
         let row = sqlx::query_as(
             r#"
             SELECT
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
               last_used_at, last_ip, revoked_at
             FROM api_keys
-            WHERE id = $1
+            JOIN projects ON projects.id = api_keys.project_id
+            JOIN accounts ON accounts.id = projects.account_id
+            WHERE api_keys.id = $1
+              AND accounts.owners_admins ? $2
             "#,
         )
         .bind(key_id)
+        .bind(subject)
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(Self::to_api_key))
     }
 
     #[instrument(skip(self))]
-    pub async fn update_api_key(&self, key_id: &str, input: UpdateApiKey) -> Result<ApiKey> {
+    pub async fn update_api_key(
+        &self,
+        subject: &str,
+        key_id: &str,
+        input: UpdateApiKey,
+    ) -> Result<ApiKey> {
         let changes = ApiKeyChangeset {
             name: input.name,
             expires_at: input.expires_at,
@@ -403,13 +503,17 @@ impl StoreRepo {
             last_ip: None,
             revoked_at: None,
         };
-        let row: ApiKeyRow = sqlx::query_as(
+        let row: Option<ApiKeyRow> = sqlx::query_as(
             r#"
             UPDATE api_keys
             SET
               name = COALESCE($1, name),
               expires_at = COALESCE($2, expires_at)
-            WHERE id = $3
+            FROM projects
+            JOIN accounts ON accounts.id = projects.account_id
+            WHERE api_keys.project_id = projects.id
+              AND api_keys.id = $3
+              AND accounts.owners_admins ? $4
             RETURNING
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
               last_used_at, last_ip, revoked_at
@@ -418,14 +522,17 @@ impl StoreRepo {
         .bind(changes.name)
         .bind(changes.expires_at)
         .bind(key_id)
-        .fetch_one(self.pool())
+        .bind(subject)
+        .fetch_optional(self.pool())
         .await?;
+        let row = row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
         Ok(Self::to_api_key(row))
     }
 
     #[instrument(skip(self))]
     pub async fn set_api_key_status(
         &self,
+        subject: &str,
         key_id: &str,
         status: ApiKeyStatus,
         revoked_at: Option<DateTime<Utc>>,
@@ -439,14 +546,18 @@ impl StoreRepo {
             last_ip: None,
             revoked_at,
         };
-        let row: ApiKeyRow = sqlx::query_as(
+        let row: Option<ApiKeyRow> = sqlx::query_as(
             r#"
             UPDATE api_keys
             SET
               status = $1,
               revoked_at = COALESCE($2, revoked_at),
               expires_at = COALESCE($3, expires_at)
-            WHERE id = $4
+            FROM projects
+            JOIN accounts ON accounts.id = projects.account_id
+            WHERE api_keys.project_id = projects.id
+              AND api_keys.id = $4
+              AND accounts.owners_admins ? $5
             RETURNING
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
               last_used_at, last_ip, revoked_at
@@ -456,17 +567,32 @@ impl StoreRepo {
         .bind(changes.revoked_at)
         .bind(changes.expires_at)
         .bind(key_id)
-        .fetch_one(self.pool())
+        .bind(subject)
+        .fetch_optional(self.pool())
         .await?;
+        let row = row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
         Ok(Self::to_api_key(row))
     }
 
     #[instrument(skip(self))]
-    pub async fn delete_api_key(&self, key_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM api_keys WHERE id = $1")
-            .bind(key_id)
-            .execute(self.pool())
-            .await?;
+    pub async fn delete_api_key(&self, subject: &str, key_id: &str) -> Result<()> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM api_keys
+            USING projects, accounts
+            WHERE api_keys.project_id = projects.id
+              AND projects.account_id = accounts.id
+              AND api_keys.id = $1
+              AND accounts.owners_admins ? $2
+            "#,
+        )
+        .bind(key_id)
+        .bind(subject)
+        .execute(self.pool())
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(lightbridge_authz_core::error::Error::NotFound);
+        }
         Ok(())
     }
 

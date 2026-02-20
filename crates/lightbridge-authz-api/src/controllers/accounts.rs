@@ -23,9 +23,11 @@ use tracing::instrument;
 )]
 pub async fn create_account(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Json(input): Json<CreateAccount>,
 ) -> Result<impl IntoResponse, Error> {
-    let account = state.store.create_account(input).await?;
+    let subject = token_info.sub.clone();
+    let account = state.store.create_account(&subject, input).await?;
     Ok((StatusCode::CREATED, Json(account)))
 }
 
@@ -61,9 +63,11 @@ pub async fn list_accounts(
 )]
 pub async fn get_account(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(account_id): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    let account = state.store.get_account(&account_id).await?;
+    let subject = token_info.sub.clone();
+    let account = state.store.get_account(&subject, &account_id).await?;
     Ok((StatusCode::OK, Json(account)))
 }
 
@@ -82,10 +86,15 @@ pub async fn get_account(
 )]
 pub async fn update_account(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(account_id): Path<String>,
     Json(input): Json<UpdateAccount>,
 ) -> Result<impl IntoResponse, Error> {
-    let account = state.store.update_account(&account_id, input).await?;
+    let subject = token_info.sub.clone();
+    let account = state
+        .store
+        .update_account(&subject, &account_id, input)
+        .await?;
     Ok((StatusCode::OK, Json(account)))
 }
 
@@ -103,8 +112,10 @@ pub async fn update_account(
 )]
 pub async fn delete_account(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(account_id): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    state.store.delete_account(&account_id).await?;
+    let subject = token_info.sub.clone();
+    state.store.delete_account(&subject, &account_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

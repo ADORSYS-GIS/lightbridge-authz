@@ -50,53 +50,75 @@ impl AuthzStoreImpl {
 
 #[async_trait]
 impl AuthzStore for AuthzStoreImpl {
-    async fn create_account(&self, input: CreateAccount) -> Result<Account> {
-        self.repo.create_account(input, cuid2()).await
+    async fn create_account(&self, subject: &str, input: CreateAccount) -> Result<Account> {
+        self.repo.create_account(subject, input, cuid2()).await
     }
 
     async fn list_accounts(&self, subject: &str) -> Result<Vec<Account>> {
         self.repo.list_accounts(subject).await
     }
 
-    async fn get_account(&self, account_id: &str) -> Result<Account> {
+    async fn get_account(&self, subject: &str, account_id: &str) -> Result<Account> {
         self.repo
-            .get_account(account_id)
+            .get_account(subject, account_id)
             .await?
             .ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)
     }
 
-    async fn update_account(&self, account_id: &str, input: UpdateAccount) -> Result<Account> {
-        self.repo.update_account(account_id, input).await
+    async fn update_account(
+        &self,
+        subject: &str,
+        account_id: &str,
+        input: UpdateAccount,
+    ) -> Result<Account> {
+        self.repo.update_account(subject, account_id, input).await
     }
 
-    async fn delete_account(&self, account_id: &str) -> Result<()> {
-        self.repo.delete_account(account_id).await
+    async fn delete_account(&self, subject: &str, account_id: &str) -> Result<()> {
+        self.repo.delete_account(subject, account_id).await
     }
 
-    async fn create_project(&self, account_id: &str, input: CreateProject) -> Result<Project> {
-        self.repo.create_project(account_id, input, cuid2()).await
-    }
-
-    async fn list_projects(&self, account_id: &str) -> Result<Vec<Project>> {
-        self.repo.list_projects(account_id).await
-    }
-
-    async fn get_project(&self, project_id: &str) -> Result<Project> {
+    async fn create_project(
+        &self,
+        subject: &str,
+        account_id: &str,
+        input: CreateProject,
+    ) -> Result<Project> {
         self.repo
-            .get_project(project_id)
+            .create_project(subject, account_id, input, cuid2())
+            .await
+    }
+
+    async fn list_projects(&self, subject: &str, account_id: &str) -> Result<Vec<Project>> {
+        self.repo.list_projects(subject, account_id).await
+    }
+
+    async fn get_project(&self, subject: &str, project_id: &str) -> Result<Project> {
+        self.repo
+            .get_project(subject, project_id)
             .await?
             .ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)
     }
 
-    async fn update_project(&self, project_id: &str, input: UpdateProject) -> Result<Project> {
-        self.repo.update_project(project_id, input).await
+    async fn update_project(
+        &self,
+        subject: &str,
+        project_id: &str,
+        input: UpdateProject,
+    ) -> Result<Project> {
+        self.repo.update_project(subject, project_id, input).await
     }
 
-    async fn delete_project(&self, project_id: &str) -> Result<()> {
-        self.repo.delete_project(project_id).await
+    async fn delete_project(&self, subject: &str, project_id: &str) -> Result<()> {
+        self.repo.delete_project(subject, project_id).await
     }
 
-    async fn create_api_key(&self, project_id: &str, input: CreateApiKey) -> Result<ApiKeySecret> {
+    async fn create_api_key(
+        &self,
+        subject: &str,
+        project_id: &str,
+        input: CreateApiKey,
+    ) -> Result<ApiKeySecret> {
         let secret = Self::generate_secret()?;
         let key_hash = hash_api_key(&secret);
         let key_prefix = Self::key_prefix(&secret);
@@ -114,39 +136,55 @@ impl AuthzStore for AuthzStoreImpl {
             last_ip: None,
             revoked_at: None,
         };
-        let api_key = self.repo.create_api_key(row).await?;
+        let api_key = self.repo.create_api_key(subject, row).await?;
         Ok(ApiKeySecret { api_key, secret })
     }
 
-    async fn list_api_keys(&self, project_id: &str) -> Result<Vec<ApiKey>> {
-        self.repo.list_api_keys(project_id).await
+    async fn list_api_keys(&self, subject: &str, project_id: &str) -> Result<Vec<ApiKey>> {
+        self.repo.list_api_keys(subject, project_id).await
     }
 
-    async fn get_api_key(&self, key_id: &str) -> Result<ApiKey> {
+    async fn get_api_key(&self, subject: &str, key_id: &str) -> Result<ApiKey> {
         self.repo
-            .get_api_key(key_id)
+            .get_api_key(subject, key_id)
             .await?
             .ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)
     }
 
-    async fn update_api_key(&self, key_id: &str, input: UpdateApiKey) -> Result<ApiKey> {
-        self.repo.update_api_key(key_id, input).await
+    async fn update_api_key(
+        &self,
+        subject: &str,
+        key_id: &str,
+        input: UpdateApiKey,
+    ) -> Result<ApiKey> {
+        self.repo.update_api_key(subject, key_id, input).await
     }
 
-    async fn delete_api_key(&self, key_id: &str) -> Result<()> {
-        self.repo.delete_api_key(key_id).await
+    async fn delete_api_key(&self, subject: &str, key_id: &str) -> Result<()> {
+        self.repo.delete_api_key(subject, key_id).await
     }
 
-    async fn revoke_api_key(&self, key_id: &str) -> Result<ApiKey> {
+    async fn revoke_api_key(&self, subject: &str, key_id: &str) -> Result<ApiKey> {
         self.repo
-            .set_api_key_status(key_id, ApiKeyStatus::Revoked, Some(Utc::now()), None)
+            .set_api_key_status(
+                subject,
+                key_id,
+                ApiKeyStatus::Revoked,
+                Some(Utc::now()),
+                None,
+            )
             .await
     }
 
-    async fn rotate_api_key(&self, key_id: &str, input: RotateApiKey) -> Result<ApiKeySecret> {
+    async fn rotate_api_key(
+        &self,
+        subject: &str,
+        key_id: &str,
+        input: RotateApiKey,
+    ) -> Result<ApiKeySecret> {
         let existing = self
             .repo
-            .get_api_key(key_id)
+            .get_api_key(subject, key_id)
             .await?
             .ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
 
@@ -159,12 +197,12 @@ impl AuthzStore for AuthzStoreImpl {
             };
             let _ = self
                 .repo
-                .set_api_key_status(key_id, ApiKeyStatus::Active, None, expires_at)
+                .set_api_key_status(subject, key_id, ApiKeyStatus::Active, None, expires_at)
                 .await?;
         } else {
             let _ = self
                 .repo
-                .set_api_key_status(key_id, ApiKeyStatus::Revoked, Some(now), None)
+                .set_api_key_status(subject, key_id, ApiKeyStatus::Revoked, Some(now), None)
                 .await?;
         }
 
@@ -184,7 +222,7 @@ impl AuthzStore for AuthzStoreImpl {
             last_ip: None,
             revoked_at: None,
         };
-        let api_key = self.repo.create_api_key(row).await?;
+        let api_key = self.repo.create_api_key(subject, row).await?;
         Ok(ApiKeySecret { api_key, secret })
     }
 }

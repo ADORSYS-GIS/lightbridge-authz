@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::IntoResponse,
 };
+use lightbridge_authz_bearer::TokenInfo;
 use lightbridge_authz_core::error::Error;
 use lightbridge_authz_core::{CreateProject, Project, UpdateProject};
 use tracing::instrument;
@@ -25,10 +26,15 @@ use tracing::instrument;
 )]
 pub async fn create_project(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(account_id): Path<String>,
     Json(input): Json<CreateProject>,
 ) -> Result<impl IntoResponse, Error> {
-    let project = state.store.create_project(&account_id, input).await?;
+    let subject = token_info.sub.clone();
+    let project = state
+        .store
+        .create_project(&subject, &account_id, input)
+        .await?;
     Ok((StatusCode::CREATED, Json(project)))
 }
 
@@ -46,9 +52,11 @@ pub async fn create_project(
 )]
 pub async fn list_projects(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(account_id): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    let projects = state.store.list_projects(&account_id).await?;
+    let subject = token_info.sub.clone();
+    let projects = state.store.list_projects(&subject, &account_id).await?;
     Ok((StatusCode::OK, Json(projects)))
 }
 
@@ -66,9 +74,11 @@ pub async fn list_projects(
 )]
 pub async fn get_project(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(project_id): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    let project = state.store.get_project(&project_id).await?;
+    let subject = token_info.sub.clone();
+    let project = state.store.get_project(&subject, &project_id).await?;
     Ok((StatusCode::OK, Json(project)))
 }
 
@@ -87,10 +97,15 @@ pub async fn get_project(
 )]
 pub async fn update_project(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(project_id): Path<String>,
     Json(input): Json<UpdateProject>,
 ) -> Result<impl IntoResponse, Error> {
-    let project = state.store.update_project(&project_id, input).await?;
+    let subject = token_info.sub.clone();
+    let project = state
+        .store
+        .update_project(&subject, &project_id, input)
+        .await?;
     Ok((StatusCode::OK, Json(project)))
 }
 
@@ -108,8 +123,10 @@ pub async fn update_project(
 )]
 pub async fn delete_project(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(project_id): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    state.store.delete_project(&project_id).await?;
+    let subject = token_info.sub.clone();
+    state.store.delete_project(&subject, &project_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

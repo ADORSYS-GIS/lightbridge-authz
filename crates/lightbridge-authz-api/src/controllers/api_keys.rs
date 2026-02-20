@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::IntoResponse,
 };
+use lightbridge_authz_bearer::TokenInfo;
 use lightbridge_authz_core::error::Error;
 use lightbridge_authz_core::{ApiKey, ApiKeySecret, CreateApiKey, RotateApiKey, UpdateApiKey};
 use tracing::instrument;
@@ -25,10 +26,15 @@ use tracing::instrument;
 )]
 pub async fn create_api_key(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(project_id): Path<String>,
     Json(input): Json<CreateApiKey>,
 ) -> Result<impl IntoResponse, Error> {
-    let api_key = state.store.create_api_key(&project_id, input).await?;
+    let subject = token_info.sub.clone();
+    let api_key = state
+        .store
+        .create_api_key(&subject, &project_id, input)
+        .await?;
     Ok((StatusCode::CREATED, Json(api_key)))
 }
 
@@ -46,9 +52,11 @@ pub async fn create_api_key(
 )]
 pub async fn list_api_keys(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(project_id): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    let api_keys = state.store.list_api_keys(&project_id).await?;
+    let subject = token_info.sub.clone();
+    let api_keys = state.store.list_api_keys(&subject, &project_id).await?;
     Ok((StatusCode::OK, Json(api_keys)))
 }
 
@@ -66,9 +74,11 @@ pub async fn list_api_keys(
 )]
 pub async fn get_api_key(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    let api_key = state.store.get_api_key(&key_id).await?;
+    let subject = token_info.sub.clone();
+    let api_key = state.store.get_api_key(&subject, &key_id).await?;
     Ok((StatusCode::OK, Json(api_key)))
 }
 
@@ -87,10 +97,12 @@ pub async fn get_api_key(
 )]
 pub async fn update_api_key(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(key_id): Path<String>,
     Json(input): Json<UpdateApiKey>,
 ) -> Result<impl IntoResponse, Error> {
-    let api_key = state.store.update_api_key(&key_id, input).await?;
+    let subject = token_info.sub.clone();
+    let api_key = state.store.update_api_key(&subject, &key_id, input).await?;
     Ok((StatusCode::OK, Json(api_key)))
 }
 
@@ -108,9 +120,11 @@ pub async fn update_api_key(
 )]
 pub async fn delete_api_key(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    state.store.delete_api_key(&key_id).await?;
+    let subject = token_info.sub.clone();
+    state.store.delete_api_key(&subject, &key_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -128,9 +142,11 @@ pub async fn delete_api_key(
 )]
 pub async fn revoke_api_key(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    let api_key = state.store.revoke_api_key(&key_id).await?;
+    let subject = token_info.sub.clone();
+    let api_key = state.store.revoke_api_key(&subject, &key_id).await?;
     Ok((StatusCode::OK, Json(api_key)))
 }
 
@@ -149,9 +165,11 @@ pub async fn revoke_api_key(
 )]
 pub async fn rotate_api_key(
     State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
     Path(key_id): Path<String>,
     Json(input): Json<RotateApiKey>,
 ) -> Result<impl IntoResponse, Error> {
-    let api_key = state.store.rotate_api_key(&key_id, input).await?;
+    let subject = token_info.sub.clone();
+    let api_key = state.store.rotate_api_key(&subject, &key_id, input).await?;
     Ok((StatusCode::CREATED, Json(api_key)))
 }
