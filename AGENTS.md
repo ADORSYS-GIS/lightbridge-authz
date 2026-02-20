@@ -24,7 +24,7 @@ This file documents structure, architecture, workflows, and practices for contri
   - `crates/lightbridge-authz-core/`: shared types, config, errors, crypto, DB pool.
   - `crates/lightbridge-authz-api/`: CRUD API routing/controllers + OpenAPI.
   - `crates/lightbridge-authz-api-key/`: DB entities + repository implementation (SQLx).
-  - `crates/lightbridge-authz-rest/`: Axum server glue (TLS bind, middleware, OPA/Authorino endpoints).
+  - `crates/lightbridge-authz-rest/`: Axum server glue (TLS bind, modular layout with handlers, routers, models, and middleware).
   - `crates/lightbridge-authz-bearer/`: JWT validation via JWKS (Keycloak in local compose).
   - `crates/lightbridge-authz-migrate/`: SQLx migrations runner library.
   - `crates/lightbridge-authz-test-utils/`: helpers for DB/migrations in tests (currently minimal).
@@ -56,11 +56,11 @@ Integration test overlay in `compose.it.yaml` adds:
 
 ### Data Model
 
-Tables (see `migrations/20260203000001_init_authz.sql`):
+Tables (see `migrations/`):
 
-- `accounts`
+- `accounts`: includes `billing_identity` (unique).
 - `projects` (belongs to `accounts`)
-- `api_keys` (belongs to `projects`)
+- `api_keys` (belongs to `projects`): includes `allowed_models`.
 
 API keys are stored as:
 
@@ -68,6 +68,7 @@ API keys are stored as:
 - `key_prefix`: derived from the secret for identification/useful listing.
 - `status`: `active` or `revoked`.
 - `expires_at`: optional expiration.
+- `allowed_models`: list of permitted models. `NULL` or `[]` (empty list) are interpreted as "all models allowed".
 - usage telemetry: `last_used_at`, `last_ip`.
 
 ### Service Responsibilities
@@ -93,12 +94,12 @@ On the OPA server:
 
 - `POST /v1/authorino/validate`
   - Designed for Authorino/external auth integrations.
-  - Accepts a dynamic `metadata` object in the request.
+  - Accepts a typed `AuthorinoMetadata` struct in the request.
   - Returns `dynamic_metadata` in the response which:
     - preserves request metadata keys
-    - enriches with `account_id`, `project_id`, `api_key_id`, `api_key_status`
+    - enriches with `account_id`, `project_id`, `api_key_id`, and `api_key_status`
 
-These are implemented in `crates/lightbridge-authz-rest/src/lib.rs`.
+These are implemented in `crates/lightbridge-authz-rest/src/handlers/authorino.rs`.
 
 ## Rust Workspace and Crates
 
@@ -124,8 +125,10 @@ Workspace manifest: `Cargo.toml`
   - OpenAPI: `crates/lightbridge-authz-api/src/openapi.rs`
 
 - OPA/Authorino endpoints:
-  - server glue + handlers: `crates/lightbridge-authz-rest/src/lib.rs`
-  - middleware: `crates/lightbridge-authz-rest/src/middleware.rs`
+  - handlers: `crates/lightbridge-authz-rest/src/handlers/*`
+  - routers: `crates/lightbridge-authz-rest/src/routers/*`
+  - models: `crates/lightbridge-authz-rest/src/models/*`
+  - middleware: `crates/lightbridge-authz-rest/src/middleware/*`
 
 - Repository:
   - `crates/lightbridge-authz-api-key/src/repo.rs`
