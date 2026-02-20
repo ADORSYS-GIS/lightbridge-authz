@@ -47,10 +47,7 @@ Primary local stack is in `compose.yaml`:
 - `authz-api`: runs the CRUD API.
 - `authz-opa`: runs validation endpoints for OPA/Authorino.
 - `adminer`: optional DB UI.
-
-Integration test overlay in `compose.it.yaml` adds:
-
-- `it-authorino`: python container that runs end-to-end checks against the stack.
+- `jaeger`: distributed tracing UI (available at `http://localhost:16686`).
 
 ## Architecture Overview
 
@@ -155,6 +152,10 @@ Key config fields:
 - `database.url`: Postgres connection string
 - `oauth2.jwks_url`: JWKS endpoint (Keycloak in local compose)
 
+### Environment Variable Interpolation
+
+The configuration loader supports `${VAR}` placeholders in YAML files. This is verified by unit tests in `lightbridge-authz-core`.
+
 ## Development Workflows
 
 ### Docker Compose (Recommended)
@@ -191,6 +192,14 @@ Note: `config/default.yaml` references `./config/tls/*` which may not exist by d
 
 ## Testing
 
+### Workspace Tests
+
+Run all tests in the workspace:
+
+```bash
+DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz" cargo test --workspace
+```
+
 ### Unit/Contract Tests (Rust)
 
 The REST crate contains behavior tests for validation flows and OpenAPI contract checks:
@@ -202,6 +211,24 @@ These tests include:
 - API key validation success/failure cases (missing/revoked/expired).
 - Authorino endpoint dynamic metadata passthrough + enrichment.
 - OpenAPI checks ensuring the Authorino endpoint/schemas are published.
+
+### Persistence Tests
+
+Database persistence tests (e.g., project limits) use `sqlx::test` with automatic migrations. Ensure `DATABASE_URL` is set to a running Postgres instance.
+
+- `cargo test -p lightbridge-authz-api-key --test project_limits_tests`
+
+### Load Tests
+
+Load tests use the [Goose](https://goose.rs/) framework and run against the OPA endpoint.
+
+```bash
+AUTHZ_API_KEY=<your-secret> just load-test
+```
+
+Findings:
+- The system handles ~600-1000 requests per second on a standard development machine with minimal latency (~10-20ms).
+- Telemetry (last used timestamp and IP) is correctly updated in the database during load.
 
 ### Integration Test (Docker Compose)
 
@@ -217,6 +244,15 @@ Implementation details:
 
 - test runner: `.docker/it/authorino_it.py`
 - overlay: `compose.it.yaml`
+
+## Observability
+
+The system is instrumented with OpenTelemetry (OTLP). When running in Compose, traces are sent to Jaeger.
+
+- **Jaeger UI**: `http://localhost:16686`
+- **OTLP Endpoint**: `http://localhost:4317` (gRPC)
+
+Traces capture the full lifecycle of a validation request, including database lookups and telemetry updates.
 
 ## Practices and Conventions
 
@@ -262,4 +298,3 @@ In Compose, `authz-migrate` runs before API/OPA start.
 - Overview and quickstart: `README.md`
 - Manual end-to-end protocol (OAuth2 + OPA): `docs/test-protocol.md`
 - Authorino endpoint usage + integration test: `docs/authorino-usage.md`
-
