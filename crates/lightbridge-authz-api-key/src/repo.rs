@@ -9,6 +9,7 @@ use lightbridge_authz_core::{
 };
 use serde_json::Value;
 use sqlx::PgPool;
+use tracing::instrument;
 
 use crate::entities::account_row::{AccountChangeset, AccountRow};
 use crate::entities::api_key_row::{ApiKeyChangeset, ApiKeyRow};
@@ -91,6 +92,7 @@ impl StoreRepo {
         }
     }
 
+    #[instrument(skip(self))]
     pub async fn create_account(&self, input: CreateAccount, id: String) -> Result<Account> {
         let now = Utc::now();
         let new_account = NewAccountRow {
@@ -130,6 +132,7 @@ impl StoreRepo {
         Ok(Self::to_account(row))
     }
 
+    #[instrument(skip(self))]
     pub async fn list_accounts(&self) -> Result<Vec<Account>> {
         let rows: Vec<AccountRow> = sqlx::query_as(
             r#"
@@ -143,6 +146,7 @@ impl StoreRepo {
         Ok(rows.into_iter().map(Self::to_account).collect())
     }
 
+    #[instrument(skip(self))]
     pub async fn get_account(&self, account_id: &str) -> Result<Option<Account>> {
         let row = sqlx::query_as(
             r#"
@@ -157,6 +161,7 @@ impl StoreRepo {
         Ok(row.map(Self::to_account))
     }
 
+    #[instrument(skip(self))]
     pub async fn update_account(&self, account_id: &str, input: UpdateAccount) -> Result<Account> {
         let changes = AccountChangeset {
             billing_identity: input.billing_identity,
@@ -184,6 +189,7 @@ impl StoreRepo {
         Ok(Self::to_account(row))
     }
 
+    #[instrument(skip(self))]
     pub async fn delete_account(&self, account_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM accounts WHERE id = $1")
             .bind(account_id)
@@ -192,6 +198,7 @@ impl StoreRepo {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub async fn create_project(
         &self,
         account_id: &str,
@@ -231,6 +238,7 @@ impl StoreRepo {
         Ok(Self::to_project(row))
     }
 
+    #[instrument(skip(self))]
     pub async fn list_projects(&self, account_id: &str) -> Result<Vec<Project>> {
         let rows: Vec<ProjectRow> = sqlx::query_as(
             r#"
@@ -246,6 +254,7 @@ impl StoreRepo {
         Ok(rows.into_iter().map(Self::to_project).collect())
     }
 
+    #[instrument(skip(self))]
     pub async fn get_project(&self, project_id: &str) -> Result<Option<Project>> {
         let row = sqlx::query_as(
             r#"
@@ -260,6 +269,7 @@ impl StoreRepo {
         Ok(row.map(Self::to_project))
     }
 
+    #[instrument(skip(self))]
     pub async fn update_project(&self, project_id: &str, input: UpdateProject) -> Result<Project> {
         let changes = ProjectChangeset {
             name: input.name,
@@ -292,6 +302,7 @@ impl StoreRepo {
         Ok(Self::to_project(row))
     }
 
+    #[instrument(skip(self))]
     pub async fn delete_project(&self, project_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM projects WHERE id = $1")
             .bind(project_id)
@@ -300,6 +311,7 @@ impl StoreRepo {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub async fn create_api_key(&self, input: NewApiKeyRow) -> Result<ApiKey> {
         let row: ApiKeyRow = sqlx::query_as(
             r#"
@@ -329,6 +341,7 @@ impl StoreRepo {
         Ok(Self::to_api_key(row))
     }
 
+    #[instrument(skip(self))]
     pub async fn list_api_keys(&self, project_id: &str) -> Result<Vec<ApiKey>> {
         let rows: Vec<ApiKeyRow> = sqlx::query_as(
             r#"
@@ -346,6 +359,7 @@ impl StoreRepo {
         Ok(rows.into_iter().map(Self::to_api_key).collect())
     }
 
+    #[instrument(skip(self))]
     pub async fn get_api_key(&self, key_id: &str) -> Result<Option<ApiKey>> {
         let row = sqlx::query_as(
             r#"
@@ -362,6 +376,7 @@ impl StoreRepo {
         Ok(row.map(Self::to_api_key))
     }
 
+    #[instrument(skip(self))]
     pub async fn update_api_key(&self, key_id: &str, input: UpdateApiKey) -> Result<ApiKey> {
         let changes = ApiKeyChangeset {
             name: input.name,
@@ -391,6 +406,7 @@ impl StoreRepo {
         Ok(Self::to_api_key(row))
     }
 
+    #[instrument(skip(self))]
     pub async fn set_api_key_status(
         &self,
         key_id: &str,
@@ -428,6 +444,7 @@ impl StoreRepo {
         Ok(Self::to_api_key(row))
     }
 
+    #[instrument(skip(self))]
     pub async fn delete_api_key(&self, key_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM api_keys WHERE id = $1")
             .bind(key_id)
@@ -436,6 +453,7 @@ impl StoreRepo {
         Ok(())
     }
 
+    #[instrument(skip(self, key_hash))]
     pub async fn find_api_key_by_hash(&self, key_hash: &str) -> Result<Option<ApiKey>> {
         let row = sqlx::query_as(
             r#"
@@ -452,6 +470,7 @@ impl StoreRepo {
         Ok(row.map(Self::to_api_key))
     }
 
+    #[instrument(skip(self))]
     pub async fn record_api_key_usage(
         &self,
         key_id: &str,

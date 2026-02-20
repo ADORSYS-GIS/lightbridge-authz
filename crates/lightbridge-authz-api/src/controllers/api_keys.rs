@@ -10,7 +10,7 @@ use lightbridge_authz_core::error::Error;
 use lightbridge_authz_core::{ApiKey, ApiKeySecret, CreateApiKey, RotateApiKey, UpdateApiKey};
 use tracing::instrument;
 
-#[instrument]
+#[instrument(skip(state))]
 #[utoipa::path(
     post,
     path = "/api/v1/projects/{project_id}/api-keys",
@@ -32,7 +32,7 @@ pub async fn create_api_key(
     Ok((StatusCode::CREATED, Json(api_key)))
 }
 
-#[instrument]
+#[instrument(skip(state))]
 #[utoipa::path(
     get,
     path = "/api/v1/projects/{project_id}/api-keys",
@@ -52,7 +52,7 @@ pub async fn list_api_keys(
     Ok((StatusCode::OK, Json(api_keys)))
 }
 
-#[instrument]
+#[instrument(skip(state))]
 #[utoipa::path(
     get,
     path = "/api/v1/api-keys/{key_id}",
@@ -72,7 +72,7 @@ pub async fn get_api_key(
     Ok((StatusCode::OK, Json(api_key)))
 }
 
-#[instrument]
+#[instrument(skip(state))]
 #[utoipa::path(
     patch,
     path = "/api/v1/api-keys/{key_id}",
@@ -94,7 +94,7 @@ pub async fn update_api_key(
     Ok((StatusCode::OK, Json(api_key)))
 }
 
-#[instrument]
+#[instrument(skip(state))]
 #[utoipa::path(
     delete,
     path = "/api/v1/api-keys/{key_id}",
@@ -114,7 +114,7 @@ pub async fn delete_api_key(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[instrument]
+#[instrument(skip(state))]
 #[utoipa::path(
     post,
     path = "/api/v1/api-keys/{key_id}/revoke",
@@ -134,7 +134,7 @@ pub async fn revoke_api_key(
     Ok((StatusCode::OK, Json(api_key)))
 }
 
-#[instrument]
+#[instrument(skip(state))]
 #[utoipa::path(
     post,
     path = "/api/v1/api-keys/{key_id}/rotate",

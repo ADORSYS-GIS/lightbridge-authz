@@ -10,7 +10,7 @@ use lightbridge_authz_core::error::Error;
 use lightbridge_authz_core::{Account, CreateAccount, UpdateAccount};
 use tracing::instrument;
 
-#[instrument]
+#[instrument(skip(state))]
 #[utoipa::path(
     post,
     path = "/api/v1/accounts",
@@ -28,7 +28,7 @@ pub async fn create_account(
     Ok((StatusCode::CREATED, Json(account)))
 }
 
-#[instrument]
+#[instrument(skip(state))]
 #[utoipa::path(
     get,
     path = "/api/v1/accounts",
@@ -44,7 +44,7 @@ pub async fn list_accounts(
     Ok((StatusCode::OK, Json(accounts)))
 }
 
-#[instrument]
+#[instrument(skip(state))]
 #[utoipa::path(
     get,
     path = "/api/v1/accounts/{account_id}",
@@ -64,7 +64,7 @@ pub async fn get_account(
     Ok((StatusCode::OK, Json(account)))
 }
 
-#[instrument]
+#[instrument(skip(state))]
 #[utoipa::path(
     patch,
     path = "/api/v1/accounts/{account_id}",
@@ -86,7 +86,7 @@ pub async fn update_account(
     Ok((StatusCode::OK, Json(account)))
 }
 
-#[instrument]
+#[instrument(skip(state))]
 #[utoipa::path(
     delete,
     path = "/api/v1/accounts/{account_id}",

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use lightbridge_authz_core::Result;
+use tracing::instrument;
 
 use crate::OpaState;
 use crate::handlers::opa::validate_api_key_context;
@@ -21,6 +22,7 @@ use crate::models::authorino::{
     ),
     tag = "authorino"
 )]
+#[instrument(skip(state, input))]
 pub async fn validate_authorino_api_key(
     State(state): State<Arc<OpaState>>,
     Json(input): Json<AuthorinoCheckRequest>,

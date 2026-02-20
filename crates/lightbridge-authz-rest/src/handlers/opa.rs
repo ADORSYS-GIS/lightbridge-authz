@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use lightbridge_authz_core::{ApiKeyStatus, Result, error::Error, hash_api_key};
+use tracing::instrument;
 
 use crate::OpaState;
 use crate::models::{OpaCheckRequest, OpaCheckResponse, OpaErrorResponse};
@@ -14,6 +15,7 @@ pub struct ValidatedApiKeyContext {
 }
 
 /// Validates an API key and returns its context (project, account).
+#[instrument(skip(state, raw_api_key))]
 pub async fn validate_api_key_context(
     state: &Arc<OpaState>,
     raw_api_key: &str,
@@ -64,6 +66,7 @@ pub async fn validate_api_key_context(
     ),
     tag = "opa"
 )]
+#[instrument(skip(state, input))]
 pub async fn validate_api_key(
     State(state): State<Arc<OpaState>>,
     Json(input): Json<OpaCheckRequest>,
