@@ -29,5 +29,7 @@ runs:
         just it-authorino
     - run: docker compose -f compose.yaml -f compose.it.yaml logs
       if: failure()
+      shell: bash
     - run: just it-authorino-down
       if: always()
+      shell: bash

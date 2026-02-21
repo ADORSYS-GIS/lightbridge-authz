@@ -19,7 +19,7 @@ runs:
   using: composite
   steps:
     - uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
-    - uses: azure/setup-helm@v3
+    - uses: azure/setup-helm@5119fcb9089d432beecbf79bb2c7915207344b78
     - name: Package charts
       shell: bash
       run: |

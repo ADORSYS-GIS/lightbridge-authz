@@ -7,6 +7,7 @@ runs:
   using: composite
   steps:
     - uses: ./.github/actions/rust-setup
-    - run: cargo test --workspace
+    - shell: bash
+      run: cargo test --workspace
       env:
         DATABASE_URL: ${{ inputs.database-url }}

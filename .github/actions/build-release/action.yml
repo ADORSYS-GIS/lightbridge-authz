@@ -3,8 +3,10 @@ runs:
   using: composite
   steps:
     - uses: ./.github/actions/rust-setup
-    - run: cargo build --profile prod --all-targets --all-features
-    - run: tar -czf release-artifacts.tar.gz -C target/prod .
+    - shell: bash
+      run: cargo build --profile prod --all-targets --all-features
+    - shell: bash
+      run: tar -czf release-artifacts.tar.gz -C target/prod .
     - uses: actions/upload-artifact@47309c993abb98030a35d55ef7ff34b7fa1074b5
       with:
         name: release-artifacts
