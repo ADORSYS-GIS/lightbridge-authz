@@ -8,4 +8,8 @@ runs:
   steps:
     - uses: ./.github/actions/rust-setup
     - shell: bash
-      run: cargo deny check ${{ inputs.check }}
+      run: |
+        if ! command -v cargo-deny >/dev/null; then
+          cargo install --locked cargo-deny
+        fi
+        cargo deny check ${{ inputs.check }}
