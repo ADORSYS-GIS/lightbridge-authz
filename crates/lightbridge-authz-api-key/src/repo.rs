@@ -422,7 +422,15 @@ impl StoreRepo {
             WHERE projects.account_id = accounts.id
               AND projects.id = $6
               AND accounts.owners_admins ? $7
-            RETURNING id, account_id, name, allowed_models, default_limits, billing_plan, created_at, updated_at
+            RETURNING
+              projects.id,
+              projects.account_id,
+              projects.name,
+              projects.allowed_models,
+              projects.default_limits,
+              projects.billing_plan,
+              projects.created_at,
+              projects.updated_at
             "#,
         )
         .bind(changes.name)
