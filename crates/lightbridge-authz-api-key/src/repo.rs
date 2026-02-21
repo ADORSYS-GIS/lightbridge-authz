@@ -55,8 +55,8 @@ impl StoreRepo {
 
     fn limits_to_json(limits: &Option<DefaultLimits>) -> Value {
         match limits {
-            Some(l) => serde_json::to_value(l).unwrap_or(Value::Null),
-            None => Value::Null,
+            Some(l) => serde_json::to_value(l).unwrap_or_else(|_| serde_json::json!({})),
+            None => serde_json::json!({}),
         }
     }
 
@@ -402,9 +402,14 @@ impl StoreRepo {
         project_id: &str,
         input: UpdateProject,
     ) -> Result<Project> {
+        let (allowed_models_supplied, allowed_models_value) = match input.allowed_models {
+            Some(Some(models)) => (true, Some(serde_json::json!(models))),
+            Some(None) => (true, None),
+            None => (false, None),
+        };
         let changes = ProjectChangeset {
             name: input.name,
-            allowed_models: input.allowed_models.map(|v| Self::vec_to_json(&v)),
+            allowed_models: allowed_models_value.clone(),
             default_limits: input.default_limits.map(|l| Self::limits_to_json(&Some(l))),
             billing_plan: input.billing_plan,
             updated_at: Utc::now(),
@@ -414,14 +419,14 @@ impl StoreRepo {
             UPDATE projects
             SET
               name = COALESCE($1, name),
-              allowed_models = COALESCE($2, allowed_models),
-              default_limits = COALESCE($3, default_limits),
-              billing_plan = COALESCE($4, billing_plan),
-              updated_at = $5
+              allowed_models = CASE WHEN $2 THEN $3 ELSE allowed_models END,
+              default_limits = COALESCE($4, default_limits),
+              billing_plan = COALESCE($5, billing_plan),
+              updated_at = $6
             FROM accounts
             WHERE projects.account_id = accounts.id
-              AND projects.id = $6
-              AND accounts.owners_admins ? $7
+              AND projects.id = $7
+              AND accounts.owners_admins ? $8
             RETURNING
               projects.id,
               projects.account_id,
@@ -434,6 +439,7 @@ impl StoreRepo {
             "#,
         )
         .bind(changes.name)
+        .bind(allowed_models_supplied)
         .bind(changes.allowed_models)
         .bind(changes.default_limits)
         .bind(changes.billing_plan)

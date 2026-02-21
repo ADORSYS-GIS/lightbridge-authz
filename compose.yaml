@@ -7,8 +7,13 @@ services:
       - -c
       - |
         set -e
+        mkdir -p /tls /host_tls
         apk add --no-cache openssl
-        mkdir -p /tls
+        for host_file in api.key api.crt opa.key opa.crt; do
+          if [ -f /host_tls/$host_file ]; then
+            cp /host_tls/$host_file /tls/$host_file
+          fi
+        done
         if [ ! -f /tls/api.key ]; then
           openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
             -keyout /tls/api.key -out /tls/api.crt \
@@ -19,10 +24,16 @@ services:
             -keyout /tls/opa.key -out /tls/opa.crt \
             -subj "/CN=lightbridge-authz-opa"
         fi
-        chmod 644 /tls/api.crt /tls/opa.crt
-        chmod 644 /tls/api.key /tls/opa.key
+        for tls_file in api.crt api.key opa.crt opa.key; do
+          chmod 644 /tls/$tls_file
+          if [ -f /tls/$tls_file ]; then
+            cp /tls/$tls_file /host_tls/$tls_file
+            chmod 644 /host_tls/$tls_file
+          fi
+        done
     volumes:
-      - "./config/tls:/tls"
+      - "authz_tls:/tls"
+      - "./config/tls:/host_tls"
 
   postgresql:
     image: docker.io/bitnamilegacy/postgresql:17
