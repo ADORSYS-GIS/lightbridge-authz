@@ -1,3 +1,5 @@
+#![cfg(feature = "load-tests")]
+
 use goose::prelude::*;
 use serde_json::json;
 use std::env;

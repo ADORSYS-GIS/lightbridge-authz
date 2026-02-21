@@ -34,7 +34,11 @@ anyhow.workspace = true
 goose.workspace = true
 reqwest.workspace = true
 
+[features]
+load-tests = []
+
 [[test]]
 name = "load_tests"
 path = "tests/load_tests.rs"
 harness = false
+required-features = ["load-tests"]

@@ -226,6 +226,8 @@ Load tests use the [Goose](https://goose.rs/) framework and run against the OPA 
 AUTHZ_API_KEY=<your-secret> just load-test
 ```
 
+These load tests live behind the `load-tests` feature of the `lightbridge-authz-rest` crate, so they are only built/executed when `just load-test` runs (it passes `--features load-tests --test load_tests`). This keeps them out of the regular `cargo test` runs.
+
 Findings:
 - The system handles ~600-1000 requests per second on a standard development machine with minimal latency (~10-20ms).
 - Telemetry (last used timestamp and IP) is correctly updated in the database during load.
