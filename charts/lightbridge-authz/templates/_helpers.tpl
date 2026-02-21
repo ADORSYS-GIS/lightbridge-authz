@@ -30,33 +30,117 @@ Create chart name and version as used by the chart label.
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
-{{/*
-Common labels
-*/}}
 {{- define "lightbridge-authz.labels" -}}
-helm.sh/chart: {{ include "lightbridge-authz.chart" . }}
-{{ include "lightbridge-authz.selectorLabels" . }}
-{{- if .Chart.AppVersion }}
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
-{{- end }}
-app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- include "bjw-s.common.lib.metadata.allLabels" . -}}
 {{- end }}
 
-{{/*
-Selector labels
-*/}}
 {{- define "lightbridge-authz.selectorLabels" -}}
 app.kubernetes.io/name: {{ include "lightbridge-authz.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/controller: {{ include "lightbridge-authz.controllerName" . }}
 {{- end }}
 
-{{/*
-Create the name of the service account to use
-*/}}
+{{- define "lightbridge-authz.controllerName" -}}
+{{- printf "%s-controller" (include "lightbridge-authz.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
 {{- define "lightbridge-authz.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create }}
 {{- default (include "lightbridge-authz.fullname" .) .Values.serviceAccount.name }}
 {{- else }}
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
+{{- end }}
+
+{{- define "lightbridge-authz.configMapName" -}}
+{{- if .Values.configMap.name }}
+{{- .Values.configMap.name }}
+{{- else if and .Values.global .Values.global.configMapName }}
+{{- .Values.global.configMapName }}
+{{- else if and .Values.global .Values.global.configMapNameTemplate }}
+{{- tpl .Values.global.configMapNameTemplate . }}
+{{- else }}
+{{- printf "%s-config" (include "lightbridge-authz.fullname" .) }}
+{{- end }}
+{{- end }}
+
+{{- define "lightbridge-authz.tlsSecretName" -}}
+{{- if .Values.tls.secretName }}
+{{- .Values.tls.secretName }}
+{{- else if and .Values.global .Values.global.tlsSecretName }}
+{{- .Values.global.tlsSecretName }}
+{{- else if and .Values.global .Values.global.tlsSecretNameTemplate }}
+{{- tpl .Values.global.tlsSecretNameTemplate . }}
+{{- else }}
+{{- printf "%s-tls" (include "lightbridge-authz.fullname" .) }}
+{{- end }}
+{{- end }}
+
+{{- define "lightbridge-authz.tlsJobName" -}}
+{{- printf "%s-tls-job" (include "lightbridge-authz.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{- define "lightbridge-authz.tlsJobServiceAccountName" -}}
+{{- if .Values.tls.job.serviceAccount.name }}
+{{- .Values.tls.job.serviceAccount.name }}
+{{- else }}
+{{- printf "%s-tls-job-sa" (include "lightbridge-authz.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+
+{{- define "lightbridge-authz.tlsJobRoleName" -}}
+{{- if .Values.tls.job.role.name }}
+{{- .Values.tls.job.role.name }}
+{{- else }}
+{{- printf "%s-tls-job-role" (include "lightbridge-authz.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+
+{{- define "lightbridge-authz.tlsJobRoleBindingName" -}}
+{{- printf "%s-tls-job-rolebinding" (include "lightbridge-authz.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{- define "lightbridge-authz.useKnative" -}}
+{{- .Capabilities.APIVersions.Has "serving.knative.dev/v1" -}}
+{{- end }}
+
+{{- define "lightbridge-authz.shouldUseKnative" -}}
+{{- and (include "lightbridge-authz.useKnative" .) .Values.knative.enabled -}}
+{{- end }}
+
+{{- define "lightbridge-authz.mergeEnv" -}}
+{{- $configPath := .configPath -}}
+{{- $configFile := .configFile -}}
+{{- $extra := .extra -}}
+{{- $default := list (dict "name" "CONFIG_PATH" "value" (printf "%s/%s" $configPath $configFile)) -}}
+{{- $envList := $default -}}
+{{- if $extra -}}
+  {{- if kindIs "slice" $extra -}}
+    {{- range $item := $extra -}}
+      {{- $envList = append $envList $item -}}
+    {{- end -}}
+  {{- else if kindIs "map" $extra -}}
+    {{- range $name, $value := $extra -}}
+      {{- $entry := dict "name" $name -}}
+      {{- if kindIs "map" $value -}}
+        {{- $entry = merge $entry $value -}}
+      {{- else -}}
+        {{- $entry = merge $entry (dict "value" $value) -}}
+      {{- end -}}
+      {{- $envList = append $envList $entry -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- $envList -}}
+{{- end }}
+
+{{- define "lightbridge-authz.migrateJobImage" -}}
+{{- $jobImage := .Values.migrateJob.image -}}
+{{- $repository := default .Values.image.repository $jobImage.repository -}}
+{{- $tag := default (default .Values.image.tag .Chart.AppVersion) $jobImage.tag -}}
+{{- printf "%s:%s" $repository $tag -}}
+{{- end }}
+
+{{- define "lightbridge-authz.migrateJobPullPolicy" -}}
+{{- default .Values.image.pullPolicy .Values.migrateJob.image.pullPolicy -}}
 {{- end }}

@@ -11,16 +11,23 @@ cuid.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
 serde_json.workspace = true
+regex.workspace = true
 chrono.workspace = true
-diesel-async.workspace = true
-rand_core.workspace = true
+sqlx.workspace = true
+sha2.workspace = true
+hex.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum = { workspace = true, optional = true }
-diesel = { workspace = true, optional = true }
+utoipa.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
 
 [features]
 default = []
 axum = ["dep:axum"]
-db = ["diesel"]

@@ -1,39 +1,38 @@
 use crate::config::Database;
-use crate::error::{Error, Result};
-use anyhow::anyhow;
-use diesel_async::AsyncPgConnection;
-use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use diesel_async::pooled_connection::bb8::{Pool, PooledConnection};
+use crate::error::Result;
+use sqlx::{PgPool, postgres::PgPoolOptions};
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct DbPool {
-    pool: Pool<AsyncPgConnection>,
+    pool: PgPool,
 }
 
 #[crate::async_trait]
 pub trait DbPoolTrait: Send + Sync + std::fmt::Debug {
-    async fn get(&self) -> Result<PooledConnection<'_, AsyncPgConnection>>;
+    fn pool(&self) -> &PgPool;
 }
 
 impl DbPool {
-    pub async fn new(database: &Database) -> Result<Self> {
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database.url);
-        let max_size = database.pool_size.unwrap_or(10);
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
+    }
 
-        let pool = Pool::builder()
-            .max_size(max_size) // Increase maximum connections
-            .min_idle(Some(5)) // Maintain minimum idle connections
-            .connection_timeout(std::time::Duration::from_secs(30)) // Increase connection timeout
-            .build(manager)
-            .await
-            .map_err(anyhow::Error::from)?;
+    pub async fn new(database: &Database) -> Result<Self> {
+        let max_size = database.pool_size.unwrap_or(10);
+        let pool = PgPoolOptions::new()
+            .max_connections(max_size)
+            .min_connections(5)
+            .acquire_timeout(Duration::from_secs(30))
+            .connect(&database.url)
+            .await?;
         Ok(Self { pool })
     }
 }
 
 #[crate::async_trait]
 impl DbPoolTrait for DbPool {
-    async fn get(&self) -> Result<PooledConnection<'_, AsyncPgConnection>> {
-        self.pool.get().await.map_err(|e| Error::Any(anyhow!(e)))
+    fn pool(&self) -> &PgPool {
+        &self.pool
     }
 }

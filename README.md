@@ -1,116 +1,141 @@
 # Lightbridge Authz
 
-Lightbridge Authz is a modular authorization and API-key validation service with pluggable transports (REST and gRPC), a shared core library for configuration, persistence, and errors, and a CLI to run servers and perform basic checks.
+Lightbridge Authz is a two‑API service for managing API keys with OAuth2‑secured CRUD and an Authorino/OPA validation interface. Both servers use TLS, share the same database, and share the same migrations.
 
-- Workspace layout is defined in [Cargo.toml](Cargo.toml:1).
-- Core exports are in [crates/lightbridge-authz-core/src/lib.rs](crates/lightbridge-authz-core/src/lib.rs:1).
-- REST server entry point is [start_rest_server()](crates/lightbridge-authz-rest/src/lib.rs:4).
-- gRPC server entry point is [start_grpc_server()](crates/lightbridge-authz-grpc/src/lib.rs:19).
-- CLI entry is [main()](crates/lightbridge-authz-cli/src/main.rs:37), with subcommands declared at [enum Commands](crates/lightbridge-authz-cli/src/main.rs:11).
+## Services
 
-## Why?
+- **authz-api** (frontend CRUD, OAuth2)
+  - TLS on `:3000` inside the container, exposed as `:13000` via compose.
+  - Public routes: `GET /` and `GET /health`
+  - Protected routes under `/api/v1` (OAuth2 bearer token).
+- **authz-opa** (Authorino, basic auth)
+  - TLS on `:3001` inside the container, exposed as `:13001` via compose.
+  - `POST /v1/opa/validate` (basic auth).
+- **authz-migrate**
+  - Runs SQL migrations before the API services start.
+- **postgresql**, **keycloak**, **adminer**, **authz-tls**
 
-- Centralize API key validation and authorization logic behind a transport-agnostic core.
-- Provide REST and gRPC frontends for flexible integration.
-- Use a single YAML config to keep deployments simple and reproducible.
+## Quick start (Docker Compose)
 
-## Actual
+```bash
+just up
+```
 
-- Core library exposes config loading, error types, DB primitives, and API key models, see re-exports in [lib.rs](crates/lightbridge-authz-core/src/lib.rs:7).
-- REST and gRPC crates currently expose async server start functions: [start_rest_server()](crates/lightbridge-authz-rest/src/lib.rs:4) and [start_grpc_server()](crates/lightbridge-authz-grpc/src/lib.rs:19). They are placeholders ready for wiring.
-- CLI parses commands and flags using clap, see [Cli](crates/lightbridge-authz-cli/src/main.rs:6), [Commands](crates/lightbridge-authz-cli/src/main.rs:11), and [main()](crates/lightbridge-authz-cli/src/main.rs:37).
-- Configuration lives in [config/default.yaml](config/default.yaml:1).
+Verify health:
 
-## Constraints
+```bash
+curl -k https://localhost:13000/health
+curl -k https://localhost:13001/health
+```
 
-- Rust 2024 edition (workspace-wide).
-- Single-source configuration via YAML files.
-- Error handling centralized in core; prefer using the core Result and Error.
-- Avoid putting too much logic in one file; favor small, focused modules.
-
-## Installation
-
-- Prerequisites:
-  - Rust stable toolchain.
-  - PostgreSQL (if using the database features).
-- Clone the repo and build:
-  - cargo build
-  - cargo test
-- Optional: set DATABASE_URL if different from the YAML configuration.
-
-Workspace crates are listed in [Cargo.toml](Cargo.toml:2).
-
-## Usage
-
-- Prepare a config file patterned after [config/default.yaml](config/default.yaml:1).
-
-Example run commands (CLI parsing defined at [crates/lightbridge-authz-cli/src/main.rs](crates/lightbridge-authz-cli/src/main.rs:1)):
-
-- Run REST server (placeholder implementation):
-  - cargo run -p lightbridge-authz-cli -- serve --config ./config/default.yaml --rest
-- Run gRPC server (placeholder implementation):
-  - cargo run -p lightbridge-authz-cli -- serve --config ./config/default.yaml --grpc
-- Validate config:
-  - cargo run -p lightbridge-authz-cli -- config --config ./config/default.yaml --check_config
-- Client health (transport argument parsed at [transport](crates/lightbridge-authz-cli/src/main.rs:30) and health flag at [health](crates/lightbridge-authz-cli/src/main.rs:33)):
-  - cargo run -p lightbridge-authz-cli -- client --config ./config/default.yaml --transport rest --health
-
-## API Documentation
-
-Current status: REST and gRPC servers are scaffolds.
-
-- REST:
-  - Entrypoint: [start_rest_server()](crates/lightbridge-authz-rest/src/lib.rs:4).
-  - Planned endpoints:
-    - POST /v1/keys/validate: Validate an API key.
-    - GET /health: Health check.
-- gRPC:
-  - Entrypoint: [start_grpc_server()](crates/lightbridge-authz-grpc/src/lib.rs:19).
-  - Planned services:
-    - Authz.ValidateKey: Validate an API key.
-    - Health.Check: Health check.
-
-Proto definitions will live under the proto crate (see [crates/lightbridge-authz-proto](crates/lightbridge-authz-proto/src/lib.rs:1) and build script [build.rs](crates/lightbridge-authz-proto/build.rs:1)).
+`-k` is required because the certs are self‑signed.
 
 ## Configuration
 
-Base config example: [config/default.yaml](config/default.yaml:1)
+Default container config is mounted from `.docker/authz/container.yaml`:
 
-- server.grpc.address: string IP to bind, see [address](config/default.yaml:4).
-- server.grpc.port: numeric port, see [port](config/default.yaml:5).
-- logging.level: log level string, see [level](config/default.yaml:7).
-- auth.api_keys: list of allowed API keys, see [api_keys](config/default.yaml:9).
-- database.url: Postgres connection string, see [url](config/default.yaml:13).
+- API TLS: `/tls/api.crt` + `/tls/api.key`
+- OPA TLS: `/tls/opa.crt` + `/tls/opa.key`
+- OPA basic auth: `authorino / change-me`
+- OAuth2 JWKS: `http://keycloak:9100/realms/dev/protocol/openid-connect/certs`
 
-Core config loader is exposed from [load_from_path()](crates/lightbridge-authz-core/src/lib.rs:8) and [Config](crates/lightbridge-authz-core/src/lib.rs:8).
+## Helm deployment
 
-## Development
+- Install the `charts/lightbridge` umbrella chart—the shared `global.config` block is rendered into a single config map (`global.configMapName`, defaults to `lightbridge-authz-config`) that both `lightbridge-api` and `lightbridge-opa` mount at `/etc/lightbridge/config.yaml`. Use YAML anchors (see `charts/lightbridge/values.yaml`) to keep the base `logging`, `database`, `oauth2`, and `server` sections in sync while overriding the API/OPA ports or service-specific knobs.
+- The same umbrella chart also owns the TLS secret (`global.tlsSecretName`, defaults to `lightbridge-authz-tls`) via a pre-install/pre-upgrade `global-tls` job. The job skips generation if the secret already exists, so reruns are safe; disable it (e.g., when cert-manager manages certs) with `--set global.tls.job.enabled=false`.
+- Every dependency still renders its own hooks locally, but the umbrella chart disables the per-service TLS job/configmap so the shared resources are reused. Each `lightbridge-authz` release now also has a pre-install/pre-upgrade `migrate` job that writes the templated config to `/tmp/lightbridge-config/config.yaml` and runs `lightbridge-authz migrate --config-path ...`, keeping the schema ready before the servers start.
+- Override TLS paths, service types, image tags, etc., via the per-release `lightbridge-api` and `lightbridge-opa` value blocks; for example, bump `lightbridge-api.service.type` to `LoadBalancer` or tweak `lightbridge-opa.image.tag` while relying on the shared `global.config`.
+- Validate the charts before deployment with `helm lint charts/lightbridge-authz` and `helm lint charts/lightbridge`. You can preview the combined output (config map, TLS secret job, migrations job, and services) with `helm template charts/lightbridge`. After installing, run `helm test <release>` to exercise the `lightbridge-authz` test pod that hits the rendered service port.
 
-- Primary crates:
-  - Core: [crates/lightbridge-authz-core](crates/lightbridge-authz-core/src/lib.rs:1)
-  - REST: [crates/lightbridge-authz-rest](crates/lightbridge-authz-rest/src/lib.rs:1)
-  - gRPC: [crates/lightbridge-authz-grpc](crates/lightbridge-authz-grpc/src/lib.rs:1)
-  - CLI: [crates/lightbridge-authz-cli](crates/lightbridge-authz-cli/src/main.rs:1)
-  - API facade: [crates/lightbridge-authz-api](crates/lightbridge-authz-api/src/lib.rs:1)
-  - Proto: [crates/lightbridge-authz-proto](crates/lightbridge-authz-proto/src/lib.rs:1)
 
-- Testing:
-  - Integration tests live in tests/ folders like [crates/lightbridge-authz-rest/tests/api_tests.rs](crates/lightbridge-authz-rest/tests/api_tests.rs:1).
-  - Run all: cargo test
+## API overview
 
-- Logging:
-  - Provided by tracing; level set via config [logging.level](config/default.yaml:7).
+**CRUD API (OAuth2, `/api/v1`)**
+- Accounts: `POST/GET /accounts`, `GET/PATCH/DELETE /accounts/{account_id}`
+- Projects: `POST/GET /accounts/{account_id}/projects`, `GET/PATCH/DELETE /projects/{project_id}`
+- API keys: `POST/GET /projects/{project_id}/api-keys`, `GET/PATCH/DELETE /api-keys/{key_id}`
+- Lifecycle: `POST /api-keys/{key_id}/revoke`, `POST /api-keys/{key_id}/rotate`
+- OpenAPI docs: `https://localhost:13000/api/v1/docs`
 
-## Contributing
+**OPA API (Basic Auth)**
+- `POST /v1/opa/validate`
+- `POST /v1/authorino/validate` (supports dynamic metadata passthrough/enrichment)
+- OpenAPI docs: `https://localhost:13001/v1/opa/docs`
 
-- Fork and create a feature branch.
-- Ensure rustfmt and clippy pass.
-- Add tests in the respective crate's tests/ directory.
-- Open a PR with a clear description and link relevant code areas:
-  - Core changes around [Error, Result](crates/lightbridge-authz-core/src/lib.rs:9).
-  - CLI surface at [Commands](crates/lightbridge-authz-cli/src/main.rs:11).
-  - REST/gRPC servers at [start_rest_server()](crates/lightbridge-authz-rest/src/lib.rs:4) and [start_grpc_server()](crates/lightbridge-authz-grpc/src/lib.rs:19).
+Use this endpoint from Authorino’s OPA external authz policy to validate API keys; send the presented API key and optional client IP.
 
-## License
+Example:
 
-No LICENSE file found in the repository at this time. Add a LICENSE file (e.g., MIT, Apache-2.0) at the repo root and reference it here once chosen.
+```bash
+curl -k -u authorino:change-me \
+  https://localhost:13001/v1/opa/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"api_key":"<plain_api_key>","ip":"203.0.113.10"}'
+```
+
+Authorino-oriented example with metadata:
+
+```bash
+curl -k -u authorino:change-me \
+  https://localhost:13001/v1/authorino/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"api_key":"<plain_api_key>","ip":"203.0.113.10","metadata":{"tenant":"acme"}}'
+```
+
+Detailed usage + integration test guide:
+- `docs/authorino-usage.md`
+
+## Testing with Keycloak (OAuth2)
+
+Keycloak is preloaded with:
+- Realm: `dev`
+- User: `test@admin` / `test` (email-as-username)
+- Client: `test-client` (public)
+
+### Option A: Enable direct access grants (recommended for quick local testing)
+
+1. Open Keycloak admin: `http://localhost:9100`  
+   Admin user: `admin` / `password`
+2. Realm `dev` → Clients → `test-client`
+3. Enable **Direct Access Grants** and save.
+
+If you see `{"error":"invalid_request","error_description":"HTTPS required"}`, set the realm SSL requirement to `none` (realm `dev` → Realm Settings → SSL Required), or run:
+
+```bash
+docker compose exec keycloak /opt/keycloak/bin/kcadm.sh update realms/dev -s sslRequired=none
+```
+
+Then fetch a token:
+
+```bash
+curl -s -X POST 'http://localhost:9100/realms/dev/protocol/openid-connect/token' \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'grant_type=password' \
+  -d 'client_id=test-client' \
+  -d 'username=test@admin' \
+  -d 'password=test'
+```
+
+Use the `access_token`:
+
+```bash
+curl -k https://localhost:13000/api/v1/accounts \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"billing_identity":"acme","owners_admins":["test@admin"]}'
+```
+
+### Option B: Use authorization code flow
+
+If you prefer not to enable direct access grants, configure a redirect URI in Keycloak and follow the standard authorization code flow to obtain an access token.
+
+## Justfile shortcuts
+
+```bash
+just build
+just up
+just up-no-build
+just logs-api
+just logs-opa
+just migrate
+```

@@ -10,5 +10,5 @@ authors.workspace = true
 axum.workspace = true
 lightbridge-authz-core = { workspace = true, features = ["axum"] }
 tracing.workspace = true
-diesel = { workspace = true, features = ["postgres"] }
 lightbridge-authz-bearer = { workspace = true }
+utoipa.workspace = true

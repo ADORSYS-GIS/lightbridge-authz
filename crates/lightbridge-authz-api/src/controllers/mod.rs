@@ -1,5 +1,3 @@
-pub mod create;
-pub mod delete;
-pub mod get;
-pub mod list;
-pub mod patch;
+pub mod accounts;
+pub mod api_keys;
+pub mod projects;

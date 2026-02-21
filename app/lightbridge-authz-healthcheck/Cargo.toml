@@ -1,0 +1,10 @@
+[package]
+name = "lightbridge-authz-healthcheck"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+clap.workspace = true

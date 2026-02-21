@@ -1,13 +1,78 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::HashMap;
 use std::fmt::Display;
+use utoipa::ToSchema;
 
 const ACTIVE: &str = "active";
-const REVOKED: &str = "REVOKED";
+const REVOKED: &str = "revoked";
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default, PartialEq, Eq)]
+pub struct DefaultLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests_per_second: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests_per_day: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrent_requests: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct Account {
+    pub id: String,
+    pub billing_identity: String,
+    #[serde(default)]
+    pub owners_admins: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateAccount {
+    pub billing_identity: String,
+    #[serde(default)]
+    pub owners_admins: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpdateAccount {
+    pub billing_identity: Option<String>,
+    pub owners_admins: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct Project {
+    pub id: String,
+    pub account_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
+    #[serde(default)]
+    pub default_limits: Option<DefaultLimits>,
+    pub billing_plan: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateProject {
+    pub name: String,
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
+    #[serde(default)]
+    pub default_limits: Option<DefaultLimits>,
+    pub billing_plan: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpdateProject {
+    pub name: Option<String>,
+    pub allowed_models: Option<Option<Vec<String>>>,
+    pub default_limits: Option<DefaultLimits>,
+    pub billing_plan: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
 pub enum ApiKeyStatus {
     #[default]
     Active,
@@ -33,61 +98,43 @@ impl From<String> for ApiKeyStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateApiKey {
-    pub expires_at: Option<DateTime<Utc>>,
-    pub metadata: Option<Value>,
-    pub acl: Option<Acl>, // Add ACL to CreateApiKey
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PatchApiKey {
-    pub expires_at: Option<DateTime<Utc>>,
-    pub metadata: Option<Value>,
-    pub status: Option<ApiKeyStatus>,
-    pub acl: Option<Acl>, // Add ACL to PatchApiKey
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiKey {
     pub id: String,
-    pub user_id: String,
+    pub project_id: String,
+    pub name: String,
+    pub key_prefix: String,
+    #[serde(skip_serializing)]
     pub key_hash: String,
-    pub created_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
-    pub metadata: Option<Value>,
     pub status: ApiKeyStatus,
-    pub acl: Acl,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub last_ip: Option<String>,
+    pub revoked_at: Option<DateTime<Utc>>,
 }
 
-/// Defines the Access Control List (ACL) for an API Key.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Acl {
-    /// A list of models that the API Key is allowed to access.
-    #[serde(default)]
-    pub allowed_models: Vec<String>,
-    /// A map of model names to their respective token limits.
-    #[serde(default)]
-    pub tokens_per_model: HashMap<String, u64>,
-    /// The rate-limiting configuration for the API Key.
-    #[serde(default)]
-    pub rate_limit: RateLimit,
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateApiKey {
+    pub name: String,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
-/// Configures rate-limiting for an API Key.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RateLimit {
-    /// The number of allowed requests per window.
-    pub requests: u32,
-    /// The time window in seconds.
-    pub window_seconds: u32,
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpdateApiKey {
+    pub name: Option<String>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
-impl Default for RateLimit {
-    fn default() -> Self {
-        Self {
-            requests: 1000,       // Default to 1000 requests
-            window_seconds: 3600, // Default to 1 hour
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RotateApiKey {
+    pub name: Option<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub grace_period_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ApiKeySecret {
+    pub api_key: ApiKey,
+    pub secret: String,
 }

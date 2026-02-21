@@ -7,13 +7,24 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true
-diesel.workspace = true
-diesel-async.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
 tracing.workspace = true
 
 [dependencies.lightbridge-authz-core]
 workspace = true
-features = ["db"]
+
+[features]
+it-tests = []
+
+[[test]]
+name = "rotate_transaction_tests"
+path = "tests/rotate_transaction_tests.rs"
+required-features = ["it-tests"]
+
+[[test]]
+name = "project_limits_tests"
+path = "tests/project_limits_tests.rs"
+required-features = ["it-tests"]
