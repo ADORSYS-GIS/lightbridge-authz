@@ -212,11 +212,11 @@ These tests include:
 - Authorino endpoint dynamic metadata passthrough + enrichment.
 - OpenAPI checks ensuring the Authorino endpoint/schemas are published.
 
-### Persistence Tests
+### Persistence tests (it-tests)
 
-Database persistence tests (e.g., project limits) use `sqlx::test` with automatic migrations. Ensure `DATABASE_URL` is set to a running Postgres instance.
+The Postgres-backed `lightbridge-authz-api-key` tests (rotate/limits) are now guarded by the `it-tests` feature so they only compile/run when requested. This keeps the default `cargo test` free of database setup, and lets us treat these as Docker-backed integration tests.
 
-- `cargo test -p lightbridge-authz-api-key --test project_limits_tests`
+Run them with `just it-tests`, which brings up the `postgresql` service, waits a moment, then sets `DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"` before invoking the crate tests with `--features it-tests`. These tests exercise the migrations under `sqlx::test`.
 
 ### Load Tests
 

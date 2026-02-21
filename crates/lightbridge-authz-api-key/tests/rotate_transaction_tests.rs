@@ -1,3 +1,5 @@
+#![cfg(feature = "it-tests")]
+
 use chrono::Utc;
 use lightbridge_authz_api_key::entities::new_api_key_row::NewApiKeyRow;
 use lightbridge_authz_api_key::repo::StoreRepo;

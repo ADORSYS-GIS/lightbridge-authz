@@ -119,6 +119,12 @@ load-test:
 	@# For now, we'll assume the user might have run the test-protocol or we'll use a default.
 	cargo test -p lightbridge-authz-rest --features load-tests --test load_tests -- --host https://localhost:13001 -u 10 -r 2 -t 30s --accept-invalid-certs
 
+# Run database-backed integration tests
+it-tests:
+	docker compose -p lightbridge-authz -f compose.yaml up -d postgresql
+	@sleep 3
+	DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz" cargo test -p lightbridge-authz-api-key --features it-tests --test rotate_transaction_tests --test project_limits_tests
+
 all-checks:
 	@echo "Running Rust formatting, lint, and checks"
 	cargo fmt

@@ -15,3 +15,16 @@ tracing.workspace = true
 
 [dependencies.lightbridge-authz-core]
 workspace = true
+
+[features]
+it-tests = []
+
+[[test]]
+name = "rotate_transaction_tests"
+path = "tests/rotate_transaction_tests.rs"
+required-features = ["it-tests"]
+
+[[test]]
+name = "project_limits_tests"
+path = "tests/project_limits_tests.rs"
+required-features = ["it-tests"]
