@@ -118,3 +118,10 @@ load-test:
 	@# or we can try to extract one from the DB if it exists.
 	@# For now, we'll assume the user might have run the test-protocol or we'll use a default.
 	cargo test -p lightbridge-authz-rest --test load_tests -- --host https://localhost:13001 -u 10 -r 2 -t 30s --accept-invalid-certs
+
+all-checks:
+	@echo "Running Rust formatting, lint, and checks"
+	cargo fmt
+	cargo fix --allow-dirty
+	cargo clippy --all-targets --all-features --fix --allow-dirty -- -D warnings
+	cargo check --all-targets --all-features

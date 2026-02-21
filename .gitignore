@@ -8,3 +8,4 @@ charts/*/charts
 
 __pycache__
 tls
+!.roo/rules/AGENTS.md

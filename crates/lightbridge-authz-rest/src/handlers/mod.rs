@@ -4,7 +4,7 @@ pub mod opa;
 use std::sync::Arc;
 
 use base64::Engine;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use getrandom::fill;
 use lightbridge_authz_api::contract::AuthzStore;
 use lightbridge_authz_api_key::repo::StoreRepo;
@@ -51,6 +51,13 @@ impl AuthzStoreImpl {
             secret.chars().take(8).collect()
         }
     }
+}
+
+fn resolve_rotated_expires_at(
+    input: Option<DateTime<Utc>>,
+    existing: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    input.or(existing)
 }
 
 #[async_trait]
@@ -214,6 +221,7 @@ impl AuthzStore for AuthzStoreImpl {
         let secret = Self::generate_secret()?;
         let key_hash = hash_api_key(&secret);
         let key_prefix = Self::key_prefix(&secret);
+        let expires_at = resolve_rotated_expires_at(input.expires_at, existing.expires_at);
         let row = lightbridge_authz_api_key::entities::new_api_key_row::NewApiKeyRow {
             id: cuid2(),
             project_id: existing.project_id,
@@ -221,7 +229,7 @@ impl AuthzStore for AuthzStoreImpl {
             key_prefix,
             key_hash,
             created_at: now,
-            expires_at: input.expires_at,
+            expires_at,
             status: ApiKeyStatus::Active.to_string(),
             last_used_at: None,
             last_ip: None,
@@ -229,5 +237,37 @@ impl AuthzStore for AuthzStoreImpl {
         };
         let api_key = self.repo.create_api_key(subject, row).await?;
         Ok(ApiKeySecret { api_key, secret })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_rotated_expires_at;
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn rotate_defaults_to_existing_expiry_when_missing() {
+        let existing_expiry = Utc::now() + Duration::minutes(5);
+        assert_eq!(
+            resolve_rotated_expires_at(None, Some(existing_expiry)),
+            Some(existing_expiry)
+        );
+    }
+
+    #[test]
+    fn rotate_prefers_input_expiry_when_provided() {
+        let base_time = Utc::now();
+        let existing_expiry = base_time + Duration::minutes(5);
+        let input_expiry = base_time + Duration::minutes(10);
+
+        assert_eq!(
+            resolve_rotated_expires_at(Some(input_expiry), Some(existing_expiry)),
+            Some(input_expiry)
+        );
+    }
+
+    #[test]
+    fn rotate_returns_none_when_no_expiry() {
+        assert_eq!(resolve_rotated_expires_at(None, None), None);
     }
 }
