@@ -17,18 +17,22 @@ keywords:
   - api
 sources:
   - https://github.com/ADORSYS-GIS/lightbridge-authz
-tags: "authz, oauth2, opa, tls, postgres, api"
-
 
 dependencies:
   - name: lightbridge-authz
     version: "*"
     repository: "file://../lightbridge-authz"
     alias: api
-    condition: lightbridge-api.enabled
+    condition: api.enabled
 
   - name: lightbridge-authz
     version: "*"
     repository: "file://../lightbridge-authz"
     alias: opa
-    condition: lightbridge-opa.enabled
+    condition: opa.enabled
+
+  - name: lightbridge-migrate
+    version: "*"
+    repository: "file://../lightbridge-migrate"
+    alias: migration
+    condition: migration.enabled

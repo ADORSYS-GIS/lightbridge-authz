@@ -44,18 +44,18 @@ global:
       restartPolicy: OnFailure
       backoffLimit: 3
       ttlSecondsAfterFinished: 300
-      annotations: {}
-      labels: {}
+      annotations: { }
+      labels: { }
       serviceAccount:
         create: true
-        name: 
+        name:
         automount: true
       role:
         create: true
-        name: 
+        name:
       addKubectlOpenssl: true
 
-lightbridge-api:
+api:
   enabled: true
   config: *sharedConfig
   controllers:
@@ -74,7 +74,7 @@ lightbridge-api:
   service:
     port: 3000
 
-lightbridge-opa:
+opa:
   enabled: true
   config: *sharedConfig
   controllers:
@@ -92,3 +92,18 @@ lightbridge-opa:
       enabled: false
   service:
     port: 3000
+
+migration:
+  enabled: true
+  image:
+    repository: lightbridge-authz
+    tag: 0.5.0
+    pullPolicy: IfNotPresent
+  configMapName: lightbridge-authz-config
+  command:
+    - lightbridge-authz
+    - migrate
+    - "--config-path"
+    - /tmp/lightbridge-config/config.yaml
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300

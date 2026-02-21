@@ -79,6 +79,14 @@ Since the API and OPA workloads are never deployed together in this guide, we ke
   kubectl create secret generic lightbridge-lightbridge-opa-secrets ...
   ```
 
+Each controller alias (`api` and `opa`) ends up with three supporting resources so secrets/config can be rotated independently:
+
+1. `<release>-lightbridge-<alias>-config` is the ConfigMap rendered from `sharedConfig`/`global.config` and mounted as `/etc/lightbridge/config.yaml`.
+2. `<release>-lightbridge-<alias>-secrets` keeps `DATABASE_URL` plus `OPA_PASSWORD` (mounted with `secretKeyRef` to avoid baking credentials into the ConfigMap).
+3. `<release>-lightbridge-<alias>-tls` holds the TLS cert/key pair written by the umbrella hook job or supplied by cert-manager so each pod can mount `/etc/lightbridge/tls`.
+
+Because those names are derived from the same `bjw-s/common` fullname helper, the Linux instructions above intentionally create the config map and the `-secrets` secret with matching release aliases (`lightbridge-lightbridge-api-*` and `lightbridge-lightbridge-opa-*`), while the TLS job produces `lightbridge-lightbridge-api-tls` and `lightbridge-lightbridge-opa-tls`.
+
 ## Windows/WSL (deploy)
 
 - Run Helm with overrides for the shared config, ingresses, and the injected `CONFIG_PATH` env var so the CLI knows where to read `/etc/lightbridge/config.yaml`:
@@ -105,6 +113,12 @@ Since the API and OPA workloads are never deployed together in this guide, we ke
 - Monitor the workloads with `kubectl get pods` and `kubectl logs` to ensure both `lightbridge-lightbridge-api` and `lightbridge-lightbridge-opa` transition to `Running`. If TLS certs, secrets, or the config map change, delete the pods so new ones mount the updated assets.
 
 With this file you have a repeatable recipe per platform: macOS for installing chart prerequisites, Linux for configuring the shared YAML/secrets, and Windows/WSL for deploying the Helm release that wires everything into `/etc/lightbridge` volumes.
+
+## Migration job
+
+The umbrella also wires a `migration` dependency (`charts/lightbridge-migrate`, aliased as `migration`) that renders a pre-install/pre-upgrade job running `lightbridge-authz migrate --config-path /tmp/lightbridge-config/config.yaml`. That job reuses the same config map and handshake secrets that the API/OPA subcharts consume, so schema migrations always run before new controllers spin up. `migration.enabled`, `migration.backoffLimit`, `migration.ttlSecondsAfterFinished`, and the image knobs under `migration.image` let you tune retries or run a different build, while the `bjw-s/common v4` loader takes care of creating the supporting config map/secret/job resources with the familiar naming helpers.
+
+Check `kubectl get jobs` or `kubectl logs` on the job whose name follows the migration subchart's fullname to confirm completion; if you ever disable the job (e.g., for manual migrations), rerun the migration binary yourself and re-enable the hook before the next upgrade so the database and API/OPA workloads stay in sync.
 
 ## TLS certificate generation paths
 
