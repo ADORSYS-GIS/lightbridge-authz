@@ -26,11 +26,16 @@ services:
         fi
         for tls_file in api.crt api.key opa.crt opa.key; do
           chmod 644 /tls/$tls_file
+          chown 65532:65532 /tls/$tls_file
           if [ -f /tls/$tls_file ]; then
             cp /tls/$tls_file /host_tls/$tls_file
             chmod 644 /host_tls/$tls_file
           fi
         done
+        chown -R 65532:65532 /tls
+        chmod 755 /tls
+        chown -R 65532:65532 /host_tls
+        chmod 755 /host_tls
     volumes:
       - "authz_tls:/tls"
       - "./config/tls:/host_tls"

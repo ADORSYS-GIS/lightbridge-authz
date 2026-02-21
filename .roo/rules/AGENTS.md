@@ -228,6 +228,8 @@ AUTHZ_API_KEY=<your-secret> just load-test
 
 These load tests live behind the `load-tests` feature of the `lightbridge-authz-rest` crate, so they are only built/executed when `just load-test` runs (it passes `--features load-tests --test load_tests`). This keeps them out of the regular `cargo test` runs.
 
+`just load-test` now also brings up the TLS generator, Postgres, migrations, and OPA services via `docker compose`, sleeps a few seconds for them to settle, and traps `docker compose ... down` so the stack is brought down once the load test completes (even on failure). That makes the load-test command self-contained in CI/CD and local usage alike.
+
 Findings:
 - The system handles ~600-1000 requests per second on a standard development machine with minimal latency (~10-20ms).
 - Telemetry (last used timestamp and IP) is correctly updated in the database during load.

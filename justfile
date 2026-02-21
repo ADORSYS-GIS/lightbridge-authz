@@ -113,11 +113,7 @@ stats:
 
 # Run load tests against the OPA endpoint
 load-test:
-	@echo "Starting load tests..."
-	@# We need a valid API key. For simplicity in this environment, we'll try to use one if provided via AUTHZ_API_KEY
-	@# or we can try to extract one from the DB if it exists.
-	@# For now, we'll assume the user might have run the test-protocol or we'll use a default.
-	cargo test -p lightbridge-authz-rest --features load-tests --test load_tests -- --host https://localhost:13001 -u 10 -r 2 -t 30s --accept-invalid-certs
+	@bash -ec 'set -euo pipefail; cmd="docker compose -p lightbridge-authz -f compose.yaml"; ${cmd} up -d authz-tls postgresql authz-migrate authz-opa; trap "${cmd} down authz-tls postgresql authz-migrate authz-opa" EXIT; sleep 5; cargo test -p lightbridge-authz-rest --features load-tests --test load_tests -- --host https://localhost:13001 -u 10 -r 2 -t 30s --accept-invalid-certs'
 
 # Run database-backed integration tests
 it-tests:
