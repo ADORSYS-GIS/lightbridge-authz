@@ -1,0 +1,53 @@
+name: Setup Docker
+description: Composite action that logs into GHCR, prepares buildx, and computes metadata.
+inputs:
+  app-version:
+    description: Version of the application
+    required: true
+  image-name:
+    description: Name of the image
+    required: true
+  registry:
+    description: Container registry
+    required: false
+    default: ghcr.io
+outputs:
+  annotations:
+    description: Labels
+    value: ${{ steps.meta.outputs.annotations }}
+  labels:
+    description: Labels
+    value: ${{ steps.meta.outputs.labels }}
+  tags:
+    description: Tags
+    value: ${{ steps.meta.outputs.tags }}
+runs:
+  using: composite
+  steps:
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3.12.0
+    - name: Authenticate to GHCR
+      uses: docker/login-action@v3.7.0
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3.7.0
+    - id: lowercase
+      name: Lowercase image name
+      uses: AsZc/change-string-case-action@ccb130a4e483d3e86287289183704dc9bf53e77e
+      with:
+        string: ${{ inputs.image-name }}
+    - name: Extract metadata (tags, labels) for Docker
+      id: meta
+      uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
+      with:
+        tags: |
+          type=raw,value=latest,enable={{is_default_branch}}
+          type=raw,value={{branch}}
+          type=raw,value=${{ inputs.app-version }}
+          type=schedule,pattern={{date 'YYYYMMDD-hhmmss' tz='Europe/Berlin'}}
+          type=sha,format=long
+          type=sha,format=long,prefix={{branch}}
+        images: ${{ inputs.registry }}/${{ steps.lowercase.outputs.lowercase }}

@@ -74,8 +74,6 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
       - uses: ./.github/actions/container-build
-        with:
-          ghcr-token: ${{ secrets.GITHUB_TOKEN }}
 
   release:
     needs: [build,container-build]
