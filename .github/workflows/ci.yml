@@ -103,6 +103,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@7c525be6cc8a882d5163ce04293cac18617c709f # v3.9.0
 
+      - name: Install just
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y just
+
       - name: Start Test Stack
         run: docker compose -f compose.yaml -f compose.it.yaml up -d
 
@@ -126,7 +131,7 @@ jobs:
           echo "Services are healthy!"
 
       - name: Run Integration Test Runner
-        run: docker compose -f compose.it.yaml run it-authorino
+        run: just it-authorino
 
       - name: Collect Logs on Failure
         if: failure()
@@ -135,7 +140,7 @@ jobs:
 
       - name: Shut Down Stack
         if: always()
-        run: docker compose -f compose.yaml -f compose.it.yaml down -v
+        run: just it-authorino-down
 
   build:
     name: Build
