@@ -16,6 +16,8 @@ jobs:
   publish-helm-charts:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
       - id: package
         uses: ./.github/actions/helm-package
         with:
