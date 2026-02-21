@@ -624,14 +624,6 @@ impl StoreRepo {
         revoked_at: Option<DateTime<Utc>>,
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<ApiKey> {
-        let changes = ApiKeyChangeset {
-            name: None,
-            expires_at,
-            status: Some(status.to_string()),
-            last_used_at: None,
-            last_ip: None,
-            revoked_at,
-        };
         let row: Option<ApiKeyRow> = sqlx::query_as(
             r#"
             UPDATE api_keys
@@ -649,14 +641,89 @@ impl StoreRepo {
               last_used_at, last_ip, revoked_at
             "#,
         )
-        .bind(changes.status)
-        .bind(changes.revoked_at)
-        .bind(changes.expires_at)
+        .bind(status.to_string())
+        .bind(revoked_at)
+        .bind(expires_at)
         .bind(key_id)
         .bind(subject)
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
+        Ok(Self::to_api_key(row))
+    }
+
+    #[instrument(skip(self))]
+    pub async fn rotate_api_key_transaction(
+        &self,
+        subject: &str,
+        key_id: &str,
+        status: ApiKeyStatus,
+        revoked_at: Option<DateTime<Utc>>,
+        expires_at: Option<DateTime<Utc>>,
+        new_key: NewApiKeyRow,
+    ) -> Result<ApiKey> {
+        let mut tx = self.pool().begin().await?;
+        let existing_update = sqlx::query_as::<_, ApiKeyRow>(
+            r#"
+            UPDATE api_keys
+            SET
+              status = $1,
+              revoked_at = COALESCE($2, revoked_at),
+              expires_at = COALESCE($3, expires_at)
+            FROM projects
+            JOIN accounts ON accounts.id = projects.account_id
+            WHERE api_keys.project_id = projects.id
+              AND api_keys.id = $4
+              AND accounts.owners_admins ? $5
+            RETURNING
+              id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
+              last_used_at, last_ip, revoked_at
+            "#,
+        )
+        .bind(status.to_string())
+        .bind(revoked_at)
+        .bind(expires_at)
+        .bind(key_id)
+        .bind(subject)
+        .fetch_optional(&mut *tx)
+        .await?;
+        existing_update.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
+        let new_row = sqlx::query_as::<_, ApiKeyRow>(
+            r#"
+            WITH project_auth AS (
+                SELECT projects.id
+                FROM projects
+                JOIN accounts ON accounts.id = projects.account_id
+                WHERE projects.id = $1
+                  AND accounts.owners_admins ? $2
+            )
+            INSERT INTO api_keys (
+              id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
+              last_used_at, last_ip, revoked_at
+            )
+            SELECT $3, project_auth.id, $4, $5, $6, $7, $8, $9, $10, $11, $12
+            FROM project_auth
+            RETURNING
+              id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
+              last_used_at, last_ip, revoked_at
+            "#,
+        )
+        .bind(new_key.project_id)
+        .bind(subject)
+        .bind(new_key.id)
+        .bind(new_key.name)
+        .bind(new_key.key_prefix)
+        .bind(new_key.key_hash)
+        .bind(new_key.created_at)
+        .bind(new_key.expires_at)
+        .bind(new_key.status)
+        .bind(new_key.last_used_at)
+        .bind(new_key.last_ip)
+        .bind(new_key.revoked_at)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let row = new_row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
+        tx.commit().await?;
         Ok(Self::to_api_key(row))
     }
 

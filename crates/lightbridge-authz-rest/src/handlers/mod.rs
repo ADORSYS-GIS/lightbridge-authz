@@ -201,22 +201,17 @@ impl AuthzStore for AuthzStoreImpl {
             .ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
 
         let now = Utc::now();
-        if let Some(grace) = input.grace_period_seconds.filter(|v| *v > 0) {
-            let grace_exp = now + Duration::seconds(grace);
-            let expires_at = match existing.expires_at {
-                Some(existing_exp) if existing_exp < grace_exp => Some(existing_exp),
-                _ => Some(grace_exp),
+        let (status, revoked_at, old_expires_at) =
+            if let Some(grace) = input.grace_period_seconds.filter(|v| *v > 0) {
+                let grace_exp = now + Duration::seconds(grace);
+                let expires_at = match existing.expires_at {
+                    Some(existing_exp) if existing_exp < grace_exp => Some(existing_exp),
+                    _ => Some(grace_exp),
+                };
+                (ApiKeyStatus::Active, None, expires_at)
+            } else {
+                (ApiKeyStatus::Revoked, Some(now), None)
             };
-            let _ = self
-                .repo
-                .set_api_key_status(subject, key_id, ApiKeyStatus::Active, None, expires_at)
-                .await?;
-        } else {
-            let _ = self
-                .repo
-                .set_api_key_status(subject, key_id, ApiKeyStatus::Revoked, Some(now), None)
-                .await?;
-        }
 
         let secret = Self::generate_secret()?;
         let key_hash = hash_api_key(&secret);
@@ -235,7 +230,10 @@ impl AuthzStore for AuthzStoreImpl {
             last_ip: None,
             revoked_at: None,
         };
-        let api_key = self.repo.create_api_key(subject, row).await?;
+        let api_key = self
+            .repo
+            .rotate_api_key_transaction(subject, key_id, status, revoked_at, old_expires_at, row)
+            .await?;
         Ok(ApiKeySecret { api_key, secret })
     }
 }
