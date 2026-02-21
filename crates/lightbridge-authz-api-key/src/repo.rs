@@ -478,7 +478,7 @@ impl StoreRepo {
         let row: Option<ApiKeyRow> = sqlx::query_as(
             r#"
             WITH project_auth AS (
-                SELECT projects.id
+                SELECT projects.id AS project_id
                 FROM projects
                 JOIN accounts ON accounts.id = projects.account_id
                 WHERE projects.id = $1
@@ -488,11 +488,11 @@ impl StoreRepo {
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
               last_used_at, last_ip, revoked_at
             )
-            SELECT $3, project_auth.id, $4, $5, $6, $7, $8, $9, $10, $11, $12
+            SELECT $3, project_auth.project_id, $4, $5, $6, $7, $8, $9, $10, $11, $12
             FROM project_auth
             RETURNING
-              id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, revoked_at
+              api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at
             "#,
         )
         .bind(input.project_id)
@@ -601,8 +601,8 @@ impl StoreRepo {
               AND api_keys.id = $3
               AND accounts.owners_admins ? $4
             RETURNING
-              id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, revoked_at
+              api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at
             "#,
         )
         .bind(changes.name)
@@ -637,8 +637,8 @@ impl StoreRepo {
               AND api_keys.id = $4
               AND accounts.owners_admins ? $5
             RETURNING
-              id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, revoked_at
+              api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at
             "#,
         )
         .bind(status.to_string())
@@ -676,8 +676,8 @@ impl StoreRepo {
               AND api_keys.id = $4
               AND accounts.owners_admins ? $5
             RETURNING
-              id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, revoked_at
+              api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at
             "#,
         )
         .bind(status.to_string())
@@ -691,7 +691,7 @@ impl StoreRepo {
         let new_row = sqlx::query_as::<_, ApiKeyRow>(
             r#"
             WITH project_auth AS (
-                SELECT projects.id
+                SELECT projects.id AS project_id
                 FROM projects
                 JOIN accounts ON accounts.id = projects.account_id
                 WHERE projects.id = $1
@@ -701,11 +701,11 @@ impl StoreRepo {
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
               last_used_at, last_ip, revoked_at
             )
-            SELECT $3, project_auth.id, $4, $5, $6, $7, $8, $9, $10, $11, $12
+            SELECT $3, project_auth.project_id, $4, $5, $6, $7, $8, $9, $10, $11, $12
             FROM project_auth
             RETURNING
-              id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, revoked_at
+              api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at
             "#,
         )
         .bind(new_key.project_id)
