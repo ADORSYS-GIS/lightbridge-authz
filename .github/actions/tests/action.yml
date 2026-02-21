@@ -1,0 +1,12 @@
+name: Workspace Tests
+inputs:
+  database-url:
+    description: Postgres connection string
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/rust-setup
+    - run: cargo test --workspace
+      env:
+        DATABASE_URL: ${{ inputs.database-url }}

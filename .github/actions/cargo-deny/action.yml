@@ -1,0 +1,10 @@
+name: Cargo Deny
+inputs:
+  check:
+    description: cargo-deny command to run
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/rust-setup
+    - run: cargo deny check ${{ inputs.check }}

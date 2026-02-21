@@ -1,0 +1,27 @@
+name: Helm Charts Publish
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - 'charts/**'
+      - '.github/workflows/helm-gh-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+
+jobs:
+  publish-helm-charts:
+    runs-on: ubuntu-latest
+    steps:
+      - id: package
+        uses: ./.github/actions/helm-package
+        with:
+          charts-root: charts
+          output-dir: artifacts/helm
+      - uses: ./.github/actions/gh-pages-deploy
+        with:
+          publish-dir: ${{ steps.package.outputs.packages-dir }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}

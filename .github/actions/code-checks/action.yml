@@ -1,0 +1,10 @@
+name: Code Checks
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/rust-setup
+      with:
+        components: clippy,rustfmt
+    - run: cargo check --all-targets --all-features
+    - run: cargo fmt -- --check
+    - run: cargo clippy --all-targets --all-features -- -D warnings

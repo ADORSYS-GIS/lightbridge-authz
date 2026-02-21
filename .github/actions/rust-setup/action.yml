@@ -1,0 +1,32 @@
+name: Rust Setup
+description: Checkout repository, install Rust, and cache dependencies.
+inputs:
+  components:
+    description: Comma-separated rustup components to install (clippy, rustfmt, etc.)
+    required: false
+    default: ''
+  toolchain:
+    description: Rust toolchain to install
+    required: false
+    default: stable
+runs:
+  using: composite
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
+
+    - name: Install Rust
+      if: ${{ inputs.components == '' }}
+      uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+      with:
+        toolchain: ${{ inputs.toolchain }}
+
+    - name: Install Rust (with components)
+      if: ${{ inputs.components != '' }}
+      uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@11da8522bc3856a8fbc565f1d1530989c793d67d

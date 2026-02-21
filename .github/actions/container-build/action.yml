@@ -1,0 +1,25 @@
+name: Container Build
+inputs:
+  ghcr-token:
+    description: Token for GHCR login
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: docker/setup-buildx-action@7c525be6cc8a882d5163ce04293cac18617c709f
+    - name: Log in to GHCR
+      uses: docker/login-action@75b1fe5f7d3de16775dd6d52ffa60a7185b595dd
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ inputs.ghcr-token }}
+    - name: Build and push image
+      uses: docker/build-push-action@d5c5c38c1a483ee1fc40b1079a1c41ef1f26d006
+      with:
+        context: .
+        file: Dockerfile
+        push: true
+        platforms: linux/amd64,linux/arm64
+        tags: |
+          ghcr.io/${{ github.repository_owner }}/lightbridge-authz:${{ github.sha }}
+          ghcr.io/${{ github.repository_owner }}/lightbridge-authz:latest

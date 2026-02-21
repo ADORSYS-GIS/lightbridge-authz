@@ -1,0 +1,24 @@
+name: Release Artifacts
+inputs:
+  github-token:
+    description: Token to publish release
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
+    - name: Download artifact
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+      with:
+        name: release-artifacts
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@e798e6a1ede8d07b74ac4cdac6bdfa4cc1653907
+      with:
+        tag_name: v${{ github.run_number }}
+        name: Release v${{ github.run_number }}
+        files: release-artifacts.tar.gz
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
