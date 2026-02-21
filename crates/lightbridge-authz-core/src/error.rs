@@ -36,10 +36,28 @@ pub enum Error {
 mod axum_impl {
     use super::Error;
     use axum::{http::StatusCode, response::IntoResponse};
+    use sqlx::error::{Error as SqlxError, ErrorKind};
+
+    fn sqlx_status_code(err: &SqlxError) -> StatusCode {
+        match err {
+            SqlxError::RowNotFound => StatusCode::NOT_FOUND,
+            SqlxError::PoolTimedOut | SqlxError::PoolClosed | SqlxError::WorkerCrashed => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            SqlxError::Database(db_err) => match db_err.kind() {
+                ErrorKind::UniqueViolation => StatusCode::CONFLICT,
+                ErrorKind::ForeignKeyViolation
+                | ErrorKind::NotNullViolation
+                | ErrorKind::CheckViolation => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            },
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
 
     impl IntoResponse for Error {
         fn into_response(self) -> axum::response::Response {
-            let status_code = match self {
+            let status_code = match &self {
                 Error::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::Yaml(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::NotFound => StatusCode::NOT_FOUND,
@@ -49,7 +67,7 @@ mod axum_impl {
                 Error::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::Server(_) => StatusCode::INTERNAL_SERVER_ERROR,
 
-                Error::SqlxError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                Error::SqlxError(err) => sqlx_status_code(err),
             };
 
             (status_code, self.to_string()).into_response()
