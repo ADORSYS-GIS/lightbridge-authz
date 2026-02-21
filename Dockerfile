@@ -20,7 +20,7 @@ COPY migrations/ ./migrations/
 # Build dependencies (this is cached if dependencies don't change)
 RUN cargo build --profile prod --locked
 
-FROM debian:12 as dep
+FROM debian:13 as dep
 
 RUN rm -f /etc/apt/apt.conf.d/docker-clean; echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
 
