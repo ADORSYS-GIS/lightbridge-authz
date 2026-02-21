@@ -24,11 +24,11 @@ dependencies:
   - name: lightbridge-authz
     version: "*"
     repository: "file://../lightbridge-authz"
-    alias: lightbridge-api
+    alias: api
     condition: lightbridge-api.enabled
 
   - name: lightbridge-authz
     version: "*"
     repository: "file://../lightbridge-authz"
-    alias: lightbridge-opa
+    alias: opa
     condition: lightbridge-opa.enabled

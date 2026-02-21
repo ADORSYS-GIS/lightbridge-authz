@@ -8,16 +8,20 @@ controllers:
         image:
           repository: lightbridge-authz
           tag: 0.5.0
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
         env:
           DATABASE_URL:
             valueFrom:
               secretKeyRef:
-                name: '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}-secrets'
+                identifier: secret
                 key: DATABASE_URL
           OPA_PASSWORD:
             valueFrom:
               secretKeyRef:
-                name: '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}-secrets'
+                identifier: secret
                 key: OPA_PASSWORD
 
 configMaps:
@@ -50,7 +54,7 @@ configMaps:
               password: "${OPA_PASSWORD}"
 
 secrets:
-  secrets:
+  secret:
     enabled: true
     stringData:
       DATABASE_URL: postgres://postgres:postgres@postgresql:5432/lightbridge_authz

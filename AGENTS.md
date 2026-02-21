@@ -298,3 +298,17 @@ In Compose, `authz-migrate` runs before API/OPA start.
 - Overview and quickstart: `README.md`
 - Manual end-to-end protocol (OAuth2 + OPA): `docs/test-protocol.md`
 - Authorino endpoint usage + integration test: `docs/authorino-usage.md`
+
+## Helm / deployment notes
+
+- The umbrella chart (`charts/lightbridge`) now documents per-platform install/config/deploy commands in `docs/platform-guides.md`, including:
+  * Two documented TLS certificate flows (built-in `global.tls.job` + cert-manager) and the Ubuntu `curl` smoke test against `https://lightbridge-lightbridge-api.default.svc.cluster.local:3000/health` when cert-manager owns the `lightbridge-authz-tls` secret.
+  * Shared `3000` ports for both API and OPA because we never deploy them together in these guides, and instructions for keeping API ingress enabled while OPA stays internal-only.
+  * Manual TLS generation is noted as optional because the chart's hook already creates service-FQDN certs, but the hook can be disabled when cert-manager owns the secret.
+
+- Each subchart renders three secrets per app:
+  * `*-api` / `*-opa` holds the database/password stringData used to render the per-service configmaps (mounted into `/etc/lightbridge/config.yaml`).
+  * `*-secrets` is created so the controller can mount `DATABASE_URL`/`OPA_PASSWORD` via `secretKeyRef`, keeping credentials out of the primary TLS secret.
+  * `*-tls` contains the TLS materials mounted under `/etc/lightbridge/tls`; once cert-manager rotates `lightbridge-authz-tls` downstream consumers need to copy the new cert/key into these per-app secrets (or keep the job enabled).
+
+- Deployments now hardcode `containerPort: 3000` for both controllers so Kubernetes records the exposed port, aligning with service target ports.

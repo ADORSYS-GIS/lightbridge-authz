@@ -6,6 +6,10 @@ sharedConfig: &sharedConfig
     pool_size: 10
   oauth2:
     jwks_url: "http://keycloak:9100/realms/dev/protocol/openid-connect/certs"
+  otel:
+    enabled: true
+    otlp_endpoint: http://localhost:4317
+    service_name: lightbridge-authz
   server:
     api:
       address: "0.0.0.0"
