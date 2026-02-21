@@ -70,7 +70,11 @@ def wait_until_ready() -> None:
         try:
             request_json("GET", f"{API_URL}/health", insecure_tls=True)
             request_json("GET", f"{OPA_URL}/health", insecure_tls=True)
-            log("API and OPA health endpoints are ready")
+            request_json(
+                "GET",
+                f"{KEYCLOAK_URL}/realms/dev/.well-known/openid-configuration",
+            )
+            log("API, OPA, and Keycloak are ready")
             return
         except Exception:
             if time.time() - start > MAX_WAIT_SECONDS:
