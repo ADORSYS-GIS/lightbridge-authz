@@ -23,6 +23,7 @@ runs:
         GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
 
     - name: Add repos to Helm
+      shell: bash
       run: |
         helm repo add bjw-s https://bjw-s-labs.github.io/helm-charts
         helm repo update
