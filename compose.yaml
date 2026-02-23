@@ -107,6 +107,7 @@ services:
     build:
       context: .
       target: migrate
+      network: host
     volumes:
       - "./.docker/authz/container.yaml:/tmp/config.yaml:ro"
       - "authz_tls:/tls"
@@ -123,7 +124,7 @@ services:
       authz-migrate:
         condition: service_completed_successfully
       authz-tls:
-        condition: service_started
+        condition: service_completed_successfully
     deploy:
       replicas: 1
       resources:
@@ -133,9 +134,10 @@ services:
     build:
       context: .
       target: runtime
+      network: host
     volumes:
       - ./.docker/authz/container.yaml:/tmp/config.yaml:ro
-      - "authz_tls:/tls:ro"
+      - "./config/tls:/tls:ro"
     environment:
       RUST_LOG: "debug,opentelemetry_sdk=warn,opentelemetry_otlp=warn,h2=warn,hyper_util=warn,tower=warn"
       CONFIG_PATH: "/tmp/config.yaml"
@@ -150,7 +152,7 @@ services:
       authz-migrate:
         condition: service_completed_successfully
       authz-tls:
-        condition: service_started
+        condition: service_completed_successfully
     deploy:
       replicas: 1
       resources:
@@ -159,7 +161,7 @@ services:
           cpus: "0.5"
     volumes:
       - ./.docker/authz/container.yaml:/tmp/config.yaml:ro
-      - "authz_tls:/tls:ro"
+      - "./config/tls:/tls:ro"
     environment:
       RUST_LOG: "debug,opentelemetry_sdk=warn,opentelemetry_otlp=warn,h2=warn,hyper_util=warn,tower=warn"
       CONFIG_PATH: "/tmp/config.yaml"
@@ -179,6 +181,7 @@ services:
     build:
       context: .
       target: usage-migrate
+      network: host
     volumes:
       - "./.docker/usage/container.yaml:/tmp/config.yaml:ro"
     environment:
@@ -193,9 +196,10 @@ services:
     build:
       context: .
       target: usage-runtime
+      network: host
     volumes:
       - "./.docker/usage/container.yaml:/tmp/config.yaml:ro"
-      - "authz_tls:/tls:ro"
+      - "./config/tls:/tls:ro"
     environment:
       RUST_LOG: "debug,opentelemetry_sdk=warn,opentelemetry_otlp=warn,h2=warn,hyper_util=warn,tower=warn"
       CONFIG_PATH: "/tmp/config.yaml"
@@ -205,7 +209,7 @@ services:
       authz-usage-migrate:
         condition: service_completed_successfully
       authz-tls:
-        condition: service_started
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "/usr/local/bin/lightbridge-authz-healthcheck", "-r", "3002"]
       interval: 30s
