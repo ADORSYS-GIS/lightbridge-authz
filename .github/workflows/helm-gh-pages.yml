@@ -18,13 +18,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
-        uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
-      - id: package
-        uses: ./.github/actions/helm-package
+        uses: actions/checkout@v4
         with:
-          charts-root: charts
-          output-dir: artifacts/helm
-      - uses: ./.github/actions/gh-pages-deploy
+          fetch-depth: 0
+
+      - name: Publish Helm Charts
+        uses: ./.github/actions/helm-gh-pages-publish
         with:
-          publish-dir: ${{ steps.package.outputs.packages-dir }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          charts-dir: charts

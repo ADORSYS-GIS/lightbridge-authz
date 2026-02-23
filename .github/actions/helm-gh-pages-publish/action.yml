@@ -1,0 +1,25 @@
+name: Helm GH-Pages Publish
+description: Packages and publishes Helm charts to GitHub Pages using chart-releaser.
+inputs:
+  github-token:
+    description: Token to publish the charts and create releases
+    required: true
+  charts-dir:
+    description: Directory containing the charts
+    required: false
+    default: charts
+runs:
+  using: composite
+  steps:
+    - name: Configure Git
+      shell: bash
+      run: |
+        git config user.name "${GITHUB_ACTOR}"
+        git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+
+    - name: Run chart-releaser
+      uses: helm/chart-releaser-action@v1.6.0
+      with:
+        charts_dir: ${{ inputs.charts-dir }}
+      env:
+        CR_TOKEN: "${{ inputs.github-token }}"
