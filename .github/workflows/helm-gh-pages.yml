@@ -11,6 +11,7 @@ on:
 permissions:
   contents: read
   pages: write
+  packages: write
 
 jobs:
   publish-helm-charts:
