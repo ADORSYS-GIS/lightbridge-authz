@@ -3,7 +3,7 @@ name: lightbridge-migrate
 description: Migration job for LightBridge Authz
 
 type: application
-version: 0.1.0
+version: 0.5.1
 appVersion: "0.5.0"
 home: https://github.com/ADORSYS-GIS/lightbridge-authz
 sources:

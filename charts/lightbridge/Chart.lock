@@ -1,12 +1,12 @@
 dependencies:
 - name: lightbridge-authz
   repository: file://../lightbridge-authz
-  version: 0.5.0
+  version: 0.5.1
 - name: lightbridge-authz
   repository: file://../lightbridge-authz
-  version: 0.5.0
+  version: 0.5.1
 - name: lightbridge-migrate
   repository: file://../lightbridge-migrate
-  version: 0.1.0
-digest: sha256:38b70c3203245cc0da4d207e2c53b8b357d0c92fa5c03b6967f829b87d4d776c
-generated: "2026-02-21T08:04:33.251636+01:00"
+  version: 0.5.1
+digest: sha256:273875ab8a0d92c31a23ed5b5b0b1931e2b37041a2d74805d3c855dabbf167df
+generated: "2026-02-23T06:50:02.362264+01:00"
