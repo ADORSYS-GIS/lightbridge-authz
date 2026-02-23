@@ -25,14 +25,6 @@ Create the fully qualified app name.
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
-{{- define "lightbridge.globalConfigMapName" -}}
-{{- if .Values.global.configMapName }}
-{{- .Values.global.configMapName }}
-{{- else }}
-{{- printf "%s-config" (include "lightbridge.fullname" .) }}
-{{- end }}
-{{- end }}
-
 {{- define "lightbridge.globalTlsSecretName" -}}
 {{- if .Values.global.tlsSecretName }}
 {{- .Values.global.tlsSecretName }}

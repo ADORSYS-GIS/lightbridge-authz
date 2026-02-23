@@ -33,7 +33,7 @@ controllers:
     containers:
       main:
         image:
-          repository: lightbridge-authz
+          repository: ghcr.io/adorsys-gis/lightbridge-authz-migrate
           tag: 0.5.0
         command:
           - lightbridge-authz

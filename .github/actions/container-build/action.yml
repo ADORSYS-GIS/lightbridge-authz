@@ -1,18 +1,30 @@
 name: Container Build
+description: Build and push a Docker image for the requested target.
+inputs:
+  app-version:
+    description: Version of the application
+    required: true
+  image-name:
+    description: Name of the image
+    required: true
+  target:
+    description: Docker build target
+    required: false
+    default: runtime
 runs:
   using: composite
   steps:
     - id: docker-setup
       uses: ./.github/actions/setup-docker
       with:
-        app-version: ${{ github.sha }}
-        image-name: ${{ github.repository }}
+        app-version: ${{ inputs.app-version }}
+        image-name: ${{ inputs.image-name }}
     - name: Build and push image
       uses: docker/build-push-action@v6.19.2
       with:
         context: .
         file: Dockerfile
-        target: runtime
+        target: ${{ inputs.target }}
         push: true
         platforms: linux/amd64,linux/arm64
         tags: ${{ steps.docker-setup.outputs.tags }}

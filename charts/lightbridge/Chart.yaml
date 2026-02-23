@@ -3,7 +3,7 @@ name: lightbridge
 description: A Helm chart for Kubernetes
 
 type: application
-version: 0.5.1
+version: 0.5.2
 appVersion: "0.5.0"
 icon: https://adorsys.com/favicon.svg?v=05f867cc1aa036716c10a6c1d4ad6365
 home: https://github.com/ADORSYS-GIS/lightbridge-authz
@@ -30,6 +30,12 @@ dependencies:
     repository: "file://../lightbridge-authz"
     alias: opa
     condition: opa.enabled
+
+  - name: lightbridge-authz-usage
+    version: "*"
+    repository: "file://../lightbridge-authz-usage"
+    alias: usage
+    condition: usage.enabled
 
   - name: lightbridge-migrate
     version: "*"

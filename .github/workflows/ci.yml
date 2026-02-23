@@ -67,13 +67,30 @@ jobs:
     needs: build
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: authz
+            target: runtime
+            image-name: ${{ github.repository }}
+          - name: usage
+            target: usage-runtime
+            image-name: adorsys-gis/lightbridge-authz-usage
+          - name: usage-migrate
+            target: usage-migrate
+            image-name: adorsys-gis/lightbridge-authz-usage-migrate
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout repo
         uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
-      - uses: ./.github/actions/container-build
+      - name: Build and push Docker image
+        uses: ./.github/actions/container-build
+        with:
+          app-version: ${{ github.sha }}
+          image-name: ${{ matrix.image-name }}
+          target: ${{ matrix.target }}
 
   release:
     needs: [build,container-build]

@@ -50,9 +50,13 @@ spec:
                 -keyout /tls/api.key -out /tls/api.crt -subj "/CN={{ .Values.global.tls.apiCommonName }}"
               openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
                 -keyout /tls/opa.key -out /tls/opa.crt -subj "/CN={{ .Values.global.tls.opaCommonName }}"
+              openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+                -keyout /tls/usage.key -out /tls/usage.crt -subj "/CN={{ .Values.global.tls.usageCommonName }}"
               kubectl create secret generic "$SECRET" \
                 --from-file=api.crt=/tls/api.crt \
                 --from-file=api.key=/tls/api.key \
                 --from-file=opa.crt=/tls/opa.crt \
-                --from-file=opa.key=/tls/opa.key >/dev/null
+                --from-file=opa.key=/tls/opa.key \
+                --from-file=usage.crt=/tls/usage.crt \
+                --from-file=usage.key=/tls/usage.key >/dev/null
 {{- end }}
