@@ -1,0 +1,74 @@
+[workspace]
+members = [
+    "crates/lightbridge-authz-core",
+    "crates/lightbridge-authz-rest",
+    "app/lightbridge-authz",
+    "app/lightbridge-authz-healthcheck",
+    "app/lightbridge-authz-migrate-bin",
+    "crates/lightbridge-authz-api",
+    "crates/lightbridge-authz-api-key",
+    "crates/lightbridge-authz-bearer",
+    "crates/lightbridge-authz-migrate",
+    "crates/lightbridge-authz-test-utils",
+]
+resolver = "3"
+
+[workspace.dependencies]
+lightbridge-authz-core = { path = "./crates/lightbridge-authz-core" }
+lightbridge-authz-rest = { path = "./crates/lightbridge-authz-rest" }
+lightbridge-authz-api = { path = "./crates/lightbridge-authz-api" }
+lightbridge-authz-api-key = { path = "./crates/lightbridge-authz-api-key" }
+lightbridge-authz-bearer = { path = "./crates/lightbridge-authz-bearer" }
+lightbridge-authz-migrate = { path = "./crates/lightbridge-authz-migrate" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+jsonwebtoken = { version = "10.3" }
+jwks = "0.5"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "tracing", "net"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "serde", "serde_json"] }
+opentelemetry = { version = "0.31" }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "tokio"] }
+tracing-opentelemetry = "0.32.1"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+axum = { version = "0.8", features = ["macros", "tracing"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
+cuid = { version = "1" }
+getrandom = "0.4"
+goose = "0.18"
+reqwest = { version = "0.13", features = ["json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "json", "macros"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+utoipa = { version = "5", features = ["macros", "chrono"] }
+utoipa-swagger-ui = { version = "9", features = ["axum", "reqwest"] }
+regex = "1.10"
+
+mimalloc = "0"
+
+[profile.prod]
+inherits = "release"
+lto = true
+opt-level = "z"
+codegen-units = 1
+incremental = false
+strip = true
+
+[workspace.package]
+version = "0.5.0"
+edition = "2024"
+license = "MIT"
+publish = false
+authors = [
+    "Stephane Segning <selastlambou@gmail.com>"
+]

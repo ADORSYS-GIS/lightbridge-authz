@@ -1,0 +1,24 @@
+apiVersion: v2
+name: lightbridge-authz
+description: Kubernetes deployment for the lightbridge authz services
+
+type: application
+version: 0.5.0
+appVersion: "0.5.0"
+icon: https://adorsys.com/favicon.svg?v=05f867cc1aa036716c10a6c1d4ad6365
+home: https://github.com/ADORSYS-GIS/lightbridge-authz
+kubeVersion: ">=1.20.0-0"
+keywords:
+  - authz
+  - opa
+  - tls
+  - postgres
+  - api
+sources:
+  - https://github.com/ADORSYS-GIS/lightbridge-authz
+tags: "authz, opa, tls, postgres, api"
+
+dependencies:
+  - name: common
+    version: "4.6.2"
+    repository: https://bjw-s-labs.github.io/helm-charts

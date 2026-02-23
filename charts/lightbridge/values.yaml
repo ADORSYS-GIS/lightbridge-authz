@@ -1,0 +1,109 @@
+sharedConfig: &sharedConfig
+  logging:
+    level: info
+  database:
+    url: "postgres://postgres:postgres@postgresql:5432/lightbridge_authz"
+    pool_size: 10
+  oauth2:
+    jwks_url: "http://keycloak:9100/realms/dev/protocol/openid-connect/certs"
+  otel:
+    enabled: true
+    otlp_endpoint: http://localhost:4317
+    service_name: lightbridge-authz
+  server:
+    api:
+      address: "0.0.0.0"
+      port: 3000
+      tls:
+        cert_path: "/etc/lightbridge/tls/api.crt"
+        key_path: "/etc/lightbridge/tls/api.key"
+    opa:
+      address: "0.0.0.0"
+      port: 3000
+      tls:
+        cert_path: "/etc/lightbridge/tls/opa.crt"
+        key_path: "/etc/lightbridge/tls/opa.key"
+      basic_auth:
+        username: "authorino"
+        password: "change-me"
+
+global:
+  config: *sharedConfig
+  configMapName: lightbridge-authz-config
+  tlsSecretName: lightbridge-authz-tls
+  tls:
+    enabled: true
+    mountPath: /etc/lightbridge/tls
+    apiCommonName: lightbridge-authz-api
+    opaCommonName: lightbridge-authz-opa
+    job:
+      enabled: true
+      image:
+        repository: docker.io/bitnami/kubectl
+        tag: 1.29.4
+      restartPolicy: OnFailure
+      backoffLimit: 3
+      ttlSecondsAfterFinished: 300
+      annotations: { }
+      labels: { }
+      serviceAccount:
+        create: true
+        name:
+        automount: true
+      role:
+        create: true
+        name:
+      addKubectlOpenssl: true
+
+api:
+  enabled: true
+  config: *sharedConfig
+  controllers:
+    main:
+      containers:
+        main:
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+  configMap:
+    enabled: false
+  tls:
+    job:
+      enabled: false
+  service:
+    port: 3000
+
+opa:
+  enabled: true
+  config: *sharedConfig
+  controllers:
+    main:
+      containers:
+        main:
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+  configMap:
+    enabled: false
+  tls:
+    job:
+      enabled: false
+  service:
+    port: 3000
+
+migration:
+  enabled: true
+  image:
+    repository: lightbridge-authz
+    tag: 0.5.0
+    pullPolicy: IfNotPresent
+  configMapName: lightbridge-authz-config
+  command:
+    - lightbridge-authz
+    - migrate
+    - "--config-path"
+    - /tmp/lightbridge-config/config.yaml
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300

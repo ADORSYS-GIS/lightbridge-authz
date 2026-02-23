@@ -1,0 +1,205 @@
+# Default values for lightbridge-authz.
+
+# bjw-s/common v4 configuration
+controllers:
+  main:
+    containers:
+      main:
+        image:
+          repository: lightbridge-authz
+          tag: 0.5.0
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+        env:
+          DATABASE_URL:
+            valueFrom:
+              secretKeyRef:
+                identifier: secret
+                key: DATABASE_URL
+          OPA_PASSWORD:
+            valueFrom:
+              secretKeyRef:
+                identifier: secret
+                key: OPA_PASSWORD
+
+configMaps:
+  config:
+    enabled: true
+    data:
+      config.yaml: |
+        logging:
+          level: info
+        database:
+          url: "${DATABASE_URL}"
+          pool_size: 10
+        oauth2:
+          jwks_url: http://keycloak:9100/realms/dev/protocol/openid-connect/certs
+        server:
+          api:
+            address: 0.0.0.0
+            port: 3000
+            tls:
+              cert_path: /etc/lightbridge/tls/api.crt
+              key_path: /etc/lightbridge/tls/api.key
+          opa:
+            address: 0.0.0.0
+            port: 3001
+            tls:
+              cert_path: /etc/lightbridge/tls/opa.crt
+              key_path: /etc/lightbridge/tls/opa.key
+            basic_auth:
+              username: authorino
+              password: "${OPA_PASSWORD}"
+
+secrets:
+  secret:
+    enabled: true
+    stringData:
+      DATABASE_URL: postgres://postgres:postgres@postgresql:5432/lightbridge_authz
+      OPA_PASSWORD: change-me
+
+service:
+  main:
+    controller: main
+    ports:
+      http:
+        port: 3000
+
+persistence:
+  config:
+    enabled: true
+    type: configMap
+    name: '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}-config'
+    advancedMounts:
+      main:
+        main:
+          - path: /etc/lightbridge/config.yaml
+            subPath: config.yaml
+            readOnly: true
+  tls:
+    enabled: true
+    type: secret
+    name: '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}-tls'
+    globalMounts:
+      - path: /etc/lightbridge/tls
+        readOnly: true
+
+serviceAccount:
+  create: true
+
+# Global values required by bjw-s/common
+global: {}
+
+# Legacy/Custom template support values (if any remain)
+image:
+  repository: lightbridge-authz
+  tag: 0.5.0
+  pullPolicy: IfNotPresent
+
+# This "config" section is used by migrate-job.yaml
+config:
+  logging:
+    level: info
+  database:
+    url: "${DATABASE_URL}"
+    pool_size: 10
+  oauth2:
+    jwks_url: http://keycloak:9100/realms/dev/protocol/openid-connect/certs
+  server:
+    api:
+      address: 0.0.0.0
+      port: 3000
+      tls:
+        cert_path: /etc/lightbridge/tls/api.crt
+        key_path: /etc/lightbridge/tls/api.key
+    opa:
+      address: 0.0.0.0
+      port: 3001
+      tls:
+        cert_path: /etc/lightbridge/tls/opa.crt
+        key_path: /etc/lightbridge/tls/opa.key
+      basic_auth:
+        username: authorino
+        password: "${OPA_PASSWORD}"
+
+# This "configMap" section is used by migrate-job.yaml and others
+configMap:
+  enabled: true
+  name: ""
+  mountPath: /etc/lightbridge
+  fileName: config.yaml
+  annotations: {}
+  labels: {}
+
+tls:
+  enabled: true
+  secretName: ""
+  mountPath: /etc/lightbridge/tls
+  apiCommonName: lightbridge-authz-api
+  opaCommonName: lightbridge-authz-opa
+  job:
+    enabled: true
+    image:
+      repository: docker.io/bitnami/kubectl
+      tag: 1.29.4
+    restartPolicy: OnFailure
+    backoffLimit: 3
+    ttlSecondsAfterFinished: 300
+    serviceAccount:
+      create: true
+      name: ""
+      annotations: {}
+    role:
+      create: true
+      name: ""
+    addKubectlOpenssl: true
+
+migrateJob:
+  enabled: true
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: IfNotPresent
+  restartPolicy: OnFailure
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  annotations: {}
+  labels: {}
+  env: []
+  imagePullSecrets: []
+
+knative:
+  enabled: false
+  service:
+    annotations: {}
+    labels: {}
+  template:
+    annotations: {}
+    labels: {}
+    timeoutSeconds: 300
+    containerConcurrency: 0
+
+# Other expected keys to avoid nil pointer errors in custom templates
+env: []
+volumeMounts: []
+volumes: []
+resources: {}
+livenessProbe: {}
+readinessProbe: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+autoscaling:
+  enabled: false
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []
+  tls: []

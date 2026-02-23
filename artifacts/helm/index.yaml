@@ -1,0 +1,87 @@
+apiVersion: v1
+entries:
+  lightbridge:
+  - apiVersion: v2
+    appVersion: 0.5.0
+    created: "2026-02-23T05:27:55.8507924Z"
+    dependencies:
+    - alias: api
+      condition: api.enabled
+      name: lightbridge-authz
+      repository: file://../lightbridge-authz
+      version: '*'
+    - alias: opa
+      condition: opa.enabled
+      name: lightbridge-authz
+      repository: file://../lightbridge-authz
+      version: '*'
+    - alias: migration
+      condition: migration.enabled
+      name: lightbridge-migrate
+      repository: file://../lightbridge-migrate
+      version: '*'
+    description: A Helm chart for Kubernetes
+    digest: 55b17b4112a9074f2c7bb650f5c0ece2e5fc179435c7a87a23e5c63bb6c86f03
+    home: https://github.com/ADORSYS-GIS/lightbridge-authz
+    icon: https://adorsys.com/favicon.svg?v=05f867cc1aa036716c10a6c1d4ad6365
+    keywords:
+    - authz
+    - oauth2
+    - opa
+    - tls
+    - postgres
+    - api
+    kubeVersion: '>=1.20.0-0'
+    name: lightbridge
+    sources:
+    - https://github.com/ADORSYS-GIS/lightbridge-authz
+    type: application
+    urls:
+    - https://ADORSYS-GIS.github.io/lightbridge-authz/lightbridge-0.5.0.tgz
+    version: 0.5.0
+  lightbridge-authz:
+  - apiVersion: v2
+    appVersion: 0.5.0
+    created: "2026-02-23T05:27:55.855997604Z"
+    dependencies:
+    - name: common
+      repository: https://bjw-s-labs.github.io/helm-charts
+      version: 4.6.2
+    description: Kubernetes deployment for the lightbridge authz services
+    digest: d579534a83767d08ea123404934b3e49ad54b43dcd0d3cbb21b7f50212fbc751
+    home: https://github.com/ADORSYS-GIS/lightbridge-authz
+    icon: https://adorsys.com/favicon.svg?v=05f867cc1aa036716c10a6c1d4ad6365
+    keywords:
+    - authz
+    - opa
+    - tls
+    - postgres
+    - api
+    kubeVersion: '>=1.20.0-0'
+    name: lightbridge-authz
+    sources:
+    - https://github.com/ADORSYS-GIS/lightbridge-authz
+    tags: authz, opa, tls, postgres, api
+    type: application
+    urls:
+    - https://ADORSYS-GIS.github.io/lightbridge-authz/lightbridge-authz-0.5.0.tgz
+    version: 0.5.0
+  lightbridge-migrate:
+  - apiVersion: v2
+    appVersion: 0.5.0
+    created: "2026-02-23T05:27:55.860075532Z"
+    dependencies:
+    - name: common
+      repository: https://bjw-s-labs.github.io/helm-charts
+      version: 4.6.2
+    description: Migration job for LightBridge Authz
+    digest: 14f7b79a710ec2648fc736252546c73db15f1578bded813250657846c8b658b8
+    home: https://github.com/ADORSYS-GIS/lightbridge-authz
+    name: lightbridge-migrate
+    sources:
+    - https://github.com/ADORSYS-GIS/lightbridge-authz
+    type: application
+    urls:
+    - https://ADORSYS-GIS.github.io/lightbridge-authz/lightbridge-migrate-0.1.0.tgz
+    version: 0.1.0
+generated: "2026-02-23T05:27:55.848951851Z"

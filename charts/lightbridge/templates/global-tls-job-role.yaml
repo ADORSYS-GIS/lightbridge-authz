@@ -1,0 +1,14 @@
+{{- if and .Values.global.tls.enabled .Values.global.tls.job.enabled .Values.global.tls.job.role.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "lightbridge.globalTlsJobRoleName" . }}
+  labels:
+    helm.sh/chart: {{ include "lightbridge.chart" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get","create","update"]
+{{- end }}

@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+.DS_Store
+.idea
+.vscode
+*.log
+charts/*/charts
+
+__pycache__
+tls
+!.roo/rules/AGENTS.md
