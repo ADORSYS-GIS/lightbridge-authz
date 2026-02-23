@@ -16,6 +16,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY app/ ./app/
 COPY migrations/ ./migrations/
+COPY migrations-usage/ ./migrations-usage/
 
 # Build dependencies (this is cached if dependencies don't change)
 RUN cargo build --profile prod --locked
@@ -81,3 +82,35 @@ ENV RUST_LOG=info
 # Run the binary
 ENTRYPOINT ["lightbridge-authz"]
 CMD ["api"]
+
+FROM gcr.io/distroless/base-debian12:nonroot as usage-runtime
+
+LABEL maintainer="stephane-segning <selastlambou@gmail.com>"
+LABEL org.opencontainers.image.description="Backend for LightBridge Authz Usage"
+
+WORKDIR /app
+
+COPY --from=builder /app/target/prod/lightbridge-authz-usage /usr/local/bin/lightbridge-authz-usage
+COPY --from=builder /app/target/prod/lightbridge-authz-healthcheck /usr/local/bin/lightbridge-authz-healthcheck
+COPY --from=dep /deps /usr/lib/
+
+EXPOSE 3002
+
+ENV RUST_LOG=info
+
+ENTRYPOINT ["lightbridge-authz-usage"]
+CMD ["serve"]
+
+FROM gcr.io/distroless/base-debian12:nonroot as usage-migrate
+
+LABEL maintainer="stephane-segning <selastlambou@gmail.com>"
+LABEL org.opencontainers.image.description="Migration runner for LightBridge Authz Usage"
+
+WORKDIR /app
+
+COPY --from=builder /app/target/prod/lightbridge-authz-usage /usr/local/bin/lightbridge-authz-usage
+COPY --from=dep /deps /usr/lib/
+
+ENV RUST_LOG=info
+
+ENTRYPOINT ["lightbridge-authz-usage", "migrate"]

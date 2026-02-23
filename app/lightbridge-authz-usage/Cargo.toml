@@ -1,0 +1,17 @@
+[package]
+name = "lightbridge-authz-usage"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+lightbridge-authz-core.workspace = true
+lightbridge-authz-usage-rest.workspace = true
+lightbridge-authz-usage-migrate.workspace = true
+mimalloc.workspace = true

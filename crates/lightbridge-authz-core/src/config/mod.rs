@@ -1,6 +1,7 @@
 use crate::error::Result;
 use regex::{Captures, Regex};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_yaml::from_str;
 use std::env;
 use std::fs::read_to_string;
@@ -76,9 +77,17 @@ pub struct Oauth2 {
 }
 
 pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<Config> {
+    load_yaml_from_path(path)
+}
+
+pub fn load_yaml_from_path<T, P>(path: P) -> Result<T>
+where
+    T: DeserializeOwned,
+    P: AsRef<std::path::Path>,
+{
     let content = read_to_string(path)?;
     let interpolated = interpolate_env_vars(&content);
-    let cfg: Config = from_str(&interpolated)?;
+    let cfg: T = from_str(&interpolated)?;
     Ok(cfg)
 }
 

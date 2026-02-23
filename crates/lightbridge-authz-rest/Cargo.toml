@@ -21,7 +21,7 @@ axum-server.workspace = true
 getrandom.workspace = true
 rustls.workspace = true
 lightbridge-authz-api.workspace = true
-lightbridge-authz-core.workspace = true
+lightbridge-authz-core = { workspace = true, features = ["axum"] }
 lightbridge-authz-api-key.workspace = true
 lightbridge-authz-bearer.workspace = true
 utoipa.workspace = true

@@ -1,6 +1,8 @@
 # Lightbridge Authz
 
-Lightbridge Authz is a two‑API service for managing API keys with OAuth2‑secured CRUD and an Authorino/OPA validation interface. Both servers use TLS, share the same database, and share the same migrations.
+Lightbridge Authz is a multi-service backend for API key management and usage analytics:
+- `authz-api` and `authz-opa` handle key lifecycle and validation.
+- `lightbridge-authz-usage` ingests OTEL traffic data and serves Timescale-backed usage analytics.
 
 ## Services
 
@@ -13,6 +15,10 @@ Lightbridge Authz is a two‑API service for managing API keys with OAuth2‑sec
   - `POST /v1/opa/validate` (basic auth).
 - **authz-migrate**
   - Runs SQL migrations before the API services start.
+- **lightbridge-authz-usage** (OTEL ingest + usage query)
+  - OTEL ingest endpoints (no auth): `POST /v1/otel/traces`, `POST /v1/otel/metrics`
+  - Usage query endpoint: `POST /v1/usage/query`
+  - OpenAPI docs: `/v1/usage/docs`
 - **postgresql**, **keycloak**, **adminer**, **authz-tls**
 
 ## Quick start (Docker Compose)
@@ -84,6 +90,35 @@ curl -k -u authorino:change-me \
 
 Detailed usage + integration test guide:
 - `docs/authorino-usage.md`
+- `docs/usage-api.md`
+
+**Usage API (No auth on ingest/query endpoints)**
+- `POST /v1/otel/traces` (OTLP/HTTP traces, protobuf or JSON)
+- `POST /v1/otel/metrics` (OTLP/HTTP metrics, protobuf or JSON)
+- `POST /v1/usage/query` (bucketed timeseries for `user`, `project`, or `account` scopes)
+
+Example query body:
+
+```json
+{
+  "scope": "project",
+  "scope_id": "proj_123",
+  "start_time": "2026-02-20T00:00:00Z",
+  "end_time": "2026-02-23T00:00:00Z",
+  "bucket": "1 hour",
+  "group_by": ["model"],
+  "filters": {
+    "signal_type": "metric"
+  },
+  "limit": 1000
+}
+```
+
+Run locally:
+
+```bash
+cargo run -p lightbridge-authz-usage -- serve --config-path config/usage.yaml
+```
 
 ## Testing with Keycloak (OAuth2)
 

@@ -12,6 +12,7 @@ runs:
       with:
         context: .
         file: Dockerfile
+        target: runtime
         push: true
         platforms: linux/amd64,linux/arm64
         tags: ${{ steps.docker-setup.outputs.tags }}

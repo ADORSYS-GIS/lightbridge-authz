@@ -2,11 +2,11 @@ use axum::{Json, Router, http::StatusCode, routing::get};
 use lightbridge_authz_api::routers::api_router;
 use lightbridge_authz_core::{
     Account, Project, async_trait,
-    config::{ApiServer, BasicAuth, Oauth2, OpaServer, Tls},
+    config::{ApiServer, BasicAuth, Oauth2, OpaServer},
     db::DbPoolTrait,
-    error::{Error, Result},
+    error::Result,
+    server::serve_tls,
 };
-use std::sync::Once;
 
 pub mod handlers;
 pub mod middleware;
@@ -20,7 +20,6 @@ use routers::opa_router;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::BearerTokenService;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
@@ -140,28 +139,6 @@ pub async fn start_opa_server(opa: &OpaServer, pool: Arc<dyn DbPoolTrait>) -> Re
     let app = public.merge(protected).with_state(state.clone());
 
     serve_tls("OPA", &opa.address, opa.port, &opa.tls, app).await
-}
-
-fn ensure_rustls_provider() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
-
-async fn serve_tls(name: &str, address: &str, port: u16, tls: &Tls, app: Router) -> Result<()> {
-    ensure_rustls_provider();
-    let addr: SocketAddr = format!("{}:{}", address, port).parse()?;
-    let rustls_config =
-        axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
-            .await
-            .map_err(|e| Error::Server(format!("Failed to load TLS config for {name}: {e}")))?;
-    tracing::info!("Starting {name} server with TLS on {}", addr);
-    axum_server::bind_rustls(addr, rustls_config)
-        .serve(app.into_make_service())
-        .await
-        .map_err(|e| Error::Server(format!("Failed to start {name} server: {e}")))?;
-    Ok(())
 }
 
 async fn root_handler() -> (StatusCode, Json<RootResponse>) {

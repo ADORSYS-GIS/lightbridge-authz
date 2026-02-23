@@ -9,7 +9,7 @@ services:
         set -e
         mkdir -p /tls /host_tls
         apk add --no-cache openssl
-        for host_file in api.key api.crt opa.key opa.crt; do
+        for host_file in api.key api.crt opa.key opa.crt usage.key usage.crt; do
           if [ -f /host_tls/$$host_file ]; then
             cp /host_tls/$$host_file /tls/$$host_file
           fi
@@ -24,7 +24,12 @@ services:
             -keyout /tls/opa.key -out /tls/opa.crt \
             -subj "/CN=lightbridge-authz-opa"
         fi
-        for tls_file in api.crt api.key opa.crt opa.key; do
+        if [ ! -f /tls/usage.key ]; then
+          openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -keyout /tls/usage.key -out /tls/usage.crt \
+            -subj "/CN=lightbridge-authz-usage"
+        fi
+        for tls_file in api.crt api.key opa.crt opa.key usage.crt usage.key; do
           chmod 644 /tls/$$tls_file
           chown 65532:65532 /tls/$$tls_file
           if [ -f /tls/$$tls_file ]; then
@@ -49,6 +54,17 @@ services:
     environment:
       ALLOW_EMPTY_PASSWORD: "yes"
       POSTGRESQL_DATABASE: "lightbridge_authz"
+
+  timescaledb:
+    image: timescale/timescaledb:2.17.2-pg17
+    ports:
+      - "5433:5432"
+    volumes:
+      - "timescaledb_data:/var/lib/postgresql/data"
+    environment:
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "postgres"
+      POSTGRES_DB: "lightbridge_authz_usage"
 
   adminer:
     image: adminer
@@ -121,7 +137,7 @@ services:
       - ./.docker/authz/container.yaml:/tmp/config.yaml:ro
       - "authz_tls:/tls:ro"
     environment:
-      RUST_LOG: "debug"
+      RUST_LOG: "debug,opentelemetry_sdk=warn,opentelemetry_otlp=warn,h2=warn,hyper_util=warn,tower=warn"
       CONFIG_PATH: "/tmp/config.yaml"
     ports:
       - "13000:3000"
@@ -145,7 +161,7 @@ services:
       - ./.docker/authz/container.yaml:/tmp/config.yaml:ro
       - "authz_tls:/tls:ro"
     environment:
-      RUST_LOG: "debug"
+      RUST_LOG: "debug,opentelemetry_sdk=warn,opentelemetry_otlp=warn,h2=warn,hyper_util=warn,tower=warn"
       CONFIG_PATH: "/tmp/config.yaml"
     ports:
       - "13001:3001"
@@ -153,6 +169,45 @@ services:
       - opa
     healthcheck:
       test: ["CMD", "/usr/local/bin/lightbridge-authz-healthcheck", "-r", "3001"]
+      interval: 30s
+      timeout: 3s
+      start_period: 1s
+      retries: 3
+
+  authz-usage-migrate:
+    image: lightbridge-authz-usage-migrate
+    build:
+      context: .
+      target: usage-migrate
+    volumes:
+      - "./.docker/usage/container.yaml:/tmp/config.yaml:ro"
+    environment:
+      RUST_LOG: "debug"
+      CONFIG_PATH: "/tmp/config.yaml"
+    depends_on:
+      timescaledb:
+        condition: service_started
+
+  authz-usage:
+    image: lightbridge-authz-usage
+    build:
+      context: .
+      target: usage-runtime
+    volumes:
+      - "./.docker/usage/container.yaml:/tmp/config.yaml:ro"
+      - "authz_tls:/tls:ro"
+    environment:
+      RUST_LOG: "debug,opentelemetry_sdk=warn,opentelemetry_otlp=warn,h2=warn,hyper_util=warn,tower=warn"
+      CONFIG_PATH: "/tmp/config.yaml"
+    ports:
+      - "13002:3002"
+    depends_on:
+      authz-usage-migrate:
+        condition: service_completed_successfully
+      authz-tls:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/lightbridge-authz-healthcheck", "-r", "3002"]
       interval: 30s
       timeout: 3s
       start_period: 1s
@@ -169,4 +224,6 @@ volumes:
   postgresql_data:
     driver: local
   authz_tls:
+    driver: local
+  timescaledb_data:
     driver: local

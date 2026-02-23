@@ -86,6 +86,10 @@ logs-api:
 logs-opa:
 	docker compose -p lightbridge-authz -f compose.yaml logs --tail=100 -f authz-opa {{c}}
 
+# Show usage API logs
+logs-usage:
+	docker compose -p lightbridge-authz -f compose.yaml logs --tail=100 -f authz-usage {{c}}
+
 # Show status
 ps:
 	docker compose -p lightbridge-authz -f compose.yaml ps {{c}}
@@ -97,6 +101,10 @@ ps-all:
 # Run migrations once
 migrate:
 	docker compose -p lightbridge-authz -f compose.yaml run --rm authz-migrate
+
+# Run usage migrations once
+usage-migrate:
+	docker compose -p lightbridge-authz -f compose.yaml run --rm authz-usage-migrate
 
 # Run Authorino integration test setup
 it-authorino:

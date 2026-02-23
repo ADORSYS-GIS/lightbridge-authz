@@ -20,6 +20,8 @@ thiserror.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum = { workspace = true, optional = true }
+axum-server = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 utoipa.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -30,4 +32,4 @@ opentelemetry_sdk.workspace = true
 
 [features]
 default = []
-axum = ["dep:axum"]
+axum = ["dep:axum", "dep:axum-server", "dep:rustls"]

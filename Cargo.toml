@@ -5,10 +5,13 @@ members = [
     "app/lightbridge-authz",
     "app/lightbridge-authz-healthcheck",
     "app/lightbridge-authz-migrate-bin",
+    "app/lightbridge-authz-usage",
     "crates/lightbridge-authz-api",
     "crates/lightbridge-authz-api-key",
     "crates/lightbridge-authz-bearer",
     "crates/lightbridge-authz-migrate",
+    "crates/lightbridge-authz-usage",
+    "crates/lightbridge-authz-usage-migrate",
     "crates/lightbridge-authz-test-utils",
 ]
 resolver = "3"
@@ -20,6 +23,8 @@ lightbridge-authz-api = { path = "./crates/lightbridge-authz-api" }
 lightbridge-authz-api-key = { path = "./crates/lightbridge-authz-api-key" }
 lightbridge-authz-bearer = { path = "./crates/lightbridge-authz-bearer" }
 lightbridge-authz-migrate = { path = "./crates/lightbridge-authz-migrate" }
+lightbridge-authz-usage-rest = { path = "./crates/lightbridge-authz-usage" }
+lightbridge-authz-usage-migrate = { path = "./crates/lightbridge-authz-usage-migrate" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
@@ -36,8 +41,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "serde", "serde_json"] }
 opentelemetry = { version = "0.31" }
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "tokio"] }
+opentelemetry-proto = "0.31"
 tracing-opentelemetry = "0.32.1"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+prost = "0.14"
 axum = { version = "0.8", features = ["macros", "tracing"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 async-trait = "0.1"

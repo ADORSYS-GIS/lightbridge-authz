@@ -1,0 +1,16 @@
+server:
+  usage:
+    address: "0.0.0.0"
+    port: 3002
+    tls:
+      cert_path: "/tls/usage.crt"
+      key_path: "/tls/usage.key"
+logging:
+  level: "info"
+database:
+  url: "postgres://postgres:postgres@timescaledb:5432/lightbridge_authz_usage"
+  pool_size: 10
+otel:
+  enabled: true
+  otlp_endpoint: "http://jaeger:4317"
+  service_name: "lightbridge-authz-usage"

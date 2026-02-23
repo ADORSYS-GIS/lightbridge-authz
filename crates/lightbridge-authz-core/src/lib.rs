@@ -4,6 +4,9 @@ pub mod crypto;
 pub mod db;
 pub mod dto;
 pub mod error;
+pub mod migrate;
+#[cfg(feature = "axum")]
+pub mod server;
 pub mod tracing;
 
 pub use crate::api_key::{
