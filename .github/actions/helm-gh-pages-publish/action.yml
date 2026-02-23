@@ -17,9 +17,21 @@ runs:
         git config user.name "${GITHUB_ACTOR}"
         git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
 
+    - name: Install Helm
+      uses: azure/setup-helm@v4.3.1
+      env:
+        GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
+    - name: Add repos to Helm
+      run: |
+        helm repo add bjw-s https://bjw-s-labs.github.io/helm-charts
+        helm repo update
+
     - name: Run chart-releaser
-      uses: helm/chart-releaser-action@v1.6.0
+      uses: helm/chart-releaser-action@v1.7.0
+      if: github.ref == 'refs/heads/main'
       with:
         charts_dir: ${{ inputs.charts-dir }}
+        skip_existing: false
       env:
         CR_TOKEN: "${{ inputs.github-token }}"
