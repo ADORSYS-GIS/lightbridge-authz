@@ -1899,7 +1899,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -2164,13 +2164,13 @@ dependencies = [
 
 [[package]]
 name = "jwks"
-version = "0.5.2"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8aef64d712b55eab9d9291edcc5ad484380e674f70ce58f36ce9c3ba649fa4ba"
+checksum = "32a4cf2e9dd754c698b41139c2ec88304249ecf3dd15cabfeddd48665cdf5c0c"
 dependencies = [
  "base64 0.22.1",
  "jsonwebtoken",
- "reqwest 0.12.28",
+ "reqwest 0.13.2",
  "serde",
  "thiserror 2.0.18",
 ]
@@ -3231,7 +3231,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3269,7 +3269,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -5153,7 +5153,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
