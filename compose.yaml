@@ -183,7 +183,7 @@ services:
       retries: 3
 
   authz-usage-migrate:
-    image: lightbridge-authz-usage-migrate
+    image: lightbridge-authz-usage
     build:
       context: .
       target: usage-runtime

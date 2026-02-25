@@ -75,10 +75,7 @@ jobs:
             image-name: ${{ github.repository }}
           - name: usage
             target: usage-runtime
-            image-name: adorsys-gis/lightbridge-authz-usage
-          - name: usage-migrate
-            target: usage-migrate
-            image-name: adorsys-gis/lightbridge-authz-usage-migrate
+            image-name: ${{ github.repository }}-usage
     permissions:
       contents: read
       packages: write
