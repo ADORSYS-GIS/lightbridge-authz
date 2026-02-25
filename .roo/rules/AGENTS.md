@@ -18,7 +18,6 @@ This file documents structure, architecture, workflows, and practices for contri
 
 - `app/`
   - `app/lightbridge-authz/`: main binary that can run API server, OPA server, both, and migrations.
-  - `app/lightbridge-authz-migrate-bin/`: standalone migration runner (used by Docker image stage).
   - `app/lightbridge-authz-healthcheck/`: TCP healthcheck binary for container health checks.
 - `crates/`
   - `crates/lightbridge-authz-core/`: shared types, config, errors, crypto, DB pool.
@@ -113,7 +112,6 @@ Workspace manifest: `Cargo.toml`
 
 - Binary entrypoints:
   - `app/lightbridge-authz/src/main.rs`
-  - `app/lightbridge-authz-migrate-bin/src/main.rs`
   - `app/lightbridge-authz-healthcheck/src/main.rs`
 
 - CRUD API:

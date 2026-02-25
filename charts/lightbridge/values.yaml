@@ -1,8 +1,10 @@
 global:
   tlsSecretName: lightbridge-authz-tls
+  image:
+    version: "0.5.3"
+    repository: "ghcr.io/adorsys-gis/lightbridge-authz-usage"
   tls:
     enabled: true
-    mountPath: /etc/lightbridge/tls
     apiCommonName: lightbridge-authz-api
     opaCommonName: lightbridge-authz-opa
     usageCommonName: lightbridge-authz-usage
@@ -18,21 +20,33 @@ global:
       labels: {}
       serviceAccount:
         create: true
-        name:
         automount: true
       role:
         create: true
-        name:
       addKubectlOpenssl: true
 
 api:
   enabled: true
+  controllers:
+    main:
+      replicas: 1
+      containers:
+        authz:
+          args:
+            - api
   persistence:
     tls:
       name: lightbridge-authz-tls
 
 opa:
   enabled: true
+  controllers:
+    main:
+      replicas: 2
+      containers:
+        authz:
+          args:
+            - opa
   persistence:
     tls:
       name: lightbridge-authz-tls
@@ -41,12 +55,7 @@ usage:
   enabled: true
   persistence:
     tls:
-      name: lightbridge-authz-tls
+      name: lightbridge-authz-usage-tls
 
-migration:
-  enabled: true
-  secrets:
-    secret:
-      stringData:
-        DATABASE_URL: "postgres://postgres:postgres@postgresql:5432/lightbridge_authz"
-        OPA_PASSWORD: "change-me"
+
+rawRessources: []

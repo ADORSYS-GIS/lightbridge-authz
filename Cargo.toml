@@ -4,7 +4,6 @@ members = [
     "crates/lightbridge-authz-rest",
     "app/lightbridge-authz",
     "app/lightbridge-authz-healthcheck",
-    "app/lightbridge-authz-migrate-bin",
     "app/lightbridge-authz-usage",
     "crates/lightbridge-authz-api",
     "crates/lightbridge-authz-api-key",
@@ -72,7 +71,7 @@ incremental = false
 strip = true
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.3"
 edition = "2024"
 license = "MIT"
 publish = false

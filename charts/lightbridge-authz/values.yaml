@@ -1,12 +1,20 @@
-# Default values for lightbridge-authz.
+global:
+  image:
+    version: "0.5.3"
+    repository: "ghcr.io/adorsys-gis/lightbridge-authz-usage"
 
 controllers:
   main:
+    type: deployment
+    replicas: 1
     containers:
-      main:
+      authz:
         image:
-          repository: ghcr.io/adorsys-gis/lightbridge-authz
-          tag: 0.5.0
+          repository: "{{ .Values.global.image.repository }}"
+          tag: "{{ .Values.global.image.version }}"
+          pullPolicy: IfNotPresent
+        args:
+          - serve
         ports:
           - name: http
             containerPort: 3000
@@ -15,13 +23,36 @@ controllers:
           DATABASE_URL:
             valueFrom:
               secretKeyRef:
-                identifier: secret
+                name: db-secret
                 key: DATABASE_URL
           OPA_PASSWORD:
             valueFrom:
               secretKeyRef:
-                identifier: secret
+                name: opa-secret
                 key: OPA_PASSWORD
+
+  migrate:
+    type: job
+    job:
+      backoffLimit: 3
+    annotations:
+      "helm.sh/hook": post-install,post-upgrade
+      "helm.sh/hook-weight": "-5"
+      "helm.sh/hook-delete-policy": hook-succeeded
+    containers:
+      authz:
+        image:
+          repository: "{{ .Values.global.image.repository }}"
+          tag: "{{ .Values.global.image.version }}"
+          pullPolicy: IfNotPresent
+        args:
+          - migrate
+        env:
+          DATABASE_URL:
+            valueFrom:
+              secretKeyRef:
+                name: db-secret
+                key: DATABASE_URL
 
 configMaps:
   config:
@@ -44,7 +75,7 @@ configMaps:
               key_path: /etc/lightbridge/tls/api.key
           opa:
             address: 0.0.0.0
-            port: 3001
+            port: 3000
             tls:
               cert_path: /etc/lightbridge/tls/opa.crt
               key_path: /etc/lightbridge/tls/opa.key
@@ -52,15 +83,8 @@ configMaps:
               username: authorino
               password: "${OPA_PASSWORD}"
 
-secrets:
-  secret:
-    enabled: true
-    stringData:
-      DATABASE_URL: postgres://postgres:postgres@postgresql:5432/lightbridge_authz
-      OPA_PASSWORD: change-me
-
 service:
-  main:
+  authz:
     controller: main
     ports:
       http:
@@ -70,10 +94,15 @@ persistence:
   config:
     enabled: true
     type: configMap
-    name: '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}-config'
+    identifier: config
     advancedMounts:
       main:
-        main:
+        authz:
+          - path: /etc/lightbridge/config.yaml
+            subPath: config.yaml
+            readOnly: true
+      migrate:
+        authz:
           - path: /etc/lightbridge/config.yaml
             subPath: config.yaml
             readOnly: true
@@ -85,29 +114,3 @@ persistence:
       - path: /etc/lightbridge/tls
         readOnly: true
 
-serviceAccount:
-  create: true
-
-global: {}
-
-env: []
-volumeMounts: []
-volumes: []
-resources: {}
-livenessProbe: {}
-readinessProbe: {}
-nodeSelector: {}
-tolerations: []
-affinity: {}
-autoscaling:
-  enabled: false
-podAnnotations: {}
-podLabels: {}
-podSecurityContext: {}
-securityContext: {}
-ingress:
-  enabled: false
-  className: ""
-  annotations: {}
-  hosts: []
-  tls: []
