@@ -107,7 +107,6 @@ services:
     build:
       context: .
       target: migrate
-      network: host
     volumes:
       - "./.docker/authz/container.yaml:/tmp/config.yaml:ro"
       - "authz_tls:/tls"
@@ -134,7 +133,6 @@ services:
     build:
       context: .
       target: runtime
-      network: host
     volumes:
       - ./.docker/authz/container.yaml:/tmp/config.yaml:ro
       - "./config/tls:/tls:ro"
@@ -181,7 +179,6 @@ services:
     build:
       context: .
       target: usage-migrate
-      network: host
     volumes:
       - "./.docker/usage/container.yaml:/tmp/config.yaml:ro"
     environment:
@@ -196,7 +193,6 @@ services:
     build:
       context: .
       target: usage-runtime
-      network: host
     volumes:
       - "./.docker/usage/container.yaml:/tmp/config.yaml:ro"
       - "./config/tls:/tls:ro"
