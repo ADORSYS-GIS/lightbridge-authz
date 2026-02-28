@@ -1,7 +1,8 @@
 global:
-  image:
-    version: "0.5.3"
-    repository: "ghcr.io/adorsys-gis/lightbridge-authz-usage"
+  authz:
+    image:
+      version: "0.5.3"
+      repository: "ghcr.io/adorsys-gis/lightbridge-authz"
 
 controllers:
   main:
@@ -10,8 +11,8 @@ controllers:
     containers:
       authz:
         image:
-          repository: "{{ .Values.global.image.repository }}"
-          tag: "{{ .Values.global.image.version }}"
+          repository: "{{ .Values.global.authz.image.repository }}"
+          tag: "{{ .Values.global.authz.image.version }}"
           pullPolicy: IfNotPresent
         args:
           - serve
@@ -42,8 +43,8 @@ controllers:
     containers:
       authz:
         image:
-          repository: "{{ .Values.global.image.repository }}"
-          tag: "{{ .Values.global.image.version }}"
+          repository: "{{ .Values.global.authz.image.repository }}"
+          tag: "{{ .Values.global.authz.image.version }}"
           pullPolicy: IfNotPresent
         args:
           - migrate
