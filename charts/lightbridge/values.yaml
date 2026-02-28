@@ -34,6 +34,8 @@ api:
         authz:
           args:
             - api
+            - --config-path
+            - /etc/lightbridge/config.yaml
   persistence:
     tls:
       name: lightbridge-authz-tls
@@ -47,6 +49,8 @@ opa:
         authz:
           args:
             - opa
+            - --config-path
+            - /etc/lightbridge/config.yaml
   persistence:
     tls:
       name: lightbridge-authz-tls
