@@ -1,4 +1,5 @@
 ---
 {{ range .Values.rawRessources }}
+---
 {{ tpl . $ }}
 {{ end }}
