@@ -16,6 +16,8 @@ controllers:
           pullPolicy: IfNotPresent
         args:
           - serve
+          - --config-path
+          - /etc/lightbridge/config.yaml
         ports:
           - name: http
             containerPort: 3000
@@ -43,6 +45,8 @@ controllers:
           pullPolicy: IfNotPresent
         args:
           - migrate
+          - --config-path
+          - /etc/lightbridge/config.yaml
         env:
           DATABASE_URL:
             valueFrom:
