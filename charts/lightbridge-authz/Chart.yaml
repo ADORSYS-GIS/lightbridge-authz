@@ -3,7 +3,7 @@ name: lightbridge-authz
 description: Kubernetes deployment for the lightbridge authz services
 
 type: application
-version: 0.5.6
+version: 0.5.7
 appVersion: "0.5.3"
 icon: https://adorsys.com/favicon.svg?v=05f867cc1aa036716c10a6c1d4ad6365
 home: https://github.com/ADORSYS-GIS/lightbridge-authz

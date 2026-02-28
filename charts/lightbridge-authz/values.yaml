@@ -48,6 +48,8 @@ controllers:
           pullPolicy: IfNotPresent
         args:
           - migrate
+          - --config-path
+          - /etc/lightbridge/config.yaml
         env:
           DATABASE_URL:
             valueFrom:
