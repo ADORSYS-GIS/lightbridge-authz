@@ -262,7 +262,7 @@ impl StoreRepo {
         .bind(new_account.billing_identity.clone())
         .bind(new_account.created_at)
         .bind(new_account.updated_at)
-        .execute(&mut tx)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             if let sqlx::Error::Database(db_err) = &e
@@ -276,7 +276,7 @@ impl StoreRepo {
             e.into()
         })?;
 
-        self.upsert_account_memberships(&new_account.id, &members, &mut tx)
+        self.upsert_account_memberships(&new_account.id, &members, &mut *tx)
             .await?;
         tx.commit().await?;
 
@@ -358,7 +358,7 @@ impl StoreRepo {
         .bind(subject)
         .bind(input.billing_identity)
         .bind(now)
-        .fetch_optional(&mut tx)
+        .fetch_optional(&mut *tx)
         .await?;
         if update_result.is_none() {
             return Err(lightbridge_authz_core::error::Error::NotFound);
@@ -366,9 +366,9 @@ impl StoreRepo {
 
         if let Some(owners) = input.owners_admins {
             let members = Self::normalize_members(owners, subject);
-            self.upsert_account_memberships(account_id, &members, &mut tx)
+            self.upsert_account_memberships(account_id, &members, &mut *tx)
                 .await?;
-            self.delete_account_memberships_not_in(account_id, &members, &mut tx)
+            self.delete_account_memberships_not_in(account_id, &members, &mut *tx)
                 .await?;
         }
 
@@ -432,7 +432,7 @@ impl StoreRepo {
             INSERT INTO projects (
               id, account_id, name, allowed_models, default_limits, billing_plan, created_at, updated_at
             )
-            SELECT $3, account_auth.id, $4, $5, $6, $7, $8, $9
+            SELECT $3, account_auth.account_id, $4, $5, $6, $7, $8, $9
             FROM account_auth
             RETURNING id, account_id, name, allowed_models, default_limits, billing_plan, created_at, updated_at
             "#,
