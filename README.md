@@ -194,4 +194,6 @@ just up-no-build
 just logs-api
 just logs-opa
 just migrate
+just it-authorino
+just it-servers
 ```

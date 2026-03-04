@@ -8,7 +8,8 @@ use std::fs::read_to_string;
 use std::sync::LazyLock;
 
 static RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)|\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?::([^}]*))?\}").unwrap()
+    Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)|\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?:(:-|-)([^}]*))?\}")
+        .unwrap()
 });
 
 #[derive(Debug, Clone, Deserialize)]
@@ -95,23 +96,34 @@ where
 /// Supports:
 /// - $VAR
 /// - ${VAR}
-/// - ${VAR:default-value}
+/// - ${VAR-default}
+/// - ${VAR:-default}
+///
+/// Behavior mostly matches GNU envsubst:
+/// - unresolved variables are replaced with an empty string
+///
+/// It additionally supports a subset of shell default expansion to make config
+/// defaults ergonomic without external preprocessing.
 fn interpolate_env_vars(content: &str) -> String {
     RE.replace_all(content, |caps: &Captures| {
         if let Some(var_name) = caps.get(1) {
             // $VAR
-            env::var(var_name.as_str())
-                .unwrap_or_else(|_| caps.get(0).unwrap().as_str().to_string())
+            env::var(var_name.as_str()).unwrap_or_default()
         } else if let Some(var_name) = caps.get(2) {
-            // ${VAR} or ${VAR:default}
+            // ${VAR}, ${VAR-default}, ${VAR:-default}
             let name = var_name.as_str();
-            let default = caps.get(3).map(|m| m.as_str());
+            let operator = caps.get(3).map(|m| m.as_str());
+            let default_value = caps.get(4).map(|m| m.as_str()).unwrap_or_default();
 
-            env::var(name).unwrap_or_else(|_| {
-                default
-                    .map(|d| d.to_string())
-                    .unwrap_or_else(|| caps.get(0).unwrap().as_str().to_string())
-            })
+            match operator {
+                None => env::var(name).unwrap_or_default(),
+                Some("-") => env::var(name).unwrap_or_else(|_| default_value.to_string()),
+                Some(":-") => match env::var(name) {
+                    Ok(value) if !value.is_empty() => value,
+                    _ => default_value.to_string(),
+                },
+                Some(_) => caps.get(0).unwrap().as_str().to_string(),
+            }
         } else {
             caps.get(0).unwrap().as_str().to_string()
         }
@@ -129,6 +141,7 @@ mod tests {
         unsafe {
             env::set_var("TEST_VAR", "foo");
             env::set_var("TEST_VAR_2", "bar");
+            env::set_var("EMPTY_VAR", "");
         }
 
         // $VAR
@@ -145,27 +158,38 @@ mod tests {
             "prefix_foo_suffix"
         );
 
-        // ${VAR:default}
-        assert_eq!(interpolate_env_vars("${TEST_VAR:default}"), "foo");
-        assert_eq!(interpolate_env_vars("${NON_EXISTENT:default}"), "default");
-        assert_eq!(
-            interpolate_env_vars("${NON_EXISTENT:default_with_spaces}"),
-            "default_with_spaces"
-        );
-
         // Mixed
         assert_eq!(
-            interpolate_env_vars("$TEST_VAR and ${TEST_VAR_2} and ${NON_EXISTENT:baz}"),
-            "foo and bar and baz"
+            interpolate_env_vars("$TEST_VAR and ${TEST_VAR_2} and $NON_EXISTENT"),
+            "foo and bar and "
         );
 
-        // Not set, no default (should remain as is)
-        assert_eq!(interpolate_env_vars("$NOT_SET"), "$NOT_SET");
-        assert_eq!(interpolate_env_vars("${NOT_SET}"), "${NOT_SET}");
+        // Not set -> empty string
+        assert_eq!(interpolate_env_vars("$NOT_SET"), "");
+        assert_eq!(interpolate_env_vars("${NOT_SET}"), "");
+
+        // ${VAR-default} and ${VAR:-default}
+        assert_eq!(interpolate_env_vars("${TEST_VAR-default}"), "foo");
+        assert_eq!(interpolate_env_vars("${NOT_SET-default}"), "default");
+        assert_eq!(interpolate_env_vars("${EMPTY_VAR-default}"), "");
+        assert_eq!(interpolate_env_vars("${TEST_VAR:-default}"), "foo");
+        assert_eq!(interpolate_env_vars("${NOT_SET:-default}"), "default");
+        assert_eq!(interpolate_env_vars("${EMPTY_VAR:-default}"), "default");
+
+        // Unsupported syntax remains unchanged
+        assert_eq!(
+            interpolate_env_vars("${TEST_VAR:default}"),
+            "${TEST_VAR:default}"
+        );
+        assert_eq!(
+            interpolate_env_vars("${NON_EXISTENT:default_with_spaces}"),
+            "${NON_EXISTENT:default_with_spaces}"
+        );
 
         unsafe {
             env::remove_var("TEST_VAR");
             env::remove_var("TEST_VAR_2");
+            env::remove_var("EMPTY_VAR");
         }
     }
 }

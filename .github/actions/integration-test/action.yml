@@ -8,7 +8,7 @@ runs:
         sudo apt-get update
         sudo apt-get install -y just
       shell: bash
-    - name: Run Authorino test stack
+    - name: Run integration test stack
       shell: bash
       run: |
         set -eo pipefail
@@ -27,6 +27,7 @@ runs:
           COUNT=$((COUNT + 1))
         done
         just it-authorino
+        docker compose -f compose.yaml -f compose.it.yaml run --rm it-servers
     - run: docker compose -f compose.yaml -f compose.it.yaml logs
       if: failure()
       shell: bash

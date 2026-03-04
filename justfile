@@ -119,6 +119,15 @@ it-authorino:
 it-authorino-down:
 	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml down -v
 
+# Run integration checks across API/OPA/Usage/MCP services
+it-servers:
+	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml up -d --build
+	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml run --rm it-servers
+
+# Cleanup service integration test setup
+it-servers-down:
+	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml down -v
+
 # Show stats
 stats:
 	docker compose -p lightbridge-authz -f compose.yaml stats {{c}}
