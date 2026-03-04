@@ -61,5 +61,11 @@ usage:
     tls:
       name: lightbridge-authz-usage-tls
 
+mcp:
+  enabled: true
+  persistence:
+    tls:
+      name: lightbridge-authz-mcp-tls
+
 
 rawRessources: []

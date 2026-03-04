@@ -36,3 +36,9 @@ dependencies:
     repository: "file://../lightbridge-authz-usage"
     alias: usage
     condition: usage.enabled
+
+  - name: lightbridge-mcp
+    version: "*"
+    repository: "file://../lightbridge-mcp"
+    alias: mcp
+    condition: mcp.enabled
