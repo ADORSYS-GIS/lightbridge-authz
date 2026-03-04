@@ -16,14 +16,12 @@ jobs:
       - uses: ./.github/actions/cargo-deny
         with:
           check: ${{ matrix.checks }}
-
   code-checks:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
       - uses: ./.github/actions/code-checks
-
   test:
     needs: code-checks
     runs-on: ubuntu-latest
@@ -45,7 +43,6 @@ jobs:
       - uses: ./.github/actions/tests
         with:
           database-url: postgres://postgres:postgres@localhost:5432/lightbridge_authz
-
   integration-test:
     needs: code-checks
     if: github.ref == 'refs/heads/main'
@@ -54,7 +51,6 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
       - uses: ./.github/actions/integration-test
-
   build:
     needs: test
     runs-on: ubuntu-latest
@@ -62,20 +58,19 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
       - uses: ./.github/actions/build-release
-
   container-build:
     needs: build
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
-          - name: authz
-            target: runtime
-            image-name: ${{ github.repository }}
-          - name: usage
-            target: usage-runtime
-            image-name: ${{ github.repository }}-usage
+          - { os: ubuntu-24.04, platform: linux/amd64, target: runtime, image_name: '${{ github.repository }}' }
+          - { os: ubuntu-22.04-arm, platform: linux/arm64, target: runtime, image_name: '${{ github.repository }}' }
+          - { os: ubuntu-24.04, platform: linux/amd64, target: mcp-runtime, image_name: '${{ github.repository }}-mcp' }
+          - { os: ubuntu-22.04-arm, platform: linux/arm64, target: mcp-runtime, image_name: '${{ github.repository }}-mcp' }
+          - { os: ubuntu-24.04, platform: linux/amd64, target: usage-runtime, image_name: '${{ github.repository }}-usage' }
+          - { os: ubuntu-22.04-arm, platform: linux/arm64, target: usage-runtime, image_name: '${{ github.repository }}-usage' }
     permissions:
       contents: read
       packages: write
@@ -86,9 +81,9 @@ jobs:
         uses: ./.github/actions/container-build
         with:
           app-version: ${{ github.sha }}
-          image-name: ${{ matrix.image-name }}
+          image-name: ${{ matrix.image_name }}
           target: ${{ matrix.target }}
-
+          platform: ${{ matrix.platform }}
   release:
     needs: [build,container-build]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'

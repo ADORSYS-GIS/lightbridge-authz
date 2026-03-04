@@ -32,8 +32,6 @@ runs:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-    - name: Set up QEMU
-      uses: docker/setup-qemu-action@v3.7.0
     - id: lowercase
       name: Lowercase image name
       uses: AsZc/change-string-case-action@ccb130a4e483d3e86287289183704dc9bf53e77e

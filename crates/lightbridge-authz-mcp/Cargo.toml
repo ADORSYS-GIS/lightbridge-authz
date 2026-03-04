@@ -1,0 +1,28 @@
+[package]
+name = "lightbridge-authz-mcp"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[package.metadata]
+description = "MCP server for Lightbridge Authz endpoints"
+
+[dependencies]
+axum.workspace = true
+chrono.workspace = true
+rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+lightbridge-authz-api.workspace = true
+lightbridge-authz-api-key.workspace = true
+lightbridge-authz-bearer.workspace = true
+lightbridge-authz-core = { workspace = true, features = ["axum"] }
+lightbridge-authz-rest.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

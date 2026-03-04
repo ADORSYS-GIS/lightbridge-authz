@@ -1,7 +1,7 @@
 global:
   tlsSecretName: lightbridge-authz-tls
   image:
-    version: "0.5.3"
+    version: "0.6.0"
     repository: "ghcr.io/adorsys-gis/lightbridge-authz-usage"
   tls:
     enabled: true

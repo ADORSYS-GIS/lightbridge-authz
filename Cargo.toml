@@ -2,7 +2,9 @@
 members = [
     "crates/lightbridge-authz-core",
     "crates/lightbridge-authz-rest",
+    "crates/lightbridge-authz-mcp",
     "app/lightbridge-authz",
+    "app/lightbridge-mcp",
     "app/lightbridge-authz-healthcheck",
     "app/lightbridge-authz-usage",
     "crates/lightbridge-authz-api",
@@ -18,6 +20,7 @@ resolver = "3"
 [workspace.dependencies]
 lightbridge-authz-core = { path = "./crates/lightbridge-authz-core" }
 lightbridge-authz-rest = { path = "./crates/lightbridge-authz-rest" }
+lightbridge-authz-mcp = { path = "./crates/lightbridge-authz-mcp" }
 lightbridge-authz-api = { path = "./crates/lightbridge-authz-api" }
 lightbridge-authz-api-key = { path = "./crates/lightbridge-authz-api-key" }
 lightbridge-authz-bearer = { path = "./crates/lightbridge-authz-bearer" }
@@ -60,6 +63,8 @@ utoipa = { version = "5", features = ["macros", "chrono"] }
 utoipa-swagger-ui = { version = "9", features = ["axum", "reqwest"] }
 regex = "1.10"
 
+rmcp = "1.1.0"
+
 mimalloc = "0"
 
 [profile.prod]
@@ -71,7 +76,7 @@ incremental = false
 strip = true
 
 [workspace.package]
-version = "0.5.3"
+version = "0.6.0"
 edition = "2024"
 license = "MIT"
 publish = false

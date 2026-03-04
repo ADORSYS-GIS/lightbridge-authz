@@ -52,6 +52,7 @@ RUN \
   && ls -lash ./target/"${RUST_TARGET}"/prod \
   && cp ./target/"${RUST_TARGET}"/prod/lightbridge-authz-healthcheck lightbridge-authz-healthcheck \
   && cp ./target/"${RUST_TARGET}"/prod/lightbridge-authz lightbridge-authz \
+  && cp ./target/"${RUST_TARGET}"/prod/lightbridge-mcp lightbridge-mcp \
   && cp ./target/"${RUST_TARGET}"/prod/lightbridge-authz-usage lightbridge-authz-usage
 
 # Runtime stage
@@ -95,4 +96,24 @@ EXPOSE 3002
 ENV RUST_LOG=info
 
 ENTRYPOINT ["lightbridge-authz-usage"]
+CMD ["serve"]
+
+FROM gcr.io/distroless/base-debian12:nonroot as mcp-runtime
+
+LABEL maintainer="stephane-segning <selastlambou@gmail.com>"
+LABEL org.opencontainers.image.description="Backend for LightBridge Authz MCP"
+
+WORKDIR /app
+
+COPY --from=builder /app/lightbridge-mcp /usr/local/bin/lightbridge-mcp
+COPY --from=builder /app/lightbridge-authz-healthcheck /usr/local/bin/lightbridge-authz-healthcheck
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=1s --retries=3 \
+    CMD ["/usr/local/bin/lightbridge-authz-healthcheck", "-r", "3000"]
+
+ENV RUST_LOG=info
+
+ENTRYPOINT ["lightbridge-mcp"]
 CMD ["serve"]

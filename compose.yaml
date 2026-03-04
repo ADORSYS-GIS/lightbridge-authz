@@ -182,6 +182,39 @@ services:
       start_period: 1s
       retries: 3
 
+  authz-mcp:
+    image: lightbridge-mcp
+    depends_on:
+      authz-migrate:
+        condition: service_completed_successfully
+      authz-tls:
+        condition: service_started
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 1G
+          cpus: "0.5"
+    build:
+      context: .
+      target: mcp-runtime
+    volumes:
+      - ./.docker/authz/container.yaml:/tmp/config.yaml:ro
+      - "authz_tls:/tls:ro"
+    environment:
+      RUST_LOG: "debug,opentelemetry_sdk=warn,opentelemetry_otlp=warn,h2=warn,hyper_util=warn,tower=warn"
+      CONFIG_PATH: "/tmp/config.yaml"
+    ports:
+      - "13003:3000"
+    command:
+      - serve
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/lightbridge-authz-healthcheck", "-r", "3000"]
+      interval: 30s
+      timeout: 3s
+      start_period: 1s
+      retries: 3
+
   authz-usage-migrate:
     image: lightbridge-authz-usage
     build:

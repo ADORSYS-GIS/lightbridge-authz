@@ -11,6 +11,9 @@ inputs:
     description: Docker build target
     required: false
     default: runtime
+  platform:
+    description: Docker platform to build (for example linux/amd64)
+    required: true
 runs:
   using: composite
   steps:
@@ -26,7 +29,7 @@ runs:
         file: Dockerfile
         target: ${{ inputs.target }}
         push: true
-        platforms: linux/amd64,linux/arm64
+        platforms: ${{ inputs.platform }}
         tags: ${{ steps.docker-setup.outputs.tags }}
         labels: ${{ steps.docker-setup.outputs.labels }}
         annotations: ${{ steps.docker-setup.outputs.annotations }}

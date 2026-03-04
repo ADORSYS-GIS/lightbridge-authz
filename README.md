@@ -3,6 +3,7 @@
 Lightbridge Authz is a multi-service backend for API key management and usage analytics:
 - `authz-api` and `authz-opa` handle key lifecycle and validation.
 - `lightbridge-authz-usage` ingests OTEL traffic data and serves Timescale-backed usage analytics.
+- `lightbridge-mcp` exposes all `lightbridge-authz` endpoints as MCP tools over streamable HTTP (`/mcp`).
 
 ## Services
 
@@ -15,6 +16,11 @@ Lightbridge Authz is a multi-service backend for API key management and usage an
   - `POST /v1/opa/validate` (basic auth).
 - **authz-migrate**
   - Runs SQL migrations before the API services start.
+- **lightbridge-mcp**
+  - TLS on `:3000` inside the container, exposed as `:13003` via compose.
+  - MCP streamable HTTP endpoint: `POST/GET /mcp`
+  - Protected with OAuth2/JWT bearer validation (same JWKS flow as `authz-api`).
+  - Reuses the same config file as `lightbridge-authz` (API bind/tls + shared DB settings).
 - **lightbridge-authz-usage** (OTEL ingest + usage query)
   - OTEL ingest endpoints (no auth): `POST /v1/otel/traces`, `POST /v1/otel/metrics`
   - Usage query endpoint: `POST /v1/usage/query`
@@ -32,6 +38,7 @@ Verify health:
 ```bash
 curl -k https://localhost:13000/health
 curl -k https://localhost:13001/health
+curl -k https://localhost:13003/health
 ```
 
 `-k` is required because the certs are self‑signed.
@@ -118,6 +125,7 @@ Run locally:
 
 ```bash
 cargo run -p lightbridge-authz-usage -- serve --config-path config/usage.yaml
+cargo run -p lightbridge-mcp -- serve --config-path config/default.yaml
 ```
 
 ## Testing with Keycloak (OAuth2)

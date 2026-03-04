@@ -90,6 +90,10 @@ logs-opa:
 logs-usage:
 	docker compose -p lightbridge-authz -f compose.yaml logs --tail=100 -f authz-usage {{c}}
 
+# Show MCP API logs
+logs-mcp:
+	docker compose -p lightbridge-authz -f compose.yaml logs --tail=100 -f authz-mcp {{c}}
+
 # Show status
 ps:
 	docker compose -p lightbridge-authz -f compose.yaml ps {{c}}
