@@ -374,12 +374,12 @@ async fn oauth_register_handler(
 
     let mut response = Response::new(Body::from(body.to_vec()));
     *response.status_mut() = status;
-    if let Some(content_type) = content_type {
-        if let Ok(header_value) = HeaderValue::from_str(&content_type) {
-            response
-                .headers_mut()
-                .insert(header::CONTENT_TYPE, header_value);
-        }
+    if let Some(content_type) = content_type
+        && let Ok(header_value) = HeaderValue::from_str(&content_type)
+    {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, header_value);
     }
     response
 }
