@@ -742,8 +742,8 @@ impl StoreRepo {
             r#"
             UPDATE api_keys
             SET
-              name = COALESCE($1, name),
-              expires_at = COALESCE($2, expires_at)
+              name = COALESCE($1, api_keys.name),
+              expires_at = COALESCE($2, api_keys.expires_at)
             FROM projects
             JOIN account_memberships ON account_memberships.account_id = projects.account_id
             WHERE api_keys.project_id = projects.id

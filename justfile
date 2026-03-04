@@ -129,7 +129,7 @@ load-test:
 
 # Run database-backed integration tests
 it-tests:
-	@bash -ec 'set -euo pipefail; cmd="docker compose -p lightbridge-authz -f compose.yaml"; ${cmd} up -d postgresql; trap "${cmd} down postgresql" EXIT; sleep 3; export DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"; cargo test -p lightbridge-authz-api-key --features it-tests --test rotate_transaction_tests --test project_limits_tests'
+	@bash -ec 'set -euo pipefail; cmd="docker compose -p lightbridge-authz -f compose.yaml"; ${cmd} up -d postgresql; trap "${cmd} down postgresql" EXIT; sleep 3; export DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"; cargo test -p lightbridge-authz-api-key --features it-tests --tests'
 
 all-checks:
 	@echo "Running Rust formatting, lint, and checks"
