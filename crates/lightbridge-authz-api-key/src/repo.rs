@@ -8,10 +8,10 @@ use lightbridge_authz_core::{
     UpdateAccount, UpdateApiKey, UpdateProject,
 };
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{Executor, PgPool, Postgres, Transaction};
 use tracing::instrument;
 
-use crate::entities::account_row::{AccountChangeset, AccountRow};
+use crate::entities::account_row::AccountWithMembersRow;
 use crate::entities::api_key_row::{ApiKeyChangeset, ApiKeyRow};
 use crate::entities::new_account_row::NewAccountRow;
 use crate::entities::new_api_key_row::NewApiKeyRow;
@@ -68,14 +68,142 @@ impl StoreRepo {
         }
     }
 
-    fn to_account(row: AccountRow) -> Account {
+    fn to_account(row: AccountWithMembersRow) -> Account {
         Account {
             id: row.id,
             billing_identity: row.billing_identity,
-            owners_admins: Self::json_to_vec(&Some(row.owners_admins)).unwrap_or_default(),
+            owners_admins: row.owners_admins,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
+    }
+
+    fn normalize_members(mut members: Vec<String>, subject: &str) -> Vec<String> {
+        if !members.iter().any(|owner| owner == subject) {
+            members.push(subject.to_string());
+        }
+        members.sort_unstable();
+        members.dedup();
+        members
+    }
+
+    async fn upsert_account_memberships<'e, E>(
+        &self,
+        account_id: &str,
+        members: &[String],
+        executor: E,
+    ) -> Result<()>
+    where
+        E: Executor<'e, Database = Postgres>,
+    {
+        if members.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO account_memberships (account_id, subject)
+            SELECT $1, member
+            FROM unnest($2::text[]) AS member
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(account_id)
+        .bind(members)
+        .execute(executor)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_account_memberships_not_in<'e, E>(
+        &self,
+        account_id: &str,
+        members: &[String],
+        executor: E,
+    ) -> Result<()>
+    where
+        E: Executor<'e, Database = Postgres>,
+    {
+        if members.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            r#"
+            DELETE FROM account_memberships
+            WHERE account_id = $1
+              AND NOT (subject = ANY($2::text[]))
+            "#,
+        )
+        .bind(account_id)
+        .bind(members)
+        .execute(executor)
+        .await?;
+        Ok(())
+    }
+
+    async fn load_account_with_members_row(
+        &self,
+        account_id: &str,
+    ) -> Result<AccountWithMembersRow> {
+        let row = self
+            .load_account_with_members_row_optional(account_id)
+            .await?;
+        row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)
+    }
+
+    async fn load_account_with_members_row_optional(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<AccountWithMembersRow>> {
+        let row = sqlx::query_as::<_, AccountWithMembersRow>(
+            r#"
+            SELECT
+              accounts.id,
+              accounts.billing_identity,
+              COALESCE(array_agg(account_memberships.subject ORDER BY account_memberships.subject), '{}'::text[]) AS owners_admins,
+              accounts.created_at,
+              accounts.updated_at
+            FROM accounts
+            LEFT JOIN account_memberships ON accounts.id = account_memberships.account_id
+            WHERE accounts.id = $1
+            GROUP BY accounts.id
+            "#,
+        )
+        .bind(account_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    async fn load_account_with_members_row_for_subject(
+        &self,
+        account_id: &str,
+        subject: &str,
+    ) -> Result<Option<AccountWithMembersRow>> {
+        let row = sqlx::query_as::<_, AccountWithMembersRow>(
+            r#"
+            SELECT
+              accounts.id,
+              accounts.billing_identity,
+              COALESCE(array_agg(account_memberships.subject ORDER BY account_memberships.subject), '{}'::text[]) AS owners_admins,
+              accounts.created_at,
+              accounts.updated_at
+            FROM accounts
+            LEFT JOIN account_memberships ON accounts.id = account_memberships.account_id
+            WHERE accounts.id = $1
+              AND EXISTS (
+                SELECT 1
+                FROM account_memberships AS auth
+                WHERE auth.account_id = accounts.id
+                  AND auth.subject = $2
+              )
+            GROUP BY accounts.id
+            "#,
+        )
+        .bind(account_id)
+        .bind(subject)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
     }
 
     fn to_project(row: ProjectRow) -> Project {
@@ -115,33 +243,26 @@ impl StoreRepo {
         id: String,
     ) -> Result<Account> {
         let now = Utc::now();
-        let mut owners = input.owners_admins;
-        if !owners.iter().any(|owner| owner == subject) {
-            owners.push(subject.to_string());
-        }
-        owners.sort_unstable();
-        owners.dedup();
+        let members = Self::normalize_members(input.owners_admins, subject);
         let new_account = NewAccountRow {
-            id,
+            id: id.clone(),
             billing_identity: input.billing_identity,
-            owners_admins: Self::vec_to_json(&Some(owners)),
             created_at: now,
             updated_at: now,
         };
 
-        let row: AccountRow = sqlx::query_as(
+        let mut tx: Transaction<'_, Postgres> = self.pool().begin().await?;
+        sqlx::query(
             r#"
-            INSERT INTO accounts (id, billing_identity, owners_admins, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id, billing_identity, owners_admins, created_at, updated_at
+            INSERT INTO accounts (id, billing_identity, created_at, updated_at)
+            VALUES ($1, $2, $3, $4)
             "#,
         )
-        .bind(new_account.id)
+        .bind(new_account.id.clone())
         .bind(new_account.billing_identity.clone())
-        .bind(new_account.owners_admins)
         .bind(new_account.created_at)
         .bind(new_account.updated_at)
-        .fetch_one(self.pool())
+        .execute(&mut tx)
         .await
         .map_err(|e| {
             if let sqlx::Error::Database(db_err) = &e
@@ -155,17 +276,34 @@ impl StoreRepo {
             e.into()
         })?;
 
-        Ok(Self::to_account(row))
+        self.upsert_account_memberships(&new_account.id, &members, &mut tx)
+            .await?;
+        tx.commit().await?;
+
+        let account = self.load_account_with_members_row(&new_account.id).await?;
+        Ok(Self::to_account(account))
     }
 
     #[instrument(skip(self))]
     pub async fn list_accounts(&self, subject: &str) -> Result<Vec<Account>> {
-        let rows: Vec<AccountRow> = sqlx::query_as(
+        let rows: Vec<AccountWithMembersRow> = sqlx::query_as(
             r#"
-            SELECT id, billing_identity, owners_admins, created_at, updated_at
+            SELECT
+              accounts.id,
+              accounts.billing_identity,
+              COALESCE(array_agg(account_memberships.subject ORDER BY account_memberships.subject), '{}'::text[]) AS owners_admins,
+              accounts.created_at,
+              accounts.updated_at
             FROM accounts
-            WHERE owners_admins ? $1
-            ORDER BY created_at ASC
+            LEFT JOIN account_memberships ON accounts.id = account_memberships.account_id
+            WHERE EXISTS (
+                SELECT 1
+                FROM account_memberships AS auth
+                WHERE auth.account_id = accounts.id
+                  AND auth.subject = $1
+            )
+            GROUP BY accounts.id
+            ORDER BY accounts.created_at ASC
             "#,
         )
         .bind(subject)
@@ -176,33 +314,17 @@ impl StoreRepo {
 
     #[instrument(skip(self))]
     pub async fn get_account(&self, subject: &str, account_id: &str) -> Result<Option<Account>> {
-        let row = sqlx::query_as(
-            r#"
-            SELECT id, billing_identity, owners_admins, created_at, updated_at
-            FROM accounts
-            WHERE id = $1
-              AND owners_admins ? $2
-            "#,
-        )
-        .bind(account_id)
-        .bind(subject)
-        .fetch_optional(self.pool())
-        .await?;
+        let row = self
+            .load_account_with_members_row_for_subject(account_id, subject)
+            .await?;
         Ok(row.map(Self::to_account))
     }
 
     #[instrument(skip(self))]
     pub async fn get_account_by_id(&self, account_id: &str) -> Result<Option<Account>> {
-        let row = sqlx::query_as(
-            r#"
-            SELECT id, billing_identity, owners_admins, created_at, updated_at
-            FROM accounts
-            WHERE id = $1
-            "#,
-        )
-        .bind(account_id)
-        .fetch_optional(self.pool())
-        .await?;
+        let row = self
+            .load_account_with_members_row_optional(account_id)
+            .await?;
         Ok(row.map(Self::to_account))
     }
 
@@ -213,40 +335,46 @@ impl StoreRepo {
         account_id: &str,
         input: UpdateAccount,
     ) -> Result<Account> {
-        let mut updated_owners = input.owners_admins;
-        if let Some(ref mut owners) = updated_owners {
-            if !owners.iter().any(|owner| owner == subject) {
-                owners.push(subject.to_string());
-            }
-            owners.sort_unstable();
-            owners.dedup();
-        }
-        let changes = AccountChangeset {
-            billing_identity: input.billing_identity,
-            owners_admins: updated_owners.map(|v| Self::vec_to_json(&Some(v))),
-            updated_at: Utc::now(),
-        };
-
-        let row: Option<AccountRow> = sqlx::query_as(
+        let mut tx: Transaction<'_, Postgres> = self.pool().begin().await?;
+        let now = Utc::now();
+        let update_result = sqlx::query(
             r#"
+            WITH authorized AS (
+                SELECT account_id
+                FROM account_memberships
+                WHERE account_id = $1
+                  AND subject = $2
+            )
             UPDATE accounts
             SET
-              billing_identity = COALESCE($1, billing_identity),
-              owners_admins = COALESCE($2, owners_admins),
-              updated_at = $3
-            WHERE id = $4
-              AND owners_admins ? $5
-            RETURNING id, billing_identity, owners_admins, created_at, updated_at
+              billing_identity = COALESCE($3, billing_identity),
+              updated_at = $4
+            FROM authorized
+            WHERE accounts.id = authorized.account_id
+            RETURNING accounts.id
             "#,
         )
-        .bind(changes.billing_identity)
-        .bind(changes.owners_admins)
-        .bind(changes.updated_at)
         .bind(account_id)
         .bind(subject)
-        .fetch_optional(self.pool())
+        .bind(input.billing_identity)
+        .bind(now)
+        .fetch_optional(&mut tx)
         .await?;
-        let row = row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
+        if update_result.is_none() {
+            return Err(lightbridge_authz_core::error::Error::NotFound);
+        }
+
+        if let Some(owners) = input.owners_admins {
+            let members = Self::normalize_members(owners, subject);
+            self.upsert_account_memberships(account_id, &members, &mut tx)
+                .await?;
+            self.delete_account_memberships_not_in(account_id, &members, &mut tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+
+        let row = self.load_account_with_members_row(account_id).await?;
         Ok(Self::to_account(row))
     }
 
@@ -256,7 +384,12 @@ impl StoreRepo {
             r#"
             DELETE FROM accounts
             WHERE id = $1
-              AND owners_admins ? $2
+              AND EXISTS (
+                SELECT 1
+                FROM account_memberships AS auth
+                WHERE auth.account_id = accounts.id
+                  AND auth.subject = $2
+              )
             "#,
         )
         .bind(account_id)
@@ -291,10 +424,10 @@ impl StoreRepo {
         let row: Option<ProjectRow> = sqlx::query_as(
             r#"
             WITH account_auth AS (
-                SELECT id
-                FROM accounts
-                WHERE id = $1
-                  AND owners_admins ? $2
+                SELECT account_id
+                FROM account_memberships
+                WHERE account_id = $1
+                  AND subject = $2
             )
             INSERT INTO projects (
               id, account_id, name, allowed_models, default_limits, billing_plan, created_at, updated_at
@@ -333,9 +466,13 @@ impl StoreRepo {
               projects.created_at,
               projects.updated_at
             FROM projects
-            JOIN accounts ON accounts.id = projects.account_id
             WHERE projects.account_id = $1
-              AND accounts.owners_admins ? $2
+              AND EXISTS (
+                SELECT 1
+                FROM account_memberships
+                WHERE account_memberships.account_id = projects.account_id
+                  AND account_memberships.subject = $2
+              )
             ORDER BY projects.created_at ASC
             "#,
         )
@@ -360,9 +497,13 @@ impl StoreRepo {
               projects.created_at,
               projects.updated_at
             FROM projects
-            JOIN accounts ON accounts.id = projects.account_id
             WHERE projects.id = $1
-              AND accounts.owners_admins ? $2
+              AND EXISTS (
+                SELECT 1
+                FROM account_memberships
+                WHERE account_memberships.account_id = projects.account_id
+                  AND account_memberships.subject = $2
+              )
             "#,
         )
         .bind(project_id)
@@ -423,10 +564,10 @@ impl StoreRepo {
               default_limits = COALESCE($4, default_limits),
               billing_plan = COALESCE($5, billing_plan),
               updated_at = $6
-            FROM accounts
-            WHERE projects.account_id = accounts.id
+            FROM account_memberships
+            WHERE projects.account_id = account_memberships.account_id
               AND projects.id = $7
-              AND accounts.owners_admins ? $8
+              AND account_memberships.subject = $8
             RETURNING
               projects.id,
               projects.account_id,
@@ -457,10 +598,10 @@ impl StoreRepo {
         let result = sqlx::query(
             r#"
             DELETE FROM projects
-            USING accounts
-            WHERE projects.account_id = accounts.id
+            USING account_memberships
+            WHERE projects.account_id = account_memberships.account_id
               AND projects.id = $1
-              AND accounts.owners_admins ? $2
+              AND account_memberships.subject = $2
             "#,
         )
         .bind(project_id)
@@ -480,9 +621,9 @@ impl StoreRepo {
             WITH project_auth AS (
                 SELECT projects.id AS project_id
                 FROM projects
-                JOIN accounts ON accounts.id = projects.account_id
+                JOIN account_memberships ON account_memberships.account_id = projects.account_id
                 WHERE projects.id = $1
-                  AND accounts.owners_admins ? $2
+                  AND account_memberships.subject = $2
             )
             INSERT INTO api_keys (
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
@@ -531,9 +672,13 @@ impl StoreRepo {
               api_keys.revoked_at
             FROM api_keys
             JOIN projects ON projects.id = api_keys.project_id
-            JOIN accounts ON accounts.id = projects.account_id
             WHERE api_keys.project_id = $1
-              AND accounts.owners_admins ? $2
+              AND EXISTS (
+                SELECT 1
+                FROM account_memberships
+                WHERE account_memberships.account_id = projects.account_id
+                  AND account_memberships.subject = $2
+              )
             ORDER BY api_keys.created_at DESC
             "#,
         )
@@ -562,9 +707,13 @@ impl StoreRepo {
               api_keys.revoked_at
             FROM api_keys
             JOIN projects ON projects.id = api_keys.project_id
-            JOIN accounts ON accounts.id = projects.account_id
             WHERE api_keys.id = $1
-              AND accounts.owners_admins ? $2
+              AND EXISTS (
+                SELECT 1
+                FROM account_memberships
+                WHERE account_memberships.account_id = projects.account_id
+                  AND account_memberships.subject = $2
+              )
             "#,
         )
         .bind(key_id)
@@ -596,10 +745,10 @@ impl StoreRepo {
               name = COALESCE($1, name),
               expires_at = COALESCE($2, expires_at)
             FROM projects
-            JOIN accounts ON accounts.id = projects.account_id
+            JOIN account_memberships ON account_memberships.account_id = projects.account_id
             WHERE api_keys.project_id = projects.id
               AND api_keys.id = $3
-              AND accounts.owners_admins ? $4
+              AND account_memberships.subject = $4
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
               api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at
@@ -632,10 +781,10 @@ impl StoreRepo {
               revoked_at = COALESCE($2, revoked_at),
               expires_at = COALESCE($3, expires_at)
             FROM projects
-            JOIN accounts ON accounts.id = projects.account_id
+            JOIN account_memberships ON account_memberships.account_id = projects.account_id
             WHERE api_keys.project_id = projects.id
               AND api_keys.id = $4
-              AND accounts.owners_admins ? $5
+              AND account_memberships.subject = $5
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
               api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at
@@ -671,10 +820,10 @@ impl StoreRepo {
               revoked_at = COALESCE($2, revoked_at),
               expires_at = COALESCE($3, expires_at)
             FROM projects
-            JOIN accounts ON accounts.id = projects.account_id
+            JOIN account_memberships ON account_memberships.account_id = projects.account_id
             WHERE api_keys.project_id = projects.id
               AND api_keys.id = $4
-              AND accounts.owners_admins ? $5
+              AND account_memberships.subject = $5
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
               api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at
@@ -693,9 +842,9 @@ impl StoreRepo {
             WITH project_auth AS (
                 SELECT projects.id AS project_id
                 FROM projects
-                JOIN accounts ON accounts.id = projects.account_id
+                JOIN account_memberships ON account_memberships.account_id = projects.account_id
                 WHERE projects.id = $1
-                  AND accounts.owners_admins ? $2
+                  AND account_memberships.subject = $2
             )
             INSERT INTO api_keys (
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
@@ -732,11 +881,11 @@ impl StoreRepo {
         let result = sqlx::query(
             r#"
             DELETE FROM api_keys
-            USING projects, accounts
+            USING projects, account_memberships
             WHERE api_keys.project_id = projects.id
-              AND projects.account_id = accounts.id
+              AND projects.account_id = account_memberships.account_id
               AND api_keys.id = $1
-              AND accounts.owners_admins ? $2
+              AND account_memberships.subject = $2
             "#,
         )
         .bind(key_id)
