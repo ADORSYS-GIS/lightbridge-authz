@@ -21,6 +21,8 @@ Lightbridge Authz is a multi-service backend for API key management and usage an
 - **lightbridge-mcp**
   - TLS on `:3000` inside the container, exposed as `:13003` via compose.
   - MCP streamable HTTP endpoint: `POST/GET /mcp`
+  - OAuth metadata/discovery endpoints: `GET /.well-known/oauth-authorization-server`, `GET /.well-known/openid-configuration`
+  - OAuth dynamic client registration proxy endpoint: `POST /oauth/register`
   - Health probes: `GET /health` (liveness), `GET /health/ready` (DB readiness), `GET /health/startup` (startup)
   - Protected with OAuth2/JWT bearer validation (same JWKS flow as `authz-api`).
   - Reuses the same config file as `lightbridge-authz` (API bind/tls + shared DB settings).
@@ -64,6 +66,7 @@ Default container config is mounted from `.docker/authz/container.yaml`:
 - OPA TLS: `/tls/opa.crt` + `/tls/opa.key`
 - OPA basic auth: `authorino / change-me`
 - OAuth2 JWKS: `http://keycloak:9100/realms/dev/protocol/openid-connect/certs`
+- Optional OAuth2 overrides for MCP metadata/registration relay: `issuer_url`, `authorization_endpoint`, `token_endpoint`, `registration_endpoint`
 
 ## Helm deployment
 

@@ -75,6 +75,14 @@ pub struct Database {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Oauth2 {
     pub jwks_url: String,
+    #[serde(default)]
+    pub issuer_url: Option<String>,
+    #[serde(default)]
+    pub authorization_endpoint: Option<String>,
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+    #[serde(default)]
+    pub registration_endpoint: Option<String>,
 }
 
 pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<Config> {

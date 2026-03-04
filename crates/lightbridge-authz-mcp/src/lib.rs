@@ -1,6 +1,12 @@
 use std::{collections::HashMap, sync::Arc};
 
-use axum::{Json as AxumJson, Router, http::StatusCode, routing::get};
+use axum::{
+    Json as AxumJson, Router,
+    body::Body,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
 use chrono::{DateTime, Utc};
 use lightbridge_authz_api::contract::AuthzStore;
 use lightbridge_authz_api_key::repo::StoreRepo;
@@ -19,6 +25,7 @@ use lightbridge_authz_rest::{
     middleware::bearer_auth,
     models::authorino::AuthorinoMetadata,
 };
+use reqwest::Client;
 use rmcp::{
     ErrorData, Json, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -45,6 +52,22 @@ struct RootResponse {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct EndpointResponse {
     result: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Oauth2ResolvedEndpoints {
+    issuer: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    registration_endpoint: String,
+    jwks_uri: String,
+}
+
+#[derive(Clone)]
+struct OauthProxyState {
+    client: Client,
+    endpoints: Option<Oauth2ResolvedEndpoints>,
+    fallback_registration_endpoint: String,
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
@@ -169,6 +192,196 @@ fn subject_from_request_context(
         .ok_or_else(|| ErrorData::internal_error("missing bearer token context", None))?;
 
     Ok(token_info.sub.clone())
+}
+
+fn issuer_from_jwks_url(jwks_url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(jwks_url).ok()?;
+    let host = parsed.host_str()?;
+    let path = parsed.path();
+    let realm_path = path.strip_suffix("/protocol/openid-connect/certs")?;
+    let mut issuer = format!("{}://{}", parsed.scheme(), host);
+    if let Some(port) = parsed.port() {
+        issuer.push(':');
+        issuer.push_str(&port.to_string());
+    }
+    issuer.push_str(realm_path);
+    Some(issuer)
+}
+
+fn join_issuer_path(issuer: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        issuer.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+fn resolve_oauth2_endpoints(oauth2: &Oauth2) -> Option<Oauth2ResolvedEndpoints> {
+    let issuer = oauth2
+        .issuer_url
+        .clone()
+        .or_else(|| issuer_from_jwks_url(&oauth2.jwks_url))?;
+
+    let authorization_endpoint = oauth2
+        .authorization_endpoint
+        .clone()
+        .unwrap_or_else(|| join_issuer_path(&issuer, "protocol/openid-connect/auth"));
+    let token_endpoint = oauth2
+        .token_endpoint
+        .clone()
+        .unwrap_or_else(|| join_issuer_path(&issuer, "protocol/openid-connect/token"));
+    let registration_endpoint = oauth2
+        .registration_endpoint
+        .clone()
+        .unwrap_or_else(|| join_issuer_path(&issuer, "clients-registrations/openid-connect"));
+
+    Some(Oauth2ResolvedEndpoints {
+        issuer,
+        authorization_endpoint,
+        token_endpoint,
+        registration_endpoint,
+        jwks_uri: oauth2.jwks_url.clone(),
+    })
+}
+
+fn oauth_metadata_response(
+    endpoints: &Oauth2ResolvedEndpoints,
+    registration_endpoint: &str,
+) -> Value {
+    json!({
+        "issuer": endpoints.issuer,
+        "authorization_endpoint": endpoints.authorization_endpoint,
+        "token_endpoint": endpoints.token_endpoint,
+        "jwks_uri": endpoints.jwks_uri,
+        "registration_endpoint": registration_endpoint,
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token", "client_credentials"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+        "code_challenge_methods_supported": ["S256"],
+    })
+}
+
+fn request_origin(headers: &HeaderMap) -> Option<String> {
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
+        .and_then(|value| value.to_str().ok())?;
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("https");
+    Some(format!("{proto}://{}", host.trim()))
+}
+
+fn registration_endpoint_for_request(headers: &HeaderMap, fallback: &str) -> String {
+    request_origin(headers)
+        .map(|origin| format!("{}/oauth/register", origin.trim_end_matches('/')))
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn fallback_registration_endpoint(api: &ApiServer) -> String {
+    format!("https://{}:{}/oauth/register", api.address, api.port)
+}
+
+async fn oauth_authorization_server_metadata_handler(
+    state: Arc<OauthProxyState>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(endpoints) = state.endpoints.as_ref() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(json!({
+                "error": "server_error",
+                "error_description": "OAuth2 issuer URL could not be derived from configuration"
+            })),
+        )
+            .into_response();
+    };
+
+    let registration_endpoint =
+        registration_endpoint_for_request(&headers, &state.fallback_registration_endpoint);
+    let metadata = oauth_metadata_response(endpoints, &registration_endpoint);
+    (StatusCode::OK, AxumJson(metadata)).into_response()
+}
+
+async fn openid_configuration_handler(state: Arc<OauthProxyState>, headers: HeaderMap) -> Response {
+    oauth_authorization_server_metadata_handler(state, headers).await
+}
+
+async fn oauth_register_handler(
+    state: Arc<OauthProxyState>,
+    headers: HeaderMap,
+    AxumJson(payload): AxumJson<Value>,
+) -> Response {
+    let Some(endpoints) = state.endpoints.as_ref() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(json!({
+                "error": "server_error",
+                "error_description": "OAuth2 registration endpoint could not be derived from configuration"
+            })),
+        )
+            .into_response();
+    };
+
+    let mut request = state
+        .client
+        .post(&endpoints.registration_endpoint)
+        .json(&payload);
+    if let Some(auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    {
+        request = request.header(header::AUTHORIZATION, auth);
+    }
+
+    let upstream = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                AxumJson(json!({
+                    "error": "bad_gateway",
+                    "error_description": format!("failed to reach upstream registration endpoint: {error}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+
+    let body = match upstream.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                AxumJson(json!({
+                    "error": "bad_gateway",
+                    "error_description": format!("failed to read upstream registration response: {error}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut response = Response::new(Body::from(body.to_vec()));
+    *response.status_mut() = status;
+    if let Some(content_type) = content_type {
+        if let Ok(header_value) = HeaderValue::from_str(&content_type) {
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, header_value);
+        }
+    }
+    response
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -756,6 +969,11 @@ pub async fn start_mcp_server(
     });
 
     let handler = LightbridgeMcpHandler::new(store, opa_repo, basic_auth.clone());
+    let oauth_proxy_state = Arc::new(OauthProxyState {
+        client: Client::new(),
+        endpoints: resolve_oauth2_endpoints(oauth2),
+        fallback_registration_endpoint: fallback_registration_endpoint(api),
+    });
 
     let mcp_service: StreamableHttpService<LightbridgeMcpHandler, LocalSessionManager> =
         StreamableHttpService::new(
@@ -767,17 +985,44 @@ pub async fn start_mcp_server(
             StreamableHttpServerConfig::default(),
         );
 
-    let public = Router::new()
-        .route("/", get(root_handler))
-        .route("/health", get(health_handler))
-        .route("/health/startup", get(startup_handler))
-        .route(
-            "/health/ready",
-            get(move || {
-                let readiness_pool = readiness_pool.clone();
-                async move { readiness_handler(readiness_pool).await }
-            }),
-        );
+    let metadata_state = oauth_proxy_state.clone();
+    let openid_state = oauth_proxy_state.clone();
+    let register_state = oauth_proxy_state.clone();
+    let public =
+        Router::new()
+            .route("/", get(root_handler))
+            .route("/health", get(health_handler))
+            .route("/health/startup", get(startup_handler))
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(move |headers| {
+                    let metadata_state = metadata_state.clone();
+                    async move {
+                        oauth_authorization_server_metadata_handler(metadata_state, headers).await
+                    }
+                }),
+            )
+            .route(
+                "/.well-known/openid-configuration",
+                get(move |headers| {
+                    let openid_state = openid_state.clone();
+                    async move { openid_configuration_handler(openid_state, headers).await }
+                }),
+            )
+            .route(
+                "/oauth/register",
+                post(move |headers, body| {
+                    let register_state = register_state.clone();
+                    async move { oauth_register_handler(register_state, headers, body).await }
+                }),
+            )
+            .route(
+                "/health/ready",
+                get(move || {
+                    let readiness_pool = readiness_pool.clone();
+                    async move { readiness_handler(readiness_pool).await }
+                }),
+            );
 
     let protected = Router::new()
         .nest_service("/mcp", mcp_service)
@@ -833,6 +1078,7 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
     use chrono::Utc;
     use lightbridge_authz_core::{ApiKeyStatus, async_trait};
     use sqlx::postgres::PgPoolOptions;
@@ -1076,6 +1322,118 @@ mod tests {
             username: "u".to_string(),
             password: "p".to_string(),
         }
+    }
+
+    fn sample_oauth2() -> Oauth2 {
+        Oauth2 {
+            jwks_url: "http://keycloak:9100/realms/dev/protocol/openid-connect/certs".to_string(),
+            issuer_url: None,
+            authorization_endpoint: None,
+            token_endpoint: None,
+            registration_endpoint: None,
+        }
+    }
+
+    #[test]
+    fn resolve_oauth2_endpoints_from_keycloak_jwks_url() {
+        let endpoints = resolve_oauth2_endpoints(&sample_oauth2())
+            .expect("keycloak jwks url should resolve default oauth2 endpoints");
+
+        assert_eq!(endpoints.issuer, "http://keycloak:9100/realms/dev");
+        assert_eq!(
+            endpoints.authorization_endpoint,
+            "http://keycloak:9100/realms/dev/protocol/openid-connect/auth"
+        );
+        assert_eq!(
+            endpoints.token_endpoint,
+            "http://keycloak:9100/realms/dev/protocol/openid-connect/token"
+        );
+        assert_eq!(
+            endpoints.registration_endpoint,
+            "http://keycloak:9100/realms/dev/clients-registrations/openid-connect"
+        );
+        assert_eq!(
+            endpoints.jwks_uri,
+            "http://keycloak:9100/realms/dev/protocol/openid-connect/certs"
+        );
+    }
+
+    #[test]
+    fn oauth_metadata_uses_public_registration_endpoint() {
+        let endpoints = resolve_oauth2_endpoints(&sample_oauth2())
+            .expect("keycloak jwks url should resolve default oauth2 endpoints");
+        let metadata =
+            oauth_metadata_response(&endpoints, "https://authz.example.com/oauth/register");
+
+        assert_eq!(metadata["issuer"], "http://keycloak:9100/realms/dev");
+        assert_eq!(
+            metadata["registration_endpoint"],
+            "https://authz.example.com/oauth/register"
+        );
+        assert_eq!(
+            metadata["jwks_uri"],
+            "http://keycloak:9100/realms/dev/protocol/openid-connect/certs"
+        );
+    }
+
+    #[test]
+    fn registration_endpoint_prefers_forwarded_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("mcp.example.com"),
+        );
+
+        let registration =
+            registration_endpoint_for_request(&headers, "https://127.0.0.1:13000/oauth/register");
+
+        assert_eq!(registration, "https://mcp.example.com/oauth/register");
+    }
+
+    #[tokio::test]
+    async fn metadata_handler_returns_oauth_document() {
+        let state = Arc::new(OauthProxyState {
+            client: Client::new(),
+            endpoints: resolve_oauth2_endpoints(&sample_oauth2()),
+            fallback_registration_endpoint: "https://127.0.0.1:13000/oauth/register".to_string(),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("mcp.example.com"),
+        );
+
+        let response = oauth_authorization_server_metadata_handler(state, headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("metadata response body should be readable");
+        let metadata: Value =
+            serde_json::from_slice(&body).expect("metadata response should be valid json");
+
+        assert_eq!(
+            metadata["registration_endpoint"],
+            "https://mcp.example.com/oauth/register"
+        );
+        assert_eq!(metadata["issuer"], "http://keycloak:9100/realms/dev");
+    }
+
+    #[tokio::test]
+    async fn registration_handler_returns_500_when_oauth_endpoints_not_resolved() {
+        let state = Arc::new(OauthProxyState {
+            client: Client::new(),
+            endpoints: None,
+            fallback_registration_endpoint: "https://127.0.0.1:13000/oauth/register".to_string(),
+        });
+
+        let response =
+            oauth_register_handler(state, HeaderMap::new(), AxumJson(json!({"name": "demo"})))
+                .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
