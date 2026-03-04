@@ -995,7 +995,7 @@ pub async fn start_mcp_server(
             .route("/health/startup", get(startup_handler))
             .route(
                 "/.well-known/oauth-authorization-server",
-                get(move |headers| {
+                get(move |headers: HeaderMap| {
                     let metadata_state = metadata_state.clone();
                     async move {
                         oauth_authorization_server_metadata_handler(metadata_state, headers).await
@@ -1004,14 +1004,14 @@ pub async fn start_mcp_server(
             )
             .route(
                 "/.well-known/openid-configuration",
-                get(move |headers| {
+                get(move |headers: HeaderMap| {
                     let openid_state = openid_state.clone();
                     async move { openid_configuration_handler(openid_state, headers).await }
                 }),
             )
             .route(
                 "/oauth/register",
-                post(move |headers, body| {
+                post(move |headers: HeaderMap, body: AxumJson<Value>| {
                     let register_state = register_state.clone();
                     async move { oauth_register_handler(register_state, headers, body).await }
                 }),
