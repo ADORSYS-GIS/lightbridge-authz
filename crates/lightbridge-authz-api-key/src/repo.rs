@@ -243,7 +243,7 @@ impl StoreRepo {
         id: String,
     ) -> Result<Account> {
         let now = Utc::now();
-        let members = Self::normalize_members(input.owners_admins, subject);
+        let members = Self::normalize_members(Vec::new(), subject);
         let new_account = NewAccountRow {
             id: id.clone(),
             billing_identity: input.billing_identity,
@@ -285,7 +285,12 @@ impl StoreRepo {
     }
 
     #[instrument(skip(self))]
-    pub async fn list_accounts(&self, subject: &str) -> Result<Vec<Account>> {
+    pub async fn list_accounts(
+        &self,
+        subject: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<Account>> {
         let rows: Vec<AccountWithMembersRow> = sqlx::query_as(
             r#"
             SELECT
@@ -304,9 +309,13 @@ impl StoreRepo {
             )
             GROUP BY accounts.id
             ORDER BY accounts.created_at ASC
+            LIMIT $2
+            OFFSET $3
             "#,
         )
         .bind(subject)
+        .bind(i64::from(limit))
+        .bind(i64::from(offset))
         .fetch_all(self.pool())
         .await?;
         Ok(rows.into_iter().map(Self::to_account).collect())
@@ -453,7 +462,13 @@ impl StoreRepo {
     }
 
     #[instrument(skip(self))]
-    pub async fn list_projects(&self, subject: &str, account_id: &str) -> Result<Vec<Project>> {
+    pub async fn list_projects(
+        &self,
+        subject: &str,
+        account_id: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<Project>> {
         let rows: Vec<ProjectRow> = sqlx::query_as(
             r#"
             SELECT
@@ -474,10 +489,14 @@ impl StoreRepo {
                   AND account_memberships.subject = $2
               )
             ORDER BY projects.created_at ASC
+            LIMIT $3
+            OFFSET $4
             "#,
         )
         .bind(account_id)
         .bind(subject)
+        .bind(i64::from(limit))
+        .bind(i64::from(offset))
         .fetch_all(self.pool())
         .await?;
         Ok(rows.into_iter().map(Self::to_project).collect())
@@ -655,7 +674,13 @@ impl StoreRepo {
     }
 
     #[instrument(skip(self))]
-    pub async fn list_api_keys(&self, subject: &str, project_id: &str) -> Result<Vec<ApiKey>> {
+    pub async fn list_api_keys(
+        &self,
+        subject: &str,
+        project_id: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<ApiKey>> {
         let rows: Vec<ApiKeyRow> = sqlx::query_as(
             r#"
             SELECT
@@ -680,10 +705,14 @@ impl StoreRepo {
                   AND account_memberships.subject = $2
               )
             ORDER BY api_keys.created_at DESC
+            LIMIT $3
+            OFFSET $4
             "#,
         )
         .bind(project_id)
         .bind(subject)
+        .bind(i64::from(limit))
+        .bind(i64::from(offset))
         .fetch_all(self.pool())
         .await?;
         Ok(rows.into_iter().map(Self::to_api_key).collect())

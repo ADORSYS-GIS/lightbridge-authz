@@ -178,7 +178,7 @@ Use the `access_token`:
 curl -k https://localhost:13000/api/v1/accounts \
   -H "Authorization: Bearer <access_token>" \
   -H "Content-Type: application/json" \
-  -d '{"billing_identity":"acme","owners_admins":["test@admin"]}'
+  -d '{"billing_identity":"acme"}'
 ```
 
 ### Option B: Use authorization code flow

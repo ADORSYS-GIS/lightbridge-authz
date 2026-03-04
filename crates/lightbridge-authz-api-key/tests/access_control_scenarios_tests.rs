@@ -45,7 +45,6 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
             owner,
             CreateAccount {
                 billing_identity: "tenant-a".to_string(),
-                owners_admins: vec![],
             },
             "acct_access".to_string(),
         )
@@ -53,7 +52,7 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
         .unwrap();
     assert!(account.owners_admins.iter().any(|m| m == owner));
 
-    let outsider_accounts = repo.list_accounts(outsider).await.unwrap();
+    let outsider_accounts = repo.list_accounts(outsider, 0, 50).await.unwrap();
     assert!(outsider_accounts.is_empty());
     assert!(
         repo.get_account(outsider, &account.id)
@@ -88,7 +87,8 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
         .unwrap();
     assert!(invited_account.owners_admins.iter().any(|m| m == owner));
     assert!(invited_account.owners_admins.iter().any(|m| m == invited));
-    assert_eq!(repo.list_accounts(invited).await.unwrap().len(), 1);
+    assert_eq!(repo.list_accounts(invited, 0, 50).await.unwrap().len(), 1);
+    assert_eq!(repo.list_accounts(invited, 1, 50).await.unwrap().len(), 0);
 
     let project = repo
         .create_project(
@@ -121,7 +121,7 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
         .unwrap_err();
     assert!(matches!(unauthorized_project_create, Error::NotFound));
     assert_eq!(
-        repo.list_projects(outsider, &account.id)
+        repo.list_projects(outsider, &account.id, 0, 50)
             .await
             .unwrap()
             .len(),
@@ -181,7 +181,7 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
         .unwrap_err();
     assert!(matches!(unauthorized_key_create, Error::NotFound));
     assert_eq!(
-        repo.list_api_keys(outsider, &project.id)
+        repo.list_api_keys(outsider, &project.id, 0, 50)
             .await
             .unwrap()
             .len(),
@@ -306,7 +306,6 @@ async fn deleting_last_membership_deletes_account_projects_and_keys(pool: PgPool
             subject,
             CreateAccount {
                 billing_identity: "tenant-cascade".to_string(),
-                owners_admins: vec![],
             },
             "acct_cascade".to_string(),
         )

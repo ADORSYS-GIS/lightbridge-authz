@@ -29,8 +29,6 @@ pub struct Account {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateAccount {
     pub billing_identity: String,
-    #[serde(default)]
-    pub owners_admins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

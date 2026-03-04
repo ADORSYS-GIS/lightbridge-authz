@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
 };
@@ -35,6 +35,9 @@ pub async fn create_account(
 #[utoipa::path(
     get,
     path = "/api/v1/accounts",
+    params(
+        super::PaginationQuery
+    ),
     responses(
         (status = 200, body = Vec<Account>)
     ),
@@ -43,9 +46,11 @@ pub async fn create_account(
 pub async fn list_accounts(
     State(state): State<Arc<crate::AppState>>,
     Extension(token_info): Extension<TokenInfo>,
+    Query(pagination): Query<super::PaginationQuery>,
 ) -> Result<impl IntoResponse, Error> {
     let subject = token_info.sub.clone();
-    let accounts = state.store.list_accounts(&subject).await?;
+    let (offset, limit) = pagination.normalized();
+    let accounts = state.store.list_accounts(&subject, offset, limit).await?;
     Ok((StatusCode::OK, Json(accounts)))
 }
 

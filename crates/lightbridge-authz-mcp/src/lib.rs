@@ -144,6 +144,17 @@ fn to_json_value<T: Serialize>(value: T) -> std::result::Result<Json<EndpointRes
         })
 }
 
+const DEFAULT_LIST_LIMIT: u32 = 50;
+const MAX_LIST_LIMIT: u32 = 100;
+
+fn default_list_limit() -> u32 {
+    DEFAULT_LIST_LIMIT
+}
+
+fn normalize_list_pagination(offset: u32, limit: u32) -> (u32, u32) {
+    (offset, limit.clamp(1, MAX_LIST_LIMIT))
+}
+
 fn subject_from_request_context(
     context: &RequestContext<RoleServer>,
 ) -> std::result::Result<String, ErrorData> {
@@ -163,12 +174,15 @@ fn subject_from_request_context(
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct CreateAccountParams {
     billing_identity: String,
-    #[serde(default)]
-    owners_admins: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ListAccountsParams {}
+struct ListAccountsParams {
+    #[serde(default)]
+    offset: u32,
+    #[serde(default = "default_list_limit")]
+    limit: u32,
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct AccountByIdParams {
@@ -198,6 +212,10 @@ struct CreateProjectParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ListProjectsParams {
     account_id: String,
+    #[serde(default)]
+    offset: u32,
+    #[serde(default = "default_list_limit")]
+    limit: u32,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -229,6 +247,10 @@ struct CreateApiKeyParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ListApiKeysParams {
     project_id: String,
+    #[serde(default)]
+    offset: u32,
+    #[serde(default = "default_list_limit")]
+    limit: u32,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -290,7 +312,6 @@ impl LightbridgeMcpHandler {
                 &subject,
                 CreateAccount {
                     billing_identity: params.billing_identity,
-                    owners_admins: params.owners_admins,
                 },
             )
             .await
@@ -308,11 +329,11 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ListAccountsParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let _ = params;
         let subject = subject_from_request_context(&context)?;
+        let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
         let accounts: Vec<Account> = self
             .store
-            .list_accounts(&subject)
+            .list_accounts(&subject, offset, limit)
             .await
             .map_err(to_tool_error)?;
 
@@ -420,9 +441,10 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<ListProjectsParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let subject = subject_from_request_context(&context)?;
+        let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
         let projects: Vec<Project> = self
             .store
-            .list_projects(&subject, &params.account_id)
+            .list_projects(&subject, &params.account_id, offset, limit)
             .await
             .map_err(to_tool_error)?;
 
@@ -532,9 +554,10 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<ListApiKeysParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let subject = subject_from_request_context(&context)?;
+        let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
         let api_keys: Vec<ApiKey> = self
             .store
-            .list_api_keys(&subject, &params.project_id)
+            .list_api_keys(&subject, &params.project_id, offset, limit)
             .await
             .map_err(to_tool_error)?;
 
@@ -827,7 +850,12 @@ mod tests {
             Err(Error::NotFound)
         }
 
-        async fn list_accounts(&self, _subject: &str) -> std::result::Result<Vec<Account>, Error> {
+        async fn list_accounts(
+            &self,
+            _subject: &str,
+            _offset: u32,
+            _limit: u32,
+        ) -> std::result::Result<Vec<Account>, Error> {
             Err(Error::NotFound)
         }
 
@@ -869,6 +897,8 @@ mod tests {
             &self,
             _subject: &str,
             _account_id: &str,
+            _offset: u32,
+            _limit: u32,
         ) -> std::result::Result<Vec<Project>, Error> {
             Err(Error::NotFound)
         }
@@ -911,6 +941,8 @@ mod tests {
             &self,
             _subject: &str,
             _project_id: &str,
+            _offset: u32,
+            _limit: u32,
         ) -> std::result::Result<Vec<ApiKey>, Error> {
             Err(Error::NotFound)
         }
@@ -1104,6 +1136,37 @@ mod tests {
             !properties.contains_key("subject"),
             "subject should come from JWT token claims, not tool input"
         );
+        assert!(
+            !properties.contains_key("owners_admins"),
+            "owners_admins should not be accepted on account creation"
+        );
+    }
+
+    #[test]
+    fn list_tools_schema_include_pagination_fields() {
+        let handler = LightbridgeMcpHandler::new(Arc::new(MockStore), sample_repo(), basic_auth());
+        for tool_name in ["list-accounts", "list-projects", "list-api-keys"] {
+            let tool = handler
+                .tool_router
+                .list_all()
+                .into_iter()
+                .find(|tool| tool.name == tool_name)
+                .expect("list tool should exist");
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(|value| value.as_object())
+                .expect("input schema should contain object properties");
+
+            assert!(
+                properties.contains_key("offset"),
+                "offset should be present for {tool_name}"
+            );
+            assert!(
+                properties.contains_key("limit"),
+                "limit should be present for {tool_name}"
+            );
+        }
     }
 
     #[tokio::test]

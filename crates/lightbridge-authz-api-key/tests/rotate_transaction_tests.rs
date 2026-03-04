@@ -22,7 +22,6 @@ async fn rotate_rolls_back_on_create_failure(pool: PgPool) {
             subject,
             CreateAccount {
                 billing_identity: "rollback-acct".to_string(),
-                owners_admins: vec![],
             },
             "acct_rollback".to_string(),
         )

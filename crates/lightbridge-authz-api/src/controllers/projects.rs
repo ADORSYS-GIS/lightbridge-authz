@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
 };
@@ -43,7 +43,8 @@ pub async fn create_project(
     get,
     path = "/api/v1/accounts/{account_id}/projects",
     params(
-        ("account_id" = String, Path, description = "Account ID")
+        ("account_id" = String, Path, description = "Account ID"),
+        super::PaginationQuery
     ),
     responses(
         (status = 200, body = Vec<Project>)
@@ -54,9 +55,14 @@ pub async fn list_projects(
     State(state): State<Arc<crate::AppState>>,
     Extension(token_info): Extension<TokenInfo>,
     Path(account_id): Path<String>,
+    Query(pagination): Query<super::PaginationQuery>,
 ) -> Result<impl IntoResponse, Error> {
     let subject = token_info.sub.clone();
-    let projects = state.store.list_projects(&subject, &account_id).await?;
+    let (offset, limit) = pagination.normalized();
+    let projects = state
+        .store
+        .list_projects(&subject, &account_id, offset, limit)
+        .await?;
     Ok((StatusCode::OK, Json(projects)))
 }
 

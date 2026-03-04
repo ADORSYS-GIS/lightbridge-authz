@@ -2376,6 +2376,7 @@ dependencies = [
  "axum",
  "lightbridge-authz-bearer",
  "lightbridge-authz-core",
+ "serde",
  "tracing",
  "utoipa",
 ]

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
 };
@@ -43,7 +43,8 @@ pub async fn create_api_key(
     get,
     path = "/api/v1/projects/{project_id}/api-keys",
     params(
-        ("project_id" = String, Path, description = "Project ID")
+        ("project_id" = String, Path, description = "Project ID"),
+        super::PaginationQuery
     ),
     responses(
         (status = 200, body = Vec<ApiKey>)
@@ -54,9 +55,14 @@ pub async fn list_api_keys(
     State(state): State<Arc<crate::AppState>>,
     Extension(token_info): Extension<TokenInfo>,
     Path(project_id): Path<String>,
+    Query(pagination): Query<super::PaginationQuery>,
 ) -> Result<impl IntoResponse, Error> {
     let subject = token_info.sub.clone();
-    let api_keys = state.store.list_api_keys(&subject, &project_id).await?;
+    let (offset, limit) = pagination.normalized();
+    let api_keys = state
+        .store
+        .list_api_keys(&subject, &project_id, offset, limit)
+        .await?;
     Ok((StatusCode::OK, Json(api_keys)))
 }
 

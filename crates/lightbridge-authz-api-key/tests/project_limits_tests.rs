@@ -19,7 +19,6 @@ async fn test_project_limits_persistence(pool: PgPool) {
             subject,
             CreateAccount {
                 billing_identity: "test-limits-acct".to_string(),
-                owners_admins: vec![],
             },
             "acct_1".to_string(),
         )
@@ -102,7 +101,6 @@ async fn test_create_project_without_limits_uses_default(pool: PgPool) {
             subject,
             CreateAccount {
                 billing_identity: "test-no-limits-acct".to_string(),
-                owners_admins: vec![],
             },
             "acct_default_limits".to_string(),
         )
@@ -139,7 +137,6 @@ async fn test_update_project_clears_allowed_models(pool: PgPool) {
             subject,
             CreateAccount {
                 billing_identity: "test-clear-models-acct".to_string(),
-                owners_admins: vec![],
             },
             "acct_clear_models".to_string(),
         )

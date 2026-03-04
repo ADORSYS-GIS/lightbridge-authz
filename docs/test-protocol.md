@@ -60,7 +60,7 @@ TOKEN=$(curl -s -X POST 'http://localhost:9100/realms/dev/protocol/openid-connec
 ACCOUNT_JSON=$(curl -k -s https://localhost:13000/api/v1/accounts \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"billing_identity":"acme","owners_admins":["test@admin"]}')
+  -d '{"billing_identity":"acme"}')
 
 ACCOUNT_ID=$(echo "$ACCOUNT_JSON" | /usr/bin/python3 -c "import sys, json; print(json.load(sys.stdin)['id'])")
 ```

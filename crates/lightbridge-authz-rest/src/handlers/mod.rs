@@ -66,8 +66,8 @@ impl AuthzStore for AuthzStoreImpl {
         self.repo.create_account(subject, input, cuid2()).await
     }
 
-    async fn list_accounts(&self, subject: &str) -> Result<Vec<Account>> {
-        self.repo.list_accounts(subject).await
+    async fn list_accounts(&self, subject: &str, offset: u32, limit: u32) -> Result<Vec<Account>> {
+        self.repo.list_accounts(subject, offset, limit).await
     }
 
     async fn get_account(&self, subject: &str, account_id: &str) -> Result<Account> {
@@ -101,8 +101,16 @@ impl AuthzStore for AuthzStoreImpl {
             .await
     }
 
-    async fn list_projects(&self, subject: &str, account_id: &str) -> Result<Vec<Project>> {
-        self.repo.list_projects(subject, account_id).await
+    async fn list_projects(
+        &self,
+        subject: &str,
+        account_id: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<Project>> {
+        self.repo
+            .list_projects(subject, account_id, offset, limit)
+            .await
     }
 
     async fn get_project(&self, subject: &str, project_id: &str) -> Result<Project> {
@@ -152,8 +160,16 @@ impl AuthzStore for AuthzStoreImpl {
         Ok(ApiKeySecret { api_key, secret })
     }
 
-    async fn list_api_keys(&self, subject: &str, project_id: &str) -> Result<Vec<ApiKey>> {
-        self.repo.list_api_keys(subject, project_id).await
+    async fn list_api_keys(
+        &self,
+        subject: &str,
+        project_id: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<ApiKey>> {
+        self.repo
+            .list_api_keys(subject, project_id, offset, limit)
+            .await
     }
 
     async fn get_api_key(&self, subject: &str, key_id: &str) -> Result<ApiKey> {
