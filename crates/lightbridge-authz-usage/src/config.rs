@@ -55,7 +55,7 @@ server:
 logging:
   level: "info"
 database:
-  url: "postgres://${USAGE_MISSING_VAR:host}:5432/db"
+  url: "postgres://${USAGE_MISSING_VAR:-host}:5432/db"
   pool_size: 10
 otel:
   enabled: false
