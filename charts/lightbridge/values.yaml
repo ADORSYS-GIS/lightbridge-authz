@@ -1,8 +1,18 @@
 global:
   tlsSecretName: lightbridge-authz-tls
-  image:
-    version: "0.6.0"
-    repository: "ghcr.io/adorsys-gis/lightbridge-authz-usage"
+  authz:
+    image:
+      version: "0.6.0"
+      repository: "ghcr.io/adorsys-gis/lightbridge-authz"
+  authz_mcp:
+    image:
+      version: "0.6.0"
+      repository: "ghcr.io/adorsys-gis/lightbridge-authz-mcp"
+  authz_usage:
+    image:
+      version: "0.6.0"
+      repository: "ghcr.io/adorsys-gis/lightbridge-authz-usage"
+
   tls:
     enabled: true
     apiCommonName: lightbridge-authz-api
@@ -16,8 +26,8 @@ global:
       restartPolicy: OnFailure
       backoffLimit: 3
       ttlSecondsAfterFinished: 300
-      annotations: {}
-      labels: {}
+      annotations: { }
+      labels: { }
       serviceAccount:
         create: true
         automount: true
@@ -68,4 +78,4 @@ mcp:
       name: lightbridge-authz-mcp-tls
 
 
-rawRessources: []
+rawRessources: [ ]
