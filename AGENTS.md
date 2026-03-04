@@ -4,6 +4,7 @@ This repository provides API key management plus usage analytics:
 
 - `authz-api`: OAuth2/JWT-protected CRUD API for Accounts, Projects, and API keys.
 - `authz-opa`: Basic-auth protected validation API intended to be called by Authorino (or similar external auth components). It validates API keys and returns rich context plus dynamic metadata.
+- `lightbridge-mcp`: OAuth2/JWT-protected MCP server exposing the authz surface as MCP tools over streamable HTTP (`/mcp`).
 - `lightbridge-authz-usage`: unprotected OTLP/HTTP ingest API (`/v1/otel/traces`, `/v1/otel/metrics`) plus a single usage query API (`/v1/usage/query`) backed by Timescale/Postgres.
 
 The authz services (`authz-api`, `authz-opa`):
@@ -19,6 +20,7 @@ This file documents structure, architecture, workflows, and practices for contri
 
 - `app/`
   - `app/lightbridge-authz/`: main binary that can run API server, OPA server, both, and migrations.
+  - `app/lightbridge-mcp/`: MCP binary that runs the streamable HTTP MCP server.
   - `app/lightbridge-authz-usage/`: usage binary that can run usage server, usage migrations, and config validation.
   - `app/lightbridge-authz-migrate-bin/`: standalone migration runner (used by Docker image stage).
   - `app/lightbridge-authz-healthcheck/`: TCP healthcheck binary for container health checks.
@@ -28,6 +30,7 @@ This file documents structure, architecture, workflows, and practices for contri
   - `crates/lightbridge-authz-api-key/`: DB entities + repository implementation (SQLx).
   - `crates/lightbridge-authz-rest/`: Axum server glue (TLS bind, modular layout with handlers, routers, models, and middleware).
   - `crates/lightbridge-authz-bearer/`: JWT validation via JWKS (Keycloak in local compose).
+  - `crates/lightbridge-authz-mcp/`: MCP tool handlers + streamable HTTP server wiring.
   - `crates/lightbridge-authz-migrate/`: SQLx migrations runner library.
   - `crates/lightbridge-authz-usage/`: Axum usage server (OTEL ingest handlers, usage query models/routers, TLS bind, OpenAPI).
   - `crates/lightbridge-authz-usage-migrate/`: SQLx migrations runner for usage storage.
@@ -49,13 +52,15 @@ Primary local stack is in `compose.yaml`:
 
 - `authz-tls`: generates self-signed certs into `authz_tls` volume.
 - `postgresql`: Postgres backing store.
+- `timescaledb`: usage events backing store.
 - `keycloak`: OAuth2 provider (imports `dev` realm from `.docker/keycloak_config/realm.json`).
 - `authz-migrate`: runs migrations once at startup.
 - `authz-api`: runs the CRUD API.
 - `authz-opa`: runs validation endpoints for OPA/Authorino.
-- `authz-usage` (when enabled): runs OTEL ingest + usage query endpoints.
+- `authz-mcp`: runs the MCP streamable HTTP endpoint.
+- `mcp-inspector`: optional MCP Inspector UI/proxy container for MCP debugging.
+- `authz-usage`: runs OTEL ingest + usage query endpoints.
 - `adminer`: optional DB UI.
-- `jaeger`: distributed tracing UI (available at `http://localhost:16686`).
 
 ## Architecture Overview
 
@@ -90,6 +95,11 @@ API keys are stored as:
   - Returns key/project/account context to callers.
   - Provides an Authorino-oriented endpoint that supports dynamic metadata.
 
+- MCP API (`lightbridge-mcp`)
+  - Exposes authz CRUD and validation operations as MCP tools under `/mcp`.
+  - Secured with the same JWT bearer/JWKS middleware used by `authz-api`.
+  - Derives subject identity from JWT claims (tool input does not include subject).
+
 ### Validation Endpoints
 
 On the OPA server:
@@ -121,6 +131,7 @@ Workspace manifest: `Cargo.toml`
 
 - Binary entrypoints:
   - `app/lightbridge-authz/src/main.rs`
+  - `app/lightbridge-mcp/src/main.rs`
   - `app/lightbridge-authz-usage/src/main.rs`
   - `app/lightbridge-authz-migrate-bin/src/main.rs`
   - `app/lightbridge-authz-healthcheck/src/main.rs`
@@ -139,6 +150,9 @@ Workspace manifest: `Cargo.toml`
 - Repository:
   - `crates/lightbridge-authz-api-key/src/repo.rs`
   - `crates/lightbridge-authz-usage/src/repo.rs`
+
+- MCP endpoints/tools:
+  - server + tool handlers: `crates/lightbridge-authz-mcp/src/lib.rs`
 
 ## Configuration
 
@@ -180,11 +194,20 @@ Check health:
 
 - `curl -k https://localhost:13000/health`
 - `curl -k https://localhost:13001/health`
+- `curl -k https://localhost:13002/health`
+- `curl -k https://localhost:13003/health`
+- `curl -k https://localhost:13003/health/ready`
+- `curl -k https://localhost:13003/health/startup`
 
 OpenAPI docs:
 
 - CRUD API: `https://localhost:13000/api/v1/docs`
 - OPA/Authorino: `https://localhost:13001/v1/opa/docs`
+- Usage API: `https://localhost:13002/v1/usage/docs`
+
+MCP debugging:
+
+- Inspector UI: `http://localhost:6274`
 
 Stop/cleanup:
 
@@ -199,6 +222,7 @@ You can run binaries directly (requires valid TLS cert/key files at configured p
 - `cargo run -p lightbridge-authz -- api --config-path config/default.yaml`
 - `cargo run -p lightbridge-authz -- opa --config-path config/default.yaml`
 - `cargo run -p lightbridge-authz -- migrate --config-path config/default.yaml`
+- `cargo run -p lightbridge-mcp -- serve --config-path config/default.yaml`
 - `cargo run -p lightbridge-authz-usage -- serve --config-path config/usage.yaml`
 - `cargo run -p lightbridge-authz-usage -- migrate --config-path config/usage.yaml`
 
@@ -219,12 +243,14 @@ DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz" car
 The REST crate contains behavior tests for validation flows and OpenAPI contract checks:
 
 - `cargo test -p lightbridge-authz-rest`
+- `cargo test -p lightbridge-authz-mcp`
 - `cargo test -p lightbridge-authz-usage-rest`
 
 These tests include:
 
 - API key validation success/failure cases (missing/revoked/expired).
 - Authorino endpoint dynamic metadata passthrough + enrichment.
+- Health probe behavior (`/health`, `/health/startup`, `/health/ready`) including DB-unavailable readiness failures.
 - OpenAPI checks ensuring the Authorino endpoint/schemas are published.
 - OTLP trace/metrics ingestion extraction and usage query handler validation.
 
@@ -270,6 +296,7 @@ Implementation details:
 - Always confirm that the feature or fix you are working on is covered by automated tests. If existing tests do not exercise the new behavior, add targeted tests in the most appropriate crate (unit, integration, or contract) before finishing the change.
 - When you add or update behavior, document the need for those tests in your summary so reviewers can spot the linkage quickly.
 - Workflow changes should keep the top-level YAML files concise (both `/ .github/workflows/ci.yml` and `/ .github/workflows/helm-gh-pages.yml` stay under ~100 lines) by moving reusable sequences into `.github/actions/` composites (Rust setup, tests, docker build/push, Helm publishing). Confirm the helper action logic lives in the shared directory, and if you edit those helpers, mention why you need the customization and keep their scope focused.
+- Container CI builds are native per architecture (`ubuntu-24.04` for `linux/amd64` and `ubuntu-22.04-arm` for `linux/arm64`); avoid reintroducing QEMU-based cross-builds unless explicitly required.
 - When the change touches deployment automation (GHCR pushes or GitHub Pages), make sure the relevant secrets (`GITHUB_TOKEN` or PAT) still have `packages:write`/`pages:write`, rerun the workflow locally if helpful (e.g., `just all-checks` or `just it-authorino`), and note in your summary what credentials need to be present.
 - After finishing your work (and ensuring the tests exist), run `just all-checks`. This target runs `cargo fmt`, `cargo fix --allow-dirty`, `cargo clippy --all-targets --all-features --fix --allow-dirty -- -D warnings`, and `cargo check --all-targets --all-features`, making sure the repository is formatted, linted, and builds cleanly before you stop.
 
