@@ -180,7 +180,18 @@ Key config fields:
 
 ### Environment Variable Interpolation
 
-The configuration loader supports `${VAR}` placeholders in YAML files. This is verified by unit tests in `lightbridge-authz-core`.
+The configuration loader supports these placeholders in YAML files:
+
+- `$VAR`
+- `${VAR}`
+- `${VAR-default}` (default used only when `VAR` is unset)
+- `${VAR:-default}` (default used when `VAR` is unset or empty)
+
+Behavior notes:
+
+- Unset variables for `$VAR`/`${VAR}` resolve to empty strings.
+- `${VAR:default}` is not supported and remains literal text.
+- Core interpolation behavior is verified by unit tests in `lightbridge-authz-core`.
 
 ## Development Workflows
 
