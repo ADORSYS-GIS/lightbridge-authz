@@ -33,3 +33,6 @@ opentelemetry_sdk.workspace = true
 [features]
 default = []
 axum = ["dep:axum", "dep:axum-server", "dep:rustls"]
+
+[dev-dependencies]
+tokio.workspace = true

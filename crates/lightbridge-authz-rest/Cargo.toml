@@ -33,6 +33,7 @@ chrono.workspace = true
 anyhow.workspace = true
 goose.workspace = true
 reqwest.workspace = true
+sqlx.workspace = true
 
 [features]
 load-tests = []

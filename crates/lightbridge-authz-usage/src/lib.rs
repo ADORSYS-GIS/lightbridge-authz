@@ -2,7 +2,7 @@ use axum::{Json, Router, http::StatusCode, routing::get};
 use lightbridge_authz_core::{
     Result, async_trait,
     config::Database,
-    db::{DbPool, DbPoolTrait},
+    db::{DbPool, DbPoolTrait, is_database_ready},
     server::serve_tls,
 };
 use serde::{Deserialize, Serialize};
@@ -50,12 +50,21 @@ impl UsageRepoTrait for StoreRepo {
 
 pub async fn start_usage_server(usage: &UsageServer, database: &Database) -> Result<()> {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(database).await?);
+    let readiness_pool = pool.clone();
     let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool));
     let state = Arc::new(UsageState { repo });
 
     let app = Router::new()
         .route("/", get(root_handler))
         .route("/health", get(health_handler))
+        .route("/health/startup", get(startup_handler))
+        .route(
+            "/health/ready",
+            get(move || {
+                let readiness_pool = readiness_pool.clone();
+                async move { readiness_handler(readiness_pool).await }
+            }),
+        )
         .merge(SwaggerUi::new("/v1/usage/docs").url("/v1/usage/openapi.json", UsageDoc::openapi()))
         .merge(routers::usage_router())
         .with_state(state);
@@ -75,6 +84,18 @@ async fn root_handler() -> (StatusCode, Json<RootResponse>) {
 
 async fn health_handler() -> StatusCode {
     StatusCode::OK
+}
+
+async fn startup_handler() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
+    if is_database_ready(pool.as_ref()).await {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 #[derive(OpenApi)]
@@ -107,6 +128,7 @@ struct UsageDoc;
 mod tests {
     use super::*;
     use serde_json::Value;
+    use sqlx::postgres::PgPoolOptions;
 
     fn usage_openapi() -> Value {
         serde_json::to_value(UsageDoc::openapi()).expect("openapi should serialize")
@@ -142,6 +164,26 @@ mod tests {
         assert!(
             version.starts_with("3."),
             "expected an OpenAPI 3.x document, got {version}"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_and_startup_endpoints_report_ok() {
+        assert_eq!(health_handler().await, StatusCode::OK);
+        assert_eq!(startup_handler().await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readiness_endpoint_reports_unavailable_when_database_is_down() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz_usage")
+            .expect("lazy pool should be constructible");
+        let pool: Arc<dyn DbPoolTrait> =
+            Arc::new(lightbridge_authz_core::db::DbPool::from_pool(pool));
+
+        assert_eq!(
+            readiness_handler(pool).await,
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 }

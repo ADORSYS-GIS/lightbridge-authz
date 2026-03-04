@@ -3,7 +3,7 @@ use lightbridge_authz_api::routers::api_router;
 use lightbridge_authz_core::{
     Account, Project, async_trait,
     config::{ApiServer, BasicAuth, Oauth2, OpaServer},
-    db::DbPoolTrait,
+    db::{DbPoolTrait, is_database_ready},
     error::Result,
     server::serve_tls,
 };
@@ -92,6 +92,7 @@ pub async fn start_api_server(
     pool: Arc<dyn DbPoolTrait>,
     oauth2: &Oauth2,
 ) -> Result<()> {
+    let readiness_pool = pool.clone();
     let store = Arc::new(AuthzStoreImpl::with_pool(pool));
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
@@ -104,6 +105,14 @@ pub async fn start_api_server(
     let public = Router::new()
         .route("/", get(root_handler))
         .route("/health", get(health_handler))
+        .route("/health/startup", get(startup_handler))
+        .route(
+            "/health/ready",
+            get(move || {
+                let readiness_pool = readiness_pool.clone();
+                async move { readiness_handler(readiness_pool).await }
+            }),
+        )
         .merge(SwaggerUi::new("/api/v1/docs").url(
             "/api/v1/openapi.json",
             lightbridge_authz_api::openapi::ApiDoc::openapi(),
@@ -123,6 +132,7 @@ pub async fn start_api_server(
 }
 
 pub async fn start_opa_server(opa: &OpaServer, pool: Arc<dyn DbPoolTrait>) -> Result<()> {
+    let readiness_pool = pool.clone();
     let repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
     let state = Arc::new(OpaState {
         repo,
@@ -132,6 +142,14 @@ pub async fn start_opa_server(opa: &OpaServer, pool: Arc<dyn DbPoolTrait>) -> Re
     let public = Router::new()
         .route("/", get(root_handler))
         .route("/health", get(health_handler))
+        .route("/health/startup", get(startup_handler))
+        .route(
+            "/health/ready",
+            get(move || {
+                let readiness_pool = readiness_pool.clone();
+                async move { readiness_handler(readiness_pool).await }
+            }),
+        )
         .merge(SwaggerUi::new("/v1/opa/docs").url("/v1/opa/openapi.json", OpaDoc::openapi()));
 
     let protected = opa_router(state.clone()).with_state(state.clone());
@@ -151,6 +169,18 @@ async fn root_handler() -> (StatusCode, Json<RootResponse>) {
 
 async fn health_handler() -> StatusCode {
     StatusCode::OK
+}
+
+async fn startup_handler() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
+    if is_database_ready(pool.as_ref()).await {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 #[derive(OpenApi)]
@@ -183,6 +213,7 @@ struct OpaDoc;
 mod tests {
     use super::*;
     use serde_json::Value;
+    use sqlx::postgres::PgPoolOptions;
 
     fn opa_openapi() -> Value {
         serde_json::to_value(OpaDoc::openapi()).expect("openapi should serialize")
@@ -260,6 +291,26 @@ mod tests {
         assert!(
             metadata_schema.get("additionalProperties").is_some(),
             "AuthorinoMetadata should support arbitrary keys via flattened extra field"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_and_startup_endpoints_report_ok() {
+        assert_eq!(health_handler().await, StatusCode::OK);
+        assert_eq!(startup_handler().await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readiness_endpoint_reports_unavailable_when_database_is_down() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
+            .expect("lazy pool should be constructible");
+        let pool: Arc<dyn DbPoolTrait> =
+            Arc::new(lightbridge_authz_core::db::DbPool::from_pool(pool));
+
+        assert_eq!(
+            readiness_handler(pool).await,
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 }

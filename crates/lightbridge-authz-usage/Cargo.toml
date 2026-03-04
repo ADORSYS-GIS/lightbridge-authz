@@ -34,3 +34,4 @@ lightbridge-authz-core = { workspace = true, features = ["axum"] }
 [dev-dependencies]
 anyhow.workspace = true
 tokio.workspace = true
+sqlx.workspace = true

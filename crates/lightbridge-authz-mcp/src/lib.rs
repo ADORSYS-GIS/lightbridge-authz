@@ -10,7 +10,7 @@ use lightbridge_authz_core::{
     DefaultLimits, Error, Project, Result, RotateApiKey, UpdateAccount, UpdateApiKey,
     UpdateProject,
     config::{ApiServer, BasicAuth, Oauth2},
-    db::DbPoolTrait,
+    db::{DbPoolTrait, is_database_ready},
     server::serve_tls,
 };
 use lightbridge_authz_rest::{
@@ -722,6 +722,7 @@ pub async fn start_mcp_server(
     basic_auth: &BasicAuth,
     pool: Arc<dyn DbPoolTrait>,
 ) -> Result<()> {
+    let readiness_pool = pool.clone();
     let store: Arc<dyn AuthzStore> = Arc::new(AuthzStoreImpl::with_pool(pool.clone()));
     let opa_repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
     let bearer_service: Arc<dyn BearerTokenServiceTrait> =
@@ -745,7 +746,15 @@ pub async fn start_mcp_server(
 
     let public = Router::new()
         .route("/", get(root_handler))
-        .route("/health", get(health_handler));
+        .route("/health", get(health_handler))
+        .route("/health/startup", get(startup_handler))
+        .route(
+            "/health/ready",
+            get(move || {
+                let readiness_pool = readiness_pool.clone();
+                async move { readiness_handler(readiness_pool).await }
+            }),
+        );
 
     let protected = Router::new()
         .nest_service("/mcp", mcp_service)
@@ -786,11 +795,24 @@ async fn health_handler() -> StatusCode {
     StatusCode::OK
 }
 
+async fn startup_handler() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
+    if is_database_ready(pool.as_ref()).await {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
     use lightbridge_authz_core::{ApiKeyStatus, async_trait};
+    use sqlx::postgres::PgPoolOptions;
 
     #[derive(Debug)]
     struct MockStore;
@@ -1109,5 +1131,25 @@ mod tests {
         assert_eq!(output["dynamic_metadata"]["api_key_id"], "key_1");
         assert_eq!(output["dynamic_metadata"]["api_key_status"], "active");
         assert_eq!(output["dynamic_metadata"]["env"], "dev");
+    }
+
+    #[tokio::test]
+    async fn health_and_startup_endpoints_report_ok() {
+        assert_eq!(health_handler().await, StatusCode::OK);
+        assert_eq!(startup_handler().await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readiness_endpoint_reports_unavailable_when_database_is_down() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
+            .expect("lazy pool should be constructible");
+        let pool: Arc<dyn DbPoolTrait> =
+            Arc::new(lightbridge_authz_core::db::DbPool::from_pool(pool));
+
+        assert_eq!(
+            readiness_handler(pool).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }

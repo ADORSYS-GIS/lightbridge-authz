@@ -10,21 +10,25 @@ Lightbridge Authz is a multi-service backend for API key management and usage an
 - **authz-api** (frontend CRUD, OAuth2)
   - TLS on `:3000` inside the container, exposed as `:13000` via compose.
   - Public routes: `GET /` and `GET /health`
+  - Probe routes: `GET /health` (liveness), `GET /health/startup` (startup), `GET /health/ready` (DB readiness)
   - Protected routes under `/api/v1` (OAuth2 bearer token).
 - **authz-opa** (Authorino, basic auth)
   - TLS on `:3001` inside the container, exposed as `:13001` via compose.
   - `POST /v1/opa/validate` (basic auth).
+  - Probe routes: `GET /health`, `GET /health/startup`, `GET /health/ready`
 - **authz-migrate**
   - Runs SQL migrations before the API services start.
 - **lightbridge-mcp**
   - TLS on `:3000` inside the container, exposed as `:13003` via compose.
   - MCP streamable HTTP endpoint: `POST/GET /mcp`
+  - Health probes: `GET /health` (liveness), `GET /health/ready` (DB readiness), `GET /health/startup` (startup)
   - Protected with OAuth2/JWT bearer validation (same JWKS flow as `authz-api`).
   - Reuses the same config file as `lightbridge-authz` (API bind/tls + shared DB settings).
 - **lightbridge-authz-usage** (OTEL ingest + usage query)
   - OTEL ingest endpoints (no auth): `POST /v1/otel/traces`, `POST /v1/otel/metrics`
   - Usage query endpoint: `POST /v1/usage/query`
   - OpenAPI docs: `/v1/usage/docs`
+  - Probe routes: `GET /health`, `GET /health/startup`, `GET /health/ready`
 - **postgresql**, **keycloak**, **adminer**, **authz-tls**
 
 ## Quick start (Docker Compose)
@@ -37,8 +41,17 @@ Verify health:
 
 ```bash
 curl -k https://localhost:13000/health
+curl -k https://localhost:13000/health/ready
+curl -k https://localhost:13000/health/startup
 curl -k https://localhost:13001/health
+curl -k https://localhost:13001/health/ready
+curl -k https://localhost:13001/health/startup
+curl -k https://localhost:13002/health
+curl -k https://localhost:13002/health/ready
+curl -k https://localhost:13002/health/startup
 curl -k https://localhost:13003/health
+curl -k https://localhost:13003/health/ready
+curl -k https://localhost:13003/health/startup
 ```
 
 `-k` is required because the certs are self‑signed.
