@@ -2,6 +2,49 @@ apiVersion: v1
 entries:
   lightbridge:
   - apiVersion: v2
+    appVersion: 0.6.6
+    created: "2026-03-05T10:27:53.639852318Z"
+    dependencies:
+    - alias: api
+      condition: api.enabled
+      name: lightbridge-authz
+      repository: file://../lightbridge-authz
+      version: '*'
+    - alias: opa
+      condition: opa.enabled
+      name: lightbridge-authz
+      repository: file://../lightbridge-authz
+      version: '*'
+    - alias: usage
+      condition: usage.enabled
+      name: lightbridge-authz-usage
+      repository: file://../lightbridge-authz-usage
+      version: '*'
+    - alias: mcp
+      condition: mcp.enabled
+      name: lightbridge-mcp
+      repository: file://../lightbridge-mcp
+      version: '*'
+    description: A Helm chart for Kubernetes
+    digest: 4c7c8fc5709c9f34133985f6ca2c4ab475a8cfa845f87dd47db8ce2dacf3617b
+    home: https://github.com/ADORSYS-GIS/lightbridge-authz
+    icon: https://adorsys.com/favicon.svg?v=05f867cc1aa036716c10a6c1d4ad6365
+    keywords:
+    - authz
+    - oauth2
+    - opa
+    - tls
+    - postgres
+    - api
+    kubeVersion: '>=1.20.0-0'
+    name: lightbridge
+    sources:
+    - https://github.com/ADORSYS-GIS/lightbridge-authz
+    type: application
+    urls:
+    - https://github.com/ADORSYS-GIS/lightbridge-authz/releases/download/lightbridge-0.6.6/lightbridge-0.6.6.tgz
+    version: 0.6.6
+  - apiVersion: v2
     appVersion: 0.6.4
     created: "2026-03-05T04:36:13.152437023Z"
     dependencies:
@@ -565,6 +608,31 @@ entries:
     version: 0.5.1
   lightbridge-authz:
   - apiVersion: v2
+    appVersion: 0.6.6
+    created: "2026-03-05T10:27:53.912171939Z"
+    dependencies:
+    - name: common
+      repository: https://bjw-s-labs.github.io/helm-charts
+      version: 4.6.2
+    description: Kubernetes deployment for the lightbridge authz services
+    digest: 61dd174937f7f1fd148d654c2db893022d8cef9325bfd9814c9fdfd3d9a09ff3
+    home: https://github.com/ADORSYS-GIS/lightbridge-authz
+    icon: https://adorsys.com/favicon.svg?v=05f867cc1aa036716c10a6c1d4ad6365
+    keywords:
+    - authz
+    - opa
+    - tls
+    - postgres
+    - api
+    kubeVersion: '>=1.20.0-0'
+    name: lightbridge-authz
+    sources:
+    - https://github.com/ADORSYS-GIS/lightbridge-authz
+    type: application
+    urls:
+    - https://github.com/ADORSYS-GIS/lightbridge-authz/releases/download/lightbridge-authz-0.6.6/lightbridge-authz-0.6.6.tgz
+    version: 0.6.6
+  - apiVersion: v2
     appVersion: 0.6.4
     created: "2026-03-05T04:36:13.345276181Z"
     dependencies:
@@ -919,6 +987,30 @@ entries:
     version: 0.5.1
   lightbridge-authz-usage:
   - apiVersion: v2
+    appVersion: 0.6.6
+    created: "2026-03-05T10:27:54.169674726Z"
+    dependencies:
+    - name: common
+      repository: https://bjw-s-labs.github.io/helm-charts
+      version: 4.6.2
+    description: Kubernetes deployment for the Lightbridge Authz Usage service
+    digest: 6a0e62e7fc0fc694bfabfa2f6b36d3ccd4d672d21ef6e138f40a044e25af64ec
+    home: https://github.com/ADORSYS-GIS/lightbridge-authz
+    icon: https://adorsys.com/favicon.svg?v=05f867cc1aa036716c10a6c1d4ad6365
+    keywords:
+    - usage
+    - otel
+    - timescale
+    - telemetry
+    kubeVersion: '>=1.20.0-0'
+    name: lightbridge-authz-usage
+    sources:
+    - https://github.com/ADORSYS-GIS/lightbridge-authz
+    type: application
+    urls:
+    - https://github.com/ADORSYS-GIS/lightbridge-authz/releases/download/lightbridge-authz-usage-0.6.6/lightbridge-authz-usage-0.6.6.tgz
+    version: 0.6.6
+  - apiVersion: v2
     appVersion: 0.6.4
     created: "2026-03-05T04:36:13.567575595Z"
     dependencies:
@@ -1234,6 +1326,28 @@ entries:
     version: 0.5.2
   lightbridge-mcp:
   - apiVersion: v2
+    appVersion: 0.6.6
+    created: "2026-03-05T10:27:54.404360252Z"
+    dependencies:
+    - name: common
+      repository: https://bjw-s-labs.github.io/helm-charts
+      version: ^4.6.2
+    description: Kubernetes deployment for the Lightbridge Authz Usage service
+    digest: 9b4070dd8ecf42366bdff4ab2189a4bc806a5c4fe59a005ae0b9b7df0d9e163e
+    home: https://github.com/ADORSYS-GIS/lightbridge-authz
+    icon: https://adorsys.com/favicon.svg?v=05f867cc1aa036716c10a6c1d4ad6365
+    keywords:
+    - usage
+    - mcp
+    kubeVersion: '>=1.20.0-0'
+    name: lightbridge-mcp
+    sources:
+    - https://github.com/ADORSYS-GIS/lightbridge-authz
+    type: application
+    urls:
+    - https://github.com/ADORSYS-GIS/lightbridge-authz/releases/download/lightbridge-mcp-0.6.6/lightbridge-mcp-0.6.6.tgz
+    version: 0.6.6
+  - apiVersion: v2
     appVersion: 0.6.4
     created: "2026-03-05T04:36:13.768294144Z"
     dependencies:
@@ -1378,4 +1492,4 @@ entries:
     urls:
     - https://github.com/ADORSYS-GIS/lightbridge-authz/releases/download/lightbridge-migrate-0.5.1/lightbridge-migrate-0.5.1.tgz
     version: 0.5.1
-generated: "2026-03-05T04:36:13.768547478Z"
+generated: "2026-03-05T10:27:54.404911893Z"
