@@ -83,11 +83,6 @@ persistence:
           - path: /etc/lightbridge/config.yaml
             subPath: config.yaml
             readOnly: true
-      migrate:
-        authz:
-          - path: /etc/lightbridge/config.yaml
-            subPath: config.yaml
-            readOnly: true
   tls:
     enabled: true
     type: secret
