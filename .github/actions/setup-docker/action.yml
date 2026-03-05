@@ -7,6 +7,10 @@ inputs:
   image-name:
     description: Name of the image
     required: true
+  tag-suffix:
+    description: Optional suffix appended to generated tags (for example -arm)
+    required: false
+    default: ""
   registry:
     description: Container registry
     required: false
@@ -42,10 +46,10 @@ runs:
       uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
       with:
         tags: |
-          type=raw,value=latest,enable={{is_default_branch}}
-          type=raw,value={{branch}}
-          type=raw,value=${{ inputs.app-version }}
-          type=schedule,pattern={{date 'YYYYMMDD-hhmmss' tz='Europe/Berlin'}}
-          type=sha,format=long
-          type=sha,format=long,prefix={{branch}}
+          type=raw,value=latest${{ inputs.tag-suffix }},enable={{is_default_branch}}
+          type=raw,value={{branch}}${{ inputs.tag-suffix }}
+          type=raw,value=${{ inputs.app-version }}${{ inputs.tag-suffix }}
+          type=schedule,pattern={{date 'YYYYMMDD-hhmmss' tz='Europe/Berlin'}}${{ inputs.tag-suffix }}
+          type=sha,format=long,suffix=${{ inputs.tag-suffix }}
+          type=sha,format=long,prefix={{branch}},suffix=${{ inputs.tag-suffix }}
         images: ${{ inputs.registry }}/${{ steps.lowercase.outputs.lowercase }}

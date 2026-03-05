@@ -2357,7 +2357,7 @@ dependencies = [
 
 [[package]]
 name = "lightbridge-authz"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "clap",
  "lightbridge-authz-core",
@@ -2371,7 +2371,7 @@ dependencies = [
 
 [[package]]
 name = "lightbridge-authz-api"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "axum",
  "lightbridge-authz-bearer",
@@ -2383,7 +2383,7 @@ dependencies = [
 
 [[package]]
 name = "lightbridge-authz-api-key"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "chrono",
  "lightbridge-authz-core",
@@ -2395,7 +2395,7 @@ dependencies = [
 
 [[package]]
 name = "lightbridge-authz-bearer"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "httpmock",
@@ -2410,7 +2410,7 @@ dependencies = [
 
 [[package]]
 name = "lightbridge-authz-core"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2439,14 +2439,14 @@ dependencies = [
 
 [[package]]
 name = "lightbridge-authz-healthcheck"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "clap",
 ]
 
 [[package]]
 name = "lightbridge-authz-mcp"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "axum",
  "chrono",
@@ -2466,7 +2466,7 @@ dependencies = [
 
 [[package]]
 name = "lightbridge-authz-migrate"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "lightbridge-authz-core",
  "sqlx",
@@ -2475,7 +2475,7 @@ dependencies = [
 
 [[package]]
 name = "lightbridge-authz-rest"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2501,7 +2501,7 @@ dependencies = [
 
 [[package]]
 name = "lightbridge-authz-test-utils"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "clap",
  "reqwest 0.13.2",
@@ -2511,7 +2511,7 @@ dependencies = [
 
 [[package]]
 name = "lightbridge-authz-usage"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "clap",
  "lightbridge-authz-core",
@@ -2525,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "lightbridge-authz-usage-migrate"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "lightbridge-authz-core",
  "sqlx",
@@ -2534,7 +2534,7 @@ dependencies = [
 
 [[package]]
 name = "lightbridge-authz-usage-rest"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2564,7 +2564,7 @@ dependencies = [
 
 [[package]]
 name = "lightbridge-mcp"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "clap",
  "lightbridge-authz-core",

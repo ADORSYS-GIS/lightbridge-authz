@@ -65,12 +65,12 @@ jobs:
     strategy:
       matrix:
         include:
-          - { os: ubuntu-24.04, platform: linux/amd64, target: runtime, image_name: '${{ github.repository }}' }
-          - { os: ubuntu-22.04-arm, platform: linux/arm64, target: runtime, image_name: '${{ github.repository }}' }
-          - { os: ubuntu-24.04, platform: linux/amd64, target: mcp-runtime, image_name: '${{ github.repository }}-mcp' }
-          - { os: ubuntu-22.04-arm, platform: linux/arm64, target: mcp-runtime, image_name: '${{ github.repository }}-mcp' }
-          - { os: ubuntu-24.04, platform: linux/amd64, target: usage-runtime, image_name: '${{ github.repository }}-usage' }
-          - { os: ubuntu-22.04-arm, platform: linux/arm64, target: usage-runtime, image_name: '${{ github.repository }}-usage' }
+          - { os: ubuntu-24.04, platform: linux/amd64, target: runtime, image_name: '${{ github.repository }}', tag_suffix: '' }
+          - { os: ubuntu-22.04-arm, platform: linux/arm64, target: runtime, image_name: '${{ github.repository }}', tag_suffix: '-arm' }
+          - { os: ubuntu-24.04, platform: linux/amd64, target: mcp-runtime, image_name: '${{ github.repository }}-mcp', tag_suffix: '' }
+          - { os: ubuntu-22.04-arm, platform: linux/arm64, target: mcp-runtime, image_name: '${{ github.repository }}-mcp', tag_suffix: '-arm' }
+          - { os: ubuntu-24.04, platform: linux/amd64, target: usage-runtime, image_name: '${{ github.repository }}-usage', tag_suffix: '' }
+          - { os: ubuntu-22.04-arm, platform: linux/arm64, target: usage-runtime, image_name: '${{ github.repository }}-usage', tag_suffix: '-arm' }
     permissions:
       contents: read
       packages: write
@@ -84,6 +84,7 @@ jobs:
           image-name: ${{ matrix.image_name }}
           target: ${{ matrix.target }}
           platform: ${{ matrix.platform }}
+          tag-suffix: ${{ matrix.tag_suffix }}
   release:
     needs: [build,container-build]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'

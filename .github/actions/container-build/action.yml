@@ -14,6 +14,10 @@ inputs:
   platform:
     description: Docker platform to build (for example linux/amd64)
     required: true
+  tag-suffix:
+    description: Optional suffix appended to generated tags (for example -arm)
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -22,6 +26,7 @@ runs:
       with:
         app-version: ${{ inputs.app-version }}
         image-name: ${{ inputs.image-name }}
+        tag-suffix: ${{ inputs.tag-suffix }}
     - name: Build and push image
       uses: docker/build-push-action@v6.19.2
       with:
