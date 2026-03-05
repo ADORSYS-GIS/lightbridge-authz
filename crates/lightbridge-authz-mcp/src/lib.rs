@@ -991,8 +991,8 @@ pub async fn start_mcp_server(
     let public =
         Router::new()
             .route("/", get(root_handler))
-            .route("/health", get(health_handler))
-            .route("/health/startup", get(startup_handler))
+            .route("/healthz", get(health_handler))
+            .route("/healthz/startup", get(startup_handler))
             .route(
                 "/.well-known/oauth-authorization-server",
                 get(move |headers: HeaderMap| {
@@ -1017,7 +1017,7 @@ pub async fn start_mcp_server(
                 }),
             )
             .route(
-                "/health/ready",
+                "/healthz/ready",
                 get(move || {
                     let readiness_pool = readiness_pool.clone();
                     async move { readiness_handler(readiness_pool).await }

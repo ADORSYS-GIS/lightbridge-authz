@@ -15,7 +15,7 @@ This document collects the concrete commands that worked when we tested the Helm
     --set auth.database=lightbridge_authz \
     --set primary.persistence.enabled=false \
     --wait --timeout 5m
-  docker build -t lightbridge-authz:0.6.2 .
+  docker build -t lightbridge-authz:0.6.4 .
   ```
 - Generate the TLS secrets manually (optional unless you prefer full control or the built-in job/tag fails):
   ```bash

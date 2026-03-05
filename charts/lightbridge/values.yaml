@@ -2,19 +2,19 @@ global:
   tlsSecretName: lightbridge-authz-tls
   authz:
     image:
-      version: "0.6.2"
+      version: "0.6.4"
       repository: "ghcr.io/adorsys-gis/lightbridge-authz"
   authz_mcp:
     image:
-      version: "0.6.2"
+      version: "0.6.4"
       repository: "ghcr.io/adorsys-gis/lightbridge-authz-mcp"
   authz_usage:
     image:
-      version: "0.6.2"
+      version: "0.6.4"
       repository: "ghcr.io/adorsys-gis/lightbridge-authz-usage"
 
   tls:
-    enabled: true
+    enabled: false
     apiCommonName: lightbridge-authz-api
     opaCommonName: lightbridge-authz-opa
     usageCommonName: lightbridge-authz-usage

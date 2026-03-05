@@ -56,16 +56,16 @@ pub async fn start_usage_server(usage: &UsageServer, database: &Database) -> Res
 
     let app = Router::new()
         .route("/", get(root_handler))
-        .route("/health", get(health_handler))
-        .route("/health/startup", get(startup_handler))
+        .route("/healthz", get(health_handler))
+        .route("/healthz/startup", get(startup_handler))
         .route(
-            "/health/ready",
+            "/healthz/ready",
             get(move || {
                 let readiness_pool = readiness_pool.clone();
                 async move { readiness_handler(readiness_pool).await }
             }),
         )
-        .merge(SwaggerUi::new("/v1/usage/docs").url("/v1/usage/openapi.json", UsageDoc::openapi()))
+        .merge(SwaggerUi::new("/usage/v1/usage/docs").url("/usage/v1/usage/openapi.json", UsageDoc::openapi()))
         .merge(routers::usage_router())
         .with_state(state);
 

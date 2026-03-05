@@ -104,10 +104,10 @@ pub async fn start_api_server(
 
     let public = Router::new()
         .route("/", get(root_handler))
-        .route("/health", get(health_handler))
-        .route("/health/startup", get(startup_handler))
+        .route("/healthz", get(health_handler))
+        .route("/healthz/startup", get(startup_handler))
         .route(
-            "/health/ready",
+            "/healthz/ready",
             get(move || {
                 let readiness_pool = readiness_pool.clone();
                 async move { readiness_handler(readiness_pool).await }
@@ -141,10 +141,10 @@ pub async fn start_opa_server(opa: &OpaServer, pool: Arc<dyn DbPoolTrait>) -> Re
 
     let public = Router::new()
         .route("/", get(root_handler))
-        .route("/health", get(health_handler))
-        .route("/health/startup", get(startup_handler))
+        .route("/healthz", get(health_handler))
+        .route("/healthz/startup", get(startup_handler))
         .route(
-            "/health/ready",
+            "/healthz/ready",
             get(move || {
                 let readiness_pool = readiness_pool.clone();
                 async move { readiness_handler(readiness_pool).await }

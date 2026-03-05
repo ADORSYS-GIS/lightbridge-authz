@@ -8,5 +8,5 @@ pub fn usage_router() -> Router<Arc<UsageState>> {
     Router::new()
         .route("/v1/otel/traces", post(ingest_traces))
         .route("/v1/otel/metrics", post(ingest_metrics))
-        .route("/v1/usage/query", post(query_usage))
+        .route("/usage/v1/usage/query", post(query_usage))
 }
