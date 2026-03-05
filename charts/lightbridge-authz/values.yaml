@@ -43,6 +43,7 @@ controllers:
               timeoutSeconds: 2
               failureThreshold: 3
               httpGet:
+                scheme: HTTPS
                 path: /healthz
                 port: http
           readiness:
@@ -54,6 +55,7 @@ controllers:
               timeoutSeconds: 2
               failureThreshold: 3
               httpGet:
+                scheme: HTTPS
                 path: /healthz/ready
                 port: http
           startup:
@@ -64,6 +66,7 @@ controllers:
               periodSeconds: 5
               timeoutSeconds: 2
               httpGet:
+                scheme: HTTPS
                 path: /healthz/startup
                 port: http
 
