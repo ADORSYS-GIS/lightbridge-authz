@@ -51,7 +51,16 @@ struct RootResponse {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct EndpointResponse {
+    #[schemars(schema_with = "json_value_without_boolean_schema")]
     result: Value,
+}
+
+fn json_value_without_boolean_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    // Some MCP clients reject boolean JSON Schema nodes (`true` / `false`), so keep this as an
+    // object schema while still allowing any valid JSON value.
+    schemars::json_schema!({
+        "type": ["object", "array", "string", "number", "boolean", "null"]
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1525,6 +1534,38 @@ mod tests {
                 "limit should be present for {tool_name}"
             );
         }
+    }
+
+    #[test]
+    fn tool_output_schema_avoids_boolean_schema_for_result_property() {
+        let handler = LightbridgeMcpHandler::new(Arc::new(MockStore), sample_repo(), basic_auth());
+        let create_account = handler
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "create-account")
+            .expect("create-account tool should exist");
+
+        let output_schema = create_account
+            .output_schema
+            .as_ref()
+            .expect("output schema should be present");
+        let result_schema = output_schema
+            .get("properties")
+            .and_then(|value| value.as_object())
+            .and_then(|properties| properties.get("result"))
+            .expect("output schema should contain a result property");
+
+        assert!(
+            result_schema.is_object(),
+            "result schema should be a JSON object, not a boolean schema"
+        );
+        assert_eq!(
+            result_schema,
+            &json!({
+                "type": ["object", "array", "string", "number", "boolean", "null"]
+            })
+        );
     }
 
     #[tokio::test]
