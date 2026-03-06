@@ -1,0 +1,135 @@
+{
+"mappings": [
+{
+"request": {
+"method": "POST",
+"urlPathPattern": "/v1/otel/metrics",
+"bodyPatterns": [
+{
+"matchesJsonPath": "$"
+}
+]
+},
+"response": {
+"status": 202,
+"headers": {
+"Content-Type": "application/json"
+},
+"jsonBody": {
+"accepted_events": 100
+}
+}
+},
+{
+"request": {
+"method": "POST",
+"urlPathPattern": "/v1/otel/metrics",
+"bodyPatterns": [
+{
+"matchesJsonPath": "$"
+}
+]
+},
+"response": {
+"status": 400,
+"headers": {
+"Content-Type": "application/json"
+},
+"jsonBody": {}
+}
+},
+{
+"request": {
+"method": "POST",
+"urlPathPattern": "/v1/otel/traces",
+"bodyPatterns": [
+{
+"matchesJsonPath": "$"
+}
+]
+},
+"response": {
+"status": 202,
+"headers": {
+"Content-Type": "application/json"
+},
+"jsonBody": {
+"accepted_events": 100
+}
+}
+},
+{
+"request": {
+"method": "POST",
+"urlPathPattern": "/v1/otel/traces",
+"bodyPatterns": [
+{
+"matchesJsonPath": "$"
+}
+]
+},
+"response": {
+"status": 400,
+"headers": {
+"Content-Type": "application/json"
+},
+"jsonBody": {}
+}
+},
+{
+"request": {
+"method": "POST",
+"urlPathPattern": "/v1/usage/query",
+"bodyPatterns": [
+{
+"matchesJsonPath": "$"
+}
+]
+},
+"response": {
+"status": 200,
+"headers": {
+"Content-Type": "application/json"
+},
+"jsonBody": {
+"points": [
+{
+"bucket_start": "2023-11-01T00:00:00Z",
+"requests": 50,
+"usage_value": 15.75,
+"prompt_tokens": 1024,
+"completion_tokens": 512,
+"total_tokens": 1536,
+"account_id": "acc_3fa85f64",
+"project_id": "proj_98765",
+"user_id": "user_12345",
+"model": "gpt-4",
+"metric_name": "tokens",
+"signal_type": "metric"
+}
+]
+}
+}
+},
+{
+"request": {
+"method": "POST",
+"urlPathPattern": "/v1/usage/query",
+"bodyPatterns": [
+{
+"matchesJsonPath": "$"
+}
+]
+},
+"response": {
+"status": 400,
+"headers": {
+"Content-Type": "application/json"
+},
+"jsonBody": {
+"error": "Invalid request parameters or time range"
+}
+}
+}
+]
+}
