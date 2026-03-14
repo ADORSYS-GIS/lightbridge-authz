@@ -7,15 +7,16 @@ use lightbridge_authz_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::{info, warn};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
-
-pub mod config;
+ 
+ pub mod config;
 pub mod handlers;
 pub mod models;
 pub mod repo;
 pub mod routers;
-pub mod tracing;
+pub mod instrumentation;
 
 pub use config::{UsageConfig, UsageServer, load_from_path};
 use models::{UsageQueryRequest, UsageSeriesPoint};
@@ -69,11 +70,12 @@ pub async fn start_usage_server(usage: &UsageServer, database: &Database) -> Res
             SwaggerUi::new("/usage/v1/usage/docs")
                 .url("/usage/v1/usage/openapi.json", UsageDoc::openapi()),
         )
-        .merge(routers::usage_router())
-        .with_state(state);
-
-    serve_tls("USAGE", &usage.address, usage.port, &usage.tls, app).await
-}
+         .merge(routers::usage_router())
+         .with_state(state);
+ 
+     info!("starting usage server on {}:{}", &usage.address, usage.port);
+     serve_tls("USAGE", &usage.address, usage.port, &usage.tls, app).await
+ }
 
 async fn root_handler() -> (StatusCode, Json<RootResponse>) {
     (
@@ -93,13 +95,14 @@ async fn startup_handler() -> StatusCode {
     StatusCode::OK
 }
 
-async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
-    if is_database_ready(pool.as_ref()).await {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    }
-}
+ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
+     if is_database_ready(pool.as_ref()).await {
+         StatusCode::OK
+     } else {
+         warn!("database is not ready for usage server");
+         StatusCode::SERVICE_UNAVAILABLE
+     }
+ }
 
 #[derive(OpenApi)]
 #[openapi(
@@ -145,7 +148,7 @@ mod tests {
             .expect("openapi paths should be an object");
 
         assert!(
-            paths.contains_key("/v1/usage/query"),
+            paths.contains_key("/usage/v1/usage/query"),
             "expected usage query endpoint in openapi paths"
         );
         assert!(

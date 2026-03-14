@@ -1,6 +1,7 @@
+use lightbridge_authz_core::config::{load_yaml_from_path, Database, Logging, Otel, Tls};
 use lightbridge_authz_core::Result;
-use lightbridge_authz_core::config::{Database, Logging, Otel, Tls, load_yaml_from_path};
 use serde::Deserialize;
+use tracing::debug;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsageConfig {
@@ -23,7 +24,10 @@ pub struct UsageServer {
 }
 
 pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<UsageConfig> {
-    load_yaml_from_path(path)
+    debug!("loading usage config from {:?}", path.as_ref());
+    let config = load_yaml_from_path(path)?;
+    debug!("loaded usage config successfully");
+    Ok(config)
 }
 
 #[cfg(test)]

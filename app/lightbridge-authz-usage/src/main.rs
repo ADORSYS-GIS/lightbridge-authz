@@ -24,12 +24,12 @@ async fn main() -> Result<()> {
         None => None,
     };
 
-    if let Some(path) = config_path {
-        let config = load_from_path(path)?;
-        lightbridge_authz_usage_rest::tracing::init_tracing(&config);
-    } else {
-        tracing_subscriber::fmt::init();
-    }
+     if let Some(path) = config_path {
+         let config = load_from_path(path)?;
+         lightbridge_authz_usage_rest::instrumentation::init_tracing(&config);
+     } else {
+         tracing_subscriber::fmt::init();
+     }
 
     let result = match cli.command {
         Some(Commands::Serve { config_path }) => {
@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    lightbridge_authz_usage_rest::tracing::shutdown_tracing();
-
-    result
-}
+     lightbridge_authz_usage_rest::instrumentation::shutdown_tracing();
+ 
+     result
+ }

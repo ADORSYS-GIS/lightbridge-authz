@@ -20,6 +20,7 @@ use prost::Message;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::{info, warn};
 
 const ACCOUNT_KEYS: [&str; 5] = [
     "account_id",
@@ -82,14 +83,16 @@ pub async fn ingest_traces(
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let payload = decode_trace_request(&headers, &body)?;
-    let events = extract_trace_events(payload);
-    let accepted_events = state.repo.insert_usage_events(&events).await?;
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(IngestResponse { accepted_events }),
-    ))
-}
+     let events = extract_trace_events(payload);
+     let accepted_events = state.repo.insert_usage_events(&events).await?;
+ 
+     info!("accepted {} trace events", accepted_events);
+ 
+     Ok((
+         StatusCode::ACCEPTED,
+         Json(IngestResponse { accepted_events }),
+     ))
+ }
 
 #[utoipa::path(
     post,
@@ -107,32 +110,42 @@ pub async fn ingest_metrics(
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let payload = decode_metrics_request(&headers, &body)?;
-    let events = extract_metric_events(payload);
-    let accepted_events = state.repo.insert_usage_events(&events).await?;
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(IngestResponse { accepted_events }),
-    ))
-}
+     let events = extract_metric_events(payload);
+     let accepted_events = state.repo.insert_usage_events(&events).await?;
+ 
+     info!("accepted {} metric events", accepted_events);
+ 
+     Ok((
+         StatusCode::ACCEPTED,
+         Json(IngestResponse { accepted_events }),
+     ))
+ }
 
 fn decode_trace_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportTraceServiceRequest> {
     if is_json_content(headers) {
-        serde_json::from_slice(body)
-            .map_err(|e| Error::Database(format!("invalid OTLP trace JSON payload: {e}")))
+        serde_json::from_slice(body).map_err(|e| {
+            warn!("invalid OTLP trace JSON payload: {e}");
+            Error::Database(format!("invalid OTLP trace JSON payload: {e}"))
+        })
     } else {
-        ExportTraceServiceRequest::decode(body)
-            .map_err(|e| Error::Database(format!("invalid OTLP trace protobuf payload: {e}")))
+        ExportTraceServiceRequest::decode(body).map_err(|e| {
+            warn!("invalid OTLP trace protobuf payload: {e}");
+            Error::Database(format!("invalid OTLP trace protobuf payload: {e}"))
+        })
     }
 }
 
 fn decode_metrics_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportMetricsServiceRequest> {
     if is_json_content(headers) {
-        serde_json::from_slice(body)
-            .map_err(|e| Error::Database(format!("invalid OTLP metrics JSON payload: {e}")))
+        serde_json::from_slice(body).map_err(|e| {
+            warn!("invalid OTLP metrics JSON payload: {e}");
+            Error::Database(format!("invalid OTLP metrics JSON payload: {e}"))
+        })
     } else {
-        ExportMetricsServiceRequest::decode(body)
-            .map_err(|e| Error::Database(format!("invalid OTLP metrics protobuf payload: {e}")))
+        ExportMetricsServiceRequest::decode(body).map_err(|e| {
+            warn!("invalid OTLP metrics protobuf payload: {e}");
+            Error::Database(format!("invalid OTLP metrics protobuf payload: {e}"))
+        })
     }
 }
 

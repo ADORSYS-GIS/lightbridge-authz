@@ -16,6 +16,166 @@ The authz services (`authz-api`, `authz-opa`):
 
 This file documents structure, architecture, workflows, and practices for contributors and agents working on this codebase.
 
+## Quick Reference - Build/Test Commands
+
+### Essential Commands
+
+**Build & Run:**
+```bash
+# Build all services with Docker
+docker compose -p lightbridge-authz -f compose.yaml build
+
+# Start all services
+docker compose -p lightbridge-authz -f compose.yaml up -d --remove-orphans
+
+# Start specific service
+docker compose -p lightbridge-authz -f compose.yaml up -d --remove-orphans authz-api
+
+# View logs
+docker compose -p lightbridge-authz -f compose.yaml logs --tail=100 -f
+
+# Stop all services
+docker compose -p lightbridge-authz -f compose.yaml down
+
+# Destroy everything (including volumes)
+docker compose -p lightbridge-authz -f compose.yaml down -v
+```
+
+**Linting and Formatting:**
+```bash
+# Format code
+cargo fmt
+
+# Run clippy with automatic fixes
+cargo clippy --all-targets --all-features --fix --allow-dirty -- -D warnings
+
+# Check code without building
+cargo check --all-targets --all-features
+
+# Run all quality checks (fmt + clippy + check)
+just all-checks
+```
+
+**Testing:**
+```bash
+# Run all tests in workspace (requires DATABASE_URL for integration tests)
+DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz" cargo test --workspace
+
+# Run tests for a specific crate
+cargo test -p lightbridge-authz-rest
+cargo test -p lightbridge-authz-api-key --features it-tests
+cargo test -p lightbridge-authz-usage-rest
+
+# Run a single test by name
+cargo test -p lightbridge-authz-rest test_name
+
+# Run integration tests requiring Docker
+docker compose -p lightbridge-authz -f compose.yaml up -d postgresql
+export DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"
+cargo test -p lightbridge-authz-api-key --features it-tests --tests
+
+# Run integration tests with Just
+just it-tests
+
+# Run load tests (requires AUTHZ_API_KEY)
+AUTHZ_API_KEY=<your-secret> just load-test
+
+# Run Authorino integration tests
+just it-authorino
+just it-authorino-down
+```
+
+**Single Test Execution:**
+```bash
+# Run a specific test in a specific crate
+cargo test -p <crate-name> <test-function-name>
+
+# Example: Run a single test in lightbridge-authz-rest
+cargo test -p lightbridge-authz-rest validate_bucket_interval_rejects_unexpected_values
+
+# For tests with specific features
+cargo test -p lightbridge-authz-api-key --features it-tests <test-name>
+```
+
+## Code Style Guidelines
+
+### Import Conventions
+
+1. **Group imports in this order:**
+   - External crate imports (e.g., `axum`, `serde`)
+   - Internal crate imports from other modules (e.g., `lightbridge_authz_core`)
+   - Local module imports using `crate::` or `super::`
+
+2. **Use compact imports:**
+   - Group multiple imports from the same crate: `use serde::{Deserialize, Serialize};`
+   - But keep it readable - don't over-group
+
+3. **Relative vs absolute imports:**
+   - Use `use crate::` for imports within the same crate
+   - Use `lightbridge_authz_core::` for cross-crate imports
+   - Avoid `use super::` unless necessary for parent access
+
+4. **Import style examples:**
+```rust
+// Standard library
+use std::sync::Arc;
+
+// External crates
+use axum::{Json, Router, extract::State};
+use tracing::{info, debug, warn};
+
+// Cross-crate imports
+use lightbridge_authz_core::{Result, Error};
+
+// Within same crate
+use crate::models::UsageEvent;
+use crate::repo::StoreRepo;
+```
+
+### Formatting and Layout
+
+1. **No inline comments:** Never include inline comments in code (per .roo rules)
+2. **Dedicated test files:** All new tests must be in `tests/` directory, not in `src/`
+3. **File organization:**
+   - Keep files focused and not too long
+   - Each module should have a clear single responsibility
+   - Check if functionality already exists before implementing
+
+### Naming Conventions
+
+1. **Variables/functions:** `snake_case`
+2. **Types/structs/traits/enums:** `PascalCase`
+3. **Constants:** `SCREAMING_SNAKE_CASE`
+4. **Module names:** `snake_case`
+
+### Error Handling
+
+1. **Use the centralized Result type:** Always use `Result<T>` from `lightbridge_authz_core::Result`
+2. **Centralized Error enum:** All errors go through `lightbridge_authz_core::Error` enum. Propose new variants if needed
+3. **Propagate errors with `?`:** Use the `?` operator for error propagation
+4. **Custom error types:** Only when truly necessary, otherwise use the centralized Error enum
+
+### Types and Structures
+
+1. **Prefer references:** Use `&T` instead of owned values where possible to avoid cloning
+2. **Owned data:** Only use owned data when ownership is explicitly needed
+3. **String optimization:** Consider `Cow<str>` for string data optimization
+4. **Iterator chains:** Leverage iterator chains for efficient data processing
+
+### Dependency Management
+
+1. **Workspace-level dependencies:** All dependencies must be declared in root `Cargo.toml` `[workspace.dependencies]`
+2. **Crate-level references:** Use `workspace = true` in individual crate `Cargo.toml` files
+3. **Research dependencies:** Check https://docs.rs/<package_name>/<package_version> before using
+4. **Exposing dependencies:** Better to expose a dependency from a module than importing the same dep in all modules
+
+### Idiomatic Rust
+
+1. **No nightly features:** Stick to stable Rust toolchain only
+2. **Unsafe code:** Avoid unless absolutely necessary. When using unsafe, provide detailed comments explaining why it's needed
+3. **Test attributes:** Use `#[should_panic]` when appropriate for tests that should fail
+4. **Module documentation:** Use `///` for public APIs and `//!` for module-level docs
+
 ## Top-Level Layout
 
 - `app/`

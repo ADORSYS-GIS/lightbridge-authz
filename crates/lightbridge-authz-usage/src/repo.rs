@@ -6,6 +6,7 @@ use serde_json::Value;
 use sqlx::{FromRow, PgPool, Postgres, QueryBuilder};
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
+use tracing::debug;
 
 #[derive(Debug, Clone)]
 pub struct UsageEvent {
@@ -55,6 +56,7 @@ impl StoreRepo {
     }
 
     pub async fn insert_usage_events(&self, events: &[UsageEvent]) -> Result<usize> {
+        debug!("inserting {} usage events", events.len());
         if events.is_empty() {
             return Ok(0);
         }
@@ -85,6 +87,10 @@ impl StoreRepo {
     }
 
     pub async fn query_usage(&self, input: &UsageQueryRequest) -> Result<Vec<UsageSeriesPoint>> {
+        debug!(
+            "querying usage with scope={:?}, scope_id={}, bucket={}, limit={}",
+            input.scope, input.scope_id, input.bucket, input.limit
+        );
         validate_bucket_interval(&input.bucket)?;
 
         let mut group_set = HashSet::new();
