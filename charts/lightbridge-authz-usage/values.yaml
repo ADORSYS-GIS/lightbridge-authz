@@ -3,7 +3,7 @@ enabled: true
 global:
   authz_usage:
     image:
-      version: "0.6.7"
+      version: "0.6.9"
       repository: "ghcr.io/adorsys-gis/lightbridge-authz-usage"
 
 controllers:

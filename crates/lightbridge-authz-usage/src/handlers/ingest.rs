@@ -45,19 +45,21 @@ const MODEL_KEYS: [&str; 5] = [
     "gen_ai.request.model",
     "genai.request.model",
 ];
-const PROMPT_TOKENS_KEYS: [&str; 5] = [
+const PROMPT_TOKENS_KEYS: [&str; 6] = [
     "prompt_tokens",
     "input_tokens",
     "usage.prompt_tokens",
     "gen_ai.usage.prompt_tokens",
     "genai.usage.prompt_tokens",
+    "gen_ai.usage.input_tokens",
 ];
-const COMPLETION_TOKENS_KEYS: [&str; 5] = [
+const COMPLETION_TOKENS_KEYS: [&str; 6] = [
     "completion_tokens",
     "output_tokens",
     "usage.completion_tokens",
     "gen_ai.usage.completion_tokens",
     "genai.usage.completion_tokens",
+    "gen_ai.usage.output_tokens",
 ];
 const TOTAL_TOKENS_KEYS: [&str; 5] = [
     "total_tokens",
