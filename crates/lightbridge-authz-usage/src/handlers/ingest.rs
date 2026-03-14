@@ -9,6 +9,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use lightbridge_authz_core::{Error, Result};
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
@@ -83,16 +84,16 @@ pub async fn ingest_traces(
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let payload = decode_trace_request(&headers, &body)?;
-     let events = extract_trace_events(payload);
-     let accepted_events = state.repo.insert_usage_events(&events).await?;
- 
-     info!("accepted {} trace events", accepted_events);
- 
-     Ok((
-         StatusCode::ACCEPTED,
-         Json(IngestResponse { accepted_events }),
-     ))
- }
+    let events = extract_trace_events(payload);
+    let accepted_events = state.repo.insert_usage_events(&events).await?;
+
+    info!("accepted {} trace events", accepted_events);
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(IngestResponse { accepted_events }),
+    ))
+}
 
 #[utoipa::path(
     post,
@@ -110,16 +111,110 @@ pub async fn ingest_metrics(
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let payload = decode_metrics_request(&headers, &body)?;
-     let events = extract_metric_events(payload);
-     let accepted_events = state.repo.insert_usage_events(&events).await?;
- 
-     info!("accepted {} metric events", accepted_events);
- 
-     Ok((
-         StatusCode::ACCEPTED,
-         Json(IngestResponse { accepted_events }),
-     ))
- }
+    let events = extract_metric_events(payload);
+    let accepted_events = state.repo.insert_usage_events(&events).await?;
+
+    info!("accepted {} metric events", accepted_events);
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(IngestResponse { accepted_events }),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/otel/logs",
+    request_body(content = String, content_type = "application/x-protobuf"),
+    responses(
+        (status = 202, body = IngestResponse),
+        (status = 400)
+    ),
+    tag = "ingest"
+)]
+pub async fn ingest_logs(
+    State(state): State<Arc<UsageState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<IngestResponse>)> {
+    let payload = decode_logs_request(&headers, &body)?;
+    let events = extract_log_events(payload);
+    let accepted_events = state.repo.insert_usage_events(&events).await?;
+
+    info!("accepted {} log events", accepted_events);
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(IngestResponse { accepted_events }),
+    ))
+}
+
+fn decode_logs_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportLogsServiceRequest> {
+    if is_json_content(headers) {
+        serde_json::from_slice(body).map_err(|e| {
+            warn!("invalid OTLP logs JSON payload: {e}");
+            Error::Database(format!("invalid OTLP logs JSON payload: {e}"))
+        })
+    } else {
+        ExportLogsServiceRequest::decode(body).map_err(|e| {
+            warn!("invalid OTLP logs protobuf payload: {e}");
+            Error::Database(format!("invalid OTLP logs protobuf payload: {e}"))
+        })
+    }
+}
+
+fn extract_log_events(payload: ExportLogsServiceRequest) -> Vec<UsageEvent> {
+    let mut events = Vec::new();
+
+    for resource_logs in payload.resource_logs {
+        let resource_attrs = resource_logs
+            .resource
+            .map(|resource| key_values_to_map(&resource.attributes))
+            .unwrap_or_default();
+
+        for scope_logs in resource_logs.scope_logs {
+            for log_record in scope_logs.log_records {
+                let attrs =
+                    merge_attr_maps(&resource_attrs, &key_values_to_map(&log_record.attributes));
+
+                let observed_nanos = if log_record.time_unix_nano > 0 {
+                    log_record.time_unix_nano
+                } else if log_record.observed_time_unix_nano > 0 {
+                    log_record.observed_time_unix_nano
+                } else {
+                    0
+                };
+
+                let prompt_tokens = extract_i64(&attrs, &PROMPT_TOKENS_KEYS);
+                let completion_tokens = extract_i64(&attrs, &COMPLETION_TOKENS_KEYS);
+                let total_tokens = extract_i64(&attrs, &TOTAL_TOKENS_KEYS)
+                    .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
+
+                let usage_value = extract_f64(&attrs, &USAGE_VALUE_KEYS)
+                    .or_else(|| total_tokens.map(|v| v as f64))
+                    .unwrap_or(1.0);
+
+                events.push(UsageEvent {
+                    observed_at: nanos_to_datetime(observed_nanos),
+                    signal_type: "log".to_string(),
+                    account_id: extract_string(&attrs, &ACCOUNT_KEYS),
+                    project_id: extract_string(&attrs, &PROJECT_KEYS),
+                    user_id: extract_string(&attrs, &USER_KEYS),
+                    model: extract_string(&attrs, &MODEL_KEYS),
+                    metric_name: non_empty(Some(log_record.severity_text)),
+                    usage_value,
+                    request_count: 1,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    attributes: Value::Object(attrs.into_iter().collect()),
+                });
+            }
+        }
+    }
+
+    events
+}
 
 fn decode_trace_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportTraceServiceRequest> {
     if is_json_content(headers) {
@@ -667,5 +762,102 @@ mod tests {
         );
         assert_eq!(event.usage_value, 99.0);
         assert_eq!(event.request_count, 99);
+    }
+
+    #[test]
+    fn extract_log_events_should_capture_dimensions_and_tokens() {
+        use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+        use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueValue;
+        use opentelemetry_proto::tonic::logs::v1::{
+            LogRecord, ResourceLogs, ScopeLogs, SeverityNumber,
+        };
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let payload = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![
+                        KeyValue {
+                            key: "account_id".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(AnyValueValue::StringValue("acct_1".to_string())),
+                            }),
+                        },
+                        KeyValue {
+                            key: "project_id".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(AnyValueValue::StringValue("proj_1".to_string())),
+                            }),
+                        },
+                    ],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(InstrumentationScope {
+                        name: "test-logger".to_string(),
+                        version: "1.0".to_string(),
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                    }),
+                    log_records: vec![LogRecord {
+                        event_name: String::new(),
+                        time_unix_nano: 1_735_689_601_000_000_000,
+                        observed_time_unix_nano: 0,
+                        severity_number: SeverityNumber::Info as i32,
+                        severity_text: "INFO".to_string(),
+                        body: None,
+                        attributes: vec![
+                            KeyValue {
+                                key: "user_id".to_string(),
+                                value: Some(AnyValue {
+                                    value: Some(AnyValueValue::StringValue("user_1".to_string())),
+                                }),
+                            },
+                            KeyValue {
+                                key: "model".to_string(),
+                                value: Some(AnyValue {
+                                    value: Some(AnyValueValue::StringValue("gpt-4.1".to_string())),
+                                }),
+                            },
+                            KeyValue {
+                                key: "gen_ai.usage.prompt_tokens".to_string(),
+                                value: Some(AnyValue {
+                                    value: Some(AnyValueValue::IntValue(15)),
+                                }),
+                            },
+                            KeyValue {
+                                key: "gen_ai.usage.completion_tokens".to_string(),
+                                value: Some(AnyValue {
+                                    value: Some(AnyValueValue::IntValue(10)),
+                                }),
+                            },
+                        ],
+                        dropped_attributes_count: 0,
+                        flags: 0,
+                        trace_id: vec![],
+                        span_id: vec![],
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let events = extract_log_events(payload);
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.signal_type, "log");
+        assert_eq!(event.account_id.as_deref(), Some("acct_1"));
+        assert_eq!(event.project_id.as_deref(), Some("proj_1"));
+        assert_eq!(event.user_id.as_deref(), Some("user_1"));
+        assert_eq!(event.model.as_deref(), Some("gpt-4.1"));
+        assert_eq!(event.metric_name.as_deref(), Some("INFO"));
+        assert_eq!(event.prompt_tokens, Some(15));
+        assert_eq!(event.completion_tokens, Some(10));
+        assert_eq!(event.total_tokens, Some(25));
+        assert_eq!(event.usage_value, 25.0);
+        assert_eq!(event.request_count, 1);
     }
 }

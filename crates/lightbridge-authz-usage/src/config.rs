@@ -1,5 +1,5 @@
-use lightbridge_authz_core::config::{load_yaml_from_path, Database, Logging, Otel, Tls};
 use lightbridge_authz_core::Result;
+use lightbridge_authz_core::config::{Database, Logging, Otel, Tls, load_yaml_from_path};
 use serde::Deserialize;
 use tracing::debug;
 
