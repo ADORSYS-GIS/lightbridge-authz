@@ -20,8 +20,10 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use prost::Message;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::Arc;
-use tracing::{info, warn};
+use axum::http::header::CONTENT_ENCODING;
+use tracing::{info, instrument, warn};
 
 const ACCOUNT_KEYS: [&str; 5] = [
     "account_id",
@@ -80,6 +82,7 @@ const USAGE_VALUE_KEYS: [&str; 3] = ["usage_value", "usage", "gen_ai.usage.total
     ),
     tag = "ingest"
 )]
+#[instrument(skip(state, headers))]
 pub async fn ingest_traces(
     State(state): State<Arc<UsageState>>,
     headers: HeaderMap,
@@ -107,6 +110,7 @@ pub async fn ingest_traces(
     ),
     tag = "ingest"
 )]
+#[instrument(skip(state, headers))]
 pub async fn ingest_metrics(
     State(state): State<Arc<UsageState>>,
     headers: HeaderMap,
@@ -134,6 +138,7 @@ pub async fn ingest_metrics(
     ),
     tag = "ingest"
 )]
+#[instrument(skip(state, headers))]
 pub async fn ingest_logs(
     State(state): State<Arc<UsageState>>,
     headers: HeaderMap,
@@ -152,17 +157,41 @@ pub async fn ingest_logs(
 }
 
 fn decode_logs_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportLogsServiceRequest> {
+    let body = decode_maybe_gzip(headers, body)?;
     if is_json_content(headers) {
-        serde_json::from_slice(body).map_err(|e| {
+        serde_json::from_slice(&body).map_err(|e| {
             warn!("invalid OTLP logs JSON payload: {e}");
             Error::Database(format!("invalid OTLP logs JSON payload: {e}"))
         })
     } else {
-        ExportLogsServiceRequest::decode(body).map_err(|e| {
+        ExportLogsServiceRequest::decode(body.as_slice()).map_err(|e| {
             warn!("invalid OTLP logs protobuf payload: {e}");
             Error::Database(format!("invalid OTLP logs protobuf payload: {e}"))
         })
     }
+}
+
+fn decode_maybe_gzip(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>> {
+    let encoding = headers
+        .get(CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let is_gzip = encoding
+        .split(',')
+        .any(|e| e.trim().eq_ignore_ascii_case("gzip"));
+
+    if !is_gzip {
+        return Ok(body.to_vec());
+    }
+
+    let mut decoder = flate2::read::GzDecoder::new(body);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).map_err(|e| {
+        warn!("invalid gzip body: {e}");
+        Error::Database(format!("invalid gzip body: {e}"))
+    })?;
+    Ok(out)
 }
 
 fn extract_log_events(payload: ExportLogsServiceRequest) -> Vec<UsageEvent> {

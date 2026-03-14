@@ -6,7 +6,7 @@ use serde_json::Value;
 use sqlx::{FromRow, PgPool, Postgres, QueryBuilder};
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
-use tracing::debug;
+use tracing::{debug, instrument};
 
 #[derive(Debug, Clone)]
 pub struct UsageEvent {
@@ -55,6 +55,7 @@ impl StoreRepo {
         self.pool.pool()
     }
 
+    #[instrument(skip(self))]
     pub async fn insert_usage_events(&self, events: &[UsageEvent]) -> Result<usize> {
         debug!("inserting {} usage events", events.len());
         if events.is_empty() {
@@ -66,6 +67,7 @@ impl StoreRepo {
         );
 
         builder.push_values(events, |mut row, event| {
+            debug!("inserting event {:?}", event);
             row.push_bind(event.observed_at)
                 .push_bind(&event.signal_type)
                 .push_bind(&event.account_id)
@@ -86,6 +88,7 @@ impl StoreRepo {
             .map_err(|_| Error::Database("rows_affected overflowed usize".to_string()))
     }
 
+    #[instrument(skip(self))]
     pub async fn query_usage(&self, input: &UsageQueryRequest) -> Result<Vec<UsageSeriesPoint>> {
         debug!(
             "querying usage with scope={:?}, scope_id={}, bucket={}, limit={}",

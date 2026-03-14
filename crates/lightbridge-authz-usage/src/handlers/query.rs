@@ -3,7 +3,7 @@ use crate::models::{UsageErrorResponse, UsageQueryRequest, UsageQueryResponse};
 use axum::{Json, extract::State, http::StatusCode};
 use lightbridge_authz_core::{Error, Result};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{info, instrument, warn};
 
 #[utoipa::path(
     post,
@@ -15,6 +15,7 @@ use tracing::{info, warn};
     ),
     tag = "usage"
 )]
+#[instrument(skip(state))]
 pub async fn query_usage(
     State(state): State<Arc<UsageState>>,
     Json(input): Json<UsageQueryRequest>,

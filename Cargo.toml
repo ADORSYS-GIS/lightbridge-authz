@@ -62,6 +62,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 utoipa = { version = "5", features = ["macros", "chrono"] }
 utoipa-swagger-ui = { version = "9", features = ["axum", "reqwest"] }
 regex = "1.10"
+flate2 = "1.1.9"
 
 rmcp = { version = "1.1.0", features = ["transport-streamable-http-server"] }
 
@@ -76,7 +77,7 @@ incremental = false
 strip = true
 
 [workspace.package]
-version = "0.6.9"
+version = "0.7.0"
 edition = "2024"
 license = "MIT"
 publish = false

@@ -30,6 +30,7 @@ tracing-opentelemetry.workspace = true
 utoipa.workspace = true
 utoipa-swagger-ui.workspace = true
 lightbridge-authz-core = { workspace = true, features = ["axum"] }
+flate2.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
