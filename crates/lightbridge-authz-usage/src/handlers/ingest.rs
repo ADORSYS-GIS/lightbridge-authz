@@ -1,6 +1,7 @@
 use crate::UsageState;
 use crate::models::IngestResponse;
 use crate::repo::UsageEvent;
+use axum::http::header::CONTENT_ENCODING;
 use axum::{
     Json,
     body::Bytes,
@@ -22,7 +23,6 @@ use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
-use axum::http::header::CONTENT_ENCODING;
 use tracing::{info, instrument, warn};
 
 const ACCOUNT_KEYS: [&str; 5] = [
