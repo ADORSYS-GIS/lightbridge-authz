@@ -204,6 +204,10 @@ async fn validate_api_key_returns_ok_and_records_usage_when_valid() {
     assert_eq!(payload["api_key"]["id"], "key_1");
     assert_eq!(payload["project"]["id"], "proj_1");
     assert_eq!(payload["account"]["id"], "acct_1");
+    assert_eq!(
+        payload["account"]["owners_admins"],
+        serde_json::json!(["owner@example.com"])
+    );
 
     let calls = usage_calls.lock().expect("lock should work").clone();
     assert_eq!(calls.len(), 1);
@@ -249,6 +253,10 @@ async fn validate_authorino_api_key_preserves_and_enriches_metadata() {
     assert_eq!(payload["dynamic_metadata"]["project_id"], "proj_1");
     assert_eq!(payload["dynamic_metadata"]["api_key_id"], "key_1");
     assert_eq!(payload["dynamic_metadata"]["api_key_status"], "active");
+    assert_eq!(
+        payload["account"]["owners_admins"],
+        serde_json::json!(["owner@example.com"])
+    );
 }
 
 #[tokio::test]
