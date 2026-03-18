@@ -1,0 +1,350 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "lightbridge-authz-usage-rest",
+    "description": "",
+    "contact": {
+      "name": "Stephane Segning",
+      "email": "selastlambou@gmail.com"
+    },
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "0.5.0"
+  },
+  "paths": {
+    "/v1/otel/metrics": {
+      "post": {
+        "tags": [
+          "ingest"
+        ],
+        "operationId": "ingest_metrics",
+        "requestBody": {
+          "content": {
+            "application/x-protobuf": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/v1/otel/traces": {
+      "post": {
+        "tags": [
+          "ingest"
+        ],
+        "operationId": "ingest_traces",
+        "requestBody": {
+          "content": {
+            "application/x-protobuf": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/v1/usage/query": {
+      "post": {
+        "tags": [
+          "usage"
+        ],
+        "operationId": "query_usage",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UsageQueryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageQueryResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "IngestResponse": {
+        "type": "object",
+        "required": [
+          "accepted_events"
+        ],
+        "properties": {
+          "accepted_events": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "UsageErrorResponse": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "UsageGroupBy": {
+        "type": "string",
+        "enum": [
+          "account_id",
+          "project_id",
+          "user_id",
+          "model",
+          "metric_name",
+          "signal_type"
+        ]
+      },
+      "UsageQueryFilters": {
+        "type": "object",
+        "properties": {
+          "account_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metric_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "signal_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "UsageQueryRequest": {
+        "type": "object",
+        "required": [
+          "scope",
+          "scope_id",
+          "start_time",
+          "end_time"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "string"
+          },
+          "end_time": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "filters": {
+            "$ref": "#/components/schemas/UsageQueryFilters"
+          },
+          "group_by": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UsageGroupBy"
+            }
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "scope": {
+            "$ref": "#/components/schemas/UsageScope"
+          },
+          "scope_id": {
+            "type": "string"
+          },
+          "start_time": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "UsageQueryResponse": {
+        "type": "object",
+        "required": [
+          "points"
+        ],
+        "properties": {
+          "points": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UsageSeriesPoint"
+            }
+          }
+        }
+      },
+      "UsageScope": {
+        "type": "string",
+        "enum": [
+          "user",
+          "project",
+          "account"
+        ]
+      },
+      "UsageSeriesPoint": {
+        "type": "object",
+        "required": [
+          "bucket_start",
+          "requests",
+          "usage_value",
+          "prompt_tokens",
+          "completion_tokens",
+          "total_tokens"
+        ],
+        "properties": {
+          "account_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bucket_start": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "completion_tokens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "metric_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt_tokens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "requests": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "signal_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "total_tokens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "usage_value": {
+            "type": "number",
+            "format": "double"
+          },
+          "user_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "ingest",
+      "description": "OTEL ingest endpoints"
+    },
+    {
+      "name": "usage",
+      "description": "Timeseries usage query endpoint"
+    }
+  ]
+}
