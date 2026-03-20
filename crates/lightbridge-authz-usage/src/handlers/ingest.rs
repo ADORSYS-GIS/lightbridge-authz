@@ -71,7 +71,11 @@ const TOTAL_TOKENS_KEYS: [&str; 5] = [
     "genai.usage.total_tokens",
 ];
 const USAGE_VALUE_KEYS: [&str; 3] = ["usage_value", "usage", "gen_ai.usage.total_tokens"];
-const COST_KEYS: [&str; 3] = ["custom_total_cost", "cost", "gen_ai.usage.custom_total_cost"];
+const COST_KEYS: [&str; 3] = [
+    "custom_total_cost",
+    "cost",
+    "gen_ai.usage.custom_total_cost",
+];
 
 #[utoipa::path(
     post,
