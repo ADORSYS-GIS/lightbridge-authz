@@ -158,7 +158,7 @@ impl StoreRepo {
         builder.push(", SUM(prompt_tokens)::bigint AS prompt_tokens");
         builder.push(", SUM(completion_tokens)::bigint AS completion_tokens");
         builder.push(", SUM(total_tokens)::bigint AS total_tokens");
-        builder.push(", SUM(total_cost)::bigint AS total_cost");
+        builder.push(", SUM(total_cost)::double precision AS total_cost");
 
         builder.push(" FROM usage_events WHERE observed_at >= ");
         builder.push_bind(input.start_time);
