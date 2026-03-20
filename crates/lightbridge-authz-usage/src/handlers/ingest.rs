@@ -71,6 +71,7 @@ const TOTAL_TOKENS_KEYS: [&str; 5] = [
     "genai.usage.total_tokens",
 ];
 const USAGE_VALUE_KEYS: [&str; 3] = ["usage_value", "usage", "gen_ai.usage.total_tokens"];
+const COST_KEYS: [&str; 3] = ["custom_total_cost", "cost", "gen_ai.usage.custom_total_cost"];
 
 #[utoipa::path(
     post,
@@ -225,6 +226,8 @@ fn extract_log_events(payload: ExportLogsServiceRequest) -> Vec<UsageEvent> {
                     .or_else(|| total_tokens.map(|v| v as f64))
                     .unwrap_or(1.0);
 
+                let total_cost = extract_f64(&attrs, &COST_KEYS);
+
                 events.push(UsageEvent {
                     observed_at: nanos_to_datetime(observed_nanos),
                     signal_type: "log".to_string(),
@@ -238,6 +241,7 @@ fn extract_log_events(payload: ExportLogsServiceRequest) -> Vec<UsageEvent> {
                     prompt_tokens,
                     completion_tokens,
                     total_tokens,
+                    total_cost,
                     attributes: Value::Object(attrs.into_iter().collect()),
                 });
             }
@@ -304,6 +308,8 @@ fn extract_trace_events(payload: ExportTraceServiceRequest) -> Vec<UsageEvent> {
                     .or_else(|| total_tokens.map(|v| v as f64))
                     .unwrap_or(1.0);
 
+                let total_cost = extract_f64(&attrs, &COST_KEYS);
+
                 let observed_nanos = if span.end_time_unix_nano > 0 {
                     span.end_time_unix_nano
                 } else {
@@ -319,6 +325,7 @@ fn extract_trace_events(payload: ExportTraceServiceRequest) -> Vec<UsageEvent> {
                     model: extract_string(&attrs, &MODEL_KEYS),
                     metric_name: non_empty(Some(span.name)),
                     usage_value,
+                    total_cost,
                     request_count: 1,
                     prompt_tokens,
                     completion_tokens,
@@ -416,6 +423,7 @@ fn number_data_point_to_event(
         None => 0.0,
     };
 
+    let total_cost = extract_f64(&attrs, &COST_KEYS);
     let prompt_tokens = extract_i64(&attrs, &PROMPT_TOKENS_KEYS);
     let completion_tokens = extract_i64(&attrs, &COMPLETION_TOKENS_KEYS);
     let total_tokens = extract_i64(&attrs, &TOTAL_TOKENS_KEYS)
@@ -434,6 +442,7 @@ fn number_data_point_to_event(
         prompt_tokens,
         completion_tokens,
         total_tokens,
+        total_cost,
         attributes: Value::Object(attrs.into_iter().collect()),
     }
 }
@@ -446,6 +455,7 @@ fn histogram_data_point_to_event(
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
     let count = u64_to_i64(point.count);
     let usage_value = point.sum.unwrap_or(count as f64);
+    let total_cost = extract_f64(&attrs, &COST_KEYS);
 
     UsageEvent {
         observed_at: nanos_to_datetime(point.time_unix_nano),
@@ -456,6 +466,7 @@ fn histogram_data_point_to_event(
         model: extract_string(&attrs, &MODEL_KEYS),
         metric_name,
         usage_value,
+        total_cost,
         request_count: count.max(1),
         prompt_tokens: extract_i64(&attrs, &PROMPT_TOKENS_KEYS),
         completion_tokens: extract_i64(&attrs, &COMPLETION_TOKENS_KEYS),
@@ -472,6 +483,7 @@ fn exponential_histogram_data_point_to_event(
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
     let count = u64_to_i64(point.count);
     let usage_value = point.sum.unwrap_or(count as f64);
+    let total_cost = extract_f64(&attrs, &COST_KEYS);
 
     UsageEvent {
         observed_at: nanos_to_datetime(point.time_unix_nano),
@@ -482,6 +494,7 @@ fn exponential_histogram_data_point_to_event(
         model: extract_string(&attrs, &MODEL_KEYS),
         metric_name,
         usage_value,
+        total_cost,
         request_count: count.max(1),
         prompt_tokens: extract_i64(&attrs, &PROMPT_TOKENS_KEYS),
         completion_tokens: extract_i64(&attrs, &COMPLETION_TOKENS_KEYS),
@@ -497,6 +510,7 @@ fn summary_data_point_to_event(
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
     let count = u64_to_i64(point.count);
+    let total_cost = extract_f64(&attrs, &COST_KEYS);
 
     UsageEvent {
         observed_at: nanos_to_datetime(point.time_unix_nano),
@@ -506,6 +520,7 @@ fn summary_data_point_to_event(
         user_id: extract_string(&attrs, &USER_KEYS),
         model: extract_string(&attrs, &MODEL_KEYS),
         metric_name,
+        total_cost,
         usage_value: point.sum,
         request_count: count.max(1),
         prompt_tokens: extract_i64(&attrs, &PROMPT_TOKENS_KEYS),

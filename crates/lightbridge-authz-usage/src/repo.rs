@@ -22,6 +22,7 @@ pub struct UsageEvent {
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
+    pub total_cost: Option<f64>,
     pub attributes: Value,
 }
 
@@ -44,6 +45,7 @@ struct UsageQueryRow {
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
     total_tokens: Option<i64>,
+    total_cost: Option<f64>,
 }
 
 impl StoreRepo {
@@ -63,7 +65,7 @@ impl StoreRepo {
         }
 
         let mut builder = QueryBuilder::<Postgres>::new(
-            "INSERT INTO usage_events (observed_at, signal_type, account_id, project_id, user_id, model, metric_name, usage_value, request_count, prompt_tokens, completion_tokens, total_tokens, attributes) ",
+            "INSERT INTO usage_events (observed_at, signal_type, account_id, project_id, user_id, model, metric_name, usage_value, request_count, prompt_tokens, completion_tokens, total_tokens, total_cost, attributes) ",
         );
 
         builder.push_values(events, |mut row, event| {
@@ -80,6 +82,7 @@ impl StoreRepo {
                 .push_bind(event.prompt_tokens)
                 .push_bind(event.completion_tokens)
                 .push_bind(event.total_tokens)
+                .push_bind(event.total_cost)
                 .push_bind(&event.attributes);
         });
 
@@ -155,6 +158,7 @@ impl StoreRepo {
         builder.push(", SUM(prompt_tokens)::bigint AS prompt_tokens");
         builder.push(", SUM(completion_tokens)::bigint AS completion_tokens");
         builder.push(", SUM(total_tokens)::bigint AS total_tokens");
+        builder.push(", SUM(total_cost)::bigint AS total_cost");
 
         builder.push(" FROM usage_events WHERE observed_at >= ");
         builder.push_bind(input.start_time);
@@ -224,6 +228,7 @@ impl StoreRepo {
                 signal_type: row.signal_type,
                 requests: row.requests.unwrap_or(0),
                 usage_value: row.usage_value.unwrap_or(0.0),
+                total_cost: row.total_cost.unwrap_or(0.0),
                 prompt_tokens: row.prompt_tokens.unwrap_or(0),
                 completion_tokens: row.completion_tokens.unwrap_or(0),
                 total_tokens: row.total_tokens.unwrap_or(0),

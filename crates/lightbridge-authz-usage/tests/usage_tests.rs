@@ -74,6 +74,7 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
                 metric_name: Some("gen_ai.usage.total_tokens".to_string()),
                 signal_type: Some("metric".to_string()),
                 requests: 3,
+                total_cost: 42.0,
                 usage_value: 120.0,
                 prompt_tokens: 80,
                 completion_tokens: 40,

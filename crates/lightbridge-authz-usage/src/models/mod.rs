@@ -73,6 +73,7 @@ pub struct UsageSeriesPoint {
     pub signal_type: Option<String>,
     pub requests: i64,
     pub usage_value: f64,
+    pub total_cost: f64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
