@@ -12,8 +12,6 @@ Without a clear reference, it is easy to:
 
 This document describes the query endpoint as implemented in this repository.
 
-## Actual
-
 ### Service
 
 The query endpoint is exposed by the `lightbridge-authz-usage` service.
