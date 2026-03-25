@@ -71,7 +71,10 @@ const TOTAL_TOKENS_KEYS: [&str; 5] = [
     "genai.usage.total_tokens",
 ];
 const USAGE_VALUE_KEYS: [&str; 3] = ["usage_value", "usage", "gen_ai.usage.total_tokens"];
-const COST_KEYS: [&str; 3] = [
+// FIX: Added "io.envoy.ai_gateway.llm_custom_total_cost" to match the attribute key
+// written by the Envoy AI Gateway extproc when it writes the CEL-computed cost.
+const COST_KEYS: [&str; 4] = [
+    "io.envoy.ai_gateway.llm_custom_total_cost",
     "custom_total_cost",
     "cost",
     "gen_ai.usage.custom_total_cost",
@@ -909,5 +912,99 @@ mod tests {
         assert_eq!(event.total_tokens, Some(25));
         assert_eq!(event.usage_value, 25.0);
         assert_eq!(event.request_count, 1);
+    }
+
+    #[test]
+    fn extract_log_events_should_read_envoy_ai_gateway_custom_cost() {
+        use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+        use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueValue;
+        use opentelemetry_proto::tonic::logs::v1::{
+            LogRecord, ResourceLogs, ScopeLogs, SeverityNumber,
+        };
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        // This test verifies that the cost written by the Envoy AI Gateway extproc
+        // (io.envoy.ai_gateway.llm_custom_total_cost) is correctly extracted.
+        let payload = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![
+                        KeyValue {
+                            key: "account_id".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(AnyValueValue::StringValue("acct_1".to_string())),
+                            }),
+                        },
+                    ],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(InstrumentationScope {
+                        name: "test-logger".to_string(),
+                        version: "1.0".to_string(),
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                    }),
+                    log_records: vec![LogRecord {
+                        event_name: String::new(),
+                        time_unix_nano: 1_735_689_601_000_000_000,
+                        observed_time_unix_nano: 0,
+                        severity_number: SeverityNumber::Info as i32,
+                        severity_text: "INFO".to_string(),
+                        body: None,
+                        attributes: vec![
+                            KeyValue {
+                                key: "user_id".to_string(),
+                                value: Some(AnyValue {
+                                    value: Some(AnyValueValue::StringValue("user_1".to_string())),
+                                }),
+                            },
+                            KeyValue {
+                                key: "model".to_string(),
+                                value: Some(AnyValue {
+                                    value: Some(AnyValueValue::StringValue("gpt-4.1".to_string())),
+                                }),
+                            },
+                            // The key written by Envoy AI Gateway extproc
+                            KeyValue {
+                                key: "io.envoy.ai_gateway.llm_custom_total_cost".to_string(),
+                                value: Some(AnyValue {
+                                    value: Some(AnyValueValue::DoubleValue(123.45)),
+                                }),
+                            },
+                            KeyValue {
+                                key: "gen_ai.usage.prompt_tokens".to_string(),
+                                value: Some(AnyValue {
+                                    value: Some(AnyValueValue::IntValue(100)),
+                                }),
+                            },
+                            KeyValue {
+                                key: "gen_ai.usage.completion_tokens".to_string(),
+                                value: Some(AnyValue {
+                                    value: Some(AnyValueValue::IntValue(50)),
+                                }),
+                            },
+                        ],
+                        dropped_attributes_count: 0,
+                        flags: 0,
+                        trace_id: vec![],
+                        span_id: vec![],
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let events = extract_log_events(payload);
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        // This is the key assertion - the custom cost should now be extracted
+        assert_eq!(event.total_cost, Some(123.45));
+        assert_eq!(event.prompt_tokens, Some(100));
+        assert_eq!(event.completion_tokens, Some(50));
+        assert_eq!(event.total_tokens, Some(150));
     }
 }
