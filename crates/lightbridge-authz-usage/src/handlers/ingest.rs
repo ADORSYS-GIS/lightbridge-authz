@@ -83,7 +83,7 @@ const COST_KEYS: [&str; 4] = [
 #[utoipa::path(
     post,
     path = "/v1/otel/traces",
-    request_body(content = String, content_type = "application/x-protobuf"),
+    request_body(content = String, content_type = "application/x-protobuf" ),
     responses(
         (status = 202, body = IngestResponse),
         (status = 400)
@@ -928,14 +928,12 @@ mod tests {
         let payload = ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
                 resource: Some(Resource {
-                    attributes: vec![
-                        KeyValue {
-                            key: "account_id".to_string(),
-                            value: Some(AnyValue {
-                                value: Some(AnyValueValue::StringValue("acct_1".to_string())),
-                            }),
-                        },
-                    ],
+                    attributes: vec![KeyValue {
+                        key: "account_id".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(AnyValueValue::StringValue("acct_1".to_string())),
+                        }),
+                    }],
                     dropped_attributes_count: 0,
                     entity_refs: vec![],
                 }),
