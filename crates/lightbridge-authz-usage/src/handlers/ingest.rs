@@ -288,7 +288,7 @@ fn decode_metrics_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportMetr
 
 fn is_json_content(headers: &HeaderMap) -> bool {
     headers
-        .get(axum::http::header::CONTENT_TYPE )
+        .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|value| value.contains("json"))
 }
