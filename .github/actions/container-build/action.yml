@@ -1,5 +1,6 @@
 name: Container Build
 description: Build and push a Docker image for the requested target.
+
 inputs:
   app-version:
     description: Version of the application
@@ -18,6 +19,10 @@ inputs:
     description: Optional suffix appended to generated tags (for example -arm)
     required: false
     default: ""
+  github-token:   # ✅ NEW
+    description: GitHub token for registry auth
+    required: true
+
 runs:
   using: composite
   steps:
@@ -27,6 +32,8 @@ runs:
         app-version: ${{ inputs.app-version }}
         image-name: ${{ inputs.image-name }}
         tag-suffix: ${{ inputs.tag-suffix }}
+        github-token: ${{ inputs.github-token }}   # ✅ pass through
+
     - name: Build and push image
       uses: docker/build-push-action@v6.19.2
       with:
