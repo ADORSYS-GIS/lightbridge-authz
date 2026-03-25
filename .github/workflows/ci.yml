@@ -48,7 +48,7 @@ jobs:
 
   integration-test:
     needs: code-checks
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/fix/formatting'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -65,7 +65,7 @@ jobs:
 
   container-build:
     needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/fix/formatting' && github.event_name == 'push'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -94,7 +94,7 @@ jobs:
 
   release:
     needs: [build,container-build]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/fix/formatting' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
