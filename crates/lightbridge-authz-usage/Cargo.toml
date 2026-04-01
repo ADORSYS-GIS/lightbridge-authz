@@ -29,6 +29,7 @@ opentelemetry_sdk.workspace = true
 tracing-opentelemetry.workspace = true
 utoipa.workspace = true
 utoipa-swagger-ui.workspace = true
+tower-http = { workspace = true, features = ["cors"] }
 lightbridge-authz-core = { workspace = true, features = ["axum"] }
 flate2.workspace = true
 

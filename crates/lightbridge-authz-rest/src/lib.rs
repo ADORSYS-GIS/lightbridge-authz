@@ -126,7 +126,15 @@ pub async fn start_api_server(
             bearer_auth,
         ));
 
-    let app = public.merge(protected).with_state(app_state.clone());
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any);
+
+    let app = public
+        .merge(protected)
+        .with_state(app_state.clone())
+        .layer(cors);
 
     serve_tls("API", &api.address, api.port, &api.tls, app).await
 }
