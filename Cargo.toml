@@ -31,7 +31,7 @@ lightbridge-authz-usage-migrate = { path = "./crates/lightbridge-authz-usage-mig
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 base64 = "0.22"
 jsonwebtoken = { version = "10.3" }
