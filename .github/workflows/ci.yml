@@ -86,7 +86,7 @@ jobs:
           platform: ${{ matrix.platform }}
           tag-suffix: ${{ matrix.tag_suffix }}
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@v0.35.0
         with:
           image-ref: ${{ matrix.image_name }}:${{ github.sha }}${{ matrix.tag_suffix }}
           format: 'table'
