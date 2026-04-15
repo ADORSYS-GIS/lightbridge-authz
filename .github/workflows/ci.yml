@@ -12,7 +12,7 @@ jobs:
         checks: [advisories,"bans licenses sources"]
     steps:
       - name: Checkout repo
-        uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
+        uses: actions/checkout@v6
       - uses: ./.github/actions/cargo-deny
         with:
           check: ${{ matrix.checks }}
@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
-        uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
+        uses: actions/checkout@v6
       - uses: ./.github/actions/code-checks
   test:
     needs: code-checks
@@ -39,7 +39,7 @@ jobs:
           --health-retries 5
     steps:
       - name: Checkout repo
-        uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
+        uses: actions/checkout@v6
       - uses: ./.github/actions/tests
         with:
           database-url: postgres://postgres:postgres@localhost:5432/lightbridge_authz
@@ -49,14 +49,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
-        uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
+        uses: actions/checkout@v6
       - uses: ./.github/actions/integration-test
   build:
     needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
-        uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
+        uses: actions/checkout@v6
       - uses: ./.github/actions/build-release
   container-build:
     needs: build
@@ -76,7 +76,7 @@ jobs:
       packages: write
     steps:
       - name: Checkout repo
-        uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
+        uses: actions/checkout@v6
       - name: Build and push Docker image
         uses: ./.github/actions/container-build
         with:
@@ -85,6 +85,14 @@ jobs:
           target: ${{ matrix.target }}
           platform: ${{ matrix.platform }}
           tag-suffix: ${{ matrix.tag_suffix }}
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          image-ref: ${{ matrix.image_name }}:${{ github.sha }}${{ matrix.tag_suffix }}
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: 'HIGH,CRITICAL'
   release:
     needs: [build,container-build]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -93,7 +101,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout repo
-        uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
+        uses: actions/checkout@v6
       - uses: ./.github/actions/release
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
