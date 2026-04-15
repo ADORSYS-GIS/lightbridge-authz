@@ -55,6 +55,11 @@ pub async fn start_usage_server(usage: &UsageServer, database: &Database) -> Res
     let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool));
     let state = Arc::new(UsageState { repo });
 
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any);
+
     let app = Router::new()
         .route("/", get(root_handler))
         .route("/healthz", get(health_handler))
@@ -71,7 +76,8 @@ pub async fn start_usage_server(usage: &UsageServer, database: &Database) -> Res
                 .url("/usage/v1/usage/openapi.json", UsageDoc::openapi()),
         )
         .merge(routers::usage_router())
-        .with_state(state);
+        .with_state(state)
+        .layer(cors);
 
     info!("starting usage server on {}:{}", &usage.address, usage.port);
     serve_tls("USAGE", &usage.address, usage.port, &usage.tls, app).await
