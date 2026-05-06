@@ -82,7 +82,7 @@ impl StoreRepo {
                 .push_bind(event.prompt_tokens)
                 .push_bind(event.completion_tokens)
                 .push_bind(event.total_tokens)
-                .push_bind(event.total_cost)
+                .push_bind(event.total_cost.unwrap_or(0.0))
                 .push_bind(&event.attributes);
         });
 
@@ -263,7 +263,7 @@ fn validate_bucket_interval(bucket: &str) -> Result<()> {
     if BUCKET_RE.is_match(bucket.trim()) {
         Ok(())
     } else {
-        Err(Error::Database(
+        Err(Error::BadRequest(
             "bucket must look like `5 minutes`, `1 hour`, or `1 day`".to_string(),
         ))
     }

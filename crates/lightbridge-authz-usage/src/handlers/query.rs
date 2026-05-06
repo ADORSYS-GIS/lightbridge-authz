@@ -29,21 +29,21 @@ pub async fn query_usage(
             "invalid time range: start_time={} end_time={}",
             input.start_time, input.end_time
         );
-        return Err(Error::Database(
+        return Err(Error::BadRequest(
             "start_time must be before end_time".to_string(),
         ));
     }
 
     if input.scope_id.trim().is_empty() {
         warn!("missing scope_id for usage query");
-        return Err(Error::Database(
+        return Err(Error::BadRequest(
             "scope_id is required for usage queries".to_string(),
         ));
     }
 
     if input.limit == 0 {
         warn!("invalid limit for usage query: limit=0");
-        return Err(Error::Database(
+        return Err(Error::BadRequest(
             "limit must be greater than zero".to_string(),
         ));
     }
