@@ -30,6 +30,9 @@ outputs:
   tags:
     description: Tags
     value: ${{ steps.meta.outputs.tags }}
+  version-tag:
+    description: Fully qualified image tag for this application version
+    value: ${{ inputs.registry }}/${{ steps.lowercase.outputs.lowercase }}:${{ inputs.app-version }}${{ inputs.tag-suffix }}
 
 runs:
   using: composite

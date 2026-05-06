@@ -47,3 +47,8 @@ runs:
         annotations: ${{ steps.docker-setup.outputs.annotations }}
         provenance: true
         sbom: true
+
+outputs:
+  version-tag:
+    description: Fully qualified image tag for this application version
+    value: ${{ steps.docker-setup.outputs.version-tag }}
