@@ -71,8 +71,6 @@ const TOTAL_TOKENS_KEYS: [&str; 5] = [
     "genai.usage.total_tokens",
 ];
 const USAGE_VALUE_KEYS: [&str; 3] = ["usage_value", "usage", "gen_ai.usage.total_tokens"];
-// FIX: Added "io.envoy.ai_gateway.llm_custom_total_cost" to match the attribute key
-// written by the Envoy AI Gateway extproc when it writes the CEL-computed cost.
 const COST_KEYS: [&str; 4] = [
     "io.envoy.ai_gateway.llm_custom_total_cost",
     "custom_total_cost",
@@ -98,7 +96,7 @@ pub async fn ingest_traces(
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let payload = decode_trace_request(&headers, &body)?;
     let events = extract_trace_events(payload);
-    let accepted_events = state.repo.insert_usage_events(&events).await?;
+    let accepted_events = persist_events(&state, "trace", &events).await?;
 
     info!("accepted {} trace events", accepted_events);
 
@@ -126,7 +124,7 @@ pub async fn ingest_metrics(
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let payload = decode_metrics_request(&headers, &body)?;
     let events = extract_metric_events(payload);
-    let accepted_events = state.repo.insert_usage_events(&events).await?;
+    let accepted_events = persist_events(&state, "metric", &events).await?;
 
     info!("accepted {} metric events", accepted_events);
 
@@ -154,7 +152,7 @@ pub async fn ingest_logs(
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let payload = decode_logs_request(&headers, &body)?;
     let events = extract_log_events(payload);
-    let accepted_events = state.repo.insert_usage_events(&events).await?;
+    let accepted_events = persist_events(&state, "log", &events).await?;
 
     info!("accepted {} log events", accepted_events);
 
@@ -169,12 +167,12 @@ fn decode_logs_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportLogsSer
     if is_json_content(headers) {
         serde_json::from_slice(&body).map_err(|e| {
             warn!("invalid OTLP logs JSON payload: {e}");
-            Error::Database(format!("invalid OTLP logs JSON payload: {e}"))
+            Error::BadRequest(format!("invalid OTLP logs JSON payload: {e}"))
         })
     } else {
         ExportLogsServiceRequest::decode(body.as_slice()).map_err(|e| {
             warn!("invalid OTLP logs protobuf payload: {e}");
-            Error::Database(format!("invalid OTLP logs protobuf payload: {e}"))
+            Error::BadRequest(format!("invalid OTLP logs protobuf payload: {e}"))
         })
     }
 }
@@ -197,9 +195,67 @@ fn decode_maybe_gzip(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     decoder.read_to_end(&mut out).map_err(|e| {
         warn!("invalid gzip body: {e}");
-        Error::Database(format!("invalid gzip body: {e}"))
+        Error::BadRequest(format!("invalid gzip body: {e}"))
     })?;
     Ok(out)
+}
+
+async fn persist_events(
+    state: &UsageState,
+    signal_type: &str,
+    events: &[UsageEvent],
+) -> Result<usize> {
+    validate_events(events)?;
+    let persisted_events = state.repo.insert_usage_events(events).await?;
+
+    if persisted_events < events.len() {
+        warn!(
+            "usage {signal_type} insert persisted {} of {} decoded events; treating remaining events as accepted",
+            persisted_events,
+            events.len()
+        );
+        Ok(events.len())
+    } else {
+        Ok(persisted_events)
+    }
+}
+
+fn validate_events(events: &[UsageEvent]) -> Result<()> {
+    for event in events {
+        if event.signal_type.trim().is_empty() {
+            return Err(Error::BadRequest("signal_type is required".to_string()));
+        }
+
+        if !event.usage_value.is_finite() {
+            return Err(Error::BadRequest("usage_value must be finite".to_string()));
+        }
+
+        if event.total_cost.is_some_and(|value| !value.is_finite()) {
+            return Err(Error::BadRequest("total_cost must be finite".to_string()));
+        }
+
+        if event.request_count < 0 {
+            return Err(Error::BadRequest(
+                "request_count cannot be negative".to_string(),
+            ));
+        }
+
+        if [
+            event.prompt_tokens,
+            event.completion_tokens,
+            event.total_tokens,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| value < 0)
+        {
+            return Err(Error::BadRequest(
+                "token counts cannot be negative".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn extract_log_events(payload: ExportLogsServiceRequest) -> Vec<UsageEvent> {
@@ -262,12 +318,12 @@ fn decode_trace_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportTraceS
     if is_json_content(headers) {
         serde_json::from_slice(body).map_err(|e| {
             warn!("invalid OTLP trace JSON payload: {e}");
-            Error::Database(format!("invalid OTLP trace JSON payload: {e}"))
+            Error::BadRequest(format!("invalid OTLP trace JSON payload: {e}"))
         })
     } else {
         ExportTraceServiceRequest::decode(body).map_err(|e| {
             warn!("invalid OTLP trace protobuf payload: {e}");
-            Error::Database(format!("invalid OTLP trace protobuf payload: {e}"))
+            Error::BadRequest(format!("invalid OTLP trace protobuf payload: {e}"))
         })
     }
 }
@@ -276,12 +332,12 @@ fn decode_metrics_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportMetr
     if is_json_content(headers) {
         serde_json::from_slice(body).map_err(|e| {
             warn!("invalid OTLP metrics JSON payload: {e}");
-            Error::Database(format!("invalid OTLP metrics JSON payload: {e}"))
+            Error::BadRequest(format!("invalid OTLP metrics JSON payload: {e}"))
         })
     } else {
         ExportMetricsServiceRequest::decode(body).map_err(|e| {
             warn!("invalid OTLP metrics protobuf payload: {e}");
-            Error::Database(format!("invalid OTLP metrics protobuf payload: {e}"))
+            Error::BadRequest(format!("invalid OTLP metrics protobuf payload: {e}"))
         })
     }
 }
