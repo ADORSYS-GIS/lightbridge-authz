@@ -4,7 +4,7 @@ FROM rust:1-alpine as builder
 ARG TARGETARCH
 
 RUN --mount=type=cache,target=/var/cache/apk \
-    apk add \
+    apk add --no-cache \
     musl-dev \
     build-base \
     pkgconfig \
@@ -78,6 +78,8 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=1s --retries=3 \
 # Set environment variables
 ENV RUST_LOG=info
 
+USER 65532:65532
+
 # Run the binary
 ENTRYPOINT ["lightbridge-authz"]
 
@@ -94,6 +96,8 @@ COPY --from=builder /app/lightbridge-authz-healthcheck /usr/local/bin/lightbridg
 EXPOSE 3002
 
 ENV RUST_LOG=info
+
+USER 65532:65532
 
 ENTRYPOINT ["lightbridge-authz-usage"]
 CMD ["serve"]
@@ -114,6 +118,8 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=1s --retries=3 \
     CMD ["/usr/local/bin/lightbridge-authz-healthcheck", "-r", "3000"]
 
 ENV RUST_LOG=info
+
+USER 65532:65532
 
 ENTRYPOINT ["lightbridge-mcp"]
 CMD ["serve"]
