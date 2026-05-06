@@ -95,6 +95,9 @@ jobs:
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_IMAGE_SRC: remote
+          TRIVY_PLATFORM: ${{ matrix.platform }}
         with:
           image-ref: ${{ steps.build-image.outputs.version-tag }}
           format: 'table'
