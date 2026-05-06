@@ -16,12 +16,14 @@ jobs:
       - uses: ./.github/actions/cargo-deny
         with:
           check: ${{ matrix.checks }}
+
   code-checks:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v6
       - uses: ./.github/actions/code-checks
+
   test:
     needs: code-checks
     runs-on: ubuntu-latest
@@ -43,21 +45,24 @@ jobs:
       - uses: ./.github/actions/tests
         with:
           database-url: postgres://postgres:postgres@localhost:5432/lightbridge_authz
+
   integration-test:
     needs: code-checks
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v6
       - uses: ./.github/actions/integration-test
+
   build:
     needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v6
       - uses: ./.github/actions/build-release
+
   container-build:
     needs: build
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -78,6 +83,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v6
       - name: Build and push Docker image
+        id: build-image
         uses: ./.github/actions/container-build
         with:
           app-version: ${{ github.sha }}
@@ -85,10 +91,12 @@ jobs:
           target: ${{ matrix.target }}
           platform: ${{ matrix.platform }}
           tag-suffix: ${{ matrix.tag_suffix }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: ${{ matrix.image_name }}:${{ github.sha }}${{ matrix.tag_suffix }}
+          image-ref: ${{ steps.build-image.outputs.version-tag }}
           format: 'table'
           exit-code: '1'
           ignore-unfixed: true
