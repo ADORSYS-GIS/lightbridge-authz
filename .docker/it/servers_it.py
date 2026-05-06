@@ -139,6 +139,7 @@ def wait_until_ready() -> None:
     ]
 
     start = time.time()
+    last_error = "readiness checks have not run yet"
     while True:
         try:
             for probe_url in probe_urls:
@@ -151,10 +152,11 @@ def wait_until_ready() -> None:
             )
             log("all probes and Keycloak discovery endpoint are ready")
             return
-        except Exception:
+        except Exception as err:
+            last_error = str(err) or err.__class__.__name__
             if time.time() - start > MAX_WAIT_SECONDS:
                 raise TimeoutError(
-                    f"services not ready after {MAX_WAIT_SECONDS}s"
+                    f"services not ready after {MAX_WAIT_SECONDS}s: {last_error}"
                 ) from None
             time.sleep(2)
 

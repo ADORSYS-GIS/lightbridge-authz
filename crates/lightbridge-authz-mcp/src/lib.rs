@@ -164,6 +164,7 @@ fn to_tool_error(error: Error) -> ErrorData {
     match error {
         Error::NotFound => ErrorData::resource_not_found("not found", None),
         Error::Conflict(msg) => ErrorData::invalid_params(msg, None),
+        Error::BadRequest(msg) => ErrorData::invalid_params(msg, None),
         other => ErrorData::internal_error(other.to_string(), None),
     }
 }

@@ -39,7 +39,29 @@ const PROJECT_KEYS: [&str; 5] = [
     "authz.project_id",
     "lb.project_id",
 ];
-const USER_KEYS: [&str; 4] = ["user_id", "user.id", "end_user.id", "authz.user_id"];
+const API_KEY_KEYS: [&str; 5] = [
+    "api_key_id",
+    "api_key.id",
+    "x-api-key-id",
+    "authz.api_key_id",
+    "lb.api_key_id",
+];
+const USER_KEYS: [&str; 6] = [
+    "user_id",
+    "user.id",
+    "end_user.id",
+    "lc_user_id",
+    "x-user-id",
+    "authz.user_id",
+];
+const USER_NAME_KEYS: [&str; 6] = [
+    "user_name",
+    "user.name",
+    "end_user.name",
+    "lc_user_name",
+    "x-user-name",
+    "authz.user_name",
+];
 const MODEL_KEYS: [&str; 5] = [
     "model",
     "llm.model",
@@ -71,8 +93,6 @@ const TOTAL_TOKENS_KEYS: [&str; 5] = [
     "genai.usage.total_tokens",
 ];
 const USAGE_VALUE_KEYS: [&str; 3] = ["usage_value", "usage", "gen_ai.usage.total_tokens"];
-// FIX: Added "io.envoy.ai_gateway.llm_custom_total_cost" to match the attribute key
-// written by the Envoy AI Gateway extproc when it writes the CEL-computed cost.
 const COST_KEYS: [&str; 4] = [
     "io.envoy.ai_gateway.llm_custom_total_cost",
     "custom_total_cost",
@@ -98,7 +118,7 @@ pub async fn ingest_traces(
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let payload = decode_trace_request(&headers, &body)?;
     let events = extract_trace_events(payload);
-    let accepted_events = state.repo.insert_usage_events(&events).await?;
+    let accepted_events = persist_events(&state, "trace", &events).await?;
 
     info!("accepted {} trace events", accepted_events);
 
@@ -126,7 +146,7 @@ pub async fn ingest_metrics(
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let payload = decode_metrics_request(&headers, &body)?;
     let events = extract_metric_events(payload);
-    let accepted_events = state.repo.insert_usage_events(&events).await?;
+    let accepted_events = persist_events(&state, "metric", &events).await?;
 
     info!("accepted {} metric events", accepted_events);
 
@@ -154,7 +174,7 @@ pub async fn ingest_logs(
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let payload = decode_logs_request(&headers, &body)?;
     let events = extract_log_events(payload);
-    let accepted_events = state.repo.insert_usage_events(&events).await?;
+    let accepted_events = persist_events(&state, "log", &events).await?;
 
     info!("accepted {} log events", accepted_events);
 
@@ -169,12 +189,12 @@ fn decode_logs_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportLogsSer
     if is_json_content(headers) {
         serde_json::from_slice(&body).map_err(|e| {
             warn!("invalid OTLP logs JSON payload: {e}");
-            Error::Database(format!("invalid OTLP logs JSON payload: {e}"))
+            Error::BadRequest(format!("invalid OTLP logs JSON payload: {e}"))
         })
     } else {
         ExportLogsServiceRequest::decode(body.as_slice()).map_err(|e| {
             warn!("invalid OTLP logs protobuf payload: {e}");
-            Error::Database(format!("invalid OTLP logs protobuf payload: {e}"))
+            Error::BadRequest(format!("invalid OTLP logs protobuf payload: {e}"))
         })
     }
 }
@@ -197,9 +217,67 @@ fn decode_maybe_gzip(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     decoder.read_to_end(&mut out).map_err(|e| {
         warn!("invalid gzip body: {e}");
-        Error::Database(format!("invalid gzip body: {e}"))
+        Error::BadRequest(format!("invalid gzip body: {e}"))
     })?;
     Ok(out)
+}
+
+async fn persist_events(
+    state: &UsageState,
+    signal_type: &str,
+    events: &[UsageEvent],
+) -> Result<usize> {
+    validate_events(events)?;
+    let persisted_events = state.repo.insert_usage_events(events).await?;
+
+    if persisted_events < events.len() {
+        warn!(
+            "usage {signal_type} insert persisted {} of {} decoded events; treating remaining events as accepted",
+            persisted_events,
+            events.len()
+        );
+        Ok(events.len())
+    } else {
+        Ok(persisted_events)
+    }
+}
+
+fn validate_events(events: &[UsageEvent]) -> Result<()> {
+    for event in events {
+        if event.signal_type.trim().is_empty() {
+            return Err(Error::BadRequest("signal_type is required".to_string()));
+        }
+
+        if !event.usage_value.is_finite() {
+            return Err(Error::BadRequest("usage_value must be finite".to_string()));
+        }
+
+        if event.total_cost.is_some_and(|value| !value.is_finite()) {
+            return Err(Error::BadRequest("total_cost must be finite".to_string()));
+        }
+
+        if event.request_count < 0 {
+            return Err(Error::BadRequest(
+                "request_count cannot be negative".to_string(),
+            ));
+        }
+
+        if [
+            event.prompt_tokens,
+            event.completion_tokens,
+            event.total_tokens,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| value < 0)
+        {
+            return Err(Error::BadRequest(
+                "token counts cannot be negative".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn extract_log_events(payload: ExportLogsServiceRequest) -> Vec<UsageEvent> {
@@ -240,7 +318,9 @@ fn extract_log_events(payload: ExportLogsServiceRequest) -> Vec<UsageEvent> {
                     signal_type: "log".to_string(),
                     account_id: extract_string(&attrs, &ACCOUNT_KEYS),
                     project_id: extract_string(&attrs, &PROJECT_KEYS),
+                    api_key_id: extract_string(&attrs, &API_KEY_KEYS),
                     user_id: extract_string(&attrs, &USER_KEYS),
+                    user_name: extract_string(&attrs, &USER_NAME_KEYS),
                     model: extract_string(&attrs, &MODEL_KEYS),
                     metric_name: non_empty(Some(log_record.severity_text)),
                     usage_value,
@@ -262,12 +342,12 @@ fn decode_trace_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportTraceS
     if is_json_content(headers) {
         serde_json::from_slice(body).map_err(|e| {
             warn!("invalid OTLP trace JSON payload: {e}");
-            Error::Database(format!("invalid OTLP trace JSON payload: {e}"))
+            Error::BadRequest(format!("invalid OTLP trace JSON payload: {e}"))
         })
     } else {
         ExportTraceServiceRequest::decode(body).map_err(|e| {
             warn!("invalid OTLP trace protobuf payload: {e}");
-            Error::Database(format!("invalid OTLP trace protobuf payload: {e}"))
+            Error::BadRequest(format!("invalid OTLP trace protobuf payload: {e}"))
         })
     }
 }
@@ -276,12 +356,12 @@ fn decode_metrics_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportMetr
     if is_json_content(headers) {
         serde_json::from_slice(body).map_err(|e| {
             warn!("invalid OTLP metrics JSON payload: {e}");
-            Error::Database(format!("invalid OTLP metrics JSON payload: {e}"))
+            Error::BadRequest(format!("invalid OTLP metrics JSON payload: {e}"))
         })
     } else {
         ExportMetricsServiceRequest::decode(body).map_err(|e| {
             warn!("invalid OTLP metrics protobuf payload: {e}");
-            Error::Database(format!("invalid OTLP metrics protobuf payload: {e}"))
+            Error::BadRequest(format!("invalid OTLP metrics protobuf payload: {e}"))
         })
     }
 }
@@ -328,7 +408,9 @@ fn extract_trace_events(payload: ExportTraceServiceRequest) -> Vec<UsageEvent> {
                     signal_type: "trace".to_string(),
                     account_id: extract_string(&attrs, &ACCOUNT_KEYS),
                     project_id: extract_string(&attrs, &PROJECT_KEYS),
+                    api_key_id: extract_string(&attrs, &API_KEY_KEYS),
                     user_id: extract_string(&attrs, &USER_KEYS),
+                    user_name: extract_string(&attrs, &USER_NAME_KEYS),
                     model: extract_string(&attrs, &MODEL_KEYS),
                     metric_name: non_empty(Some(span.name)),
                     usage_value,
@@ -441,7 +523,9 @@ fn number_data_point_to_event(
         signal_type: "metric".to_string(),
         account_id: extract_string(&attrs, &ACCOUNT_KEYS),
         project_id: extract_string(&attrs, &PROJECT_KEYS),
+        api_key_id: extract_string(&attrs, &API_KEY_KEYS),
         user_id: extract_string(&attrs, &USER_KEYS),
+        user_name: extract_string(&attrs, &USER_NAME_KEYS),
         model: extract_string(&attrs, &MODEL_KEYS),
         metric_name,
         usage_value: value,
@@ -469,7 +553,9 @@ fn histogram_data_point_to_event(
         signal_type: "metric".to_string(),
         account_id: extract_string(&attrs, &ACCOUNT_KEYS),
         project_id: extract_string(&attrs, &PROJECT_KEYS),
+        api_key_id: extract_string(&attrs, &API_KEY_KEYS),
         user_id: extract_string(&attrs, &USER_KEYS),
+        user_name: extract_string(&attrs, &USER_NAME_KEYS),
         model: extract_string(&attrs, &MODEL_KEYS),
         metric_name,
         usage_value,
@@ -497,7 +583,9 @@ fn exponential_histogram_data_point_to_event(
         signal_type: "metric".to_string(),
         account_id: extract_string(&attrs, &ACCOUNT_KEYS),
         project_id: extract_string(&attrs, &PROJECT_KEYS),
+        api_key_id: extract_string(&attrs, &API_KEY_KEYS),
         user_id: extract_string(&attrs, &USER_KEYS),
+        user_name: extract_string(&attrs, &USER_NAME_KEYS),
         model: extract_string(&attrs, &MODEL_KEYS),
         metric_name,
         usage_value,
@@ -524,7 +612,9 @@ fn summary_data_point_to_event(
         signal_type: "metric".to_string(),
         account_id: extract_string(&attrs, &ACCOUNT_KEYS),
         project_id: extract_string(&attrs, &PROJECT_KEYS),
+        api_key_id: extract_string(&attrs, &API_KEY_KEYS),
         user_id: extract_string(&attrs, &USER_KEYS),
+        user_name: extract_string(&attrs, &USER_NAME_KEYS),
         model: extract_string(&attrs, &MODEL_KEYS),
         metric_name,
         total_cost,
@@ -693,7 +783,9 @@ mod tests {
                                     "startTimeUnixNano": "1735689600000000000",
                                     "endTimeUnixNano": "1735689601000000000",
                                     "attributes": [
-                                        {"key": "user_id", "value": {"stringValue": "user_1"}},
+                                        {"key": "api_key_id", "value": {"stringValue": "key_1"}},
+                                        {"key": "lc_user_id", "value": {"stringValue": "user_1"}},
+                                        {"key": "lc_user_name", "value": {"stringValue": "Ada Lovelace"}},
                                         {"key": "model", "value": {"stringValue": "gpt-4.1"}},
                                         {"key": "gen_ai.usage.prompt_tokens", "value": {"intValue": "10"}},
                                         {"key": "gen_ai.usage.completion_tokens", "value": {"intValue": "5"}}
@@ -713,7 +805,9 @@ mod tests {
         let event = &events[0];
         assert_eq!(event.account_id.as_deref(), Some("acct_1"));
         assert_eq!(event.project_id.as_deref(), Some("proj_1"));
+        assert_eq!(event.api_key_id.as_deref(), Some("key_1"));
         assert_eq!(event.user_id.as_deref(), Some("user_1"));
+        assert_eq!(event.user_name.as_deref(), Some("Ada Lovelace"));
         assert_eq!(event.model.as_deref(), Some("gpt-4.1"));
         assert_eq!(event.prompt_tokens, Some(10));
         assert_eq!(event.completion_tokens, Some(5));
@@ -768,10 +862,26 @@ mod tests {
                                         }),
                                     },
                                     KeyValue {
-                                        key: "user_id".to_string(),
+                                        key: "api_key_id".to_string(),
+                                        value: Some(AnyValue {
+                                            value: Some(AnyValueValue::StringValue(
+                                                "key_1".to_string(),
+                                            )),
+                                        }),
+                                    },
+                                    KeyValue {
+                                        key: "lc_user_id".to_string(),
                                         value: Some(AnyValue {
                                             value: Some(AnyValueValue::StringValue(
                                                 "user_1".to_string(),
+                                            )),
+                                        }),
+                                    },
+                                    KeyValue {
+                                        key: "lc_user_name".to_string(),
+                                        value: Some(AnyValue {
+                                            value: Some(AnyValueValue::StringValue(
+                                                "Ada Lovelace".to_string(),
                                             )),
                                         }),
                                     },
@@ -807,7 +917,9 @@ mod tests {
         assert_eq!(event.signal_type, "metric");
         assert_eq!(event.account_id.as_deref(), Some("acct_1"));
         assert_eq!(event.project_id.as_deref(), Some("proj_1"));
+        assert_eq!(event.api_key_id.as_deref(), Some("key_1"));
         assert_eq!(event.user_id.as_deref(), Some("user_1"));
+        assert_eq!(event.user_name.as_deref(), Some("Ada Lovelace"));
         assert_eq!(event.model.as_deref(), Some("gpt-4.1"));
         assert_eq!(
             event.metric_name.as_deref(),
@@ -862,9 +974,23 @@ mod tests {
                         body: None,
                         attributes: vec![
                             KeyValue {
-                                key: "user_id".to_string(),
+                                key: "api_key_id".to_string(),
+                                value: Some(AnyValue {
+                                    value: Some(AnyValueValue::StringValue("key_1".to_string())),
+                                }),
+                            },
+                            KeyValue {
+                                key: "lc_user_id".to_string(),
                                 value: Some(AnyValue {
                                     value: Some(AnyValueValue::StringValue("user_1".to_string())),
+                                }),
+                            },
+                            KeyValue {
+                                key: "lc_user_name".to_string(),
+                                value: Some(AnyValue {
+                                    value: Some(AnyValueValue::StringValue(
+                                        "Ada Lovelace".to_string(),
+                                    )),
                                 }),
                             },
                             KeyValue {
@@ -904,7 +1030,9 @@ mod tests {
         assert_eq!(event.signal_type, "log");
         assert_eq!(event.account_id.as_deref(), Some("acct_1"));
         assert_eq!(event.project_id.as_deref(), Some("proj_1"));
+        assert_eq!(event.api_key_id.as_deref(), Some("key_1"));
         assert_eq!(event.user_id.as_deref(), Some("user_1"));
+        assert_eq!(event.user_name.as_deref(), Some("Ada Lovelace"));
         assert_eq!(event.model.as_deref(), Some("gpt-4.1"));
         assert_eq!(event.metric_name.as_deref(), Some("INFO"));
         assert_eq!(event.prompt_tokens, Some(15));

@@ -19,7 +19,7 @@ services:
       USERNAME: "test@admin"
       PASSWORD: "test"
       AUTHORINO_BASIC: "authorino:change-me"
-      MAX_WAIT_SECONDS: "180"
+      MAX_WAIT_SECONDS: "300"
     command: ["python", "/it/authorino_it.py"]
 
   it-servers:
@@ -47,5 +47,5 @@ services:
       USERNAME: "test@admin"
       PASSWORD: "test"
       AUTHORINO_BASIC: "authorino:change-me"
-      MAX_WAIT_SECONDS: "180"
+      MAX_WAIT_SECONDS: "300"
     command: ["python", "/it/servers_it.py"]

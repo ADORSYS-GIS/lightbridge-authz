@@ -20,7 +20,7 @@ runs:
     - name: Install Helm
       uses: azure/setup-helm@v4.3.1
       env:
-        GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        GITHUB_TOKEN: "${{ inputs.github-token }}"
 
     - name: Add repos to Helm
       shell: bash

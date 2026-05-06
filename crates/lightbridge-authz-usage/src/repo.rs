@@ -14,7 +14,9 @@ pub struct UsageEvent {
     pub signal_type: String,
     pub account_id: Option<String>,
     pub project_id: Option<String>,
+    pub api_key_id: Option<String>,
     pub user_id: Option<String>,
+    pub user_name: Option<String>,
     pub model: Option<String>,
     pub metric_name: Option<String>,
     pub usage_value: f64,
@@ -36,7 +38,9 @@ struct UsageQueryRow {
     bucket_start: DateTime<Utc>,
     account_id: Option<String>,
     project_id: Option<String>,
+    api_key_id: Option<String>,
     user_id: Option<String>,
+    user_name: Option<String>,
     model: Option<String>,
     metric_name: Option<String>,
     signal_type: Option<String>,
@@ -65,7 +69,7 @@ impl StoreRepo {
         }
 
         let mut builder = QueryBuilder::<Postgres>::new(
-            "INSERT INTO usage_events (observed_at, signal_type, account_id, project_id, user_id, model, metric_name, usage_value, request_count, prompt_tokens, completion_tokens, total_tokens, total_cost, attributes) ",
+            "INSERT INTO usage_events (observed_at, signal_type, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, usage_value, request_count, prompt_tokens, completion_tokens, total_tokens, total_cost, attributes) ",
         );
 
         builder.push_values(events, |mut row, event| {
@@ -74,7 +78,9 @@ impl StoreRepo {
                 .push_bind(&event.signal_type)
                 .push_bind(&event.account_id)
                 .push_bind(&event.project_id)
+                .push_bind(&event.api_key_id)
                 .push_bind(&event.user_id)
+                .push_bind(&event.user_name)
                 .push_bind(&event.model)
                 .push_bind(&event.metric_name)
                 .push_bind(event.usage_value)
@@ -82,7 +88,7 @@ impl StoreRepo {
                 .push_bind(event.prompt_tokens)
                 .push_bind(event.completion_tokens)
                 .push_bind(event.total_tokens)
-                .push_bind(event.total_cost)
+                .push_bind(event.total_cost.unwrap_or(0.0))
                 .push_bind(&event.attributes);
         });
 
@@ -128,8 +134,22 @@ impl StoreRepo {
             &mut builder,
             &mut grouped_columns,
             &group_set,
+            UsageGroupBy::ApiKeyId,
+            "api_key_id",
+        );
+        append_dimension(
+            &mut builder,
+            &mut grouped_columns,
+            &group_set,
             UsageGroupBy::UserId,
             "user_id",
+        );
+        append_dimension(
+            &mut builder,
+            &mut grouped_columns,
+            &group_set,
+            UsageGroupBy::UserName,
+            "user_name",
         );
         append_dimension(
             &mut builder,
@@ -170,6 +190,10 @@ impl StoreRepo {
                 builder.push(" AND user_id = ");
                 builder.push_bind(&input.scope_id);
             }
+            UsageScope::ApiKey => {
+                builder.push(" AND api_key_id = ");
+                builder.push_bind(&input.scope_id);
+            }
             UsageScope::Project => {
                 builder.push(" AND project_id = ");
                 builder.push_bind(&input.scope_id);
@@ -188,9 +212,17 @@ impl StoreRepo {
             builder.push(" AND project_id = ");
             builder.push_bind(project_id);
         }
+        if let Some(api_key_id) = &input.filters.api_key_id {
+            builder.push(" AND api_key_id = ");
+            builder.push_bind(api_key_id);
+        }
         if let Some(user_id) = &input.filters.user_id {
             builder.push(" AND user_id = ");
             builder.push_bind(user_id);
+        }
+        if let Some(user_name) = &input.filters.user_name {
+            builder.push(" AND user_name = ");
+            builder.push_bind(user_name);
         }
         if let Some(model) = &input.filters.model {
             builder.push(" AND model = ");
@@ -222,7 +254,9 @@ impl StoreRepo {
                 bucket_start: row.bucket_start,
                 account_id: row.account_id,
                 project_id: row.project_id,
+                api_key_id: row.api_key_id,
                 user_id: row.user_id,
+                user_name: row.user_name,
                 model: row.model,
                 metric_name: row.metric_name,
                 signal_type: row.signal_type,
@@ -263,7 +297,7 @@ fn validate_bucket_interval(bucket: &str) -> Result<()> {
     if BUCKET_RE.is_match(bucket.trim()) {
         Ok(())
     } else {
-        Err(Error::Database(
+        Err(Error::BadRequest(
             "bucket must look like `5 minutes`, `1 hour`, or `1 day`".to_string(),
         ))
     }
