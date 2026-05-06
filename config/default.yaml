@@ -29,7 +29,6 @@ oauth2:
     client_secret: "${KEYCLOAK_TOKEN_CLIENT_SECRET:-lightbridge-token-issuer-secret}"
     subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
     requested_token_type: "urn:ietf:params:oauth:token-type:access_token"
-    audience: "${KEYCLOAK_TOKEN_AUDIENCE:-lightbridge-token-issuer}"
 otel:
   enabled: true
   otlp_endpoint: "http://localhost:4317"

@@ -483,8 +483,7 @@ mod tests {
                 )
                 .body_contains(
                     "requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
-                )
-                .body_contains("audience=test-client");
+                );
             then.status(200).json_body(json!({
                 "access_token": "issued-access-token",
                 "expires_in": 60,
@@ -510,7 +509,7 @@ mod tests {
                 requested_token_type: Some(
                     "urn:ietf:params:oauth:token-type:access_token".to_string(),
                 ),
-                audience: Some("test-client".to_string()),
+                audience: None,
                 scope: None,
             }),
         })

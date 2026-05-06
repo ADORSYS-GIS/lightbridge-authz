@@ -96,8 +96,7 @@ Keycloak standard token exchange is same-realm internal token exchange. The inpu
 token and the newly issued token both come from realm `dev`; the useful boundary is
 the client context. In dev, Authz authenticates to Keycloak as the confidential
 `lightbridge-token-issuer` client using `KEYCLOAK_TOKEN_CLIENT_SECRET`, and sends
-the user's bearer token as `subject_token`, with `KEYCLOAK_TOKEN_AUDIENCE`
-defaulting to `lightbridge-token-issuer`. In Keycloak, the client making the
+the user's bearer token as `subject_token`. In Keycloak, the client making the
 exchange must have standard token exchange enabled, authenticate with its
 configured client authentication method, and be present in the incoming token's
 audience.
