@@ -32,6 +32,7 @@ pub struct UsageQueryRequest {
 #[serde(rename_all = "snake_case")]
 pub enum UsageScope {
     User,
+    ApiKey,
     Project,
     Account,
 }
@@ -41,7 +42,9 @@ pub enum UsageScope {
 pub enum UsageGroupBy {
     AccountId,
     ProjectId,
+    ApiKeyId,
     UserId,
+    UserName,
     Model,
     MetricName,
     SignalType,
@@ -51,7 +54,9 @@ pub enum UsageGroupBy {
 pub struct UsageQueryFilters {
     pub account_id: Option<String>,
     pub project_id: Option<String>,
+    pub api_key_id: Option<String>,
     pub user_id: Option<String>,
+    pub user_name: Option<String>,
     pub model: Option<String>,
     pub metric_name: Option<String>,
     pub signal_type: Option<String>,
@@ -67,7 +72,9 @@ pub struct UsageSeriesPoint {
     pub bucket_start: DateTime<Utc>,
     pub account_id: Option<String>,
     pub project_id: Option<String>,
+    pub api_key_id: Option<String>,
     pub user_id: Option<String>,
+    pub user_name: Option<String>,
     pub model: Option<String>,
     pub metric_name: Option<String>,
     pub signal_type: Option<String>,

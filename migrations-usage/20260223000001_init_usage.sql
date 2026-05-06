@@ -4,7 +4,9 @@ CREATE TABLE IF NOT EXISTS usage_events (
     signal_type TEXT NOT NULL,
     account_id TEXT,
     project_id TEXT,
+    api_key_id TEXT,
     user_id TEXT,
+    user_name TEXT,
     model TEXT,
     metric_name TEXT,
     usage_value DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -19,7 +21,9 @@ CREATE TABLE IF NOT EXISTS usage_events (
 CREATE INDEX IF NOT EXISTS idx_usage_events_observed_at ON usage_events (observed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_usage_events_account_time ON usage_events (account_id, observed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_usage_events_project_time ON usage_events (project_id, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_events_api_key_time ON usage_events (api_key_id, observed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_usage_events_user_time ON usage_events (user_id, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_events_user_name_time ON usage_events (user_name, observed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_usage_events_model_time ON usage_events (model, observed_at DESC);
 
 DO $$
