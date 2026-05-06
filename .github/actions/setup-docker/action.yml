@@ -16,7 +16,7 @@ inputs:
     description: Container registry
     required: false
     default: ghcr.io
-  github-token:   # ✅ NEW
+  github-token:
     description: GitHub token for registry auth
     required: true
 
@@ -42,7 +42,7 @@ runs:
       with:
         registry: ${{ inputs.registry }}
         username: ${{ github.actor }}
-        password: ${{ inputs.github-token }}   # ✅ FIXED
+        password: ${{ inputs.github-token }}
 
     - id: lowercase
       name: Lowercase image name

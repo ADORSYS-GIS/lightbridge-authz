@@ -19,7 +19,7 @@ inputs:
     description: Optional suffix appended to generated tags (for example -arm)
     required: false
     default: ""
-  github-token:   # ✅ NEW
+  github-token:
     description: GitHub token for registry auth
     required: true
 
@@ -32,7 +32,7 @@ runs:
         app-version: ${{ inputs.app-version }}
         image-name: ${{ inputs.image-name }}
         tag-suffix: ${{ inputs.tag-suffix }}
-        github-token: ${{ inputs.github-token }}   # ✅ pass through
+        github-token: ${{ inputs.github-token }}
 
     - name: Build and push image
       uses: docker/build-push-action@v6.19.2
