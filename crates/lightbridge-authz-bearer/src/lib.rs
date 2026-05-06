@@ -17,6 +17,8 @@ pub struct TokenInfo {
     pub active: bool,
     pub sub: String,
     pub exp: u64,
+    #[serde(default)]
+    pub access_token: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -165,6 +167,7 @@ impl BearerTokenServiceTrait for BearerTokenService {
             active: true,
             sub: claims.sub,
             exp: claims.exp,
+            access_token: token.to_string(),
         })
     }
 }

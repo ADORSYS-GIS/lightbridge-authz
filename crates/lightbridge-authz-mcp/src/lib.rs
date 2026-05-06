@@ -191,6 +191,12 @@ fn normalize_list_pagination(offset: u32, limit: u32) -> (u32, u32) {
 fn subject_from_request_context(
     context: &RequestContext<RoleServer>,
 ) -> std::result::Result<String, ErrorData> {
+    Ok(token_info_from_request_context(context)?.sub.clone())
+}
+
+fn token_info_from_request_context(
+    context: &RequestContext<RoleServer>,
+) -> std::result::Result<TokenInfo, ErrorData> {
     let parts = context
         .extensions
         .get::<axum::http::request::Parts>()
@@ -201,7 +207,7 @@ fn subject_from_request_context(
         .get::<TokenInfo>()
         .ok_or_else(|| ErrorData::internal_error("missing bearer token context", None))?;
 
-    Ok(token_info.sub.clone())
+    Ok(token_info.clone())
 }
 
 fn issuer_from_jwks_url(jwks_url: &str) -> Option<String> {
@@ -239,6 +245,7 @@ fn resolve_oauth2_endpoints(oauth2: &Oauth2) -> Option<Oauth2ResolvedEndpoints> 
     let token_endpoint = oauth2
         .token_endpoint
         .clone()
+        .or_else(|| oauth2.oauth2_url.clone())
         .unwrap_or_else(|| join_issuer_path(&issuer, "protocol/openid-connect/token"));
     let registration_endpoint = oauth2
         .registration_endpoint
@@ -748,13 +755,15 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<CreateApiKeyParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let token_info = token_info_from_request_context(&context)?;
+        let subject = token_info.sub.clone();
         let expires_at = parse_optional_datetime(params.expires_at, "expires_at")?;
 
         let api_key_secret: ApiKeySecret = self
             .store
             .create_api_key(
                 &subject,
+                Some(&token_info.access_token),
                 &params.project_id,
                 CreateApiKey {
                     name: params.name,
@@ -880,13 +889,15 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<RotateApiKeyParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let token_info = token_info_from_request_context(&context)?;
+        let subject = token_info.sub.clone();
         let expires_at = parse_optional_datetime(params.expires_at, "expires_at")?;
 
         let api_key_secret = self
             .store
             .rotate_api_key(
                 &subject,
+                Some(&token_info.access_token),
                 &params.key_id,
                 RotateApiKey {
                     name: params.name,
@@ -1187,6 +1198,7 @@ mod tests {
         async fn create_api_key(
             &self,
             _subject: &str,
+            _bearer_token: Option<&str>,
             _project_id: &str,
             _input: CreateApiKey,
         ) -> std::result::Result<ApiKeySecret, Error> {
@@ -1239,6 +1251,7 @@ mod tests {
         async fn rotate_api_key(
             &self,
             _subject: &str,
+            _bearer_token: Option<&str>,
             _key_id: &str,
             _input: RotateApiKey,
         ) -> std::result::Result<ApiKeySecret, Error> {
@@ -1337,10 +1350,12 @@ mod tests {
     fn sample_oauth2() -> Oauth2 {
         Oauth2 {
             jwks_url: "http://keycloak:9100/realms/dev/protocol/openid-connect/certs".to_string(),
+            oauth2_url: None,
             issuer_url: None,
             authorization_endpoint: None,
             token_endpoint: None,
             registration_endpoint: None,
+            issuance: None,
         }
     }
 

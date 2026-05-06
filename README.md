@@ -86,14 +86,18 @@ Default container config is mounted from `.docker/authz/container.yaml`:
 - Lifecycle: `POST /api-keys/{key_id}/revoke`, `POST /api-keys/{key_id}/rotate`
 - OpenAPI docs: `https://localhost:13000/api/v1/docs`
 
-**OPA API (Basic Auth)**
+**Internal Authz/Authorino validation API (Basic Auth)**
 - `POST /v1/opa/validate`
 - `POST /v1/authorino/validate` (supports dynamic metadata passthrough/enrichment)
 - OpenAPI docs: `https://localhost:13001/v1/opa/docs`
 
-Use this endpoint from Authorino’s OPA external authz policy to validate API keys; send the presented API key and optional client IP.
+This backend is intended to be called by Authorino, not by end users or client
+applications directly. Authorino sends the presented credential and request
+metadata, and the validation backend rejects revoked or expired credentials before
+returning enriched `api_key`, `project`, and `account` context for policy and
+upstream request metadata.
 
-Example:
+Manual validation example:
 
 ```bash
 curl -k -u authorino:change-me \
@@ -150,6 +154,11 @@ Keycloak is preloaded with:
 - Realm: `dev`
 - User: `test@admin` / `test` (email-as-username)
 - Client: `test-client` (public)
+
+API key creation uses Keycloak token exchange in dev: the API exchanges the
+caller's bearer token at the same realm token endpoint and stores the hash of the
+exchanged access token. See `docs/test-protocol.md` for the same-realm token
+exchange notes, the requester/target client distinction, and revocation behavior.
 
 ### Option A: Enable direct access grants (recommended for quick local testing)
 

@@ -93,7 +93,7 @@ pub async fn start_api_server(
     oauth2: &Oauth2,
 ) -> Result<()> {
     let readiness_pool = pool.clone();
-    let store = Arc::new(AuthzStoreImpl::with_pool(pool));
+    let store = Arc::new(AuthzStoreImpl::with_pool_and_oauth2(pool, oauth2));
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
 
