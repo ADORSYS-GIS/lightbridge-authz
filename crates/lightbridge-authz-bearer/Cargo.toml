@@ -18,5 +18,5 @@ tokio.workspace = true
 tokio.features = ["macros", "rt-multi-thread", "sync"]
 
 [dev-dependencies]
-httpmock = "0.7"
+httpmock.workspace = true
 serde_json.workspace = true

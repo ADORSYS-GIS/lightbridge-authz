@@ -78,6 +78,20 @@ PROJECT_ID=$(echo "$PROJECT_JSON" | /usr/bin/python3 -c "import sys, json; print
 
 ## 5) Create an API key
 
+In dev, API key creation is backed by Keycloak token exchange. The CRUD API sends
+the caller's validated bearer token to the realm token endpoint as `subject_token`
+and stores only the hash of the exchanged access token. The returned `secret` is
+therefore an OAuth2 access token issued on behalf of the same user, not a locally
+generated random string.
+
+Keycloak standard token exchange is same-realm internal token exchange. The input
+token and the newly issued token both come from realm `dev`; the useful boundary is
+the client context. For production-like setups, prefer a dedicated target client
+or audience for API-key credentials instead of exchanging `test-client` back to
+itself. In Keycloak, the client making the exchange must have standard token
+exchange enabled and, for confidential clients, authenticate with its configured
+client authentication method.
+
 ```bash
 KEY_JSON=$(curl -k -s https://localhost:13000/api/v1/projects/$PROJECT_ID/api-keys \
   -H "Authorization: Bearer $TOKEN" \

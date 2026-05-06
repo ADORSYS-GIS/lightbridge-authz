@@ -135,4 +135,6 @@ pub struct RotateApiKey {
 pub struct ApiKeySecret {
     pub api_key: ApiKey,
     pub secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth2_url: Option<String>,
 }

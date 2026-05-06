@@ -47,6 +47,7 @@ pub trait AuthzStore: Send + Sync + 'static + std::fmt::Debug {
     async fn create_api_key(
         &self,
         subject: &str,
+        bearer_token: Option<&str>,
         project_id: &str,
         input: CreateApiKey,
     ) -> Result<ApiKeySecret, Error>;
@@ -69,6 +70,7 @@ pub trait AuthzStore: Send + Sync + 'static + std::fmt::Debug {
     async fn rotate_api_key(
         &self,
         subject: &str,
+        bearer_token: Option<&str>,
         key_id: &str,
         input: RotateApiKey,
     ) -> Result<ApiKeySecret, Error>;

@@ -151,6 +151,11 @@ Keycloak is preloaded with:
 - User: `test@admin` / `test` (email-as-username)
 - Client: `test-client` (public)
 
+API key creation uses Keycloak token exchange in dev: the API exchanges the
+caller's bearer token at the same realm token endpoint and stores the hash of the
+exchanged access token. See `docs/test-protocol.md` for the same-realm token
+exchange notes and the requester/target client distinction.
+
 ### Option A: Enable direct access grants (recommended for quick local testing)
 
 1. Open Keycloak admin: `http://localhost:9100`  
