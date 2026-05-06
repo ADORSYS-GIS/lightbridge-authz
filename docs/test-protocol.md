@@ -15,10 +15,18 @@ Start or rebuild:
 docker compose -f compose.yaml up -d --build
 ```
 
-## 1) Enable direct access grants for test-client
+## 1) Confirm the dev clients
 
-Keycloak is preloaded with realm `dev`, user `test@admin` / `test` (email‑as‑username), and client `test-client` (public).
-Direct access grants are required to get tokens via password grant for local testing.
+Keycloak is preloaded with realm `dev`, user `test@admin` / `test`
+(email‑as‑username), public login client `test-client`, and confidential token
+issuer client `lightbridge-token-issuer` with secret
+`lightbridge-token-issuer-secret`. The `test-client` access token includes
+`lightbridge-token-issuer` as an audience so Keycloak permits that confidential
+client to exchange the user's token.
+
+Direct access grants on `test-client` are only required to get user tokens via
+password grant for local testing. `lightbridge-token-issuer` is the client used
+by Authz for token exchange; it does not use username or password credentials.
 
 ```bash
 docker compose -f compose.yaml exec -T keycloak \
@@ -86,11 +94,12 @@ generated random string.
 
 Keycloak standard token exchange is same-realm internal token exchange. The input
 token and the newly issued token both come from realm `dev`; the useful boundary is
-the client context. For production-like setups, prefer a dedicated target client
-or audience for API-key credentials instead of exchanging `test-client` back to
-itself. In Keycloak, the client making the exchange must have standard token
-exchange enabled and, for confidential clients, authenticate with its configured
-client authentication method.
+the client context. In dev, Authz authenticates to Keycloak as the confidential
+`lightbridge-token-issuer` client using `KEYCLOAK_TOKEN_CLIENT_SECRET`, and sends
+the user's bearer token as `subject_token`. In Keycloak, the client making the
+exchange must have standard token exchange enabled, authenticate with its
+configured client authentication method, and be present in the incoming token's
+audience.
 
 Revoking the API key invalidates the credential at the Lightbridge validation
 layer immediately. The validation backend stores only the exchanged token hash and
