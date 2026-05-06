@@ -53,7 +53,7 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
 chrono = { version = "0.4", features = ["serde"] }
-cuid = { version = "1" }
+cuid = { version = "2", default-features = false, features = ["v2"] }
 getrandom = "0.4"
 goose = "0.18"
 httpmock = "0.7"
