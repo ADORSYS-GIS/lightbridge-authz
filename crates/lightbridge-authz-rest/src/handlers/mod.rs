@@ -476,13 +476,15 @@ mod tests {
                     "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange",
                 )
                 .body_contains("client_id=test-client")
+                .body_contains("client_secret=test-client-secret")
                 .body_contains("subject_token=incoming-access-token")
                 .body_contains(
                     "subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
                 )
                 .body_contains(
                     "requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
-                );
+                )
+                .body_contains("audience=test-client");
             then.status(200).json_body(json!({
                 "access_token": "issued-access-token",
                 "expires_in": 60,
@@ -501,14 +503,14 @@ mod tests {
                 enabled: true,
                 grant_type: Some("urn:ietf:params:oauth:grant-type:token-exchange".to_string()),
                 client_id: "test-client".to_string(),
-                client_secret: None,
+                client_secret: Some("test-client-secret".to_string()),
                 subject_token_type: Some(
                     "urn:ietf:params:oauth:token-type:access_token".to_string(),
                 ),
                 requested_token_type: Some(
                     "urn:ietf:params:oauth:token-type:access_token".to_string(),
                 ),
-                audience: None,
+                audience: Some("test-client".to_string()),
                 scope: None,
             }),
         })

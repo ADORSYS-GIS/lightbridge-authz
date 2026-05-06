@@ -153,12 +153,16 @@ cargo run -p lightbridge-mcp -- serve --config-path config/default.yaml
 Keycloak is preloaded with:
 - Realm: `dev`
 - User: `test@admin` / `test` (email-as-username)
-- Client: `test-client` (public)
+- Login client: `test-client` (public)
+- Token issuer client: `lightbridge-token-issuer` (confidential, client secret `lightbridge-token-issuer-secret`)
 
 API key creation uses Keycloak token exchange in dev: the API exchanges the
-caller's bearer token at the same realm token endpoint and stores the hash of the
-exchanged access token. See `docs/test-protocol.md` for the same-realm token
-exchange notes, the requester/target client distinction, and revocation behavior.
+caller's bearer token at the same realm token endpoint through the confidential
+`lightbridge-token-issuer` client, then stores the hash of the exchanged access
+token. The public `test-client` includes `lightbridge-token-issuer` as an access
+token audience so Keycloak allows that confidential client to perform the exchange.
+See `docs/test-protocol.md` for the same-realm token exchange notes, the
+requester/target client/audience distinction, and revocation behavior.
 
 ### Option A: Enable direct access grants (recommended for quick local testing)
 

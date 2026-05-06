@@ -1,5 +1,35 @@
 ---
 services:
+  postgresql:
+    ports: !reset []
+
+  timescaledb:
+    ports: !reset []
+
+  keycloak:
+    ports: !reset []
+
+  authz-api:
+    ports: !reset []
+
+  authz-opa:
+    ports: !reset []
+
+  authz-usage:
+    ports: !reset []
+
+  authz-mcp:
+    ports: !reset []
+
+  jaeger:
+    ports: !reset []
+
+  adminer:
+    ports: !reset []
+
+  mcp-inspector:
+    ports: !reset []
+
   it-authorino:
     image: python:3.12-slim
     depends_on:
