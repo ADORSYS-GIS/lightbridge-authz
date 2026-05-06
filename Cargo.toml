@@ -31,7 +31,7 @@ lightbridge-authz-usage-migrate = { path = "./crates/lightbridge-authz-usage-mig
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 base64 = "0.22"
 jsonwebtoken = { version = "10.3" }
@@ -56,7 +56,8 @@ chrono = { version = "0.4", features = ["serde"] }
 cuid = { version = "1" }
 getrandom = "0.4"
 goose = "0.18"
-reqwest = { version = "0.13", features = ["json"] }
+httpmock = "0.7"
+reqwest = { version = "0.13", features = ["json", "form"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "json", "macros"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 utoipa = { version = "5", features = ["macros", "chrono"] }
@@ -64,7 +65,7 @@ utoipa-swagger-ui = { version = "9", features = ["axum", "reqwest"] }
 regex = "1.10"
 flate2 = "1.1.9"
 
-rmcp = { version = "1.1.0", features = ["transport-streamable-http-server"] }
+rmcp = { version = "1.6.0", features = ["transport-streamable-http-server"] }
 
 mimalloc = "0"
 

@@ -76,6 +76,8 @@ pub struct Database {
 pub struct Oauth2 {
     pub jwks_url: String,
     #[serde(default)]
+    pub oauth2_url: Option<String>,
+    #[serde(default)]
     pub issuer_url: Option<String>,
     #[serde(default)]
     pub authorization_endpoint: Option<String>,
@@ -83,6 +85,28 @@ pub struct Oauth2 {
     pub token_endpoint: Option<String>,
     #[serde(default)]
     pub registration_endpoint: Option<String>,
+    #[serde(default)]
+    pub issuance: Option<Oauth2Issuance>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Oauth2Issuance {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub grant_type: Option<String>,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default)]
+    pub subject_token_type: Option<String>,
+    #[serde(default)]
+    pub requested_token_type: Option<String>,
+    #[serde(default)]
+    pub audience: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<Config> {

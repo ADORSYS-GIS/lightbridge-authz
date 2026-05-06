@@ -33,7 +33,7 @@ pub async fn create_api_key(
     let subject = token_info.sub.clone();
     let api_key = state
         .store
-        .create_api_key(&subject, &project_id, input)
+        .create_api_key(&subject, Some(&token_info.access_token), &project_id, input)
         .await?;
     Ok((StatusCode::CREATED, Json(api_key)))
 }
@@ -176,6 +176,9 @@ pub async fn rotate_api_key(
     Json(input): Json<RotateApiKey>,
 ) -> Result<impl IntoResponse, Error> {
     let subject = token_info.sub.clone();
-    let api_key = state.store.rotate_api_key(&subject, &key_id, input).await?;
+    let api_key = state
+        .store
+        .rotate_api_key(&subject, Some(&token_info.access_token), &key_id, input)
+        .await?;
     Ok((StatusCode::CREATED, Json(api_key)))
 }

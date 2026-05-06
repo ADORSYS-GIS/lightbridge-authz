@@ -9,16 +9,23 @@ use getrandom::fill;
 use lightbridge_authz_api::contract::AuthzStore;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::async_trait;
+use lightbridge_authz_core::config::{Oauth2, Oauth2Issuance};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey, CreateProject,
     Project, RotateApiKey, UpdateAccount, UpdateApiKey, UpdateProject, hash_api_key,
 };
-use lightbridge_authz_core::{db::DbPoolTrait, error::Result};
+use lightbridge_authz_core::{
+    db::DbPoolTrait,
+    error::{Error, Result},
+};
+use reqwest::Client;
+use serde::Deserialize;
 
 #[derive(Clone)]
 pub struct AuthzStoreImpl {
     repo: Arc<StoreRepo>,
+    token_issuer: Option<OAuth2TokenIssuer>,
 }
 
 impl std::fmt::Debug for AuthzStoreImpl {
@@ -32,6 +39,15 @@ impl AuthzStoreImpl {
         let repo = StoreRepo::new(pool);
         Self {
             repo: Arc::new(repo),
+            token_issuer: None,
+        }
+    }
+
+    pub fn with_pool_and_oauth2(pool: Arc<dyn DbPoolTrait>, oauth2: &Oauth2) -> Self {
+        let repo = StoreRepo::new(pool);
+        Self {
+            repo: Arc::new(repo),
+            token_issuer: OAuth2TokenIssuer::from_config(oauth2),
         }
     }
 
@@ -51,6 +67,131 @@ impl AuthzStoreImpl {
             secret.chars().take(8).collect()
         }
     }
+
+    async fn issue_secret(&self, bearer_token: Option<&str>) -> Result<IssuedSecret> {
+        if let Some(token_issuer) = &self.token_issuer {
+            token_issuer.issue(bearer_token).await
+        } else {
+            Ok(IssuedSecret {
+                secret: Self::generate_secret()?,
+                expires_at: None,
+                oauth2_url: None,
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IssuedSecret {
+    secret: String,
+    expires_at: Option<DateTime<Utc>>,
+    oauth2_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OAuth2TokenIssuer {
+    client: Client,
+    oauth2_url: String,
+    issuance: Oauth2Issuance,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuth2TokenResponse {
+    access_token: String,
+    expires_in: Option<i64>,
+}
+
+impl OAuth2TokenIssuer {
+    fn from_config(oauth2: &Oauth2) -> Option<Self> {
+        let issuance = oauth2.issuance.clone()?;
+        if !issuance.enabled {
+            return None;
+        }
+        let oauth2_url = oauth2
+            .oauth2_url
+            .clone()
+            .or_else(|| oauth2.token_endpoint.clone())?;
+        Some(Self {
+            client: Client::new(),
+            oauth2_url,
+            issuance,
+        })
+    }
+
+    fn grant_type(&self) -> &str {
+        self.issuance
+            .grant_type
+            .as_deref()
+            .unwrap_or("urn:ietf:params:oauth:grant-type:token-exchange")
+    }
+
+    async fn issue(&self, bearer_token: Option<&str>) -> Result<IssuedSecret> {
+        let grant_type = self.grant_type();
+        if self.issuance.client_id.trim().is_empty() {
+            return Err(Error::Server(
+                "oauth2 issuance client_id is required".to_string(),
+            ));
+        }
+        let subject_token = bearer_token
+            .filter(|token| !token.trim().is_empty())
+            .ok_or_else(|| Error::Server("oauth2 issuance bearer token is required".to_string()))?;
+        let mut form = vec![
+            ("grant_type".to_string(), grant_type.to_string()),
+            ("client_id".to_string(), self.issuance.client_id.clone()),
+            ("subject_token".to_string(), subject_token.to_string()),
+            (
+                "subject_token_type".to_string(),
+                self.issuance
+                    .subject_token_type
+                    .clone()
+                    .unwrap_or_else(|| "urn:ietf:params:oauth:token-type:access_token".to_string()),
+            ),
+        ];
+
+        if let Some(client_secret) = &self.issuance.client_secret {
+            form.push(("client_secret".to_string(), client_secret.clone()));
+        }
+        if let Some(requested_token_type) = &self.issuance.requested_token_type {
+            form.push((
+                "requested_token_type".to_string(),
+                requested_token_type.clone(),
+            ));
+        }
+        if let Some(audience) = &self.issuance.audience {
+            form.push(("audience".to_string(), audience.clone()));
+        }
+        if let Some(scope) = &self.issuance.scope {
+            form.push(("scope".to_string(), scope.clone()));
+        }
+
+        let response = self
+            .client
+            .post(&self.oauth2_url)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| Error::Server(format!("oauth2 token issuance request failed: {e}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Error::Server(format!(
+                "oauth2 token issuance failed with status {status}: {body}"
+            )));
+        }
+        let token = response
+            .json::<OAuth2TokenResponse>()
+            .await
+            .map_err(|e| Error::Server(format!("oauth2 token response parse failed: {e}")))?;
+        let expires_at = token
+            .expires_in
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| Utc::now() + Duration::seconds(seconds));
+        Ok(IssuedSecret {
+            secret: token.access_token,
+            expires_at,
+            oauth2_url: Some(self.oauth2_url.clone()),
+        })
+    }
 }
 
 fn resolve_rotated_expires_at(
@@ -58,6 +199,18 @@ fn resolve_rotated_expires_at(
     existing: Option<DateTime<Utc>>,
 ) -> Option<DateTime<Utc>> {
     input.or(existing)
+}
+
+fn resolve_issued_expires_at(
+    requested: Option<DateTime<Utc>>,
+    issued: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    match (requested, issued) {
+        (Some(requested), Some(issued)) => Some(requested.min(issued)),
+        (Some(requested), None) => Some(requested),
+        (None, Some(issued)) => Some(issued),
+        (None, None) => None,
+    }
 }
 
 #[async_trait]
@@ -136,13 +289,15 @@ impl AuthzStore for AuthzStoreImpl {
     async fn create_api_key(
         &self,
         subject: &str,
+        bearer_token: Option<&str>,
         project_id: &str,
         input: CreateApiKey,
     ) -> Result<ApiKeySecret> {
-        let secret = Self::generate_secret()?;
-        let key_hash = hash_api_key(&secret);
-        let key_prefix = Self::key_prefix(&secret);
+        let issued = self.issue_secret(bearer_token).await?;
+        let key_hash = hash_api_key(&issued.secret);
+        let key_prefix = Self::key_prefix(&issued.secret);
         let now = Utc::now();
+        let expires_at = resolve_issued_expires_at(input.expires_at, issued.expires_at);
         let row = lightbridge_authz_api_key::entities::new_api_key_row::NewApiKeyRow {
             id: cuid2(),
             project_id: project_id.to_string(),
@@ -150,14 +305,18 @@ impl AuthzStore for AuthzStoreImpl {
             key_prefix,
             key_hash,
             created_at: now,
-            expires_at: input.expires_at,
+            expires_at,
             status: ApiKeyStatus::Active.to_string(),
             last_used_at: None,
             last_ip: None,
             revoked_at: None,
         };
         let api_key = self.repo.create_api_key(subject, row).await?;
-        Ok(ApiKeySecret { api_key, secret })
+        Ok(ApiKeySecret {
+            api_key,
+            secret: issued.secret,
+            oauth2_url: issued.oauth2_url,
+        })
     }
 
     async fn list_api_keys(
@@ -207,6 +366,7 @@ impl AuthzStore for AuthzStoreImpl {
     async fn rotate_api_key(
         &self,
         subject: &str,
+        bearer_token: Option<&str>,
         key_id: &str,
         input: RotateApiKey,
     ) -> Result<ApiKeySecret> {
@@ -229,10 +389,12 @@ impl AuthzStore for AuthzStoreImpl {
                 (ApiKeyStatus::Revoked, Some(now), None)
             };
 
-        let secret = Self::generate_secret()?;
-        let key_hash = hash_api_key(&secret);
-        let key_prefix = Self::key_prefix(&secret);
-        let expires_at = resolve_rotated_expires_at(input.expires_at, existing.expires_at);
+        let issued = self.issue_secret(bearer_token).await?;
+        let key_hash = hash_api_key(&issued.secret);
+        let key_prefix = Self::key_prefix(&issued.secret);
+        let requested_expires_at =
+            resolve_rotated_expires_at(input.expires_at, existing.expires_at);
+        let expires_at = resolve_issued_expires_at(requested_expires_at, issued.expires_at);
         let row = lightbridge_authz_api_key::entities::new_api_key_row::NewApiKeyRow {
             id: cuid2(),
             project_id: existing.project_id,
@@ -250,14 +412,21 @@ impl AuthzStore for AuthzStoreImpl {
             .repo
             .rotate_api_key_transaction(subject, key_id, status, revoked_at, old_expires_at, row)
             .await?;
-        Ok(ApiKeySecret { api_key, secret })
+        Ok(ApiKeySecret {
+            api_key,
+            secret: issued.secret,
+            oauth2_url: issued.oauth2_url,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_rotated_expires_at;
+    use super::{OAuth2TokenIssuer, resolve_issued_expires_at, resolve_rotated_expires_at};
     use chrono::{Duration, Utc};
+    use httpmock::{Method::POST, MockServer};
+    use lightbridge_authz_core::config::{Oauth2, Oauth2Issuance};
+    use serde_json::json;
 
     #[test]
     fn rotate_defaults_to_existing_expiry_when_missing() {
@@ -283,5 +452,73 @@ mod tests {
     #[test]
     fn rotate_returns_none_when_no_expiry() {
         assert_eq!(resolve_rotated_expires_at(None, None), None);
+    }
+
+    #[test]
+    fn issued_expiry_prefers_earliest_timestamp() {
+        let base_time = Utc::now();
+        let requested = base_time + Duration::minutes(10);
+        let issued = base_time + Duration::minutes(5);
+
+        assert_eq!(
+            resolve_issued_expires_at(Some(requested), Some(issued)),
+            Some(issued)
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth2_issuer_posts_token_exchange_and_returns_access_token() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/token")
+                .body_contains(
+                    "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange",
+                )
+                .body_contains("client_id=test-client")
+                .body_contains("subject_token=incoming-access-token")
+                .body_contains(
+                    "subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
+                )
+                .body_contains(
+                    "requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
+                );
+            then.status(200).json_body(json!({
+                "access_token": "issued-access-token",
+                "expires_in": 60,
+                "token_type": "Bearer"
+            }));
+        });
+        let oauth2_url = server.url("/token");
+        let issuer = OAuth2TokenIssuer::from_config(&Oauth2 {
+            jwks_url: server.url("/jwks"),
+            oauth2_url: Some(oauth2_url.clone()),
+            issuer_url: None,
+            authorization_endpoint: None,
+            token_endpoint: None,
+            registration_endpoint: None,
+            issuance: Some(Oauth2Issuance {
+                enabled: true,
+                grant_type: Some("urn:ietf:params:oauth:grant-type:token-exchange".to_string()),
+                client_id: "test-client".to_string(),
+                client_secret: None,
+                subject_token_type: Some(
+                    "urn:ietf:params:oauth:token-type:access_token".to_string(),
+                ),
+                requested_token_type: Some(
+                    "urn:ietf:params:oauth:token-type:access_token".to_string(),
+                ),
+                audience: None,
+                scope: None,
+            }),
+        })
+        .expect("issuer should be configured");
+
+        let issued = issuer.issue(Some("incoming-access-token")).await.unwrap();
+
+        assert_eq!(issued.secret, "issued-access-token");
+        assert_eq!(issued.oauth2_url, Some(oauth2_url));
+        assert!(issued.expires_at.is_some());
+        assert_eq!(mock.hits(), 1);
     }
 }

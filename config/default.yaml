@@ -21,6 +21,13 @@ database:
   pool_size: 10
 oauth2:
   jwks_url: "http://localhost:9100/realms/dev/protocol/openid-connect/certs"
+  oauth2_url: "http://localhost:9100/realms/dev/protocol/openid-connect/token"
+  issuance:
+    enabled: true
+    grant_type: "urn:ietf:params:oauth:grant-type:token-exchange"
+    client_id: "${KEYCLOAK_TOKEN_CLIENT_ID:-test-client}"
+    subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
+    requested_token_type: "urn:ietf:params:oauth:token-type:access_token"
 otel:
   enabled: true
   otlp_endpoint: "http://localhost:4317"
