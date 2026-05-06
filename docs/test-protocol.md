@@ -1,9 +1,9 @@
-# Test Protocol (OAuth2 + OPA)
+# Test Protocol (OAuth2 + Authorino Validation)
 
 This protocol validates the full flow:
 1) OAuth2‑protected CRUD API
 2) API key creation
-3) OPA validation with usage telemetry
+3) Authorino-facing validation with usage telemetry and enrichment
 
 ## Prerequisites
 - Docker Compose services are running
@@ -92,6 +92,14 @@ itself. In Keycloak, the client making the exchange must have standard token
 exchange enabled and, for confidential clients, authenticate with its configured
 client authentication method.
 
+Revoking the API key invalidates the credential at the Lightbridge validation
+layer immediately. The validation backend stores only the exchanged token hash and
+checks the `api_keys` row status before returning any enrichment, so a revoked key
+is rejected when Authorino asks Lightbridge to authorize a request. This does not
+revoke the OAuth2 token at Keycloak/provider level; if that token is usable
+outside the Authorino-to-Lightbridge validation path, keep its audience narrow and
+its lifetime short or add provider-side revocation/introspection.
+
 ```bash
 KEY_JSON=$(curl -k -s https://localhost:13000/api/v1/projects/$PROJECT_ID/api-keys \
   -H "Authorization: Bearer $TOKEN" \
@@ -101,7 +109,7 @@ KEY_JSON=$(curl -k -s https://localhost:13000/api/v1/projects/$PROJECT_ID/api-ke
 SECRET=$(echo "$KEY_JSON" | /usr/bin/python3 -c "import sys, json; print(json.load(sys.stdin)['secret'])")
 ```
 
-## 6) Validate via OPA (basic auth)
+## 6) Validate through the internal Authorino backend
 
 ```bash
 curl -k -u authorino:change-me https://localhost:13001/v1/opa/validate \
@@ -110,6 +118,11 @@ curl -k -u authorino:change-me https://localhost:13001/v1/opa/validate \
 ```
 
 Expected: `200` with `api_key`, `project`, and `account` fields, and `last_used_at` populated.
+
+In a deployed path, callers do not invoke this backend directly. Authorino calls
+the validation endpoint using basic auth, then uses the returned context to enrich
+the authorized request with account, project, API key, and any preserved request
+metadata.
 
 ## Cleanup (optional)
 
