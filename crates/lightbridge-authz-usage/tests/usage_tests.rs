@@ -57,7 +57,38 @@ async fn query_usage_returns_bad_request_when_time_window_is_invalid() {
 
     let result = query_usage(axum::extract::State(state), Json(req)).await;
 
-    assert!(result.is_err());
+    let err = match result {
+        Ok(_) => panic!("invalid query should be rejected"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    assert_eq!(err.1.0.error, "start_time must be before end_time");
+}
+
+#[tokio::test]
+async fn query_usage_returns_bad_request_when_bucket_is_invalid() {
+    let req = UsageQueryRequest {
+        bucket: "hourly".to_string(),
+        ..base_request()
+    };
+
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo { points: vec![] }),
+    });
+
+    let result = query_usage(axum::extract::State(state), Json(req)).await;
+
+    let err = match result {
+        Ok(_) => panic!("invalid bucket should be rejected"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        err.1.0.error,
+        "bucket must look like `5 minutes`, `1 hour`, or `1 day`"
+    );
 }
 
 #[tokio::test]

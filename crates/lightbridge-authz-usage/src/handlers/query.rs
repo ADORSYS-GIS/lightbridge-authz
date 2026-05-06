@@ -1,9 +1,11 @@
 use crate::UsageState;
 use crate::models::{UsageErrorResponse, UsageQueryRequest, UsageQueryResponse};
+use crate::repo::validate_bucket_interval;
 use axum::{Json, extract::State, http::StatusCode};
-use lightbridge_authz_core::{Error, Result};
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
+
+type UsageHandlerResult<T> = std::result::Result<T, (StatusCode, Json<UsageErrorResponse>)>;
 
 #[utoipa::path(
     post,
@@ -11,7 +13,8 @@ use tracing::{info, instrument, warn};
     request_body = UsageQueryRequest,
     responses(
         (status = 200, body = UsageQueryResponse),
-        (status = 400, body = UsageErrorResponse)
+        (status = 400, body = UsageErrorResponse),
+        (status = 500, body = UsageErrorResponse)
     ),
     tag = "usage"
 )]
@@ -19,7 +22,7 @@ use tracing::{info, instrument, warn};
 pub async fn query_usage(
     State(state): State<Arc<UsageState>>,
     Json(input): Json<UsageQueryRequest>,
-) -> Result<(StatusCode, Json<UsageQueryResponse>)> {
+) -> UsageHandlerResult<(StatusCode, Json<UsageQueryResponse>)> {
     info!(
         "querying usage with scope={:?}, scope_id={}, bucket={}, limit={}",
         input.scope, input.scope_id, input.bucket, input.limit
@@ -29,26 +32,47 @@ pub async fn query_usage(
             "invalid time range: start_time={} end_time={}",
             input.start_time, input.end_time
         );
-        return Err(Error::Database(
-            "start_time must be before end_time".to_string(),
-        ));
+        return Err(bad_request("start_time must be before end_time"));
     }
 
     if input.scope_id.trim().is_empty() {
         warn!("missing scope_id for usage query");
-        return Err(Error::Database(
-            "scope_id is required for usage queries".to_string(),
-        ));
+        return Err(bad_request("scope_id is required for usage queries"));
     }
 
     if input.limit == 0 {
         warn!("invalid limit for usage query: limit=0");
-        return Err(Error::Database(
-            "limit must be greater than zero".to_string(),
-        ));
+        return Err(bad_request("limit must be greater than zero"));
     }
 
-    let points = state.repo.query_usage(&input).await?;
+    if let Err(message) = validate_bucket_interval(&input.bucket) {
+        warn!("invalid bucket for usage query: bucket={}", input.bucket);
+        return Err(bad_request(message));
+    }
+
+    let points = state
+        .repo
+        .query_usage(&input)
+        .await
+        .map_err(|err| server_error(err.to_string()))?;
 
     Ok((StatusCode::OK, Json(UsageQueryResponse { points })))
+}
+
+fn bad_request(message: impl Into<String>) -> (StatusCode, Json<UsageErrorResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(UsageErrorResponse {
+            error: message.into(),
+        }),
+    )
+}
+
+fn server_error(message: impl Into<String>) -> (StatusCode, Json<UsageErrorResponse>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(UsageErrorResponse {
+            error: message.into(),
+        }),
+    )
 }

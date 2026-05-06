@@ -97,7 +97,7 @@ impl StoreRepo {
             "querying usage with scope={:?}, scope_id={}, bucket={}, limit={}",
             input.scope, input.scope_id, input.bucket, input.limit
         );
-        validate_bucket_interval(&input.bucket)?;
+        validate_bucket_interval(&input.bucket).map_err(Error::Database)?;
 
         let mut group_set = HashSet::new();
         for group in &input.group_by {
@@ -254,7 +254,7 @@ fn append_dimension(
     }
 }
 
-fn validate_bucket_interval(bucket: &str) -> Result<()> {
+pub(crate) fn validate_bucket_interval(bucket: &str) -> std::result::Result<(), String> {
     static BUCKET_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"^\d+\s+(second|seconds|minute|minutes|hour|hours|day|days)$")
             .expect("bucket regex should be valid")
@@ -263,9 +263,7 @@ fn validate_bucket_interval(bucket: &str) -> Result<()> {
     if BUCKET_RE.is_match(bucket.trim()) {
         Ok(())
     } else {
-        Err(Error::Database(
-            "bucket must look like `5 minutes`, `1 hour`, or `1 day`".to_string(),
-        ))
+        Err("bucket must look like `5 minutes`, `1 hour`, or `1 day`".to_string())
     }
 }
 

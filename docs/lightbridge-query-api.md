@@ -154,16 +154,25 @@ This handler performs a small set of input validations (see [`crates/lightbridge
 - `limit` must be greater than 0
 - `bucket` must match the supported interval format (see [`crates/lightbridge-authz-usage/src/repo.rs`](crates/lightbridge-authz-usage/src/repo.rs:257))
 
-Current behaviour to be aware of:
-
-- Many invalid-input cases are returned as `Error::Database(...)`, which maps to **HTTP 500** and a **plain-text** body (not JSON) via the shared error response mapping in [`crates/lightbridge-authz-core/src/error.rs`](crates/lightbridge-authz-core/src/error.rs:1).
-- SQLx errors are mapped to status codes based on SQLx error kind. For example, connection pool failures can surface as **503**.
-
 Example invalid time window:
 
-```text
-HTTP/1.1 500 Internal Server Error
-Database error: start_time must be before end_time
+```http
+HTTP/1.1 400 Bad Request
+Content-Type: application/json
+```
+
+```json
+{
+  "error": "start_time must be before end_time"
+}
+```
+
+Example invalid bucket:
+
+```json
+{
+  "error": "bucket must look like `5 minutes`, `1 hour`, or `1 day`"
+}
 ```
 
 ## Constraints
@@ -181,10 +190,10 @@ Database error: start_time must be before end_time
 - The usage query endpoint is exercised by the integration test runner in [`.docker/it/servers_it.py`](.docker/it/servers_it.py:1).
 - The endpoint is also described at a high level in [`README.md`](README.md:118) and [`docs/usage-api.md`](docs/usage-api.md:1).
 
-### Known quirks and limitations
+### Known limitations
 
-- Input validation errors currently surface as plain-text errors (often with HTTP 500) due to the shared error-to-response mapping in [`crates/lightbridge-authz-core/src/error.rs`](crates/lightbridge-authz-core/src/error.rs:1).
 - The API is aggregation-first: no raw events, no server-side ranking/top-N, no offset pagination, and fixed ordering by time bucket.
+- Frontend integration guidance lives in [`usage-frontend-integration.md`](usage-frontend-integration.md:1).
 
 ## How to?
 

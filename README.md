@@ -28,8 +28,8 @@ Lightbridge Authz is a multi-service backend for API key management and usage an
   - Reuses the same config file as `lightbridge-authz` (API bind/tls + shared DB settings).
 - **lightbridge-authz-usage** (OTEL ingest + usage query)
   - OTEL ingest endpoints (no auth): `POST /v1/otel/traces`, `POST /v1/otel/metrics`
-  - Usage query endpoint: `POST /v1/usage/query`
-  - OpenAPI docs: `/v1/usage/docs`
+  - Usage query endpoint: `POST /usage/v1/usage/query`
+  - OpenAPI docs: `/usage/v1/usage/docs`
   - Probe routes: `GET /health`, `GET /health/startup`, `GET /health/ready`
 - **postgresql**, **keycloak**, **adminer**, **authz-tls**
 
@@ -118,7 +118,7 @@ Detailed usage + integration test guide:
 **Usage API (No auth on ingest/query endpoints)**
 - `POST /v1/otel/traces` (OTLP/HTTP traces, protobuf or JSON)
 - `POST /v1/otel/metrics` (OTLP/HTTP metrics, protobuf or JSON)
-- `POST /v1/usage/query` (bucketed timeseries for `user`, `project`, or `account` scopes)
+- `POST /usage/v1/usage/query` (bucketed timeseries for `user`, `project`, or `account` scopes)
 
 Example query body:
 
