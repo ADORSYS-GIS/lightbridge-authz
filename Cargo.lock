@@ -1935,7 +1935,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -2212,7 +2212,7 @@ checksum = "32a4cf2e9dd754c698b41139c2ec88304249ecf3dd15cabfeddd48665cdf5c0c"
 dependencies = [
  "base64 0.22.1",
  "jsonwebtoken",
- "reqwest 0.13.2",
+ "reqwest 0.13.3",
  "serde",
  "thiserror 2.0.18",
 ]
@@ -2431,7 +2431,7 @@ dependencies = [
  "lightbridge-authz-bearer",
  "lightbridge-authz-core",
  "lightbridge-authz-rest",
- "reqwest 0.13.2",
+ "reqwest 0.13.3",
  "rmcp",
  "serde",
  "serde_json",
@@ -2465,7 +2465,7 @@ dependencies = [
  "lightbridge-authz-api-key",
  "lightbridge-authz-bearer",
  "lightbridge-authz-core",
- "reqwest 0.13.2",
+ "reqwest 0.13.3",
  "rustls",
  "serde",
  "serde_json",
@@ -2481,7 +2481,7 @@ name = "lightbridge-authz-test-utils"
 version = "0.8.1"
 dependencies = [
  "clap",
- "reqwest 0.13.2",
+ "reqwest 0.13.3",
  "serde",
  "sqlx",
 ]
@@ -3308,7 +3308,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3346,7 +3346,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -3582,9 +3582,9 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.13.2"
+version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab3f43e3283ab1488b624b44b0e988d0acea0b3214e694730a055cb6b2efa801"
+checksum = "62e0021ea2c22aed41653bc7e1419abb2c97e038ff2c33d0e1309e49a97deec0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -5361,7 +5361,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
