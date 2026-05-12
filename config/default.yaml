@@ -22,6 +22,10 @@ database:
 oauth2:
   jwks_url: "http://localhost:9100/realms/dev/protocol/openid-connect/certs"
   oauth2_url: "http://localhost:9100/realms/dev/protocol/openid-connect/token"
+  # Expected audience claim(s) in JWT tokens. If set, tokens must contain at least one of these values.
+  # This is critical for security - ensures tokens are intended for this service.
+  # Example: ["lightbridge-api-key", "converse-frontend"]
+  audience: []
   issuance:
     enabled: true
     grant_type: "urn:ietf:params:oauth:grant-type:token-exchange"

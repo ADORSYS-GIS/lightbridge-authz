@@ -498,6 +498,7 @@ mod tests {
             authorization_endpoint: None,
             token_endpoint: None,
             registration_endpoint: None,
+            audience: None,
             issuance: Some(Oauth2Issuance {
                 enabled: true,
                 grant_type: Some("urn:ietf:params:oauth:grant-type:token-exchange".to_string()),

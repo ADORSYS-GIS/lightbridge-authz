@@ -87,6 +87,10 @@ pub struct Oauth2 {
     pub registration_endpoint: Option<String>,
     #[serde(default)]
     pub issuance: Option<Oauth2Issuance>,
+    /// Expected audience(s) for JWT validation. If set, the JWT's `aud` claim must
+    /// contain at least one of these values. Can be a single value or multiple values.
+    #[serde(default)]
+    pub audience: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

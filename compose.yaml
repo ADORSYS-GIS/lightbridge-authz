@@ -130,7 +130,7 @@ services:
       authz-migrate:
         condition: service_completed_successfully
       authz-tls:
-        condition: service_started
+        condition: service_completed_successfully
     deploy:
       replicas: 1
       resources:
@@ -163,7 +163,7 @@ services:
       authz-migrate:
         condition: service_completed_successfully
       authz-tls:
-        condition: service_started
+        condition: service_completed_successfully
     deploy:
       replicas: 1
       resources:
@@ -193,7 +193,7 @@ services:
       authz-migrate:
         condition: service_completed_successfully
       authz-tls:
-        condition: service_started
+        condition: service_completed_successfully
     deploy:
       replicas: 1
       resources:
@@ -272,7 +272,7 @@ services:
       authz-usage-migrate:
         condition: service_completed_successfully
       authz-tls:
-        condition: service_started
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "/usr/local/bin/lightbridge-authz-healthcheck", "-r", "3002"]
       interval: 30s

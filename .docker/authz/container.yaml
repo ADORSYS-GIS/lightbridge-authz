@@ -22,6 +22,12 @@ database:
 oauth2:
   jwks_url: "http://keycloak:9100/realms/dev/protocol/openid-connect/certs"
   oauth2_url: "http://keycloak:9100/realms/dev/protocol/openid-connect/token"
+  # Expected audience claim(s) in JWT tokens.
+  # Tokens must contain at least one matching audience value.
+  # For local development, we accept tokens from both test-client and converse-frontend.
+  audience:
+    - "lightbridge-api-key"
+    - "lightbridge-token-issuer"
   issuance:
     enabled: true
     grant_type: "urn:ietf:params:oauth:grant-type:token-exchange"

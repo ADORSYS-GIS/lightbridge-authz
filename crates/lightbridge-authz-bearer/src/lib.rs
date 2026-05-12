@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
+use tracing;
 
 /// Token information returned by JWT validation.
 #[derive(Debug, Clone, Deserialize)]
@@ -17,6 +18,9 @@ pub struct TokenInfo {
     pub active: bool,
     pub sub: String,
     pub exp: u64,
+    /// The audience claim from the JWT, if present.
+    #[serde(default)]
+    pub aud: Vec<String>,
     #[serde(default)]
     pub access_token: String,
 }
@@ -25,6 +29,32 @@ pub struct TokenInfo {
 struct Claims {
     sub: String,
     exp: u64,
+    /// Audience claim - can be a single string or array of strings
+    #[serde(default)]
+    aud: Option<Audience>,
+}
+
+/// Audience claim can be either a single string or an array of strings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum Audience {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl Audience {
+    fn to_vec(&self) -> Vec<String> {
+        match self {
+            Audience::Single(s) => vec![s.clone()],
+            Audience::Multiple(v) => v.clone(),
+        }
+    }
+}
+
+impl Default for Audience {
+    fn default() -> Self {
+        Audience::Multiple(Vec::new())
+    }
 }
 
 const DEFAULT_JWKS_CACHE_TTL: Duration = Duration::from_secs(300);
@@ -125,6 +155,7 @@ impl fmt::Debug for BearerTokenService {
 impl BearerTokenService {
     /// Create a new instance of the BearerTokenService.
     pub fn new(config: Oauth2) -> Self {
+        tracing::info!("Initializing BearerTokenService with audience config: {:?}", config.audience);
         let cache = JwksCache::new(config.jwks_url.clone());
         BearerTokenService { config, cache }
     }
@@ -136,37 +167,74 @@ impl BearerTokenServiceTrait for BearerTokenService {
     ///
     /// If JWKS validation fails (including missing jwks_url), this function returns an error
     /// which should be translated to HTTP 401 by the caller.
+    ///
+    /// If `audience` is configured in the Oauth2 config, the JWT's `aud` claim must contain
+    /// at least one of the configured audience values.
     async fn validate_bearer_token(&self, token: &str) -> anyhow::Result<TokenInfo> {
-        ensure!(!token.trim().is_empty(), anyhow!("empty token"));
+        ensure!(!token.trim().is_empty(), anyhow!("unauthorized"));
 
         // Decode JWT header and extract kid
-        let header = decode_header(token).map_err(|_| anyhow!("unauthorized"))?;
-        let kid = header.kid.as_ref().ok_or_else(|| anyhow!("unauthorized"))?;
+        let header = decode_header(token).map_err(|e| {
+            tracing::debug!("Failed to decode JWT header: {}", e);
+            anyhow!("unauthorized")
+        })?;
+        let kid = header.kid.as_ref().ok_or_else(|| {
+            tracing::debug!("JWT missing kid header");
+            anyhow!("unauthorized")
+        })?;
 
         // Load JWKS (cached) and find JWK by kid.
         let jwk = match self.cache.get(kid).await {
             Ok(Some(key)) => key,
-            Ok(None) => return Err(anyhow!("unauthorized")),
+            Ok(None) => {
+                tracing::debug!("JWK not found for kid: {}", kid);
+                return Err(anyhow!("unauthorized"));
+            }
             Err(err) => {
-                tracing::error!("Some error {err}");
+                tracing::error!("JWKS retrieval error: {}", err);
                 return Err(anyhow!("unauthorized"));
             }
         };
 
         // Validate the token using the JWK decoding key.
         let mut validation = Validation::new(header.alg);
-        validation.validate_aud = false;
+        if let Some(expected_audiences) = &self.config.audience {
+            tracing::debug!("Validating JWT with expected audiences: {:?}", expected_audiences);
+            if !expected_audiences.is_empty() {
+                validation.set_audience(expected_audiences);
+                validation.validate_aud = true;
+            } else {
+                validation.validate_aud = false;
+            }
+        } else {
+            validation.validate_aud = false;
+        }
 
         let token_data = decode::<Claims>(token, &jwk.decoding_key, &validation).map_err(|e| {
-            tracing::error!("Some error {e}");
+            tracing::error!("JWT validation failed: {}", e);
             anyhow!("unauthorized")
         })?;
         let claims = token_data.claims;
+
+        // Extract audience from claims
+        let token_audience: Vec<String> = claims.aud.map(|a| a.to_vec()).unwrap_or_default();
+
+        // Explicit check: If we have expected audiences, verify that the token actually has one.
+        // Some JWT libraries might allow a missing 'aud' claim even when validate_aud=true if no required audiences are set.
+        if let Some(expected) = &self.config.audience {
+            if !expected.is_empty() && token_audience.is_empty() {
+                tracing::error!("JWT validation failed: missing mandatory 'aud' claim");
+                return Err(anyhow!("unauthorized"));
+            }
+        }
+
+        tracing::debug!("JWT claims validated. Subject: {}, Audience: {:?}", claims.sub, token_audience);
 
         Ok(TokenInfo {
             active: true,
             sub: claims.sub,
             exp: claims.exp,
+            aud: token_audience,
             access_token: token.to_string(),
         })
     }
