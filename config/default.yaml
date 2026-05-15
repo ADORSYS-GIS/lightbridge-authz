@@ -24,8 +24,19 @@ oauth2:
   oauth2_url: "http://localhost:9100/realms/dev/protocol/openid-connect/token"
   # Expected audience claim(s) in JWT tokens. If set, tokens must contain at least one of these values.
   # This is critical for security - ensures tokens are intended for this service.
-  # Example: ["lightbridge-api-key", "converse-frontend"]
-  audience: []
+  # When empty or not set, audience validation is disabled.
+  #
+  # Valid audience values:
+  #   - lightbridge-api-key: Primary audience for API Key service
+  #   - lightbridge-token-issuer: Audience for token issuer service
+  #
+  # For production, override in deployment configs or via environment variable:
+  #   OAUTH2__AUDIENCE='["lightbridge-api-key"]'
+  # For multiple audiences:
+  #   OAUTH2__AUDIENCE='["lightbridge-api-key","lightbridge-token-issuer"]'
+  audience:
+    - "lightbridge-api-key"
+    - "lightbridge-token-issuer"
   issuance:
     enabled: true
     grant_type: "urn:ietf:params:oauth:grant-type:token-exchange"
@@ -33,7 +44,9 @@ oauth2:
     client_secret: "${KEYCLOAK_TOKEN_CLIENT_SECRET:-lightbridge-token-issuer-secret}"
     subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
     requested_token_type: "urn:ietf:params:oauth:token-type:access_token"
+
 otel:
   enabled: true
   otlp_endpoint: "http://localhost:4317"
   service_name: "lightbridge-authz"
+

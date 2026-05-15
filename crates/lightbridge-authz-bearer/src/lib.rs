@@ -226,6 +226,27 @@ impl BearerTokenServiceTrait for BearerTokenService {
                 tracing::error!("JWT validation failed: missing mandatory 'aud' claim");
                 return Err(anyhow!("unauthorized"));
             }
+            
+            // Check that at least one of the configured expected audiences is present in the token.
+            // This ensures tokens are explicitly issued for this service.
+            let has_matching_audience = token_audience.iter().any(|token_aud| {
+                expected.iter().any(|expected_aud| token_aud == expected_aud)
+            });
+            
+            if !has_matching_audience {
+                tracing::error!(
+                    "JWT validation failed: no matching audience found. Expected one of {:?}, got {:?}",
+                    expected,
+                    token_audience
+                );
+                return Err(anyhow!("unauthorized"));
+            }
+            
+            tracing::debug!(
+                "JWT audience validation passed. Expected: {:?}, Token: {:?}",
+                expected,
+                token_audience
+            );
         }
 
         tracing::debug!("JWT claims validated. Subject: {}, Audience: {:?}", claims.sub, token_audience);

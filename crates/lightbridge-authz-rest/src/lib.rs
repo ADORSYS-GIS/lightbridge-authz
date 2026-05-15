@@ -1,4 +1,5 @@
-use axum::{Json, Router, http::StatusCode, routing::get};
+use axum::{Json, Router, http::{Method, StatusCode, header}, routing::get};
+use tower_http::cors::{Any, CorsLayer};
 use lightbridge_authz_api::routers::api_router;
 use lightbridge_authz_core::{
     Account, Project, async_trait,
@@ -126,7 +127,21 @@ pub async fn start_api_server(
             bearer_auth,
         ));
 
-    let app = public.merge(protected).with_state(app_state.clone());
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+
+    let app = public
+        .merge(protected)
+        .with_state(app_state.clone())
+        .layer(cors);
 
     serve_tls("API", &api.address, api.port, &api.tls, app).await
 }

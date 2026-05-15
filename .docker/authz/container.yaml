@@ -24,7 +24,13 @@ oauth2:
   oauth2_url: "http://keycloak:9100/realms/dev/protocol/openid-connect/token"
   # Expected audience claim(s) in JWT tokens.
   # Tokens must contain at least one matching audience value.
-  # For local development, we accept tokens from both test-client and converse-frontend.
+  #
+  # Valid audience values:
+  #   - lightbridge-api-key: Primary audience for API Key service
+  #   - lightbridge-token-issuer: Audience for token issuer service
+  #
+  # For production deployments, set via environment:
+  #   OAUTH2__AUDIENCE='["lightbridge-api-key"]'
   audience:
     - "lightbridge-api-key"
     - "lightbridge-token-issuer"
@@ -35,6 +41,8 @@ oauth2:
     client_secret: "${KEYCLOAK_TOKEN_CLIENT_SECRET:-lightbridge-token-issuer-secret}"
     subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
     requested_token_type: "urn:ietf:params:oauth:token-type:access_token"
+    # Target audience for issued tokens - must match one of the valid audiences above
+    # audience: "lightbridge-api-key"
 otel:
   enabled: true
   otlp_endpoint: "http://jaeger:4317"
