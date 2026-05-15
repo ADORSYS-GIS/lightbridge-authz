@@ -29,11 +29,6 @@ oauth2:
   # Valid audience values:
   #   - lightbridge-api-key: Primary audience for API Key service
   #   - lightbridge-token-issuer: Audience for token issuer service
-  #
-  # For production, override in deployment configs or via environment variable:
-  #   OAUTH2__AUDIENCE='["lightbridge-api-key"]'
-  # For multiple audiences:
-  #   OAUTH2__AUDIENCE='["lightbridge-api-key","lightbridge-token-issuer"]'
   audience:
     - "lightbridge-api-key"
     - "lightbridge-token-issuer"

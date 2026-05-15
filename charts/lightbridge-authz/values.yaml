@@ -114,8 +114,14 @@ configMaps:
           #   - lightbridge-api-key: Primary audience for API Key service
           #   - lightbridge-token-issuer: Audience for token issuer service
           #
-          # For production, set via Helm values or environment variable:
-          #   OAUTH2__AUDIENCE='["lightbridge-api-key"]'
+          # For production deployment, override in your Helm values:
+          #   configMaps:
+          #     config:
+          #       data:
+          #         config.yaml: |
+          #           oauth2:
+          #             audience: ["lightbridge-api-key"]
+          #
           # For local development with multiple audiences:
           #   audience: ["lightbridge-api-key", "lightbridge-token-issuer"]
           audience: []
