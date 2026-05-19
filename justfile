@@ -142,8 +142,8 @@ it-tests:
 
 all-checks:
 	@echo "Running Rust formatting, lint, and checks"
-	cargo fmt
+	cargo fmt --all
 	cargo deny check
-	cargo fix --allow-dirty
-	cargo clippy --all-targets --all-features --fix --allow-dirty -- -D warnings
-	cargo check --all-targets --all-features
+	cargo fix --workspace --allow-dirty
+	cargo clippy --workspace --all-targets --all-features --fix --allow-dirty -- -D warnings
+	cargo check --workspace --all-targets --all-features

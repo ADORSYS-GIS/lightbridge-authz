@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
-use tracing;
+
 
 /// Token information returned by JWT validation.
 #[derive(Debug, Clone, Deserialize)]

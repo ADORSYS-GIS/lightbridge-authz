@@ -8,6 +8,6 @@ runs:
     - shell: bash
       run: cargo check --all-targets --all-features
     - shell: bash
-      run: cargo fmt -- --check
+      run: cargo fmt --all -- --check
     - shell: bash
       run: cargo clippy --all-targets --all-features -- -D warnings
