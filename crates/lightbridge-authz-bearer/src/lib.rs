@@ -11,7 +11,6 @@ use std::{
 };
 use tokio::sync::RwLock;
 
-
 /// Token information returned by JWT validation.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TokenInfo {
@@ -155,7 +154,10 @@ impl fmt::Debug for BearerTokenService {
 impl BearerTokenService {
     /// Create a new instance of the BearerTokenService.
     pub fn new(config: Oauth2) -> Self {
-        tracing::info!("Initializing BearerTokenService with audience config: {:?}", config.audience);
+        tracing::info!(
+            "Initializing BearerTokenService with audience config: {:?}",
+            config.audience
+        );
         let cache = JwksCache::new(config.jwks_url.clone());
         BearerTokenService { config, cache }
     }
@@ -199,7 +201,10 @@ impl BearerTokenServiceTrait for BearerTokenService {
         // Validate the token using the JWK decoding key.
         let mut validation = Validation::new(header.alg);
         if let Some(expected_audiences) = &self.config.audience {
-            tracing::debug!("Validating JWT with expected audiences: {:?}", expected_audiences);
+            tracing::debug!(
+                "Validating JWT with expected audiences: {:?}",
+                expected_audiences
+            );
             if !expected_audiences.is_empty() {
                 validation.set_audience(expected_audiences);
                 validation.validate_aud = true;
@@ -226,13 +231,15 @@ impl BearerTokenServiceTrait for BearerTokenService {
                 tracing::error!("JWT validation failed: missing mandatory 'aud' claim");
                 return Err(anyhow!("unauthorized"));
             }
-            
+
             // Check that at least one of the configured expected audiences is present in the token.
             // This ensures tokens are explicitly issued for this service.
             let has_matching_audience = token_audience.iter().any(|token_aud| {
-                expected.iter().any(|expected_aud| token_aud == expected_aud)
+                expected
+                    .iter()
+                    .any(|expected_aud| token_aud == expected_aud)
             });
-            
+
             if !has_matching_audience {
                 tracing::error!(
                     "JWT validation failed: no matching audience found. Expected one of {:?}, got {:?}",
@@ -241,7 +248,7 @@ impl BearerTokenServiceTrait for BearerTokenService {
                 );
                 return Err(anyhow!("unauthorized"));
             }
-            
+
             tracing::debug!(
                 "JWT audience validation passed. Expected: {:?}, Token: {:?}",
                 expected,
@@ -249,7 +256,11 @@ impl BearerTokenServiceTrait for BearerTokenService {
             );
         }
 
-        tracing::debug!("JWT claims validated. Subject: {}, Audience: {:?}", claims.sub, token_audience);
+        tracing::debug!(
+            "JWT claims validated. Subject: {}, Audience: {:?}",
+            claims.sub,
+            token_audience
+        );
 
         Ok(TokenInfo {
             active: true,

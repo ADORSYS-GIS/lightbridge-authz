@@ -1,5 +1,8 @@
-use axum::{Json, Router, http::{Method, StatusCode, header}, routing::get};
-use tower_http::cors::{Any, CorsLayer};
+use axum::{
+    Json, Router,
+    http::{Method, StatusCode, header},
+    routing::get,
+};
 use lightbridge_authz_api::routers::api_router;
 use lightbridge_authz_core::{
     Account, Project, async_trait,
@@ -8,6 +11,7 @@ use lightbridge_authz_core::{
     error::Result,
     server::serve_tls,
 };
+use tower_http::cors::{Any, CorsLayer};
 
 pub mod handlers;
 pub mod middleware;
