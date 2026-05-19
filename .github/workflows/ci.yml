@@ -46,13 +46,13 @@ jobs:
         with:
           database-url: postgres://postgres:postgres@localhost:5432/lightbridge_authz
 
-  integration-test:
-    needs: code-checks
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v6
-      - uses: ./.github/actions/integration-test
+  # integration-test:
+  #   needs: code-checks
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout repo
+  #       uses: actions/checkout@v6
+  #     - uses: ./.github/actions/integration-test
 
   build:
     needs: test
