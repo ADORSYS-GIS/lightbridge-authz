@@ -31,6 +31,7 @@ oauth2:
   #   - lightbridge-token-issuer: Audience for token issuer service
   audience:
     - "lightbridge-api-key"
+    - "lightbridge-token-issuer"
   issuance:
     enabled: true
     grant_type: "urn:ietf:params:oauth:grant-type:token-exchange"
