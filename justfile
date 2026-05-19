@@ -112,6 +112,7 @@ usage-migrate:
 
 # Run Authorino integration test setup
 it-authorino:
+	@just it-authorino-down
 	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml up -d --build
 	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml run --rm it-authorino
 
