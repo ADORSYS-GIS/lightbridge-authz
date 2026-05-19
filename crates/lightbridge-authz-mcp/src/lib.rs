@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use axum::{
     Json as AxumJson, Router,
     body::Body,
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -42,6 +42,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RootResponse {
@@ -1003,17 +1004,22 @@ pub async fn start_mcp_server(
                 move || Ok(handler.clone())
             },
             Default::default(),
-            StreamableHttpServerConfig::default(),
+            StreamableHttpServerConfig::default().disable_allowed_hosts(),
         );
 
     let metadata_state = oauth_proxy_state.clone();
     let openid_state = oauth_proxy_state.clone();
     let register_state = oauth_proxy_state.clone();
+    let rp1 = readiness_pool.clone();
+    let rp2 = readiness_pool.clone();
+
     let public =
         Router::new()
             .route("/", get(root_handler))
             .route("/healthz", get(health_handler))
+            .route("/health", get(health_handler))
             .route("/healthz/startup", get(startup_handler))
+            .route("/health/startup", get(startup_handler))
             .route(
                 "/.well-known/oauth-authorization-server",
                 get(move |headers: HeaderMap| {
@@ -1039,10 +1045,11 @@ pub async fn start_mcp_server(
             )
             .route(
                 "/healthz/ready",
-                get(move || {
-                    let readiness_pool = readiness_pool.clone();
-                    async move { readiness_handler(readiness_pool).await }
-                }),
+                get(move || async move { readiness_handler(rp1).await }),
+            )
+            .route(
+                "/health/ready",
+                get(move || async move { readiness_handler(rp2).await }),
             );
 
     let protected = Router::new()
@@ -1053,7 +1060,21 @@ pub async fn start_mcp_server(
             bearer_auth,
         ));
 
-    let app = public.merge(protected);
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+
+    let app = public
+        .merge(protected)
+        .with_state(app_state.clone())
+        .layer(cors);
 
     serve_tls("MCP", &api.address, api.port, &api.tls, app).await
 }

@@ -107,17 +107,22 @@ pub async fn start_api_server(
         bearer: bearer_service,
     });
 
+    let rp1 = readiness_pool.clone();
+    let rp2 = readiness_pool.clone();
+
     let public = Router::new()
         .route("/", get(root_handler))
         .route("/healthz", get(health_handler))
         .route("/health", get(health_handler))
         .route("/healthz/startup", get(startup_handler))
+        .route("/health/startup", get(startup_handler))
         .route(
             "/healthz/ready",
-            get(move || {
-                let readiness_pool = readiness_pool.clone();
-                async move { readiness_handler(readiness_pool).await }
-            }),
+            get(move || async move { readiness_handler(rp1).await }),
+        )
+        .route(
+            "/health/ready",
+            get(move || async move { readiness_handler(rp2).await }),
         )
         .merge(SwaggerUi::new("/api/v1/docs").url(
             "/api/v1/openapi.json",
@@ -159,17 +164,22 @@ pub async fn start_opa_server(opa: &OpaServer, pool: Arc<dyn DbPoolTrait>) -> Re
         basic_auth: opa.basic_auth.clone(),
     });
 
+    let rp1 = readiness_pool.clone();
+    let rp2 = readiness_pool.clone();
+
     let public = Router::new()
         .route("/", get(root_handler))
         .route("/healthz", get(health_handler))
         .route("/health", get(health_handler))
         .route("/healthz/startup", get(startup_handler))
+        .route("/health/startup", get(startup_handler))
         .route(
             "/healthz/ready",
-            get(move || {
-                let readiness_pool = readiness_pool.clone();
-                async move { readiness_handler(readiness_pool).await }
-            }),
+            get(move || async move { readiness_handler(rp1).await }),
+        )
+        .route(
+            "/health/ready",
+            get(move || async move { readiness_handler(rp2).await }),
         )
         .merge(SwaggerUi::new("/v1/opa/docs").url("/v1/opa/openapi.json", OpaDoc::openapi()));
 

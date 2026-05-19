@@ -122,6 +122,7 @@ it-authorino-down:
 
 # Run integration checks across API/OPA/Usage/MCP services
 it-servers:
+	@just it-servers-down
 	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml up -d --build
 	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml run --rm it-servers
 
