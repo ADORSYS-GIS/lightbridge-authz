@@ -1,8 +1,4 @@
-use axum::{
-    Json, Router,
-    http::{Method, StatusCode, header},
-    routing::get,
-};
+use axum::{Json, Router, http::StatusCode, routing::get};
 use lightbridge_authz_api::routers::api_router;
 use lightbridge_authz_core::{
     Account, Project, async_trait,
@@ -11,8 +7,6 @@ use lightbridge_authz_core::{
     error::Result,
     server::serve_tls,
 };
-use tower_http::cors::{Any, CorsLayer};
-
 pub mod handlers;
 pub mod middleware;
 pub mod models;
@@ -107,22 +101,16 @@ pub async fn start_api_server(
         bearer: bearer_service,
     });
 
-    let rp1 = readiness_pool.clone();
-    let rp2 = readiness_pool.clone();
-
     let public = Router::new()
         .route("/", get(root_handler))
         .route("/healthz", get(health_handler))
-        .route("/health", get(health_handler))
         .route("/healthz/startup", get(startup_handler))
-        .route("/health/startup", get(startup_handler))
         .route(
             "/healthz/ready",
-            get(move || async move { readiness_handler(rp1).await }),
-        )
-        .route(
-            "/health/ready",
-            get(move || async move { readiness_handler(rp2).await }),
+            get(move || {
+                let readiness_pool = readiness_pool.clone();
+                async move { readiness_handler(readiness_pool).await }
+            }),
         )
         .merge(SwaggerUi::new("/api/v1/docs").url(
             "/api/v1/openapi.json",
@@ -137,21 +125,7 @@ pub async fn start_api_server(
             bearer_auth,
         ));
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PATCH,
-            Method::DELETE,
-            Method::OPTIONS,
-        ])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
-
-    let app = public
-        .merge(protected)
-        .with_state(app_state.clone())
-        .layer(cors);
+    let app = public.merge(protected).with_state(app_state.clone());
 
     serve_tls("API", &api.address, api.port, &api.tls, app).await
 }
@@ -164,22 +138,16 @@ pub async fn start_opa_server(opa: &OpaServer, pool: Arc<dyn DbPoolTrait>) -> Re
         basic_auth: opa.basic_auth.clone(),
     });
 
-    let rp1 = readiness_pool.clone();
-    let rp2 = readiness_pool.clone();
-
     let public = Router::new()
         .route("/", get(root_handler))
         .route("/healthz", get(health_handler))
-        .route("/health", get(health_handler))
         .route("/healthz/startup", get(startup_handler))
-        .route("/health/startup", get(startup_handler))
         .route(
             "/healthz/ready",
-            get(move || async move { readiness_handler(rp1).await }),
-        )
-        .route(
-            "/health/ready",
-            get(move || async move { readiness_handler(rp2).await }),
+            get(move || {
+                let readiness_pool = readiness_pool.clone();
+                async move { readiness_handler(readiness_pool).await }
+            }),
         )
         .merge(SwaggerUi::new("/v1/opa/docs").url("/v1/opa/openapi.json", OpaDoc::openapi()));
 

@@ -7,7 +7,7 @@ use tracing::{info, instrument, warn};
 
 #[utoipa::path(
     post,
-    path = "/v1/usage/query",
+    path = "/usage/v1/usage/query",
     request_body = UsageQueryRequest,
     responses(
         (status = 200, body = UsageQueryResponse),

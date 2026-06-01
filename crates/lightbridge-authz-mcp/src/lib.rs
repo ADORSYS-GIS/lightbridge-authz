@@ -1010,16 +1010,11 @@ pub async fn start_mcp_server(
     let metadata_state = oauth_proxy_state.clone();
     let openid_state = oauth_proxy_state.clone();
     let register_state = oauth_proxy_state.clone();
-    let rp1 = readiness_pool.clone();
-    let rp2 = readiness_pool.clone();
-
     let public =
         Router::new()
             .route("/", get(root_handler))
             .route("/healthz", get(health_handler))
-            .route("/health", get(health_handler))
             .route("/healthz/startup", get(startup_handler))
-            .route("/health/startup", get(startup_handler))
             .route(
                 "/.well-known/oauth-authorization-server",
                 get(move |headers: HeaderMap| {
@@ -1045,11 +1040,10 @@ pub async fn start_mcp_server(
             )
             .route(
                 "/healthz/ready",
-                get(move || async move { readiness_handler(rp1).await }),
-            )
-            .route(
-                "/health/ready",
-                get(move || async move { readiness_handler(rp2).await }),
+                get(move || {
+                    let readiness_pool = readiness_pool.clone();
+                    async move { readiness_handler(readiness_pool).await }
+                }),
             );
 
     let protected = Router::new()

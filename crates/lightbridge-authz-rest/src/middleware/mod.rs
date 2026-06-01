@@ -19,12 +19,6 @@ pub async fn bearer_auth(
     mut req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    if req.method() == axum::http::Method::OPTIONS {
-        tracing::debug!("Bypassing bearer_auth for OPTIONS request to {}", req.uri());
-        return next.run(req).await;
-    }
-
-    tracing::debug!("bearer_auth: processing request to {}", req.uri());
     let auth_header = req
         .headers()
         .get(header::AUTHORIZATION)

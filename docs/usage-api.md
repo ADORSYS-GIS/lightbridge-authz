@@ -8,7 +8,7 @@
   - Accepts `application/x-protobuf` or OTLP JSON payloads compatible with `ExportTraceServiceRequest`.
 - `POST /v1/otel/metrics`
   - Accepts `application/x-protobuf` or OTLP JSON payloads compatible with `ExportMetricsServiceRequest`.
-- `POST /v1/usage/query`
+- `POST /usage/v1/usage/query`
   - Single query endpoint for scoped, bucketed usage retrieval.
 
 ## Query request

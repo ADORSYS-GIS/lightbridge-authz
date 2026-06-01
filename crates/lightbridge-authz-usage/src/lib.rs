@@ -55,24 +55,21 @@ pub async fn start_usage_server(usage: &UsageServer, database: &Database) -> Res
     let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool));
     let state = Arc::new(UsageState { repo });
 
-    let rp1 = readiness_pool.clone();
-    let rp2 = readiness_pool.clone();
-
     let app = Router::new()
         .route("/", get(root_handler))
         .route("/healthz", get(health_handler))
-        .route("/health", get(health_handler))
         .route("/healthz/startup", get(startup_handler))
-        .route("/health/startup", get(startup_handler))
         .route(
             "/healthz/ready",
-            get(move || async move { readiness_handler(rp1).await }),
+            get(move || {
+                let readiness_pool = readiness_pool.clone();
+                async move { readiness_handler(readiness_pool).await }
+            }),
         )
-        .route(
-            "/health/ready",
-            get(move || async move { readiness_handler(rp2).await }),
+        .merge(
+            SwaggerUi::new("/usage/v1/usage/docs")
+                .url("/usage/v1/usage/openapi.json", UsageDoc::openapi()),
         )
-        .merge(SwaggerUi::new("/v1/usage/docs").url("/v1/usage/openapi.json", UsageDoc::openapi()))
         .merge(routers::usage_router())
         .with_state(state);
 
@@ -152,7 +149,7 @@ mod tests {
             .expect("openapi paths should be an object");
 
         assert!(
-            paths.contains_key("/v1/usage/query"),
+            paths.contains_key("/usage/v1/usage/query"),
             "expected usage query endpoint in openapi paths"
         );
         assert!(
