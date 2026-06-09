@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use axum::{
     Json as AxumJson, Router,
     body::Body,
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -42,7 +42,6 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RootResponse {
@@ -1004,7 +1003,7 @@ pub async fn start_mcp_server(
                 move || Ok(handler.clone())
             },
             Default::default(),
-            StreamableHttpServerConfig::default().disable_allowed_hosts(),
+            StreamableHttpServerConfig::default(),
         );
 
     let metadata_state = oauth_proxy_state.clone();
@@ -1054,21 +1053,7 @@ pub async fn start_mcp_server(
             bearer_auth,
         ));
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PATCH,
-            Method::DELETE,
-            Method::OPTIONS,
-        ])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
-
-    let app = public
-        .merge(protected)
-        .with_state(app_state.clone())
-        .layer(cors);
+    let app = public.merge(protected);
 
     serve_tls("MCP", &api.address, api.port, &api.tls, app).await
 }
