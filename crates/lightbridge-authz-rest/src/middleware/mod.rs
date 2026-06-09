@@ -47,16 +47,28 @@ pub async fn bearer_auth(
     });
 
     let Some(token) = token else {
+        tracing::debug!("bearer_auth: no token found in Authorization header");
         return unauthorized_response();
     };
 
     // Use the BearerTokenService stored in the shared state
     match state.bearer.validate_bearer_token(&token).await {
         Ok(token_info) if token_info.active => {
+            tracing::debug!(
+                "bearer_auth: token validated successfully for sub: {}",
+                token_info.sub
+            );
             req.extensions_mut().insert(token_info);
             next.run(req).await
         }
-        _ => unauthorized_response(),
+        Ok(_) => {
+            tracing::warn!("bearer_auth: token validated but not active");
+            unauthorized_response()
+        }
+        Err(e) => {
+            tracing::warn!("bearer_auth: token validation failed: {}", e);
+            unauthorized_response()
+        }
     }
 }
 

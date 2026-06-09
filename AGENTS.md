@@ -5,7 +5,7 @@ This repository provides API key management plus usage analytics:
 - `authz-api`: OAuth2/JWT-protected CRUD API for Accounts, Projects, and API keys.
 - `authz-opa`: Basic-auth protected validation API intended to be called by Authorino (or similar external auth components). It validates API keys and returns rich context plus dynamic metadata.
 - `lightbridge-mcp`: OAuth2/JWT-protected MCP server exposing the authz surface as MCP tools over streamable HTTP (`/mcp`).
-- `lightbridge-authz-usage`: unprotected OTLP/HTTP ingest API (`/v1/otel/traces`, `/v1/otel/metrics`) plus a single usage query API (`/v1/usage/query`) backed by Timescale/Postgres.
+- `lightbridge-authz-usage`: unprotected OTLP/HTTP ingest API (`/v1/otel/traces`, `/v1/otel/metrics`) plus a single usage query API (`/usage/v1/usage/query`) backed by Timescale/Postgres.
 
 The authz services (`authz-api`, `authz-opa`):
 
@@ -363,18 +363,18 @@ Start everything:
 
 Check health:
 
-- `curl -k https://localhost:13000/health`
-- `curl -k https://localhost:13001/health`
-- `curl -k https://localhost:13002/health`
-- `curl -k https://localhost:13003/health`
-- `curl -k https://localhost:13003/health/ready`
-- `curl -k https://localhost:13003/health/startup`
+- `curl -k https://localhost:13000/healthz`
+- `curl -k https://localhost:13001/healthz`
+- `curl -k https://localhost:13002/healthz`
+- `curl -k https://localhost:13003/healthz`
+- `curl -k https://localhost:13003/healthz/ready`
+- `curl -k https://localhost:13003/healthz/startup`
 
 OpenAPI docs:
 
 - CRUD API: `https://localhost:13000/api/v1/docs`
 - OPA/Authorino: `https://localhost:13001/v1/opa/docs`
-- Usage API: `https://localhost:13002/v1/usage/docs`
+- Usage API: `https://localhost:13002/usage/v1/usage/docs`
 
 MCP debugging:
 
@@ -421,7 +421,7 @@ These tests include:
 
 - API key validation success/failure cases (missing/revoked/expired).
 - Authorino endpoint dynamic metadata passthrough + enrichment.
-- Health probe behavior (`/health`, `/health/startup`, `/health/ready`) including DB-unavailable readiness failures.
+- Health probe behavior (`/healthz`, `/healthz/startup`, `/healthz/ready`) including DB-unavailable readiness failures.
 - OpenAPI checks ensuring the Authorino endpoint/schemas are published.
 - OTLP trace/metrics ingestion extraction and usage query handler validation.
 
@@ -531,7 +531,7 @@ In Compose, `authz-migrate` runs before API/OPA start.
 ## Helm / deployment notes
 
 - The umbrella chart (`charts/lightbridge`) now documents per-platform install/config/deploy commands in `docs/platform-guides.md`, including:
-  * Two documented TLS certificate flows (built-in `global.tls.job` + cert-manager) and the Ubuntu `curl` smoke test against `https://lightbridge-lightbridge-api.default.svc.cluster.local:3000/health` when cert-manager owns the `lightbridge-authz-tls` secret.
+  * Two documented TLS certificate flows (built-in `global.tls.job` + cert-manager) and the Ubuntu `curl` smoke test against `https://lightbridge-lightbridge-api.default.svc.cluster.local:3000/healthz` when cert-manager owns the `lightbridge-authz-tls` secret.
   * Shared `3000` ports for both API and OPA because we never deploy them together in these guides, and instructions for keeping API ingress enabled while OPA stays internal-only.
   * Manual TLS generation is noted as optional because the chart's hook already creates service-FQDN certs, but the hook can be disabled when cert-manager owns the secret.
 

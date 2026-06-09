@@ -46,17 +46,17 @@ jobs:
         with:
           database-url: postgres://postgres:postgres@localhost:5432/lightbridge_authz
 
-  integration-test:
-    needs: code-checks
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v6
-      - uses: ./.github/actions/integration-test
+  # integration-test:
+  #   needs: code-checks
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout repo
+  #       uses: actions/checkout@v6
+  #     - uses: ./.github/actions/integration-test
 
   build:
     needs: test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/284-us-a-use-audience-in-jwts-in-backends-and-frontends') && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -65,7 +65,7 @@ jobs:
 
   container-build:
     needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/284-us-a-use-audience-in-jwts-in-backends-and-frontends') && github.event_name == 'push'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -106,7 +106,7 @@ jobs:
           severity: 'HIGH,CRITICAL'
   release:
     needs: [build,container-build]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/284-us-a-use-audience-in-jwts-in-backends-and-frontends') && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -7,7 +7,6 @@ use lightbridge_authz_core::{
     error::Result,
     server::serve_tls,
 };
-
 pub mod handlers;
 pub mod middleware;
 pub mod models;

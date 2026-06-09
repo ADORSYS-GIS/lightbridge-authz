@@ -2,7 +2,7 @@ name: Helm Charts Publish
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "284-us-a-use-audience-in-jwts-in-backends-and-frontends"]
     paths:
       - 'charts/**'
       - '.github/workflows/helm-gh-pages.yml'

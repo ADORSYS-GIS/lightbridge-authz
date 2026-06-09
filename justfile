@@ -112,6 +112,7 @@ usage-migrate:
 
 # Run Authorino integration test setup
 it-authorino:
+	@just it-authorino-down
 	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml up -d --build
 	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml run --rm it-authorino
 
@@ -121,6 +122,7 @@ it-authorino-down:
 
 # Run integration checks across API/OPA/Usage/MCP services
 it-servers:
+	@just it-servers-down
 	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml up -d --build
 	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml run --rm it-servers
 
@@ -142,8 +144,8 @@ it-tests:
 
 all-checks:
 	@echo "Running Rust formatting, lint, and checks"
-	cargo fmt
+	cargo fmt --all
 	cargo deny check
-	cargo fix --allow-dirty
-	cargo clippy --all-targets --all-features --fix --allow-dirty -- -D warnings
-	cargo check --all-targets --all-features
+	cargo fix --workspace --allow-dirty
+	cargo clippy --workspace --all-targets --all-features --fix --allow-dirty -- -D warnings
+	cargo check --workspace --all-targets --all-features
