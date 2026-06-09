@@ -8,7 +8,7 @@ This repository follows the [ADORSYS-GIS AI Governance](https://adorsys-gis.gith
 - **Open issues** with the structured forms — [Epic](.github/ISSUE_TEMPLATE/epic.yml),
   [User Story](.github/ISSUE_TEMPLATE/user-story.yml), or
   [Development Ticket](.github/ISSUE_TEMPLATE/dev-ticket.yml). Blank issues are disabled on purpose.
-- **Open pull requests** using the [pull request template](.github/PULL_REQUEST_TEMPLATE.md). Fill in every section.
+- **Open pull requests** using the [pull request template](.github/pull_request_template.md). Fill in every section.
 - Always complete the **AI Usage Declaration**, link a **source of truth**, and attach **verification evidence**.
 
 ## Definition of Ready / Done gates
