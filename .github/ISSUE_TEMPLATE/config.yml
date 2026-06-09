@@ -6,3 +6,6 @@ contact_links:
   - name: Documentation
     url: https://github.com/ADORSYS-GIS/wazuh-cert-oauth2#readme
     about: Check the documentation before opening an issue
+  - name: AI Governance
+    url: https://adorsys-gis.github.io/ai-governance/
+    about: Templates, Definition of Ready/Done, and the AI working agreement
