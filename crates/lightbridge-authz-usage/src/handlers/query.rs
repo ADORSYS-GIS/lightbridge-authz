@@ -51,20 +51,16 @@ pub async fn query_usage(
         return Err(bad_request(message));
     }
 
-    let points = state
-        .repo
-        .query_usage(&input)
-        .await
-        .map_err(|err| {
-            // Preserve the status mapping (e.g. transient pool failures -> 503)
-            // while returning the structured UsageErrorResponse JSON shape.
-            (
-                err.status_code(),
-                Json(UsageErrorResponse {
-                    error: err.to_string(),
-                }),
-            )
-        })?;
+    let points = state.repo.query_usage(&input).await.map_err(|err| {
+        // Preserve the status mapping (e.g. transient pool failures -> 503)
+        // while returning the structured UsageErrorResponse JSON shape.
+        (
+            err.status_code(),
+            Json(UsageErrorResponse {
+                error: err.to_string(),
+            }),
+        )
+    })?;
 
     Ok((StatusCode::OK, Json(UsageQueryResponse { points })))
 }
