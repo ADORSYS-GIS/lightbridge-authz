@@ -546,8 +546,6 @@ In Compose, `authz-migrate` runs before API/OPA start.
 - That migration chart is now built on the `bjw-s/common v4` app-template library, so the job/configmap/secret skeletal resources are rendered by the shared loader instead of bespoke templates, keeping the chart plumbing consistent with the rest of the stack.
 
 <!-- ai-governance:stanza -->
-## AI Governance
-
 <!-- BEGIN: AI Governance stanza (managed by ADORSYS-GIS/ai-governance) -->
 ## AI Governance
 
