@@ -14,7 +14,8 @@ type UsageHandlerResult<T> = std::result::Result<T, (StatusCode, Json<UsageError
     responses(
         (status = 200, body = UsageQueryResponse),
         (status = 400, body = UsageErrorResponse),
-        (status = 500, body = UsageErrorResponse)
+        (status = 500, body = UsageErrorResponse),
+        (status = 503, body = UsageErrorResponse)
     ),
     tag = "usage"
 )]
@@ -54,7 +55,16 @@ pub async fn query_usage(
         .repo
         .query_usage(&input)
         .await
-        .map_err(|err| server_error(err.to_string()))?;
+        .map_err(|err| {
+            // Preserve the status mapping (e.g. transient pool failures -> 503)
+            // while returning the structured UsageErrorResponse JSON shape.
+            (
+                err.status_code(),
+                Json(UsageErrorResponse {
+                    error: err.to_string(),
+                }),
+            )
+        })?;
 
     Ok((StatusCode::OK, Json(UsageQueryResponse { points })))
 }
@@ -62,15 +72,6 @@ pub async fn query_usage(
 fn bad_request(message: impl Into<String>) -> (StatusCode, Json<UsageErrorResponse>) {
     (
         StatusCode::BAD_REQUEST,
-        Json(UsageErrorResponse {
-            error: message.into(),
-        }),
-    )
-}
-
-fn server_error(message: impl Into<String>) -> (StatusCode, Json<UsageErrorResponse>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
         Json(UsageErrorResponse {
             error: message.into(),
         }),

@@ -55,9 +55,14 @@ mod axum_impl {
         }
     }
 
-    impl IntoResponse for Error {
-        fn into_response(self) -> axum::response::Response {
-            let status_code = match &self {
+    impl Error {
+        /// HTTP status code used when this error is returned from an API handler.
+        ///
+        /// Transient SQLx pool failures (`PoolTimedOut`, `PoolClosed`,
+        /// `WorkerCrashed`) map to `503 Service Unavailable` so clients and load
+        /// balancers retain the retryable signal.
+        pub fn status_code(&self) -> StatusCode {
+            match self {
                 Error::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::Yaml(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::NotFound => StatusCode::NOT_FOUND,
@@ -66,11 +71,14 @@ mod axum_impl {
                 Error::AddrParseError(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::Server(_) => StatusCode::INTERNAL_SERVER_ERROR,
-
                 Error::SqlxError(err) => sqlx_status_code(err),
-            };
+            }
+        }
+    }
 
-            (status_code, self.to_string()).into_response()
+    impl IntoResponse for Error {
+        fn into_response(self) -> axum::response::Response {
+            (self.status_code(), self.to_string()).into_response()
         }
     }
 }
