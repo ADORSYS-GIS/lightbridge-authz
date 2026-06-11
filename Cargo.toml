@@ -45,7 +45,7 @@ opentelemetry = { version = "0.31" }
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "tokio"] }
 opentelemetry-proto = "0.31"
 tracing-opentelemetry = "0.32.1"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 prost = "0.14"
 axum = { version = "0.8", features = ["macros", "tracing"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
