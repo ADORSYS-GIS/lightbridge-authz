@@ -1,6 +1,7 @@
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, CreateProject, Project,
-    RotateApiKey, UpdateAccount, UpdateApiKey, UpdateProject,
+    Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, CreateIdentityRequest,
+    CreateProject, IdentityRequest, Project, RotateApiKey, UpdateAccount, UpdateApiKey,
+    UpdateProject,
 };
 use lightbridge_authz_core::{async_trait, error::Error};
 
@@ -74,4 +75,10 @@ pub trait AuthzStore: Send + Sync + 'static + std::fmt::Debug {
         key_id: &str,
         input: RotateApiKey,
     ) -> Result<ApiKeySecret, Error>;
+
+    async fn create_identity_request(
+        &self,
+        subject: &str,
+        input: CreateIdentityRequest,
+    ) -> Result<IdentityRequest, Error>;
 }

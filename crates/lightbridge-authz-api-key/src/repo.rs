@@ -4,8 +4,8 @@ use chrono::{DateTime, Utc};
 use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_core::error::Result;
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeyStatus, CreateAccount, CreateProject, DefaultLimits, Project,
-    UpdateAccount, UpdateApiKey, UpdateProject,
+    Account, ApiKey, ApiKeyStatus, CreateAccount, CreateProject, DefaultLimits, IdentityRequest,
+    Project, ResolvedContext, UpdateAccount, UpdateApiKey, UpdateProject,
 };
 use serde_json::Value;
 use sqlx::{Executor, PgPool, Postgres, Transaction};
@@ -13,6 +13,7 @@ use tracing::instrument;
 
 use crate::entities::account_row::AccountWithMembersRow;
 use crate::entities::api_key_row::{ApiKeyChangeset, ApiKeyRow};
+use crate::entities::identity_request_row::IdentityRequestRow;
 use crate::entities::new_account_row::NewAccountRow;
 use crate::entities::new_api_key_row::NewApiKeyRow;
 use crate::entities::new_project_row::NewProjectRow;
@@ -232,6 +233,17 @@ impl StoreRepo {
             last_used_at: row.last_used_at,
             last_ip: row.last_ip,
             revoked_at: row.revoked_at,
+        }
+    }
+
+    fn to_identity_request(row: IdentityRequestRow) -> IdentityRequest {
+        IdentityRequest {
+            id: row.id,
+            account_id: row.account_id,
+            project_id: row.project_id,
+            subject: row.subject,
+            created_at: row.created_at,
+            expires_at: row.expires_at,
         }
     }
 
@@ -459,6 +471,74 @@ impl StoreRepo {
         .await?;
         let row = row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
         Ok(Self::to_project(row))
+    }
+
+    #[instrument(skip(self))]
+    pub async fn create_identity_request(
+        &self,
+        subject: &str,
+        project_id: &str,
+        client_id: Option<&str>,
+        expires_at: DateTime<Utc>,
+        id: String,
+    ) -> Result<IdentityRequest> {
+        let now = Utc::now();
+        let row: Option<IdentityRequestRow> = sqlx::query_as(
+            r#"
+            WITH authorized AS (
+                SELECT projects.id AS project_id, projects.account_id AS account_id
+                FROM projects
+                JOIN account_memberships ON account_memberships.account_id = projects.account_id
+                WHERE projects.id = $1
+                  AND account_memberships.subject = $2
+            )
+            INSERT INTO identity_requests (
+              id, account_id, project_id, subject, client_id, created_at, expires_at, consumed_at
+            )
+            SELECT $3, authorized.account_id, authorized.project_id, $2, $4, $5, $6, NULL
+            FROM authorized
+            RETURNING id, account_id, project_id, subject, client_id, created_at, expires_at, consumed_at
+            "#,
+        )
+        .bind(project_id)
+        .bind(subject)
+        .bind(id)
+        .bind(client_id)
+        .bind(now)
+        .bind(expires_at)
+        .fetch_optional(self.pool())
+        .await?;
+        let row = row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
+        Ok(Self::to_identity_request(row))
+    }
+
+    #[instrument(skip(self))]
+    pub async fn consume_identity_request(
+        &self,
+        request_id: &str,
+        subject: &str,
+    ) -> Result<ResolvedContext> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            r#"
+            UPDATE identity_requests
+            SET consumed_at = now()
+            WHERE id = $1
+              AND subject = $2
+              AND consumed_at IS NULL
+              AND expires_at > now()
+            RETURNING account_id, project_id
+            "#,
+        )
+        .bind(request_id)
+        .bind(subject)
+        .fetch_optional(self.pool())
+        .await?;
+        let (account_id, project_id) =
+            row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
+        Ok(ResolvedContext {
+            account_id,
+            project_id,
+        })
     }
 
     #[instrument(skip(self))]

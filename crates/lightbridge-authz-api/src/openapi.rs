@@ -20,7 +20,8 @@ use utoipa::{Modify, OpenApi};
         crate::controllers::api_keys::update_api_key,
         crate::controllers::api_keys::delete_api_key,
         crate::controllers::api_keys::revoke_api_key,
-        crate::controllers::api_keys::rotate_api_key
+        crate::controllers::api_keys::rotate_api_key,
+        crate::controllers::idp::create_identity_request
     ),
     components(
         schemas(
@@ -35,13 +36,16 @@ use utoipa::{Modify, OpenApi};
             lightbridge_authz_core::CreateApiKey,
             lightbridge_authz_core::UpdateApiKey,
             lightbridge_authz_core::RotateApiKey,
-            lightbridge_authz_core::ApiKeySecret
+            lightbridge_authz_core::ApiKeySecret,
+            lightbridge_authz_core::CreateIdentityRequest,
+            lightbridge_authz_core::IdentityRequest
         )
     ),
     tags(
         (name = "accounts", description = "Account management"),
         (name = "projects", description = "Project management"),
-        (name = "api_keys", description = "API key management")
+        (name = "api_keys", description = "API key management"),
+        (name = "idp", description = "Identity request minting")
     ),
     modifiers(&ApiSecurity),
     security(

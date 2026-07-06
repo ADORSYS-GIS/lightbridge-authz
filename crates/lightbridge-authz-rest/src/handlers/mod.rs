@@ -1,4 +1,5 @@
 pub mod authorino;
+pub mod idp;
 pub mod opa;
 
 use std::sync::Arc;
@@ -12,8 +13,9 @@ use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::config::{Oauth2, Oauth2Issuance};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey, CreateProject,
-    Project, RotateApiKey, UpdateAccount, UpdateApiKey, UpdateProject, hash_api_key,
+    Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey,
+    CreateIdentityRequest, CreateProject, IdentityRequest, Project, RotateApiKey, UpdateAccount,
+    UpdateApiKey, UpdateProject, hash_api_key,
 };
 use lightbridge_authz_core::{
     db::DbPoolTrait,
@@ -417,6 +419,22 @@ impl AuthzStore for AuthzStoreImpl {
             secret: issued.secret,
             oauth2_url: issued.oauth2_url,
         })
+    }
+
+    async fn create_identity_request(
+        &self,
+        subject: &str,
+        input: CreateIdentityRequest,
+    ) -> Result<IdentityRequest> {
+        let ttl = input
+            .ttl_seconds
+            .unwrap_or(lightbridge_authz_core::IDENTITY_REQUEST_DEFAULT_TTL_SECS)
+            .clamp(1, lightbridge_authz_core::IDENTITY_REQUEST_MAX_TTL_SECS);
+        let expires_at = Utc::now() + Duration::seconds(ttl as i64);
+        let id = format!("req_{}", cuid2());
+        self.repo
+            .create_identity_request(subject, &input.project_id, None, expires_at, id)
+            .await
     }
 }
 
