@@ -473,12 +473,11 @@ impl StoreRepo {
         Ok(Self::to_project(row))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, subject, id))]
     pub async fn create_identity_request(
         &self,
         subject: &str,
         project_id: &str,
-        client_id: Option<&str>,
         expires_at: DateTime<Utc>,
         id: String,
     ) -> Result<IdentityRequest> {
@@ -493,17 +492,16 @@ impl StoreRepo {
                   AND account_memberships.subject = $2
             )
             INSERT INTO identity_requests (
-              id, account_id, project_id, subject, client_id, created_at, expires_at, consumed_at
+              id, account_id, project_id, subject, created_at, expires_at, consumed_at
             )
-            SELECT $3, authorized.account_id, authorized.project_id, $2, $4, $5, $6, NULL
+            SELECT $3, authorized.account_id, authorized.project_id, $2, $4, $5, NULL
             FROM authorized
-            RETURNING id, account_id, project_id, subject, client_id, created_at, expires_at, consumed_at
+            RETURNING id, account_id, project_id, subject, created_at, expires_at, consumed_at
             "#,
         )
         .bind(project_id)
         .bind(subject)
         .bind(id)
-        .bind(client_id)
         .bind(now)
         .bind(expires_at)
         .fetch_optional(self.pool())
@@ -512,7 +510,7 @@ impl StoreRepo {
         Ok(Self::to_identity_request(row))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, request_id, subject))]
     pub async fn consume_identity_request(
         &self,
         request_id: &str,

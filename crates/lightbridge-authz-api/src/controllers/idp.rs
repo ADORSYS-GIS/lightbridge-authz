@@ -11,7 +11,7 @@ use lightbridge_authz_core::error::Error;
 use lightbridge_authz_core::{CreateIdentityRequest, IdentityRequest};
 use tracing::instrument;
 
-#[instrument(skip(state))]
+#[instrument(skip(state, token_info))]
 #[utoipa::path(
     post,
     path = "/api/v1/idp/requests",

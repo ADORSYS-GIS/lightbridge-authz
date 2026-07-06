@@ -49,13 +49,7 @@ async fn mint_then_consume_returns_context_once(pool: PgPool) {
 
     let expires_at = Utc::now() + Duration::minutes(5);
     let request = repo
-        .create_identity_request(
-            subject,
-            &project_id,
-            None,
-            expires_at,
-            format!("req_{}", cuid2()),
-        )
+        .create_identity_request(subject, &project_id, expires_at, format!("req_{}", cuid2()))
         .await
         .expect("mint should succeed for a member");
     assert_eq!(request.account_id, account_id);
@@ -77,6 +71,43 @@ async fn mint_then_consume_returns_context_once(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_consume_allows_exactly_one(pool: PgPool) {
+    let repo = Arc::new(build_repo(pool));
+    let subject = "user-1";
+    let (_account_id, project_id) = seed_project(&repo, subject).await;
+
+    let expires_at = Utc::now() + Duration::minutes(5);
+    let request = repo
+        .create_identity_request(subject, &project_id, expires_at, format!("req_{}", cuid2()))
+        .await
+        .unwrap();
+
+    let first = {
+        let repo = repo.clone();
+        let id = request.id.clone();
+        tokio::spawn(async move { repo.consume_identity_request(&id, subject).await })
+    };
+    let second = {
+        let repo = repo.clone();
+        let id = request.id.clone();
+        tokio::spawn(async move { repo.consume_identity_request(&id, subject).await })
+    };
+    let (a, b) = tokio::join!(first, second);
+    let results = [a.expect("task a"), b.expect("task b")];
+
+    let ok = results.iter().filter(|r| r.is_ok()).count();
+    let not_found = results
+        .iter()
+        .filter(|r| matches!(r, Err(Error::NotFound)))
+        .count();
+    assert_eq!(ok, 1, "exactly one concurrent consume must win");
+    assert_eq!(
+        not_found, 1,
+        "the other concurrent consume must get NotFound"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn consume_rejects_wrong_subject_without_consuming(pool: PgPool) {
     let repo = build_repo(pool);
     let subject = "user-1";
@@ -84,13 +115,7 @@ async fn consume_rejects_wrong_subject_without_consuming(pool: PgPool) {
 
     let expires_at = Utc::now() + Duration::minutes(5);
     let request = repo
-        .create_identity_request(
-            subject,
-            &project_id,
-            None,
-            expires_at,
-            format!("req_{}", cuid2()),
-        )
+        .create_identity_request(subject, &project_id, expires_at, format!("req_{}", cuid2()))
         .await
         .unwrap();
 
@@ -115,13 +140,7 @@ async fn consume_rejects_expired_request(pool: PgPool) {
 
     let expires_at = Utc::now() - Duration::seconds(1);
     let request = repo
-        .create_identity_request(
-            subject,
-            &project_id,
-            None,
-            expires_at,
-            format!("req_{}", cuid2()),
-        )
+        .create_identity_request(subject, &project_id, expires_at, format!("req_{}", cuid2()))
         .await
         .unwrap();
 
@@ -142,7 +161,6 @@ async fn mint_rejects_non_member(pool: PgPool) {
         .create_identity_request(
             "outsider",
             &project_id,
-            None,
             expires_at,
             format!("req_{}", cuid2()),
         )

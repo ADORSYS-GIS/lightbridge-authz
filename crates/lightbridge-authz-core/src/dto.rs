@@ -168,15 +168,18 @@ pub struct IdentityRequest {
 }
 
 /// Request body sent by the IdP adapter to resolve (and consume) a `request_id`.
+///
+/// `request_id` and `subject` are required for a successful resolution but are modelled as optional
+/// so a malformed/partial body resolves to a uniform `404` (an authz miss) rather than a `422`.
+/// Any extra fields the adapter sends (e.g. `client_id`, `realm`) are accepted and ignored — the
+/// request is bound to the subject only.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResolveContextRequest {
-    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     /// Subject the request was bound to at mint time; enforced on resolution.
-    pub subject: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub realm: Option<String>,
+    pub subject: Option<String>,
 }
 
 /// Business context resolved from a `request_id`.

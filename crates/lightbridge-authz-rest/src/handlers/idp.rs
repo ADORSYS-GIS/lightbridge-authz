@@ -24,9 +24,11 @@ pub async fn resolve_context(
     State(state): State<Arc<OpaState>>,
     Json(input): Json<ResolveContextRequest>,
 ) -> Result<axum::response::Response> {
+    let request_id = input.request_id.unwrap_or_default();
+    let subject = input.subject.unwrap_or_default();
     let context: ResolvedContext = state
         .repo
-        .consume_identity_request(&input.request_id, &input.subject)
+        .consume_identity_request(&request_id, &subject)
         .await?;
     Ok((StatusCode::OK, Json(context)).into_response())
 }

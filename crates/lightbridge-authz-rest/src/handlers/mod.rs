@@ -428,12 +428,13 @@ impl AuthzStore for AuthzStoreImpl {
     ) -> Result<IdentityRequest> {
         let ttl = input
             .ttl_seconds
+            .filter(|&secs| secs > 0)
             .unwrap_or(lightbridge_authz_core::IDENTITY_REQUEST_DEFAULT_TTL_SECS)
-            .clamp(1, lightbridge_authz_core::IDENTITY_REQUEST_MAX_TTL_SECS);
+            .min(lightbridge_authz_core::IDENTITY_REQUEST_MAX_TTL_SECS);
         let expires_at = Utc::now() + Duration::seconds(ttl as i64);
         let id = format!("req_{}", cuid2());
         self.repo
-            .create_identity_request(subject, &input.project_id, None, expires_at, id)
+            .create_identity_request(subject, &input.project_id, expires_at, id)
             .await
     }
 }
