@@ -1,5 +1,10 @@
 enabled: true
 
+# Extra Host authorities accepted by the MCP server's `/mcp` DNS-rebinding protection, on top of
+# the release's in-cluster Service name (which is added automatically). Set your ingress host(s)
+# here for external access, e.g. `--set mcpAllowedHosts={mcp.example.com}`.
+mcpAllowedHosts: []
+
 global:
   authz_mcp:
     image:
@@ -98,6 +103,22 @@ configMaps:
             tls:
               cert_path: /etc/lightbridge/tls/api.crt
               key_path: /etc/lightbridge/tls/api.key
+            # Host authorities MCP clients may present in the inbound Host header when reaching
+            # `/mcp` (rmcp streamable-HTTP DNS-rebinding protection). Consumed only by the MCP
+            # server. Defaults to this release's in-cluster Service name (short + FQDN, with and
+            # without :3000) so pod-to-pod access works out of the box; `/healthz` probes are
+            # never gated by this. Add ingress host(s) for external access via `mcpAllowedHosts`
+            # below (e.g. `--set mcpAllowedHosts={mcp.example.com}`).
+            allowed_hosts:
+              - localhost
+              - 127.0.0.1
+              - '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}'
+              - '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}:3000'
+              - '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}.{{ $.Release.Namespace }}.svc.cluster.local'
+              - '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}.{{ $.Release.Namespace }}.svc.cluster.local:3000'
+              {{- range ($.Values.mcpAllowedHosts | default list) }}
+              - {{ . | quote }}
+              {{- end }}
           opa:
             address: 0.0.0.0
             port: 3000
