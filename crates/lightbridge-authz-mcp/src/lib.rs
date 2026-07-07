@@ -996,6 +996,12 @@ pub async fn start_mcp_server(
         fallback_registration_endpoint: fallback_registration_endpoint(api),
     });
 
+    let http_config = match &api.allowed_hosts {
+        Some(hosts) if !hosts.is_empty() => {
+            StreamableHttpServerConfig::default().with_allowed_hosts(hosts.clone())
+        }
+        _ => StreamableHttpServerConfig::default(),
+    };
     let mcp_service: StreamableHttpService<LightbridgeMcpHandler, LocalSessionManager> =
         StreamableHttpService::new(
             {
@@ -1003,7 +1009,7 @@ pub async fn start_mcp_server(
                 move || Ok(handler.clone())
             },
             Default::default(),
-            StreamableHttpServerConfig::default(),
+            http_config,
         );
 
     let metadata_state = oauth_proxy_state.clone();

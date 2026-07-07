@@ -5,6 +5,10 @@ server:
     tls:
       cert_path: "./config/tls/api.crt"
       key_path: "./config/tls/api.key"
+    # Consumed only by the MCP server: hostnames/authorities accepted in the inbound Host header
+    # (DNS-rebinding protection). Defaults to localhost/127.0.0.1/::1 when unset — override in any
+    # deployment where the MCP server is reached by a service name or ingress host.
+    # allowed_hosts: ["localhost", "127.0.0.1"]
   opa:
     address: "0.0.0.0"
     port: 3001

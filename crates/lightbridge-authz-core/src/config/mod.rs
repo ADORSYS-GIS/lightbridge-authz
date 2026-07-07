@@ -39,6 +39,11 @@ pub struct ApiServer {
     pub address: String,
     pub port: u16,
     pub tls: Tls,
+    /// Hostnames or `host:port` authorities accepted in the inbound `Host` header by the MCP
+    /// streamable-HTTP transport (DNS-rebinding protection). Only consumed by the MCP server; when
+    /// unset it keeps the secure default (`localhost`/`127.0.0.1`/`::1`).
+    #[serde(default)]
+    pub allowed_hosts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
