@@ -2178,7 +2178,7 @@ dependencies = [
  "lightbridge-authz-core",
  "opentelemetry 0.31.0",
  "opentelemetry-otlp",
- "opentelemetry-proto",
+ "opentelemetry-proto 0.32.0",
  "opentelemetry_sdk 0.32.1",
  "prost",
  "regex",
@@ -2607,7 +2607,7 @@ dependencies = [
  "http",
  "opentelemetry 0.31.0",
  "opentelemetry-http",
- "opentelemetry-proto",
+ "opentelemetry-proto 0.31.0",
  "opentelemetry_sdk 0.31.0",
  "prost",
  "reqwest 0.12.28",
@@ -2623,13 +2623,25 @@ version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7175df06de5eaee9909d4805a3d07e28bb752c34cab57fa9cff549da596b30f"
 dependencies = [
- "base64",
- "const-hex",
  "opentelemetry 0.31.0",
  "opentelemetry_sdk 0.31.0",
  "prost",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
+name = "opentelemetry-proto"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
+dependencies = [
+ "base64",
+ "const-hex",
+ "opentelemetry 0.32.0",
+ "opentelemetry_sdk 0.32.1",
+ "prost",
  "serde",
- "serde_json",
  "tonic",
  "tonic-prost",
 ]
