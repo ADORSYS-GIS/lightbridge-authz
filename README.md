@@ -84,13 +84,12 @@ Default container config is mounted from `.docker/authz/container.yaml`:
 - Projects: `POST/GET /accounts/{account_id}/projects`, `GET/PATCH/DELETE /projects/{project_id}`
 - API keys: `POST/GET /projects/{project_id}/api-keys`, `GET/PATCH/DELETE /api-keys/{key_id}`
 - Lifecycle: `POST /api-keys/{key_id}/revoke`, `POST /api-keys/{key_id}/rotate`
-- Identity requests: `POST /idp/requests` — mint a single-use `request_id` bound to the caller's subject and scoped to a project the caller's account owns (body `{project_id, ttl_seconds?}`)
 - OpenAPI docs: `https://localhost:13000/api/v1/docs`
 
-**Internal Authz/Authorino validation API (Basic Auth, except where noted)**
+**Internal Authz/Authorino validation API (Basic Auth)**
 - `POST /v1/opa/validate`
 - `POST /v1/authorino/validate` (supports dynamic metadata passthrough/enrichment)
-- `POST /idp/v1/resolve-context` — **no auth**; resolves and consumes a single-use `request_id` (body `{request_id, subject, client_id?, realm?}`) → `{account_id, project_id}`. Enforces subject binding, TTL, and single use; any failure is a uniform `404`. Called by the Keycloak IdP adapter; network-isolate it in production.
+- `POST /idp/v1/resolve-context` — resolves the tenant context for a subject scoped to a project (body `{subject, project_id}`) → `{account_id, project_id}`. Membership-enforced; any miss is a uniform `404`. Called by the Keycloak IdP adapter during token exchange; Basic-auth protected (the adapter presents the OPA credentials).
 - OpenAPI docs: `https://localhost:13001/v1/opa/docs`
 
 This backend is intended to be called by Authorino, not by end users or client

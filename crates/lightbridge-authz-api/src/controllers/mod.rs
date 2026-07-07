@@ -1,6 +1,5 @@
 pub mod accounts;
 pub mod api_keys;
-pub mod idp;
 pub mod projects;
 
 use serde::Deserialize;

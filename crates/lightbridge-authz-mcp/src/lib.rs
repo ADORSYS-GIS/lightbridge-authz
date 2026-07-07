@@ -1117,14 +1117,6 @@ mod tests {
             Err(Error::NotFound)
         }
 
-        async fn create_identity_request(
-            &self,
-            _subject: &str,
-            _input: lightbridge_authz_core::CreateIdentityRequest,
-        ) -> std::result::Result<lightbridge_authz_core::IdentityRequest, Error> {
-            Err(Error::NotFound)
-        }
-
         async fn list_accounts(
             &self,
             _subject: &str,
@@ -1298,10 +1290,10 @@ mod tests {
             Ok(None)
         }
 
-        async fn consume_identity_request(
+        async fn resolve_context(
             &self,
-            _request_id: &str,
             _subject: &str,
+            _project_id: &str,
         ) -> Result<lightbridge_authz_core::ResolvedContext> {
             Err(lightbridge_authz_core::error::Error::NotFound)
         }

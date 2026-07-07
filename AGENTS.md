@@ -276,12 +276,11 @@ On the OPA server:
 
 These are implemented in `crates/lightbridge-authz-rest/src/handlers/authorino.rs`.
 
-### Identity Request Service (`request_id` → context)
+### Identity context resolution (`subject` + `project` → context)
 
-Backs the `lightbridge-keycloak-spi` IdP adapter, which seals `account_id`/`project_id` into JWTs via an opaque, single-use `request_id`. Two endpoints, one store (`identity_requests` table):
+Backs the `lightbridge-keycloak-spi` IdP adapter, which seals `account_id`/`project_id` into JWTs at token-exchange time. The adapter reads the authenticated `subject` and a `project_id` form param on the exchange, resolves the context, and a dumb protocol mapper copies it into claims. Stateless — no store.
 
-- Mint — `POST /api/v1/idp/requests` on the CRUD API (**bearer**). Binds the request to the caller's subject and derives the account from the given `project_id`; the caller must be a member of that account (same `account_memberships` CTE as `create_project`). Controller: `crates/lightbridge-authz-api/src/controllers/idp.rs`.
-- Resolve — `POST /idp/v1/resolve-context` on the OPA/validation server as a **public (no-auth)** route (the single-use, subject-bound `request_id` is the credential; network-isolate it to Keycloak in prod). A single atomic `UPDATE … WHERE id AND subject AND consumed_at IS NULL AND expires_at > now() RETURNING` does single-use + TTL + subject enforcement; any miss is a uniform `404`. Handler: `crates/lightbridge-authz-rest/src/handlers/idp.rs`; repo methods `create_identity_request`/`consume_identity_request` in `crates/lightbridge-authz-api-key/src/repo.rs`.
+- Resolve — `POST /idp/v1/resolve-context` on the OPA/validation server, **Basic-auth protected** (the adapter presents the OPA credentials; the endpoint returns tenant context so it must not be publicly reachable). Body `{subject, project_id}` → `{account_id, project_id}`. Authorized by the `account_memberships` CTE (a `SELECT … JOIN account_memberships WHERE projects.id = $1 AND subject = $2`); a non-member or unknown project is a uniform `404`. Handler: `crates/lightbridge-authz-rest/src/handlers/idp.rs`; repo method `resolve_context` in `crates/lightbridge-authz-api-key/src/repo.rs`.
 
 ## Rust Workspace and Crates
 
