@@ -79,6 +79,18 @@ configMaps:
           pool_size: 10
         oauth2:
           jwks_url: http://keycloak:9100/realms/dev/protocol/openid-connect/certs
+          # Expected audience claim(s) in JWT tokens. Set to restrict token acceptance.
+          # Tokens must contain at least one matching audience value.
+          #
+          # Valid audience values:
+          #   - lightbridge-api-key: Primary audience for API Key service
+          #   - lightbridge-token-issuer: Audience for token issuer service
+          #
+          # For production, set via Helm values or environment variable:
+          #   OAUTH2__AUDIENCE='["lightbridge-api-key"]'
+          # For local development with multiple audiences:
+          #   audience: ["lightbridge-api-key", "lightbridge-token-issuer"]
+          audience: []
         server:
           api:
             address: 0.0.0.0

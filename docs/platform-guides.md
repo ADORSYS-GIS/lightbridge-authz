@@ -179,6 +179,6 @@ Once the cert-manager resource emits a TLS secret, the chart mounts it and pods 
 2. Run `helm upgrade lightbridge charts/lightbridge --reuse-values --set global.tls.job.enabled=false --wait` so the release relies on the cert-manager secret instead of the built-in job.
 3. Launch an Ubuntu pod, install `curl`, and call the API health endpoint over the service FQDN:
    ```bash
-   kubectl run curl-ubuntu --image=ubuntu:22.04 --restart=Never -- bash -lc 'apt-get update >/tmp/apt.log && apt-get install -y curl >/tmp/curl.log && curl -k -s -o /tmp/health.out -w "HTTP %{http_code}\n" https://lightbridge-lightbridge-api.default.svc.cluster.local:3000/health && cat /tmp/health.out'
+   kubectl run curl-ubuntu --image=ubuntu:22.04 --restart=Never -- bash -lc 'apt-get update >/tmp/apt.log && apt-get install -y curl >/tmp/curl.log && curl -k -s -o /tmp/health.out -w "HTTP %{http_code}\n" https://lightbridge-lightbridge-api.default.svc.cluster.local:3000/healthz && cat /tmp/health.out'
    ```
    The pod prints `HTTP 200`, proving the cluster-internal TLS cert is trusted by clients that skip verification (`-k`) and the API endpoint is reachable. Delete the test pod after reading the logs.

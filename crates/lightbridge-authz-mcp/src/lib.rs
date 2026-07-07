@@ -1364,6 +1364,7 @@ mod tests {
             token_endpoint: None,
             registration_endpoint: None,
             issuance: None,
+            audience: None,
         }
     }
 

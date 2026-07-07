@@ -108,10 +108,11 @@ def main() -> int:
         token = fetch_token()
         authz_headers = {"Authorization": f"Bearer {token}"}
 
+        billing_identity = f"acme-it-{int(time.time())}"
         status, account = request_json(
             "POST",
             f"{API_URL}/api/v1/accounts",
-            {"billing_identity": "acme-it", "owners_admins": [USERNAME]},
+            {"billing_identity": billing_identity, "owners_admins": [USERNAME]},
             headers=authz_headers,
             insecure_tls=True,
         )
