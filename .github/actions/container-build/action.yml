@@ -35,6 +35,7 @@ runs:
         github-token: ${{ inputs.github-token }}
 
     - name: Build and push image
+      id: build
       uses: docker/build-push-action@v6.19.2
       with:
         context: .
@@ -48,7 +49,20 @@ runs:
         provenance: true
         sbom: true
 
+    - name: Install cosign
+      uses: sigstore/cosign-installer@v3.7.0
+
+    - name: Sign image (keyless, GitHub OIDC)
+      shell: bash
+      env:
+        IMAGE_REF: ${{ steps.docker-setup.outputs.image-ref }}
+        DIGEST: ${{ steps.build.outputs.digest }}
+      run: cosign sign --yes "${IMAGE_REF}@${DIGEST}"
+
 outputs:
   version-tag:
     description: Fully qualified image tag for this application version
     value: ${{ steps.docker-setup.outputs.version-tag }}
+  digest:
+    description: Digest of the pushed image
+    value: ${{ steps.build.outputs.digest }}

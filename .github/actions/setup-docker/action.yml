@@ -33,6 +33,9 @@ outputs:
   version-tag:
     description: Fully qualified image tag for this application version
     value: ${{ inputs.registry }}/${{ steps.lowercase.outputs.lowercase }}:${{ inputs.app-version }}${{ inputs.tag-suffix }}
+  image-ref:
+    description: Fully qualified image reference without a tag (for signing by digest)
+    value: ${{ inputs.registry }}/${{ steps.lowercase.outputs.lowercase }}
 
 runs:
   using: composite
