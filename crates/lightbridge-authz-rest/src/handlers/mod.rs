@@ -491,16 +491,16 @@ mod tests {
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/token")
-                .body_contains(
+                .body_includes(
                     "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange",
                 )
-                .body_contains("client_id=test-client")
-                .body_contains("client_secret=test-client-secret")
-                .body_contains("subject_token=incoming-access-token")
-                .body_contains(
+                .body_includes("client_id=test-client")
+                .body_includes("client_secret=test-client-secret")
+                .body_includes("subject_token=incoming-access-token")
+                .body_includes(
                     "subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
                 )
-                .body_contains(
+                .body_includes(
                     "requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
                 );
             then.status(200).json_body(json!({
@@ -539,6 +539,6 @@ mod tests {
         assert_eq!(issued.secret, "issued-access-token");
         assert_eq!(issued.oauth2_url, Some(oauth2_url));
         assert!(issued.expires_at.is_some());
-        assert_eq!(mock.hits(), 1);
+        assert_eq!(mock.calls(), 1);
     }
 }

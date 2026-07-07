@@ -41,10 +41,10 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "serde", "serde_json"] }
-opentelemetry = { version = "0.31" }
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "tokio"] }
+opentelemetry = { version = "0.32" }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "tokio"] }
 opentelemetry-proto = "0.32"
-tracing-opentelemetry = "0.32.1"
+tracing-opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 prost = "0.14"
 axum = { version = "0.8", features = ["macros", "tracing"] }

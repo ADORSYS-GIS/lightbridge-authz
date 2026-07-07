@@ -710,6 +710,7 @@ fn any_value_to_json(any: &AnyValue) -> Value {
             Value::Object(object)
         }
         Some(any_value::Value::BytesValue(v)) => Value::String(hex::encode(v)),
+        Some(any_value::Value::StringValueStrindex(_)) => Value::Null,
         None => Value::Null,
     }
 }
@@ -834,6 +835,7 @@ mod tests {
                         value: Some(AnyValue {
                             value: Some(AnyValueValue::StringValue("acct_1".to_string())),
                         }),
+                        key_strindex: 0,
                     }],
                     dropped_attributes_count: 0,
                     entity_refs: vec![],
@@ -860,6 +862,7 @@ mod tests {
                                                 "proj_1".to_string(),
                                             )),
                                         }),
+                                        key_strindex: 0,
                                     },
                                     KeyValue {
                                         key: "api_key_id".to_string(),
@@ -868,6 +871,7 @@ mod tests {
                                                 "key_1".to_string(),
                                             )),
                                         }),
+                                        key_strindex: 0,
                                     },
                                     KeyValue {
                                         key: "lc_user_id".to_string(),
@@ -876,6 +880,7 @@ mod tests {
                                                 "user_1".to_string(),
                                             )),
                                         }),
+                                        key_strindex: 0,
                                     },
                                     KeyValue {
                                         key: "lc_user_name".to_string(),
@@ -884,6 +889,7 @@ mod tests {
                                                 "Ada Lovelace".to_string(),
                                             )),
                                         }),
+                                        key_strindex: 0,
                                     },
                                     KeyValue {
                                         key: "model".to_string(),
@@ -892,6 +898,7 @@ mod tests {
                                                 "gpt-4.1".to_string(),
                                             )),
                                         }),
+                                        key_strindex: 0,
                                     },
                                 ],
                                 start_time_unix_nano: 0,
@@ -947,12 +954,14 @@ mod tests {
                             value: Some(AnyValue {
                                 value: Some(AnyValueValue::StringValue("acct_1".to_string())),
                             }),
+                            key_strindex: 0,
                         },
                         KeyValue {
                             key: "project_id".to_string(),
                             value: Some(AnyValue {
                                 value: Some(AnyValueValue::StringValue("proj_1".to_string())),
                             }),
+                            key_strindex: 0,
                         },
                     ],
                     dropped_attributes_count: 0,
@@ -978,12 +987,14 @@ mod tests {
                                 value: Some(AnyValue {
                                     value: Some(AnyValueValue::StringValue("key_1".to_string())),
                                 }),
+                                key_strindex: 0,
                             },
                             KeyValue {
                                 key: "lc_user_id".to_string(),
                                 value: Some(AnyValue {
                                     value: Some(AnyValueValue::StringValue("user_1".to_string())),
                                 }),
+                                key_strindex: 0,
                             },
                             KeyValue {
                                 key: "lc_user_name".to_string(),
@@ -992,24 +1003,28 @@ mod tests {
                                         "Ada Lovelace".to_string(),
                                     )),
                                 }),
+                                key_strindex: 0,
                             },
                             KeyValue {
                                 key: "model".to_string(),
                                 value: Some(AnyValue {
                                     value: Some(AnyValueValue::StringValue("gpt-4.1".to_string())),
                                 }),
+                                key_strindex: 0,
                             },
                             KeyValue {
                                 key: "gen_ai.usage.prompt_tokens".to_string(),
                                 value: Some(AnyValue {
                                     value: Some(AnyValueValue::IntValue(15)),
                                 }),
+                                key_strindex: 0,
                             },
                             KeyValue {
                                 key: "gen_ai.usage.completion_tokens".to_string(),
                                 value: Some(AnyValue {
                                     value: Some(AnyValueValue::IntValue(10)),
                                 }),
+                                key_strindex: 0,
                             },
                         ],
                         dropped_attributes_count: 0,
@@ -1061,6 +1076,7 @@ mod tests {
                         value: Some(AnyValue {
                             value: Some(AnyValueValue::StringValue("acct_1".to_string())),
                         }),
+                        key_strindex: 0,
                     }],
                     dropped_attributes_count: 0,
                     entity_refs: vec![],
@@ -1085,12 +1101,14 @@ mod tests {
                                 value: Some(AnyValue {
                                     value: Some(AnyValueValue::StringValue("user_1".to_string())),
                                 }),
+                                key_strindex: 0,
                             },
                             KeyValue {
                                 key: "model".to_string(),
                                 value: Some(AnyValue {
                                     value: Some(AnyValueValue::StringValue("gpt-4.1".to_string())),
                                 }),
+                                key_strindex: 0,
                             },
                             // The key written by Envoy AI Gateway extproc
                             KeyValue {
@@ -1098,18 +1116,21 @@ mod tests {
                                 value: Some(AnyValue {
                                     value: Some(AnyValueValue::DoubleValue(123.45)),
                                 }),
+                                key_strindex: 0,
                             },
                             KeyValue {
                                 key: "gen_ai.usage.prompt_tokens".to_string(),
                                 value: Some(AnyValue {
                                     value: Some(AnyValueValue::IntValue(100)),
                                 }),
+                                key_strindex: 0,
                             },
                             KeyValue {
                                 key: "gen_ai.usage.completion_tokens".to_string(),
                                 value: Some(AnyValue {
                                     value: Some(AnyValueValue::IntValue(50)),
                                 }),
+                                key_strindex: 0,
                             },
                         ],
                         dropped_attributes_count: 0,
