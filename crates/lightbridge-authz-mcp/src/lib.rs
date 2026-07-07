@@ -1117,6 +1117,14 @@ mod tests {
             Err(Error::NotFound)
         }
 
+        async fn create_identity_request(
+            &self,
+            _subject: &str,
+            _input: lightbridge_authz_core::CreateIdentityRequest,
+        ) -> std::result::Result<lightbridge_authz_core::IdentityRequest, Error> {
+            Err(Error::NotFound)
+        }
+
         async fn list_accounts(
             &self,
             _subject: &str,
@@ -1288,6 +1296,14 @@ mod tests {
                 return Ok(Some(self.account.clone()));
             }
             Ok(None)
+        }
+
+        async fn consume_identity_request(
+            &self,
+            _request_id: &str,
+            _subject: &str,
+        ) -> Result<lightbridge_authz_core::ResolvedContext> {
+            Err(lightbridge_authz_core::error::Error::NotFound)
         }
 
         async fn get_project_by_id(&self, project_id: &str) -> Result<Option<Project>> {
