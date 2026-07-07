@@ -53,10 +53,10 @@ impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
         Ok(self.account.clone())
     }
 
-    async fn consume_identity_request(
+    async fn resolve_context(
         &self,
-        _request_id: &str,
         _subject: &str,
+        _project_id: &str,
     ) -> Result<lightbridge_authz_core::ResolvedContext> {
         Err(lightbridge_authz_core::error::Error::NotFound)
     }

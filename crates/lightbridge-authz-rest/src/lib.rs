@@ -1,8 +1,4 @@
-use axum::{
-    Json, Router,
-    http::StatusCode,
-    routing::{get, post},
-};
+use axum::{Json, Router, http::StatusCode, routing::get};
 use lightbridge_authz_api::routers::api_router;
 use lightbridge_authz_core::{
     Account, Project, async_trait,
@@ -55,10 +51,10 @@ pub trait OpaRepoTrait: Send + Sync {
     async fn get_account(&self, subject: &str, account_id: &str) -> Result<Option<Account>>;
     async fn get_project_by_id(&self, project_id: &str) -> Result<Option<Project>>;
     async fn get_account_by_id(&self, account_id: &str) -> Result<Option<Account>>;
-    async fn consume_identity_request(
+    async fn resolve_context(
         &self,
-        request_id: &str,
         subject: &str,
+        project_id: &str,
     ) -> Result<lightbridge_authz_core::ResolvedContext>;
 }
 
@@ -95,12 +91,12 @@ impl OpaRepoTrait for StoreRepo {
         StoreRepo::get_account_by_id(self, account_id).await
     }
 
-    async fn consume_identity_request(
+    async fn resolve_context(
         &self,
-        request_id: &str,
         subject: &str,
+        project_id: &str,
     ) -> Result<lightbridge_authz_core::ResolvedContext> {
-        StoreRepo::consume_identity_request(self, request_id, subject).await
+        StoreRepo::resolve_context(self, subject, project_id).await
     }
 }
 
@@ -160,10 +156,6 @@ pub async fn start_opa_server(opa: &OpaServer, pool: Arc<dyn DbPoolTrait>) -> Re
         .route("/", get(root_handler))
         .route("/healthz", get(health_handler))
         .route("/healthz/startup", get(startup_handler))
-        .route(
-            "/idp/v1/resolve-context",
-            post(handlers::idp::resolve_context),
-        )
         .route(
             "/healthz/ready",
             get(move || {

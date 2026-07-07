@@ -12,7 +12,6 @@ use crate::controllers::{
         create_api_key, delete_api_key, get_api_key, list_api_keys, revoke_api_key, rotate_api_key,
         update_api_key,
     },
-    idp::create_identity_request,
     projects::{create_project, delete_project, get_project, list_projects, update_project},
 };
 
@@ -48,5 +47,4 @@ pub fn api_router() -> Router<Arc<AppState>> {
         )
         .route("/api-keys/{key_id}/revoke", post(revoke_api_key))
         .route("/api-keys/{key_id}/rotate", post(rotate_api_key))
-        .route("/idp/requests", post(create_identity_request))
 }
