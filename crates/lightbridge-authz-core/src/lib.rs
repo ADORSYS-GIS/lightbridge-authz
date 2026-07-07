@@ -15,7 +15,9 @@ pub use crate::api_key::{
 pub use crate::config::{Config, load_from_path};
 pub use crate::crypto::hash_api_key;
 pub use crate::dto::{
-    Account, CreateAccount, CreateProject, DefaultLimits, Project, UpdateAccount, UpdateProject,
+    Account, CreateAccount, CreateIdentityRequest, CreateProject, DefaultLimits,
+    IDENTITY_REQUEST_DEFAULT_TTL_SECS, IDENTITY_REQUEST_MAX_TTL_SECS, IdentityRequest, Project,
+    ResolveContextRequest, ResolvedContext, UpdateAccount, UpdateProject,
 };
 pub use crate::error::{Error, Result};
 

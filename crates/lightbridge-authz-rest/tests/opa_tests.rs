@@ -52,6 +52,14 @@ impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
     async fn get_account_by_id(&self, _account_id: &str) -> Result<Option<Account>> {
         Ok(self.account.clone())
     }
+
+    async fn consume_identity_request(
+        &self,
+        _request_id: &str,
+        _subject: &str,
+    ) -> Result<lightbridge_authz_core::ResolvedContext> {
+        Err(lightbridge_authz_core::error::Error::NotFound)
+    }
 }
 
 fn mk_api_key(status: ApiKeyStatus, expires_at: Option<chrono::DateTime<Utc>>) -> ApiKey {
