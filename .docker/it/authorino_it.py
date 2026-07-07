@@ -5,6 +5,7 @@ import os
 import ssl
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -69,8 +70,8 @@ def wait_until_ready() -> None:
     last_error = "readiness checks have not run yet"
     while True:
         try:
-            request_json("GET", f"{API_URL}/health", insecure_tls=True)
-            request_json("GET", f"{OPA_URL}/health", insecure_tls=True)
+            request_json("GET", f"{API_URL}/healthz", insecure_tls=True)
+            request_json("GET", f"{OPA_URL}/healthz", insecure_tls=True)
             request_json(
                 "GET",
                 f"{KEYCLOAK_URL}/realms/dev/.well-known/openid-configuration",
@@ -108,7 +109,7 @@ def main() -> int:
         token = fetch_token()
         authz_headers = {"Authorization": f"Bearer {token}"}
 
-        billing_identity = f"acme-it-{int(time.time())}"
+        billing_identity = f"acme-it-{uuid.uuid4().hex[:12]}"
         status, account = request_json(
             "POST",
             f"{API_URL}/api/v1/accounts",

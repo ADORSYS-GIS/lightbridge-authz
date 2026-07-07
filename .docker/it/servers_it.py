@@ -5,6 +5,7 @@ import os
 import ssl
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -124,18 +125,18 @@ def parse_sse_json_messages(raw: str) -> list[dict]:
 
 def wait_until_ready() -> None:
     probe_urls = [
-        f"{API_URL}/health",
-        f"{API_URL}/health/startup",
-        f"{API_URL}/health/ready",
-        f"{OPA_URL}/health",
-        f"{OPA_URL}/health/startup",
-        f"{OPA_URL}/health/ready",
-        f"{USAGE_URL}/health",
-        f"{USAGE_URL}/health/startup",
-        f"{USAGE_URL}/health/ready",
-        f"{MCP_URL}/health",
-        f"{MCP_URL}/health/startup",
-        f"{MCP_URL}/health/ready",
+        f"{API_URL}/healthz",
+        f"{API_URL}/healthz/startup",
+        f"{API_URL}/healthz/ready",
+        f"{OPA_URL}/healthz",
+        f"{OPA_URL}/healthz/startup",
+        f"{OPA_URL}/healthz/ready",
+        f"{USAGE_URL}/healthz",
+        f"{USAGE_URL}/healthz/startup",
+        f"{USAGE_URL}/healthz/ready",
+        f"{MCP_URL}/healthz",
+        f"{MCP_URL}/healthz/startup",
+        f"{MCP_URL}/healthz/ready",
     ]
 
     start = time.time()
@@ -234,7 +235,7 @@ def main() -> int:
 
         token = fetch_token()
         authz_headers = {"Authorization": f"Bearer {token}"}
-        billing_identity = f"it-servers-{int(time.time())}"
+        billing_identity = f"it-servers-{uuid.uuid4().hex[:12]}"
 
         expect_http_error(
             401,
@@ -307,7 +308,7 @@ def main() -> int:
         try:
             request_raw(
                 "POST",
-                f"{USAGE_URL}/v1/usage/query",
+                f"{USAGE_URL}/usage/v1/usage/query",
                 body={
                     "scope": "project",
                     "scope_id": "proj_invalid",
