@@ -310,10 +310,10 @@ mod tests {
 
         let cache = JwksCache::with_ttl(server.url("/jwks"), Duration::from_secs(60));
         assert!(cache.get(TEST_KID).await.unwrap().is_some());
-        assert_eq!(mock.hits(), 1);
+        assert_eq!(mock.calls(), 1);
 
         assert!(cache.get(TEST_KID).await.unwrap().is_some());
-        assert_eq!(mock.hits(), 1);
+        assert_eq!(mock.calls(), 1);
     }
 
     #[tokio::test]
@@ -328,9 +328,9 @@ mod tests {
 
         let cache = JwksCache::with_ttl(server.url("/jwks"), Duration::from_secs(0));
         assert!(cache.get(TEST_KID).await.unwrap().is_some());
-        assert_eq!(mock.hits(), 1);
+        assert_eq!(mock.calls(), 1);
 
         assert!(cache.get(TEST_KID).await.unwrap().is_some());
-        assert_eq!(mock.hits(), 2);
+        assert_eq!(mock.calls(), 2);
     }
 }

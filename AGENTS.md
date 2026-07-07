@@ -276,6 +276,13 @@ On the OPA server:
 
 These are implemented in `crates/lightbridge-authz-rest/src/handlers/authorino.rs`.
 
+### Identity Request Service (`request_id` → context)
+
+Backs the `lightbridge-keycloak-spi` IdP adapter, which seals `account_id`/`project_id` into JWTs via an opaque, single-use `request_id`. Two endpoints, one store (`identity_requests` table):
+
+- Mint — `POST /api/v1/idp/requests` on the CRUD API (**bearer**). Binds the request to the caller's subject and derives the account from the given `project_id`; the caller must be a member of that account (same `account_memberships` CTE as `create_project`). Controller: `crates/lightbridge-authz-api/src/controllers/idp.rs`.
+- Resolve — `POST /idp/v1/resolve-context` on the OPA/validation server as a **public (no-auth)** route (the single-use, subject-bound `request_id` is the credential; network-isolate it to Keycloak in prod). A single atomic `UPDATE … WHERE id AND subject AND consumed_at IS NULL AND expires_at > now() RETURNING` does single-use + TTL + subject enforcement; any miss is a uniform `404`. Handler: `crates/lightbridge-authz-rest/src/handlers/idp.rs`; repo methods `create_identity_request`/`consume_identity_request` in `crates/lightbridge-authz-api-key/src/repo.rs`.
+
 ## Rust Workspace and Crates
 
 Workspace manifest: `Cargo.toml`
@@ -544,3 +551,21 @@ In Compose, `authz-migrate` runs before API/OPA start.
 
 - A brand-new `lightbridge-migrate` chart (aliased `migration` under `charts/lightbridge`) runs `lightbridge-authz migrate --config-path /tmp/lightbridge-config/config.yaml` as a `pre-install/pre-upgrade` job so schema migrations happen before the API/OPA controllers become active. It reuses the ambient `lightbridge-authz-config` config map, shares the same image artifacts, and exposes TTL/backoff knobs to keep the job brief.
 - That migration chart is now built on the `bjw-s/common v4` app-template library, so the job/configmap/secret skeletal resources are rendered by the shared loader instead of bespoke templates, keeping the chart plumbing consistent with the rest of the stack.
+
+<!-- ai-governance:stanza -->
+<!-- BEGIN: AI Governance stanza (managed by ADORSYS-GIS/ai-governance) -->
+## AI Governance
+
+AI may accelerate the work, but humans own intent, verification, and consequences.
+AI output is not truth: review AI-generated code as untrusted, and never submit work you cannot explain.
+
+When opening issues or pull requests in this repo:
+
+- Use the provided **issue forms** (Epic, User Story, Dev Ticket) and the **pull request template** — do not open blank issues/PRs.
+- Fill in the **AI Usage Declaration** honestly (what AI was used for, what you verified).
+- Include a **source-of-truth link** (a URL or `#123` reference). No source of truth means the work is not ready.
+- Provide **verification evidence** (commands, logs, links, or checked verification boxes). No evidence means it is not done.
+
+Source of truth and full doctrine: https://adorsys-gis.github.io/ai-governance/
+This stanza is intentionally thin — read the site; do not duplicate the doctrine here.
+<!-- END: AI Governance stanza -->

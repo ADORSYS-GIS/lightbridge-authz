@@ -1,4 +1,5 @@
 pub mod authorino;
+pub mod idp;
 pub mod opa;
 
 use std::sync::Arc;
@@ -12,8 +13,9 @@ use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::config::{Oauth2, Oauth2Issuance};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey, CreateProject,
-    Project, RotateApiKey, UpdateAccount, UpdateApiKey, UpdateProject, hash_api_key,
+    Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey,
+    CreateIdentityRequest, CreateProject, IdentityRequest, Project, RotateApiKey, UpdateAccount,
+    UpdateApiKey, UpdateProject, hash_api_key,
 };
 use lightbridge_authz_core::{
     db::DbPoolTrait,
@@ -418,6 +420,23 @@ impl AuthzStore for AuthzStoreImpl {
             oauth2_url: issued.oauth2_url,
         })
     }
+
+    async fn create_identity_request(
+        &self,
+        subject: &str,
+        input: CreateIdentityRequest,
+    ) -> Result<IdentityRequest> {
+        let ttl = input
+            .ttl_seconds
+            .filter(|&secs| secs > 0)
+            .unwrap_or(lightbridge_authz_core::IDENTITY_REQUEST_DEFAULT_TTL_SECS)
+            .min(lightbridge_authz_core::IDENTITY_REQUEST_MAX_TTL_SECS);
+        let expires_at = Utc::now() + Duration::seconds(ttl as i64);
+        let id = format!("req_{}", cuid2());
+        self.repo
+            .create_identity_request(subject, &input.project_id, expires_at, id)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -472,16 +491,16 @@ mod tests {
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/token")
-                .body_contains(
+                .body_includes(
                     "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange",
                 )
-                .body_contains("client_id=test-client")
-                .body_contains("client_secret=test-client-secret")
-                .body_contains("subject_token=incoming-access-token")
-                .body_contains(
+                .body_includes("client_id=test-client")
+                .body_includes("client_secret=test-client-secret")
+                .body_includes("subject_token=incoming-access-token")
+                .body_includes(
                     "subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
                 )
-                .body_contains(
+                .body_includes(
                     "requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
                 );
             then.status(200).json_body(json!({
@@ -521,6 +540,6 @@ mod tests {
         assert_eq!(issued.secret, "issued-access-token");
         assert_eq!(issued.oauth2_url, Some(oauth2_url));
         assert!(issued.expires_at.is_some());
-        assert_eq!(mock.hits(), 1);
+        assert_eq!(mock.calls(), 1);
     }
 }

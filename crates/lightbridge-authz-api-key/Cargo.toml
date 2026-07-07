@@ -16,6 +16,9 @@ tracing.workspace = true
 [dependencies.lightbridge-authz-core]
 workspace = true
 
+[dev-dependencies]
+tokio.workspace = true
+
 [features]
 it-tests = []
 

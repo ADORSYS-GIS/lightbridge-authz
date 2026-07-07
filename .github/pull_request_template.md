@@ -42,3 +42,27 @@ How was this tested?
 - [ ] Integration tests
 - [ ] Manual testing with `just it-test`
 - [ ] Other:
+
+---
+
+## Intent / Source of Truth
+
+Why this change exists, and the source of truth (issue link, ADR, decision, or incident).
+
+Source of truth: <link or #issue>
+
+## Verification
+
+Evidence this change works — commands run, output, screenshots, or links (see **Testing** above).
+
+- [ ] Verified locally (`just all-checks`)
+
+## AI Usage Declaration
+
+Declare whether/how AI was used:
+
+- [ ] Not used
+- [ ] AI-assisted (describe what AI was used for below)
+
+> AI may accelerate the work, but it must not launder ignorance into polished artifacts.
+> Governance: https://adorsys-gis.github.io/ai-governance/

@@ -1,4 +1,8 @@
-use axum::{Json, Router, http::StatusCode, routing::get};
+use axum::{
+    Json, Router,
+    http::StatusCode,
+    routing::{get, post},
+};
 use lightbridge_authz_api::routers::api_router;
 use lightbridge_authz_core::{
     Account, Project, async_trait,
@@ -50,6 +54,11 @@ pub trait OpaRepoTrait: Send + Sync {
     async fn get_account(&self, subject: &str, account_id: &str) -> Result<Option<Account>>;
     async fn get_project_by_id(&self, project_id: &str) -> Result<Option<Project>>;
     async fn get_account_by_id(&self, account_id: &str) -> Result<Option<Account>>;
+    async fn consume_identity_request(
+        &self,
+        request_id: &str,
+        subject: &str,
+    ) -> Result<lightbridge_authz_core::ResolvedContext>;
 }
 
 #[async_trait]
@@ -83,6 +92,14 @@ impl OpaRepoTrait for StoreRepo {
 
     async fn get_account_by_id(&self, account_id: &str) -> Result<Option<Account>> {
         StoreRepo::get_account_by_id(self, account_id).await
+    }
+
+    async fn consume_identity_request(
+        &self,
+        request_id: &str,
+        subject: &str,
+    ) -> Result<lightbridge_authz_core::ResolvedContext> {
+        StoreRepo::consume_identity_request(self, request_id, subject).await
     }
 }
 
@@ -143,6 +160,10 @@ pub async fn start_opa_server(opa: &OpaServer, pool: Arc<dyn DbPoolTrait>) -> Re
         .route("/healthz", get(health_handler))
         .route("/healthz/startup", get(startup_handler))
         .route(
+            "/idp/v1/resolve-context",
+            post(handlers::idp::resolve_context),
+        )
+        .route(
             "/healthz/ready",
             get(move || {
                 let readiness_pool = readiness_pool.clone();
@@ -186,7 +207,8 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
 #[openapi(
     paths(
         crate::handlers::opa::validate_api_key,
-        crate::handlers::authorino::validate_authorino_api_key
+        crate::handlers::authorino::validate_authorino_api_key,
+        crate::handlers::idp::resolve_context
     ),
     components(
         schemas(
@@ -198,12 +220,15 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
             crate::models::OpaErrorResponse,
             lightbridge_authz_core::ApiKey,
             lightbridge_authz_core::Project,
-            lightbridge_authz_core::Account
+            lightbridge_authz_core::Account,
+            lightbridge_authz_core::ResolveContextRequest,
+            lightbridge_authz_core::ResolvedContext
         )
     ),
     tags(
         (name = "opa", description = "OPA validation"),
-        (name = "authorino", description = "Authorino integration")
+        (name = "authorino", description = "Authorino integration"),
+        (name = "idp", description = "Identity request resolution")
     )
 )]
 struct OpaDoc;
@@ -228,6 +253,19 @@ mod tests {
         assert!(
             paths.contains_key("/v1/authorino/validate"),
             "expected OPA API to expose an Authorino-specific endpoint"
+        );
+    }
+
+    #[test]
+    fn resolve_context_endpoint_should_exist_in_opa_openapi() {
+        let doc = opa_openapi();
+        let paths = doc["paths"]
+            .as_object()
+            .expect("openapi paths should be an object");
+
+        assert!(
+            paths.contains_key("/idp/v1/resolve-context"),
+            "expected the OPA server to expose the identity resolve-context endpoint"
         );
     }
 

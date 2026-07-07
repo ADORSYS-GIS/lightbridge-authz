@@ -138,3 +138,53 @@ pub struct ApiKeySecret {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth2_url: Option<String>,
 }
+
+/// Default lifetime applied to a minted identity request when the caller omits `ttl_seconds`.
+pub const IDENTITY_REQUEST_DEFAULT_TTL_SECS: u64 = 300;
+/// Upper bound the requested `ttl_seconds` is clamped to.
+pub const IDENTITY_REQUEST_MAX_TTL_SECS: u64 = 3600;
+
+/// Request body to mint a single-use identity request bound to the authenticated caller.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateIdentityRequest {
+    /// Project the resolved token context should be scoped to. The caller must be a member of the
+    /// project's account.
+    pub project_id: String,
+    /// Optional lifetime in seconds; defaults to `IDENTITY_REQUEST_DEFAULT_TTL_SECS`, clamped to
+    /// `IDENTITY_REQUEST_MAX_TTL_SECS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
+}
+
+/// A minted, single-use identity request. `id` is the opaque `request_id` handed to the IdP.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct IdentityRequest {
+    pub id: String,
+    pub account_id: String,
+    pub project_id: String,
+    pub subject: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Request body sent by the IdP adapter to resolve (and consume) a `request_id`.
+///
+/// `request_id` and `subject` are required for a successful resolution but are modelled as optional
+/// so a malformed/partial body resolves to a uniform `404` (an authz miss) rather than a `422`.
+/// Any extra fields the adapter sends (e.g. `client_id`, `realm`) are accepted and ignored — the
+/// request is bound to the subject only.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResolveContextRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Subject the request was bound to at mint time; enforced on resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+/// Business context resolved from a `request_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResolvedContext {
+    pub account_id: String,
+    pub project_id: String,
+}
