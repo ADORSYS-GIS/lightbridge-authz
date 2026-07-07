@@ -520,6 +520,6 @@ mod tests {
         assert_eq!(issued.secret, "issued-access-token");
         assert_eq!(issued.oauth2_url, Some(oauth2_url));
         assert!(issued.expires_at.is_some());
-        assert_eq!(mock.hits(), 1);
+        assert_eq!(mock.calls(), 1);
     }
 }
