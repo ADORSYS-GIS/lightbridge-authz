@@ -198,18 +198,13 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        crate::handlers::opa::validate_api_key,
-        crate::handlers::authorino::validate_authorino_api_key,
+        crate::handlers::introspect::introspect_api_key,
         crate::handlers::idp::resolve_context
     ),
     components(
         schemas(
-            crate::models::OpaCheckRequest,
-            crate::models::OpaCheckResponse,
-            crate::models::authorino::AuthorinoCheckRequest,
-            crate::models::authorino::AuthorinoCheckResponse,
-            crate::models::authorino::AuthorinoMetadata,
-            crate::models::OpaErrorResponse,
+            crate::models::IntrospectRequest,
+            crate::models::IntrospectResponse,
             lightbridge_authz_core::ApiKey,
             lightbridge_authz_core::Project,
             lightbridge_authz_core::Account,
@@ -218,7 +213,6 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
         )
     ),
     tags(
-        (name = "opa", description = "OPA validation"),
         (name = "authorino", description = "Authorino integration"),
         (name = "idp", description = "Identity request resolution")
     )
@@ -236,15 +230,23 @@ mod tests {
     }
 
     #[test]
-    fn authorino_endpoint_should_exist_in_opa_openapi() {
+    fn introspect_endpoint_should_exist_in_opa_openapi() {
         let doc = opa_openapi();
         let paths = doc["paths"]
             .as_object()
             .expect("openapi paths should be an object");
 
         assert!(
-            paths.contains_key("/v1/authorino/validate"),
-            "expected OPA API to expose an Authorino-specific endpoint"
+            paths.contains_key("/v1/authorino/validate/introspect"),
+            "expected the OPA server to expose the RFC 7662 introspection endpoint"
+        );
+        assert!(
+            !paths.contains_key("/v1/authorino/validate"),
+            "the legacy authorino validate endpoint should no longer be exposed"
+        );
+        assert!(
+            !paths.contains_key("/v1/opa/validate"),
+            "the legacy opa validate endpoint should no longer be exposed"
         );
     }
 
@@ -262,64 +264,18 @@ mod tests {
     }
 
     #[test]
-    fn authorino_request_should_support_dynamic_metadata() {
+    fn introspect_response_should_expose_active_flag() {
         let doc = opa_openapi();
         let schemas = doc["components"]["schemas"]
             .as_object()
             .expect("schemas should be an object");
-        let req = schemas
-            .get("AuthorinoCheckRequest")
-            .expect("missing AuthorinoCheckRequest schema");
-        let metadata = &req["properties"]["metadata"];
-
-        assert_eq!(
-            metadata["type"].as_str(),
-            Some("object"),
-            "metadata should be a JSON object for dynamic metadata"
-        );
-        assert!(
-            metadata.get("additionalProperties").is_some(),
-            "metadata should support arbitrary keys via additionalProperties"
-        );
-    }
-
-    #[test]
-    fn authorino_success_response_should_include_dynamic_metadata() {
-        let doc = opa_openapi();
-        let schemas = doc["components"]["schemas"]
-            .as_object()
-            .expect("schemas should be an object");
-
-        // Check AuthorinoCheckResponse has dynamic_metadata
         let resp = schemas
-            .get("AuthorinoCheckResponse")
-            .expect("missing AuthorinoCheckResponse schema");
-        let metadata_ref = &resp["properties"]["dynamic_metadata"];
+            .get("IntrospectResponse")
+            .expect("missing IntrospectResponse schema");
 
         assert!(
-            metadata_ref.get("$ref").is_some() || metadata_ref["type"].as_str() == Some("object"),
-            "dynamic_metadata should be a reference or an object"
-        );
-
-        // Check AuthorinoMetadata schema
-        let metadata_schema = schemas
-            .get("AuthorinoMetadata")
-            .expect("missing AuthorinoMetadata schema");
-
-        assert_eq!(
-            metadata_schema["type"].as_str(),
-            Some("object"),
-            "AuthorinoMetadata should be a JSON object"
-        );
-
-        assert!(
-            metadata_schema.get("properties").is_some(),
-            "AuthorinoMetadata should have explicit properties"
-        );
-
-        assert!(
-            metadata_schema.get("additionalProperties").is_some(),
-            "AuthorinoMetadata should support arbitrary keys via flattened extra field"
+            resp["properties"].get("active").is_some(),
+            "IntrospectResponse should expose the RFC 7662 `active` flag"
         );
     }
 
@@ -327,6 +283,14 @@ mod tests {
     async fn health_and_startup_endpoints_report_ok() {
         assert_eq!(health_handler().await, StatusCode::OK);
         assert_eq!(startup_handler().await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn root_handler_reports_welcome() {
+        let (status, body) = root_handler().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.status, "ok");
+        assert!(!body.message.is_empty());
     }
 
     #[tokio::test]

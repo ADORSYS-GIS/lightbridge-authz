@@ -36,9 +36,11 @@ goose.workspace = true
 reqwest.workspace = true
 sqlx.workspace = true
 httpmock.workspace = true
+tower.workspace = true
 
 [features]
 load-tests = []
+it-tests = []
 
 [[test]]
 name = "load_tests"

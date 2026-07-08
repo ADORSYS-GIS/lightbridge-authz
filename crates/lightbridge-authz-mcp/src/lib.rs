@@ -913,7 +913,7 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "validate-api-key",
-        description = "Validate API key context (maps to POST /v1/opa/validate)"
+        description = "Validate an API key: hash lookup with status/expiry check, returns account/project context"
     )]
     async fn validate_api_key_tool(
         &self,
@@ -939,7 +939,7 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "validate-authorino-api-key",
-        description = "Validate API key + metadata enrichment (maps to POST /v1/authorino/validate)"
+        description = "Validate an API key and return account/project context plus dynamic metadata enrichment"
     )]
     async fn validate_authorino_api_key(
         &self,

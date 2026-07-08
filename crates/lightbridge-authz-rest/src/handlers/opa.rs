@@ -1,11 +1,9 @@
 use std::sync::Arc;
 
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use lightbridge_authz_core::{ApiKeyStatus, Result, error::Error, hash_api_key};
 use tracing::instrument;
 
 use crate::OpaState;
-use crate::models::{OpaCheckRequest, OpaCheckResponse, OpaErrorResponse};
 
 /// Context for a validated API key.
 pub struct ValidatedApiKeyContext {
@@ -53,45 +51,4 @@ pub async fn validate_api_key_context(
         project,
         account,
     }))
-}
-
-/// OPA validation handler.
-#[utoipa::path(
-    post,
-    path = "/v1/opa/validate",
-    request_body = OpaCheckRequest,
-    responses(
-        (status = 200, body = OpaCheckResponse),
-        (status = 401, body = OpaErrorResponse)
-    ),
-    tag = "opa"
-)]
-#[instrument(skip(state, input))]
-pub async fn validate_api_key(
-    State(state): State<Arc<OpaState>>,
-    Json(input): Json<OpaCheckRequest>,
-) -> Result<axum::response::Response> {
-    let unauthorized = || {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(OpaErrorResponse {
-                error: "unauthorized".to_string(),
-            }),
-        )
-            .into_response()
-    };
-
-    let Some(validated) = validate_api_key_context(&state, &input.api_key, input.ip).await? else {
-        return Ok(unauthorized());
-    };
-
-    Ok((
-        StatusCode::OK,
-        Json(OpaCheckResponse {
-            api_key: validated.api_key,
-            project: validated.project,
-            account: validated.account,
-        }),
-    )
-        .into_response())
 }

@@ -86,28 +86,27 @@ PROJECT_ID=$(echo "$PROJECT_JSON" | /usr/bin/python3 -c "import sys, json; print
 
 ## 5) Create an API key
 
-In dev, API key creation is backed by Keycloak token exchange. The CRUD API sends
-the caller's validated bearer token to the realm token endpoint as `subject_token`
-and stores only the hash of the exchanged access token. The returned `secret` is
-therefore an OAuth2 access token issued on behalf of the same user, not a locally
-generated random string.
+API keys are opaque, locally-generated secrets (`lbk_secret_...`). The CRUD API
+stores only the SHA-256 hash of the secret and returns the plaintext `secret`
+exactly once, on create/rotate. The token has no standalone meaning: it is not a
+JWT and no JWKS validator accepts it — it is only interpretable by asking the
+Lightbridge validation layer, which makes it inert if leaked or replayed outside
+that path.
 
-Keycloak standard token exchange is same-realm internal token exchange. The input
-token and the newly issued token both come from realm `dev`; the useful boundary is
-the client context. In dev, Authz authenticates to Keycloak as the confidential
-`lightbridge-token-issuer` client using `KEYCLOAK_TOKEN_CLIENT_SECRET`, and sends
-the user's bearer token as `subject_token`. In Keycloak, the client making the
-exchange must have standard token exchange enabled, authenticate with its
-configured client authentication method, and be present in the incoming token's
-audience.
+(The `oauth2.issuance` config can switch key creation to Keycloak token exchange,
+which returns a real OAuth2 access token instead. That is disabled by default:
+an exchanged JWT is stateless and cannot be revoked before its `exp`, which
+defeats immediate revocation. Leave issuance disabled unless you specifically need
+provider-issued tokens and accept a revocation window equal to the token lifetime.)
 
-Revoking the API key invalidates the credential at the Lightbridge validation
-layer immediately. The validation backend stores only the exchanged token hash and
-checks the `api_keys` row status before returning any enrichment, so a revoked key
-is rejected when Authorino asks Lightbridge to authorize a request. This does not
-revoke the OAuth2 token at Keycloak/provider level; if that token is usable
-outside the Authorino-to-Lightbridge validation path, keep its audience narrow and
-its lifetime short or add provider-side revocation/introspection.
+Revoking or deleting the API key takes effect on the **next request**. Authorino
+authorizes each request by calling the Lightbridge validation endpoint
+(`POST /v1/authorino/validate`), which hashes the presented key, looks up the
+`api_keys` row, and rejects anything whose `status` is not `Active` or whose
+`expires_at` has passed. Revocation flips `status` to `Revoked`; deletion removes
+the row (lookup then misses). Either way the very next authorize call fails — the
+DB row is the single source of truth, so there is no denylist, no stored
+credential, and no provider round-trip to keep in sync.
 
 ```bash
 KEY_JSON=$(curl -k -s https://localhost:13000/api/v1/projects/$PROJECT_ID/api-keys \

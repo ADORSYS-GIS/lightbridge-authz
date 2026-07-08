@@ -18,28 +18,3 @@ pub struct AuthorinoMetadata {
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
-
-/// Request for Authorino validation.
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct AuthorinoCheckRequest {
-    /// The API key secret to validate.
-    pub api_key: String,
-    /// The IP address of the client.
-    pub ip: Option<String>,
-    /// Dynamic metadata provided by Authorino or external sources.
-    #[serde(default)]
-    pub metadata: HashMap<String, Value>,
-}
-
-/// Response for Authorino validation.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct AuthorinoCheckResponse {
-    /// The validated API key details.
-    pub api_key: lightbridge_authz_core::ApiKey,
-    /// The project associated with the API key.
-    pub project: lightbridge_authz_core::Project,
-    /// The account associated with the API key.
-    pub account: lightbridge_authz_core::Account,
-    /// Enriched dynamic metadata for Authorino.
-    pub dynamic_metadata: AuthorinoMetadata,
-}

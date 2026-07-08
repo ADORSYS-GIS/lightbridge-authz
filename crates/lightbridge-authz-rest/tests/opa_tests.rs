@@ -1,4 +1,4 @@
-use axum::Json;
+use axum::Form;
 use axum::body::to_bytes;
 use axum::http::StatusCode;
 use chrono::{Duration, Utc};
@@ -6,10 +6,8 @@ use lightbridge_authz_core::{
     Account, ApiKey, ApiKeyStatus, Project, async_trait, config::BasicAuth, error::Result,
 };
 use lightbridge_authz_rest::OpaState;
-use lightbridge_authz_rest::handlers::authorino::validate_authorino_api_key;
-use lightbridge_authz_rest::handlers::opa::validate_api_key;
-use lightbridge_authz_rest::models::OpaCheckRequest;
-use lightbridge_authz_rest::models::authorino::AuthorinoCheckRequest;
+use lightbridge_authz_rest::handlers::introspect::introspect_api_key;
+use lightbridge_authz_rest::models::IntrospectRequest;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
@@ -83,7 +81,7 @@ fn mk_project() -> Project {
         id: "proj_1".to_string(),
         account_id: "acct_1".to_string(),
         name: "demo-project".to_string(),
-        allowed_models: Some(vec![]),
+        allowed_models: Some(vec!["gpt-4.1-mini".to_string()]),
         default_limits: None,
         billing_plan: "free".to_string(),
         created_at: Utc::now(),
@@ -111,8 +109,74 @@ fn mk_state(repo: MockOpaRepo) -> Arc<OpaState> {
     })
 }
 
+async fn introspect(state: Arc<OpaState>, token: &str) -> (StatusCode, Value) {
+    let response = introspect_api_key(
+        axum::extract::State(state),
+        Form(IntrospectRequest {
+            token: token.to_string(),
+            token_type_hint: Some("access_token".to_string()),
+        }),
+    )
+    .await
+    .expect("handler should return response");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body should be readable");
+    let payload: Value = serde_json::from_slice(&body).expect("body should be valid json");
+    (status, payload)
+}
+
 #[tokio::test]
-async fn validate_api_key_returns_unauthorized_when_missing() {
+async fn introspect_returns_active_with_context_and_records_usage() {
+    let expires_at = Utc::now() + Duration::minutes(10);
+    let usage_calls = Arc::new(Mutex::new(vec![]));
+    let state = mk_state(MockOpaRepo {
+        api_key: Some(mk_api_key(ApiKeyStatus::Active, Some(expires_at))),
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: usage_calls.clone(),
+    });
+
+    let (status, payload) = introspect(state, "lbk_secret_valid").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], true);
+    assert_eq!(payload["account_id"], "acct_1");
+    assert_eq!(payload["project_id"], "proj_1");
+    assert_eq!(payload["api_key_id"], "key_1");
+    assert_eq!(payload["api_key_status"], "active");
+    assert_eq!(payload["billing_plan"], "free");
+    assert_eq!(
+        payload["allowed_models"],
+        serde_json::json!(["gpt-4.1-mini"])
+    );
+    assert_eq!(payload["exp"], expires_at.timestamp());
+
+    let calls = usage_calls.lock().expect("lock should work").clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "key_1");
+}
+
+#[tokio::test]
+async fn introspect_returns_inactive_when_revoked() {
+    let state = mk_state(MockOpaRepo {
+        api_key: Some(mk_api_key(ApiKeyStatus::Revoked, None)),
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+    });
+
+    let (status, payload) = introspect(state, "lbk_secret_revoked").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], false);
+    assert!(payload.get("account_id").is_none());
+    assert!(payload.get("api_key_id").is_none());
+}
+
+#[tokio::test]
+async fn introspect_returns_inactive_when_missing() {
     let state = mk_state(MockOpaRepo {
         api_key: None,
         project: Some(mk_project()),
@@ -120,159 +184,34 @@ async fn validate_api_key_returns_unauthorized_when_missing() {
         usage_calls: Arc::new(Mutex::new(vec![])),
     });
 
-    let response = validate_api_key(
-        axum::extract::State(state),
-        Json(OpaCheckRequest {
-            api_key: "lbk_secret_missing".to_string(),
-            ip: Some("203.0.113.10".to_string()),
-        }),
-    )
-    .await
-    .expect("handler should return response");
+    let (status, payload) = introspect(state, "lbk_secret_missing").await;
 
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], false);
 }
 
 #[tokio::test]
-async fn validate_api_key_returns_unauthorized_when_revoked() {
-    let repo = MockOpaRepo {
-        api_key: Some(mk_api_key(ApiKeyStatus::Revoked, None)),
-        project: Some(mk_project()),
-        account: Some(mk_account()),
-        usage_calls: Arc::new(Mutex::new(vec![])),
-    };
-    let state = mk_state(repo);
-
-    let response = validate_api_key(
-        axum::extract::State(state),
-        Json(OpaCheckRequest {
-            api_key: "lbk_secret_revoked".to_string(),
-            ip: None,
-        }),
-    )
-    .await
-    .expect("handler should return response");
-
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn validate_api_key_returns_unauthorized_when_expired() {
-    let expired_at = Utc::now() - Duration::seconds(1);
-    let state = mk_state(MockOpaRepo {
-        api_key: Some(mk_api_key(ApiKeyStatus::Active, Some(expired_at))),
-        project: Some(mk_project()),
-        account: Some(mk_account()),
-        usage_calls: Arc::new(Mutex::new(vec![])),
-    });
-
-    let response = validate_api_key(
-        axum::extract::State(state),
-        Json(OpaCheckRequest {
-            api_key: "lbk_secret_expired".to_string(),
-            ip: None,
-        }),
-    )
-    .await
-    .expect("handler should return response");
-
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn validate_api_key_returns_ok_and_records_usage_when_valid() {
-    let usage_calls = Arc::new(Mutex::new(vec![]));
-    let repo = MockOpaRepo {
-        api_key: Some(mk_api_key(
-            ApiKeyStatus::Active,
-            Some(Utc::now() + Duration::minutes(10)),
-        )),
-        project: Some(mk_project()),
-        account: Some(mk_account()),
-        usage_calls: usage_calls.clone(),
-    };
-    let state = mk_state(repo);
-
-    let response = validate_api_key(
-        axum::extract::State(state.clone()),
-        Json(OpaCheckRequest {
-            api_key: "lbk_secret_valid".to_string(),
-            ip: Some("203.0.113.10".to_string()),
-        }),
-    )
-    .await
-    .expect("handler should return response");
-
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body should be readable");
-    let payload: Value = serde_json::from_slice(&body).expect("body should be valid json");
-    assert_eq!(payload["api_key"]["id"], "key_1");
-    assert_eq!(payload["project"]["id"], "proj_1");
-    assert_eq!(payload["account"]["id"], "acct_1");
-    assert_eq!(
-        payload["account"]["owners_admins"],
-        serde_json::json!(["owner@example.com"])
-    );
-
-    let calls = usage_calls.lock().expect("lock should work").clone();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].0, "key_1");
-    assert_eq!(calls[0].1.as_deref(), Some("203.0.113.10"));
-}
-
-#[tokio::test]
-async fn validate_authorino_api_key_preserves_and_enriches_metadata() {
+async fn introspect_returns_inactive_when_expired() {
     let state = mk_state(MockOpaRepo {
         api_key: Some(mk_api_key(
             ApiKeyStatus::Active,
-            Some(Utc::now() + Duration::minutes(10)),
+            Some(Utc::now() - Duration::seconds(1)),
         )),
         project: Some(mk_project()),
         account: Some(mk_account()),
         usage_calls: Arc::new(Mutex::new(vec![])),
     });
 
-    let response = validate_authorino_api_key(
-        axum::extract::State(state),
-        Json(AuthorinoCheckRequest {
-            api_key: "lbk_secret_valid".to_string(),
-            ip: Some("203.0.113.10".to_string()),
-            metadata: std::collections::HashMap::from([(
-                "tenant".to_string(),
-                serde_json::json!("acme"),
-            )]),
-        }),
-    )
-    .await
-    .expect("handler should return response");
+    let (status, payload) = introspect(state, "lbk_secret_expired").await;
 
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body should be readable");
-    let payload: Value = serde_json::from_slice(&body).expect("body should be valid json");
-
-    assert_eq!(payload["dynamic_metadata"]["tenant"], "acme");
-    assert_eq!(payload["dynamic_metadata"]["account_id"], "acct_1");
-    assert_eq!(payload["dynamic_metadata"]["project_id"], "proj_1");
-    assert_eq!(payload["dynamic_metadata"]["api_key_id"], "key_1");
-    assert_eq!(payload["dynamic_metadata"]["api_key_status"], "active");
-    assert_eq!(
-        payload["account"]["owners_admins"],
-        serde_json::json!(["owner@example.com"])
-    );
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], false);
 }
 
 #[tokio::test]
-async fn validate_authorino_api_key_with_null_allowed_models() {
+async fn introspect_omits_allowed_models_when_null() {
     let mut project = mk_project();
-    project.allowed_models = None; // NULL in DB
-    project.default_limits = None;
-
+    project.allowed_models = None;
     let state = mk_state(MockOpaRepo {
         api_key: Some(mk_api_key(ApiKeyStatus::Active, None)),
         project: Some(project),
@@ -280,31 +219,24 @@ async fn validate_authorino_api_key_with_null_allowed_models() {
         usage_calls: Arc::new(Mutex::new(vec![])),
     });
 
-    let response = validate_authorino_api_key(
-        axum::extract::State(state),
-        Json(AuthorinoCheckRequest {
-            api_key: "lbk_secret_valid".to_string(),
-            ip: None,
-            metadata: std::collections::HashMap::new(),
-        }),
-    )
-    .await
-    .expect("handler should return response");
+    let (status, payload) = introspect(state, "lbk_secret_valid").await;
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let payload: Value = serde_json::from_slice(&body).unwrap();
-
-    // Verify allowed_models is null in JSON
-    assert!(payload["project"]["allowed_models"].is_null());
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], true);
+    assert!(
+        payload.get("allowed_models").is_none(),
+        "allowed_models should be omitted when the project allows all models"
+    );
+    assert!(
+        payload.get("exp").is_none(),
+        "exp should be omitted when the key has no expiry"
+    );
 }
 
 #[tokio::test]
-async fn validate_authorino_api_key_with_empty_allowed_models() {
+async fn introspect_returns_empty_allowed_models_when_empty() {
     let mut project = mk_project();
-    project.allowed_models = Some(vec![]); // [] in DB
-    project.default_limits = None;
-
+    project.allowed_models = Some(vec![]);
     let state = mk_state(MockOpaRepo {
         api_key: Some(mk_api_key(ApiKeyStatus::Active, None)),
         project: Some(project),
@@ -312,28 +244,10 @@ async fn validate_authorino_api_key_with_empty_allowed_models() {
         usage_calls: Arc::new(Mutex::new(vec![])),
     });
 
-    let response = validate_authorino_api_key(
-        axum::extract::State(state),
-        Json(AuthorinoCheckRequest {
-            api_key: "lbk_secret_valid".to_string(),
-            ip: None,
-            metadata: std::collections::HashMap::new(),
-        }),
-    )
-    .await
-    .expect("handler should return response");
+    let (status, payload) = introspect(state, "lbk_secret_valid").await;
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let payload: Value = serde_json::from_slice(&body).unwrap();
-
-    // Verify allowed_models is [] in JSON
-    assert!(payload["project"]["allowed_models"].is_array());
-    assert_eq!(
-        payload["project"]["allowed_models"]
-            .as_array()
-            .unwrap()
-            .len(),
-        0
-    );
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], true);
+    assert!(payload["allowed_models"].is_array());
+    assert_eq!(payload["allowed_models"].as_array().unwrap().len(), 0);
 }

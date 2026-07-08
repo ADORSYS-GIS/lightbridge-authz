@@ -1,5 +1,5 @@
-pub mod authorino;
 pub mod idp;
+pub mod introspect;
 pub mod opa;
 
 use std::sync::Arc;
@@ -540,5 +540,90 @@ mod tests {
         assert_eq!(issued.oauth2_url, Some(oauth2_url));
         assert!(issued.expires_at.is_some());
         assert_eq!(mock.calls(), 1);
+    }
+
+    fn test_issuer(oauth2_url: String, client_id: &str) -> OAuth2TokenIssuer {
+        OAuth2TokenIssuer::from_config(&Oauth2 {
+            jwks_url: "http://jwks".to_string(),
+            oauth2_url: Some(oauth2_url),
+            issuer_url: None,
+            authorization_endpoint: None,
+            token_endpoint: None,
+            registration_endpoint: None,
+            audience: None,
+            issuance: Some(Oauth2Issuance {
+                enabled: true,
+                grant_type: None,
+                client_id: client_id.to_string(),
+                client_secret: None,
+                subject_token_type: None,
+                requested_token_type: None,
+                audience: None,
+                scope: None,
+            }),
+        })
+        .expect("issuer should be configured")
+    }
+
+    #[test]
+    fn issuer_disabled_config_returns_none() {
+        let cfg = Oauth2 {
+            jwks_url: "http://jwks".to_string(),
+            oauth2_url: Some("http://token".to_string()),
+            issuer_url: None,
+            authorization_endpoint: None,
+            token_endpoint: None,
+            registration_endpoint: None,
+            audience: None,
+            issuance: Some(Oauth2Issuance {
+                enabled: false,
+                grant_type: None,
+                client_id: "c".to_string(),
+                client_secret: None,
+                subject_token_type: None,
+                requested_token_type: None,
+                audience: None,
+                scope: None,
+            }),
+        };
+        assert!(OAuth2TokenIssuer::from_config(&cfg).is_none());
+    }
+
+    #[tokio::test]
+    async fn issue_requires_non_empty_client_id() {
+        let issuer = test_issuer("http://unused".to_string(), "   ");
+        let err = issuer.issue(Some("token"), None).await.unwrap_err();
+        assert!(format!("{err}").contains("client_id is required"));
+    }
+
+    #[tokio::test]
+    async fn issue_requires_bearer_token() {
+        let issuer = test_issuer("http://unused".to_string(), "client");
+        let err = issuer.issue(None, None).await.unwrap_err();
+        assert!(format!("{err}").contains("bearer token is required"));
+    }
+
+    #[tokio::test]
+    async fn issue_errors_on_non_success_status() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(400).body("bad request");
+        });
+        let issuer = test_issuer(server.url("/token"), "client");
+        let err = issuer.issue(Some("token"), None).await.unwrap_err();
+        assert!(format!("{err}").contains("issuance failed with status"));
+    }
+
+    #[tokio::test]
+    async fn issue_errors_on_unparsable_response() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200).body("not json");
+        });
+        let issuer = test_issuer(server.url("/token"), "client");
+        let err = issuer.issue(Some("token"), None).await.unwrap_err();
+        assert!(format!("{err}").contains("response parse failed"));
     }
 }
