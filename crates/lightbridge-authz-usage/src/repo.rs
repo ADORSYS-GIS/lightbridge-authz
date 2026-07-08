@@ -272,7 +272,7 @@ impl StoreRepo {
 }
 
 fn append_dimension(
-    builder: &mut QueryBuilder<'_, Postgres>,
+    builder: &mut QueryBuilder<Postgres>,
     grouped_columns: &mut Vec<&'static str>,
     group_set: &HashSet<UsageGroupBy>,
     group_key: UsageGroupBy,
