@@ -160,7 +160,10 @@ Keycloak is preloaded with:
 API key creation uses Keycloak token exchange in dev: the API exchanges the
 caller's bearer token at the same realm token endpoint through the confidential
 `lightbridge-token-issuer` client, then stores the hash of the exchanged access
-token. The public `test-client` includes `lightbridge-token-issuer` as an access
+token. The exchange forwards the key's `project_id` as a form param so the
+Keycloak Lightbridge SPI can seal `account_id`/`project_id` into the issued
+token (see `lightbridge-keycloak-spi`); when the issuer client has no SPI wired,
+Keycloak ignores the extra param, so this stays backward-compatible. The public `test-client` includes `lightbridge-token-issuer` as an access
 token audience so Keycloak allows that confidential client to perform the exchange.
 See `docs/test-protocol.md` for the same-realm token exchange notes, the
 requester/target client/audience distinction, and revocation behavior.
