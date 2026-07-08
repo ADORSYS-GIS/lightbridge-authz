@@ -5,6 +5,9 @@ Lightbridge Authz is a multi-service backend for API key management and usage an
 - `lightbridge-authz-usage` ingests OTEL traffic data and serves Timescale-backed usage analytics.
 - `lightbridge-mcp` exposes all `lightbridge-authz` endpoints as MCP tools over streamable HTTP (`/mcp`).
 
+See [`docs/architecture.md`](docs/architecture.md) for the service/caller topology, crate layering, and
+the `resolve-context` + Authorino validation flows (mermaid diagrams).
+
 ## Services
 
 - **authz-api** (frontend CRUD, OAuth2)
