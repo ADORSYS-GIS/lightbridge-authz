@@ -69,9 +69,13 @@ impl AuthzStoreImpl {
         }
     }
 
-    async fn issue_secret(&self, bearer_token: Option<&str>) -> Result<IssuedSecret> {
+    async fn issue_secret(
+        &self,
+        bearer_token: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<IssuedSecret> {
         if let Some(token_issuer) = &self.token_issuer {
-            token_issuer.issue(bearer_token).await
+            token_issuer.issue(bearer_token, project_id).await
         } else {
             Ok(IssuedSecret {
                 secret: Self::generate_secret()?,
@@ -126,7 +130,11 @@ impl OAuth2TokenIssuer {
             .unwrap_or("urn:ietf:params:oauth:grant-type:token-exchange")
     }
 
-    async fn issue(&self, bearer_token: Option<&str>) -> Result<IssuedSecret> {
+    async fn issue(
+        &self,
+        bearer_token: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<IssuedSecret> {
         let grant_type = self.grant_type();
         if self.issuance.client_id.trim().is_empty() {
             return Err(Error::Server(
@@ -163,6 +171,9 @@ impl OAuth2TokenIssuer {
         }
         if let Some(scope) = &self.issuance.scope {
             form.push(("scope".to_string(), scope.clone()));
+        }
+        if let Some(project_id) = project_id.filter(|value| !value.trim().is_empty()) {
+            form.push(("project_id".to_string(), project_id.to_string()));
         }
 
         let response = self
@@ -294,7 +305,7 @@ impl AuthzStore for AuthzStoreImpl {
         project_id: &str,
         input: CreateApiKey,
     ) -> Result<ApiKeySecret> {
-        let issued = self.issue_secret(bearer_token).await?;
+        let issued = self.issue_secret(bearer_token, Some(project_id)).await?;
         let key_hash = hash_api_key(&issued.secret);
         let key_prefix = Self::key_prefix(&issued.secret);
         let now = Utc::now();
@@ -390,7 +401,9 @@ impl AuthzStore for AuthzStoreImpl {
                 (ApiKeyStatus::Revoked, Some(now), None)
             };
 
-        let issued = self.issue_secret(bearer_token).await?;
+        let issued = self
+            .issue_secret(bearer_token, Some(existing.project_id.as_str()))
+            .await?;
         let key_hash = hash_api_key(&issued.secret);
         let key_prefix = Self::key_prefix(&issued.secret);
         let requested_expires_at =
@@ -484,7 +497,8 @@ mod tests {
                 )
                 .body_includes(
                     "requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
-                );
+                )
+                .body_includes("project_id=proj-test");
             then.status(200).json_body(json!({
                 "access_token": "issued-access-token",
                 "expires_in": 60,
@@ -517,7 +531,10 @@ mod tests {
         })
         .expect("issuer should be configured");
 
-        let issued = issuer.issue(Some("incoming-access-token")).await.unwrap();
+        let issued = issuer
+            .issue(Some("incoming-access-token"), Some("proj-test"))
+            .await
+            .unwrap();
 
         assert_eq!(issued.secret, "issued-access-token");
         assert_eq!(issued.oauth2_url, Some(oauth2_url));
