@@ -143,6 +143,14 @@ fn capped_expiry_defaults_to_ttl_when_unrequested() {
     assert_eq!(capped_expiry(now, CAP_TTL_SECONDS, None), cap);
 }
 
+#[test]
+fn capped_expiry_ignores_past_request_to_avoid_dead_token() {
+    let now = chrono::Utc::now();
+    let cap = now + chrono::Duration::seconds(CAP_TTL_SECONDS);
+    let past = now - chrono::Duration::days(1);
+    assert_eq!(capped_expiry(now, CAP_TTL_SECONDS, Some(past)), cap);
+}
+
 #[cfg(feature = "it-tests")]
 mod db {
     use super::*;

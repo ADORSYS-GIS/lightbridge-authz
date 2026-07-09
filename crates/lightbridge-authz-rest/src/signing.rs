@@ -146,7 +146,8 @@ pub struct SignedApiKey {
 
 /// Resolves the JWT `exp` for an issued key. `ttl_seconds` is both the default lifetime (when the
 /// frontend requests no expiry) and the hard cap: a requested expiry beyond `now + ttl_seconds` is
-/// clamped down to it.
+/// clamped down to it. A requested expiry at or before `now` is ignored (defaults to the cap) so a
+/// malformed request can never mint a dead-on-arrival token.
 pub fn capped_expiry(
     now: DateTime<Utc>,
     ttl_seconds: i64,
@@ -154,8 +155,8 @@ pub fn capped_expiry(
 ) -> DateTime<Utc> {
     let cap = now + Duration::seconds(ttl_seconds);
     match requested {
-        Some(requested) => requested.min(cap),
-        None => cap,
+        Some(requested) if requested > now => requested.min(cap),
+        _ => cap,
     }
 }
 
