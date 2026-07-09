@@ -29,5 +29,11 @@ pub async fn resolve_context(
     let subject = input.subject.unwrap_or_default();
     let project_id = input.project_id.unwrap_or_default();
     let context: ResolvedContext = state.repo.resolve_context(&subject, &project_id).await?;
+    tracing::info!(
+        subject = %subject,
+        project_id = %project_id,
+        account_id = %context.account_id,
+        "resolved tenant context"
+    );
     Ok((StatusCode::OK, Json(context)).into_response())
 }

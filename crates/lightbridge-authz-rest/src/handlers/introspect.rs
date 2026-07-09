@@ -27,8 +27,17 @@ pub async fn introspect_api_key(
     Form(input): Form<IntrospectRequest>,
 ) -> Result<axum::response::Response> {
     let Some(validated) = validate_api_key_context(&state, &input.token, None).await? else {
+        tracing::info!(active = false, "api key introspection resolved inactive");
         return Ok((StatusCode::OK, Json(IntrospectResponse::inactive())).into_response());
     };
+
+    tracing::info!(
+        active = true,
+        api_key_id = %validated.api_key.id,
+        account_id = %validated.account.id,
+        project_id = %validated.project.id,
+        "api key introspection resolved active"
+    );
 
     let response = IntrospectResponse {
         active: true,

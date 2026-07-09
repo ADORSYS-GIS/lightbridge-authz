@@ -140,6 +140,26 @@ impl ServerHandler for LightbridgeMcpHandler {
             "MCP interface for Lightbridge Authz API and OPA validation endpoints",
         )
     }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<rmcp::model::CallToolResult, ErrorData> {
+        let tool = request.name.clone();
+        let subject = token_info_from_request_context(&context)
+            .map(|info| info.sub)
+            .unwrap_or_else(|_| "anonymous".to_string());
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let result = self.tool_router.call(tcc).await;
+        let outcome = match &result {
+            Ok(call_result) if call_result.is_error.unwrap_or(false) => "error",
+            Ok(_) => "ok",
+            Err(_) => "error",
+        };
+        tracing::info!(tool = %tool, subject = %subject, outcome, "mcp tool invoked");
+        result
+    }
 }
 
 fn parse_optional_datetime(
@@ -1065,6 +1085,20 @@ pub async fn start_mcp_server(
         ));
 
     let app = public.merge(protected);
+
+    let signing_enabled = oauth2.signing.as_ref().is_some_and(|s| s.enabled);
+    let issuance_enabled = oauth2
+        .issuance
+        .as_ref()
+        .is_some_and(|issuance| issuance.enabled);
+    tracing::info!(
+        server = "lightbridge-mcp",
+        address = %api.address,
+        port = api.port,
+        signing_enabled,
+        issuance_enabled,
+        "starting mcp server"
+    );
 
     serve_tls("MCP", &api.address, api.port, &api.tls, app).await
 }
