@@ -249,7 +249,11 @@ impl ApiKeyJwtSigner {
 /// expire. Stateless w.r.t. axum state, so it merges into any router. CORS is wide-open (any
 /// origin, GET) because these are public, non-secret discovery documents — browser-based OIDC
 /// clients must be able to fetch them cross-origin, as any standard OIDC provider allows.
-pub fn well_known_router<S>(issuer: &str, repo: Arc<StoreRepo>) -> Router<S>
+pub fn well_known_router<S>(
+    issuer: &str,
+    repo: Arc<StoreRepo>,
+    token_exchange_enabled: bool,
+) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -263,13 +267,22 @@ where
             get(move || {
                 let issuer = discovery_issuer.clone();
                 async move {
-                    Json(serde_json::json!({
+                    let mut doc = serde_json::json!({
                         "issuer": issuer,
                         "jwks_uri": format!("{issuer}/.well-known/jwks.json"),
                         "id_token_signing_alg_values_supported": ["RS256"],
                         "response_types_supported": ["token"],
                         "subject_types_supported": ["public"],
-                    }))
+                    });
+                    if token_exchange_enabled {
+                        doc["token_endpoint"] =
+                            serde_json::Value::from(format!("{issuer}/oauth2/token"));
+                        doc["grant_types_supported"] = serde_json::json!([
+                            "urn:ietf:params:oauth:grant-type:token-exchange",
+                            "refresh_token",
+                        ]);
+                    }
+                    Json(doc)
                 }
             }),
         )

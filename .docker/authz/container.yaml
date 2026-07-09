@@ -59,6 +59,19 @@ oauth2:
     audience: "${JWT_SIGNING_AUDIENCE:-lightbridge-api-key}"
     ttl_seconds: ${JWT_SIGNING_TTL_SECONDS:-7776000}
     max_key_age_days: ${JWT_SIGNING_MAX_KEY_AGE_DAYS:-30}
+  # Native RFC 8693 token-exchange on this service (POST /oauth2/token). Requires signing (the
+  # exchanged access token is a self-signed JWT). A client presents an upstream IdP access token
+  # + project_id; we resolve tenant context and mint a short-lived project-scoped JWT, plus a
+  # revocable refresh token when `offline_access` is requested. Independent of `issuance` above.
+  token_exchange:
+    enabled: ${TOKEN_EXCHANGE_ENABLED:-false}
+    access_ttl_seconds: ${TOKEN_EXCHANGE_ACCESS_TTL_SECONDS:-900}
+    refresh_ttl_seconds: ${TOKEN_EXCHANGE_REFRESH_TTL_SECONDS:-2592000}
+    allowed_scopes:
+      - openid
+      - profile
+      - email
+      - offline_access
 otel:
   enabled: true
   otlp_endpoint: "http://jaeger:4317"

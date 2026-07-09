@@ -1,11 +1,8 @@
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use lightbridge_authz_core::config::JwtSigning;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
-use lightbridge_authz_rest::signing::{
-    ApiKeyJwtSigner, KeyOwner, capped_expiry, generate_rs256_key,
-};
+use lightbridge_authz_rest::signing::{ApiKeyJwtSigner, capped_expiry, generate_rs256_key};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 
@@ -96,7 +93,7 @@ async fn well_known_serves_cors_headers() {
     use lightbridge_authz_rest::signing::well_known_router;
     use tower::ServiceExt;
 
-    let response = well_known_router::<()>(ISSUER, lazy_repo())
+    let response = well_known_router::<()>(ISSUER, lazy_repo(), false)
         .oneshot(
             Request::builder()
                 .uri("/.well-known/openid-configuration")
@@ -160,7 +157,8 @@ mod db {
     use lightbridge_authz_core::config::Oauth2;
     use lightbridge_authz_core::{CreateAccount, CreateApiKey, CreateProject};
     use lightbridge_authz_rest::handlers::AuthzStoreImpl;
-    use lightbridge_authz_rest::signing::bootstrap_signing_key;
+    use lightbridge_authz_rest::signing::{KeyOwner, bootstrap_signing_key};
+    use serde_json::Value;
     use sqlx::PgPool;
 
     #[derive(Debug, Deserialize)]
@@ -313,6 +311,7 @@ mod db {
             issuance: None,
             audience: None,
             signing: Some(signing_cfg(true, 3600)),
+            token_exchange: None,
         }
     }
 
@@ -403,7 +402,7 @@ mod db {
         .await
         .unwrap();
 
-        let jwks = well_known_router::<()>(ISSUER, repo.clone())
+        let jwks = well_known_router::<()>(ISSUER, repo.clone(), false)
             .oneshot(
                 Request::builder()
                     .uri("/.well-known/jwks.json")
@@ -422,7 +421,7 @@ mod db {
         );
         assert_eq!(payload["keys"][0]["alg"], "RS256");
 
-        let discovery = well_known_router::<()>(ISSUER, repo)
+        let discovery = well_known_router::<()>(ISSUER, repo, true)
             .oneshot(
                 Request::builder()
                     .uri("/.well-known/openid-configuration")
@@ -438,6 +437,43 @@ mod db {
         assert_eq!(
             payload["jwks_uri"],
             format!("{ISSUER}/.well-known/jwks.json")
+        );
+        assert_eq!(
+            payload["token_endpoint"],
+            format!("{ISSUER}/oauth2/token"),
+            "token_endpoint must be advertised when token-exchange is enabled"
+        );
+        let grants = payload["grant_types_supported"].as_array().unwrap();
+        assert!(
+            grants
+                .iter()
+                .any(|g| g == "urn:ietf:params:oauth:grant-type:token-exchange"),
+            "discovery must advertise the token-exchange grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_omits_token_endpoint_when_exchange_disabled() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Request, StatusCode};
+        use lightbridge_authz_rest::signing::well_known_router;
+        use tower::ServiceExt;
+
+        let discovery = well_known_router::<()>(ISSUER, lazy_repo(), false)
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/openid-configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(discovery.status(), StatusCode::OK);
+        let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            payload.get("token_endpoint").is_none(),
+            "token_endpoint must be absent when token-exchange is disabled"
         );
     }
 }

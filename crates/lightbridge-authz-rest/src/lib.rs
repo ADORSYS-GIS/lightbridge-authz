@@ -4,7 +4,7 @@ use lightbridge_authz_core::{
     Account, Project, async_trait,
     config::{ApiServer, BasicAuth, Oauth2, OpaServer},
     db::{DbPoolTrait, is_database_ready},
-    error::Result,
+    error::{Error, Result},
     server::serve_tls,
 };
 pub mod handlers;
@@ -12,6 +12,7 @@ pub mod middleware;
 pub mod models;
 pub mod routers;
 pub mod signing;
+pub mod token_exchange;
 
 use handlers::AuthzStoreImpl;
 use middleware::bearer_auth;
@@ -108,6 +109,7 @@ pub fn build_api_router(
     app_state: Arc<lightbridge_authz_api::AppState>,
     readiness_pool: Arc<dyn DbPoolTrait>,
     signing_repo: Arc<StoreRepo>,
+    token_exchange: Option<token_exchange::TokenExchangeState>,
 ) -> Router {
     let mut public = Router::new()
         .route("/", get(root_handler))
@@ -125,8 +127,17 @@ pub fn build_api_router(
             lightbridge_authz_api::openapi::ApiDoc::openapi(),
         ));
 
+    let token_exchange_enabled = token_exchange.is_some();
     if let Some(signing) = oauth2.signing.as_ref().filter(|s| s.enabled) {
-        public = public.merge(signing::well_known_router(&signing.issuer, signing_repo));
+        public = public.merge(signing::well_known_router(
+            &signing.issuer,
+            signing_repo,
+            token_exchange_enabled,
+        ));
+    }
+
+    if let Some(te_state) = token_exchange {
+        public = public.merge(token_exchange::token_exchange_router(te_state));
     }
 
     let protected = Router::new()
@@ -138,6 +149,37 @@ pub fn build_api_router(
         ));
 
     public.merge(protected).with_state(app_state)
+}
+
+/// Builds the native token-exchange state, enabled only when BOTH `signing` and `token_exchange`
+/// are on (the exchanged access token is a self-signed JWT, so signing is a hard prerequisite).
+/// Returns `Ok(None)` when disabled; errors on invalid config so startup fails fast.
+fn build_token_exchange_state(
+    oauth2: &Oauth2,
+    repo: Arc<StoreRepo>,
+    bearer: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait>,
+) -> Result<Option<token_exchange::TokenExchangeState>> {
+    let (Some(signing), Some(cfg)) = (
+        oauth2.signing.as_ref().filter(|s| s.enabled),
+        oauth2.token_exchange.as_ref().filter(|t| t.enabled),
+    ) else {
+        return Ok(None);
+    };
+    if cfg.access_ttl_seconds <= 0 || cfg.refresh_ttl_seconds <= 0 {
+        return Err(Error::Server(
+            "token_exchange access_ttl_seconds and refresh_ttl_seconds must be positive"
+                .to_string(),
+        ));
+    }
+    let Some(signer) = signing::ApiKeyJwtSigner::from_config(signing, repo.clone())? else {
+        return Ok(None);
+    };
+    Ok(Some(token_exchange::TokenExchangeState {
+        repo,
+        signer,
+        bearer,
+        cfg: cfg.clone(),
+    }))
 }
 
 pub async fn start_api_server(
@@ -154,12 +196,22 @@ pub async fn start_api_server(
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
 
+    let token_exchange_state =
+        build_token_exchange_state(oauth2, signing_repo.clone(), bearer_service.clone())?;
+    let token_exchange_enabled = token_exchange_state.is_some();
+
     let app_state = Arc::new(lightbridge_authz_api::AppState {
         store,
         bearer: bearer_service,
     });
 
-    let app = build_api_router(oauth2, app_state, readiness_pool, signing_repo);
+    let app = build_api_router(
+        oauth2,
+        app_state,
+        readiness_pool,
+        signing_repo,
+        token_exchange_state,
+    );
 
     let signing_enabled = oauth2.signing.as_ref().is_some_and(|s| s.enabled);
     let issuance_enabled = oauth2
@@ -172,6 +224,7 @@ pub async fn start_api_server(
         port = api.port,
         signing_enabled,
         issuance_enabled,
+        token_exchange_enabled,
         "starting api server"
     );
 

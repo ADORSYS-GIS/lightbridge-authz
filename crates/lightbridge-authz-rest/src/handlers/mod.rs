@@ -628,6 +628,7 @@ mod tests {
             registration_endpoint: None,
             audience: None,
             signing: None,
+            token_exchange: None,
             issuance: Some(Oauth2Issuance {
                 enabled: true,
                 grant_type: Some("urn:ietf:params:oauth:grant-type:token-exchange".to_string()),
@@ -666,6 +667,7 @@ mod tests {
             registration_endpoint: None,
             audience: None,
             signing: None,
+            token_exchange: None,
             issuance: Some(Oauth2Issuance {
                 enabled: true,
                 grant_type: None,
@@ -691,6 +693,7 @@ mod tests {
             registration_endpoint: None,
             audience: None,
             signing: None,
+            token_exchange: None,
             issuance: Some(Oauth2Issuance {
                 enabled: false,
                 grant_type: None,
