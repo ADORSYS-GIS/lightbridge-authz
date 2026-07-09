@@ -111,7 +111,7 @@ pub struct JwtSigning {
     /// Optional `aud` claim stamped on issued tokens.
     #[serde(default)]
     pub audience: Option<String>,
-    /// Token lifetime in seconds.
+    /// Default token lifetime in seconds and the hard cap on any frontend-requested expiry.
     #[serde(default = "default_signing_ttl_seconds")]
     pub ttl_seconds: i64,
     /// Auto-rotate the active signing key once it is older than this many days (checked at
@@ -121,7 +121,7 @@ pub struct JwtSigning {
 }
 
 fn default_signing_ttl_seconds() -> i64 {
-    3600
+    7_776_000
 }
 
 fn default_max_key_age_days() -> i64 {

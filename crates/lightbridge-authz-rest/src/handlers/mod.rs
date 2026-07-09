@@ -67,6 +67,7 @@ impl AuthzStoreImpl {
         bearer_token: Option<&str>,
         project_id: &str,
         api_key_id: &str,
+        requested_expires_at: Option<DateTime<Utc>>,
     ) -> Result<IssuedSecret> {
         if let Some(signer) = &self.jwt_signer {
             let project = self
@@ -88,6 +89,7 @@ impl AuthzStoreImpl {
                     &project.account_id,
                     project.allowed_models.clone(),
                     Utc::now(),
+                    requested_expires_at,
                 )
                 .await?;
             Ok(IssuedSecret {
@@ -375,7 +377,7 @@ impl AuthzStore for AuthzStoreImpl {
     ) -> Result<ApiKeySecret> {
         let id = cuid2();
         let issued = self
-            .issue_api_key_secret(subject, bearer_token, project_id, &id)
+            .issue_api_key_secret(subject, bearer_token, project_id, &id, input.expires_at)
             .await?;
         let key_hash = hash_api_key(&issued.secret);
         let key_prefix = Self::key_prefix(&issued.secret);
@@ -473,13 +475,19 @@ impl AuthzStore for AuthzStoreImpl {
             };
 
         let new_id = cuid2();
+        let requested_expires_at =
+            resolve_rotated_expires_at(input.expires_at, existing.expires_at);
         let issued = self
-            .issue_api_key_secret(subject, bearer_token, existing.project_id.as_str(), &new_id)
+            .issue_api_key_secret(
+                subject,
+                bearer_token,
+                existing.project_id.as_str(),
+                &new_id,
+                requested_expires_at,
+            )
             .await?;
         let key_hash = hash_api_key(&issued.secret);
         let key_prefix = Self::key_prefix(&issued.secret);
-        let requested_expires_at =
-            resolve_rotated_expires_at(input.expires_at, existing.expires_at);
         let expires_at = resolve_issued_expires_at(requested_expires_at, issued.expires_at);
         let row = lightbridge_authz_api_key::entities::new_api_key_row::NewApiKeyRow {
             id: new_id,
