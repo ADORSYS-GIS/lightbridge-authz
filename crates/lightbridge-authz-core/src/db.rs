@@ -20,13 +20,44 @@ impl DbPool {
 
     pub async fn new(database: &Database) -> Result<Self> {
         let max_size = database.pool_size.unwrap_or(10);
-        let pool = PgPoolOptions::new()
+        let options = PgPoolOptions::new()
             .max_connections(max_size)
             .min_connections(5)
-            .acquire_timeout(Duration::from_secs(30))
-            .connect(&database.url)
-            .await?;
-        Ok(Self { pool })
+            .acquire_timeout(Duration::from_secs(30));
+
+        let max_attempts: u32 = 30;
+        let max_backoff = Duration::from_secs(5);
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            match options.clone().connect(&database.url).await {
+                Ok(pool) => {
+                    if attempt > 1 {
+                        tracing::info!(attempt, "connected to database after retrying");
+                    }
+                    return Ok(Self { pool });
+                }
+                Err(err) if attempt >= max_attempts => {
+                    tracing::error!(
+                        attempt,
+                        error = %err,
+                        "database connection failed after exhausting retries"
+                    );
+                    return Err(err.into());
+                }
+                Err(err) => {
+                    let backoff = Duration::from_millis(250u64.saturating_mul(attempt as u64))
+                        .min(max_backoff);
+                    tracing::warn!(
+                        attempt,
+                        error = %err,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "database not ready, retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
     }
 }
 
