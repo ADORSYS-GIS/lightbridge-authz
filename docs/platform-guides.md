@@ -91,7 +91,7 @@ Because those names are derived from the same `bjw-s/common` fullname helper, th
 
 - Run Helm with overrides for the shared config, ingresses, and the injected `CONFIG_PATH` env var so the CLI knows where to read `/etc/lightbridge/config.yaml`:
   ```bash
-  helm install lightbridge charts/lightbridge \
+  helm install lightbridge charts/lightbridge-authz-stack \
     --set global.tls.job.enabled=false \
     --set sharedConfig.database.url=postgres://postgres:postgres@lb-postgres-postgresql.default.svc.cluster.local:5432/lightbridge_authz \
     --set global.config.database.url=postgres://postgres:postgres@lb-postgres-postgresql.default.svc.cluster.local:5432/lightbridge_authz \
@@ -135,7 +135,7 @@ LightBridge Authz only exposes TLS-secured ports, so you need a certificate in K
       job:
         enabled: true
   ```
-  Run `helm upgrade --install lightbridge charts/lightbridge ...` with that snippet merged into your values; the job will create the secret in the same namespace before the API/OPA pods start.
+  Run `helm upgrade --install lightbridge charts/lightbridge-authz-stack ...` with that snippet merged into your values; the job will create the secret in the same namespace before the API/OPA pods start.
 
 - **Cert-manager certificate** – install cert-manager (`kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml`), then provision a `Certificate` that writes to the same secret name and covers the service FQDNs. The chart can skip its job once cert-manager owns the secret:
   ```yaml
@@ -176,7 +176,7 @@ Once the cert-manager resource emits a TLS secret, the chart mounts it and pods 
 
 ### Live cert-manager example
 1. Install cert-manager from the official release, then create the `lightbridge-selfsigned` `Issuer` and the `lightbridge-authz-tls` `Certificate` that covers both `lightbridge-lightbridge-api` and `lightbridge-lightbridge-opa` service names (the `Secret` name must match what `global.tls.tlsSecretName` expects).
-2. Run `helm upgrade lightbridge charts/lightbridge --reuse-values --set global.tls.job.enabled=false --wait` so the release relies on the cert-manager secret instead of the built-in job.
+2. Run `helm upgrade lightbridge charts/lightbridge-authz-stack --reuse-values --set global.tls.job.enabled=false --wait` so the release relies on the cert-manager secret instead of the built-in job.
 3. Launch an Ubuntu pod, install `curl`, and call the API health endpoint over the service FQDN:
    ```bash
    kubectl run curl-ubuntu --image=ubuntu:22.04 --restart=Never -- bash -lc 'apt-get update >/tmp/apt.log && apt-get install -y curl >/tmp/curl.log && curl -k -s -o /tmp/health.out -w "HTTP %{http_code}\n" https://lightbridge-lightbridge-api.default.svc.cluster.local:3000/healthz && cat /tmp/health.out'
