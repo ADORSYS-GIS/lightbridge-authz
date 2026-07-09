@@ -17,6 +17,8 @@ use serde::Serialize;
 
 const RSA_KEY_BITS: usize = 2048;
 const ALGORITHM: &str = "RS256";
+const TOKEN_TYP: &str = "Bearer";
+const TOKEN_SCOPE: &str = "profile email";
 
 /// A freshly generated RS256 signing key: PKCS#8 private PEM + the public JWK to publish.
 pub struct GeneratedKey {
@@ -96,6 +98,16 @@ impl std::fmt::Debug for ApiKeyJwtSigner {
     }
 }
 
+/// Identity of the human who created or rotated the key, snapshotted into the issued JWT so the
+/// token mirrors a Keycloak access token. Captured at issuance from the creator's bearer token;
+/// frozen for the token's TTL and refreshed on rotation.
+#[derive(Debug, Clone, Default)]
+pub struct KeyOwner {
+    pub subject: String,
+    pub email: Option<String>,
+    pub email_verified: Option<bool>,
+}
+
 #[derive(Serialize)]
 struct ApiKeyClaims<'a> {
     iss: &'a str,
@@ -103,11 +115,20 @@ struct ApiKeyClaims<'a> {
     jti: String,
     iat: i64,
     exp: i64,
+    typ: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     aud: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    azp: Option<&'a str>,
+    sid: String,
+    scope: &'static str,
     api_key_id: &'a str,
     project_id: &'a str,
     account_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email_verified: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     allowed_models: Option<Vec<String>>,
 }
@@ -144,9 +165,11 @@ impl ApiKeyJwtSigner {
         }))
     }
 
-    /// Signs an API-key JWT with the current active key for the given key/project/account.
+    /// Signs an API-key JWT with the current active key for the given key/project/account. `owner`
+    /// supplies the creator's Keycloak `sub` and (optionally) email, mirroring a Keycloak token.
     pub async fn sign(
         &self,
+        owner: &KeyOwner,
         api_key_id: &str,
         project_id: &str,
         account_id: &str,
@@ -165,14 +188,20 @@ impl ApiKeyJwtSigner {
         header.kid = Some(active.kid);
         let claims = ApiKeyClaims {
             iss: &self.issuer,
-            sub: api_key_id,
-            jti: cuid2(),
+            sub: &owner.subject,
+            jti: format!("lgbr:{}", cuid2()),
             iat: now.timestamp(),
             exp: expires_at.timestamp(),
+            typ: TOKEN_TYP,
             aud: self.audience.as_deref(),
+            azp: self.audience.as_deref(),
+            sid: cuid2(),
+            scope: TOKEN_SCOPE,
             api_key_id,
             project_id,
             account_id,
+            email: owner.email.as_deref(),
+            email_verified: owner.email_verified,
             allowed_models,
         };
         let token = encode(&header, &claims, &encoding_key)
