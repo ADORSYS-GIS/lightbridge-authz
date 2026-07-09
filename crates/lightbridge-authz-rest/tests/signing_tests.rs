@@ -1,7 +1,7 @@
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use lightbridge_authz_core::config::JwtSigning;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
-use lightbridge_authz_rest::signing::{ApiKeyJwtSigner, generate_rs256_key};
+use lightbridge_authz_rest::signing::{ApiKeyJwtSigner, KeyOwner, generate_rs256_key};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
@@ -102,10 +102,15 @@ mod db {
     #[derive(Debug, Deserialize)]
     struct ApiKeyClaims {
         iss: String,
+        sub: String,
         api_key_id: String,
         project_id: String,
         account_id: String,
         allowed_models: Option<Vec<String>>,
+        email: Option<String>,
+        email_verified: Option<bool>,
+        typ: Option<String>,
+        scope: Option<String>,
     }
 
     fn repo(pool: PgPool) -> Arc<StoreRepo> {
@@ -199,8 +204,14 @@ mod db {
         let signer = ApiKeyJwtSigner::from_config(&signing_cfg(true, 3600), repo.clone())
             .unwrap()
             .unwrap();
+        let owner = KeyOwner {
+            subject: "kc-user-123".to_string(),
+            email: Some("dev@example.test".to_string()),
+            email_verified: Some(true),
+        };
         let signed = signer
             .sign(
+                &owner,
                 "key_1",
                 "proj_1",
                 "acct_1",
@@ -212,9 +223,14 @@ mod db {
 
         let claims = verify_against(&active.public_jwk, &signed.token);
         assert_eq!(claims.iss, ISSUER);
+        assert_eq!(claims.sub, "kc-user-123");
         assert_eq!(claims.api_key_id, "key_1");
         assert_eq!(claims.project_id, "proj_1");
         assert_eq!(claims.account_id, "acct_1");
+        assert_eq!(claims.email.as_deref(), Some("dev@example.test"));
+        assert_eq!(claims.email_verified, Some(true));
+        assert_eq!(claims.typ.as_deref(), Some("Bearer"));
+        assert_eq!(claims.scope.as_deref(), Some("profile email"));
         assert_eq!(
             claims.allowed_models,
             Some(vec!["gpt-4.1-mini".to_string()])
@@ -269,10 +285,14 @@ mod db {
             )
             .await
             .unwrap();
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"email":"owner@example.test","email_verified":true}"#);
+        let bearer = format!("h.{payload}.s");
         let created = store
             .create_api_key(
                 subject,
-                None,
+                Some(&bearer),
                 &project.id,
                 CreateApiKey {
                     name: "k".to_string(),
@@ -284,9 +304,12 @@ mod db {
 
         assert_eq!(created.secret.split('.').count(), 3, "must be a JWT");
         let claims = verify_against(&active.public_jwk, &created.secret);
+        assert_eq!(claims.sub, subject);
         assert_eq!(claims.api_key_id, created.api_key.id);
         assert_eq!(claims.project_id, project.id);
         assert_eq!(claims.account_id, account.id);
+        assert_eq!(claims.email.as_deref(), Some("owner@example.test"));
+        assert_eq!(claims.email_verified, Some(true));
     }
 
     #[sqlx::test(migrations = "../../migrations")]

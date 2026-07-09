@@ -153,9 +153,31 @@ no stored credential, no provider round-trip.
 ## Self-signed JWT API keys (enterprise default)
 
 When `oauth2.signing.enabled` is set, issued API keys are **RS256 JWTs signed by this
-service**, carrying `api_key_id`, `project_id`, `account_id`, and `allowed_models` claims.
-The public half is published so Authorino can verify signatures, via OIDC discovery on the
-API server:
+service**, shaped to mirror a Keycloak access token so gateways can consume them uniformly:
+
+```json
+{
+  "iss": "https://authz.example/",
+  "sub": "<creator's Keycloak user id>",
+  "aud": "lightbridge-api-key",
+  "azp": "lightbridge-api-key",
+  "typ": "Bearer",
+  "scope": "profile email",
+  "jti": "...", "sid": "...", "iat": 0, "exp": 0,
+  "api_key_id": "key_...",
+  "project_id": "proj_...",
+  "account_id": "acct_...",
+  "allowed_models": ["gpt-4.1-mini"],
+  "email": "owner@example.test",
+  "email_verified": true
+}
+```
+
+`sub` is the **creator's Keycloak subject** (not the api-key id — that lives in
+`api_key_id`). `email`/`email_verified` are snapshotted from the creator's bearer token at
+create/rotate time and frozen for the token's TTL; they are omitted when the creating token
+carried no email. The public half is published so Authorino can verify signatures, via OIDC
+discovery on the API server:
 
 - `GET /.well-known/openid-configuration` — points at the JWKS
 - `GET /.well-known/jwks.json` — the signing public key(s)
