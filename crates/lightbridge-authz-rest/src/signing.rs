@@ -144,6 +144,22 @@ pub struct SignedApiKey {
     pub expires_at: DateTime<Utc>,
 }
 
+/// Resolves the JWT `exp` for an issued key. `ttl_seconds` is both the default lifetime (when the
+/// frontend requests no expiry) and the hard cap: a requested expiry beyond `now + ttl_seconds` is
+/// clamped down to it. A requested expiry at or before `now` is ignored (defaults to the cap) so a
+/// malformed request can never mint a dead-on-arrival token.
+pub fn capped_expiry(
+    now: DateTime<Utc>,
+    ttl_seconds: i64,
+    requested: Option<DateTime<Utc>>,
+) -> DateTime<Utc> {
+    let cap = now + Duration::seconds(ttl_seconds);
+    match requested {
+        Some(requested) if requested > now => requested.min(cap),
+        _ => cap,
+    }
+}
+
 impl ApiKeyJwtSigner {
     /// Builds a signer from config. Returns `Ok(None)` when signing is disabled, and an error
     /// for invalid config (fail-fast at startup). Key material lives in the DB, not config.
@@ -172,6 +188,9 @@ impl ApiKeyJwtSigner {
 
     /// Signs an API-key JWT with the current active key for the given key/project/account. `owner`
     /// supplies the creator's Keycloak `sub` and (optionally) email, mirroring a Keycloak token.
+    /// `requested_expires_at` is the frontend-requested expiry; the stamped `exp` is
+    /// `min(now + ttl_seconds, requested_expires_at)`, defaulting to `now + ttl_seconds`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn sign(
         &self,
         owner: &KeyOwner,
@@ -180,6 +199,7 @@ impl ApiKeyJwtSigner {
         account_id: &str,
         allowed_models: Option<Vec<String>>,
         now: DateTime<Utc>,
+        requested_expires_at: Option<DateTime<Utc>>,
     ) -> Result<SignedApiKey> {
         let active = self
             .repo
@@ -188,7 +208,7 @@ impl ApiKeyJwtSigner {
             .ok_or_else(|| Error::Server("no active api-key signing key".to_string()))?;
         let encoding_key = EncodingKey::from_rsa_pem(active.private_key_pem.as_bytes())
             .map_err(|e| Error::Server(format!("invalid stored signing key: {e}")))?;
-        let expires_at = now + Duration::seconds(self.ttl_seconds);
+        let expires_at = capped_expiry(now, self.ttl_seconds, requested_expires_at);
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(active.kid);
         let claims = ApiKeyClaims {

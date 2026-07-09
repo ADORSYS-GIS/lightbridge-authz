@@ -1,7 +1,9 @@
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use lightbridge_authz_core::config::JwtSigning;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
-use lightbridge_authz_rest::signing::{ApiKeyJwtSigner, KeyOwner, generate_rs256_key};
+use lightbridge_authz_rest::signing::{
+    ApiKeyJwtSigner, KeyOwner, capped_expiry, generate_rs256_key,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
@@ -112,6 +114,41 @@ async fn well_known_serves_cors_headers() {
             .expect("well-known responses must carry a CORS allow-origin header"),
         "*"
     );
+}
+
+const CAP_TTL_SECONDS: i64 = 7_776_000;
+
+#[test]
+fn capped_expiry_honors_requested_within_cap() {
+    let now = chrono::Utc::now();
+    let requested = now + chrono::Duration::days(30);
+    assert_eq!(
+        capped_expiry(now, CAP_TTL_SECONDS, Some(requested)),
+        requested
+    );
+}
+
+#[test]
+fn capped_expiry_clamps_requested_beyond_cap() {
+    let now = chrono::Utc::now();
+    let requested = now + chrono::Duration::days(365);
+    let cap = now + chrono::Duration::seconds(CAP_TTL_SECONDS);
+    assert_eq!(capped_expiry(now, CAP_TTL_SECONDS, Some(requested)), cap);
+}
+
+#[test]
+fn capped_expiry_defaults_to_ttl_when_unrequested() {
+    let now = chrono::Utc::now();
+    let cap = now + chrono::Duration::seconds(CAP_TTL_SECONDS);
+    assert_eq!(capped_expiry(now, CAP_TTL_SECONDS, None), cap);
+}
+
+#[test]
+fn capped_expiry_ignores_past_request_to_avoid_dead_token() {
+    let now = chrono::Utc::now();
+    let cap = now + chrono::Duration::seconds(CAP_TTL_SECONDS);
+    let past = now - chrono::Duration::days(1);
+    assert_eq!(capped_expiry(now, CAP_TTL_SECONDS, Some(past)), cap);
 }
 
 #[cfg(feature = "it-tests")]
@@ -244,6 +281,7 @@ mod db {
                 "acct_1",
                 Some(vec!["gpt-4.1-mini".to_string()]),
                 Utc::now(),
+                None,
             )
             .await
             .unwrap();
