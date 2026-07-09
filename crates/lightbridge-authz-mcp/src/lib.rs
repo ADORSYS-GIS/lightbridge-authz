@@ -980,7 +980,8 @@ pub async fn start_mcp_server(
     pool: Arc<dyn DbPoolTrait>,
 ) -> Result<()> {
     let readiness_pool = pool.clone();
-    let store: Arc<dyn AuthzStore> = Arc::new(AuthzStoreImpl::with_pool(pool.clone()));
+    let store: Arc<dyn AuthzStore> =
+        Arc::new(AuthzStoreImpl::with_pool_and_oauth2(pool.clone(), oauth2)?);
     let opa_repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
     let bearer_service: Arc<dyn BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
@@ -1371,6 +1372,7 @@ mod tests {
             registration_endpoint: None,
             issuance: None,
             audience: None,
+            signing: None,
         }
     }
 

@@ -11,6 +11,7 @@ pub mod handlers;
 pub mod middleware;
 pub mod models;
 pub mod routers;
+pub mod signing;
 
 use handlers::AuthzStoreImpl;
 use middleware::bearer_auth;
@@ -99,22 +100,15 @@ impl OpaRepoTrait for StoreRepo {
     }
 }
 
-pub async fn start_api_server(
-    api: &ApiServer,
-    pool: Arc<dyn DbPoolTrait>,
+/// Assembles the API server router (public probes, OIDC discovery/JWKS when signing is
+/// enabled, and the bearer-protected CRUD API). Separated from `start_api_server` so the
+/// composition can be tested without binding a TLS socket.
+pub fn build_api_router(
     oauth2: &Oauth2,
-) -> Result<()> {
-    let readiness_pool = pool.clone();
-    let store = Arc::new(AuthzStoreImpl::with_pool_and_oauth2(pool, oauth2));
-    let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
-        Arc::new(BearerTokenService::new(oauth2.clone()));
-
-    let app_state = Arc::new(lightbridge_authz_api::AppState {
-        store,
-        bearer: bearer_service,
-    });
-
-    let public = Router::new()
+    app_state: Arc<lightbridge_authz_api::AppState>,
+    readiness_pool: Arc<dyn DbPoolTrait>,
+) -> Router {
+    let mut public = Router::new()
         .route("/", get(root_handler))
         .route("/healthz", get(health_handler))
         .route("/healthz/startup", get(startup_handler))
@@ -130,6 +124,10 @@ pub async fn start_api_server(
             lightbridge_authz_api::openapi::ApiDoc::openapi(),
         ));
 
+    if let Some(signing) = oauth2.signing.as_ref().filter(|s| s.enabled) {
+        public = public.merge(signing::well_known_router(&signing.issuer, &signing.jwks));
+    }
+
     let protected = Router::new()
         .nest("/api/v1", api_router())
         .with_state(app_state.clone())
@@ -138,19 +136,32 @@ pub async fn start_api_server(
             bearer_auth,
         ));
 
-    let app = public.merge(protected).with_state(app_state.clone());
+    public.merge(protected).with_state(app_state)
+}
+
+pub async fn start_api_server(
+    api: &ApiServer,
+    pool: Arc<dyn DbPoolTrait>,
+    oauth2: &Oauth2,
+) -> Result<()> {
+    let readiness_pool = pool.clone();
+    let store = Arc::new(AuthzStoreImpl::with_pool_and_oauth2(pool, oauth2)?);
+    let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
+        Arc::new(BearerTokenService::new(oauth2.clone()));
+
+    let app_state = Arc::new(lightbridge_authz_api::AppState {
+        store,
+        bearer: bearer_service,
+    });
+
+    let app = build_api_router(oauth2, app_state, readiness_pool);
 
     serve_tls("API", &api.address, api.port, &api.tls, app).await
 }
 
-pub async fn start_opa_server(opa: &OpaServer, pool: Arc<dyn DbPoolTrait>) -> Result<()> {
-    let readiness_pool = pool.clone();
-    let repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
-    let state = Arc::new(OpaState {
-        repo,
-        basic_auth: opa.basic_auth.clone(),
-    });
-
+/// Assembles the OPA server router (public probes + Basic-auth introspection/resolve routes).
+/// Separated from `start_opa_server` for testability.
+pub fn build_opa_router(state: Arc<OpaState>, readiness_pool: Arc<dyn DbPoolTrait>) -> Router {
     let public = Router::new()
         .route("/", get(root_handler))
         .route("/healthz", get(health_handler))
@@ -166,7 +177,18 @@ pub async fn start_opa_server(opa: &OpaServer, pool: Arc<dyn DbPoolTrait>) -> Re
 
     let protected = opa_router(state.clone()).with_state(state.clone());
 
-    let app = public.merge(protected).with_state(state.clone());
+    public.merge(protected).with_state(state)
+}
+
+pub async fn start_opa_server(opa: &OpaServer, pool: Arc<dyn DbPoolTrait>) -> Result<()> {
+    let readiness_pool = pool.clone();
+    let repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
+    let state = Arc::new(OpaState {
+        repo,
+        basic_auth: opa.basic_auth.clone(),
+    });
+
+    let app = build_opa_router(state, readiness_pool);
 
     serve_tls("OPA", &opa.address, opa.port, &opa.tls, app).await
 }

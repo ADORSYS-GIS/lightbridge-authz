@@ -27,6 +27,7 @@ use serde::Deserialize;
 pub struct AuthzStoreImpl {
     repo: Arc<StoreRepo>,
     token_issuer: Option<OAuth2TokenIssuer>,
+    jwt_signer: Option<Arc<crate::signing::ApiKeyJwtSigner>>,
 }
 
 impl std::fmt::Debug for AuthzStoreImpl {
@@ -41,14 +42,50 @@ impl AuthzStoreImpl {
         Self {
             repo: Arc::new(repo),
             token_issuer: None,
+            jwt_signer: None,
         }
     }
 
-    pub fn with_pool_and_oauth2(pool: Arc<dyn DbPoolTrait>, oauth2: &Oauth2) -> Self {
+    pub fn with_pool_and_oauth2(pool: Arc<dyn DbPoolTrait>, oauth2: &Oauth2) -> Result<Self> {
         let repo = StoreRepo::new(pool);
-        Self {
+        let jwt_signer = match oauth2.signing.as_ref() {
+            Some(signing) => crate::signing::ApiKeyJwtSigner::from_config(signing)?.map(Arc::new),
+            None => None,
+        };
+        Ok(Self {
             repo: Arc::new(repo),
             token_issuer: OAuth2TokenIssuer::from_config(oauth2),
+            jwt_signer,
+        })
+    }
+
+    async fn issue_api_key_secret(
+        &self,
+        subject: &str,
+        bearer_token: Option<&str>,
+        project_id: &str,
+        api_key_id: &str,
+    ) -> Result<IssuedSecret> {
+        if let Some(signer) = &self.jwt_signer {
+            let project = self
+                .repo
+                .get_project(subject, project_id)
+                .await?
+                .ok_or(Error::NotFound)?;
+            let signed = signer.sign(
+                api_key_id,
+                project_id,
+                &project.account_id,
+                project.allowed_models.clone(),
+                Utc::now(),
+            )?;
+            Ok(IssuedSecret {
+                secret: signed.token,
+                expires_at: Some(signed.expires_at),
+                oauth2_url: None,
+            })
+        } else {
+            self.issue_secret(bearer_token, Some(project_id)).await
         }
     }
 
@@ -305,13 +342,16 @@ impl AuthzStore for AuthzStoreImpl {
         project_id: &str,
         input: CreateApiKey,
     ) -> Result<ApiKeySecret> {
-        let issued = self.issue_secret(bearer_token, Some(project_id)).await?;
+        let id = cuid2();
+        let issued = self
+            .issue_api_key_secret(subject, bearer_token, project_id, &id)
+            .await?;
         let key_hash = hash_api_key(&issued.secret);
         let key_prefix = Self::key_prefix(&issued.secret);
         let now = Utc::now();
         let expires_at = resolve_issued_expires_at(input.expires_at, issued.expires_at);
         let row = lightbridge_authz_api_key::entities::new_api_key_row::NewApiKeyRow {
-            id: cuid2(),
+            id,
             project_id: project_id.to_string(),
             name: input.name,
             key_prefix,
@@ -401,8 +441,9 @@ impl AuthzStore for AuthzStoreImpl {
                 (ApiKeyStatus::Revoked, Some(now), None)
             };
 
+        let new_id = cuid2();
         let issued = self
-            .issue_secret(bearer_token, Some(existing.project_id.as_str()))
+            .issue_api_key_secret(subject, bearer_token, existing.project_id.as_str(), &new_id)
             .await?;
         let key_hash = hash_api_key(&issued.secret);
         let key_prefix = Self::key_prefix(&issued.secret);
@@ -410,7 +451,7 @@ impl AuthzStore for AuthzStoreImpl {
             resolve_rotated_expires_at(input.expires_at, existing.expires_at);
         let expires_at = resolve_issued_expires_at(requested_expires_at, issued.expires_at);
         let row = lightbridge_authz_api_key::entities::new_api_key_row::NewApiKeyRow {
-            id: cuid2(),
+            id: new_id,
             project_id: existing.project_id,
             name: input.name.unwrap_or(existing.name),
             key_prefix,
@@ -514,6 +555,7 @@ mod tests {
             token_endpoint: None,
             registration_endpoint: None,
             audience: None,
+            signing: None,
             issuance: Some(Oauth2Issuance {
                 enabled: true,
                 grant_type: Some("urn:ietf:params:oauth:grant-type:token-exchange".to_string()),
@@ -551,6 +593,7 @@ mod tests {
             token_endpoint: None,
             registration_endpoint: None,
             audience: None,
+            signing: None,
             issuance: Some(Oauth2Issuance {
                 enabled: true,
                 grant_type: None,
@@ -575,6 +618,7 @@ mod tests {
             token_endpoint: None,
             registration_endpoint: None,
             audience: None,
+            signing: None,
             issuance: Some(Oauth2Issuance {
                 enabled: false,
                 grant_type: None,

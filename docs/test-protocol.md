@@ -86,27 +86,26 @@ PROJECT_ID=$(echo "$PROJECT_JSON" | /usr/bin/python3 -c "import sys, json; print
 
 ## 5) Create an API key
 
-API keys are opaque, locally-generated secrets (`lbk_secret_...`). The CRUD API
-stores only the SHA-256 hash of the secret and returns the plaintext `secret`
-exactly once, on create/rotate. The token has no standalone meaning: it is not a
-JWT and no JWKS validator accepts it — it is only interpretable by asking the
-Lightbridge validation layer, which makes it inert if leaked or replayed outside
-that path.
+The CRUD API stores only the SHA-256 hash of the issued secret and returns the
+plaintext `secret` exactly once, on create/rotate. The credential format depends on
+config:
 
-(The `oauth2.issuance` config can switch key creation to Keycloak token exchange,
-which returns a real OAuth2 access token instead. That is disabled by default:
-an exchanged JWT is stateless and cannot be revoked before its `exp`, which
-defeats immediate revocation. Leave issuance disabled unless you specifically need
-provider-issued tokens and accept a revocation window equal to the token lifetime.)
+- **Self-signed JWT** (`oauth2.signing.enabled`, enterprise default): an RS256 JWT
+  signed by this service, carrying `api_key_id`/`project_id`/`account_id`/`allowed_models`
+  claims. Authorino verifies the signature via the published JWKS (`/.well-known/jwks.json`)
+  and enforces revocation via introspection (see `docs/authorino-usage.md`).
+- **Opaque secret** (`lbk_secret_...`, signing disabled): not a JWT; no JWKS validator
+  accepts it, so it is inert if leaked outside the introspection path.
+- **Keycloak token exchange** (`oauth2.issuance.enabled`): a Keycloak-issued OAuth2 JWT.
 
-Revoking or deleting the API key takes effect on the **next request**. Authorino
-authorizes each request by calling the Lightbridge validation endpoint
-(`POST /v1/authorino/validate`), which hashes the presented key, looks up the
-`api_keys` row, and rejects anything whose `status` is not `Active` or whose
-`expires_at` has passed. Revocation flips `status` to `Revoked`; deletion removes
-the row (lookup then misses). Either way the very next authorize call fails — the
-DB row is the single source of truth, so there is no denylist, no stored
-credential, and no provider round-trip to keep in sync.
+Regardless of format, revoking or deleting the API key takes effect on the **next
+request**. Authorino authorizes each request by introspecting the presented key
+(`POST /v1/authorino/validate/introspect`), which hashes it, looks up the `api_keys`
+row, and rejects anything whose `status` is not `Active` or whose `expires_at` has
+passed. Revocation flips `status` to `Revoked`; deletion removes the row (lookup then
+misses). The DB row is the single source of truth — no denylist, no stored credential,
+no provider round-trip to keep in sync. (A self-signed JWT also remains independently
+verifiable until its own `exp`; keep the signing `ttl_seconds` bounded accordingly.)
 
 ```bash
 KEY_JSON=$(curl -k -s https://localhost:13000/api/v1/projects/$PROJECT_ID/api-keys \

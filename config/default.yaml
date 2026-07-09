@@ -47,6 +47,20 @@ oauth2:
     client_secret: "${KEYCLOAK_TOKEN_CLIENT_SECRET:-lightbridge-token-issuer-secret}"
     subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
     requested_token_type: "urn:ietf:params:oauth:token-type:access_token"
+  # Self-signed API-key JWTs (enterprise: the credential must be a JWT). When enabled, issued
+  # keys are RS256 JWTs signed by this service, carrying api_key_id/project_id/account_id/
+  # allowed_models claims. The public key is published as JWKS (+ OIDC discovery) so Authorino
+  # verifies the signature via its `jwt` identity; revocation still flows through the
+  # introspection endpoint (delete/revoke takes effect on the next request). Provision the
+  # private key and JWKS via secret/env; keep enabled=false when they are absent.
+  signing:
+    enabled: ${JWT_SIGNING_ENABLED:-false}
+    issuer: "${JWT_SIGNING_ISSUER:-https://localhost:13000}"
+    kid: "${JWT_SIGNING_KID:-authz-apikey-dev}"
+    private_key_pem: "${JWT_SIGNING_PRIVATE_KEY_PEM:-}"
+    jwks: "${JWT_SIGNING_JWKS:-}"
+    audience: "${JWT_SIGNING_AUDIENCE:-lightbridge-api-key}"
+    ttl_seconds: ${JWT_SIGNING_TTL_SECONDS:-3600}
 
 otel:
   enabled: true

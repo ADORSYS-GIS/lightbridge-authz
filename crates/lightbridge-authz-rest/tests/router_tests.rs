@@ -293,3 +293,99 @@ async fn bearer_auth_accepts_mixed_case_scheme() {
         StatusCode::OK
     );
 }
+
+fn lazy_pool() -> Arc<dyn DbPoolTrait> {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
+        .expect("lazy pool should be constructible");
+    Arc::new(DbPool::from_pool(pool))
+}
+
+fn oauth2_without_signing() -> lightbridge_authz_core::config::Oauth2 {
+    lightbridge_authz_core::config::Oauth2 {
+        jwks_url: "http://jwks".to_string(),
+        oauth2_url: None,
+        issuer_url: None,
+        authorization_endpoint: None,
+        token_endpoint: None,
+        registration_endpoint: None,
+        issuance: None,
+        audience: None,
+        signing: None,
+    }
+}
+
+#[tokio::test]
+async fn build_api_router_serves_probes_and_protects_the_api() {
+    let store: Arc<dyn AuthzStore> = Arc::new(AuthzStoreImpl::with_pool(lazy_pool()));
+    let app_state = Arc::new(AppState {
+        store,
+        bearer: Arc::new(MockBearer {
+            outcome: BearerOutcome::Active,
+        }),
+    });
+    let router =
+        lightbridge_authz_rest::build_api_router(&oauth2_without_signing(), app_state, lazy_pool());
+
+    let health = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+
+    let unauth = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/accounts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn build_opa_router_serves_probes_and_introspection() {
+    let state = Arc::new(OpaState {
+        repo: Arc::new(MockOpaRepo),
+        basic_auth: BasicAuth {
+            username: "authorino".to_string(),
+            password: "change-me".to_string(),
+        },
+    });
+    let router = lightbridge_authz_rest::build_opa_router(state, lazy_pool());
+
+    let health = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+
+    let introspect = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/authorino/validate/introspect")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::AUTHORIZATION, basic("authorino:change-me"))
+                .body(Body::from("token=lbk_secret_x"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(introspect.status(), StatusCode::OK);
+}

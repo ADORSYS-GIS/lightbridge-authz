@@ -51,6 +51,16 @@ oauth2:
     requested_token_type: "urn:ietf:params:oauth:token-type:access_token"
     # Target audience for issued tokens - must match one of the valid audiences above
     # audience: "lightbridge-api-key"
+  # Self-signed API-key JWTs. Enable and provide the RS256 private key + public JWKS via
+  # secret/env to issue verifiable, revocable JWT API keys (see docs/authorino-usage.md).
+  signing:
+    enabled: ${JWT_SIGNING_ENABLED:-false}
+    issuer: "${JWT_SIGNING_ISSUER:-https://authz-api:3000}"
+    kid: "${JWT_SIGNING_KID:-authz-apikey-dev}"
+    private_key_pem: "${JWT_SIGNING_PRIVATE_KEY_PEM:-}"
+    jwks: "${JWT_SIGNING_JWKS:-}"
+    audience: "${JWT_SIGNING_AUDIENCE:-lightbridge-api-key}"
+    ttl_seconds: ${JWT_SIGNING_TTL_SECONDS:-3600}
 otel:
   enabled: true
   otlp_endpoint: "http://jaeger:4317"
