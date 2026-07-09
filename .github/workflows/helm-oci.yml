@@ -5,12 +5,12 @@ on:
     branches: ["main"]
     paths:
       - 'charts/**'
-      - '.github/workflows/helm-gh-pages.yml'
+      - '.github/workflows/helm-oci.yml'
+      - '.github/actions/helm-oci-publish/**'
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pages: write
+  contents: read
   packages: write
 
 jobs:
@@ -19,11 +19,9 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
       - name: Publish Helm Charts
-        uses: ./.github/actions/helm-gh-pages-publish
+        uses: ./.github/actions/helm-oci-publish
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           charts-dir: charts

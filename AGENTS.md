@@ -204,7 +204,7 @@ use crate::repo::StoreRepo;
 - `compose.it.yaml`: integration-test overlay (adds `it-authorino` and `it-servers` test runners).
 - `docs/`: human docs (manual protocol, Authorino usage).
 - `.github/actions/`: composite helpers that encapsulate Rust setup, cargo tooling, docker build/publish, and Helm publishing so workflows stay short.
-- `.github/workflows/`: main CI/CD pipeline (`ci.yml`) plus the Helm charts publish workflow (`helm-gh-pages.yml`), both kept lean by calling the shared actions.
+- `.github/workflows/`: main CI/CD pipeline (`ci.yml`) plus the Helm charts publish workflow (`helm-oci.yml`), both kept lean by calling the shared actions.
 
 ## Runtime Services (Compose)
 
@@ -474,9 +474,9 @@ Implementation details:
 
 - Always confirm that the feature or fix you are working on is covered by automated tests. If existing tests do not exercise the new behavior, add targeted tests in the most appropriate crate (unit, integration, or contract) before finishing the change.
 - When you add or update behavior, document the need for those tests in your summary so reviewers can spot the linkage quickly.
-- Workflow changes should keep the top-level YAML files concise (both `/ .github/workflows/ci.yml` and `/ .github/workflows/helm-gh-pages.yml` stay under ~100 lines) by moving reusable sequences into `.github/actions/` composites (Rust setup, tests, docker build/push, Helm publishing). Confirm the helper action logic lives in the shared directory, and if you edit those helpers, mention why you need the customization and keep their scope focused.
+- Workflow changes should keep the top-level YAML files concise (both `/ .github/workflows/ci.yml` and `/ .github/workflows/helm-oci.yml` stay under ~100 lines) by moving reusable sequences into `.github/actions/` composites (Rust setup, tests, docker build/push, Helm publishing). Confirm the helper action logic lives in the shared directory, and if you edit those helpers, mention why you need the customization and keep their scope focused.
 - Container CI builds are native per architecture (`ubuntu-24.04` for `linux/amd64` and `ubuntu-22.04-arm` for `linux/arm64`); avoid reintroducing QEMU-based cross-builds unless explicitly required.
-- When the change touches deployment automation (GHCR pushes or GitHub Pages), make sure the relevant secrets (`GITHUB_TOKEN` or PAT) still have `packages:write`/`pages:write`, rerun the workflow locally if helpful (e.g., `just all-checks`, `just it-authorino`, or `just it-servers`), and note in your summary what credentials need to be present.
+- When the change touches deployment automation (GHCR image or Helm chart pushes), make sure the relevant secrets (`GITHUB_TOKEN` or PAT) still have `packages:write`, rerun the workflow locally if helpful (e.g., `just all-checks`, `just it-authorino`, or `just it-servers`), and note in your summary what credentials need to be present. Charts publish as OCI artifacts to `oci://ghcr.io/adorsys-gis/charts/<chart>`.
 - After finishing your work (and ensuring the tests exist), run `just all-checks`. This target runs `cargo fmt`, `cargo fix --allow-dirty`, `cargo clippy --all-targets --all-features --fix --allow-dirty -- -D warnings`, and `cargo check --all-targets --all-features`, making sure the repository is formatted, linted, and builds cleanly before you stop.
 
 ## Observability
