@@ -47,13 +47,15 @@ impl AuthzStoreImpl {
     }
 
     pub fn with_pool_and_oauth2(pool: Arc<dyn DbPoolTrait>, oauth2: &Oauth2) -> Result<Self> {
-        let repo = StoreRepo::new(pool);
+        let repo = Arc::new(StoreRepo::new(pool));
         let jwt_signer = match oauth2.signing.as_ref() {
-            Some(signing) => crate::signing::ApiKeyJwtSigner::from_config(signing)?.map(Arc::new),
+            Some(signing) => {
+                crate::signing::ApiKeyJwtSigner::from_config(signing, repo.clone())?.map(Arc::new)
+            }
             None => None,
         };
         Ok(Self {
-            repo: Arc::new(repo),
+            repo,
             token_issuer: OAuth2TokenIssuer::from_config(oauth2),
             jwt_signer,
         })
@@ -72,13 +74,15 @@ impl AuthzStoreImpl {
                 .get_project(subject, project_id)
                 .await?
                 .ok_or(Error::NotFound)?;
-            let signed = signer.sign(
-                api_key_id,
-                project_id,
-                &project.account_id,
-                project.allowed_models.clone(),
-                Utc::now(),
-            )?;
+            let signed = signer
+                .sign(
+                    api_key_id,
+                    project_id,
+                    &project.account_id,
+                    project.allowed_models.clone(),
+                    Utc::now(),
+                )
+                .await?;
             Ok(IssuedSecret {
                 secret: signed.token,
                 expires_at: Some(signed.expires_at),

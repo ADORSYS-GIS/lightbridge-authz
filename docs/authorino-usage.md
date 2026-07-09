@@ -160,10 +160,16 @@ API server:
 - `GET /.well-known/openid-configuration` — points at the JWKS
 - `GET /.well-known/jwks.json` — the signing public key(s)
 
-Provision the RS256 private key (`JWT_SIGNING_PRIVATE_KEY_PEM`) and the matching public
-JWKS (`JWT_SIGNING_JWKS`) via secret/env, with `JWT_SIGNING_ISSUER` set to the API
+The signing keypair is **generated on first startup and stored in the DB** (`signing_keys`
+table) — no key material is provisioned by operators. Set `JWT_SIGNING_ISSUER` to the API
 server's externally-reachable URL (the `iss` claim and the discovery issuer). A JWT is
 still verifiable *and* revocable: signature by JWKS, liveness by introspection.
+
+**Rotation** is automatic and time-based: at startup, if the active key is older than
+`max_key_age_days` (default 30) it is marked `stale` and a fresh key is generated and
+activated. Stale keys stay in the JWKS so tokens they signed keep verifying until they
+expire; only the active key signs new tokens. Boot key-provisioning is race-safe across
+replicas (a Postgres advisory lock ensures exactly one active key).
 
 ### AuthConfig wiring — JWT signature + introspection (gateway repo)
 

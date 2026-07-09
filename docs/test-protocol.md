@@ -92,8 +92,11 @@ config:
 
 - **Self-signed JWT** (`oauth2.signing.enabled`, enterprise default): an RS256 JWT
   signed by this service, carrying `api_key_id`/`project_id`/`account_id`/`allowed_models`
-  claims. Authorino verifies the signature via the published JWKS (`/.well-known/jwks.json`)
-  and enforces revocation via introspection (see `docs/authorino-usage.md`).
+  claims. The signing keypair is generated on first startup and stored in the DB
+  (`signing_keys`), auto-rotated once older than `max_key_age_days` (rotated-out keys are
+  marked stale and kept in the JWKS until their tokens expire). Authorino verifies the
+  signature via the published JWKS (`/.well-known/jwks.json`) and enforces revocation via
+  introspection (see `docs/authorino-usage.md`).
 - **Opaque secret** (`lbk_secret_...`, signing disabled): not a JWT; no JWKS validator
   accepts it, so it is inert if leaked outside the introspection path.
 - **Keycloak token exchange** (`oauth2.issuance.enabled`): a Keycloak-issued OAuth2 JWT.

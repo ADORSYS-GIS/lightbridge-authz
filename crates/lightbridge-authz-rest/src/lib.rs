@@ -107,6 +107,7 @@ pub fn build_api_router(
     oauth2: &Oauth2,
     app_state: Arc<lightbridge_authz_api::AppState>,
     readiness_pool: Arc<dyn DbPoolTrait>,
+    signing_repo: Arc<StoreRepo>,
 ) -> Router {
     let mut public = Router::new()
         .route("/", get(root_handler))
@@ -125,7 +126,7 @@ pub fn build_api_router(
         ));
 
     if let Some(signing) = oauth2.signing.as_ref().filter(|s| s.enabled) {
-        public = public.merge(signing::well_known_router(&signing.issuer, &signing.jwks));
+        public = public.merge(signing::well_known_router(&signing.issuer, signing_repo));
     }
 
     let protected = Router::new()
@@ -145,6 +146,10 @@ pub async fn start_api_server(
     oauth2: &Oauth2,
 ) -> Result<()> {
     let readiness_pool = pool.clone();
+    let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
+    if let Some(signing) = oauth2.signing.as_ref() {
+        signing::bootstrap_signing_key(&signing_repo, signing).await?;
+    }
     let store = Arc::new(AuthzStoreImpl::with_pool_and_oauth2(pool, oauth2)?);
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
@@ -154,7 +159,7 @@ pub async fn start_api_server(
         bearer: bearer_service,
     });
 
-    let app = build_api_router(oauth2, app_state, readiness_pool);
+    let app = build_api_router(oauth2, app_state, readiness_pool, signing_repo);
 
     serve_tls("API", &api.address, api.port, &api.tls, app).await
 }

@@ -324,8 +324,13 @@ async fn build_api_router_serves_probes_and_protects_the_api() {
             outcome: BearerOutcome::Active,
         }),
     });
-    let router =
-        lightbridge_authz_rest::build_api_router(&oauth2_without_signing(), app_state, lazy_pool());
+    let signing_repo = Arc::new(lightbridge_authz_api_key::repo::StoreRepo::new(lazy_pool()));
+    let router = lightbridge_authz_rest::build_api_router(
+        &oauth2_without_signing(),
+        app_state,
+        lazy_pool(),
+        signing_repo,
+    );
 
     let health = router
         .clone()

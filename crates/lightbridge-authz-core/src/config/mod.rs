@@ -108,24 +108,24 @@ pub struct JwtSigning {
     pub enabled: bool,
     /// `iss` claim and the OIDC issuer URL Authorino discovers the JWKS from.
     pub issuer: String,
-    /// Key id set in the JWT header and matched against the served JWKS.
-    pub kid: String,
-    /// RS256 private key in PEM (PKCS#8). Provision via secret/env in production.
-    #[serde(default)]
-    pub private_key_pem: String,
-    /// Public JWKS document served verbatim at the JWKS endpoint for signature verification.
-    #[serde(default)]
-    pub jwks: String,
     /// Optional `aud` claim stamped on issued tokens.
     #[serde(default)]
     pub audience: Option<String>,
     /// Token lifetime in seconds.
     #[serde(default = "default_signing_ttl_seconds")]
     pub ttl_seconds: i64,
+    /// Auto-rotate the active signing key once it is older than this many days (checked at
+    /// startup). The rotated-out key is marked stale and kept in the JWKS for verification.
+    #[serde(default = "default_max_key_age_days")]
+    pub max_key_age_days: i64,
 }
 
 fn default_signing_ttl_seconds() -> i64 {
     3600
+}
+
+fn default_max_key_age_days() -> i64 {
+    30
 }
 
 #[derive(Debug, Clone, Deserialize)]

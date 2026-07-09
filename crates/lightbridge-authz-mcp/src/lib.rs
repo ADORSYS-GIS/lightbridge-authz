@@ -980,6 +980,10 @@ pub async fn start_mcp_server(
     pool: Arc<dyn DbPoolTrait>,
 ) -> Result<()> {
     let readiness_pool = pool.clone();
+    if let Some(signing) = oauth2.signing.as_ref() {
+        let signing_repo = StoreRepo::new(pool.clone());
+        lightbridge_authz_rest::signing::bootstrap_signing_key(&signing_repo, signing).await?;
+    }
     let store: Arc<dyn AuthzStore> =
         Arc::new(AuthzStoreImpl::with_pool_and_oauth2(pool.clone(), oauth2)?);
     let opa_repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
