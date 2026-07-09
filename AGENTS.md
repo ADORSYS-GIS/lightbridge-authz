@@ -536,7 +536,7 @@ In Compose, `authz-migrate` runs before API/OPA start.
 
 ## Helm / deployment notes
 
-- The umbrella chart (`charts/lightbridge`) now documents per-platform install/config/deploy commands in `docs/platform-guides.md`, including:
+- The umbrella chart (`charts/lightbridge-authz-stack`) now documents per-platform install/config/deploy commands in `docs/platform-guides.md`, including:
   * Two documented TLS certificate flows (built-in `global.tls.job` + cert-manager) and the Ubuntu `curl` smoke test against `https://lightbridge-lightbridge-api.default.svc.cluster.local:3000/healthz` when cert-manager owns the `lightbridge-authz-tls` secret.
   * Shared `3000` ports for both API and OPA because we never deploy them together in these guides, and instructions for keeping API ingress enabled while OPA stays internal-only.
   * Manual TLS generation is noted as optional because the chart's hook already creates service-FQDN certs, but the hook can be disabled when cert-manager owns the secret.
@@ -548,7 +548,7 @@ In Compose, `authz-migrate` runs before API/OPA start.
 
 - Deployments now hardcode `containerPort: 3000` for both controllers so Kubernetes records the exposed port, aligning with service target ports.
 
-- A brand-new `lightbridge-migrate` chart (aliased `migration` under `charts/lightbridge`) runs `lightbridge-authz migrate --config-path /tmp/lightbridge-config/config.yaml` as a `pre-install/pre-upgrade` job so schema migrations happen before the API/OPA controllers become active. It reuses the ambient `lightbridge-authz-config` config map, shares the same image artifacts, and exposes TTL/backoff knobs to keep the job brief.
+- A brand-new `lightbridge-migrate` chart (aliased `migration` under `charts/lightbridge-authz-stack`) runs `lightbridge-authz migrate --config-path /tmp/lightbridge-config/config.yaml` as a `pre-install/pre-upgrade` job so schema migrations happen before the API/OPA controllers become active. It reuses the ambient `lightbridge-authz-config` config map, shares the same image artifacts, and exposes TTL/backoff knobs to keep the job brief.
 - That migration chart is now built on the `bjw-s/common v4` app-template library, so the job/configmap/secret skeletal resources are rendered by the shared loader instead of bespoke templates, keeping the chart plumbing consistent with the rest of the stack.
 
 <!-- ai-governance:stanza -->

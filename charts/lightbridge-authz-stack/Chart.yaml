@@ -1,6 +1,6 @@
 apiVersion: v2
-name: lightbridge
-description: A Helm chart for Kubernetes
+name: lightbridge-authz-stack
+description: Umbrella chart deploying the full lightbridge-authz stack (api, opa, usage, mcp)
 
 type: application
 version: 0.8.1

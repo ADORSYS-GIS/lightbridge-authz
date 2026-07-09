@@ -1,3 +1,5 @@
+nameOverride: lightbridge
+
 global:
   tlsSecretName: lightbridge-authz-tls
   authz:
