@@ -87,6 +87,33 @@ async fn from_config_rejects_non_positive_ttl() {
     assert!(format!("{err}").contains("ttl_seconds must be positive"));
 }
 
+#[tokio::test]
+async fn well_known_serves_cors_headers() {
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    use lightbridge_authz_rest::signing::well_known_router;
+    use tower::ServiceExt;
+
+    let response = well_known_router::<()>(ISSUER, lazy_repo())
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/openid-configuration")
+                .header(header::ORIGIN, "https://example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .expect("well-known responses must carry a CORS allow-origin header"),
+        "*"
+    );
+}
+
 #[cfg(feature = "it-tests")]
 mod db {
     use super::*;

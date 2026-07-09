@@ -1,6 +1,10 @@
 use std::sync::Arc;
 
-use axum::{Json, Router, http::StatusCode, routing::get};
+use axum::{
+    Json, Router,
+    http::{Method, StatusCode},
+    routing::get,
+};
 use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -14,6 +18,7 @@ use rsa::pkcs8::EncodePrivateKey;
 use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde::Serialize;
+use tower_http::cors::{Any, CorsLayer};
 
 const RSA_KEY_BITS: usize = 2048;
 const ALGORITHM: &str = "RS256";
@@ -212,12 +217,17 @@ impl ApiKeyJwtSigner {
 
 /// Public OIDC discovery + JWKS routes for Authorino's `jwt` identity. JWKS is served live from
 /// the DB (active + stale keys) so tokens signed by a rotated-out key keep verifying until they
-/// expire. Stateless w.r.t. axum state, so it merges into any router.
+/// expire. Stateless w.r.t. axum state, so it merges into any router. CORS is wide-open (any
+/// origin, GET) because these are public, non-secret discovery documents — browser-based OIDC
+/// clients must be able to fetch them cross-origin, as any standard OIDC provider allows.
 pub fn well_known_router<S>(issuer: &str, repo: Arc<StoreRepo>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     let discovery_issuer = issuer.to_string();
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET]);
     Router::new()
         .route(
             "/.well-known/openid-configuration",
@@ -249,4 +259,5 @@ where
                 }
             }),
         )
+        .layer(cors)
 }
