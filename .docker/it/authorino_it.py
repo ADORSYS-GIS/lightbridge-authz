@@ -56,12 +56,16 @@ def request_json(
         return resp.status, json.loads(payload.decode("utf-8"))
 
 
-def post_form(url: str, form_data: dict):
+def post_form(url: str, form_data: dict, headers=None, insecure_tls: bool = False):
     payload = urllib.parse.urlencode(form_data).encode("utf-8")
     req = urllib.request.Request(url=url, method="POST", data=payload)
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     req.add_header("Accept", "application/json")
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    if headers:
+        for key, value in headers.items():
+            req.add_header(key, value)
+    context = INSECURE_TLS if insecure_tls else None
+    with urllib.request.urlopen(req, timeout=30, context=context) as resp:
         return resp.status, json.loads(resp.read().decode("utf-8"))
 
 
@@ -150,48 +154,33 @@ def main() -> int:
         log(f"created api key {api_key_id}")
 
         basic = base64.b64encode(AUTHORINO_BASIC.encode("utf-8")).decode("utf-8")
-        status, authorino_ok = request_json(
-            "POST",
-            f"{OPA_URL}/v1/authorino/validate",
-            {
-                "api_key": secret,
-                "ip": "203.0.113.10",
-                "metadata": {"tenant": "acme", "request_id": "it-001"},
-            },
+        status, introspected = post_form(
+            f"{OPA_URL}/v1/authorino/validate/introspect",
+            {"token": secret, "token_type_hint": "access_token"},
             headers={"Authorization": f"Basic {basic}"},
             insecure_tls=True,
         )
         assert status == 200, (
-            "authorino validate should succeed, "
-            f"got status={status}, body={authorino_ok}"
+            "authorino introspection should succeed, "
+            f"got status={status}, body={introspected}"
         )
 
-        metadata = authorino_ok.get("dynamic_metadata", {})
-        assert metadata.get("tenant") == "acme", f"tenant metadata mismatch: {metadata}"
-        assert metadata.get("request_id") == "it-001", f"request_id mismatch: {metadata}"
-        assert metadata.get("account_id") == account_id, f"account_id mismatch: {metadata}"
-        assert metadata.get("project_id") == project_id, f"project_id mismatch: {metadata}"
-        assert metadata.get("api_key_id") == api_key_id, f"api_key_id mismatch: {metadata}"
-        assert metadata.get("api_key_status") == "active", f"status mismatch: {metadata}"
-        log("authorino validate success payload assertions passed")
+        assert introspected.get("active") is True, f"expected active token: {introspected}"
+        assert introspected.get("account_id") == account_id, f"account_id mismatch: {introspected}"
+        assert introspected.get("project_id") == project_id, f"project_id mismatch: {introspected}"
+        assert introspected.get("api_key_id") == api_key_id, f"api_key_id mismatch: {introspected}"
+        assert introspected.get("api_key_status") == "active", f"status mismatch: {introspected}"
+        log("authorino introspect success payload assertions passed")
 
-        try:
-            request_json(
-                "POST",
-                f"{OPA_URL}/v1/authorino/validate",
-                {
-                    "api_key": "lbk_secret_invalid_key",
-                    "ip": "203.0.113.10",
-                    "metadata": {"tenant": "acme"},
-                },
-                headers={"Authorization": f"Basic {basic}"},
-                insecure_tls=True,
-            )
-            raise AssertionError("invalid key should return 401")
-        except urllib.error.HTTPError as err:
-            if err.code != 401:
-                raise AssertionError(f"expected 401 for invalid key, got {err.code}") from err
-            log("invalid key returns 401 as expected")
+        status, inactive = post_form(
+            f"{OPA_URL}/v1/authorino/validate/introspect",
+            {"token": "lbk_secret_invalid_key", "token_type_hint": "access_token"},
+            headers={"Authorization": f"Basic {basic}"},
+            insecure_tls=True,
+        )
+        assert status == 200, f"introspection of invalid key should be 200: {inactive}"
+        assert inactive.get("active") is False, f"invalid key should be inactive: {inactive}"
+        log("invalid key returns active=false as expected")
 
         return 0
     except Exception as err:

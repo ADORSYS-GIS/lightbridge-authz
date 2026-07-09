@@ -57,6 +57,9 @@ cuid = { version = "2", default-features = false, features = ["v2"] }
 getrandom = "0.4"
 goose = "0.18"
 httpmock = "0.8"
+tower = { version = "0.5", features = ["util"] }
+rsa = { version = "0.9", features = ["pem", "std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.13", features = ["json", "form"] }
 sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "chrono", "json", "macros"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

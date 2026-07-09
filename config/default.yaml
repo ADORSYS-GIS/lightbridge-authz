@@ -36,13 +36,30 @@ oauth2:
   audience:
     - "lightbridge-api-key"
     - "lightbridge-token-issuer"
+  # Disabled: API keys are opaque, locally-generated secrets (lbk_secret_...) stored by
+  # hash and validated live via the OPA endpoint. Revocation/deletion takes effect on the
+  # next request (the DB row is the source of truth). Enable only to mint Keycloak-exchanged
+  # JWTs instead, which are stateless and cannot be revoked before they expire.
   issuance:
-    enabled: true
+    enabled: false
     grant_type: "urn:ietf:params:oauth:grant-type:token-exchange"
     client_id: "${KEYCLOAK_TOKEN_CLIENT_ID:-lightbridge-token-issuer}"
     client_secret: "${KEYCLOAK_TOKEN_CLIENT_SECRET:-lightbridge-token-issuer-secret}"
     subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
     requested_token_type: "urn:ietf:params:oauth:token-type:access_token"
+  # Self-signed API-key JWTs (enterprise: the credential must be a JWT). When enabled, issued
+  # keys are RS256 JWTs signed by this service, carrying api_key_id/project_id/account_id/
+  # allowed_models claims. The signing keypair is generated on first startup and stored in the
+  # DB (signing_keys table); the public keys are published as JWKS (+ OIDC discovery) so
+  # Authorino verifies signatures via its `jwt` identity. Revocation still flows through the
+  # introspection endpoint. The active key auto-rotates once older than max_key_age_days; the
+  # rotated-out key is marked stale and kept in the JWKS until its tokens expire.
+  signing:
+    enabled: ${JWT_SIGNING_ENABLED:-false}
+    issuer: "${JWT_SIGNING_ISSUER:-https://localhost:13000}"
+    audience: "${JWT_SIGNING_AUDIENCE:-lightbridge-api-key}"
+    ttl_seconds: ${JWT_SIGNING_TTL_SECONDS:-3600}
+    max_key_age_days: ${JWT_SIGNING_MAX_KEY_AGE_DAYS:-30}
 
 otel:
   enabled: true

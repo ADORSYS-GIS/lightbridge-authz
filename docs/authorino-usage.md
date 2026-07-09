@@ -108,3 +108,114 @@ When configuring Authorino to call this API, forward:
 - any request-scoped attributes you want to preserve as `metadata`
 
 Then consume `dynamic_metadata` fields in downstream policy decisions or for audit/telemetry.
+
+## Token Introspection (RFC 7662)
+
+Whatever the API-key format, revocation is enforced by a single RFC 7662 endpoint that
+checks the live `api_keys` row (delete/revoke takes effect on the very next request — no
+denylist, no stored credential, no provider round-trip):
+
+- `POST /v1/authorino/validate/introspect`
+
+Request (form-encoded, per RFC 7662; the endpoint sits behind the same Basic auth as
+`/validate`):
+
+```
+token=<opaque-api-key>&token_type_hint=access_token
+```
+
+Response — active key:
+
+```json
+{
+  "active": true,
+  "sub": "key_...",
+  "account_id": "acct_...",
+  "project_id": "proj_...",
+  "api_key_id": "key_...",
+  "api_key_status": "active",
+  "billing_plan": "free",
+  "allowed_models": ["gpt-4.1-mini"],
+  "exp": 1767225600
+}
+```
+
+Response — deleted / revoked / expired / unknown key (canonical inactive form):
+
+```json
+{ "active": false }
+```
+
+Because the check hashes the presented key and reads the live `api_keys` row, a
+deleted or revoked key returns `active: false` on the very next request — no denylist,
+no stored credential, no provider round-trip.
+
+## Self-signed JWT API keys (enterprise default)
+
+When `oauth2.signing.enabled` is set, issued API keys are **RS256 JWTs signed by this
+service**, carrying `api_key_id`, `project_id`, `account_id`, and `allowed_models` claims.
+The public half is published so Authorino can verify signatures, via OIDC discovery on the
+API server:
+
+- `GET /.well-known/openid-configuration` — points at the JWKS
+- `GET /.well-known/jwks.json` — the signing public key(s)
+
+The signing keypair is **generated on first startup and stored in the DB** (`signing_keys`
+table) — no key material is provisioned by operators. Set `JWT_SIGNING_ISSUER` to the API
+server's externally-reachable URL (the `iss` claim and the discovery issuer). A JWT is
+still verifiable *and* revocable: signature by JWKS, liveness by introspection.
+
+**Rotation** is automatic and time-based: at startup, if the active key is older than
+`max_key_age_days` (default 30) it is marked `stale` and a fresh key is generated and
+activated. Stale keys stay in the JWKS so tokens they signed keep verifying until they
+expire; only the active key signs new tokens. Boot key-provisioning is race-safe across
+replicas (a Postgres advisory lock ensures exactly one active key).
+
+### AuthConfig wiring — JWT signature + introspection (gateway repo)
+
+Verify the signature via the `jwt` identity (issuer discovery), then gate on liveness with
+an introspection `metadata` call plus an authorization rule. Claims are exposed as
+`auth.identity.*` for header mapping:
+
+```yaml
+authentication:
+  # ...github-actions / keycloak jwt identities stay as-is...
+  apikey:
+    jwt:
+      issuerUrl: https://authz-api.converse.svc.cluster.local:3000   # OIDC discovery -> JWKS
+      ttl: 300
+metadata:
+  apikey-liveness:
+    http:
+      url: https://authz-opa.converse.svc.cluster.local:3001/v1/authorino/validate/introspect
+      method: POST
+      contentType: application/x-www-form-urlencoded
+      body:
+        value: 'token={context.request.http.headers.authorization.@extract:{"sep":" ","pos":1}}'
+      credentials:
+        authorizationHeader: { prefix: Basic }
+      sharedSecretRef: { name: lightbridge-authz-opa-basic, key: basic-auth }
+    cache:
+      key: { selector: auth.identity.api_key_id }
+      ttl: 30
+authorization:
+  apikey-not-revoked:
+    patternMatching:
+      patterns:
+        - predicate: auth.metadata["apikey-liveness"].active == true
+      when:
+        - selector: auth.identity.api_key_id
+          operator: neq
+          value: ''
+```
+
+The `jwt` identity fetches the JWKS via `issuerUrl` discovery (self-signed TLS in dev —
+trust its CA or terminate TLS in-cluster). The `metadata` call forwards the raw JWT to
+introspection so a deleted/revoked key flips to `active: false` within the cache TTL.
+
+### Alternative: opaque keys (no signing)
+
+With signing disabled, issued keys are opaque `lbk_secret_...` secrets. They are not JWTs,
+so Authorino authenticates them with its native `oauth2Introspection` identity pointed at
+the same `/v1/authorino/validate/introspect` endpoint — one call authenticates and returns
+the context claims. No `jwt` identity or separate metadata rule is needed in that mode.

@@ -39,8 +39,11 @@ oauth2:
   audience:
     - "lightbridge-api-key"
     - "lightbridge-token-issuer"
+  # Disabled: API keys are opaque, locally-generated secrets validated live via the OPA
+  # endpoint, so delete/revoke takes effect on the next request. Enable only to mint
+  # Keycloak-exchanged JWTs, which cannot be revoked before they expire.
   issuance:
-    enabled: true
+    enabled: false
     grant_type: "urn:ietf:params:oauth:grant-type:token-exchange"
     client_id: "${KEYCLOAK_TOKEN_CLIENT_ID:-lightbridge-token-issuer}"
     client_secret: "${KEYCLOAK_TOKEN_CLIENT_SECRET:-lightbridge-token-issuer-secret}"
@@ -48,6 +51,14 @@ oauth2:
     requested_token_type: "urn:ietf:params:oauth:token-type:access_token"
     # Target audience for issued tokens - must match one of the valid audiences above
     # audience: "lightbridge-api-key"
+  # Self-signed API-key JWTs. Enable to issue verifiable, revocable JWT API keys; the signing
+  # keypair is generated on first startup and stored in the DB (see docs/authorino-usage.md).
+  signing:
+    enabled: ${JWT_SIGNING_ENABLED:-false}
+    issuer: "${JWT_SIGNING_ISSUER:-https://authz-api:3000}"
+    audience: "${JWT_SIGNING_AUDIENCE:-lightbridge-api-key}"
+    ttl_seconds: ${JWT_SIGNING_TTL_SECONDS:-3600}
+    max_key_age_days: ${JWT_SIGNING_MAX_KEY_AGE_DAYS:-30}
 otel:
   enabled: true
   otlp_endpoint: "http://jaeger:4317"

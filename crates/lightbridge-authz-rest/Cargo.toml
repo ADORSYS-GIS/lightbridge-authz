@@ -25,6 +25,9 @@ lightbridge-authz-api.workspace = true
 lightbridge-authz-core = { workspace = true, features = ["axum"] }
 lightbridge-authz-api-key.workspace = true
 lightbridge-authz-bearer.workspace = true
+jsonwebtoken.workspace = true
+rsa.workspace = true
+rand_core.workspace = true
 utoipa.workspace = true
 utoipa-swagger-ui.workspace = true
 
@@ -36,9 +39,11 @@ goose.workspace = true
 reqwest.workspace = true
 sqlx.workspace = true
 httpmock.workspace = true
+tower.workspace = true
 
 [features]
 load-tests = []
+it-tests = []
 
 [[test]]
 name = "load_tests"

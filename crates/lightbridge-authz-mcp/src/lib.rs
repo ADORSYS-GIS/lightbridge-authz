@@ -913,7 +913,7 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "validate-api-key",
-        description = "Validate API key context (maps to POST /v1/opa/validate)"
+        description = "Validate an API key: hash lookup with status/expiry check, returns account/project context"
     )]
     async fn validate_api_key_tool(
         &self,
@@ -939,7 +939,7 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "validate-authorino-api-key",
-        description = "Validate API key + metadata enrichment (maps to POST /v1/authorino/validate)"
+        description = "Validate an API key and return account/project context plus dynamic metadata enrichment"
     )]
     async fn validate_authorino_api_key(
         &self,
@@ -980,7 +980,12 @@ pub async fn start_mcp_server(
     pool: Arc<dyn DbPoolTrait>,
 ) -> Result<()> {
     let readiness_pool = pool.clone();
-    let store: Arc<dyn AuthzStore> = Arc::new(AuthzStoreImpl::with_pool(pool.clone()));
+    if let Some(signing) = oauth2.signing.as_ref() {
+        let signing_repo = StoreRepo::new(pool.clone());
+        lightbridge_authz_rest::signing::bootstrap_signing_key(&signing_repo, signing).await?;
+    }
+    let store: Arc<dyn AuthzStore> =
+        Arc::new(AuthzStoreImpl::with_pool_and_oauth2(pool.clone(), oauth2)?);
     let opa_repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
     let bearer_service: Arc<dyn BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
@@ -1371,6 +1376,7 @@ mod tests {
             registration_endpoint: None,
             issuance: None,
             audience: None,
+            signing: None,
         }
     }
 

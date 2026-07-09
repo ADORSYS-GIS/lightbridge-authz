@@ -96,6 +96,36 @@ pub struct Oauth2 {
     /// contain at least one of these values. Can be a single value or multiple values.
     #[serde(default)]
     pub audience: Option<Vec<String>>,
+    /// Optional self-signing config: when enabled, issued API keys are RS256 JWTs signed
+    /// by this service (rather than opaque secrets or Keycloak-exchanged tokens).
+    #[serde(default)]
+    pub signing: Option<JwtSigning>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct JwtSigning {
+    #[serde(default)]
+    pub enabled: bool,
+    /// `iss` claim and the OIDC issuer URL Authorino discovers the JWKS from.
+    pub issuer: String,
+    /// Optional `aud` claim stamped on issued tokens.
+    #[serde(default)]
+    pub audience: Option<String>,
+    /// Token lifetime in seconds.
+    #[serde(default = "default_signing_ttl_seconds")]
+    pub ttl_seconds: i64,
+    /// Auto-rotate the active signing key once it is older than this many days (checked at
+    /// startup). The rotated-out key is marked stale and kept in the JWKS for verification.
+    #[serde(default = "default_max_key_age_days")]
+    pub max_key_age_days: i64,
+}
+
+fn default_signing_ttl_seconds() -> i64 {
+    3600
+}
+
+fn default_max_key_age_days() -> i64 {
+    30
 }
 
 #[derive(Debug, Clone, Deserialize)]

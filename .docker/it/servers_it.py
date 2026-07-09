@@ -102,12 +102,16 @@ def expect_http_error(
     raise AssertionError(f"expected HTTP {expected_status} from {method} {url}")
 
 
-def post_form(url: str, form_data: dict):
+def post_form(url: str, form_data: dict, headers=None, insecure_tls: bool = False):
     payload = urllib.parse.urlencode(form_data).encode("utf-8")
     req = urllib.request.Request(url=url, method="POST", data=payload)
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     req.add_header("Accept", "application/json")
-    with urllib.request.urlopen(req, timeout=30) as response:
+    if headers:
+        for key, value in headers.items():
+            req.add_header(key, value)
+    context = INSECURE_TLS if insecure_tls else None
+    with urllib.request.urlopen(req, timeout=30, context=context) as response:
         return response.status, json.loads(response.read().decode("utf-8"))
 
 
@@ -284,24 +288,24 @@ def main() -> int:
         expect_http_error(
             401,
             method="POST",
-            url=f"{OPA_URL}/v1/opa/validate",
-            body={"api_key": secret, "ip": "203.0.113.10"},
+            url=f"{OPA_URL}/v1/authorino/validate/introspect",
+            body={"token": secret},
             insecure_tls=True,
         )
         log("opa rejects missing basic auth")
 
         basic = base64.b64encode(AUTHORINO_BASIC.encode("utf-8")).decode("utf-8")
-        status, opa_ok, _ = request_json(
-            "POST",
-            f"{OPA_URL}/v1/opa/validate",
-            {"api_key": secret, "ip": "203.0.113.10"},
+        status, opa_ok = post_form(
+            f"{OPA_URL}/v1/authorino/validate/introspect",
+            {"token": secret, "token_type_hint": "access_token"},
             headers={"Authorization": f"Basic {basic}"},
             insecure_tls=True,
         )
-        assert status == 200, f"opa validation failed: status={status}, body={opa_ok}"
-        assert opa_ok["account"]["id"] == account_id, f"unexpected opa account: {opa_ok}"
-        assert opa_ok["project"]["id"] == project_id, f"unexpected opa project: {opa_ok}"
-        log("opa validate endpoint passed")
+        assert status == 200, f"opa introspection failed: status={status}, body={opa_ok}"
+        assert opa_ok["active"] is True, f"expected active token: {opa_ok}"
+        assert opa_ok["account_id"] == account_id, f"unexpected opa account: {opa_ok}"
+        assert opa_ok["project_id"] == project_id, f"unexpected opa project: {opa_ok}"
+        log("opa introspect endpoint passed")
 
         usage_status = None
         usage_error_body = ""

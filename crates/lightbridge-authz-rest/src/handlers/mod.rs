@@ -1,5 +1,5 @@
-pub mod authorino;
 pub mod idp;
+pub mod introspect;
 pub mod opa;
 
 use std::sync::Arc;
@@ -27,6 +27,7 @@ use serde::Deserialize;
 pub struct AuthzStoreImpl {
     repo: Arc<StoreRepo>,
     token_issuer: Option<OAuth2TokenIssuer>,
+    jwt_signer: Option<Arc<crate::signing::ApiKeyJwtSigner>>,
 }
 
 impl std::fmt::Debug for AuthzStoreImpl {
@@ -41,14 +42,54 @@ impl AuthzStoreImpl {
         Self {
             repo: Arc::new(repo),
             token_issuer: None,
+            jwt_signer: None,
         }
     }
 
-    pub fn with_pool_and_oauth2(pool: Arc<dyn DbPoolTrait>, oauth2: &Oauth2) -> Self {
-        let repo = StoreRepo::new(pool);
-        Self {
-            repo: Arc::new(repo),
+    pub fn with_pool_and_oauth2(pool: Arc<dyn DbPoolTrait>, oauth2: &Oauth2) -> Result<Self> {
+        let repo = Arc::new(StoreRepo::new(pool));
+        let jwt_signer = match oauth2.signing.as_ref() {
+            Some(signing) => {
+                crate::signing::ApiKeyJwtSigner::from_config(signing, repo.clone())?.map(Arc::new)
+            }
+            None => None,
+        };
+        Ok(Self {
+            repo,
             token_issuer: OAuth2TokenIssuer::from_config(oauth2),
+            jwt_signer,
+        })
+    }
+
+    async fn issue_api_key_secret(
+        &self,
+        subject: &str,
+        bearer_token: Option<&str>,
+        project_id: &str,
+        api_key_id: &str,
+    ) -> Result<IssuedSecret> {
+        if let Some(signer) = &self.jwt_signer {
+            let project = self
+                .repo
+                .get_project(subject, project_id)
+                .await?
+                .ok_or(Error::NotFound)?;
+            let signed = signer
+                .sign(
+                    api_key_id,
+                    project_id,
+                    &project.account_id,
+                    project.allowed_models.clone(),
+                    Utc::now(),
+                )
+                .await?;
+            Ok(IssuedSecret {
+                secret: signed.token,
+                expires_at: Some(signed.expires_at),
+                oauth2_url: None,
+            })
+        } else {
+            self.issue_secret(bearer_token, Some(project_id)).await
         }
     }
 
@@ -305,13 +346,16 @@ impl AuthzStore for AuthzStoreImpl {
         project_id: &str,
         input: CreateApiKey,
     ) -> Result<ApiKeySecret> {
-        let issued = self.issue_secret(bearer_token, Some(project_id)).await?;
+        let id = cuid2();
+        let issued = self
+            .issue_api_key_secret(subject, bearer_token, project_id, &id)
+            .await?;
         let key_hash = hash_api_key(&issued.secret);
         let key_prefix = Self::key_prefix(&issued.secret);
         let now = Utc::now();
         let expires_at = resolve_issued_expires_at(input.expires_at, issued.expires_at);
         let row = lightbridge_authz_api_key::entities::new_api_key_row::NewApiKeyRow {
-            id: cuid2(),
+            id,
             project_id: project_id.to_string(),
             name: input.name,
             key_prefix,
@@ -401,8 +445,9 @@ impl AuthzStore for AuthzStoreImpl {
                 (ApiKeyStatus::Revoked, Some(now), None)
             };
 
+        let new_id = cuid2();
         let issued = self
-            .issue_secret(bearer_token, Some(existing.project_id.as_str()))
+            .issue_api_key_secret(subject, bearer_token, existing.project_id.as_str(), &new_id)
             .await?;
         let key_hash = hash_api_key(&issued.secret);
         let key_prefix = Self::key_prefix(&issued.secret);
@@ -410,7 +455,7 @@ impl AuthzStore for AuthzStoreImpl {
             resolve_rotated_expires_at(input.expires_at, existing.expires_at);
         let expires_at = resolve_issued_expires_at(requested_expires_at, issued.expires_at);
         let row = lightbridge_authz_api_key::entities::new_api_key_row::NewApiKeyRow {
-            id: cuid2(),
+            id: new_id,
             project_id: existing.project_id,
             name: input.name.unwrap_or(existing.name),
             key_prefix,
@@ -514,6 +559,7 @@ mod tests {
             token_endpoint: None,
             registration_endpoint: None,
             audience: None,
+            signing: None,
             issuance: Some(Oauth2Issuance {
                 enabled: true,
                 grant_type: Some("urn:ietf:params:oauth:grant-type:token-exchange".to_string()),
@@ -540,5 +586,92 @@ mod tests {
         assert_eq!(issued.oauth2_url, Some(oauth2_url));
         assert!(issued.expires_at.is_some());
         assert_eq!(mock.calls(), 1);
+    }
+
+    fn test_issuer(oauth2_url: String, client_id: &str) -> OAuth2TokenIssuer {
+        OAuth2TokenIssuer::from_config(&Oauth2 {
+            jwks_url: "http://jwks".to_string(),
+            oauth2_url: Some(oauth2_url),
+            issuer_url: None,
+            authorization_endpoint: None,
+            token_endpoint: None,
+            registration_endpoint: None,
+            audience: None,
+            signing: None,
+            issuance: Some(Oauth2Issuance {
+                enabled: true,
+                grant_type: None,
+                client_id: client_id.to_string(),
+                client_secret: None,
+                subject_token_type: None,
+                requested_token_type: None,
+                audience: None,
+                scope: None,
+            }),
+        })
+        .expect("issuer should be configured")
+    }
+
+    #[test]
+    fn issuer_disabled_config_returns_none() {
+        let cfg = Oauth2 {
+            jwks_url: "http://jwks".to_string(),
+            oauth2_url: Some("http://token".to_string()),
+            issuer_url: None,
+            authorization_endpoint: None,
+            token_endpoint: None,
+            registration_endpoint: None,
+            audience: None,
+            signing: None,
+            issuance: Some(Oauth2Issuance {
+                enabled: false,
+                grant_type: None,
+                client_id: "c".to_string(),
+                client_secret: None,
+                subject_token_type: None,
+                requested_token_type: None,
+                audience: None,
+                scope: None,
+            }),
+        };
+        assert!(OAuth2TokenIssuer::from_config(&cfg).is_none());
+    }
+
+    #[tokio::test]
+    async fn issue_requires_non_empty_client_id() {
+        let issuer = test_issuer("http://unused".to_string(), "   ");
+        let err = issuer.issue(Some("token"), None).await.unwrap_err();
+        assert!(format!("{err}").contains("client_id is required"));
+    }
+
+    #[tokio::test]
+    async fn issue_requires_bearer_token() {
+        let issuer = test_issuer("http://unused".to_string(), "client");
+        let err = issuer.issue(None, None).await.unwrap_err();
+        assert!(format!("{err}").contains("bearer token is required"));
+    }
+
+    #[tokio::test]
+    async fn issue_errors_on_non_success_status() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(400).body("bad request");
+        });
+        let issuer = test_issuer(server.url("/token"), "client");
+        let err = issuer.issue(Some("token"), None).await.unwrap_err();
+        assert!(format!("{err}").contains("issuance failed with status"));
+    }
+
+    #[tokio::test]
+    async fn issue_errors_on_unparsable_response() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200).body("not json");
+        });
+        let issuer = test_issuer(server.url("/token"), "client");
+        let err = issuer.issue(Some("token"), None).await.unwrap_err();
+        assert!(format!("{err}").contains("response parse failed"));
     }
 }

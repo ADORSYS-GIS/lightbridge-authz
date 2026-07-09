@@ -86,28 +86,29 @@ PROJECT_ID=$(echo "$PROJECT_JSON" | /usr/bin/python3 -c "import sys, json; print
 
 ## 5) Create an API key
 
-In dev, API key creation is backed by Keycloak token exchange. The CRUD API sends
-the caller's validated bearer token to the realm token endpoint as `subject_token`
-and stores only the hash of the exchanged access token. The returned `secret` is
-therefore an OAuth2 access token issued on behalf of the same user, not a locally
-generated random string.
+The CRUD API stores only the SHA-256 hash of the issued secret and returns the
+plaintext `secret` exactly once, on create/rotate. The credential format depends on
+config:
 
-Keycloak standard token exchange is same-realm internal token exchange. The input
-token and the newly issued token both come from realm `dev`; the useful boundary is
-the client context. In dev, Authz authenticates to Keycloak as the confidential
-`lightbridge-token-issuer` client using `KEYCLOAK_TOKEN_CLIENT_SECRET`, and sends
-the user's bearer token as `subject_token`. In Keycloak, the client making the
-exchange must have standard token exchange enabled, authenticate with its
-configured client authentication method, and be present in the incoming token's
-audience.
+- **Self-signed JWT** (`oauth2.signing.enabled`, enterprise default): an RS256 JWT
+  signed by this service, carrying `api_key_id`/`project_id`/`account_id`/`allowed_models`
+  claims. The signing keypair is generated on first startup and stored in the DB
+  (`signing_keys`), auto-rotated once older than `max_key_age_days` (rotated-out keys are
+  marked stale and kept in the JWKS until their tokens expire). Authorino verifies the
+  signature via the published JWKS (`/.well-known/jwks.json`) and enforces revocation via
+  introspection (see `docs/authorino-usage.md`).
+- **Opaque secret** (`lbk_secret_...`, signing disabled): not a JWT; no JWKS validator
+  accepts it, so it is inert if leaked outside the introspection path.
+- **Keycloak token exchange** (`oauth2.issuance.enabled`): a Keycloak-issued OAuth2 JWT.
 
-Revoking the API key invalidates the credential at the Lightbridge validation
-layer immediately. The validation backend stores only the exchanged token hash and
-checks the `api_keys` row status before returning any enrichment, so a revoked key
-is rejected when Authorino asks Lightbridge to authorize a request. This does not
-revoke the OAuth2 token at Keycloak/provider level; if that token is usable
-outside the Authorino-to-Lightbridge validation path, keep its audience narrow and
-its lifetime short or add provider-side revocation/introspection.
+Regardless of format, revoking or deleting the API key takes effect on the **next
+request**. Authorino authorizes each request by introspecting the presented key
+(`POST /v1/authorino/validate/introspect`), which hashes it, looks up the `api_keys`
+row, and rejects anything whose `status` is not `Active` or whose `expires_at` has
+passed. Revocation flips `status` to `Revoked`; deletion removes the row (lookup then
+misses). The DB row is the single source of truth — no denylist, no stored credential,
+no provider round-trip to keep in sync. (A self-signed JWT also remains independently
+verifiable until its own `exp`; keep the signing `ttl_seconds` bounded accordingly.)
 
 ```bash
 KEY_JSON=$(curl -k -s https://localhost:13000/api/v1/projects/$PROJECT_ID/api-keys \
