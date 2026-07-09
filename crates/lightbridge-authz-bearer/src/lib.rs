@@ -12,7 +12,7 @@ use std::{
 use tokio::sync::RwLock;
 
 /// Token information returned by JWT validation.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct TokenInfo {
     pub active: bool,
     pub sub: String,
@@ -22,6 +22,18 @@ pub struct TokenInfo {
     pub aud: Vec<String>,
     #[serde(default)]
     pub access_token: String,
+}
+
+impl std::fmt::Debug for TokenInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenInfo")
+            .field("active", &self.active)
+            .field("sub", &self.sub)
+            .field("exp", &self.exp)
+            .field("aud", &self.aud)
+            .field("access_token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
