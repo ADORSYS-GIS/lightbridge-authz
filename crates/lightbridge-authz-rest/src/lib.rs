@@ -161,6 +161,20 @@ pub async fn start_api_server(
 
     let app = build_api_router(oauth2, app_state, readiness_pool, signing_repo);
 
+    let signing_enabled = oauth2.signing.as_ref().is_some_and(|s| s.enabled);
+    let issuance_enabled = oauth2
+        .issuance
+        .as_ref()
+        .is_some_and(|issuance| issuance.enabled);
+    tracing::info!(
+        server = "authz-api",
+        address = %api.address,
+        port = api.port,
+        signing_enabled,
+        issuance_enabled,
+        "starting api server"
+    );
+
     serve_tls("API", &api.address, api.port, &api.tls, app).await
 }
 
@@ -194,6 +208,13 @@ pub async fn start_opa_server(opa: &OpaServer, pool: Arc<dyn DbPoolTrait>) -> Re
     });
 
     let app = build_opa_router(state, readiness_pool);
+
+    tracing::info!(
+        server = "authz-opa",
+        address = %opa.address,
+        port = opa.port,
+        "starting opa server"
+    );
 
     serve_tls("OPA", &opa.address, opa.port, &opa.tls, app).await
 }

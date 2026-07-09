@@ -210,6 +210,7 @@ impl ApiKeyJwtSigner {
             .map_err(|e| Error::Server(format!("invalid stored signing key: {e}")))?;
         let expires_at = capped_expiry(now, self.ttl_seconds, requested_expires_at);
         let mut header = Header::new(Algorithm::RS256);
+        let kid = active.kid.clone();
         header.kid = Some(active.kid);
         let claims = ApiKeyClaims {
             iss: &self.issuer,
@@ -231,6 +232,14 @@ impl ApiKeyJwtSigner {
         };
         let token = encode(&header, &claims, &encoding_key)
             .map_err(|e| Error::Server(format!("api-key signing failed: {e}")))?;
+        tracing::info!(
+            api_key_id = %api_key_id,
+            project_id = %project_id,
+            account_id = %account_id,
+            kid = %kid,
+            exp = expires_at.timestamp(),
+            "issued api-key jwt"
+        );
         Ok(SignedApiKey { token, expires_at })
     }
 }

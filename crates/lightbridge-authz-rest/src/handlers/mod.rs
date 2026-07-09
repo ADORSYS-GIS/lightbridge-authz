@@ -397,6 +397,14 @@ impl AuthzStore for AuthzStoreImpl {
             revoked_at: None,
         };
         let api_key = self.repo.create_api_key(subject, row).await?;
+        tracing::info!(
+            operation = "create_api_key",
+            subject = %subject,
+            project_id = %project_id,
+            api_key_id = %api_key.id,
+            expires_at = ?api_key.expires_at,
+            "api key created and secret issued"
+        );
         Ok(ApiKeySecret {
             api_key,
             secret: issued.secret,
@@ -433,11 +441,19 @@ impl AuthzStore for AuthzStoreImpl {
     }
 
     async fn delete_api_key(&self, subject: &str, key_id: &str) -> Result<()> {
-        self.repo.delete_api_key(subject, key_id).await
+        self.repo.delete_api_key(subject, key_id).await?;
+        tracing::info!(
+            operation = "delete_api_key",
+            subject = %subject,
+            api_key_id = %key_id,
+            "api key deleted"
+        );
+        Ok(())
     }
 
     async fn revoke_api_key(&self, subject: &str, key_id: &str) -> Result<ApiKey> {
-        self.repo
+        let api_key = self
+            .repo
             .set_api_key_status(
                 subject,
                 key_id,
@@ -445,7 +461,15 @@ impl AuthzStore for AuthzStoreImpl {
                 Some(Utc::now()),
                 None,
             )
-            .await
+            .await?;
+        tracing::info!(
+            operation = "revoke_api_key",
+            subject = %subject,
+            project_id = %api_key.project_id,
+            api_key_id = %api_key.id,
+            "api key revoked"
+        );
+        Ok(api_key)
     }
 
     async fn rotate_api_key(
@@ -506,6 +530,15 @@ impl AuthzStore for AuthzStoreImpl {
             .repo
             .rotate_api_key_transaction(subject, key_id, status, revoked_at, old_expires_at, row)
             .await?;
+        tracing::info!(
+            operation = "rotate_api_key",
+            subject = %subject,
+            project_id = %api_key.project_id,
+            previous_api_key_id = %key_id,
+            api_key_id = %api_key.id,
+            expires_at = ?api_key.expires_at,
+            "api key rotated and new secret issued"
+        );
         Ok(ApiKeySecret {
             api_key,
             secret: issued.secret,
