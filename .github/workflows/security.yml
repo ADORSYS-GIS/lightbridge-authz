@@ -11,8 +11,11 @@ permissions:
 
 jobs:
   scan:
-    uses: ADORSYS-GIS/ai-ops/.github/workflows/security-gates.yml@v1.0.0
+    # ADORSYS-GIS/ai-ops security-gates including the runs-on input (PR #148).
+    # Pinned to the merge commit (immutable) since v1.0.0 predates that input.
+    uses: ADORSYS-GIS/ai-ops/.github/workflows/security-gates.yml@ecbe971243ffb96db98826c5c0a57f88f47e3bbc
     secrets: inherit
     with:
       trivy-scan-type: 'fs'
       trivy-target: '.'
+      runs-on: adorsys-gis-runner
