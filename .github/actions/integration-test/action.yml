@@ -66,6 +66,16 @@ runs:
           echo "::error::$svc failed after 3 attempts"; podman logs --tail 80 "$c" || true; return 1
         }
 
+        run_suite() { # service : the IT runners create unique resources per run, so retry to
+          # ride out transient rootless-timing flakes (e.g. MCP session store warmup).
+          for attempt in 1 2 3; do
+            timeout 360 $compose run --rm --no-deps "$1" && return 0
+            echo "suite $1 attempt $attempt failed; retrying"
+            sleep 8
+          done
+          echo "::error::suite $1 failed after 3 attempts"; return 1
+        }
+
         wait_completed() { # service : wait for a one-shot container to exit 0
           local c; c="$(cn "$1")"
           for _ in $(seq 1 90); do
@@ -103,5 +113,5 @@ runs:
         wait_ready_hc authz-usage 3002
 
         echo "== running IT suites =="
-        timeout 360 $compose run --rm --no-deps it-authorino
-        timeout 360 $compose run --rm --no-deps it-servers
+        run_suite it-authorino
+        run_suite it-servers
