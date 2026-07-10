@@ -1,137 +1,312 @@
 # Architecture
 
-`lightbridge-authz` is a Rust (edition 2024) Cargo **workspace**: thin `app/*` binaries over layered
-`crates/*`, deployed as several services that share one Postgres/Timescale database. A request takes one
-of four roles.
+This document maps the architecture implemented by the repository today. The proposed replacement
+architecture and migration sequence are documented in
+[ADR-0002](adr/0002-consolidate-workspace-around-bounded-contexts.md).
 
-## Services & callers
+## Runtime services
 
-The **OPA / validation server** (`authz-opa`) is the internal, Basic-auth surface with **three**
-responsibilities: API-key validation for Authorino, dynamic-metadata enrichment, and — since the
-resolve-by-project work — the IdP **`/idp/v1/resolve-context`** endpoint the Keycloak SPI calls during a
-`project_id` token exchange.
+The workspace produces four runtime surfaces backed by two databases.
+
+| Service | Authentication | Responsibilities |
+| --- | --- | --- |
+| `authz-api` | OAuth2/JWT bearer | Account, project, and API-key CRUD; optional OIDC discovery, JWKS, and token exchange |
+| `authz-opa` | HTTP Basic | RFC 7662-style API-key introspection and subject/project context resolution |
+| `authz-mcp` | OAuth2/JWT bearer | Nineteen MCP tools, OAuth metadata, and dynamic client-registration proxying |
+| `authz-usage` | None | OTLP/HTTP trace, metric, and log ingestion plus aggregated usage queries |
 
 ```mermaid
 flowchart LR
-    subgraph callers["Callers"]
-        UI["Self-service UI /<br/>CRUD clients"]
-        KC["Keycloak +<br/>Lightbridge SPI"]
-        AZ["Authorino<br/>(API gateway)"]
-        MC["MCP clients"]
-        OT["OTEL exporters"]
+    subgraph callers[Callers]
+        UI[Control-plane clients]
+        IdP[Keycloak and IdP adapters]
+        Gateway[Authorino or API gateway]
+        McpClient[MCP clients]
+        OTel[OTLP exporters]
     end
 
-    subgraph authz["lightbridge-authz workspace"]
-        API["authz-api :13000<br/>OAuth2/JWT CRUD · /api/v1/*"]
-        OPA["authz-opa :13001 · Basic auth<br/>/v1/opa/validate<br/>/v1/authorino/validate<br/>/idp/v1/resolve-context"]
-        MCP["lightbridge-mcp :13003<br/>MCP tools over /mcp · JWKS bearer"]
-        USG["lightbridge-authz-usage :13002<br/>OTLP ingest + /v1/usage/query"]
+    subgraph services[Runtime services]
+        API[authz-api]
+        OPA[authz-opa]
+        MCP[authz-mcp]
+        Usage[authz-usage]
     end
 
-    DB[("Postgres / Timescale<br/>accounts · projects · api_keys<br/>account_memberships · usage")]
+    AuthzDb[(Postgres authz)]
+    UsageDb[(Timescale or Postgres usage)]
 
-    UI -->|"Bearer JWT"| API
-    MC -->|"Bearer JWT"| MCP
-    AZ -->|"validate API key"| OPA
-    KC -->|"resolve-context<br/>(token exchange)"| OPA
-    OT -->|"OTLP traces/metrics"| USG
+    UI -->|Bearer JWT| API
+    IdP -->|Basic auth| OPA
+    Gateway -->|Basic auth| OPA
+    McpClient -->|Bearer JWT| MCP
+    OTel -->|OTLP/HTTP| Usage
 
-    API --- DB
-    OPA --- DB
-    MCP --- DB
-    USG --- DB
+    API --> AuthzDb
+    OPA --> AuthzDb
+    MCP --> AuthzDb
+    Usage --> UsageDb
 ```
 
-Ports are the host-exposed Compose ports; inside containers services bind `:3000`/`:3001`/`:3002`. All
-local TLS is self-signed — use `curl -k`.
+The services are deployed independently even where they share the same binary or database. This is
+the security and scaling boundary that must be preserved during restructuring.
 
-## Crate layering
+## Cargo workspace
 
-`app/*` are thin entrypoints; the logic lives in `crates/*`. Only `lightbridge-authz-api-key` talks to the
-`accounts`/`projects`/`api_keys` tables, and every error funnels through the centralized `Result`/`Error`
-in `-core`.
+The workspace has fourteen active packages. Package edges are shown below; development-only edges
+are omitted.
 
 ```mermaid
 flowchart TB
-    subgraph apps["app/* — thin binaries"]
-        A1["lightbridge-authz<br/>serve · api · opa · migrate"]
-        A2["lightbridge-mcp"]
-        A3["lightbridge-authz-usage"]
-    end
+    AuthzBin[lightbridge-authz binary]
+    McpBin[lightbridge-mcp binary]
+    UsageBin[lightbridge-authz-usage binary]
+    Health[lightbridge-authz-healthcheck binary]
 
-    REST["lightbridge-authz-rest<br/>axum glue · TLS · middleware<br/>handlers/authorino · handlers/idp (resolve-context)"]
-    APIC["lightbridge-authz-api<br/>routers · controllers · OpenAPI"]
-    MCPC["lightbridge-authz-mcp<br/>MCP tool handlers"]
-    BEARER["lightbridge-authz-bearer<br/>JWT validation via JWKS"]
-    KEY["lightbridge-authz-api-key<br/>SQLx entities + repo.rs<br/>(only crate touching the tables)"]
-    CORE["lightbridge-authz-core<br/>config · Result/Error · crypto · DB pool"]
+    Rest[lightbridge-authz-rest]
+    Mcp[lightbridge-authz-mcp]
+    Usage[lightbridge-authz-usage-rest]
+    Api[lightbridge-authz-api]
+    Repo[lightbridge-authz-api-key]
+    Bearer[lightbridge-authz-bearer]
+    Core[lightbridge-authz-core]
+    Migrate[lightbridge-authz-migrate]
+    UsageMigrate[lightbridge-authz-usage-migrate]
+    TestUtils[lightbridge-authz-test-utils]
 
-    A1 --> REST
-    A2 --> MCPC
-    A3 --> CORE
-    REST --> APIC
-    REST --> BEARER
-    APIC --> KEY
-    MCPC --> KEY
-    KEY --> CORE
-    APIC --> CORE
-    BEARER --> CORE
+    AuthzBin --> Rest
+    AuthzBin --> Migrate
+    AuthzBin --> Core
+    McpBin --> Mcp
+    McpBin --> Core
+    UsageBin --> Usage
+    UsageBin --> UsageMigrate
+    UsageBin --> Core
+
+    Mcp --> Rest
+    Mcp --> Api
+    Mcp --> Repo
+    Mcp --> Bearer
+    Mcp --> Core
+    Rest --> Api
+    Rest --> Repo
+    Rest --> Bearer
+    Rest --> Core
+    Api --> Bearer
+    Api --> Core
+    Repo --> Core
+    Bearer --> Core
+    Migrate --> Core
+    Usage --> Core
+    UsageMigrate --> Core
+    TestUtils -. no active consumer .-> Core
 ```
 
-## Flow: IdP token exchange → `resolve-context`
+The package names do not consistently match their responsibilities:
 
-The Keycloak adapter ([lightbridge-keycloak-spi](https://github.com/adorsys-gis/lightbridge-keycloak-spi))
-resolves `(subject, project_id)` to tenant context during a token exchange and seals it into the JWT. The
-endpoint is Basic-auth protected (the pair is enumerable) and membership-enforced; every miss is a uniform
+- `lightbridge-authz-core` contains domain DTOs, configuration, SQLx pool handling, errors, API-key
+  hashing, TLS serving, and tracing.
+- `lightbridge-authz-api-key` persists accounts, memberships, projects, API keys, signing keys, and
+  refresh tokens.
+- `lightbridge-authz-rest` contains application behavior in addition to HTTP transport code.
+- `lightbridge-authz-mcp` depends on REST types and handlers to reuse application behavior, which
+  creates a transport-to-transport dependency.
+- The two migration packages contain only thin wrappers around SQLx migration calls.
+- `lightbridge-authz-test-utils` is an active workspace member with no active consumer.
+- `lightbridge-authz-proto` remains in the source tree but is not an active workspace member.
+
+## Authz data model
+
+The authz database contains:
+
+- `accounts`
+- `account_memberships`
+- `projects`
+- `api_keys`
+- `signing_keys`
+- `exchange_refresh_tokens`
+
+Relationships and notable behavior:
+
+```mermaid
+erDiagram
+    accounts ||--o{ account_memberships : has
+    accounts ||--o{ projects : owns
+    projects ||--o{ api_keys : contains
+    accounts ||--o{ exchange_refresh_tokens : scopes
+    projects ||--o{ exchange_refresh_tokens : scopes
+
+    accounts {
+        text id PK
+        text billing_identity UK
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    account_memberships {
+        text account_id PK,FK
+        text subject PK
+        timestamptz created_at
+    }
+    projects {
+        text id PK
+        text account_id FK
+        text name
+        jsonb allowed_models
+        jsonb default_limits
+        text billing_plan
+    }
+    api_keys {
+        text id PK
+        text project_id FK
+        text key_prefix
+        text key_hash UK
+        text status
+        timestamptz expires_at
+        timestamptz last_used_at
+    }
+    signing_keys {
+        text kid PK
+        text private_key_pem
+        jsonb public_jwk
+        text status
+    }
+    exchange_refresh_tokens {
+        text id PK
+        text subject
+        text account_id
+        text project_id
+        text token_hash UK
+        text status
+        timestamptz expires_at
+    }
+```
+
+Account creation adds the caller as an account member. Account updates keep the current caller in
+the membership set. A database trigger deletes an account if its final membership is removed.
+
+`projects.allowed_models` uses these semantics:
+
+- SQL `NULL`: all models are allowed.
+- Empty JSON array: no models are allowed.
+- Non-empty JSON array: only the listed models are allowed.
+
+## Credential lifecycle
+
+One API operation can currently create three materially different credential forms:
+
+1. A random opaque API-key secret.
+2. An access token obtained from an upstream OAuth2 token-exchange endpoint.
+3. A locally signed RS256 JWT.
+
+All three are hashed with SHA-256 and stored in `api_keys`. Only the plaintext credential returned
+by create or rotate leaves the service. Local JWT signing also stores the private signing key in the
+authz database and publishes OIDC discovery and JWKS documents.
+
+```mermaid
+flowchart LR
+    Create[Create or rotate API key]
+    Choice{Issuance configuration}
+    Opaque[Generate opaque secret]
+    Upstream[Exchange caller token upstream]
+    Signed[Sign local RS256 JWT]
+    Hash[SHA-256 credential]
+    Store[Store hash and prefix]
+
+    Create --> Choice
+    Choice -->|default| Opaque
+    Choice -->|issuance enabled| Upstream
+    Choice -->|signing enabled| Signed
+    Opaque --> Hash
+    Upstream --> Hash
+    Signed --> Hash
+    Hash --> Store
+```
+
+## Validation and identity flows
+
+### API-key introspection
+
+`POST /v1/authorino/validate/introspect` accepts form-encoded RFC 7662-style input. The service:
+
+1. Hashes the presented credential.
+2. Loads the API-key row by hash.
+3. Rejects unknown, revoked, or expired keys using `{"active": false}`.
+4. Updates `last_used_at` and `last_ip` for active keys.
+5. Loads project and account context.
+6. Returns the enriched introspection response.
+
+### Subject and project context resolution
+
+`POST /idp/v1/resolve-context` resolves a subject and project to account/project context. The query
+joins `projects` to `account_memberships`; an unknown project and a non-member both return the same
 `404`. See [ADR-0001](adr/0001-resolve-context-by-subject-and-project.md).
 
-```mermaid
-sequenceDiagram
-    participant KC as Keycloak + SPI
-    participant OPA as authz-opa :13001
-    participant REPO as api-key repo.rs
-    participant DB as Postgres
+### Native token exchange
 
-    KC->>OPA: POST /idp/v1/resolve-context<br/>Basic auth · {subject, project_id}
-    OPA->>REPO: resolve_context(subject, project_id)
-    REPO->>DB: SELECT project + account_id<br/>JOIN account_memberships (subject)
-    alt subject is a member of the project's account
-        DB-->>REPO: row {account_id, project_id}
-        REPO-->>OPA: Ok
-        OPA-->>KC: 200 {account_id, project_id}
-    else non-member / unknown project
-        DB-->>REPO: no row
-        REPO-->>OPA: Error::NotFound
-        OPA-->>KC: 404 (uniform — no existence leak)
-    end
+When local signing and token exchange are both enabled, `POST /oauth2/token` supports:
+
+- RFC 8693 token exchange using an upstream bearer token and requested `project_id`.
+- Refresh-token rotation for scopes that include `offline_access`.
+
+The access JWT is locally signed. Refresh-token secrets are random and only their hashes are
+persisted.
+
+## MCP surface
+
+The MCP server exposes the seventeen admin CRUD operations plus two API-key validation tools. It
+calls the same `AuthzStore` interface as HTTP controllers, but constructs the implementation through
+the REST package.
+
+It also exposes public OAuth metadata and proxies dynamic client registration to a configured
+upstream registration endpoint. Public registration URLs are currently derived from forwarded or
+host headers when present.
+
+## Usage pipeline
+
+The usage service accepts OTLP/HTTP protobuf or JSON for traces, metrics, and logs, with optional
+gzip encoding. It merges resource, scope, and record attributes and searches compatibility aliases
+for account, project, API-key, user, model, token, and cost dimensions.
+
+```mermaid
+flowchart LR
+    OTLP[OTLP traces, metrics, logs]
+    Decode[Decode JSON, protobuf, gzip]
+    Normalize[Normalize attributes]
+    Events[UsageEvent rows]
+    DB[(Timescale or Postgres)]
+    Query[Scoped date-bin aggregation]
+
+    OTLP --> Decode --> Normalize --> Events --> DB --> Query
 ```
 
-## Flow: Authorino API-key validation
+The usage schema becomes a Timescale hypertable when the extension is available and requests a
+thirty-day retention policy. The query endpoint always aggregates by time bucket and can group by
+tenant, user, model, metric, and signal dimensions.
 
-Authorino (not end users) calls the validation surface with the presented key. Only `key_hash`
-(SHA-256) + `key_prefix` are stored — the plaintext `secret` is returned **only** on create/rotate — so
-validation hashes the presented key and looks it up.
+## Deployment and operations
 
-```mermaid
-sequenceDiagram
-    participant GW as API gateway
-    participant AZ as Authorino
-    participant OPA as authz-opa :13001
-    participant DB as Postgres
+The repository provides:
 
-    GW->>AZ: request carrying an API key
-    AZ->>OPA: POST /v1/authorino/validate<br/>Basic auth · {api_key, ip, metadata}
-    OPA->>OPA: SHA-256(api_key) → key_hash + key_prefix
-    OPA->>DB: lookup by key_hash, check revoked / expired
-    alt valid
-        DB-->>OPA: api_key + project + account
-        OPA-->>AZ: 200 enriched {api_key, project, account}<br/>+ Authorino dynamic metadata
-        AZ-->>GW: allow (with metadata)
-    else revoked / expired / unknown
-        OPA-->>AZ: deny
-        AZ-->>GW: 401 / 403
-    end
-```
+- One multi-stage Dockerfile that builds all binaries.
+- Compose services for Postgres, Timescale, Keycloak, TLS generation, API, OPA, MCP, usage,
+  migrations, Jaeger, and MCP Inspector.
+- Separate Helm subcharts plus an umbrella chart.
+- Public health, startup, and readiness probes on every Rust service.
+- A standalone TCP healthcheck binary included in every runtime image.
+- Rootless Buildah and sccache-based CI builds.
 
-> `allowed_models` NULL or `[]` means "all models allowed". The two migration sets are independent:
-> `migrations/` (authz) and `migrations-usage/` (usage/Timescale).
+Application-level TLS is used by the Rust services in local and chart configuration. The proposed
+architecture must decide explicitly whether TLS remains in-process or terminates at the platform
+boundary.
+
+## Known architectural debt
+
+- Domain DTOs derive transport-specific OpenAPI schemas.
+- The central error type combines domain, SQLx, configuration, and HTTP response concerns.
+- Validation writes usage metadata synchronously for every active credential.
+- The usage ingest and query routes have no application authentication.
+- Debug logging can include complete normalized usage attributes.
+- Credential status is stored as free-form text.
+- Documentation and route contracts have drifted after the introspection and token-exchange work.
+- Default workspace tests do not execute feature-gated database and token-exchange scenarios.
+
+These findings motivate ADR-0002; they are not all addressed by documentation changes alone.
