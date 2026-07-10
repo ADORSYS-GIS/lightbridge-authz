@@ -36,6 +36,7 @@ jobs:
 
   binaries:
     needs: code-checks
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: adorsys-gis-runner
     steps:
       - name: Checkout repo
@@ -43,16 +44,11 @@ jobs:
       - uses: ./.github/actions/build-release
 
   integration-test:
-    needs: [code-checks, binaries]
+    needs: code-checks
     runs-on: adorsys-gis-runner
     steps:
       - name: Checkout repo
         uses: actions/checkout@v7
-      - name: Download prebuilt binaries
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
-        with:
-          name: dist-binaries
-          path: dist
       - uses: ./.github/actions/integration-test
 
   container-build:

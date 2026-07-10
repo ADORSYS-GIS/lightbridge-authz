@@ -15,9 +15,11 @@ runs:
       with:
         name: release-artifacts
         path: release-artifacts.tar.gz
+        retention-days: 1
 
     - name: Upload dist binaries (for container build)
       uses: actions/upload-artifact@47309c993abb98030a35d55ef7ff34b7fa1074b5
       with:
         name: dist-binaries
         path: dist/
+        retention-days: 1
