@@ -30,3 +30,9 @@ runs:
 
     - name: Rust Cache
       uses: Swatinem/rust-cache@11da8522bc3856a8fbc565f1d1530989c793d67d
+
+    - name: Enable sccache
+      shell: bash
+      run: |
+        echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+        echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"

@@ -6,7 +6,7 @@ on:
 jobs:
   sast:
     name: SAST Scan
-    runs-on: ubuntu-latest
+    runs-on: adorsys-gis-runner
     strategy:
       matrix:
         checks: [advisories,"bans licenses sources"]
@@ -18,7 +18,7 @@ jobs:
           check: ${{ matrix.checks }}
 
   code-checks:
-    runs-on: ubuntu-latest
+    runs-on: adorsys-gis-runner
     steps:
       - name: Checkout repo
         uses: actions/checkout@v7
@@ -26,7 +26,7 @@ jobs:
 
   test:
     needs: code-checks
-    runs-on: ubuntu-latest
+    runs-on: adorsys-gis-runner
     services:
       postgres:
         image: postgres:17
@@ -48,7 +48,7 @@ jobs:
 
   integration-test:
     needs: code-checks
-    runs-on: ubuntu-latest
+    runs-on: adorsys-gis-runner
     steps:
       - name: Checkout repo
         uses: actions/checkout@v7
@@ -57,7 +57,7 @@ jobs:
   build:
     needs: test
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: adorsys-gis-runner
     steps:
       - name: Checkout repo
         uses: actions/checkout@v7
@@ -66,16 +66,13 @@ jobs:
   container-build:
     needs: build
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ${{ matrix.os }}
+    runs-on: adorsys-gis-runner
     strategy:
       matrix:
         include:
-          - { os: ubuntu-24.04, platform: linux/amd64, target: runtime, image_name: '${{ github.repository }}', tag_suffix: '' }
-          - { os: ubuntu-22.04-arm, platform: linux/arm64, target: runtime, image_name: '${{ github.repository }}', tag_suffix: '-arm' }
-          - { os: ubuntu-24.04, platform: linux/amd64, target: mcp-runtime, image_name: '${{ github.repository }}-mcp', tag_suffix: '' }
-          - { os: ubuntu-22.04-arm, platform: linux/arm64, target: mcp-runtime, image_name: '${{ github.repository }}-mcp', tag_suffix: '-arm' }
-          - { os: ubuntu-24.04, platform: linux/amd64, target: usage-runtime, image_name: '${{ github.repository }}-usage', tag_suffix: '' }
-          - { os: ubuntu-22.04-arm, platform: linux/arm64, target: usage-runtime, image_name: '${{ github.repository }}-usage', tag_suffix: '-arm' }
+          - { target: runtime, image_name: '${{ github.repository }}' }
+          - { target: mcp-runtime, image_name: '${{ github.repository }}-mcp' }
+          - { target: usage-runtime, image_name: '${{ github.repository }}-usage' }
     permissions:
       contents: read
       packages: write
@@ -83,22 +80,21 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v7
-      - name: Build and push Docker image
+      - name: Build and push container image
         id: build-image
         uses: ./.github/actions/container-build
         with:
           app-version: ${{ github.sha }}
           image-name: ${{ matrix.image_name }}
           target: ${{ matrix.target }}
-          platform: ${{ matrix.platform }}
-          tag-suffix: ${{ matrix.tag_suffix }}
+          platform: linux/amd64
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@v0.36.0
         env:
           TRIVY_IMAGE_SRC: remote
-          TRIVY_PLATFORM: ${{ matrix.platform }}
+          TRIVY_PLATFORM: linux/amd64
         with:
           image-ref: ${{ steps.build-image.outputs.version-tag }}
           format: 'table'
@@ -108,7 +104,7 @@ jobs:
   release:
     needs: [build,container-build]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: adorsys-gis-runner
     permissions:
       contents: write
     steps:

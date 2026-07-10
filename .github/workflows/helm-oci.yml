@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   publish-helm-charts:
-    runs-on: ubuntu-latest
+    runs-on: adorsys-gis-runner
     steps:
       - name: Checkout repo
         uses: actions/checkout@v7
