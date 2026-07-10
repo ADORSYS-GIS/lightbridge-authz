@@ -3,6 +3,13 @@ on:
   push: {}
   pull_request: {}
 
+# A branch with an open PR fires both `push` and `pull_request`, running the heavy
+# jobs (integration-test) twice concurrently on the self-hosted runner and starving
+# each other. Collapse duplicate runs per branch to a single in-flight run.
+concurrency:
+  group: ci-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   sast:
     name: SAST Scan
