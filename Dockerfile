@@ -7,6 +7,7 @@ ARG TARGETARCH
 # are non-secret build args; the AWS credentials are passed as build secrets.
 ARG SCCACHE_BUCKET=""
 ARG SCCACHE_ENDPOINT=""
+ARG SCCACHE_REGION="us-east-1"
 ARG CARGO_BUILD_JOBS="2"
 
 RUN apk add --no-cache \
@@ -36,6 +37,7 @@ ENV CARGO_INCREMENTAL=0 \
     RUSTC_WRAPPER=sccache \
     SCCACHE_BUCKET=${SCCACHE_BUCKET} \
     SCCACHE_ENDPOINT=${SCCACHE_ENDPOINT} \
+    SCCACHE_REGION=${SCCACHE_REGION} \
     CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 
 RUN \

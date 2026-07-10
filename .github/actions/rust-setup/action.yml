@@ -36,3 +36,7 @@ runs:
       run: |
         echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
         echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+        # Custom S3 endpoints (MinIO-style) cannot auto-detect a region, so
+        # sccache requires SCCACHE_REGION explicitly. Respect a runner-provided
+        # value; otherwise fall back to the conventional default.
+        echo "SCCACHE_REGION=${SCCACHE_REGION:-us-east-1}" >> "$GITHUB_ENV"

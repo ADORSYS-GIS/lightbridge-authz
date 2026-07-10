@@ -67,6 +67,7 @@ runs:
           --platform "$PLATFORM" \
           --build-arg SCCACHE_BUCKET="${SCCACHE_BUCKET:-}" \
           --build-arg SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT:-}" \
+          --build-arg SCCACHE_REGION="${SCCACHE_REGION:-us-east-1}" \
           --build-arg CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
           --secret "id=aws_access_key_id,src=${akid_file}" \
           --secret "id=aws_secret_access_key,src=${sak_file}" \
