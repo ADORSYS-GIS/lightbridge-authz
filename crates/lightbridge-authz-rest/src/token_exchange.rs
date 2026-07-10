@@ -378,7 +378,9 @@ fn token_response(
 }
 
 /// Intersects the client's requested scopes with the configured allow-list. An empty/absent
-/// request grants the full allow-list (standard OAuth2 "default scope" behaviour).
+/// request grants the allow-list *minus `offline_access`*: per OpenID Connect Core §5.4,
+/// `offline_access` MUST be explicitly requested, so it never rides the default-scope grant and
+/// a scope-less exchange never silently mints a refresh token.
 fn grant_scopes(requested: &Option<String>, allowed: &[String]) -> Vec<String> {
     let requested: Vec<String> = requested
         .as_deref()
@@ -387,7 +389,11 @@ fn grant_scopes(requested: &Option<String>, allowed: &[String]) -> Vec<String> {
         .map(str::to_string)
         .collect();
     if requested.is_empty() {
-        return allowed.to_vec();
+        return allowed
+            .iter()
+            .filter(|scope| *scope != OFFLINE_ACCESS_SCOPE)
+            .cloned()
+            .collect();
     }
     requested
         .into_iter()
