@@ -1411,6 +1411,7 @@ mod tests {
             issuance: None,
             audience: None,
             signing: None,
+            token_exchange: None,
         }
     }
 

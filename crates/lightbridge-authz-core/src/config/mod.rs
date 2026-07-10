@@ -100,6 +100,12 @@ pub struct Oauth2 {
     /// by this service (rather than opaque secrets or Keycloak-exchanged tokens).
     #[serde(default)]
     pub signing: Option<JwtSigning>,
+    /// Optional native RFC 8693 token-exchange: when enabled, this service exchanges an
+    /// upstream IdP access token for a short-lived, project-scoped self-signed JWT (and an
+    /// optional refresh token). Requires `signing.enabled` (the exchanged token is signed by
+    /// this service). Independent of `issuance`, which proxies exchange to an upstream IdP.
+    #[serde(default)]
+    pub token_exchange: Option<Oauth2TokenExchange>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,6 +152,41 @@ pub struct Oauth2Issuance {
     pub audience: Option<String>,
     #[serde(default)]
     pub scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Oauth2TokenExchange {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Lifetime of the exchanged access JWT, in seconds. Kept short (session-scoped) because
+    /// these tokens are only revocable by expiry; renewal flows through the refresh token.
+    #[serde(default = "default_exchange_access_ttl_seconds")]
+    pub access_ttl_seconds: i64,
+    /// Lifetime of an issued refresh token, in seconds. Refresh tokens are stored hashed and are
+    /// revocable, so they carry the long-lived session; only minted when `offline_access` is
+    /// requested and permitted.
+    #[serde(default = "default_exchange_refresh_ttl_seconds")]
+    pub refresh_ttl_seconds: i64,
+    /// Scopes a client may request on exchange. `offline_access` gates refresh-token issuance.
+    #[serde(default = "default_exchange_allowed_scopes")]
+    pub allowed_scopes: Vec<String>,
+}
+
+fn default_exchange_access_ttl_seconds() -> i64 {
+    900
+}
+
+fn default_exchange_refresh_ttl_seconds() -> i64 {
+    2_592_000
+}
+
+fn default_exchange_allowed_scopes() -> Vec<String> {
+    vec![
+        "openid".to_string(),
+        "profile".to_string(),
+        "email".to_string(),
+        "offline_access".to_string(),
+    ]
 }
 
 pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<Config> {

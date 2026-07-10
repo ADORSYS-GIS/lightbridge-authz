@@ -13,6 +13,9 @@ use tracing::instrument;
 
 use crate::entities::account_row::AccountWithMembersRow;
 use crate::entities::api_key_row::{ApiKeyChangeset, ApiKeyRow};
+use crate::entities::exchange_refresh_token_row::{
+    ExchangeRefreshTokenRow, NewExchangeRefreshToken,
+};
 use crate::entities::new_account_row::NewAccountRow;
 use crate::entities::new_api_key_row::NewApiKeyRow;
 use crate::entities::new_project_row::NewProjectRow;
@@ -487,6 +490,121 @@ impl StoreRepo {
             account_id,
             project_id,
         })
+    }
+
+    pub async fn create_exchange_refresh_token(
+        &self,
+        input: NewExchangeRefreshToken,
+    ) -> Result<ExchangeRefreshTokenRow> {
+        let row: ExchangeRefreshTokenRow = sqlx::query_as(
+            r#"
+            INSERT INTO exchange_refresh_tokens
+              (id, subject, account_id, project_id, token_hash, scope, status, created_at, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8)
+            RETURNING id, subject, account_id, project_id, token_hash, scope, status, created_at, expires_at, last_used_at
+            "#,
+        )
+        .bind(input.id)
+        .bind(input.subject)
+        .bind(input.account_id)
+        .bind(input.project_id)
+        .bind(input.token_hash)
+        .bind(input.scope)
+        .bind(input.created_at)
+        .bind(input.expires_at)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn find_active_exchange_refresh_token(
+        &self,
+        token_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<ExchangeRefreshTokenRow>> {
+        let row = sqlx::query_as(
+            r#"
+            SELECT id, subject, account_id, project_id, token_hash, scope, status, created_at, expires_at, last_used_at
+            FROM exchange_refresh_tokens
+            WHERE token_hash = $1
+              AND status = 'active'
+              AND expires_at > $2
+            "#,
+        )
+        .bind(token_hash)
+        .bind(now)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// Atomically consumes a refresh token (single-use rotation): under a row lock, flips the
+    /// presented token to `rotated` and inserts a successor that copies the session context
+    /// (subject/account/project/scope), returning the successor. Returns `None` if the presented
+    /// token is no longer active/live (already used, revoked, expired) so the caller can reject
+    /// replay. Copying context inside the transaction keeps rotation race-safe without the caller
+    /// needing a separate lookup.
+    pub async fn rotate_exchange_refresh_token(
+        &self,
+        presented_hash: &str,
+        new_id: &str,
+        new_token_hash: &str,
+        new_expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<ExchangeRefreshTokenRow>> {
+        let mut tx = self.pool().begin().await?;
+        let existing: Option<ExchangeRefreshTokenRow> = sqlx::query_as(
+            r#"
+            SELECT id, subject, account_id, project_id, token_hash, scope, status, created_at, expires_at, last_used_at
+            FROM exchange_refresh_tokens
+            WHERE token_hash = $1
+              AND status = 'active'
+              AND expires_at > $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(presented_hash)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(existing) = existing else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+
+        sqlx::query(
+            r#"
+            UPDATE exchange_refresh_tokens
+            SET status = 'rotated', last_used_at = $2
+            WHERE id = $1
+            "#,
+        )
+        .bind(&existing.id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        let inserted: ExchangeRefreshTokenRow = sqlx::query_as(
+            r#"
+            INSERT INTO exchange_refresh_tokens
+              (id, subject, account_id, project_id, token_hash, scope, status, created_at, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8)
+            RETURNING id, subject, account_id, project_id, token_hash, scope, status, created_at, expires_at, last_used_at
+            "#,
+        )
+        .bind(new_id)
+        .bind(&existing.subject)
+        .bind(&existing.account_id)
+        .bind(&existing.project_id)
+        .bind(new_token_hash)
+        .bind(&existing.scope)
+        .bind(now)
+        .bind(new_expires_at)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(inserted))
     }
 
     #[instrument(skip(self))]

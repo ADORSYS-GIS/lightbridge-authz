@@ -312,6 +312,7 @@ fn oauth2_without_signing() -> lightbridge_authz_core::config::Oauth2 {
         issuance: None,
         audience: None,
         signing: None,
+        token_exchange: None,
     }
 }
 
@@ -330,6 +331,7 @@ async fn build_api_router_serves_probes_and_protects_the_api() {
         app_state,
         lazy_pool(),
         signing_repo,
+        None,
     );
 
     let health = router
