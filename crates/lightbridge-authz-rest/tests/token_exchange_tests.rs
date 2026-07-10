@@ -206,6 +206,32 @@ async fn exchange_without_offline_scope_has_no_refresh_token(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn exchange_with_absent_scope_grants_no_refresh_token(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    // No `scope` param at all: the default-scope grant must exclude offline_access (OIDC Core
+    // §5.4), so no refresh token is minted unless the client explicitly asks for it.
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type={TOKEN_EXCHANGE_GRANT}&subject_token=x&project_id=proj_xchg"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body.get("refresh_token").is_none(),
+        "absent scope must not silently grant offline_access / a refresh token"
+    );
+    let scope = body["scope"].as_str().unwrap_or("");
+    assert!(
+        !scope.split_whitespace().any(|s| s == "offline_access"),
+        "granted scope must not include offline_access on an absent request: {scope}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn exchange_for_non_member_project_is_denied(pool: PgPool) {
     let repo = repo(pool);
     bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
