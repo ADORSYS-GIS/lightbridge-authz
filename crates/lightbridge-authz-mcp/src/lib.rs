@@ -993,6 +993,25 @@ impl LightbridgeMcpHandler {
     }
 }
 
+/// Build the streamable-HTTP transport config for the MCP server.
+///
+/// Runs statelessly (`stateful_mode(false)` + `json_response(true)`) so any replica
+/// can serve any request. In stateful mode the session lives in each pod's in-memory
+/// `LocalSessionManager`, so behind a round-robin LB the follow-up POST lands on a
+/// different replica and 404s ("Session not found"). This server is a stateless tool
+/// proxy — identity comes from the JWT on every request, no server-side session state —
+/// so stateless mode is safe and keeps multi-replica HA. `allowed_hosts` (DNS-rebinding
+/// protection) is applied on top when configured; unset keeps rmcp's localhost default.
+fn build_streamable_http_config(allowed_hosts: &Option<Vec<String>>) -> StreamableHttpServerConfig {
+    let base_config = StreamableHttpServerConfig::default()
+        .with_stateful_mode(false)
+        .with_json_response(true);
+    match allowed_hosts {
+        Some(hosts) if !hosts.is_empty() => base_config.with_allowed_hosts(hosts.clone()),
+        _ => base_config,
+    }
+}
+
 pub async fn start_mcp_server(
     api: &ApiServer,
     oauth2: &Oauth2,
@@ -1021,12 +1040,7 @@ pub async fn start_mcp_server(
         fallback_registration_endpoint: fallback_registration_endpoint(api),
     });
 
-    let http_config = match &api.allowed_hosts {
-        Some(hosts) if !hosts.is_empty() => {
-            StreamableHttpServerConfig::default().with_allowed_hosts(hosts.clone())
-        }
-        _ => StreamableHttpServerConfig::default(),
-    };
+    let http_config = build_streamable_http_config(&api.allowed_hosts);
     let mcp_service: StreamableHttpService<LightbridgeMcpHandler, LocalSessionManager> =
         StreamableHttpService::new(
             {
@@ -1148,6 +1162,31 @@ mod tests {
     use chrono::Utc;
     use lightbridge_authz_core::{ApiKeyStatus, async_trait};
     use sqlx::postgres::PgPoolOptions;
+
+    #[test]
+    fn streamable_http_config_is_stateless_for_multi_replica() {
+        let cfg = build_streamable_http_config(&Some(vec!["mcp.example.com".to_string()]));
+        let dbg = format!("{cfg:?}");
+        assert!(
+            dbg.contains("stateful_mode: false"),
+            "MCP transport must run stateless so any replica can serve any request \
+             (stateful sessions live per-pod and 404 behind a round-robin LB): {dbg}"
+        );
+        assert!(
+            dbg.contains("json_response: true"),
+            "stateless request/response calls should return application/json: {dbg}"
+        );
+        assert!(
+            dbg.contains("mcp.example.com"),
+            "configured allowed_hosts must be wired into the transport: {dbg}"
+        );
+
+        let cfg_default = build_streamable_http_config(&None);
+        assert!(
+            format!("{cfg_default:?}").contains("stateful_mode: false"),
+            "stateless mode must hold even when allowed_hosts is unset"
+        );
+    }
 
     #[derive(Debug)]
     struct MockStore;
