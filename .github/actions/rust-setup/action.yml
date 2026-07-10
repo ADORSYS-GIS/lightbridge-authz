@@ -73,3 +73,7 @@ runs:
         # sccache requires SCCACHE_REGION explicitly. Respect a runner-provided
         # value; otherwise fall back to the conventional default.
         echo "SCCACHE_REGION=${SCCACHE_REGION:-us-east-1}" >> "$GITHUB_ENV"
+        # The endpoint has no scheme, so sccache defaults to plain HTTP; the
+        # MinIO endpoint (behind Cloudflare/HSTS) requires HTTPS. mc over https
+        # authenticates fine, so force sccache onto TLS too.
+        echo "SCCACHE_S3_USE_SSL=${SCCACHE_S3_USE_SSL:-true}" >> "$GITHUB_ENV"
