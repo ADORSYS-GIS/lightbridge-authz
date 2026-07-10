@@ -1,35 +1,34 @@
 name: Integration Tests
+description: Build binaries bare, then bring the compose stack up (rootless podman, prebuilt-binary images) and run the Authorino/servers IT suites.
 runs:
   using: composite
   steps:
     - uses: ./.github/actions/rust-setup
-    - run: |
-        sudo apt-get update
-        sudo apt-get install -y just
-      shell: bash
-    - name: Run integration test stack
+    - uses: ./.github/actions/build-binaries
+
+    - name: Integration tests (rootless podman compose)
       shell: bash
       run: |
         set -eo pipefail
-        docker compose -f compose.yaml -f compose.it.yaml up -d
-        MAX_RETRIES=30
-        COUNT=0
-        until [ "$(docker compose ps authz-opa --format '{{.Health}}')" = "healthy" ]; do
-          if [ $COUNT -ge $MAX_RETRIES ]; then
-            echo "Timeout waiting for services to be healthy"
-            docker compose ps
-            docker compose logs
-            exit 1
-          fi
-          echo "Still waiting ($COUNT/$MAX_RETRIES)..."
-          sleep 5
-          COUNT=$((COUNT + 1))
-        done
-        just it-authorino
-        docker compose -f compose.yaml -f compose.it.yaml run --rm it-servers
-    - run: docker compose -f compose.yaml -f compose.it.yaml logs
-      if: failure()
-      shell: bash
-    - run: just it-authorino-down
-      if: always()
-      shell: bash
+
+        # The self-hosted runner is rootless with no Docker daemon. `podman compose`
+        # delegates to the docker-compose provider, which talks to the podman API
+        # socket over the Docker protocol -- so that socket must be running first.
+        sock="$(podman info --format '{{.Host.RemoteSocket.Path}}')"
+        mkdir -p "$(dirname "$sock")"
+        podman system service --time=0 "unix://${sock}" >/tmp/podman-service.log 2>&1 &
+        svc=$!
+        for i in $(seq 1 40); do [ -S "$sock" ] && break; sleep 0.5; done
+        if [ ! -S "$sock" ]; then
+          echo "podman API socket did not come up:"; cat /tmp/podman-service.log || true; exit 1
+        fi
+
+        # compose.ci.yaml builds the app images from ./dist via Dockerfile.dist
+        # (a COPY, not a compile) -> fast and within the runner memory limit.
+        compose="podman compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml -f compose.ci.yaml"
+        trap '$compose logs || true; $compose down -v || true; kill "$svc" 2>/dev/null || true' EXIT
+
+        $compose version
+        $compose up -d --build
+        $compose run --rm it-authorino
+        $compose run --rm it-servers

@@ -26,6 +26,12 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Download prebuilt binaries
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+      with:
+        name: dist-binaries
+        path: dist
+
     - id: docker-setup
       uses: ./.github/actions/setup-docker
       with:
@@ -45,6 +51,8 @@ runs:
       run: |
         set -euo pipefail
 
+        chmod +x dist/* || true
+
         tag_args=()
         while IFS= read -r tag; do
           [ -n "$tag" ] && tag_args+=(--tag "$tag")
@@ -55,23 +63,10 @@ runs:
           [ -n "$label" ] && label_args+=(--label "$label")
         done <<< "$LABELS"
 
-        akid_file="$(mktemp)"
-        sak_file="$(mktemp)"
-        trap 'rm -f "$akid_file" "$sak_file"' EXIT
-        printf '%s' "${AWS_ACCESS_KEY_ID:-}" > "$akid_file"
-        printf '%s' "${AWS_SECRET_ACCESS_KEY:-}" > "$sak_file"
-
         buildah build \
-          --file Dockerfile \
+          --file Dockerfile.dist \
           --target "$TARGET" \
           --platform "$PLATFORM" \
-          --build-arg SCCACHE_BUCKET="${SCCACHE_BUCKET:-}" \
-          --build-arg SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT:-}" \
-          --build-arg SCCACHE_REGION="${SCCACHE_REGION:-us-east-1}" \
-          --build-arg SCCACHE_S3_USE_SSL="${SCCACHE_S3_USE_SSL:-true}" \
-          --build-arg CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
-          --secret "id=aws_access_key_id,src=${akid_file}" \
-          --secret "id=aws_secret_access_key,src=${sak_file}" \
           "${label_args[@]}" \
           "${tag_args[@]}" \
           .

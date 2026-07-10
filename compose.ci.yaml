@@ -1,0 +1,24 @@
+---
+# CI overlay: build the app images from prebuilt binaries (Dockerfile.dist) instead
+# of compiling in-container. Requires ./dist populated by the build-binaries action.
+# Keeps the per-service build.target from compose.yaml; only swaps the Dockerfile.
+services:
+  authz-migrate:
+    build:
+      dockerfile: Dockerfile.dist
+
+  authz-api:
+    build:
+      dockerfile: Dockerfile.dist
+
+  authz-mcp:
+    build:
+      dockerfile: Dockerfile.dist
+
+  authz-usage:
+    build:
+      dockerfile: Dockerfile.dist
+
+  authz-usage-migrate:
+    build:
+      dockerfile: Dockerfile.dist

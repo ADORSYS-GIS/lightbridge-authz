@@ -1,0 +1,32 @@
+name: Build Binaries
+description: Compile the static musl release binaries on the host (sccache-cached) and stage them in ./dist for image builds.
+inputs:
+  target:
+    description: Rust target triple to build
+    required: false
+    default: x86_64-unknown-linux-musl
+runs:
+  using: composite
+  steps:
+    - name: Install musl toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y musl-tools
+        rustup target add "${{ inputs.target }}"
+
+    - name: Build release binaries
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        CC_x86_64_unknown_linux_musl: musl-gcc
+        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      run: |
+        set -euo pipefail
+        cargo build --profile prod --locked --target "${TARGET}"
+        mkdir -p dist
+        for bin in lightbridge-authz lightbridge-mcp lightbridge-authz-usage lightbridge-authz-healthcheck; do
+          cp "target/${TARGET}/prod/${bin}" "dist/${bin}"
+        done
+        ls -lash dist/
