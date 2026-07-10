@@ -24,3 +24,5 @@ jobs:
     permissions:
       pull-requests: write
       contents: read
+    with:
+      runs-on: adorsys-gis-runner
