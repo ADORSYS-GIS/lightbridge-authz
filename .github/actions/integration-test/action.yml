@@ -36,5 +36,5 @@ runs:
         # the container/disk footprint within the runner limits.
         $compose version
         $compose build
-        $compose run --rm it-authorino
-        $compose run --rm it-servers
+        timeout 480 $compose run --rm it-authorino
+        timeout 480 $compose run --rm it-servers

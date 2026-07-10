@@ -3,6 +3,16 @@
 # of compiling in-container. Requires ./dist populated by the build-binaries action.
 # Keeps the per-service build.target from compose.yaml; only swaps the Dockerfile.
 services:
+  # The Bitnami Postgres image does volume chown/perm setup that fails under
+  # rootless podman; the official image starts cleanly (trust auth, fresh
+  # ephemeral data dir -- CI needs no persistence).
+  postgresql:
+    image: docker.io/library/postgres:17
+    volumes: !reset []
+    environment:
+      POSTGRES_DB: lightbridge_authz
+      POSTGRES_HOST_AUTH_METHOD: trust
+
   authz-migrate:
     build:
       dockerfile: Dockerfile.dist
