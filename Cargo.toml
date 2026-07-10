@@ -58,7 +58,7 @@ getrandom = "0.4"
 goose = "0.18"
 httpmock = "0.8"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 rsa = { version = "0.9", features = ["pem", "std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.13", features = ["json", "form"] }
