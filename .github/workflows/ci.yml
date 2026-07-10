@@ -34,25 +34,29 @@ jobs:
         with:
           database-url: postgres://postgres:postgres@localhost:5432/lightbridge_authz
 
-  integration-test:
+  binaries:
     needs: code-checks
-    runs-on: adorsys-gis-runner
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v7
-      - uses: ./.github/actions/integration-test
-
-  build:
-    needs: test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: adorsys-gis-runner
     steps:
       - name: Checkout repo
         uses: actions/checkout@v7
       - uses: ./.github/actions/build-release
 
+  integration-test:
+    needs: [code-checks, binaries]
+    runs-on: adorsys-gis-runner
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: dist-binaries
+          path: dist
+      - uses: ./.github/actions/integration-test
+
   container-build:
-    needs: build
+    needs: [binaries, test]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: adorsys-gis-runner
     strategy:
@@ -90,7 +94,7 @@ jobs:
           ignore-unfixed: true
           severity: 'HIGH,CRITICAL'
   release:
-    needs: [build,container-build]
+    needs: [binaries,container-build]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: adorsys-gis-runner
     permissions:

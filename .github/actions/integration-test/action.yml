@@ -1,15 +1,14 @@
 name: Integration Tests
-description: Build binaries bare, then bring the compose stack up (rootless podman, prebuilt-binary images) and run the Authorino/servers IT suites.
+description: Bring the compose stack up (rootless podman, prebuilt-binary images) and run the Authorino/servers IT suites. Expects ./dist populated by the caller.
 runs:
   using: composite
   steps:
-    - uses: ./.github/actions/rust-setup
-    - uses: ./.github/actions/build-binaries
-
     - name: Integration tests (rootless podman compose)
       shell: bash
       run: |
         set -eo pipefail
+
+        chmod +x dist/* || true
 
         # The self-hosted runner is rootless with no Docker daemon. `podman compose`
         # delegates to the docker-compose provider, which talks to the podman API
