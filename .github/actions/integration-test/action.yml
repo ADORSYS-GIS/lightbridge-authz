@@ -28,13 +28,54 @@ runs:
         # compose.ci.yaml builds the app images from ./dist via Dockerfile.dist
         # (a COPY, not a compile) -> fast and within the runner memory limit.
         compose="podman compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml -f compose.ci.yaml"
-        trap '$compose logs || true; $compose down -v || true; kill "$svc" 2>/dev/null || true' EXIT
+        trap '$compose ps || true; $compose logs || true; $compose down -v || true; kill "$svc" 2>/dev/null || true' EXIT
 
-        # Build the app images (COPY from ./dist -> fast), then run each suite via
-        # `run`, which starts only that suite's depends_on subgraph. This avoids the
-        # leaf services (jaeger, adminer, mcp-inspector) that no test needs, keeping
-        # the container/disk footprint within the runner limits.
+        cn() { echo "lightbridge-authz-$1-1"; }
+
+        wait_ready() { # container cmd... : poll until the command succeeds inside the container
+          local c; c="$(cn "$1")"; shift
+          for _ in $(seq 1 90); do
+            podman exec "$c" "$@" >/dev/null 2>&1 && return 0
+            sleep 2
+          done
+          echo "::error::$c not ready after timeout"; podman logs --tail 50 "$c" || true; return 1
+        }
+
+        wait_exit0() { # service : poll until the one-shot container has exited successfully
+          local c; c="$(cn "$1")"
+          for _ in $(seq 1 90); do
+            case "$(podman inspect -f '{{.State.Status}}' "$c" 2>/dev/null)" in
+              exited)
+                local code; code="$(podman inspect -f '{{.State.ExitCode}}' "$c" 2>/dev/null)"
+                [ "$code" = "0" ] && return 0
+                echo "::error::$c exited with code $code"; podman logs --tail 80 "$c" || true; return 1 ;;
+            esac
+            sleep 2
+          done
+          echo "::error::$c did not finish in time"; podman logs --tail 80 "$c" || true; return 1
+        }
+
         $compose version
         $compose build
-        timeout 480 $compose run --rm it-authorino
-        timeout 480 $compose run --rm it-servers
+
+        # Rootless podman does not run container healthchecks (they need a systemd
+        # session), so compose `depends_on: service_healthy` never satisfies. Start
+        # services with --no-deps and gate readiness manually. Leaf services
+        # (jaeger/adminer/mcp-inspector) are never started -> fits the runner limits.
+        echo "== starting datastores + tls + keycloak =="
+        $compose up -d --no-deps postgresql timescaledb authz-tls keycloak
+        wait_ready postgresql pg_isready -U postgres -d lightbridge_authz -h 127.0.0.1
+        wait_ready timescaledb pg_isready -U postgres -d lightbridge_authz_usage -h 127.0.0.1
+        wait_exit0 authz-tls
+
+        echo "== running migrations =="
+        $compose up -d --no-deps authz-migrate authz-usage-migrate
+        wait_exit0 authz-migrate
+        wait_exit0 authz-usage-migrate
+
+        echo "== starting app services =="
+        $compose up -d --no-deps authz-api authz-opa authz-mcp authz-usage
+
+        echo "== running IT suites =="
+        timeout 360 $compose run --rm --no-deps it-authorino
+        timeout 360 $compose run --rm --no-deps it-servers
