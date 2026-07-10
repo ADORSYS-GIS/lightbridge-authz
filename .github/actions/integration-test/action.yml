@@ -66,6 +66,18 @@ runs:
           echo "::error::$svc failed after 3 attempts"; podman logs --tail 80 "$c" || true; return 1
         }
 
+        wait_completed() { # service : wait for a one-shot container to exit 0
+          local c; c="$(cn "$1")"
+          for _ in $(seq 1 90); do
+            if [ "$(podman inspect -f '{{.State.Status}}' "$c" 2>/dev/null)" = "exited" ]; then
+              [ "$(podman inspect -f '{{.State.ExitCode}}' "$c" 2>/dev/null)" = "0" ] && return 0
+              echo "::error::$c exited non-zero"; podman logs --tail 80 "$c" || true; return 1
+            fi
+            sleep 2
+          done
+          echo "::error::$c did not finish in time"; podman logs --tail 80 "$c" || true; return 1
+        }
+
         $compose version
         $compose build
 
@@ -77,7 +89,7 @@ runs:
         $compose up -d --no-deps postgresql timescaledb authz-tls keycloak
         wait_ready postgresql pg_isready -U postgres -d lightbridge_authz -h 127.0.0.1
         wait_ready timescaledb pg_isready -U postgres -d lightbridge_authz_usage -h 127.0.0.1
-        wait_exit0 authz-tls
+        wait_completed authz-tls
 
         echo "== running migrations =="
         run_migration authz-migrate
