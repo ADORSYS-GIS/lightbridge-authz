@@ -41,18 +41,29 @@ runs:
           echo "::error::$c not ready after timeout"; podman logs --tail 50 "$c" || true; return 1
         }
 
-        wait_exit0() { # service : poll until the one-shot container has exited successfully
-          local c; c="$(cn "$1")"
+        wait_ready_hc() { # service port : poll the healthcheck binary inside the container
+          local c; c="$(cn "$1")"; local port="$2"
           for _ in $(seq 1 90); do
-            case "$(podman inspect -f '{{.State.Status}}' "$c" 2>/dev/null)" in
-              exited)
-                local code; code="$(podman inspect -f '{{.State.ExitCode}}' "$c" 2>/dev/null)"
-                [ "$code" = "0" ] && return 0
-                echo "::error::$c exited with code $code"; podman logs --tail 80 "$c" || true; return 1 ;;
-            esac
+            podman exec "$c" /usr/local/bin/lightbridge-authz-healthcheck -r "$port" >/dev/null 2>&1 && return 0
             sleep 2
           done
-          echo "::error::$c did not finish in time"; podman logs --tail 80 "$c" || true; return 1
+          echo "::error::$c (:$port) not ready"; podman logs --tail 60 "$c" || true; return 1
+        }
+
+        run_migration() { # service : one-shot; retry to ride out transient rootless DNS (EAI_AGAIN)
+          local svc="$1" c; c="$(cn "$svc")"
+          for attempt in 1 2 3; do
+            $compose up -d --no-deps --force-recreate "$svc" >/dev/null 2>&1 || true
+            for _ in $(seq 1 90); do
+              [ "$(podman inspect -f '{{.State.Status}}' "$c" 2>/dev/null)" = "exited" ] && break
+              sleep 2
+            done
+            [ "$(podman inspect -f '{{.State.ExitCode}}' "$c" 2>/dev/null)" = "0" ] && return 0
+            echo "migration $svc attempt $attempt failed (transient rootless DNS?); retrying"
+            podman logs --tail 15 "$c" || true
+            sleep 5
+          done
+          echo "::error::$svc failed after 3 attempts"; podman logs --tail 80 "$c" || true; return 1
         }
 
         $compose version
@@ -69,12 +80,15 @@ runs:
         wait_exit0 authz-tls
 
         echo "== running migrations =="
-        $compose up -d --no-deps authz-migrate authz-usage-migrate
-        wait_exit0 authz-migrate
-        wait_exit0 authz-usage-migrate
+        run_migration authz-migrate
+        run_migration authz-usage-migrate
 
         echo "== starting app services =="
         $compose up -d --no-deps authz-api authz-opa authz-mcp authz-usage
+        wait_ready_hc authz-api 3000
+        wait_ready_hc authz-opa 3001
+        wait_ready_hc authz-mcp 3000
+        wait_ready_hc authz-usage 3002
 
         echo "== running IT suites =="
         timeout 360 $compose run --rm --no-deps it-authorino

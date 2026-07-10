@@ -17,17 +17,25 @@ services:
     build:
       dockerfile: Dockerfile.dist
 
+  # restart on-failure lets the long-running services ride out transient
+  # rootless-podman DNS blips (aardvark-dns EAI_AGAIN) at startup.
   authz-api:
     build:
       dockerfile: Dockerfile.dist
+    restart: on-failure
+
+  authz-opa:
+    restart: on-failure
 
   authz-mcp:
     build:
       dockerfile: Dockerfile.dist
+    restart: on-failure
 
   authz-usage:
     build:
       dockerfile: Dockerfile.dist
+    restart: on-failure
 
   authz-usage-migrate:
     build:
