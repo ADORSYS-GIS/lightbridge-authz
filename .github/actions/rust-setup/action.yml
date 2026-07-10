@@ -30,3 +30,50 @@ runs:
 
     - name: Rust Cache
       uses: Swatinem/rust-cache@11da8522bc3856a8fbc565f1d1530989c793d67d
+
+    - name: Verify sccache S3 credentials (mc)
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        : "${SCCACHE_ENDPOINT:?SCCACHE_ENDPOINT is not set on the runner}"
+        : "${SCCACHE_BUCKET:?SCCACHE_BUCKET is not set on the runner}"
+        : "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID is not set on the runner}"
+        : "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is not set on the runner}"
+
+        if ! command -v mc >/dev/null 2>&1; then
+          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /tmp/mc
+          chmod +x /tmp/mc
+          echo "/tmp" >> "$GITHUB_PATH"
+          export PATH="/tmp:${PATH}"
+        fi
+
+        case "${SCCACHE_ENDPOINT}" in
+          http://*|https://*) url="${SCCACHE_ENDPOINT}" ;;
+          *) url="https://${SCCACHE_ENDPOINT}" ;;
+        esac
+
+        mc alias set sccache "${url}" "${AWS_ACCESS_KEY_ID}" "${AWS_SECRET_ACCESS_KEY}" >/dev/null
+
+        probe="sccache/${SCCACHE_BUCKET}/.ci-cred-check-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}"
+        if ! mc ls "sccache/${SCCACHE_BUCKET}" >/dev/null 2>&1 \
+           || ! printf 'ok' | mc pipe "${probe}" >/dev/null 2>&1; then
+          echo "::error::sccache S3 preflight failed — cannot read/write bucket '${SCCACHE_BUCKET}' at ${url} with the runner key. Grant that key a MinIO policy for s3:GetObject/PutObject/DeleteObject/ListBucket on 'arn:aws:s3:::${SCCACHE_BUCKET}' (+ /*), and confirm the bucket exists."
+          exit 1
+        fi
+        mc rm "${probe}" >/dev/null 2>&1 || true
+        echo "sccache S3 credentials OK — read+write verified on '${SCCACHE_BUCKET}' (${url})."
+
+    - name: Enable sccache
+      shell: bash
+      run: |
+        echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+        echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+        # Custom S3 endpoints (MinIO-style) cannot auto-detect a region, so
+        # sccache requires SCCACHE_REGION explicitly. Respect a runner-provided
+        # value; otherwise fall back to the conventional default.
+        echo "SCCACHE_REGION=${SCCACHE_REGION:-us-east-1}" >> "$GITHUB_ENV"
+        # The endpoint has no scheme, so sccache defaults to plain HTTP; the
+        # MinIO endpoint (behind Cloudflare/HSTS) requires HTTPS. mc over https
+        # authenticates fine, so force sccache onto TLS too.
+        echo "SCCACHE_S3_USE_SSL=${SCCACHE_S3_USE_SSL:-true}" >> "$GITHUB_ENV"

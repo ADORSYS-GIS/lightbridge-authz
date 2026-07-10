@@ -34,20 +34,62 @@ runs:
         tag-suffix: ${{ inputs.tag-suffix }}
         github-token: ${{ inputs.github-token }}
 
-    - name: Build and push image
+    - name: Build image with buildah
       id: build
-      uses: docker/build-push-action@v6.19.2
-      with:
-        context: .
-        file: Dockerfile
-        target: ${{ inputs.target }}
-        push: true
-        platforms: ${{ inputs.platform }}
-        tags: ${{ steps.docker-setup.outputs.tags }}
-        labels: ${{ steps.docker-setup.outputs.labels }}
-        annotations: ${{ steps.docker-setup.outputs.annotations }}
-        provenance: true
-        sbom: true
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        PLATFORM: ${{ inputs.platform }}
+        TAGS: ${{ steps.docker-setup.outputs.tags }}
+        LABELS: ${{ steps.docker-setup.outputs.labels }}
+      run: |
+        set -euo pipefail
+
+        tag_args=()
+        while IFS= read -r tag; do
+          [ -n "$tag" ] && tag_args+=(--tag "$tag")
+        done <<< "$TAGS"
+
+        label_args=()
+        while IFS= read -r label; do
+          [ -n "$label" ] && label_args+=(--label "$label")
+        done <<< "$LABELS"
+
+        akid_file="$(mktemp)"
+        sak_file="$(mktemp)"
+        trap 'rm -f "$akid_file" "$sak_file"' EXIT
+        printf '%s' "${AWS_ACCESS_KEY_ID:-}" > "$akid_file"
+        printf '%s' "${AWS_SECRET_ACCESS_KEY:-}" > "$sak_file"
+
+        buildah build \
+          --file Dockerfile \
+          --target "$TARGET" \
+          --platform "$PLATFORM" \
+          --build-arg SCCACHE_BUCKET="${SCCACHE_BUCKET:-}" \
+          --build-arg SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT:-}" \
+          --build-arg SCCACHE_REGION="${SCCACHE_REGION:-us-east-1}" \
+          --build-arg SCCACHE_S3_USE_SSL="${SCCACHE_S3_USE_SSL:-true}" \
+          --build-arg CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
+          --secret "id=aws_access_key_id,src=${akid_file}" \
+          --secret "id=aws_secret_access_key,src=${sak_file}" \
+          "${label_args[@]}" \
+          "${tag_args[@]}" \
+          .
+
+    - name: Push image with buildah
+      id: push
+      shell: bash
+      env:
+        TAGS: ${{ steps.docker-setup.outputs.tags }}
+      run: |
+        set -euo pipefail
+        digest_file="$(mktemp)"
+        while IFS= read -r tag; do
+          [ -n "$tag" ] || continue
+          echo "Pushing ${tag}"
+          buildah push --digestfile "$digest_file" "$tag"
+        done <<< "$TAGS"
+        echo "digest=$(cat "$digest_file")" >> "$GITHUB_OUTPUT"
 
     - name: Install cosign
       uses: sigstore/cosign-installer@v3.7.0
@@ -56,7 +98,7 @@ runs:
       shell: bash
       env:
         IMAGE_REF: ${{ steps.docker-setup.outputs.image-ref }}
-        DIGEST: ${{ steps.build.outputs.digest }}
+        DIGEST: ${{ steps.push.outputs.digest }}
       run: cosign sign --yes "${IMAGE_REF}@${DIGEST}"
 
 outputs:
@@ -65,4 +107,4 @@ outputs:
     value: ${{ steps.docker-setup.outputs.version-tag }}
   digest:
     description: Digest of the pushed image
-    value: ${{ steps.build.outputs.digest }}
+    value: ${{ steps.push.outputs.digest }}

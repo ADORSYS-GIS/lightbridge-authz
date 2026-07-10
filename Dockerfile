@@ -3,8 +3,15 @@ FROM rust:1-alpine as builder
 
 ARG TARGETARCH
 
-RUN --mount=type=cache,target=/var/cache/apk \
-    apk add --no-cache \
+# sccache configuration (S3 backend on the self-hosted runner). Bucket/endpoint
+# are non-secret build args; the AWS credentials are passed as build secrets.
+ARG SCCACHE_BUCKET=""
+ARG SCCACHE_ENDPOINT=""
+ARG SCCACHE_REGION="us-east-1"
+ARG SCCACHE_S3_USE_SSL="true"
+ARG CARGO_BUILD_JOBS="2"
+
+RUN apk add --no-cache \
     musl-dev \
     build-base \
     pkgconfig \
@@ -18,11 +25,22 @@ RUN --mount=type=cache,target=/var/cache/apk \
     clang-dev \
     llvm-dev \
     ca-certificates \
-    cmake
+    cmake \
+    sccache
 
 # Create app directory
 WORKDIR /app
 
+# Route rustc through sccache; incremental compilation is disabled (sccache
+# requirement and the CI norm). Docker layer caching is intentionally not used
+# for the build — sccache provides the cross-build compilation cache instead.
+ENV CARGO_INCREMENTAL=0 \
+    RUSTC_WRAPPER=sccache \
+    SCCACHE_BUCKET=${SCCACHE_BUCKET} \
+    SCCACHE_ENDPOINT=${SCCACHE_ENDPOINT} \
+    SCCACHE_REGION=${SCCACHE_REGION} \
+    SCCACHE_S3_USE_SSL=${SCCACHE_S3_USE_SSL} \
+    CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 
 RUN \
   # Mount workspace files and only the necessary crates
@@ -32,10 +50,8 @@ RUN \
   --mount=type=bind,source=./crates/,target=/app/crates \
   --mount=type=bind,source=./migrations/,target=/app/migrations \
   --mount=type=bind,source=./migrations-usage/,target=/app/migrations-usage \
-  --mount=type=cache,target=/app/target \
-  --mount=type=cache,target=/usr/local/cargo/registry/cache \
-  --mount=type=cache,target=/usr/local/cargo/registry/index \
-  --mount=type=cache,target=/usr/local/cargo/git/db \
+  --mount=type=secret,id=aws_access_key_id \
+  --mount=type=secret,id=aws_secret_access_key \
   case "$TARGETARCH" in \
     "amd64") \
       export RUST_TARGET=x86_64-unknown-linux-musl; \
@@ -48,7 +64,10 @@ RUN \
       exit 1; \
       ;; \
   esac; \
+  export AWS_ACCESS_KEY_ID="$(cat /run/secrets/aws_access_key_id 2>/dev/null || true)"; \
+  export AWS_SECRET_ACCESS_KEY="$(cat /run/secrets/aws_secret_access_key 2>/dev/null || true)"; \
   cargo build --profile prod --locked --target "${RUST_TARGET}" \
+  && sccache --show-stats \
   && ls -lash ./target/"${RUST_TARGET}"/prod \
   && cp ./target/"${RUST_TARGET}"/prod/lightbridge-authz-healthcheck lightbridge-authz-healthcheck \
   && cp ./target/"${RUST_TARGET}"/prod/lightbridge-authz lightbridge-authz \
