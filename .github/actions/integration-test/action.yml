@@ -30,7 +30,11 @@ runs:
         compose="podman compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml -f compose.ci.yaml"
         trap '$compose logs || true; $compose down -v || true; kill "$svc" 2>/dev/null || true' EXIT
 
+        # Build the app images (COPY from ./dist -> fast), then run each suite via
+        # `run`, which starts only that suite's depends_on subgraph. This avoids the
+        # leaf services (jaeger, adminer, mcp-inspector) that no test needs, keeping
+        # the container/disk footprint within the runner limits.
         $compose version
-        $compose up -d --build
+        $compose build
         $compose run --rm it-authorino
         $compose run --rm it-servers
