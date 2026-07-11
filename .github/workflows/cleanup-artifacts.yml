@@ -97,13 +97,16 @@ jobs:
 
           older="${MAX_AGE_DAYS}d"
           target="cleanup/${SCCACHE_BUCKET}"
-          count="$(mc find "${target}" --older-than "${older}" 2>/dev/null | wc -l | tr -d ' ')"
-          echo "sccache bucket '${SCCACHE_BUCKET}' (${url}): ${count} object(s) older than ${older}"
 
           if [ "${DRY_RUN}" = "true" ]; then
-            echo "dry-run — sample of what would be removed:"
-            mc find "${target}" --older-than "${older}" 2>/dev/null | head -50 | sed 's/^/  [dry] /'
+            # List to a file first, then head the FILE — piping `mc find` straight
+            # into `head` makes mc die on SIGPIPE (141) once head closes the pipe,
+            # which `set -o pipefail` turns into a step failure.
+            mc find "${target}" --older-than "${older}" 2>/dev/null > /tmp/old-objects.txt || true
+            count="$(wc -l < /tmp/old-objects.txt | tr -d ' ')"
+            echo "dry-run: ${count} object(s) in '${SCCACHE_BUCKET}' (${url}) older than ${older}; first 50:"
+            head -50 /tmp/old-objects.txt | sed 's/^/  [dry] /'
           else
             removed="$(mc rm --recursive --force --older-than "${older}" "${target}/" 2>/dev/null | wc -l | tr -d ' ')"
-            echo "sccache: removed ${removed} object(s) older than ${older}"
+            echo "sccache: removed ${removed} object(s) in '${SCCACHE_BUCKET}' (${url}) older than ${older}"
           fi
