@@ -303,6 +303,7 @@ fn lazy_pool() -> Arc<dyn DbPoolTrait> {
 
 fn oauth2_without_signing() -> lightbridge_authz_core::config::Oauth2 {
     lightbridge_authz_core::config::Oauth2 {
+        oauth2_type: lightbridge_authz_core::config::Oauth2Type::External,
         jwks_url: "http://jwks".to_string(),
         oauth2_url: None,
         issuer_url: None,

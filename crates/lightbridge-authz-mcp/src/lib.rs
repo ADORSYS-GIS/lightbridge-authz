@@ -1019,7 +1019,10 @@ pub async fn start_mcp_server(
     pool: Arc<dyn DbPoolTrait>,
 ) -> Result<()> {
     let readiness_pool = pool.clone();
-    if let Some(signing) = oauth2.signing.as_ref() {
+    if oauth2.is_self_signed() {
+        let signing = oauth2.signing.as_ref().ok_or_else(|| {
+            Error::Server("oauth2.type is 'self' but oauth2.signing is missing".to_string())
+        })?;
         let signing_repo = StoreRepo::new(pool.clone());
         lightbridge_authz_rest::signing::bootstrap_signing_key(&signing_repo, signing).await?;
     }
@@ -1100,15 +1103,13 @@ pub async fn start_mcp_server(
 
     let app = public.merge(protected);
 
-    let signing_enabled = oauth2.signing.as_ref().is_some_and(|s| s.enabled);
-    let issuance_enabled = oauth2
-        .issuance
-        .as_ref()
-        .is_some_and(|issuance| issuance.enabled);
+    let signing_enabled = oauth2.is_self_signed();
+    let issuance_enabled = oauth2.is_external();
     tracing::info!(
         server = "lightbridge-mcp",
         address = %api.address,
         port = api.port,
+        oauth2_type = ?oauth2.oauth2_type,
         signing_enabled,
         issuance_enabled,
         "starting mcp server"
@@ -1441,6 +1442,7 @@ mod tests {
 
     fn sample_oauth2() -> Oauth2 {
         Oauth2 {
+            oauth2_type: lightbridge_authz_core::config::Oauth2Type::External,
             jwks_url: "http://keycloak:9100/realms/dev/protocol/openid-connect/certs".to_string(),
             oauth2_url: None,
             issuer_url: None,

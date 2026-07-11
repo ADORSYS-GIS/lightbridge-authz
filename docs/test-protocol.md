@@ -90,16 +90,20 @@ The CRUD API stores only the SHA-256 hash of the issued secret and returns the
 plaintext `secret` exactly once, on create/rotate. The credential format depends on
 config:
 
-- **Self-signed JWT** (`oauth2.signing.enabled`, enterprise default): an RS256 JWT
+The credential format is chosen by the **required** `oauth2.type` key (no default):
+
+- **Self-signed JWT** (`oauth2.type: self`, enterprise default): an RS256 JWT
   signed by this service, carrying `api_key_id`/`project_id`/`account_id`/`allowed_models`
   claims. The signing keypair is generated on first startup and stored in the DB
   (`signing_keys`), auto-rotated once older than `max_key_age_days` (rotated-out keys are
   marked stale and kept in the JWKS until their tokens expire). Authorino verifies the
   signature via the published JWKS (`/.well-known/jwks.json`) and enforces revocation via
   introspection (see `docs/authorino-usage.md`).
-- **Opaque secret** (`lbk_secret_...`, signing disabled): not a JWT; no JWKS validator
-  accepts it, so it is inert if leaked outside the introspection path.
-- **Keycloak token exchange** (`oauth2.issuance.enabled`): a Keycloak-issued OAuth2 JWT.
+- **Keycloak token exchange** (`oauth2.type: external`): a Keycloak-issued OAuth2 JWT,
+  exchanged via `oauth2.issuance`.
+
+(The former opaque `lbk_secret_...` mode has been removed — `oauth2.type` is mandatory and
+only `self` or `external` are valid.)
 
 Regardless of format, revoking or deleting the API key takes effect on the **next
 request**. Authorino authorizes each request by introspecting the presented key

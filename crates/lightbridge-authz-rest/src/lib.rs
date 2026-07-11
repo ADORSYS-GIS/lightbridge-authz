@@ -128,7 +128,9 @@ pub fn build_api_router(
         ));
 
     let token_exchange_enabled = token_exchange.is_some();
-    if let Some(signing) = oauth2.signing.as_ref().filter(|s| s.enabled) {
+    if oauth2.is_self_signed()
+        && let Some(signing) = oauth2.signing.as_ref()
+    {
         public = public.merge(signing::well_known_router(
             &signing.issuer,
             signing_repo,
@@ -151,29 +153,32 @@ pub fn build_api_router(
     public.merge(protected).with_state(app_state)
 }
 
-/// Builds the native token-exchange state, enabled only when BOTH `signing` and `token_exchange`
-/// are on (the exchanged access token is a self-signed JWT, so signing is a hard prerequisite).
-/// Returns `Ok(None)` when disabled; errors on invalid config so startup fails fast.
+/// Builds the native token-exchange state. Enabled only when `token_exchange.enabled` is set, and
+/// it REQUIRES `oauth2.type: self` (the exchanged access token is a self-signed JWT). Returns
+/// `Ok(None)` when the feature is off; errors on invalid config so startup fails fast.
 fn build_token_exchange_state(
     oauth2: &Oauth2,
     repo: Arc<StoreRepo>,
     bearer: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait>,
 ) -> Result<Option<token_exchange::TokenExchangeState>> {
-    let (Some(signing), Some(cfg)) = (
-        oauth2.signing.as_ref().filter(|s| s.enabled),
-        oauth2.token_exchange.as_ref().filter(|t| t.enabled),
-    ) else {
+    let Some(cfg) = oauth2.token_exchange.as_ref().filter(|t| t.enabled) else {
         return Ok(None);
     };
+    if !oauth2.is_self_signed() {
+        return Err(Error::Server(
+            "oauth2.token_exchange is enabled but requires oauth2.type: self".to_string(),
+        ));
+    }
+    let signing = oauth2.signing.as_ref().ok_or_else(|| {
+        Error::Server("oauth2.token_exchange requires oauth2.signing (type: self)".to_string())
+    })?;
     if cfg.access_ttl_seconds <= 0 || cfg.refresh_ttl_seconds <= 0 {
         return Err(Error::Server(
             "token_exchange access_ttl_seconds and refresh_ttl_seconds must be positive"
                 .to_string(),
         ));
     }
-    let Some(signer) = signing::ApiKeyJwtSigner::from_config(signing, repo.clone())? else {
-        return Ok(None);
-    };
+    let signer = signing::ApiKeyJwtSigner::from_config(signing, repo.clone())?;
     Ok(Some(token_exchange::TokenExchangeState {
         repo,
         signer,
@@ -189,7 +194,10 @@ pub async fn start_api_server(
 ) -> Result<()> {
     let readiness_pool = pool.clone();
     let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
-    if let Some(signing) = oauth2.signing.as_ref() {
+    if oauth2.is_self_signed() {
+        let signing = oauth2.signing.as_ref().ok_or_else(|| {
+            Error::Server("oauth2.type is 'self' but oauth2.signing is missing".to_string())
+        })?;
         signing::bootstrap_signing_key(&signing_repo, signing).await?;
     }
     let store = Arc::new(AuthzStoreImpl::with_pool_and_oauth2(pool, oauth2)?);
@@ -213,15 +221,13 @@ pub async fn start_api_server(
         token_exchange_state,
     );
 
-    let signing_enabled = oauth2.signing.as_ref().is_some_and(|s| s.enabled);
-    let issuance_enabled = oauth2
-        .issuance
-        .as_ref()
-        .is_some_and(|issuance| issuance.enabled);
+    let signing_enabled = oauth2.is_self_signed();
+    let issuance_enabled = oauth2.is_external();
     tracing::info!(
         server = "authz-api",
         address = %api.address,
         port = api.port,
+        oauth2_type = ?oauth2.oauth2_type,
         signing_enabled,
         issuance_enabled,
         token_exchange_enabled,

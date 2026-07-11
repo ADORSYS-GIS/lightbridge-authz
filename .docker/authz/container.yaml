@@ -25,6 +25,10 @@ database:
   url: "postgres://postgres:postgres@postgresql:5432/lightbridge_authz"
   pool_size: 10
 oauth2:
+  # REQUIRED credential-issuance mode — no default; must be stated explicitly.
+  #   self     → mint self-signed JWT API keys (uses `signing`). external → Keycloak-exchanged
+  #   tokens (uses `issuance`).
+  type: self
   jwks_url: "http://keycloak:9100/realms/dev/protocol/openid-connect/certs"
   oauth2_url: "http://keycloak:9100/realms/dev/protocol/openid-connect/token"
   # Expected audience claim(s) in JWT tokens.
@@ -39,11 +43,8 @@ oauth2:
   audience:
     - "lightbridge-api-key"
     - "lightbridge-token-issuer"
-  # Disabled: API keys are opaque, locally-generated secrets validated live via the OPA
-  # endpoint, so delete/revoke takes effect on the next request. Enable only to mint
-  # Keycloak-exchanged JWTs, which cannot be revoked before they expire.
+  # Used only when `type: external` (Keycloak token-exchange). Ignored under `type: self`.
   issuance:
-    enabled: false
     grant_type: "urn:ietf:params:oauth:grant-type:token-exchange"
     client_id: "${KEYCLOAK_TOKEN_CLIENT_ID:-lightbridge-token-issuer}"
     client_secret: "${KEYCLOAK_TOKEN_CLIENT_SECRET:-lightbridge-token-issuer-secret}"
@@ -51,10 +52,9 @@ oauth2:
     requested_token_type: "urn:ietf:params:oauth:token-type:access_token"
     # Target audience for issued tokens - must match one of the valid audiences above
     # audience: "lightbridge-api-key"
-  # Self-signed API-key JWTs. Enable to issue verifiable, revocable JWT API keys; the signing
-  # keypair is generated on first startup and stored in the DB (see docs/authorino-usage.md).
+  # Used only when `type: self` — signing keypair generated on first startup and stored in the DB
+  # (see docs/authorino-usage.md). Ignored under `type: external`.
   signing:
-    enabled: ${JWT_SIGNING_ENABLED:-false}
     issuer: "${JWT_SIGNING_ISSUER:-https://authz-api:3000}"
     audience: "${JWT_SIGNING_AUDIENCE:-lightbridge-api-key}"
     ttl_seconds: ${JWT_SIGNING_TTL_SECONDS:-7776000}
