@@ -77,8 +77,24 @@ pub struct Database {
     pub pool_size: Option<u32>,
 }
 
+/// Credential-issuance mode. REQUIRED and has no default — the operator must state it explicitly,
+/// because it decides how every API key is minted. `self` mints self-signed JWTs via
+/// `oauth2.signing`; `external` exchanges the credential at an upstream IdP (e.g. Keycloak) via
+/// `oauth2.issuance`. The two are mutually exclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Oauth2Type {
+    #[serde(rename = "self")]
+    SelfSigned,
+    External,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Oauth2 {
+    /// REQUIRED credential-issuance mode (`self` or `external`). No default — a missing `type`
+    /// fails config load rather than silently picking a mode.
+    #[serde(rename = "type")]
+    pub oauth2_type: Oauth2Type,
     pub jwks_url: String,
     #[serde(default)]
     pub oauth2_url: Option<String>,
@@ -102,16 +118,24 @@ pub struct Oauth2 {
     pub signing: Option<JwtSigning>,
     /// Optional native RFC 8693 token-exchange: when enabled, this service exchanges an
     /// upstream IdP access token for a short-lived, project-scoped self-signed JWT (and an
-    /// optional refresh token). Requires `signing.enabled` (the exchanged token is signed by
-    /// this service). Independent of `issuance`, which proxies exchange to an upstream IdP.
+    /// optional refresh token). Requires `type: self` (the exchanged token is signed by this
+    /// service). Independent of `issuance`, which proxies exchange to an upstream IdP.
     #[serde(default)]
     pub token_exchange: Option<Oauth2TokenExchange>,
 }
 
+impl Oauth2 {
+    pub fn is_self_signed(&self) -> bool {
+        matches!(self.oauth2_type, Oauth2Type::SelfSigned)
+    }
+
+    pub fn is_external(&self) -> bool {
+        matches!(self.oauth2_type, Oauth2Type::External)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct JwtSigning {
-    #[serde(default)]
-    pub enabled: bool,
     /// `iss` claim and the OIDC issuer URL Authorino discovers the JWKS from.
     pub issuer: String,
     /// Optional `aud` claim stamped on issued tokens.
@@ -136,8 +160,6 @@ fn default_max_key_age_days() -> i64 {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Oauth2Issuance {
-    #[serde(default)]
-    pub enabled: bool,
     #[serde(default)]
     pub grant_type: Option<String>,
     #[serde(default)]
@@ -303,5 +325,34 @@ mod tests {
             env::remove_var("TEST_VAR_2");
             env::remove_var("EMPTY_VAR");
         }
+    }
+
+    #[test]
+    fn oauth2_type_self_parses() {
+        let cfg: Oauth2 = from_str("type: self\njwks_url: \"http://x\"\n").unwrap();
+        assert_eq!(cfg.oauth2_type, Oauth2Type::SelfSigned);
+        assert!(cfg.is_self_signed());
+        assert!(!cfg.is_external());
+    }
+
+    #[test]
+    fn oauth2_type_external_parses() {
+        let cfg: Oauth2 = from_str("type: external\njwks_url: \"http://x\"\n").unwrap();
+        assert_eq!(cfg.oauth2_type, Oauth2Type::External);
+        assert!(cfg.is_external());
+    }
+
+    #[test]
+    fn oauth2_type_is_required_no_default() {
+        let err = from_str::<Oauth2>("jwks_url: \"http://x\"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("type"),
+            "missing oauth2.type must fail config load, got: {err}"
+        );
+    }
+
+    #[test]
+    fn oauth2_type_rejects_unknown_value() {
+        assert!(from_str::<Oauth2>("type: opaque\njwks_url: \"http://x\"\n").is_err());
     }
 }

@@ -152,7 +152,7 @@ no stored credential, no provider round-trip.
 
 ## Self-signed JWT API keys (enterprise default)
 
-When `oauth2.signing.enabled` is set, issued API keys are **RS256 JWTs signed by this
+When `oauth2.type` is `self`, issued API keys are **RS256 JWTs signed by this
 service**, shaped to mirror a Keycloak access token so gateways can consume them uniformly:
 
 ```json

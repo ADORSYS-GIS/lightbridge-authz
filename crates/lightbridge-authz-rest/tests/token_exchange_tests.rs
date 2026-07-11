@@ -54,7 +54,6 @@ impl BearerTokenServiceTrait for MockBearer {
 
 fn signing_cfg() -> JwtSigning {
     JwtSigning {
-        enabled: true,
         issuer: ISSUER.to_string(),
         audience: Some("lightbridge-api-key".to_string()),
         ttl_seconds: 7_776_000,
@@ -107,9 +106,7 @@ async fn seed(repo: &StoreRepo) {
 }
 
 fn state(repo: Arc<StoreRepo>, active: bool) -> TokenExchangeState {
-    let signer = ApiKeyJwtSigner::from_config(&signing_cfg(), repo.clone())
-        .unwrap()
-        .unwrap();
+    let signer = ApiKeyJwtSigner::from_config(&signing_cfg(), repo.clone()).unwrap();
     TokenExchangeState {
         repo,
         signer,

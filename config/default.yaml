@@ -24,6 +24,10 @@ database:
   url: "postgres://postgres:postgres@localhost:5432/lightbridge_authz"
   pool_size: 10
 oauth2:
+  # REQUIRED credential-issuance mode — no default; you must state it.
+  #   self     → this service mints self-signed JWT API keys (uses `signing` below).
+  #   external → API keys are exchanged at the upstream IdP/Keycloak (uses `issuance` below).
+  type: self
   jwks_url: "http://localhost:9100/realms/dev/protocol/openid-connect/certs"
   oauth2_url: "http://localhost:9100/realms/dev/protocol/openid-connect/token"
   # Expected audience claim(s) in JWT tokens. If set, tokens must contain at least one of these values.
@@ -36,12 +40,9 @@ oauth2:
   audience:
     - "lightbridge-api-key"
     - "lightbridge-token-issuer"
-  # Disabled: API keys are opaque, locally-generated secrets (lbk_secret_...) stored by
-  # hash and validated live via the OPA endpoint. Revocation/deletion takes effect on the
-  # next request (the DB row is the source of truth). Enable only to mint Keycloak-exchanged
-  # JWTs instead, which are stateless and cannot be revoked before they expire.
+  # Used only when `type: external` — exchanges the credential at the upstream IdP (Keycloak
+  # token-exchange). Ignored under `type: self`.
   issuance:
-    enabled: false
     grant_type: "urn:ietf:params:oauth:grant-type:token-exchange"
     client_id: "${KEYCLOAK_TOKEN_CLIENT_ID:-lightbridge-token-issuer}"
     client_secret: "${KEYCLOAK_TOKEN_CLIENT_SECRET:-lightbridge-token-issuer-secret}"
@@ -54,8 +55,9 @@ oauth2:
   # Authorino verifies signatures via its `jwt` identity. Revocation still flows through the
   # introspection endpoint. The active key auto-rotates once older than max_key_age_days; the
   # rotated-out key is marked stale and kept in the JWKS until its tokens expire.
+  # Used only when `type: self` — RS256 keypair generated + stored in the DB, JWKS published for
+  # Authorino. Ignored under `type: external`.
   signing:
-    enabled: ${JWT_SIGNING_ENABLED:-false}
     issuer: "${JWT_SIGNING_ISSUER:-https://localhost:13000}"
     audience: "${JWT_SIGNING_AUDIENCE:-lightbridge-api-key}"
     ttl_seconds: ${JWT_SIGNING_TTL_SECONDS:-7776000}
