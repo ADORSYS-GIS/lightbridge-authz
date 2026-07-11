@@ -1,0 +1,42 @@
+---
+# CI overlay: build the app images from prebuilt binaries (Dockerfile.dist) instead
+# of compiling in-container. Requires ./dist populated by the build-binaries action.
+# Keeps the per-service build.target from compose.yaml; only swaps the Dockerfile.
+services:
+  # The Bitnami Postgres image does volume chown/perm setup that fails under
+  # rootless podman; the official image starts cleanly (trust auth, fresh
+  # ephemeral data dir -- CI needs no persistence).
+  postgresql:
+    image: docker.io/library/postgres:17
+    volumes: !reset []
+    environment:
+      POSTGRES_DB: lightbridge_authz
+      POSTGRES_HOST_AUTH_METHOD: trust
+
+  authz-migrate:
+    build:
+      dockerfile: Dockerfile.dist
+
+  # restart on-failure lets the long-running services ride out transient
+  # rootless-podman DNS blips (aardvark-dns EAI_AGAIN) at startup.
+  authz-api:
+    build:
+      dockerfile: Dockerfile.dist
+    restart: on-failure
+
+  authz-opa:
+    restart: on-failure
+
+  authz-mcp:
+    build:
+      dockerfile: Dockerfile.dist
+    restart: on-failure
+
+  authz-usage:
+    build:
+      dockerfile: Dockerfile.dist
+    restart: on-failure
+
+  authz-usage-migrate:
+    build:
+      dockerfile: Dockerfile.dist

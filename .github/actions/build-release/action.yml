@@ -1,13 +1,25 @@
 name: Build Release
+description: Build the static release binaries and publish them as artifacts (for the release job and the container image builds).
 runs:
   using: composite
   steps:
     - uses: ./.github/actions/rust-setup
-    - shell: bash
-      run: cargo build --profile prod --all-targets --all-features
-    - shell: bash
-      run: tar -czf release-artifacts.tar.gz -C target/prod .
-    - uses: actions/upload-artifact@47309c993abb98030a35d55ef7ff34b7fa1074b5
+    - uses: ./.github/actions/build-binaries
+
+    - name: Package release tarball
+      shell: bash
+      run: tar -czf release-artifacts.tar.gz -C dist .
+
+    - name: Upload release tarball
+      uses: actions/upload-artifact@47309c993abb98030a35d55ef7ff34b7fa1074b5
       with:
         name: release-artifacts
         path: release-artifacts.tar.gz
+        retention-days: 1
+
+    - name: Upload dist binaries (for container build)
+      uses: actions/upload-artifact@47309c993abb98030a35d55ef7ff34b7fa1074b5
+      with:
+        name: dist-binaries
+        path: dist/
+        retention-days: 1
