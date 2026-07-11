@@ -97,9 +97,31 @@ jobs:
           exit-code: '1'
           ignore-unfixed: true
           severity: 'HIGH,CRITICAL'
-  release:
-    needs: [binaries,container-build]
+  release-please:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: adorsys-gis-runner
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release-please.outputs.release_created }}
+      tag_name: ${{ steps.release-please.outputs.tag_name }}
+    steps:
+      - name: Open/advance the release PR (cuts the release + tag on merge)
+        id: release-please
+        uses: googleapis/release-please-action@v5
+        with:
+          # A PAT (RELEASE_PLEASE_TOKEN) lets the release PR trigger CI and its
+          # tag fire the publish jobs; falls back to GITHUB_TOKEN until it exists.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  release:
+    needs: [binaries, container-build, release-please]
+    if: >-
+      github.ref == 'refs/heads/main' && github.event_name == 'push'
+      && needs.release-please.outputs.release_created == 'true'
     runs-on: adorsys-gis-runner
     permissions:
       contents: write
@@ -109,3 +131,4 @@ jobs:
       - uses: ./.github/actions/release
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ needs.release-please.outputs.tag_name }}

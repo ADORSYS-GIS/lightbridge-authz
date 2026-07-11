@@ -1,8 +1,11 @@
 name: Release Artifacts
-description: Download the release tarball from the CI S3 bucket, publish a GitHub Release, and sweep the run's S3 artifacts.
+description: Download the release tarball from the CI S3 bucket, attach it to the release-please GitHub Release, and sweep the run's S3 artifacts.
 inputs:
   github-token:
-    description: Token to publish release
+    description: Token to upload the release asset
+    required: true
+  tag:
+    description: Tag of the release-please release to attach binaries to (e.g. v0.9.0)
     required: true
 runs:
   using: composite
@@ -14,14 +17,14 @@ runs:
       with:
         mode: download
         name: release-artifacts.tar.gz
-    - name: Create GitHub Release
+    - name: Attach binaries to the release
+      # release-please already created the GitHub Release + tag on the merge
+      # commit; pointing at that tag updates the existing release and appends
+      # the freshly built binary tarball (no new release is created here).
       uses: softprops/action-gh-release@e798e6a1ede8d07b74ac4cdac6bdfa4cc1653907
       with:
-        tag_name: v${{ github.run_number }}
-        name: Release v${{ github.run_number }}
+        tag_name: ${{ inputs.tag }}
         files: release-artifacts.tar.gz
-        draft: false
-        prerelease: false
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
     # Terminal job of the run (needs binaries + container-build), so the per-run
