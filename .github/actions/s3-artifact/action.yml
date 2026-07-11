@@ -1,0 +1,69 @@
+name: S3 Artifact
+description: >-
+  Upload/download/cleanup a build artifact on the CI S3 (MinIO) bucket, reusing the
+  ambient sccache credentials on the runner. Replaces actions/upload-artifact +
+  actions/download-artifact, which fail once the org GitHub Actions artifact-storage
+  quota is exhausted ("Failed to CreateArtifact: Artifact storage quota has been hit").
+  Objects are namespaced per workflow run so jobs in the same run share them.
+
+inputs:
+  mode:
+    description: "upload | download | cleanup"
+    required: true
+  name:
+    description: "Artifact file name (e.g. dist-binaries.tar.gz). Ignored for cleanup."
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Transfer via mc
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        NAME: ${{ inputs.name }}
+      run: |
+        set -euo pipefail
+
+        : "${SCCACHE_ENDPOINT:?SCCACHE_ENDPOINT is not set on the runner}"
+        : "${SCCACHE_BUCKET:?SCCACHE_BUCKET is not set on the runner}"
+        : "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID is not set on the runner}"
+        : "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is not set on the runner}"
+
+        # mc may already be on PATH (rust-setup installs it); otherwise fetch it.
+        if ! command -v mc >/dev/null 2>&1; then
+          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /tmp/mc
+          chmod +x /tmp/mc
+          export PATH="/tmp:${PATH}"
+        fi
+
+        case "${SCCACHE_ENDPOINT}" in
+          http://*|https://*) url="${SCCACHE_ENDPOINT}" ;;
+          *) url="https://${SCCACHE_ENDPOINT}" ;;
+        esac
+        mc alias set ciart "${url}" "${AWS_ACCESS_KEY_ID}" "${AWS_SECRET_ACCESS_KEY}" >/dev/null
+
+        # Per-run prefix (stable across jobs in a run, unique across runs/attempts).
+        prefix="ciart/${SCCACHE_BUCKET}/ci-artifacts/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+        case "${MODE}" in
+          upload)
+            [ -n "${NAME}" ] || { echo "::error::name is required for upload"; exit 1; }
+            mc cp --quiet "${NAME}" "${prefix}/${NAME}"
+            echo "Uploaded ${NAME} -> ${prefix}/${NAME}"
+            ;;
+          download)
+            [ -n "${NAME}" ] || { echo "::error::name is required for download"; exit 1; }
+            mc cp --quiet "${prefix}/${NAME}" "${NAME}"
+            echo "Downloaded ${prefix}/${NAME} -> ${NAME}"
+            ;;
+          cleanup)
+            mc rm --recursive --force "${prefix}" >/dev/null 2>&1 || true
+            echo "Cleaned ${prefix}"
+            ;;
+          *)
+            echo "::error::unknown mode '${MODE}' (want upload|download|cleanup)"
+            exit 1
+            ;;
+        esac
