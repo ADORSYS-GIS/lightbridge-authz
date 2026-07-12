@@ -1988,9 +1988,10 @@ version = "0.8.1"
 dependencies = [
  "clap",
  "lightbridge-authz-core",
- "lightbridge-authz-migrate",
+ "lightbridge-authz-mcp",
  "lightbridge-authz-rest",
  "mimalloc",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2066,13 +2067,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lightbridge-authz-healthcheck"
-version = "0.8.1"
-dependencies = [
- "clap",
-]
-
-[[package]]
 name = "lightbridge-authz-mcp"
 version = "0.8.1"
 dependencies = [
@@ -2089,15 +2083,6 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
- "tracing",
-]
-
-[[package]]
-name = "lightbridge-authz-migrate"
-version = "0.8.1"
-dependencies = [
- "lightbridge-authz-core",
- "sqlx",
  "tracing",
 ]
 
@@ -2134,36 +2119,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "lightbridge-authz-test-utils"
-version = "0.8.1"
-dependencies = [
- "clap",
- "reqwest 0.13.4",
- "serde",
- "sqlx",
-]
-
-[[package]]
 name = "lightbridge-authz-usage"
 version = "0.8.1"
 dependencies = [
  "clap",
  "lightbridge-authz-core",
- "lightbridge-authz-usage-migrate",
  "lightbridge-authz-usage-rest",
  "mimalloc",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "lightbridge-authz-usage-migrate"
-version = "0.8.1"
-dependencies = [
- "lightbridge-authz-core",
- "sqlx",
- "tracing",
 ]
 
 [[package]]
@@ -2195,19 +2161,6 @@ dependencies = [
  "tracing-subscriber",
  "utoipa",
  "utoipa-swagger-ui",
-]
-
-[[package]]
-name = "lightbridge-mcp"
-version = "0.8.1"
-dependencies = [
- "clap",
- "lightbridge-authz-core",
- "lightbridge-authz-mcp",
- "mimalloc",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

@@ -4,16 +4,11 @@ members = [
     "crates/lightbridge-authz-rest",
     "crates/lightbridge-authz-mcp",
     "app/lightbridge-authz",
-    "app/lightbridge-mcp",
-    "app/lightbridge-authz-healthcheck",
     "app/lightbridge-authz-usage",
     "crates/lightbridge-authz-api",
     "crates/lightbridge-authz-api-key",
     "crates/lightbridge-authz-bearer",
-    "crates/lightbridge-authz-migrate",
     "crates/lightbridge-authz-usage",
-    "crates/lightbridge-authz-usage-migrate",
-    "crates/lightbridge-authz-test-utils",
 ]
 resolver = "3"
 
@@ -24,9 +19,7 @@ lightbridge-authz-mcp = { path = "./crates/lightbridge-authz-mcp" }
 lightbridge-authz-api = { path = "./crates/lightbridge-authz-api" }
 lightbridge-authz-api-key = { path = "./crates/lightbridge-authz-api-key" }
 lightbridge-authz-bearer = { path = "./crates/lightbridge-authz-bearer" }
-lightbridge-authz-migrate = { path = "./crates/lightbridge-authz-migrate" }
 lightbridge-authz-usage-rest = { path = "./crates/lightbridge-authz-usage" }
-lightbridge-authz-usage-migrate = { path = "./crates/lightbridge-authz-usage-migrate" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"

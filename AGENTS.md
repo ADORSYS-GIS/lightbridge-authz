@@ -179,11 +179,8 @@ use crate::repo::StoreRepo;
 ## Top-Level Layout
 
 - `app/`
-  - `app/lightbridge-authz/`: main binary that can run API server, OPA server, both, and migrations.
-  - `app/lightbridge-mcp/`: MCP binary that runs the streamable HTTP MCP server.
+  - `app/lightbridge-authz/`: package that produces the authz server, MCP server, and TCP healthcheck binaries; the authz binary can run API server, OPA server, both, and migrations.
   - `app/lightbridge-authz-usage/`: usage binary that can run usage server, usage migrations, and config validation.
-  - `app/lightbridge-authz-migrate-bin/`: standalone migration runner (used by Docker image stage).
-  - `app/lightbridge-authz-healthcheck/`: TCP healthcheck binary for container health checks.
 - `crates/`
   - `crates/lightbridge-authz-core/`: shared types, config, errors, crypto, DB pool.
   - `crates/lightbridge-authz-api/`: CRUD API routing/controllers + OpenAPI.
@@ -191,10 +188,7 @@ use crate::repo::StoreRepo;
   - `crates/lightbridge-authz-rest/`: Axum server glue (TLS bind, modular layout with handlers, routers, models, and middleware).
   - `crates/lightbridge-authz-bearer/`: JWT validation via JWKS (Keycloak in local compose).
   - `crates/lightbridge-authz-mcp/`: MCP tool handlers + streamable HTTP server wiring.
-  - `crates/lightbridge-authz-migrate/`: SQLx migrations runner library.
   - `crates/lightbridge-authz-usage/`: Axum usage server (OTEL ingest handlers, usage query models/routers, TLS bind, OpenAPI).
-  - `crates/lightbridge-authz-usage-migrate/`: SQLx migrations runner for usage storage.
-  - `crates/lightbridge-authz-test-utils/`: helpers for DB/migrations in tests (currently minimal).
   - `crates/lightbridge-authz-proto/`: proto-related exports (currently minimal).
 - `migrations/`: SQLx migrations.
 - `migrations-usage/`: SQLx migrations for usage events storage (Timescale-compatible schema).
@@ -297,10 +291,9 @@ Workspace manifest: `Cargo.toml`
 
 - Binary entrypoints:
   - `app/lightbridge-authz/src/main.rs`
-  - `app/lightbridge-mcp/src/main.rs`
+  - `app/lightbridge-authz/src/bin/lightbridge-mcp.rs`
+  - `app/lightbridge-authz/src/bin/lightbridge-authz-healthcheck.rs`
   - `app/lightbridge-authz-usage/src/main.rs`
-  - `app/lightbridge-authz-migrate-bin/src/main.rs`
-  - `app/lightbridge-authz-healthcheck/src/main.rs`
 
 - CRUD API:
   - routing: `crates/lightbridge-authz-api/src/routers.rs`
@@ -399,7 +392,7 @@ You can run binaries directly (requires valid TLS cert/key files at configured p
 - `cargo run -p lightbridge-authz -- api --config-path config/default.yaml`
 - `cargo run -p lightbridge-authz -- opa --config-path config/default.yaml`
 - `cargo run -p lightbridge-authz -- migrate --config-path config/default.yaml`
-- `cargo run -p lightbridge-mcp -- serve --config-path config/default.yaml`
+- `cargo run -p lightbridge-authz --bin lightbridge-mcp -- serve --config-path config/default.yaml`
 - `cargo run -p lightbridge-authz-usage -- serve --config-path config/usage.yaml`
 - `cargo run -p lightbridge-authz-usage -- migrate --config-path config/usage.yaml`
 
@@ -509,10 +502,10 @@ Traces capture the full lifecycle of a validation request, including database lo
 
 ## Migrations
 
-Migrations are run with SQLx embedded migrations:
+Migrations are run with SQLx embedded migrations in the owning binary packages:
 
-- library: `crates/lightbridge-authz-migrate/src/migrate.rs`
-- binary: `app/lightbridge-authz-migrate-bin/src/main.rs`
+- authz: `app/lightbridge-authz/src/migrate.rs`
+- usage: `app/lightbridge-authz-usage/src/migrate.rs`
 
 In Compose, `authz-migrate` runs before API/OPA start.
 

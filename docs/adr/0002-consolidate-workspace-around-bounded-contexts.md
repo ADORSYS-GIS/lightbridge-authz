@@ -1,14 +1,14 @@
 # ADR-0002: Consolidate the workspace around bounded contexts
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-10
 - Decision owners: Lightbridge Authz maintainers
 
 ## Context
 
-The repository currently has fourteen active Cargo packages for approximately 9,700 lines of
-production Rust. Its package graph was built around technical layers and deployment surfaces rather
-than independently versioned capabilities.
+At the time this ADR was written, the repository had fourteen active Cargo packages for approximately
+9,700 lines of production Rust. Its package graph was built around technical layers and deployment
+surfaces rather than independently versioned capabilities.
 
 The result is a high-maintenance dependency structure:
 
@@ -17,7 +17,7 @@ The result is a high-maintenance dependency structure:
 - `lightbridge-authz-api-key` owns persistence for every authz aggregate.
 - `lightbridge-authz-rest` owns application behavior as well as transport concerns.
 - `lightbridge-authz-mcp` depends on REST to construct and reuse application behavior.
-- Migration, healthcheck, and app packages contain mostly wiring.
+- Migration, healthcheck, and app packages contained mostly wiring.
 - The usage bounded context is independent operationally but still imports the authz core package.
 
 The largest source files and historical churn are concentrated in the authz repository, MCP
@@ -34,6 +34,13 @@ Replace the current workspace with two production packages and one optional deve
 
 Deployment boundaries remain separate runtime modes. They are not represented as separate library
 packages unless a component later demonstrates independent versioning or reuse.
+
+### Implementation progress
+
+The first migration slice folds the MCP and healthcheck wrapper applications into the
+`lightbridge-authz` package and folds each SQLx migration wrapper into its owning binary package.
+The workspace now has nine active packages while retaining the `lightbridge-authz`,
+`lightbridge-mcp`, `lightbridge-authz-healthcheck`, and `lightbridge-authz-usage` binary names.
 
 ### Authz package
 
@@ -238,8 +245,8 @@ HTTP and MCP parity tests must pass after each slice moves.
 
 ### 6. Remove the old workspace
 
-Delete the current `core`, `api`, `api-key`, `bearer`, `rest`, `mcp`, migration, test-utils,
-healthcheck, and wrapper-app packages after all deployment modes use the new packages.
+Delete the remaining `core`, `api`, `api-key`, `bearer`, `rest`, and `mcp` packages after all
+deployment modes use the new packages.
 
 ## Consequences
 

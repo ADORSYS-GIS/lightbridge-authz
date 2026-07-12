@@ -13,5 +13,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 lightbridge-authz-core.workspace = true
 lightbridge-authz-usage-rest.workspace = true
-lightbridge-authz-usage-migrate.workspace = true
 mimalloc.workspace = true
+sqlx.workspace = true
