@@ -16,7 +16,7 @@ The result is a high-maintenance dependency structure:
   and crypto.
 - `lightbridge-authz-api-key` owns persistence for every authz aggregate.
 - `lightbridge-authz-rest` owns application behavior as well as transport concerns.
-- `lightbridge-authz-mcp` depends on REST to construct and reuse application behavior.
+- The MCP adapter depends on REST to construct and reuse application behavior.
 - Migration, healthcheck, and app packages contained mostly wiring.
 - The usage bounded context is independent operationally but still imports the authz core package.
 
@@ -39,8 +39,9 @@ packages unless a component later demonstrates independent versioning or reuse.
 
 The first migration slice folds the MCP and healthcheck wrapper applications into the
 `lightbridge-authz` package and folds each SQLx migration wrapper into its owning binary package.
-The workspace now has nine active packages while retaining the `lightbridge-authz`,
-`lightbridge-mcp`, `lightbridge-authz-healthcheck`, and `lightbridge-authz-usage` binary names.
+The workspace now has eight active packages. It retains the `lightbridge-authz`,
+`lightbridge-mcp`, `lightbridge-authz-healthcheck`, and `lightbridge-authz-usage` binary names;
+the MCP adapter now lives within the authz package.
 
 ### Authz package
 

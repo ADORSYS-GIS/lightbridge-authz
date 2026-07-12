@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
+use lightbridge_authz::mcp::start_mcp_server_from_config;
 use lightbridge_authz_core::{Result, config::load_from_path};
-use lightbridge_authz_mcp::start_mcp_server_from_config;
 use mimalloc::MiMalloc;
 use tracing::info;
 
