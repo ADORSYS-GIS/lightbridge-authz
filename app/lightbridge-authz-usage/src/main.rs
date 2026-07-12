@@ -1,8 +1,8 @@
+mod migrate;
 mod utils;
 
 use clap::Parser;
 use lightbridge_authz_core::Result;
-use lightbridge_authz_usage_migrate::migrate;
 use lightbridge_authz_usage_rest::{load_from_path, start_usage_server};
 use mimalloc::MiMalloc;
 use tracing::info;
@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Migrate { config_path }) => {
             let config = load_from_path(&config_path)?;
-            migrate(&config.database.url).await
+            migrate::migrate(&config.database.url).await
         }
         Some(Commands::Config { config_path }) => {
             let _ = load_from_path(&config_path)?;

@@ -52,15 +52,13 @@ the security and scaling boundary that must be preserved during restructuring.
 
 ## Cargo workspace
 
-The workspace has fourteen active packages. Package edges are shown below; development-only edges
+The workspace has ten active packages. Package edges are shown below; development-only edges
 are omitted.
 
 ```mermaid
 flowchart TB
-    AuthzBin[lightbridge-authz binary]
-    McpBin[lightbridge-mcp binary]
-    UsageBin[lightbridge-authz-usage binary]
-    Health[lightbridge-authz-healthcheck binary]
+    AuthzBin[lightbridge-authz package\nlightbridge-authz, lightbridge-mcp, healthcheck binaries]
+    UsageBin[lightbridge-authz-usage package\nusage server and migrations]
 
     Rest[lightbridge-authz-rest]
     Mcp[lightbridge-authz-mcp]
@@ -69,17 +67,11 @@ flowchart TB
     Repo[lightbridge-authz-api-key]
     Bearer[lightbridge-authz-bearer]
     Core[lightbridge-authz-core]
-    Migrate[lightbridge-authz-migrate]
-    UsageMigrate[lightbridge-authz-usage-migrate]
-    TestUtils[lightbridge-authz-test-utils]
 
     AuthzBin --> Rest
-    AuthzBin --> Migrate
+    AuthzBin --> Mcp
     AuthzBin --> Core
-    McpBin --> Mcp
-    McpBin --> Core
     UsageBin --> Usage
-    UsageBin --> UsageMigrate
     UsageBin --> Core
 
     Mcp --> Rest
@@ -95,10 +87,7 @@ flowchart TB
     Api --> Core
     Repo --> Core
     Bearer --> Core
-    Migrate --> Core
     Usage --> Core
-    UsageMigrate --> Core
-    TestUtils -. no active consumer .-> Core
 ```
 
 The package names do not consistently match their responsibilities:
@@ -110,8 +99,7 @@ The package names do not consistently match their responsibilities:
 - `lightbridge-authz-rest` contains application behavior in addition to HTTP transport code.
 - `lightbridge-authz-mcp` depends on REST types and handlers to reuse application behavior, which
   creates a transport-to-transport dependency.
-- The two migration packages contain only thin wrappers around SQLx migration calls.
-- `lightbridge-authz-test-utils` is an active workspace member with no active consumer.
+- Migration code lives as modules in the authz and usage binary packages.
 - `lightbridge-authz-proto` remains in the source tree but is not an active workspace member.
 
 ## Authz data model
