@@ -52,7 +52,7 @@ the security and scaling boundary that must be preserved during restructuring.
 
 ## Cargo workspace
 
-The workspace has ten active packages. Package edges are shown below; development-only edges
+The workspace has nine active packages. Package edges are shown below; development-only edges
 are omitted.
 
 ```mermaid
