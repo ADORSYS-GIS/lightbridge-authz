@@ -28,6 +28,38 @@
         }
       ],
       "realmRoles": ["offline_access", "lightbridge-admin"]
+    },
+    {
+      "email": "test@editor",
+      "username": "test@editor",
+      "firstName": "Editor",
+      "lastName": "SRE",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        {
+          "temporary": false,
+          "type": "password",
+          "value": "test"
+        }
+      ],
+      "realmRoles": ["offline_access", "lightbridge-editor"]
+    },
+    {
+      "email": "test@viewer",
+      "username": "test@viewer",
+      "firstName": "Viewer",
+      "lastName": "SRE",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        {
+          "temporary": false,
+          "type": "password",
+          "value": "test"
+        }
+      ],
+      "realmRoles": ["offline_access", "lightbridge-viewer"]
     }
   ],
   "roles": {
