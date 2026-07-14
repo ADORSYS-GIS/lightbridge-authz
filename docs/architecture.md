@@ -52,7 +52,7 @@ the security and scaling boundary that must be preserved during restructuring.
 
 ## Cargo workspace
 
-The workspace has nine active packages. Package edges are shown below; development-only edges
+The workspace has eight active packages. Package edges are shown below; development-only edges
 are omitted.
 
 ```mermaid
@@ -61,7 +61,6 @@ flowchart TB
     UsageBin[lightbridge-authz-usage package\nusage server and migrations]
 
     Rest[lightbridge-authz-rest]
-    Mcp[lightbridge-authz-mcp]
     Usage[lightbridge-authz-usage-rest]
     Api[lightbridge-authz-api]
     Repo[lightbridge-authz-api-key]
@@ -69,16 +68,13 @@ flowchart TB
     Core[lightbridge-authz-core]
 
     AuthzBin --> Rest
-    AuthzBin --> Mcp
+    AuthzBin --> Api
+    AuthzBin --> Repo
+    AuthzBin --> Bearer
     AuthzBin --> Core
     UsageBin --> Usage
     UsageBin --> Core
 
-    Mcp --> Rest
-    Mcp --> Api
-    Mcp --> Repo
-    Mcp --> Bearer
-    Mcp --> Core
     Rest --> Api
     Rest --> Repo
     Rest --> Bearer
@@ -97,8 +93,9 @@ The package names do not consistently match their responsibilities:
 - `lightbridge-authz-api-key` persists accounts, memberships, projects, API keys, signing keys, and
   refresh tokens.
 - `lightbridge-authz-rest` contains application behavior in addition to HTTP transport code.
-- `lightbridge-authz-mcp` depends on REST types and handlers to reuse application behavior, which
-  creates a transport-to-transport dependency.
+- The MCP module in `lightbridge-authz` still depends on REST types and handlers to reuse
+  application behavior, which preserves a transport-to-transport dependency until the application
+  layer is extracted.
 - Migration code lives as modules in the authz and usage binary packages.
 - `lightbridge-authz-proto` remains in the source tree but is not an active workspace member.
 

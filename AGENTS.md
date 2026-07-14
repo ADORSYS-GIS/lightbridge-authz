@@ -187,7 +187,6 @@ use crate::repo::StoreRepo;
   - `crates/lightbridge-authz-api-key/`: DB entities + repository implementation (SQLx).
   - `crates/lightbridge-authz-rest/`: Axum server glue (TLS bind, modular layout with handlers, routers, models, and middleware).
   - `crates/lightbridge-authz-bearer/`: JWT validation via JWKS (Keycloak in local compose).
-  - `crates/lightbridge-authz-mcp/`: MCP tool handlers + streamable HTTP server wiring.
   - `crates/lightbridge-authz-usage/`: Axum usage server (OTEL ingest handlers, usage query models/routers, TLS bind, OpenAPI).
   - `crates/lightbridge-authz-proto/`: proto-related exports (currently minimal).
 - `migrations/`: SQLx migrations.
@@ -311,7 +310,7 @@ Workspace manifest: `Cargo.toml`
   - `crates/lightbridge-authz-usage/src/repo.rs`
 
 - MCP endpoints/tools:
-  - server + tool handlers: `crates/lightbridge-authz-mcp/src/lib.rs`
+  - server + tool handlers: `app/lightbridge-authz/src/mcp.rs`
 
 ## Configuration
 
@@ -413,7 +412,7 @@ DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz" car
 The REST crate contains behavior tests for validation flows and OpenAPI contract checks:
 
 - `cargo test -p lightbridge-authz-rest`
-- `cargo test -p lightbridge-authz-mcp`
+- `cargo test -p lightbridge-authz --lib`
 - `cargo test -p lightbridge-authz-usage-rest`
 
 These tests include:

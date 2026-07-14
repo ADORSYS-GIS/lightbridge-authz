@@ -2,7 +2,6 @@
 members = [
     "crates/lightbridge-authz-core",
     "crates/lightbridge-authz-rest",
-    "crates/lightbridge-authz-mcp",
     "app/lightbridge-authz",
     "app/lightbridge-authz-usage",
     "crates/lightbridge-authz-api",
@@ -15,7 +14,6 @@ resolver = "3"
 [workspace.dependencies]
 lightbridge-authz-core = { path = "./crates/lightbridge-authz-core" }
 lightbridge-authz-rest = { path = "./crates/lightbridge-authz-rest" }
-lightbridge-authz-mcp = { path = "./crates/lightbridge-authz-mcp" }
 lightbridge-authz-api = { path = "./crates/lightbridge-authz-api" }
 lightbridge-authz-api-key = { path = "./crates/lightbridge-authz-api-key" }
 lightbridge-authz-bearer = { path = "./crates/lightbridge-authz-bearer" }

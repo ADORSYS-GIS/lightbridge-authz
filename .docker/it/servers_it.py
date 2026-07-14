@@ -21,6 +21,27 @@ USERNAME = os.environ.get("USERNAME", "test@admin")
 PASSWORD = os.environ.get("PASSWORD", "test")
 AUTHORINO_BASIC = os.environ.get("AUTHORINO_BASIC", "authorino:change-me")
 MAX_WAIT_SECONDS = int(os.environ.get("MAX_WAIT_SECONDS", "180"))
+EXPECTED_MCP_TOOLS = {
+    "create-account",
+    "list-accounts",
+    "get-account",
+    "update-account",
+    "delete-account",
+    "create-project",
+    "list-projects",
+    "get-project",
+    "update-project",
+    "delete-project",
+    "create-api-key",
+    "list-api-keys",
+    "get-api-key",
+    "update-api-key",
+    "delete-api-key",
+    "revoke-api-key",
+    "rotate-api-key",
+    "validate-api-key",
+    "validate-authorino-api-key",
+}
 
 
 INSECURE_TLS = ssl.create_default_context()
@@ -116,6 +137,13 @@ def post_form(url: str, form_data: dict, headers=None, insecure_tls: bool = Fals
 
 
 def parse_sse_json_messages(raw: str) -> list[dict]:
+    try:
+        message = json.loads(raw)
+        if isinstance(message, dict):
+            return [message]
+    except json.JSONDecodeError:
+        pass
+
     messages = []
     for line in raw.splitlines():
         if not line.startswith("data: "):
@@ -182,7 +210,35 @@ def fetch_token() -> str:
     return payload["access_token"]
 
 
-def mcp_initialize(token: str) -> str:
+def assert_mcp_oauth_metadata() -> None:
+    authorization_server_url = f"{MCP_URL}/.well-known/oauth-authorization-server"
+    openid_configuration_url = f"{MCP_URL}/.well-known/openid-configuration"
+    status, authorization_server, _ = request_json(
+        "GET", authorization_server_url, insecure_tls=True
+    )
+    assert status == 200, f"oauth metadata failed: status={status}, body={authorization_server}"
+    status, openid_configuration, _ = request_json(
+        "GET", openid_configuration_url, insecure_tls=True
+    )
+    assert status == 200, f"openid metadata failed: status={status}, body={openid_configuration}"
+    assert authorization_server == openid_configuration, "oauth metadata documents differ"
+
+    issuer = f"{KEYCLOAK_URL}/realms/dev"
+    expected = {
+        "issuer": issuer,
+        "authorization_endpoint": f"{issuer}/protocol/openid-connect/auth",
+        "token_endpoint": f"{issuer}/protocol/openid-connect/token",
+        "jwks_uri": f"{issuer}/protocol/openid-connect/certs",
+        "registration_endpoint": f"{MCP_URL}/oauth/register",
+    }
+    for field, value in expected.items():
+        assert authorization_server.get(field) == value, (
+            f"unexpected MCP OAuth metadata {field}: {authorization_server}"
+        )
+    log("mcp oauth discovery metadata passed")
+
+
+def mcp_initialize(token: str) -> None:
     status, body, headers = request_raw(
         "POST",
         f"{MCP_URL}/mcp",
@@ -204,29 +260,22 @@ def mcp_initialize(token: str) -> str:
     )
     assert status == 200, f"mcp initialize failed: status={status}, body={body}"
 
-    session_id = None
-    for key, value in headers.items():
-        if key.lower() == "mcp-session-id":
-            session_id = value
-            break
-    assert session_id, f"missing mcp-session-id header: headers={headers}"
+    assert not any(key.lower() == "mcp-session-id" for key in headers), (
+        f"stateless MCP server unexpectedly returned a session header: {headers}"
+    )
 
     messages = parse_sse_json_messages(body)
     init_result = next((msg for msg in messages if msg.get("id") == 1), None)
     assert init_result is not None, f"missing initialize result: body={body}"
     assert init_result.get("result"), f"unexpected initialize payload: {init_result}"
 
-    return session_id
-
-
-def mcp_post(token: str, session_id: str, payload: dict):
+def mcp_post(token: str, payload: dict):
     return request_raw(
         "POST",
         f"{MCP_URL}/mcp",
         body=payload,
         headers={
             "Authorization": f"Bearer {token}",
-            "Mcp-Session-Id": session_id,
             "Accept": "application/json, text/event-stream",
         },
         insecure_tls=True,
@@ -236,6 +285,7 @@ def mcp_post(token: str, session_id: str, payload: dict):
 def main() -> int:
     try:
         wait_until_ready()
+        assert_mcp_oauth_metadata()
 
         token = fetch_token()
         authz_headers = {"Authorization": f"Bearer {token}"}
@@ -348,19 +398,17 @@ def main() -> int:
         )
         log("mcp rejects missing bearer token")
 
-        session_id = mcp_initialize(token)
-        log(f"mcp initialize passed (session={session_id})")
+        mcp_initialize(token)
+        log("stateless mcp initialize passed")
 
         status, _, _ = mcp_post(
             token,
-            session_id,
             {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
         )
         assert status in (200, 202, 204), f"initialized notify failed: status={status}"
 
         status, tools_body, _ = mcp_post(
             token,
-            session_id,
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
         )
         assert status == 200, f"tools/list failed: status={status}, body={tools_body}"
@@ -368,11 +416,15 @@ def main() -> int:
         tools_result = next((msg for msg in tools_messages if msg.get("id") == 2), None)
         assert tools_result is not None, f"missing tools/list result: body={tools_body}"
         tool_names = [tool["name"] for tool in tools_result["result"]["tools"]]
-        assert "get-account" in tool_names, f"missing get-account tool: {tool_names}"
+        assert len(tool_names) == len(EXPECTED_MCP_TOOLS), (
+            f"unexpected MCP tool count: {tool_names}"
+        )
+        assert set(tool_names) == EXPECTED_MCP_TOOLS, (
+            f"unexpected MCP tools: {tool_names}"
+        )
 
         status, account_body, _ = mcp_post(
             token,
-            session_id,
             {
                 "jsonrpc": "2.0",
                 "id": 3,

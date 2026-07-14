@@ -1986,11 +1986,19 @@ dependencies = [
 name = "lightbridge-authz"
 version = "0.8.1"
 dependencies = [
+ "axum",
+ "chrono",
  "clap",
+ "lightbridge-authz-api",
+ "lightbridge-authz-api-key",
+ "lightbridge-authz-bearer",
  "lightbridge-authz-core",
- "lightbridge-authz-mcp",
  "lightbridge-authz-rest",
  "mimalloc",
+ "reqwest 0.13.4",
+ "rmcp",
+ "serde",
+ "serde_json",
  "sqlx",
  "tokio",
  "tracing",
@@ -2064,26 +2072,6 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "utoipa",
-]
-
-[[package]]
-name = "lightbridge-authz-mcp"
-version = "0.8.1"
-dependencies = [
- "axum",
- "chrono",
- "lightbridge-authz-api",
- "lightbridge-authz-api-key",
- "lightbridge-authz-bearer",
- "lightbridge-authz-core",
- "lightbridge-authz-rest",
- "reqwest 0.13.4",
- "rmcp",
- "serde",
- "serde_json",
- "sqlx",
- "tokio",
- "tracing",
 ]
 
 [[package]]
