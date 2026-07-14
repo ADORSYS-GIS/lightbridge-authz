@@ -466,6 +466,10 @@ impl StoreRepo {
     /// Remove `member` from `account_id`, authorised by `subject` being a member. Refuses to remove
     /// the last remaining member (that would trigger `prune_account_without_memberships` and delete
     /// the account — use `delete_account` for that intent). Removing a non-member is a no-op.
+    ///
+    /// Runs in a transaction that takes `SELECT ... FOR UPDATE` on the account row, serialising
+    /// concurrent membership mutations so the last-member guard is race-free: two concurrent removes
+    /// cannot both pass the count check and drop the account to zero members.
     #[instrument(skip(self))]
     pub async fn remove_account_member(
         &self,
@@ -473,6 +477,17 @@ impl StoreRepo {
         account_id: &str,
         member: &str,
     ) -> Result<Account> {
+        let mut tx: Transaction<'_, Postgres> = self.pool().begin().await?;
+
+        let account_exists: Option<String> =
+            sqlx::query_scalar(r#"SELECT id FROM accounts WHERE id = $1 FOR UPDATE"#)
+                .bind(account_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if account_exists.is_none() {
+            return Err(lightbridge_authz_core::error::Error::NotFound);
+        }
+
         let authorized: bool = sqlx::query_scalar(
             r#"
             SELECT EXISTS (
@@ -483,7 +498,7 @@ impl StoreRepo {
         )
         .bind(account_id)
         .bind(subject)
-        .fetch_one(self.pool())
+        .fetch_one(&mut *tx)
         .await?;
         if !authorized {
             return Err(lightbridge_authz_core::error::Error::NotFound);
@@ -492,7 +507,7 @@ impl StoreRepo {
         let member_count: i64 =
             sqlx::query_scalar(r#"SELECT count(*) FROM account_memberships WHERE account_id = $1"#)
                 .bind(account_id)
-                .fetch_one(self.pool())
+                .fetch_one(&mut *tx)
                 .await?;
         let removing_existing_member: bool = sqlx::query_scalar(
             r#"
@@ -504,7 +519,7 @@ impl StoreRepo {
         )
         .bind(account_id)
         .bind(member)
-        .fetch_one(self.pool())
+        .fetch_one(&mut *tx)
         .await?;
         if removing_existing_member && member_count <= 1 {
             return Err(lightbridge_authz_core::error::Error::Conflict(
@@ -515,8 +530,10 @@ impl StoreRepo {
         sqlx::query(r#"DELETE FROM account_memberships WHERE account_id = $1 AND subject = $2"#)
             .bind(account_id)
             .bind(member)
-            .execute(self.pool())
+            .execute(&mut *tx)
             .await?;
+
+        tx.commit().await?;
 
         let row = self.load_account_with_members_row(account_id).await?;
         Ok(Self::to_account(row))

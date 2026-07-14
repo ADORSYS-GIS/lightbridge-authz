@@ -128,6 +128,51 @@ async fn cannot_remove_last_member(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_removes_cannot_empty_the_account(pool: PgPool) {
+    let repo = Arc::new(build_repo(pool));
+    let account_id = seed_account(&repo, "owner").await;
+    repo.add_account_member("owner", &account_id, "invitee")
+        .await
+        .expect("add succeeds");
+
+    let first = {
+        let repo = repo.clone();
+        let account_id = account_id.clone();
+        tokio::spawn(async move {
+            repo.remove_account_member("owner", &account_id, "invitee")
+                .await
+        })
+    };
+    let second = {
+        let repo = repo.clone();
+        let account_id = account_id.clone();
+        tokio::spawn(async move {
+            repo.remove_account_member("invitee", &account_id, "owner")
+                .await
+        })
+    };
+    let (first, second) = tokio::join!(first, second);
+    let first = first.expect("task 1 joins");
+    let second = second.expect("task 2 joins");
+
+    let succeeded = [first.is_ok(), second.is_ok()]
+        .into_iter()
+        .filter(|ok| *ok)
+        .count();
+    assert!(succeeded >= 1, "at least one remove should succeed");
+
+    let account = repo
+        .get_account_by_id(&account_id)
+        .await
+        .expect("query should succeed")
+        .expect("the account must NOT have been pruned to zero members");
+    assert!(
+        !account.owners_admins.is_empty(),
+        "account must retain at least one member after concurrent removes"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn added_member_can_manage_the_account(pool: PgPool) {
     let repo = build_repo(pool);
     let account_id = seed_account(&repo, "owner").await;
