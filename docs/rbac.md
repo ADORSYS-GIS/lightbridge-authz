@@ -16,10 +16,21 @@ each operation requires.
 2. `lightbridge-authz-bearer` validates the JWT (JWKS) and reads that claim by name.
 3. Each role string is mapped to a set of permissions via configuration.
 4. The union of those permissions is attached to the request.
-5. Each handler calls `require(<permission>)`; a missing permission is `403 Forbidden`.
+5. A single enforcement point checks the permission the requested operation needs; a caller who
+   lacks it is rejected with `403 Forbidden` before the handler runs.
 
-The claim is read at request time; the role→permission map is compiled once at startup (wildcards
-expanded), so the request-time check is a plain set lookup.
+Enforcement is centralized, so the handlers/tools themselves contain no authorization code:
+
+- **REST** — an `authorize` middleware (`crates/lightbridge-authz-rest/src/middleware`) runs after
+  `bearer_auth` and after route matching. It maps the matched `(method, route pattern)` to the
+  required permission and checks it. It **fails closed**: a protected route with no mapping, a
+  missing matched path, or a missing token is denied.
+- **MCP** — `call_tool` maps the tool name to the required permission and checks it before
+  dispatching. It likewise fails closed (an unmapped tool name is rejected).
+
+The `(method, path)` → permission and tool → permission maps are the single sources of truth and
+must stay in sync with the tables below. The claim is read at request time; the role→permission map
+is compiled once at startup (wildcards expanded), so the request-time check is a plain set lookup.
 
 ## Configuration (`oauth2.rbac`)
 

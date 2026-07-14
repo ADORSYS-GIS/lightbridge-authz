@@ -8,9 +8,7 @@ use axum::{
 };
 use lightbridge_authz_bearer::TokenInfo;
 use lightbridge_authz_core::error::Error;
-use lightbridge_authz_core::{
-    ApiKey, ApiKeySecret, CreateApiKey, Permission, RotateApiKey, UpdateApiKey,
-};
+use lightbridge_authz_core::{ApiKey, ApiKeySecret, CreateApiKey, RotateApiKey, UpdateApiKey};
 use tracing::instrument;
 
 #[instrument(skip(state))]
@@ -32,7 +30,6 @@ pub async fn create_api_key(
     Path(project_id): Path<String>,
     Json(input): Json<CreateApiKey>,
 ) -> Result<impl IntoResponse, Error> {
-    token_info.require(Permission::ApiKeyCreate)?;
     let subject = token_info.sub.clone();
     let api_key = state
         .store
@@ -60,7 +57,6 @@ pub async fn list_api_keys(
     Path(project_id): Path<String>,
     Query(pagination): Query<super::PaginationQuery>,
 ) -> Result<impl IntoResponse, Error> {
-    token_info.require(Permission::ApiKeyRead)?;
     let subject = token_info.sub.clone();
     let (offset, limit) = pagination.normalized();
     let api_keys = state
@@ -87,7 +83,6 @@ pub async fn get_api_key(
     Extension(token_info): Extension<TokenInfo>,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    token_info.require(Permission::ApiKeyRead)?;
     let subject = token_info.sub.clone();
     let api_key = state.store.get_api_key(&subject, &key_id).await?;
     Ok((StatusCode::OK, Json(api_key)))
@@ -112,7 +107,6 @@ pub async fn update_api_key(
     Path(key_id): Path<String>,
     Json(input): Json<UpdateApiKey>,
 ) -> Result<impl IntoResponse, Error> {
-    token_info.require(Permission::ApiKeyUpdate)?;
     let subject = token_info.sub.clone();
     let api_key = state.store.update_api_key(&subject, &key_id, input).await?;
     Ok((StatusCode::OK, Json(api_key)))
@@ -135,7 +129,6 @@ pub async fn delete_api_key(
     Extension(token_info): Extension<TokenInfo>,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    token_info.require(Permission::ApiKeyDelete)?;
     let subject = token_info.sub.clone();
     state.store.delete_api_key(&subject, &key_id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -158,7 +151,6 @@ pub async fn revoke_api_key(
     Extension(token_info): Extension<TokenInfo>,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    token_info.require(Permission::ApiKeyRevoke)?;
     let subject = token_info.sub.clone();
     let api_key = state.store.revoke_api_key(&subject, &key_id).await?;
     Ok((StatusCode::OK, Json(api_key)))
@@ -183,7 +175,6 @@ pub async fn rotate_api_key(
     Path(key_id): Path<String>,
     Json(input): Json<RotateApiKey>,
 ) -> Result<impl IntoResponse, Error> {
-    token_info.require(Permission::ApiKeyRotate)?;
     let subject = token_info.sub.clone();
     let api_key = state
         .store

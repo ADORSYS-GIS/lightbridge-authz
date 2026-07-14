@@ -8,7 +8,7 @@ use axum::{
 };
 use lightbridge_authz_bearer::TokenInfo;
 use lightbridge_authz_core::error::Error;
-use lightbridge_authz_core::{Account, CreateAccount, Permission, UpdateAccount};
+use lightbridge_authz_core::{Account, CreateAccount, UpdateAccount};
 use tracing::instrument;
 
 #[instrument(skip(state))]
@@ -26,7 +26,6 @@ pub async fn create_account(
     Extension(token_info): Extension<TokenInfo>,
     Json(input): Json<CreateAccount>,
 ) -> Result<impl IntoResponse, Error> {
-    token_info.require(Permission::AccountCreate)?;
     let subject = token_info.sub.clone();
     let account = state.store.create_account(&subject, input).await?;
     Ok((StatusCode::CREATED, Json(account)))
@@ -49,7 +48,6 @@ pub async fn list_accounts(
     Extension(token_info): Extension<TokenInfo>,
     Query(pagination): Query<super::PaginationQuery>,
 ) -> Result<impl IntoResponse, Error> {
-    token_info.require(Permission::AccountRead)?;
     let subject = token_info.sub.clone();
     let (offset, limit) = pagination.normalized();
     let accounts = state.store.list_accounts(&subject, offset, limit).await?;
@@ -73,7 +71,6 @@ pub async fn get_account(
     Extension(token_info): Extension<TokenInfo>,
     Path(account_id): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    token_info.require(Permission::AccountRead)?;
     let subject = token_info.sub.clone();
     let account = state.store.get_account(&subject, &account_id).await?;
     Ok((StatusCode::OK, Json(account)))
@@ -98,7 +95,6 @@ pub async fn update_account(
     Path(account_id): Path<String>,
     Json(input): Json<UpdateAccount>,
 ) -> Result<impl IntoResponse, Error> {
-    token_info.require(Permission::AccountUpdate)?;
     let subject = token_info.sub.clone();
     let account = state
         .store
@@ -124,7 +120,6 @@ pub async fn delete_account(
     Extension(token_info): Extension<TokenInfo>,
     Path(account_id): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    token_info.require(Permission::AccountDelete)?;
     let subject = token_info.sub.clone();
     state.store.delete_account(&subject, &account_id).await?;
     Ok(StatusCode::NO_CONTENT)

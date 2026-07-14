@@ -147,9 +147,19 @@ impl ServerHandler for LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<rmcp::model::CallToolResult, ErrorData> {
         let tool = request.name.clone();
-        let subject = token_info_from_request_context(&context)
-            .map(|info| info.sub)
-            .unwrap_or_else(|_| "anonymous".to_string());
+
+        let token_info = token_info_from_request_context(&context)?;
+        let subject = token_info.sub.clone();
+        match required_tool_permission(&tool) {
+            Some(required) => token_info.require(required).map_err(to_tool_error)?,
+            None => {
+                return Err(ErrorData::invalid_request(
+                    format!("unknown tool: {tool}"),
+                    None,
+                ));
+            }
+        }
+
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let result = self.tool_router.call(tcc).await;
         let outcome = match &result {
@@ -209,15 +219,34 @@ fn normalize_list_pagination(offset: u32, limit: u32) -> (u32, u32) {
     (offset, limit.clamp(1, MAX_LIST_LIMIT))
 }
 
-/// Enforce that the caller holds `permission`, returning their subject on success. Mirrors the
-/// per-endpoint RBAC checks in the REST controllers.
-fn authorize_subject(
+fn subject_from_request_context(
     context: &RequestContext<RoleServer>,
-    permission: Permission,
 ) -> std::result::Result<String, ErrorData> {
-    let token_info = token_info_from_request_context(context)?;
-    token_info.require(permission).map_err(to_tool_error)?;
-    Ok(token_info.sub.clone())
+    Ok(token_info_from_request_context(context)?.sub.clone())
+}
+
+/// The permission a tool requires, keyed by tool name. Single source of truth for RBAC on the MCP
+/// surface; mirrors `required_permission` on the REST server and `docs/rbac.md`. Enforced centrally
+/// in `call_tool`, so the tool bodies stay free of authorization code.
+fn required_tool_permission(tool: &str) -> Option<Permission> {
+    Some(match tool {
+        "create-account" => Permission::AccountCreate,
+        "list-accounts" | "get-account" => Permission::AccountRead,
+        "update-account" => Permission::AccountUpdate,
+        "delete-account" => Permission::AccountDelete,
+        "create-project" => Permission::ProjectCreate,
+        "list-projects" | "get-project" => Permission::ProjectRead,
+        "update-project" => Permission::ProjectUpdate,
+        "delete-project" => Permission::ProjectDelete,
+        "create-api-key" => Permission::ApiKeyCreate,
+        "list-api-keys" | "get-api-key" => Permission::ApiKeyRead,
+        "update-api-key" => Permission::ApiKeyUpdate,
+        "delete-api-key" => Permission::ApiKeyDelete,
+        "revoke-api-key" => Permission::ApiKeyRevoke,
+        "rotate-api-key" => Permission::ApiKeyRotate,
+        "validate-api-key" | "validate-authorino-api-key" => Permission::ApiKeyValidate,
+        _ => return None,
+    })
 }
 
 fn token_info_from_request_context(
@@ -561,7 +590,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<CreateAccountParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = authorize_subject(&context, Permission::AccountCreate)?;
+        let subject = subject_from_request_context(&context)?;
         let account = self
             .store
             .create_account(
@@ -585,7 +614,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ListAccountsParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = authorize_subject(&context, Permission::AccountRead)?;
+        let subject = subject_from_request_context(&context)?;
         let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
         let accounts: Vec<Account> = self
             .store
@@ -605,7 +634,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<AccountByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = authorize_subject(&context, Permission::AccountRead)?;
+        let subject = subject_from_request_context(&context)?;
         let account = self
             .store
             .get_account(&subject, &params.account_id)
@@ -624,7 +653,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<UpdateAccountParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = authorize_subject(&context, Permission::AccountUpdate)?;
+        let subject = subject_from_request_context(&context)?;
         let account = self
             .store
             .update_account(
@@ -650,7 +679,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<AccountByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = authorize_subject(&context, Permission::AccountDelete)?;
+        let subject = subject_from_request_context(&context)?;
         self.store
             .delete_account(&subject, &params.account_id)
             .await
@@ -668,7 +697,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<CreateProjectParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = authorize_subject(&context, Permission::ProjectCreate)?;
+        let subject = subject_from_request_context(&context)?;
         let project = self
             .store
             .create_project(
@@ -696,7 +725,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ListProjectsParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = authorize_subject(&context, Permission::ProjectRead)?;
+        let subject = subject_from_request_context(&context)?;
         let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
         let projects: Vec<Project> = self
             .store
@@ -716,7 +745,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ProjectByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = authorize_subject(&context, Permission::ProjectRead)?;
+        let subject = subject_from_request_context(&context)?;
         let project = self
             .store
             .get_project(&subject, &params.project_id)
@@ -735,7 +764,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<UpdateProjectParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = authorize_subject(&context, Permission::ProjectUpdate)?;
+        let subject = subject_from_request_context(&context)?;
         let project = self
             .store
             .update_project(
@@ -763,7 +792,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ProjectByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = authorize_subject(&context, Permission::ProjectDelete)?;
+        let subject = subject_from_request_context(&context)?;
         self.store
             .delete_project(&subject, &params.project_id)
             .await
@@ -782,9 +811,6 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<CreateApiKeyParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
-        token_info
-            .require(Permission::ApiKeyCreate)
-            .map_err(to_tool_error)?;
         let subject = token_info.sub.clone();
         let expires_at = parse_optional_datetime(params.expires_at, "expires_at")?;
 
@@ -814,7 +840,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ListApiKeysParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = authorize_subject(&context, Permission::ApiKeyRead)?;
+        let subject = subject_from_request_context(&context)?;
         let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
         let api_keys: Vec<ApiKey> = self
             .store
@@ -834,7 +860,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ApiKeyByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = authorize_subject(&context, Permission::ApiKeyRead)?;
+        let subject = subject_from_request_context(&context)?;
         let api_key = self
             .store
             .get_api_key(&subject, &params.key_id)
@@ -853,7 +879,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<UpdateApiKeyParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = authorize_subject(&context, Permission::ApiKeyUpdate)?;
+        let subject = subject_from_request_context(&context)?;
         let expires_at = parse_optional_datetime(params.expires_at, "expires_at")?;
 
         let api_key = self
@@ -881,7 +907,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ApiKeyByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = authorize_subject(&context, Permission::ApiKeyDelete)?;
+        let subject = subject_from_request_context(&context)?;
         self.store
             .delete_api_key(&subject, &params.key_id)
             .await
@@ -899,7 +925,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ApiKeyByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = authorize_subject(&context, Permission::ApiKeyRevoke)?;
+        let subject = subject_from_request_context(&context)?;
         let api_key = self
             .store
             .revoke_api_key(&subject, &params.key_id)
@@ -919,9 +945,6 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<RotateApiKeyParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
-        token_info
-            .require(Permission::ApiKeyRotate)
-            .map_err(to_tool_error)?;
         let subject = token_info.sub.clone();
         let expires_at = parse_optional_datetime(params.expires_at, "expires_at")?;
 
@@ -949,10 +972,8 @@ impl LightbridgeMcpHandler {
     )]
     async fn validate_api_key_tool(
         &self,
-        context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ValidateApiKeyParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        authorize_subject(&context, Permission::ApiKeyValidate)?;
         let validated = validate_api_key_context(&self.opa_state, &params.api_key, params.ip)
             .await
             .map_err(to_tool_error)?;
@@ -977,10 +998,8 @@ impl LightbridgeMcpHandler {
     )]
     async fn validate_authorino_api_key(
         &self,
-        context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ValidateAuthorinoApiKeyParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        authorize_subject(&context, Permission::ApiKeyValidate)?;
         run_validate_authorino(&self.opa_state, params).await
     }
 }

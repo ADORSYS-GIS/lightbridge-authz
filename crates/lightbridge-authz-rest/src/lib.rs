@@ -145,6 +145,7 @@ pub fn build_api_router(
     let protected = Router::new()
         .nest("/api/v1", api_router())
         .with_state(app_state.clone())
+        .route_layer(axum::middleware::from_fn(middleware::authorize))
         .layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             bearer_auth,

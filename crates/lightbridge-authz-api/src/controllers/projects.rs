@@ -8,7 +8,7 @@ use axum::{
 };
 use lightbridge_authz_bearer::TokenInfo;
 use lightbridge_authz_core::error::Error;
-use lightbridge_authz_core::{CreateProject, Permission, Project, UpdateProject};
+use lightbridge_authz_core::{CreateProject, Project, UpdateProject};
 use tracing::instrument;
 
 #[instrument(skip(state))]
@@ -30,7 +30,6 @@ pub async fn create_project(
     Path(account_id): Path<String>,
     Json(input): Json<CreateProject>,
 ) -> Result<impl IntoResponse, Error> {
-    token_info.require(Permission::ProjectCreate)?;
     let subject = token_info.sub.clone();
     let project = state
         .store
@@ -58,7 +57,6 @@ pub async fn list_projects(
     Path(account_id): Path<String>,
     Query(pagination): Query<super::PaginationQuery>,
 ) -> Result<impl IntoResponse, Error> {
-    token_info.require(Permission::ProjectRead)?;
     let subject = token_info.sub.clone();
     let (offset, limit) = pagination.normalized();
     let projects = state
@@ -85,7 +83,6 @@ pub async fn get_project(
     Extension(token_info): Extension<TokenInfo>,
     Path(project_id): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    token_info.require(Permission::ProjectRead)?;
     let subject = token_info.sub.clone();
     let project = state.store.get_project(&subject, &project_id).await?;
     Ok((StatusCode::OK, Json(project)))
@@ -110,7 +107,6 @@ pub async fn update_project(
     Path(project_id): Path<String>,
     Json(input): Json<UpdateProject>,
 ) -> Result<impl IntoResponse, Error> {
-    token_info.require(Permission::ProjectUpdate)?;
     let subject = token_info.sub.clone();
     let project = state
         .store
@@ -136,7 +132,6 @@ pub async fn delete_project(
     Extension(token_info): Extension<TokenInfo>,
     Path(project_id): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    token_info.require(Permission::ProjectDelete)?;
     let subject = token_info.sub.clone();
     state.store.delete_project(&subject, &project_id).await?;
     Ok(StatusCode::NO_CONTENT)

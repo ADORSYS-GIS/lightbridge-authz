@@ -1,11 +1,13 @@
 use axum::{
-    extract::State,
-    http::{HeaderValue, Request, StatusCode, header},
+    extract::{MatchedPath, State},
+    http::{HeaderValue, Method, Request, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use base64::Engine;
 use lightbridge_authz_api::AppState;
+use lightbridge_authz_bearer::TokenInfo;
+use lightbridge_authz_core::Permission;
 use std::sync::Arc;
 
 use crate::OpaState;
@@ -69,6 +71,77 @@ pub async fn bearer_auth(
             tracing::warn!("bearer_auth: token validation failed: {}", e);
             unauthorized_response()
         }
+    }
+}
+
+/// The permission a CRUD endpoint requires, keyed by HTTP method and the axum `MatchedPath`
+/// route pattern (nested under `/api/v1`). This is the single source of truth for RBAC on the
+/// REST surface and mirrors the tool → permission map on the MCP server; keep both in sync with
+/// `docs/rbac.md`. Auto-generated `HEAD` routes inherit their `GET` handler's permission.
+fn required_permission(method: &Method, matched_path: &str) -> Option<Permission> {
+    let method = if *method == Method::HEAD {
+        "GET"
+    } else {
+        method.as_str()
+    };
+    Some(match (method, matched_path) {
+        ("POST", "/api/v1/accounts") => Permission::AccountCreate,
+        ("GET", "/api/v1/accounts") => Permission::AccountRead,
+        ("GET", "/api/v1/accounts/{account_id}") => Permission::AccountRead,
+        ("PATCH", "/api/v1/accounts/{account_id}") => Permission::AccountUpdate,
+        ("DELETE", "/api/v1/accounts/{account_id}") => Permission::AccountDelete,
+        ("POST", "/api/v1/accounts/{account_id}/projects") => Permission::ProjectCreate,
+        ("GET", "/api/v1/accounts/{account_id}/projects") => Permission::ProjectRead,
+        ("GET", "/api/v1/projects/{project_id}") => Permission::ProjectRead,
+        ("PATCH", "/api/v1/projects/{project_id}") => Permission::ProjectUpdate,
+        ("DELETE", "/api/v1/projects/{project_id}") => Permission::ProjectDelete,
+        ("POST", "/api/v1/projects/{project_id}/api-keys") => Permission::ApiKeyCreate,
+        ("GET", "/api/v1/projects/{project_id}/api-keys") => Permission::ApiKeyRead,
+        ("GET", "/api/v1/api-keys/{key_id}") => Permission::ApiKeyRead,
+        ("PATCH", "/api/v1/api-keys/{key_id}") => Permission::ApiKeyUpdate,
+        ("DELETE", "/api/v1/api-keys/{key_id}") => Permission::ApiKeyDelete,
+        ("POST", "/api/v1/api-keys/{key_id}/revoke") => Permission::ApiKeyRevoke,
+        ("POST", "/api/v1/api-keys/{key_id}/rotate") => Permission::ApiKeyRotate,
+        _ => return None,
+    })
+}
+
+/// RBAC enforcement for the CRUD API. Runs after `bearer_auth` (so `TokenInfo` is present) and
+/// after route matching (so `MatchedPath` is populated — hence it must be attached with
+/// `route_layer`). Resolves the permission the matched route requires and rejects the request
+/// with `403 Forbidden` unless the caller holds it. Fails closed: a protected route with no
+/// mapping, a missing matched path, or a missing token is denied.
+pub async fn authorize(req: Request<axum::body::Body>, next: Next) -> Response {
+    let forbidden = || (StatusCode::FORBIDDEN, "Forbidden").into_response();
+
+    let Some(matched_path) = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_string())
+    else {
+        tracing::warn!("authorize: no matched path; denying");
+        return forbidden();
+    };
+
+    let Some(required) = required_permission(req.method(), &matched_path) else {
+        tracing::warn!(path = %matched_path, "authorize: no permission mapping for route; denying");
+        return forbidden();
+    };
+
+    let granted = req
+        .extensions()
+        .get::<TokenInfo>()
+        .is_some_and(|token_info| token_info.has_permission(required));
+
+    if granted {
+        next.run(req).await
+    } else {
+        tracing::debug!(
+            path = %matched_path,
+            required = %required.as_str(),
+            "authorize: caller lacks required permission"
+        );
+        forbidden()
     }
 }
 
