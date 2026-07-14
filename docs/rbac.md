@@ -195,8 +195,9 @@ An admin holding `account:member` manages the roster directly (no invite/accept 
 - `POST /api/v1/accounts/{id}/members` with `{ "subject": "<keycloak-sub>" }` — add a member.
   Idempotent; returns the account with the updated `owners_admins` list.
 - `DELETE /api/v1/accounts/{id}/members/{member}` — remove a member. Refuses to remove the **last**
-  remaining member with `409 Conflict` (that would orphan and delete the account — use
-  `DELETE /accounts/{id}` for that intent).
+  remaining member with `409 Conflict` (emptying the roster would trip the account-prune trigger and
+  delete the account). To intentionally delete the account and all its resources, use
+  `DELETE /api/v1/accounts/{id}` instead — that removes the whole account regardless of member count.
 
 The acting caller must themselves be a member of the account (a non-member gets a uniform `404`),
 so `account:member` lets an admin manage rosters of accounts they belong to, not arbitrary tenants.

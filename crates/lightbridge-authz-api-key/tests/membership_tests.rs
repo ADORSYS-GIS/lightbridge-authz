@@ -71,6 +71,18 @@ async fn add_member_is_idempotent(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn add_rejects_empty_subject(pool: PgPool) {
+    let repo = build_repo(pool);
+    let account_id = seed_account(&repo, "owner").await;
+
+    let err = repo
+        .add_account_member("owner", &account_id, "   ")
+        .await
+        .expect_err("an empty/whitespace member subject must be rejected");
+    assert!(matches!(err, Error::BadRequest(_)));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn non_member_cannot_add(pool: PgPool) {
     let repo = build_repo(pool);
     let account_id = seed_account(&repo, "owner").await;

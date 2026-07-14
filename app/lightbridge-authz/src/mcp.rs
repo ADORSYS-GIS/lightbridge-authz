@@ -1828,6 +1828,30 @@ mod tests {
     }
 
     #[test]
+    fn member_tools_are_gated_by_account_member_permission() {
+        assert_eq!(
+            required_tool_permission("add-account-member"),
+            Some(Permission::AccountMember)
+        );
+        assert_eq!(
+            required_tool_permission("remove-account-member"),
+            Some(Permission::AccountMember)
+        );
+    }
+
+    #[test]
+    fn every_registered_tool_has_a_permission_mapping() {
+        let handler = LightbridgeMcpHandler::new(Arc::new(MockStore), sample_repo(), basic_auth());
+        for tool in handler.tool_router.list_all() {
+            assert!(
+                required_tool_permission(&tool.name).is_some(),
+                "tool `{}` is registered but has no permission mapping (would fail closed in call_tool)",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
     fn create_account_tool_schema_uses_jwt_subject_not_input_subject() {
         let handler = LightbridgeMcpHandler::new(Arc::new(MockStore), sample_repo(), basic_auth());
         let create_account = handler

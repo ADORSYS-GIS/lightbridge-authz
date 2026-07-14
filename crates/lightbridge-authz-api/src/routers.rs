@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 
 use crate::controllers::{
@@ -36,7 +36,7 @@ pub fn api_router() -> Router<Arc<AppState>> {
         .route("/accounts/{account_id}/members", post(add_account_member))
         .route(
             "/accounts/{account_id}/members/{member}",
-            axum::routing::delete(remove_account_member),
+            delete(remove_account_member),
         )
         .route(
             "/accounts/{account_id}/projects",

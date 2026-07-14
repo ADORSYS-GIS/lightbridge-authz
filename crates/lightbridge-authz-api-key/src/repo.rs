@@ -431,6 +431,12 @@ impl StoreRepo {
         account_id: &str,
         new_member: &str,
     ) -> Result<Account> {
+        if new_member.trim().is_empty() {
+            return Err(lightbridge_authz_core::error::Error::BadRequest(
+                "member subject must not be empty".to_string(),
+            ));
+        }
+
         let authorized: bool = sqlx::query_scalar(
             r#"
             SELECT EXISTS (

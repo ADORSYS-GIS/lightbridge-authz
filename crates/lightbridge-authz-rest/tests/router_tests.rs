@@ -531,6 +531,50 @@ async fn add_member_passes_gate_with_member_permission() {
     assert_ne!(status, StatusCode::UNAUTHORIZED);
 }
 
+async fn remove_member_status(permissions: PermissionSet) -> StatusCode {
+    let store: Arc<dyn AuthzStore> = Arc::new(AuthzStoreImpl::with_pool(lazy_pool()));
+    let app_state = Arc::new(AppState {
+        store,
+        bearer: Arc::new(PermBearer { permissions }),
+    });
+    let signing_repo = Arc::new(lightbridge_authz_api_key::repo::StoreRepo::new(lazy_pool()));
+    let router = lightbridge_authz_rest::build_api_router(
+        &oauth2_without_signing(),
+        app_state,
+        lazy_pool(),
+        signing_repo,
+        None,
+    );
+
+    router
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/accounts/acct_1/members/invitee")
+                .header(header::AUTHORIZATION, "Bearer any")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn remove_member_denies_without_member_permission() {
+    assert_eq!(
+        remove_member_status(PermissionSet::from_iter([Permission::AccountUpdate])).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn remove_member_passes_gate_with_member_permission() {
+    let status = remove_member_status(PermissionSet::from_iter([Permission::AccountMember])).await;
+    assert_ne!(status, StatusCode::FORBIDDEN);
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn build_opa_router_serves_probes_and_introspection() {
     let state = Arc::new(OpaState {

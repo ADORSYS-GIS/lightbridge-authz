@@ -73,9 +73,10 @@ pub struct UpdateAccount {
 }
 
 /// Body for adding a member to an account. `subject` is the member's identity (the Keycloak `sub`),
-/// the same value carried on their bearer token.
+/// the same value carried on their bearer token. Must be non-empty (enforced by the store).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AddAccountMember {
+    #[schema(min_length = 1)]
     pub subject: String,
 }
 
