@@ -306,6 +306,7 @@ mod db {
             audience: None,
             signing: Some(signing_cfg(3600)),
             token_exchange: None,
+            rbac: Default::default(),
         }
     }
 

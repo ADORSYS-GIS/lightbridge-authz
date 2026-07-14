@@ -6,8 +6,8 @@ use lightbridge_authz_api::contract::AuthzStore;
 use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeyStatus, Project, ResolvedContext, async_trait, config::BasicAuth,
-    error::Result,
+    Account, ApiKey, ApiKeyStatus, Permission, PermissionSet, Project, ResolvedContext,
+    async_trait, config::BasicAuth, error::Result,
 };
 use lightbridge_authz_rest::OpaState;
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
@@ -23,8 +23,8 @@ struct MockOpaRepo;
 
 #[async_trait]
 impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
-    async fn find_api_key_by_hash(&self, _key_hash: &str) -> Result<Option<ApiKey>> {
-        Ok(Some(ApiKey {
+    async fn record_api_key_usage(&self, _key_id: &str, _ip: Option<String>) -> Result<ApiKey> {
+        Ok(ApiKey {
             id: "key_1".to_string(),
             project_id: "proj_1".to_string(),
             name: "demo".to_string(),
@@ -36,13 +36,24 @@ impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
             last_used_at: None,
             last_ip: None,
             revoked_at: None,
-        }))
+        })
     }
 
-    async fn record_api_key_usage(&self, _key_id: &str, _ip: Option<String>) -> Result<ApiKey> {
-        self.find_api_key_by_hash("")
-            .await
-            .map(|k| k.expect("key exists"))
+    async fn find_api_key_validation_by_hash(
+        &self,
+        _key_hash: &str,
+    ) -> Result<Option<lightbridge_authz_core::ApiKeyValidation>> {
+        Ok(Some(lightbridge_authz_core::ApiKeyValidation {
+            api_key_id: "key_1".to_string(),
+            key_hash: "hash".to_string(),
+            project_id: "proj_1".to_string(),
+            account_id: "acct_1".to_string(),
+            api_key_status: "active".to_string(),
+            project_status: "active".to_string(),
+            account_status: "active".to_string(),
+            expires_at: None,
+            effective_status: "active".to_string(),
+        }))
     }
 
     async fn get_project(&self, _subject: &str, _project_id: &str) -> Result<Option<Project>> {
@@ -77,6 +88,7 @@ fn mk_project() -> Project {
         allowed_models: None,
         default_limits: None,
         billing_plan: "free".to_string(),
+        status: lightbridge_authz_core::ResourceStatus::Active,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -87,6 +99,7 @@ fn mk_account() -> Account {
         id: "acct_1".to_string(),
         billing_identity: "acme".to_string(),
         owners_admins: vec!["owner@example.com".to_string()],
+        status: lightbridge_authz_core::ResourceStatus::Active,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -210,6 +223,8 @@ fn mk_token_info(active: bool) -> TokenInfo {
         sub: "user-1".to_string(),
         exp: 0,
         aud: vec![],
+        roles: vec![],
+        permissions: Default::default(),
         access_token: String::new(),
     }
 }
@@ -314,6 +329,7 @@ fn oauth2_without_signing() -> lightbridge_authz_core::config::Oauth2 {
         audience: None,
         signing: None,
         token_exchange: None,
+        rbac: Default::default(),
     }
 }
 
@@ -358,6 +374,116 @@ async fn build_api_router_serves_probes_and_protects_the_api() {
         .await
         .unwrap();
     assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[derive(Debug)]
+struct PermBearer {
+    permissions: PermissionSet,
+}
+
+#[async_trait]
+impl BearerTokenServiceTrait for PermBearer {
+    async fn validate_bearer_token(&self, _token: &str) -> anyhow::Result<TokenInfo> {
+        Ok(TokenInfo {
+            active: true,
+            sub: "user-1".to_string(),
+            exp: 0,
+            aud: vec![],
+            roles: vec![],
+            permissions: self.permissions.clone(),
+            access_token: String::new(),
+        })
+    }
+}
+
+async fn create_account_status(permissions: PermissionSet) -> StatusCode {
+    let store: Arc<dyn AuthzStore> = Arc::new(AuthzStoreImpl::with_pool(lazy_pool()));
+    let app_state = Arc::new(AppState {
+        store,
+        bearer: Arc::new(PermBearer { permissions }),
+    });
+    let signing_repo = Arc::new(lightbridge_authz_api_key::repo::StoreRepo::new(lazy_pool()));
+    let router = lightbridge_authz_rest::build_api_router(
+        &oauth2_without_signing(),
+        app_state,
+        lazy_pool(),
+        signing_repo,
+        None,
+    );
+
+    router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/accounts")
+                .header(header::AUTHORIZATION, "Bearer any")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"billing_identity":"acct-1"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn api_denies_when_caller_lacks_required_permission() {
+    assert_eq!(
+        create_account_status(PermissionSet::new()).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn api_passes_rbac_gate_when_caller_has_required_permission() {
+    let status = create_account_status(PermissionSet::from_iter([Permission::AccountCreate])).await;
+    assert_ne!(status, StatusCode::FORBIDDEN);
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+}
+
+async fn disable_account_status(permissions: PermissionSet) -> StatusCode {
+    let store: Arc<dyn AuthzStore> = Arc::new(AuthzStoreImpl::with_pool(lazy_pool()));
+    let app_state = Arc::new(AppState {
+        store,
+        bearer: Arc::new(PermBearer { permissions }),
+    });
+    let signing_repo = Arc::new(lightbridge_authz_api_key::repo::StoreRepo::new(lazy_pool()));
+    let router = lightbridge_authz_rest::build_api_router(
+        &oauth2_without_signing(),
+        app_state,
+        lazy_pool(),
+        signing_repo,
+        None,
+    );
+
+    router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/accounts/acct_1/disable")
+                .header(header::AUTHORIZATION, "Bearer any")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn disable_account_denies_without_disable_permission() {
+    assert_eq!(
+        disable_account_status(PermissionSet::from_iter([Permission::AccountDelete])).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn disable_account_passes_gate_with_disable_permission() {
+    let status =
+        disable_account_status(PermissionSet::from_iter([Permission::AccountDisable])).await;
+    assert_ne!(status, StatusCode::FORBIDDEN);
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

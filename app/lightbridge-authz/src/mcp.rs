@@ -13,8 +13,8 @@ use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait, TokenInfo};
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, Config, CreateAccount, CreateApiKey, CreateProject,
-    DefaultLimits, Error, Project, Result, RotateApiKey, UpdateAccount, UpdateApiKey,
-    UpdateProject,
+    DefaultLimits, Error, Permission, Project, ResourceStatus, Result, RotateApiKey, UpdateAccount,
+    UpdateApiKey, UpdateProject,
     config::{ApiServer, BasicAuth, Oauth2},
     db::{DbPoolTrait, is_database_ready},
     server::serve_tls,
@@ -147,9 +147,19 @@ impl ServerHandler for LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<rmcp::model::CallToolResult, ErrorData> {
         let tool = request.name.clone();
-        let subject = token_info_from_request_context(&context)
-            .map(|info| info.sub)
-            .unwrap_or_else(|_| "anonymous".to_string());
+
+        let token_info = token_info_from_request_context(&context)?;
+        let subject = token_info.sub.clone();
+        match required_tool_permission(&tool) {
+            Some(required) => token_info.require(required).map_err(to_tool_error)?,
+            None => {
+                return Err(ErrorData::invalid_request(
+                    format!("unknown tool: {tool}"),
+                    None,
+                ));
+            }
+        }
+
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let result = self.tool_router.call(tcc).await;
         let outcome = match &result {
@@ -183,6 +193,7 @@ fn parse_optional_datetime(
 fn to_tool_error(error: Error) -> ErrorData {
     match error {
         Error::NotFound => ErrorData::resource_not_found("not found", None),
+        Error::Forbidden(msg) => ErrorData::invalid_request(msg, None),
         Error::Conflict(msg) => ErrorData::invalid_params(msg, None),
         Error::BadRequest(msg) => ErrorData::invalid_params(msg, None),
         other => ErrorData::internal_error(other.to_string(), None),
@@ -212,6 +223,32 @@ fn subject_from_request_context(
     context: &RequestContext<RoleServer>,
 ) -> std::result::Result<String, ErrorData> {
     Ok(token_info_from_request_context(context)?.sub.clone())
+}
+
+/// The permission a tool requires, keyed by tool name. Single source of truth for RBAC on the MCP
+/// surface; mirrors `required_permission` on the REST server and `docs/rbac.md`. Enforced centrally
+/// in `call_tool`, so the tool bodies stay free of authorization code.
+fn required_tool_permission(tool: &str) -> Option<Permission> {
+    Some(match tool {
+        "create-account" => Permission::AccountCreate,
+        "list-accounts" | "get-account" => Permission::AccountRead,
+        "update-account" => Permission::AccountUpdate,
+        "delete-account" => Permission::AccountDelete,
+        "disable-account" | "enable-account" => Permission::AccountDisable,
+        "create-project" => Permission::ProjectCreate,
+        "list-projects" | "get-project" => Permission::ProjectRead,
+        "update-project" => Permission::ProjectUpdate,
+        "delete-project" => Permission::ProjectDelete,
+        "disable-project" | "enable-project" => Permission::ProjectDisable,
+        "create-api-key" => Permission::ApiKeyCreate,
+        "list-api-keys" | "get-api-key" => Permission::ApiKeyRead,
+        "update-api-key" => Permission::ApiKeyUpdate,
+        "delete-api-key" => Permission::ApiKeyDelete,
+        "revoke-api-key" => Permission::ApiKeyRevoke,
+        "rotate-api-key" => Permission::ApiKeyRotate,
+        "validate-api-key" | "validate-authorino-api-key" => Permission::ApiKeyValidate,
+        _ => return None,
+    })
 }
 
 fn token_info_from_request_context(
@@ -654,6 +691,44 @@ impl LightbridgeMcpHandler {
     }
 
     #[tool(
+        name = "disable-account",
+        description = "Suspend an account (maps to POST /api/v1/accounts/{account_id}/disable); every API key beneath it fails validation"
+    )]
+    async fn disable_account_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<AccountByIdParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let account = self
+            .store
+            .set_account_status(&subject, &params.account_id, ResourceStatus::Suspended)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(account)
+    }
+
+    #[tool(
+        name = "enable-account",
+        description = "Reactivate a suspended account (maps to POST /api/v1/accounts/{account_id}/enable)"
+    )]
+    async fn enable_account_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<AccountByIdParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let account = self
+            .store
+            .set_account_status(&subject, &params.account_id, ResourceStatus::Active)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(account)
+    }
+
+    #[tool(
         name = "create-project",
         description = "Create a project (maps to POST /api/v1/accounts/{account_id}/projects)"
     )]
@@ -764,6 +839,44 @@ impl LightbridgeMcpHandler {
             .map_err(to_tool_error)?;
 
         to_json_value(json!({ "deleted": true }))
+    }
+
+    #[tool(
+        name = "disable-project",
+        description = "Suspend a project (maps to POST /api/v1/projects/{project_id}/disable); every API key beneath it fails validation"
+    )]
+    async fn disable_project_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ProjectByIdParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let project = self
+            .store
+            .set_project_status(&subject, &params.project_id, ResourceStatus::Suspended)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(project)
+    }
+
+    #[tool(
+        name = "enable-project",
+        description = "Reactivate a suspended project (maps to POST /api/v1/projects/{project_id}/enable)"
+    )]
+    async fn enable_project_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ProjectByIdParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let project = self
+            .store
+            .set_project_status(&subject, &params.project_id, ResourceStatus::Active)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(project)
     }
 
     #[tool(
@@ -965,32 +1078,41 @@ impl LightbridgeMcpHandler {
         &self,
         Parameters(params): Parameters<ValidateAuthorinoApiKeyParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let validated = validate_api_key_context(&self.opa_state, &params.api_key, params.ip)
-            .await
-            .map_err(to_tool_error)?;
-
-        let Some(validated) = validated else {
-            return Err(ErrorData::invalid_params(
-                "unauthorized",
-                Some(json!({ "http_status": 401 })),
-            ));
-        };
-
-        let dynamic_metadata = AuthorinoMetadata {
-            account_id: validated.account.id.clone(),
-            project_id: validated.project.id.clone(),
-            api_key_id: validated.api_key.id.clone(),
-            api_key_status: validated.api_key.status.to_string(),
-            extra: params.metadata,
-        };
-
-        to_json_value(json!({
-            "api_key": validated.api_key,
-            "project": validated.project,
-            "account": validated.account,
-            "dynamic_metadata": dynamic_metadata
-        }))
+        run_validate_authorino(&self.opa_state, params).await
     }
+}
+
+/// Core of the `validate-authorino-api-key` tool (validation + dynamic-metadata enrichment),
+/// factored out of the RBAC-gated tool method so it can be exercised directly in tests.
+async fn run_validate_authorino(
+    opa_state: &Arc<OpaState>,
+    params: ValidateAuthorinoApiKeyParams,
+) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+    let validated = validate_api_key_context(opa_state, &params.api_key, params.ip)
+        .await
+        .map_err(to_tool_error)?;
+
+    let Some(validated) = validated else {
+        return Err(ErrorData::invalid_params(
+            "unauthorized",
+            Some(json!({ "http_status": 401 })),
+        ));
+    };
+
+    let dynamic_metadata = AuthorinoMetadata {
+        account_id: validated.account.id.clone(),
+        project_id: validated.project.id.clone(),
+        api_key_id: validated.api_key.id.clone(),
+        api_key_status: validated.api_key.status.to_string(),
+        extra: params.metadata,
+    };
+
+    to_json_value(json!({
+        "api_key": validated.api_key,
+        "project": validated.project,
+        "account": validated.account,
+        "dynamic_metadata": dynamic_metadata
+    }))
 }
 
 /// Build the streamable-HTTP transport config for the MCP server.
@@ -1236,6 +1358,15 @@ mod tests {
             Err(Error::NotFound)
         }
 
+        async fn set_account_status(
+            &self,
+            _subject: &str,
+            _account_id: &str,
+            _status: lightbridge_authz_core::ResourceStatus,
+        ) -> std::result::Result<Account, Error> {
+            Err(Error::NotFound)
+        }
+
         async fn create_project(
             &self,
             _subject: &str,
@@ -1277,6 +1408,15 @@ mod tests {
             _subject: &str,
             _project_id: &str,
         ) -> std::result::Result<(), Error> {
+            Err(Error::NotFound)
+        }
+
+        async fn set_project_status(
+            &self,
+            _subject: &str,
+            _project_id: &str,
+            _status: lightbridge_authz_core::ResourceStatus,
+        ) -> std::result::Result<Project, Error> {
             Err(Error::NotFound)
         }
 
@@ -1353,12 +1493,25 @@ mod tests {
 
     #[async_trait]
     impl OpaRepoTrait for MockOpaRepo {
-        async fn find_api_key_by_hash(&self, _key_hash: &str) -> Result<Option<ApiKey>> {
-            Ok(Some(self.api_key.clone()))
-        }
-
         async fn record_api_key_usage(&self, _key_id: &str, _ip: Option<String>) -> Result<ApiKey> {
             Ok(self.api_key.clone())
+        }
+
+        async fn find_api_key_validation_by_hash(
+            &self,
+            _key_hash: &str,
+        ) -> Result<Option<lightbridge_authz_core::ApiKeyValidation>> {
+            Ok(Some(lightbridge_authz_core::ApiKeyValidation {
+                api_key_id: self.api_key.id.clone(),
+                key_hash: self.api_key.key_hash.clone(),
+                project_id: self.project.id.clone(),
+                account_id: self.account.id.clone(),
+                api_key_status: self.api_key.status.to_string(),
+                project_status: self.project.status.to_string(),
+                account_status: self.account.status.to_string(),
+                expires_at: self.api_key.expires_at,
+                effective_status: "active".to_string(),
+            }))
         }
 
         async fn get_project(&self, _subject: &str, project_id: &str) -> Result<Option<Project>> {
@@ -1420,6 +1573,7 @@ mod tests {
                 allowed_models: None,
                 default_limits: None,
                 billing_plan: "free".to_string(),
+                status: lightbridge_authz_core::ResourceStatus::Active,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -1427,6 +1581,7 @@ mod tests {
                 id: "acct_1".to_string(),
                 billing_identity: "bill_1".to_string(),
                 owners_admins: vec!["owner".to_string()],
+                status: lightbridge_authz_core::ResourceStatus::Active,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -1453,6 +1608,7 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
+            rbac: Default::default(),
         }
     }
 
@@ -1577,6 +1733,10 @@ mod tests {
             "delete-account",
             "delete-api-key",
             "delete-project",
+            "disable-account",
+            "disable-project",
+            "enable-account",
+            "enable-project",
             "get-account",
             "get-api-key",
             "get-project",
@@ -1687,14 +1847,16 @@ mod tests {
         let mut metadata = HashMap::new();
         metadata.insert("env".to_string(), json!("dev"));
 
-        let result = handler
-            .validate_authorino_api_key(Parameters(ValidateAuthorinoApiKeyParams {
+        let result = run_validate_authorino(
+            &handler.opa_state,
+            ValidateAuthorinoApiKeyParams {
                 api_key: "lbk_secret_sample".to_string(),
                 ip: Some("127.0.0.1".to_string()),
                 metadata,
-            }))
-            .await
-            .expect("validation should succeed");
+            },
+        )
+        .await
+        .expect("validation should succeed");
 
         let output = result.0.result;
 

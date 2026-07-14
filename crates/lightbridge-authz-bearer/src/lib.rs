@@ -2,9 +2,13 @@ use anyhow::{anyhow, ensure};
 use jsonwebtoken::{Validation, decode, decode_header};
 use jwks::{Jwk, Jwks};
 use lightbridge_authz_core::async_trait;
+use lightbridge_authz_core::authz::{PermissionSet, permissions_for_roles};
 use lightbridge_authz_core::config::Oauth2;
+use lightbridge_authz_core::{Error, Permission};
 use serde::Deserialize;
+use serde_json::Value;
 use std::{
+    collections::HashMap,
     fmt,
     sync::Arc,
     time::{Duration, Instant},
@@ -20,6 +24,12 @@ pub struct TokenInfo {
     /// The audience claim from the JWT, if present.
     #[serde(default)]
     pub aud: Vec<String>,
+    /// Raw role strings extracted from the configured roles claim.
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// Permissions derived from `roles` via the configured RBAC mapping.
+    #[serde(default)]
+    pub permissions: PermissionSet,
     #[serde(default)]
     pub access_token: String,
 }
@@ -31,8 +41,23 @@ impl std::fmt::Debug for TokenInfo {
             .field("sub", &self.sub)
             .field("exp", &self.exp)
             .field("aud", &self.aud)
+            .field("roles", &self.roles)
+            .field("permissions", &self.permissions)
             .field("access_token", &"<redacted>")
             .finish()
+    }
+}
+
+impl TokenInfo {
+    /// Whether the caller holds `permission`.
+    pub fn has_permission(&self, permission: Permission) -> bool {
+        self.permissions.contains(permission)
+    }
+
+    /// Returns `Ok(())` when the caller holds `permission`, otherwise [`Error::Forbidden`]
+    /// (HTTP 403). Handlers call this before performing a gated operation.
+    pub fn require(&self, permission: Permission) -> Result<(), Error> {
+        self.permissions.require(permission)
     }
 }
 
@@ -43,6 +68,22 @@ struct Claims {
     /// Audience claim - can be a single string or array of strings
     #[serde(default)]
     aud: Option<Audience>,
+    /// All remaining claims, so the configurable roles claim can be read by name at runtime.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
+}
+
+/// Extract role strings from a JWT claim value. Accepts a JSON array of strings or a single
+/// space-delimited string (Keycloak emits either shape depending on the mapper).
+fn roles_from_claim(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        Some(Value::String(s)) => s.split_whitespace().map(str::to_string).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Audience claim can be either a single string or an array of strings.
@@ -153,12 +194,17 @@ pub trait BearerTokenServiceTrait: Send + Sync {
 pub struct BearerTokenService {
     config: Oauth2,
     cache: JwksCache,
+    /// JWT claim carrying the caller's roles.
+    roles_claim: String,
+    /// Precompiled role → permission map (wildcards already expanded).
+    role_permissions: HashMap<String, PermissionSet>,
 }
 
 impl fmt::Debug for BearerTokenService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BearerTokenService")
             .field("jwks_url", &self.config.jwks_url)
+            .field("roles_claim", &self.roles_claim)
             .finish()
     }
 }
@@ -167,11 +213,19 @@ impl BearerTokenService {
     /// Create a new instance of the BearerTokenService.
     pub fn new(config: Oauth2) -> Self {
         tracing::info!(
-            "Initializing BearerTokenService with audience config: {:?}",
-            config.audience
+            "Initializing BearerTokenService with audience config: {:?}, roles_claim: {:?}",
+            config.audience,
+            config.rbac.roles_claim
         );
         let cache = JwksCache::new(config.jwks_url.clone());
-        BearerTokenService { config, cache }
+        let roles_claim = config.rbac.roles_claim.clone();
+        let role_permissions = config.rbac.compile();
+        BearerTokenService {
+            config,
+            cache,
+            roles_claim,
+            role_permissions,
+        }
     }
 }
 
@@ -268,10 +322,15 @@ impl BearerTokenServiceTrait for BearerTokenService {
             );
         }
 
+        let roles = roles_from_claim(claims.extra.get(&self.roles_claim));
+        let permissions = permissions_for_roles(&roles, &self.role_permissions);
+
         tracing::debug!(
-            "JWT claims validated. Subject: {}, Audience: {:?}",
+            "JWT claims validated. Subject: {}, Audience: {:?}, Roles: {:?}, Permissions: {}",
             claims.sub,
-            token_audience
+            token_audience,
+            roles,
+            permissions.len()
         );
 
         Ok(TokenInfo {
@@ -279,6 +338,8 @@ impl BearerTokenServiceTrait for BearerTokenService {
             sub: claims.sub,
             exp: claims.exp,
             aud: token_audience,
+            roles,
+            permissions,
             access_token: token.to_string(),
         })
     }
@@ -308,6 +369,37 @@ mod tests {
             ]
         })
         .to_string()
+    }
+
+    #[test]
+    fn roles_from_array_claim() {
+        let value = json!(["lightbridge-admin", "offline_access"]);
+        assert_eq!(
+            roles_from_claim(Some(&value)),
+            vec![
+                "lightbridge-admin".to_string(),
+                "offline_access".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn roles_from_space_delimited_string_claim() {
+        let value = json!("lightbridge-admin lightbridge-viewer");
+        assert_eq!(
+            roles_from_claim(Some(&value)),
+            vec![
+                "lightbridge-admin".to_string(),
+                "lightbridge-viewer".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn roles_from_missing_or_wrong_type_claim_is_empty() {
+        assert!(roles_from_claim(None).is_empty());
+        assert!(roles_from_claim(Some(&json!(42))).is_empty());
+        assert!(roles_from_claim(Some(&json!({"a": 1}))).is_empty());
     }
 
     #[tokio::test]

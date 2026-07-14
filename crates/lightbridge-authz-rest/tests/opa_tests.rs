@@ -3,7 +3,8 @@ use axum::body::to_bytes;
 use axum::http::StatusCode;
 use chrono::{Duration, Utc};
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeyStatus, Project, async_trait, config::BasicAuth, error::Result,
+    Account, ApiKey, ApiKeyStatus, ApiKeyValidation, Project, ResourceStatus, async_trait,
+    config::BasicAuth, error::Result,
 };
 use lightbridge_authz_rest::OpaState;
 use lightbridge_authz_rest::handlers::introspect::introspect_api_key;
@@ -23,16 +24,66 @@ struct MockOpaRepo {
 
 #[async_trait]
 impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
-    async fn find_api_key_by_hash(&self, _key_hash: &str) -> Result<Option<ApiKey>> {
-        Ok(self.api_key.clone())
-    }
-
     async fn record_api_key_usage(&self, key_id: &str, ip: Option<String>) -> Result<ApiKey> {
         self.usage_calls
             .lock()
             .expect("lock should work")
             .push((key_id.to_string(), ip));
         Ok(self.api_key.clone().expect("api key should exist in mock"))
+    }
+
+    async fn find_api_key_validation_by_hash(
+        &self,
+        _key_hash: &str,
+    ) -> Result<Option<ApiKeyValidation>> {
+        let Some(api_key) = self.api_key.clone() else {
+            return Ok(None);
+        };
+        let now = Utc::now();
+        let project_suspended = self
+            .project
+            .as_ref()
+            .map(|p| p.status != ResourceStatus::Active)
+            .unwrap_or(false);
+        let account_suspended = self
+            .account
+            .as_ref()
+            .map(|a| a.status != ResourceStatus::Active)
+            .unwrap_or(false);
+        let effective_status = if api_key.status != ApiKeyStatus::Active {
+            "key_revoked"
+        } else if api_key.expires_at.map(|e| e <= now).unwrap_or(false) {
+            "key_expired"
+        } else if project_suspended {
+            "project_suspended"
+        } else if account_suspended {
+            "account_suspended"
+        } else {
+            "active"
+        };
+        Ok(Some(ApiKeyValidation {
+            api_key_id: api_key.id.clone(),
+            key_hash: api_key.key_hash.clone(),
+            project_id: api_key.project_id.clone(),
+            account_id: self
+                .account
+                .as_ref()
+                .map(|a| a.id.clone())
+                .unwrap_or_default(),
+            api_key_status: api_key.status.to_string(),
+            project_status: self
+                .project
+                .as_ref()
+                .map(|p| p.status.to_string())
+                .unwrap_or_else(|| "active".to_string()),
+            account_status: self
+                .account
+                .as_ref()
+                .map(|a| a.status.to_string())
+                .unwrap_or_else(|| "active".to_string()),
+            expires_at: api_key.expires_at,
+            effective_status: effective_status.to_string(),
+        }))
     }
 
     async fn get_project(&self, _subject: &str, _project_id: &str) -> Result<Option<Project>> {
@@ -84,6 +135,7 @@ fn mk_project() -> Project {
         allowed_models: Some(vec!["gpt-4.1-mini".to_string()]),
         default_limits: None,
         billing_plan: "free".to_string(),
+        status: ResourceStatus::Active,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -94,6 +146,7 @@ fn mk_account() -> Account {
         id: "acct_1".to_string(),
         billing_identity: "acme".to_string(),
         owners_admins: vec!["owner@example.com".to_string()],
+        status: ResourceStatus::Active,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -203,6 +256,41 @@ async fn introspect_returns_inactive_when_expired() {
     });
 
     let (status, payload) = introspect(state, "lbk_secret_expired").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], false);
+}
+
+#[tokio::test]
+async fn introspect_returns_inactive_when_account_suspended() {
+    let mut account = mk_account();
+    account.status = ResourceStatus::Suspended;
+    let state = mk_state(MockOpaRepo {
+        api_key: Some(mk_api_key(ApiKeyStatus::Active, None)),
+        project: Some(mk_project()),
+        account: Some(account),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+    });
+
+    let (status, payload) = introspect(state, "lbk_secret_suspended_account").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], false);
+    assert!(payload.get("account_id").is_none());
+}
+
+#[tokio::test]
+async fn introspect_returns_inactive_when_project_suspended() {
+    let mut project = mk_project();
+    project.status = ResourceStatus::Suspended;
+    let state = mk_state(MockOpaRepo {
+        api_key: Some(mk_api_key(ApiKeyStatus::Active, None)),
+        project: Some(project),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+    });
+
+    let (status, payload) = introspect(state, "lbk_secret_suspended_project").await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["active"], false);

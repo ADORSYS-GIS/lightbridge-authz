@@ -338,6 +338,17 @@ impl AuthzStore for AuthzStoreImpl {
         self.repo.delete_account(subject, account_id).await
     }
 
+    async fn set_account_status(
+        &self,
+        subject: &str,
+        account_id: &str,
+        status: lightbridge_authz_core::ResourceStatus,
+    ) -> Result<Account> {
+        self.repo
+            .set_account_status(subject, account_id, status)
+            .await
+    }
+
     async fn create_project(
         &self,
         subject: &str,
@@ -379,6 +390,17 @@ impl AuthzStore for AuthzStoreImpl {
 
     async fn delete_project(&self, subject: &str, project_id: &str) -> Result<()> {
         self.repo.delete_project(subject, project_id).await
+    }
+
+    async fn set_project_status(
+        &self,
+        subject: &str,
+        project_id: &str,
+        status: lightbridge_authz_core::ResourceStatus,
+    ) -> Result<Project> {
+        self.repo
+            .set_project_status(subject, project_id, status)
+            .await
     }
 
     async fn create_api_key(
@@ -585,6 +607,7 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
+            rbac: Default::default(),
             issuance: None,
         }
     }
@@ -687,6 +710,7 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
+            rbac: Default::default(),
             issuance: Some(Oauth2Issuance {
                 grant_type: Some("urn:ietf:params:oauth:grant-type:token-exchange".to_string()),
                 client_id: "test-client".to_string(),
@@ -726,6 +750,7 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
+            rbac: Default::default(),
             issuance: Some(Oauth2Issuance {
                 grant_type: None,
                 client_id: client_id.to_string(),
@@ -752,6 +777,7 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
+            rbac: Default::default(),
             issuance: None,
         };
         let err = OAuth2TokenIssuer::from_config(&cfg).unwrap_err();

@@ -9,11 +9,15 @@ use utoipa::{Modify, OpenApi};
         crate::controllers::accounts::get_account,
         crate::controllers::accounts::update_account,
         crate::controllers::accounts::delete_account,
+        crate::controllers::accounts::disable_account,
+        crate::controllers::accounts::enable_account,
         crate::controllers::projects::create_project,
         crate::controllers::projects::list_projects,
         crate::controllers::projects::get_project,
         crate::controllers::projects::update_project,
         crate::controllers::projects::delete_project,
+        crate::controllers::projects::disable_project,
+        crate::controllers::projects::enable_project,
         crate::controllers::api_keys::create_api_key,
         crate::controllers::api_keys::list_api_keys,
         crate::controllers::api_keys::get_api_key,
@@ -25,6 +29,7 @@ use utoipa::{Modify, OpenApi};
     components(
         schemas(
             lightbridge_authz_core::Account,
+            lightbridge_authz_core::ResourceStatus,
             lightbridge_authz_core::CreateAccount,
             lightbridge_authz_core::UpdateAccount,
             lightbridge_authz_core::Project,

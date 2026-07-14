@@ -7,12 +7,18 @@ use axum::{
 };
 
 use crate::controllers::{
-    accounts::{create_account, delete_account, get_account, list_accounts, update_account},
+    accounts::{
+        create_account, delete_account, disable_account, enable_account, get_account,
+        list_accounts, update_account,
+    },
     api_keys::{
         create_api_key, delete_api_key, get_api_key, list_api_keys, revoke_api_key, rotate_api_key,
         update_api_key,
     },
-    projects::{create_project, delete_project, get_project, list_projects, update_project},
+    projects::{
+        create_project, delete_project, disable_project, enable_project, get_project,
+        list_projects, update_project,
+    },
 };
 
 /// Creates an Axum router for the CRUD API.
@@ -25,6 +31,8 @@ pub fn api_router() -> Router<Arc<AppState>> {
                 .patch(update_account)
                 .delete(delete_account),
         )
+        .route("/accounts/{account_id}/disable", post(disable_account))
+        .route("/accounts/{account_id}/enable", post(enable_account))
         .route(
             "/accounts/{account_id}/projects",
             post(create_project).get(list_projects),
@@ -45,6 +53,8 @@ pub fn api_router() -> Router<Arc<AppState>> {
                 .patch(update_api_key)
                 .delete(delete_api_key),
         )
+        .route("/projects/{project_id}/disable", post(disable_project))
+        .route("/projects/{project_id}/enable", post(enable_project))
         .route("/api-keys/{key_id}/revoke", post(revoke_api_key))
         .route("/api-keys/{key_id}/rotate", post(rotate_api_key))
 }

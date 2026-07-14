@@ -526,6 +526,7 @@ In Compose, `authz-migrate` runs before API/OPA start.
 - Manual end-to-end protocol (OAuth2 + OPA): `docs/test-protocol.md`
 - Authorino endpoint usage + integration test: `docs/authorino-usage.md`
 - Usage ingest/query API: `docs/usage-api.md`
+- RBAC (JWT claim → permission mapping): `docs/rbac.md`
 
 ## Helm / deployment notes
 
