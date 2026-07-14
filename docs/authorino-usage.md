@@ -235,6 +235,20 @@ The `jwt` identity fetches the JWKS via `issuerUrl` discovery (self-signed TLS i
 trust its CA or terminate TLS in-cluster). The `metadata` call forwards the raw JWT to
 introspection so a deleted/revoked key flips to `active: false` within the cache TTL.
 
+Introspection reports liveness from the `api_key_validation` view, which cascades
+`account → project → key` status. So **suspending an account or project** (see
+[docs/rbac.md](rbac.md) → *Account / project suspension*) also flips `active: false` for every key
+beneath it, and the same `apikey-not-revoked` rule denies the request.
+
+This gives a clean 401-vs-403 split, decided by which phase fails:
+
+- an **invalid or expired** JWT fails the `jwt` **identity** phase → Authorino returns **401
+  Unauthorized** (Envoy's default for identity failure);
+- a **valid** JWT whose key is revoked or whose account/project is **suspended** fails the
+  `apikey-not-revoked` **authorization** rule → Authorino returns **403 Forbidden** (the default
+  status for an authorization deny; override with `denyWith.unauthorized`/`denyWith.forbidden` if
+  you want to customise the body).
+
 ### Alternative: opaque keys (no signing)
 
 With signing disabled, issued keys are opaque `lbk_secret_...` secrets. They are not JWTs,

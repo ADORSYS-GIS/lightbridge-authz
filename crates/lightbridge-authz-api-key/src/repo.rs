@@ -4,8 +4,8 @@ use chrono::{DateTime, Utc};
 use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_core::error::Result;
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeyStatus, CreateAccount, CreateProject, DefaultLimits, Project,
-    ResolvedContext, UpdateAccount, UpdateApiKey, UpdateProject,
+    Account, ApiKey, ApiKeyStatus, ApiKeyValidation, CreateAccount, CreateProject, DefaultLimits,
+    Project, ResolvedContext, ResourceStatus, UpdateAccount, UpdateApiKey, UpdateProject,
 };
 use serde_json::Value;
 use sqlx::{Executor, PgPool, Postgres, Transaction};
@@ -13,6 +13,7 @@ use tracing::instrument;
 
 use crate::entities::account_row::AccountWithMembersRow;
 use crate::entities::api_key_row::{ApiKeyChangeset, ApiKeyRow};
+use crate::entities::api_key_validation_row::ApiKeyValidationRow;
 use crate::entities::exchange_refresh_token_row::{
     ExchangeRefreshTokenRow, NewExchangeRefreshToken,
 };
@@ -77,6 +78,7 @@ impl StoreRepo {
             id: row.id,
             billing_identity: row.billing_identity,
             owners_admins: row.owners_admins,
+            status: ResourceStatus::from(row.status),
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -164,6 +166,7 @@ impl StoreRepo {
               accounts.id,
               accounts.billing_identity,
               COALESCE(array_agg(account_memberships.subject ORDER BY account_memberships.subject), '{}'::text[]) AS owners_admins,
+              accounts.status,
               accounts.created_at,
               accounts.updated_at
             FROM accounts
@@ -189,6 +192,7 @@ impl StoreRepo {
               accounts.id,
               accounts.billing_identity,
               COALESCE(array_agg(account_memberships.subject ORDER BY account_memberships.subject), '{}'::text[]) AS owners_admins,
+              accounts.status,
               accounts.created_at,
               accounts.updated_at
             FROM accounts
@@ -218,6 +222,7 @@ impl StoreRepo {
             allowed_models: Self::json_to_vec(&row.allowed_models),
             default_limits: Self::json_to_limits(&row.default_limits),
             billing_plan: row.billing_plan,
+            status: ResourceStatus::from(row.status),
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -301,6 +306,7 @@ impl StoreRepo {
               accounts.id,
               accounts.billing_identity,
               COALESCE(array_agg(account_memberships.subject ORDER BY account_memberships.subject), '{}'::text[]) AS owners_admins,
+              accounts.status,
               accounts.created_at,
               accounts.updated_at
             FROM accounts
@@ -447,7 +453,7 @@ impl StoreRepo {
             )
             SELECT $3, account_auth.account_id, $4, $5, $6, $7, $8, $9
             FROM account_auth
-            RETURNING id, account_id, name, allowed_models, default_limits, billing_plan, created_at, updated_at
+            RETURNING id, account_id, name, allowed_models, default_limits, billing_plan, status, created_at, updated_at
             "#,
         )
         .bind(account_id)
@@ -624,6 +630,7 @@ impl StoreRepo {
               projects.allowed_models,
               projects.default_limits,
               projects.billing_plan,
+              projects.status,
               projects.created_at,
               projects.updated_at
             FROM projects
@@ -659,6 +666,7 @@ impl StoreRepo {
               projects.allowed_models,
               projects.default_limits,
               projects.billing_plan,
+              projects.status,
               projects.created_at,
               projects.updated_at
             FROM projects
@@ -689,6 +697,7 @@ impl StoreRepo {
               allowed_models,
               default_limits,
               billing_plan,
+              status,
               created_at,
               updated_at
             FROM projects
@@ -740,6 +749,7 @@ impl StoreRepo {
               projects.allowed_models,
               projects.default_limits,
               projects.billing_plan,
+              projects.status,
               projects.created_at,
               projects.updated_at
             "#,
@@ -937,6 +947,112 @@ impl StoreRepo {
         .await?;
         let row = row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
         Ok(Self::to_api_key(row))
+    }
+
+    #[instrument(skip(self))]
+    pub async fn set_account_status(
+        &self,
+        subject: &str,
+        account_id: &str,
+        status: ResourceStatus,
+    ) -> Result<Account> {
+        let result = sqlx::query(
+            r#"
+            UPDATE accounts
+            SET status = $1, updated_at = $2
+            FROM account_memberships
+            WHERE accounts.id = account_memberships.account_id
+              AND accounts.id = $3
+              AND account_memberships.subject = $4
+            "#,
+        )
+        .bind(status.to_string())
+        .bind(Utc::now())
+        .bind(account_id)
+        .bind(subject)
+        .execute(self.pool())
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(lightbridge_authz_core::error::Error::NotFound);
+        }
+        let row = self.load_account_with_members_row(account_id).await?;
+        Ok(Self::to_account(row))
+    }
+
+    #[instrument(skip(self))]
+    pub async fn set_project_status(
+        &self,
+        subject: &str,
+        project_id: &str,
+        status: ResourceStatus,
+    ) -> Result<Project> {
+        let row: Option<ProjectRow> = sqlx::query_as(
+            r#"
+            UPDATE projects
+            SET status = $1, updated_at = $2
+            FROM account_memberships
+            WHERE projects.account_id = account_memberships.account_id
+              AND projects.id = $3
+              AND account_memberships.subject = $4
+            RETURNING
+              projects.id,
+              projects.account_id,
+              projects.name,
+              projects.allowed_models,
+              projects.default_limits,
+              projects.billing_plan,
+              projects.status,
+              projects.created_at,
+              projects.updated_at
+            "#,
+        )
+        .bind(status.to_string())
+        .bind(Utc::now())
+        .bind(project_id)
+        .bind(subject)
+        .fetch_optional(self.pool())
+        .await?;
+        let row = row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
+        Ok(Self::to_project(row))
+    }
+
+    /// Read the effective validity of an API key from the `api_key_validation` view (one indexed
+    /// lookup by `key_hash`), with the account -> project -> key status cascade resolved by the DB.
+    #[instrument(skip(self, key_hash))]
+    pub async fn find_api_key_validation_by_hash(
+        &self,
+        key_hash: &str,
+    ) -> Result<Option<ApiKeyValidation>> {
+        let row: Option<ApiKeyValidationRow> = sqlx::query_as(
+            r#"
+            SELECT
+              api_key_id,
+              key_hash,
+              project_id,
+              account_id,
+              api_key_status,
+              project_status,
+              account_status,
+              expires_at,
+              effective_status
+            FROM api_key_validation
+            WHERE key_hash = $1
+            "#,
+        )
+        .bind(key_hash)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(|row| ApiKeyValidation {
+            api_key_id: row.api_key_id,
+            key_hash: row.key_hash,
+            project_id: row.project_id,
+            account_id: row.account_id,
+            api_key_status: row.api_key_status,
+            project_status: row.project_status,
+            account_status: row.account_status,
+            expires_at: row.expires_at,
+            effective_status: row.effective_status,
+        }))
     }
 
     #[instrument(skip(self))]

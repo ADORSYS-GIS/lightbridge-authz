@@ -45,6 +45,23 @@ impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
             .map(|k| k.expect("key exists"))
     }
 
+    async fn find_api_key_validation_by_hash(
+        &self,
+        _key_hash: &str,
+    ) -> Result<Option<lightbridge_authz_core::ApiKeyValidation>> {
+        Ok(Some(lightbridge_authz_core::ApiKeyValidation {
+            api_key_id: "key_1".to_string(),
+            key_hash: "hash".to_string(),
+            project_id: "proj_1".to_string(),
+            account_id: "acct_1".to_string(),
+            api_key_status: "active".to_string(),
+            project_status: "active".to_string(),
+            account_status: "active".to_string(),
+            expires_at: None,
+            effective_status: "active".to_string(),
+        }))
+    }
+
     async fn get_project(&self, _subject: &str, _project_id: &str) -> Result<Option<Project>> {
         Ok(Some(mk_project()))
     }
@@ -77,6 +94,7 @@ fn mk_project() -> Project {
         allowed_models: None,
         default_limits: None,
         billing_plan: "free".to_string(),
+        status: lightbridge_authz_core::ResourceStatus::Active,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -87,6 +105,7 @@ fn mk_account() -> Account {
         id: "acct_1".to_string(),
         billing_identity: "acme".to_string(),
         owners_admins: vec!["owner@example.com".to_string()],
+        status: lightbridge_authz_core::ResourceStatus::Active,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -424,6 +443,52 @@ async fn api_denies_when_caller_lacks_required_permission() {
 #[tokio::test]
 async fn api_passes_rbac_gate_when_caller_has_required_permission() {
     let status = create_account_status(PermissionSet::from_iter([Permission::AccountCreate])).await;
+    assert_ne!(status, StatusCode::FORBIDDEN);
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+}
+
+async fn disable_account_status(permissions: PermissionSet) -> StatusCode {
+    let store: Arc<dyn AuthzStore> = Arc::new(AuthzStoreImpl::with_pool(lazy_pool()));
+    let app_state = Arc::new(AppState {
+        store,
+        bearer: Arc::new(PermBearer { permissions }),
+    });
+    let signing_repo = Arc::new(lightbridge_authz_api_key::repo::StoreRepo::new(lazy_pool()));
+    let router = lightbridge_authz_rest::build_api_router(
+        &oauth2_without_signing(),
+        app_state,
+        lazy_pool(),
+        signing_repo,
+        None,
+    );
+
+    router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/accounts/acct_1/disable")
+                .header(header::AUTHORIZATION, "Bearer any")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn disable_account_denies_without_disable_permission() {
+    // account:delete must NOT be enough to disable — the gate is a distinct permission.
+    assert_eq!(
+        disable_account_status(PermissionSet::from_iter([Permission::AccountDelete])).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn disable_account_passes_gate_with_disable_permission() {
+    let status =
+        disable_account_status(PermissionSet::from_iter([Permission::AccountDisable])).await;
     assert_ne!(status, StatusCode::FORBIDDEN);
     assert_ne!(status, StatusCode::UNAUTHORIZED);
 }

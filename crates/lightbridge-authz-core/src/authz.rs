@@ -34,6 +34,8 @@ pub enum Permission {
     AccountUpdate,
     #[serde(rename = "account:delete")]
     AccountDelete,
+    #[serde(rename = "account:disable")]
+    AccountDisable,
 
     #[serde(rename = "project:create")]
     ProjectCreate,
@@ -43,6 +45,8 @@ pub enum Permission {
     ProjectUpdate,
     #[serde(rename = "project:delete")]
     ProjectDelete,
+    #[serde(rename = "project:disable")]
+    ProjectDisable,
 
     #[serde(rename = "apikey:create")]
     ApiKeyCreate,
@@ -63,15 +67,17 @@ pub enum Permission {
 impl Permission {
     /// Every permission, in declaration order. The single source of truth for wildcard expansion
     /// and documentation.
-    pub const ALL: [Permission; 15] = [
+    pub const ALL: [Permission; 17] = [
         Permission::AccountCreate,
         Permission::AccountRead,
         Permission::AccountUpdate,
         Permission::AccountDelete,
+        Permission::AccountDisable,
         Permission::ProjectCreate,
         Permission::ProjectRead,
         Permission::ProjectUpdate,
         Permission::ProjectDelete,
+        Permission::ProjectDisable,
         Permission::ApiKeyCreate,
         Permission::ApiKeyRead,
         Permission::ApiKeyUpdate,
@@ -88,10 +94,12 @@ impl Permission {
             Permission::AccountRead => "account:read",
             Permission::AccountUpdate => "account:update",
             Permission::AccountDelete => "account:delete",
+            Permission::AccountDisable => "account:disable",
             Permission::ProjectCreate => "project:create",
             Permission::ProjectRead => "project:read",
             Permission::ProjectUpdate => "project:update",
             Permission::ProjectDelete => "project:delete",
+            Permission::ProjectDisable => "project:disable",
             Permission::ApiKeyCreate => "apikey:create",
             Permission::ApiKeyRead => "apikey:read",
             Permission::ApiKeyUpdate => "apikey:update",
@@ -294,9 +302,10 @@ mod tests {
     #[test]
     fn resource_wildcard_expands_to_resource_actions() {
         let project = expand_grant("project:*");
-        assert_eq!(project.len(), 4);
+        assert_eq!(project.len(), 5);
         assert!(project.contains(&Permission::ProjectCreate));
         assert!(project.contains(&Permission::ProjectDelete));
+        assert!(project.contains(&Permission::ProjectDisable));
         assert!(!project.contains(&Permission::AccountCreate));
     }
 

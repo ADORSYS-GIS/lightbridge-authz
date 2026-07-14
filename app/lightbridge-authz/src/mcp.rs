@@ -13,8 +13,8 @@ use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait, TokenInfo};
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, Config, CreateAccount, CreateApiKey, CreateProject,
-    DefaultLimits, Error, Permission, Project, Result, RotateApiKey, UpdateAccount, UpdateApiKey,
-    UpdateProject,
+    DefaultLimits, Error, Permission, Project, ResourceStatus, Result, RotateApiKey, UpdateAccount,
+    UpdateApiKey, UpdateProject,
     config::{ApiServer, BasicAuth, Oauth2},
     db::{DbPoolTrait, is_database_ready},
     server::serve_tls,
@@ -234,10 +234,12 @@ fn required_tool_permission(tool: &str) -> Option<Permission> {
         "list-accounts" | "get-account" => Permission::AccountRead,
         "update-account" => Permission::AccountUpdate,
         "delete-account" => Permission::AccountDelete,
+        "disable-account" | "enable-account" => Permission::AccountDisable,
         "create-project" => Permission::ProjectCreate,
         "list-projects" | "get-project" => Permission::ProjectRead,
         "update-project" => Permission::ProjectUpdate,
         "delete-project" => Permission::ProjectDelete,
+        "disable-project" | "enable-project" => Permission::ProjectDisable,
         "create-api-key" => Permission::ApiKeyCreate,
         "list-api-keys" | "get-api-key" => Permission::ApiKeyRead,
         "update-api-key" => Permission::ApiKeyUpdate,
@@ -689,6 +691,44 @@ impl LightbridgeMcpHandler {
     }
 
     #[tool(
+        name = "disable-account",
+        description = "Suspend an account (maps to POST /api/v1/accounts/{account_id}/disable); every API key beneath it fails validation"
+    )]
+    async fn disable_account_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<AccountByIdParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let account = self
+            .store
+            .set_account_status(&subject, &params.account_id, ResourceStatus::Suspended)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(account)
+    }
+
+    #[tool(
+        name = "enable-account",
+        description = "Reactivate a suspended account (maps to POST /api/v1/accounts/{account_id}/enable)"
+    )]
+    async fn enable_account_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<AccountByIdParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let account = self
+            .store
+            .set_account_status(&subject, &params.account_id, ResourceStatus::Active)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(account)
+    }
+
+    #[tool(
         name = "create-project",
         description = "Create a project (maps to POST /api/v1/accounts/{account_id}/projects)"
     )]
@@ -799,6 +839,44 @@ impl LightbridgeMcpHandler {
             .map_err(to_tool_error)?;
 
         to_json_value(json!({ "deleted": true }))
+    }
+
+    #[tool(
+        name = "disable-project",
+        description = "Suspend a project (maps to POST /api/v1/projects/{project_id}/disable); every API key beneath it fails validation"
+    )]
+    async fn disable_project_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ProjectByIdParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let project = self
+            .store
+            .set_project_status(&subject, &params.project_id, ResourceStatus::Suspended)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(project)
+    }
+
+    #[tool(
+        name = "enable-project",
+        description = "Reactivate a suspended project (maps to POST /api/v1/projects/{project_id}/enable)"
+    )]
+    async fn enable_project_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ProjectByIdParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let project = self
+            .store
+            .set_project_status(&subject, &params.project_id, ResourceStatus::Active)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(project)
     }
 
     #[tool(
@@ -1280,6 +1358,15 @@ mod tests {
             Err(Error::NotFound)
         }
 
+        async fn set_account_status(
+            &self,
+            _subject: &str,
+            _account_id: &str,
+            _status: lightbridge_authz_core::ResourceStatus,
+        ) -> std::result::Result<Account, Error> {
+            Err(Error::NotFound)
+        }
+
         async fn create_project(
             &self,
             _subject: &str,
@@ -1321,6 +1408,15 @@ mod tests {
             _subject: &str,
             _project_id: &str,
         ) -> std::result::Result<(), Error> {
+            Err(Error::NotFound)
+        }
+
+        async fn set_project_status(
+            &self,
+            _subject: &str,
+            _project_id: &str,
+            _status: lightbridge_authz_core::ResourceStatus,
+        ) -> std::result::Result<Project, Error> {
             Err(Error::NotFound)
         }
 
@@ -1405,6 +1501,23 @@ mod tests {
             Ok(self.api_key.clone())
         }
 
+        async fn find_api_key_validation_by_hash(
+            &self,
+            _key_hash: &str,
+        ) -> Result<Option<lightbridge_authz_core::ApiKeyValidation>> {
+            Ok(Some(lightbridge_authz_core::ApiKeyValidation {
+                api_key_id: self.api_key.id.clone(),
+                key_hash: self.api_key.key_hash.clone(),
+                project_id: self.project.id.clone(),
+                account_id: self.account.id.clone(),
+                api_key_status: self.api_key.status.to_string(),
+                project_status: self.project.status.to_string(),
+                account_status: self.account.status.to_string(),
+                expires_at: self.api_key.expires_at,
+                effective_status: "active".to_string(),
+            }))
+        }
+
         async fn get_project(&self, _subject: &str, project_id: &str) -> Result<Option<Project>> {
             if project_id == self.project.id {
                 return Ok(Some(self.project.clone()));
@@ -1464,6 +1577,7 @@ mod tests {
                 allowed_models: None,
                 default_limits: None,
                 billing_plan: "free".to_string(),
+                status: lightbridge_authz_core::ResourceStatus::Active,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -1471,6 +1585,7 @@ mod tests {
                 id: "acct_1".to_string(),
                 billing_identity: "bill_1".to_string(),
                 owners_admins: vec!["owner".to_string()],
+                status: lightbridge_authz_core::ResourceStatus::Active,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -1622,6 +1737,10 @@ mod tests {
             "delete-account",
             "delete-api-key",
             "delete-project",
+            "disable-account",
+            "disable-project",
+            "enable-account",
+            "enable-project",
             "get-account",
             "get-api-key",
             "get-project",

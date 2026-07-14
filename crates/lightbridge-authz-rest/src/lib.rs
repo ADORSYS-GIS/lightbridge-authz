@@ -48,6 +48,10 @@ pub trait OpaRepoTrait: Send + Sync {
         key_id: &str,
         ip: Option<String>,
     ) -> Result<lightbridge_authz_core::ApiKey>;
+    async fn find_api_key_validation_by_hash(
+        &self,
+        key_hash: &str,
+    ) -> Result<Option<lightbridge_authz_core::ApiKeyValidation>>;
     async fn get_project(&self, subject: &str, project_id: &str) -> Result<Option<Project>>;
     async fn get_account(&self, subject: &str, account_id: &str) -> Result<Option<Account>>;
     async fn get_project_by_id(&self, project_id: &str) -> Result<Option<Project>>;
@@ -74,6 +78,13 @@ impl OpaRepoTrait for StoreRepo {
         ip: Option<String>,
     ) -> Result<lightbridge_authz_core::ApiKey> {
         StoreRepo::record_api_key_usage(self, key_id, ip).await
+    }
+
+    async fn find_api_key_validation_by_hash(
+        &self,
+        key_hash: &str,
+    ) -> Result<Option<lightbridge_authz_core::ApiKeyValidation>> {
+        StoreRepo::find_api_key_validation_by_hash(self, key_hash).await
     }
 
     async fn get_project(&self, subject: &str, project_id: &str) -> Result<Option<Project>> {

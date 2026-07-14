@@ -95,10 +95,12 @@ endpoint and the equivalent MCP tool require the same permission.
 | `account:read`     | `GET /api/v1/accounts`, `GET .../accounts/{id}` | `list-accounts`, `get-account` |
 | `account:update`   | `PATCH /api/v1/accounts/{id}`                   | `update-account`               |
 | `account:delete`   | `DELETE /api/v1/accounts/{id}`                  | `delete-account`               |
+| `account:disable`  | `POST .../accounts/{id}/disable`, `.../enable`  | `disable-account`, `enable-account` |
 | `project:create`   | `POST /api/v1/accounts/{id}/projects`           | `create-project`               |
 | `project:read`     | `GET .../projects`, `GET /api/v1/projects/{id}` | `list-projects`, `get-project` |
 | `project:update`   | `PATCH /api/v1/projects/{id}`                   | `update-project`               |
 | `project:delete`   | `DELETE /api/v1/projects/{id}`                  | `delete-project`               |
+| `project:disable`  | `POST .../projects/{id}/disable`, `.../enable`  | `disable-project`, `enable-project` |
 | `apikey:create`    | `POST /api/v1/projects/{id}/api-keys`           | `create-api-key`               |
 | `apikey:read`      | `GET .../api-keys`, `GET /api/v1/api-keys/{id}` | `list-api-keys`, `get-api-key` |
 | `apikey:update`    | `PATCH /api/v1/api-keys/{id}`                   | `update-api-key`               |
@@ -135,3 +137,36 @@ The dev realm (`.docker/keycloak_config/realm.json`) shows the required wiring:
 
 For your own realm, create the roles, assign them to users/groups, and add an equivalent mapper
 whose `claim.name` matches `oauth2.rbac.roles_claim`.
+
+## Account / project suspension (data-plane authorization)
+
+RBAC above gates the **control plane** (who may call the management API). Suspension gates the
+**data plane** (whether an issued API key still works at the gateway).
+
+An admin holding `account:disable` / `project:disable` can soft-disable a tenant without deleting
+anything:
+
+- `POST /api/v1/accounts/{id}/disable` · `POST /api/v1/accounts/{id}/enable`
+- `POST /api/v1/projects/{id}/disable` · `POST /api/v1/projects/{id}/enable`
+
+Disabling sets `status = 'suspended'` on the row. The `api_key_validation` SQL view resolves the
+full cascade (`account → project → key`) in one indexed read, so **every API key beneath a
+suspended account or project immediately fails validation** — no token reissue, no per-key writes.
+It takes effect within the gateway's auth-cache TTL. `validate_api_key_context`
+(`crates/lightbridge-authz-rest/src/handlers/opa.rs`) reads this view and reports the key as
+inactive with a precise reason (`account_suspended`, `project_suspended`, `key_revoked`,
+`key_expired`).
+
+### 401 vs 403 at the gateway
+
+API keys are JWTs, so Authorino evaluates them in two phases, and the phase that fails determines
+the status code:
+
+| Situation | Failing phase | Status |
+|---|---|---|
+| Missing / malformed / **expired** JWT (bad signature or `exp`) | Identity (JWKS) | **401 Unauthorized** |
+| Valid JWT, but key revoked or **account/project suspended** | Authorization (liveness rule) | **403 Forbidden** |
+
+So "the JWT passes but OPA refuses" is precisely the authorization-phase deny: the introspection
+metadata reports `active: false`, the `active == true` authorization rule fails, and Authorino
+returns 403. See `docs/authorino-usage.md` for the AuthConfig.

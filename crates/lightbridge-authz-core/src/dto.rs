@@ -5,6 +5,36 @@ use utoipa::ToSchema;
 
 const ACTIVE: &str = "active";
 const REVOKED: &str = "revoked";
+const SUSPENDED: &str = "suspended";
+
+/// Lifecycle state of an account or project. `Suspended` is a soft-disable: the row and its
+/// descendants are kept, but every API key beneath a suspended account/project fails validation.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourceStatus {
+    #[default]
+    Active,
+    Suspended,
+}
+
+impl Display for ResourceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let r = match self {
+            ResourceStatus::Active => ACTIVE,
+            ResourceStatus::Suspended => SUSPENDED,
+        };
+        write!(f, "{}", r)
+    }
+}
+
+impl From<String> for ResourceStatus {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            SUSPENDED => ResourceStatus::Suspended,
+            _ => ResourceStatus::Active,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default, PartialEq, Eq)]
 pub struct DefaultLimits {
@@ -22,6 +52,8 @@ pub struct Account {
     pub billing_identity: String,
     #[serde(default)]
     pub owners_admins: Vec<String>,
+    #[serde(default)]
+    pub status: ResourceStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -47,6 +79,8 @@ pub struct Project {
     #[serde(default)]
     pub default_limits: Option<DefaultLimits>,
     pub billing_plan: String,
+    #[serde(default)]
+    pub status: ResourceStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -160,4 +194,28 @@ pub struct ResolveContextRequest {
 pub struct ResolvedContext {
     pub account_id: String,
     pub project_id: String,
+}
+
+/// One row of the `api_key_validation` view: an API key's effective validity with the full
+/// account -> project -> key status cascade already resolved by the database. `effective_status`
+/// is `"active"` when the key is usable, otherwise it is the deny reason (`key_revoked`,
+/// `key_expired`, `project_suspended`, `account_suspended`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyValidation {
+    pub api_key_id: String,
+    pub key_hash: String,
+    pub project_id: String,
+    pub account_id: String,
+    pub api_key_status: String,
+    pub project_status: String,
+    pub account_status: String,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub effective_status: String,
+}
+
+impl ApiKeyValidation {
+    /// Whether the key is usable (the cascade resolved to `active`).
+    pub fn is_active(&self) -> bool {
+        self.effective_status == ACTIVE
+    }
 }

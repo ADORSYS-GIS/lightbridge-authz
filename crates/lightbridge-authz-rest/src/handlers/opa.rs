@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use lightbridge_authz_core::{ApiKeyStatus, Result, error::Error, hash_api_key};
+use lightbridge_authz_core::{Result, error::Error, hash_api_key};
 use tracing::instrument;
 
 use crate::OpaState;
@@ -20,7 +20,14 @@ pub async fn validate_api_key_context(
     ip: Option<String>,
 ) -> Result<Option<ValidatedApiKeyContext>> {
     let key_hash = hash_api_key(raw_api_key);
-    let Some(api_key) = state.repo.find_api_key_by_hash(&key_hash).await? else {
+    // Single indexed read of the `api_key_validation` view: the account -> project -> key status
+    // cascade (revoked key, expired key, suspended project, suspended account) is resolved by the
+    // DB, so disabling an account/project instantly invalidates every key beneath it.
+    let Some(validation) = state
+        .repo
+        .find_api_key_validation_by_hash(&key_hash)
+        .await?
+    else {
         tracing::info!(
             active = false,
             reason = "not_found",
@@ -29,38 +36,30 @@ pub async fn validate_api_key_context(
         return Ok(None);
     };
 
-    let now = chrono::Utc::now();
-    if api_key.status != ApiKeyStatus::Active {
+    if !validation.is_active() {
         tracing::info!(
             active = false,
-            reason = "inactive_status",
-            api_key_id = %api_key.id,
-            status = %api_key.status,
-            "api key validation failed"
-        );
-        return Ok(None);
-    }
-    if let Some(expires_at) = api_key.expires_at
-        && expires_at <= now
-    {
-        tracing::info!(
-            active = false,
-            reason = "expired",
-            api_key_id = %api_key.id,
+            reason = %validation.effective_status,
+            api_key_id = %validation.api_key_id,
+            account_id = %validation.account_id,
+            project_id = %validation.project_id,
             "api key validation failed"
         );
         return Ok(None);
     }
 
-    let api_key = state.repo.record_api_key_usage(&api_key.id, ip).await?;
+    let api_key = state
+        .repo
+        .record_api_key_usage(&validation.api_key_id, ip)
+        .await?;
     let project = state
         .repo
-        .get_project_by_id(&api_key.project_id)
+        .get_project_by_id(&validation.project_id)
         .await?
         .ok_or_else(|| Error::NotFound)?;
     let account = state
         .repo
-        .get_account_by_id(&project.account_id)
+        .get_account_by_id(&validation.account_id)
         .await?
         .ok_or_else(|| Error::NotFound)?;
 
