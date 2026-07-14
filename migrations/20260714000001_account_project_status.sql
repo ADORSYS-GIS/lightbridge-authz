@@ -14,6 +14,12 @@ ALTER TABLE projects
 -- and gets the whole decision, so suspending an account instantly invalidates every key beneath it
 -- with no fan-out writes. `effective_status = 'active'` means the key is usable; any other value is
 -- the deny reason.
+--
+-- The INNER JOINs are safe: api_keys.project_id -> projects(id) and projects.account_id ->
+-- accounts(id) are both `ON DELETE CASCADE` foreign keys, so a key can never outlive its parent
+-- project/account. Soft-disable is expressed via `status = 'suspended'` (the row stays), never by
+-- deletion, so a suspended tenant still produces a row here with an explicit deny reason rather
+-- than vanishing into a `not_found`.
 CREATE VIEW api_key_validation AS
 SELECT
     k.id            AS api_key_id,

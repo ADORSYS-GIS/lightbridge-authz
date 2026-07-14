@@ -13,6 +13,10 @@ pub struct ValidatedApiKeyContext {
 }
 
 /// Validates an API key and returns its context (project, account).
+///
+/// Gating is a single indexed read of the `api_key_validation` view: the account -> project -> key
+/// status cascade (revoked key, expired key, suspended project, suspended account) is resolved by
+/// the database, so disabling an account/project instantly invalidates every key beneath it.
 #[instrument(skip(state, raw_api_key))]
 pub async fn validate_api_key_context(
     state: &Arc<OpaState>,
@@ -20,9 +24,6 @@ pub async fn validate_api_key_context(
     ip: Option<String>,
 ) -> Result<Option<ValidatedApiKeyContext>> {
     let key_hash = hash_api_key(raw_api_key);
-    // Single indexed read of the `api_key_validation` view: the account -> project -> key status
-    // cascade (revoked key, expired key, suspended project, suspended account) is resolved by the
-    // DB, so disabling an account/project instantly invalidates every key beneath it.
     let Some(validation) = state
         .repo
         .find_api_key_validation_by_hash(&key_hash)

@@ -117,7 +117,6 @@ async fn suspending_project_invalidates_its_keys(pool: PgPool) {
 async fn expired_key_reports_key_expired(pool: PgPool) {
     let repo = build_repo(pool);
     let subject = "user-1";
-    // Exercise the view's real `key_expired` CASE branch against Postgres (not the Rust mock).
     let past = Utc::now() - chrono::Duration::minutes(5);
     let (_account_id, _project_id, key_hash) = seed_key(&repo, subject, Some(past)).await;
 

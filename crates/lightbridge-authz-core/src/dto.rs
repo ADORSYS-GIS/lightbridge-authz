@@ -28,10 +28,13 @@ impl Display for ResourceStatus {
 }
 
 impl From<String> for ResourceStatus {
+    /// Fails safe: only the exact `active` string is treated as active; any other value (including
+    /// a future/unknown status or corrupted data) maps to the restricted `Suspended` state,
+    /// matching the SQL view's `status <> 'active'` deny semantics.
     fn from(s: String) -> Self {
         match s.as_str() {
-            SUSPENDED => ResourceStatus::Suspended,
-            _ => ResourceStatus::Active,
+            ACTIVE => ResourceStatus::Active,
+            _ => ResourceStatus::Suspended,
         }
     }
 }
@@ -187,6 +190,31 @@ pub struct ResolveContextRequest {
     /// account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_status_from_string_fails_safe() {
+        assert_eq!(
+            ResourceStatus::from("active".to_string()),
+            ResourceStatus::Active
+        );
+        assert_eq!(
+            ResourceStatus::from("suspended".to_string()),
+            ResourceStatus::Suspended
+        );
+        assert_eq!(
+            ResourceStatus::from("pending".to_string()),
+            ResourceStatus::Suspended
+        );
+        assert_eq!(
+            ResourceStatus::from(String::new()),
+            ResourceStatus::Suspended
+        );
+    }
 }
 
 /// Business context resolved for a subject + project.

@@ -472,7 +472,6 @@ async fn disable_account_status(permissions: PermissionSet) -> StatusCode {
 
 #[tokio::test]
 async fn disable_account_denies_without_disable_permission() {
-    // account:delete must NOT be enough to disable — the gate is a distinct permission.
     assert_eq!(
         disable_account_status(PermissionSet::from_iter([Permission::AccountDelete])).await,
         StatusCode::FORBIDDEN
