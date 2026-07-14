@@ -349,6 +349,28 @@ impl AuthzStore for AuthzStoreImpl {
             .await
     }
 
+    async fn add_account_member(
+        &self,
+        subject: &str,
+        account_id: &str,
+        new_member: &str,
+    ) -> Result<Account> {
+        self.repo
+            .add_account_member(subject, account_id, new_member)
+            .await
+    }
+
+    async fn remove_account_member(
+        &self,
+        subject: &str,
+        account_id: &str,
+        member: &str,
+    ) -> Result<Account> {
+        self.repo
+            .remove_account_member(subject, account_id, member)
+            .await
+    }
+
     async fn create_project(
         &self,
         subject: &str,

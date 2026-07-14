@@ -103,6 +103,7 @@ endpoint and the equivalent MCP tool require the same permission.
 | `account:update`   | `PATCH /api/v1/accounts/{id}`                   | `update-account`               |
 | `account:delete`   | `DELETE /api/v1/accounts/{id}`                  | `delete-account`               |
 | `account:disable`  | `POST .../accounts/{id}/disable`, `.../enable`  | `disable-account`, `enable-account` |
+| `account:member`   | `POST .../accounts/{id}/members`, `DELETE .../members/{member}` | `add-account-member`, `remove-account-member` |
 | `project:create`   | `POST /api/v1/accounts/{id}/projects`           | `create-project`               |
 | `project:read`     | `GET .../projects`, `GET /api/v1/projects/{id}` | `list-projects`, `get-project` |
 | `project:update`   | `PATCH /api/v1/projects/{id}`                   | `update-project`               |
@@ -177,3 +178,28 @@ the status code:
 So "the JWT passes but OPA refuses" is precisely the authorization-phase deny: the introspection
 metadata reports `active: false`, the `active == true` authorization rule fails, and Authorino
 returns 403. See `docs/authorino-usage.md` for the AuthConfig.
+
+## Account membership (who a tenant's resources belong to)
+
+RBAC decides *what actions* a caller may attempt; **membership** decides *whose* accounts and
+projects they act on. A caller can only see or mutate an account (and every project and API key
+beneath it) if their JWT `sub` is in that account's `account_memberships`. This is enforced in SQL
+on every account/project/key query — RBAC is checked first (else `403`), then membership (else
+`404`).
+
+Membership is **account-level**: a member of an account can act on all of its projects. There is no
+project-scoped membership.
+
+An admin holding `account:member` manages the roster directly (no invite/accept handshake):
+
+- `POST /api/v1/accounts/{id}/members` with `{ "subject": "<keycloak-sub>" }` — add a member.
+  Idempotent; returns the account with the updated `owners_admins` list.
+- `DELETE /api/v1/accounts/{id}/members/{member}` — remove a member. Refuses to remove the **last**
+  remaining member with `409 Conflict` (that would orphan and delete the account — use
+  `DELETE /accounts/{id}` for that intent).
+
+The acting caller must themselves be a member of the account (a non-member gets a uniform `404`),
+so `account:member` lets an admin manage rosters of accounts they belong to, not arbitrary tenants.
+The creating subject is always seeded as the first member. (`PATCH /accounts/{id}` with
+`owners_admins` still exists but **replaces** the whole list; prefer the incremental member
+endpoints.)

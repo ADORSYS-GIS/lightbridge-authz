@@ -8,7 +8,9 @@ use axum::{
 };
 use lightbridge_authz_bearer::TokenInfo;
 use lightbridge_authz_core::error::Error;
-use lightbridge_authz_core::{Account, CreateAccount, ResourceStatus, UpdateAccount};
+use lightbridge_authz_core::{
+    Account, AddAccountMember, CreateAccount, ResourceStatus, UpdateAccount,
+};
 use tracing::instrument;
 
 #[instrument(skip(state))]
@@ -171,6 +173,59 @@ pub async fn enable_account(
     let account = state
         .store
         .set_account_status(&subject, &account_id, ResourceStatus::Active)
+        .await?;
+    Ok((StatusCode::OK, Json(account)))
+}
+
+#[instrument(skip(state))]
+#[utoipa::path(
+    post,
+    path = "/api/v1/accounts/{account_id}/members",
+    request_body = AddAccountMember,
+    params(
+        ("account_id" = String, Path, description = "Account ID")
+    ),
+    responses(
+        (status = 200, body = Account)
+    ),
+    tag = "accounts"
+)]
+pub async fn add_account_member(
+    State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
+    Path(account_id): Path<String>,
+    Json(input): Json<AddAccountMember>,
+) -> Result<impl IntoResponse, Error> {
+    let subject = token_info.sub.clone();
+    let account = state
+        .store
+        .add_account_member(&subject, &account_id, &input.subject)
+        .await?;
+    Ok((StatusCode::OK, Json(account)))
+}
+
+#[instrument(skip(state))]
+#[utoipa::path(
+    delete,
+    path = "/api/v1/accounts/{account_id}/members/{member}",
+    params(
+        ("account_id" = String, Path, description = "Account ID"),
+        ("member" = String, Path, description = "Member subject to remove")
+    ),
+    responses(
+        (status = 200, body = Account)
+    ),
+    tag = "accounts"
+)]
+pub async fn remove_account_member(
+    State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
+    Path((account_id, member)): Path<(String, String)>,
+) -> Result<impl IntoResponse, Error> {
+    let subject = token_info.sub.clone();
+    let account = state
+        .store
+        .remove_account_member(&subject, &account_id, &member)
         .await?;
     Ok((StatusCode::OK, Json(account)))
 }

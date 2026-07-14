@@ -92,6 +92,8 @@ fn required_permission(method: &Method, matched_path: &str) -> Option<Permission
         ("DELETE", "/api/v1/accounts/{account_id}") => Permission::AccountDelete,
         ("POST", "/api/v1/accounts/{account_id}/disable") => Permission::AccountDisable,
         ("POST", "/api/v1/accounts/{account_id}/enable") => Permission::AccountDisable,
+        ("POST", "/api/v1/accounts/{account_id}/members") => Permission::AccountMember,
+        ("DELETE", "/api/v1/accounts/{account_id}/members/{member}") => Permission::AccountMember,
         ("POST", "/api/v1/accounts/{account_id}/projects") => Permission::ProjectCreate,
         ("GET", "/api/v1/accounts/{account_id}/projects") => Permission::ProjectRead,
         ("GET", "/api/v1/projects/{project_id}") => Permission::ProjectRead,

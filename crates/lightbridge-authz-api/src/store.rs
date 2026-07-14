@@ -29,6 +29,20 @@ pub trait AuthzStore: Send + Sync + 'static + std::fmt::Debug {
         account_id: &str,
         status: ResourceStatus,
     ) -> Result<Account, Error>;
+    /// Add a member (subject) to an account. The acting `subject` must already be a member.
+    async fn add_account_member(
+        &self,
+        subject: &str,
+        account_id: &str,
+        new_member: &str,
+    ) -> Result<Account, Error>;
+    /// Remove a member from an account. Refuses to remove the last member.
+    async fn remove_account_member(
+        &self,
+        subject: &str,
+        account_id: &str,
+        member: &str,
+    ) -> Result<Account, Error>;
 
     async fn create_project(
         &self,

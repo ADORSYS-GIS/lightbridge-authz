@@ -36,6 +36,8 @@ pub enum Permission {
     AccountDelete,
     #[serde(rename = "account:disable")]
     AccountDisable,
+    #[serde(rename = "account:member")]
+    AccountMember,
 
     #[serde(rename = "project:create")]
     ProjectCreate,
@@ -67,12 +69,13 @@ pub enum Permission {
 impl Permission {
     /// Every permission, in declaration order. The single source of truth for wildcard expansion
     /// and documentation.
-    pub const ALL: [Permission; 17] = [
+    pub const ALL: [Permission; 18] = [
         Permission::AccountCreate,
         Permission::AccountRead,
         Permission::AccountUpdate,
         Permission::AccountDelete,
         Permission::AccountDisable,
+        Permission::AccountMember,
         Permission::ProjectCreate,
         Permission::ProjectRead,
         Permission::ProjectUpdate,
@@ -95,6 +98,7 @@ impl Permission {
             Permission::AccountUpdate => "account:update",
             Permission::AccountDelete => "account:delete",
             Permission::AccountDisable => "account:disable",
+            Permission::AccountMember => "account:member",
             Permission::ProjectCreate => "project:create",
             Permission::ProjectRead => "project:read",
             Permission::ProjectUpdate => "project:update",

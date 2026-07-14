@@ -8,8 +8,8 @@ use axum::{
 
 use crate::controllers::{
     accounts::{
-        create_account, delete_account, disable_account, enable_account, get_account,
-        list_accounts, update_account,
+        add_account_member, create_account, delete_account, disable_account, enable_account,
+        get_account, list_accounts, remove_account_member, update_account,
     },
     api_keys::{
         create_api_key, delete_api_key, get_api_key, list_api_keys, revoke_api_key, rotate_api_key,
@@ -33,6 +33,11 @@ pub fn api_router() -> Router<Arc<AppState>> {
         )
         .route("/accounts/{account_id}/disable", post(disable_account))
         .route("/accounts/{account_id}/enable", post(enable_account))
+        .route("/accounts/{account_id}/members", post(add_account_member))
+        .route(
+            "/accounts/{account_id}/members/{member}",
+            axum::routing::delete(remove_account_member),
+        )
         .route(
             "/accounts/{account_id}/projects",
             post(create_project).get(list_projects),
