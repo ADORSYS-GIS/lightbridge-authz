@@ -1997,6 +1997,7 @@ name = "lightbridge-authz"
 version = "0.8.1"
 dependencies = [
  "clap",
+ "dotenvy",
  "lightbridge-authz-core",
  "lightbridge-authz-migrate",
  "lightbridge-authz-rest",
@@ -2200,6 +2201,8 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
+ "tower-http",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

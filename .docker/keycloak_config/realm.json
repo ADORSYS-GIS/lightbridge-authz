@@ -26,7 +26,8 @@
           "type": "password",
           "value": "test"
         }
-      ]
+      ],
+      "realmRoles": ["offline_access"]
     }
   ],
   "clients": [
@@ -42,10 +43,12 @@
       "alwaysDisplayInConsole": false,
       "clientAuthenticatorType": "client-secret",
       "redirectUris": [
-        "*"
+        "http://localhost:8081",
+        "http://localhost:8081/*",
+        "http://localhost:8081/auth"
       ],
       "webOrigins": [
-        "*"
+        "+"
       ],
       "notBefore": 0,
       "bearerOnly": false,
@@ -68,6 +71,17 @@
             "id.token.claim": "false",
             "access.token.claim": "true"
           }
+        },
+        {
+          "name": "lightbridge-api-key-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "lightbridge-api-key",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
         }
       ],
       "attributes": {
@@ -76,7 +90,8 @@
         "backchannel.logout.session.required": "true",
         "standard.token.exchange.enabled": "true",
         "oauth2.device.authorization.grant.enabled": "false",
-        "backchannel.logout.revoke.offline.tokens": "false"
+        "backchannel.logout.revoke.offline.tokens": "false",
+        "use.offline.access.token.by.default": "true"
       },
       "authenticationFlowBindingOverrides": {},
       "fullScopeAllowed": true,

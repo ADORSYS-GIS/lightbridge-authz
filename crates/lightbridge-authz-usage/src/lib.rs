@@ -3,10 +3,11 @@ use lightbridge_authz_core::{
     Result, async_trait,
     config::Database,
     db::{DbPool, DbPoolTrait, is_database_ready},
-    server::serve_tls,
+    server::{dev_cors_enabled, serve_tls},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
@@ -49,13 +50,17 @@ impl UsageRepoTrait for StoreRepo {
     }
 }
 
-pub async fn start_usage_server(usage: &UsageServer, database: &Database) -> Result<()> {
-    let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(database).await?);
-    let readiness_pool = pool.clone();
-    let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool));
-    let state = Arc::new(UsageState { repo });
-
-    let app = Router::new()
+/// Assembles the usage server router (public probes, docs, OTEL ingest + usage query).
+/// Separated from `start_usage_server` so the composition can be tested without binding
+/// a socket. `dev_cors` (driven by `AUTHZ_DEV_CORS` in `start_usage_server`) layers a
+/// wide-open CORS policy over the whole router — preflights included — so browser SPAs
+/// on other origins can call the API in local dev; never enable it in production.
+pub fn build_usage_router(
+    state: Arc<UsageState>,
+    readiness_pool: Arc<dyn DbPoolTrait>,
+    dev_cors: bool,
+) -> Router {
+    let router = Router::new()
         .route("/", get(root_handler))
         .route("/healthz", get(health_handler))
         .route("/healthz/startup", get(startup_handler))
@@ -73,6 +78,25 @@ pub async fn start_usage_server(usage: &UsageServer, database: &Database) -> Res
         .merge(routers::usage_router())
         .with_state(state);
 
+    if dev_cors {
+        router.layer(CorsLayer::permissive())
+    } else {
+        router
+    }
+}
+
+pub async fn start_usage_server(usage: &UsageServer, database: &Database) -> Result<()> {
+    let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(database).await?);
+    let readiness_pool = pool.clone();
+    let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool));
+    let state = Arc::new(UsageState { repo });
+
+    let dev_cors = dev_cors_enabled();
+    let app = build_usage_router(state, readiness_pool, dev_cors);
+
+    if dev_cors {
+        warn!("AUTHZ_DEV_CORS is set — usage server allows any CORS origin (dev only)");
+    }
     info!("starting usage server on {}:{}", &usage.address, usage.port);
     serve_tls("USAGE", &usage.address, usage.port, &usage.tls, app).await
 }

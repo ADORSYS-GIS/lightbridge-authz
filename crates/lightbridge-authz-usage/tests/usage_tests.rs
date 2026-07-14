@@ -1,9 +1,14 @@
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
 use axum::{Json, body::Bytes, http::HeaderMap};
 use chrono::{Duration, Utc};
+use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_core::{Error, Result, async_trait};
 use lightbridge_authz_usage_rest::UsageRepoTrait;
 use lightbridge_authz_usage_rest::UsageState;
+use lightbridge_authz_usage_rest::build_usage_router;
+use sqlx::postgres::PgPoolOptions;
+use tower::ServiceExt;
 use lightbridge_authz_usage_rest::handlers::ingest::ingest_logs;
 use lightbridge_authz_usage_rest::handlers::query::query_usage;
 use lightbridge_authz_usage_rest::models::{
@@ -47,6 +52,87 @@ fn base_request() -> UsageQueryRequest {
         group_by: vec![UsageGroupBy::Model],
         limit: 100,
     }
+}
+
+fn lazy_pool() -> Arc<dyn DbPoolTrait> {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz_usage")
+        .expect("lazy pool should be constructible");
+    Arc::new(DbPool::from_pool(pool))
+}
+
+fn usage_app(dev_cors: bool) -> axum::Router {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+        }),
+    });
+    build_usage_router(state, lazy_pool(), dev_cors)
+}
+
+#[tokio::test]
+async fn build_usage_router_serves_probes() {
+    let response = usage_app(false)
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn build_usage_router_with_dev_cors_answers_preflight_with_any_origin() {
+    let preflight = usage_app(true)
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/usage/v1/usage/query")
+                .header(header::ORIGIN, "https://spa.example.com")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(preflight.status(), StatusCode::OK);
+    assert_eq!(
+        preflight
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .expect("dev-cors preflight must carry a CORS allow-origin header"),
+        "*"
+    );
+}
+
+#[tokio::test]
+async fn build_usage_router_without_dev_cors_omits_cors_headers() {
+    let response = usage_app(false)
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .header(header::ORIGIN, "https://spa.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none(),
+        "CORS headers must stay off unless AUTHZ_DEV_CORS enables them"
+    );
 }
 
 #[tokio::test]

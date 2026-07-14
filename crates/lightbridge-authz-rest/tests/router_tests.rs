@@ -316,8 +316,7 @@ fn oauth2_without_signing() -> lightbridge_authz_core::config::Oauth2 {
     }
 }
 
-#[tokio::test]
-async fn build_api_router_serves_probes_and_protects_the_api() {
+fn api_router(dev_cors: bool) -> axum::Router {
     let store: Arc<dyn AuthzStore> = Arc::new(AuthzStoreImpl::with_pool(lazy_pool()));
     let app_state = Arc::new(AppState {
         store,
@@ -326,13 +325,19 @@ async fn build_api_router_serves_probes_and_protects_the_api() {
         }),
     });
     let signing_repo = Arc::new(lightbridge_authz_api_key::repo::StoreRepo::new(lazy_pool()));
-    let router = lightbridge_authz_rest::build_api_router(
+    lightbridge_authz_rest::build_api_router(
         &oauth2_without_signing(),
         app_state,
         lazy_pool(),
         signing_repo,
         None,
-    );
+        dev_cors,
+    )
+}
+
+#[tokio::test]
+async fn build_api_router_serves_probes_and_protects_the_api() {
+    let router = api_router(false);
 
     let health = router
         .clone()
@@ -357,6 +362,78 @@ async fn build_api_router_serves_probes_and_protects_the_api() {
         .await
         .unwrap();
     assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn build_api_router_with_dev_cors_answers_preflight_with_any_origin() {
+    let preflight = api_router(true)
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/api/v1/accounts")
+                .header(header::ORIGIN, "https://spa.example.com")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(preflight.status(), StatusCode::OK);
+    assert_eq!(
+        preflight
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .expect("dev-cors preflight must carry a CORS allow-origin header"),
+        "*"
+    );
+}
+
+#[tokio::test]
+async fn build_api_router_with_dev_cors_adds_cors_headers_to_responses() {
+    let response = api_router(true)
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .header(header::ORIGIN, "https://spa.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .expect("dev-cors responses must carry a CORS allow-origin header"),
+        "*"
+    );
+}
+
+#[tokio::test]
+async fn build_api_router_without_dev_cors_omits_cors_headers() {
+    let response = api_router(false)
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .header(header::ORIGIN, "https://spa.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none(),
+        "CORS headers must stay off unless AUTHZ_DEV_CORS enables them"
+    );
 }
 
 #[tokio::test]

@@ -5,7 +5,7 @@ use lightbridge_authz_core::{
     config::{ApiServer, BasicAuth, Oauth2, OpaServer},
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
-    server::serve_tls,
+    server::{dev_cors_enabled, serve_tls},
 };
 pub mod handlers;
 pub mod middleware;
@@ -22,6 +22,7 @@ use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::BearerTokenService;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tower_http::cors::CorsLayer;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -103,13 +104,17 @@ impl OpaRepoTrait for StoreRepo {
 
 /// Assembles the API server router (public probes, OIDC discovery/JWKS when signing is
 /// enabled, and the bearer-protected CRUD API). Separated from `start_api_server` so the
-/// composition can be tested without binding a TLS socket.
+/// composition can be tested without binding a TLS socket. `dev_cors` (driven by
+/// `AUTHZ_DEV_CORS` in `start_api_server`) layers a wide-open CORS policy over the whole
+/// router — preflights included — so browser SPAs on other origins can call the API in
+/// local dev; never enable it in production.
 pub fn build_api_router(
     oauth2: &Oauth2,
     app_state: Arc<lightbridge_authz_api::AppState>,
     readiness_pool: Arc<dyn DbPoolTrait>,
     signing_repo: Arc<StoreRepo>,
     token_exchange: Option<token_exchange::TokenExchangeState>,
+    dev_cors: bool,
 ) -> Router {
     let mut public = Router::new()
         .route("/", get(root_handler))
@@ -148,7 +153,12 @@ pub fn build_api_router(
             bearer_auth,
         ));
 
-    public.merge(protected).with_state(app_state)
+    let router = public.merge(protected).with_state(app_state);
+    if dev_cors {
+        router.layer(CorsLayer::permissive())
+    } else {
+        router
+    }
 }
 
 /// Builds the native token-exchange state, enabled only when BOTH `signing` and `token_exchange`
@@ -205,14 +215,19 @@ pub async fn start_api_server(
         bearer: bearer_service,
     });
 
+    let dev_cors = dev_cors_enabled();
     let app = build_api_router(
         oauth2,
         app_state,
         readiness_pool,
         signing_repo,
         token_exchange_state,
+        dev_cors,
     );
 
+    if dev_cors {
+        tracing::warn!("AUTHZ_DEV_CORS is set — API server allows any CORS origin (dev only)");
+    }
     let signing_enabled = oauth2.signing.as_ref().is_some_and(|s| s.enabled);
     let issuance_enabled = oauth2
         .issuance

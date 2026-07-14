@@ -18,6 +18,10 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load .env file from the working directory if present. Variables already
+    // set in the environment take precedence (dotenvy never overwrites them).
+    let _ = dotenvy::dotenv();
+
     let cli = Cli::parse();
 
     let config_path = match &cli.command {
