@@ -83,6 +83,15 @@ configMaps:
           url: "${DATABASE_URL}"
           pool_size: 10
         oauth2:
+          # REQUIRED credential-issuance mode — no default. `self` mints self-signed JWT API keys
+          # (uses `signing`); `external` exchanges at the upstream IdP (uses `issuance`). MUST match
+          # the api service so both surfaces mint the same credential format.
+          type: self
+          signing:
+            issuer: "https://authz-api:3000"
+            audience: "lightbridge-api-key"
+            ttl_seconds: 7776000
+            max_key_age_days: 30
           jwks_url: http://keycloak:9100/realms/dev/protocol/openid-connect/certs
           # Expected audience claim(s) in JWT tokens. Set to restrict token acceptance.
           # Tokens must contain at least one matching audience value.

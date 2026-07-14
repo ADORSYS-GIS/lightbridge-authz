@@ -40,6 +40,7 @@ This document collects the concrete commands that worked when we tested the Helm
     url: "${DATABASE_URL}"
     pool_size: 10
   oauth2:
+    type: self
     jwks_url: http://keycloak:9100/realms/dev/protocol/openid-connect/certs
   otel:
     enabled: true

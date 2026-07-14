@@ -40,6 +40,6 @@
 Usage storage migrations are separate from authz migrations:
 
 - `migrations-usage/`
-- runner crate: `crates/lightbridge-authz-usage-migrate/`
+- migration module: `app/lightbridge-authz-usage/src/migrate.rs`
 
 The primary table is `usage_events` (hypertable when Timescale is available).

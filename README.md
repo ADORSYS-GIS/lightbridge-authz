@@ -149,7 +149,7 @@ Run locally:
 
 ```bash
 cargo run -p lightbridge-authz-usage -- serve --config-path config/usage.yaml
-cargo run -p lightbridge-mcp -- serve --config-path config/default.yaml
+cargo run -p lightbridge-authz --bin lightbridge-mcp -- serve --config-path config/default.yaml
 ```
 
 ## Testing with Keycloak (OAuth2)

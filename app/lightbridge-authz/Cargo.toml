@@ -12,10 +12,16 @@ dotenvy.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-lightbridge-authz-core.workspace = true
+axum.workspace = true
+chrono.workspace = true
+rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+lightbridge-authz-api.workspace = true
+lightbridge-authz-api-key.workspace = true
+lightbridge-authz-bearer.workspace = true
+lightbridge-authz-core = { workspace = true, features = ["axum"] }
 lightbridge-authz-rest.workspace = true
-lightbridge-authz-migrate.workspace = true
 mimalloc.workspace = true
-
-[target.'cfg(target_arch = "x86_64")']
-rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+avx2,+fma"]
+sqlx.workspace = true

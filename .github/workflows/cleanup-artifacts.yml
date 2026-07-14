@@ -1,0 +1,112 @@
+name: Cleanup old artifacts
+
+# Prunes stale build artifacts so the org's GitHub Actions storage quota and the
+# sccache S3 bucket don't fill up (a full artifact quota blocks the `binaries`
+# job's upload → container-build/signing never run). Runs daily, and can be
+# triggered manually with a custom age / dry-run.
+on:
+  schedule:
+    # Every day at 03:00 UTC.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      max_age_days:
+        description: 'Delete artifacts/objects older than this many days'
+        required: false
+        default: '7'
+      target:
+        description: 'What to clean'
+        type: choice
+        options: [both, github, s3]
+        default: both
+      dry_run:
+        description: 'List what would be deleted, but delete nothing'
+        type: boolean
+        default: false
+
+permissions:
+  actions: write   # delete Actions artifacts
+  contents: read
+
+concurrency:
+  group: cleanup-artifacts
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    # Self-hosted runner: the sccache S3 credentials + endpoint/bucket are only
+    # present in this runner's environment (arc-runner-secrets).
+    runs-on: adorsys-gis-runner
+    steps:
+      - name: Delete old GitHub Actions artifacts
+        if: ${{ github.event_name == 'schedule' || inputs.target == 'both' || inputs.target == 'github' }}
+        uses: actions/github-script@v9
+        env:
+          MAX_AGE_DAYS: ${{ inputs.max_age_days || '7' }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+        with:
+          script: |
+            const days = Number(process.env.MAX_AGE_DAYS || '7');
+            const dry = process.env.DRY_RUN === 'true';
+            const cutoff = Date.now() - days * 86400000;
+            const arts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 },
+            );
+            let del = 0, kept = 0, freed = 0;
+            for (const a of arts) {
+              if (Date.parse(a.created_at) >= cutoff) { kept++; continue; }
+              freed += a.size_in_bytes || 0; del++;
+              core.info(`${dry ? '[dry] ' : ''}delete #${a.id} ${a.name} `
+                + `${((a.size_in_bytes || 0) / 1048576).toFixed(1)}MB ${a.created_at}`);
+              if (dry) continue;
+              try {
+                await github.rest.actions.deleteArtifact(
+                  { owner: context.repo.owner, repo: context.repo.repo, artifact_id: a.id });
+              } catch (e) { core.warning(`could not delete #${a.id}: ${e.message}`); }
+            }
+            core.notice(`GitHub artifacts >${days}d: ${dry ? 'would delete' : 'deleted'} `
+              + `${del}, kept ${kept}, freed ~${(freed / 1073741824).toFixed(2)} GB`);
+
+      - name: Delete old sccache S3 objects
+        if: ${{ github.event_name == 'schedule' || inputs.target == 'both' || inputs.target == 's3' }}
+        shell: bash
+        env:
+          MAX_AGE_DAYS: ${{ inputs.max_age_days || '7' }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+
+          : "${SCCACHE_ENDPOINT:?SCCACHE_ENDPOINT is not set on the runner}"
+          : "${SCCACHE_BUCKET:?SCCACHE_BUCKET is not set on the runner}"
+          : "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID is not set on the runner}"
+          : "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is not set on the runner}"
+
+          if ! command -v mc >/dev/null 2>&1; then
+            curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /tmp/mc
+            chmod +x /tmp/mc
+            export PATH="/tmp:${PATH}"
+          fi
+
+          case "${SCCACHE_ENDPOINT}" in
+            http://*|https://*) url="${SCCACHE_ENDPOINT}" ;;
+            *) url="https://${SCCACHE_ENDPOINT}" ;;
+          esac
+
+          mc alias set cleanup "${url}" "${AWS_ACCESS_KEY_ID}" "${AWS_SECRET_ACCESS_KEY}" >/dev/null
+
+          older="${MAX_AGE_DAYS}d"
+          target="cleanup/${SCCACHE_BUCKET}"
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            # List to a file first, then head the FILE — piping `mc find` straight
+            # into `head` makes mc die on SIGPIPE (141) once head closes the pipe,
+            # which `set -o pipefail` turns into a step failure.
+            mc find "${target}" --older-than "${older}" 2>/dev/null > /tmp/old-objects.txt || true
+            count="$(wc -l < /tmp/old-objects.txt | tr -d ' ')"
+            echo "dry-run: ${count} object(s) in '${SCCACHE_BUCKET}' (${url}) older than ${older}; first 50:"
+            head -50 /tmp/old-objects.txt | sed 's/^/  [dry] /'
+          else
+            removed="$(mc rm --recursive --force --older-than "${older}" "${target}/" 2>/dev/null | wc -l | tr -d ' ')"
+            echo "sccache: removed ${removed} object(s) in '${SCCACHE_BUCKET}' (${url}) older than ${older}"
+          fi

@@ -47,16 +47,21 @@ impl AuthzStoreImpl {
     }
 
     pub fn with_pool_and_oauth2(pool: Arc<dyn DbPoolTrait>, oauth2: &Oauth2) -> Result<Self> {
+        use lightbridge_authz_core::config::Oauth2Type;
         let repo = Arc::new(StoreRepo::new(pool));
-        let jwt_signer = match oauth2.signing.as_ref() {
-            Some(signing) => {
-                crate::signing::ApiKeyJwtSigner::from_config(signing, repo.clone())?.map(Arc::new)
+        let (jwt_signer, token_issuer) = match oauth2.oauth2_type {
+            Oauth2Type::SelfSigned => {
+                let signing = oauth2.signing.as_ref().ok_or_else(|| {
+                    Error::Server("oauth2.type is 'self' but oauth2.signing is missing".to_string())
+                })?;
+                let signer = crate::signing::ApiKeyJwtSigner::from_config(signing, repo.clone())?;
+                (Some(Arc::new(signer)), None)
             }
-            None => None,
+            Oauth2Type::External => (None, Some(OAuth2TokenIssuer::from_config(oauth2)?)),
         };
         Ok(Self {
             repo,
-            token_issuer: OAuth2TokenIssuer::from_config(oauth2),
+            token_issuer,
             jwt_signer,
         })
     }
@@ -157,16 +162,24 @@ struct OAuth2TokenResponse {
 }
 
 impl OAuth2TokenIssuer {
-    fn from_config(oauth2: &Oauth2) -> Option<Self> {
-        let issuance = oauth2.issuance.clone()?;
-        if !issuance.enabled {
-            return None;
-        }
+    /// Builds the upstream token-exchange proxy from config (only reached under
+    /// `oauth2.type: external`). Errors if the `issuance` block or the upstream token URL is
+    /// missing, so a misconfigured external mode fails fast at startup.
+    fn from_config(oauth2: &Oauth2) -> Result<Self> {
+        let issuance = oauth2.issuance.clone().ok_or_else(|| {
+            Error::Server("oauth2.type is 'external' but oauth2.issuance is missing".to_string())
+        })?;
         let oauth2_url = oauth2
             .oauth2_url
             .clone()
-            .or_else(|| oauth2.token_endpoint.clone())?;
-        Some(Self {
+            .or_else(|| oauth2.token_endpoint.clone())
+            .ok_or_else(|| {
+                Error::Server(
+                    "oauth2.type is 'external' but neither oauth2.oauth2_url nor oauth2.token_endpoint is set"
+                        .to_string(),
+                )
+            })?;
+        Ok(Self {
             client: Client::new(),
             oauth2_url,
             issuance,
@@ -549,11 +562,55 @@ impl AuthzStore for AuthzStoreImpl {
 
 #[cfg(test)]
 mod tests {
-    use super::{OAuth2TokenIssuer, resolve_issued_expires_at, resolve_rotated_expires_at};
+    use super::{
+        AuthzStoreImpl, OAuth2TokenIssuer, resolve_issued_expires_at, resolve_rotated_expires_at,
+    };
     use chrono::{Duration, Utc};
     use httpmock::{Method::POST, MockServer};
-    use lightbridge_authz_core::config::{Oauth2, Oauth2Issuance};
+    use lightbridge_authz_core::config::{Oauth2, Oauth2Issuance, Oauth2Type};
+    use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
     use serde_json::json;
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+
+    fn base_oauth2(oauth2_type: Oauth2Type) -> Oauth2 {
+        Oauth2 {
+            oauth2_type,
+            jwks_url: "http://x".to_string(),
+            oauth2_url: None,
+            issuer_url: None,
+            authorization_endpoint: None,
+            token_endpoint: None,
+            registration_endpoint: None,
+            audience: None,
+            signing: None,
+            token_exchange: None,
+            issuance: None,
+        }
+    }
+
+    fn lazy_pool() -> Arc<dyn DbPoolTrait> {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/x")
+            .unwrap();
+        Arc::new(DbPool::from_pool(pool))
+    }
+
+    #[tokio::test]
+    async fn self_type_without_signing_block_errors() {
+        let err =
+            AuthzStoreImpl::with_pool_and_oauth2(lazy_pool(), &base_oauth2(Oauth2Type::SelfSigned))
+                .unwrap_err();
+        assert!(format!("{err}").contains("oauth2.signing is missing"));
+    }
+
+    #[tokio::test]
+    async fn external_type_without_issuance_block_errors() {
+        let err =
+            AuthzStoreImpl::with_pool_and_oauth2(lazy_pool(), &base_oauth2(Oauth2Type::External))
+                .unwrap_err();
+        assert!(format!("{err}").contains("oauth2.issuance is missing"));
+    }
 
     #[test]
     fn rotate_defaults_to_existing_expiry_when_missing() {
@@ -620,6 +677,7 @@ mod tests {
         });
         let oauth2_url = server.url("/token");
         let issuer = OAuth2TokenIssuer::from_config(&Oauth2 {
+            oauth2_type: lightbridge_authz_core::config::Oauth2Type::External,
             jwks_url: server.url("/jwks"),
             oauth2_url: Some(oauth2_url.clone()),
             issuer_url: None,
@@ -630,7 +688,6 @@ mod tests {
             signing: None,
             token_exchange: None,
             issuance: Some(Oauth2Issuance {
-                enabled: true,
                 grant_type: Some("urn:ietf:params:oauth:grant-type:token-exchange".to_string()),
                 client_id: "test-client".to_string(),
                 client_secret: Some("test-client-secret".to_string()),
@@ -659,6 +716,7 @@ mod tests {
 
     fn test_issuer(oauth2_url: String, client_id: &str) -> OAuth2TokenIssuer {
         OAuth2TokenIssuer::from_config(&Oauth2 {
+            oauth2_type: lightbridge_authz_core::config::Oauth2Type::External,
             jwks_url: "http://jwks".to_string(),
             oauth2_url: Some(oauth2_url),
             issuer_url: None,
@@ -669,7 +727,6 @@ mod tests {
             signing: None,
             token_exchange: None,
             issuance: Some(Oauth2Issuance {
-                enabled: true,
                 grant_type: None,
                 client_id: client_id.to_string(),
                 client_secret: None,
@@ -683,8 +740,9 @@ mod tests {
     }
 
     #[test]
-    fn issuer_disabled_config_returns_none() {
+    fn issuer_config_without_issuance_block_errors() {
         let cfg = Oauth2 {
+            oauth2_type: lightbridge_authz_core::config::Oauth2Type::External,
             jwks_url: "http://jwks".to_string(),
             oauth2_url: Some("http://token".to_string()),
             issuer_url: None,
@@ -694,18 +752,10 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
-            issuance: Some(Oauth2Issuance {
-                enabled: false,
-                grant_type: None,
-                client_id: "c".to_string(),
-                client_secret: None,
-                subject_token_type: None,
-                requested_token_type: None,
-                audience: None,
-                scope: None,
-            }),
+            issuance: None,
         };
-        assert!(OAuth2TokenIssuer::from_config(&cfg).is_none());
+        let err = OAuth2TokenIssuer::from_config(&cfg).unwrap_err();
+        assert!(format!("{err}").contains("oauth2.issuance is missing"));
     }
 
     #[tokio::test]

@@ -2,31 +2,22 @@
 members = [
     "crates/lightbridge-authz-core",
     "crates/lightbridge-authz-rest",
-    "crates/lightbridge-authz-mcp",
     "app/lightbridge-authz",
-    "app/lightbridge-mcp",
-    "app/lightbridge-authz-healthcheck",
     "app/lightbridge-authz-usage",
     "crates/lightbridge-authz-api",
     "crates/lightbridge-authz-api-key",
     "crates/lightbridge-authz-bearer",
-    "crates/lightbridge-authz-migrate",
     "crates/lightbridge-authz-usage",
-    "crates/lightbridge-authz-usage-migrate",
-    "crates/lightbridge-authz-test-utils",
 ]
 resolver = "3"
 
 [workspace.dependencies]
 lightbridge-authz-core = { path = "./crates/lightbridge-authz-core" }
 lightbridge-authz-rest = { path = "./crates/lightbridge-authz-rest" }
-lightbridge-authz-mcp = { path = "./crates/lightbridge-authz-mcp" }
 lightbridge-authz-api = { path = "./crates/lightbridge-authz-api" }
 lightbridge-authz-api-key = { path = "./crates/lightbridge-authz-api-key" }
 lightbridge-authz-bearer = { path = "./crates/lightbridge-authz-bearer" }
-lightbridge-authz-migrate = { path = "./crates/lightbridge-authz-migrate" }
 lightbridge-authz-usage-rest = { path = "./crates/lightbridge-authz-usage" }
-lightbridge-authz-usage-migrate = { path = "./crates/lightbridge-authz-usage-migrate" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
@@ -58,7 +49,7 @@ getrandom = "0.4"
 goose = "0.18"
 httpmock = "0.8"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 rsa = { version = "0.9", features = ["pem", "std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.13", features = ["json", "form"] }

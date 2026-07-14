@@ -1,4 +1,5 @@
 name: Workspace Tests
+description: Start a Postgres backend (rootless podman) and run the workspace test suite.
 inputs:
   database-url:
     description: Postgres connection string
@@ -7,7 +8,37 @@ runs:
   using: composite
   steps:
     - uses: ./.github/actions/rust-setup
-    - shell: bash
+
+    - name: Start PostgreSQL (rootless podman)
+      shell: bash
+      run: |
+        set -euo pipefail
+        # The self-hosted runner is rootless (podman/buildah, no Docker daemon),
+        # so GitHub `services:` containers are unavailable; run Postgres directly.
+        podman run -d --name lightbridge-pg \
+          -e POSTGRES_PASSWORD=postgres \
+          -e POSTGRES_DB=lightbridge_authz \
+          -p 5432:5432 \
+          docker.io/library/postgres:17
+        echo "Waiting for Postgres to accept connections..."
+        for i in $(seq 1 60); do
+          if podman exec lightbridge-pg pg_isready -U postgres -d lightbridge_authz >/dev/null 2>&1; then
+            echo "Postgres is ready."
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "Postgres did not become ready in time; recent logs:"
+        podman logs --tail 50 lightbridge-pg || true
+        exit 1
+
+    - name: Run tests
+      shell: bash
       run: cargo test --workspace
       env:
         DATABASE_URL: ${{ inputs.database-url }}
+
+    - name: Stop PostgreSQL
+      if: always()
+      shell: bash
+      run: podman rm -f lightbridge-pg || true

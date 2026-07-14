@@ -1,3 +1,4 @@
+mod migrate;
 mod utils;
 
 use clap::Parser;
@@ -109,7 +110,7 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Migrate { config_path }) => {
             let config = load_from_path(&config_path)?;
-            lightbridge_authz_migrate::migrate(&config.database.url).await?;
+            migrate::migrate(&config.database.url).await?;
             Ok(())
         }
         Some(Commands::Config { config_path }) => {

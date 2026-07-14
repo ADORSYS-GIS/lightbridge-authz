@@ -8,9 +8,8 @@ use std::sync::Arc;
 
 const ISSUER: &str = "https://authz.example.test";
 
-fn signing_cfg(enabled: bool, ttl: i64) -> JwtSigning {
+fn signing_cfg(ttl: i64) -> JwtSigning {
     JwtSigning {
-        enabled,
         issuer: ISSUER.to_string(),
         audience: Some("lightbridge-api-key".to_string()),
         ttl_seconds: ttl,
@@ -64,25 +63,21 @@ fn keygen_produces_matched_keypair_and_jwk() {
 }
 
 #[tokio::test]
-async fn from_config_disabled_returns_none() {
-    assert!(
-        ApiKeyJwtSigner::from_config(&signing_cfg(false, 3600), lazy_repo())
-            .unwrap()
-            .is_none()
-    );
+async fn from_config_builds_signer_for_valid_config() {
+    assert!(ApiKeyJwtSigner::from_config(&signing_cfg(3600), lazy_repo()).is_ok());
 }
 
 #[tokio::test]
 async fn from_config_rejects_empty_issuer() {
-    let mut cfg = signing_cfg(true, 3600);
+    let mut cfg = signing_cfg(3600);
     cfg.issuer = "   ".to_string();
     let err = ApiKeyJwtSigner::from_config(&cfg, lazy_repo()).unwrap_err();
-    assert!(format!("{err}").contains("issuer is empty"));
+    assert!(format!("{err}").contains("issuer is required"));
 }
 
 #[tokio::test]
 async fn from_config_rejects_non_positive_ttl() {
-    let err = ApiKeyJwtSigner::from_config(&signing_cfg(true, 0), lazy_repo()).unwrap_err();
+    let err = ApiKeyJwtSigner::from_config(&signing_cfg(0), lazy_repo()).unwrap_err();
     assert!(format!("{err}").contains("ttl_seconds must be positive"));
 }
 
@@ -199,7 +194,7 @@ mod db {
         let repo = repo(pool);
         assert!(repo.get_active_signing_key().await.unwrap().is_none());
 
-        bootstrap_signing_key(&repo, &signing_cfg(true, 3600))
+        bootstrap_signing_key(&repo, &signing_cfg(3600))
             .await
             .unwrap();
         let first = repo
@@ -209,7 +204,7 @@ mod db {
             .expect("active");
 
         // Second boot must not create a second active key.
-        bootstrap_signing_key(&repo, &signing_cfg(true, 3600))
+        bootstrap_signing_key(&repo, &signing_cfg(3600))
             .await
             .unwrap();
         let second = repo
@@ -224,7 +219,7 @@ mod db {
     #[sqlx::test(migrations = "../../migrations")]
     async fn rotation_stales_old_key_and_publishes_both(pool: PgPool) {
         let repo = repo(pool);
-        bootstrap_signing_key(&repo, &signing_cfg(true, 3600))
+        bootstrap_signing_key(&repo, &signing_cfg(3600))
             .await
             .unwrap();
         let old = repo.get_active_signing_key().await.unwrap().unwrap();
@@ -258,14 +253,12 @@ mod db {
     #[sqlx::test(migrations = "../../migrations")]
     async fn signer_signs_verifiable_against_active_jwk(pool: PgPool) {
         let repo = repo(pool);
-        bootstrap_signing_key(&repo, &signing_cfg(true, 3600))
+        bootstrap_signing_key(&repo, &signing_cfg(3600))
             .await
             .unwrap();
         let active = repo.get_active_signing_key().await.unwrap().unwrap();
 
-        let signer = ApiKeyJwtSigner::from_config(&signing_cfg(true, 3600), repo.clone())
-            .unwrap()
-            .unwrap();
+        let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
         let owner = KeyOwner {
             subject: "kc-user-123".to_string(),
             email: Some("dev@example.test".to_string()),
@@ -302,6 +295,7 @@ mod db {
 
     fn signing_oauth2() -> Oauth2 {
         Oauth2 {
+            oauth2_type: lightbridge_authz_core::config::Oauth2Type::SelfSigned,
             jwks_url: "http://unused".to_string(),
             oauth2_url: None,
             issuer_url: None,
@@ -310,7 +304,7 @@ mod db {
             registration_endpoint: None,
             issuance: None,
             audience: None,
-            signing: Some(signing_cfg(true, 3600)),
+            signing: Some(signing_cfg(3600)),
             token_exchange: None,
         }
     }
@@ -318,7 +312,7 @@ mod db {
     #[sqlx::test(migrations = "../../migrations")]
     async fn create_api_key_emits_verifiable_signed_jwt(pool: PgPool) {
         let key_repo = repo(pool.clone());
-        bootstrap_signing_key(&key_repo, &signing_cfg(true, 3600))
+        bootstrap_signing_key(&key_repo, &signing_cfg(3600))
             .await
             .unwrap();
         let active = key_repo.get_active_signing_key().await.unwrap().unwrap();
@@ -384,7 +378,7 @@ mod db {
         use tower::ServiceExt;
 
         let repo = repo(pool);
-        bootstrap_signing_key(&repo, &signing_cfg(true, 3600))
+        bootstrap_signing_key(&repo, &signing_cfg(3600))
             .await
             .unwrap();
         // Rotate so both an active and a stale key are published.

@@ -1,13 +1,31 @@
 name: Build Release
+description: Build the static release binaries and publish them to the CI S3 bucket (for the release job and the container image builds).
 runs:
   using: composite
   steps:
     - uses: ./.github/actions/rust-setup
-    - shell: bash
-      run: cargo build --profile prod --all-targets --all-features
-    - shell: bash
-      run: tar -czf release-artifacts.tar.gz -C target/prod .
-    - uses: actions/upload-artifact@47309c993abb98030a35d55ef7ff34b7fa1074b5
+    - uses: ./.github/actions/build-binaries
+
+    - name: Package tarballs
+      shell: bash
+      run: |
+        set -euo pipefail
+        # release-artifacts.tar.gz: dist contents (attached to the GitHub Release).
+        tar -czf release-artifacts.tar.gz -C dist .
+        # dist-binaries.tar.gz: the dist/ dir (extracted verbatim for the image build).
+        tar -czf dist-binaries.tar.gz dist
+
+    # Published to S3 (MinIO) instead of actions/upload-artifact: the org GitHub
+    # Actions artifact-storage quota is exhausted, which fails CreateArtifact and
+    # blocks the whole image build. See .github/actions/s3-artifact.
+    - name: Upload release tarball
+      uses: ./.github/actions/s3-artifact
       with:
-        name: release-artifacts
-        path: release-artifacts.tar.gz
+        mode: upload
+        name: release-artifacts.tar.gz
+
+    - name: Upload dist binaries (for container build)
+      uses: ./.github/actions/s3-artifact
+      with:
+        mode: upload
+        name: dist-binaries.tar.gz

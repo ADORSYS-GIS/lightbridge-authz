@@ -1,0 +1,66 @@
+# Lean image build for CI: copies binaries built bare on the runner (host sccache)
+# into distroless. No in-container compilation -> fast, low-memory, no build secrets.
+# The binaries must be staged in ./dist (see the build-binaries composite action).
+# Local development still uses the source-building `Dockerfile` via compose.
+
+FROM gcr.io/distroless/base-debian12:nonroot AS runtime
+
+LABEL maintainer="stephane-segning <selastlambou@gmail.com>"
+LABEL org.opencontainers.image.description="Backend for LightBridge Authz"
+
+WORKDIR /app
+
+COPY dist/lightbridge-authz /usr/local/bin/lightbridge-authz
+COPY dist/lightbridge-authz-healthcheck /usr/local/bin/lightbridge-authz-healthcheck
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=1s --retries=3 \
+    CMD ["/usr/local/bin/lightbridge-authz-healthcheck", "-r", "3000"]
+
+ENV RUST_LOG=info
+
+USER 65532:65532
+
+ENTRYPOINT ["lightbridge-authz"]
+
+FROM gcr.io/distroless/base-debian12:nonroot AS usage-runtime
+
+LABEL maintainer="stephane-segning <selastlambou@gmail.com>"
+LABEL org.opencontainers.image.description="Backend for LightBridge Authz Usage"
+
+WORKDIR /app
+
+COPY dist/lightbridge-authz-usage /usr/local/bin/lightbridge-authz-usage
+COPY dist/lightbridge-authz-healthcheck /usr/local/bin/lightbridge-authz-healthcheck
+
+EXPOSE 3002
+
+ENV RUST_LOG=info
+
+USER 65532:65532
+
+ENTRYPOINT ["lightbridge-authz-usage"]
+CMD ["serve"]
+
+FROM gcr.io/distroless/base-debian12:nonroot AS mcp-runtime
+
+LABEL maintainer="stephane-segning <selastlambou@gmail.com>"
+LABEL org.opencontainers.image.description="Backend for LightBridge Authz MCP"
+
+WORKDIR /app
+
+COPY dist/lightbridge-mcp /usr/local/bin/lightbridge-mcp
+COPY dist/lightbridge-authz-healthcheck /usr/local/bin/lightbridge-authz-healthcheck
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=1s --retries=3 \
+    CMD ["/usr/local/bin/lightbridge-authz-healthcheck", "-r", "3000"]
+
+ENV RUST_LOG=info
+
+USER 65532:65532
+
+ENTRYPOINT ["lightbridge-mcp"]
+CMD ["serve"]

@@ -73,9 +73,6 @@ impl GeneratedKey {
 /// Ensures an active signing key exists, generating one on first boot and auto-rotating when
 /// the active key is older than `max_key_age_days`. Idempotent and safe across replicas.
 pub async fn bootstrap_signing_key(repo: &StoreRepo, cfg: &JwtSigning) -> Result<()> {
-    if !cfg.enabled {
-        return Ok(());
-    }
     let now = Utc::now();
     let cutoff = now - Duration::days(cfg.max_key_age_days.max(1));
     let candidate = generate_rs256_key()?.into_candidate(now);
@@ -161,29 +158,26 @@ pub fn capped_expiry(
 }
 
 impl ApiKeyJwtSigner {
-    /// Builds a signer from config. Returns `Ok(None)` when signing is disabled, and an error
-    /// for invalid config (fail-fast at startup). Key material lives in the DB, not config.
-    pub fn from_config(cfg: &JwtSigning, repo: Arc<StoreRepo>) -> Result<Option<Self>> {
-        if !cfg.enabled {
-            return Ok(None);
-        }
+    /// Builds a signer from the `signing` config (only reached under `oauth2.type: self`). Errors
+    /// on invalid config (fail-fast at startup). Key material lives in the DB, not config.
+    pub fn from_config(cfg: &JwtSigning, repo: Arc<StoreRepo>) -> Result<Self> {
         if cfg.issuer.trim().is_empty() {
             return Err(Error::Server(
-                "jwt signing is enabled but issuer is empty".to_string(),
+                "oauth2.signing.issuer is required for oauth2.type: self".to_string(),
             ));
         }
         if cfg.ttl_seconds <= 0 {
             return Err(Error::Server(format!(
-                "jwt signing ttl_seconds must be positive, got {}",
+                "oauth2.signing.ttl_seconds must be positive, got {}",
                 cfg.ttl_seconds
             )));
         }
-        Ok(Some(Self {
+        Ok(Self {
             repo,
             issuer: cfg.issuer.clone(),
             audience: cfg.audience.clone(),
             ttl_seconds: cfg.ttl_seconds,
-        }))
+        })
     }
 
     /// Signs an API-key JWT with the current active key for the given key/project/account. `owner`
