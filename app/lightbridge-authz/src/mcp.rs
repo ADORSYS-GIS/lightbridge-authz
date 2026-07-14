@@ -235,6 +235,7 @@ fn required_tool_permission(tool: &str) -> Option<Permission> {
         "update-account" => Permission::AccountUpdate,
         "delete-account" => Permission::AccountDelete,
         "disable-account" | "enable-account" => Permission::AccountDisable,
+        "add-account-member" | "remove-account-member" => Permission::AccountMember,
         "create-project" => Permission::ProjectCreate,
         "list-projects" | "get-project" => Permission::ProjectRead,
         "update-project" => Permission::ProjectUpdate,
@@ -486,6 +487,18 @@ struct UpdateAccountParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AddAccountMemberParams {
+    account_id: String,
+    subject: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RemoveAccountMemberParams {
+    account_id: String,
+    member: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct CreateProjectParams {
     account_id: String,
     name: String,
@@ -722,6 +735,44 @@ impl LightbridgeMcpHandler {
         let account = self
             .store
             .set_account_status(&subject, &params.account_id, ResourceStatus::Active)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(account)
+    }
+
+    #[tool(
+        name = "add-account-member",
+        description = "Add a member to an account (maps to POST /api/v1/accounts/{account_id}/members); grants access to the account and all its projects"
+    )]
+    async fn add_account_member_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<AddAccountMemberParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let account = self
+            .store
+            .add_account_member(&subject, &params.account_id, &params.subject)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(account)
+    }
+
+    #[tool(
+        name = "remove-account-member",
+        description = "Remove a member from an account (maps to DELETE /api/v1/accounts/{account_id}/members/{member}); refuses to remove the last member"
+    )]
+    async fn remove_account_member_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<RemoveAccountMemberParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let account = self
+            .store
+            .remove_account_member(&subject, &params.account_id, &params.member)
             .await
             .map_err(to_tool_error)?;
 
@@ -1367,6 +1418,24 @@ mod tests {
             Err(Error::NotFound)
         }
 
+        async fn add_account_member(
+            &self,
+            _subject: &str,
+            _account_id: &str,
+            _new_member: &str,
+        ) -> std::result::Result<Account, Error> {
+            Err(Error::NotFound)
+        }
+
+        async fn remove_account_member(
+            &self,
+            _subject: &str,
+            _account_id: &str,
+            _member: &str,
+        ) -> std::result::Result<Account, Error> {
+            Err(Error::NotFound)
+        }
+
         async fn create_project(
             &self,
             _subject: &str,
@@ -1727,6 +1796,7 @@ mod tests {
         tool_names.sort();
 
         let mut expected = vec![
+            "add-account-member",
             "create-account",
             "create-api-key",
             "create-project",
@@ -1743,6 +1813,7 @@ mod tests {
             "list-accounts",
             "list-api-keys",
             "list-projects",
+            "remove-account-member",
             "revoke-api-key",
             "rotate-api-key",
             "update-account",
@@ -1754,6 +1825,30 @@ mod tests {
         expected.sort();
 
         assert_eq!(tool_names, expected);
+    }
+
+    #[test]
+    fn member_tools_are_gated_by_account_member_permission() {
+        assert_eq!(
+            required_tool_permission("add-account-member"),
+            Some(Permission::AccountMember)
+        );
+        assert_eq!(
+            required_tool_permission("remove-account-member"),
+            Some(Permission::AccountMember)
+        );
+    }
+
+    #[test]
+    fn every_registered_tool_has_a_permission_mapping() {
+        let handler = LightbridgeMcpHandler::new(Arc::new(MockStore), sample_repo(), basic_auth());
+        for tool in handler.tool_router.list_all() {
+            assert!(
+                required_tool_permission(&tool.name).is_some(),
+                "tool `{}` is registered but has no permission mapping (would fail closed in call_tool)",
+                tool.name
+            );
+        }
     }
 
     #[test]

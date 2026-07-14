@@ -72,6 +72,14 @@ pub struct UpdateAccount {
     pub owners_admins: Option<Vec<String>>,
 }
 
+/// Body for adding a member to an account. `subject` is the member's identity (the Keycloak `sub`),
+/// the same value carried on their bearer token. Must be non-empty (enforced by the store).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AddAccountMember {
+    #[schema(min_length = 1)]
+    pub subject: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Project {
     pub id: String,
