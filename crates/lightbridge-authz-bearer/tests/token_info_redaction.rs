@@ -7,6 +7,8 @@ fn token_info_debug_never_leaks_the_access_token() {
         sub: "user-sub-123".to_string(),
         exp: 42,
         aud: vec!["lightbridge-api-key".to_string()],
+        roles: vec![],
+        permissions: Default::default(),
         access_token: "eyJ.super-secret-bearer.value".to_string(),
     };
 

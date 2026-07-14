@@ -122,6 +122,11 @@ pub struct Oauth2 {
     /// service). Independent of `issuance`, which proxies exchange to an upstream IdP.
     #[serde(default)]
     pub token_exchange: Option<Oauth2TokenExchange>,
+    /// Role-based access control: which JWT claim carries the caller's roles and how those roles
+    /// map to permissions. When omitted, the built-in default mapping is used
+    /// (`crate::authz::default_role_permissions`).
+    #[serde(default)]
+    pub rbac: crate::authz::Rbac,
 }
 
 impl Oauth2 {

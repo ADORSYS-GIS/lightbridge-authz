@@ -47,6 +47,8 @@ impl BearerTokenServiceTrait for MockBearer {
             sub: SUBJECT.to_string(),
             exp: 0,
             aud: vec![],
+            roles: vec![],
+            permissions: Default::default(),
             access_token: String::new(),
         })
     }

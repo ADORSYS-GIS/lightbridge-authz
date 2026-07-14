@@ -6,8 +6,8 @@ use lightbridge_authz_api::contract::AuthzStore;
 use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeyStatus, Project, ResolvedContext, async_trait, config::BasicAuth,
-    error::Result,
+    Account, ApiKey, ApiKeyStatus, Permission, PermissionSet, Project, ResolvedContext,
+    async_trait, config::BasicAuth, error::Result,
 };
 use lightbridge_authz_rest::OpaState;
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
@@ -210,6 +210,8 @@ fn mk_token_info(active: bool) -> TokenInfo {
         sub: "user-1".to_string(),
         exp: 0,
         aud: vec![],
+        roles: vec![],
+        permissions: Default::default(),
         access_token: String::new(),
     }
 }
@@ -314,6 +316,7 @@ fn oauth2_without_signing() -> lightbridge_authz_core::config::Oauth2 {
         audience: None,
         signing: None,
         token_exchange: None,
+        rbac: Default::default(),
     }
 }
 
@@ -358,6 +361,71 @@ async fn build_api_router_serves_probes_and_protects_the_api() {
         .await
         .unwrap();
     assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[derive(Debug)]
+struct PermBearer {
+    permissions: PermissionSet,
+}
+
+#[async_trait]
+impl BearerTokenServiceTrait for PermBearer {
+    async fn validate_bearer_token(&self, _token: &str) -> anyhow::Result<TokenInfo> {
+        Ok(TokenInfo {
+            active: true,
+            sub: "user-1".to_string(),
+            exp: 0,
+            aud: vec![],
+            roles: vec![],
+            permissions: self.permissions.clone(),
+            access_token: String::new(),
+        })
+    }
+}
+
+async fn create_account_status(permissions: PermissionSet) -> StatusCode {
+    let store: Arc<dyn AuthzStore> = Arc::new(AuthzStoreImpl::with_pool(lazy_pool()));
+    let app_state = Arc::new(AppState {
+        store,
+        bearer: Arc::new(PermBearer { permissions }),
+    });
+    let signing_repo = Arc::new(lightbridge_authz_api_key::repo::StoreRepo::new(lazy_pool()));
+    let router = lightbridge_authz_rest::build_api_router(
+        &oauth2_without_signing(),
+        app_state,
+        lazy_pool(),
+        signing_repo,
+        None,
+    );
+
+    router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/accounts")
+                .header(header::AUTHORIZATION, "Bearer any")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"billing_identity":"acct-1"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn api_denies_when_caller_lacks_required_permission() {
+    assert_eq!(
+        create_account_status(PermissionSet::new()).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn api_passes_rbac_gate_when_caller_has_required_permission() {
+    let status = create_account_status(PermissionSet::from_iter([Permission::AccountCreate])).await;
+    assert_ne!(status, StatusCode::FORBIDDEN);
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

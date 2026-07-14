@@ -26,9 +26,28 @@
           "type": "password",
           "value": "test"
         }
+      ],
+      "realmRoles": [
+        "lightbridge-admin"
       ]
     }
   ],
+  "roles": {
+    "realm": [
+      {
+        "name": "lightbridge-admin",
+        "description": "Full access to the Lightbridge authz API (all permissions)."
+      },
+      {
+        "name": "lightbridge-editor",
+        "description": "Read accounts; full manage of projects and API keys."
+      },
+      {
+        "name": "lightbridge-viewer",
+        "description": "Read-only access to accounts, projects, and API keys."
+      }
+    ]
+  },
   "clients": [
     {
       "clientId": "test-client",
@@ -67,6 +86,20 @@
             "included.client.audience": "lightbridge-token-issuer",
             "id.token.claim": "false",
             "access.token.claim": "true"
+          }
+        },
+        {
+          "name": "lightbridge-roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "userinfo.token.claim": "false"
           }
         }
       ],

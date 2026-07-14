@@ -72,6 +72,24 @@ oauth2:
       - profile
       - email
       - offline_access
+  # Role-based access control. Roles arrive on the JWT in a single, flat, top-level claim
+  # (`roles_claim`, configurable). Each role maps to the permissions it grants; a grant is `*`
+  # (everything), `<resource>:*` (all actions on a resource), or `<resource>:<action>`. These
+  # permissions gate every CRUD/MCP operation — a caller whose roles grant nothing is denied
+  # (HTTP 403). The dev realm assigns `lightbridge-admin` to the seeded user. See docs/rbac.md.
+  rbac:
+    roles_claim: "${RBAC_ROLES_CLAIM:-roles}"
+    role_permissions:
+      lightbridge-admin:
+        - "*"
+      lightbridge-editor:
+        - "account:read"
+        - "project:*"
+        - "apikey:*"
+      lightbridge-viewer:
+        - "account:read"
+        - "project:read"
+        - "apikey:read"
 otel:
   enabled: true
   otlp_endpoint: "http://jaeger:4317"
