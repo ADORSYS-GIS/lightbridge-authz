@@ -39,10 +39,6 @@ pub struct OpaState {
 
 #[async_trait]
 pub trait OpaRepoTrait: Send + Sync {
-    async fn find_api_key_by_hash(
-        &self,
-        key_hash: &str,
-    ) -> Result<Option<lightbridge_authz_core::ApiKey>>;
     async fn record_api_key_usage(
         &self,
         key_id: &str,
@@ -65,13 +61,6 @@ pub trait OpaRepoTrait: Send + Sync {
 
 #[async_trait]
 impl OpaRepoTrait for StoreRepo {
-    async fn find_api_key_by_hash(
-        &self,
-        key_hash: &str,
-    ) -> Result<Option<lightbridge_authz_core::ApiKey>> {
-        StoreRepo::find_api_key_by_hash(self, key_hash).await
-    }
-
     async fn record_api_key_usage(
         &self,
         key_id: &str,

@@ -13,8 +13,13 @@ fn build_repo(pool: PgPool) -> StoreRepo {
     StoreRepo::new(Arc::new(DbPool::from_pool(pool)))
 }
 
-/// Seed an account -> project -> active API key and return their ids plus the key hash.
-async fn seed_key(repo: &StoreRepo, subject: &str) -> (String, String, String) {
+/// Seed an account -> project -> API key (with the given expiry) and return their ids plus the
+/// key hash.
+async fn seed_key(
+    repo: &StoreRepo,
+    subject: &str,
+    expires_at: Option<chrono::DateTime<Utc>>,
+) -> (String, String, String) {
     let account = repo
         .create_account(
             subject,
@@ -49,7 +54,7 @@ async fn seed_key(repo: &StoreRepo, subject: &str) -> (String, String, String) {
             key_prefix: "lbk_test".to_string(),
             key_hash: key_hash.clone(),
             created_at: Utc::now(),
-            expires_at: None,
+            expires_at,
             status: ApiKeyStatus::Active.to_string(),
             last_used_at: None,
             last_ip: None,
@@ -73,7 +78,7 @@ async fn effective_status(repo: &StoreRepo, key_hash: &str) -> String {
 async fn suspending_account_invalidates_its_keys(pool: PgPool) {
     let repo = build_repo(pool);
     let subject = "user-1";
-    let (account_id, _project_id, key_hash) = seed_key(&repo, subject).await;
+    let (account_id, _project_id, key_hash) = seed_key(&repo, subject, None).await;
 
     assert_eq!(effective_status(&repo, &key_hash).await, "active");
 
@@ -95,7 +100,7 @@ async fn suspending_account_invalidates_its_keys(pool: PgPool) {
 async fn suspending_project_invalidates_its_keys(pool: PgPool) {
     let repo = build_repo(pool);
     let subject = "user-1";
-    let (_account_id, project_id, key_hash) = seed_key(&repo, subject).await;
+    let (_account_id, project_id, key_hash) = seed_key(&repo, subject, None).await;
 
     assert_eq!(effective_status(&repo, &key_hash).await, "active");
 
@@ -109,9 +114,20 @@ async fn suspending_project_invalidates_its_keys(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn expired_key_reports_key_expired(pool: PgPool) {
+    let repo = build_repo(pool);
+    let subject = "user-1";
+    // Exercise the view's real `key_expired` CASE branch against Postgres (not the Rust mock).
+    let past = Utc::now() - chrono::Duration::minutes(5);
+    let (_account_id, _project_id, key_hash) = seed_key(&repo, subject, Some(past)).await;
+
+    assert_eq!(effective_status(&repo, &key_hash).await, "key_expired");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn set_account_status_requires_membership(pool: PgPool) {
     let repo = build_repo(pool);
-    let (account_id, _project_id, _key_hash) = seed_key(&repo, "owner").await;
+    let (account_id, _project_id, _key_hash) = seed_key(&repo, "owner", None).await;
 
     let err = repo
         .set_account_status("intruder", &account_id, ResourceStatus::Suspended)

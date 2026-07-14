@@ -23,8 +23,8 @@ struct MockOpaRepo;
 
 #[async_trait]
 impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
-    async fn find_api_key_by_hash(&self, _key_hash: &str) -> Result<Option<ApiKey>> {
-        Ok(Some(ApiKey {
+    async fn record_api_key_usage(&self, _key_id: &str, _ip: Option<String>) -> Result<ApiKey> {
+        Ok(ApiKey {
             id: "key_1".to_string(),
             project_id: "proj_1".to_string(),
             name: "demo".to_string(),
@@ -36,13 +36,7 @@ impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
             last_used_at: None,
             last_ip: None,
             revoked_at: None,
-        }))
-    }
-
-    async fn record_api_key_usage(&self, _key_id: &str, _ip: Option<String>) -> Result<ApiKey> {
-        self.find_api_key_by_hash("")
-            .await
-            .map(|k| k.expect("key exists"))
+        })
     }
 
     async fn find_api_key_validation_by_hash(

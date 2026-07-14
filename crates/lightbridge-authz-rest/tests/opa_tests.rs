@@ -24,10 +24,6 @@ struct MockOpaRepo {
 
 #[async_trait]
 impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
-    async fn find_api_key_by_hash(&self, _key_hash: &str) -> Result<Option<ApiKey>> {
-        Ok(self.api_key.clone())
-    }
-
     async fn record_api_key_usage(&self, key_id: &str, ip: Option<String>) -> Result<ApiKey> {
         self.usage_calls
             .lock()

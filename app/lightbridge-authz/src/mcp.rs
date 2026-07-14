@@ -1493,10 +1493,6 @@ mod tests {
 
     #[async_trait]
     impl OpaRepoTrait for MockOpaRepo {
-        async fn find_api_key_by_hash(&self, _key_hash: &str) -> Result<Option<ApiKey>> {
-            Ok(Some(self.api_key.clone()))
-        }
-
         async fn record_api_key_usage(&self, _key_id: &str, _ip: Option<String>) -> Result<ApiKey> {
             Ok(self.api_key.clone())
         }

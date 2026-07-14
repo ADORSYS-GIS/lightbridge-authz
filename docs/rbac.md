@@ -67,6 +67,13 @@ A **grant** is one of:
 Unknown grant strings are logged and ignored — they never widen access. A role present in the JWT
 but absent from the map grants nothing.
 
+> **Wildcards expand dynamically over the whole permission set.** `<resource>:*` and `*` include
+> **every** action on that resource — that means `project:*` grants `project:disable` (suspend a
+> project → invalidate all its keys) and `*` grants `account:disable`, not just the CRUD verbs. So
+> `lightbridge-editor` (`project:*`) can suspend projects, and any operator config using
+> `<resource>:*` inherits new actions as they are added. If you want CRUD without the disable
+> capability, list the individual grants instead of a wildcard.
+
 ### Configurable claim name
 
 `roles_claim` selects which JWT claim is read. The default `roles` matches the protocol mapper the
