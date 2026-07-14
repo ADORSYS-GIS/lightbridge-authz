@@ -40,15 +40,15 @@ pub struct OpaState {
 
 #[async_trait]
 pub trait OpaRepoTrait: Send + Sync {
-    async fn find_api_key_by_hash(
-        &self,
-        key_hash: &str,
-    ) -> Result<Option<lightbridge_authz_core::ApiKey>>;
     async fn record_api_key_usage(
         &self,
         key_id: &str,
         ip: Option<String>,
     ) -> Result<lightbridge_authz_core::ApiKey>;
+    async fn find_api_key_validation_by_hash(
+        &self,
+        key_hash: &str,
+    ) -> Result<Option<lightbridge_authz_core::ApiKeyValidation>>;
     async fn get_project(&self, subject: &str, project_id: &str) -> Result<Option<Project>>;
     async fn get_account(&self, subject: &str, account_id: &str) -> Result<Option<Account>>;
     async fn get_project_by_id(&self, project_id: &str) -> Result<Option<Project>>;
@@ -62,19 +62,19 @@ pub trait OpaRepoTrait: Send + Sync {
 
 #[async_trait]
 impl OpaRepoTrait for StoreRepo {
-    async fn find_api_key_by_hash(
-        &self,
-        key_hash: &str,
-    ) -> Result<Option<lightbridge_authz_core::ApiKey>> {
-        StoreRepo::find_api_key_by_hash(self, key_hash).await
-    }
-
     async fn record_api_key_usage(
         &self,
         key_id: &str,
         ip: Option<String>,
     ) -> Result<lightbridge_authz_core::ApiKey> {
         StoreRepo::record_api_key_usage(self, key_id, ip).await
+    }
+
+    async fn find_api_key_validation_by_hash(
+        &self,
+        key_hash: &str,
+    ) -> Result<Option<lightbridge_authz_core::ApiKeyValidation>> {
+        StoreRepo::find_api_key_validation_by_hash(self, key_hash).await
     }
 
     async fn get_project(&self, subject: &str, project_id: &str) -> Result<Option<Project>> {
@@ -150,6 +150,7 @@ pub fn build_api_router(
     let protected = Router::new()
         .nest("/api/v1", api_router())
         .with_state(app_state.clone())
+        .route_layer(axum::middleware::from_fn(middleware::authorize))
         .layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             bearer_auth,

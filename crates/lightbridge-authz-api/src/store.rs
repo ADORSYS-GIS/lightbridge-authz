@@ -1,6 +1,6 @@
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, CreateProject, Project,
-    RotateApiKey, UpdateAccount, UpdateApiKey, UpdateProject,
+    ResourceStatus, RotateApiKey, UpdateAccount, UpdateApiKey, UpdateProject,
 };
 use lightbridge_authz_core::{async_trait, error::Error};
 
@@ -21,6 +21,14 @@ pub trait AuthzStore: Send + Sync + 'static + std::fmt::Debug {
         input: UpdateAccount,
     ) -> Result<Account, Error>;
     async fn delete_account(&self, subject: &str, account_id: &str) -> Result<(), Error>;
+    /// Soft-disable/enable an account. Suspending it makes every API key beneath it fail
+    /// validation at the OPA layer without deleting anything.
+    async fn set_account_status(
+        &self,
+        subject: &str,
+        account_id: &str,
+        status: ResourceStatus,
+    ) -> Result<Account, Error>;
 
     async fn create_project(
         &self,
@@ -43,6 +51,14 @@ pub trait AuthzStore: Send + Sync + 'static + std::fmt::Debug {
         input: UpdateProject,
     ) -> Result<Project, Error>;
     async fn delete_project(&self, subject: &str, project_id: &str) -> Result<(), Error>;
+    /// Soft-disable/enable a project. Suspending it makes every API key beneath it fail validation
+    /// at the OPA layer without deleting anything.
+    async fn set_project_status(
+        &self,
+        subject: &str,
+        project_id: &str,
+        status: ResourceStatus,
+    ) -> Result<Project, Error>;
 
     async fn create_api_key(
         &self,

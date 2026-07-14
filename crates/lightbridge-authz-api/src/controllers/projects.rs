@@ -8,7 +8,7 @@ use axum::{
 };
 use lightbridge_authz_bearer::TokenInfo;
 use lightbridge_authz_core::error::Error;
-use lightbridge_authz_core::{CreateProject, Project, UpdateProject};
+use lightbridge_authz_core::{CreateProject, Project, ResourceStatus, UpdateProject};
 use tracing::instrument;
 
 #[instrument(skip(state))]
@@ -135,4 +135,54 @@ pub async fn delete_project(
     let subject = token_info.sub.clone();
     state.store.delete_project(&subject, &project_id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[instrument(skip(state))]
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects/{project_id}/disable",
+    params(
+        ("project_id" = String, Path, description = "Project ID")
+    ),
+    responses(
+        (status = 200, body = Project)
+    ),
+    tag = "projects"
+)]
+pub async fn disable_project(
+    State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
+    Path(project_id): Path<String>,
+) -> Result<impl IntoResponse, Error> {
+    let subject = token_info.sub.clone();
+    let project = state
+        .store
+        .set_project_status(&subject, &project_id, ResourceStatus::Suspended)
+        .await?;
+    Ok((StatusCode::OK, Json(project)))
+}
+
+#[instrument(skip(state))]
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects/{project_id}/enable",
+    params(
+        ("project_id" = String, Path, description = "Project ID")
+    ),
+    responses(
+        (status = 200, body = Project)
+    ),
+    tag = "projects"
+)]
+pub async fn enable_project(
+    State(state): State<Arc<crate::AppState>>,
+    Extension(token_info): Extension<TokenInfo>,
+    Path(project_id): Path<String>,
+) -> Result<impl IntoResponse, Error> {
+    let subject = token_info.sub.clone();
+    let project = state
+        .store
+        .set_project_status(&subject, &project_id, ResourceStatus::Active)
+        .await?;
+    Ok((StatusCode::OK, Json(project)))
 }

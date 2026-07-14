@@ -11,6 +11,7 @@ lightbridge-authz-core.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde.features = ["derive"]
+serde_json.workspace = true
 jwks.workspace = true
 jsonwebtoken.workspace = true
 tracing.workspace = true

@@ -10,6 +10,7 @@ pub struct ProjectRow {
     pub allowed_models: Option<serde_json::Value>,
     pub default_limits: serde_json::Value,
     pub billing_plan: String,
+    pub status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

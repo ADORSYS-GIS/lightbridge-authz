@@ -13,6 +13,9 @@ pub enum Error {
     #[error("Not found")]
     NotFound,
 
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
     #[error("Conflict: {0}")]
     Conflict(String),
 
@@ -64,6 +67,7 @@ mod axum_impl {
                 Error::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::Yaml(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::NotFound => StatusCode::NOT_FOUND,
+                Error::Forbidden(_) => StatusCode::FORBIDDEN,
                 Error::Conflict(_) => StatusCode::CONFLICT,
                 Error::BadRequest(_) => StatusCode::BAD_REQUEST,
                 Error::Any(_) => StatusCode::INTERNAL_SERVER_ERROR,
