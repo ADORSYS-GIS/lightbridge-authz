@@ -31,6 +31,9 @@ opentelemetry-otlp.workspace = true
 tracing-opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "sync"] }
+
 [features]
 default = []
 axum = ["dep:axum", "dep:axum-server", "dep:rustls"]

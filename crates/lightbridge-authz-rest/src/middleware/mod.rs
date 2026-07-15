@@ -198,3 +198,139 @@ pub async fn basic_auth(
 
     next.run(req).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn required_permission_maps_head_to_get() {
+        assert_eq!(
+            required_permission(&Method::HEAD, "/api/v1/accounts"),
+            Some(Permission::AccountRead)
+        );
+    }
+
+    #[test]
+    fn required_permission_covers_every_crud_route() {
+        let cases = [
+            ("POST", "/api/v1/accounts", Permission::AccountCreate),
+            ("GET", "/api/v1/accounts", Permission::AccountRead),
+            (
+                "GET",
+                "/api/v1/accounts/{account_id}",
+                Permission::AccountRead,
+            ),
+            (
+                "PATCH",
+                "/api/v1/accounts/{account_id}",
+                Permission::AccountUpdate,
+            ),
+            (
+                "DELETE",
+                "/api/v1/accounts/{account_id}",
+                Permission::AccountDelete,
+            ),
+            (
+                "POST",
+                "/api/v1/accounts/{account_id}/disable",
+                Permission::AccountDisable,
+            ),
+            (
+                "POST",
+                "/api/v1/accounts/{account_id}/enable",
+                Permission::AccountDisable,
+            ),
+            (
+                "POST",
+                "/api/v1/accounts/{account_id}/members",
+                Permission::AccountMember,
+            ),
+            (
+                "DELETE",
+                "/api/v1/accounts/{account_id}/members/{member}",
+                Permission::AccountMember,
+            ),
+            (
+                "POST",
+                "/api/v1/accounts/{account_id}/projects",
+                Permission::ProjectCreate,
+            ),
+            (
+                "GET",
+                "/api/v1/accounts/{account_id}/projects",
+                Permission::ProjectRead,
+            ),
+            (
+                "GET",
+                "/api/v1/projects/{project_id}",
+                Permission::ProjectRead,
+            ),
+            (
+                "PATCH",
+                "/api/v1/projects/{project_id}",
+                Permission::ProjectUpdate,
+            ),
+            (
+                "DELETE",
+                "/api/v1/projects/{project_id}",
+                Permission::ProjectDelete,
+            ),
+            (
+                "POST",
+                "/api/v1/projects/{project_id}/disable",
+                Permission::ProjectDisable,
+            ),
+            (
+                "POST",
+                "/api/v1/projects/{project_id}/enable",
+                Permission::ProjectDisable,
+            ),
+            (
+                "POST",
+                "/api/v1/projects/{project_id}/api-keys",
+                Permission::ApiKeyCreate,
+            ),
+            (
+                "GET",
+                "/api/v1/projects/{project_id}/api-keys",
+                Permission::ApiKeyRead,
+            ),
+            ("GET", "/api/v1/api-keys/{key_id}", Permission::ApiKeyRead),
+            (
+                "PATCH",
+                "/api/v1/api-keys/{key_id}",
+                Permission::ApiKeyUpdate,
+            ),
+            (
+                "DELETE",
+                "/api/v1/api-keys/{key_id}",
+                Permission::ApiKeyDelete,
+            ),
+            (
+                "POST",
+                "/api/v1/api-keys/{key_id}/revoke",
+                Permission::ApiKeyRevoke,
+            ),
+            (
+                "POST",
+                "/api/v1/api-keys/{key_id}/rotate",
+                Permission::ApiKeyRotate,
+            ),
+        ];
+
+        for (method, path, expected) in cases {
+            let method = Method::from_bytes(method.as_bytes()).unwrap();
+            assert_eq!(
+                required_permission(&method, path),
+                Some(expected),
+                "method={method} path={path}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_permission_denies_unmapped_route() {
+        assert_eq!(required_permission(&Method::GET, "/api/v1/unknown"), None);
+    }
+}

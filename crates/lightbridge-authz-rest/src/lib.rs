@@ -345,8 +345,121 @@ struct OpaDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
+    use lightbridge_authz_core::config::{Oauth2TokenExchange, Oauth2Type};
     use serde_json::Value;
     use sqlx::postgres::PgPoolOptions;
+
+    struct NoopBearer;
+
+    #[async_trait]
+    impl BearerTokenServiceTrait for NoopBearer {
+        async fn validate_bearer_token(&self, _token: &str) -> anyhow::Result<TokenInfo> {
+            unreachable!("build_token_exchange_state never calls the bearer service")
+        }
+    }
+
+    fn lazy_signing_repo() -> Arc<StoreRepo> {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
+            .expect("lazy pool should be constructible");
+        let pool: Arc<dyn DbPoolTrait> =
+            Arc::new(lightbridge_authz_core::db::DbPool::from_pool(pool));
+        Arc::new(StoreRepo::new(pool))
+    }
+
+    fn noop_bearer() -> Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> {
+        Arc::new(NoopBearer)
+    }
+
+    fn base_oauth2(oauth2_type: Oauth2Type) -> Oauth2 {
+        Oauth2 {
+            oauth2_type,
+            jwks_url: "http://jwks".to_string(),
+            oauth2_url: None,
+            issuer_url: None,
+            authorization_endpoint: None,
+            token_endpoint: None,
+            registration_endpoint: None,
+            issuance: None,
+            audience: None,
+            signing: None,
+            token_exchange: None,
+            rbac: Default::default(),
+        }
+    }
+
+    fn exchange_cfg() -> Oauth2TokenExchange {
+        Oauth2TokenExchange {
+            enabled: true,
+            access_ttl_seconds: 900,
+            refresh_ttl_seconds: 2_592_000,
+            allowed_scopes: vec!["openid".to_string()],
+        }
+    }
+
+    fn signing_cfg() -> lightbridge_authz_core::config::JwtSigning {
+        lightbridge_authz_core::config::JwtSigning {
+            issuer: "https://authz.example.test".to_string(),
+            audience: None,
+            ttl_seconds: 7_776_000,
+            max_key_age_days: 30,
+        }
+    }
+
+    #[tokio::test]
+    async fn build_token_exchange_state_is_none_when_disabled() {
+        let oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        let result =
+            build_token_exchange_state(&oauth2, lazy_signing_repo(), noop_bearer()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_external_oauth2() {
+        let mut oauth2 = base_oauth2(Oauth2Type::External);
+        oauth2.token_exchange = Some(exchange_cfg());
+        let Err(err) = build_token_exchange_state(&oauth2, lazy_signing_repo(), noop_bearer())
+        else {
+            panic!("expected an error for external oauth2 with token_exchange enabled");
+        };
+        assert!(format!("{err}").contains("requires oauth2.type: self"));
+    }
+
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_missing_signing_block() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.token_exchange = Some(exchange_cfg());
+        let Err(err) = build_token_exchange_state(&oauth2, lazy_signing_repo(), noop_bearer())
+        else {
+            panic!("expected an error for a missing signing block");
+        };
+        assert!(format!("{err}").contains("requires oauth2.signing"));
+    }
+
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_non_positive_ttls() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        let mut cfg = exchange_cfg();
+        cfg.access_ttl_seconds = 0;
+        oauth2.token_exchange = Some(cfg);
+        let Err(err) = build_token_exchange_state(&oauth2, lazy_signing_repo(), noop_bearer())
+        else {
+            panic!("expected an error for a non-positive ttl");
+        };
+        assert!(format!("{err}").contains("must be positive"));
+    }
+
+    #[tokio::test]
+    async fn build_token_exchange_state_builds_state_for_valid_config() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        oauth2.token_exchange = Some(exchange_cfg());
+        let result =
+            build_token_exchange_state(&oauth2, lazy_signing_repo(), noop_bearer()).unwrap();
+        assert!(result.is_some());
+    }
 
     fn opa_openapi() -> Value {
         serde_json::to_value(OpaDoc::openapi()).expect("openapi should serialize")

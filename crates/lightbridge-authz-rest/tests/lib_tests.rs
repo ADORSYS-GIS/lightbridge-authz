@@ -1,0 +1,327 @@
+use std::sync::Arc;
+
+use lightbridge_authz_core::config::{ApiServer, BasicAuth, Oauth2, Oauth2Type, OpaServer, Tls};
+use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
+use sqlx::postgres::PgPoolOptions;
+
+fn lazy_pool() -> Arc<dyn DbPoolTrait> {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
+        .expect("lazy pool should be constructible");
+    Arc::new(DbPool::from_pool(pool))
+}
+
+fn bad_tls() -> Tls {
+    Tls {
+        cert_path: "/nonexistent/lightbridge-authz-rest-test/cert.pem".to_string(),
+        key_path: "/nonexistent/lightbridge-authz-rest-test/key.pem".to_string(),
+    }
+}
+
+fn external_oauth2() -> Oauth2 {
+    Oauth2 {
+        oauth2_type: Oauth2Type::External,
+        jwks_url: "http://jwks".to_string(),
+        oauth2_url: None,
+        issuer_url: None,
+        authorization_endpoint: None,
+        token_endpoint: None,
+        registration_endpoint: None,
+        issuance: None,
+        audience: None,
+        signing: None,
+        token_exchange: None,
+        rbac: Default::default(),
+    }
+}
+
+/// `serve_tls` loads the TLS cert/key from disk before ever binding a socket (see
+/// `lightbridge_authz_core::server::serve_tls`), so pointing it at nonexistent paths makes it
+/// fail fast during cert loading without opening any real listener. This exercises the entire
+/// setup path of `start_api_server`/`start_opa_server` (config branches, router assembly,
+/// tracing) while staying fully offline.
+#[tokio::test]
+async fn start_api_server_fails_fast_when_tls_certs_are_missing() {
+    let api = ApiServer {
+        address: "127.0.0.1".to_string(),
+        port: 0,
+        tls: bad_tls(),
+        allowed_hosts: None,
+    };
+    let result =
+        lightbridge_authz_rest::start_api_server(&api, lazy_pool(), &external_oauth2()).await;
+    assert!(
+        result.is_err(),
+        "missing TLS cert paths must surface as an error"
+    );
+}
+
+#[tokio::test]
+async fn start_opa_server_fails_fast_when_tls_certs_are_missing() {
+    let opa = OpaServer {
+        address: "127.0.0.1".to_string(),
+        port: 0,
+        tls: bad_tls(),
+        basic_auth: BasicAuth {
+            username: "authorino".to_string(),
+            password: "change-me".to_string(),
+        },
+    };
+    let result = lightbridge_authz_rest::start_opa_server(&opa, lazy_pool()).await;
+    assert!(
+        result.is_err(),
+        "missing TLS cert paths must surface as an error"
+    );
+}
+
+/// `oauth2.type: self` with a missing `signing` block must fail before ever touching the
+/// database (the `ok_or_else` short-circuits ahead of `bootstrap_signing_key`), so this stays
+/// fully offline like the tests above.
+#[tokio::test]
+async fn start_api_server_rejects_self_signed_oauth2_without_signing_block() {
+    let mut oauth2 = external_oauth2();
+    oauth2.oauth2_type = Oauth2Type::SelfSigned;
+    let api = ApiServer {
+        address: "127.0.0.1".to_string(),
+        port: 0,
+        tls: bad_tls(),
+        allowed_hosts: None,
+    };
+    let result = lightbridge_authz_rest::start_api_server(&api, lazy_pool(), &oauth2).await;
+    assert!(
+        result.is_err(),
+        "self-signed oauth2 without a signing block must be rejected"
+    );
+}
+
+/// Exercises the `AUTHZ_DEV_CORS` branch of `start_api_server`. The env var is process-global, so
+/// this test owns it for its short, synchronous-looking critical section and restores it
+/// afterwards; no other test in this crate reads `AUTHZ_DEV_CORS`, mirroring the pattern already
+/// used for it in `lightbridge-authz-core`'s `server_tests.rs`.
+#[tokio::test]
+async fn start_api_server_warns_when_dev_cors_is_enabled() {
+    unsafe {
+        std::env::set_var("AUTHZ_DEV_CORS", "true");
+    }
+    let api = ApiServer {
+        address: "127.0.0.1".to_string(),
+        port: 0,
+        tls: bad_tls(),
+        allowed_hosts: None,
+    };
+    let result =
+        lightbridge_authz_rest::start_api_server(&api, lazy_pool(), &external_oauth2()).await;
+    unsafe {
+        std::env::remove_var("AUTHZ_DEV_CORS");
+    }
+    assert!(
+        result.is_err(),
+        "missing TLS cert paths must surface as an error"
+    );
+}
+
+#[cfg(feature = "it-tests")]
+mod db {
+    use super::*;
+    use lightbridge_authz_api_key::repo::StoreRepo;
+    use lightbridge_authz_core::config::JwtSigning;
+    use lightbridge_authz_core::{CreateAccount, CreateApiKey, CreateProject};
+    use lightbridge_authz_rest::OpaRepoTrait;
+    use sqlx::PgPool;
+
+    fn repo(pool: PgPool) -> Arc<StoreRepo> {
+        let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        Arc::new(StoreRepo::new(pool))
+    }
+
+    fn signing_cfg() -> JwtSigning {
+        JwtSigning {
+            issuer: "https://authz.example.test".to_string(),
+            audience: None,
+            ttl_seconds: 7_776_000,
+            max_key_age_days: 30,
+        }
+    }
+
+    fn self_signed_oauth2() -> Oauth2 {
+        let mut oauth2 = external_oauth2();
+        oauth2.oauth2_type = Oauth2Type::SelfSigned;
+        oauth2.signing = Some(signing_cfg());
+        oauth2
+    }
+
+    /// Covers the `oauth2.is_self_signed()` branch inside `start_api_server`, which bootstraps
+    /// the signing key against the real database before router assembly. The TLS cert paths are
+    /// still bogus, so `serve_tls` fails fast right after bootstrap without binding a socket.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_api_server_bootstraps_signing_key_for_self_signed_oauth2(pool: PgPool) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
+        let api = ApiServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+            allowed_hosts: None,
+        };
+        let result =
+            lightbridge_authz_rest::start_api_server(&api, db_pool, &self_signed_oauth2()).await;
+        assert!(
+            result.is_err(),
+            "missing TLS cert paths must surface as an error"
+        );
+
+        let repo = repo(pool);
+        assert!(
+            repo.get_active_signing_key().await.unwrap().is_some(),
+            "start_api_server must bootstrap a signing key before failing on TLS load"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn readiness_route_reports_ok_with_a_reachable_database(pool: PgPool) {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use lightbridge_authz_api::AppState;
+        use lightbridge_authz_api::contract::AuthzStore;
+        use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
+        use lightbridge_authz_core::async_trait;
+        use lightbridge_authz_rest::handlers::AuthzStoreImpl;
+        use tower::ServiceExt;
+
+        struct NoopBearer;
+        #[async_trait]
+        impl BearerTokenServiceTrait for NoopBearer {
+            async fn validate_bearer_token(&self, _token: &str) -> anyhow::Result<TokenInfo> {
+                unreachable!("readiness probe never validates a bearer token")
+            }
+        }
+
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let store: Arc<dyn AuthzStore> = Arc::new(AuthzStoreImpl::with_pool(db_pool.clone()));
+        let app_state = Arc::new(AppState {
+            store,
+            bearer: Arc::new(NoopBearer),
+        });
+        let signing_repo = Arc::new(StoreRepo::new(db_pool.clone()));
+        let router = lightbridge_authz_rest::build_api_router(
+            &external_oauth2(),
+            app_state,
+            db_pool,
+            signing_repo,
+            None,
+            false,
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// `OpaRepoTrait for StoreRepo` is a thin one-line delegation per method, only reachable
+    /// through `start_opa_server`'s production wiring (the test suite otherwise talks to a
+    /// `MockOpaRepo`). Exercise the real delegation against the database directly, seeding data
+    /// through the higher-level `AuthzStoreImpl` (mirroring `store_it_tests.rs`) and then
+    /// re-reading it through the `OpaRepoTrait` object built on the same pool.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn opa_repo_trait_impl_delegates_to_store_repo(pool: PgPool) {
+        use lightbridge_authz_api::contract::AuthzStore;
+        use lightbridge_authz_rest::handlers::AuthzStoreImpl;
+
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
+        let store = AuthzStoreImpl::with_pool(db_pool);
+        let subject = "owner-opa-trait";
+
+        let account = store
+            .create_account(
+                subject,
+                CreateAccount {
+                    billing_identity: "billing-opa-trait".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let project = store
+            .create_project(
+                subject,
+                &account.id,
+                CreateProject {
+                    name: "opa-trait-project".to_string(),
+                    allowed_models: None,
+                    default_limits: None,
+                    billing_plan: "free".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let created = store
+            .create_api_key(
+                subject,
+                None,
+                &project.id,
+                CreateApiKey {
+                    name: "opa-trait-key".to_string(),
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        let api_key = created.api_key;
+
+        let trait_object: Arc<dyn OpaRepoTrait> = repo(pool);
+
+        let updated = trait_object
+            .record_api_key_usage(&api_key.id, Some("127.0.0.1".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(updated.id, api_key.id);
+        assert_eq!(updated.last_ip.as_deref(), Some("127.0.0.1"));
+
+        let validation = trait_object
+            .find_api_key_validation_by_hash(&api_key.key_hash)
+            .await
+            .unwrap()
+            .expect("validation row should exist");
+        assert_eq!(validation.api_key_id, api_key.id);
+
+        let fetched_project = trait_object
+            .get_project(subject, &project.id)
+            .await
+            .unwrap()
+            .expect("project should exist for owning subject");
+        assert_eq!(fetched_project.id, project.id);
+
+        let fetched_account = trait_object
+            .get_account(subject, &account.id)
+            .await
+            .unwrap()
+            .expect("account should exist for owning subject");
+        assert_eq!(fetched_account.id, account.id);
+
+        let project_by_id = trait_object
+            .get_project_by_id(&project.id)
+            .await
+            .unwrap()
+            .expect("project should be found by id");
+        assert_eq!(project_by_id.id, project.id);
+
+        let account_by_id = trait_object
+            .get_account_by_id(&account.id)
+            .await
+            .unwrap()
+            .expect("account should be found by id");
+        assert_eq!(account_by_id.id, account.id);
+
+        let resolved = trait_object
+            .resolve_context(subject, &project.id)
+            .await
+            .unwrap();
+        assert_eq!(resolved.account_id, account.id);
+        assert_eq!(resolved.project_id, project.id);
+    }
+}

@@ -13,3 +13,10 @@ tracing.workspace = true
 lightbridge-authz-bearer = { workspace = true }
 utoipa.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tower.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true

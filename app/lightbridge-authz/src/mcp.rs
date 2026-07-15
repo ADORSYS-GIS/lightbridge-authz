@@ -1103,22 +1103,7 @@ impl LightbridgeMcpHandler {
         &self,
         Parameters(params): Parameters<ValidateApiKeyParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let validated = validate_api_key_context(&self.opa_state, &params.api_key, params.ip)
-            .await
-            .map_err(to_tool_error)?;
-
-        let Some(validated) = validated else {
-            return Err(ErrorData::invalid_params(
-                "unauthorized",
-                Some(json!({ "http_status": 401 })),
-            ));
-        };
-
-        to_json_value(json!({
-            "api_key": validated.api_key,
-            "project": validated.project,
-            "account": validated.account
-        }))
+        run_validate_api_key(&self.opa_state, params).await
     }
 
     #[tool(
@@ -1131,6 +1116,31 @@ impl LightbridgeMcpHandler {
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         run_validate_authorino(&self.opa_state, params).await
     }
+}
+
+/// Core of the `validate-api-key` tool, factored out of the RBAC-gated tool method (which takes
+/// no `RequestContext`, so the method itself is already directly callable, but keeping the two
+/// validation tools symmetric makes the "unauthorized" branch trivial to exercise in isolation).
+async fn run_validate_api_key(
+    opa_state: &Arc<OpaState>,
+    params: ValidateApiKeyParams,
+) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+    let validated = validate_api_key_context(opa_state, &params.api_key, params.ip)
+        .await
+        .map_err(to_tool_error)?;
+
+    let Some(validated) = validated else {
+        return Err(ErrorData::invalid_params(
+            "unauthorized",
+            Some(json!({ "http_status": 401 })),
+        ));
+    };
+
+    to_json_value(json!({
+        "api_key": validated.api_key,
+        "project": validated.project,
+        "account": validated.account
+    }))
 }
 
 /// Core of the `validate-authorino-api-key` tool (validation + dynamic-metadata enrichment),
@@ -1185,31 +1195,26 @@ fn build_streamable_http_config(allowed_hosts: &Option<Vec<String>>) -> Streamab
     }
 }
 
-pub async fn start_mcp_server(
+/// Assembles the MCP server router (public probes + OAuth2 discovery/registration proxy, and the
+/// bearer-protected `/mcp` streamable-HTTP endpoint). Separated from `start_mcp_server` so the
+/// composition can be driven with real HTTP requests (JSON-RPC over `/mcp`) in tests without
+/// binding a TLS socket, mirroring `build_api_router`/`build_opa_router` in
+/// `lightbridge-authz-rest`.
+fn build_mcp_router(
     api: &ApiServer,
     oauth2: &Oauth2,
-    basic_auth: &BasicAuth,
-    pool: Arc<dyn DbPoolTrait>,
-) -> Result<()> {
-    let readiness_pool = pool.clone();
-    if oauth2.is_self_signed() {
-        let signing = oauth2.signing.as_ref().ok_or_else(|| {
-            Error::Server("oauth2.type is 'self' but oauth2.signing is missing".to_string())
-        })?;
-        let signing_repo = StoreRepo::new(pool.clone());
-        lightbridge_authz_rest::signing::bootstrap_signing_key(&signing_repo, signing).await?;
-    }
-    let store: Arc<dyn AuthzStore> =
-        Arc::new(AuthzStoreImpl::with_pool_and_oauth2(pool.clone(), oauth2)?);
-    let opa_repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
-    let bearer_service: Arc<dyn BearerTokenServiceTrait> =
-        Arc::new(BearerTokenService::new(oauth2.clone()));
+    basic_auth: BasicAuth,
+    store: Arc<dyn AuthzStore>,
+    opa_repo: Arc<dyn OpaRepoTrait>,
+    bearer_service: Arc<dyn BearerTokenServiceTrait>,
+    readiness_pool: Arc<dyn DbPoolTrait>,
+) -> Router {
     let app_state = Arc::new(lightbridge_authz_api::AppState {
         store: store.clone(),
         bearer: bearer_service,
     });
 
-    let handler = LightbridgeMcpHandler::new(store, opa_repo, basic_auth.clone());
+    let handler = LightbridgeMcpHandler::new(store, opa_repo, basic_auth);
     let oauth_proxy_state = Arc::new(OauthProxyState {
         client: Client::new(),
         endpoints: resolve_oauth2_endpoints(oauth2),
@@ -1274,7 +1279,38 @@ pub async fn start_mcp_server(
             bearer_auth,
         ));
 
-    let app = public.merge(protected);
+    public.merge(protected)
+}
+
+pub async fn start_mcp_server(
+    api: &ApiServer,
+    oauth2: &Oauth2,
+    basic_auth: &BasicAuth,
+    pool: Arc<dyn DbPoolTrait>,
+) -> Result<()> {
+    let readiness_pool = pool.clone();
+    if oauth2.is_self_signed() {
+        let signing = oauth2.signing.as_ref().ok_or_else(|| {
+            Error::Server("oauth2.type is 'self' but oauth2.signing is missing".to_string())
+        })?;
+        let signing_repo = StoreRepo::new(pool.clone());
+        lightbridge_authz_rest::signing::bootstrap_signing_key(&signing_repo, signing).await?;
+    }
+    let store: Arc<dyn AuthzStore> =
+        Arc::new(AuthzStoreImpl::with_pool_and_oauth2(pool.clone(), oauth2)?);
+    let opa_repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
+    let bearer_service: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(BearerTokenService::new(oauth2.clone()));
+
+    let app = build_mcp_router(
+        api,
+        oauth2,
+        basic_auth.clone(),
+        store,
+        opa_repo,
+        bearer_service,
+        readiness_pool,
+    );
 
     let signing_enabled = oauth2.is_self_signed();
     let issuance_enabled = oauth2.is_external();
@@ -1620,41 +1656,467 @@ mod tests {
         }
     }
 
+    fn fixture_api_key() -> ApiKey {
+        ApiKey {
+            id: "key_1".to_string(),
+            project_id: "proj_1".to_string(),
+            name: "k1".to_string(),
+            key_prefix: "prefix".to_string(),
+            key_hash: "hash".to_string(),
+            created_at: Utc::now(),
+            expires_at: None,
+            status: ApiKeyStatus::Active,
+            last_used_at: None,
+            last_ip: None,
+            revoked_at: None,
+        }
+    }
+
+    fn fixture_project() -> Project {
+        Project {
+            id: "proj_1".to_string(),
+            account_id: "acct_1".to_string(),
+            name: "project".to_string(),
+            allowed_models: None,
+            default_limits: None,
+            billing_plan: "free".to_string(),
+            status: lightbridge_authz_core::ResourceStatus::Active,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn fixture_account() -> Account {
+        Account {
+            id: "acct_1".to_string(),
+            billing_identity: "bill_1".to_string(),
+            owners_admins: vec!["owner".to_string()],
+            status: lightbridge_authz_core::ResourceStatus::Active,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn fixture_api_key_secret() -> ApiKeySecret {
+        ApiKeySecret {
+            api_key: fixture_api_key(),
+            secret: "lbk_secret_value".to_string(),
+            oauth2_url: None,
+        }
+    }
+
     fn sample_repo() -> Arc<dyn OpaRepoTrait> {
         Arc::new(MockOpaRepo {
-            api_key: ApiKey {
-                id: "key_1".to_string(),
-                project_id: "proj_1".to_string(),
-                name: "k1".to_string(),
-                key_prefix: "prefix".to_string(),
-                key_hash: "hash".to_string(),
-                created_at: Utc::now(),
-                expires_at: None,
-                status: ApiKeyStatus::Active,
-                last_used_at: None,
-                last_ip: None,
-                revoked_at: None,
-            },
-            project: Project {
-                id: "proj_1".to_string(),
-                account_id: "acct_1".to_string(),
-                name: "project".to_string(),
-                allowed_models: None,
-                default_limits: None,
-                billing_plan: "free".to_string(),
-                status: lightbridge_authz_core::ResourceStatus::Active,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
-            account: Account {
-                id: "acct_1".to_string(),
-                billing_identity: "bill_1".to_string(),
-                owners_admins: vec!["owner".to_string()],
-                status: lightbridge_authz_core::ResourceStatus::Active,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
+            api_key: fixture_api_key(),
+            project: fixture_project(),
+            account: fixture_account(),
         })
+    }
+
+    #[derive(Debug)]
+    struct NotFoundOpaRepo;
+
+    #[async_trait]
+    impl OpaRepoTrait for NotFoundOpaRepo {
+        async fn record_api_key_usage(&self, _key_id: &str, _ip: Option<String>) -> Result<ApiKey> {
+            Err(Error::NotFound)
+        }
+
+        async fn find_api_key_validation_by_hash(
+            &self,
+            _key_hash: &str,
+        ) -> Result<Option<lightbridge_authz_core::ApiKeyValidation>> {
+            Ok(None)
+        }
+
+        async fn get_project(&self, _subject: &str, _project_id: &str) -> Result<Option<Project>> {
+            Ok(None)
+        }
+
+        async fn get_account(&self, _subject: &str, _account_id: &str) -> Result<Option<Account>> {
+            Ok(None)
+        }
+
+        async fn resolve_context(
+            &self,
+            _subject: &str,
+            _project_id: &str,
+        ) -> Result<lightbridge_authz_core::ResolvedContext> {
+            Err(Error::NotFound)
+        }
+
+        async fn get_project_by_id(&self, _project_id: &str) -> Result<Option<Project>> {
+            Ok(None)
+        }
+
+        async fn get_account_by_id(&self, _account_id: &str) -> Result<Option<Account>> {
+            Ok(None)
+        }
+    }
+
+    /// A store whose every method succeeds with fixed fixture data, used to exercise the
+    /// happy-path body of every `#[tool]` method through the real MCP router.
+    #[derive(Debug)]
+    struct FixtureStore;
+
+    #[async_trait]
+    impl AuthzStore for FixtureStore {
+        async fn create_account(
+            &self,
+            _subject: &str,
+            _input: CreateAccount,
+        ) -> std::result::Result<Account, Error> {
+            Ok(fixture_account())
+        }
+
+        async fn list_accounts(
+            &self,
+            _subject: &str,
+            _offset: u32,
+            _limit: u32,
+        ) -> std::result::Result<Vec<Account>, Error> {
+            Ok(vec![fixture_account()])
+        }
+
+        async fn get_account(
+            &self,
+            _subject: &str,
+            _account_id: &str,
+        ) -> std::result::Result<Account, Error> {
+            Ok(fixture_account())
+        }
+
+        async fn update_account(
+            &self,
+            _subject: &str,
+            _account_id: &str,
+            _input: UpdateAccount,
+        ) -> std::result::Result<Account, Error> {
+            Ok(fixture_account())
+        }
+
+        async fn delete_account(
+            &self,
+            _subject: &str,
+            _account_id: &str,
+        ) -> std::result::Result<(), Error> {
+            Ok(())
+        }
+
+        async fn set_account_status(
+            &self,
+            _subject: &str,
+            _account_id: &str,
+            _status: lightbridge_authz_core::ResourceStatus,
+        ) -> std::result::Result<Account, Error> {
+            Ok(fixture_account())
+        }
+
+        async fn add_account_member(
+            &self,
+            _subject: &str,
+            _account_id: &str,
+            _new_member: &str,
+        ) -> std::result::Result<Account, Error> {
+            Ok(fixture_account())
+        }
+
+        async fn remove_account_member(
+            &self,
+            _subject: &str,
+            _account_id: &str,
+            _member: &str,
+        ) -> std::result::Result<Account, Error> {
+            Ok(fixture_account())
+        }
+
+        async fn create_project(
+            &self,
+            _subject: &str,
+            _account_id: &str,
+            _input: CreateProject,
+        ) -> std::result::Result<Project, Error> {
+            Ok(fixture_project())
+        }
+
+        async fn list_projects(
+            &self,
+            _subject: &str,
+            _account_id: &str,
+            _offset: u32,
+            _limit: u32,
+        ) -> std::result::Result<Vec<Project>, Error> {
+            Ok(vec![fixture_project()])
+        }
+
+        async fn get_project(
+            &self,
+            _subject: &str,
+            _project_id: &str,
+        ) -> std::result::Result<Project, Error> {
+            Ok(fixture_project())
+        }
+
+        async fn update_project(
+            &self,
+            _subject: &str,
+            _project_id: &str,
+            _input: UpdateProject,
+        ) -> std::result::Result<Project, Error> {
+            Ok(fixture_project())
+        }
+
+        async fn delete_project(
+            &self,
+            _subject: &str,
+            _project_id: &str,
+        ) -> std::result::Result<(), Error> {
+            Ok(())
+        }
+
+        async fn set_project_status(
+            &self,
+            _subject: &str,
+            _project_id: &str,
+            _status: lightbridge_authz_core::ResourceStatus,
+        ) -> std::result::Result<Project, Error> {
+            Ok(fixture_project())
+        }
+
+        async fn create_api_key(
+            &self,
+            _subject: &str,
+            _bearer_token: Option<&str>,
+            _project_id: &str,
+            _input: CreateApiKey,
+        ) -> std::result::Result<ApiKeySecret, Error> {
+            Ok(fixture_api_key_secret())
+        }
+
+        async fn list_api_keys(
+            &self,
+            _subject: &str,
+            _project_id: &str,
+            _offset: u32,
+            _limit: u32,
+        ) -> std::result::Result<Vec<ApiKey>, Error> {
+            Ok(vec![fixture_api_key()])
+        }
+
+        async fn get_api_key(
+            &self,
+            _subject: &str,
+            _key_id: &str,
+        ) -> std::result::Result<ApiKey, Error> {
+            Ok(fixture_api_key())
+        }
+
+        async fn update_api_key(
+            &self,
+            _subject: &str,
+            _key_id: &str,
+            _input: UpdateApiKey,
+        ) -> std::result::Result<ApiKey, Error> {
+            Ok(fixture_api_key())
+        }
+
+        async fn delete_api_key(
+            &self,
+            _subject: &str,
+            _key_id: &str,
+        ) -> std::result::Result<(), Error> {
+            Ok(())
+        }
+
+        async fn revoke_api_key(
+            &self,
+            _subject: &str,
+            _key_id: &str,
+        ) -> std::result::Result<ApiKey, Error> {
+            Ok(fixture_api_key())
+        }
+
+        async fn rotate_api_key(
+            &self,
+            _subject: &str,
+            _bearer_token: Option<&str>,
+            _key_id: &str,
+            _input: RotateApiKey,
+        ) -> std::result::Result<ApiKeySecret, Error> {
+            Ok(fixture_api_key_secret())
+        }
+    }
+
+    struct MockBearer {
+        token_info: TokenInfo,
+    }
+
+    #[async_trait]
+    impl BearerTokenServiceTrait for MockBearer {
+        async fn validate_bearer_token(&self, _token: &str) -> anyhow::Result<TokenInfo> {
+            Ok(self.token_info.clone())
+        }
+    }
+
+    fn token_info_with_permissions(
+        permissions: lightbridge_authz_core::authz::PermissionSet,
+    ) -> TokenInfo {
+        TokenInfo {
+            active: true,
+            sub: "mcp-tester".to_string(),
+            exp: 0,
+            aud: vec![],
+            roles: vec![],
+            permissions,
+            access_token: "test-access-token".to_string(),
+        }
+    }
+
+    fn full_access_token_info() -> TokenInfo {
+        token_info_with_permissions(Permission::ALL.into_iter().collect())
+    }
+
+    fn lazy_pool() -> Arc<dyn DbPoolTrait> {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
+            .expect("lazy pool should be constructible");
+        Arc::new(lightbridge_authz_core::db::DbPool::from_pool(pool))
+    }
+
+    fn test_api_server() -> ApiServer {
+        ApiServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: lightbridge_authz_core::config::Tls {
+                cert_path: "unused".to_string(),
+                key_path: "unused".to_string(),
+            },
+            allowed_hosts: None,
+        }
+    }
+
+    fn test_router(
+        store: Arc<dyn AuthzStore>,
+        opa_repo: Arc<dyn OpaRepoTrait>,
+        token_info: TokenInfo,
+    ) -> Router {
+        build_mcp_router(
+            &test_api_server(),
+            &sample_oauth2(),
+            basic_auth(),
+            store,
+            opa_repo,
+            Arc::new(MockBearer { token_info }),
+            lazy_pool(),
+        )
+    }
+
+    fn tool_call_request(
+        tool: &str,
+        arguments: Value,
+        token: Option<&str>,
+    ) -> axum::http::Request<Body> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": tool,
+                "arguments": arguments
+            }
+        });
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    async fn call_tool(
+        router: Router,
+        tool: &str,
+        arguments: Value,
+        token: Option<&str>,
+    ) -> (StatusCode, Value) {
+        use tower::ServiceExt;
+
+        let response = router
+            .oneshot(tool_call_request(tool, arguments, token))
+            .await
+            .expect("router should respond");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        let payload = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        (status, payload)
+    }
+
+    /// One representative `arguments` payload per registered tool, shared by the router-driven
+    /// success test (against `FixtureStore`) and the store-error test (against `MockStore`).
+    fn crud_and_validation_tool_cases() -> Vec<(&'static str, Value)> {
+        vec![
+            ("create-account", json!({ "billing_identity": "acme" })),
+            ("list-accounts", json!({})),
+            ("get-account", json!({ "account_id": "acct_1" })),
+            (
+                "update-account",
+                json!({ "account_id": "acct_1", "billing_identity": "acme2" }),
+            ),
+            ("disable-account", json!({ "account_id": "acct_1" })),
+            ("enable-account", json!({ "account_id": "acct_1" })),
+            (
+                "add-account-member",
+                json!({ "account_id": "acct_1", "subject": "new-member" }),
+            ),
+            (
+                "remove-account-member",
+                json!({ "account_id": "acct_1", "member": "old-member" }),
+            ),
+            (
+                "create-project",
+                json!({ "account_id": "acct_1", "name": "proj", "billing_plan": "free" }),
+            ),
+            ("list-projects", json!({ "account_id": "acct_1" })),
+            ("get-project", json!({ "project_id": "proj_1" })),
+            (
+                "update-project",
+                json!({ "project_id": "proj_1", "name": "proj2" }),
+            ),
+            ("disable-project", json!({ "project_id": "proj_1" })),
+            ("enable-project", json!({ "project_id": "proj_1" })),
+            (
+                "create-api-key",
+                json!({ "project_id": "proj_1", "name": "key", "expires_at": "2030-01-01T00:00:00Z" }),
+            ),
+            ("list-api-keys", json!({ "project_id": "proj_1" })),
+            ("get-api-key", json!({ "key_id": "key_1" })),
+            (
+                "update-api-key",
+                json!({ "key_id": "key_1", "name": "key2", "expires_at": "2030-01-01T00:00:00Z" }),
+            ),
+            ("revoke-api-key", json!({ "key_id": "key_1" })),
+            (
+                "rotate-api-key",
+                json!({ "key_id": "key_1", "grace_period_seconds": 60 }),
+            ),
+            ("delete-api-key", json!({ "key_id": "key_1" })),
+            ("delete-project", json!({ "project_id": "proj_1" })),
+            ("delete-account", json!({ "account_id": "acct_1" })),
+            (
+                "validate-api-key",
+                json!({ "api_key": "lbk_secret_sample" }),
+            ),
+            (
+                "validate-authorino-api-key",
+                json!({ "api_key": "lbk_secret_sample", "metadata": { "env": "test" } }),
+            ),
+        ]
     }
 
     fn basic_auth() -> BasicAuth {
@@ -1966,6 +2428,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_validate_api_key_returns_unauthorized_when_key_not_found() {
+        let opa_state = Arc::new(OpaState {
+            repo: Arc::new(NotFoundOpaRepo),
+            basic_auth: basic_auth(),
+        });
+
+        let result = run_validate_api_key(
+            &opa_state,
+            ValidateApiKeyParams {
+                api_key: "lbk_unknown".to_string(),
+                ip: None,
+            },
+        )
+        .await;
+
+        match result {
+            Err(error) => assert_eq!(error.message, "unauthorized"),
+            Ok(_) => panic!("validation should fail when the key hash is not found"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_validate_authorino_returns_unauthorized_when_key_not_found() {
+        let opa_state = Arc::new(OpaState {
+            repo: Arc::new(NotFoundOpaRepo),
+            basic_auth: basic_auth(),
+        });
+
+        let result = run_validate_authorino(
+            &opa_state,
+            ValidateAuthorinoApiKeyParams {
+                api_key: "lbk_unknown".to_string(),
+                ip: None,
+                metadata: HashMap::new(),
+            },
+        )
+        .await;
+
+        match result {
+            Err(error) => assert_eq!(error.message, "unauthorized"),
+            Ok(_) => panic!("validation should fail when the key hash is not found"),
+        }
+    }
+
+    #[tokio::test]
     async fn health_and_startup_endpoints_report_ok() {
         assert_eq!(health_handler().await, StatusCode::OK);
         assert_eq!(startup_handler().await, StatusCode::OK);
@@ -1973,15 +2480,146 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_endpoint_reports_unavailable_when_database_is_down() {
-        let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
-            .expect("lazy pool should be constructible");
-        let pool: Arc<dyn DbPoolTrait> =
-            Arc::new(lightbridge_authz_core::db::DbPool::from_pool(pool));
-
         assert_eq!(
-            readiness_handler(pool).await,
+            readiness_handler(lazy_pool()).await,
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn every_crud_and_validation_tool_succeeds_through_the_real_mcp_router() {
+        for (tool, arguments) in crud_and_validation_tool_cases() {
+            let router = test_router(
+                Arc::new(FixtureStore),
+                sample_repo(),
+                full_access_token_info(),
+            );
+            let (status, payload) = call_tool(router, tool, arguments, Some("good")).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "tool `{tool}` should return HTTP 200: {payload}"
+            );
+            assert!(
+                payload.get("error").is_none(),
+                "tool `{tool}` should not return a JSON-RPC error: {payload}"
+            );
+        }
+    }
+
+    /// Every non-validation tool call, against a store that fails every call, should surface a
+    /// JSON-RPC error (exercising each CRUD method's `map_err(to_tool_error)?` line). The
+    /// validate-* tools are excluded because they consult `opa_state`, not `self.store`.
+    #[tokio::test]
+    async fn every_crud_tool_surfaces_a_store_not_found_error_as_a_json_rpc_error() {
+        for (tool, arguments) in crud_and_validation_tool_cases() {
+            if tool.starts_with("validate-") {
+                continue;
+            }
+            let router = test_router(Arc::new(MockStore), sample_repo(), full_access_token_info());
+            let (status, payload) = call_tool(router, tool, arguments, Some("good")).await;
+            assert_eq!(status, StatusCode::OK, "tool `{tool}`: {payload}");
+            assert!(
+                payload.get("error").is_some(),
+                "tool `{tool}` should surface a NotFound store error as a JSON-RPC error: {payload}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_api_key_tool_rejects_an_invalid_expires_at() {
+        let router = test_router(
+            Arc::new(FixtureStore),
+            sample_repo(),
+            full_access_token_info(),
+        );
+        let (status, payload) = call_tool(
+            router,
+            "create-api-key",
+            json!({ "project_id": "proj_1", "name": "key", "expires_at": "not-a-date" }),
+            Some("good"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            payload.get("error").is_some(),
+            "an invalid RFC3339 expires_at should be rejected: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_rejects_a_caller_missing_the_required_permission() {
+        let router = test_router(
+            Arc::new(FixtureStore),
+            sample_repo(),
+            token_info_with_permissions(lightbridge_authz_core::authz::PermissionSet::new()),
+        );
+        let (status, payload) = call_tool(
+            router,
+            "create-account",
+            json!({ "billing_identity": "acme" }),
+            Some("good"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            payload.get("error").is_some(),
+            "missing permission should produce a JSON-RPC error: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_rejects_an_unknown_tool_name() {
+        let router = test_router(
+            Arc::new(FixtureStore),
+            sample_repo(),
+            full_access_token_info(),
+        );
+        let (status, payload) = call_tool(router, "not-a-real-tool", json!({}), Some("good")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let error = payload
+            .get("error")
+            .expect("an unknown tool name should produce a JSON-RPC error");
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown tool"),
+            "unexpected error message: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_reports_missing_bearer_token_context_when_bearer_auth_is_bypassed() {
+        let handler =
+            LightbridgeMcpHandler::new(Arc::new(FixtureStore), sample_repo(), basic_auth());
+        let http_config = build_streamable_http_config(&None);
+        let mcp_service: StreamableHttpService<LightbridgeMcpHandler, LocalSessionManager> =
+            StreamableHttpService::new(
+                {
+                    let handler = handler.clone();
+                    move || Ok(handler.clone())
+                },
+                Default::default(),
+                http_config,
+            );
+        let router = Router::new().nest_service("/mcp", mcp_service);
+
+        let (status, payload) = call_tool(router, "list-accounts", json!({}), None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let error = payload
+            .get("error")
+            .expect("a request without bearer_auth-injected TokenInfo should error");
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("missing bearer token context"),
+            "unexpected error message: {error}"
         );
     }
 }
