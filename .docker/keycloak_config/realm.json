@@ -137,7 +137,7 @@
           "protocolMapper": "oidc-usermodel-realm-role-mapper",
           "consentRequired": false,
           "config": {
-            "claim.name": "roles",
+            "claim.name": "lightbridge_api_roles",
             "jsonType.label": "String",
             "multivalued": "true",
             "access.token.claim": "true",
