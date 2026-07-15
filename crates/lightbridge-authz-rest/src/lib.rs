@@ -2,7 +2,7 @@ use axum::{Json, Router, http::StatusCode, routing::get};
 use lightbridge_authz_api::routers::api_router;
 use lightbridge_authz_core::{
     Account, Project, async_trait,
-    config::{ApiServer, BasicAuth, Oauth2, OpaServer},
+    config::{ApiServer, BasicAuth, Billing, Oauth2, OpaServer},
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
     server::{dev_cors_enabled, serve_tls},
@@ -202,6 +202,7 @@ pub async fn start_api_server(
     api: &ApiServer,
     pool: Arc<dyn DbPoolTrait>,
     oauth2: &Oauth2,
+    billing: &Billing,
 ) -> Result<()> {
     let readiness_pool = pool.clone();
     let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
@@ -211,7 +212,7 @@ pub async fn start_api_server(
         })?;
         signing::bootstrap_signing_key(&signing_repo, signing).await?;
     }
-    let store = Arc::new(AuthzStoreImpl::with_pool_and_oauth2(pool, oauth2)?);
+    let store = Arc::new(AuthzStoreImpl::with_pool_and_oauth2(pool, oauth2, billing)?);
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
 

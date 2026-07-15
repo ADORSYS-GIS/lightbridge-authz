@@ -36,6 +36,7 @@ impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
             last_used_at: None,
             last_ip: None,
             revoked_at: None,
+            billing_plan: "free".to_string(),
         })
     }
 

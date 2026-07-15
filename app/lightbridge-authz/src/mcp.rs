@@ -15,7 +15,7 @@ use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, Config, CreateAccount, CreateApiKey, CreateProject,
     DefaultLimits, Error, Permission, Project, ResourceStatus, Result, RotateApiKey, UpdateAccount,
     UpdateApiKey, UpdateProject,
-    config::{ApiServer, BasicAuth, Oauth2},
+    config::{ApiServer, BasicAuth, Billing, Oauth2},
     db::{DbPoolTrait, is_database_ready},
     server::serve_tls,
 };
@@ -542,6 +542,7 @@ struct CreateApiKeyParams {
     name: String,
     #[serde(default)]
     expires_at: Option<String>,
+    billing_plan: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -952,6 +953,7 @@ impl LightbridgeMcpHandler {
                 CreateApiKey {
                     name: params.name,
                     expires_at,
+                    billing_plan: params.billing_plan,
                 },
             )
             .await
@@ -1189,6 +1191,7 @@ pub async fn start_mcp_server(
     api: &ApiServer,
     oauth2: &Oauth2,
     basic_auth: &BasicAuth,
+    billing: &Billing,
     pool: Arc<dyn DbPoolTrait>,
 ) -> Result<()> {
     let readiness_pool = pool.clone();
@@ -1199,8 +1202,11 @@ pub async fn start_mcp_server(
         let signing_repo = StoreRepo::new(pool.clone());
         lightbridge_authz_rest::signing::bootstrap_signing_key(&signing_repo, signing).await?;
     }
-    let store: Arc<dyn AuthzStore> =
-        Arc::new(AuthzStoreImpl::with_pool_and_oauth2(pool.clone(), oauth2)?);
+    let store: Arc<dyn AuthzStore> = Arc::new(AuthzStoreImpl::with_pool_and_oauth2(
+        pool.clone(),
+        oauth2,
+        billing,
+    )?);
     let opa_repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
     let bearer_service: Arc<dyn BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
@@ -1298,6 +1304,7 @@ pub async fn start_mcp_server_from_config(config: &Config) -> Result<()> {
         &config.server.api,
         &config.oauth2,
         &config.server.opa.basic_auth,
+        &config.billing,
         pool,
     )
     .await
@@ -1634,6 +1641,7 @@ mod tests {
                 last_used_at: None,
                 last_ip: None,
                 revoked_at: None,
+                billing_plan: "free".to_string(),
             },
             project: Project {
                 id: "proj_1".to_string(),

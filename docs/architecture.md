@@ -145,6 +145,7 @@ erDiagram
         text key_prefix
         text key_hash UK
         text status
+        text billing_plan
         timestamptz expires_at
         timestamptz last_used_at
     }
@@ -173,6 +174,12 @@ the membership set. A database trigger deletes an account if its final membershi
 - SQL `NULL`: all models are allowed.
 - Empty JSON array: no models are allowed.
 - Non-empty JSON array: only the listed models are allowed.
+
+`api_keys.billing_plan` is chosen per key at creation time. The set of valid plans is defined
+entirely by the operator through the `billing.plans` config (env-driven, e.g.
+`BILLING_PLANS=free,pro,enterprise`) — there is no plan table or entity. `CreateApiKey` must name
+one of the configured plans or the request is rejected with `400 Bad Request`; rotation preserves
+the existing key's plan. Token introspection surfaces the key's plan as `billing_plan`.
 
 ## Credential lifecycle
 

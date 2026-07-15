@@ -98,3 +98,10 @@ otel:
   otlp_endpoint: "http://localhost:4317"
   service_name: "lightbridge-authz"
 
+# Billing plans a caller may attach to an API key at creation time. The catalogue is defined
+# entirely by the operator via the BILLING_PLANS env var (no plan table/entity). A CreateApiKey
+# must name one of these plans, otherwise the request is rejected with 400 Bad Request.
+# Accepts a comma-separated string (env case) or a YAML sequence.
+billing:
+  plans: "${BILLING_PLANS:-free,pro,enterprise}"
+

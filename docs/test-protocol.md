@@ -118,7 +118,7 @@ verifiable until its own `exp`; keep the signing `ttl_seconds` bounded according
 KEY_JSON=$(curl -k -s https://localhost:13000/api/v1/projects/$PROJECT_ID/api-keys \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"name":"demo-key"}')
+  -d '{"name":"demo-key","billing_plan":"free"}')
 
 SECRET=$(echo "$KEY_JSON" | /usr/bin/python3 -c "import sys, json; print(json.load(sys.stdin)['secret'])")
 ```

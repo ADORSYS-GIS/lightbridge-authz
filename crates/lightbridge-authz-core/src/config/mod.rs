@@ -19,6 +19,51 @@ pub struct Config {
     pub database: Database,
     pub oauth2: Oauth2,
     pub otel: Otel,
+    /// Billing plans a caller may attach to an API key at creation time. The set is defined
+    /// entirely by the operator (env-driven via YAML interpolation) — there is no plan table or
+    /// entity. A `CreateApiKey` must name one of these plans or the request is rejected.
+    #[serde(default)]
+    pub billing: Billing,
+}
+
+/// The operator-configured catalogue of billing plan names. Populated from env (e.g.
+/// `plans: "${BILLING_PLANS:-free,pro,enterprise}"`), so `plans` accepts either a
+/// comma-separated string or a YAML sequence.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Billing {
+    #[serde(default, deserialize_with = "deserialize_plan_list")]
+    pub plans: Vec<String>,
+}
+
+impl Billing {
+    /// Whether `plan` is one of the configured, non-empty plan names.
+    pub fn is_allowed(&self, plan: &str) -> bool {
+        !plan.is_empty() && self.plans.iter().any(|p| p == plan)
+    }
+}
+
+/// Accepts a comma-separated string (the env-interpolation case) or a YAML sequence, trims each
+/// entry, and drops empties so a blank/unset env var yields an empty list rather than `[""]`.
+fn deserialize_plan_list<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Plans {
+        Csv(String),
+        List(Vec<String>),
+    }
+
+    let raw = match Plans::deserialize(deserializer)? {
+        Plans::Csv(s) => s.split(',').map(|p| p.to_string()).collect(),
+        Plans::List(list) => list,
+    };
+    Ok(raw
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -359,5 +404,30 @@ mod tests {
     #[test]
     fn oauth2_type_rejects_unknown_value() {
         assert!(from_str::<Oauth2>("type: opaque\njwks_url: \"http://x\"\n").is_err());
+    }
+
+    #[test]
+    fn billing_plans_parse_from_csv_string() {
+        let billing: Billing = from_str("plans: \"free, pro ,enterprise\"\n").unwrap();
+        assert_eq!(billing.plans, vec!["free", "pro", "enterprise"]);
+        assert!(billing.is_allowed("pro"));
+        assert!(!billing.is_allowed("scale"));
+        assert!(!billing.is_allowed(""));
+    }
+
+    #[test]
+    fn billing_plans_parse_from_sequence() {
+        let billing: Billing = from_str("plans:\n  - free\n  - pro\n").unwrap();
+        assert_eq!(billing.plans, vec!["free", "pro"]);
+    }
+
+    #[test]
+    fn billing_plans_empty_when_unset() {
+        let billing: Billing = from_str("{}\n").unwrap();
+        assert!(billing.plans.is_empty());
+        assert!(!billing.is_allowed("free"));
+
+        let blank: Billing = from_str("plans: \"\"\n").unwrap();
+        assert!(blank.plans.is_empty());
     }
 }

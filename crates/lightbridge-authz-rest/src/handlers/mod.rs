@@ -10,7 +10,7 @@ use getrandom::fill;
 use lightbridge_authz_api::contract::AuthzStore;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::async_trait;
-use lightbridge_authz_core::config::{Oauth2, Oauth2Issuance};
+use lightbridge_authz_core::config::{Billing, Oauth2, Oauth2Issuance};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey, CreateProject,
@@ -28,6 +28,7 @@ pub struct AuthzStoreImpl {
     repo: Arc<StoreRepo>,
     token_issuer: Option<OAuth2TokenIssuer>,
     jwt_signer: Option<Arc<crate::signing::ApiKeyJwtSigner>>,
+    billing: Arc<Billing>,
 }
 
 impl std::fmt::Debug for AuthzStoreImpl {
@@ -43,10 +44,22 @@ impl AuthzStoreImpl {
             repo: Arc::new(repo),
             token_issuer: None,
             jwt_signer: None,
+            billing: Arc::new(Billing::default()),
         }
     }
 
-    pub fn with_pool_and_oauth2(pool: Arc<dyn DbPoolTrait>, oauth2: &Oauth2) -> Result<Self> {
+    /// Override the configured billing plans. Primarily for tests that drive `create_api_key`
+    /// without going through the full config-loading path.
+    pub fn with_billing(mut self, billing: Billing) -> Self {
+        self.billing = Arc::new(billing);
+        self
+    }
+
+    pub fn with_pool_and_oauth2(
+        pool: Arc<dyn DbPoolTrait>,
+        oauth2: &Oauth2,
+        billing: &Billing,
+    ) -> Result<Self> {
         use lightbridge_authz_core::config::Oauth2Type;
         let repo = Arc::new(StoreRepo::new(pool));
         let (jwt_signer, token_issuer) = match oauth2.oauth2_type {
@@ -63,6 +76,7 @@ impl AuthzStoreImpl {
             repo,
             token_issuer,
             jwt_signer,
+            billing: Arc::new(billing.clone()),
         })
     }
 
@@ -432,6 +446,13 @@ impl AuthzStore for AuthzStoreImpl {
         project_id: &str,
         input: CreateApiKey,
     ) -> Result<ApiKeySecret> {
+        if !self.billing.is_allowed(&input.billing_plan) {
+            return Err(Error::BadRequest(format!(
+                "unknown billing_plan '{}': must be one of the configured plans [{}]",
+                input.billing_plan,
+                self.billing.plans.join(", ")
+            )));
+        }
         let id = cuid2();
         let issued = self
             .issue_api_key_secret(subject, bearer_token, project_id, &id, input.expires_at)
@@ -452,6 +473,7 @@ impl AuthzStore for AuthzStoreImpl {
             last_used_at: None,
             last_ip: None,
             revoked_at: None,
+            billing_plan: input.billing_plan,
         };
         let api_key = self.repo.create_api_key(subject, row).await?;
         tracing::info!(
@@ -582,6 +604,7 @@ impl AuthzStore for AuthzStoreImpl {
             last_used_at: None,
             last_ip: None,
             revoked_at: None,
+            billing_plan: existing.billing_plan,
         };
         let api_key = self
             .repo
@@ -611,7 +634,7 @@ mod tests {
     };
     use chrono::{Duration, Utc};
     use httpmock::{Method::POST, MockServer};
-    use lightbridge_authz_core::config::{Oauth2, Oauth2Issuance, Oauth2Type};
+    use lightbridge_authz_core::config::{Billing, Oauth2, Oauth2Issuance, Oauth2Type};
     use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
@@ -643,18 +666,54 @@ mod tests {
 
     #[tokio::test]
     async fn self_type_without_signing_block_errors() {
-        let err =
-            AuthzStoreImpl::with_pool_and_oauth2(lazy_pool(), &base_oauth2(Oauth2Type::SelfSigned))
-                .unwrap_err();
+        let err = AuthzStoreImpl::with_pool_and_oauth2(
+            lazy_pool(),
+            &base_oauth2(Oauth2Type::SelfSigned),
+            &Billing::default(),
+        )
+        .unwrap_err();
         assert!(format!("{err}").contains("oauth2.signing is missing"));
     }
 
     #[tokio::test]
     async fn external_type_without_issuance_block_errors() {
-        let err =
-            AuthzStoreImpl::with_pool_and_oauth2(lazy_pool(), &base_oauth2(Oauth2Type::External))
-                .unwrap_err();
+        let err = AuthzStoreImpl::with_pool_and_oauth2(
+            lazy_pool(),
+            &base_oauth2(Oauth2Type::External),
+            &Billing::default(),
+        )
+        .unwrap_err();
         assert!(format!("{err}").contains("oauth2.issuance is missing"));
+    }
+
+    #[tokio::test]
+    async fn create_api_key_rejects_billing_plan_not_in_configured_set() {
+        use lightbridge_authz_api::contract::AuthzStore;
+        use lightbridge_authz_core::CreateApiKey;
+
+        let store = AuthzStoreImpl::with_pool(lazy_pool()).with_billing(Billing {
+            plans: vec!["pro".to_string()],
+        });
+
+        for plan in ["free", ""] {
+            let err = store
+                .create_api_key(
+                    "subject",
+                    None,
+                    "proj",
+                    CreateApiKey {
+                        name: "k".to_string(),
+                        expires_at: None,
+                        billing_plan: plan.to_string(),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, lightbridge_authz_core::error::Error::BadRequest(ref m) if m.contains("unknown billing_plan")),
+                "plan {plan:?} should be rejected before any DB access, got: {err}"
+            );
+        }
     }
 
     #[test]

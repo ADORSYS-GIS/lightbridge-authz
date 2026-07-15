@@ -1,5 +1,5 @@
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use lightbridge_authz_core::config::JwtSigning;
+use lightbridge_authz_core::config::{Billing, JwtSigning};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::signing::{ApiKeyJwtSigner, capped_expiry, generate_rs256_key};
 use serde::{Deserialize, Serialize};
@@ -319,7 +319,14 @@ mod db {
         let active = key_repo.get_active_signing_key().await.unwrap().unwrap();
 
         let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
-        let store = AuthzStoreImpl::with_pool_and_oauth2(db_pool, &signing_oauth2()).unwrap();
+        let store = AuthzStoreImpl::with_pool_and_oauth2(
+            db_pool,
+            &signing_oauth2(),
+            &Billing {
+                plans: vec!["free".to_string()],
+            },
+        )
+        .unwrap();
         let subject = "owner-sign";
 
         let account = store
@@ -356,6 +363,7 @@ mod db {
                 CreateApiKey {
                     name: "k".to_string(),
                     expires_at: None,
+                    billing_plan: "free".to_string(),
                 },
             )
             .await
