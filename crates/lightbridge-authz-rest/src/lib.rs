@@ -409,6 +409,17 @@ mod tests {
             resp["properties"].get("active").is_some(),
             "IntrospectResponse should expose the RFC 7662 `active` flag"
         );
+
+        assert!(
+            resp["properties"].get("billing_plan_name").is_some()
+                && resp["properties"].get("billing_plan_limits").is_some(),
+            "IntrospectResponse should expose the resolved billing plan name and limits"
+        );
+        assert!(
+            schemas.contains_key("BillingLimits"),
+            "the BillingLimits schema referenced by IntrospectResponse must be a defined \
+             component (no dangling $ref)"
+        );
     }
 
     #[tokio::test]
