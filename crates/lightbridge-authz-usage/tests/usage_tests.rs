@@ -7,8 +7,6 @@ use lightbridge_authz_core::{Error, Result, async_trait};
 use lightbridge_authz_usage_rest::UsageRepoTrait;
 use lightbridge_authz_usage_rest::UsageState;
 use lightbridge_authz_usage_rest::build_usage_router;
-use sqlx::postgres::PgPoolOptions;
-use tower::ServiceExt;
 use lightbridge_authz_usage_rest::handlers::ingest::ingest_logs;
 use lightbridge_authz_usage_rest::handlers::query::query_usage;
 use lightbridge_authz_usage_rest::models::{
@@ -19,7 +17,9 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use prost::Message;
+use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
+use tower::ServiceExt;
 
 #[derive(Debug)]
 struct MockUsageRepo {

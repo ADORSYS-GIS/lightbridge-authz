@@ -45,7 +45,9 @@ fn fetch_healthz_plaintext(port: u16) -> String {
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .expect("read timeout should be settable");
                 stream
-                    .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .write_all(
+                        b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
                     .expect("request should be writable");
                 let mut response = String::new();
                 stream
@@ -66,9 +68,8 @@ fn fetch_healthz_plaintext(port: u16) -> String {
 async fn serve_plain_http_serves_requests_without_tls() {
     let port = reserve_port();
     let app = Router::new().route("/healthz", get(|| async { StatusCode::OK }));
-    let server = tokio::spawn(async move {
-        serve_plain_http("TEST", "127.0.0.1", port, app).await
-    });
+    let server =
+        tokio::spawn(async move { serve_plain_http("TEST", "127.0.0.1", port, app).await });
 
     let response = tokio::task::spawn_blocking(move || fetch_healthz_plaintext(port))
         .await
