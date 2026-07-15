@@ -36,6 +36,9 @@ struct RootResponse {
 pub struct OpaState {
     pub repo: Arc<dyn OpaRepoTrait>,
     pub basic_auth: BasicAuth,
+    /// Configured billing-plan catalogue, used to resolve a key's plan id into its display name
+    /// and limits at introspection time.
+    pub billing: Arc<Billing>,
 }
 
 #[async_trait]
@@ -275,12 +278,17 @@ pub fn build_opa_router(state: Arc<OpaState>, readiness_pool: Arc<dyn DbPoolTrai
     public.merge(protected).with_state(state)
 }
 
-pub async fn start_opa_server(opa: &OpaServer, pool: Arc<dyn DbPoolTrait>) -> Result<()> {
+pub async fn start_opa_server(
+    opa: &OpaServer,
+    pool: Arc<dyn DbPoolTrait>,
+    billing: &Billing,
+) -> Result<()> {
     let readiness_pool = pool.clone();
     let repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
     let state = Arc::new(OpaState {
         repo,
         basic_auth: opa.basic_auth.clone(),
+        billing: Arc::new(billing.clone()),
     });
 
     let app = build_opa_router(state, readiness_pool);

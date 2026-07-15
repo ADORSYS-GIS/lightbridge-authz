@@ -175,11 +175,15 @@ the membership set. A database trigger deletes an account if its final membershi
 - Empty JSON array: no models are allowed.
 - Non-empty JSON array: only the listed models are allowed.
 
-`api_keys.billing_plan` is chosen per key at creation time. The set of valid plans is defined
-entirely by the operator through the `billing.plans` config (env-driven, e.g.
-`BILLING_PLANS=free,pro,enterprise`) — there is no plan table or entity. `CreateApiKey` must name
-one of the configured plans or the request is rejected with `400 Bad Request`; rotation preserves
-the existing key's plan. Token introspection surfaces the key's plan as `billing_plan`.
+`api_keys.billing_plan` stores the **id** of the plan the key is minted on, chosen per key at
+creation. The plan catalogue is defined entirely by the operator through `billing.plans` — there
+is no plan table or entity. Each plan is `{ id, name, limits }`: a stable `id` (what the key
+stores and `CreateApiKey` names), a UI `name`, and optional rate/usage `limits`
+(`requests_per_second` / `requests_per_day` / `requests_per_month` / `concurrent_requests`). The
+catalogue is an inline YAML sequence, or a single `BILLING_PLANS` JSON-array env var for
+fully-env setups. `CreateApiKey` must name a configured `id` or the request is rejected with
+`400 Bad Request`; rotation preserves the existing key's plan. Token introspection returns the
+key's `billing_plan` (id) plus the resolved `billing_plan_name` and `billing_plan_limits`.
 
 ## Credential lifecycle
 

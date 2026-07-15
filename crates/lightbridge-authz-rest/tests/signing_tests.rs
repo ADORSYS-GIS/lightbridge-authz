@@ -1,5 +1,5 @@
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use lightbridge_authz_core::config::{Billing, JwtSigning};
+use lightbridge_authz_core::config::{Billing, BillingPlan, JwtSigning};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::signing::{ApiKeyJwtSigner, capped_expiry, generate_rs256_key};
 use serde::{Deserialize, Serialize};
@@ -323,7 +323,11 @@ mod db {
             db_pool,
             &signing_oauth2(),
             &Billing {
-                plans: vec!["free".to_string()],
+                plans: vec![BillingPlan {
+                    id: "free".to_string(),
+                    name: "Free".to_string(),
+                    limits: None,
+                }],
             },
         )
         .unwrap();

@@ -1,7 +1,7 @@
 #![cfg(feature = "it-tests")]
 
 use lightbridge_authz_api::contract::AuthzStore;
-use lightbridge_authz_core::config::Billing;
+use lightbridge_authz_core::config::{Billing, BillingPlan};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_core::{
     ApiKeyStatus, CreateAccount, CreateApiKey, CreateProject, RotateApiKey, UpdateAccount,
@@ -14,7 +14,18 @@ use std::sync::Arc;
 fn store(pool: PgPool) -> AuthzStoreImpl {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
     AuthzStoreImpl::with_pool(pool).with_billing(Billing {
-        plans: vec!["free".to_string(), "pro".to_string()],
+        plans: vec![
+            BillingPlan {
+                id: "free".to_string(),
+                name: "Free".to_string(),
+                limits: None,
+            },
+            BillingPlan {
+                id: "pro".to_string(),
+                name: "Pro".to_string(),
+                limits: None,
+            },
+        ],
     })
 }
 

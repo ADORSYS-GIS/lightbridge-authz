@@ -39,6 +39,7 @@ pub async fn introspect_api_key(
         "api key introspection resolved active"
     );
 
+    let plan = state.billing.get(&validated.api_key.billing_plan);
     let response = IntrospectResponse {
         active: true,
         sub: Some(validated.api_key.id.clone()),
@@ -47,6 +48,8 @@ pub async fn introspect_api_key(
         api_key_id: Some(validated.api_key.id.clone()),
         api_key_status: Some(validated.api_key.status.to_string()),
         billing_plan: Some(validated.api_key.billing_plan.clone()),
+        billing_plan_name: plan.map(|p| p.name.clone()),
+        billing_plan_limits: plan.and_then(|p| p.limits.clone()),
         allowed_models: validated.project.allowed_models.clone(),
         exp: validated.api_key.expires_at.map(|value| value.timestamp()),
     };

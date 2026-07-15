@@ -113,6 +113,7 @@ fn app() -> axum::Router {
             username: "authorino".to_string(),
             password: "change-me".to_string(),
         },
+        billing: Arc::new(lightbridge_authz_core::config::Billing::default()),
     });
     opa_router(state.clone()).with_state(state)
 }
@@ -665,6 +666,7 @@ async fn build_opa_router_serves_probes_and_introspection() {
             username: "authorino".to_string(),
             password: "change-me".to_string(),
         },
+        billing: Arc::new(lightbridge_authz_core::config::Billing::default()),
     });
     let router = lightbridge_authz_rest::build_opa_router(state, lazy_pool());
 

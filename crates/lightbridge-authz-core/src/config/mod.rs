@@ -1,11 +1,12 @@
 use crate::error::Result;
 use regex::{Captures, Regex};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_yaml::from_str;
 use std::env;
 use std::fs::read_to_string;
 use std::sync::LazyLock;
+use utoipa::ToSchema;
 
 static RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)|\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?:(:-|-)([^}]*))?\}")
@@ -19,51 +20,91 @@ pub struct Config {
     pub database: Database,
     pub oauth2: Oauth2,
     pub otel: Otel,
-    /// Billing plans a caller may attach to an API key at creation time. The set is defined
-    /// entirely by the operator (env-driven via YAML interpolation) — there is no plan table or
-    /// entity. A `CreateApiKey` must name one of these plans or the request is rejected.
+    /// Billing plans a caller may attach to an API key at creation time. The catalogue is defined
+    /// entirely by the operator (env-driven) — there is no plan table or entity. A `CreateApiKey`
+    /// must name one of these plans (by `id`) or the request is rejected.
     #[serde(default)]
     pub billing: Billing,
 }
 
-/// The operator-configured catalogue of billing plan names. Populated from env (e.g.
-/// `plans: "${BILLING_PLANS:-free,pro,enterprise}"`), so `plans` accepts either a
-/// comma-separated string or a YAML sequence.
+/// The operator-configured catalogue of billing plans. Populated from env — either a single
+/// `BILLING_PLANS` JSON-array env var (e.g. `plans: "${BILLING_PLANS}"`) or an inline YAML/JSON
+/// sequence of plan objects.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Billing {
     #[serde(default, deserialize_with = "deserialize_plan_list")]
-    pub plans: Vec<String>,
+    pub plans: Vec<BillingPlan>,
+}
+
+/// A single billing plan. `id` is the stable key stored on the API key and named in
+/// `CreateApiKey`; `name` is the human-facing label for UIs; `limits` carries the plan's
+/// rate/usage envelope (all fields optional — absent means "unset / unlimited").
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+pub struct BillingPlan {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<BillingLimits>,
+}
+
+/// Rate/usage limits attached to a billing plan. Purely descriptive here — enforcement lives at
+/// the edge (e.g. Authorino), which reads these via token introspection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+pub struct BillingLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests_per_second: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests_per_day: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests_per_month: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrent_requests: Option<i32>,
 }
 
 impl Billing {
-    /// Whether `plan` is one of the configured, non-empty plan names.
-    pub fn is_allowed(&self, plan: &str) -> bool {
-        !plan.is_empty() && self.plans.iter().any(|p| p == plan)
+    /// Whether a plan with this `id` is configured.
+    pub fn is_allowed(&self, id: &str) -> bool {
+        self.get(id).is_some()
+    }
+
+    /// Look up a plan by its `id`.
+    pub fn get(&self, id: &str) -> Option<&BillingPlan> {
+        if id.is_empty() {
+            return None;
+        }
+        self.plans.iter().find(|p| p.id == id)
+    }
+
+    /// The configured plan ids, for error messages.
+    pub fn plan_ids(&self) -> Vec<&str> {
+        self.plans.iter().map(|p| p.id.as_str()).collect()
     }
 }
 
-/// Accepts a comma-separated string (the env-interpolation case) or a YAML sequence, trims each
-/// entry, and drops empties so a blank/unset env var yields an empty list rather than `[""]`.
-fn deserialize_plan_list<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+/// Accepts either a JSON-array string (the single-env-var case, e.g. `${BILLING_PLANS}`) or an
+/// inline YAML/JSON sequence of plan objects. A blank/unset env var yields an empty catalogue
+/// rather than a parse error.
+fn deserialize_plan_list<'de, D>(deserializer: D) -> std::result::Result<Vec<BillingPlan>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Plans {
-        Csv(String),
-        List(Vec<String>),
+        Json(String),
+        List(Vec<BillingPlan>),
     }
 
-    let raw = match Plans::deserialize(deserializer)? {
-        Plans::Csv(s) => s.split(',').map(|p| p.to_string()).collect(),
-        Plans::List(list) => list,
-    };
-    Ok(raw
-        .into_iter()
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
-        .collect())
+    match Plans::deserialize(deserializer)? {
+        Plans::Json(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(Vec::new());
+            }
+            serde_json::from_str(trimmed).map_err(serde::de::Error::custom)
+        }
+        Plans::List(list) => Ok(list),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -407,18 +448,38 @@ mod tests {
     }
 
     #[test]
-    fn billing_plans_parse_from_csv_string() {
-        let billing: Billing = from_str("plans: \"free, pro ,enterprise\"\n").unwrap();
-        assert_eq!(billing.plans, vec!["free", "pro", "enterprise"]);
+    fn billing_plans_parse_from_json_env_string() {
+        let json = r#"[{"id":"free","name":"Free","limits":{"requests_per_second":5,"requests_per_month":10000}},{"id":"pro","name":"Pro"}]"#;
+        let billing: Billing = from_str(&format!("plans: '{json}'\n")).unwrap();
+        assert_eq!(billing.plan_ids(), vec!["free", "pro"]);
         assert!(billing.is_allowed("pro"));
         assert!(!billing.is_allowed("scale"));
         assert!(!billing.is_allowed(""));
+
+        let free = billing.get("free").unwrap();
+        assert_eq!(free.name, "Free");
+        let limits = free.limits.as_ref().unwrap();
+        assert_eq!(limits.requests_per_second, Some(5));
+        assert_eq!(limits.requests_per_month, Some(10000));
+        assert_eq!(limits.concurrent_requests, None);
+        assert!(billing.get("pro").unwrap().limits.is_none());
     }
 
     #[test]
-    fn billing_plans_parse_from_sequence() {
-        let billing: Billing = from_str("plans:\n  - free\n  - pro\n").unwrap();
-        assert_eq!(billing.plans, vec!["free", "pro"]);
+    fn billing_plans_parse_from_inline_sequence() {
+        let yaml = "plans:\n  - id: free\n    name: Free\n  - id: pro\n    name: Pro\n    limits:\n      concurrent_requests: 20\n";
+        let billing: Billing = from_str(yaml).unwrap();
+        assert_eq!(billing.plan_ids(), vec!["free", "pro"]);
+        assert_eq!(
+            billing
+                .get("pro")
+                .unwrap()
+                .limits
+                .as_ref()
+                .unwrap()
+                .concurrent_requests,
+            Some(20)
+        );
     }
 
     #[test]

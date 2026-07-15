@@ -4,7 +4,8 @@ use axum::http::StatusCode;
 use chrono::{Duration, Utc};
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeyStatus, ApiKeyValidation, Project, ResourceStatus, async_trait,
-    config::BasicAuth, error::Result,
+    config::{BasicAuth, Billing, BillingLimits, BillingPlan},
+    error::Result,
 };
 use lightbridge_authz_rest::OpaState;
 use lightbridge_authz_rest::handlers::introspect::introspect_api_key;
@@ -160,6 +161,18 @@ fn mk_state(repo: MockOpaRepo) -> Arc<OpaState> {
             username: "authorino".to_string(),
             password: "change-me".to_string(),
         },
+        billing: Arc::new(Billing {
+            plans: vec![BillingPlan {
+                id: "free".to_string(),
+                name: "Free".to_string(),
+                limits: Some(BillingLimits {
+                    requests_per_second: Some(5),
+                    requests_per_day: Some(1000),
+                    requests_per_month: None,
+                    concurrent_requests: Some(2),
+                }),
+            }],
+        }),
     })
 }
 
@@ -201,6 +214,15 @@ async fn introspect_returns_active_with_context_and_records_usage() {
     assert_eq!(payload["api_key_id"], "key_1");
     assert_eq!(payload["api_key_status"], "active");
     assert_eq!(payload["billing_plan"], "free");
+    assert_eq!(payload["billing_plan_name"], "Free");
+    assert_eq!(payload["billing_plan_limits"]["requests_per_second"], 5);
+    assert_eq!(payload["billing_plan_limits"]["concurrent_requests"], 2);
+    assert!(
+        payload["billing_plan_limits"]
+            .get("requests_per_month")
+            .is_none(),
+        "unset limit fields must be omitted"
+    );
     assert_eq!(
         payload["allowed_models"],
         serde_json::json!(["gpt-4.1-mini"])

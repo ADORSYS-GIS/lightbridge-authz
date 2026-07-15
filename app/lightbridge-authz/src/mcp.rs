@@ -123,6 +123,7 @@ impl LightbridgeMcpHandler {
         let opa_state = Arc::new(OpaState {
             repo: opa_repo,
             basic_auth,
+            billing: Arc::new(Billing::default()),
         });
 
         Self {

@@ -95,7 +95,24 @@ otel:
   otlp_endpoint: "http://jaeger:4317"
   service_name: "lightbridge-authz"
 
-# Billing plans a caller may attach to an API key at creation time. Env-driven catalogue only
-# (no plan table/entity); a CreateApiKey must name one of these or it is rejected (400).
+# Billing plans a caller may attach to an API key at creation. Operator-defined catalogue (no
+# plan table/entity): each plan has a stable `id`, a UI `name`, and optional `limits`. A
+# CreateApiKey must name one of these ids or it is rejected (400); introspection resolves the id
+# to name + limits. `plans` also accepts a single JSON-array string via "${BILLING_PLANS}".
 billing:
-  plans: "${BILLING_PLANS:-free,pro,enterprise}"
+  plans:
+    - id: free
+      name: Free
+      limits:
+        requests_per_second: 5
+        requests_per_day: 1000
+        concurrent_requests: 2
+    - id: pro
+      name: Pro
+      limits:
+        requests_per_second: 50
+        requests_per_day: 50000
+        requests_per_month: 1000000
+        concurrent_requests: 20
+    - id: enterprise
+      name: Enterprise

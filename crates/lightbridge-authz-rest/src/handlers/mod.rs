@@ -450,7 +450,7 @@ impl AuthzStore for AuthzStoreImpl {
             return Err(Error::BadRequest(format!(
                 "unknown billing_plan '{}': must be one of the configured plans [{}]",
                 input.billing_plan,
-                self.billing.plans.join(", ")
+                self.billing.plan_ids().join(", ")
             )));
         }
         let id = cuid2();
@@ -634,7 +634,9 @@ mod tests {
     };
     use chrono::{Duration, Utc};
     use httpmock::{Method::POST, MockServer};
-    use lightbridge_authz_core::config::{Billing, Oauth2, Oauth2Issuance, Oauth2Type};
+    use lightbridge_authz_core::config::{
+        Billing, BillingPlan, Oauth2, Oauth2Issuance, Oauth2Type,
+    };
     use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
@@ -692,7 +694,11 @@ mod tests {
         use lightbridge_authz_core::CreateApiKey;
 
         let store = AuthzStoreImpl::with_pool(lazy_pool()).with_billing(Billing {
-            plans: vec!["pro".to_string()],
+            plans: vec![BillingPlan {
+                id: "pro".to_string(),
+                name: "Pro".to_string(),
+                limits: None,
+            }],
         });
 
         for plan in ["free", ""] {
