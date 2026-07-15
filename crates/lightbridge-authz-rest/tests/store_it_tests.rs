@@ -1,6 +1,7 @@
 #![cfg(feature = "it-tests")]
 
 use lightbridge_authz_api::contract::AuthzStore;
+use lightbridge_authz_core::config::{Billing, BillingPlan};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_core::{
     ApiKeyStatus, CreateAccount, CreateApiKey, CreateProject, RotateApiKey, UpdateAccount,
@@ -12,7 +13,20 @@ use std::sync::Arc;
 
 fn store(pool: PgPool) -> AuthzStoreImpl {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
-    AuthzStoreImpl::with_pool(pool)
+    AuthzStoreImpl::with_pool(pool).with_billing(Billing {
+        plans: vec![
+            BillingPlan {
+                id: "free".to_string(),
+                name: "Free".to_string(),
+                limits: None,
+            },
+            BillingPlan {
+                id: "pro".to_string(),
+                name: "Pro".to_string(),
+                limits: None,
+            },
+        ],
+    })
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -97,6 +111,7 @@ async fn store_drives_full_account_project_apikey_lifecycle(pool: PgPool) {
             CreateApiKey {
                 name: "key-store".to_string(),
                 expires_at: None,
+                billing_plan: "free".to_string(),
             },
         )
         .await
@@ -106,6 +121,7 @@ async fn store_drives_full_account_project_apikey_lifecycle(pool: PgPool) {
         "issuance disabled should yield an opaque secret, got: {}",
         created.secret
     );
+    assert_eq!(created.api_key.billing_plan, "free");
     let key_id = created.api_key.id.clone();
 
     assert_eq!(
@@ -148,6 +164,10 @@ async fn store_drives_full_account_project_apikey_lifecycle(pool: PgPool) {
         .await
         .expect("rotate api key");
     assert!(rotated.secret.starts_with("lbk_secret_"));
+    assert_eq!(
+        rotated.api_key.billing_plan, "free",
+        "rotation must preserve the billing plan"
+    );
     let rotated_id = rotated.api_key.id.clone();
 
     let revoked = store

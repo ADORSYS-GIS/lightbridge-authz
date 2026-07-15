@@ -55,6 +55,7 @@ async fn rotate_rolls_back_on_create_failure(pool: PgPool) {
         last_used_at: None,
         last_ip: None,
         revoked_at: None,
+        billing_plan: "starter".to_string(),
     };
 
     let api_key = repo.create_api_key(subject, initial_row).await.unwrap();
@@ -71,6 +72,7 @@ async fn rotate_rolls_back_on_create_failure(pool: PgPool) {
         last_used_at: None,
         last_ip: None,
         revoked_at: None,
+        billing_plan: "starter".to_string(),
     };
 
     let err = repo

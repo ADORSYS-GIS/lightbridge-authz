@@ -144,7 +144,7 @@ def main() -> int:
         status, key_payload = request_json(
             "POST",
             f"{API_URL}/api/v1/projects/{project_id}/api-keys",
-            {"name": "it-key"},
+            {"name": "it-key", "billing_plan": "free"},
             headers=authz_headers,
             insecure_tls=True,
         )

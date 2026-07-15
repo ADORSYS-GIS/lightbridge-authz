@@ -61,12 +61,20 @@ async fn main() -> Result<()> {
 
             let api = config.clone().server.api;
             let opa = config.clone().server.opa;
+            let opa_billing = config.billing.clone();
 
             let config_clone = config.clone();
             let tx_clone = tx.clone();
             let pool_clone = pool.clone();
             tokio::spawn(async move {
-                if let Err(e) = start_api_server(&api, pool_clone, &config_clone.oauth2).await {
+                if let Err(e) = start_api_server(
+                    &api,
+                    pool_clone,
+                    &config_clone.oauth2,
+                    &config_clone.billing,
+                )
+                .await
+                {
                     let _ = tx_clone
                         .send(format!("API server failed to start: {}", e))
                         .await;
@@ -76,7 +84,7 @@ async fn main() -> Result<()> {
             let tx_clone = tx.clone();
             let pool_clone = pool.clone();
             tokio::spawn(async move {
-                if let Err(e) = start_opa_server(&opa, pool_clone).await {
+                if let Err(e) = start_opa_server(&opa, pool_clone, &opa_billing).await {
                     let _ = tx_clone
                         .send(format!("OPA server failed to start: {}", e))
                         .await;
@@ -94,7 +102,7 @@ async fn main() -> Result<()> {
             info!("Connecting to DB...");
             let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(&config.database).await?);
 
-            start_api_server(&config.server.api, pool, &config.oauth2).await?;
+            start_api_server(&config.server.api, pool, &config.oauth2, &config.billing).await?;
             Ok(())
         }
         Some(Commands::Opa { config_path }) => {
@@ -105,7 +113,7 @@ async fn main() -> Result<()> {
             info!("Connecting to DB...");
             let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(&config.database).await?);
 
-            start_opa_server(&config.server.opa, pool).await?;
+            start_opa_server(&config.server.opa, pool, &config.billing).await?;
             Ok(())
         }
         Some(Commands::Migrate { config_path }) => {
