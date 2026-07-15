@@ -175,6 +175,9 @@ pub struct UpdateApiKey {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+/// Rotation mints a fresh secret for an existing key. It does not carry a `billing_plan`: a key's
+/// plan is fixed at creation and preserved across rotation (there is no supported path to change a
+/// key's plan — create a new key on the desired plan instead).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RotateApiKey {
     pub name: Option<String>,

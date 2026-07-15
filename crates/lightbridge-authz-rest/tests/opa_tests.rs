@@ -235,6 +235,35 @@ async fn introspect_returns_active_with_context_and_records_usage() {
 }
 
 #[tokio::test]
+async fn introspect_omits_name_and_limits_for_plan_absent_from_catalogue() {
+    let mut api_key = mk_api_key(ApiKeyStatus::Active, None);
+    api_key.billing_plan = "removed-plan".to_string();
+    let state = mk_state(MockOpaRepo {
+        api_key: Some(api_key),
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+    });
+
+    let (status, payload) = introspect(state, "lbk_secret_valid").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], true);
+    assert_eq!(
+        payload["billing_plan"], "removed-plan",
+        "the stored plan id is always returned"
+    );
+    assert!(
+        payload.get("billing_plan_name").is_none(),
+        "an id not in the catalogue resolves to no name"
+    );
+    assert!(
+        payload.get("billing_plan_limits").is_none(),
+        "an id not in the catalogue resolves to no limits"
+    );
+}
+
+#[tokio::test]
 async fn introspect_returns_inactive_when_revoked() {
     let state = mk_state(MockOpaRepo {
         api_key: Some(mk_api_key(ApiKeyStatus::Revoked, None)),

@@ -114,5 +114,6 @@ billing:
         requests_per_day: 50000
         requests_per_month: 1000000
         concurrent_requests: 20
+    # No `limits` block ⇒ unlimited on every dimension (the edge treats absent limits as no cap).
     - id: enterprise
       name: Enterprise

@@ -146,6 +146,8 @@ configMaps:
         # CreateApiKey must name one of these ids or it is rejected (400); introspection resolves
         # the id to name + limits. `plans` also accepts a single JSON-array string via
         # "${BILLING_PLANS}".
+        # NOTE: keep this catalogue in sync with charts/lightbridge-authz/values.yaml — API and MCP
+        # share the same DB, so a key created under one must be creatable under the other.
         billing:
           plans:
             - id: free
@@ -161,6 +163,7 @@ configMaps:
                 requests_per_day: 50000
                 requests_per_month: 1000000
                 concurrent_requests: 20
+            # No `limits` block ⇒ unlimited on every dimension.
             - id: enterprise
               name: Enterprise
 

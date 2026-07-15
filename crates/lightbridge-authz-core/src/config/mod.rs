@@ -48,7 +48,9 @@ pub struct BillingPlan {
 }
 
 /// Rate/usage limits attached to a billing plan. Purely descriptive here — enforcement lives at
-/// the edge (e.g. Authorino), which reads these via token introspection.
+/// the edge (e.g. Authorino), which reads these via token introspection. Convention: an omitted
+/// field (or an entirely omitted `limits` block, e.g. an unlimited "enterprise" plan) means *no
+/// limit* for that dimension; the edge must treat an absent value as unlimited, not as "deny".
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
 pub struct BillingLimits {
     #[serde(default, skip_serializing_if = "Option::is_none")]

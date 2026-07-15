@@ -40,6 +40,15 @@ pub async fn introspect_api_key(
     );
 
     let plan = state.billing.get(&validated.api_key.billing_plan);
+    if plan.is_none() {
+        tracing::warn!(
+            api_key_id = %validated.api_key.id,
+            billing_plan = %validated.api_key.billing_plan,
+            "api key references a billing plan absent from the configured catalogue; \
+             billing_plan_name/billing_plan_limits omitted (a downstream enforcer will see the key \
+             as having no limits — reconcile the catalogue with keys still in use)"
+        );
+    }
     let response = IntrospectResponse {
         active: true,
         sub: Some(validated.api_key.id.clone()),
