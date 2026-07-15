@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{Error, Result};
 use regex::{Captures, Regex};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ pub struct Config {
     /// Billing plans a caller may attach to an API key at creation time. The catalogue is defined
     /// entirely by the operator (env-driven) — there is no plan table or entity. A `CreateApiKey`
     /// must name one of these plans (by `id`) or the request is rejected.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub billing: Billing,
 }
 
@@ -79,32 +79,102 @@ impl Billing {
     pub fn plan_ids(&self) -> Vec<&str> {
         self.plans.iter().map(|p| p.id.as_str()).collect()
     }
+
+    /// Validates the catalogue for a server that issues API keys: it must be non-empty, every plan
+    /// must have a non-empty `id`, and ids must be unique. Called at startup by the key-issuing
+    /// servers so a misconfiguration fails loudly instead of silently rejecting every
+    /// `CreateApiKey` with a `400`.
+    pub fn validate(&self) -> Result<()> {
+        if self.plans.is_empty() {
+            return Err(Error::Server(
+                "billing.plans is empty: configure at least one billing plan (API-key creation \
+                 requires a valid plan)"
+                    .to_string(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for plan in &self.plans {
+            if plan.id.trim().is_empty() {
+                return Err(Error::Server(
+                    "billing.plans contains a plan with an empty id".to_string(),
+                ));
+            }
+            if !seen.insert(plan.id.as_str()) {
+                return Err(Error::Server(format!(
+                    "billing.plans contains a duplicate plan id '{}'",
+                    plan.id
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
-/// Accepts either a JSON-array string (the single-env-var case, e.g. `${BILLING_PLANS}`) or an
-/// inline YAML/JSON sequence of plan objects. A blank/unset env var yields an empty catalogue
-/// rather than a parse error.
+/// Deserializes an optional field to its `Default` when the YAML value is null (rather than
+/// erroring). Lets `billing:` with no value fall back to an empty catalogue.
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// Accepts a JSON-array string (the single-env-var case, e.g. `${BILLING_PLANS}`), an inline
+/// YAML/JSON sequence of plan objects, or null/blank. A null value or a blank/unset env var yields
+/// an empty catalogue rather than a parse error.
 fn deserialize_plan_list<'de, D>(deserializer: D) -> std::result::Result<Vec<BillingPlan>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Plans {
-        Json(String),
-        List(Vec<BillingPlan>),
-    }
+    struct PlansVisitor;
 
-    match Plans::deserialize(deserializer)? {
-        Plans::Json(s) => {
-            let trimmed = s.trim();
+    impl<'de> serde::de::Visitor<'de> for PlansVisitor {
+        type Value = Vec<BillingPlan>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a JSON-array string, a sequence of billing plans, or null")
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            let trimmed = value.trim();
             if trimmed.is_empty() {
                 return Ok(Vec::new());
             }
-            serde_json::from_str(trimmed).map_err(serde::de::Error::custom)
+            serde_json::from_str(trimmed).map_err(E::custom)
         }
-        Plans::List(list) => Ok(list),
+
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut plans = Vec::new();
+            while let Some(plan) = seq.next_element::<BillingPlan>()? {
+                plans.push(plan);
+            }
+            Ok(plans)
+        }
     }
+
+    deserializer.deserialize_any(PlansVisitor)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -490,5 +560,46 @@ mod tests {
 
         let blank: Billing = from_str("plans: \"\"\n").unwrap();
         assert!(blank.plans.is_empty());
+    }
+
+    #[test]
+    fn billing_plans_null_is_tolerated_as_empty() {
+        let via_plans_null: Billing = from_str("plans: null\n").unwrap();
+        assert!(via_plans_null.plans.is_empty());
+
+        let via_plans_bare: Billing = from_str("plans:\n").unwrap();
+        assert!(via_plans_bare.plans.is_empty());
+
+        #[derive(Deserialize)]
+        struct Wrap {
+            #[serde(default, deserialize_with = "deserialize_null_default")]
+            billing: Billing,
+        }
+        let via_billing_null: Wrap = from_str("billing:\n").unwrap();
+        assert!(via_billing_null.billing.plans.is_empty());
+    }
+
+    #[test]
+    fn billing_validate_rejects_empty_dup_and_blank_ids() {
+        assert!(Billing::default().validate().is_err());
+
+        let dup: Billing =
+            from_str("plans:\n  - id: free\n    name: Free\n  - id: free\n    name: Free2\n")
+                .unwrap();
+        let err = dup.validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate plan id 'free'"), "got: {err}");
+
+        let blank: Billing = from_str("plans:\n  - id: \"\"\n    name: Nameless\n").unwrap();
+        assert!(
+            blank
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("empty id")
+        );
+
+        let ok: Billing =
+            from_str("plans:\n  - id: free\n    name: Free\n  - id: pro\n    name: Pro\n").unwrap();
+        assert!(ok.validate().is_ok());
     }
 }

@@ -207,6 +207,7 @@ pub async fn start_api_server(
     oauth2: &Oauth2,
     billing: &Billing,
 ) -> Result<()> {
+    billing.validate()?;
     let readiness_pool = pool.clone();
     let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
     if oauth2.is_self_signed() {

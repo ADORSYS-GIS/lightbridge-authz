@@ -1255,8 +1255,7 @@ impl StoreRepo {
         .bind(subject)
         .fetch_optional(&mut *tx)
         .await?;
-        let existing =
-            existing_update.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
+        existing_update.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
         let new_row = sqlx::query_as::<_, ApiKeyRow>(
             r#"
             WITH project_auth AS (
@@ -1289,7 +1288,7 @@ impl StoreRepo {
         .bind(new_key.last_used_at)
         .bind(new_key.last_ip)
         .bind(new_key.revoked_at)
-        .bind(existing.billing_plan)
+        .bind(new_key.billing_plan)
         .fetch_optional(&mut *tx)
         .await?;
         let row = new_row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;

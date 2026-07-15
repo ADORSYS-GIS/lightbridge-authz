@@ -29,7 +29,7 @@ use reqwest::Client;
 use rmcp::{
     ErrorData, Json, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo},
     schemars,
     service::RequestContext,
     tool, tool_handler, tool_router,
@@ -104,6 +104,7 @@ pub struct LightbridgeMcpHandler {
     tool_router: ToolRouter<Self>,
     store: Arc<dyn AuthzStore>,
     opa_state: Arc<OpaState>,
+    billing: Arc<Billing>,
 }
 
 impl std::fmt::Debug for LightbridgeMcpHandler {
@@ -119,18 +120,39 @@ impl LightbridgeMcpHandler {
         store: Arc<dyn AuthzStore>,
         opa_repo: Arc<dyn OpaRepoTrait>,
         basic_auth: BasicAuth,
+        billing: &Billing,
     ) -> Self {
+        let billing = Arc::new(billing.clone());
         let opa_state = Arc::new(OpaState {
             repo: opa_repo,
             basic_auth,
-            billing: Arc::new(Billing::default()),
+            billing: billing.clone(),
         });
 
         Self {
             tool_router: Self::tool_router(),
             store,
             opa_state,
+            billing,
         }
+    }
+
+    /// The tool list advertised to clients: the router's tools, with the `create-api-key`
+    /// description annotated with the operator-configured billing plan ids so a caller can see the
+    /// valid `billing_plan` values without a round-trip.
+    fn advertised_tools(&self) -> Vec<rmcp::model::Tool> {
+        let mut tools = self.tool_router.list_all();
+        let plan_ids = self.billing.plan_ids();
+        if !plan_ids.is_empty() {
+            let suffix = format!(" Valid `billing_plan` ids: {}.", plan_ids.join(", "));
+            for tool in tools.iter_mut() {
+                if tool.name == "create-api-key" {
+                    let base = tool.description.take().unwrap_or_default().into_owned();
+                    tool.description = Some(format!("{base}{suffix}").into());
+                }
+            }
+        }
+        tools
     }
 }
 
@@ -140,6 +162,18 @@ impl ServerHandler for LightbridgeMcpHandler {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "MCP interface for Lightbridge Authz API and OPA validation endpoints",
         )
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult {
+            tools: self.advertised_tools(),
+            next_cursor: None,
+            meta: None,
+        })
     }
 
     async fn call_tool(
@@ -1195,6 +1229,7 @@ pub async fn start_mcp_server(
     billing: &Billing,
     pool: Arc<dyn DbPoolTrait>,
 ) -> Result<()> {
+    billing.validate()?;
     let readiness_pool = pool.clone();
     if oauth2.is_self_signed() {
         let signing = oauth2.signing.as_ref().ok_or_else(|| {
@@ -1216,7 +1251,7 @@ pub async fn start_mcp_server(
         bearer: bearer_service,
     });
 
-    let handler = LightbridgeMcpHandler::new(store, opa_repo, basic_auth.clone());
+    let handler = LightbridgeMcpHandler::new(store, opa_repo, basic_auth.clone(), billing);
     let oauth_proxy_state = Arc::new(OauthProxyState {
         client: Client::new(),
         endpoints: resolve_oauth2_endpoints(oauth2),
@@ -1673,6 +1708,24 @@ mod tests {
         }
     }
 
+    fn sample_billing() -> Billing {
+        use lightbridge_authz_core::config::BillingPlan;
+        Billing {
+            plans: vec![
+                BillingPlan {
+                    id: "free".to_string(),
+                    name: "Free".to_string(),
+                    limits: None,
+                },
+                BillingPlan {
+                    id: "pro".to_string(),
+                    name: "Pro".to_string(),
+                    limits: None,
+                },
+            ],
+        }
+    }
+
     fn sample_oauth2() -> Oauth2 {
         Oauth2 {
             oauth2_type: lightbridge_authz_core::config::Oauth2Type::External,
@@ -1794,7 +1847,12 @@ mod tests {
 
     #[test]
     fn router_lists_all_lightbridge_endpoint_tools() {
-        let handler = LightbridgeMcpHandler::new(Arc::new(MockStore), sample_repo(), basic_auth());
+        let handler = LightbridgeMcpHandler::new(
+            Arc::new(MockStore),
+            sample_repo(),
+            basic_auth(),
+            &sample_billing(),
+        );
 
         let mut tool_names = handler
             .tool_router
@@ -1837,6 +1895,63 @@ mod tests {
     }
 
     #[test]
+    fn create_api_key_tool_advertises_configured_billing_plans() {
+        let handler = LightbridgeMcpHandler::new(
+            Arc::new(MockStore),
+            sample_repo(),
+            basic_auth(),
+            &sample_billing(),
+        );
+
+        let tools = handler.advertised_tools();
+        let create = tools
+            .iter()
+            .find(|tool| tool.name == "create-api-key")
+            .expect("create-api-key tool should be advertised");
+        let description = create.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("Valid `billing_plan` ids: free, pro."),
+            "create-api-key description should list the configured plan ids, got: {description}"
+        );
+
+        let other = tools
+            .iter()
+            .find(|tool| tool.name == "get-api-key")
+            .expect("get-api-key tool should be advertised");
+        assert!(
+            !other
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("billing_plan"),
+            "only create-api-key should carry the billing-plan annotation"
+        );
+    }
+
+    #[test]
+    fn advertised_tools_unchanged_when_no_billing_plans_configured() {
+        let handler = LightbridgeMcpHandler::new(
+            Arc::new(MockStore),
+            sample_repo(),
+            basic_auth(),
+            &Billing::default(),
+        );
+        let tools = handler.advertised_tools();
+        let create = tools
+            .iter()
+            .find(|tool| tool.name == "create-api-key")
+            .expect("create-api-key tool should be advertised");
+        assert!(
+            !create
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Valid `billing_plan` ids"),
+            "no annotation should be added when the catalogue is empty"
+        );
+    }
+
+    #[test]
     fn member_tools_are_gated_by_account_member_permission() {
         assert_eq!(
             required_tool_permission("add-account-member"),
@@ -1850,7 +1965,12 @@ mod tests {
 
     #[test]
     fn every_registered_tool_has_a_permission_mapping() {
-        let handler = LightbridgeMcpHandler::new(Arc::new(MockStore), sample_repo(), basic_auth());
+        let handler = LightbridgeMcpHandler::new(
+            Arc::new(MockStore),
+            sample_repo(),
+            basic_auth(),
+            &sample_billing(),
+        );
         for tool in handler.tool_router.list_all() {
             assert!(
                 required_tool_permission(&tool.name).is_some(),
@@ -1862,7 +1982,12 @@ mod tests {
 
     #[test]
     fn create_account_tool_schema_uses_jwt_subject_not_input_subject() {
-        let handler = LightbridgeMcpHandler::new(Arc::new(MockStore), sample_repo(), basic_auth());
+        let handler = LightbridgeMcpHandler::new(
+            Arc::new(MockStore),
+            sample_repo(),
+            basic_auth(),
+            &sample_billing(),
+        );
         let create_account = handler
             .tool_router
             .list_all()
@@ -1888,7 +2013,12 @@ mod tests {
 
     #[test]
     fn list_tools_schema_include_pagination_fields() {
-        let handler = LightbridgeMcpHandler::new(Arc::new(MockStore), sample_repo(), basic_auth());
+        let handler = LightbridgeMcpHandler::new(
+            Arc::new(MockStore),
+            sample_repo(),
+            basic_auth(),
+            &sample_billing(),
+        );
         for tool_name in ["list-accounts", "list-projects", "list-api-keys"] {
             let tool = handler
                 .tool_router
@@ -1915,7 +2045,12 @@ mod tests {
 
     #[test]
     fn tool_output_schema_avoids_boolean_schema_for_result_property() {
-        let handler = LightbridgeMcpHandler::new(Arc::new(MockStore), sample_repo(), basic_auth());
+        let handler = LightbridgeMcpHandler::new(
+            Arc::new(MockStore),
+            sample_repo(),
+            basic_auth(),
+            &sample_billing(),
+        );
         let create_account = handler
             .tool_router
             .list_all()
@@ -1947,7 +2082,12 @@ mod tests {
 
     #[tokio::test]
     async fn authorino_validation_tool_enriches_dynamic_metadata() {
-        let handler = LightbridgeMcpHandler::new(Arc::new(MockStore), sample_repo(), basic_auth());
+        let handler = LightbridgeMcpHandler::new(
+            Arc::new(MockStore),
+            sample_repo(),
+            basic_auth(),
+            &sample_billing(),
+        );
         let mut metadata = HashMap::new();
         metadata.insert("env".to_string(), json!("dev"));
 

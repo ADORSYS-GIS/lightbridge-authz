@@ -181,9 +181,13 @@ is no plan table or entity. Each plan is `{ id, name, limits }`: a stable `id` (
 stores and `CreateApiKey` names), a UI `name`, and optional rate/usage `limits`
 (`requests_per_second` / `requests_per_day` / `requests_per_month` / `concurrent_requests`). The
 catalogue is an inline YAML sequence, or a single `BILLING_PLANS` JSON-array env var for
-fully-env setups. `CreateApiKey` must name a configured `id` or the request is rejected with
-`400 Bad Request`; rotation preserves the existing key's plan. Token introspection returns the
-key's `billing_plan` (id) plus the resolved `billing_plan_name` and `billing_plan_limits`.
+fully-env setups. The key-issuing servers (`api`, `mcp`) validate the catalogue at startup —
+non-empty, unique non-empty `id`s — and refuse to start otherwise, so a misconfiguration fails
+loudly instead of silently rejecting every create. `CreateApiKey` must name a configured `id` or
+the request is rejected with `400 Bad Request`; rotation preserves the existing key's plan. Token
+introspection returns the key's `billing_plan` (id) plus the resolved `billing_plan_name` and
+`billing_plan_limits`. The MCP `create-api-key` tool advertises the configured ids in its
+description.
 
 ## Credential lifecycle
 
