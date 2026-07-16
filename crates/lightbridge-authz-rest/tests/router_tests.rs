@@ -176,6 +176,14 @@ async fn basic_auth_rejects_wrong_credentials() {
 }
 
 #[tokio::test]
+async fn basic_auth_rejects_valid_base64_that_is_not_utf8() {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode([0xFF, 0xFE, 0xFD, 0x00, 0xFF]);
+    let (status, _) = send(introspect_req(Some(&format!("Basic {encoded}")))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn basic_auth_accepts_valid_credentials_and_routes_to_introspect() {
     let (status, payload) = send(introspect_req(Some(&basic("authorino:change-me")))).await;
     assert_eq!(status, StatusCode::OK);
@@ -308,6 +316,14 @@ async fn bearer_auth_accepts_mixed_case_scheme() {
     assert_eq!(
         bearer_status(BearerOutcome::Active, Some("BEARER good")).await,
         StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn bearer_auth_rejects_non_bearer_scheme() {
+    assert_eq!(
+        bearer_status(BearerOutcome::Active, Some("Token good")).await,
+        StatusCode::UNAUTHORIZED
     );
 }
 
@@ -695,4 +711,190 @@ async fn build_opa_router_serves_probes_and_introspection() {
         .await
         .unwrap();
     assert_eq!(introspect.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn readiness_via_api_router_reports_unavailable_when_database_is_down() {
+    let response = api_router(false)
+        .oneshot(
+            Request::builder()
+                .uri("/healthz/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn readiness_via_opa_router_reports_unavailable_when_database_is_down() {
+    let state = Arc::new(OpaState {
+        repo: Arc::new(MockOpaRepo),
+        basic_auth: BasicAuth {
+            username: "authorino".to_string(),
+            password: "change-me".to_string(),
+        },
+        billing: Arc::new(lightbridge_authz_core::config::Billing::default()),
+    });
+    let response = lightbridge_authz_rest::build_opa_router(state, lazy_pool())
+        .oneshot(
+            Request::builder()
+                .uri("/healthz/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+fn self_signed_oauth2_without_token_exchange() -> lightbridge_authz_core::config::Oauth2 {
+    lightbridge_authz_core::config::Oauth2 {
+        oauth2_type: lightbridge_authz_core::config::Oauth2Type::SelfSigned,
+        jwks_url: "http://unused".to_string(),
+        oauth2_url: None,
+        issuer_url: None,
+        authorization_endpoint: None,
+        token_endpoint: None,
+        registration_endpoint: None,
+        issuance: None,
+        audience: None,
+        signing: Some(lightbridge_authz_core::config::JwtSigning {
+            issuer: "https://authz.example.test".to_string(),
+            audience: None,
+            ttl_seconds: 7_776_000,
+            max_key_age_days: 30,
+        }),
+        token_exchange: None,
+        rbac: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn build_api_router_merges_well_known_routes_when_self_signed() {
+    let store: Arc<dyn AuthzStore> = Arc::new(AuthzStoreImpl::with_pool(lazy_pool()));
+    let app_state = Arc::new(AppState {
+        store,
+        bearer: Arc::new(MockBearer {
+            outcome: BearerOutcome::Active,
+        }),
+    });
+    let signing_repo = Arc::new(lightbridge_authz_api_key::repo::StoreRepo::new(lazy_pool()));
+    let router = lightbridge_authz_rest::build_api_router(
+        &self_signed_oauth2_without_token_exchange(),
+        app_state,
+        lazy_pool(),
+        signing_repo,
+        None,
+        false,
+    );
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn build_api_router_merges_token_exchange_route_when_enabled() {
+    let store: Arc<dyn AuthzStore> = Arc::new(AuthzStoreImpl::with_pool(lazy_pool()));
+    let app_state = Arc::new(AppState {
+        store,
+        bearer: Arc::new(MockBearer {
+            outcome: BearerOutcome::Active,
+        }),
+    });
+    let oauth2 = self_signed_oauth2_without_token_exchange();
+    let signing_repo = Arc::new(lightbridge_authz_api_key::repo::StoreRepo::new(lazy_pool()));
+    let signer = lightbridge_authz_rest::signing::ApiKeyJwtSigner::from_config(
+        oauth2.signing.as_ref().unwrap(),
+        signing_repo.clone(),
+    )
+    .unwrap();
+    let te_state = lightbridge_authz_rest::token_exchange::TokenExchangeState {
+        repo: signing_repo.clone(),
+        signer,
+        bearer: Arc::new(MockBearer {
+            outcome: BearerOutcome::Active,
+        }),
+        cfg: lightbridge_authz_core::config::Oauth2TokenExchange {
+            enabled: true,
+            access_ttl_seconds: 900,
+            refresh_ttl_seconds: 2_592_000,
+            allowed_scopes: vec!["openid".to_string()],
+        },
+    };
+    let router = lightbridge_authz_rest::build_api_router(
+        &oauth2,
+        app_state,
+        lazy_pool(),
+        signing_repo,
+        Some(te_state),
+        false,
+    );
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth2/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("grant_type=client_credentials"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn authorize_denies_when_matched_path_is_missing() {
+    use axum::response::IntoResponse;
+    use tower::{Layer, ServiceExt};
+
+    let inner = tower::service_fn(|_req: Request<Body>| async {
+        Ok::<_, std::convert::Infallible>(StatusCode::OK.into_response())
+    });
+    let svc = axum::middleware::from_fn(lightbridge_authz_rest::middleware::authorize).layer(inner);
+
+    let response = svc
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/accounts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn authorize_denies_unmapped_route() {
+    let app = axum::Router::new()
+        .route(
+            "/api/v1/not-a-real-route",
+            axum::routing::get(|| async { "ok" }),
+        )
+        .route_layer(axum::middleware::from_fn(
+            lightbridge_authz_rest::middleware::authorize,
+        ));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/not-a-real-route")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }

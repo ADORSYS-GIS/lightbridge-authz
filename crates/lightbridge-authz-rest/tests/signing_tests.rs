@@ -68,6 +68,17 @@ async fn from_config_builds_signer_for_valid_config() {
 }
 
 #[tokio::test]
+async fn debug_impl_omits_private_key_material() {
+    let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), lazy_repo()).unwrap();
+    let debug = format!("{signer:?}");
+    assert!(debug.contains(ISSUER));
+    assert!(
+        !debug.to_lowercase().contains("private"),
+        "Debug output must not expose private key material: {debug}"
+    );
+}
+
+#[tokio::test]
 async fn from_config_rejects_empty_issuer() {
     let mut cfg = signing_cfg(3600);
     cfg.issuer = "   ".to_string();
@@ -106,6 +117,30 @@ async fn well_known_serves_cors_headers() {
             .expect("well-known responses must carry a CORS allow-origin header"),
         "*"
     );
+}
+
+#[tokio::test]
+async fn jwks_endpoint_returns_server_error_when_repo_is_unreachable() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use lightbridge_authz_rest::signing::well_known_router;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    let response = well_known_router::<()>(ISSUER, lazy_repo(), false)
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/jwks.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["keys"].as_array().unwrap().len(), 0);
 }
 
 const CAP_TTL_SECONDS: i64 = 7_776_000;

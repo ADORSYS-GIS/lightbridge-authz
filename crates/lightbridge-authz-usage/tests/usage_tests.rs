@@ -7,15 +7,22 @@ use lightbridge_authz_core::{Error, Result, async_trait};
 use lightbridge_authz_usage_rest::UsageRepoTrait;
 use lightbridge_authz_usage_rest::UsageState;
 use lightbridge_authz_usage_rest::build_usage_router;
-use lightbridge_authz_usage_rest::handlers::ingest::ingest_logs;
+use lightbridge_authz_usage_rest::handlers::ingest::{ingest_logs, ingest_metrics, ingest_traces};
 use lightbridge_authz_usage_rest::handlers::query::query_usage;
 use lightbridge_authz_usage_rest::models::{
     UsageGroupBy, UsageQueryFilters, UsageQueryRequest, UsageScope, UsageSeriesPoint,
 };
-use lightbridge_authz_usage_rest::repo::UsageEvent;
+use lightbridge_authz_usage_rest::repo::{StoreRepo, UsageEvent};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use opentelemetry_proto::tonic::metrics::v1::{
+    Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric, number_data_point,
+};
+use opentelemetry_proto::tonic::resource::v1::Resource;
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
@@ -286,4 +293,297 @@ fn int_attr(key: &str, value: i64) -> KeyValue {
         }),
         key_strindex: 0,
     }
+}
+
+fn encoded_trace_request() -> Bytes {
+    let request = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![string_attr("account_id", "acct_1")],
+                ..Default::default()
+            }),
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    name: "chat.completion".to_string(),
+                    start_time_unix_nano: 1_700_000_000_000_000_000,
+                    end_time_unix_nano: 1_700_000_001_000_000_000,
+                    attributes: vec![
+                        string_attr("project_id", "proj_1"),
+                        int_attr("prompt_tokens", 3),
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+
+    let mut encoded = Vec::new();
+    request
+        .encode(&mut encoded)
+        .expect("trace request should encode");
+    Bytes::from(encoded)
+}
+
+fn encoded_metrics_request() -> Bytes {
+    let request = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![string_attr("account_id", "acct_1")],
+                ..Default::default()
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "gen_ai.usage.total_tokens".to_string(),
+                    data: Some(metric::Data::Sum(Sum {
+                        data_points: vec![NumberDataPoint {
+                            time_unix_nano: 1_700_000_000_000_000_000,
+                            value: Some(number_data_point::Value::AsInt(42)),
+                            ..Default::default()
+                        }],
+                        aggregation_temporality: 0,
+                        is_monotonic: true,
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+
+    let mut encoded = Vec::new();
+    request
+        .encode(&mut encoded)
+        .expect("metrics request should encode");
+    Bytes::from(encoded)
+}
+
+#[tokio::test]
+async fn ingest_traces_treats_noop_insert_as_success() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+        }),
+    });
+
+    let response = ingest_traces(
+        axum::extract::State(state),
+        HeaderMap::new(),
+        encoded_trace_request(),
+    )
+    .await
+    .expect("noop insert should still acknowledge OTLP traces");
+
+    assert_eq!(response.0, StatusCode::ACCEPTED);
+    assert_eq!(response.1.0.accepted_events, 1);
+}
+
+#[tokio::test]
+async fn ingest_traces_rejects_invalid_protobuf_as_bad_request() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+        }),
+    });
+
+    let result = ingest_traces(
+        axum::extract::State(state),
+        HeaderMap::new(),
+        Bytes::from_static(b"not protobuf"),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(Error::BadRequest(message))
+            if message.contains("invalid OTLP trace protobuf payload")
+    ));
+}
+
+#[tokio::test]
+async fn ingest_metrics_treats_noop_insert_as_success() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+        }),
+    });
+
+    let response = ingest_metrics(
+        axum::extract::State(state),
+        HeaderMap::new(),
+        encoded_metrics_request(),
+    )
+    .await
+    .expect("noop insert should still acknowledge OTLP metrics");
+
+    assert_eq!(response.0, StatusCode::ACCEPTED);
+    assert_eq!(response.1.0.accepted_events, 1);
+}
+
+#[tokio::test]
+async fn ingest_metrics_rejects_invalid_protobuf_as_bad_request() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+        }),
+    });
+
+    let result = ingest_metrics(
+        axum::extract::State(state),
+        HeaderMap::new(),
+        Bytes::from_static(b"not protobuf"),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(Error::BadRequest(message))
+            if message.contains("invalid OTLP metrics protobuf payload")
+    ));
+}
+
+#[tokio::test]
+async fn ingest_logs_accepts_json_content_type_payload() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+        }),
+    });
+
+    let body = serde_json::json!({
+        "resourceLogs": [
+            {
+                "scopeLogs": [
+                    {
+                        "logRecords": [
+                            {
+                                "timeUnixNano": "1700000000000000000",
+                                "severityText": "INFO"
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    })
+    .to_string();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+
+    let response = ingest_logs(
+        axum::extract::State(state),
+        headers,
+        Bytes::from(body.into_bytes()),
+    )
+    .await
+    .expect("json OTLP logs payload should be accepted");
+
+    assert_eq!(response.0, StatusCode::ACCEPTED);
+    assert_eq!(response.1.0.accepted_events, 1);
+}
+
+#[tokio::test]
+async fn ingest_logs_accepts_gzip_encoded_body() {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+        }),
+    });
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(&encoded_log_request())
+        .expect("write should succeed");
+    let compressed = encoder.finish().expect("gzip encoding should succeed");
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+
+    let response = ingest_logs(
+        axum::extract::State(state),
+        headers,
+        Bytes::from(compressed),
+    )
+    .await
+    .expect("gzip encoded OTLP logs payload should be accepted");
+
+    assert_eq!(response.0, StatusCode::ACCEPTED);
+    assert_eq!(response.1.0.accepted_events, 1);
+}
+
+#[tokio::test]
+async fn root_route_reports_a_welcome_message() {
+    let response = usage_app(false)
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn healthz_ready_route_reports_unavailable_when_database_is_down() {
+    let response = usage_app(false)
+        .oneshot(
+            Request::builder()
+                .uri("/healthz/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn store_repo_insert_usage_events_is_a_noop_for_empty_batch_without_a_live_pool() {
+    let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(lazy_pool()));
+
+    let persisted = repo
+        .insert_usage_events(&[])
+        .await
+        .expect("empty insert should succeed without touching the pool");
+
+    assert_eq!(persisted, 0);
+}
+
+#[tokio::test]
+async fn store_repo_query_usage_rejects_invalid_bucket_without_a_live_pool() {
+    let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(lazy_pool()));
+    let request = UsageQueryRequest {
+        bucket: "1 fortnight".to_string(),
+        ..base_request()
+    };
+
+    let result = repo.query_usage(&request).await;
+
+    assert!(matches!(result, Err(Error::BadRequest(_))));
+}
+
+#[test]
+fn usage_query_request_deserializes_default_bucket_and_limit() {
+    let request: UsageQueryRequest = serde_json::from_value(serde_json::json!({
+        "scope": "project",
+        "scope_id": "proj_1",
+        "start_time": "2026-01-01T00:00:00Z",
+        "end_time": "2026-01-01T01:00:00Z"
+    }))
+    .expect("minimal usage query request should deserialize");
+
+    assert_eq!(request.bucket, "1 hour");
+    assert_eq!(request.limit, 1_000);
 }

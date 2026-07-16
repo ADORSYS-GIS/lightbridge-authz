@@ -25,3 +25,7 @@ lightbridge-authz-core = { workspace = true, features = ["axum"] }
 lightbridge-authz-rest.workspace = true
 mimalloc.workspace = true
 sqlx.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+tower.workspace = true

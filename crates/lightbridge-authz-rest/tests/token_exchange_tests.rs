@@ -54,6 +54,23 @@ impl BearerTokenServiceTrait for MockBearer {
     }
 }
 
+struct ErrBearer;
+
+#[async_trait]
+impl BearerTokenServiceTrait for ErrBearer {
+    async fn validate_bearer_token(&self, _token: &str) -> anyhow::Result<TokenInfo> {
+        Err(anyhow::anyhow!("upstream jwks unreachable"))
+    }
+}
+
+fn lazy_repo() -> Arc<StoreRepo> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
+        .expect("lazy pool should be constructible");
+    let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+    Arc::new(StoreRepo::new(pool))
+}
+
 fn signing_cfg() -> JwtSigning {
     JwtSigning {
         issuer: ISSUER.to_string(),
@@ -334,4 +351,192 @@ async fn unsupported_grant_type_is_rejected(pool: PgPool) {
 
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
     assert_eq!(body["error"], "unsupported_grant_type");
+}
+
+#[tokio::test]
+async fn missing_subject_token_is_invalid_request() {
+    let (status, body) = post_token(
+        state(lazy_repo(), true),
+        &format!("grant_type={TOKEN_EXCHANGE_GRANT}&project_id=proj_xchg"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(body["error_description"], "subject_token is required");
+}
+
+#[tokio::test]
+async fn unsupported_subject_token_type_is_invalid_request() {
+    let (status, body) = post_token(
+        state(lazy_repo(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&subject_token=x&subject_token_type=urn:ietf:params:oauth:token-type:saml2&project_id=proj_xchg"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(
+        body["error_description"],
+        "subject_token_type must be urn:ietf:params:oauth:token-type:access_token"
+    );
+}
+
+#[tokio::test]
+async fn bearer_validation_error_is_unauthorized() {
+    let mut state = state(lazy_repo(), true);
+    state.bearer = Arc::new(ErrBearer);
+
+    let (status, body) = post_token(
+        state,
+        &format!("grant_type={TOKEN_EXCHANGE_GRANT}&subject_token=x&project_id=proj_xchg"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"], "invalid_token");
+    assert_eq!(body["error_description"], "subject_token validation failed");
+}
+
+#[tokio::test]
+async fn context_resolution_failure_is_server_error() {
+    let (status, body) = post_token(
+        state(lazy_repo(), true),
+        &format!("grant_type={TOKEN_EXCHANGE_GRANT}&subject_token=x&project_id=proj_xchg"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+    assert_eq!(body["error"], "server_error");
+    assert_eq!(body["error_description"], "context resolution failed");
+}
+
+#[tokio::test]
+async fn missing_refresh_token_is_invalid_request() {
+    let (status, body) = post_token(state(lazy_repo(), true), "grant_type=refresh_token").await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(body["error_description"], "refresh_token is required");
+}
+
+#[tokio::test]
+async fn refresh_rotation_failure_is_server_error() {
+    let (status, body) = post_token(
+        state(lazy_repo(), true),
+        "grant_type=refresh_token&refresh_token=lgbr_rt_unreachable",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+    assert_eq!(body["error"], "server_error");
+    assert_eq!(body["error_description"], "refresh token rotation failed");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn exchange_fails_when_no_signing_key_is_bootstrapped(pool: PgPool) {
+    let repo = repo(pool);
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type={TOKEN_EXCHANGE_GRANT}&subject_token=x&project_id=proj_xchg"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+    assert_eq!(body["error"], "server_error");
+    assert_eq!(body["error_description"], "access token signing failed");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn exchange_with_unrecognized_scope_omits_scope_from_response(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&subject_token=x&project_id=proj_xchg&scope=totally_unrecognized_scope"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body.get("scope").is_none(),
+        "an unrecognized scope must not be echoed back: {body}"
+    );
+    assert!(body.get("refresh_token").is_none());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn exchange_snapshots_email_claims_from_subject_token(pool: PgPool) {
+    use base64::Engine;
+
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(br#"{"email":"owner@example.test","email_verified":true}"#);
+    let subject_token = format!("h.{payload}.s");
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&subject_token={subject_token}&subject_token_type={ACCESS_TOKEN_TYPE}&project_id=proj_xchg"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let claims = verify_access_token(&repo, body["access_token"].as_str().unwrap()).await;
+    assert_eq!(claims.email.as_deref(), Some("owner@example.test"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn exchange_tolerates_a_subject_token_with_an_unparsable_payload_segment(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&subject_token=h.not-valid-base64!!!.s&project_id=proj_xchg"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let claims = verify_access_token(&repo, body["access_token"].as_str().unwrap()).await;
+    assert_eq!(claims.email, None);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn exchange_tolerates_a_subject_token_with_a_non_json_payload_segment(pool: PgPool) {
+    use base64::Engine;
+
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json");
+    let subject_token = format!("h.{payload}.s");
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&subject_token={subject_token}&project_id=proj_xchg"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let claims = verify_access_token(&repo, body["access_token"].as_str().unwrap()).await;
+    assert_eq!(claims.email, None);
 }

@@ -38,3 +38,11 @@ anyhow.workspace = true
 tokio.workspace = true
 sqlx.workspace = true
 tower.workspace = true
+
+[features]
+it-tests = []
+
+[[test]]
+name = "repo_it_tests"
+path = "tests/repo_it_tests.rs"
+required-features = ["it-tests"]

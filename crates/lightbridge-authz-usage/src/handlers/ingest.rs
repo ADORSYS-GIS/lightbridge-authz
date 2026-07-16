@@ -1154,4 +1154,662 @@ mod tests {
         assert_eq!(event.completion_tokens, Some(50));
         assert_eq!(event.total_tokens, Some(150));
     }
+
+    fn string_kv(key: &str, value: &str) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(value.to_string())),
+            }),
+            key_strindex: 0,
+        }
+    }
+
+    fn base_usage_event() -> UsageEvent {
+        UsageEvent {
+            observed_at: Utc::now(),
+            signal_type: "trace".to_string(),
+            account_id: None,
+            project_id: None,
+            api_key_id: None,
+            user_id: None,
+            user_name: None,
+            model: None,
+            metric_name: None,
+            usage_value: 1.0,
+            request_count: 1,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            total_cost: None,
+            attributes: Value::Null,
+        }
+    }
+
+    #[test]
+    fn extract_trace_events_should_fall_back_to_start_time_when_end_time_is_missing() {
+        let payload: ExportTraceServiceRequest = serde_json::from_value(json!({
+            "resourceSpans": [
+                {
+                    "scopeSpans": [
+                        {
+                            "spans": [
+                                {
+                                    "name": "chat.completion",
+                                    "startTimeUnixNano": "1735689600000000000",
+                                    "endTimeUnixNano": "0"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("valid trace payload");
+
+        let events = extract_trace_events(payload);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].observed_at,
+            nanos_to_datetime(1_735_689_600_000_000_000)
+        );
+        assert_eq!(events[0].usage_value, 1.0);
+        assert_eq!(events[0].account_id, None);
+    }
+
+    #[test]
+    fn extract_log_events_should_fall_back_to_observed_time_and_default_usage_value() {
+        let payload: ExportLogsServiceRequest = serde_json::from_value(json!({
+            "resourceLogs": [
+                {
+                    "scopeLogs": [
+                        {
+                            "logRecords": [
+                                {
+                                    "timeUnixNano": "0",
+                                    "observedTimeUnixNano": "1735689600000000000",
+                                    "severityText": ""
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("valid log payload");
+
+        let events = extract_log_events(payload);
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(
+            event.observed_at,
+            nanos_to_datetime(1_735_689_600_000_000_000)
+        );
+        assert_eq!(event.metric_name, None);
+        assert_eq!(event.usage_value, 1.0);
+    }
+
+    #[test]
+    fn extract_metric_events_should_capture_gauge_data_points() {
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, ResourceMetrics, ScopeMetrics, metric,
+        };
+
+        let payload = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "queue.depth".to_string(),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                time_unix_nano: 1_735_689_601_000_000_000,
+                                value: Some(number_data_point::Value::AsDouble(3.5)),
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let events = extract_metric_events(payload);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].usage_value, 3.5);
+        assert_eq!(events[0].metric_name.as_deref(), Some("queue.depth"));
+        assert_eq!(events[0].request_count, 4);
+    }
+
+    #[test]
+    fn extract_metric_events_should_capture_histogram_data_points() {
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Histogram, HistogramDataPoint, Metric, ResourceMetrics, ScopeMetrics, metric,
+        };
+
+        let payload = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "request.latency".to_string(),
+                        data: Some(metric::Data::Histogram(Histogram {
+                            data_points: vec![HistogramDataPoint {
+                                time_unix_nano: 1_735_689_601_000_000_000,
+                                count: 7,
+                                sum: Some(42.0),
+                                attributes: vec![string_kv("model", "gpt-4.1")],
+                                ..Default::default()
+                            }],
+                            aggregation_temporality: 0,
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let events = extract_metric_events(payload);
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.usage_value, 42.0);
+        assert_eq!(event.request_count, 7);
+        assert_eq!(event.model.as_deref(), Some("gpt-4.1"));
+    }
+
+    #[test]
+    fn extract_metric_events_should_capture_exponential_histogram_data_points() {
+        use opentelemetry_proto::tonic::metrics::v1::{
+            ExponentialHistogram, ExponentialHistogramDataPoint, Metric, ResourceMetrics,
+            ScopeMetrics, metric,
+        };
+
+        let payload = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "token.distribution".to_string(),
+                        data: Some(metric::Data::ExponentialHistogram(ExponentialHistogram {
+                            data_points: vec![ExponentialHistogramDataPoint {
+                                time_unix_nano: 1_735_689_601_000_000_000,
+                                count: 5,
+                                sum: Some(15.0),
+                                ..Default::default()
+                            }],
+                            aggregation_temporality: 0,
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let events = extract_metric_events(payload);
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.usage_value, 15.0);
+        assert_eq!(event.request_count, 5);
+    }
+
+    #[test]
+    fn extract_metric_events_should_capture_summary_data_points() {
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Metric, ResourceMetrics, ScopeMetrics, Summary, SummaryDataPoint, metric,
+        };
+
+        let payload = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "latency.summary".to_string(),
+                        data: Some(metric::Data::Summary(Summary {
+                            data_points: vec![SummaryDataPoint {
+                                time_unix_nano: 1_735_689_601_000_000_000,
+                                count: 9,
+                                sum: 27.0,
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let events = extract_metric_events(payload);
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.usage_value, 27.0);
+        assert_eq!(event.request_count, 9);
+    }
+
+    #[test]
+    fn extract_metric_events_should_skip_metrics_without_data() {
+        use opentelemetry_proto::tonic::metrics::v1::{Metric, ResourceMetrics, ScopeMetrics};
+
+        let payload = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "no.data".to_string(),
+                        data: None,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let events = extract_metric_events(payload);
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn any_value_to_json_should_convert_bool_double_array_kvlist_and_bytes() {
+        use opentelemetry_proto::tonic::common::v1::{ArrayValue, KeyValueList};
+
+        assert_eq!(
+            any_value_to_json(&AnyValue {
+                value: Some(any_value::Value::BoolValue(true)),
+            }),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            any_value_to_json(&AnyValue {
+                value: Some(any_value::Value::DoubleValue(1.5)),
+            }),
+            json!(1.5)
+        );
+        assert_eq!(
+            any_value_to_json(&AnyValue {
+                value: Some(any_value::Value::ArrayValue(ArrayValue {
+                    values: vec![AnyValue {
+                        value: Some(any_value::Value::StringValue("a".to_string())),
+                    }],
+                })),
+            }),
+            Value::Array(vec![Value::String("a".to_string())])
+        );
+
+        let kvlist = any_value_to_json(&AnyValue {
+            value: Some(any_value::Value::KvlistValue(KeyValueList {
+                values: vec![string_kv("nested", "value")],
+            })),
+        });
+        assert_eq!(kvlist["nested"], Value::String("value".to_string()));
+
+        assert_eq!(
+            any_value_to_json(&AnyValue {
+                value: Some(any_value::Value::BytesValue(vec![0xDE, 0xAD])),
+            }),
+            Value::String("dead".to_string())
+        );
+        assert_eq!(any_value_to_json(&AnyValue { value: None }), Value::Null);
+    }
+
+    #[test]
+    fn extract_string_should_read_numbers_and_booleans_and_ignore_other_types() {
+        let mut attrs = HashMap::new();
+        attrs.insert("num".to_string(), json!(42));
+        attrs.insert("flag".to_string(), json!(true));
+        attrs.insert("nullish".to_string(), Value::Null);
+
+        assert_eq!(extract_string(&attrs, &["num"]), Some("42".to_string()));
+        assert_eq!(extract_string(&attrs, &["flag"]), Some("true".to_string()));
+        assert_eq!(extract_string(&attrs, &["nullish"]), None);
+        assert_eq!(extract_string(&attrs, &["missing"]), None);
+    }
+
+    #[test]
+    fn extract_i64_should_parse_numeric_strings_and_reject_out_of_range_values() {
+        let mut attrs = HashMap::new();
+        attrs.insert("str_tokens".to_string(), json!("128"));
+        attrs.insert("big".to_string(), json!(18_446_744_073_709_551_615u64));
+        attrs.insert("not_a_number".to_string(), json!("nope"));
+
+        assert_eq!(extract_i64(&attrs, &["str_tokens"]), Some(128));
+        assert_eq!(extract_i64(&attrs, &["big"]), None);
+        assert_eq!(extract_i64(&attrs, &["not_a_number"]), None);
+    }
+
+    #[test]
+    fn extract_f64_should_parse_numeric_strings() {
+        let mut attrs = HashMap::new();
+        attrs.insert("cost".to_string(), json!("12.5"));
+        attrs.insert("bad".to_string(), json!("abc"));
+
+        assert_eq!(extract_f64(&attrs, &["cost"]), Some(12.5));
+        assert_eq!(extract_f64(&attrs, &["bad"]), None);
+    }
+
+    #[test]
+    fn non_empty_should_trim_and_reject_blank_values() {
+        assert_eq!(
+            non_empty(Some("  hello  ".to_string())),
+            Some("hello".to_string())
+        );
+        assert_eq!(non_empty(Some("   ".to_string())), None);
+        assert_eq!(non_empty(None), None);
+    }
+
+    #[test]
+    fn combine_token_total_should_cover_every_combination() {
+        assert_eq!(combine_token_total(Some(3), Some(4)), Some(7));
+        assert_eq!(combine_token_total(Some(3), None), Some(3));
+        assert_eq!(combine_token_total(None, Some(4)), Some(4));
+        assert_eq!(combine_token_total(None, None), None);
+        assert_eq!(combine_token_total(Some(i64::MAX), Some(1)), None);
+    }
+
+    #[test]
+    fn request_count_from_metric_value_should_default_to_one_for_small_or_non_finite_values() {
+        assert_eq!(request_count_from_metric_value(0.4), 1);
+        assert_eq!(request_count_from_metric_value(-5.0), 1);
+        assert_eq!(request_count_from_metric_value(f64::NAN), 1);
+    }
+
+    #[test]
+    fn request_count_from_metric_value_should_cap_at_i64_max_for_huge_values() {
+        assert_eq!(request_count_from_metric_value(f64::MAX), i64::MAX);
+        assert_eq!(request_count_from_metric_value(5.0), 5);
+    }
+
+    #[test]
+    fn u64_to_i64_should_cap_at_i64_max_on_overflow() {
+        assert_eq!(u64_to_i64(u64::MAX), i64::MAX);
+        assert_eq!(u64_to_i64(10), 10);
+    }
+
+    #[test]
+    fn nanos_to_datetime_should_fall_back_to_now_when_nanos_is_zero() {
+        let before = Utc::now();
+        let observed = nanos_to_datetime(0);
+        let after = Utc::now();
+
+        assert!(observed >= before && observed <= after);
+    }
+
+    #[test]
+    fn decode_logs_request_should_accept_json_payload() {
+        let body = json!({"resourceLogs": []}).to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+
+        let payload =
+            decode_logs_request(&headers, body.as_bytes()).expect("json payload should decode");
+
+        assert!(payload.resource_logs.is_empty());
+    }
+
+    #[test]
+    fn decode_logs_request_should_reject_invalid_json_payload() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+
+        let err = decode_logs_request(&headers, b"{not json")
+            .expect_err("invalid json should be rejected");
+
+        assert!(
+            matches!(err, Error::BadRequest(m) if m.contains("invalid OTLP logs JSON payload"))
+        );
+    }
+
+    #[test]
+    fn decode_trace_request_should_accept_json_payload() {
+        let body = json!({"resourceSpans": []}).to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+
+        let payload =
+            decode_trace_request(&headers, body.as_bytes()).expect("json payload should decode");
+
+        assert!(payload.resource_spans.is_empty());
+    }
+
+    #[test]
+    fn decode_trace_request_should_reject_invalid_json_payload() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+
+        let err = decode_trace_request(&headers, b"{not json")
+            .expect_err("invalid json should be rejected");
+
+        assert!(
+            matches!(err, Error::BadRequest(m) if m.contains("invalid OTLP trace JSON payload"))
+        );
+    }
+
+    #[test]
+    fn decode_trace_request_should_reject_invalid_protobuf_payload() {
+        let err = decode_trace_request(&HeaderMap::new(), b"not protobuf")
+            .expect_err("invalid protobuf should be rejected");
+
+        assert!(
+            matches!(err, Error::BadRequest(m) if m.contains("invalid OTLP trace protobuf payload"))
+        );
+    }
+
+    #[test]
+    fn decode_metrics_request_should_accept_json_payload() {
+        let body = json!({"resourceMetrics": []}).to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+
+        let payload =
+            decode_metrics_request(&headers, body.as_bytes()).expect("json payload should decode");
+
+        assert!(payload.resource_metrics.is_empty());
+    }
+
+    #[test]
+    fn decode_metrics_request_should_reject_invalid_json_payload() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+
+        let err = decode_metrics_request(&headers, b"{not json")
+            .expect_err("invalid json should be rejected");
+
+        assert!(
+            matches!(err, Error::BadRequest(m) if m.contains("invalid OTLP metrics JSON payload"))
+        );
+    }
+
+    #[test]
+    fn decode_metrics_request_should_reject_invalid_protobuf_payload() {
+        let err = decode_metrics_request(&HeaderMap::new(), b"not protobuf")
+            .expect_err("invalid protobuf should be rejected");
+
+        assert!(
+            matches!(err, Error::BadRequest(m) if m.contains("invalid OTLP metrics protobuf payload"))
+        );
+    }
+
+    #[test]
+    fn decode_maybe_gzip_should_passthrough_uncompressed_bodies() {
+        let headers = HeaderMap::new();
+
+        let out =
+            decode_maybe_gzip(&headers, b"plain body").expect("uncompressed body should pass");
+
+        assert_eq!(out, b"plain body");
+    }
+
+    #[test]
+    fn decode_maybe_gzip_should_decompress_gzip_encoded_bodies() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(b"compressed body")
+            .expect("write should succeed");
+        let compressed = encoder.finish().expect("gzip encoding should succeed");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+
+        let out = decode_maybe_gzip(&headers, &compressed).expect("gzip body should decompress");
+
+        assert_eq!(out, b"compressed body");
+    }
+
+    #[test]
+    fn decode_maybe_gzip_should_reject_invalid_gzip_bodies() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+
+        let err = decode_maybe_gzip(&headers, b"not gzip")
+            .expect_err("invalid gzip body should be rejected");
+
+        assert!(matches!(err, Error::BadRequest(m) if m.contains("invalid gzip body")));
+    }
+
+    #[test]
+    fn is_json_content_should_detect_json_and_non_json_content_types() {
+        let mut json_headers = HeaderMap::new();
+        json_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        assert!(is_json_content(&json_headers));
+
+        let mut proto_headers = HeaderMap::new();
+        proto_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-protobuf".parse().unwrap(),
+        );
+        assert!(!is_json_content(&proto_headers));
+
+        assert!(!is_json_content(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn validate_events_should_reject_empty_signal_type() {
+        let event = UsageEvent {
+            signal_type: "   ".to_string(),
+            ..base_usage_event()
+        };
+
+        let err = validate_events(&[event]).expect_err("blank signal_type must be rejected");
+
+        assert!(matches!(err, Error::BadRequest(m) if m == "signal_type is required"));
+    }
+
+    #[test]
+    fn validate_events_should_reject_non_finite_usage_value() {
+        let event = UsageEvent {
+            usage_value: f64::NAN,
+            ..base_usage_event()
+        };
+
+        let err = validate_events(&[event]).expect_err("non-finite usage_value must be rejected");
+
+        assert!(matches!(err, Error::BadRequest(m) if m == "usage_value must be finite"));
+    }
+
+    #[test]
+    fn validate_events_should_reject_non_finite_total_cost() {
+        let event = UsageEvent {
+            total_cost: Some(f64::INFINITY),
+            ..base_usage_event()
+        };
+
+        let err = validate_events(&[event]).expect_err("non-finite total_cost must be rejected");
+
+        assert!(matches!(err, Error::BadRequest(m) if m == "total_cost must be finite"));
+    }
+
+    #[test]
+    fn validate_events_should_reject_negative_request_count() {
+        let event = UsageEvent {
+            request_count: -1,
+            ..base_usage_event()
+        };
+
+        let err = validate_events(&[event]).expect_err("negative request_count must be rejected");
+
+        assert!(matches!(err, Error::BadRequest(m) if m == "request_count cannot be negative"));
+    }
+
+    #[test]
+    fn validate_events_should_reject_negative_token_counts() {
+        let event = UsageEvent {
+            prompt_tokens: Some(-1),
+            ..base_usage_event()
+        };
+
+        let err = validate_events(&[event]).expect_err("negative token counts must be rejected");
+
+        assert!(matches!(err, Error::BadRequest(m) if m == "token counts cannot be negative"));
+    }
+
+    #[test]
+    fn validate_events_should_accept_a_well_formed_event() {
+        assert!(validate_events(&[base_usage_event()]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn persist_events_should_treat_a_partial_insert_as_fully_accepted() {
+        struct PartialInsertRepo {
+            persisted: usize,
+        }
+
+        #[lightbridge_authz_core::async_trait]
+        impl crate::UsageRepoTrait for PartialInsertRepo {
+            async fn insert_usage_events(&self, _events: &[UsageEvent]) -> Result<usize> {
+                Ok(self.persisted)
+            }
+
+            async fn query_usage(
+                &self,
+                _input: &crate::models::UsageQueryRequest,
+            ) -> Result<Vec<crate::models::UsageSeriesPoint>> {
+                Ok(vec![])
+            }
+        }
+
+        let state = crate::UsageState {
+            repo: Arc::new(PartialInsertRepo { persisted: 1 }),
+        };
+        let events = vec![base_usage_event(), base_usage_event()];
+
+        let accepted = persist_events(&state, "trace", &events)
+            .await
+            .expect("partial insert should still be treated as accepted");
+
+        assert_eq!(accepted, 2);
+    }
 }

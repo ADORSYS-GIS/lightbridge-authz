@@ -37,9 +37,10 @@ is compiled once at startup (wildcards expanded), so the request-time check is a
 ```yaml
 oauth2:
   rbac:
-    # Top-level JWT claim carrying the caller's roles. Configurable; defaults to "roles".
+    # Top-level JWT claim carrying the caller's roles. Configurable; defaults to
+    # "lightbridge_api_roles" (matches the dev realm's protocol mapper).
     # Value may be a JSON array of strings, or a single space-delimited string.
-    roles_claim: "${RBAC_ROLES_CLAIM:-roles}"
+    roles_claim: "${RBAC_ROLES_CLAIM:-lightbridge_api_roles}"
 
     # Each role → the permission grants it confers. When this map is omitted/empty, the
     # built-in default mapping below is used instead.
@@ -76,9 +77,11 @@ but absent from the map grants nothing.
 
 ### Configurable claim name
 
-`roles_claim` selects which JWT claim is read. The default `roles` matches the protocol mapper the
-dev realm installs (`oidc-usermodel-realm-role-mapper` → top-level `roles` array). Point it at any
-other flat claim (e.g. a custom `permissions` claim emitted by your own mapper) without a rebuild.
+`roles_claim` selects which JWT claim is read. The default `lightbridge_api_roles` matches the
+protocol mapper the dev realm installs (`oidc-usermodel-realm-role-mapper` → top-level
+`lightbridge_api_roles` array — named to match the frontend's `getJwtRoles` expectations). Point it
+at any other flat claim (e.g. a custom `permissions` claim emitted by your own mapper) without a
+rebuild.
 
 ## Default role → permission mapping
 
@@ -128,14 +131,14 @@ The dev realm (`.docker/keycloak_config/realm.json`) shows the required wiring:
 - **Realm roles** `lightbridge-admin` / `lightbridge-editor` / `lightbridge-viewer`.
 - The seeded user is granted `lightbridge-admin` (`realmRoles`).
 - A protocol mapper on `test-client` (`oidc-usermodel-realm-role-mapper`) emits the user's realm
-  roles into a top-level, multivalued `roles` claim on the **access token**:
+  roles into a top-level, multivalued `lightbridge_api_roles` claim on the **access token**:
 
   ```json
   {
     "name": "lightbridge-roles",
     "protocolMapper": "oidc-usermodel-realm-role-mapper",
     "config": {
-      "claim.name": "roles",
+      "claim.name": "lightbridge_api_roles",
       "jsonType.label": "String",
       "multivalued": "true",
       "access.token.claim": "true"

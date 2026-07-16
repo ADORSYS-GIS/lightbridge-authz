@@ -402,6 +402,23 @@ mod tests {
         assert!(roles_from_claim(Some(&json!({"a": 1}))).is_empty());
     }
 
+    #[test]
+    fn audience_default_is_empty() {
+        assert!(Audience::default().to_vec().is_empty());
+    }
+
+    #[test]
+    fn audience_to_vec_variants() {
+        assert_eq!(
+            Audience::Single("a".to_string()).to_vec(),
+            vec!["a".to_string()]
+        );
+        assert_eq!(
+            Audience::Multiple(vec!["a".to_string(), "b".to_string()]).to_vec(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn cache_reuses_jwks_within_ttl() {
         let server = MockServer::start();

@@ -1986,6 +1986,7 @@ dependencies = [
 name = "lightbridge-authz"
 version = "0.8.1"
 dependencies = [
+ "anyhow",
  "axum",
  "chrono",
  "clap",
@@ -2002,6 +2003,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2010,10 +2012,15 @@ dependencies = [
 name = "lightbridge-authz-api"
 version = "0.8.1"
 dependencies = [
+ "anyhow",
  "axum",
+ "chrono",
  "lightbridge-authz-bearer",
  "lightbridge-authz-core",
  "serde",
+ "serde_json",
+ "tokio",
+ "tower",
  "tracing",
  "utoipa",
 ]
@@ -2036,10 +2043,13 @@ name = "lightbridge-authz-bearer"
 version = "0.8.1"
 dependencies = [
  "anyhow",
+ "base64",
  "httpmock",
  "jsonwebtoken",
  "jwks",
  "lightbridge-authz-core",
+ "rand_core 0.6.4",
+ "rsa",
  "serde",
  "serde_json",
  "tokio",
