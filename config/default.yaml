@@ -80,7 +80,7 @@ oauth2:
   # permissions gate every CRUD/MCP operation — a caller whose roles grant nothing is denied
   # (HTTP 403). See docs/rbac.md for the full claim ↔ permission mapping.
   rbac:
-    roles_claim: "${RBAC_ROLES_CLAIM:-roles}"
+    roles_claim: "${RBAC_ROLES_CLAIM:-lightbridge_api_roles}"
     role_permissions:
       lightbridge-admin:
         - "*"
