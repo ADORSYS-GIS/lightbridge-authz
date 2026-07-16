@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use lightbridge_authz_core::config::{ApiServer, BasicAuth, Oauth2, Oauth2Type, OpaServer, Tls};
+use lightbridge_authz_core::config::{
+    ApiServer, BasicAuth, Billing, BillingPlan, Oauth2, Oauth2Type, OpaServer, Tls,
+};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use sqlx::postgres::PgPoolOptions;
 
@@ -9,6 +11,16 @@ fn lazy_pool() -> Arc<dyn DbPoolTrait> {
         .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
         .expect("lazy pool should be constructible");
     Arc::new(DbPool::from_pool(pool))
+}
+
+fn sample_billing() -> Billing {
+    Billing {
+        plans: vec![BillingPlan {
+            id: "free".to_string(),
+            name: "Free".to_string(),
+            limits: None,
+        }],
+    }
 }
 
 fn bad_tls() -> Tls {
@@ -48,8 +60,13 @@ async fn start_api_server_fails_fast_when_tls_certs_are_missing() {
         tls: bad_tls(),
         allowed_hosts: None,
     };
-    let result =
-        lightbridge_authz_rest::start_api_server(&api, lazy_pool(), &external_oauth2()).await;
+    let result = lightbridge_authz_rest::start_api_server(
+        &api,
+        lazy_pool(),
+        &external_oauth2(),
+        &sample_billing(),
+    )
+    .await;
     assert!(
         result.is_err(),
         "missing TLS cert paths must surface as an error"
@@ -67,7 +84,8 @@ async fn start_opa_server_fails_fast_when_tls_certs_are_missing() {
             password: "change-me".to_string(),
         },
     };
-    let result = lightbridge_authz_rest::start_opa_server(&opa, lazy_pool()).await;
+    let result =
+        lightbridge_authz_rest::start_opa_server(&opa, lazy_pool(), &sample_billing()).await;
     assert!(
         result.is_err(),
         "missing TLS cert paths must surface as an error"
@@ -87,7 +105,9 @@ async fn start_api_server_rejects_self_signed_oauth2_without_signing_block() {
         tls: bad_tls(),
         allowed_hosts: None,
     };
-    let result = lightbridge_authz_rest::start_api_server(&api, lazy_pool(), &oauth2).await;
+    let result =
+        lightbridge_authz_rest::start_api_server(&api, lazy_pool(), &oauth2, &sample_billing())
+            .await;
     assert!(
         result.is_err(),
         "self-signed oauth2 without a signing block must be rejected"
@@ -109,8 +129,13 @@ async fn start_api_server_warns_when_dev_cors_is_enabled() {
         tls: bad_tls(),
         allowed_hosts: None,
     };
-    let result =
-        lightbridge_authz_rest::start_api_server(&api, lazy_pool(), &external_oauth2()).await;
+    let result = lightbridge_authz_rest::start_api_server(
+        &api,
+        lazy_pool(),
+        &external_oauth2(),
+        &sample_billing(),
+    )
+    .await;
     unsafe {
         std::env::remove_var("AUTHZ_DEV_CORS");
     }
@@ -162,8 +187,13 @@ mod db {
             tls: bad_tls(),
             allowed_hosts: None,
         };
-        let result =
-            lightbridge_authz_rest::start_api_server(&api, db_pool, &self_signed_oauth2()).await;
+        let result = lightbridge_authz_rest::start_api_server(
+            &api,
+            db_pool,
+            &self_signed_oauth2(),
+            &sample_billing(),
+        )
+        .await;
         assert!(
             result.is_err(),
             "missing TLS cert paths must surface as an error"
@@ -234,7 +264,7 @@ mod db {
         use lightbridge_authz_rest::handlers::AuthzStoreImpl;
 
         let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
-        let store = AuthzStoreImpl::with_pool(db_pool);
+        let store = AuthzStoreImpl::with_pool(db_pool).with_billing(sample_billing());
         let subject = "owner-opa-trait";
 
         let account = store
@@ -267,6 +297,7 @@ mod db {
                 CreateApiKey {
                     name: "opa-trait-key".to_string(),
                     expires_at: None,
+                    billing_plan: "free".to_string(),
                 },
             )
             .await

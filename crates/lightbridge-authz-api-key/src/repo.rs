@@ -241,6 +241,7 @@ impl StoreRepo {
             last_used_at: row.last_used_at,
             last_ip: row.last_ip,
             revoked_at: row.revoked_at,
+            billing_plan: row.billing_plan,
         }
     }
 
@@ -926,13 +927,13 @@ impl StoreRepo {
             )
             INSERT INTO api_keys (
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, revoked_at
+              last_used_at, last_ip, revoked_at, billing_plan
             )
-            SELECT $3, project_auth.project_id, $4, $5, $6, $7, $8, $9, $10, $11, $12
+            SELECT $3, project_auth.project_id, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
             FROM project_auth
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
-              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan
             "#,
         )
         .bind(input.project_id)
@@ -947,6 +948,7 @@ impl StoreRepo {
         .bind(input.last_used_at)
         .bind(input.last_ip)
         .bind(input.revoked_at)
+        .bind(input.billing_plan)
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
@@ -974,7 +976,8 @@ impl StoreRepo {
               api_keys.status,
               api_keys.last_used_at,
               api_keys.last_ip,
-              api_keys.revoked_at
+              api_keys.revoked_at,
+              api_keys.billing_plan
             FROM api_keys
             JOIN projects ON projects.id = api_keys.project_id
             WHERE api_keys.project_id = $1
@@ -1013,7 +1016,8 @@ impl StoreRepo {
               api_keys.status,
               api_keys.last_used_at,
               api_keys.last_ip,
-              api_keys.revoked_at
+              api_keys.revoked_at,
+              api_keys.billing_plan
             FROM api_keys
             JOIN projects ON projects.id = api_keys.project_id
             WHERE api_keys.id = $1
@@ -1060,7 +1064,7 @@ impl StoreRepo {
               AND account_memberships.subject = $4
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
-              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan
             "#,
         )
         .bind(changes.name)
@@ -1202,7 +1206,7 @@ impl StoreRepo {
               AND account_memberships.subject = $5
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
-              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan
             "#,
         )
         .bind(status.to_string())
@@ -1241,7 +1245,7 @@ impl StoreRepo {
               AND account_memberships.subject = $5
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
-              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan
             "#,
         )
         .bind(status.to_string())
@@ -1263,13 +1267,13 @@ impl StoreRepo {
             )
             INSERT INTO api_keys (
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, revoked_at
+              last_used_at, last_ip, revoked_at, billing_plan
             )
-            SELECT $3, project_auth.project_id, $4, $5, $6, $7, $8, $9, $10, $11, $12
+            SELECT $3, project_auth.project_id, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
             FROM project_auth
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
-              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan
             "#,
         )
         .bind(new_key.project_id)
@@ -1284,6 +1288,7 @@ impl StoreRepo {
         .bind(new_key.last_used_at)
         .bind(new_key.last_ip)
         .bind(new_key.revoked_at)
+        .bind(new_key.billing_plan)
         .fetch_optional(&mut *tx)
         .await?;
         let row = new_row.ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
@@ -1319,7 +1324,7 @@ impl StoreRepo {
             r#"
             SELECT
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, revoked_at
+              last_used_at, last_ip, revoked_at, billing_plan
             FROM api_keys
             WHERE key_hash = $1
             "#,
@@ -1353,7 +1358,7 @@ impl StoreRepo {
             WHERE id = $3
             RETURNING
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, revoked_at
+              last_used_at, last_ip, revoked_at, billing_plan
             "#,
         )
         .bind(changes.last_used_at)

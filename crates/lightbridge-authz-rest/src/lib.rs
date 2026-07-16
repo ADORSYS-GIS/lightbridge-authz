@@ -2,7 +2,7 @@ use axum::{Json, Router, http::StatusCode, routing::get};
 use lightbridge_authz_api::routers::api_router;
 use lightbridge_authz_core::{
     Account, Project, async_trait,
-    config::{ApiServer, BasicAuth, Oauth2, OpaServer},
+    config::{ApiServer, BasicAuth, Billing, Oauth2, OpaServer},
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
     server::{dev_cors_enabled, serve_tls},
@@ -36,6 +36,9 @@ struct RootResponse {
 pub struct OpaState {
     pub repo: Arc<dyn OpaRepoTrait>,
     pub basic_auth: BasicAuth,
+    /// Configured billing-plan catalogue, used to resolve a key's plan id into its display name
+    /// and limits at introspection time.
+    pub billing: Arc<Billing>,
 }
 
 #[async_trait]
@@ -202,7 +205,9 @@ pub async fn start_api_server(
     api: &ApiServer,
     pool: Arc<dyn DbPoolTrait>,
     oauth2: &Oauth2,
+    billing: &Billing,
 ) -> Result<()> {
+    billing.validate()?;
     let readiness_pool = pool.clone();
     let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
     if oauth2.is_self_signed() {
@@ -211,7 +216,7 @@ pub async fn start_api_server(
         })?;
         signing::bootstrap_signing_key(&signing_repo, signing).await?;
     }
-    let store = Arc::new(AuthzStoreImpl::with_pool_and_oauth2(pool, oauth2)?);
+    let store = Arc::new(AuthzStoreImpl::with_pool_and_oauth2(pool, oauth2, billing)?);
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
 
@@ -274,12 +279,17 @@ pub fn build_opa_router(state: Arc<OpaState>, readiness_pool: Arc<dyn DbPoolTrai
     public.merge(protected).with_state(state)
 }
 
-pub async fn start_opa_server(opa: &OpaServer, pool: Arc<dyn DbPoolTrait>) -> Result<()> {
+pub async fn start_opa_server(
+    opa: &OpaServer,
+    pool: Arc<dyn DbPoolTrait>,
+    billing: &Billing,
+) -> Result<()> {
     let readiness_pool = pool.clone();
     let repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
     let state = Arc::new(OpaState {
         repo,
         basic_auth: opa.basic_auth.clone(),
+        billing: Arc::new(billing.clone()),
     });
 
     let app = build_opa_router(state, readiness_pool);
@@ -512,6 +522,17 @@ mod tests {
         assert!(
             resp["properties"].get("active").is_some(),
             "IntrospectResponse should expose the RFC 7662 `active` flag"
+        );
+
+        assert!(
+            resp["properties"].get("billing_plan_name").is_some()
+                && resp["properties"].get("billing_plan_limits").is_some(),
+            "IntrospectResponse should expose the resolved billing plan name and limits"
+        );
+        assert!(
+            schemas.contains_key("BillingLimits"),
+            "the BillingLimits schema referenced by IntrospectResponse must be a defined \
+             component (no dangling $ref)"
         );
     }
 

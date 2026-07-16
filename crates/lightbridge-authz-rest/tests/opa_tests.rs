@@ -4,7 +4,8 @@ use axum::http::StatusCode;
 use chrono::{Duration, Utc};
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeyStatus, ApiKeyValidation, Project, ResourceStatus, async_trait,
-    config::BasicAuth, error::Result,
+    config::{BasicAuth, Billing, BillingLimits, BillingPlan},
+    error::Result,
 };
 use lightbridge_authz_rest::OpaState;
 use lightbridge_authz_rest::handlers::introspect::introspect_api_key;
@@ -124,6 +125,7 @@ fn mk_api_key(status: ApiKeyStatus, expires_at: Option<chrono::DateTime<Utc>>) -
         last_used_at: None,
         last_ip: None,
         revoked_at: None,
+        billing_plan: "free".to_string(),
     }
 }
 
@@ -159,6 +161,18 @@ fn mk_state(repo: MockOpaRepo) -> Arc<OpaState> {
             username: "authorino".to_string(),
             password: "change-me".to_string(),
         },
+        billing: Arc::new(Billing {
+            plans: vec![BillingPlan {
+                id: "free".to_string(),
+                name: "Free".to_string(),
+                limits: Some(BillingLimits {
+                    requests_per_second: Some(5),
+                    requests_per_day: Some(1000),
+                    requests_per_month: None,
+                    concurrent_requests: Some(2),
+                }),
+            }],
+        }),
     })
 }
 
@@ -200,6 +214,15 @@ async fn introspect_returns_active_with_context_and_records_usage() {
     assert_eq!(payload["api_key_id"], "key_1");
     assert_eq!(payload["api_key_status"], "active");
     assert_eq!(payload["billing_plan"], "free");
+    assert_eq!(payload["billing_plan_name"], "Free");
+    assert_eq!(payload["billing_plan_limits"]["requests_per_second"], 5);
+    assert_eq!(payload["billing_plan_limits"]["concurrent_requests"], 2);
+    assert!(
+        payload["billing_plan_limits"]
+            .get("requests_per_month")
+            .is_none(),
+        "unset limit fields must be omitted"
+    );
     assert_eq!(
         payload["allowed_models"],
         serde_json::json!(["gpt-4.1-mini"])
@@ -209,6 +232,35 @@ async fn introspect_returns_active_with_context_and_records_usage() {
     let calls = usage_calls.lock().expect("lock should work").clone();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "key_1");
+}
+
+#[tokio::test]
+async fn introspect_omits_name_and_limits_for_plan_absent_from_catalogue() {
+    let mut api_key = mk_api_key(ApiKeyStatus::Active, None);
+    api_key.billing_plan = "removed-plan".to_string();
+    let state = mk_state(MockOpaRepo {
+        api_key: Some(api_key),
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+    });
+
+    let (status, payload) = introspect(state, "lbk_secret_valid").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], true);
+    assert_eq!(
+        payload["billing_plan"], "removed-plan",
+        "the stored plan id is always returned"
+    );
+    assert!(
+        payload.get("billing_plan_name").is_none(),
+        "an id not in the catalogue resolves to no name"
+    );
+    assert!(
+        payload.get("billing_plan_limits").is_none(),
+        "an id not in the catalogue resolves to no limits"
+    );
 }
 
 #[tokio::test]

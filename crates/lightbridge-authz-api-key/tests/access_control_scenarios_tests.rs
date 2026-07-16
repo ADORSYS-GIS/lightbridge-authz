@@ -30,6 +30,7 @@ fn build_new_api_key_row(project_id: &str, name: &str, key_hash: &str) -> NewApi
         last_used_at: None,
         last_ip: None,
         revoked_at: None,
+        billing_plan: "free".to_string(),
     }
 }
 

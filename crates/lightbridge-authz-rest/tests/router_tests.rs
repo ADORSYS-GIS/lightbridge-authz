@@ -36,6 +36,7 @@ impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
             last_used_at: None,
             last_ip: None,
             revoked_at: None,
+            billing_plan: "free".to_string(),
         })
     }
 
@@ -112,6 +113,7 @@ fn app() -> axum::Router {
             username: "authorino".to_string(),
             password: "change-me".to_string(),
         },
+        billing: Arc::new(lightbridge_authz_core::config::Billing::default()),
     });
     opa_router(state.clone()).with_state(state)
 }
@@ -680,6 +682,7 @@ async fn build_opa_router_serves_probes_and_introspection() {
             username: "authorino".to_string(),
             password: "change-me".to_string(),
         },
+        billing: Arc::new(lightbridge_authz_core::config::Billing::default()),
     });
     let router = lightbridge_authz_rest::build_opa_router(state, lazy_pool());
 
@@ -732,6 +735,7 @@ async fn readiness_via_opa_router_reports_unavailable_when_database_is_down() {
             username: "authorino".to_string(),
             password: "change-me".to_string(),
         },
+        billing: Arc::new(lightbridge_authz_core::config::Billing::default()),
     });
     let response = lightbridge_authz_rest::build_opa_router(state, lazy_pool())
         .oneshot(

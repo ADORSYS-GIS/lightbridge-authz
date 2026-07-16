@@ -39,6 +39,16 @@ pub async fn introspect_api_key(
         "api key introspection resolved active"
     );
 
+    let plan = state.billing.get(&validated.api_key.billing_plan);
+    if plan.is_none() {
+        tracing::warn!(
+            api_key_id = %validated.api_key.id,
+            billing_plan = %validated.api_key.billing_plan,
+            "api key references a billing plan absent from the configured catalogue; \
+             billing_plan_name/billing_plan_limits omitted (a downstream enforcer will see the key \
+             as having no limits — reconcile the catalogue with keys still in use)"
+        );
+    }
     let response = IntrospectResponse {
         active: true,
         sub: Some(validated.api_key.id.clone()),
@@ -46,7 +56,9 @@ pub async fn introspect_api_key(
         project_id: Some(validated.project.id.clone()),
         api_key_id: Some(validated.api_key.id.clone()),
         api_key_status: Some(validated.api_key.status.to_string()),
-        billing_plan: Some(validated.project.billing_plan.clone()),
+        billing_plan: Some(validated.api_key.billing_plan.clone()),
+        billing_plan_name: plan.map(|p| p.name.clone()),
+        billing_plan_limits: plan.and_then(|p| p.limits.clone()),
         allowed_models: validated.project.allowed_models.clone(),
         exp: validated.api_key.expires_at.map(|value| value.timestamp()),
     };

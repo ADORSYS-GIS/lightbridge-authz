@@ -155,12 +155,18 @@ pub struct ApiKey {
     pub last_used_at: Option<DateTime<Utc>>,
     pub last_ip: Option<String>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// Billing plan this key is minted on. Chosen at creation from the operator-configured
+    /// (env-driven) plan set; preserved across rotation.
+    pub billing_plan: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateApiKey {
     pub name: String,
     pub expires_at: Option<DateTime<Utc>>,
+    /// Billing plan for the key. Required, and must be one of the operator-configured
+    /// (env-driven) billing plans, otherwise creation is rejected with `400 Bad Request`.
+    pub billing_plan: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -169,6 +175,9 @@ pub struct UpdateApiKey {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+/// Rotation mints a fresh secret for an existing key. It does not carry a `billing_plan`: a key's
+/// plan is fixed at creation and preserved across rotation (there is no supported path to change a
+/// key's plan — create a new key on the desired plan instead).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RotateApiKey {
     pub name: Option<String>,

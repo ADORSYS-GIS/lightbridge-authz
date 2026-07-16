@@ -33,9 +33,16 @@ pub struct IntrospectResponse {
     /// The API key status.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_status: Option<String>,
-    /// Project billing plan.
+    /// Billing plan id the key is minted on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub billing_plan: Option<String>,
+    /// Human-facing name of the billing plan, resolved from config (absent when the id is not in
+    /// the configured catalogue).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing_plan_name: Option<String>,
+    /// Rate/usage limits of the billing plan, resolved from config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing_plan_limits: Option<lightbridge_authz_core::config::BillingLimits>,
     /// Models the project is allowed to use (empty/absent means all).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_models: Option<Vec<String>>,
@@ -55,6 +62,8 @@ impl IntrospectResponse {
             api_key_id: None,
             api_key_status: None,
             billing_plan: None,
+            billing_plan_name: None,
+            billing_plan_limits: None,
             allowed_models: None,
             exp: None,
         }

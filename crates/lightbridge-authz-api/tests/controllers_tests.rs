@@ -324,6 +324,7 @@ fn mk_api_key(id: &str, project_id: &str) -> ApiKey {
         last_used_at: None,
         last_ip: None,
         revoked_at: None,
+        billing_plan: "free".to_string(),
     }
 }
 
@@ -727,7 +728,7 @@ async fn create_api_key_returns_201_with_secret() {
         req(
             "POST",
             "/projects/proj_1/api-keys",
-            Some(json!({"name": "demo-key"})),
+            Some(json!({"name": "demo-key", "billing_plan": "free"})),
         ),
     )
     .await;
@@ -744,7 +745,7 @@ async fn create_api_key_maps_not_found_error_to_404() {
         req(
             "POST",
             "/projects/missing/api-keys",
-            Some(json!({"name": "demo-key"})),
+            Some(json!({"name": "demo-key", "billing_plan": "free"})),
         ),
     )
     .await;
