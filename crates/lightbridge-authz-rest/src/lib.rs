@@ -1,30 +1,49 @@
 use axum::{Json, Router, http::StatusCode, routing::get};
-use lightbridge_authz_api::routers::api_router;
 use lightbridge_authz_core::{
-    Account, Project, async_trait,
-    config::{ApiServer, BasicAuth, Billing, Oauth2, OpaServer},
+    Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, RotateApiKey, async_trait,
+    config::{ApiServer, BasicAuth, Billing, Oauth2, OpaServer, Redis},
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
     server::{dev_cors_enabled, serve_tls},
 };
+
+pub mod auth_provider;
 pub mod handlers;
 pub mod middleware;
 pub mod models;
+pub mod ratelimit_redis;
 pub mod routers;
+pub mod rpc_authorize;
 pub mod signing;
 pub mod token_exchange;
 
+use auth_provider::{ACCESS_TOKEN_CONTEXT_KEY, CratestackAuthProvider};
 use handlers::AuthzStoreImpl;
-use middleware::bearer_auth;
+use ratelimit_redis::build_redis_rate_limit_store;
 use routers::opa_router;
 
+use chrono::Utc;
+use cratestack::idempotency::IdempotencyLayer;
+use cratestack::ratelimit::{RateLimitConfig, RateLimitLayer, RateLimitStore};
+use cratestack::{CodecSet, CoolContext, CoolError, SqlxIdempotencyStore, Value};
+use cratestack_codec_cbor::CborCodec;
+use cratestack_codec_json::JsonCodec;
+use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
-use lightbridge_authz_bearer::BearerTokenService;
+use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::CorsLayer;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
+
+/// Idempotency replay window for the CRUD RPC surface (ADR-0003, "Idempotency").
+const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 3600);
+/// Per-principal token-bucket rate-limit defaults for the CRUD RPC surface (ADR-0003, "Rate
+/// limiting (Redis-backed)"). Generous burst with steady refill; tune via deployment as needed.
+const RATE_LIMIT_BURST: u32 = 120;
+const RATE_LIMIT_REFILL_PER_SECOND: f64 = 60.0;
 
 #[derive(Serialize, Deserialize)]
 struct RootResponse {
@@ -105,18 +124,408 @@ impl OpaRepoTrait for StoreRepo {
     }
 }
 
-/// Assembles the API server router (public probes, OIDC discovery/JWKS when signing is
-/// enabled, and the bearer-protected CRUD API). Separated from `start_api_server` so the
-/// composition can be tested without binding a TLS socket. `dev_cors` (driven by
-/// `AUTHZ_DEV_CORS` in `start_api_server`) layers a wide-open CORS policy over the whole
-/// router — preflights included — so browser SPAs on other origins can call the API in
-/// local dev; never enable it in production.
+/// Maps a core repository `Error` (reused hand-written sqlx) into cratestack's `CoolError` so an RPC
+/// procedure failure surfaces with the right HTTP status through the RPC error envelope.
+fn to_cool_error(err: Error) -> CoolError {
+    match err {
+        Error::NotFound => CoolError::NotFound("not found".to_owned()),
+        Error::Forbidden(m) => CoolError::Forbidden(m),
+        Error::Conflict(m) => CoolError::Conflict(m),
+        Error::BadRequest(m) => CoolError::BadRequest(m),
+        other => CoolError::Internal(other.to_string()),
+    }
+}
+
+/// The validated caller's subject, projected as `auth().id` by [`CratestackAuthProvider`].
+fn subject_from_ctx(ctx: &CoolContext) -> Option<String> {
+    match ctx.auth_field("id") {
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// The caller's raw access token, stashed into the context by [`CratestackAuthProvider`] so the
+/// rotate procedure's downstream secret issuance can reuse it (email profile / token exchange).
+fn access_token_from_ctx(ctx: &CoolContext) -> Option<String> {
+    match ctx.extensions.get(ACCESS_TOKEN_CONTEXT_KEY) {
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn to_schema_api_key(k: ApiKey) -> schema::ApiKey {
+    schema::ApiKey {
+        createdAt: k.created_at,
+        updatedAt: Utc::now(),
+        id: k.id,
+        projectId: k.project_id,
+        name: k.name,
+        keyPrefix: k.key_prefix,
+        keyHash: k.key_hash,
+        status: k.status.to_string(),
+        expiresAt: k.expires_at,
+        lastUsedAt: k.last_used_at,
+        lastIp: k.last_ip,
+        revokedAt: k.revoked_at,
+        deletedAt: None,
+        billingPlan: k.billing_plan,
+    }
+}
+
+fn to_schema_account(a: Account) -> schema::Account {
+    schema::Account {
+        createdAt: a.created_at,
+        updatedAt: a.updated_at,
+        id: a.id,
+        billingIdentity: a.billing_identity,
+        status: a.status.to_string(),
+    }
+}
+
+/// Recursively lower a `serde_json::Value` (the shape the core repo speaks) into cratestack's own
+/// `Value` enum, which is what the generated model structs carry for `Json` columns. Needed because
+/// the two crates use different JSON value types and there is no cross-conversion in either.
+fn json_to_cratestack_value(value: serde_json::Value) -> Value {
+    match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(b),
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .map(Value::Int)
+            .unwrap_or_else(|| Value::Float(n.as_f64().unwrap_or(0.0))),
+        serde_json::Value::String(s) => Value::String(s),
+        serde_json::Value::Array(items) => {
+            Value::List(items.into_iter().map(json_to_cratestack_value).collect())
+        }
+        serde_json::Value::Object(map) => Value::Map(
+            map.into_iter()
+                .map(|(k, v)| (k, json_to_cratestack_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+fn to_schema_project(p: Project) -> schema::Project {
+    let allowed_models = p
+        .allowed_models
+        .map(|models| cratestack::Json(json_to_cratestack_value(serde_json::json!(models))));
+    let default_limits = cratestack::Json(json_to_cratestack_value(
+        serde_json::to_value(&p.default_limits).unwrap_or(serde_json::Value::Null),
+    ));
+    schema::Project {
+        createdAt: p.created_at,
+        updatedAt: p.updated_at,
+        id: p.id,
+        accountId: p.account_id,
+        name: p.name,
+        allowedModels: allowed_models,
+        defaultLimits: default_limits,
+        billingPlan: p.billing_plan,
+        status: p.status.to_string(),
+    }
+}
+
+fn to_schema_api_key_secret(s: ApiKeySecret) -> schema::ApiKeySecret {
+    let k = s.api_key;
+    schema::ApiKeySecret {
+        id: k.id,
+        projectId: k.project_id,
+        name: k.name,
+        keyPrefix: k.key_prefix,
+        status: k.status.to_string(),
+        expiresAt: k.expires_at,
+        lastUsedAt: k.last_used_at,
+        lastIp: k.last_ip,
+        revokedAt: k.revoked_at,
+        billingPlan: k.billing_plan,
+        createdAt: k.created_at,
+        updatedAt: Utc::now(),
+        secret: s.secret,
+        oauth2Url: s.oauth2_url,
+    }
+}
+
+/// RPC procedure registry (ADR-0003 item 4). All four procedures delegate to the reused,
+/// hand-written sqlx in `AuthzStoreImpl`/`StoreRepo` (tenant-scoped by the `account_memberships`
+/// CTE), never cratestack's `run_in_tx`, so the chained-write deadlock in cratestack-pg 0.4.9
+/// (ADR-0003, "Known cratestack-pg 0.4.9 bugs", item 1) cannot occur. `db` is intentionally unused:
+/// the generated CRUD client speaks over cratestack's own sqlx pool (a different sqlx major than
+/// this workspace's), so the procedures use the pre-migration repository pool for their writes.
+#[derive(Clone)]
+pub struct Procedures {
+    issuer: Arc<AuthzStoreImpl>,
+}
+
+impl Procedures {
+    pub fn new(issuer: Arc<AuthzStoreImpl>) -> Self {
+        Self { issuer }
+    }
+}
+
+impl schema::procedures::ProcedureRegistry for Procedures {
+    fn create_account(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::create_account::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::create_account::Output, CoolError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let billing_identity = args.args.billingIdentity;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let account = issuer
+                .create_account(&subject, CreateAccount { billing_identity })
+                .await
+                .map_err(to_cool_error)?;
+            Ok(to_schema_account(account))
+        }
+    }
+
+    fn rotate_api_key(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::rotate_api_key::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::rotate_api_key::Output, CoolError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let access_token = access_token_from_ctx(ctx);
+        let key_id = args.args.keyId;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let secret = issuer
+                .rotate_api_key(
+                    &subject,
+                    access_token.as_deref(),
+                    &key_id,
+                    RotateApiKey {
+                        name: None,
+                        expires_at: None,
+                        grace_period_seconds: None,
+                    },
+                )
+                .await
+                .map_err(to_cool_error)?;
+            Ok(to_schema_api_key_secret(secret))
+        }
+    }
+
+    fn create_api_key(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::create_api_key::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::create_api_key::Output, CoolError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let access_token = access_token_from_ctx(ctx);
+        let input = args.args;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let secret = issuer
+                .create_api_key(
+                    &subject,
+                    access_token.as_deref(),
+                    &input.projectId,
+                    CreateApiKey {
+                        name: input.name,
+                        expires_at: input.expiresAt,
+                        billing_plan: input.billingPlan,
+                    },
+                )
+                .await
+                .map_err(to_cool_error)?;
+            Ok(to_schema_api_key_secret(secret))
+        }
+    }
+
+    fn disable_account(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::disable_account::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::disable_account::Output, CoolError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let account_id = args.args.accountId;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let account = issuer
+                .disable_account(&subject, &account_id)
+                .await
+                .map_err(to_cool_error)?;
+            Ok(to_schema_account(account))
+        }
+    }
+
+    fn enable_account(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::enable_account::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::enable_account::Output, CoolError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let account_id = args.args.accountId;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let account = issuer
+                .enable_account(&subject, &account_id)
+                .await
+                .map_err(to_cool_error)?;
+            Ok(to_schema_account(account))
+        }
+    }
+
+    fn disable_project(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::disable_project::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::disable_project::Output, CoolError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let project_id = args.args.projectId;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let project = issuer
+                .disable_project(&subject, &project_id)
+                .await
+                .map_err(to_cool_error)?;
+            Ok(to_schema_project(project))
+        }
+    }
+
+    fn enable_project(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::enable_project::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::enable_project::Output, CoolError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let project_id = args.args.projectId;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let project = issuer
+                .enable_project(&subject, &project_id)
+                .await
+                .map_err(to_cool_error)?;
+            Ok(to_schema_project(project))
+        }
+    }
+
+    fn revoke_api_key(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::revoke_api_key::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::revoke_api_key::Output, CoolError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let key_id = args.args.keyId;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let key = issuer
+                .revoke_api_key(&subject, &key_id)
+                .await
+                .map_err(to_cool_error)?;
+            Ok(to_schema_api_key(key))
+        }
+    }
+
+    fn add_account_member(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::add_account_member::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::add_account_member::Output, CoolError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let account_id = args.args.accountId;
+        let new_member = args.args.subject;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let account = issuer
+                .add_account_member(&subject, &account_id, &new_member)
+                .await
+                .map_err(to_cool_error)?;
+            Ok(to_schema_account(account))
+        }
+    }
+
+    fn remove_account_member(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::remove_account_member::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::remove_account_member::Output, CoolError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let account_id = args.args.accountId;
+        let member = args.args.subject;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let account = issuer
+                .remove_account_member(&subject, &account_id, &member)
+                .await
+                .map_err(to_cool_error)?;
+            Ok(to_schema_account(account))
+        }
+    }
+}
+
+/// Assembles the API server router: public probes, OIDC discovery/JWKS (when signing is enabled),
+/// native token-exchange, and the generated cratestack RPC CRUD surface (`POST /rpc/{op_id}`,
+/// `POST /rpc/batch`) wrapped in idempotency + rate-limit middleware. Separated from
+/// `start_api_server` so the composition can be built without binding a TLS socket. `dev_cors`
+/// (driven by `AUTHZ_DEV_CORS`) layers a wide-open CORS policy over the whole router — never enable
+/// it in production. `cratestack_db` and `idempotency_store` are built on cratestack's own sqlx pool
+/// (see `start_api_server`); the RPC surface replaces the old REST `/api/v1` CRUD mount entirely
+/// (ADR-0003, "RPC transport, not REST"), and its OpenAPI/Swagger UI is intentionally gone
+/// (ADR-0003, "Loss of Swagger UI").
+#[allow(clippy::too_many_arguments)]
 pub fn build_api_router(
     oauth2: &Oauth2,
-    app_state: Arc<lightbridge_authz_api::AppState>,
+    bearer: Arc<dyn BearerTokenServiceTrait>,
+    issuer: Arc<AuthzStoreImpl>,
+    cratestack_db: schema::Cratestack,
     readiness_pool: Arc<dyn DbPoolTrait>,
     signing_repo: Arc<StoreRepo>,
     token_exchange: Option<token_exchange::TokenExchangeState>,
+    idempotency_store: Arc<SqlxIdempotencyStore>,
+    rate_limit_store: Arc<dyn RateLimitStore>,
     dev_cors: bool,
 ) -> Router {
     let mut public = Router::new()
@@ -129,11 +538,7 @@ pub fn build_api_router(
                 let readiness_pool = readiness_pool.clone();
                 async move { readiness_handler(readiness_pool).await }
             }),
-        )
-        .merge(SwaggerUi::new("/api/v1/docs").url(
-            "/api/v1/openapi.json",
-            lightbridge_authz_api::openapi::ApiDoc::openapi(),
-        ));
+        );
 
     let token_exchange_enabled = token_exchange.is_some();
     if oauth2.is_self_signed()
@@ -150,16 +555,33 @@ pub fn build_api_router(
         public = public.merge(token_exchange::token_exchange_router(te_state));
     }
 
-    let protected = Router::new()
-        .nest("/api/v1", api_router())
-        .with_state(app_state.clone())
-        .route_layer(axum::middleware::from_fn(middleware::authorize))
-        .layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
-            bearer_auth,
-        ));
+    // Generated RPC CRUD surface. Codec: a single `CodecSet` accepting both wire formats, dispatched
+    // on request `Content-Type` — CBOR primary (production default) with JSON secondary so
+    // `curl`/dev/CI stay usable on the same router instance (ADR-0003, "CBOR in production, JSON in
+    // dev/CI"; the ADR explicitly blesses the single-CodecSet form).
+    // The coarse RBAC gate (docs/rbac.md) that cratestack's membership `@@allow` policies do not
+    // express. Applied as the OUTERMOST layer so an unauthorized caller is rejected with 403 before
+    // consuming idempotency/rate-limit budget or reaching cratestack's dispatch; the membership
+    // policy then runs as the second gate inside dispatch. The bearer service is validated here and
+    // again by the RPC `AuthProvider` — cheap given the shared JWKS cache — keeping this a pure,
+    // additive gate that shares no state with the provider.
+    let rpc = schema::axum::rpc_router(
+        cratestack_db,
+        Procedures::new(issuer),
+        CodecSet::new(CborCodec, JsonCodec),
+        CratestackAuthProvider::new(bearer.clone()),
+    )
+    .layer(IdempotencyLayer::new(idempotency_store, IDEMPOTENCY_TTL))
+    .layer(RateLimitLayer::new(
+        rate_limit_store,
+        RateLimitConfig::new(RATE_LIMIT_BURST, RATE_LIMIT_REFILL_PER_SECOND),
+    ))
+    .layer(axum::middleware::from_fn_with_state(
+        bearer,
+        rpc_authorize::rpc_authorize,
+    ));
 
-    let router = public.merge(protected).with_state(app_state);
+    let router = public.merge(rpc);
     if dev_cors {
         router.layer(CorsLayer::permissive())
     } else {
@@ -206,6 +628,7 @@ pub async fn start_api_server(
     pool: Arc<dyn DbPoolTrait>,
     oauth2: &Oauth2,
     billing: &Billing,
+    redis: &Option<Redis>,
 ) -> Result<()> {
     billing.validate()?;
     let readiness_pool = pool.clone();
@@ -216,7 +639,13 @@ pub async fn start_api_server(
         })?;
         signing::bootstrap_signing_key(&signing_repo, signing).await?;
     }
-    let store = Arc::new(AuthzStoreImpl::with_pool_and_oauth2(pool, oauth2, billing)?);
+    // Secret-issuance + membership operations reused by the RPC procedures (hand-written sqlx on the
+    // core `DbPool`, sqlx 0.9).
+    let issuer = Arc::new(AuthzStoreImpl::with_pool_and_oauth2(
+        pool.clone(),
+        oauth2,
+        billing,
+    )?);
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
 
@@ -224,18 +653,53 @@ pub async fn start_api_server(
         build_token_exchange_state(oauth2, signing_repo.clone(), bearer_service.clone())?;
     let token_exchange_enabled = token_exchange_state.is_some();
 
-    let app_state = Arc::new(lightbridge_authz_api::AppState {
-        store,
-        bearer: bearer_service,
-    });
+    // cratestack runs on its own sqlx major (0.8, vs this workspace's 0.9), so its CRUD client and
+    // Postgres-backed idempotency store need a separate pool built with cratestack's sqlx. Both talk
+    // to the same database as the core `DbPool`; the URL comes from `DATABASE_URL` (the same env the
+    // schema's `datasource ... env("DATABASE_URL")` reads).
+    let database_url = std::env::var("DATABASE_URL").map_err(|_| {
+        Error::Server(
+            "DATABASE_URL must be set for the cratestack CRUD pool (authz-api RPC surface)"
+                .to_string(),
+        )
+    })?;
+    let cratestack_pool = cratestack::sqlx::postgres::PgPoolOptions::new()
+        .connect(&database_url)
+        .await
+        .map_err(|e| Error::Server(format!("failed to open cratestack Postgres pool: {e}")))?;
+    let cratestack_db = schema::Cratestack::builder(cratestack_pool.clone()).build();
+
+    // Idempotency store (Postgres-backed, cratestack sqlx); create its table before serving
+    // (ADR-0003, "Idempotency").
+    let idempotency_store = Arc::new(SqlxIdempotencyStore::new(cratestack_pool.clone()));
+    idempotency_store
+        .ensure_schema()
+        .await
+        .map_err(|e| Error::Server(format!("failed to ensure idempotency schema: {e}")))?;
+
+    // Redis-backed rate-limit store for multi-replica correctness (ADR-0003, "Rate limiting
+    // (Redis-backed)"). `redis::Client::open` is lazy, so this does not block on a live Redis here.
+    // The URL comes from the already-loaded `Config.redis.url` (YAML `redis: url:`, itself
+    // populated from `REDIS_URL` via env interpolation — see `config/default.yaml`), not a
+    // separately-read raw env var, mirroring how every other config value reaches this function.
+    let redis = redis.as_ref().ok_or_else(|| {
+        Error::Server(
+            "redis config is required for authz-api rate limiting (set `redis.url`)".to_string(),
+        )
+    })?;
+    let rate_limit_store = build_redis_rate_limit_store(&redis.url, "authz-api")?;
 
     let dev_cors = dev_cors_enabled();
     let app = build_api_router(
         oauth2,
-        app_state,
+        bearer_service,
+        issuer,
+        cratestack_db,
         readiness_pool,
         signing_repo,
         token_exchange_state,
+        idempotency_store,
+        rate_limit_store,
         dev_cors,
     );
 

@@ -297,33 +297,41 @@ def main() -> int:
         authz_headers = {"Authorization": f"Bearer {token}"}
         billing_identity = f"it-servers-{uuid.uuid4().hex[:12]}"
 
+        # authz-api migrated to cratestack RPC transport (ADR-0003): CRUD dispatches via
+        # POST /rpc/{op_id}. A mapped op with no bearer is rejected by the coarse RBAC gate with 401
+        # (fail-closed) before dispatch.
         expect_http_error(
             401,
-            method="GET",
-            url=f"{API_URL}/api/v1/accounts",
+            method="POST",
+            url=f"{API_URL}/rpc/model.Account.list",
+            body={},
             insecure_tls=True,
         )
         log("api rejects missing bearer token")
 
         status, account, _ = request_json(
             "POST",
-            f"{API_URL}/api/v1/accounts",
-            {"billing_identity": billing_identity, "owners_admins": [USERNAME]},
+            f"{API_URL}/rpc/procedure.createAccount",
+            {"args": {"billingIdentity": billing_identity}},
             headers=authz_headers,
             insecure_tls=True,
         )
-        assert status == 201, f"create account failed: status={status}, body={account}"
+        assert status == 200, f"create account failed: status={status}, body={account}"
         account_id = account["id"]
         log(f"api create-account passed ({account_id})")
 
+        project_client_id = "c" + uuid.uuid4().hex[:24]
         status, project, _ = request_json(
             "POST",
-            f"{API_URL}/api/v1/accounts/{account_id}/projects",
+            f"{API_URL}/rpc/model.Project.create",
             {
+                "id": project_client_id,
+                "accountId": account_id,
                 "name": "it-servers-project",
-                "allowed_models": ["gpt-4.1-mini"],
-                "default_limits": {},
-                "billing_plan": "free",
+                "allowedModels": {"List": [{"String": "gpt-4.1-mini"}]},
+                "defaultLimits": {"Map": {}},
+                "billingPlan": "free",
+                "status": "active",
             },
             headers=authz_headers,
             insecure_tls=True,
@@ -333,12 +341,12 @@ def main() -> int:
 
         status, key_payload, _ = request_json(
             "POST",
-            f"{API_URL}/api/v1/projects/{project_id}/api-keys",
-            {"name": "it-servers-key", "billing_plan": "free"},
+            f"{API_URL}/rpc/procedure.createApiKey",
+            {"args": {"projectId": project_id, "name": "it-servers-key", "billingPlan": "free"}},
             headers=authz_headers,
             insecure_tls=True,
         )
-        assert status == 201, f"create api key failed: status={status}, body={key_payload}"
+        assert status == 200, f"create api key failed: status={status}, body={key_payload}"
         secret = key_payload["secret"]
 
         expect_http_error(

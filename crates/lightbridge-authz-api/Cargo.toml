@@ -7,16 +7,11 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-axum.workspace = true
-lightbridge-authz-core = { workspace = true, features = ["axum"] }
-tracing.workspace = true
-lightbridge-authz-bearer = { workspace = true }
-utoipa.workspace = true
+# Schema-first CRUD codegen: this crate owns `schema/authz.cstack` and emits the generated
+# `cratestack_schema` module (models, inputs, the RPC `axum::rpc_router`, and the
+# `procedures::ProcedureRegistry` trait). See docs/adr/0003-cratestack-crud-migration.md.
+cratestack = { workspace = true }
 serde.workspace = true
-
-[dev-dependencies]
-tokio.workspace = true
-tower.workspace = true
-chrono.workspace = true
-anyhow.workspace = true
-serde_json.workspace = true
+# Retained only for `AppState.bearer`, still consumed by the (now-unmounted) RBAC middleware in the
+# rest crate. The CRUD `AuthzStore` trait/impl this crate used to host is deleted (ADR-0003).
+lightbridge-authz-bearer = { workspace = true }

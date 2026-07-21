@@ -33,6 +33,19 @@ controllers:
               secretKeyRef:
                 name: opa-secret
                 key: OPA_PASSWORD
+          # Redis-backed rate limiting for authz-api only (see
+          # docs/adr/0003-cratestack-crud-migration.md, "Rate limiting (Redis-backed)").
+          # Provisioning the `redis-secret` Secret itself, and Redis's own deployment
+          # topology (external managed instance vs. a new bundled subchart), are left
+          # as a follow-up decision — this chart has no existing convention for
+          # bundling a dependency database (postgresql/timescaledb aren't bundled
+          # subcharts either; see compose.yaml / docs/platform-guides.md for how
+          # DATABASE_URL is provisioned externally today).
+          REDIS_URL:
+            valueFrom:
+              secretKeyRef:
+                name: redis-secret
+                key: REDIS_URL
         probes:
           liveness:
             enabled: true
@@ -105,6 +118,10 @@ configMaps:
         database:
           url: "${DATABASE_URL}"
           pool_size: 10
+        # Redis-backed rate limiting for authz-api (see
+        # docs/adr/0003-cratestack-crud-migration.md, "Rate limiting (Redis-backed)").
+        redis:
+          url: "${REDIS_URL}"
         oauth2:
           # REQUIRED credential-issuance mode — no default. `self` mints self-signed JWT API keys
           # (uses `signing`); `external` exchanges at the upstream IdP (uses `issuance`). Override

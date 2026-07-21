@@ -1,19 +1,13 @@
 use anyhow::{anyhow, ensure};
-use jsonwebtoken::{Validation, decode, decode_header};
-use jwks::{Jwk, Jwks};
+use authkestra_guard::jwt::{JwksCache, ValidationConfig, validate_jwt_generic};
+use jsonwebtoken::{Algorithm, Validation, decode_header};
 use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::authz::{PermissionSet, permissions_for_roles};
 use lightbridge_authz_core::config::Oauth2;
 use lightbridge_authz_core::{Error, Permission};
 use serde::Deserialize;
 use serde_json::Value;
-use std::{
-    collections::HashMap,
-    fmt,
-    sync::Arc,
-    time::{Duration, Instant},
-};
-use tokio::sync::RwLock;
+use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
 
 /// Token information returned by JWT validation.
 #[derive(Clone, Deserialize)]
@@ -109,75 +103,18 @@ impl Default for Audience {
     }
 }
 
+/// Default JWKS cache refresh interval, matching the previous hand-written cache's TTL.
+///
+/// `authkestra_guard::jwt::ValidationConfigBuilder` defaults to one hour when unset; we keep the
+/// tighter five-minute interval this service shipped with so key rotation propagates promptly.
 const DEFAULT_JWKS_CACHE_TTL: Duration = Duration::from_secs(300);
 
-#[derive(Clone)]
-struct JwksCache {
-    url: String,
-    ttl: Duration,
-    inner: Arc<RwLock<Option<CachedJwks>>>,
-}
-
-struct CachedJwks {
-    jwks: Jwks,
-    expires_at: Instant,
-}
-
-impl JwksCache {
-    fn new(url: String) -> Self {
-        Self::with_ttl(url, DEFAULT_JWKS_CACHE_TTL)
-    }
-
-    fn with_ttl(url: String, ttl: Duration) -> Self {
-        Self {
-            url,
-            ttl,
-            inner: Arc::new(RwLock::new(None)),
-        }
-    }
-
-    async fn get(&self, kid: &str) -> Result<Option<Jwk>, jwks::JwksError> {
-        self.ensure_fresh().await?;
-        if let Some(key) = self.lookup(kid).await {
-            return Ok(Some(key));
-        }
-
-        self.refresh().await?;
-        Ok(self.lookup(kid).await)
-    }
-
-    async fn lookup(&self, kid: &str) -> Option<Jwk> {
-        let guard = self.inner.read().await;
-        guard
-            .as_ref()
-            .and_then(|cached| cached.jwks.keys.get(kid).cloned())
-    }
-
-    async fn ensure_fresh(&self) -> Result<(), jwks::JwksError> {
-        let now = Instant::now();
-        {
-            let guard = self.inner.read().await;
-            if guard
-                .as_ref()
-                .map(|cached| cached.expires_at > now)
-                .unwrap_or(false)
-            {
-                return Ok(());
-            }
-        }
-        self.refresh().await
-    }
-
-    async fn refresh(&self) -> Result<(), jwks::JwksError> {
-        let jwks = Jwks::from_jwks_url(&self.url).await?;
-        let mut guard = self.inner.write().await;
-        *guard = Some(CachedJwks {
-            jwks,
-            expires_at: Instant::now() + self.ttl,
-        });
-        Ok(())
-    }
-}
+/// JWT signing algorithms this service accepts. Fixed (rather than trusting the `alg` the
+/// presented token's header claims, as the previous implementation did via
+/// `Validation::new(header.alg)`) to avoid algorithm-confusion: an attacker-controlled header
+/// must never select which verification algorithm is used. Keycloak (and every JWKS-backed RSA
+/// issuer this service targets) signs with RS256.
+const ACCEPTED_ALGORITHMS: [Algorithm; 1] = [Algorithm::RS256];
 
 /// Trait for validating bearer tokens.
 #[async_trait]
@@ -190,10 +127,18 @@ pub trait BearerTokenServiceTrait: Send + Sync {
 }
 
 /// Service responsible for validating bearer tokens.
+///
+/// JWKS fetch/cache and JWT decode/verify are delegated to `authkestra_guard::jwt` (crate
+/// `authkestra-guard`, published separately on crates.io — see the module docs below for why).
+/// This service still owns: the `kid`-presence check (`authkestra`'s key lookup falls back to the
+/// JWKS's first key when a token omits `kid`, which this service intentionally does not allow),
+/// the accepted-algorithm allowlist, and the multi-value audience match (`authkestra`'s
+/// `ValidationConfig::audience` only accepts a single expected value, but `oauth2.audience` here
+/// is a list — see [`ValidationConfig`] docs upstream).
 #[derive(Clone)]
 pub struct BearerTokenService {
     config: Oauth2,
-    cache: JwksCache,
+    cache: Arc<JwksCache>,
     /// JWT claim carrying the caller's roles.
     roles_claim: String,
     /// Precompiled role → permission map (wildcards already expanded).
@@ -217,7 +162,20 @@ impl BearerTokenService {
             config.audience,
             config.rbac.roles_claim
         );
-        let cache = JwksCache::new(config.jwks_url.clone());
+        // `ValidationConfig` also exposes `.issuer()`/`.audience()` builder methods, but neither
+        // is wired here: this service has never enforced `iss` (the JWKS URL itself is
+        // realm-scoped), and `.audience()` only accepts a single expected value while
+        // `oauth2.audience` is a list — so audience matching is done manually below, against
+        // jsonwebtoken's own multi-value `set_audience`, exactly as before this migration.
+        let validation_config = ValidationConfig::builder()
+            .jwks_url(config.jwks_url.clone())
+            .refresh_interval(DEFAULT_JWKS_CACHE_TTL)
+            .algorithms(ACCEPTED_ALGORITHMS.to_vec())
+            .build();
+        let cache = Arc::new(JwksCache::new(
+            validation_config.jwks_url,
+            validation_config.refresh_interval,
+        ));
         let roles_claim = config.rbac.roles_claim.clone();
         let role_permissions = config.rbac.compile();
         BearerTokenService {
@@ -241,31 +199,20 @@ impl BearerTokenServiceTrait for BearerTokenService {
     async fn validate_bearer_token(&self, token: &str) -> anyhow::Result<TokenInfo> {
         ensure!(!token.trim().is_empty(), anyhow!("unauthorized"));
 
-        // Decode JWT header and extract kid
+        // Decode the JWT header ourselves first, purely to require a `kid`: authkestra's key
+        // lookup (`Jwks::find_key`) falls back to the JWKS's first key when `kid` is absent,
+        // which this service does not allow (JWKS here may hold multiple keys during rotation).
         let header = decode_header(token).map_err(|e| {
             tracing::debug!("Failed to decode JWT header: {}", e);
             anyhow!("unauthorized")
         })?;
-        let kid = header.kid.as_ref().ok_or_else(|| {
+        if header.kid.is_none() {
             tracing::debug!("JWT missing kid header");
-            anyhow!("unauthorized")
-        })?;
+            return Err(anyhow!("unauthorized"));
+        }
 
-        // Load JWKS (cached) and find JWK by kid.
-        let jwk = match self.cache.get(kid).await {
-            Ok(Some(key)) => key,
-            Ok(None) => {
-                tracing::debug!("JWK not found for kid: {}", kid);
-                return Err(anyhow!("unauthorized"));
-            }
-            Err(err) => {
-                tracing::error!("JWKS retrieval error: {}", err);
-                return Err(anyhow!("unauthorized"));
-            }
-        };
-
-        // Validate the token using the JWK decoding key.
-        let mut validation = Validation::new(header.alg);
+        let mut validation = Validation::new(ACCEPTED_ALGORITHMS[0]);
+        validation.algorithms = ACCEPTED_ALGORITHMS.to_vec();
         if let Some(expected_audiences) = &self.config.audience {
             tracing::debug!(
                 "Validating JWT with expected audiences: {:?}",
@@ -281,11 +228,16 @@ impl BearerTokenServiceTrait for BearerTokenService {
             validation.validate_aud = false;
         }
 
-        let token_data = decode::<Claims>(token, &jwk.decoding_key, &validation).map_err(|e| {
-            tracing::error!("JWT validation failed: {}", e);
-            anyhow!("unauthorized")
-        })?;
-        let claims = token_data.claims;
+        // JWKS fetch/cache + kid lookup + signature/exp verification, delegated to
+        // authkestra_guard::jwt::validate_jwt_generic. Any failure (network, missing key,
+        // signature, expiry) is folded into a uniform "unauthorized" so callers never see which
+        // step failed, matching this service's existing security posture.
+        let claims: Claims = validate_jwt_generic(token, &self.cache, &validation)
+            .await
+            .map_err(|e| {
+                tracing::error!("JWT validation failed: {}", e);
+                anyhow!("unauthorized")
+            })?;
 
         // Extract audience from claims
         let token_audience: Vec<String> = claims.aud.map(|a| a.to_vec()).unwrap_or_default();
@@ -419,6 +371,8 @@ mod tests {
         );
     }
 
+    /// Exercises the real `authkestra_guard::jwt::JwksCache` (this crate no longer hand-rolls
+    /// its own cache), preserving the coverage the previous hand-written cache had.
     #[tokio::test]
     async fn cache_reuses_jwks_within_ttl() {
         let server = MockServer::start();
@@ -429,11 +383,11 @@ mod tests {
                 .body(jwks_body());
         });
 
-        let cache = JwksCache::with_ttl(server.url("/jwks"), Duration::from_secs(60));
-        assert!(cache.get(TEST_KID).await.unwrap().is_some());
+        let cache = JwksCache::new(server.url("/jwks"), Duration::from_secs(60));
+        assert!(cache.get_key(Some(TEST_KID)).await.unwrap().is_some());
         assert_eq!(mock.calls(), 1);
 
-        assert!(cache.get(TEST_KID).await.unwrap().is_some());
+        assert!(cache.get_key(Some(TEST_KID)).await.unwrap().is_some());
         assert_eq!(mock.calls(), 1);
     }
 
@@ -447,11 +401,30 @@ mod tests {
                 .body(jwks_body());
         });
 
-        let cache = JwksCache::with_ttl(server.url("/jwks"), Duration::from_secs(0));
-        assert!(cache.get(TEST_KID).await.unwrap().is_some());
+        let cache = JwksCache::new(server.url("/jwks"), Duration::from_secs(0));
+        assert!(cache.get_key(Some(TEST_KID)).await.unwrap().is_some());
         assert_eq!(mock.calls(), 1);
 
-        assert!(cache.get(TEST_KID).await.unwrap().is_some());
+        assert!(cache.get_key(Some(TEST_KID)).await.unwrap().is_some());
         assert_eq!(mock.calls(), 2);
+    }
+
+    /// The service must reject tokens with no `kid` header before ever consulting the JWKS
+    /// cache, because `authkestra_guard`'s own key lookup falls back to the JWKS's first key
+    /// when `kid` is absent (see `Jwks::find_key`) rather than rejecting outright.
+    #[tokio::test]
+    async fn missing_kid_falls_back_to_first_key_in_authkestra_but_this_service_rejects_it() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/jwks");
+            then.header("content-type", "application/json")
+                .status(200)
+                .body(jwks_body());
+        });
+
+        let cache = JwksCache::new(server.url("/jwks"), Duration::from_secs(60));
+        // Demonstrates the upstream fallback this service's explicit kid check guards against.
+        assert!(cache.get_key(None).await.unwrap().is_some());
+        assert_eq!(mock.calls(), 1);
     }
 }

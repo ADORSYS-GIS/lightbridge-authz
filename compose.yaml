@@ -83,6 +83,17 @@ services:
       start_period: 10s
       retries: 12
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      start_period: 5s
+      retries: 12
+
   adminer:
     image: adminer
     ports:
@@ -141,6 +152,8 @@ services:
     depends_on:
       postgresql:
         condition: service_healthy
+      redis:
+        condition: service_healthy
       authz-migrate:
         condition: service_completed_successfully
       authz-tls:
@@ -160,6 +173,10 @@ services:
     environment:
       RUST_LOG: "debug,opentelemetry_sdk=warn,opentelemetry_otlp=warn,h2=warn,hyper_util=warn,tower=warn"
       CONFIG_PATH: "/tmp/config.yaml"
+      # Read directly by cratestack's own sqlx pool (the RPC surface's `datasource ...
+      # env("DATABASE_URL")` declaration, see docs/adr/0003-cratestack-crud-migration.md) — separate
+      # from the core `DbPool`, which reads `database.url` out of CONFIG_PATH's YAML instead.
+      DATABASE_URL: "postgres://postgres:postgres@postgresql:5432/lightbridge_authz"
     ports:
       - "13000:3000"
     command:
@@ -229,6 +246,10 @@ services:
       CONFIG_PATH: "/tmp/config.yaml"
       TLS_CERT_PATH: "/tls/mcp.crt"
       TLS_KEY_PATH: "/tls/mcp.key"
+      # cratestack builds its own sqlx pool directly from this env var (see
+      # crates/lightbridge-authz-api/schema/authz.cstack's `env("DATABASE_URL")` datasource);
+      # it does not read database.url out of the mounted config.yaml.
+      DATABASE_URL: "postgres://postgres:postgres@postgresql:5432/lightbridge_authz"
     ports:
       - "13003:3000"
     command:

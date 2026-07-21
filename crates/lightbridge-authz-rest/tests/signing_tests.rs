@@ -182,9 +182,9 @@ fn capped_expiry_ignores_past_request_to_avoid_dead_token() {
 mod db {
     use super::*;
     use chrono::{Duration, Utc};
-    use lightbridge_authz_api::contract::AuthzStore;
     use lightbridge_authz_api_key::repo::StoreRepo;
     use lightbridge_authz_core::config::Oauth2;
+    use lightbridge_authz_core::cuid::cuid2;
     use lightbridge_authz_core::{CreateAccount, CreateApiKey, CreateProject};
     use lightbridge_authz_rest::handlers::AuthzStoreImpl;
     use lightbridge_authz_rest::signing::{KeyOwner, bootstrap_signing_key};
@@ -377,7 +377,11 @@ mod db {
             )
             .await
             .unwrap();
-        let project = store
+        // Project creation left `AuthzStoreImpl` in the cratestack migration (the CRUD verbs now run
+        // through the generated client). Seed the project row directly via the surviving
+        // hand-written `StoreRepo::create_project` (membership already seeded by `create_account`);
+        // this test only needs a project to exist so `create_api_key` can sign against it.
+        let project = key_repo
             .create_project(
                 subject,
                 &account.id,
@@ -387,6 +391,7 @@ mod db {
                     default_limits: None,
                     billing_plan: "free".to_string(),
                 },
+                cuid2(),
             )
             .await
             .unwrap();

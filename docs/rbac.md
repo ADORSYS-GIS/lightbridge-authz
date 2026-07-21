@@ -21,16 +21,41 @@ each operation requires.
 
 Enforcement is centralized, so the handlers/tools themselves contain no authorization code:
 
-- **REST** — an `authorize` middleware (`crates/lightbridge-authz-rest/src/middleware`) runs after
-  `bearer_auth` and after route matching. It maps the matched `(method, route pattern)` to the
-  required permission and checks it. It **fails closed**: a protected route with no mapping, a
-  missing matched path, or a missing token is denied.
+- **CRUD API (RPC)** — an `rpc_authorize` middleware
+  (`crates/lightbridge-authz-rest/src/rpc_authorize.rs`) wraps the cratestack RPC router as its
+  **outermost** layer. For every `POST /rpc/{op_id}` it extracts the bearer token, validates it via
+  the same `BearerTokenServiceTrait` used everywhere (reusing the `TokenInfo.permissions` set it
+  already computes), maps the `op_id` to the required permission, and rejects with `403 Forbidden`
+  **before the request reaches cratestack's dispatch** if the token lacks it. It **fails closed**: an
+  unmapped op-id, the `/rpc/batch` fan-out endpoint, and any missing/invalid token are all denied.
 - **MCP** — `call_tool` maps the tool name to the required permission and checks it before
   dispatching. It likewise fails closed (an unmapped tool name is rejected).
 
-The `(method, path)` → permission and tool → permission maps are the single sources of truth and
-must stay in sync with the tables below. The claim is read at request time; the role→permission map
-is compiled once at startup (wildcards expanded), so the request-time check is a plain set lookup.
+### Two gates on the CRUD surface, in order
+
+The CRUD surface (`authz-api`) migrated to cratestack-generated RPC routing (see
+`docs/adr/0003-cratestack-crud-migration.md`). Authorization there is now **two independent layers,
+both mandatory, evaluated in this order**:
+
+1. **RBAC gate (coarse capability) — first.** The `rpc_authorize` middleware above. Answers "may
+   this caller perform this *kind* of operation at all?" A caller lacking the permission gets
+   `403 Forbidden` and the request never reaches cratestack. This is the layer this document's
+   `op_id` → permission table defines.
+2. **Membership policy (per-tenant ownership) — second.** cratestack's generated `@@allow` policies
+   on the schema (`crates/lightbridge-authz-api/schema/authz.cstack`), which check
+   `…memberships.some.subject == auth().id`. Answers "does this specific account/project/key belong
+   to a tenant this caller is a member of?" A non-member gets a policy-driven empty result / `404`.
+
+So a `lightbridge-viewer` who is a legitimate account member is still blocked from
+create/update/delete by gate 1 (they hold only `*:read`), and a `lightbridge-editor` acting on an
+account they do **not** belong to passes gate 1 but is stopped by gate 2. Both must pass.
+
+RBAC enforcement on non-CRUD paths — OPA/Authorino validation and `/idp/v1/resolve-context` (Basic
+auth, outside RBAC) — is unchanged, and the MCP enforcement above is unaffected.
+
+The `op_id` → permission and tool → permission maps are the single sources of truth and must stay in
+sync with the tables below. The claim is read at request time; the role→permission map is compiled
+once at startup (wildcards expanded), so the request-time check is a plain set lookup.
 
 ## Configuration (`oauth2.rbac`)
 
@@ -96,33 +121,59 @@ Used when `oauth2.rbac.role_permissions` is not configured
 
 ## Permissions and the operations they gate
 
-Each permission is the canonical `resource:action` string used in config and grants. Both the REST
-endpoint and the equivalent MCP tool require the same permission.
+Each permission is the canonical `resource:action` string used in config and grants. On the CRUD
+API the operation is an RPC `op_id` (`POST /rpc/{op_id}`); the equivalent MCP tool requires the same
+permission. cratestack's `op_id` scheme is `model.<Model>.<verb>` (verb ∈ `list|get|create|update|
+delete`) for generated model CRUD and `procedure.<name>` for the hand-written procedures.
 
-| Permission         | REST endpoint                                   | MCP tool                       |
-| ------------------ | ----------------------------------------------- | ------------------------------ |
-| `account:create`   | `POST /api/v1/accounts`                         | `create-account`               |
-| `account:read`     | `GET /api/v1/accounts`, `GET .../accounts/{id}` | `list-accounts`, `get-account` |
-| `account:update`   | `PATCH /api/v1/accounts/{id}`                   | `update-account`               |
-| `account:delete`   | `DELETE /api/v1/accounts/{id}`                  | `delete-account`               |
-| `account:disable`  | `POST .../accounts/{id}/disable`, `.../enable`  | `disable-account`, `enable-account` |
-| `account:member`   | `POST .../accounts/{id}/members`, `DELETE .../members/{member}` | `add-account-member`, `remove-account-member` |
-| `project:create`   | `POST /api/v1/accounts/{id}/projects`           | `create-project`               |
-| `project:read`     | `GET .../projects`, `GET /api/v1/projects/{id}` | `list-projects`, `get-project` |
-| `project:update`   | `PATCH /api/v1/projects/{id}`                   | `update-project`               |
-| `project:delete`   | `DELETE /api/v1/projects/{id}`                  | `delete-project`               |
-| `project:disable`  | `POST .../projects/{id}/disable`, `.../enable`  | `disable-project`, `enable-project` |
-| `apikey:create`    | `POST /api/v1/projects/{id}/api-keys`           | `create-api-key`               |
-| `apikey:read`      | `GET .../api-keys`, `GET /api/v1/api-keys/{id}` | `list-api-keys`, `get-api-key` |
-| `apikey:update`    | `PATCH /api/v1/api-keys/{id}`                   | `update-api-key`               |
-| `apikey:delete`    | `DELETE /api/v1/api-keys/{id}`                  | `delete-api-key`               |
-| `apikey:revoke`    | `POST /api/v1/api-keys/{id}/revoke`             | `revoke-api-key`               |
-| `apikey:rotate`    | `POST /api/v1/api-keys/{id}/rotate`             | `rotate-api-key`               |
-| `apikey:validate`  | — (OPA server, Basic-auth)                      | `validate-api-key`, `validate-authorino-api-key` |
+This table is the source of truth for `rpc_authorize::required_permission`. **Any RPC `op_id` not
+listed here is denied unconditionally (fail closed).**
 
-`read` covers both the list and get operations for a resource. The OPA validation endpoints
-(`/v1/opa/validate`, `/v1/authorino/validate`) are protected by Basic auth, not JWT, so they are
-outside RBAC; the equivalent MCP validation tools (which run behind JWT) require `apikey:validate`.
+| Permission        | RPC `op_id`                                          | MCP tool                            |
+| ----------------- | ---------------------------------------------------- | ----------------------------------- |
+| `account:create`  | `model.Account.create`                               | `create-account`                    |
+| `account:read`    | `model.Account.list`, `model.Account.get`, `model.AccountSummary.list`, `model.AccountSummary.get` | `list-accounts`, `get-account` |
+| `account:update`  | `model.Account.update`                               | `update-account`                    |
+| `account:delete`  | `model.Account.delete`                               | `delete-account`                    |
+| `account:disable` | `procedure.disableAccount`, `procedure.enableAccount`| `disable-account`, `enable-account` |
+| `account:member`  | `procedure.addAccountMember`, `procedure.removeAccountMember` | `add-account-member`, `remove-account-member` |
+| `project:create`  | `model.Project.create`                               | `create-project`                    |
+| `project:read`    | `model.Project.list`, `model.Project.get`            | `list-projects`, `get-project`      |
+| `project:update`  | `model.Project.update`                               | `update-project`                    |
+| `project:delete`  | `model.Project.delete`                               | `delete-project`                    |
+| `project:disable` | `procedure.disableProject`, `procedure.enableProject`| `disable-project`, `enable-project` |
+| `apikey:create`   | `procedure.createApiKey`                             | `create-api-key`                    |
+| `apikey:read`     | `model.ApiKey.list`, `model.ApiKey.get`              | `list-api-keys`, `get-api-key`      |
+| `apikey:update`   | `model.ApiKey.update`                                | `update-api-key`                    |
+| `apikey:delete`   | `model.ApiKey.delete`                                | `delete-api-key`                    |
+| `apikey:revoke`   | `procedure.revokeApiKey`                             | `revoke-api-key`                    |
+| `apikey:rotate`   | `procedure.rotateApiKey`                             | `rotate-api-key`                    |
+| `apikey:validate` | — (OPA server, Basic-auth)                           | `validate-api-key`, `validate-authorino-api-key` |
+
+`read` covers both the list and get operations for a resource.
+
+**Deliberately unmapped → denied (defense in depth):**
+
+- `model.ApiKey.create` — the schema removed its `@@allow("create")`, so the generic create verb is
+  already fail-closed at the policy layer; the RBAC gate denies it too. API-key creation is
+  server-side only, via `procedure.createApiKey` (the server generates + hashes the secret and
+  validates the billing plan; a caller can never supply `keyHash`/`keyPrefix`/`billingPlan`).
+- `model.AccountMembership.*` — that model is policy-locked to read-self with no generated mutation
+  verbs; membership changes go through the `addAccountMember` / `removeAccountMember` procedures.
+- `/rpc/batch` — a batch bundles multiple ops in its frame body, so a single URL-derived `op_id`
+  cannot represent the per-op permissions; the whole endpoint is denied.
+
+> **Field-level immutability on `ApiKey` update.** The coarse `apikey:update` gate allows
+> `model.ApiKey.update`, but the schema additionally marks the key's server-managed columns
+> (`status`, `keyHash`, `billingPlan`, `keyPrefix`, `projectId`, `revokedAt`, timestamps) as
+> `@readonly` / `@server_only`, so they are dropped from the generated `UpdateApiKeyInput`. The
+> update surface is therefore `{ name, expiresAt }` only — a caller with `apikey:update` cannot flip
+> a key's `status`, overwrite its `keyHash`, or change its `billingPlan`; those transitions are
+> reachable exclusively through `apikey:rotate` / `apikey:revoke` / `apikey:create`.
+
+The OPA validation endpoints (introspection / `/idp/v1/resolve-context`) are protected by Basic
+auth, not JWT, so they are outside RBAC; the equivalent MCP validation tools (which run behind JWT)
+require `apikey:validate`.
 
 ## Keycloak setup
 
@@ -155,10 +206,11 @@ RBAC above gates the **control plane** (who may call the management API). Suspen
 **data plane** (whether an issued API key still works at the gateway).
 
 An admin holding `account:disable` / `project:disable` can soft-disable a tenant without deleting
-anything:
+anything, via the RPC procedures (`account:disable` gates both disable and enable, `project:disable`
+likewise):
 
-- `POST /api/v1/accounts/{id}/disable` · `POST /api/v1/accounts/{id}/enable`
-- `POST /api/v1/projects/{id}/disable` · `POST /api/v1/projects/{id}/enable`
+- `procedure.disableAccount` · `procedure.enableAccount`
+- `procedure.disableProject` · `procedure.enableProject`
 
 Disabling sets `status = 'suspended'` on the row. The `api_key_validation` SQL view resolves the
 full cascade (`account → project → key`) in one indexed read, so **every API key beneath a
@@ -193,17 +245,19 @@ on every account/project/key query — RBAC is checked first (else `403`), then 
 Membership is **account-level**: a member of an account can act on all of its projects. There is no
 project-scoped membership.
 
-An admin holding `account:member` manages the roster directly (no invite/accept handshake):
+An admin holding `account:member` manages the roster directly (no invite/accept handshake), via the
+RPC procedures:
 
-- `POST /api/v1/accounts/{id}/members` with `{ "subject": "<keycloak-sub>" }` — add a member.
-  Idempotent; returns the account with the updated `owners_admins` list.
-- `DELETE /api/v1/accounts/{id}/members/{member}` — remove a member. Refuses to remove the **last**
-  remaining member with `409 Conflict` (emptying the roster would trip the account-prune trigger and
-  delete the account). To intentionally delete the account and all its resources, use
-  `DELETE /api/v1/accounts/{id}` instead — that removes the whole account regardless of member count.
+- `procedure.addAccountMember` with `{ accountId, subject }` — add a member. Idempotent; returns the
+  account with the updated `owners_admins` list.
+- `procedure.removeAccountMember` with `{ accountId, subject }` — remove a member. Refuses to remove
+  the **last** remaining member with `409 Conflict` (emptying the roster would trip the account-prune
+  trigger and delete the account). To intentionally delete the account and all its resources, use
+  `model.Account.delete` (`account:delete`) instead — that removes the whole account regardless of
+  member count.
 
 The acting caller must themselves be a member of the account (a non-member gets a uniform `404`),
 so `account:member` lets an admin manage rosters of accounts they belong to, not arbitrary tenants.
-The creating subject is always seeded as the first member. (`PATCH /accounts/{id}` with
-`owners_admins` still exists but **replaces** the whole list; prefer the incremental member
-endpoints.)
+The creating subject is always seeded as the first member. Membership is mutated **only** through
+these two procedures — the cratestack `Account` model exposes no `owners_admins` column, so
+`model.Account.update` cannot change the roster.

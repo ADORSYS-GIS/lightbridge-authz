@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use lightbridge_authz_core::config::{
-    ApiServer, BasicAuth, Billing, BillingPlan, Oauth2, Oauth2Type, OpaServer, Tls,
+    ApiServer, BasicAuth, Billing, BillingPlan, Oauth2, Oauth2Type, OpaServer, Redis, Tls,
 };
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use sqlx::postgres::PgPoolOptions;
@@ -11,6 +11,12 @@ fn lazy_pool() -> Arc<dyn DbPoolTrait> {
         .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
         .expect("lazy pool should be constructible");
     Arc::new(DbPool::from_pool(pool))
+}
+
+fn sample_redis() -> Option<Redis> {
+    Some(Redis {
+        url: "redis://127.0.0.1:6379".to_string(),
+    })
 }
 
 fn sample_billing() -> Billing {
@@ -65,6 +71,7 @@ async fn start_api_server_fails_fast_when_tls_certs_are_missing() {
         lazy_pool(),
         &external_oauth2(),
         &sample_billing(),
+        &sample_redis(),
     )
     .await;
     assert!(
@@ -105,9 +112,14 @@ async fn start_api_server_rejects_self_signed_oauth2_without_signing_block() {
         tls: bad_tls(),
         allowed_hosts: None,
     };
-    let result =
-        lightbridge_authz_rest::start_api_server(&api, lazy_pool(), &oauth2, &sample_billing())
-            .await;
+    let result = lightbridge_authz_rest::start_api_server(
+        &api,
+        lazy_pool(),
+        &oauth2,
+        &sample_billing(),
+        &sample_redis(),
+    )
+    .await;
     assert!(
         result.is_err(),
         "self-signed oauth2 without a signing block must be rejected"
@@ -134,6 +146,7 @@ async fn start_api_server_warns_when_dev_cors_is_enabled() {
         lazy_pool(),
         &external_oauth2(),
         &sample_billing(),
+        &sample_redis(),
     )
     .await;
     unsafe {
@@ -148,15 +161,47 @@ async fn start_api_server_warns_when_dev_cors_is_enabled() {
 #[cfg(feature = "it-tests")]
 mod db {
     use super::*;
+    use cratestack::SqlxIdempotencyStore;
+    use cratestack::ratelimit::RateLimitStore;
+    use lightbridge_authz_api::schema;
     use lightbridge_authz_api_key::repo::StoreRepo;
+    use lightbridge_authz_bearer::BearerTokenServiceTrait;
     use lightbridge_authz_core::config::JwtSigning;
+    use lightbridge_authz_core::cuid::cuid2;
     use lightbridge_authz_core::{CreateAccount, CreateApiKey, CreateProject};
     use lightbridge_authz_rest::OpaRepoTrait;
+    use lightbridge_authz_rest::handlers::AuthzStoreImpl;
+    use lightbridge_authz_rest::ratelimit_redis::build_redis_rate_limit_store;
     use sqlx::PgPool;
 
     fn repo(pool: PgPool) -> Arc<StoreRepo> {
         let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
         Arc::new(StoreRepo::new(pool))
+    }
+
+    /// The cratestack CRUD client / idempotency store / rate-limit store are built on their own
+    /// (cratestack sqlx) pools pointed at an unreachable address. `build_api_router` only *stores*
+    /// them behind the RPC router's idempotency/rate-limit layers — the `/healthz/*` probes this
+    /// module drives live on the un-wrapped public router, so these lazily-connected handles are
+    /// never actually queried. This keeps the readiness test hermetic to the real `sqlx::test`
+    /// database (the readiness pool) without needing a second live DB for the cratestack surface.
+    fn lazy_cratestack_db() -> schema::Cratestack {
+        let pool = cratestack::sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
+            .expect("lazy cratestack pool should be constructible");
+        schema::Cratestack::builder(pool).build()
+    }
+
+    fn lazy_idempotency_store() -> Arc<SqlxIdempotencyStore> {
+        let pool = cratestack::sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
+            .expect("lazy cratestack pool should be constructible");
+        Arc::new(SqlxIdempotencyStore::new(pool))
+    }
+
+    fn lazy_rate_limit_store() -> Arc<dyn RateLimitStore> {
+        build_redis_rate_limit_store("redis://127.0.0.1:6379", "authz-api-test")
+            .expect("well-formed redis url constructs a store without connecting")
     }
 
     fn signing_cfg() -> JwtSigning {
@@ -192,6 +237,7 @@ mod db {
             db_pool,
             &self_signed_oauth2(),
             &sample_billing(),
+            &sample_redis(),
         )
         .await;
         assert!(
@@ -206,15 +252,16 @@ mod db {
         );
     }
 
+    /// Drives the settled 11-arg `build_api_router` (the RPC surface replaced the old REST mount).
+    /// The cratestack CRUD client / idempotency store / rate-limit store are lazily-connected to an
+    /// unreachable address and never touched — the `/healthz/ready` probe sits on the un-wrapped
+    /// public router and only consults `readiness_pool`, the real `sqlx::test` database.
     #[sqlx::test(migrations = "../../migrations")]
     async fn readiness_route_reports_ok_with_a_reachable_database(pool: PgPool) {
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
-        use lightbridge_authz_api::AppState;
-        use lightbridge_authz_api::contract::AuthzStore;
-        use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
+        use lightbridge_authz_bearer::TokenInfo;
         use lightbridge_authz_core::async_trait;
-        use lightbridge_authz_rest::handlers::AuthzStoreImpl;
         use tower::ServiceExt;
 
         struct NoopBearer;
@@ -226,18 +273,19 @@ mod db {
         }
 
         let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
-        let store: Arc<dyn AuthzStore> = Arc::new(AuthzStoreImpl::with_pool(db_pool.clone()));
-        let app_state = Arc::new(AppState {
-            store,
-            bearer: Arc::new(NoopBearer),
-        });
+        let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(NoopBearer);
+        let issuer = Arc::new(AuthzStoreImpl::with_pool(db_pool.clone()));
         let signing_repo = Arc::new(StoreRepo::new(db_pool.clone()));
         let router = lightbridge_authz_rest::build_api_router(
             &external_oauth2(),
-            app_state,
-            db_pool,
+            bearer,
+            issuer,
+            lazy_cratestack_db(),
+            db_pool.clone(),
             signing_repo,
             None,
+            lazy_idempotency_store(),
+            lazy_rate_limit_store(),
             false,
         );
 
@@ -255,16 +303,16 @@ mod db {
 
     /// `OpaRepoTrait for StoreRepo` is a thin one-line delegation per method, only reachable
     /// through `start_opa_server`'s production wiring (the test suite otherwise talks to a
-    /// `MockOpaRepo`). Exercise the real delegation against the database directly, seeding data
-    /// through the higher-level `AuthzStoreImpl` (mirroring `store_it_tests.rs`) and then
-    /// re-reading it through the `OpaRepoTrait` object built on the same pool.
+    /// `MockOpaRepo`). Exercise the real delegation against the database directly, seeding the
+    /// account + api-key through the surviving `AuthzStoreImpl` procedures and the project directly
+    /// through the hand-written `StoreRepo::create_project` (project CRUD left `AuthzStoreImpl` in
+    /// the cratestack migration), then re-reading it all through the `OpaRepoTrait` object built on
+    /// the same pool.
     #[sqlx::test(migrations = "../../migrations")]
     async fn opa_repo_trait_impl_delegates_to_store_repo(pool: PgPool) {
-        use lightbridge_authz_api::contract::AuthzStore;
-        use lightbridge_authz_rest::handlers::AuthzStoreImpl;
-
         let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
         let store = AuthzStoreImpl::with_pool(db_pool).with_billing(sample_billing());
+        let seed = repo(pool.clone());
         let subject = "owner-opa-trait";
 
         let account = store
@@ -276,7 +324,7 @@ mod db {
             )
             .await
             .unwrap();
-        let project = store
+        let project = seed
             .create_project(
                 subject,
                 &account.id,
@@ -286,6 +334,7 @@ mod db {
                     default_limits: None,
                     billing_plan: "free".to_string(),
                 },
+                cuid2(),
             )
             .await
             .unwrap();

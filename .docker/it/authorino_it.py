@@ -113,26 +113,35 @@ def main() -> int:
         token = fetch_token()
         authz_headers = {"Authorization": f"Bearer {token}"}
 
+        # authz-api migrated to cratestack RPC transport (ADR-0003): CRUD is dispatched via
+        # POST /rpc/{op_id} with the codec-encoded input as the body. The router serves JSON and
+        # CBOR from one CodecSet, so plain JSON works here. Model verbs use camelCase field names
+        # (the generated schema struct fields); the `Json` columns carry cratestack's own externally
+        # tagged `Value` enum, so `{}` is `{"Map": {}}` and a string list is `{"List": [...]}`.
         billing_identity = f"acme-it-{uuid.uuid4().hex[:12]}"
         status, account = request_json(
             "POST",
-            f"{API_URL}/api/v1/accounts",
-            {"billing_identity": billing_identity, "owners_admins": [USERNAME]},
+            f"{API_URL}/rpc/procedure.createAccount",
+            {"args": {"billingIdentity": billing_identity}},
             headers=authz_headers,
             insecure_tls=True,
         )
-        assert status == 201, f"create account failed: status={status}, body={account}"
+        assert status == 200, f"create account failed: status={status}, body={account}"
         account_id = account["id"]
         log(f"created account {account_id}")
 
+        project_client_id = "c" + uuid.uuid4().hex[:24]
         status, project = request_json(
             "POST",
-            f"{API_URL}/api/v1/accounts/{account_id}/projects",
+            f"{API_URL}/rpc/model.Project.create",
             {
+                "id": project_client_id,
+                "accountId": account_id,
                 "name": "it-project",
-                "allowed_models": ["gpt-4.1-mini"],
-                "default_limits": {},
-                "billing_plan": "free",
+                "allowedModels": {"List": [{"String": "gpt-4.1-mini"}]},
+                "defaultLimits": {"Map": {}},
+                "billingPlan": "free",
+                "status": "active",
             },
             headers=authz_headers,
             insecure_tls=True,
@@ -143,14 +152,14 @@ def main() -> int:
 
         status, key_payload = request_json(
             "POST",
-            f"{API_URL}/api/v1/projects/{project_id}/api-keys",
-            {"name": "it-key", "billing_plan": "free"},
+            f"{API_URL}/rpc/procedure.createApiKey",
+            {"args": {"projectId": project_id, "name": "it-key", "billingPlan": "free"}},
             headers=authz_headers,
             insecure_tls=True,
         )
-        assert status == 201, f"create api key failed: status={status}, body={key_payload}"
+        assert status == 200, f"create api key failed: status={status}, body={key_payload}"
         secret = key_payload["secret"]
-        api_key_id = key_payload["api_key"]["id"]
+        api_key_id = key_payload["id"]
         log(f"created api key {api_key_id}")
 
         basic = base64.b64encode(AUTHORINO_BASIC.encode("utf-8")).decode("utf-8")

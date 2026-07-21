@@ -8,19 +8,21 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use lightbridge_authz_api::contract::AuthzStore;
+use cratestack::{CoolContext, CoolError, Value as CratestackValue};
+use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait, TokenInfo};
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeySecret, Config, CreateAccount, CreateApiKey, CreateProject,
-    DefaultLimits, Error, Permission, Project, ResourceStatus, Result, RotateApiKey, UpdateAccount,
-    UpdateApiKey, UpdateProject,
+    Config, CreateAccount, CreateApiKey, DefaultLimits, Error, Permission, ResourceStatus, Result,
+    RotateApiKey,
     config::{ApiServer, BasicAuth, Billing, Oauth2},
+    cuid::cuid2,
     db::{DbPoolTrait, is_database_ready},
     server::serve_tls,
 };
 use lightbridge_authz_rest::{
     OpaRepoTrait, OpaState,
+    auth_provider::{ACCESS_TOKEN_CONTEXT_KEY, ROLES_CONTEXT_KEY},
     handlers::{AuthzStoreImpl, opa::validate_api_key_context},
     middleware::bearer_auth,
     models::authorino::AuthorinoMetadata,
@@ -99,10 +101,23 @@ impl From<DefaultLimitsInput> for DefaultLimits {
     }
 }
 
+/// MCP handler.
+///
+/// CRUD tools (account/project/api-key create/list/get/update/delete) call the generated cratestack
+/// client directly — `cratestack_db.bind_context(ctx)` yields context-bound model delegates that
+/// enforce the schema's `@@allow` membership policies exactly as the RPC surface does (ADR-0003).
+/// Procedure-backed tools (create/rotate/revoke api-key, disable/enable account/project,
+/// add/remove member) call the reused `AuthzStoreImpl` — the same hand-written, membership-scoped
+/// sqlx the RPC `ProcedureRegistry` in `lightbridge-authz-rest` delegates to (see that crate's
+/// `Procedures`). Calling the issuer directly rather than through `Procedures` keeps the richer
+/// `rotate-api-key` capability (name / expires_at / grace_period_seconds) that the RPC
+/// `rotateApiKey` procedure's `keyId`-only input cannot express. Validation tools stay on the
+/// hand-written OPA path (`OpaState`) — outside the cratestack CRUD migration's scope.
 #[derive(Clone)]
 pub struct LightbridgeMcpHandler {
     tool_router: ToolRouter<Self>,
-    store: Arc<dyn AuthzStore>,
+    cratestack_db: schema::Cratestack,
+    issuer: Arc<AuthzStoreImpl>,
     opa_state: Arc<OpaState>,
     billing: Arc<Billing>,
 }
@@ -117,7 +132,8 @@ impl std::fmt::Debug for LightbridgeMcpHandler {
 
 impl LightbridgeMcpHandler {
     pub fn new(
-        store: Arc<dyn AuthzStore>,
+        cratestack_db: schema::Cratestack,
+        issuer: Arc<AuthzStoreImpl>,
         opa_repo: Arc<dyn OpaRepoTrait>,
         basic_auth: BasicAuth,
         billing: &Billing,
@@ -131,7 +147,8 @@ impl LightbridgeMcpHandler {
 
         Self {
             tool_router: Self::tool_router(),
-            store,
+            cratestack_db,
+            issuer,
             opa_state,
             billing,
         }
@@ -233,6 +250,89 @@ fn to_tool_error(error: Error) -> ErrorData {
         Error::BadRequest(msg) => ErrorData::invalid_params(msg, None),
         other => ErrorData::internal_error(other.to_string(), None),
     }
+}
+
+/// Map a cratestack `CoolError` (returned by the generated CRUD client) onto an MCP `ErrorData`,
+/// mirroring [`to_tool_error`]'s status mapping for the hand-written `Error`. Internal/database
+/// variants collapse to a generic internal error so operator detail never leaks to the client.
+fn cool_error_to_tool_error(error: CoolError) -> ErrorData {
+    match error {
+        CoolError::NotFound(_) => ErrorData::resource_not_found("not found", None),
+        CoolError::Forbidden(msg) | CoolError::Unauthorized(msg) => {
+            ErrorData::invalid_request(msg, None)
+        }
+        CoolError::Conflict(msg)
+        | CoolError::PreconditionFailed(msg)
+        | CoolError::BadRequest(msg)
+        | CoolError::Validation(msg)
+        | CoolError::NotAcceptable(msg)
+        | CoolError::UnsupportedMediaType(msg) => ErrorData::invalid_params(msg, None),
+        other => ErrorData::internal_error(other.to_string(), None),
+    }
+}
+
+/// Build a cratestack [`CoolContext`] for the authenticated MCP caller, mirroring
+/// `lightbridge_authz_rest::auth_provider::CratestackAuthProvider::authenticate`: the validated
+/// subject is projected as `auth().id` (what the schema's `@@allow` membership predicates resolve
+/// against) and the raw access token + roles are stashed as context extensions, so a CRUD tool
+/// invoking the generated client is scoped to exactly the caller's tenants — the same second-gate
+/// policy path the RPC surface applies. The extension keys are the public constants exported by
+/// that module, so the two surfaces stay in lockstep.
+fn cool_context_from_token_info(info: &TokenInfo) -> CoolContext {
+    let mut ctx =
+        CoolContext::authenticated([("id".to_owned(), CratestackValue::String(info.sub.clone()))]);
+    ctx.extensions.insert(
+        ACCESS_TOKEN_CONTEXT_KEY.to_owned(),
+        CratestackValue::String(info.access_token.clone()),
+    );
+    if !info.roles.is_empty() {
+        ctx.extensions.insert(
+            ROLES_CONTEXT_KEY.to_owned(),
+            CratestackValue::List(
+                info.roles
+                    .iter()
+                    .cloned()
+                    .map(CratestackValue::String)
+                    .collect(),
+            ),
+        );
+    }
+    ctx
+}
+
+/// A `find_unique` that returned `None` (row absent, or hidden by the membership read policy) is a
+/// uniform not-found for the caller, matching the RPC surface's policy-driven behavior.
+fn require_found<T>(value: Option<T>) -> std::result::Result<T, ErrorData> {
+    value.ok_or_else(|| ErrorData::resource_not_found("not found", None))
+}
+
+/// Lower a `serde_json::Value` (the shape MCP tool inputs speak) into cratestack's own `Value`
+/// enum, which is what the generated model input structs carry for `Json` columns. Mirrors the
+/// identical private helper in `lightbridge-authz-rest` (the two crates use different JSON value
+/// types and neither ships a cross-conversion).
+fn json_to_cratestack_value(value: Value) -> CratestackValue {
+    match value {
+        Value::Null => CratestackValue::Null,
+        Value::Bool(b) => CratestackValue::Bool(b),
+        Value::Number(n) => n
+            .as_i64()
+            .map(CratestackValue::Int)
+            .unwrap_or_else(|| CratestackValue::Float(n.as_f64().unwrap_or(0.0))),
+        Value::String(s) => CratestackValue::String(s),
+        Value::Array(items) => {
+            CratestackValue::List(items.into_iter().map(json_to_cratestack_value).collect())
+        }
+        Value::Object(map) => CratestackValue::Map(
+            map.into_iter()
+                .map(|(k, v)| (k, json_to_cratestack_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+/// Build a `cratestack::Json<cratestack::Value>` payload from any serde_json value.
+fn cratestack_json(value: Value) -> cratestack::Json<CratestackValue> {
+    cratestack::Json(json_to_cratestack_value(value))
 }
 
 fn to_json_value<T: Serialize>(value: T) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
@@ -517,8 +617,6 @@ struct UpdateAccountParams {
     account_id: String,
     #[serde(default)]
     billing_identity: Option<String>,
-    #[serde(default)]
-    owners_admins: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -634,7 +732,7 @@ struct ValidateAuthorinoApiKeyParams {
 impl LightbridgeMcpHandler {
     #[tool(
         name = "create-account",
-        description = "Create an account (maps to POST /api/v1/accounts)"
+        description = "Create an account (RPC procedure.createAccount); seeds the caller as the account's first member"
     )]
     async fn create_account_tool(
         &self,
@@ -643,7 +741,7 @@ impl LightbridgeMcpHandler {
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let subject = subject_from_request_context(&context)?;
         let account = self
-            .store
+            .issuer
             .create_account(
                 &subject,
                 CreateAccount {
@@ -658,90 +756,107 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "list-accounts",
-        description = "List accounts (maps to GET /api/v1/accounts)"
+        description = "List accounts (RPC model.Account.list)"
     )]
     async fn list_accounts_tool(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ListAccountsParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let token_info = token_info_from_request_context(&context)?;
         let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
-        let accounts: Vec<Account> = self
-            .store
-            .list_accounts(&subject, offset, limit)
+        let bound = self
+            .cratestack_db
+            .bind_context(cool_context_from_token_info(&token_info));
+        let accounts = bound
+            .account()
+            .find_many()
+            .limit(limit as i64)
+            .offset(offset as i64)
+            .run()
             .await
-            .map_err(to_tool_error)?;
+            .map_err(cool_error_to_tool_error)?;
 
         to_json_value(accounts)
     }
 
     #[tool(
         name = "get-account",
-        description = "Get an account (maps to GET /api/v1/accounts/{account_id})"
+        description = "Get an account (RPC model.Account.get)"
     )]
     async fn get_account_tool(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<AccountByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
-        let account = self
-            .store
-            .get_account(&subject, &params.account_id)
+        let token_info = token_info_from_request_context(&context)?;
+        let bound = self
+            .cratestack_db
+            .bind_context(cool_context_from_token_info(&token_info));
+        let account = bound
+            .account()
+            .find_unique(params.account_id)
+            .run()
             .await
-            .map_err(to_tool_error)?;
+            .map_err(cool_error_to_tool_error)?;
 
-        to_json_value(account)
+        to_json_value(require_found(account)?)
     }
 
     #[tool(
         name = "update-account",
-        description = "Update an account (maps to PATCH /api/v1/accounts/{account_id})"
+        description = "Update an account's billing_identity (RPC model.Account.update)"
     )]
     async fn update_account_tool(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<UpdateAccountParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
-        let account = self
-            .store
-            .update_account(
-                &subject,
-                &params.account_id,
-                UpdateAccount {
-                    billing_identity: params.billing_identity,
-                    owners_admins: params.owners_admins,
-                },
-            )
+        let token_info = token_info_from_request_context(&context)?;
+        let bound = self
+            .cratestack_db
+            .bind_context(cool_context_from_token_info(&token_info));
+        let mut input = schema::inputs::UpdateAccountInput::default();
+        if let Some(billing_identity) = params.billing_identity {
+            input.billingIdentity = Some(billing_identity);
+        }
+        let account = bound
+            .account()
+            .update(params.account_id)
+            .set(input)
+            .run()
             .await
-            .map_err(to_tool_error)?;
+            .map_err(cool_error_to_tool_error)?;
 
         to_json_value(account)
     }
 
     #[tool(
         name = "delete-account",
-        description = "Delete an account (maps to DELETE /api/v1/accounts/{account_id})"
+        description = "Delete an account (RPC model.Account.delete)"
     )]
     async fn delete_account_tool(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<AccountByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
-        self.store
-            .delete_account(&subject, &params.account_id)
+        let token_info = token_info_from_request_context(&context)?;
+        let bound = self
+            .cratestack_db
+            .bind_context(cool_context_from_token_info(&token_info));
+        let account = bound
+            .account()
+            .delete(params.account_id)
+            .run()
             .await
-            .map_err(to_tool_error)?;
+            .map_err(cool_error_to_tool_error)?;
 
-        to_json_value(json!({ "deleted": true }))
+        to_json_value(account)
     }
 
     #[tool(
         name = "disable-account",
-        description = "Suspend an account (maps to POST /api/v1/accounts/{account_id}/disable); every API key beneath it fails validation"
+        description = "Suspend an account (RPC procedure.disableAccount); every API key beneath it fails validation"
     )]
     async fn disable_account_tool(
         &self,
@@ -750,8 +865,8 @@ impl LightbridgeMcpHandler {
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let subject = subject_from_request_context(&context)?;
         let account = self
-            .store
-            .set_account_status(&subject, &params.account_id, ResourceStatus::Suspended)
+            .issuer
+            .disable_account(&subject, &params.account_id)
             .await
             .map_err(to_tool_error)?;
 
@@ -760,7 +875,7 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "enable-account",
-        description = "Reactivate a suspended account (maps to POST /api/v1/accounts/{account_id}/enable)"
+        description = "Reactivate a suspended account (RPC procedure.enableAccount)"
     )]
     async fn enable_account_tool(
         &self,
@@ -769,8 +884,8 @@ impl LightbridgeMcpHandler {
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let subject = subject_from_request_context(&context)?;
         let account = self
-            .store
-            .set_account_status(&subject, &params.account_id, ResourceStatus::Active)
+            .issuer
+            .enable_account(&subject, &params.account_id)
             .await
             .map_err(to_tool_error)?;
 
@@ -779,7 +894,7 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "add-account-member",
-        description = "Add a member to an account (maps to POST /api/v1/accounts/{account_id}/members); grants access to the account and all its projects"
+        description = "Add a member to an account (RPC procedure.addAccountMember); grants access to the account and all its projects"
     )]
     async fn add_account_member_tool(
         &self,
@@ -788,7 +903,7 @@ impl LightbridgeMcpHandler {
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let subject = subject_from_request_context(&context)?;
         let account = self
-            .store
+            .issuer
             .add_account_member(&subject, &params.account_id, &params.subject)
             .await
             .map_err(to_tool_error)?;
@@ -798,7 +913,7 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "remove-account-member",
-        description = "Remove a member from an account (maps to DELETE /api/v1/accounts/{account_id}/members/{member}); refuses to remove the last member"
+        description = "Remove a member from an account (RPC procedure.removeAccountMember); refuses to remove the last member"
     )]
     async fn remove_account_member_tool(
         &self,
@@ -807,7 +922,7 @@ impl LightbridgeMcpHandler {
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let subject = subject_from_request_context(&context)?;
         let account = self
-            .store
+            .issuer
             .remove_account_member(&subject, &params.account_id, &params.member)
             .await
             .map_err(to_tool_error)?;
@@ -817,120 +932,159 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "create-project",
-        description = "Create a project (maps to POST /api/v1/accounts/{account_id}/projects)"
+        description = "Create a project (RPC model.Project.create)"
     )]
     async fn create_project_tool(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<CreateProjectParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
-        let project = self
-            .store
-            .create_project(
-                &subject,
-                &params.account_id,
-                CreateProject {
-                    name: params.name,
-                    allowed_models: params.allowed_models,
-                    default_limits: params.default_limits.map(Into::into),
-                    billing_plan: params.billing_plan,
-                },
-            )
+        let token_info = token_info_from_request_context(&context)?;
+        let bound = self
+            .cratestack_db
+            .bind_context(cool_context_from_token_info(&token_info));
+        let default_limits = params
+            .default_limits
+            .map(DefaultLimits::from)
+            .unwrap_or_default();
+        let default_limits_json =
+            serde_json::to_value(default_limits).unwrap_or_else(|_| json!({}));
+        let input = schema::inputs::CreateProjectInput {
+            id: cuid2(),
+            accountId: params.account_id,
+            name: params.name,
+            allowedModels: params
+                .allowed_models
+                .map(|models| cratestack_json(json!(models))),
+            defaultLimits: cratestack_json(default_limits_json),
+            billingPlan: params.billing_plan,
+            status: ResourceStatus::Active.to_string(),
+        };
+        let project = bound
+            .project()
+            .create(input)
+            .run()
             .await
-            .map_err(to_tool_error)?;
+            .map_err(cool_error_to_tool_error)?;
 
         to_json_value(project)
     }
 
     #[tool(
         name = "list-projects",
-        description = "List projects (maps to GET /api/v1/accounts/{account_id}/projects)"
+        description = "List projects under an account (RPC model.Project.list)"
     )]
     async fn list_projects_tool(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ListProjectsParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let token_info = token_info_from_request_context(&context)?;
         let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
-        let projects: Vec<Project> = self
-            .store
-            .list_projects(&subject, &params.account_id, offset, limit)
+        let bound = self
+            .cratestack_db
+            .bind_context(cool_context_from_token_info(&token_info));
+        let projects = bound
+            .project()
+            .find_many()
+            .where_(schema::project::accountId().eq(params.account_id))
+            .limit(limit as i64)
+            .offset(offset as i64)
+            .run()
             .await
-            .map_err(to_tool_error)?;
+            .map_err(cool_error_to_tool_error)?;
 
         to_json_value(projects)
     }
 
     #[tool(
         name = "get-project",
-        description = "Get a project (maps to GET /api/v1/projects/{project_id})"
+        description = "Get a project (RPC model.Project.get)"
     )]
     async fn get_project_tool(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ProjectByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
-        let project = self
-            .store
-            .get_project(&subject, &params.project_id)
+        let token_info = token_info_from_request_context(&context)?;
+        let bound = self
+            .cratestack_db
+            .bind_context(cool_context_from_token_info(&token_info));
+        let project = bound
+            .project()
+            .find_unique(params.project_id)
+            .run()
             .await
-            .map_err(to_tool_error)?;
+            .map_err(cool_error_to_tool_error)?;
 
-        to_json_value(project)
+        to_json_value(require_found(project)?)
     }
 
     #[tool(
         name = "update-project",
-        description = "Update a project (maps to PATCH /api/v1/projects/{project_id})"
+        description = "Update a project (RPC model.Project.update)"
     )]
     async fn update_project_tool(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<UpdateProjectParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
-        let project = self
-            .store
-            .update_project(
-                &subject,
-                &params.project_id,
-                UpdateProject {
-                    name: params.name,
-                    allowed_models: params.allowed_models,
-                    default_limits: params.default_limits.map(Into::into),
-                    billing_plan: params.billing_plan,
-                },
-            )
+        let token_info = token_info_from_request_context(&context)?;
+        let bound = self
+            .cratestack_db
+            .bind_context(cool_context_from_token_info(&token_info));
+        let mut input = schema::inputs::UpdateProjectInput::default();
+        if let Some(name) = params.name {
+            input.name = Some(name);
+        }
+        if let Some(billing_plan) = params.billing_plan {
+            input.billingPlan = Some(billing_plan);
+        }
+        if let Some(allowed_models) = params.allowed_models {
+            input.allowedModels = Some(allowed_models.map(|models| cratestack_json(json!(models))));
+        }
+        if let Some(default_limits) = params.default_limits {
+            let value = serde_json::to_value(DefaultLimits::from(default_limits))
+                .unwrap_or_else(|_| json!({}));
+            input.defaultLimits = Some(cratestack_json(value));
+        }
+        let project = bound
+            .project()
+            .update(params.project_id)
+            .set(input)
+            .run()
             .await
-            .map_err(to_tool_error)?;
+            .map_err(cool_error_to_tool_error)?;
 
         to_json_value(project)
     }
 
     #[tool(
         name = "delete-project",
-        description = "Delete a project (maps to DELETE /api/v1/projects/{project_id})"
+        description = "Delete a project (RPC model.Project.delete)"
     )]
     async fn delete_project_tool(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ProjectByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
-        self.store
-            .delete_project(&subject, &params.project_id)
+        let token_info = token_info_from_request_context(&context)?;
+        let bound = self
+            .cratestack_db
+            .bind_context(cool_context_from_token_info(&token_info));
+        let project = bound
+            .project()
+            .delete(params.project_id)
+            .run()
             .await
-            .map_err(to_tool_error)?;
+            .map_err(cool_error_to_tool_error)?;
 
-        to_json_value(json!({ "deleted": true }))
+        to_json_value(project)
     }
 
     #[tool(
         name = "disable-project",
-        description = "Suspend a project (maps to POST /api/v1/projects/{project_id}/disable); every API key beneath it fails validation"
+        description = "Suspend a project (RPC procedure.disableProject); every API key beneath it fails validation"
     )]
     async fn disable_project_tool(
         &self,
@@ -939,8 +1093,8 @@ impl LightbridgeMcpHandler {
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let subject = subject_from_request_context(&context)?;
         let project = self
-            .store
-            .set_project_status(&subject, &params.project_id, ResourceStatus::Suspended)
+            .issuer
+            .disable_project(&subject, &params.project_id)
             .await
             .map_err(to_tool_error)?;
 
@@ -949,7 +1103,7 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "enable-project",
-        description = "Reactivate a suspended project (maps to POST /api/v1/projects/{project_id}/enable)"
+        description = "Reactivate a suspended project (RPC procedure.enableProject)"
     )]
     async fn enable_project_tool(
         &self,
@@ -958,8 +1112,8 @@ impl LightbridgeMcpHandler {
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let subject = subject_from_request_context(&context)?;
         let project = self
-            .store
-            .set_project_status(&subject, &params.project_id, ResourceStatus::Active)
+            .issuer
+            .enable_project(&subject, &params.project_id)
             .await
             .map_err(to_tool_error)?;
 
@@ -968,7 +1122,7 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "create-api-key",
-        description = "Create an API key (maps to POST /api/v1/projects/{project_id}/api-keys)"
+        description = "Create an API key (RPC procedure.createApiKey; the server generates + hashes the secret and validates the billing plan)"
     )]
     async fn create_api_key_tool(
         &self,
@@ -976,13 +1130,12 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<CreateApiKeyParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
-        let subject = token_info.sub.clone();
         let expires_at = parse_optional_datetime(params.expires_at, "expires_at")?;
 
-        let api_key_secret: ApiKeySecret = self
-            .store
+        let api_key_secret = self
+            .issuer
             .create_api_key(
-                &subject,
+                &token_info.sub,
                 Some(&token_info.access_token),
                 &params.project_id,
                 CreateApiKey {
@@ -999,92 +1152,112 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "list-api-keys",
-        description = "List API keys (maps to GET /api/v1/projects/{project_id}/api-keys)"
+        description = "List API keys under a project (RPC model.ApiKey.list)"
     )]
     async fn list_api_keys_tool(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ListApiKeysParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let token_info = token_info_from_request_context(&context)?;
         let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
-        let api_keys: Vec<ApiKey> = self
-            .store
-            .list_api_keys(&subject, &params.project_id, offset, limit)
+        let bound = self
+            .cratestack_db
+            .bind_context(cool_context_from_token_info(&token_info));
+        let api_keys = bound
+            .api_key()
+            .find_many()
+            .where_(schema::api_key::projectId().eq(params.project_id))
+            .limit(limit as i64)
+            .offset(offset as i64)
+            .run()
             .await
-            .map_err(to_tool_error)?;
+            .map_err(cool_error_to_tool_error)?;
 
         to_json_value(api_keys)
     }
 
     #[tool(
         name = "get-api-key",
-        description = "Get an API key (maps to GET /api/v1/api-keys/{key_id})"
+        description = "Get an API key (RPC model.ApiKey.get)"
     )]
     async fn get_api_key_tool(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ApiKeyByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
-        let api_key = self
-            .store
-            .get_api_key(&subject, &params.key_id)
+        let token_info = token_info_from_request_context(&context)?;
+        let bound = self
+            .cratestack_db
+            .bind_context(cool_context_from_token_info(&token_info));
+        let api_key = bound
+            .api_key()
+            .find_unique(params.key_id)
+            .run()
             .await
-            .map_err(to_tool_error)?;
+            .map_err(cool_error_to_tool_error)?;
 
-        to_json_value(api_key)
+        to_json_value(require_found(api_key)?)
     }
 
     #[tool(
         name = "update-api-key",
-        description = "Update an API key (maps to PATCH /api/v1/api-keys/{key_id})"
+        description = "Update an API key's name/expires_at (RPC model.ApiKey.update)"
     )]
     async fn update_api_key_tool(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<UpdateApiKeyParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let token_info = token_info_from_request_context(&context)?;
         let expires_at = parse_optional_datetime(params.expires_at, "expires_at")?;
-
-        let api_key = self
-            .store
-            .update_api_key(
-                &subject,
-                &params.key_id,
-                UpdateApiKey {
-                    name: params.name,
-                    expires_at,
-                },
-            )
+        let bound = self
+            .cratestack_db
+            .bind_context(cool_context_from_token_info(&token_info));
+        let mut input = schema::inputs::UpdateApiKeyInput::default();
+        if let Some(name) = params.name {
+            input.name = Some(name);
+        }
+        if let Some(expires_at) = expires_at {
+            input.expiresAt = Some(Some(expires_at));
+        }
+        let api_key = bound
+            .api_key()
+            .update(params.key_id)
+            .set(input)
+            .run()
             .await
-            .map_err(to_tool_error)?;
+            .map_err(cool_error_to_tool_error)?;
 
         to_json_value(api_key)
     }
 
     #[tool(
         name = "delete-api-key",
-        description = "Delete an API key (maps to DELETE /api/v1/api-keys/{key_id})"
+        description = "Delete (soft-delete) an API key (RPC model.ApiKey.delete)"
     )]
     async fn delete_api_key_tool(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ApiKeyByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
-        self.store
-            .delete_api_key(&subject, &params.key_id)
+        let token_info = token_info_from_request_context(&context)?;
+        let bound = self
+            .cratestack_db
+            .bind_context(cool_context_from_token_info(&token_info));
+        let api_key = bound
+            .api_key()
+            .delete(params.key_id)
+            .run()
             .await
-            .map_err(to_tool_error)?;
+            .map_err(cool_error_to_tool_error)?;
 
-        to_json_value(json!({ "deleted": true }))
+        to_json_value(api_key)
     }
 
     #[tool(
         name = "revoke-api-key",
-        description = "Revoke an API key (maps to POST /api/v1/api-keys/{key_id}/revoke)"
+        description = "Revoke an API key (RPC procedure.revokeApiKey)"
     )]
     async fn revoke_api_key_tool(
         &self,
@@ -1093,7 +1266,7 @@ impl LightbridgeMcpHandler {
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let subject = subject_from_request_context(&context)?;
         let api_key = self
-            .store
+            .issuer
             .revoke_api_key(&subject, &params.key_id)
             .await
             .map_err(to_tool_error)?;
@@ -1103,7 +1276,7 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "rotate-api-key",
-        description = "Rotate an API key (maps to POST /api/v1/api-keys/{key_id}/rotate)"
+        description = "Rotate an API key (RPC procedure.rotateApiKey)"
     )]
     async fn rotate_api_key_tool(
         &self,
@@ -1111,13 +1284,12 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<RotateApiKeyParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
-        let subject = token_info.sub.clone();
         let expires_at = parse_optional_datetime(params.expires_at, "expires_at")?;
 
         let api_key_secret = self
-            .store
+            .issuer
             .rotate_api_key(
-                &subject,
+                &token_info.sub,
                 Some(&token_info.access_token),
                 &params.key_id,
                 RotateApiKey {
@@ -1243,17 +1415,17 @@ fn build_mcp_router(
     oauth2: &Oauth2,
     basic_auth: BasicAuth,
     billing: &Billing,
-    store: Arc<dyn AuthzStore>,
+    cratestack_db: schema::Cratestack,
+    issuer: Arc<AuthzStoreImpl>,
     opa_repo: Arc<dyn OpaRepoTrait>,
     bearer_service: Arc<dyn BearerTokenServiceTrait>,
     readiness_pool: Arc<dyn DbPoolTrait>,
 ) -> Router {
     let app_state = Arc::new(lightbridge_authz_api::AppState {
-        store: store.clone(),
         bearer: bearer_service,
     });
 
-    let handler = LightbridgeMcpHandler::new(store, opa_repo, basic_auth, billing);
+    let handler = LightbridgeMcpHandler::new(cratestack_db, issuer, opa_repo, basic_auth, billing);
     let oauth_proxy_state = Arc::new(OauthProxyState {
         client: Client::new(),
         endpoints: resolve_oauth2_endpoints(oauth2),
@@ -1337,7 +1509,10 @@ pub async fn start_mcp_server(
         let signing_repo = StoreRepo::new(pool.clone());
         lightbridge_authz_rest::signing::bootstrap_signing_key(&signing_repo, signing).await?;
     }
-    let store: Arc<dyn AuthzStore> = Arc::new(AuthzStoreImpl::with_pool_and_oauth2(
+    // Secret-issuance + membership operations reused by the procedure-backed tools (hand-written
+    // sqlx on the core `DbPool`, sqlx 0.9) — the same `AuthzStoreImpl` the RPC procedures delegate
+    // to in `lightbridge-authz-rest`.
+    let issuer = Arc::new(AuthzStoreImpl::with_pool_and_oauth2(
         pool.clone(),
         oauth2,
         billing,
@@ -1346,12 +1521,29 @@ pub async fn start_mcp_server(
     let bearer_service: Arc<dyn BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
 
+    // cratestack CRUD client for the model-backed tools. cratestack runs on its own sqlx major
+    // (0.8, vs this workspace's 0.9), so it needs a separate pool built with cratestack's sqlx,
+    // talking to the same database (the URL comes from `DATABASE_URL`, the same env the schema's
+    // `datasource ... env("DATABASE_URL")` reads) — mirroring `start_api_server`.
+    let database_url = std::env::var("DATABASE_URL").map_err(|_| {
+        Error::Server(
+            "DATABASE_URL must be set for the cratestack CRUD pool (MCP model-backed tools)"
+                .to_string(),
+        )
+    })?;
+    let cratestack_pool = cratestack::sqlx::postgres::PgPoolOptions::new()
+        .connect(&database_url)
+        .await
+        .map_err(|e| Error::Server(format!("failed to open cratestack Postgres pool: {e}")))?;
+    let cratestack_db = schema::Cratestack::builder(cratestack_pool).build();
+
     let app = build_mcp_router(
         api,
         oauth2,
         basic_auth.clone(),
         billing,
-        store,
+        cratestack_db,
+        issuer,
         opa_repo,
         bearer_service,
         readiness_pool,
@@ -1416,7 +1608,7 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use chrono::Utc;
-    use lightbridge_authz_core::{ApiKeyStatus, async_trait};
+    use lightbridge_authz_core::{Account, ApiKey, ApiKeyStatus, Project, async_trait};
     use sqlx::postgres::PgPoolOptions;
 
     #[test]
@@ -1442,197 +1634,6 @@ mod tests {
             format!("{cfg_default:?}").contains("stateful_mode: false"),
             "stateless mode must hold even when allowed_hosts is unset"
         );
-    }
-
-    #[derive(Debug)]
-    struct MockStore;
-
-    #[async_trait]
-    impl AuthzStore for MockStore {
-        async fn create_account(
-            &self,
-            _subject: &str,
-            _input: CreateAccount,
-        ) -> std::result::Result<Account, Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn list_accounts(
-            &self,
-            _subject: &str,
-            _offset: u32,
-            _limit: u32,
-        ) -> std::result::Result<Vec<Account>, Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn get_account(
-            &self,
-            _subject: &str,
-            _account_id: &str,
-        ) -> std::result::Result<Account, Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn update_account(
-            &self,
-            _subject: &str,
-            _account_id: &str,
-            _input: UpdateAccount,
-        ) -> std::result::Result<Account, Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn delete_account(
-            &self,
-            _subject: &str,
-            _account_id: &str,
-        ) -> std::result::Result<(), Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn set_account_status(
-            &self,
-            _subject: &str,
-            _account_id: &str,
-            _status: lightbridge_authz_core::ResourceStatus,
-        ) -> std::result::Result<Account, Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn add_account_member(
-            &self,
-            _subject: &str,
-            _account_id: &str,
-            _new_member: &str,
-        ) -> std::result::Result<Account, Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn remove_account_member(
-            &self,
-            _subject: &str,
-            _account_id: &str,
-            _member: &str,
-        ) -> std::result::Result<Account, Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn create_project(
-            &self,
-            _subject: &str,
-            _account_id: &str,
-            _input: CreateProject,
-        ) -> std::result::Result<Project, Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn list_projects(
-            &self,
-            _subject: &str,
-            _account_id: &str,
-            _offset: u32,
-            _limit: u32,
-        ) -> std::result::Result<Vec<Project>, Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn get_project(
-            &self,
-            _subject: &str,
-            _project_id: &str,
-        ) -> std::result::Result<Project, Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn update_project(
-            &self,
-            _subject: &str,
-            _project_id: &str,
-            _input: UpdateProject,
-        ) -> std::result::Result<Project, Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn delete_project(
-            &self,
-            _subject: &str,
-            _project_id: &str,
-        ) -> std::result::Result<(), Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn set_project_status(
-            &self,
-            _subject: &str,
-            _project_id: &str,
-            _status: lightbridge_authz_core::ResourceStatus,
-        ) -> std::result::Result<Project, Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn create_api_key(
-            &self,
-            _subject: &str,
-            _bearer_token: Option<&str>,
-            _project_id: &str,
-            _input: CreateApiKey,
-        ) -> std::result::Result<ApiKeySecret, Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn list_api_keys(
-            &self,
-            _subject: &str,
-            _project_id: &str,
-            _offset: u32,
-            _limit: u32,
-        ) -> std::result::Result<Vec<ApiKey>, Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn get_api_key(
-            &self,
-            _subject: &str,
-            _key_id: &str,
-        ) -> std::result::Result<ApiKey, Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn update_api_key(
-            &self,
-            _subject: &str,
-            _key_id: &str,
-            _input: UpdateApiKey,
-        ) -> std::result::Result<ApiKey, Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn delete_api_key(
-            &self,
-            _subject: &str,
-            _key_id: &str,
-        ) -> std::result::Result<(), Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn revoke_api_key(
-            &self,
-            _subject: &str,
-            _key_id: &str,
-        ) -> std::result::Result<ApiKey, Error> {
-            Err(Error::NotFound)
-        }
-
-        async fn rotate_api_key(
-            &self,
-            _subject: &str,
-            _bearer_token: Option<&str>,
-            _key_id: &str,
-            _input: RotateApiKey,
-        ) -> std::result::Result<ApiKeySecret, Error> {
-            Err(Error::NotFound)
-        }
     }
 
     #[derive(Debug)]
@@ -1744,14 +1745,6 @@ mod tests {
         }
     }
 
-    fn fixture_api_key_secret() -> ApiKeySecret {
-        ApiKeySecret {
-            api_key: fixture_api_key(),
-            secret: "lbk_secret_value".to_string(),
-            oauth2_url: None,
-        }
-    }
-
     fn sample_repo() -> Arc<dyn OpaRepoTrait> {
         Arc::new(MockOpaRepo {
             api_key: fixture_api_key(),
@@ -1801,199 +1794,6 @@ mod tests {
         }
     }
 
-    /// A store whose every method succeeds with fixed fixture data, used to exercise the
-    /// happy-path body of every `#[tool]` method through the real MCP router.
-    #[derive(Debug)]
-    struct FixtureStore;
-
-    #[async_trait]
-    impl AuthzStore for FixtureStore {
-        async fn create_account(
-            &self,
-            _subject: &str,
-            _input: CreateAccount,
-        ) -> std::result::Result<Account, Error> {
-            Ok(fixture_account())
-        }
-
-        async fn list_accounts(
-            &self,
-            _subject: &str,
-            _offset: u32,
-            _limit: u32,
-        ) -> std::result::Result<Vec<Account>, Error> {
-            Ok(vec![fixture_account()])
-        }
-
-        async fn get_account(
-            &self,
-            _subject: &str,
-            _account_id: &str,
-        ) -> std::result::Result<Account, Error> {
-            Ok(fixture_account())
-        }
-
-        async fn update_account(
-            &self,
-            _subject: &str,
-            _account_id: &str,
-            _input: UpdateAccount,
-        ) -> std::result::Result<Account, Error> {
-            Ok(fixture_account())
-        }
-
-        async fn delete_account(
-            &self,
-            _subject: &str,
-            _account_id: &str,
-        ) -> std::result::Result<(), Error> {
-            Ok(())
-        }
-
-        async fn set_account_status(
-            &self,
-            _subject: &str,
-            _account_id: &str,
-            _status: lightbridge_authz_core::ResourceStatus,
-        ) -> std::result::Result<Account, Error> {
-            Ok(fixture_account())
-        }
-
-        async fn add_account_member(
-            &self,
-            _subject: &str,
-            _account_id: &str,
-            _new_member: &str,
-        ) -> std::result::Result<Account, Error> {
-            Ok(fixture_account())
-        }
-
-        async fn remove_account_member(
-            &self,
-            _subject: &str,
-            _account_id: &str,
-            _member: &str,
-        ) -> std::result::Result<Account, Error> {
-            Ok(fixture_account())
-        }
-
-        async fn create_project(
-            &self,
-            _subject: &str,
-            _account_id: &str,
-            _input: CreateProject,
-        ) -> std::result::Result<Project, Error> {
-            Ok(fixture_project())
-        }
-
-        async fn list_projects(
-            &self,
-            _subject: &str,
-            _account_id: &str,
-            _offset: u32,
-            _limit: u32,
-        ) -> std::result::Result<Vec<Project>, Error> {
-            Ok(vec![fixture_project()])
-        }
-
-        async fn get_project(
-            &self,
-            _subject: &str,
-            _project_id: &str,
-        ) -> std::result::Result<Project, Error> {
-            Ok(fixture_project())
-        }
-
-        async fn update_project(
-            &self,
-            _subject: &str,
-            _project_id: &str,
-            _input: UpdateProject,
-        ) -> std::result::Result<Project, Error> {
-            Ok(fixture_project())
-        }
-
-        async fn delete_project(
-            &self,
-            _subject: &str,
-            _project_id: &str,
-        ) -> std::result::Result<(), Error> {
-            Ok(())
-        }
-
-        async fn set_project_status(
-            &self,
-            _subject: &str,
-            _project_id: &str,
-            _status: lightbridge_authz_core::ResourceStatus,
-        ) -> std::result::Result<Project, Error> {
-            Ok(fixture_project())
-        }
-
-        async fn create_api_key(
-            &self,
-            _subject: &str,
-            _bearer_token: Option<&str>,
-            _project_id: &str,
-            _input: CreateApiKey,
-        ) -> std::result::Result<ApiKeySecret, Error> {
-            Ok(fixture_api_key_secret())
-        }
-
-        async fn list_api_keys(
-            &self,
-            _subject: &str,
-            _project_id: &str,
-            _offset: u32,
-            _limit: u32,
-        ) -> std::result::Result<Vec<ApiKey>, Error> {
-            Ok(vec![fixture_api_key()])
-        }
-
-        async fn get_api_key(
-            &self,
-            _subject: &str,
-            _key_id: &str,
-        ) -> std::result::Result<ApiKey, Error> {
-            Ok(fixture_api_key())
-        }
-
-        async fn update_api_key(
-            &self,
-            _subject: &str,
-            _key_id: &str,
-            _input: UpdateApiKey,
-        ) -> std::result::Result<ApiKey, Error> {
-            Ok(fixture_api_key())
-        }
-
-        async fn delete_api_key(
-            &self,
-            _subject: &str,
-            _key_id: &str,
-        ) -> std::result::Result<(), Error> {
-            Ok(())
-        }
-
-        async fn revoke_api_key(
-            &self,
-            _subject: &str,
-            _key_id: &str,
-        ) -> std::result::Result<ApiKey, Error> {
-            Ok(fixture_api_key())
-        }
-
-        async fn rotate_api_key(
-            &self,
-            _subject: &str,
-            _bearer_token: Option<&str>,
-            _key_id: &str,
-            _input: RotateApiKey,
-        ) -> std::result::Result<ApiKeySecret, Error> {
-            Ok(fixture_api_key_secret())
-        }
-    }
-
     struct MockBearer {
         token_info: TokenInfo,
     }
@@ -2030,6 +1830,40 @@ mod tests {
         Arc::new(lightbridge_authz_core::db::DbPool::from_pool(pool))
     }
 
+    /// The generated cratestack CRUD client over a lazily-connected pool pointed at an unreachable
+    /// address. Constructing it never connects; the first actual query a CRUD tool issues fails
+    /// fast with a connection error. That is exactly what these tests want: the generated client is
+    /// a concrete type over a real sqlx pool (there is no trait seam to mock, unlike the deleted
+    /// `AuthzStore`), so instead of a fixture double we assert each CRUD tool is wired to the client
+    /// and maps the resulting error to a JSON-RPC error rather than panicking. DB-backed happy-path
+    /// coverage for the CRUD surface lives in the RPC integration tests, not here.
+    fn lazy_cratestack_db() -> schema::Cratestack {
+        let pool = cratestack::sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
+            .expect("lazy cratestack pool should be constructible");
+        schema::Cratestack::builder(pool).build()
+    }
+
+    /// The reused issuer (procedure-backed tools) over the same unreachable lazy core pool, with the
+    /// sample billing catalogue so `create-api-key`'s pre-DB billing-plan check passes and the call
+    /// then reaches (and fails at) the dead pool.
+    fn lazy_issuer() -> Arc<AuthzStoreImpl> {
+        Arc::new(AuthzStoreImpl::with_pool(lazy_pool()).with_billing(sample_billing()))
+    }
+
+    /// Build a handler over the lazy (unreachable) cratestack client + issuer. Sufficient for the
+    /// non-DB tests (tool listing, schema shape, billing advertisement, permission mapping) and for
+    /// the dead-pool dispatch/error-mapping test; DB-touching tool bodies error at first query.
+    fn lazy_handler() -> LightbridgeMcpHandler {
+        LightbridgeMcpHandler::new(
+            lazy_cratestack_db(),
+            lazy_issuer(),
+            sample_repo(),
+            basic_auth(),
+            &sample_billing(),
+        )
+    }
+
     fn test_api_server() -> ApiServer {
         ApiServer {
             address: "127.0.0.1".to_string(),
@@ -2042,17 +1876,14 @@ mod tests {
         }
     }
 
-    fn test_router(
-        store: Arc<dyn AuthzStore>,
-        opa_repo: Arc<dyn OpaRepoTrait>,
-        token_info: TokenInfo,
-    ) -> Router {
+    fn test_router(opa_repo: Arc<dyn OpaRepoTrait>, token_info: TokenInfo) -> Router {
         build_mcp_router(
             &test_api_server(),
             &sample_oauth2(),
             basic_auth(),
             &sample_billing(),
-            store,
+            lazy_cratestack_db(),
+            lazy_issuer(),
             opa_repo,
             Arc::new(MockBearer { token_info }),
             lazy_pool(),
@@ -2105,8 +1936,8 @@ mod tests {
         (status, payload)
     }
 
-    /// One representative `arguments` payload per registered tool, shared by the router-driven
-    /// success test (against `FixtureStore`) and the store-error test (against `MockStore`).
+    /// One representative `arguments` payload per registered tool, driven through the real MCP
+    /// router by `every_tool_dispatches_and_maps_backend_errors_through_the_real_mcp_router`.
     fn crud_and_validation_tool_cases() -> Vec<(&'static str, Value)> {
         vec![
             ("create-account", json!({ "billing_identity": "acme" })),
@@ -2311,14 +2142,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    #[test]
-    fn router_lists_all_lightbridge_endpoint_tools() {
-        let handler = LightbridgeMcpHandler::new(
-            Arc::new(MockStore),
-            sample_repo(),
-            basic_auth(),
-            &sample_billing(),
-        );
+    // `#[tokio::test]` (not `#[test]`): `lazy_handler()` builds the cratestack CRUD client over a
+    // `connect_lazy` sqlx pool, whose background pool-maintenance task needs a Tokio runtime to
+    // spawn onto. A plain sync `#[test]` has none and panics ("this functionality requires a Tokio
+    // context") the moment the pool is constructed, even though the assertions below never touch the
+    // DB. Running on a Tokio worker gives the pool its runtime; the test body stays synchronous.
+    #[tokio::test]
+    async fn router_lists_all_lightbridge_endpoint_tools() {
+        let handler = lazy_handler();
 
         let mut tool_names = handler
             .tool_router
@@ -2360,14 +2191,9 @@ mod tests {
         assert_eq!(tool_names, expected);
     }
 
-    #[test]
-    fn create_api_key_tool_advertises_configured_billing_plans() {
-        let handler = LightbridgeMcpHandler::new(
-            Arc::new(MockStore),
-            sample_repo(),
-            basic_auth(),
-            &sample_billing(),
-        );
+    #[tokio::test]
+    async fn create_api_key_tool_advertises_configured_billing_plans() {
+        let handler = lazy_handler();
 
         let tools = handler.advertised_tools();
         let create = tools
@@ -2394,10 +2220,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn advertised_tools_unchanged_when_no_billing_plans_configured() {
+    #[tokio::test]
+    async fn advertised_tools_unchanged_when_no_billing_plans_configured() {
         let handler = LightbridgeMcpHandler::new(
-            Arc::new(MockStore),
+            lazy_cratestack_db(),
+            lazy_issuer(),
             sample_repo(),
             basic_auth(),
             &Billing::default(),
@@ -2429,14 +2256,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn every_registered_tool_has_a_permission_mapping() {
-        let handler = LightbridgeMcpHandler::new(
-            Arc::new(MockStore),
-            sample_repo(),
-            basic_auth(),
-            &sample_billing(),
-        );
+    #[tokio::test]
+    async fn every_registered_tool_has_a_permission_mapping() {
+        let handler = lazy_handler();
         for tool in handler.tool_router.list_all() {
             assert!(
                 required_tool_permission(&tool.name).is_some(),
@@ -2446,14 +2268,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn create_account_tool_schema_uses_jwt_subject_not_input_subject() {
-        let handler = LightbridgeMcpHandler::new(
-            Arc::new(MockStore),
-            sample_repo(),
-            basic_auth(),
-            &sample_billing(),
-        );
+    #[tokio::test]
+    async fn create_account_tool_schema_uses_jwt_subject_not_input_subject() {
+        let handler = lazy_handler();
         let create_account = handler
             .tool_router
             .list_all()
@@ -2477,14 +2294,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn list_tools_schema_include_pagination_fields() {
-        let handler = LightbridgeMcpHandler::new(
-            Arc::new(MockStore),
-            sample_repo(),
-            basic_auth(),
-            &sample_billing(),
-        );
+    #[tokio::test]
+    async fn list_tools_schema_include_pagination_fields() {
+        let handler = lazy_handler();
         for tool_name in ["list-accounts", "list-projects", "list-api-keys"] {
             let tool = handler
                 .tool_router
@@ -2509,14 +2321,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tool_output_schema_avoids_boolean_schema_for_result_property() {
-        let handler = LightbridgeMcpHandler::new(
-            Arc::new(MockStore),
-            sample_repo(),
-            basic_auth(),
-            &sample_billing(),
-        );
+    #[tokio::test]
+    async fn tool_output_schema_avoids_boolean_schema_for_result_property() {
+        let handler = lazy_handler();
         let create_account = handler
             .tool_router
             .list_all()
@@ -2548,12 +2355,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorino_validation_tool_enriches_dynamic_metadata() {
-        let handler = LightbridgeMcpHandler::new(
-            Arc::new(MockStore),
-            sample_repo(),
-            basic_auth(),
-            &sample_billing(),
-        );
+        let handler = lazy_handler();
         let mut metadata = HashMap::new();
         metadata.insert("env".to_string(), json!("dev"));
 
@@ -2641,53 +2443,40 @@ mod tests {
         );
     }
 
+    /// Drive every tool through the real MCP router (JSON-RPC over `/mcp`) with a permission-holding
+    /// caller. The CRUD tools run against the generated cratestack client and the procedure-backed
+    /// tools against the issuer, both over an unreachable lazy pool — so each must dispatch,
+    /// serialize its input, reach the DB, and map the resulting connection error onto a JSON-RPC
+    /// error rather than panicking (there is no trait seam to substitute a fixture store for; see
+    /// `lazy_cratestack_db`). The validate-* tools instead consult `opa_state` (a real mock repo)
+    /// and therefore succeed, proving the validation path is unaffected by the CRUD migration.
     #[tokio::test]
-    async fn every_crud_and_validation_tool_succeeds_through_the_real_mcp_router() {
+    async fn every_tool_dispatches_and_maps_backend_errors_through_the_real_mcp_router() {
         for (tool, arguments) in crud_and_validation_tool_cases() {
-            let router = test_router(
-                Arc::new(FixtureStore),
-                sample_repo(),
-                full_access_token_info(),
-            );
+            let router = test_router(sample_repo(), full_access_token_info());
             let (status, payload) = call_tool(router, tool, arguments, Some("good")).await;
             assert_eq!(
                 status,
                 StatusCode::OK,
                 "tool `{tool}` should return HTTP 200: {payload}"
             );
-            assert!(
-                payload.get("error").is_none(),
-                "tool `{tool}` should not return a JSON-RPC error: {payload}"
-            );
-        }
-    }
-
-    /// Every non-validation tool call, against a store that fails every call, should surface a
-    /// JSON-RPC error (exercising each CRUD method's `map_err(to_tool_error)?` line). The
-    /// validate-* tools are excluded because they consult `opa_state`, not `self.store`.
-    #[tokio::test]
-    async fn every_crud_tool_surfaces_a_store_not_found_error_as_a_json_rpc_error() {
-        for (tool, arguments) in crud_and_validation_tool_cases() {
             if tool.starts_with("validate-") {
-                continue;
+                assert!(
+                    payload.get("error").is_none(),
+                    "validation tool `{tool}` (mock OPA repo) should succeed: {payload}"
+                );
+            } else {
+                assert!(
+                    payload.get("error").is_some(),
+                    "tool `{tool}` should map the unreachable-DB error to a JSON-RPC error: {payload}"
+                );
             }
-            let router = test_router(Arc::new(MockStore), sample_repo(), full_access_token_info());
-            let (status, payload) = call_tool(router, tool, arguments, Some("good")).await;
-            assert_eq!(status, StatusCode::OK, "tool `{tool}`: {payload}");
-            assert!(
-                payload.get("error").is_some(),
-                "tool `{tool}` should surface a NotFound store error as a JSON-RPC error: {payload}"
-            );
         }
     }
 
     #[tokio::test]
     async fn create_api_key_tool_rejects_an_invalid_expires_at() {
-        let router = test_router(
-            Arc::new(FixtureStore),
-            sample_repo(),
-            full_access_token_info(),
-        );
+        let router = test_router(sample_repo(), full_access_token_info());
         let (status, payload) = call_tool(
             router,
             "create-api-key",
@@ -2706,7 +2495,6 @@ mod tests {
     #[tokio::test]
     async fn call_tool_rejects_a_caller_missing_the_required_permission() {
         let router = test_router(
-            Arc::new(FixtureStore),
             sample_repo(),
             token_info_with_permissions(lightbridge_authz_core::authz::PermissionSet::new()),
         );
@@ -2727,11 +2515,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_rejects_an_unknown_tool_name() {
-        let router = test_router(
-            Arc::new(FixtureStore),
-            sample_repo(),
-            full_access_token_info(),
-        );
+        let router = test_router(sample_repo(), full_access_token_info());
         let (status, payload) = call_tool(router, "not-a-real-tool", json!({}), Some("good")).await;
 
         assert_eq!(status, StatusCode::OK);
@@ -2749,12 +2533,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_reports_missing_bearer_token_context_when_bearer_auth_is_bypassed() {
-        let handler = LightbridgeMcpHandler::new(
-            Arc::new(FixtureStore),
-            sample_repo(),
-            basic_auth(),
-            &sample_billing(),
-        );
+        let handler = lazy_handler();
         let http_config = build_streamable_http_config(&None);
         let mcp_service: StreamableHttpService<LightbridgeMcpHandler, LocalSessionManager> =
             StreamableHttpService::new(

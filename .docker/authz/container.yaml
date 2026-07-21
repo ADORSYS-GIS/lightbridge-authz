@@ -24,6 +24,10 @@ logging:
 database:
   url: "postgres://postgres:postgres@postgresql:5432/lightbridge_authz"
   pool_size: 10
+# Redis-backed rate limiting for authz-api (see docs/adr/0003-cratestack-crud-migration.md,
+# "Rate limiting (Redis-backed)"). Optional: authz-opa/lightbridge-mcp/usage ignore this block.
+redis:
+  url: "${REDIS_URL:-redis://redis:6379}"
 oauth2:
   # REQUIRED credential-issuance mode — no default; must be stated explicitly.
   #   self     → mint self-signed JWT API keys (uses `signing`). external → Keycloak-exchanged
