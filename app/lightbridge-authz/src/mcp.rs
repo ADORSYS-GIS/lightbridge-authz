@@ -370,7 +370,9 @@ fn required_tool_permission(tool: &str) -> Option<Permission> {
         "update-account" => Permission::AccountUpdate,
         "delete-account" => Permission::AccountDelete,
         "disable-account" | "enable-account" => Permission::AccountDisable,
-        "add-account-member" | "remove-account-member" => Permission::AccountMember,
+        "add-account-member" | "remove-account-member" | "set-account-member-role" => {
+            Permission::AccountMember
+        }
         "create-project" => Permission::ProjectCreate,
         "list-projects" | "get-project" => Permission::ProjectRead,
         "update-project" => Permission::ProjectUpdate,
@@ -623,12 +625,24 @@ struct UpdateAccountParams {
 struct AddAccountMemberParams {
     account_id: String,
     subject: String,
+    /// "owner" | "admin" | "member"; defaults to "member" if omitted. Granting "owner" requires
+    /// the caller to already be an "owner".
+    #[serde(default)]
+    role: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct RemoveAccountMemberParams {
     account_id: String,
     member: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetAccountMemberRoleParams {
+    account_id: String,
+    subject: String,
+    /// "owner" | "admin" | "member". Owner-only.
+    role: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -833,23 +847,23 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "delete-account",
-        description = "Delete an account (RPC model.Account.delete)"
+        description = "Permanently delete an account and cascade-delete its projects/api-keys/memberships (RPC procedure.deleteAccountPermanently); owner-only"
     )]
     async fn delete_account_tool(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<AccountByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let token_info = token_info_from_request_context(&context)?;
-        let bound = self
-            .cratestack_db
-            .bind_context(cool_context_from_token_info(&token_info));
-        let account = bound
-            .account()
-            .delete(params.account_id)
-            .run()
+        // Repointed from the generic `model.Account.delete` client call: that op is now denied
+        // unconditionally (membership-role gating -- owner-only -- can't be expressed as an
+        // `@@allow` policy, see the schema's comment on `Account`), so this now calls the
+        // `deleteAccountPermanently` procedure instead, same as the RPC surface.
+        let subject = subject_from_request_context(&context)?;
+        let account = self
+            .issuer
+            .delete_account(&subject, &params.account_id)
             .await
-            .map_err(cool_error_to_tool_error)?;
+            .map_err(to_tool_error)?;
 
         to_json_value(account)
     }
@@ -902,9 +916,10 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<AddAccountMemberParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let subject = subject_from_request_context(&context)?;
+        let role = params.role.unwrap_or_else(|| "member".to_string());
         let account = self
             .issuer
-            .add_account_member(&subject, &params.account_id, &params.subject)
+            .add_account_member(&subject, &params.account_id, &params.subject, &role)
             .await
             .map_err(to_tool_error)?;
 
@@ -913,7 +928,7 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "remove-account-member",
-        description = "Remove a member from an account (RPC procedure.removeAccountMember); refuses to remove the last member"
+        description = "Remove a member from an account (RPC procedure.removeAccountMember); refuses to remove the last member or the last owner"
     )]
     async fn remove_account_member_tool(
         &self,
@@ -924,6 +939,25 @@ impl LightbridgeMcpHandler {
         let account = self
             .issuer
             .remove_account_member(&subject, &params.account_id, &params.member)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(account)
+    }
+
+    #[tool(
+        name = "set-account-member-role",
+        description = "Change a member's role (RPC procedure.setAccountMemberRole); owner-only, refuses to demote the last owner"
+    )]
+    async fn set_account_member_role_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SetAccountMemberRoleParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let account = self
+            .issuer
+            .set_account_member_role(&subject, &params.account_id, &params.subject, &params.role)
             .await
             .map_err(to_tool_error)?;
 
@@ -2181,6 +2215,7 @@ mod tests {
             "remove-account-member",
             "revoke-api-key",
             "rotate-api-key",
+            "set-account-member-role",
             "update-account",
             "update-api-key",
             "update-project",

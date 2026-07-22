@@ -53,11 +53,21 @@ model Account {
   // `createAccount` procedure, which inserts the account and the creator's membership in
   // one transaction, and `model.Account.create` is also denied unconditionally at the
   // RBAC layer (crates/lightbridge-authz-rest/src/rpc_authorize.rs).
+  //
+  // NOTE: no `@@allow("delete", ...)` either, as of the membership-roles change. Account
+  // deletion is now owner-only, and cratestack's relation-quantifier policy predicates can't
+  // express a per-row compound condition ("the member row matching my subject must ALSO have
+  // role='owner'") -- `memberships.some.subject == auth().id && memberships.some.role ==
+  // "owner"` would compile to two independent EXISTS checks, not one joint check on the same
+  // row (confirmed by reading `cratestack-macros/src/policy/model/relation_path.rs`: each
+  // dotted policy path resolves to exactly one target field per relation hop, no support for
+  // multiple fields on one related row). So the role check moved into the `deleteAccountPermanently`
+  // procedure's hand-written SQL instead, and `model.Account.delete` is denied unconditionally
+  // at the RBAC layer, same pattern as create.
   @@audit
   @@paged
   @@allow("read", memberships.some.subject == auth().id)
   @@allow("update", memberships.some.subject == auth().id)
-  @@allow("delete", memberships.some.subject == auth().id)
 }
 
 model Project {
@@ -147,6 +157,14 @@ model AccountMembership {
   id Cuid @id
   accountId Cuid
   subject String
+  // "owner" | "admin" | "member" (DB CHECK constraint, migrations/20260722000001_account_
+  // membership_roles.sql). Gates addAccountMember/removeAccountMember/disableAccount/
+  // enableAccount/deleteAccountPermanently/setAccountMemberRole via hand-written sqlx role checks in
+  // those procedures (see the compound-condition limitation noted on `Account` above for why
+  // this isn't expressed as an `@@allow` policy). Not independently mutable through generic
+  // CRUD -- there is no `@@allow("update", ...)` below, so role changes go exclusively through
+  // `setAccountMemberRole`.
+  role String
   createdAt DateTime
   account Account @relation(fields:[accountId],references:[id])
 
@@ -235,17 +253,23 @@ type RevokeApiKeyInput {
 mutation procedure revokeApiKey(args: RevokeApiKeyInput): ApiKey
   @allow(auth() != null)
 
-// Membership mutations (ADR-0003 item 4). These are hand-written sqlx in the
-// ProcedureRegistry impl (not generated CRUD): `account_memberships` is a
-// relation-target-only model here (composite PK, no `id` column), so it has no
-// generated create/delete verb, and `removeAccountMember` must enforce the
-// "cannot remove the last member" invariant that generated CRUD cannot express.
-// The `@allow(auth() != null)` gate only asserts an authenticated caller; the
-// real membership authorization lives in the hand-written SQL (the acting
-// subject must already be a member), exactly as the pre-migration REST path did.
+// Membership mutations (ADR-0003 item 4; role gating added when membership roles landed). These
+// are hand-written sqlx in the ProcedureRegistry impl (not generated CRUD): `account_memberships`
+// is a relation-target-only model here (composite PK, no `id` column), so it has no generated
+// create/delete verb, `removeAccountMember` must enforce the "cannot remove the last member" (and
+// now "cannot remove the last owner") invariants generated CRUD can't express, and role gating
+// itself can't be expressed as an `@@allow` policy (see the compound-condition note on `Account`
+// above). The `@allow(auth() != null)` gate only asserts an authenticated caller; the real
+// authorization -- membership AND role -- lives in the hand-written SQL: adding or removing a
+// member requires the acting subject to be an owner or admin; granting the `owner` role requires
+// the acting subject to already be an owner (admins cannot mint new owners); an admin cannot
+// remove an owner.
 type AddAccountMemberInput {
   accountId Cuid
   subject String
+  // Optional; defaults to "member" if omitted. Granting "owner" requires the acting subject to
+  // already hold "owner" (see above).
+  role String?
 }
 
 mutation procedure addAccountMember(args: AddAccountMemberInput): Account
@@ -257,6 +281,27 @@ type RemoveAccountMemberInput {
 }
 
 mutation procedure removeAccountMember(args: RemoveAccountMemberInput): Account
+  @allow(auth() != null)
+
+// Owner-only. Refuses to demote/reassign-away-from-owner the account's last remaining owner (same
+// lockout-avoidance shape as removeAccountMember's "cannot remove the last owner").
+type SetAccountMemberRoleInput {
+  accountId Cuid
+  subject String
+  role String
+}
+
+mutation procedure setAccountMemberRole(args: SetAccountMemberRoleInput): Account
+  @allow(auth() != null)
+
+// Owner-only. Replaces the now-denied generic `model.Account.delete` verb (see the `Account`
+// model's `@@allow` comments). Cascades to projects/api-keys/memberships via the existing
+// `ON DELETE CASCADE` foreign keys, same as the pre-migration hand-written delete did.
+type DeleteAccountPermanentlyInput {
+  accountId Cuid
+}
+
+mutation procedure deleteAccountPermanently(args: DeleteAccountPermanentlyInput): Account
   @allow(auth() != null)
 
 // Account / project suspension (data-plane authorization; see docs/rbac.md). Disabling sets

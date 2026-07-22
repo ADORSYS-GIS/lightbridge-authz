@@ -57,11 +57,19 @@ pub fn required_permission(op_id: &str) -> Option<Permission> {
         "model.Account.list" => AccountRead,
         "model.Account.get" => AccountRead,
         "model.Account.update" => AccountUpdate,
-        "model.Account.delete" => AccountDelete,
+        // model.Account.delete is intentionally absent (falls through to `_ => None`, denied): the
+        // schema no longer carries `@@allow("delete", ...)` on Account (membership-role gating can't
+        // be expressed as a relation-quantifier policy predicate, see the schema's own comment on
+        // `Account`), so the cratestack policy layer already fail-closes this op-id -- omitted here
+        // too, same defense-in-depth pattern as `model.ApiKey.create`. Account deletion is now
+        // `procedure.deleteAccountPermanently`, below.
         "procedure.disableAccount" => AccountDisable,
         "procedure.enableAccount" => AccountDisable,
         "procedure.addAccountMember" => AccountMember,
         "procedure.removeAccountMember" => AccountMember,
+        // Role changes are membership management, same coarse capability as add/remove.
+        "procedure.setAccountMemberRole" => AccountMember,
+        "procedure.deleteAccountPermanently" => AccountDelete,
 
         "model.Project.create" => ProjectCreate,
         "model.Project.list" => ProjectRead,
@@ -167,11 +175,15 @@ mod tests {
             ("model.Account.list", Permission::AccountRead),
             ("model.Account.get", Permission::AccountRead),
             ("model.Account.update", Permission::AccountUpdate),
-            ("model.Account.delete", Permission::AccountDelete),
             ("procedure.disableAccount", Permission::AccountDisable),
             ("procedure.enableAccount", Permission::AccountDisable),
             ("procedure.addAccountMember", Permission::AccountMember),
             ("procedure.removeAccountMember", Permission::AccountMember),
+            ("procedure.setAccountMemberRole", Permission::AccountMember),
+            (
+                "procedure.deleteAccountPermanently",
+                Permission::AccountDelete,
+            ),
             ("model.Project.create", Permission::ProjectCreate),
             ("model.Project.list", Permission::ProjectRead),
             ("model.Project.get", Permission::ProjectRead),
@@ -202,6 +214,7 @@ mod tests {
     fn unmapped_and_sensitive_op_ids_are_fail_closed() {
         for op_id in [
             "model.Account.create",
+            "model.Account.delete",
             "model.ApiKey.create",
             "model.AccountMembership.list",
             "model.AccountMembership.get",

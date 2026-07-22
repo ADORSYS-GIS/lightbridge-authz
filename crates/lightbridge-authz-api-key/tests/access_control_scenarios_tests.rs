@@ -293,7 +293,13 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
         .await
         .unwrap_err();
     assert!(matches!(unauthorized_account_delete, Error::NotFound));
-    repo.delete_account(invited, &account.id).await.unwrap();
+    // Account deletion is owner-only (ADR-0005) -- `invited` was seeded with the default "member"
+    // role via the legacy `update_account` owners_admins-replace path (line ~84 above), so unlike
+    // api-key/project deletion (any member), a member-role account delete must be Forbidden. Only
+    // `owner` (the account's creator, seeded as "owner" by `create_account`) can actually delete it.
+    let member_account_delete = repo.delete_account(invited, &account.id).await.unwrap_err();
+    assert!(matches!(member_account_delete, Error::Forbidden(_)));
+    repo.delete_account(owner, &account.id).await.unwrap();
     assert!(repo.get_account_by_id(&account.id).await.unwrap().is_none());
 }
 

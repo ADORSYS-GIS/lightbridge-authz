@@ -443,11 +443,14 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    // Account deletion is owner-only and no longer the generic `model.Account.delete` verb
+    // (ADR-0005) -- the account's creator ("admin", the token subject used throughout this test)
+    // was seeded as "owner" by `createAccount`, so this still succeeds.
     let (status, _) = rpc_call(
         r.clone(),
-        "model.Account.delete",
+        "procedure.deleteAccountPermanently",
         Wire::Json,
-        &json!({ "id": account_id }),
+        &json!({ "args": { "accountId": account_id } }),
         Some("admin"),
     )
     .await;
@@ -522,11 +525,14 @@ async fn crud_lifecycle_over_cbor() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(Wire::Cbor.decode::<Value>(&body)["name"], "p-cbor");
 
+    // Account deletion is owner-only and no longer the generic `model.Account.delete` verb
+    // (ADR-0005) -- the account's creator ("admin", the token subject used throughout this test)
+    // was seeded as "owner" by `createAccount`, so this still succeeds.
     let (status, _) = rpc_call(
         r.clone(),
-        "model.Account.delete",
+        "procedure.deleteAccountPermanently",
         Wire::Cbor,
-        &json!({ "id": account_id }),
+        &json!({ "args": { "accountId": account_id } }),
         Some("admin"),
     )
     .await;

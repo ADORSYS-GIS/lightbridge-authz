@@ -461,14 +461,15 @@ impl AuthzStoreImpl {
         subject: &str,
         account_id: &str,
         new_member: &str,
+        role: &str,
     ) -> Result<Account> {
         self.repo
-            .add_account_member(subject, account_id, new_member)
+            .add_account_member(subject, account_id, new_member, role)
             .await
     }
 
-    /// Remove a member from an account, refusing to remove the last remaining member. Backs
-    /// `removeAccountMember`.
+    /// Remove a member from an account, refusing to remove the last remaining member or the last
+    /// remaining owner. Backs `removeAccountMember`.
     pub async fn remove_account_member(
         &self,
         subject: &str,
@@ -478,6 +479,26 @@ impl AuthzStoreImpl {
         self.repo
             .remove_account_member(subject, account_id, member)
             .await
+    }
+
+    /// Change a member's role (owner-only), refusing to demote the last remaining owner. Backs
+    /// `setAccountMemberRole`.
+    pub async fn set_account_member_role(
+        &self,
+        subject: &str,
+        account_id: &str,
+        target_subject: &str,
+        role: &str,
+    ) -> Result<Account> {
+        self.repo
+            .set_account_member_role(subject, account_id, target_subject, role)
+            .await
+    }
+
+    /// Permanently delete an account (owner-only), cascading to its projects/api-keys/memberships.
+    /// Backs `deleteAccountPermanently`.
+    pub async fn delete_account(&self, subject: &str, account_id: &str) -> Result<Account> {
+        self.repo.delete_account(subject, account_id).await
     }
 
     /// Rotate an API key: issue a fresh secret (generation/hashing unchanged from before the

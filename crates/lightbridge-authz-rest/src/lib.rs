@@ -458,11 +458,12 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         let subject = subject_from_ctx(ctx);
         let account_id = args.args.accountId;
         let new_member = args.args.subject;
+        let role = args.args.role.unwrap_or_else(|| "member".to_owned());
         async move {
             let subject =
                 subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
             let account = issuer
-                .add_account_member(&subject, &account_id, &new_member)
+                .add_account_member(&subject, &account_id, &new_member, &role)
                 .await
                 .map_err(to_cool_error)?;
             Ok(to_schema_account(account))
@@ -486,6 +487,58 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
             let account = issuer
                 .remove_account_member(&subject, &account_id, &member)
+                .await
+                .map_err(to_cool_error)?;
+            Ok(to_schema_account(account))
+        }
+    }
+
+    fn set_account_member_role(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::set_account_member_role::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::set_account_member_role::Output,
+            CoolError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let account_id = args.args.accountId;
+        let target_subject = args.args.subject;
+        let role = args.args.role;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let account = issuer
+                .set_account_member_role(&subject, &account_id, &target_subject, &role)
+                .await
+                .map_err(to_cool_error)?;
+            Ok(to_schema_account(account))
+        }
+    }
+
+    fn delete_account_permanently(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::delete_account_permanently::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::delete_account_permanently::Output,
+            CoolError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let account_id = args.args.accountId;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let account = issuer
+                .delete_account(&subject, &account_id)
                 .await
                 .map_err(to_cool_error)?;
             Ok(to_schema_account(account))

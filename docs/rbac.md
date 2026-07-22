@@ -134,9 +134,9 @@ listed here is denied unconditionally (fail closed).**
 | `account:create`  | `model.Account.create`                               | `create-account`                    |
 | `account:read`    | `model.Account.list`, `model.Account.get`, `model.AccountSummary.list`, `model.AccountSummary.get` | `list-accounts`, `get-account` |
 | `account:update`  | `model.Account.update`                               | `update-account`                    |
-| `account:delete`  | `model.Account.delete`                               | `delete-account`                    |
+| `account:delete`  | `procedure.deleteAccountPermanently`                 | `delete-account`                    |
 | `account:disable` | `procedure.disableAccount`, `procedure.enableAccount`| `disable-account`, `enable-account` |
-| `account:member`  | `procedure.addAccountMember`, `procedure.removeAccountMember` | `add-account-member`, `remove-account-member` |
+| `account:member`  | `procedure.addAccountMember`, `procedure.removeAccountMember`, `procedure.setAccountMemberRole` | `add-account-member`, `remove-account-member`, `set-account-member-role` |
 | `project:create`  | `model.Project.create`                               | `create-project`                    |
 | `project:read`    | `model.Project.list`, `model.Project.get`            | `list-projects`, `get-project`      |
 | `project:update`  | `model.Project.update`                               | `update-project`                    |
@@ -158,8 +158,13 @@ listed here is denied unconditionally (fail closed).**
   already fail-closed at the policy layer; the RBAC gate denies it too. API-key creation is
   server-side only, via `procedure.createApiKey` (the server generates + hashes the secret and
   validates the billing plan; a caller can never supply `keyHash`/`keyPrefix`/`billingPlan`).
+- `model.Account.delete` — same reasoning as above: membership-*role* gating (owner-only) can't be
+  expressed as a schema `@@allow` policy predicate (see "Account roles" below for why), so the
+  generic delete verb has no `@@allow` at all and is denied here too. Account deletion is
+  `procedure.deleteAccountPermanently` only.
 - `model.AccountMembership.*` — that model is policy-locked to read-self with no generated mutation
-  verbs; membership changes go through the `addAccountMember` / `removeAccountMember` procedures.
+  verbs; membership changes go through the `addAccountMember` / `removeAccountMember` /
+  `setAccountMemberRole` procedures.
 - `/rpc/batch` — a batch bundles multiple ops in its frame body, so a single URL-derived `op_id`
   cannot represent the per-op permissions; the whole endpoint is denied.
 
@@ -248,16 +253,52 @@ project-scoped membership.
 An admin holding `account:member` manages the roster directly (no invite/accept handshake), via the
 RPC procedures:
 
-- `procedure.addAccountMember` with `{ accountId, subject }` — add a member. Idempotent; returns the
-  account with the updated `owners_admins` list.
+- `procedure.addAccountMember` with `{ accountId, subject, role? }` — add a member. `role` defaults
+  to `"member"` if omitted; granting `"owner"` requires the caller to already be an `"owner"` (see
+  "Account roles" below). Idempotent on the membership itself — re-adding an existing member is a
+  no-op and does **not** change their role; use `setAccountMemberRole` for that.
 - `procedure.removeAccountMember` with `{ accountId, subject }` — remove a member. Refuses to remove
-  the **last** remaining member with `409 Conflict` (emptying the roster would trip the account-prune
-  trigger and delete the account). To intentionally delete the account and all its resources, use
-  `model.Account.delete` (`account:delete`) instead — that removes the whole account regardless of
-  member count.
+  the **last** remaining member (`409 Conflict`; emptying the roster would trip the account-prune
+  trigger and delete the account) *and* refuses to remove the account's **last remaining owner**, even
+  if other non-owner members remain (would otherwise orphan the account with nobody able to perform
+  owner-only operations). To intentionally delete the account and all its resources, use
+  `procedure.deleteAccountPermanently` (`account:delete`) instead.
+- `procedure.setAccountMemberRole` with `{ accountId, subject, role }` — change an existing member's
+  role. Owner-only. Refuses to demote the account's last remaining owner away from `"owner"`.
 
 The acting caller must themselves be a member of the account (a non-member gets a uniform `404`),
 so `account:member` lets an admin manage rosters of accounts they belong to, not arbitrary tenants.
-The creating subject is always seeded as the first member. Membership is mutated **only** through
-these two procedures — the cratestack `Account` model exposes no `owners_admins` column, so
-`model.Account.update` cannot change the roster.
+The creating subject is always seeded as the account's first member **with the `"owner"` role**.
+Membership is mutated **only** through these three procedures — the cratestack `Account` model
+exposes no `owners_admins` column, so `model.Account.update` cannot change the roster.
+
+### Account roles
+
+Every `account_memberships` row carries a `role` — `"owner"`, `"admin"`, or `"member"`
+(`migrations/20260722000001_account_membership_roles.sql`; the account-scoped taxonomy ADR-0002
+originally called for). This is a **second, finer authorization layer inside a single account**,
+distinct from both the coarse RBAC gate above (global, JWT-role-driven, "may this caller attempt
+this kind of operation at all") and account membership (binary, "is this caller a member of this
+account at all"). Role gates account-scoped membership-management and destructive operations only —
+project and api-key create/read/update/delete stay open to *any* member of the account, unchanged:
+
+| Role     | Can do beyond plain membership |
+| -------- | ------------------------------- |
+| `member` | Nothing extra — read/create/update on the account's projects and api-keys, same as any member. |
+| `admin`  | + `addAccountMember` / `removeAccountMember` (cannot grant `"owner"` or remove an `"owner"`), + `disableAccount` / `enableAccount`. |
+| `owner`  | Everything `admin` can do, plus: grant/revoke the `"owner"` role itself, remove another owner, `setAccountMemberRole` (owner-only entirely), `deleteAccountPermanently` (owner-only entirely). |
+
+An account can have more than one owner. Two lockout-avoidance invariants are enforced in SQL
+regardless of caller intent: **the last remaining owner of an account can never be removed or
+demoted** (`removeAccountMember` / `setAccountMemberRole` both check this before acting), so an
+account can never end up with members but zero owners.
+
+**Why this isn't expressed as an `@@allow` schema policy, unlike account membership itself:**
+cratestack's relation-quantifier policy predicates (`account.memberships.some.subject == auth().id`)
+resolve each dotted path to exactly one target scalar field per relation hop — there's no support for
+a compound condition jointly checked on the *same* related row. Writing
+`memberships.some.subject == auth().id && memberships.some.role == "owner"` would compile to two
+independent `EXISTS` checks ("some member matches my subject" AND, separately, "some member — any
+member — has role owner"), not "the member row matching my subject also has role owner". So role
+gating lives entirely in hand-written SQL inside the five procedures above (confirmed by reading
+`cratestack-macros/src/policy/model/relation_path.rs`) rather than in the schema's `@@allow` policies.

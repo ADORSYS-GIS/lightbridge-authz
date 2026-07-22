@@ -37,7 +37,7 @@ async fn add_member_grants_access(pool: PgPool) {
     );
 
     let account = repo
-        .add_account_member("owner", &account_id, "invitee")
+        .add_account_member("owner", &account_id, "invitee", "member")
         .await
         .expect("owner should add a member");
     assert!(account.owners_admins.contains(&"owner".to_string()));
@@ -55,11 +55,11 @@ async fn add_member_is_idempotent(pool: PgPool) {
     let repo = build_repo(pool);
     let account_id = seed_account(&repo, "owner").await;
 
-    repo.add_account_member("owner", &account_id, "invitee")
+    repo.add_account_member("owner", &account_id, "invitee", "member")
         .await
         .expect("first add succeeds");
     let account = repo
-        .add_account_member("owner", &account_id, "invitee")
+        .add_account_member("owner", &account_id, "invitee", "member")
         .await
         .expect("re-adding is a no-op, not an error");
     let invitee_count = account
@@ -76,7 +76,7 @@ async fn add_rejects_empty_subject(pool: PgPool) {
     let account_id = seed_account(&repo, "owner").await;
 
     let err = repo
-        .add_account_member("owner", &account_id, "   ")
+        .add_account_member("owner", &account_id, "   ", "member")
         .await
         .expect_err("an empty/whitespace member subject must be rejected");
     assert!(matches!(err, Error::BadRequest(_)));
@@ -88,7 +88,7 @@ async fn non_member_cannot_add(pool: PgPool) {
     let account_id = seed_account(&repo, "owner").await;
 
     let err = repo
-        .add_account_member("stranger", &account_id, "invitee")
+        .add_account_member("stranger", &account_id, "invitee", "member")
         .await
         .expect_err("a non-member must not add members");
     assert!(matches!(err, Error::NotFound));
@@ -104,7 +104,7 @@ async fn non_member_cannot_add(pool: PgPool) {
 async fn remove_member_revokes_access(pool: PgPool) {
     let repo = build_repo(pool);
     let account_id = seed_account(&repo, "owner").await;
-    repo.add_account_member("owner", &account_id, "invitee")
+    repo.add_account_member("owner", &account_id, "invitee", "member")
         .await
         .expect("add succeeds");
 
@@ -143,7 +143,11 @@ async fn cannot_remove_last_member(pool: PgPool) {
 async fn concurrent_removes_cannot_empty_the_account(pool: PgPool) {
     let repo = Arc::new(build_repo(pool));
     let account_id = seed_account(&repo, "owner").await;
-    repo.add_account_member("owner", &account_id, "invitee")
+    // Both members are "owner" here deliberately: this test exercises the last-member/last-owner
+    // race guard itself, not the role gate (an "admin" or "member" invitee removing an "owner"
+    // would hit the separate "only an owner can remove another owner" Forbidden path instead of
+    // the race condition under test).
+    repo.add_account_member("owner", &account_id, "invitee", "owner")
         .await
         .expect("add succeeds");
 
@@ -185,15 +189,31 @@ async fn concurrent_removes_cannot_empty_the_account(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn added_member_can_manage_the_account(pool: PgPool) {
+async fn added_admin_can_manage_the_account(pool: PgPool) {
+    // Suspend/resume is owner-or-admin since membership roles landed (previously any member).
+    // A plain "member" role is covered separately by `member_role_cannot_suspend_the_account`.
     let repo = build_repo(pool);
     let account_id = seed_account(&repo, "owner").await;
-    repo.add_account_member("owner", &account_id, "invitee")
+    repo.add_account_member("owner", &account_id, "invitee", "admin")
         .await
         .expect("add succeeds");
     let account = repo
         .set_account_status("invitee", &account_id, ResourceStatus::Suspended)
         .await
-        .expect("the new member should be able to act on the account");
+        .expect("an admin should be able to suspend the account");
     assert_eq!(account.status, ResourceStatus::Suspended);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn member_role_cannot_suspend_the_account(pool: PgPool) {
+    let repo = build_repo(pool);
+    let account_id = seed_account(&repo, "owner").await;
+    repo.add_account_member("owner", &account_id, "invitee", "member")
+        .await
+        .expect("add succeeds");
+    let err = repo
+        .set_account_status("invitee", &account_id, ResourceStatus::Suspended)
+        .await
+        .expect_err("a plain member must not be able to suspend the account");
+    assert!(matches!(err, Error::Forbidden(_)));
 }
