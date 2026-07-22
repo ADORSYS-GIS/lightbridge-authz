@@ -136,6 +136,13 @@ model ApiKey {
 // shape that does not match the hand-written migration. It exists solely so
 // `.some`/`.every`/`.none` policy predicates on Account/Project/ApiKey can
 // traverse into it.
+//
+// cratestack-pg 0.4.13 added parser/migrate-layer support for composite keys
+// (`@@id([accountId, subject])`, cratestack/cratestack#145), which would match this table's
+// real shape exactly and drop the synthetic `id` -- tried it, but codegen (query builders,
+// routing, generated clients) explicitly rejects it as not yet supported, tracked at
+// cratestack/cratestack#136. Revisit once that lands; the synthetic-`id` workaround stays
+// until then.
 model AccountMembership {
   id Cuid @id
   accountId Cuid
@@ -166,31 +173,18 @@ type RotateApiKeyInput {
   keyId Cuid
 }
 
-// Flattened deliberately -- cratestack-pg 0.4.9's codegen for `type` blocks
-// cannot reference a model type by name as a field (confirmed by a real
-// `include_server_schema!` compile: `type` structs are emitted inside
-// `cratestack_schema::types`, model structs inside the sibling
-// `cratestack_schema::models`, and the `type`-struct field-type generator
-// (`cratestack-macros/src/types.rs::generate_type_struct`) never emits the
-// `super::`/`super::models::` qualifier those cross-module references need
-// -- `type ApiKeySecret { apiKey ApiKey secret String }` fails with "cannot
-// find type `ApiKey` in this scope"). So this type inlines the ApiKey shape
-// as scalars instead of nesting the model, matching the real
-// `ApiKeySecret { api_key: ApiKey, secret: String, oauth2_url: Option<String> }`
-// DTO shape (crates/lightbridge-authz-core/src/dto.rs) field-by-field.
+// Nests the real `ApiKey` model directly, matching the real
+// `ApiKeySecret { api_key: ApiKey, secret: String, oauth2_url: Option<String> }` DTO shape
+// (crates/lightbridge-authz-core/src/dto.rs). Previously flattened as scalars, because
+// cratestack-pg 0.4.9-0.4.12's codegen for `type` blocks couldn't reference a model type by
+// name as a field (`type` structs were emitted inside `cratestack_schema::types`, model
+// structs in the sibling `cratestack_schema::models`, and the `type`-struct field generator
+// never emitted the `super::`/`super::models::` qualifier the cross-module reference needed --
+// confirmed by a real `include_server_schema!` compile failing with "cannot find type `ApiKey`
+// in this scope"). Fixed in cratestack-pg 0.4.13 (cratestack/cratestack#147); un-flattened here
+// now that it's adopted.
 type ApiKeySecret {
-  id Cuid
-  projectId Cuid
-  name String
-  keyPrefix String
-  status String
-  expiresAt DateTime?
-  lastUsedAt DateTime?
-  lastIp String?
-  revokedAt DateTime?
-  billingPlan String
-  createdAt DateTime
-  updatedAt DateTime
+  apiKey ApiKey
   secret String
   oauth2Url String?
 }

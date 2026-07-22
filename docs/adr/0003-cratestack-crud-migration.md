@@ -280,20 +280,39 @@ own.
    under 0.4.9 — that specific caveat no longer applies as of the 0.4.10 upgrade, since `ApiKey`'s
    soft-delete goes through the now-fixed generated path (it was never part of the `run_in_tx`
    workaround in item 1, which only covers the four hand-written procedures).
-3. **`@default(dbgenerated())` DDL emitter produces invalid SQL**, and separately **requires a real
-   Postgres-level `DEFAULT`** to exist for insert-time omission to work at all (an insert without a
-   DB-level default for a `dbgenerated()` field fails with a `NOT NULL` violation, not a graceful
-   fallback). See Migration ownership below — this is one of the two findings that changed the
-   migration-ownership decision, and this migration works around the second half by adding real
-   `DEFAULT now()` at the DB level via hand-written SQL for every `dbgenerated()`-typed column.
-4. **`type` blocks cannot reference a model type as a field** (found while authoring the schema, see
-   the inline comment on `ApiKeySecret` in `crates/lightbridge-authz-api/schema/authz.cstack`) —
-   `type` structs are generated in a sibling module to model structs and the generator never emits the
-   cross-module qualifier. Worked around by flattening the referenced model's fields directly into the
-   `type` instead of nesting it.
+3. **`@default(dbgenerated())` DDL emitter produces invalid SQL, and separately requires a real
+   Postgres-level `DEFAULT` — DDL-emitter half FIXED upstream in 0.4.13 (#148).** The migration-diff
+   emitter no longer produces invalid SQL for `dbgenerated()` fields, and now warns when it can't
+   verify a real DB-level default exists. This migration doesn't use cratestack's migration-diff
+   emitter at all (see Migration ownership below — schema-source-only, hand-written SQLx owns DDL),
+   so the fix doesn't change anything here in practice: the hand-written migration that adds real
+   `DEFAULT now()` for every `dbgenerated()`-typed column stays, independent of the emitter fix,
+   because the *insert-time* requirement (cratestack still needs a real DB default to correctly omit
+   the field from `INSERT`s) is unrelated to which tool emits the `DEFAULT` clause.
+4. **`type` blocks cannot reference a model type as a field — FIXED upstream in 0.4.13 (#137/#147).**
+   `type` structs were generated in a sibling module to model structs, and the field-type generator
+   never emitted the `super::`/`super::models::` qualifier the cross-module reference needed.
+   Upstream fix: `type`-block field generation now passes `custom_in_super = true`, resolving model
+   references through `super::`. **Adopted**: `ApiKeySecret` in
+   `crates/lightbridge-authz-api/schema/authz.cstack` now nests `apiKey ApiKey` directly instead of
+   the hand-flattened field list; `to_schema_api_key_secret` in
+   `crates/lightbridge-authz-rest/src/lib.rs` updated to match.
 
-None of these are worked around by silently changing behavior without a comment — each workaround is
-documented at its call site with a pointer back to this ADR.
+None of the remaining open items are worked around by silently changing behavior without a comment —
+each workaround is documented at its call site with a pointer back to this ADR.
+
+### Composite primary keys (0.4.13) — parser support only so far, not adopted
+
+cratestack-pg 0.4.13 added `@@id([...])` composite-primary-key support (cratestack/cratestack#145),
+which would let `AccountMembership` (Context above) drop its synthetic `id Cuid @id` field and
+declare `@@id([accountId, subject])` matching the real table's actual composite primary key exactly.
+Tried it — **codegen rejects it** with an explicit compile-time error: *"composite primary key ...
+not yet supported by codegen (query builders, routing, and generated clients still assume a single
+scalar `@id`)"*, pointing at cratestack/cratestack#136 as the tracking issue for full support. So
+0.4.13 only landed parser- and migration-diff-layer support; the synthetic-`id` workaround on
+`AccountMembership` stays until #136 lands. Confirmed by an actual `include_server_schema!` compile,
+not by reading the release notes alone — the release notes describe the feature as shipped, but
+codegen support is a separate, not-yet-complete piece.
 
 ### Migration ownership — REVISED after the spike (schema-source-only, not cratestack-owned)
 

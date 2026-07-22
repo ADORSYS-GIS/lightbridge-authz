@@ -225,20 +225,8 @@ fn to_schema_project(p: Project) -> schema::Project {
 }
 
 fn to_schema_api_key_secret(s: ApiKeySecret) -> schema::ApiKeySecret {
-    let k = s.api_key;
     schema::ApiKeySecret {
-        id: k.id,
-        projectId: k.project_id,
-        name: k.name,
-        keyPrefix: k.key_prefix,
-        status: k.status.to_string(),
-        expiresAt: k.expires_at,
-        lastUsedAt: k.last_used_at,
-        lastIp: k.last_ip,
-        revokedAt: k.revoked_at,
-        billingPlan: k.billing_plan,
-        createdAt: k.created_at,
-        updatedAt: k.updated_at,
+        apiKey: to_schema_api_key(s.api_key),
         secret: s.secret,
         oauth2Url: s.oauth2_url,
     }

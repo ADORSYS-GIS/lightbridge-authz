@@ -248,7 +248,7 @@ async fn create_api_key(
     );
     let v = json_body(&body);
     (
-        v["id"].as_str().expect("key id").to_string(),
+        v["apiKey"]["id"].as_str().expect("key id").to_string(),
         v["secret"].as_str().expect("secret").to_string(),
     )
 }
