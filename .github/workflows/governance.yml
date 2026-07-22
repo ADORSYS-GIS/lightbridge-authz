@@ -20,7 +20,7 @@ on:
 jobs:
   governance:
     # ADORSYS-GIS/ai-governance @ v1.0.0
-    uses: ADORSYS-GIS/ai-governance/.github/workflows/governance-check.yml@ac9e07188e34ca435d97e57c910d7d4a29895683
+    uses: ADORSYS-GIS/ai-governance/.github/workflows/governance-check.yml@4fad43310d18dd3eb47df614979966e244eca1b5
     permissions:
       pull-requests: write
       contents: read
