@@ -1717,6 +1717,7 @@ mod tests {
             last_ip: None,
             revoked_at: None,
             billing_plan: "free".to_string(),
+            updated_at: Utc::now(),
         }
     }
 

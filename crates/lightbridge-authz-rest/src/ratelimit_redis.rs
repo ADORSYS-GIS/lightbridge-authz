@@ -7,8 +7,9 @@
 //!
 //! IMPORTANT — read before touching this file: a Redis-backed implementation of this
 //! exact trait already exists and is published as its own crate, `cratestack-redis`
-//! (crates.io, pinned to the same `0.4.9` release as `cratestack-pg`/`cratestack-axum`,
-//! same author/homepage as the rest of the cratestack family). Its
+//! (crates.io, pinned to the same release as `cratestack-pg`/`cratestack-axum` — see the
+//! version comment in the workspace root `Cargo.toml`, currently `0.4.11` — kept in lockstep
+//! with the rest of the cratestack family whenever it's bumped). Its
 //! `cratestack_redis::RedisRateLimitStore`:
 //!
 //! - implements `cratestack_axum::ratelimit::RateLimitStore` (the trait this crate's

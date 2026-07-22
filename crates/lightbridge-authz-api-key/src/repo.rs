@@ -242,6 +242,7 @@ impl StoreRepo {
             last_ip: row.last_ip,
             revoked_at: row.revoked_at,
             billing_plan: row.billing_plan,
+            updated_at: row.updated_at,
         }
     }
 
@@ -933,7 +934,7 @@ impl StoreRepo {
             FROM project_auth
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
-              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan, api_keys.updated_at
             "#,
         )
         .bind(input.project_id)
@@ -977,7 +978,8 @@ impl StoreRepo {
               api_keys.last_used_at,
               api_keys.last_ip,
               api_keys.revoked_at,
-              api_keys.billing_plan
+              api_keys.billing_plan,
+              api_keys.updated_at
             FROM api_keys
             JOIN projects ON projects.id = api_keys.project_id
             WHERE api_keys.project_id = $1
@@ -1017,7 +1019,8 @@ impl StoreRepo {
               api_keys.last_used_at,
               api_keys.last_ip,
               api_keys.revoked_at,
-              api_keys.billing_plan
+              api_keys.billing_plan,
+              api_keys.updated_at
             FROM api_keys
             JOIN projects ON projects.id = api_keys.project_id
             WHERE api_keys.id = $1
@@ -1064,7 +1067,7 @@ impl StoreRepo {
               AND account_memberships.subject = $4
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
-              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan, api_keys.updated_at
             "#,
         )
         .bind(changes.name)
@@ -1206,7 +1209,7 @@ impl StoreRepo {
               AND account_memberships.subject = $5
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
-              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan, api_keys.updated_at
             "#,
         )
         .bind(status.to_string())
@@ -1245,7 +1248,7 @@ impl StoreRepo {
               AND account_memberships.subject = $5
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
-              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan, api_keys.updated_at
             "#,
         )
         .bind(status.to_string())
@@ -1273,7 +1276,7 @@ impl StoreRepo {
             FROM project_auth
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
-              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan, api_keys.updated_at
             "#,
         )
         .bind(new_key.project_id)
@@ -1324,7 +1327,7 @@ impl StoreRepo {
             r#"
             SELECT
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, revoked_at, billing_plan
+              last_used_at, last_ip, revoked_at, billing_plan, updated_at
             FROM api_keys
             WHERE key_hash = $1
             "#,
@@ -1358,7 +1361,7 @@ impl StoreRepo {
             WHERE id = $3
             RETURNING
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, revoked_at, billing_plan
+              last_used_at, last_ip, revoked_at, billing_plan, updated_at
             "#,
         )
         .bind(changes.last_used_at)

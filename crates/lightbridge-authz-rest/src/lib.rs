@@ -22,7 +22,6 @@ use handlers::AuthzStoreImpl;
 use ratelimit_redis::build_redis_rate_limit_store;
 use routers::opa_router;
 
-use chrono::Utc;
 use cratestack::idempotency::IdempotencyLayer;
 use cratestack::ratelimit::{RateLimitConfig, RateLimitLayer, RateLimitStore};
 use cratestack::{CodecSet, CoolContext, CoolError, SqlxIdempotencyStore, Value};
@@ -156,7 +155,7 @@ fn access_token_from_ctx(ctx: &CoolContext) -> Option<String> {
 fn to_schema_api_key(k: ApiKey) -> schema::ApiKey {
     schema::ApiKey {
         createdAt: k.created_at,
-        updatedAt: Utc::now(),
+        updatedAt: k.updated_at,
         id: k.id,
         projectId: k.project_id,
         name: k.name,
@@ -239,7 +238,7 @@ fn to_schema_api_key_secret(s: ApiKeySecret) -> schema::ApiKeySecret {
         revokedAt: k.revoked_at,
         billingPlan: k.billing_plan,
         createdAt: k.created_at,
-        updatedAt: Utc::now(),
+        updatedAt: k.updated_at,
         secret: s.secret,
         oauth2Url: s.oauth2_url,
     }
