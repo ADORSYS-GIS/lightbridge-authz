@@ -104,13 +104,17 @@ compiling unchanged after `@@paged` was added, and matching the codegen split fo
 axum handler and the generated client after calling the same underlying query, not inside the sqlx
 query builder itself).
 
-**Known upstream gap, filed as
-[cratestack/cratestack#123](https://github.com/cratestack/cratestack/issues/123):** cratestack does
-not clamp `limit`/`offset` server-side — `parse_model_list_query` parses them as plain unbounded
-`i64`. Not worked around here (these lists sit behind the RBAC gate and membership scoping, so
-exposure is to authenticated tenant members, not the open internet) — but a ceiling belongs in
-`rpc_authorize.rs` or equivalent before these routes are exposed to a less-trusted caller population,
-or once upstream adds native support.
+**Upstream gap — FIXED in 0.4.11.** cratestack previously did not clamp `limit`/`offset`
+server-side (`parse_model_list_query` parsed them as plain unbounded `i64`); filed as
+[cratestack/cratestack#123](https://github.com/cratestack/cratestack/issues/123) and fixed in
+[cratestack/cratestack#126](https://github.com/cratestack/cratestack/pull/126) (0.4.11, merged
+2026-07-22): a new `MAX_LIST_LIMIT = 1000` constant now rejects an explicit `limit` above it with
+`400`, and — note the behavior change — **defaults an omitted `limit` to `1000` rather than leaving
+it unbounded** (previously the easy way to bypass a would-be cap). Applies identically to REST and
+RPC list dispatch (the same fix added `rpc_pagination.rs` proving RPC `model.<M>.list` matches REST's
+`Page<T>` envelope and cap). No caller in this codebase currently relies on an unbounded/omitted
+`limit` returning more than 1,000 rows — confirmed by the full test suite passing unchanged after the
+0.4.11 upgrade.
 
 ### Soft-delete for `api_keys` only
 
