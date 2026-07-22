@@ -89,6 +89,29 @@ hand-declaring the pair three times. Mixins are field-only (no `@id`, no relatio
 attributes) and are expanded into the model before codegen, so this is purely a schema-authoring
 convenience — it changes nothing about the generated Rust types or the underlying columns.
 
+### Pagination (`@@paged`) on all four models
+
+`Account`, `Project`, `ApiKey`, and `AccountMembership` all declare `@@paged` (bare form — confirmed
+against real cratestack source that configurable paging modes aren't implemented yet). Every
+generated `list` route (REST and RPC alike) wraps its response in
+`Page<T> { items, totalCount, pageInfo: { limit, offset, hasNextPage, hasPreviousPage } }` instead of
+a bare array, and the handler runs a second count-only query per call for `totalCount`. This only
+affects HTTP-facing consumers (the RPC surface, and the generated Rust/TS *client*) — the raw
+server-side query builder (`cool.account().find_many()...run(ctx)`, what `lib.rs`'s procedures and
+`mcp.rs` call directly) is unaffected and still returns a plain `Vec<T>`; confirmed by the workspace
+compiling unchanged after `@@paged` was added, and matching the codegen split found in
+`cratestack-macros/src/axum/model/handlers_list.rs` / `prep/list_logging.rs` (paging is applied by the
+axum handler and the generated client after calling the same underlying query, not inside the sqlx
+query builder itself).
+
+**Known upstream gap, filed as
+[cratestack/cratestack#123](https://github.com/cratestack/cratestack/issues/123):** cratestack does
+not clamp `limit`/`offset` server-side — `parse_model_list_query` parses them as plain unbounded
+`i64`. Not worked around here (these lists sit behind the RBAC gate and membership scoping, so
+exposure is to authenticated tenant members, not the open internet) — but a ceiling belongs in
+`rpc_authorize.rs` or equivalent before these routes are exposed to a less-trusted caller population,
+or once upstream adds native support.
+
 ### Soft-delete for `api_keys` only
 
 `ApiKey` declares `@@soft_delete` with a `deletedAt DateTime?` field (mapped to a fixed `deleted_at`
@@ -206,31 +229,53 @@ spike that validates policy-expressibility (can `account_memberships`-style tena
 layered on top of cratestack-generated queries where needed) and CBOR wiring still happens before the
 full cutover lands, but it is tracked and executed separately and does not gate this ADR.
 
+**Version pin:** this migration went in against `cratestack-pg` `0.4.9`, then upgraded the whole
+family (`cratestack-pg`/`cratestack-core`/`cratestack-axum`/`cratestack-redis`/
+`cratestack-codec-{cbor,json}`) to `0.4.10` once released, to pick up the fixes for two of the four
+bugs found during the spike — see "Known cratestack-pg 0.4.9 bugs" below for what's fixed and what
+workarounds are (deliberately, for now) still in place on top of the fix.
+
 ### Known cratestack-pg 0.4.9 bugs found during this migration
 
 The required spike (see Pre-1.0 risk above) surfaced four real, reproduced bugs in `cratestack-pg`
 `0.4.9` — worth recording here in one place since this migration is explicitly dogfooding the
-author's own product and these are exactly the class of finding that should feed back into it:
+author's own product and these are exactly the class of finding that should feed back into it. Items
+1 and 2 were filed upstream as
+[cratestack/cratestack#116](https://github.com/cratestack/cratestack/issues/116) and
+[#117](https://github.com/cratestack/cratestack/issues/117), and both were **fixed and released in
+`cratestack-pg` 0.4.10** via
+[cratestack/cratestack#120](https://github.com/cratestack/cratestack/pull/120) (merged 2026-07-22),
+which this migration adopted (see Pre-1.0 risk's version-pin note below). The workarounds described
+below are **intentionally left in place for now** — the fix landing means the underlying bug no
+longer blocks anyone, but reverting the workarounds (restoring generated `run_in_tx`/full `@@audit`
+coverage on `rotateApiKey`/`revokeApiKey`/`createApiKey`/`createAccount`) is deliberately deferred to
+a separate follow-up rather than bundled into the version bump, to keep that change reviewable on its
+own.
 
-1. **`run_in_tx` self-deadlock on chained calls.** Every `run_in_tx` call unconditionally re-runs
-   `ensure_audit_table` DDL (including `CREATE INDEX IF NOT EXISTS`) against a fresh pool connection,
-   not the caller's transaction. Two chained `run_in_tx` calls to `@@audit`-enabled models inside one
-   caller-managed transaction deadlock: the first call's audit insert holds a lock the second call's
-   `CREATE INDEX IF NOT EXISTS` needs, and the caller's own transaction can't advance to commit while
-   blocked on the second call. Reproduced with a straightforward two-write rotate procedure (see
-   below). Workaround adopted here: `rotateApiKey`/`revokeApiKey` do their writes via hand-written
-   `sqlx` inside their own transaction (the same approach `rotate_api_key_transaction` already used
-   pre-migration), not via generated `run_in_tx` — sacrificing cratestack's automatic per-write audit
-   row for exactly these two procedures. Every plain CRUD create/update/delete elsewhere is unaffected
-   (single write per call, nothing chained). The real fix belongs upstream: cache "audit table
-   ensured" per-process instead of re-issuing `CREATE INDEX IF NOT EXISTS` on every write.
-2. **Soft-delete audit snapshot is wrong.** For `@@soft_delete` models, `delete()` runs an `UPDATE ...
-   RETURNING *`, not a hard `DELETE ... RETURNING *`, but the audit code unconditionally treats the
-   `RETURNING` row as the `before` snapshot and always writes `after = null`. Confirmed by inspecting
-   a real `cratestack_audit` row after a soft-delete: `before` already showed `deleted_at` set (the
-   *post*-update state), `after` was `null`. This means `ApiKey`'s audit trail for the `delete` verb
-   is misleading as shipped — accepted as a known limitation for this migration (not worked around by
-   hand, to avoid adding more special-casing on top of an upstream bug); revisit once fixed upstream.
+1. **`run_in_tx` self-deadlock on chained calls — FIXED upstream in 0.4.10 (#116/#120).** Every
+   `run_in_tx` call unconditionally re-ran `ensure_audit_table` DDL (including
+   `CREATE INDEX IF NOT EXISTS`) against a fresh pool connection, not the caller's transaction. Two
+   chained `run_in_tx` calls to `@@audit`-enabled models inside one caller-managed transaction
+   deadlocked: the first call's audit insert held a lock the second call's `CREATE INDEX IF NOT
+   EXISTS` needed, and the caller's own transaction couldn't advance to commit while blocked on the
+   second call. Reproduced with a straightforward two-write rotate procedure. Upstream fix: the
+   "audit table ensured" check is now cached per `SqlxRuntime` instead of re-issuing DDL on every
+   write. **Workaround still in place here** (not yet reverted): `rotateApiKey`/`revokeApiKey`/
+   `createApiKey`/`createAccount` do their writes via hand-written `sqlx` inside their own
+   transaction rather than generated `run_in_tx` — which means these four procedures currently
+   produce **no `cratestack_audit` rows**, unlike every plain CRUD create/update/delete elsewhere.
+   Reverting to generated `run_in_tx` (now deadlock-free) would close that audit-coverage gap; this
+   is the deferred follow-up referenced above.
+2. **Soft-delete audit snapshot is wrong — FIXED upstream in 0.4.10 (#117/#120).** For `@@soft_delete`
+   models, `delete()` ran an `UPDATE ... RETURNING *`, not a hard `DELETE ... RETURNING *`, but the
+   audit code unconditionally treated the `RETURNING` row as the `before` snapshot and always wrote
+   `after = null`. Confirmed by inspecting a real `cratestack_audit` row after a soft-delete: `before`
+   already showed `deleted_at` set (the *post*-update state), `after` was `null`. Upstream fix:
+   `before` now comes from a genuine pre-mutation row-locked read, `after` is now populated from the
+   `RETURNING` row. This means `ApiKey`'s audit trail for the `delete` verb was misleading as shipped
+   under 0.4.9 — that specific caveat no longer applies as of the 0.4.10 upgrade, since `ApiKey`'s
+   soft-delete goes through the now-fixed generated path (it was never part of the `run_in_tx`
+   workaround in item 1, which only covers the four hand-written procedures).
 3. **`@default(dbgenerated())` DDL emitter produces invalid SQL**, and separately **requires a real
    Postgres-level `DEFAULT`** to exist for insert-time omission to work at all (an insert without a
    DB-level default for a `dbgenerated()` field fails with a `NOT NULL` violation, not a graceful

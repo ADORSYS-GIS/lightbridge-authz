@@ -287,15 +287,18 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    // `Account` carries `@@paged`: the list route wraps results in
+    // `Page<T> { items, totalCount, pageInfo }` rather than a bare array.
     let accounts = json_body(&body);
     assert!(
-        accounts
+        accounts["items"]
             .as_array()
             .unwrap()
             .iter()
             .any(|a| a["id"] == account_id),
         "list should include the created account"
     );
+    assert!(accounts["totalCount"].as_i64().unwrap() >= 1);
 
     let new_billing = format!("tenant2-{}", cuid2());
     let (status, body) = rpc_call(
@@ -338,7 +341,7 @@ async fn crud_lifecycle_for_all_resources_over_json() {
         String::from_utf8_lossy(&body)
     );
     assert!(
-        json_body(&body)
+        json_body(&body)["items"]
             .as_array()
             .unwrap()
             .iter()
@@ -384,7 +387,7 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        json_body(&body)
+        json_body(&body)["items"]
             .as_array()
             .unwrap()
             .iter()
@@ -422,7 +425,7 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        !json_body(&body)
+        !json_body(&body)["items"]
             .as_array()
             .unwrap()
             .iter()

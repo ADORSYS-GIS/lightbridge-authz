@@ -23,6 +23,17 @@ mixin AuditFields {
   updatedAt DateTime @default(dbgenerated())
 }
 
+// `@@paged` (bare form only, confirmed against cratestack source -- configurable paging modes
+// aren't implemented yet) wraps every `list` route's response in
+// `Page<T> { items, totalCount, pageInfo: { limit, offset, hasNextPage, hasPreviousPage } }`
+// instead of a bare array, and runs a second count-only query per list call for `total_count`.
+// Applied to all four models below. Known upstream gap, filed as
+// https://github.com/cratestack/cratestack/issues/123: cratestack does not clamp `limit`/`offset`
+// server-side (see `parse_model_list_query` -- `crates/cratestack-macros/src/axum/shared_support.rs`),
+// so a caller can request an unbounded `limit`; if these lists become externally reachable with
+// meaningfully large tables, a ceiling needs to live in `rpc_authorize.rs` or equivalent until
+// upstream adds one.
+
 model Account {
   @use(AuditFields)
 
@@ -43,6 +54,7 @@ model Account {
   // one transaction, and `model.Account.create` is also denied unconditionally at the
   // RBAC layer (crates/lightbridge-authz-rest/src/rpc_authorize.rs).
   @@audit
+  @@paged
   @@allow("read", memberships.some.subject == auth().id)
   @@allow("update", memberships.some.subject == auth().id)
   @@allow("delete", memberships.some.subject == auth().id)
@@ -62,6 +74,7 @@ model Project {
   apiKeys ApiKey[] @relation(fields:[id],references:[projectId])
 
   @@audit
+  @@paged
   @@allow("create", account.memberships.some.subject == auth().id)
   @@allow("read", account.memberships.some.subject == auth().id)
   @@allow("update", account.memberships.some.subject == auth().id)
@@ -107,6 +120,7 @@ model ApiKey {
   // denied unconditionally at the RBAC layer (crates/lightbridge-authz-rest/src/rpc_authorize.rs).
   @@soft_delete
   @@audit
+  @@paged
   @@allow("read", project.account.memberships.some.subject == auth().id)
   @@allow("update", project.account.memberships.some.subject == auth().id)
   @@allow("delete", project.account.memberships.some.subject == auth().id)
@@ -129,6 +143,7 @@ model AccountMembership {
   createdAt DateTime
   account Account @relation(fields:[accountId],references:[id])
 
+  @@paged
   @@allow("read", subject == auth().id)
 }
 

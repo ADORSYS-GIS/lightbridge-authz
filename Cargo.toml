@@ -70,19 +70,22 @@ rmcp = { version = "2.1.0", features = ["transport-streamable-http-server"] }
 
 mimalloc = "0"
 
-# cratestack: pinned to the same 0.4.9 release across the family so `cratestack-redis`'s
+# cratestack: pinned to the same 0.4.10 release across the family so `cratestack-redis`'s
 # `RateLimitStore` impl and `cratestack-axum`'s trait/config types stay in lockstep (see
-# docs/adr/0003-cratestack-crud-migration.md, "Rate limiting (Redis-backed)").
-cratestack-core = "0.4.9"
-cratestack-axum = "0.4.9"
-cratestack-redis = "0.4.9"
+# docs/adr/0003-cratestack-crud-migration.md, "Rate limiting (Redis-backed)"). 0.4.10 carries
+# cratestack/cratestack#120, fixing the two upstream bugs this migration found and worked around
+# (see ADR-0003, "Known cratestack-pg 0.4.9 bugs" for the issues; #116/#117 respectively) — the
+# workarounds themselves are left in place for now, not reverted as part of this version bump.
+cratestack-core = "0.4.10"
+cratestack-axum = "0.4.10"
+cratestack-redis = "0.4.10"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
 # `include_server_schema!` macro emits `::cratestack::*` paths (see cratestack-pg lib docs). The
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
 # it to build the RPC router (ADR-0003).
-cratestack = { package = "cratestack-pg", version = "0.4.9" }
-cratestack-codec-cbor = "0.4.9"
-cratestack-codec-json = "0.4.9"
+cratestack = { package = "cratestack-pg", version = "0.4.10" }
+cratestack-codec-cbor = "0.4.10"
+cratestack-codec-json = "0.4.10"
 redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
 
 [profile.prod]

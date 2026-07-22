@@ -782,9 +782,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-axum"
-version = "0.4.9"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bf24e1cbce9a656de10ad6b0704695748f1e94d2aea5c49451714984929bab9"
+checksum = "cb981ceb3d48007faa85ab3f50ed95e1126197298c4cf8195695095e04323f8e"
 dependencies = [
  "async-trait",
  "axum",
@@ -801,9 +801,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-client-rust"
-version = "0.4.9"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43c7e997210be288c498229f8ef54a1342cb963dc009699c38fa6f785b655f70"
+checksum = "e8914f48d2342de67951bf199c82e5b0641ffc18f791c8ef13ceeed37d980d56"
 dependencies = [
  "bytes",
  "chrono",
@@ -824,9 +824,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-codec-cbor"
-version = "0.4.9"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b227c62f81c967cae9db38d2c17822e86674413150637ca2cd78f2f527632352"
+checksum = "bdd57daa2271d643b0f21ae675bac46947523eb0b943dc6a9df0809ec1314ebc"
 dependencies = [
  "cratestack-core",
  "minicbor-serde",
@@ -835,9 +835,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-codec-json"
-version = "0.4.9"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d428908da53bbf2b863087c57105860c6d2de4f327c50a25e4400da48f2b57a"
+checksum = "33bb6dfcdfd6e1039fbe5d1b6271c25ca9ba1c0efd0d20ece3bdc98a23c5717f"
 dependencies = [
  "cratestack-core",
  "serde",
@@ -846,9 +846,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-core"
-version = "0.4.9"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a333875794b0a637d2537b62e5f5ed650de99740d535604c49c0085d5601b75"
+checksum = "fb9f9865ddb2fd9e71a4cf5115c1581f86350c55f904d920135370093b9775d3"
 dependencies = [
  "async-trait",
  "base64",
@@ -868,9 +868,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-macros"
-version = "0.4.9"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "601958c69b55a3e32bd93e50566a373d5da1198d8c3551fa6139b0ed537edcfb"
+checksum = "a20e7c3723aa7da72df361b635b85a60f908940fce8708a69fb7b9b6d721ee65"
 dependencies = [
  "cratestack-core",
  "cratestack-parser",
@@ -882,9 +882,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-parser"
-version = "0.4.9"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "086f679f4f355dcd960aca458dd3f54b8b281d8a9174b110d1855df823334e06"
+checksum = "946e00a8f4b0d1d9960c1ac2df13de21bb4e76e87b759ea303744190b42ed3f1"
 dependencies = [
  "ariadne",
  "chumsky",
@@ -895,9 +895,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-pg"
-version = "0.4.9"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad42ce419de48f1af78f3fc0f6836fdce52083579aca7d8b12b917f58a4a4f7d"
+checksum = "b5c875a3d94330286e5e9752a6351c007b4227568903153db5f2427c22fd5156"
 dependencies = [
  "chrono",
  "cratestack-axum",
@@ -917,9 +917,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-policy"
-version = "0.4.9"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c381c25ee803c92ff5402ee4c7683829f3786ef75f1be4d7b6a234cb4d98b1bd"
+checksum = "cfa633f1e3419e9d377c43cbd95e5ae1dd6880b123ecdca93d33f5040c25629d"
 dependencies = [
  "cratestack-core",
  "serde",
@@ -927,9 +927,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-redis"
-version = "0.4.9"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a008c63d537a2e82a11601c8e55a835fc7a7700c31d6ccc19030845c0dde3c03"
+checksum = "566318aeebd8f1b503bd3f690fd31e858f6ac73cc655a8ce45f891aedaa44932"
 dependencies = [
  "async-trait",
  "cratestack-axum",
@@ -941,9 +941,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-sql"
-version = "0.4.9"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a3723c422f8a89c29cb37db44ef2f660d9b9d616753d22ab6c221883d15455e"
+checksum = "b6f219126b8f16148beea20290997f02140f44d381487e38f7db91cb6ab95e8f"
 dependencies = [
  "chrono",
  "cratestack-core",
@@ -956,9 +956,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-sqlx"
-version = "0.4.9"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62cbe3490cf1cbefb30c8209d697233d1c5856a46e26dba4dab59a820acc3231"
+checksum = "0143c7c1e9f880741bcefd5f07ffe2da7d9aa999d59936999847e988bc254bdc"
 dependencies = [
  "async-trait",
  "chrono",
