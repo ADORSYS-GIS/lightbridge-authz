@@ -39,7 +39,11 @@ model Account {
 
   id Cuid @id
   billingIdentity String @unique
-  status String
+  // Server-managed lifecycle state: set only by the disable/enable procedures and the
+  // DB `DEFAULT 'active'` (migrations/20260714000001). `@readonly` drops it from the
+  // generated create/update inputs so a raw RPC caller cannot supply a born-suspended
+  // status, matching `ApiKey.status` below.
+  status String @readonly
   projects Project[] @relation(fields:[id],references:[accountId])
   memberships AccountMembership[] @relation(fields:[id],references:[accountId])
 
@@ -79,7 +83,10 @@ model Project {
   allowedModels Json?
   defaultLimits Json
   billingPlan String
-  status String
+  // Server-managed lifecycle state, same contract as `Account.status` above: mutated only
+  // by disable/enable procedures + DB `DEFAULT 'active'`, `@readonly` so it is absent from
+  // the generic `model.Project.create`/`update` inputs.
+  status String @readonly
   account Account @relation(fields:[accountId],references:[id])
   apiKeys ApiKey[] @relation(fields:[id],references:[projectId])
 

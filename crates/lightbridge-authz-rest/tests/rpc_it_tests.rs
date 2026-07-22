@@ -199,7 +199,6 @@ fn project_input(
         }),
         defaultLimits: Json(CValue::Map(std::collections::BTreeMap::new())),
         billingPlan: "free".to_string(),
-        status: "active".to_string(),
     }
 }
 

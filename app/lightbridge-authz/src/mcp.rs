@@ -13,8 +13,7 @@ use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait, TokenInfo};
 use lightbridge_authz_core::{
-    Config, CreateAccount, CreateApiKey, DefaultLimits, Error, Permission, ResourceStatus, Result,
-    RotateApiKey,
+    Config, CreateAccount, CreateApiKey, DefaultLimits, Error, Permission, Result, RotateApiKey,
     config::{ApiServer, BasicAuth, Billing, Oauth2},
     cuid::cuid2,
     db::{DbPoolTrait, is_database_ready},
@@ -992,7 +991,6 @@ impl LightbridgeMcpHandler {
                 .map(|models| cratestack_json(json!(models))),
             defaultLimits: cratestack_json(default_limits_json),
             billingPlan: params.billing_plan,
-            status: ResourceStatus::Active.to_string(),
         };
         let project = bound
             .project()
