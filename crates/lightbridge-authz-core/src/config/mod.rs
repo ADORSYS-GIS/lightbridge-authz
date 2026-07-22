@@ -18,6 +18,13 @@ pub struct Config {
     pub server: Server,
     pub logging: Logging,
     pub database: Database,
+    /// Redis connection used for `authz-api`'s Redis-backed rate limiting (see
+    /// `docs/adr/0003-cratestack-crud-migration.md`, "Rate limiting (Redis-backed)").
+    /// Optional: `authz-opa`, `lightbridge-mcp`, and the usage service load this same
+    /// `Config` type but do not need Redis, so a config file that omits `redis` entirely
+    /// still loads.
+    #[serde(default)]
+    pub redis: Option<Redis>,
     pub oauth2: Oauth2,
     pub otel: Otel,
     /// Billing plans a caller may attach to an API key at creation time. The catalogue is defined
@@ -233,6 +240,14 @@ pub struct Logging {
 pub struct Database {
     pub url: String,
     pub pool_size: Option<u32>,
+}
+
+/// Redis connection settings. `url` is a standard `redis://[:password@]host:port[/db]`
+/// connection string, e.g. `redis://redis:6379` in Compose or `redis://localhost:6379`
+/// for non-container local runs (see `config/default.yaml`, `.docker/authz/container.yaml`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Redis {
+    pub url: String,
 }
 
 /// Credential-issuance mode. REQUIRED and has no default — the operator must state it explicitly,

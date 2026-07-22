@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
                     pool_clone,
                     &config_clone.oauth2,
                     &config_clone.billing,
+                    &config_clone.redis,
                 )
                 .await
                 {
@@ -102,7 +103,14 @@ async fn main() -> Result<()> {
             info!("Connecting to DB...");
             let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(&config.database).await?);
 
-            start_api_server(&config.server.api, pool, &config.oauth2, &config.billing).await?;
+            start_api_server(
+                &config.server.api,
+                pool,
+                &config.oauth2,
+                &config.billing,
+                &config.redis,
+            )
+            .await?;
             Ok(())
         }
         Some(Commands::Opa { config_path }) => {

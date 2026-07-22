@@ -158,6 +158,7 @@ pub struct ApiKey {
     /// Billing plan this key is minted on. Chosen at creation from the operator-configured
     /// (env-driven) plan set; preserved across rotation.
     pub billing_plan: String,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

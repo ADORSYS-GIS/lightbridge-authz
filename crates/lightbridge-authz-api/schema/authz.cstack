@@ -1,0 +1,339 @@
+// authz-api CRUD schema (ADR-0003: cratestack-pg migration).
+//
+// Owns: accounts, projects, api_keys (cratestack-generated CRUD + migrations
+// going forward). account_memberships is modeled here too, but ONLY as a
+// relation target for @@allow/@@deny policy traversal -- its real schema
+// evolution stays owned by the hand-written SQLx migrations under
+// migrations/, per the ADR's scope boundary. See the `AccountMembership`
+// model below for the specific caveat this creates.
+
+transport rpc
+
+datasource db {
+  provider = "postgresql"
+  url = env("DATABASE_URL")
+}
+
+auth Principal {
+  id String
+}
+
+mixin AuditFields {
+  createdAt DateTime @default(dbgenerated())
+  updatedAt DateTime @default(dbgenerated())
+}
+
+// `@@paged` (bare form only, confirmed against cratestack source -- configurable paging modes
+// aren't implemented yet) wraps every `list` route's response in
+// `Page<T> { items, totalCount, pageInfo: { limit, offset, hasNextPage, hasPreviousPage } }`
+// instead of a bare array, and runs a second count-only query per list call for `total_count`.
+// Applied to all four models below. Known upstream gap, filed as
+// https://github.com/cratestack/cratestack/issues/123: cratestack does not clamp `limit`/`offset`
+// server-side (see `parse_model_list_query` -- `crates/cratestack-macros/src/axum/shared_support.rs`),
+// so a caller can request an unbounded `limit`; if these lists become externally reachable with
+// meaningfully large tables, a ceiling needs to live in `rpc_authorize.rs` or equivalent until
+// upstream adds one.
+
+model Account {
+  @use(AuditFields)
+
+  id Cuid @id
+  billingIdentity String @unique
+  // Server-managed lifecycle state: set only by the disable/enable procedures and the
+  // DB `DEFAULT 'active'` (migrations/20260714000001). `@readonly` drops it from the
+  // generated create/update inputs so a raw RPC caller cannot supply a born-suspended
+  // status, matching `ApiKey.status` below.
+  status String @readonly
+  projects Project[] @relation(fields:[id],references:[accountId])
+  memberships AccountMembership[] @relation(fields:[id],references:[accountId])
+
+  // NOTE: no `@@allow("create", ...)`. Removing it fail-closes the generic
+  // `model.Account.create` RPC verb: that verb inserts ONLY the `accounts` row and
+  // never seeds `account_memberships`, so the creator would immediately fail every
+  // membership-scoped `@@allow` below -- unable to read the account back, create a
+  // project under it (Project's create policy traverses `account.memberships`), or add
+  // a member (`addAccountMember` requires the acting subject to already be a member) --
+  // a chicken-and-egg deadlock. Account creation now goes exclusively through the
+  // `createAccount` procedure, which inserts the account and the creator's membership in
+  // one transaction, and `model.Account.create` is also denied unconditionally at the
+  // RBAC layer (crates/lightbridge-authz-rest/src/rpc_authorize.rs).
+  //
+  // NOTE: no `@@allow("delete", ...)` either, as of the membership-roles change. Account
+  // deletion is now owner-only, and cratestack's relation-quantifier policy predicates can't
+  // express a per-row compound condition ("the member row matching my subject must ALSO have
+  // role='owner'") -- `memberships.some.subject == auth().id && memberships.some.role ==
+  // "owner"` would compile to two independent EXISTS checks, not one joint check on the same
+  // row (confirmed by reading `cratestack-macros/src/policy/model/relation_path.rs`: each
+  // dotted policy path resolves to exactly one target field per relation hop, no support for
+  // multiple fields on one related row). So the role check moved into the `deleteAccountPermanently`
+  // procedure's hand-written SQL instead, and `model.Account.delete` is denied unconditionally
+  // at the RBAC layer, same pattern as create.
+  @@audit
+  @@paged
+  @@allow("read", memberships.some.subject == auth().id)
+  @@allow("update", memberships.some.subject == auth().id)
+}
+
+model Project {
+  @use(AuditFields)
+
+  id Cuid @id
+  accountId Cuid
+  name String
+  allowedModels Json?
+  defaultLimits Json
+  billingPlan String
+  // Server-managed lifecycle state, same contract as `Account.status` above: mutated only
+  // by disable/enable procedures + DB `DEFAULT 'active'`, `@readonly` so it is absent from
+  // the generic `model.Project.create`/`update` inputs.
+  status String @readonly
+  account Account @relation(fields:[accountId],references:[id])
+  apiKeys ApiKey[] @relation(fields:[id],references:[projectId])
+
+  @@audit
+  @@paged
+  @@allow("create", account.memberships.some.subject == auth().id)
+  @@allow("read", account.memberships.some.subject == auth().id)
+  @@allow("update", account.memberships.some.subject == auth().id)
+  @@allow("delete", account.memberships.some.subject == auth().id)
+}
+
+// Field-level immutability closes the gap the coarse RBAC gate cannot express on
+// its own: a caller who legitimately holds `apikey:update` (and account
+// membership) must still not be able to overwrite the security-sensitive columns
+// that are supposed to be gated by the dedicated `apikey:rotate` / `apikey:revoke`
+// / `apikey:create` capabilities. `@readonly` drops a field from BOTH the
+// generated `CreateApiKeyInput` and `UpdateApiKeyInput` (it stays readable in the
+// read/output model), and `@server_only` additionally masks the field from
+// outbound JSON. So the generated `UpdateApiKeyInput` collapses to exactly
+// `{ name, expiresAt }` -- matching the pre-migration `UpdateApiKey` DTO -- while
+// `status`/`keyHash`/`billingPlan`/`revokedAt`/`keyPrefix`/`projectId`/telemetry
+// remain server-managed (set only by the hand-written `createApiKey`/`rotateApiKey`/
+// `revokeApiKey` procedures). `keyHash` is `@server_only` so it is never emitted on
+// the wire, restoring the `#[serde(skip_serializing)]` guarantee the pre-migration
+// `ApiKey` DTO had (the generic model read would otherwise leak the hash).
+model ApiKey {
+  @use(AuditFields)
+
+  id Cuid @id
+  projectId Cuid @readonly
+  name String
+  keyPrefix String @readonly
+  keyHash String @unique @server_only
+  status String @readonly
+  expiresAt DateTime?
+  lastUsedAt DateTime? @readonly
+  lastIp String? @readonly
+  revokedAt DateTime? @readonly
+  deletedAt DateTime? @readonly
+  billingPlan String @readonly
+  project Project @relation(fields:[projectId],references:[id])
+
+  // NOTE: no `@@allow("create", ...)`. Removing it fail-closes the generic
+  // `model.ApiKey.create` RPC verb (a caller could otherwise supply
+  // `keyHash`/`keyPrefix`/`billingPlan` directly instead of the server generating,
+  // hashing, and billing-validating a secret). Key creation now goes exclusively
+  // through the `createApiKey` procedure below, and `model.ApiKey.create` is also
+  // denied unconditionally at the RBAC layer (crates/lightbridge-authz-rest/src/rpc_authorize.rs).
+  @@soft_delete
+  @@audit
+  @@paged
+  @@allow("read", project.account.memberships.some.subject == auth().id)
+  @@allow("update", project.account.memberships.some.subject == auth().id)
+  @@allow("delete", project.account.memberships.some.subject == auth().id)
+}
+
+// Relation target ONLY. The real `account_memberships` table (owned by
+// migrations/20260304000001_account_memberships.sql) has a composite
+// primary key (account_id, subject) and no `id` column. cratestack requires
+// every model to declare exactly one scalar `@id` field, so `id` below is a
+// synthetic field with no backing column in the real table. This model must
+// never be handed to cratestack's migration generator/diff tool -- doing so
+// would try to create an `id` column and an `account_memberships` table
+// shape that does not match the hand-written migration. It exists solely so
+// `.some`/`.every`/`.none` policy predicates on Account/Project/ApiKey can
+// traverse into it.
+//
+// cratestack-pg 0.4.13 added parser/migrate-layer support for composite keys
+// (`@@id([accountId, subject])`, cratestack/cratestack#145), which would match this table's
+// real shape exactly and drop the synthetic `id` -- tried it, but codegen (query builders,
+// routing, generated clients) explicitly rejects it as not yet supported, tracked at
+// cratestack/cratestack#136. Revisit once that lands; the synthetic-`id` workaround stays
+// until then.
+model AccountMembership {
+  id Cuid @id
+  accountId Cuid
+  subject String
+  // "owner" | "admin" | "member" (DB CHECK constraint, migrations/20260722000001_account_
+  // membership_roles.sql). Gates addAccountMember/removeAccountMember/disableAccount/
+  // enableAccount/deleteAccountPermanently/setAccountMemberRole via hand-written sqlx role checks in
+  // those procedures (see the compound-condition limitation noted on `Account` above for why
+  // this isn't expressed as an `@@allow` policy). Not independently mutable through generic
+  // CRUD -- there is no `@@allow("update", ...)` below, so role changes go exclusively through
+  // `setAccountMemberRole`.
+  role String
+  createdAt DateTime
+  account Account @relation(fields:[accountId],references:[id])
+
+  @@paged
+  @@allow("read", subject == auth().id)
+}
+
+// Stale-tolerant dashboard aggregate only -- explicitly NOT used for any
+// authorization or validation decision (see ADR-0003, "Materialized views").
+// Refresh is explicit (runtime.views().account_summary().refresh().await),
+// never automatic-on-write.
+view AccountSummary from Account, Project, ApiKey {
+  id Cuid @id @from(Account.id)
+  projectCount Int
+  apiKeyCount Int
+  activeApiKeyCount Int
+
+  @@server_sql("SELECT a.id, COUNT(DISTINCT p.id)::int AS project_count, COUNT(DISTINCT k.id)::int AS api_key_count, COUNT(DISTINCT k.id) FILTER (WHERE k.status = 'active' AND k.deleted_at IS NULL)::int AS active_api_key_count FROM accounts a LEFT JOIN projects p ON p.account_id = a.id LEFT JOIN api_keys k ON k.project_id = p.id GROUP BY a.id")
+  @@allow("read", auth() != null)
+  @@materialized
+}
+
+type RotateApiKeyInput {
+  keyId Cuid
+}
+
+// Nests the real `ApiKey` model directly, matching the real
+// `ApiKeySecret { api_key: ApiKey, secret: String, oauth2_url: Option<String> }` DTO shape
+// (crates/lightbridge-authz-core/src/dto.rs). Previously flattened as scalars, because
+// cratestack-pg 0.4.9-0.4.12's codegen for `type` blocks couldn't reference a model type by
+// name as a field (`type` structs were emitted inside `cratestack_schema::types`, model
+// structs in the sibling `cratestack_schema::models`, and the `type`-struct field generator
+// never emitted the `super::`/`super::models::` qualifier the cross-module reference needed --
+// confirmed by a real `include_server_schema!` compile failing with "cannot find type `ApiKey`
+// in this scope"). Fixed in cratestack-pg 0.4.13 (cratestack/cratestack#147); un-flattened here
+// now that it's adopted.
+type ApiKeySecret {
+  apiKey ApiKey
+  secret String
+  oauth2Url String?
+}
+
+mutation procedure rotateApiKey(args: RotateApiKeyInput): ApiKeySecret
+  @allow(auth() != null)
+
+// Server-side account creation (ADR-0003 follow-up). Replaces the now-denied generic
+// `model.Account.create` verb, which inserted only the `accounts` row and never seeded
+// `account_memberships` -- leaving the creator with zero memberships and therefore locked out
+// of every membership-scoped `@@allow` on Account/Project/ApiKey (could not read the account
+// back, create a project under it, or add a member). Implemented as hand-written sqlx in the
+// ProcedureRegistry impl (reusing `AuthzStoreImpl::create_account` -> `StoreRepo::create_account`),
+// which inserts the account row and the creator's membership row in one transaction (NOT
+// cratestack's `run_in_tx`, per the chained-write deadlock finding in ADR-0003, "Known
+// cratestack-pg 0.4.9 bugs", item 1). The server generates the account id; the caller supplies
+// only `billingIdentity` (status defaults to 'active' at the DB level).
+type CreateAccountInput {
+  billingIdentity String
+}
+
+mutation procedure createAccount(args: CreateAccountInput): Account
+  @allow(auth() != null)
+
+// Server-side API-key creation (ADR-0003 follow-up). Replaces the now-denied generic
+// `model.ApiKey.create` verb: the server generates the secret, hashes it, derives the
+// prefix, and validates `billingPlan` against the operator-configured catalogue -- none
+// of which the caller may supply. Input mirrors the pre-migration
+// `POST /projects/{project_id}/api-keys` request (path `project_id` + body
+// `{ name, expires_at, billing_plan }`); the pre-migration `CreateApiKey` DTO carried no
+// `allowed_models` (that lives on Project), so this input does not either. Implemented as
+// hand-written sqlx in the ProcedureRegistry impl (reusing `AuthzStoreImpl::create_api_key`),
+// tenant-scoped by the `account_memberships` CTE exactly as `rotateApiKey` is.
+type CreateApiKeyInput {
+  projectId Cuid
+  name String
+  expiresAt DateTime?
+  billingPlan String
+}
+
+mutation procedure createApiKey(args: CreateApiKeyInput): ApiKeySecret
+  @allow(auth() != null)
+
+type RevokeApiKeyInput {
+  keyId Cuid
+}
+
+mutation procedure revokeApiKey(args: RevokeApiKeyInput): ApiKey
+  @allow(auth() != null)
+
+// Membership mutations (ADR-0003 item 4; role gating added when membership roles landed). These
+// are hand-written sqlx in the ProcedureRegistry impl (not generated CRUD): `account_memberships`
+// is a relation-target-only model here (composite PK, no `id` column), so it has no generated
+// create/delete verb, `removeAccountMember` must enforce the "cannot remove the last member" (and
+// now "cannot remove the last owner") invariants generated CRUD can't express, and role gating
+// itself can't be expressed as an `@@allow` policy (see the compound-condition note on `Account`
+// above). The `@allow(auth() != null)` gate only asserts an authenticated caller; the real
+// authorization -- membership AND role -- lives in the hand-written SQL: adding or removing a
+// member requires the acting subject to be an owner or admin; granting the `owner` role requires
+// the acting subject to already be an owner (admins cannot mint new owners); an admin cannot
+// remove an owner.
+type AddAccountMemberInput {
+  accountId Cuid
+  subject String
+  // Optional; defaults to "member" if omitted. Granting "owner" requires the acting subject to
+  // already hold "owner" (see above).
+  role String?
+}
+
+mutation procedure addAccountMember(args: AddAccountMemberInput): Account
+  @allow(auth() != null)
+
+type RemoveAccountMemberInput {
+  accountId Cuid
+  subject String
+}
+
+mutation procedure removeAccountMember(args: RemoveAccountMemberInput): Account
+  @allow(auth() != null)
+
+// Owner-only. Refuses to demote/reassign-away-from-owner the account's last remaining owner (same
+// lockout-avoidance shape as removeAccountMember's "cannot remove the last owner").
+type SetAccountMemberRoleInput {
+  accountId Cuid
+  subject String
+  role String
+}
+
+mutation procedure setAccountMemberRole(args: SetAccountMemberRoleInput): Account
+  @allow(auth() != null)
+
+// Owner-only. Replaces the now-denied generic `model.Account.delete` verb (see the `Account`
+// model's `@@allow` comments). Cascades to projects/api-keys/memberships via the existing
+// `ON DELETE CASCADE` foreign keys, same as the pre-migration hand-written delete did.
+type DeleteAccountPermanentlyInput {
+  accountId Cuid
+}
+
+mutation procedure deleteAccountPermanently(args: DeleteAccountPermanentlyInput): Account
+  @allow(auth() != null)
+
+// Account / project suspension (data-plane authorization; see docs/rbac.md). Disabling sets
+// `status = 'suspended'`, which the `api_key_validation` view cascades so every key beneath a
+// suspended account/project immediately fails validation; enabling restores `status = 'active'`.
+// Hand-written sqlx wrappers over `StoreRepo::set_account_status` / `set_project_status`, so the
+// `account_memberships` membership check is enforced in SQL as in the rest of the repo surface.
+// The `@allow(auth() != null)` gate only asserts an authenticated caller; the coarse
+// `account:disable` / `project:disable` capability is enforced by the RBAC layer.
+type AccountStatusInput {
+  accountId Cuid
+}
+
+mutation procedure disableAccount(args: AccountStatusInput): Account
+  @allow(auth() != null)
+
+mutation procedure enableAccount(args: AccountStatusInput): Account
+  @allow(auth() != null)
+
+type ProjectStatusInput {
+  projectId Cuid
+}
+
+mutation procedure disableProject(args: ProjectStatusInput): Project
+  @allow(auth() != null)
+
+mutation procedure enableProject(args: ProjectStatusInput): Project
+  @allow(auth() != null)

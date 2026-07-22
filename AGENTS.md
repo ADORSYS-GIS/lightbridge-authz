@@ -295,9 +295,7 @@ Workspace manifest: `Cargo.toml`
   - `app/lightbridge-authz-usage/src/main.rs`
 
 - CRUD API:
-  - routing: `crates/lightbridge-authz-api/src/routers.rs`
-  - controllers: `crates/lightbridge-authz-api/src/controllers/*`
-  - OpenAPI: `crates/lightbridge-authz-api/src/openapi.rs`
+  - routing/controllers are generated via cratestack (`cratestack-pg`) from a schema definition in `crates/lightbridge-authz-api`, replacing the previous hand-written `routers.rs`/`controllers/*`; there is no longer a hand-authored OpenAPI module (`openapi.rs` was removed — see "OpenAPI docs" under Development Workflows and `docs/adr/0003-cratestack-crud-migration.md`).
 
 - OPA/Authorino endpoints:
   - handlers: `crates/lightbridge-authz-rest/src/handlers/*`
@@ -331,6 +329,7 @@ Local non-container config example:
 Key config fields:
 
 - `server.api`: address/port/tls paths
+- `server.api.codec` (name indicative — see `config/default.yaml`/container config for the exact key): selects the wire codec (`json` or `cbor`) for `authz-api`'s CRUD endpoints; production defaults to CBOR, dev/CI config keeps `json`. Scoped to `authz-api` only — `authz-opa`, the usage service, and the MCP server always speak JSON.
 - `server.opa`: address/port/tls paths + basic auth credentials
 - `server.usage`: address/port/tls paths for usage service
 - `database.url`: Postgres connection string
@@ -370,7 +369,7 @@ Check health:
 
 OpenAPI docs:
 
-- CRUD API: `https://localhost:13000/api/v1/docs`
+- CRUD API: removed. Swagger UI/OpenAPI generation for the CRUD API was dropped as part of the cratestack migration (see `docs/adr/0003-cratestack-crud-migration.md`); the generated cratestack Rust client is now the primary integration contract.
 - OPA/Authorino: `https://localhost:13001/v1/opa/docs`
 - Usage API: `https://localhost:13002/usage/v1/usage/docs`
 
@@ -527,6 +526,7 @@ In Compose, `authz-migrate` runs before API/OPA start.
 - Authorino endpoint usage + integration test: `docs/authorino-usage.md`
 - Usage ingest/query API: `docs/usage-api.md`
 - RBAC (JWT claim → permission mapping): `docs/rbac.md`
+- CRUD API migration to cratestack (routing/policy generation, Swagger UI removal, CBOR-in-prod): `docs/adr/0003-cratestack-crud-migration.md`
 
 ## Helm / deployment notes
 

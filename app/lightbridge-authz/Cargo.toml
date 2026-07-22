@@ -25,6 +25,11 @@ lightbridge-authz-core = { workspace = true, features = ["axum"] }
 lightbridge-authz-rest.workspace = true
 mimalloc.workspace = true
 sqlx.workspace = true
+# MCP CRUD tools call the generated cratestack client directly (ADR-0003): they build a
+# `schema::Cratestack` over cratestack's own sqlx pool and project the caller into a `CoolContext`,
+# so the app needs the `cratestack` (package `cratestack-pg`) runtime types the same way the rest
+# crate does.
+cratestack.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

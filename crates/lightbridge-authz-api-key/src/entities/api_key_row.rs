@@ -16,6 +16,7 @@ pub struct ApiKeyRow {
     pub last_ip: Option<String>,
     pub revoked_at: Option<DateTime<Utc>>,
     pub billing_plan: String,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]

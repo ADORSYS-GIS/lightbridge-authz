@@ -7,14 +7,12 @@ use std::sync::Arc;
 use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
 use getrandom::fill;
-use lightbridge_authz_api::contract::AuthzStore;
 use lightbridge_authz_api_key::repo::StoreRepo;
-use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::config::{Billing, Oauth2, Oauth2Issuance};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey, CreateProject,
-    Project, RotateApiKey, UpdateAccount, UpdateApiKey, UpdateProject, hash_api_key,
+    Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey, Project,
+    ResourceStatus, RotateApiKey, hash_api_key,
 };
 use lightbridge_authz_core::{
     db::DbPoolTrait,
@@ -322,124 +320,37 @@ fn resolve_issued_expires_at(
     }
 }
 
-#[async_trait]
-impl AuthzStore for AuthzStoreImpl {
-    async fn create_account(&self, subject: &str, input: CreateAccount) -> Result<Account> {
-        self.repo.create_account(subject, input, cuid2()).await
+/// The four write operations the RPC procedures delegate to (ADR-0003 item 4). Everything else the
+/// old `AuthzStore` trait exposed (account/project/api-key list/read/create/update/delete) now runs
+/// through the generated cratestack CRUD client, so only these survive — as inherent methods, no
+/// trait. All four reuse the pre-migration hand-written sqlx in `StoreRepo` (tenant-scoped by the
+/// `account_memberships` CTE); none use cratestack's `run_in_tx`, per the deadlock finding in
+/// ADR-0003 ("Known cratestack-pg 0.4.9 bugs", item 1).
+impl AuthzStoreImpl {
+    /// Create an account and seed the creator's membership in one transaction. Backs the
+    /// `createAccount` procedure. The generic `model.Account.create` verb only inserts the
+    /// `accounts` row and never seeds `account_memberships`, which locks the creator out of every
+    /// membership-scoped `@@allow` policy; this reuses the pre-migration
+    /// `StoreRepo::create_account` (insert account + creator membership atomically), so the creator
+    /// is immediately a member and can read/extend the account. The server generates the account id.
+    pub async fn create_account(&self, subject: &str, input: CreateAccount) -> Result<Account> {
+        let account = self.repo.create_account(subject, input, cuid2()).await?;
+        tracing::info!(
+            operation = "create_account",
+            subject = %subject,
+            account_id = %account.id,
+            "account created and creator membership seeded"
+        );
+        Ok(account)
     }
 
-    async fn list_accounts(&self, subject: &str, offset: u32, limit: u32) -> Result<Vec<Account>> {
-        self.repo.list_accounts(subject, offset, limit).await
-    }
-
-    async fn get_account(&self, subject: &str, account_id: &str) -> Result<Account> {
-        self.repo
-            .get_account(subject, account_id)
-            .await?
-            .ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)
-    }
-
-    async fn update_account(
-        &self,
-        subject: &str,
-        account_id: &str,
-        input: UpdateAccount,
-    ) -> Result<Account> {
-        self.repo.update_account(subject, account_id, input).await
-    }
-
-    async fn delete_account(&self, subject: &str, account_id: &str) -> Result<()> {
-        self.repo.delete_account(subject, account_id).await
-    }
-
-    async fn set_account_status(
-        &self,
-        subject: &str,
-        account_id: &str,
-        status: lightbridge_authz_core::ResourceStatus,
-    ) -> Result<Account> {
-        self.repo
-            .set_account_status(subject, account_id, status)
-            .await
-    }
-
-    async fn add_account_member(
-        &self,
-        subject: &str,
-        account_id: &str,
-        new_member: &str,
-    ) -> Result<Account> {
-        self.repo
-            .add_account_member(subject, account_id, new_member)
-            .await
-    }
-
-    async fn remove_account_member(
-        &self,
-        subject: &str,
-        account_id: &str,
-        member: &str,
-    ) -> Result<Account> {
-        self.repo
-            .remove_account_member(subject, account_id, member)
-            .await
-    }
-
-    async fn create_project(
-        &self,
-        subject: &str,
-        account_id: &str,
-        input: CreateProject,
-    ) -> Result<Project> {
-        self.repo
-            .create_project(subject, account_id, input, cuid2())
-            .await
-    }
-
-    async fn list_projects(
-        &self,
-        subject: &str,
-        account_id: &str,
-        offset: u32,
-        limit: u32,
-    ) -> Result<Vec<Project>> {
-        self.repo
-            .list_projects(subject, account_id, offset, limit)
-            .await
-    }
-
-    async fn get_project(&self, subject: &str, project_id: &str) -> Result<Project> {
-        self.repo
-            .get_project(subject, project_id)
-            .await?
-            .ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)
-    }
-
-    async fn update_project(
-        &self,
-        subject: &str,
-        project_id: &str,
-        input: UpdateProject,
-    ) -> Result<Project> {
-        self.repo.update_project(subject, project_id, input).await
-    }
-
-    async fn delete_project(&self, subject: &str, project_id: &str) -> Result<()> {
-        self.repo.delete_project(subject, project_id).await
-    }
-
-    async fn set_project_status(
-        &self,
-        subject: &str,
-        project_id: &str,
-        status: lightbridge_authz_core::ResourceStatus,
-    ) -> Result<Project> {
-        self.repo
-            .set_project_status(subject, project_id, status)
-            .await
-    }
-
-    async fn create_api_key(
+    /// Create an API key: validate the requested `billing_plan` against the operator-configured
+    /// catalogue (before any DB write), issue a fresh secret (generation/hashing unchanged from
+    /// before the migration), and insert the row via hand-written sqlx (tenant-scoped by the
+    /// `account_memberships` CTE). Backs the `createApiKey` procedure. This restores the
+    /// pre-migration `create_api_key` path verbatim; the only change is that it is now an inherent
+    /// method invoked by the RPC procedure instead of the deleted `AuthzStore` trait.
+    pub async fn create_api_key(
         &self,
         subject: &str,
         bearer_token: Option<&str>,
@@ -491,46 +402,38 @@ impl AuthzStore for AuthzStoreImpl {
         })
     }
 
-    async fn list_api_keys(
-        &self,
-        subject: &str,
-        project_id: &str,
-        offset: u32,
-        limit: u32,
-    ) -> Result<Vec<ApiKey>> {
+    /// Suspend an account (`status = 'suspended'`). Backs `disableAccount`. Thin wrapper over
+    /// `StoreRepo::set_account_status` (membership enforced in SQL).
+    pub async fn disable_account(&self, subject: &str, account_id: &str) -> Result<Account> {
         self.repo
-            .list_api_keys(subject, project_id, offset, limit)
+            .set_account_status(subject, account_id, ResourceStatus::Suspended)
             .await
     }
 
-    async fn get_api_key(&self, subject: &str, key_id: &str) -> Result<ApiKey> {
+    /// Reactivate a suspended account (`status = 'active'`). Backs `enableAccount`.
+    pub async fn enable_account(&self, subject: &str, account_id: &str) -> Result<Account> {
         self.repo
-            .get_api_key(subject, key_id)
-            .await?
-            .ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)
+            .set_account_status(subject, account_id, ResourceStatus::Active)
+            .await
     }
 
-    async fn update_api_key(
-        &self,
-        subject: &str,
-        key_id: &str,
-        input: UpdateApiKey,
-    ) -> Result<ApiKey> {
-        self.repo.update_api_key(subject, key_id, input).await
+    /// Suspend a project (`status = 'suspended'`). Backs `disableProject`. Thin wrapper over
+    /// `StoreRepo::set_project_status` (membership enforced in SQL).
+    pub async fn disable_project(&self, subject: &str, project_id: &str) -> Result<Project> {
+        self.repo
+            .set_project_status(subject, project_id, ResourceStatus::Suspended)
+            .await
     }
 
-    async fn delete_api_key(&self, subject: &str, key_id: &str) -> Result<()> {
-        self.repo.delete_api_key(subject, key_id).await?;
-        tracing::info!(
-            operation = "delete_api_key",
-            subject = %subject,
-            api_key_id = %key_id,
-            "api key deleted"
-        );
-        Ok(())
+    /// Reactivate a suspended project (`status = 'active'`). Backs `enableProject`.
+    pub async fn enable_project(&self, subject: &str, project_id: &str) -> Result<Project> {
+        self.repo
+            .set_project_status(subject, project_id, ResourceStatus::Active)
+            .await
     }
 
-    async fn revoke_api_key(&self, subject: &str, key_id: &str) -> Result<ApiKey> {
+    /// Revoke an API key (business-state transition to `revoked`). Backs `revokeApiKey`.
+    pub async fn revoke_api_key(&self, subject: &str, key_id: &str) -> Result<ApiKey> {
         let api_key = self
             .repo
             .set_api_key_status(
@@ -551,7 +454,57 @@ impl AuthzStore for AuthzStoreImpl {
         Ok(api_key)
     }
 
-    async fn rotate_api_key(
+    /// Add a member to an account (idempotent), authorised by the acting `subject` already being a
+    /// member. Backs `addAccountMember`.
+    pub async fn add_account_member(
+        &self,
+        subject: &str,
+        account_id: &str,
+        new_member: &str,
+        role: &str,
+    ) -> Result<Account> {
+        self.repo
+            .add_account_member(subject, account_id, new_member, role)
+            .await
+    }
+
+    /// Remove a member from an account, refusing to remove the last remaining member or the last
+    /// remaining owner. Backs `removeAccountMember`.
+    pub async fn remove_account_member(
+        &self,
+        subject: &str,
+        account_id: &str,
+        member: &str,
+    ) -> Result<Account> {
+        self.repo
+            .remove_account_member(subject, account_id, member)
+            .await
+    }
+
+    /// Change a member's role (owner-only), refusing to demote the last remaining owner. Backs
+    /// `setAccountMemberRole`.
+    pub async fn set_account_member_role(
+        &self,
+        subject: &str,
+        account_id: &str,
+        target_subject: &str,
+        role: &str,
+    ) -> Result<Account> {
+        self.repo
+            .set_account_member_role(subject, account_id, target_subject, role)
+            .await
+    }
+
+    /// Permanently delete an account (owner-only), cascading to its projects/api-keys/memberships.
+    /// Backs `deleteAccountPermanently`.
+    pub async fn delete_account(&self, subject: &str, account_id: &str) -> Result<Account> {
+        self.repo.delete_account(subject, account_id).await
+    }
+
+    /// Rotate an API key: issue a fresh secret (generation/hashing unchanged from before the
+    /// migration) and, in one hand-written transaction (`StoreRepo::rotate_api_key_transaction`,
+    /// NOT `run_in_tx`), revoke the old key and insert its successor. Backs `rotateApiKey`.
+    pub async fn rotate_api_key(
         &self,
         subject: &str,
         bearer_token: Option<&str>,
@@ -634,9 +587,7 @@ mod tests {
     };
     use chrono::{Duration, Utc};
     use httpmock::{Method::POST, MockServer};
-    use lightbridge_authz_core::config::{
-        Billing, BillingPlan, Oauth2, Oauth2Issuance, Oauth2Type,
-    };
+    use lightbridge_authz_core::config::{Billing, Oauth2, Oauth2Issuance, Oauth2Type};
     use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
@@ -688,10 +639,14 @@ mod tests {
         assert!(format!("{err}").contains("oauth2.issuance is missing"));
     }
 
+    // ADR-0003 follow-up: billing-plan validation on create is re-established. Creation now goes
+    // through the `createApiKey` procedure -> `AuthzStoreImpl::create_api_key`, which validates the
+    // requested plan against the configured catalogue before any DB write (the generic
+    // `model.ApiKey.create` verb is fail-closed at the schema and denied at the RBAC layer).
     #[tokio::test]
     async fn create_api_key_rejects_billing_plan_not_in_configured_set() {
-        use lightbridge_authz_api::contract::AuthzStore;
         use lightbridge_authz_core::CreateApiKey;
+        use lightbridge_authz_core::config::BillingPlan;
 
         let store = AuthzStoreImpl::with_pool(lazy_pool()).with_billing(Billing {
             plans: vec![BillingPlan {

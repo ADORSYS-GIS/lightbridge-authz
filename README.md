@@ -87,7 +87,7 @@ Default container config is mounted from `.docker/authz/container.yaml`:
 - Projects: `POST/GET /accounts/{account_id}/projects`, `GET/PATCH/DELETE /projects/{project_id}`
 - API keys: `POST/GET /projects/{project_id}/api-keys`, `GET/PATCH/DELETE /api-keys/{key_id}`
 - Lifecycle: `POST /api-keys/{key_id}/revoke`, `POST /api-keys/{key_id}/rotate`
-- OpenAPI docs: `https://localhost:13000/api/v1/docs`
+- OpenAPI docs: removed (CRUD API is now generated via cratestack, which has no OpenAPI/Swagger UI generation). The generated cratestack Rust client is the primary integration contract; see `docs/adr/0003-cratestack-crud-migration.md`.
 
 **Internal Authz/Authorino validation API (Basic Auth)**
 - `POST /v1/opa/validate`

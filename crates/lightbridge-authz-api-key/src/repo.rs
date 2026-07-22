@@ -97,6 +97,7 @@ impl StoreRepo {
         &self,
         account_id: &str,
         members: &[String],
+        role: &str,
         executor: E,
     ) -> Result<()>
     where
@@ -107,17 +108,70 @@ impl StoreRepo {
         }
         sqlx::query(
             r#"
-            INSERT INTO account_memberships (account_id, subject)
-            SELECT $1, member
+            INSERT INTO account_memberships (account_id, subject, role)
+            SELECT $1, member, $3
             FROM unnest($2::text[]) AS member
             ON CONFLICT DO NOTHING
             "#,
         )
         .bind(account_id)
         .bind(members)
+        .bind(role)
         .execute(executor)
         .await?;
         Ok(())
+    }
+
+    /// The valid `account_memberships.role` values, matching the DB `CHECK` constraint
+    /// (migrations/20260722000001_account_membership_roles.sql). Used to reject an invalid role
+    /// early (`BadRequest`) instead of surfacing a raw constraint-violation error.
+    const VALID_MEMBERSHIP_ROLES: [&'static str; 3] = ["owner", "admin", "member"];
+
+    fn validate_membership_role(role: &str) -> Result<()> {
+        if Self::VALID_MEMBERSHIP_ROLES.contains(&role) {
+            Ok(())
+        } else {
+            Err(lightbridge_authz_core::error::Error::BadRequest(format!(
+                "invalid membership role '{role}', must be one of {:?}",
+                Self::VALID_MEMBERSHIP_ROLES
+            )))
+        }
+    }
+
+    /// The acting subject's role in `account_id`, or `None` if they aren't a member. Shared by
+    /// every membership-management/destructive-op procedure's authorization check.
+    async fn member_role<'e, E>(
+        &self,
+        account_id: &str,
+        subject: &str,
+        executor: E,
+    ) -> Result<Option<String>>
+    where
+        E: Executor<'e, Database = Postgres>,
+    {
+        let role: Option<String> = sqlx::query_scalar(
+            r#"SELECT role FROM account_memberships WHERE account_id = $1 AND subject = $2"#,
+        )
+        .bind(account_id)
+        .bind(subject)
+        .fetch_optional(executor)
+        .await?;
+        Ok(role)
+    }
+
+    /// Count of members currently holding the `owner` role for `account_id`. Used by the
+    /// last-owner lockout guards in `remove_account_member`/`set_account_member_role`.
+    async fn owner_count<'e, E>(&self, account_id: &str, executor: E) -> Result<i64>
+    where
+        E: Executor<'e, Database = Postgres>,
+    {
+        let count: i64 = sqlx::query_scalar(
+            r#"SELECT count(*) FROM account_memberships WHERE account_id = $1 AND role = 'owner'"#,
+        )
+        .bind(account_id)
+        .fetch_one(executor)
+        .await?;
+        Ok(count)
     }
 
     async fn delete_account_memberships_not_in<'e, E>(
@@ -242,6 +296,7 @@ impl StoreRepo {
             last_ip: row.last_ip,
             revoked_at: row.revoked_at,
             billing_plan: row.billing_plan,
+            updated_at: row.updated_at,
         }
     }
 
@@ -286,7 +341,9 @@ impl StoreRepo {
             e.into()
         })?;
 
-        self.upsert_account_memberships(&new_account.id, &members, &mut *tx)
+        // The creator is the account's sole initial member and becomes its owner (ADR-0002's
+        // originally-stated data-model direction, implemented when membership roles landed).
+        self.upsert_account_memberships(&new_account.id, &members, "owner", &mut *tx)
             .await?;
         tx.commit().await?;
 
@@ -386,7 +443,11 @@ impl StoreRepo {
 
         if let Some(owners) = input.owners_admins {
             let members = Self::normalize_members(owners, subject);
-            self.upsert_account_memberships(account_id, &members, &mut *tx)
+            // This bulk-replace path predates membership roles and isn't reachable from the RPC
+            // surface (generic `model.Account.update` runs entirely through cratestack's
+            // generated update, not this hand-written method) or MCP -- new members it inserts
+            // default to "member"; use `addAccountMember`/`setAccountMemberRole` for role control.
+            self.upsert_account_memberships(account_id, &members, "member", &mut *tx)
                 .await?;
             self.delete_account_memberships_not_in(account_id, &members, &mut *tx)
                 .await?;
@@ -398,85 +459,122 @@ impl StoreRepo {
         Ok(Self::to_account(row))
     }
 
+    /// Permanently delete `account_id` (cascades to projects/api-keys/memberships via the existing
+    /// `ON DELETE CASCADE` foreign keys). Owner-only: `subject` must hold the `owner` role on this
+    /// account. Distinguishes "not a member" (`NotFound`, matching the rest of the
+    /// membership-scoped repo surface — existence isn't leaked to non-members) from "member but not
+    /// owner" (`Forbidden` — no existence to leak once membership is already confirmed).
     #[instrument(skip(self))]
-    pub async fn delete_account(&self, subject: &str, account_id: &str) -> Result<()> {
-        let result = sqlx::query(
+    pub async fn delete_account(&self, subject: &str, account_id: &str) -> Result<Account> {
+        let mut tx: Transaction<'_, Postgres> = self.pool().begin().await?;
+
+        match self.member_role(account_id, subject, &mut *tx).await? {
+            None => return Err(lightbridge_authz_core::error::Error::NotFound),
+            Some(role) if role == "owner" => {}
+            Some(_) => {
+                return Err(lightbridge_authz_core::error::Error::Forbidden(
+                    "only an account owner can delete the account".to_string(),
+                ));
+            }
+        }
+
+        let row: Option<AccountWithMembersRow> = sqlx::query_as(
             r#"
             DELETE FROM accounts
             WHERE id = $1
-              AND EXISTS (
-                SELECT 1
-                FROM account_memberships AS auth
-                WHERE auth.account_id = accounts.id
-                  AND auth.subject = $2
-              )
+            RETURNING id, billing_identity, '{}'::text[] AS owners_admins, status, created_at, updated_at
             "#,
         )
         .bind(account_id)
-        .bind(subject)
-        .execute(self.pool())
+        .fetch_optional(&mut *tx)
         .await?;
-        if result.rows_affected() == 0 {
-            return Err(lightbridge_authz_core::error::Error::NotFound);
-        }
-        Ok(())
+        let row = row.ok_or(lightbridge_authz_core::error::Error::NotFound)?;
+
+        tx.commit().await?;
+        Ok(Self::to_account(row))
     }
 
-    /// Add `new_member` to `account_id`, authorised by `subject` already being a member. Idempotent
-    /// (re-adding an existing member is a no-op). A non-member acting subject or unknown account is
-    /// a uniform `NotFound`, mirroring the rest of the membership-scoped repo surface.
+    /// Add `new_member` to `account_id` with the given `role` ("owner"/"admin"/"member"),
+    /// authorised by `subject` holding `owner` or `admin` on the account. Granting `owner`
+    /// specifically requires `subject` to already be an `owner` (admins cannot mint new owners).
+    /// Idempotent (re-adding an existing member is a no-op — their role is unchanged; use
+    /// `set_account_member_role` to change an existing member's role). A non-member acting subject
+    /// or unknown account is a uniform `NotFound`; a member lacking the required role is
+    /// `Forbidden`.
+    ///
+    /// Runs in a transaction with `SELECT ... FOR UPDATE` on the account row, matching
+    /// `remove_account_member`'s race-free pattern.
     #[instrument(skip(self))]
     pub async fn add_account_member(
         &self,
         subject: &str,
         account_id: &str,
         new_member: &str,
+        role: &str,
     ) -> Result<Account> {
         if new_member.trim().is_empty() {
             return Err(lightbridge_authz_core::error::Error::BadRequest(
                 "member subject must not be empty".to_string(),
             ));
         }
+        Self::validate_membership_role(role)?;
 
-        let authorized: bool = sqlx::query_scalar(
-            r#"
-            SELECT EXISTS (
-                SELECT 1 FROM account_memberships
-                WHERE account_id = $1 AND subject = $2
-            )
-            "#,
-        )
-        .bind(account_id)
-        .bind(subject)
-        .fetch_one(self.pool())
-        .await?;
-        if !authorized {
+        let mut tx: Transaction<'_, Postgres> = self.pool().begin().await?;
+
+        let account_exists: Option<String> =
+            sqlx::query_scalar(r#"SELECT id FROM accounts WHERE id = $1 FOR UPDATE"#)
+                .bind(account_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if account_exists.is_none() {
             return Err(lightbridge_authz_core::error::Error::NotFound);
+        }
+
+        let acting_role = self.member_role(account_id, subject, &mut *tx).await?;
+        match acting_role.as_deref() {
+            None => return Err(lightbridge_authz_core::error::Error::NotFound),
+            Some("owner") => {}
+            Some("admin") if role != "owner" => {}
+            Some("admin") => {
+                return Err(lightbridge_authz_core::error::Error::Forbidden(
+                    "only an owner can grant the owner role".to_string(),
+                ));
+            }
+            Some(_) => {
+                return Err(lightbridge_authz_core::error::Error::Forbidden(
+                    "only an account owner or admin can add members".to_string(),
+                ));
+            }
         }
 
         sqlx::query(
             r#"
-            INSERT INTO account_memberships (account_id, subject)
-            VALUES ($1, $2)
+            INSERT INTO account_memberships (account_id, subject, role)
+            VALUES ($1, $2, $3)
             ON CONFLICT DO NOTHING
             "#,
         )
         .bind(account_id)
         .bind(new_member)
-        .execute(self.pool())
+        .bind(role)
+        .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         let row = self.load_account_with_members_row(account_id).await?;
         Ok(Self::to_account(row))
     }
 
-    /// Remove `member` from `account_id`, authorised by `subject` being a member. Refuses to remove
-    /// the last remaining member (that would trigger `prune_account_without_memberships` and delete
-    /// the account — use `delete_account` for that intent). Removing a non-member is a no-op.
+    /// Remove `member` from `account_id`, authorised by `subject` holding `owner` or `admin`.
+    /// Admins cannot remove an owner (`Forbidden`). Refuses to remove the last remaining member
+    /// (would trigger `prune_account_without_memberships` and delete the account — use
+    /// `delete_account` for that intent) or the account's last remaining owner, even if other
+    /// non-owner members remain (would otherwise orphan the account with no one able to perform
+    /// owner-only operations). Removing a non-member is a no-op, matching the pre-roles behavior.
     ///
     /// Runs in a transaction that takes `SELECT ... FOR UPDATE` on the account row, serialising
-    /// concurrent membership mutations so the last-member guard is race-free: two concurrent removes
-    /// cannot both pass the count check and drop the account to zero members.
+    /// concurrent membership mutations so the last-member/last-owner guards are race-free.
     #[instrument(skip(self))]
     pub async fn remove_account_member(
         &self,
@@ -495,43 +593,41 @@ impl StoreRepo {
             return Err(lightbridge_authz_core::error::Error::NotFound);
         }
 
-        let authorized: bool = sqlx::query_scalar(
-            r#"
-            SELECT EXISTS (
-                SELECT 1 FROM account_memberships
-                WHERE account_id = $1 AND subject = $2
-            )
-            "#,
-        )
-        .bind(account_id)
-        .bind(subject)
-        .fetch_one(&mut *tx)
-        .await?;
-        if !authorized {
-            return Err(lightbridge_authz_core::error::Error::NotFound);
+        let acting_role = self.member_role(account_id, subject, &mut *tx).await?;
+        match acting_role.as_deref() {
+            None => return Err(lightbridge_authz_core::error::Error::NotFound),
+            Some("owner") | Some("admin") => {}
+            Some(_) => {
+                return Err(lightbridge_authz_core::error::Error::Forbidden(
+                    "only an account owner or admin can remove members".to_string(),
+                ));
+            }
         }
 
-        let member_count: i64 =
-            sqlx::query_scalar(r#"SELECT count(*) FROM account_memberships WHERE account_id = $1"#)
-                .bind(account_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        let removing_existing_member: bool = sqlx::query_scalar(
-            r#"
-            SELECT EXISTS (
-                SELECT 1 FROM account_memberships
-                WHERE account_id = $1 AND subject = $2
+        let target_role = self.member_role(account_id, member, &mut *tx).await?;
+        if let Some(target_role) = target_role.as_deref() {
+            if target_role == "owner" && acting_role.as_deref() != Some("owner") {
+                return Err(lightbridge_authz_core::error::Error::Forbidden(
+                    "only an owner can remove another owner".to_string(),
+                ));
+            }
+            if target_role == "owner" && self.owner_count(account_id, &mut *tx).await? <= 1 {
+                return Err(lightbridge_authz_core::error::Error::Conflict(
+                    "cannot remove the last owner of an account".to_string(),
+                ));
+            }
+
+            let member_count: i64 = sqlx::query_scalar(
+                r#"SELECT count(*) FROM account_memberships WHERE account_id = $1"#,
             )
-            "#,
-        )
-        .bind(account_id)
-        .bind(member)
-        .fetch_one(&mut *tx)
-        .await?;
-        if removing_existing_member && member_count <= 1 {
-            return Err(lightbridge_authz_core::error::Error::Conflict(
-                "cannot remove the last member of an account".to_string(),
-            ));
+            .bind(account_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if member_count <= 1 {
+                return Err(lightbridge_authz_core::error::Error::Conflict(
+                    "cannot remove the last member of an account".to_string(),
+                ));
+            }
         }
 
         sqlx::query(r#"DELETE FROM account_memberships WHERE account_id = $1 AND subject = $2"#)
@@ -539,6 +635,76 @@ impl StoreRepo {
             .bind(member)
             .execute(&mut *tx)
             .await?;
+
+        tx.commit().await?;
+
+        let row = self.load_account_with_members_row(account_id).await?;
+        Ok(Self::to_account(row))
+    }
+
+    /// Change `target_subject`'s role within `account_id`. Owner-only. Refuses to demote the
+    /// account's last remaining owner away from `owner` (would orphan the account). `target_subject`
+    /// must already be a member (`NotFound` otherwise, distinct from `remove_account_member`'s
+    /// no-op-on-non-member, since setting a role for a nonexistent membership is meaningless rather
+    /// than idempotent).
+    #[instrument(skip(self))]
+    pub async fn set_account_member_role(
+        &self,
+        subject: &str,
+        account_id: &str,
+        target_subject: &str,
+        role: &str,
+    ) -> Result<Account> {
+        Self::validate_membership_role(role)?;
+
+        let mut tx: Transaction<'_, Postgres> = self.pool().begin().await?;
+
+        let account_exists: Option<String> =
+            sqlx::query_scalar(r#"SELECT id FROM accounts WHERE id = $1 FOR UPDATE"#)
+                .bind(account_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if account_exists.is_none() {
+            return Err(lightbridge_authz_core::error::Error::NotFound);
+        }
+
+        match self
+            .member_role(account_id, subject, &mut *tx)
+            .await?
+            .as_deref()
+        {
+            None => return Err(lightbridge_authz_core::error::Error::NotFound),
+            Some("owner") => {}
+            Some(_) => {
+                return Err(lightbridge_authz_core::error::Error::Forbidden(
+                    "only an account owner can change member roles".to_string(),
+                ));
+            }
+        }
+
+        let target_role = self
+            .member_role(account_id, target_subject, &mut *tx)
+            .await?;
+        let Some(target_role) = target_role else {
+            return Err(lightbridge_authz_core::error::Error::NotFound);
+        };
+        if target_role == "owner"
+            && role != "owner"
+            && self.owner_count(account_id, &mut *tx).await? <= 1
+        {
+            return Err(lightbridge_authz_core::error::Error::Conflict(
+                "cannot demote the last owner of an account".to_string(),
+            ));
+        }
+
+        sqlx::query(
+            r#"UPDATE account_memberships SET role = $1 WHERE account_id = $2 AND subject = $3"#,
+        )
+        .bind(role)
+        .bind(account_id)
+        .bind(target_subject)
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit().await?;
 
@@ -933,7 +1099,7 @@ impl StoreRepo {
             FROM project_auth
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
-              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan, api_keys.updated_at
             "#,
         )
         .bind(input.project_id)
@@ -977,7 +1143,8 @@ impl StoreRepo {
               api_keys.last_used_at,
               api_keys.last_ip,
               api_keys.revoked_at,
-              api_keys.billing_plan
+              api_keys.billing_plan,
+              api_keys.updated_at
             FROM api_keys
             JOIN projects ON projects.id = api_keys.project_id
             WHERE api_keys.project_id = $1
@@ -1017,7 +1184,8 @@ impl StoreRepo {
               api_keys.last_used_at,
               api_keys.last_ip,
               api_keys.revoked_at,
-              api_keys.billing_plan
+              api_keys.billing_plan,
+              api_keys.updated_at
             FROM api_keys
             JOIN projects ON projects.id = api_keys.project_id
             WHERE api_keys.id = $1
@@ -1064,7 +1232,7 @@ impl StoreRepo {
               AND account_memberships.subject = $4
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
-              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan, api_keys.updated_at
             "#,
         )
         .bind(changes.name)
@@ -1084,20 +1252,30 @@ impl StoreRepo {
         account_id: &str,
         status: ResourceStatus,
     ) -> Result<Account> {
+        // Suspend/resume is owner-or-admin, same as membership management (see
+        // `add_account_member`/`remove_account_member`) -- checked separately from the UPDATE so
+        // "not a member" (NotFound) and "member but insufficient role" (Forbidden) stay
+        // distinguishable, same pattern as the rest of this membership-scoped surface.
+        match self.member_role(account_id, subject, self.pool()).await? {
+            None => return Err(lightbridge_authz_core::error::Error::NotFound),
+            Some(role) if role == "owner" || role == "admin" => {}
+            Some(_) => {
+                return Err(lightbridge_authz_core::error::Error::Forbidden(
+                    "only an account owner or admin can suspend or resume an account".to_string(),
+                ));
+            }
+        }
+
         let result = sqlx::query(
             r#"
             UPDATE accounts
             SET status = $1, updated_at = $2
-            FROM account_memberships
-            WHERE accounts.id = account_memberships.account_id
-              AND accounts.id = $3
-              AND account_memberships.subject = $4
+            WHERE accounts.id = $3
             "#,
         )
         .bind(status.to_string())
         .bind(Utc::now())
         .bind(account_id)
-        .bind(subject)
         .execute(self.pool())
         .await?;
         if result.rows_affected() == 0 {
@@ -1206,7 +1384,7 @@ impl StoreRepo {
               AND account_memberships.subject = $5
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
-              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan, api_keys.updated_at
             "#,
         )
         .bind(status.to_string())
@@ -1245,7 +1423,7 @@ impl StoreRepo {
               AND account_memberships.subject = $5
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
-              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan, api_keys.updated_at
             "#,
         )
         .bind(status.to_string())
@@ -1273,7 +1451,7 @@ impl StoreRepo {
             FROM project_auth
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,
-              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan
+              api_keys.last_used_at, api_keys.last_ip, api_keys.revoked_at, api_keys.billing_plan, api_keys.updated_at
             "#,
         )
         .bind(new_key.project_id)
@@ -1324,7 +1502,7 @@ impl StoreRepo {
             r#"
             SELECT
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, revoked_at, billing_plan
+              last_used_at, last_ip, revoked_at, billing_plan, updated_at
             FROM api_keys
             WHERE key_hash = $1
             "#,
@@ -1358,7 +1536,7 @@ impl StoreRepo {
             WHERE id = $3
             RETURNING
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, revoked_at, billing_plan
+              last_used_at, last_ip, revoked_at, billing_plan, updated_at
             "#,
         )
         .bind(changes.last_used_at)
