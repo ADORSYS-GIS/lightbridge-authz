@@ -113,6 +113,33 @@ fn build_router(
         lazy_idempotency(),
         lazy_rate_limit(),
         dev_cors,
+        // Root mount (`/rpc/<op_id>`) for the shared helper; the configured-base-path mount is
+        // exercised by `rpc_surface_honours_configured_base_path` via `build_router_at`.
+        None,
+    )
+}
+
+/// Like [`build_router`] but mounts the RPC surface under `rpc_base_path` (e.g. `/api`), for the
+/// configurable-mount test.
+fn build_router_at(
+    bearer: Arc<dyn BearerTokenServiceTrait>,
+    oauth2: &Oauth2,
+    rpc_base_path: Option<&str>,
+) -> Router {
+    let core = lazy_core_pool();
+    let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()));
+    lightbridge_authz_rest::build_api_router(
+        oauth2,
+        bearer,
+        issuer,
+        lazy_cratestack_db(),
+        core,
+        lazy_store_repo(),
+        None,
+        lazy_idempotency(),
+        lazy_rate_limit(),
+        false,
+        rpc_base_path,
     )
 }
 
@@ -367,6 +394,60 @@ async fn rbac_gate_denies_the_batch_endpoint_for_admin() {
         response.status(),
         StatusCode::FORBIDDEN,
         "the batch fan-out endpoint must be denied by the RBAC gate"
+    );
+}
+
+/// The RPC surface honours `server.api.rpc_base_path`. With `/api` configured, a mapped op is
+/// reachable — and gate-resolved — at `/api/rpc/<op_id>`; an unauthenticated call gets 401
+/// (missing bearer), which proves the op-id resolved (an unmapped op would be a 403 *before* the
+/// bearer check). Meanwhile the old root path `/rpc/<op_id>` is gone (404). Status codes alone
+/// distinguish the cases (401 resolved-but-unauthenticated vs 404 no-route), so this needs no
+/// bearer, body, or DB.
+#[tokio::test]
+async fn rpc_surface_honours_configured_base_path() {
+    let req = |uri: &str| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap()
+    };
+
+    // Mapped op at the configured prefix: op-id resolves, then 401 for the missing bearer.
+    let router = build_router_at(admin_bearer(), &external_oauth2(), Some("/api"));
+    let resolved = router
+        .oneshot(req("/api/rpc/model.Account.list"))
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.status(),
+        StatusCode::UNAUTHORIZED,
+        "a mapped op under the base path must resolve then require a bearer (401), not read as unmapped"
+    );
+
+    // The surface no longer answers at the root when a base path is configured.
+    let router = build_router_at(admin_bearer(), &external_oauth2(), Some("/api"));
+    let moved = router
+        .oneshot(req("/rpc/model.Account.list"))
+        .await
+        .unwrap();
+    assert_eq!(
+        moved.status(),
+        StatusCode::NOT_FOUND,
+        "the RPC surface must not stay mounted at the root when rpc_base_path is set"
+    );
+
+    // Default (no base path) keeps serving at the root.
+    let router = build_router_at(admin_bearer(), &external_oauth2(), None);
+    let default_root = router
+        .oneshot(req("/rpc/model.Account.list"))
+        .await
+        .unwrap();
+    assert_eq!(
+        default_root.status(),
+        StatusCode::UNAUTHORIZED,
+        "with no base path the op stays at the root and resolves (401 for the missing bearer)"
     );
 }
 

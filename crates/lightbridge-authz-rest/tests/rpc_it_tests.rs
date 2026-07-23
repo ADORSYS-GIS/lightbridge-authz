@@ -127,6 +127,7 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
         idempotency,
         rate_limit,
         false,
+        None,
     );
 
     let verify = PgPoolOptions::new()

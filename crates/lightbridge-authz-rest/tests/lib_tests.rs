@@ -65,6 +65,7 @@ async fn start_api_server_fails_fast_when_tls_certs_are_missing() {
         port: 0,
         tls: bad_tls(),
         allowed_hosts: None,
+        rpc_base_path: None,
     };
     let result = lightbridge_authz_rest::start_api_server(
         &api,
@@ -111,6 +112,7 @@ async fn start_api_server_rejects_self_signed_oauth2_without_signing_block() {
         port: 0,
         tls: bad_tls(),
         allowed_hosts: None,
+        rpc_base_path: None,
     };
     let result = lightbridge_authz_rest::start_api_server(
         &api,
@@ -140,6 +142,7 @@ async fn start_api_server_warns_when_dev_cors_is_enabled() {
         port: 0,
         tls: bad_tls(),
         allowed_hosts: None,
+        rpc_base_path: None,
     };
     let result = lightbridge_authz_rest::start_api_server(
         &api,
@@ -231,6 +234,7 @@ mod db {
             port: 0,
             tls: bad_tls(),
             allowed_hosts: None,
+            rpc_base_path: None,
         };
         let result = lightbridge_authz_rest::start_api_server(
             &api,
@@ -287,6 +291,7 @@ mod db {
             lazy_idempotency_store(),
             lazy_rate_limit_store(),
             false,
+            None,
         );
 
         let response = router

@@ -9,6 +9,12 @@ server:
     # (DNS-rebinding protection). Defaults to localhost/127.0.0.1/::1 when unset — override in any
     # deployment where the MCP server is reached by a service name or ingress host.
     # allowed_hosts: ["localhost", "127.0.0.1"]
+    # Consumed only by authz-api: base path the generated RPC CRUD surface is mounted under.
+    # Unset (default) serves the ops at /rpc/<op_id>; set e.g. /api to serve them at
+    # /api/rpc/<op_id> so the server matches a generated client whose basePath is /api without an
+    # edge rewrite. Only the RPC surface moves — health probes, /.well-known/*, and /oauth2/token
+    # stay at the root. Leading slash is added if missing, trailing slash stripped; "" or "/" = root.
+    # rpc_base_path: /api
   opa:
     address: "0.0.0.0"
     port: 3001
