@@ -64,8 +64,15 @@ runs:
           done
         }
 
-        # Per-run prefix (stable across jobs in a run, unique across runs/attempts).
-        prefix="ciart/${SCCACHE_BUCKET}/ci-artifacts/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        # Per-run prefix (stable across jobs AND attempts of a run, unique across runs).
+        #
+        # Keyed on GITHUB_RUN_ID only, deliberately NOT run_attempt: a partial re-run
+        # ("Re-run failed jobs") does NOT re-execute the already-succeeded `binaries` upload job, so
+        # keying on run_attempt made the re-run's container-build jobs look under `<run_id>-2/` while
+        # the artifact only ever existed at `<run_id>-1/` -> `mc: Insufficient permissions` on
+        # download, failing the image build. The binaries are deterministic for a run's commit, so a
+        # re-run correctly reuses the first attempt's upload; run_id alone is the right key.
+        prefix="ciart/${SCCACHE_BUCKET}/ci-artifacts/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}"
 
         case "${MODE}" in
           upload)
