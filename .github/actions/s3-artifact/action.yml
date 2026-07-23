@@ -44,6 +44,26 @@ runs:
         esac
         mc alias set ciart "${url}" "${AWS_ACCESS_KEY_ID}" "${AWS_SECRET_ACCESS_KEY}" >/dev/null
 
+        # Retry mc transfers. The sc-cache MinIO intermittently fails a transfer of a
+        # just-written object under artifact-quota / cleanup pressure — it has surfaced as
+        # `mc: Insufficient permissions to access this path` on a download whose upload succeeded
+        # moments earlier, failing the image build. Retry with exponential backoff so a transient
+        # transfer failure doesn't sink the run. (A permanently-evicted object still fails after the
+        # last attempt — the durable answer to that is a run-scoped store, tracked separately.)
+        mc_retry() {
+          local n=1 max=5 delay=3
+          while true; do
+            if "$@"; then return 0; fi
+            if [ "${n}" -ge "${max}" ]; then
+              echo "::error::mc transfer failed after ${max} attempts: $*"
+              return 1
+            fi
+            echo "mc attempt ${n}/${max} failed; retrying in ${delay}s..." >&2
+            sleep "${delay}"
+            n=$((n + 1)); delay=$((delay * 2))
+          done
+        }
+
         # Per-run prefix (stable across jobs AND attempts of a run, unique across runs).
         #
         # Keyed on GITHUB_RUN_ID only, deliberately NOT run_attempt: a partial re-run
@@ -57,12 +77,12 @@ runs:
         case "${MODE}" in
           upload)
             [ -n "${NAME}" ] || { echo "::error::name is required for upload"; exit 1; }
-            mc cp --quiet "${NAME}" "${prefix}/${NAME}"
+            mc_retry mc cp --quiet "${NAME}" "${prefix}/${NAME}"
             echo "Uploaded ${NAME} -> ${prefix}/${NAME}"
             ;;
           download)
             [ -n "${NAME}" ] || { echo "::error::name is required for download"; exit 1; }
-            mc cp --quiet "${prefix}/${NAME}" "${NAME}"
+            mc_retry mc cp --quiet "${prefix}/${NAME}" "${NAME}"
             echo "Downloaded ${prefix}/${NAME} -> ${NAME}"
             ;;
           cleanup)

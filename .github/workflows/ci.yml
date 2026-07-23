@@ -60,7 +60,11 @@ jobs:
       - uses: ./.github/actions/integration-test
 
   container-build:
-    needs: [binaries, test]
+    # Only depends on `binaries` (it consumes dist-binaries.tar.gz). Deliberately NOT `test` or
+    # `integration-test`: image builds must not be gated on the test suites, so a flaky/slow test
+    # can't block publishing. `test` + `integration-test` run in parallel and gate CI status only;
+    # deployment gating (if any) lives downstream in GitOps, not here.
+    needs: [binaries]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: adorsys-gis-runner
     strategy:
