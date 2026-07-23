@@ -209,6 +209,14 @@ pub struct ApiServer {
     /// unset it keeps the secure default (`localhost`/`127.0.0.1`/`::1`).
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
+    /// Optional base path the generated RPC CRUD surface is mounted under. Unset (the default)
+    /// serves the ops at `/rpc/<op_id>`; setting e.g. `/api` serves them at `/api/rpc/<op_id>` so
+    /// `authz-api` can match a generated client whose `basePath` is `/api` without an edge rewrite.
+    /// Only the RPC surface moves — the health probes, `/.well-known/*`, and `/oauth2/token` stay at
+    /// the root. Only consumed by `authz-api`; `opa`/`mcp`/usage ignore it. A leading slash is added
+    /// if missing and a trailing slash is stripped; empty or `/` is treated as unset (root mount).
+    #[serde(default)]
+    pub rpc_base_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

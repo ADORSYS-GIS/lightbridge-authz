@@ -10,6 +10,9 @@ server:
       - "authz-mcp:3000"
       - "localhost"
       - "127.0.0.1"
+    # Base path the generated RPC CRUD surface is mounted under (authz-api only). Unset serves
+    # /rpc/<op_id>; set e.g. /api to serve /api/rpc/<op_id> and match a client whose basePath is /api.
+    # rpc_base_path: "${RPC_BASE_PATH:-}"
   opa:
     address: "0.0.0.0"
     port: 3001

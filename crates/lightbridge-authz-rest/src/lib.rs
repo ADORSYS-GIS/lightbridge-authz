@@ -567,6 +567,7 @@ pub fn build_api_router(
     idempotency_store: Arc<SqlxIdempotencyStore>,
     rate_limit_store: Arc<dyn RateLimitStore>,
     dev_cors: bool,
+    rpc_base_path: Option<&str>,
 ) -> Router {
     let mut public = Router::new()
         .route("/", get(root_handler))
@@ -621,12 +622,35 @@ pub fn build_api_router(
         rpc_authorize::rpc_authorize,
     ));
 
-    let router = public.merge(rpc);
+    // Mount the RPC surface at the configured base path (default: root, i.e. `/rpc/<op_id>`). axum's
+    // `nest` strips the prefix before the inner router runs, so the gate, idempotency/rate-limit
+    // layers, and cratestack's dispatch all still see the canonical `/rpc/<op_id>` the client signs
+    // byte-for-byte — only the externally-visible path gains the prefix. `op_id_from_path` is also
+    // prefix-agnostic as a second line of defense.
+    let router = match normalize_rpc_base_path(rpc_base_path) {
+        Some(base) => public.nest(&base, rpc),
+        None => public.merge(rpc),
+    };
     if dev_cors {
         router.layer(CorsLayer::permissive())
     } else {
         router
     }
+}
+
+/// Normalize a configured RPC base path into an axum-`nest`-safe prefix, or `None` for the historical
+/// root mount. Ensures a single leading slash and strips a trailing slash; treats `None`, empty, or
+/// `/` as unset. axum's `nest` panics on an empty path or a trailing slash, so this guards both.
+fn normalize_rpc_base_path(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    })
 }
 
 /// Builds the native token-exchange state. Enabled only when `token_exchange.enabled` is set, and
@@ -741,6 +765,7 @@ pub async fn start_api_server(
         idempotency_store,
         rate_limit_store,
         dev_cors,
+        api.rpc_base_path.as_deref(),
     );
 
     if dev_cors {
@@ -884,6 +909,36 @@ mod tests {
 
     fn noop_bearer() -> Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> {
         Arc::new(NoopBearer)
+    }
+
+    #[test]
+    fn normalize_rpc_base_path_handles_unset_and_root() {
+        // Unset / empty / bare-slash all mean "root mount" (caller uses `merge`).
+        assert_eq!(normalize_rpc_base_path(None), None);
+        assert_eq!(normalize_rpc_base_path(Some("")), None);
+        assert_eq!(normalize_rpc_base_path(Some("   ")), None);
+        assert_eq!(normalize_rpc_base_path(Some("/")), None);
+    }
+
+    #[test]
+    fn normalize_rpc_base_path_normalizes_slashes() {
+        // Leading slash added if missing; trailing slash stripped (axum `nest` rejects both edges).
+        assert_eq!(
+            normalize_rpc_base_path(Some("/api")).as_deref(),
+            Some("/api")
+        );
+        assert_eq!(
+            normalize_rpc_base_path(Some("api")).as_deref(),
+            Some("/api")
+        );
+        assert_eq!(
+            normalize_rpc_base_path(Some("/api/")).as_deref(),
+            Some("/api")
+        );
+        assert_eq!(
+            normalize_rpc_base_path(Some(" /gateway/v1/ ")).as_deref(),
+            Some("/gateway/v1")
+        );
     }
 
     fn base_oauth2(oauth2_type: Oauth2Type) -> Oauth2 {

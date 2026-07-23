@@ -70,6 +70,15 @@ Batch requests (`POST /rpc/batch`) and per-frame idempotency (an `idem` field pe
 from the `Idempotency-Key` header used for single requests — see Idempotency below) come as part of
 this transport, not as separately-built features.
 
+cratestack mounts the surface at `/rpc/<op_id>` (the client signs that canonical path
+byte-for-byte). `server.api.rpc_base_path` lets a deployment mount it under a prefix instead — e.g.
+`/api` serves `/api/rpc/<op_id>` — so authz-api can match a generated client whose `basePath` is
+`/api` without an edge rewrite. It is implemented by `nest`-ing only the RPC router (the health
+probes, `/.well-known/*`, and `/oauth2/token` stay at the root); `nest` strips the prefix before the
+inner layers run, so the RBAC gate, idempotency/rate-limit layers, and dispatch all still see the
+canonical `/rpc/<op_id>`. The gate's op-id extraction (`rpc_authorize::op_id_from_path`) also matches
+`/rpc/` anywhere in the path as a second line of defense. Unset (the default) keeps the root mount.
+
 ### Collapse of the `AuthzStore` trait indirection
 
 `crates/lightbridge-authz-api/src/store.rs` (`AuthzStore` trait) and its single implementation

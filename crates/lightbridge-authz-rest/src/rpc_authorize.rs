@@ -119,10 +119,19 @@ fn deny(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
 }
 
-/// The op-id segment of an RPC request path (`/rpc/<op_id>`), or an empty string when the path is
-/// not under `/rpc/` (which the map treats as unmapped -> denied anyway).
+/// The op-id segment of an RPC request path — the part after the last `/rpc/`, or an empty string
+/// when the path contains no `/rpc/` segment (which the map treats as unmapped -> denied anyway).
+///
+/// Matches on `/rpc/` anywhere rather than only as a leading prefix so the gate is correct whether
+/// the RPC surface is mounted at the root (`/rpc/<op_id>`) or under a configured base path
+/// (`server.api.rpc_base_path`, e.g. `/api/rpc/<op_id>`). axum's `nest` normally strips the prefix
+/// before this middleware runs, but matching the substring keeps the gate correct regardless of
+/// layer ordering. Op-ids never contain `/rpc/` (they are dot-delimited, e.g. `model.Account.list`).
 fn op_id_from_path(path: &str) -> &str {
-    path.strip_prefix("/rpc/").unwrap_or("")
+    match path.rfind("/rpc/") {
+        Some(idx) => &path[idx + "/rpc/".len()..],
+        None => "",
+    }
 }
 
 /// Axum middleware enforcing the coarse RBAC gate ahead of cratestack's RPC dispatch. Wire it with
@@ -241,6 +250,23 @@ mod tests {
         );
         assert_eq!(op_id_from_path("/rpc/batch"), "batch");
         assert_eq!(op_id_from_path("/healthz"), "");
+    }
+
+    #[test]
+    fn op_id_is_extracted_under_a_configured_base_path() {
+        // With `server.api.rpc_base_path` set (e.g. `/api`), the externally-visible path is
+        // `/api/rpc/<op_id>`. The gate must still resolve the op-id.
+        assert_eq!(
+            op_id_from_path("/api/rpc/model.Account.list"),
+            "model.Account.list"
+        );
+        assert_eq!(
+            op_id_from_path("/gateway/v1/rpc/procedure.createAccount"),
+            "procedure.createAccount"
+        );
+        assert_eq!(op_id_from_path("/api/rpc/batch"), "batch");
+        // No `/rpc/` segment anywhere -> unmapped (denied).
+        assert_eq!(op_id_from_path("/api/healthz"), "");
     }
 
     #[test]

@@ -1906,6 +1906,7 @@ mod tests {
                 key_path: "unused".to_string(),
             },
             allowed_hosts: None,
+            rpc_base_path: None,
         }
     }
 
