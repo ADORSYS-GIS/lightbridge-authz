@@ -537,6 +537,85 @@ async fn list_projects_recovers_from_legacy_jsonb_null_allowed_models() {
     );
 }
 
+/// Regression for the legacy plain-`{}` `default_limits` decode failure (migration
+/// `20260723000002`). Pre-cratestack projects stored an empty `default_limits` as plain JSON `{}`,
+/// but cratestack persists/expects its externally-tagged `Value` form (an empty map is
+/// `{"Map": {}}`). Reading the plain `{}` fails with `expected value at line 1 column 2`, so
+/// `model.Project.list`/`get` 500 for that account. `default_limits` is NOT NULL, so this forces the
+/// legacy shape, asserts it reproduces the 500, applies the migration's exact normalization
+/// (plain `{}` -> the tagged empty map `{"Map": {}}`), and asserts the list recovers.
+#[tokio::test]
+async fn list_projects_recovers_from_legacy_plain_empty_default_limits() {
+    let subject = format!("owner-{}", cuid2());
+    let ctx = setup(admin_bearer(&subject)).await;
+    let r = &ctx.router;
+    let billing_id = format!("tenant-{}", cuid2());
+    let account_id = create_account(r, "admin", &billing_id).await;
+    let project_id = create_project(r, "admin", &account_id, "legacy-dl").await;
+
+    // Legacy write shape: plain JSON empty object, NOT cratestack's `{"Map": {}}`.
+    sqlx::query("UPDATE projects SET default_limits = '{}'::jsonb WHERE id = $1")
+        .bind(&project_id)
+        .execute(&ctx.verify)
+        .await
+        .expect("force plain empty default_limits");
+    let stored: String =
+        sqlx::query_scalar("SELECT default_limits::text FROM projects WHERE id = $1")
+            .bind(&project_id)
+            .fetch_one(&ctx.verify)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored, "{}",
+        "must be plain empty object, not the tagged form"
+    );
+
+    let list = |r: Router| {
+        let account_id = account_id.clone();
+        async move {
+            rpc_call(
+                r,
+                "model.Project.list",
+                Wire::Json,
+                &json!({ "filters": [{ "key": "accountId", "value": account_id }] }),
+                Some("admin"),
+            )
+            .await
+        }
+    };
+
+    let (before, _) = list(r.clone()).await;
+    assert_eq!(
+        before,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the legacy plain `{{}}` default_limits must reproduce the decode failure"
+    );
+
+    // Migration 20260723000002: normalize plain `{}` -> the tagged empty map `{"Map": {}}`.
+    sqlx::query(r#"UPDATE projects SET default_limits = '{"Map": {}}'::jsonb WHERE default_limits = '{}'::jsonb"#)
+        .execute(&ctx.verify)
+        .await
+        .expect("normalize plain {} -> tagged empty map");
+
+    let (after, body) = list(r.clone()).await;
+    assert_eq!(
+        after,
+        StatusCode::OK,
+        "after normalization the list must decode: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let ids: Vec<String> = json_body(&body)["items"]
+        .as_array()
+        .expect("items array")
+        .iter()
+        .filter_map(|p| p["id"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        ids.contains(&project_id),
+        "normalized project must be listed; got {ids:?}"
+    );
+}
+
 /// Regression for the `Cuid -> String` schema fix: `model.Project.list` filtered by a real
 /// account id must succeed over the wire. cratestack's `Cuid` scalar rejected any id not starting
 /// with `'c'`, but the app mints cuid2 ids (e.g. `go17t93z1vbd99yl5toj7eu5`), so the frontend's
