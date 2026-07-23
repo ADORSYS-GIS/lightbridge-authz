@@ -37,11 +37,13 @@ impl StoreRepo {
         self.pool.pool()
     }
 
-    fn vec_to_json(values: &Option<Vec<String>>) -> Value {
-        match values {
-            Some(v) => serde_json::json!(v),
-            None => Value::Null,
-        }
+    /// Map an optional model list to the value stored in `projects.allowed_models`. `None` maps to
+    /// SQL `NULL` (bound as `Option::None`), NOT the jsonb `null` literal: cratestack's
+    /// `allowedModels Json?` decode fails on `'null'::jsonb` (see migration
+    /// `20260723000001_normalize_allowed_models_json_null`). Both SQL NULL and `[]` mean "all models
+    /// allowed"; SQL NULL is the shape cratestack reads cleanly.
+    fn vec_to_json(values: &Option<Vec<String>>) -> Option<Value> {
+        values.as_ref().map(|v| serde_json::json!(v))
     }
 
     fn json_to_vec(value: &Option<Value>) -> Option<Vec<String>> {
@@ -725,7 +727,7 @@ impl StoreRepo {
             id,
             account_id: account_id.to_string(),
             name: input.name,
-            allowed_models: Some(Self::vec_to_json(&input.allowed_models)),
+            allowed_models: Self::vec_to_json(&input.allowed_models),
             default_limits: Self::limits_to_json(&input.default_limits),
             billing_plan: input.billing_plan,
             created_at: now,
