@@ -456,6 +456,49 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// Regression for the `Cuid -> String` schema fix: `model.Project.list` filtered by a real
+/// account id must succeed over the wire. cratestack's `Cuid` scalar rejected any id not starting
+/// with `'c'`, but the app mints cuid2 ids (e.g. `go17t93z1vbd99yl5toj7eu5`), so the frontend's
+/// list-by-account 400'd with `invalid cuid '<id>': expected ... starting with 'c'`. This exercises
+/// the exact `{filters:[{key:accountId,value:<id>}]}` wire shape the generated client emits, with a
+/// server-minted cuid2 account id.
+#[tokio::test]
+async fn list_projects_filtered_by_a_cuid2_account_id_is_accepted() {
+    let subject = format!("owner-{}", cuid2());
+    let ctx = setup(admin_bearer(&subject)).await;
+    let r = &ctx.router;
+
+    let billing_id = format!("tenant-{}", cuid2());
+    let account_id = create_account(r, "admin", &billing_id).await;
+    let project_id = create_project(r, "admin", &account_id, "proj-filter").await;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Project.list",
+        Wire::Json,
+        &json!({ "filters": [{ "key": "accountId", "value": account_id }] }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "list-by-accountId must not be rejected as an invalid cuid (got {status}): {}",
+        String::from_utf8_lossy(&body)
+    );
+    let page = json_body(&body);
+    let returned: Vec<&str> = page["items"]
+        .as_array()
+        .expect("paged list returns an items array")
+        .iter()
+        .filter_map(|p| p["id"].as_str())
+        .collect();
+    assert!(
+        returned.contains(&project_id.as_str()),
+        "the accountId-filtered list must return the created project; got {returned:?}"
+    );
+}
+
 #[tokio::test]
 async fn crud_lifecycle_over_cbor() {
     let subject = format!("owner-cbor-{}", cuid2());
