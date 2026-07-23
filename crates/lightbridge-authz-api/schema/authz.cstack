@@ -37,7 +37,7 @@ mixin AuditFields {
 model Account {
   @use(AuditFields)
 
-  id Cuid @id
+  id String @id
   billingIdentity String @unique
   // Server-managed lifecycle state: set only by the disable/enable procedures and the
   // DB `DEFAULT 'active'` (migrations/20260714000001). `@readonly` drops it from the
@@ -77,8 +77,8 @@ model Account {
 model Project {
   @use(AuditFields)
 
-  id Cuid @id
-  accountId Cuid
+  id String @id
+  accountId String
   name String
   allowedModels Json?
   defaultLimits Json
@@ -115,8 +115,8 @@ model Project {
 model ApiKey {
   @use(AuditFields)
 
-  id Cuid @id
-  projectId Cuid @readonly
+  id String @id
+  projectId String @readonly
   name String
   keyPrefix String @readonly
   keyHash String @unique @server_only
@@ -161,8 +161,8 @@ model ApiKey {
 // cratestack/cratestack#136. Revisit once that lands; the synthetic-`id` workaround stays
 // until then.
 model AccountMembership {
-  id Cuid @id
-  accountId Cuid
+  id String @id
+  accountId String
   subject String
   // "owner" | "admin" | "member" (DB CHECK constraint, migrations/20260722000001_account_
   // membership_roles.sql). Gates addAccountMember/removeAccountMember/disableAccount/
@@ -184,7 +184,7 @@ model AccountMembership {
 // Refresh is explicit (runtime.views().account_summary().refresh().await),
 // never automatic-on-write.
 view AccountSummary from Account, Project, ApiKey {
-  id Cuid @id @from(Account.id)
+  id String @id @from(Account.id)
   projectCount Int
   apiKeyCount Int
   activeApiKeyCount Int
@@ -195,7 +195,7 @@ view AccountSummary from Account, Project, ApiKey {
 }
 
 type RotateApiKeyInput {
-  keyId Cuid
+  keyId String
 }
 
 // Nests the real `ApiKey` model directly, matching the real
@@ -244,7 +244,7 @@ mutation procedure createAccount(args: CreateAccountInput): Account
 // hand-written sqlx in the ProcedureRegistry impl (reusing `AuthzStoreImpl::create_api_key`),
 // tenant-scoped by the `account_memberships` CTE exactly as `rotateApiKey` is.
 type CreateApiKeyInput {
-  projectId Cuid
+  projectId String
   name String
   expiresAt DateTime?
   billingPlan String
@@ -254,7 +254,7 @@ mutation procedure createApiKey(args: CreateApiKeyInput): ApiKeySecret
   @allow(auth() != null)
 
 type RevokeApiKeyInput {
-  keyId Cuid
+  keyId String
 }
 
 mutation procedure revokeApiKey(args: RevokeApiKeyInput): ApiKey
@@ -272,7 +272,7 @@ mutation procedure revokeApiKey(args: RevokeApiKeyInput): ApiKey
 // the acting subject to already be an owner (admins cannot mint new owners); an admin cannot
 // remove an owner.
 type AddAccountMemberInput {
-  accountId Cuid
+  accountId String
   subject String
   // Optional; defaults to "member" if omitted. Granting "owner" requires the acting subject to
   // already hold "owner" (see above).
@@ -283,7 +283,7 @@ mutation procedure addAccountMember(args: AddAccountMemberInput): Account
   @allow(auth() != null)
 
 type RemoveAccountMemberInput {
-  accountId Cuid
+  accountId String
   subject String
 }
 
@@ -293,7 +293,7 @@ mutation procedure removeAccountMember(args: RemoveAccountMemberInput): Account
 // Owner-only. Refuses to demote/reassign-away-from-owner the account's last remaining owner (same
 // lockout-avoidance shape as removeAccountMember's "cannot remove the last owner").
 type SetAccountMemberRoleInput {
-  accountId Cuid
+  accountId String
   subject String
   role String
 }
@@ -305,7 +305,7 @@ mutation procedure setAccountMemberRole(args: SetAccountMemberRoleInput): Accoun
 // model's `@@allow` comments). Cascades to projects/api-keys/memberships via the existing
 // `ON DELETE CASCADE` foreign keys, same as the pre-migration hand-written delete did.
 type DeleteAccountPermanentlyInput {
-  accountId Cuid
+  accountId String
 }
 
 mutation procedure deleteAccountPermanently(args: DeleteAccountPermanentlyInput): Account
@@ -319,7 +319,7 @@ mutation procedure deleteAccountPermanently(args: DeleteAccountPermanentlyInput)
 // The `@allow(auth() != null)` gate only asserts an authenticated caller; the coarse
 // `account:disable` / `project:disable` capability is enforced by the RBAC layer.
 type AccountStatusInput {
-  accountId Cuid
+  accountId String
 }
 
 mutation procedure disableAccount(args: AccountStatusInput): Account
@@ -329,7 +329,7 @@ mutation procedure enableAccount(args: AccountStatusInput): Account
   @allow(auth() != null)
 
 type ProjectStatusInput {
-  projectId Cuid
+  projectId String
 }
 
 mutation procedure disableProject(args: ProjectStatusInput): Project
