@@ -457,6 +457,86 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// Regression for the legacy jsonb-`null` `allowed_models` decode failure (migration
+/// `20260723000001`). Pre-cratestack projects stored an empty `allowed_models` as the jsonb `null`
+/// LITERAL (`'null'::jsonb`), not SQL NULL. cratestack's `allowedModels Json?` decode fails on it
+/// with `expected value at line 1 column 1`, so `model.Project.list`/`get` 500 for that account.
+/// This forces the legacy shape, asserts it reproduces the 500, then applies the migration's exact
+/// normalization (`'null'::jsonb` -> SQL NULL) and asserts the list recovers and returns the project.
+#[tokio::test]
+async fn list_projects_recovers_from_legacy_jsonb_null_allowed_models() {
+    let subject = format!("owner-{}", cuid2());
+    let ctx = setup(admin_bearer(&subject)).await;
+    let r = &ctx.router;
+    let billing_id = format!("tenant-{}", cuid2());
+    let account_id = create_account(r, "admin", &billing_id).await;
+    let project_id = create_project(r, "admin", &account_id, "legacy").await;
+
+    // Legacy write shape: the jsonb `null` literal (jsonb_typeof = 'null'), not SQL NULL.
+    sqlx::query("UPDATE projects SET allowed_models = 'null'::jsonb WHERE id = $1")
+        .bind(&project_id)
+        .execute(&ctx.verify)
+        .await
+        .expect("force jsonb null literal");
+    let (sql_null, json_type): (bool, Option<String>) = sqlx::query_as(
+        "SELECT allowed_models IS NULL, jsonb_typeof(allowed_models) FROM projects WHERE id = $1",
+    )
+    .bind(&project_id)
+    .fetch_one(&ctx.verify)
+    .await
+    .unwrap();
+    assert!(!sql_null && json_type.as_deref() == Some("null"));
+
+    let list = |r: Router| {
+        let account_id = account_id.clone();
+        async move {
+            rpc_call(
+                r,
+                "model.Project.list",
+                Wire::Json,
+                &json!({ "filters": [{ "key": "accountId", "value": account_id }] }),
+                Some("admin"),
+            )
+            .await
+        }
+    };
+
+    // Before the fix: the jsonb null literal breaks cratestack's decode.
+    let (before, _) = list(r.clone()).await;
+    assert_eq!(
+        before,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the legacy jsonb null literal must reproduce the decode failure"
+    );
+
+    // Migration 20260723000001: normalize `'null'::jsonb` -> SQL NULL.
+    sqlx::query(
+        "UPDATE projects SET allowed_models = NULL WHERE jsonb_typeof(allowed_models) = 'null'",
+    )
+    .execute(&ctx.verify)
+    .await
+    .expect("normalize jsonb null -> SQL NULL");
+
+    // After: the list decodes cleanly and returns the project.
+    let (after, body) = list(r.clone()).await;
+    assert_eq!(
+        after,
+        StatusCode::OK,
+        "after normalization the list must decode: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let ids: Vec<String> = json_body(&body)["items"]
+        .as_array()
+        .expect("items array")
+        .iter()
+        .filter_map(|p| p["id"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        ids.contains(&project_id),
+        "normalized project must be listed; got {ids:?}"
+    );
+}
+
 /// Regression for the `Cuid -> String` schema fix: `model.Project.list` filtered by a real
 /// account id must succeed over the wire. cratestack's `Cuid` scalar rejected any id not starting
 /// with `'c'`, but the app mints cuid2 ids (e.g. `go17t93z1vbd99yl5toj7eu5`), so the frontend's
