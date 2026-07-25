@@ -44,6 +44,7 @@ model Account {
   // generated create/update inputs so a raw RPC caller cannot supply a born-suspended
   // status, matching `ApiKey.status` below.
   status String @readonly
+  isDefault Boolean @readonly
   projects Project[] @relation(fields:[id],references:[accountId])
   memberships AccountMembership[] @relation(fields:[id],references:[accountId])
 
@@ -57,6 +58,12 @@ model Account {
   // `createAccount` procedure, which inserts the account and the creator's membership in
   // one transaction, and `model.Account.create` is also denied unconditionally at the
   // RBAC layer (crates/lightbridge-authz-rest/src/rpc_authorize.rs).
+  //
+  // isDefault is set once, server-side, inside `createAccount` -- true only if the creating
+  // subject had zero prior account memberships at that moment (their genuine first/bootstrap
+  // account). `@readonly` keeps it out of the generic update input entirely; nothing mutates it
+  // after insert. `deleteAccountPermanently` (hand-written SQL) refuses to delete a default
+  // account -- disableAccount (suspend) still works on it.
   //
   // NOTE: no `@@allow("delete", ...)` either, as of the membership-roles change. Account
   // deletion is now owner-only, and cratestack's relation-quantifier policy predicates can't
@@ -87,6 +94,16 @@ model Project {
   // by disable/enable procedures + DB `DEFAULT 'active'`, `@readonly` so it is absent from
   // the generic `model.Project.create`/`update` inputs.
   status String @readonly
+  // Set once, server-side, by a `BEFORE INSERT` trigger (`migrations/20260725000001_default_
+  // account_project.sql`) -- true only for an account's first-ever project. `@readonly` keeps it
+  // out of the generic create/update inputs; unlike Account/ApiKey, Project creation was never
+  // moved to a hand-written procedure (see `@@allow("create", ...)` below), so cratestack's
+  // generic `model.Project.create` verb has no hook for this per-request "is this the account's
+  // first project" computation -- the DB trigger is the only mechanism available. A partial
+  // unique index backstops the race where two concurrent first-project creates for the same
+  // brand-new account would otherwise both see zero existing rows. Gates `@@allow("delete", ...)`
+  // below -- a default project can still be suspended (disableProject) but never hard-deleted.
+  isDefault Boolean @readonly
   account Account @relation(fields:[accountId],references:[id])
   apiKeys ApiKey[] @relation(fields:[id],references:[projectId])
 
@@ -95,7 +112,7 @@ model Project {
   @@allow("create", account.memberships.some.subject == auth().id)
   @@allow("read", account.memberships.some.subject == auth().id)
   @@allow("update", account.memberships.some.subject == auth().id)
-  @@allow("delete", account.memberships.some.subject == auth().id)
+  @@allow("delete", isDefault != true && account.memberships.some.subject == auth().id)
 }
 
 // Field-level immutability closes the gap the coarse RBAC gate cannot express on

@@ -57,6 +57,8 @@ pub struct Account {
     pub owners_admins: Vec<String>,
     #[serde(default)]
     pub status: ResourceStatus,
+    #[serde(default)]
+    pub is_default: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -92,6 +94,8 @@ pub struct Project {
     pub billing_plan: String,
     #[serde(default)]
     pub status: ResourceStatus,
+    #[serde(default)]
+    pub is_default: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

@@ -139,6 +139,7 @@ fn mk_project() -> Project {
         default_limits: None,
         billing_plan: "free".to_string(),
         status: ResourceStatus::Active,
+        is_default: false,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -150,6 +151,7 @@ fn mk_account() -> Account {
         billing_identity: "acme".to_string(),
         owners_admins: vec!["owner@example.com".to_string()],
         status: ResourceStatus::Active,
+        is_default: false,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

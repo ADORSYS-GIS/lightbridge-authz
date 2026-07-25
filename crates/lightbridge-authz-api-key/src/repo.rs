@@ -81,6 +81,7 @@ impl StoreRepo {
             billing_identity: row.billing_identity,
             owners_admins: row.owners_admins,
             status: ResourceStatus::from(row.status),
+            is_default: row.is_default,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -223,6 +224,7 @@ impl StoreRepo {
               accounts.billing_identity,
               COALESCE(array_agg(account_memberships.subject ORDER BY account_memberships.subject), '{}'::text[]) AS owners_admins,
               accounts.status,
+              accounts.is_default,
               accounts.created_at,
               accounts.updated_at
             FROM accounts
@@ -249,6 +251,7 @@ impl StoreRepo {
               accounts.billing_identity,
               COALESCE(array_agg(account_memberships.subject ORDER BY account_memberships.subject), '{}'::text[]) AS owners_admins,
               accounts.status,
+              accounts.is_default,
               accounts.created_at,
               accounts.updated_at
             FROM accounts
@@ -279,6 +282,7 @@ impl StoreRepo {
             default_limits: Self::json_to_limits(&row.default_limits),
             billing_plan: row.billing_plan,
             status: ResourceStatus::from(row.status),
+            is_default: row.is_default,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -311,22 +315,39 @@ impl StoreRepo {
     ) -> Result<Account> {
         let now = Utc::now();
         let members = Self::normalize_members(Vec::new(), subject);
+
+        let mut tx: Transaction<'_, Postgres> = self.pool().begin().await?;
+
+        // Default = this is the subject's genuine first account (zero prior memberships anywhere,
+        // checked before this account's own membership row is inserted below). Computed here, not
+        // left to a DB default, because -- unlike Project's "first project per account" (a plain
+        // per-row existence check the DB trigger can express) -- "first account for this subject"
+        // needs a cross-table lookup on `account_memberships` that has no natural column to hang a
+        // trigger off inside the `accounts` table itself.
+        let has_existing_account: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS(SELECT 1 FROM account_memberships WHERE subject = $1)"#,
+        )
+        .bind(subject)
+        .fetch_one(&mut *tx)
+        .await?;
+
         let new_account = NewAccountRow {
             id: id.clone(),
             billing_identity: input.billing_identity,
+            is_default: !has_existing_account,
             created_at: now,
             updated_at: now,
         };
 
-        let mut tx: Transaction<'_, Postgres> = self.pool().begin().await?;
         sqlx::query(
             r#"
-            INSERT INTO accounts (id, billing_identity, created_at, updated_at)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO accounts (id, billing_identity, is_default, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5)
             "#,
         )
         .bind(new_account.id.clone())
         .bind(new_account.billing_identity.clone())
+        .bind(new_account.is_default)
         .bind(new_account.created_at)
         .bind(new_account.updated_at)
         .execute(&mut *tx)
@@ -367,6 +388,7 @@ impl StoreRepo {
               accounts.billing_identity,
               COALESCE(array_agg(account_memberships.subject ORDER BY account_memberships.subject), '{}'::text[]) AS owners_admins,
               accounts.status,
+              accounts.is_default,
               accounts.created_at,
               accounts.updated_at
             FROM accounts
@@ -480,11 +502,30 @@ impl StoreRepo {
             }
         }
 
+        // The default account (the one `createAccount` seeded for this tenant when they had none)
+        // can be suspended (disableAccount) but never permanently deleted -- checked before the
+        // DELETE so a default account is never even briefly removed.
+        let is_default: Option<bool> =
+            sqlx::query_scalar(r#"SELECT is_default FROM accounts WHERE id = $1"#)
+                .bind(account_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        match is_default {
+            None => return Err(lightbridge_authz_core::error::Error::NotFound),
+            Some(true) => {
+                return Err(lightbridge_authz_core::error::Error::Conflict(
+                    "the default account cannot be permanently deleted; suspend it instead"
+                        .to_string(),
+                ));
+            }
+            Some(false) => {}
+        }
+
         let row: Option<AccountWithMembersRow> = sqlx::query_as(
             r#"
             DELETE FROM accounts
             WHERE id = $1
-            RETURNING id, billing_identity, '{}'::text[] AS owners_admins, status, created_at, updated_at
+            RETURNING id, billing_identity, '{}'::text[] AS owners_admins, status, is_default, created_at, updated_at
             "#,
         )
         .bind(account_id)
@@ -746,7 +787,7 @@ impl StoreRepo {
             )
             SELECT $3, account_auth.account_id, $4, $5, $6, $7, $8, $9
             FROM account_auth
-            RETURNING id, account_id, name, allowed_models, default_limits, billing_plan, status, created_at, updated_at
+            RETURNING id, account_id, name, allowed_models, default_limits, billing_plan, status, is_default, created_at, updated_at
             "#,
         )
         .bind(account_id)
@@ -924,6 +965,7 @@ impl StoreRepo {
               projects.default_limits,
               projects.billing_plan,
               projects.status,
+              projects.is_default,
               projects.created_at,
               projects.updated_at
             FROM projects
@@ -960,6 +1002,7 @@ impl StoreRepo {
               projects.default_limits,
               projects.billing_plan,
               projects.status,
+              projects.is_default,
               projects.created_at,
               projects.updated_at
             FROM projects
@@ -991,6 +1034,7 @@ impl StoreRepo {
               default_limits,
               billing_plan,
               status,
+              is_default,
               created_at,
               updated_at
             FROM projects
@@ -1043,6 +1087,7 @@ impl StoreRepo {
               projects.default_limits,
               projects.billing_plan,
               projects.status,
+              projects.is_default,
               projects.created_at,
               projects.updated_at
             "#,
@@ -1310,6 +1355,7 @@ impl StoreRepo {
               projects.default_limits,
               projects.billing_plan,
               projects.status,
+              projects.is_default,
               projects.created_at,
               projects.updated_at
             "#,

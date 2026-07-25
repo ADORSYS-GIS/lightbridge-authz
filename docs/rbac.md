@@ -302,3 +302,24 @@ independent `EXISTS` checks ("some member matches my subject" AND, separately, "
 member — has role owner"), not "the member row matching my subject also has role owner". So role
 gating lives entirely in hand-written SQL inside the five procedures above (confirmed by reading
 `cratestack-macros/src/policy/model/relation_path.rs`) rather than in the schema's `@@allow` policies.
+
+### The default account/project can't be hard-deleted
+
+The account `createAccount` seeds for a brand-new tenant, and the first project ever created under
+an account, are each marked `isDefault = true` — server-computed once at insert time, immutable
+after (`isDefault Boolean @readonly` in the schema; a subject's *second* `createAccount` call, or an
+account's *second* project, both come back `isDefault: false`). This is a hard safety rail, not a
+role check: `deleteAccountPermanently` refuses a default account with `409 Conflict` regardless of
+who's calling (even the sole owner), and `model.Project.delete`'s `@@allow` policy denies a default
+project the same way. Suspending (`disableAccount`/`disableProject`) still works on either — only
+the permanent-delete path is blocked, so a tenant can never accidentally wipe out their only
+account/project (and every API key underneath it) with no way back.
+
+`isDefault` for `Account` is computed in `createAccount`'s own transaction (`StoreRepo::
+create_account`, checking whether the calling subject already has any `account_memberships` row).
+For `Project` there's no equivalent hand-written procedure — `model.Project.create` is still the
+generic cratestack verb (see the `Project` model's `@@allow("create", ...)` above) — so `isDefault`
+is computed by a `BEFORE INSERT` trigger instead (`migrations/20260725000001_default_account_
+project.sql`), backstopped by a partial unique index (`projects_account_id_default_uidx`) against
+the race where two concurrent first-project creates for the same brand-new account would otherwise
+both see zero existing rows.
