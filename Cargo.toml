@@ -24,7 +24,7 @@ serde_yaml = "0.9"
 serde_json = "1.0"
 sha2 = "0.11"
 hex = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 jsonwebtoken = { version = "10.3" }
 # Resource-server JWT/JWKS validation (see crates/lightbridge-authz-bearer). This is the
 # published crate that implements the module ADR-0004 refers to as "authkestra-resource" — that
