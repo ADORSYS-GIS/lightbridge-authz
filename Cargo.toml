@@ -92,6 +92,11 @@ cratestack-redis = "0.4.13"
 cratestack = { package = "cratestack-pg", version = "0.4.13" }
 cratestack-codec-cbor = "0.4.13"
 cratestack-codec-json = "0.4.13"
+# Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
+# `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
+# level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
+# feature). See that module for why.
+minicbor = { version = "2.2", features = ["std", "half"] }
 redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
 
 [profile.prod]

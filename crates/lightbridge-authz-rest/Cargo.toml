@@ -39,6 +39,7 @@ cratestack-redis.workspace = true
 cratestack = { workspace = true }
 cratestack-codec-cbor.workspace = true
 cratestack-codec-json.workspace = true
+minicbor.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
