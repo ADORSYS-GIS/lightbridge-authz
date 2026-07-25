@@ -71,6 +71,10 @@ controllers:
     type: job
     job:
       backoffLimit: 3
+      # Backstop against ArgoCD's helm.sh/hook-delete-policy cleanup silently not firing -- see the
+      # matching comment in charts/lightbridge-authz/values.yaml for the incident this guards
+      # against (a stuck migrate Job silently blocked every future deploy's migration from running).
+      ttlSecondsAfterFinished: 300
     annotations:
       "helm.sh/hook": post-install,post-upgrade
       "helm.sh/hook-weight": "-5"
