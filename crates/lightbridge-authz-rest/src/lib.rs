@@ -179,6 +179,7 @@ fn to_schema_account(a: Account) -> schema::Account {
         id: a.id,
         billingIdentity: a.billing_identity,
         status: a.status.to_string(),
+        isDefault: a.is_default,
     }
 }
 
@@ -222,6 +223,7 @@ fn to_schema_project(p: Project) -> schema::Project {
         defaultLimits: default_limits,
         billingPlan: p.billing_plan,
         status: p.status.to_string(),
+        isDefault: p.is_default,
     }
 }
 

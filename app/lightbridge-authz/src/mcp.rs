@@ -1762,6 +1762,7 @@ mod tests {
             default_limits: None,
             billing_plan: "free".to_string(),
             status: lightbridge_authz_core::ResourceStatus::Active,
+            is_default: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -1773,6 +1774,7 @@ mod tests {
             billing_identity: "bill_1".to_string(),
             owners_admins: vec!["owner".to_string()],
             status: lightbridge_authz_core::ResourceStatus::Active,
+            is_default: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

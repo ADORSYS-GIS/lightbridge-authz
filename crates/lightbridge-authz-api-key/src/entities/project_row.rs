@@ -11,6 +11,7 @@ pub struct ProjectRow {
     pub default_limits: serde_json::Value,
     pub billing_plan: String,
     pub status: String,
+    pub is_default: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

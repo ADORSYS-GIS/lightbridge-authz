@@ -71,9 +71,19 @@ fn billing() -> Billing {
     }
 }
 
+// Each `#[tokio::test]` calls `setup()`, which builds its own `core_pool()` + `cratestack_pool()`
+// + `verify` pool -- with `cargo test`'s default full parallelism, that's N tests running
+// concurrently, each holding its own small pool, against Postgres's `max_connections = 100`
+// (local compose default, `compose.yaml`'s `postgresql` service). At 5 connections apiece the
+// combined ceiling (2 pools x 5 x ~16 tests = 160) exceeds 100, so a busy run intermittently hits
+// "pool timed out while waiting for an open connection" -- each test's actual concurrent need is
+// low (mostly one sequential transaction at a time), so a small per-test cap has ample headroom
+// without slowing any individual test down.
+const TEST_POOL_MAX_CONNECTIONS: u32 = 2;
+
 async fn core_pool() -> Arc<dyn DbPoolTrait> {
     let pool = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(TEST_POOL_MAX_CONNECTIONS)
         .connect(&database_url())
         .await
         .expect("connect core pool");
@@ -82,7 +92,7 @@ async fn core_pool() -> Arc<dyn DbPoolTrait> {
 
 async fn cratestack_pool() -> cratestack::sqlx::PgPool {
     cratestack::sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(TEST_POOL_MAX_CONNECTIONS)
         .connect(&database_url())
         .await
         .expect("connect cratestack pool")
@@ -100,6 +110,16 @@ struct Ctx {
     issuer: Arc<AuthzStoreImpl>,
 }
 
+// `SqlxIdempotencyStore::ensure_schema()` issues its `CREATE TYPE`/`CREATE TABLE` DDL without
+// `IF NOT EXISTS`-safe concurrency handling, so when every one of this file's ~16 tests calls it
+// from `setup()` against the same fresh (just-migrated) database under `cargo test`'s default
+// parallelism, several race and hit `duplicate key value violates unique constraint
+// "pg_type_typname_nsp_index"`. The schema is process-wide idempotent (identical DDL, no
+// per-test state), so it only needs to run once per test binary -- guarded by a `OnceCell` shared
+// across every `setup()` call; concurrent callers await the same in-flight future rather than
+// each issuing their own DDL.
+static IDEMPOTENCY_SCHEMA_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
 /// Build the full `build_api_router` for `bearer`, connecting the cratestack CRUD client,
 /// Postgres-backed idempotency store, and Redis rate-limit store to the live backends.
 async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
@@ -109,12 +129,23 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()).with_billing(billing()));
     let signing_repo = Arc::new(StoreRepo::new(core.clone()));
     let idempotency = Arc::new(SqlxIdempotencyStore::new(cpool.clone()));
-    idempotency
-        .ensure_schema()
-        .await
-        .expect("ensure idempotency schema");
+    IDEMPOTENCY_SCHEMA_READY
+        .get_or_init(|| async {
+            idempotency
+                .ensure_schema()
+                .await
+                .expect("ensure idempotency schema");
+        })
+        .await;
+    // A per-`setup()`-call namespace, not a shared literal: `RateLimitLayer`'s default key hashes
+    // the raw `Authorization` header value, and every test in this file authenticates with the
+    // literal bearer token `"admin"` (or another fixed literal like `"owner"`/`"viewer"`) -- a
+    // shared `"authz-api-it"` prefix would put every concurrently-running test's "admin" calls
+    // into the SAME token-bucket, so a big-enough test file blows through the shared burst budget
+    // under `cargo test`'s default parallelism regardless of any single test's own call volume.
     let rate_limit: Arc<dyn RateLimitStore> =
-        build_redis_rate_limit_store(&redis_url(), "authz-api-it").expect("redis rate-limit store");
+        build_redis_rate_limit_store(&redis_url(), format!("authz-api-it-{}", cuid2()))
+            .expect("redis rate-limit store");
 
     let router = lightbridge_authz_rest::build_api_router(
         &external_oauth2(),
@@ -433,24 +464,32 @@ async fn crud_lifecycle_for_all_resources_over_json() {
         "a soft-deleted api-key must not appear in list"
     );
 
-    // Project + account hard delete.
+    // Project + account hard delete. `project_id`/`account_id` above are this subject's/account's
+    // defaults (first-ever), which `model.Project.delete`/`deleteAccountPermanently` now correctly
+    // refuse (see `default_project_cannot_be_hard_deleted_only_suspended` /
+    // `default_account_cannot_be_hard_deleted_only_suspended` below) -- so hard-delete is exercised
+    // against a second, non-default project/account instead.
+    let second_project_id = create_project(r, "admin", &account_id, "proj-2").await;
     let (status, _) = rpc_call(
         r.clone(),
         "model.Project.delete",
         Wire::Json,
-        &json!({ "id": project_id }),
+        &json!({ "id": second_project_id }),
         Some("admin"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+
     // Account deletion is owner-only and no longer the generic `model.Account.delete` verb
-    // (ADR-0005) -- the account's creator ("admin", the token subject used throughout this test)
-    // was seeded as "owner" by `createAccount`, so this still succeeds.
+    // (ADR-0005) -- `create_account` below seeds "admin" as owner of its own second account, same
+    // as it did for `account_id`, so this still succeeds.
+    let second_account_id =
+        create_account(r, "admin", &format!("tenant2-hard-delete-{}", cuid2())).await;
     let (status, _) = rpc_call(
         r.clone(),
         "procedure.deleteAccountPermanently",
         Wire::Json,
-        &json!({ "args": { "accountId": account_id } }),
+        &json!({ "args": { "accountId": second_account_id } }),
         Some("admin"),
     )
     .await;
@@ -729,12 +768,30 @@ async fn crud_lifecycle_over_cbor() {
 
     // Account deletion is owner-only and no longer the generic `model.Account.delete` verb
     // (ADR-0005) -- the account's creator ("admin", the token subject used throughout this test)
-    // was seeded as "owner" by `createAccount`, so this still succeeds.
+    // was seeded as "owner" by `createAccount`, so this still succeeds. `account_id` above is this
+    // subject's default (first-ever) account, which `deleteAccountPermanently` now correctly
+    // refuses (see `default_account_cannot_be_hard_deleted_only_suspended` below) -- exercised
+    // against a second, non-default account instead.
+    let second_billing_id = format!("tenant-cbor-2nd-{}", cuid2());
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.createAccount",
+        Wire::Cbor,
+        &json!({ "args": { "billingIdentity": second_billing_id } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let second_account_id = Wire::Cbor.decode::<Value>(&body)["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
     let (status, _) = rpc_call(
         r.clone(),
         "procedure.deleteAccountPermanently",
         Wire::Cbor,
-        &json!({ "args": { "accountId": account_id } }),
+        &json!({ "args": { "accountId": second_account_id } }),
         Some("admin"),
     )
     .await;
@@ -1055,11 +1112,16 @@ async fn audit_rows_land_on_create_update_delete_for_an_audited_model() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+
+    // `project_id` above is the account's default (first-ever) project, which `model.Project.delete`
+    // now correctly refuses (see `default_project_cannot_be_hard_deleted_only_suspended` below) --
+    // the delete-audit-row assertion is exercised against a second, non-default project instead.
+    let second_project_id = create_project(r, "admin", &account_id, "proj-audit-delete").await;
     let (status, _) = rpc_call(
         r.clone(),
         "model.Project.delete",
         Wire::Json,
-        &json!({ "id": project_id }),
+        &json!({ "id": second_project_id }),
         Some("admin"),
     )
     .await;
@@ -1075,7 +1137,7 @@ async fn audit_rows_land_on_create_update_delete_for_an_audited_model() {
         "update audit row"
     );
     assert!(
-        audit_count(pool, "Project", "delete", &project_id).await >= 1,
+        audit_count(pool, "Project", "delete", &second_project_id).await >= 1,
         "delete audit row"
     );
 
@@ -1262,6 +1324,219 @@ async fn create_account_seeds_membership_enabling_project_create() {
     assert!(
         status.is_client_error(),
         "a non-member must be refused project creation under someone else's account (got {status}: {})",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Section 4: the default account/project (the one `createAccount` / the account's first project
+// seed) can be suspended but never hard-deleted -- a second account/project stays freely
+// deletable. Prevents a tenant from accidentally deleting their only account/project and losing
+// every API key underneath it.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn default_account_cannot_be_hard_deleted_only_suspended() {
+    let subject = format!("owner-default-acct-{}", cuid2());
+    let ctx = setup(admin_bearer(&subject)).await;
+    let r = &ctx.router;
+
+    // This subject's first-ever account -- is_default is computed true server-side.
+    let account_id = create_account(r, "admin", &format!("tenant-default-{}", cuid2())).await;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Account.get",
+        Wire::Json,
+        &json!({ "id": account_id }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json_body(&body)["isDefault"],
+        true,
+        "the account created for a brand-new subject must be marked default"
+    );
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.deleteAccountPermanently",
+        Wire::Json,
+        &json!({ "args": { "accountId": account_id } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "deleting the default account must be refused (got {status}: {})",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Still there.
+    let (status, _) = rpc_call(
+        r.clone(),
+        "model.Account.get",
+        Wire::Json,
+        &json!({ "id": account_id }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the default account must survive the refused delete"
+    );
+
+    // Suspend still works on it.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.disableAccount",
+        Wire::Json,
+        &json!({ "args": { "accountId": account_id } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the default account must still be suspendable: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(json_body(&body)["status"], "suspended");
+
+    // A second account for the SAME subject is NOT default, and stays freely deletable.
+    let second_account_id =
+        create_account(r, "admin", &format!("tenant-default-2nd-{}", cuid2())).await;
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Account.get",
+        Wire::Json,
+        &json!({ "id": second_account_id }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json_body(&body)["isDefault"],
+        false,
+        "a subject's second account must not be marked default"
+    );
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.deleteAccountPermanently",
+        Wire::Json,
+        &json!({ "args": { "accountId": second_account_id } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a non-default account must still be hard-deletable: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn default_project_cannot_be_hard_deleted_only_suspended() {
+    let subject = format!("owner-default-proj-{}", cuid2());
+    let ctx = setup(admin_bearer(&subject)).await;
+    let r = &ctx.router;
+
+    let account_id = create_account(r, "admin", &format!("tenant-default-proj-{}", cuid2())).await;
+    // This account's first-ever project -- is_default is computed true by the DB trigger.
+    let project_id = create_project(r, "admin", &account_id, "proj-default").await;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Project.get",
+        Wire::Json,
+        &json!({ "id": project_id }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json_body(&body)["isDefault"],
+        true,
+        "an account's first project must be marked default"
+    );
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Project.delete",
+        Wire::Json,
+        &json!({ "id": project_id }),
+        Some("admin"),
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "deleting the default project must be refused (got {status}: {})",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Still there.
+    let (status, _) = rpc_call(
+        r.clone(),
+        "model.Project.get",
+        Wire::Json,
+        &json!({ "id": project_id }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the default project must survive the refused delete"
+    );
+
+    // Suspend still works on it.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.disableProject",
+        Wire::Json,
+        &json!({ "args": { "projectId": project_id } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the default project must still be suspendable: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(json_body(&body)["status"], "suspended");
+
+    // A second project under the SAME account is NOT default, and stays freely deletable.
+    let second_project_id = create_project(r, "admin", &account_id, "proj-default-2nd").await;
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Project.get",
+        Wire::Json,
+        &json!({ "id": second_project_id }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json_body(&body)["isDefault"],
+        false,
+        "an account's second project must not be marked default"
+    );
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Project.delete",
+        Wire::Json,
+        &json!({ "id": second_project_id }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a non-default project must still be hard-deletable: {}",
         String::from_utf8_lossy(&body)
     );
 }

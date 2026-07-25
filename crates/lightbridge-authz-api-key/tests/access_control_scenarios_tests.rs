@@ -299,8 +299,34 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
     // `owner` (the account's creator, seeded as "owner" by `create_account`) can actually delete it.
     let member_account_delete = repo.delete_account(invited, &account.id).await.unwrap_err();
     assert!(matches!(member_account_delete, Error::Forbidden(_)));
-    repo.delete_account(owner, &account.id).await.unwrap();
-    assert!(repo.get_account_by_id(&account.id).await.unwrap().is_none());
+
+    // `account` is `owner`'s first-ever account (created above), so it is marked default and
+    // `delete_account` now correctly refuses it regardless of role -- exercised against a second,
+    // non-default account instead.
+    let default_account_delete = repo.delete_account(owner, &account.id).await.unwrap_err();
+    assert!(matches!(default_account_delete, Error::Conflict(_)));
+    assert!(repo.get_account_by_id(&account.id).await.unwrap().is_some());
+
+    let second_account = repo
+        .create_account(
+            owner,
+            CreateAccount {
+                billing_identity: "tenant-a-2nd".to_string(),
+            },
+            "acct_access_2nd".to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(!second_account.is_default);
+    repo.delete_account(owner, &second_account.id)
+        .await
+        .unwrap();
+    assert!(
+        repo.get_account_by_id(&second_account.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
