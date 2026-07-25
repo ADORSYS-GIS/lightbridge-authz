@@ -70,6 +70,9 @@ pub fn required_permission(op_id: &str) -> Option<Permission> {
         // Role changes are membership management, same coarse capability as add/remove.
         "procedure.setAccountMemberRole" => AccountMember,
         "procedure.deleteAccountPermanently" => AccountDelete,
+        // Reassigning the default account is an update to `isDefault`, same coarse capability as
+        // any other account mutation short of delete/disable/membership.
+        "procedure.setDefaultAccount" => AccountUpdate,
 
         "model.Project.create" => ProjectCreate,
         "model.Project.list" => ProjectRead,
@@ -78,6 +81,7 @@ pub fn required_permission(op_id: &str) -> Option<Permission> {
         "model.Project.delete" => ProjectDelete,
         "procedure.disableProject" => ProjectDisable,
         "procedure.enableProject" => ProjectDisable,
+        "procedure.setDefaultProject" => ProjectUpdate,
 
         "procedure.createApiKey" => ApiKeyCreate,
         "model.ApiKey.list" => ApiKeyRead,
@@ -193,6 +197,7 @@ mod tests {
                 "procedure.deleteAccountPermanently",
                 Permission::AccountDelete,
             ),
+            ("procedure.setDefaultAccount", Permission::AccountUpdate),
             ("model.Project.create", Permission::ProjectCreate),
             ("model.Project.list", Permission::ProjectRead),
             ("model.Project.get", Permission::ProjectRead),
@@ -200,6 +205,7 @@ mod tests {
             ("model.Project.delete", Permission::ProjectDelete),
             ("procedure.disableProject", Permission::ProjectDisable),
             ("procedure.enableProject", Permission::ProjectDisable),
+            ("procedure.setDefaultProject", Permission::ProjectUpdate),
             ("procedure.createApiKey", Permission::ApiKeyCreate),
             ("model.ApiKey.list", Permission::ApiKeyRead),
             ("model.ApiKey.get", Permission::ApiKeyRead),

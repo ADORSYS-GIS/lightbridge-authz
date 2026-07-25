@@ -133,13 +133,13 @@ listed here is denied unconditionally (fail closed).**
 | ----------------- | ---------------------------------------------------- | ----------------------------------- |
 | `account:create`  | `model.Account.create`                               | `create-account`                    |
 | `account:read`    | `model.Account.list`, `model.Account.get`, `model.AccountSummary.list`, `model.AccountSummary.get` | `list-accounts`, `get-account` |
-| `account:update`  | `model.Account.update`                               | `update-account`                    |
+| `account:update`  | `model.Account.update`, `procedure.setDefaultAccount`| `update-account`, `set-default-account` |
 | `account:delete`  | `procedure.deleteAccountPermanently`                 | `delete-account`                    |
 | `account:disable` | `procedure.disableAccount`, `procedure.enableAccount`| `disable-account`, `enable-account` |
 | `account:member`  | `procedure.addAccountMember`, `procedure.removeAccountMember`, `procedure.setAccountMemberRole` | `add-account-member`, `remove-account-member`, `set-account-member-role` |
 | `project:create`  | `model.Project.create`                               | `create-project`                    |
 | `project:read`    | `model.Project.list`, `model.Project.get`            | `list-projects`, `get-project`      |
-| `project:update`  | `model.Project.update`                               | `update-project`                    |
+| `project:update`  | `model.Project.update`, `procedure.setDefaultProject` | `update-project`, `set-default-project` |
 | `project:delete`  | `model.Project.delete`                               | `delete-project`                    |
 | `project:disable` | `procedure.disableProject`, `procedure.enableProject`| `disable-project`, `enable-project` |
 | `apikey:create`   | `procedure.createApiKey`                             | `create-api-key`                    |
@@ -306,14 +306,15 @@ gating lives entirely in hand-written SQL inside the five procedures above (conf
 ### The default account/project can't be hard-deleted
 
 The account `createAccount` seeds for a brand-new tenant, and the first project ever created under
-an account, are each marked `isDefault = true` — server-computed once at insert time, immutable
-after (`isDefault Boolean @readonly` in the schema; a subject's *second* `createAccount` call, or an
-account's *second* project, both come back `isDefault: false`). This is a hard safety rail, not a
-role check: `deleteAccountPermanently` refuses a default account with `409 Conflict` regardless of
-who's calling (even the sole owner), and `model.Project.delete`'s `@@allow` policy denies a default
-project the same way. Suspending (`disableAccount`/`disableProject`) still works on either — only
-the permanent-delete path is blocked, so a tenant can never accidentally wipe out their only
-account/project (and every API key underneath it) with no way back.
+an account, are each marked `isDefault = true` — server-computed once at insert time (`isDefault
+Boolean @readonly` in the schema, so a raw RPC caller can never supply or overwrite it directly; a
+subject's *second* `createAccount` call, or an account's *second* project, both come back
+`isDefault: false`). This is a hard safety rail, not a role check: `deleteAccountPermanently`
+refuses a default account with `409 Conflict` regardless of who's calling (even the sole owner), and
+`model.Project.delete`'s `@@allow` policy denies a default project the same way. Suspending
+(`disableAccount`/`disableProject`) still works on either — only the permanent-delete path is
+blocked, so a tenant can never accidentally wipe out their only account/project (and every API key
+underneath it) with no way back.
 
 `isDefault` for `Account` is computed in `createAccount`'s own transaction (`StoreRepo::
 create_account`, checking whether the calling subject already has any `account_memberships` row).
@@ -323,3 +324,35 @@ is computed by a `BEFORE INSERT` trigger instead (`migrations/20260725000001_def
 project.sql`), backstopped by a partial unique index (`projects_account_id_default_uidx`) against
 the race where two concurrent first-project creates for the same brand-new account would otherwise
 both see zero existing rows.
+
+### Escape hatch: reassigning the default (`setDefaultAccount` / `setDefaultProject`)
+
+Because the default row can never be hard-deleted, a subject's bootstrap account/project would be
+*permanently* undeletable with no way out if `isDefault` could never move — so it can, but only
+through two dedicated procedures, never through generic `model.Account.update` /
+`model.Project.update` (both still carry `@readonly` on the field). `setDefaultAccount(accountId)`
+and `setDefaultProject(projectId)` each promote a different row to default, atomically demoting
+whichever row is currently default, in a single transaction (`StoreRepo::set_default_account` /
+`set_default_project`) — never a bare "unset then set" a caller could race against. Once a
+different row is promoted, the old default is a plain non-default row and `deleteAccountPermanently`
+/ `model.Project.delete` work on it normally.
+
+Membership gating matches the rest of this surface: any member of the account may reassign its
+default (no extra owner/admin role check — the same posture `model.Project.delete` and the
+membership-scoped `@@allow`s already take; reassigning default status is a strictly less
+destructive operation than deletion itself, and `Account` deletion's own owner-only gate covers the
+more consequential action). A caller who isn't a member of the target account/project gets a uniform
+`404 Not Found`, same non-leaking pattern as everywhere else here. Coarsely, both procedures require
+`account:update` / `project:update` (the same permission generic field updates require) — reassigning
+`isDefault` is conceptually an update, just one that can't go through the generic verb.
+
+The two invariants are enforced differently because `isDefault` is scoped differently on each model:
+- **Project**: scoped by `account_id`, backstopped by the existing partial unique index
+  (`projects_account_id_default_uidx`) — even if two `setDefaultProject` calls for the same account
+  raced past the unset step, the second `SET is_default = true` would hit a unique-constraint
+  conflict (surfaced as `409 Conflict`) rather than silently leaving two defaults.
+- **Account**: `isDefault` has no such column to hang a partial unique index off — "default" means
+  "this subject's bootstrap account", a property of the *membership*, not of the account row alone.
+  `set_default_account` instead takes a `pg_advisory_xact_lock` keyed on the calling subject (same
+  mechanism `ensure_active_signing_key` uses for key rotation) to serialize concurrent reassignment
+  attempts by that subject.
