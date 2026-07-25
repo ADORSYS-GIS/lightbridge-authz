@@ -8,6 +8,7 @@ use lightbridge_authz_core::{
 };
 
 pub mod auth_provider;
+pub mod codec;
 pub mod handlers;
 pub mod middleware;
 pub mod models;
@@ -18,6 +19,7 @@ pub mod signing;
 pub mod token_exchange;
 
 use auth_provider::{ACCESS_TOKEN_CONTEXT_KEY, CratestackAuthProvider};
+use codec::LenientCborCodec;
 use handlers::AuthzStoreImpl;
 use ratelimit_redis::build_redis_rate_limit_store;
 use routers::opa_router;
@@ -25,7 +27,6 @@ use routers::opa_router;
 use cratestack::idempotency::IdempotencyLayer;
 use cratestack::ratelimit::{RateLimitConfig, RateLimitLayer, RateLimitStore};
 use cratestack::{CodecSet, CoolContext, CoolError, SqlxIdempotencyStore, Value};
-use cratestack_codec_cbor::CborCodec;
 use cratestack_codec_json::JsonCodec;
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
@@ -599,7 +600,9 @@ pub fn build_api_router(
     // Generated RPC CRUD surface. Codec: a single `CodecSet` accepting both wire formats, dispatched
     // on request `Content-Type` — CBOR primary (production default) with JSON secondary so
     // `curl`/dev/CI stay usable on the same router instance (ADR-0003, "CBOR in production, JSON in
-    // dev/CI"; the ADR explicitly blesses the single-CodecSet form).
+    // dev/CI"; the ADR explicitly blesses the single-CodecSet form). Primary is `LenientCborCodec`,
+    // not the raw `cratestack_codec_cbor::CborCodec` — see `codec.rs` for why (CBOR clients that
+    // encode JS `undefined` as wire-level `undefined` instead of omitting the key, e.g. `cborg`).
     // The coarse RBAC gate (docs/rbac.md) that cratestack's membership `@@allow` policies do not
     // express. Applied as the OUTERMOST layer so an unauthorized caller is rejected with 403 before
     // consuming idempotency/rate-limit budget or reaching cratestack's dispatch; the membership
@@ -609,7 +612,7 @@ pub fn build_api_router(
     let rpc = schema::axum::rpc_router(
         cratestack_db,
         Procedures::new(issuer),
-        CodecSet::new(CborCodec, JsonCodec),
+        CodecSet::new(LenientCborCodec::default(), JsonCodec),
         CratestackAuthProvider::new(bearer.clone()),
     )
     .layer(IdempotencyLayer::new(idempotency_store, IDEMPOTENCY_TTL))

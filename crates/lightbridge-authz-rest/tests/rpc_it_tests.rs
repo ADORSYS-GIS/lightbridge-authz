@@ -741,6 +741,100 @@ async fn crud_lifecycle_over_cbor() {
     assert_eq!(status, StatusCode::OK, "cbor cascade delete");
 }
 
+/// `rpc_call`'s body encoding goes through `T: Serialize`, which can only ever produce a `None`
+/// field as CBOR `null` (0xf6) — Rust has no way to emit CBOR's distinct `undefined` (0xf7). The
+/// regression below needs the literal `undefined` wire byte the frontend's `cborg` encoder
+/// actually sends for a JS `undefined` property value, so this builds the raw frame by hand
+/// instead of going through the typed `CreateProjectInput`.
+fn raw_cbor_create_project_with_undefined_allowed_models(
+    id: &str,
+    account_id: &str,
+    name: &str,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut e = minicbor::Encoder::new(&mut out);
+    e.map(6).unwrap();
+    e.str("id").unwrap();
+    e.str(id).unwrap();
+    e.str("accountId").unwrap();
+    e.str(account_id).unwrap();
+    e.str("name").unwrap();
+    e.str(name).unwrap();
+    e.str("allowedModels").unwrap();
+    e.undefined().unwrap();
+    e.str("defaultLimits").unwrap();
+    e.map(1).unwrap();
+    e.str("Map").unwrap();
+    e.map(0).unwrap();
+    e.str("billingPlan").unwrap();
+    e.str("free").unwrap();
+    out
+}
+
+/// Like `common::rpc_call`, but takes an already-encoded body instead of a `T: Serialize` value —
+/// needed to send the hand-built raw CBOR frame above verbatim.
+async fn rpc_call_raw(
+    router: &Router,
+    op_id: &str,
+    wire: Wire,
+    raw_body: Vec<u8>,
+    token: &str,
+) -> (StatusCode, Vec<u8>) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/rpc/{op_id}"))
+        .header("content-type", wire.content_type())
+        .header("accept", wire.content_type())
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(raw_body))
+        .unwrap();
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body readable");
+    (status, bytes.to_vec())
+}
+
+#[tokio::test]
+async fn cbor_project_create_accepts_the_frontends_undefined_allowed_models() {
+    // Regression test for the prod-only "invalid_argument" / "invalid request payload" bug: the
+    // TS client's `cborg` CBOR encoder (`converse-frontends/packages/authz-rpc/src/codec.ts`)
+    // encodes a JS `undefined` property value as the CBOR `undefined` simple value instead of
+    // omitting the key. The create-project screen never collects `allowedModels`, so every real
+    // `createProject` call on the CBOR path (`authz-api`'s production default) sent exactly this
+    // frame and 400'd — `crud_lifecycle_over_cbor` above sidesteps it entirely (its comment notes
+    // "allowedModels carried as a real list", never `None`). `codec_undefined_regression_tests.rs`
+    // covers `LenientCborCodec` in isolation; this exercises the same frame through the real
+    // router + a live DB.
+    let subject = format!("owner-cbor-undefined-{}", cuid2());
+    let ctx = setup(admin_bearer(&subject)).await;
+    let r = &ctx.router;
+
+    let billing_id = format!("tenant-cbor-undefined-{}", cuid2());
+    let account_id = create_account(r, "admin", &billing_id).await;
+
+    let project_id = cuid2();
+    let raw = raw_cbor_create_project_with_undefined_allowed_models(
+        &project_id,
+        &account_id,
+        "p-cbor-undefined",
+    );
+    let (status, body) = rpc_call_raw(r, "model.Project.create", Wire::Cbor, raw, "admin").await;
+    assert!(
+        status.is_success(),
+        "cbor project create with undefined allowedModels: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let decoded = Wire::Cbor.decode::<Value>(&body);
+    assert_eq!(decoded["id"], project_id);
+    assert!(decoded["allowedModels"].is_null());
+}
+
 // ---------------------------------------------------------------------------------------------
 // Section 3: the RBAC gate end-to-end (highest priority) — admin succeeds, member-viewer reads
 // but cannot write.
