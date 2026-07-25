@@ -87,6 +87,14 @@ controllers:
     type: job
     job:
       backoffLimit: 3
+      # Backstop against ArgoCD's helm.sh/hook-delete-policy cleanup silently not firing (observed
+      # in prod: a completed migrate Job from 2026-07-23 was never deleted, and since this Job's
+      # name is static -- not revision-hashed, a bjw-s/common `job` controller limitation -- every
+      # subsequent deploy's hook-creation step then no-ops against the stale, already-existing,
+      # immutable Job object instead of running a fresh migration. `ttlSecondsAfterFinished` is a
+      # native Kubernetes Job-controller GC mechanism, independent of ArgoCD's hook-finalizer path,
+      # so cleanup no longer depends on that one mechanism working correctly.
+      ttlSecondsAfterFinished: 300
     annotations:
       "helm.sh/hook": post-install,post-upgrade
       "helm.sh/hook-weight": "-5"
