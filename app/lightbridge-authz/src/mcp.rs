@@ -372,11 +372,13 @@ fn required_tool_permission(tool: &str) -> Option<Permission> {
         "add-account-member" | "remove-account-member" | "set-account-member-role" => {
             Permission::AccountMember
         }
+        "set-default-account" => Permission::AccountUpdate,
         "create-project" => Permission::ProjectCreate,
         "list-projects" | "get-project" => Permission::ProjectRead,
         "update-project" => Permission::ProjectUpdate,
         "delete-project" => Permission::ProjectDelete,
         "disable-project" | "enable-project" => Permission::ProjectDisable,
+        "set-default-project" => Permission::ProjectUpdate,
         "create-api-key" => Permission::ApiKeyCreate,
         "list-api-keys" | "get-api-key" => Permission::ApiKeyRead,
         "update-api-key" => Permission::ApiKeyUpdate,
@@ -964,6 +966,25 @@ impl LightbridgeMcpHandler {
     }
 
     #[tool(
+        name = "set-default-account",
+        description = "Promote a different account to be the caller's default (RPC procedure.setDefaultAccount); frees the old default account up for permanent deletion"
+    )]
+    async fn set_default_account_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<AccountByIdParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let account = self
+            .issuer
+            .set_default_account(&subject, &params.account_id)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(account)
+    }
+
+    #[tool(
         name = "create-project",
         description = "Create a project (RPC model.Project.create)"
     )]
@@ -1146,6 +1167,25 @@ impl LightbridgeMcpHandler {
         let project = self
             .issuer
             .enable_project(&subject, &params.project_id)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(project)
+    }
+
+    #[tool(
+        name = "set-default-project",
+        description = "Promote a different project to be its account's default (RPC procedure.setDefaultProject); frees the old default project up for hard deletion"
+    )]
+    async fn set_default_project_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ProjectByIdParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let project = self
+            .issuer
+            .set_default_project(&subject, &params.project_id)
             .await
             .map_err(to_tool_error)?;
 
@@ -1993,6 +2033,7 @@ mod tests {
                 "remove-account-member",
                 json!({ "account_id": "acct_1", "member": "old-member" }),
             ),
+            ("set-default-account", json!({ "account_id": "acct_1" })),
             (
                 "create-project",
                 json!({ "account_id": "acct_1", "name": "proj", "billing_plan": "free" }),
@@ -2005,6 +2046,7 @@ mod tests {
             ),
             ("disable-project", json!({ "project_id": "proj_1" })),
             ("enable-project", json!({ "project_id": "proj_1" })),
+            ("set-default-project", json!({ "project_id": "proj_1" })),
             (
                 "create-api-key",
                 json!({ "project_id": "proj_1", "name": "key", "expires_at": "2030-01-01T00:00:00Z", "billing_plan": "free" }),
@@ -2217,6 +2259,8 @@ mod tests {
             "revoke-api-key",
             "rotate-api-key",
             "set-account-member-role",
+            "set-default-account",
+            "set-default-project",
             "update-account",
             "update-api-key",
             "update-project",

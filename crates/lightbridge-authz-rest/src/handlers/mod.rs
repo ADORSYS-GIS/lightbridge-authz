@@ -432,6 +432,20 @@ impl AuthzStoreImpl {
             .await
     }
 
+    /// Promote `account_id` to be `subject`'s new default account. Backs `setDefaultAccount`. Thin
+    /// wrapper over `StoreRepo::set_default_account` (membership + atomic unset/set enforced in
+    /// SQL).
+    pub async fn set_default_account(&self, subject: &str, account_id: &str) -> Result<Account> {
+        self.repo.set_default_account(subject, account_id).await
+    }
+
+    /// Promote `project_id` to be its account's new default project. Backs `setDefaultProject`.
+    /// Thin wrapper over `StoreRepo::set_default_project` (membership + atomic unset/set enforced
+    /// in SQL).
+    pub async fn set_default_project(&self, subject: &str, project_id: &str) -> Result<Project> {
+        self.repo.set_default_project(subject, project_id).await
+    }
+
     /// Revoke an API key (business-state transition to `revoked`). Backs `revokeApiKey`.
     pub async fn revoke_api_key(&self, subject: &str, key_id: &str) -> Result<ApiKey> {
         let api_key = self

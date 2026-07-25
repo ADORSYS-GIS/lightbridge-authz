@@ -1540,3 +1540,198 @@ async fn default_project_cannot_be_hard_deleted_only_suspended() {
         String::from_utf8_lossy(&body)
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Section 5: the `setDefaultAccount`/`setDefaultProject` escape hatch -- promoting a different
+// row to default atomically demotes the old one, freeing it up for hard deletion (otherwise a
+// subject's first-ever account/project would be permanently undeletable).
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn promoting_a_second_project_to_default_frees_the_old_default_for_deletion() {
+    let subject = format!("owner-promote-proj-{}", cuid2());
+    let ctx = setup(admin_bearer(&subject)).await;
+    let r = &ctx.router;
+
+    let account_id = create_account(r, "admin", &format!("tenant-promote-proj-{}", cuid2())).await;
+    let first_project_id = create_project(r, "admin", &account_id, "proj-first").await;
+    let second_project_id = create_project(r, "admin", &account_id, "proj-second").await;
+
+    // Sanity: still the pre-promotion state (first is default, second is not).
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Project.get",
+        Wire::Json,
+        &json!({ "id": first_project_id }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json_body(&body)["isDefault"], true);
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.setDefaultProject",
+        Wire::Json,
+        &json!({ "args": { "projectId": second_project_id } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "setDefaultProject: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(json_body(&body)["isDefault"], true);
+    assert_eq!(json_body(&body)["id"], second_project_id);
+
+    // The old default flipped false.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Project.get",
+        Wire::Json,
+        &json!({ "id": first_project_id }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json_body(&body)["isDefault"],
+        false,
+        "the old default project must be demoted"
+    );
+
+    // ...and is now freely hard-deletable.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Project.delete",
+        Wire::Json,
+        &json!({ "id": first_project_id }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the demoted project must now be hard-deletable: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // The new default cannot itself be hard-deleted.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Project.delete",
+        Wire::Json,
+        &json!({ "id": second_project_id }),
+        Some("admin"),
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "the newly-promoted default project must be refused deletion (got {status}: {})",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn promoting_a_second_account_to_default_frees_the_old_default_for_deletion() {
+    let subject = format!("owner-promote-acct-{}", cuid2());
+    let ctx = setup(admin_bearer(&subject)).await;
+    let r = &ctx.router;
+
+    let first_account_id =
+        create_account(r, "admin", &format!("tenant-promote-acct-1st-{}", cuid2())).await;
+    let second_account_id =
+        create_account(r, "admin", &format!("tenant-promote-acct-2nd-{}", cuid2())).await;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.setDefaultAccount",
+        Wire::Json,
+        &json!({ "args": { "accountId": second_account_id } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "setDefaultAccount: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(json_body(&body)["isDefault"], true);
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Account.get",
+        Wire::Json,
+        &json!({ "id": first_account_id }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json_body(&body)["isDefault"],
+        false,
+        "the old default account must be demoted"
+    );
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.deleteAccountPermanently",
+        Wire::Json,
+        &json!({ "args": { "accountId": first_account_id } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the demoted account must now be hard-deletable: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.deleteAccountPermanently",
+        Wire::Json,
+        &json!({ "args": { "accountId": second_account_id } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "the newly-promoted default account must be refused deletion (got {status}: {})",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn set_default_project_rejects_a_project_the_caller_is_not_a_member_of() {
+    let owner = format!("owner-promote-foreign-{}", cuid2());
+    let stranger = format!("stranger-promote-foreign-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("owner", token_info(&owner, admin_perms()))
+            .with("stranger", token_info(&stranger, admin_perms())),
+    );
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let account_id = create_account(r, "owner", &format!("tenant-foreign-{}", cuid2())).await;
+    let project_id = create_project(r, "owner", &account_id, "proj-foreign").await;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.setDefaultProject",
+        Wire::Json,
+        &json!({ "args": { "projectId": project_id } }),
+        Some("stranger"),
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "a non-member must be refused promoting someone else's project to default (got {status}: {})",
+        String::from_utf8_lossy(&body)
+    );
+}

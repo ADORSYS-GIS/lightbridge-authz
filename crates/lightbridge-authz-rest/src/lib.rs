@@ -427,6 +427,50 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         }
     }
 
+    fn set_default_account(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::set_default_account::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::set_default_account::Output, CoolError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let account_id = args.args.accountId;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let account = issuer
+                .set_default_account(&subject, &account_id)
+                .await
+                .map_err(to_cool_error)?;
+            Ok(to_schema_account(account))
+        }
+    }
+
+    fn set_default_project(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::set_default_project::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::set_default_project::Output, CoolError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let project_id = args.args.projectId;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let project = issuer
+                .set_default_project(&subject, &project_id)
+                .await
+                .map_err(to_cool_error)?;
+            Ok(to_schema_project(project))
+        }
+    }
+
     fn revoke_api_key(
         &self,
         _db: &schema::Cratestack,

@@ -1370,6 +1370,121 @@ impl StoreRepo {
         Ok(Self::to_project(row))
     }
 
+    /// Promote `account_id` to be `subject`'s new default account, atomically demoting whichever
+    /// account is currently default among the ones `subject` belongs to. `isDefault` has no natural
+    /// partitioning column on `accounts` (unlike `Project.isDefault`, which is scoped by
+    /// `account_id` and backstopped by `projects_account_id_default_uidx`) -- "default" here means
+    /// "the subject's bootstrap account", so the invariant is scoped by membership, not by a DB
+    /// constraint. A `pg_advisory_xact_lock` keyed on `subject` (same mechanism as
+    /// `ensure_active_signing_key`'s key-rotation lock) serializes concurrent reassignment attempts
+    /// by the same subject, closing the race a plain unset-then-set could otherwise leave a window
+    /// for. Requires `subject` to be a member of `account_id` (any role -- deletion itself carries
+    /// no role gate on Project, and Account deletion's owner-only gate is for a strictly more
+    /// destructive operation); a non-member or unknown account is `NotFound`, matching the rest of
+    /// this membership-scoped surface.
+    #[instrument(skip(self))]
+    pub async fn set_default_account(&self, subject: &str, account_id: &str) -> Result<Account> {
+        let mut tx: Transaction<'_, Postgres> = self.pool().begin().await?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(subject)
+            .execute(&mut *tx)
+            .await?;
+
+        let is_member: Option<String> = sqlx::query_scalar(
+            r#"SELECT account_id FROM account_memberships WHERE account_id = $1 AND subject = $2"#,
+        )
+        .bind(account_id)
+        .bind(subject)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if is_member.is_none() {
+            return Err(lightbridge_authz_core::error::Error::NotFound);
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE accounts
+            SET is_default = false, updated_at = $1
+            FROM account_memberships
+            WHERE accounts.id = account_memberships.account_id
+              AND account_memberships.subject = $2
+              AND accounts.is_default = true
+              AND accounts.id != $3
+            "#,
+        )
+        .bind(Utc::now())
+        .bind(subject)
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(r#"UPDATE accounts SET is_default = true, updated_at = $1 WHERE id = $2"#)
+            .bind(Utc::now())
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        let row = self.load_account_with_members_row(account_id).await?;
+        Ok(Self::to_account(row))
+    }
+
+    /// Promote `project_id` to be its account's new default project, atomically demoting whichever
+    /// project is currently default for that account. Relies on `projects_account_id_default_uidx`
+    /// (a partial unique index on `(account_id) WHERE is_default`) to guarantee the invariant even
+    /// under a race -- a concurrent reassignment targeting a different project for the same account
+    /// fails the unset-then-set with a unique-violation instead of silently producing two defaults.
+    /// Requires `subject` to be a member of the project's account (any role, same as
+    /// `set_project_status`); a non-member or unknown project is `NotFound`.
+    #[instrument(skip(self))]
+    pub async fn set_default_project(&self, subject: &str, project_id: &str) -> Result<Project> {
+        let mut tx: Transaction<'_, Postgres> = self.pool().begin().await?;
+
+        let account_id: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT projects.account_id
+            FROM projects
+            JOIN account_memberships ON account_memberships.account_id = projects.account_id
+            WHERE projects.id = $1 AND account_memberships.subject = $2
+            "#,
+        )
+        .bind(project_id)
+        .bind(subject)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let account_id = account_id.ok_or(lightbridge_authz_core::error::Error::NotFound)?;
+
+        sqlx::query(
+            r#"
+            UPDATE projects
+            SET is_default = false, updated_at = $1
+            WHERE account_id = $2 AND is_default = true AND id != $3
+            "#,
+        )
+        .bind(Utc::now())
+        .bind(&account_id)
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let row: ProjectRow = sqlx::query_as(
+            r#"
+            UPDATE projects SET is_default = true, updated_at = $1
+            WHERE id = $2
+            RETURNING id, account_id, name, allowed_models, default_limits, billing_plan, status, is_default, created_at, updated_at
+            "#,
+        )
+        .bind(Utc::now())
+        .bind(project_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(Self::to_project(row))
+    }
+
     /// Read the effective validity of an API key from the `api_key_validation` view (one indexed
     /// lookup by `key_hash`), with the account -> project -> key status cascade resolved by the DB.
     #[instrument(skip(self, key_hash))]
