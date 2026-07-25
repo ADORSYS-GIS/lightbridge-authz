@@ -310,6 +310,28 @@ own.
 None of the remaining open items are worked around by silently changing behavior without a comment —
 each workaround is documented at its call site with a pointer back to this ADR.
 
+### Known cratestack-redis bug found after this migration — connection-per-call
+
+**Pending upstream release — fixed on `main`, not yet in a published version this repo can pin.**
+While debugging intermittent 500s in this repo's own `just it-tests` (`rpc_it_tests.rs`), traced —
+via a controlled repro showing direct handler calls succeeding reliably while the same call through
+the full router with `RateLimitLayer` attached failed intermittently under concurrent load — to
+`RedisRateLimitStore::connection()` (and the identical pattern in `RedisIdempotencyStore::connection()`)
+in `cratestack-redis`: both called `redis::Client::get_multiplexed_async_connection()` fresh on every
+`consume`/`reserve_or_fetch`/`complete`/`release` call instead of caching/reusing a connection, so
+every mutating RPC request opened a brand-new TCP connection to Redis — in production, not just in
+tests. Filed as [cratestack/cratestack#174](https://github.com/cratestack/cratestack/issues/174) and
+fixed in [cratestack/cratestack#175](https://github.com/cratestack/cratestack/pull/175) (merged
+2026-07-25): both stores now lazily cache a single auto-reconnecting `redis::aio::ConnectionManager`
+and reuse it; see that repo's `docs/design/redis-store-connection-reuse.md` for the full decision
+record (including why a naively-cached `MultiplexedConnection` was rejected — no auto-reconnect —
+and why the regression test needed connection-identity tagging rather than a `connected_clients`
+count, which is too timing-sensitive to catch per-call churn that self-closes fast).
+
+**Follow-up, not yet done**: this repo's `Cargo.toml` still pins `cratestack-redis = "0.4.13"`, which
+predates the fix — the version bump to whichever release first publishes it (expected `0.4.14`) is a
+separate follow-up PR in this repo, deliberately not bundled with the upstream fix itself.
+
 ### Composite primary keys (0.4.13) — parser support only so far, not adopted
 
 cratestack-pg 0.4.13 added `@@id([...])` composite-primary-key support (cratestack/cratestack#145),
