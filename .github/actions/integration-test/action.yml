@@ -96,9 +96,10 @@ runs:
         # services with --no-deps and gate readiness manually. Leaf services
         # (jaeger/adminer/mcp-inspector) are never started -> fits the runner limits.
         echo "== starting datastores + tls + keycloak =="
-        $compose up -d --no-deps postgresql timescaledb authz-tls keycloak
+        $compose up -d --no-deps postgresql timescaledb redis authz-tls keycloak
         wait_ready postgresql pg_isready -U postgres -d lightbridge_authz -h 127.0.0.1
         wait_ready timescaledb pg_isready -U postgres -d lightbridge_authz_usage -h 127.0.0.1
+        wait_ready redis redis-cli ping
         wait_completed authz-tls
 
         echo "== running migrations =="
