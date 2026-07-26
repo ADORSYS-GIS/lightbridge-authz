@@ -123,6 +123,10 @@ static IDEMPOTENCY_SCHEMA_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCe
 /// Build the full `build_api_router` for `bearer`, connecting the cratestack CRUD client,
 /// Postgres-backed idempotency store, and Redis rate-limit store to the live backends.
 async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     let core = core_pool().await;
     let cpool = cratestack_pool().await;
     let cdb = schema::Cratestack::builder(cpool.clone()).build();
