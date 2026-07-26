@@ -1,11 +1,18 @@
-// authz-api CRUD schema (ADR-0003: cratestack-pg migration).
+// authz-api CRUD schema (ADR-0003: cratestack-pg migration; ADR-0006: project
+// membership supersedes account roles).
 //
-// Owns: accounts, projects, api_keys (cratestack-generated CRUD + migrations
-// going forward). account_memberships is modeled here too, but ONLY as a
-// relation target for @@allow/@@deny policy traversal -- its real schema
-// evolution stays owned by the hand-written SQLx migrations under
-// migrations/, per the ADR's scope boundary. See the `AccountMembership`
-// model below for the specific caveat this creates.
+// Owns: accounts, projects, api_keys, project_members (cratestack-generated
+// CRUD + migrations going forward). project_members is modeled here too, but
+// ONLY as a relation target for @@allow/@@deny policy traversal -- its real
+// schema evolution stays owned by the hand-written SQLx migrations under
+// migrations/, per the ADR's scope boundary. See the `ProjectMember` model
+// below for the specific caveat this creates.
+//
+// Per ADR-0006: a person's defining identity is their `accountId` -- there is
+// no account-level membership of any kind. Every account has a default,
+// roster-less project ("you, working alone"); real projects have a roster
+// (`ProjectMember`, role: lead|member). `billingIdentity` lives on `Project`,
+// not `Account`. `account_memberships` (ADR-0002/0005) is removed entirely.
 
 transport rpc
 
@@ -38,51 +45,32 @@ model Account {
   @use(AuditFields)
 
   id String @id
-  billingIdentity String @unique
+  // Governance tier for usage under this account's own default project (the project has no
+  // roster to hang a per-member quota on -- see `ProjectMember.quotaTier`). Validated against
+  // the operator-configured tier catalog at write time (config, not DB), same pattern
+  // `billingPlan`/`quotaTier` use elsewhere. Renamed/repurposed from the old `billingIdentity`
+  // (moved to `Project.billingIdentity`, see below) -- not the same concept, a fresh field.
+  defaultQuota String?
   // Server-managed lifecycle state: set only by the disable/enable procedures and the
   // DB `DEFAULT 'active'` (migrations/20260714000001). `@readonly` drops it from the
   // generated create/update inputs so a raw RPC caller cannot supply a born-suspended
   // status, matching `ApiKey.status` below.
   status String @readonly
-  isDefault Boolean @readonly
   projects Project[] @relation(fields:[id],references:[accountId])
-  memberships AccountMembership[] @relation(fields:[id],references:[accountId])
 
-  // NOTE: no `@@allow("create", ...)`. Removing it fail-closes the generic
-  // `model.Account.create` RPC verb: that verb inserts ONLY the `accounts` row and
-  // never seeds `account_memberships`, so the creator would immediately fail every
-  // membership-scoped `@@allow` below -- unable to read the account back, create a
-  // project under it (Project's create policy traverses `account.memberships`), or add
-  // a member (`addAccountMember` requires the acting subject to already be a member) --
-  // a chicken-and-egg deadlock. Account creation now goes exclusively through the
-  // `createAccount` procedure, which inserts the account and the creator's membership in
-  // one transaction, and `model.Account.create` is also denied unconditionally at the
-  // RBAC layer (crates/lightbridge-authz-rest/src/rpc_authorize.rs).
+  // NOTE: no `@@allow("create", ...)`. Account creation stays exclusively through the
+  // `createAccount` procedure (self-service explicit bootstrap, not implicit provisioning --
+  // see ADR-0006), which also generates the account id; `model.Account.create` is denied
+  // unconditionally at the RBAC layer too (crates/lightbridge-authz-rest/src/rpc_authorize.rs).
   //
-  // isDefault is set once, server-side, inside `createAccount` -- true only if the creating
-  // subject had zero prior account memberships at that moment (their genuine first/bootstrap
-  // account). `deleteAccountPermanently` (hand-written SQL) refuses to delete a default
-  // account -- disableAccount (suspend) still works on it. `@readonly` keeps it out of the
-  // generated create/update inputs, same as `status` above; it is reassignable, but only through
-  // the dedicated `setDefaultAccount` procedure below (hand-written SQL, same pattern as
-  // disableAccount/enableAccount), which atomically unsets the subject's current default account
-  // before setting the new one -- a raw `model.Account.update` caller can never flip it directly,
-  // and can't race the unset/set pair against itself the way a generic field update would allow.
-  //
-  // NOTE: no `@@allow("delete", ...)` either, as of the membership-roles change. Account
-  // deletion is now owner-only, and cratestack's relation-quantifier policy predicates can't
-  // express a per-row compound condition ("the member row matching my subject must ALSO have
-  // role='owner'") -- `memberships.some.subject == auth().id && memberships.some.role ==
-  // "owner"` would compile to two independent EXISTS checks, not one joint check on the same
-  // row (confirmed by reading `cratestack-macros/src/policy/model/relation_path.rs`: each
-  // dotted policy path resolves to exactly one target field per relation hop, no support for
-  // multiple fields on one related row). So the role check moved into the `deleteAccountPermanently`
-  // procedure's hand-written SQL instead, and `model.Account.delete` is denied unconditionally
-  // at the RBAC layer, same pattern as create.
+  // NOTE: no `@@allow("delete", ...)` either. `deleteAccountPermanently` remains the only path;
+  // per ADR-0006 there is no more membership/role concept to gate it with -- one account is one
+  // person, so its hand-written SQL check becomes simply "the caller is this account" (updated
+  // in the ADR-0006 follow-up procedure pass, not this schema/migration pass).
   @@audit
   @@paged
-  @@allow("read", memberships.some.subject == auth().id)
-  @@allow("update", memberships.some.subject == auth().id)
+  @@allow("read", id == auth().id)
+  @@allow("update", id == auth().id)
 }
 
 model Project {
@@ -94,33 +82,38 @@ model Project {
   allowedModels Json?
   defaultLimits Json
   billingPlan String
+  // MOVED here from `Account` per ADR-0006: one project, one billing identity ("who's
+  // paying"). Lets one account have several projects billed to different parties.
+  billingIdentity String @unique
+  // Pooled cap across everyone on the project, drawn from the same governance tier catalog as
+  // `Account.defaultQuota`/`ProjectMember.quotaTier`. Validated at write time (config, not DB).
+  projectQuota String?
+  // True only for the auto-provisioned, roster-less project every account gets. Structurally
+  // guarantees "no membership concept" on it: nothing ever inserts a `ProjectMember` row for a
+  // default project, so `members.some.accountId == auth().id` below is always false there --
+  // the requirement falls out of the data model, no `isDefault` branching needed in policy.
+  isDefault Boolean @readonly
   // Server-managed lifecycle state, same contract as `Account.status` above: mutated only
   // by disable/enable procedures + DB `DEFAULT 'active'`, `@readonly` so it is absent from
   // the generic `model.Project.create`/`update` inputs.
   status String @readonly
-  // Set once, server-side, by a `BEFORE INSERT` trigger (`migrations/20260725000001_default_
-  // account_project.sql`) -- true only for an account's first-ever project. `@readonly` keeps it
-  // out of the generic create/update inputs; unlike Account/ApiKey, Project creation was never
-  // moved to a hand-written procedure (see `@@allow("create", ...)` below), so cratestack's
-  // generic `model.Project.create` verb has no hook for this per-request "is this the account's
-  // first project" computation -- the DB trigger is the only mechanism available. A partial
-  // unique index backstops the race where two concurrent first-project creates for the same
-  // brand-new account would otherwise both see zero existing rows. Gates `@@allow("delete", ...)`
-  // below -- a default project can still be suspended (disableProject) but never hard-deleted.
-  // Reassignable within the account via the dedicated `setDefaultProject` procedure below
-  // (hand-written SQL, same shape as `setDefaultAccount`), which atomically unsets the account's
-  // current default project before setting the new one -- the partial unique index above still
-  // backstops the invariant even if two reassignments race.
-  isDefault Boolean @readonly
   account Account @relation(fields:[accountId],references:[id])
+  members ProjectMember[] @relation(fields:[id],references:[projectId])
   apiKeys ApiKey[] @relation(fields:[id],references:[projectId])
 
   @@audit
   @@paged
-  @@allow("create", account.memberships.some.subject == auth().id)
-  @@allow("read", account.memberships.some.subject == auth().id)
-  @@allow("update", account.memberships.some.subject == auth().id)
-  @@allow("delete", isDefault != true && account.memberships.some.subject == auth().id)
+  @@allow("create", account.id == auth().id)
+  @@allow("read", account.id == auth().id || members.some.accountId == auth().id)
+  @@allow("update", account.id == auth().id || members.some.accountId == auth().id)
+  @@allow("delete", account.id == auth().id)
+  // Lead-only mutations (roster add/remove, quotaTier changes, allowlist edits) are NOT
+  // expressible as `@@allow` -- same class of problem ADR-0005 hit with account roles: "the
+  // member row matching my subject must ALSO have role=lead" is a compound condition on one
+  // related row, and cratestack's relation-quantifier policy can't express it (confirmed by
+  // ADR-0005 reading the actual resolver source, `cratestack-macros/src/policy/model/
+  // relation_path.rs`). These stay hand-written procedures, ADR-0005's pattern, re-targeted at
+  // project leadership -- not built this pass, see ADR-0006.
 }
 
 // Field-level immutability closes the gap the coarse RBAC gate cannot express on
@@ -163,45 +156,47 @@ model ApiKey {
   @@soft_delete
   @@audit
   @@paged
-  @@allow("read", project.account.memberships.some.subject == auth().id)
-  @@allow("update", project.account.memberships.some.subject == auth().id)
-  @@allow("delete", project.account.memberships.some.subject == auth().id)
+  @@allow("read", project.account.id == auth().id || project.members.some.accountId == auth().id)
+  @@allow("update", project.account.id == auth().id || project.members.some.accountId == auth().id)
+  @@allow("delete", project.account.id == auth().id || project.members.some.accountId == auth().id)
 }
 
-// Relation target ONLY. The real `account_memberships` table (owned by
-// migrations/20260304000001_account_memberships.sql) has a composite
-// primary key (account_id, subject) and no `id` column. cratestack requires
-// every model to declare exactly one scalar `@id` field, so `id` below is a
-// synthetic field with no backing column in the real table. This model must
-// never be handed to cratestack's migration generator/diff tool -- doing so
-// would try to create an `id` column and an `account_memberships` table
-// shape that does not match the hand-written migration. It exists solely so
-// `.some`/`.every`/`.none` policy predicates on Account/Project/ApiKey can
-// traverse into it.
+// Relation target ONLY. The real `project_members` table (owned by
+// migrations/<date>_create_project_members.sql) has a composite primary key
+// (project_id, account_id) and no `id` column -- same shape as the removed
+// `account_memberships` table it replaces. cratestack requires every model to
+// declare exactly one scalar `@id` field, so `id` below is a synthetic field
+// with no backing column in the real table. This model must never be handed
+// to cratestack's migration generator/diff tool -- doing so would try to
+// create an `id` column and a `project_members` table shape that does not
+// match the hand-written migration. It exists solely so `.some`/`.every`/
+// `.none` policy predicates on Project/ApiKey can traverse into it.
 //
 // cratestack-pg 0.4.13 added parser/migrate-layer support for composite keys
-// (`@@id([accountId, subject])`, cratestack/cratestack#145), which would match this table's
-// real shape exactly and drop the synthetic `id` -- tried it, but codegen (query builders,
-// routing, generated clients) explicitly rejects it as not yet supported, tracked at
-// cratestack/cratestack#136. Revisit once that lands; the synthetic-`id` workaround stays
-// until then.
-model AccountMembership {
+// (`@@id([projectId, accountId])`, cratestack/cratestack#145), which would match this table's
+// real shape exactly and drop the synthetic `id` -- tried it for the predecessor
+// `AccountMembership` model, but codegen (query builders, routing, generated clients)
+// explicitly rejects it as not yet supported, tracked at cratestack/cratestack#136. Revisit
+// once that lands; the synthetic-`id` workaround stays until then.
+model ProjectMember {
   id String @id
+  projectId String
   accountId String
-  subject String
-  // "owner" | "admin" | "member" (DB CHECK constraint, migrations/20260722000001_account_
-  // membership_roles.sql). Gates addAccountMember/removeAccountMember/disableAccount/
-  // enableAccount/deleteAccountPermanently/setAccountMemberRole via hand-written sqlx role checks in
-  // those procedures (see the compound-condition limitation noted on `Account` above for why
-  // this isn't expressed as an `@@allow` policy). Not independently mutable through generic
-  // CRUD -- there is no `@@allow("update", ...)` below, so role changes go exclusively through
-  // `setAccountMemberRole`.
+  // "lead" | "member" (DB CHECK constraint). Gates roster add/remove, quotaTier changes, and
+  // allowlist edits via hand-written sqlx role checks in those procedures (see the
+  // compound-condition limitation noted on `Project` above for why this isn't expressed as an
+  // `@@allow` policy). Not built this pass -- see ADR-0006.
   role String
+  // Per-member ceiling: how much *this specific person* may use on *this specific project*.
+  // Settable only by the project's lead. Same governance tier catalog as
+  // `Account.defaultQuota`/`Project.projectQuota`, validated at write time (config, not DB).
+  quotaTier String?
   createdAt DateTime
+  project Project @relation(fields:[projectId],references:[id])
   account Account @relation(fields:[accountId],references:[id])
 
   @@paged
-  @@allow("read", subject == auth().id)
+  @@allow("read", accountId == auth().id || project.account.id == auth().id)
 }
 
 // Stale-tolerant dashboard aggregate only -- explicitly NOT used for any
@@ -361,30 +356,4 @@ mutation procedure disableProject(args: ProjectStatusInput): Project
   @allow(auth() != null)
 
 mutation procedure enableProject(args: ProjectStatusInput): Project
-  @allow(auth() != null)
-
-// Reassign the default account/project (escape hatch for the "default can never be hard-deleted"
-// policy above -- without this, the first account/project a subject ever creates is permanently
-// undeletable). Any member of the account may promote a different row to default -- same coarse
-// membership check as everywhere else on this surface, no extra owner/admin gate (deletion itself
-// carries none either, for Project; Account deletion is owner-only but reassigning default status
-// is a strictly less destructive operation than that). Hand-written sqlx in `StoreRepo::
-// set_default_account` / `set_default_project`: each atomically unsets the current default before
-// setting the new one inside a single transaction, so the "at most one default" invariant never
-// observes two rows true (or zero) at once, and rejects (NotFound) a target that doesn't belong to
-// the caller's account. The `@allow(auth() != null)` gate only asserts an authenticated caller; the
-// coarse `account:update` / `project:update` capability is enforced by the RBAC layer, and the real
-// membership check lives in the hand-written SQL, same pattern as disableAccount/disableProject.
-type SetDefaultAccountInput {
-  accountId String
-}
-
-mutation procedure setDefaultAccount(args: SetDefaultAccountInput): Account
-  @allow(auth() != null)
-
-type SetDefaultProjectInput {
-  projectId String
-}
-
-mutation procedure setDefaultProject(args: SetDefaultProjectInput): Project
   @allow(auth() != null)
