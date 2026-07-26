@@ -159,7 +159,7 @@ def main() -> int:
         )
         assert status == 200, f"create api key failed: status={status}, body={key_payload}"
         secret = key_payload["secret"]
-        api_key_id = key_payload["id"]
+        api_key_id = key_payload["apiKey"]["id"]
         log(f"created api key {api_key_id}")
 
         basic = base64.b64encode(AUTHORINO_BASIC.encode("utf-8")).decode("utf-8")
