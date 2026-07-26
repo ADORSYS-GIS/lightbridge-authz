@@ -86,8 +86,11 @@ mimalloc = "0"
 # migration worked around — composite primary keys (`@@id([...])`, cratestack/cratestack#145) and
 # `type` blocks referencing a model field (cratestack/cratestack#147) — both adopted directly in the
 # schema now that they're fixed (see the `AccountMembership`/`ApiKeySecret` comments in
-# `crates/lightbridge-authz-api/schema/authz.cstack`). See ADR-0003, "Known cratestack-pg 0.4.9 bugs"
-# and "Pagination (`@@paged`)" for the full record.
+# `crates/lightbridge-authz-api/schema/authz.cstack`). 0.4.16 fixes the connection-per-call bug in
+# `RedisRateLimitStore`/`RedisIdempotencyStore` found while debugging intermittent `it-tests` 500s
+# (cratestack/cratestack#174, fixed in #175 — see ADR-0003, "Known cratestack-redis bug found after
+# this migration"). See ADR-0003, "Known cratestack-pg 0.4.9 bugs" and "Pagination (`@@paged`)" for
+# the full record.
 #
 # THE LOCKSTEP IS LOAD-BEARING, not stylistic. Dependabot moved four of these to 0.4.16
 # (#158/#161/#162) and left the rest at 0.4.13, which broke `main`: 0.4.16's `cratestack-core` adds a
