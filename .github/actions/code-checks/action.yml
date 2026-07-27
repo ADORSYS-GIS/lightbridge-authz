@@ -5,9 +5,22 @@ runs:
     - uses: ./.github/actions/rust-setup
       with:
         components: clippy,rustfmt
+    # Memory guards for the self-hosted runner. `--all-targets --all-features` builds every
+    # integration-test binary plus the goose load-test tree, each statically linked against the
+    # whole graph; at cargo's default one-job-per-core the concurrent link steps exhausted the
+    # runner's RAM, killing the agent mid-run ("lost communication with the server") and taking the
+    # logs with it, since it dies before uploading them. Capping jobs bounds peak memory roughly
+    # linearly. CARGO_INCREMENTAL=0 is standard for CI — incremental state costs memory and disk
+    # and buys nothing on a cold checkout.
     - shell: bash
+      env:
+        CARGO_BUILD_JOBS: "4"
+        CARGO_INCREMENTAL: "0"
       run: cargo check --all-targets --all-features
     - shell: bash
       run: cargo fmt --all -- --check
     - shell: bash
+      env:
+        CARGO_BUILD_JOBS: "4"
+        CARGO_INCREMENTAL: "0"
       run: cargo clippy --all-targets --all-features -- -D warnings

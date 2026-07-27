@@ -56,6 +56,21 @@ cargo check --all-targets --all-features
 just all-checks
 ```
 
+**If a build exhausts your machine's memory**, cap the job count rather than walking away from it:
+
+```bash
+CARGO_BUILD_JOBS=4 cargo check --all-targets
+```
+
+`--all-targets` builds all 24 integration-test binaries, and Rust links each one statically against
+the full ~577-crate graph. Cargo defaults to one job per core, so the end of a build is many
+concurrent link steps, each holding a multi-hundred-MB artifact in memory — enough to OOM a
+developer laptop and to starve the CI runner until it drops off GitHub. `[profile.dev] debug =
+"line-tables-only"` in the root `Cargo.toml` already cuts the artifact size (keeping backtraces with
+line numbers); capping jobs bounds the concurrency on top of it. CI sets both. Add `debug = true`
+back locally when you need to step through a debugger. Dropping `--all-features` helps too — it
+pulls in the goose load-test tree that nothing but `just load-test` needs.
+
 **Testing:**
 ```bash
 # Run all tests in workspace (requires DATABASE_URL for integration tests)
