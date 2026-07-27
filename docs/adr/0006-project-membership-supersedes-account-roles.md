@@ -209,17 +209,55 @@ freely-creatable DB table would not save anyone a chart deploy. An **empty or ab
 any value**, so existing deployments and charts keep working until `ai-helm-values` supplies one.
 A deliberate "don't break the fleet on upgrade" choice, not an oversight.
 
-### Accepted consequence: tier and role changes are not instantly live
+### Introspection stays authoritative — the "one lookup" rewrite was not justified
 
-Introspection reduces to a single indexed `api_keys` lookup, and everything else Authorino needs
-(`account_id`, `project_id`, `role`, `quota_tier`, `project_quota`, `allowed_models`) is decoded from
-the JWT's claims, sealed in at mint/exchange time. The cost is that changing someone's tier or role
-does not take effect on their next request — it takes effect when their token is next minted (key
-rotation, or the next login/token exchange). That is strictly weaker than the 60-second cached live
-lookup an earlier draft of this epic built, and it is accepted deliberately: "as fast as possible"
-was a hard requirement, and this is what it costs. If instant revocation of a specific key or tier is
-ever needed, the fix is a version/nonce bump forcing re-issuance — not putting a lookup back on the
-hot path.
+The epic asked for introspection to shrink to a single active/revoked check, with everything else
+decoded from JWT claims. Measuring it before building it retired that requirement.
+
+Per uncached call, introspection now does **three** round trips: the indexed `api_key_validation`
+view read, the usage-telemetry `UPDATE` (which returns the api-key row, so it doubles as that
+fetch), and a project read supplying `allowed_models`/`project_quota`. A fourth — an account read
+used only for an id the view had already returned — was pure waste and has been deleted.
+
+Authorino caches the result for 30s keyed on `jti`, and only for API keys, so this runs roughly
+twice a minute per active key per replica, against a database this repo's own load test measures at
+600-1000 rps with 10-20ms latency. There is no bottleneck here to fix.
+
+What the rewrite would have cost is the reason not to do it: claims are frozen at mint time, so a
+quota or plan change would not take effect until the key was rotated. Keeping the lookup means it
+lands within the cache TTL. `x-project-id`/`x-project-quota` are therefore sourced from the
+introspection response at the gateway; `role`/`quotaTier` remain claim-sourced because they are
+per-member values and an API key belongs to a project, not to a roster seat.
+
+This supersedes the "What this ADR does not (yet) build" bullet promising a claims-only
+introspection.
+
+### The model allowlist is enforceable, and is now enforced
+
+`allowed_models` had been returned by introspection since before this epic and consumed by nothing.
+The doubt was whether Authorino could see the requested model at all, since it arrives in the
+request body and `ext_authz` is configured with `with_request_body: {}`.
+
+It can. Verified against the live gateway's filter chain (`config_dump`, 2026-07-27): on the
+external chain (`api.ai.camer.digital`) `ext_proc/aigateway` is filter 1 and `ext_authz` is filter
+7, so `x-ai-eg-model` is already populated when Authorino evaluates. The AI Gateway places its
+ext-proc first by design — it must parse the raw body to extract the model before routing, which is
+the same ordering `ai-helm` ADR-0079 established when it ruled out per-user span attribution.
+
+Two findings worth carrying forward, because both contradict a reasonable assumption:
+
+- **The ordering is per filter chain, not global.** The internal chain
+  (`core-gateway-internal…svc.cluster.local`) runs `ext_authz` first and `ext_proc` second, so no
+  model-dependent rule can ever fire there. That is acceptable: internal identities are Kubernetes
+  service accounts and static API keys, carrying no project and therefore no allowlist.
+- **The AuthConfig CRD has no `cel:` authorization type** — only `patternMatching`, `opa`,
+  `kubernetesSubjectAccessReview` and `spicedb`. The rule is a
+  `patternMatching.patterns[].predicate`. This matters because the ArgoCD app sets
+  `ignoreMissingValueFiles`, so a schema-rejected AuthConfig fails quietly rather than loudly.
+
+Enforcement fails open in three directions — no `api_key_id`, an absent or empty allowlist (both
+`NULL` and `[]` mean "all models"), or no concrete model header. Only an explicit, non-empty
+allowlist that does not contain a concretely-requested model denies.
 
 ## Consequences
 
