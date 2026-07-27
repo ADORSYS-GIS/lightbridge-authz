@@ -138,6 +138,8 @@ fn mk_project() -> Project {
         allowed_models: Some(vec!["gpt-4.1-mini".to_string()]),
         default_limits: None,
         billing_plan: "free".to_string(),
+        billing_identity: "acme".to_string(),
+        project_quota: None,
         status: ResourceStatus::Active,
         is_default: false,
         created_at: Utc::now(),
@@ -148,10 +150,8 @@ fn mk_project() -> Project {
 fn mk_account() -> Account {
     Account {
         id: "acct_1".to_string(),
-        billing_identity: "acme".to_string(),
-        owners_admins: vec!["owner@example.com".to_string()],
+        default_quota: None,
         status: ResourceStatus::Active,
-        is_default: false,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

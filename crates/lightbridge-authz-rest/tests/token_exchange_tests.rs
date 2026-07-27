@@ -103,9 +103,8 @@ async fn seed(repo: &StoreRepo) {
     repo.create_account(
         SUBJECT,
         CreateAccount {
-            billing_identity: "bill-xchg".to_string(),
+            default_quota: None,
         },
-        ACCOUNT_ID.to_string(),
     )
     .await
     .expect("seed account");
@@ -117,6 +116,8 @@ async fn seed(repo: &StoreRepo) {
             allowed_models: Some(vec!["gpt-4.1-mini".to_string()]),
             default_limits: None,
             billing_plan: "free".to_string(),
+            billing_identity: format!("bill-{}", cuid2()),
+            project_quota: None,
         },
         PROJECT_ID.to_string(),
     )

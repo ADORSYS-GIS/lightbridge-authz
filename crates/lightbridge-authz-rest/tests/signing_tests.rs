@@ -372,7 +372,7 @@ mod db {
             .create_account(
                 subject,
                 CreateAccount {
-                    billing_identity: "t".to_string(),
+                    default_quota: None,
                 },
             )
             .await
@@ -390,6 +390,8 @@ mod db {
                     allowed_models: Some(vec!["gpt-4.1-mini".to_string()]),
                     default_limits: None,
                     billing_plan: "free".to_string(),
+                    billing_identity: format!("bill-{}", cuid2()),
+                    project_quota: None,
                 },
                 cuid2(),
             )

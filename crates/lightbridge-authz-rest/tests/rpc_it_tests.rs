@@ -187,12 +187,12 @@ fn json_body(bytes: &[u8]) -> Value {
 }
 
 /// Create an account over RPC (JSON) and return its id, asserting 200.
-async fn create_account(router: &Router, token: &str, billing_identity: &str) -> String {
+async fn create_account(router: &Router, token: &str, _unused: &str) -> String {
     let (status, body) = rpc_call(
         router.clone(),
         "procedure.createAccount",
         Wire::Json,
-        &json!({ "args": { "billingIdentity": billing_identity } }),
+        &json!({ "args": {} }),
         Some(token),
     )
     .await;
@@ -231,6 +231,9 @@ fn project_input(
         }),
         defaultLimits: Json(CValue::Map(std::collections::BTreeMap::new())),
         billingPlan: "free".to_string(),
+        billingIdentity: format!("bill-{}", cuid2()),
+        projectQuota: None,
+        isDefault: false,
     }
 }
 
@@ -336,12 +339,12 @@ async fn crud_lifecycle_for_all_resources_over_json() {
         r.clone(),
         "model.Account.update",
         Wire::Json,
-        &json!({ "id": account_id, "patch": { "billingIdentity": new_billing } }),
+        &json!({ "id": account_id, "patch": { "defaultQuota": new_billing } }),
         Some("admin"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json_body(&body)["billingIdentity"], new_billing);
+    assert_eq!(json_body(&body)["defaultQuota"], new_billing);
 
     // Project: create → get → list → update.
     let project_id = create_project(r, "admin", &account_id, "proj").await;
@@ -711,7 +714,7 @@ async fn crud_lifecycle_over_cbor() {
         r.clone(),
         "procedure.createAccount",
         Wire::Cbor,
-        &json!({ "args": { "billingIdentity": billing_id } }),
+        &json!({ "args": {} }),
         Some("admin"),
     )
     .await;
@@ -777,7 +780,7 @@ async fn crud_lifecycle_over_cbor() {
         r.clone(),
         "procedure.createAccount",
         Wire::Cbor,
-        &json!({ "args": { "billingIdentity": second_billing_id } }),
+        &json!({ "args": {} }),
         Some("admin"),
     )
     .await;
@@ -914,9 +917,9 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
     let project_id = create_project(r, "admin", &account_id, "proj-rbac").await;
     let (status, _) = rpc_call(
         r.clone(),
-        "procedure.addAccountMember",
+        "procedure.addProjectMember",
         Wire::Json,
-        &json!({ "args": { "accountId": account_id, "subject": viewer_subject } }),
+        &json!({ "args": { "projectId": project_id, "accountId": viewer_subject } }),
         Some("admin"),
     )
     .await;
@@ -943,7 +946,7 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
     for (op, input) in [
         (
             "model.Account.update",
-            json!({ "id": account_id, "patch": { "billingIdentity": "x" } }),
+            json!({ "id": account_id, "patch": { "defaultQuota": "x" } }),
         ),
         ("model.Account.delete", json!({ "id": account_id })),
         (
@@ -977,7 +980,7 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
         r.clone(),
         "model.Account.update",
         Wire::Json,
-        &json!({ "id": account_id, "patch": { "billingIdentity": format!("t-{}", cuid2()) } }),
+        &json!({ "id": account_id, "patch": { "defaultQuota": format!("t-{}", cuid2()) } }),
         Some("admin"),
     )
     .await;
@@ -1171,7 +1174,7 @@ async fn idempotent_replay_does_not_double_a_mutation() {
     let r = &ctx.router;
 
     let billing_id = format!("tenant-idem-{}", cuid2());
-    let body = Wire::Json.encode(&json!({ "args": { "billingIdentity": billing_id } }));
+    let body = Wire::Json.encode(&json!({ "args": {} }));
     let idem_key = format!("idem-{}", cuid2());
 
     let send = |body: Vec<u8>, key: String| {
@@ -1247,7 +1250,7 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
 
     let good_billing = format!("tenant-batch-{}", cuid2());
     let batch = json!([
-        { "id": 1, "op": "procedure.createAccount", "input": { "args": { "billingIdentity": good_billing } } },
+        { "id": 1, "op": "procedure.createAccount", "input": { "args": {} } },
         { "id": 2, "op": "model.Account.get", "input": {} }
     ]);
 
@@ -1542,7 +1545,7 @@ async fn default_project_cannot_be_hard_deleted_only_suspended() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Section 5: the `setDefaultAccount`/`setDefaultProject` escape hatch -- promoting a different
+// Section 5: the `setDefaultProject` escape hatch -- promoting a different
 // row to default atomically demotes the old one, freeing it up for hard deletion (otherwise a
 // subject's first-ever account/project would be permanently undeletable).
 // ---------------------------------------------------------------------------------------------
@@ -1635,59 +1638,28 @@ async fn promoting_a_second_project_to_default_frees_the_old_default_for_deletio
 }
 
 #[tokio::test]
-async fn promoting_a_second_account_to_default_frees_the_old_default_for_deletion() {
-    let subject = format!("owner-promote-acct-{}", cuid2());
+async fn a_second_account_for_the_same_subject_is_refused() {
+    // Replaces the old `promoting_a_second_account_to_default_frees_the_old_default_for_deletion`.
+    // Since ADR-0006 the account id IS the caller's subject, so there is no second account to
+    // promote and no default-account concept to reassign — a repeat createAccount conflicts.
+    let subject = format!("owner-single-acct-{}", cuid2());
     let ctx = setup(admin_bearer(&subject)).await;
     let r = &ctx.router;
 
-    let first_account_id =
-        create_account(r, "admin", &format!("tenant-promote-acct-1st-{}", cuid2())).await;
-    let second_account_id =
-        create_account(r, "admin", &format!("tenant-promote-acct-2nd-{}", cuid2())).await;
+    let account_id = create_account(r, "admin", "unused").await;
 
     let (status, body) = rpc_call(
         r.clone(),
-        "procedure.setDefaultAccount",
+        "procedure.createAccount",
         Wire::Json,
-        &json!({ "args": { "accountId": second_account_id } }),
+        &json!({ "args": {} }),
         Some("admin"),
     )
     .await;
     assert_eq!(
         status,
-        StatusCode::OK,
-        "setDefaultAccount: {}",
-        String::from_utf8_lossy(&body)
-    );
-    assert_eq!(json_body(&body)["isDefault"], true);
-
-    let (status, body) = rpc_call(
-        r.clone(),
-        "model.Account.get",
-        Wire::Json,
-        &json!({ "id": first_account_id }),
-        Some("admin"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        json_body(&body)["isDefault"],
-        false,
-        "the old default account must be demoted"
-    );
-
-    let (status, body) = rpc_call(
-        r.clone(),
-        "procedure.deleteAccountPermanently",
-        Wire::Json,
-        &json!({ "args": { "accountId": first_account_id } }),
-        Some("admin"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the demoted account must now be hard-deletable: {}",
+        StatusCode::CONFLICT,
+        "a subject's second createAccount must conflict, not mint a second account: {}",
         String::from_utf8_lossy(&body)
     );
 
@@ -1695,13 +1667,14 @@ async fn promoting_a_second_account_to_default_frees_the_old_default_for_deletio
         r.clone(),
         "procedure.deleteAccountPermanently",
         Wire::Json,
-        &json!({ "args": { "accountId": second_account_id } }),
+        &json!({ "args": { "accountId": account_id } }),
         Some("admin"),
     )
     .await;
-    assert!(
-        !status.is_success(),
-        "the newly-promoted default account must be refused deletion (got {status}: {})",
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the sole account is deletable — the undeletable-default rule applies to projects only: {}",
         String::from_utf8_lossy(&body)
     );
 }

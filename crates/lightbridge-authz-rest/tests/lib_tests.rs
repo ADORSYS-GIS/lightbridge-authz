@@ -324,7 +324,7 @@ mod db {
             .create_account(
                 subject,
                 CreateAccount {
-                    billing_identity: "billing-opa-trait".to_string(),
+                    default_quota: None,
                 },
             )
             .await
@@ -338,6 +338,8 @@ mod db {
                     allowed_models: None,
                     default_limits: None,
                     billing_plan: "free".to_string(),
+                    billing_identity: format!("bill-{}", cuid2()),
+                    project_quota: None,
                 },
                 cuid2(),
             )
