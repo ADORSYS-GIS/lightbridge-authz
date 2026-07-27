@@ -841,9 +841,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-codec-json"
-version = "0.4.13"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c40b04f6a730162b6681daaed668c98289ebfc469c993ec0ebf488f6eb2b0b9d"
+checksum = "9b1eb9fc970ca8cb9e614e8410eaaa529635d7af9434db895bcf60651ec1f61d"
 dependencies = [
  "cratestack-core",
  "serde",
