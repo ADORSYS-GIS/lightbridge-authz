@@ -25,7 +25,13 @@ serde_json = "1.0"
 sha2 = "0.11"
 hex = "0.4"
 base64 = "0.23"
-jsonwebtoken = { version = "11.0" }
+# Held at 10.x on purpose: `authkestra-guard` 0.1.0 (below) requires `jsonwebtoken ^10.3.0`, and
+# `lightbridge-authz-bearer` passes `Validation`/`Algorithm` values straight into its API. Bumping
+# this alone to 11.0 (#159) put BOTH majors in the lockfile and broke `main` with
+# `error[E0308]: mismatched types` — the types are nominally identical but come from different
+# crate versions. This can only move when authkestra-guard supports 11, or when the bearer crate
+# stops sharing jsonwebtoken types across that boundary.
+jsonwebtoken = { version = "10.4" }
 # Resource-server JWT/JWKS validation (see crates/lightbridge-authz-bearer). This is the
 # published crate that implements the module ADR-0004 refers to as "authkestra-resource" — that
 # name is not published to crates.io (it exists only in the authkestra git repo, unreleased,
@@ -70,7 +76,7 @@ rmcp = { version = "2.1.0", features = ["transport-streamable-http-server"] }
 
 mimalloc = "0"
 
-# cratestack: pinned to the same 0.4.13 release across the family so `cratestack-redis`'s
+# cratestack: pinned to the same 0.4.16 release across the family so `cratestack-redis`'s
 # `RateLimitStore` impl and `cratestack-axum`'s trait/config types stay in lockstep (see
 # docs/adr/0003-cratestack-crud-migration.md, "Rate limiting (Redis-backed)"). 0.4.10 fixed the two
 # upstream bugs this migration found and worked around (cratestack/cratestack#120, closing #116/#117
@@ -82,22 +88,44 @@ mimalloc = "0"
 # schema now that they're fixed (see the `AccountMembership`/`ApiKeySecret` comments in
 # `crates/lightbridge-authz-api/schema/authz.cstack`). See ADR-0003, "Known cratestack-pg 0.4.9 bugs"
 # and "Pagination (`@@paged`)" for the full record.
-cratestack-core = "0.4.13"
-cratestack-axum = "0.4.13"
-cratestack-redis = "0.4.13"
+#
+# THE LOCKSTEP IS LOAD-BEARING, not stylistic. Dependabot moved four of these to 0.4.16
+# (#158/#161/#162) and left the rest at 0.4.13, which broke `main`: 0.4.16's `cratestack-core` adds a
+# `TransportStyle::Grpc` variant that 0.4.13's `cratestack-macros` does not cover, so the workspace
+# stopped compiling with `error[E0004]: non-exhaustive patterns`. Bump every line below together, or
+# none of them — a partial bump within a semver-compatible range is exactly the failure mode.
+cratestack-core = "0.4.16"
+cratestack-axum = "0.4.16"
+cratestack-redis = "0.4.16"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
 # `include_server_schema!` macro emits `::cratestack::*` paths (see cratestack-pg lib docs). The
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
 # it to build the RPC router (ADR-0003).
-cratestack = { package = "cratestack-pg", version = "0.4.13" }
-cratestack-codec-cbor = "0.4.13"
-cratestack-codec-json = "0.4.13"
+cratestack = { package = "cratestack-pg", version = "0.4.16" }
+cratestack-codec-cbor = "0.4.16"
+cratestack-codec-json = "0.4.16"
 # Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
 # feature). See that module for why.
 minicbor = { version = "2.2", features = ["std", "half"] }
 redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
+
+# Debug/test builds ship line tables instead of full DWARF.
+#
+# Why: `--all-targets` builds 24 integration-test binaries, and Rust links each one statically
+# against the whole graph (~577 crates). With cargo's default `debug = true` each artifact lands at
+# 250-300 MB, almost all of it debug sections, and the LINKER has to hold that in memory — peak RSS
+# per link runs several times the output size. Multiply by cargo's default job count (one per core)
+# and the tail of a build is a dozen concurrent multi-GB links; that is what has been OOM-killing
+# developer machines and starving the self-hosted CI runner until it drops its connection to
+# GitHub (which also loses the logs, since the agent dies before uploading them).
+#
+# `line-tables-only` keeps what debugging actually needs day to day — panic backtraces with file
+# and line numbers — and drops variable/type DWARF. Set `debug = true` locally when stepping
+# through a debugger.
+[profile.dev]
+debug = "line-tables-only"
 
 [profile.prod]
 inherits = "release"
