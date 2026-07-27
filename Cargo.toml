@@ -25,7 +25,13 @@ serde_json = "1.0"
 sha2 = "0.11"
 hex = "0.4"
 base64 = "0.23"
-jsonwebtoken = { version = "11.0" }
+# Held at 10.x on purpose: `authkestra-guard` 0.1.0 (below) requires `jsonwebtoken ^10.3.0`, and
+# `lightbridge-authz-bearer` passes `Validation`/`Algorithm` values straight into its API. Bumping
+# this alone to 11.0 (#159) put BOTH majors in the lockfile and broke `main` with
+# `error[E0308]: mismatched types` — the types are nominally identical but come from different
+# crate versions. This can only move when authkestra-guard supports 11, or when the bearer crate
+# stops sharing jsonwebtoken types across that boundary.
+jsonwebtoken = { version = "10.4" }
 # Resource-server JWT/JWKS validation (see crates/lightbridge-authz-bearer). This is the
 # published crate that implements the module ADR-0004 refers to as "authkestra-resource" — that
 # name is not published to crates.io (it exists only in the authkestra git repo, unreleased,
