@@ -46,6 +46,12 @@ pub struct IntrospectResponse {
     /// Models the project is allowed to use (empty/absent means all).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_models: Option<Vec<String>>,
+    /// The project's pooled spending ceiling, from the governance tier catalogue (ADR-0006).
+    /// Costs no extra query — it rides on the project row already loaded for `allowed_models` —
+    /// and keeps the gateway's `x-project-quota` header sourced from the database rather than from
+    /// a claim frozen at mint time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_quota: Option<String>,
     /// Expiry as a Unix timestamp, when the key has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exp: Option<i64>,
