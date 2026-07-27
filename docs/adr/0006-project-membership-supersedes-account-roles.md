@@ -138,6 +138,89 @@ temporarily red until a follow-up procedure pass lands:
   introspect.rs`) simplified to the active/revoked-only check the epic's "introspection must be
   JWT-only" requirement calls for.
 
+## Reconciliation with the upstream default-account work (2026-07-26)
+
+This ADR was drafted against `main` at `09f9fb9`. Eight commits landed upstream before any of it was
+committed, three of which collide with it head-on — `#148` (default account/project undeletable),
+`#152` (`setDefaultAccount`/`setDefaultProject` reassignment), `#156` (backfill fix). The collisions
+and their resolutions:
+
+### `accounts.id` is the JWT subject
+
+The schema above uses `id == auth().id` on `Account` and `account.id == auth().id` everywhere else.
+That only holds if the account's primary key *is* the caller's subject — otherwise every policy on
+every pre-existing row fail-closes the moment `account_memberships` disappears, because nothing else
+maps a person to an account. The original draft left this implicit and shipped no migration for it;
+`20260727000004_accounts_id_becomes_subject.sql` closes the gap.
+
+`createAccount` therefore no longer generates a `cuid2` — it inserts the caller's subject as the id,
+and a second call from the same subject is a `Conflict`. Two consequences worth stating plainly:
+
+- Account ids stop being opaque. They are Keycloak subject UUIDs, and they appear in URLs, logs and
+  the `account_id` JWT claim. This was already true of the claim's *value* in practice; it is now
+  true by construction.
+- `account_id` becomes derivable from the token without touching the database, which is what makes
+  the introspection requirement below reachable.
+
+The remap picks each account's owning subject (preferring the `owner` role, then oldest membership),
+and for a subject holding several accounts keeps the oldest as survivor, re-parenting the others'
+projects onto it. Accounts with **zero** memberships are left untouched: they are already unreachable
+under today's membership-scoped policies, so deleting them would destroy data to no benefit. The
+separate usage database (`migrations-usage/`) is append-only telemetry and is deliberately not
+remapped — historical usage rows keep the old account ids.
+
+**Non-owner members lose access.** Only owners survive the remap; a subject who was merely a member
+of someone else's account is not converted into a project member, and loses access when the
+membership table is dropped. This was decided explicitly rather than by omission: converting them
+would mean auto-creating an account per orphaned subject, and the audit trail of "who can reach
+what" matters more here than saving project leads a few `addProjectMember` calls. The migration
+carries the query operators should run to count who is affected before applying it.
+
+### The default-*account* concept is removed
+
+`#148`/`#152` gave `accounts` an `is_default` flag, a "your first account cannot be hard-deleted"
+rule, and a `setDefaultAccount` procedure to reassign it. All three presuppose that one subject may
+hold several accounts. Under "one account = one person" that is impossible, so the flag would be
+permanently `true` for every row and the reassignment procedure would have nothing to choose
+between. `20260727000006_accounts_drop_is_default.sql` drops the column; the procedure, its repo
+method, its RBAC entry and its tests go with it.
+
+The default-*project* half of that same work is **kept and relied upon**: `projects.is_default`, its
+`BEFORE INSERT` trigger, the partial unique index making "at most one default project per account"
+race-safe, and `setDefaultProject`. It expresses exactly the auto-provisioned, roster-less project
+this ADR already called for, and does it in the DB rather than in policy. This ADR's own migration
+no longer adds `projects.is_default` — `20260725000001` owns it.
+
+### Migration renumbering
+
+The four migrations listed above were renumbered from `20260724*` to `20260727*` so they sort after
+upstream's `20260725000001` and `20260726000001`. Not cosmetic: at the old numbers, `20260724000002`
+would have added a `projects.is_default` column that `20260725000001` also adds, and `20260724000004`
+would have dropped `account_memberships` out from under `20260726000001`'s backfill, which reads it.
+Renumbering is legitimate here only because none of the four had ever been committed to `main` — the
+"migrations are immutable once landed" rule is about migrations other databases have already applied.
+
+### Quota tiers are config-validated, and the catalog may be empty
+
+`Account.defaultQuota`, `Project.projectQuota` and `ProjectMember.quotaTier` are validated at write
+time against an operator-configured catalog rather than a DB table, because Envoy Gateway's
+`BackendTrafficPolicy` can only enforce a small, statically-rendered menu of tiers — a
+freely-creatable DB table would not save anyone a chart deploy. An **empty or absent catalog accepts
+any value**, so existing deployments and charts keep working until `ai-helm-values` supplies one.
+A deliberate "don't break the fleet on upgrade" choice, not an oversight.
+
+### Accepted consequence: tier and role changes are not instantly live
+
+Introspection reduces to a single indexed `api_keys` lookup, and everything else Authorino needs
+(`account_id`, `project_id`, `role`, `quota_tier`, `project_quota`, `allowed_models`) is decoded from
+the JWT's claims, sealed in at mint/exchange time. The cost is that changing someone's tier or role
+does not take effect on their next request — it takes effect when their token is next minted (key
+rotation, or the next login/token exchange). That is strictly weaker than the 60-second cached live
+lookup an earlier draft of this epic built, and it is accepted deliberately: "as fast as possible"
+was a hard requirement, and this is what it costs. If instant revocation of a specific key or tier is
+ever needed, the fix is a version/nonce bump forcing re-issuance — not putting a lookup back on the
+hot path.
+
 ## Consequences
 
 ### Positive

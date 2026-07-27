@@ -6,9 +6,9 @@ document describes how the roles Keycloak puts on a JWT become permissions, and 
 each operation requires.
 
 > Ownership still applies. RBAC is a *coarse capability* check (may this caller create projects at
-> all?). The existing per-row `account_memberships` model still decides *which* accounts/projects a
-> caller can touch. A request must pass **both**: the RBAC gate (or it is `403 Forbidden`) and the
-> membership check (or it is `404 Not Found`).
+> all?). Account ownership (`accounts.id = sub`) and the per-row `project_members` roster still
+> decide *which* accounts/projects a caller can touch. A request must pass **both**: the RBAC gate
+> (or it is `403 Forbidden`) and the membership check (or it is `404 Not Found`).
 
 ## How it works
 
@@ -43,8 +43,9 @@ both mandatory, evaluated in this order**:
    `op_id` → permission table defines.
 2. **Membership policy (per-tenant ownership) — second.** cratestack's generated `@@allow` policies
    on the schema (`crates/lightbridge-authz-api/schema/authz.cstack`), which check
-   `…memberships.some.subject == auth().id`. Answers "does this specific account/project/key belong
-   to a tenant this caller is a member of?" A non-member gets a policy-driven empty result / `404`.
+   `account.id == auth().id || members.some.accountId == auth().id`. Answers "does this specific
+   account/project/key belong to this caller, or to a project they sit on?" A non-member gets a
+   policy-driven empty result / `404`.
 
 So a `lightbridge-viewer` who is a legitimate account member is still blocked from
 create/update/delete by gate 1 (they hold only `*:read`), and a `lightbridge-editor` acting on an
@@ -133,15 +134,15 @@ listed here is denied unconditionally (fail closed).**
 | ----------------- | ---------------------------------------------------- | ----------------------------------- |
 | `account:create`  | `model.Account.create`                               | `create-account`                    |
 | `account:read`    | `model.Account.list`, `model.Account.get`, `model.AccountSummary.list`, `model.AccountSummary.get` | `list-accounts`, `get-account` |
-| `account:update`  | `model.Account.update`, `procedure.setDefaultAccount`| `update-account`, `set-default-account` |
+| `account:update`  | `model.Account.update`                               | `update-account`                    |
 | `account:delete`  | `procedure.deleteAccountPermanently`                 | `delete-account`                    |
 | `account:disable` | `procedure.disableAccount`, `procedure.enableAccount`| `disable-account`, `enable-account` |
-| `account:member`  | `procedure.addAccountMember`, `procedure.removeAccountMember`, `procedure.setAccountMemberRole` | `add-account-member`, `remove-account-member`, `set-account-member-role` |
 | `project:create`  | `model.Project.create`                               | `create-project`                    |
 | `project:read`    | `model.Project.list`, `model.Project.get`            | `list-projects`, `get-project`      |
 | `project:update`  | `model.Project.update`, `procedure.setDefaultProject` | `update-project`, `set-default-project` |
 | `project:delete`  | `model.Project.delete`                               | `delete-project`                    |
 | `project:disable` | `procedure.disableProject`, `procedure.enableProject`| `disable-project`, `enable-project` |
+| `project:member`  | `procedure.addProjectMember`, `procedure.removeProjectMember`, `procedure.setProjectMemberRole`, `procedure.setProjectMemberQuotaTier` | `add-project-member`, `remove-project-member`, `set-project-member-role`, `set-project-member-quota-tier` |
 | `apikey:create`   | `procedure.createApiKey`                             | `create-api-key`                    |
 | `apikey:read`     | `model.ApiKey.list`, `model.ApiKey.get`              | `list-api-keys`, `get-api-key`      |
 | `apikey:update`   | `model.ApiKey.update`                                | `update-api-key`                    |
@@ -158,13 +159,13 @@ listed here is denied unconditionally (fail closed).**
   already fail-closed at the policy layer; the RBAC gate denies it too. API-key creation is
   server-side only, via `procedure.createApiKey` (the server generates + hashes the secret and
   validates the billing plan; a caller can never supply `keyHash`/`keyPrefix`/`billingPlan`).
-- `model.Account.delete` — same reasoning as above: membership-*role* gating (owner-only) can't be
-  expressed as a schema `@@allow` policy predicate (see "Account roles" below for why), so the
-  generic delete verb has no `@@allow` at all and is denied here too. Account deletion is
-  `procedure.deleteAccountPermanently` only.
-- `model.AccountMembership.*` — that model is policy-locked to read-self with no generated mutation
-  verbs; membership changes go through the `addAccountMember` / `removeAccountMember` /
-  `setAccountMemberRole` procedures.
+- `model.Account.delete` — the generic delete verb carries no `@@allow` at all and is denied here
+  too. Account deletion is `procedure.deleteAccountPermanently` only, whose SQL check is simply "the
+  caller is this account".
+- `model.ProjectMember.*` — that model is policy-locked to read-only with no generated mutation
+  verbs; roster changes go through the `addProjectMember` / `removeProjectMember` /
+  `setProjectMemberRole` / `setProjectMemberQuotaTier` procedures, which enforce the lead check in
+  SQL (see "Project roles" below for why it cannot be an `@@allow` predicate).
 - `/rpc/batch` — a batch bundles multiple ops in its frame body, so a single URL-derived `op_id`
   cannot represent the per-op permissions; the whole endpoint is denied.
 
@@ -238,121 +239,103 @@ the status code:
 So "the JWT passes but OPA refuses" is precisely the authorization-phase deny: the introspection
 metadata reports `active: false`, the `active == true` authorization rule fails, and Authorino
 returns 403. See `docs/authorino-usage.md` for the AuthConfig.
+## Project membership (who a tenant's resources belong to)
 
-## Account membership (who a tenant's resources belong to)
+RBAC decides *what actions* a caller may attempt; **membership** decides *whose* projects and API
+keys they act on. Since ADR-0006 there is **no account-level membership at all** — a person's
+identity in this system *is* their `accountId`, and `accounts.id` holds their JWT `sub` verbatim.
+So "does this account belong to me" is a primary-key comparison (`accounts.id = sub`), not a join.
 
-RBAC decides *what actions* a caller may attempt; **membership** decides *whose* accounts and
-projects they act on. A caller can only see or mutate an account (and every project and API key
-beneath it) if their JWT `sub` is in that account's `account_memberships`. This is enforced in SQL
-on every account/project/key query — RBAC is checked first (else `403`), then membership (else
-`404`).
+A caller can see or mutate a project (and every API key beneath it) if either:
 
-Membership is **account-level**: a member of an account can act on all of its projects. There is no
-project-scoped membership.
+- they own the account the project belongs to (`projects.account_id = sub`), or
+- they hold a `project_members` row for it (`project_members.account_id = sub`).
 
-An admin holding `account:member` manages the roster directly (no invite/accept handshake), via the
-RPC procedures:
+Enforced in SQL on every project/key query — RBAC is checked first (else `403`), then membership
+(else `404`).
 
-- `procedure.addAccountMember` with `{ accountId, subject, role? }` — add a member. `role` defaults
-  to `"member"` if omitted; granting `"owner"` requires the caller to already be an `"owner"` (see
-  "Account roles" below). Idempotent on the membership itself — re-adding an existing member is a
-  no-op and does **not** change their role; use `setAccountMemberRole` for that.
-- `procedure.removeAccountMember` with `{ accountId, subject }` — remove a member. Refuses to remove
-  the **last** remaining member (`409 Conflict`; emptying the roster would trip the account-prune
-  trigger and delete the account) *and* refuses to remove the account's **last remaining owner**, even
-  if other non-owner members remain (would otherwise orphan the account with nobody able to perform
-  owner-only operations). To intentionally delete the account and all its resources, use
-  `procedure.deleteAccountPermanently` (`account:delete`) instead.
-- `procedure.setAccountMemberRole` with `{ accountId, subject, role }` — change an existing member's
-  role. Owner-only. Refuses to demote the account's last remaining owner away from `"owner"`.
+Membership is **project-level**. An account's *default* project has no roster at all: nothing ever
+inserts a `project_members` row for it, so the "no membership concept on the default project"
+requirement falls out of the data model rather than needing a special case in policy.
 
-The acting caller must themselves be a member of the account (a non-member gets a uniform `404`),
-so `account:member` lets an admin manage rosters of accounts they belong to, not arbitrary tenants.
-The creating subject is always seeded as the account's first member **with the `"owner"` role**.
-Membership is mutated **only** through these three procedures — the cratestack `Account` model
-exposes no `owners_admins` column, so `model.Account.update` cannot change the roster.
+A caller holding `project:member` manages a roster directly (no invite/accept handshake):
 
-### Account roles
+- `procedure.addProjectMember` with `{ projectId, accountId, role? }` — add a member by their
+  account id (which is their subject). `role` defaults to `"member"`. Idempotent on the membership
+  itself; use `setProjectMemberRole` to change an existing member's role.
+- `procedure.removeProjectMember` with `{ projectId, accountId }` — remove a member. Unlike the
+  account-membership model this replaces, there is **no** last-member invariant to enforce: the
+  project's owning account is a standing authority over the roster, so a project can never be left
+  with nobody able to administer it.
+- `procedure.setProjectMemberRole` with `{ projectId, accountId, role }` — `"lead"` or `"member"`.
+- `procedure.setProjectMemberQuotaTier` with `{ projectId, accountId, quotaTier }` — the member's
+  per-project spending ceiling, validated against the configured tier catalogue at write time.
 
-Every `account_memberships` row carries a `role` — `"owner"`, `"admin"`, or `"member"`
-(`migrations/20260722000001_account_membership_roles.sql`; the account-scoped taxonomy ADR-0002
-originally called for). This is a **second, finer authorization layer inside a single account**,
-distinct from both the coarse RBAC gate above (global, JWT-role-driven, "may this caller attempt
-this kind of operation at all") and account membership (binary, "is this caller a member of this
-account at all"). Role gates account-scoped membership-management and destructive operations only —
-project and api-key create/read/update/delete stay open to *any* member of the account, unchanged:
+All four are **lead-gated**: the acting caller must own the project's account or hold `role = "lead"`
+on that project. A caller who is neither gets a uniform `404`, the same non-leaking pattern used
+everywhere on this surface.
+
+### Project roles
+
+Every `project_members` row carries a `role` — `"lead"` or `"member"` — plus an optional
+`quota_tier`. Role is a **second, finer authorization layer inside a single project**, distinct from
+the coarse RBAC gate above (global, JWT-role-driven) and from membership itself (binary).
 
 | Role     | Can do beyond plain membership |
 | -------- | ------------------------------- |
-| `member` | Nothing extra — read/create/update on the account's projects and api-keys, same as any member. |
-| `admin`  | + `addAccountMember` / `removeAccountMember` (cannot grant `"owner"` or remove an `"owner"`), + `disableAccount` / `enableAccount`. |
-| `owner`  | Everything `admin` can do, plus: grant/revoke the `"owner"` role itself, remove another owner, `setAccountMemberRole` (owner-only entirely), `deleteAccountPermanently` (owner-only entirely). |
+| `member` | Nothing extra — read/update the project and its API keys, same as any member. |
+| `lead`   | + roster add/remove, + `setProjectMemberRole`, + `setProjectMemberQuotaTier`, + `createApiKey`. |
 
-An account can have more than one owner. Two lockout-avoidance invariants are enforced in SQL
-regardless of caller intent: **the last remaining owner of an account can never be removed or
-demoted** (`removeAccountMember` / `setAccountMemberRole` both check this before acting), so an
-account can never end up with members but zero owners.
+API-key creation is lead-gated deliberately: a key is live spending power with no per-request human
+in the loop, so letting any member mint unlimited keys would remove the lead's ability to bound the
+project's blast radius. It is cheaper to loosen this later than to tighten it after people depend on
+the loose behaviour.
 
-**Why this isn't expressed as an `@@allow` schema policy, unlike account membership itself:**
-cratestack's relation-quantifier policy predicates (`account.memberships.some.subject == auth().id`)
-resolve each dotted path to exactly one target scalar field per relation hop — there's no support for
-a compound condition jointly checked on the *same* related row. Writing
-`memberships.some.subject == auth().id && memberships.some.role == "owner"` would compile to two
-independent `EXISTS` checks ("some member matches my subject" AND, separately, "some member — any
-member — has role owner"), not "the member row matching my subject also has role owner". So role
-gating lives entirely in hand-written SQL inside the five procedures above (confirmed by reading
-`cratestack-macros/src/policy/model/relation_path.rs`) rather than in the schema's `@@allow` policies.
+**Why this isn't expressed as an `@@allow` schema policy, unlike membership itself:** cratestack's
+relation-quantifier policy predicates (`project.members.some.accountId == auth().id`) resolve each
+dotted path to exactly one target scalar field per relation hop — there is no support for a compound
+condition jointly checked on the *same* related row. Writing
+`members.some.accountId == auth().id && members.some.role == "lead"` would compile to two
+independent `EXISTS` checks ("some member matches me" AND, separately, "some member — any member —
+is a lead"), not "the member row matching me is also a lead". So role gating lives entirely in
+hand-written SQL inside the procedures above (confirmed by reading
+`cratestack-macros/src/policy/model/relation_path.rs`) rather than in the schema's `@@allow`
+policies. ADR-0005 first hit this limitation with account roles; ADR-0006 re-confirmed it for
+project roles.
 
-### The default account/project can't be hard-deleted
+### The default project can't be hard-deleted
 
-The account `createAccount` seeds for a brand-new tenant, and the first project ever created under
-an account, are each marked `isDefault = true` — server-computed once at insert time (`isDefault
-Boolean @readonly` in the schema, so a raw RPC caller can never supply or overwrite it directly; a
-subject's *second* `createAccount` call, or an account's *second* project, both come back
-`isDefault: false`). This is a hard safety rail, not a role check: `deleteAccountPermanently`
-refuses a default account with `409 Conflict` regardless of who's calling (even the sole owner), and
-`model.Project.delete`'s `@@allow` policy denies a default project the same way. Suspending
-(`disableAccount`/`disableProject`) still works on either — only the permanent-delete path is
-blocked, so a tenant can never accidentally wipe out their only account/project (and every API key
-underneath it) with no way back.
+The first project ever created under an account is marked `isDefault = true` — server-computed once
+at insert time by a `BEFORE INSERT` trigger (`migrations/20260725000001_default_account_project.sql`),
+since `model.Project.create` is the generic cratestack verb and has no hand-written hook for the
+"is this the account's first project" computation. A partial unique index
+(`projects_account_id_default_uidx`) backstops the race where two concurrent first-project creates
+for the same brand-new account would otherwise both see zero existing rows. `isDefault Boolean
+@readonly` keeps it out of the generated create/update inputs, so a raw RPC caller can never supply
+or overwrite it.
 
-`isDefault` for `Account` is computed in `createAccount`'s own transaction (`StoreRepo::
-create_account`, checking whether the calling subject already has any `account_memberships` row).
-For `Project` there's no equivalent hand-written procedure — `model.Project.create` is still the
-generic cratestack verb (see the `Project` model's `@@allow("create", ...)` above) — so `isDefault`
-is computed by a `BEFORE INSERT` trigger instead (`migrations/20260725000001_default_account_
-project.sql`), backstopped by a partial unique index (`projects_account_id_default_uidx`) against
-the race where two concurrent first-project creates for the same brand-new account would otherwise
-both see zero existing rows.
+This is a hard safety rail, not a role check: `model.Project.delete`'s `@@allow` policy denies a
+default project outright. Suspending (`disableProject`) still works — only the permanent-delete path
+is blocked, so a tenant can never accidentally wipe out their only project and every API key
+underneath it with no way back.
 
-### Escape hatch: reassigning the default (`setDefaultAccount` / `setDefaultProject`)
+There is **no** equivalent default-*account* concept. One account is one person, so there is nothing
+to default away from; the `accounts.is_default` column and the `setDefaultAccount` procedure that
+briefly existed were removed by ADR-0006 (`migrations/20260727000006_accounts_drop_is_default.sql`).
 
-Because the default row can never be hard-deleted, a subject's bootstrap account/project would be
-*permanently* undeletable with no way out if `isDefault` could never move — so it can, but only
-through two dedicated procedures, never through generic `model.Account.update` /
-`model.Project.update` (both still carry `@readonly` on the field). `setDefaultAccount(accountId)`
-and `setDefaultProject(projectId)` each promote a different row to default, atomically demoting
-whichever row is currently default, in a single transaction (`StoreRepo::set_default_account` /
-`set_default_project`) — never a bare "unset then set" a caller could race against. Once a
-different row is promoted, the old default is a plain non-default row and `deleteAccountPermanently`
-/ `model.Project.delete` work on it normally.
+### Escape hatch: reassigning the default (`setDefaultProject`)
 
-Membership gating matches the rest of this surface: any member of the account may reassign its
-default (no extra owner/admin role check — the same posture `model.Project.delete` and the
-membership-scoped `@@allow`s already take; reassigning default status is a strictly less
-destructive operation than deletion itself, and `Account` deletion's own owner-only gate covers the
-more consequential action). A caller who isn't a member of the target account/project gets a uniform
-`404 Not Found`, same non-leaking pattern as everywhere else here. Coarsely, both procedures require
-`account:update` / `project:update` (the same permission generic field updates require) — reassigning
-`isDefault` is conceptually an update, just one that can't go through the generic verb.
+Because the default project can never be hard-deleted, an account's bootstrap project would be
+*permanently* undeletable if `isDefault` could never move — so it can, but only through
+`setDefaultProject(projectId)`, never through the generic `model.Project.update` (the field stays
+`@readonly`). It promotes a different project to default while atomically demoting whichever project
+is currently default, in a single transaction (`StoreRepo::set_default_project`) — never a bare
+"unset then set" a caller could race against. The partial unique index still backstops the
+invariant: if two reassignments for the same account raced past the unset step, the second
+`SET is_default = true` would hit a unique-constraint conflict (surfaced as `409 Conflict`) rather
+than silently leaving two defaults.
 
-The two invariants are enforced differently because `isDefault` is scoped differently on each model:
-- **Project**: scoped by `account_id`, backstopped by the existing partial unique index
-  (`projects_account_id_default_uidx`) — even if two `setDefaultProject` calls for the same account
-  raced past the unset step, the second `SET is_default = true` would hit a unique-constraint
-  conflict (surfaced as `409 Conflict`) rather than silently leaving two defaults.
-- **Account**: `isDefault` has no such column to hang a partial unique index off — "default" means
-  "this subject's bootstrap account", a property of the *membership*, not of the account row alone.
-  `set_default_account` instead takes a `pg_advisory_xact_lock` keyed on the calling subject (same
-  mechanism `ensure_active_signing_key` uses for key rotation) to serialize concurrent reassignment
-  attempts by that subject.
+Once a different project is promoted, the old default is a plain row and `model.Project.delete`
+works on it normally. Coarsely the procedure requires `project:update` — reassigning `isDefault` is
+conceptually an update, just one that cannot go through the generic verb. A caller who owns neither
+the account nor a roster seat gets a uniform `404`.
