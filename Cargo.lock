@@ -830,9 +830,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-codec-cbor"
-version = "0.4.13"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69753d226ee4f214817033667723c42f9bcd850e24444720576c2a3201e6a468"
+checksum = "cf95c47d88d579fa99e1c243ae684377a38d4082da9b7e5d2ea87f5a7794ae15"
 dependencies = [
  "cratestack-core",
  "minicbor-serde",
@@ -852,9 +852,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-core"
-version = "0.4.13"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a76e0f3b7d7c9336159c618b3fe18c42b7590217786775c8fa324a639a9aaf49"
+checksum = "df5a59477f995e68a9ef35cb81551f24612d30b30437b183bd7b73a7a4d2649c"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
