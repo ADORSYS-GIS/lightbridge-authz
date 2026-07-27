@@ -173,8 +173,13 @@ remapped — historical usage rows keep the old account ids.
 of someone else's account is not converted into a project member, and loses access when the
 membership table is dropped. This was decided explicitly rather than by omission: converting them
 would mean auto-creating an account per orphaned subject, and the audit trail of "who can reach
-what" matters more here than saving project leads a few `addProjectMember` calls. The migration
-carries the query operators should run to count who is affected before applying it.
+what" matters more here than saving project leads a few `addProjectMember` calls.
+
+This is safe in practice, not merely accepted in principle: account-level membership shipped only
+weeks earlier (ADR-0005), was never demoed or exhibited, and has no established users to strand —
+confirmed by the product owner. Had it been a feature people depended on, the answer would have been
+to convert the rows rather than drop them. The migration still carries the query to count affected
+subjects, which is worth running before applying this anywhere that matters.
 
 ### The default-*account* concept is removed
 
