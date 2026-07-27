@@ -32,11 +32,15 @@ runs:
         podman logs --tail 50 lightbridge-pg || true
         exit 1
 
+    # Same memory guard as code-checks: `cargo test --workspace` links the same 24 test binaries,
+    # so it hits the identical wall at cargo's default job count.
     - name: Run tests
       shell: bash
       run: cargo test --workspace
       env:
         DATABASE_URL: ${{ inputs.database-url }}
+        CARGO_BUILD_JOBS: "4"
+        CARGO_INCREMENTAL: "0"
 
     - name: Stop PostgreSQL
       if: always()
