@@ -236,9 +236,9 @@ fn to_schema_api_key_secret(s: ApiKeySecret) -> schema::ApiKeySecret {
     }
 }
 
-/// RPC procedure registry (ADR-0003 item 4). All four procedures delegate to the reused,
-/// hand-written sqlx in `AuthzStoreImpl`/`StoreRepo` (tenant-scoped by the `account_memberships`
-/// CTE), never cratestack's `run_in_tx`, so the chained-write deadlock in cratestack-pg 0.4.9
+/// RPC procedure registry (ADR-0003 item 4). Every procedure delegates to the hand-written sqlx in
+/// `AuthzStoreImpl`/`StoreRepo` (tenant-scoped by account ownership or a `project_members` row,
+/// ADR-0006), never cratestack's `run_in_tx`, so the chained-write deadlock in cratestack-pg 0.4.9
 /// (ADR-0003, "Known cratestack-pg 0.4.9 bugs", item 1) cannot occur. `db` is intentionally unused:
 /// the generated CRUD client speaks over cratestack's own sqlx pool (a different sqlx major than
 /// this workspace's), so the procedures use the pre-migration repository pool for their writes.

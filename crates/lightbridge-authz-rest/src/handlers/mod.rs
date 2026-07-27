@@ -323,8 +323,8 @@ fn resolve_issued_expires_at(
 /// The four write operations the RPC procedures delegate to (ADR-0003 item 4). Everything else the
 /// old `AuthzStore` trait exposed (account/project/api-key list/read/create/update/delete) now runs
 /// through the generated cratestack CRUD client, so only these survive — as inherent methods, no
-/// trait. All four reuse the pre-migration hand-written sqlx in `StoreRepo` (tenant-scoped by the
-/// `account_memberships` CTE); none use cratestack's `run_in_tx`, per the deadlock finding in
+/// trait. They reuse the hand-written sqlx in `StoreRepo` (tenant-scoped by account ownership or a
+/// `project_members` row, ADR-0006); none use cratestack's `run_in_tx`, per the deadlock finding in
 /// ADR-0003 ("Known cratestack-pg 0.4.9 bugs", item 1).
 impl AuthzStoreImpl {
     /// Create the caller's account. Backs the `createAccount` procedure. Since ADR-0006 the account
@@ -345,10 +345,10 @@ impl AuthzStoreImpl {
 
     /// Create an API key: validate the requested `billing_plan` against the operator-configured
     /// catalogue (before any DB write), issue a fresh secret (generation/hashing unchanged from
-    /// before the migration), and insert the row via hand-written sqlx (tenant-scoped by the
-    /// `account_memberships` CTE). Backs the `createApiKey` procedure. This restores the
-    /// pre-migration `create_api_key` path verbatim; the only change is that it is now an inherent
-    /// method invoked by the RPC procedure instead of the deleted `AuthzStore` trait.
+    /// before the migration), and insert the row via hand-written sqlx. Backs the `createApiKey`
+    /// procedure. Since ADR-0006 this path is **lead-gated** in SQL: the caller must own the
+    /// project's account or hold `role = 'lead'` on it, because a key is live spending power with
+    /// no per-request human in the loop.
     pub async fn create_api_key(
         &self,
         subject: &str,
