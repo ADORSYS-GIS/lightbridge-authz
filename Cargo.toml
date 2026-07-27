@@ -70,7 +70,7 @@ rmcp = { version = "2.1.0", features = ["transport-streamable-http-server"] }
 
 mimalloc = "0"
 
-# cratestack: pinned to the same 0.4.13 release across the family so `cratestack-redis`'s
+# cratestack: pinned to the same 0.4.16 release across the family so `cratestack-redis`'s
 # `RateLimitStore` impl and `cratestack-axum`'s trait/config types stay in lockstep (see
 # docs/adr/0003-cratestack-crud-migration.md, "Rate limiting (Redis-backed)"). 0.4.10 fixed the two
 # upstream bugs this migration found and worked around (cratestack/cratestack#120, closing #116/#117
@@ -82,16 +82,22 @@ mimalloc = "0"
 # schema now that they're fixed (see the `AccountMembership`/`ApiKeySecret` comments in
 # `crates/lightbridge-authz-api/schema/authz.cstack`). See ADR-0003, "Known cratestack-pg 0.4.9 bugs"
 # and "Pagination (`@@paged`)" for the full record.
-cratestack-core = "0.4.13"
-cratestack-axum = "0.4.13"
-cratestack-redis = "0.4.13"
+#
+# THE LOCKSTEP IS LOAD-BEARING, not stylistic. Dependabot moved four of these to 0.4.16
+# (#158/#161/#162) and left the rest at 0.4.13, which broke `main`: 0.4.16's `cratestack-core` adds a
+# `TransportStyle::Grpc` variant that 0.4.13's `cratestack-macros` does not cover, so the workspace
+# stopped compiling with `error[E0004]: non-exhaustive patterns`. Bump every line below together, or
+# none of them — a partial bump within a semver-compatible range is exactly the failure mode.
+cratestack-core = "0.4.16"
+cratestack-axum = "0.4.16"
+cratestack-redis = "0.4.16"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
 # `include_server_schema!` macro emits `::cratestack::*` paths (see cratestack-pg lib docs). The
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
 # it to build the RPC router (ADR-0003).
-cratestack = { package = "cratestack-pg", version = "0.4.13" }
-cratestack-codec-cbor = "0.4.13"
-cratestack-codec-json = "0.4.13"
+cratestack = { package = "cratestack-pg", version = "0.4.16" }
+cratestack-codec-cbor = "0.4.16"
+cratestack-codec-json = "0.4.16"
 # Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
