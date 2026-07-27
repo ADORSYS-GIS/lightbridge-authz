@@ -2,13 +2,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
+/// A plain `accounts` row. Per ADR-0006 there is no more account-level membership to aggregate
+/// (`accounts.id` IS the JWT subject -- one account, one person), so this replaces the former
+/// `AccountWithMembersRow` and its `array_agg(account_memberships.subject)` machinery entirely.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct AccountWithMembersRow {
+pub struct AccountRow {
     pub id: String,
-    pub billing_identity: String,
-    pub owners_admins: Vec<String>,
+    pub default_quota: Option<String>,
     pub status: String,
-    pub is_default: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
