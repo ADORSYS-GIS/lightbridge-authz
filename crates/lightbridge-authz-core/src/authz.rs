@@ -36,8 +36,6 @@ pub enum Permission {
     AccountDelete,
     #[serde(rename = "account:disable")]
     AccountDisable,
-    #[serde(rename = "account:member")]
-    AccountMember,
 
     #[serde(rename = "project:create")]
     ProjectCreate,
@@ -49,6 +47,11 @@ pub enum Permission {
     ProjectDelete,
     #[serde(rename = "project:disable")]
     ProjectDisable,
+    /// Manage a project's roster: add/remove members and set their role or quota tier. Replaces the
+    /// removed `account:member` (ADR-0006) — membership is a project-level concept now, so the
+    /// capability moved with it rather than being renamed in place.
+    #[serde(rename = "project:member")]
+    ProjectMember,
 
     #[serde(rename = "apikey:create")]
     ApiKeyCreate,
@@ -75,12 +78,12 @@ impl Permission {
         Permission::AccountUpdate,
         Permission::AccountDelete,
         Permission::AccountDisable,
-        Permission::AccountMember,
         Permission::ProjectCreate,
         Permission::ProjectRead,
         Permission::ProjectUpdate,
         Permission::ProjectDelete,
         Permission::ProjectDisable,
+        Permission::ProjectMember,
         Permission::ApiKeyCreate,
         Permission::ApiKeyRead,
         Permission::ApiKeyUpdate,
@@ -98,12 +101,12 @@ impl Permission {
             Permission::AccountUpdate => "account:update",
             Permission::AccountDelete => "account:delete",
             Permission::AccountDisable => "account:disable",
-            Permission::AccountMember => "account:member",
             Permission::ProjectCreate => "project:create",
             Permission::ProjectRead => "project:read",
             Permission::ProjectUpdate => "project:update",
             Permission::ProjectDelete => "project:delete",
             Permission::ProjectDisable => "project:disable",
+            Permission::ProjectMember => "project:member",
             Permission::ApiKeyCreate => "apikey:create",
             Permission::ApiKeyRead => "apikey:read",
             Permission::ApiKeyUpdate => "apikey:update",

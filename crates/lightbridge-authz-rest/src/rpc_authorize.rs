@@ -13,7 +13,7 @@
 //! pass.
 //!
 //! The map below is the single source of truth for op-id -> required permission on the RPC surface.
-//! It is **fail-closed**: any op-id not listed here (unknown ops, `model.AccountMembership.*`,
+//! It is **fail-closed**: any op-id not listed here (unknown ops, `model.ProjectMember.*`,
 //! `model.ApiKey.create`, the `/rpc/batch` fan-out endpoint) is denied unconditionally, mirroring
 //! the pre-migration REST `authorize` middleware's documented behavior for unmapped routes.
 
@@ -38,16 +38,17 @@ use serde_json::json;
 /// Deliberately unmapped (=> denied):
 /// - `model.Account.create` — the schema removed its `@@allow("create")`, so it is already
 ///   fail-closed at the policy layer; denying it here as well guarantees a clean `403`. The generic
-///   verb only inserts the `accounts` row and never seeds `account_memberships`, which would lock
-///   the creator out of every membership-scoped policy. Account creation goes through
-///   `procedure.createAccount`, which seeds the creator's membership in the same transaction.
+///   verb would let a caller choose the row's id, and since ADR-0006 the account id IS the caller's
+///   JWT subject — a caller-supplied id would be an impersonation primitive. Account creation goes
+///   through `procedure.createAccount`, which takes the id from the authenticated subject.
 /// - `model.ApiKey.create` — the schema removed its `@@allow("create")`, so it is already
 ///   fail-closed at the policy layer; denying it here as well guarantees a clean `403` even if the
 ///   schema-level removal alone did not produce one. API-key creation goes through
 ///   `procedure.createApiKey`.
-/// - `model.AccountMembership.*` — that model is policy-locked to read-self and has no generated
-///   mutation verbs; denied here too for defense in depth. Membership changes go through
-///   `procedure.addAccountMember` / `procedure.removeAccountMember`.
+/// - `model.ProjectMember.*` — that model is policy-locked to read-only and has no generated
+///   mutation verbs; denied here too for defense in depth. Roster changes go through
+///   `procedure.addProjectMember` / `procedure.removeProjectMember` / `procedure.setProjectMemberRole`
+///   / `procedure.setProjectMemberQuotaTier`, which enforce the lead check in SQL.
 /// - `/rpc/batch` (op-id `batch`) — a batch bundles multiple ops in its frame body; the per-op
 ///   permission cannot be evaluated from the URL path alone, so the whole endpoint is fail-closed.
 pub fn required_permission(op_id: &str) -> Option<Permission> {
@@ -58,21 +59,14 @@ pub fn required_permission(op_id: &str) -> Option<Permission> {
         "model.Account.get" => AccountRead,
         "model.Account.update" => AccountUpdate,
         // model.Account.delete is intentionally absent (falls through to `_ => None`, denied): the
-        // schema no longer carries `@@allow("delete", ...)` on Account (membership-role gating can't
-        // be expressed as a relation-quantifier policy predicate, see the schema's own comment on
-        // `Account`), so the cratestack policy layer already fail-closes this op-id -- omitted here
-        // too, same defense-in-depth pattern as `model.ApiKey.create`. Account deletion is now
-        // `procedure.deleteAccountPermanently`, below.
+        // schema carries no `@@allow("delete", ...)` on Account, so the cratestack policy layer
+        // already fail-closes this op-id -- omitted here too, same defense-in-depth pattern as
+        // `model.ApiKey.create`. Account deletion is `procedure.deleteAccountPermanently`, below,
+        // whose SQL check is now simply "the caller is this account" (ADR-0006: one account is one
+        // person, so there is no role left to gate on).
         "procedure.disableAccount" => AccountDisable,
         "procedure.enableAccount" => AccountDisable,
-        "procedure.addAccountMember" => AccountMember,
-        "procedure.removeAccountMember" => AccountMember,
-        // Role changes are membership management, same coarse capability as add/remove.
-        "procedure.setAccountMemberRole" => AccountMember,
         "procedure.deleteAccountPermanently" => AccountDelete,
-        // Reassigning the default account is an update to `isDefault`, same coarse capability as
-        // any other account mutation short of delete/disable/membership.
-        "procedure.setDefaultAccount" => AccountUpdate,
 
         "model.Project.create" => ProjectCreate,
         "model.Project.list" => ProjectRead,
@@ -82,6 +76,15 @@ pub fn required_permission(op_id: &str) -> Option<Permission> {
         "procedure.disableProject" => ProjectDisable,
         "procedure.enableProject" => ProjectDisable,
         "procedure.setDefaultProject" => ProjectUpdate,
+        // Roster management (ADR-0006). These replace the removed account-member procedures, and
+        // the capability moved with them: `project:member`, not `account:member`. Note this is only
+        // the coarse gate — the lead check ("the member row matching my subject must ALSO have
+        // role=lead") lives in the procedures' hand-written SQL, since cratestack's policy layer
+        // cannot express a compound condition on one related row.
+        "procedure.addProjectMember" => ProjectMember,
+        "procedure.removeProjectMember" => ProjectMember,
+        "procedure.setProjectMemberRole" => ProjectMember,
+        "procedure.setProjectMemberQuotaTier" => ProjectMember,
 
         "procedure.createApiKey" => ApiKeyCreate,
         "model.ApiKey.list" => ApiKeyRead,
@@ -190,14 +193,10 @@ mod tests {
             ("model.Account.update", Permission::AccountUpdate),
             ("procedure.disableAccount", Permission::AccountDisable),
             ("procedure.enableAccount", Permission::AccountDisable),
-            ("procedure.addAccountMember", Permission::AccountMember),
-            ("procedure.removeAccountMember", Permission::AccountMember),
-            ("procedure.setAccountMemberRole", Permission::AccountMember),
             (
                 "procedure.deleteAccountPermanently",
                 Permission::AccountDelete,
             ),
-            ("procedure.setDefaultAccount", Permission::AccountUpdate),
             ("model.Project.create", Permission::ProjectCreate),
             ("model.Project.list", Permission::ProjectRead),
             ("model.Project.get", Permission::ProjectRead),
@@ -206,6 +205,13 @@ mod tests {
             ("procedure.disableProject", Permission::ProjectDisable),
             ("procedure.enableProject", Permission::ProjectDisable),
             ("procedure.setDefaultProject", Permission::ProjectUpdate),
+            ("procedure.addProjectMember", Permission::ProjectMember),
+            ("procedure.removeProjectMember", Permission::ProjectMember),
+            ("procedure.setProjectMemberRole", Permission::ProjectMember),
+            (
+                "procedure.setProjectMemberQuotaTier",
+                Permission::ProjectMember,
+            ),
             ("procedure.createApiKey", Permission::ApiKeyCreate),
             ("model.ApiKey.list", Permission::ApiKeyRead),
             ("model.ApiKey.get", Permission::ApiKeyRead),
@@ -231,10 +237,15 @@ mod tests {
             "model.Account.create",
             "model.Account.delete",
             "model.ApiKey.create",
-            "model.AccountMembership.list",
-            "model.AccountMembership.get",
-            "model.AccountMembership.create",
-            "model.AccountMembership.delete",
+            "model.ProjectMember.list",
+            "model.ProjectMember.get",
+            "model.ProjectMember.create",
+            "model.ProjectMember.delete",
+            // Removed by ADR-0006 — these must not linger as mapped op-ids after the rename.
+            "procedure.addAccountMember",
+            "procedure.removeAccountMember",
+            "procedure.setAccountMemberRole",
+            "procedure.setDefaultAccount",
             "batch",
             "",
             "model.Account.frobnicate",
