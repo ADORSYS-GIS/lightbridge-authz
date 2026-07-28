@@ -5,9 +5,13 @@
 //!
 //! Everything here is offline: the cratestack CRUD client / idempotency store / rate-limit store are
 //! lazily connected to an unreachable address and never queried, because every request either
-//!   * hits a non-RPC route (`/healthz*`, `/.well-known/*`, `/oauth2/token`, CORS preflight), or
+//!   * hits a non-RPC route (`/healthz*`, `/.well-known/*`, `/oauth2/token`, CORS preflight),
 //!   * is rejected by the outermost `rpc_authorize` gate (403/401) **before** dispatch, idempotency,
-//!     or rate-limiting run.
+//!     or rate-limiting run, or
+//!   * is a `POST /rpc/batch` call the gate *does* let through (it only requires a valid token, not a
+//!     per-op permission — see `docs/rbac.md`, "Batch RPC: per-frame RBAC") and therefore fails later
+//!     against the dead Redis/Postgres instead; this file only proves the gate itself stopped
+//!     rejecting once the token is valid, not that dispatch succeeds.
 //!
 //! The *allow* half of the gate (viewer reads → 200, admin → 200 on every mapped op) reaches
 //! dispatch and therefore needs a live DB + Redis; it lives in `rpc_it_tests.rs`.
@@ -373,27 +377,49 @@ async fn rbac_gate_denies_unmapped_and_locked_ops_even_for_admin() {
     }
 }
 
-/// `/rpc/batch` is denied wholesale by the gate — a single URL-derived op-id can't represent the
-/// per-frame permissions, so even an admin is refused (`docs/rbac.md`, `rpc_authorize.rs`).
+/// `/rpc/batch` bundles multiple ops in its frame body, so the gate can't check a single op-id's
+/// permission the way it does for unary calls — but it still requires *some* valid, active caller up
+/// front (a wholly unauthenticated batch call gets a clean top-level 401 here, rather than a `200`
+/// envelope full of per-frame errors). This file's routers are wired to unreachable Postgres/Redis on
+/// purpose (see module docs), so a request the gate *allows through* necessarily fails later, once
+/// `RateLimitLayer` tries to reach the dead Redis — the point of these two assertions is only that the
+/// RBAC gate itself stops rejecting with 401 as soon as the token is valid; per-frame permission
+/// enforcement against real ops (and a real 200 with mixed frame outcomes) needs a live DB/Redis and
+/// lives in `rpc_it_tests.rs` (`batch_rpc_frames_enforce_permission_per_frame`).
 #[tokio::test]
-async fn rbac_gate_denies_the_batch_endpoint_for_admin() {
-    let router = build_router(admin_bearer(), &external_oauth2(), None, false);
-    let response = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/rpc/batch")
-                .header("content-type", "application/json")
-                .header("authorization", "Bearer admin")
-                .body(Body::from("[]"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+async fn rbac_gate_on_the_batch_endpoint_requires_a_valid_token_then_forwards() {
+    async fn batch_request(token: Option<&str>) -> StatusCode {
+        let router = build_router(admin_bearer(), &external_oauth2(), None, false);
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/rpc/batch")
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        router
+            .oneshot(builder.body(Body::from("[]")).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
     assert_eq!(
-        response.status(),
-        StatusCode::FORBIDDEN,
-        "the batch fan-out endpoint must be denied by the RBAC gate"
+        batch_request(None).await,
+        StatusCode::UNAUTHORIZED,
+        "batch with no bearer token must be rejected before dispatch"
+    );
+    assert_eq!(
+        batch_request(Some("bogus-token")).await,
+        StatusCode::UNAUTHORIZED,
+        "batch with an invalid token must be rejected before dispatch"
+    );
+    let status = batch_request(Some("admin")).await;
+    assert!(
+        status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+        "batch with a valid, active token must not be rejected by the RBAC gate itself (got \
+         {status}); it now reaches the rate-limit layer instead, which fails against this file's \
+         intentionally dead Redis — a real 200 is proven live in rpc_it_tests.rs"
     );
 }
 
