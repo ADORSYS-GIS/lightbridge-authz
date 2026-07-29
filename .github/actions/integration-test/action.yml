@@ -55,13 +55,23 @@ runs:
         }
 
         run_suite() { # service : the IT runners create unique resources per run, so retry to
-          # ride out transient startup-timing flakes (e.g. MCP session store warmup).
-          for attempt in 1 2 3; do
+          # ride out transient rootless-timing flakes (e.g. MCP session store warmup).
+          #
+          # 5 attempts / 12s gaps (48s total idle budget, up from 3/8s = 16s): it-authorino hit a
+          # rootless-podman aardvark-dns inconsistency where authz-api's own container failed to
+          # resolve `keycloak` for its JWT/JWKS fetch (401s, all 3 old attempts, ~44s) even though a
+          # DIFFERENT container on the same compose network resolved the same hostname fine around
+          # the same time -- a per-container DNS resolver flake, not "keycloak wasn't ready" (its
+          # own readiness probe already passed). The identical DNS-inconsistency class was observed
+          # to self-heal within ~35s elsewhere in this same job (authz-mcp's Postgres connection,
+          # 7 retries with backoff) -- the old 16s budget here was shorter than that observed
+          # self-healing window.
+          for attempt in 1 2 3 4 5; do
             timeout 360 $compose run --rm --no-deps "$1" && return 0
             echo "suite $1 attempt $attempt failed; retrying"
-            sleep 8
+            sleep 12
           done
-          echo "::error::suite $1 failed after 3 attempts"; return 1
+          echo "::error::suite $1 failed after 5 attempts"; return 1
         }
 
         wait_completed() { # service : wait for a one-shot container to exit 0
