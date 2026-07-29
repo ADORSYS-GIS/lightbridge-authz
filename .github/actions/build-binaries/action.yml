@@ -16,12 +16,21 @@ runs:
         sudo apt-get install -y musl-tools
         rustup target add "${{ inputs.target }}"
 
+    # Memory guard for the self-hosted runner (same rationale as code-checks/tests): `nproc`
+    # inside the runner pod reports the HOST's core count (12), not the pod's actual cgroup
+    # `cpu` limit (4) or `memory` limit (8Gi) -- confirmed by exec'ing into a live runner pod,
+    # `free -h`/`nproc` both read cgroup-unaware /proc, so cargo's default one-job-per-`nproc`
+    # would try to run up to 12 concurrent link steps in a pod that can't back that. Without an
+    # explicit cap this step had NO guard at all (unlike code-checks/tests), making it the least
+    # safe of the cargo invocations on this runner.
     - name: Build release binaries
       shell: bash
       env:
         TARGET: ${{ inputs.target }}
         CC_x86_64_unknown_linux_musl: musl-gcc
         CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        CARGO_BUILD_JOBS: "4"
+        CARGO_INCREMENTAL: "0"
       run: |
         set -euo pipefail
         cargo build --profile prod --locked --target "${TARGET}"
