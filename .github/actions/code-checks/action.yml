@@ -10,11 +10,38 @@ runs:
     # concurrency; the guard below handles the one crate no job cap can bound. See
     # `heavy-build-guard` for why both are needed.
     - uses: ./.github/actions/heavy-build-guard
-    - shell: bash
+    # Instrumented deliberately. This step has died three times with `exit code 143` and a
+    # `cancelled` job, and two plausible-looking explanations (job concurrency, then systemd-oomd)
+    # were both wrong. Notably cargo prints NO error of its own — a kernel OOM kill of rustc would
+    # surface as "could not compile ... (signal: 9, SIGKILL)" — so the SIGTERM is arriving at the
+    # step process, not at a compiler. The sampler below records memory, swap and the largest RSS
+    # every 15s so the next failure is diagnosed from evidence rather than inference.
+    #
+    # Remove this once the cause is established and fixed.
+    - name: cargo check (instrumented)
+      shell: bash
       env:
         CARGO_BUILD_JOBS: "2"
         CARGO_INCREMENTAL: "0"
-      run: cargo check --all-targets --all-features
+      run: |
+        set -o pipefail
+        (
+          while true; do
+            printf '[mem %s] %s | swap: %s | top-rss: %s\n' \
+              "$(date -u +%H:%M:%S)" \
+              "$(free -m | awk '/^Mem:/ {printf "used=%sMi avail=%sMi", $3, $7}')" \
+              "$(free -m | awk '/^Swap:/ {printf "used=%sMi", $3}')" \
+              "$(ps -eo rss,comm --sort=-rss | awk 'NR==2 {printf "%.1fGi %s", $1/1048576, $2}')"
+            sleep 15
+          done
+        ) &
+        sampler=$!
+        trap 'kill "$sampler" 2>/dev/null || true' EXIT
+        cargo check --all-targets --all-features
+        rc=$?
+        kill "$sampler" 2>/dev/null || true
+        echo "cargo check exited rc=${rc}"
+        exit "$rc"
     - shell: bash
       run: cargo fmt --all -- --check
     - shell: bash
