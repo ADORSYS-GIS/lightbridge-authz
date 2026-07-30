@@ -27,7 +27,13 @@ Enforcement is centralized, so the handlers/tools themselves contain no authoriz
   the same `BearerTokenServiceTrait` used everywhere (reusing the `TokenInfo.permissions` set it
   already computes), maps the `op_id` to the required permission, and rejects with `403 Forbidden`
   **before the request reaches cratestack's dispatch** if the token lacks it. It **fails closed**: an
-  unmapped op-id, the `/rpc/batch` fan-out endpoint, and any missing/invalid token are all denied.
+  unmapped op-id and any missing/invalid token are denied. `POST /rpc/batch` is a special case — see
+  "Batch RPC: per-frame RBAC" below.
+- **CratestackAuthProvider** (`crates/lightbridge-authz-rest/src/auth_provider.rs`) enforces the
+  *same* `op_id` → permission map a second time, from inside cratestack's own dispatch. Redundant for
+  a unary call (already checked by `rpc_authorize` above), but this is what actually authorizes a
+  `POST /rpc/batch` request: cratestack calls this provider once per frame, each time with that
+  frame's own canonical `/rpc/<op_id>` path, so every frame in a batch is authorized independently.
 - **MCP** — `call_tool` maps the tool name to the required permission and checks it before
   dispatching. It likewise fails closed (an unmapped tool name is rejected).
 
@@ -53,6 +59,28 @@ account they do **not** belong to passes gate 1 but is stopped by gate 2. Both m
 
 RBAC enforcement on non-CRUD paths — OPA/Authorino validation and `/idp/v1/resolve-context` (Basic
 auth, outside RBAC) — is unchanged, and the MCP enforcement above is unaffected.
+
+### Batch RPC: per-frame RBAC
+
+`POST /rpc/batch` bundles multiple ops in one JSON array of frames (`{id, op, input}`), each
+carrying its own `op` (op-id). `rpc_authorize` is a URL-derived, whole-HTTP-request gate — it has no
+visibility into the frames inside the body, so it cannot check a single permission for the batch call
+the way it does for `POST /rpc/{op_id}`. Instead:
+
+1. **`rpc_authorize`** requires only that the caller present *some* valid, active bearer token, then
+   forwards the request — a wholly unauthenticated batch call still gets a clean top-level `401`
+   rather than a `200` envelope full of per-frame `unauthenticated` errors.
+2. **`CratestackAuthProvider::authenticate`** does the actual permission check, once per frame:
+   cratestack's batch dispatch calls it once for every frame, each time with that frame's own
+   canonical `/rpc/<op_id>` path, and it looks that op-id up in the *same* map `rpc_authorize` uses
+   for unary calls. A frame whose op the caller lacks permission for fails independently with
+   `{"error": {"code": "permission_denied", ...}}` in its own slot — the rest of the batch, and the
+   overall `200`, are unaffected.
+
+One token authorizes every frame in a batch (there's one `Authorization` header per HTTP request, not
+per frame) — so a batch mixing a permitted read and a forbidden write for the *same* caller returns
+`200` with the read's `output` in one frame and a `permission_denied` `error` in the other. Membership
+(`@@allow`) is still the second gate per frame, exactly as for unary calls.
 
 The `op_id` → permission and tool → permission maps are the single sources of truth and must stay in
 sync with the tables below. The claim is read at request time; the role→permission map is compiled
@@ -166,8 +194,9 @@ listed here is denied unconditionally (fail closed).**
   verbs; roster changes go through the `addProjectMember` / `removeProjectMember` /
   `setProjectMemberRole` / `setProjectMemberQuotaTier` procedures, which enforce the lead check in
   SQL (see "Project roles" below for why it cannot be an `@@allow` predicate).
-- `/rpc/batch` — a batch bundles multiple ops in its frame body, so a single URL-derived `op_id`
-  cannot represent the per-op permissions; the whole endpoint is denied.
+
+`/rpc/batch` is not in this fail-closed list — it's handled specially with real per-frame permission
+enforcement; see "Batch RPC: per-frame RBAC" above.
 
 > **Field-level immutability on `ApiKey` update.** The coarse `apikey:update` gate allows
 > `model.ApiKey.update`, but the schema additionally marks the key's server-managed columns

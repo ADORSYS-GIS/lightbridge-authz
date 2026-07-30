@@ -10,8 +10,9 @@
 //!     validate at the OPA layer);
 //!   * an `@@audit` row landing on create/update/delete for an audited model;
 //!   * idempotent replay of a mutating call under a repeated `Idempotency-Key`;
-//!   * per-frame independent success/failure on `POST /rpc/batch` (bare router, since the gate
-//!     denies batch wholesale — that denial is proven in `rpc_router_tests.rs`);
+//!   * per-frame independent success/failure on `POST /rpc/batch` (bare router — dispatch behavior
+//!     only, independent of RBAC), and, against the *real* assembled router, per-frame RBAC: one
+//!     token, one batch call, mixed permitted/forbidden frames each authorized independently;
 //!   * `createAccount` seeding the creator's membership so a subsequent project create succeeds
 //!     (and a non-member is refused).
 //!
@@ -123,6 +124,10 @@ static IDEMPOTENCY_SCHEMA_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCe
 /// Build the full `build_api_router` for `bearer`, connecting the cratestack CRUD client,
 /// Postgres-backed idempotency store, and Redis rate-limit store to the live backends.
 async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     let core = core_pool().await;
     let cpool = cratestack_pool().await;
     let cdb = schema::Cratestack::builder(cpool.clone()).build();
@@ -1229,8 +1234,7 @@ async fn idempotent_replay_does_not_double_a_mutation() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Section 3: batch RPC per-frame independence (bare router — the gate denies /rpc/batch wholesale,
-// proven in rpc_router_tests.rs).
+// Section 3: batch RPC per-frame independence and per-frame RBAC.
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1288,6 +1292,82 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
     assert!(
         frame2.get("error").is_some() && frame2.get("output").is_none(),
         "frame 2 (invalid input) should fail independently: {frame2}"
+    );
+}
+
+/// `POST /rpc/batch` used to be denied wholesale for every caller, admin included (a single
+/// URL-derived op-id can't represent per-frame permissions — see `rpc_authorize.rs`). It now enforces
+/// RBAC per frame instead: one viewer token, one batch call, two frames — a permitted read and a
+/// forbidden write — against the *real*, fully-assembled router (`rpc_authorize` included, not the
+/// bare bypass router `batch_rpc_frames_succeed_and_fail_independently` uses above). Both frames must
+/// be authorized independently, against the same op-id -> permission map unary calls use.
+#[tokio::test]
+async fn batch_rpc_frames_enforce_permission_per_frame() {
+    let admin_subject = format!("admin-batch-rbac-{}", cuid2());
+    let viewer_subject = format!("viewer-batch-rbac-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("admin", token_info(&admin_subject, admin_perms()))
+            .with("viewer", token_info(&viewer_subject, viewer_perms())),
+    );
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let account_id = create_account(r, "admin", &format!("tenant-batch-rbac-{}", cuid2())).await;
+    let project_id = create_project(r, "admin", &account_id, "proj-batch-rbac").await;
+    let (status, _) = rpc_call(
+        r.clone(),
+        "procedure.addProjectMember",
+        Wire::Json,
+        &json!({ "args": { "projectId": project_id, "accountId": viewer_subject } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "admin adds viewer as member");
+
+    let batch = json!([
+        { "id": 1, "op": "model.Project.get", "input": { "id": project_id } },
+        { "id": 2, "op": "model.Project.update", "input": { "id": project_id, "patch": { "name": "renamed" } } }
+    ]);
+
+    let response = r
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/rpc/batch")
+                .header("content-type", "application/json")
+                .header("accept", "application/json")
+                .header("authorization", "Bearer viewer")
+                .body(Body::from(serde_json::to_vec(&batch).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "batch envelope must be 200 even though one frame is forbidden"
+    );
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let frames: Vec<Value> =
+        serde_json::from_slice(&bytes).expect("batch response is a frame array");
+    assert_eq!(frames.len(), 2);
+
+    let read_frame = frames.iter().find(|f| f["id"] == 1).expect("frame 1");
+    assert!(
+        read_frame.get("output").is_some() && read_frame.get("error").is_none(),
+        "viewer's permitted read (frame 1) should succeed: {read_frame}"
+    );
+
+    let write_frame = frames.iter().find(|f| f["id"] == 2).expect("frame 2");
+    let error = write_frame
+        .get("error")
+        .expect("viewer's forbidden write (frame 2) should fail, not succeed");
+    assert_eq!(
+        error["code"], "permission_denied",
+        "frame 2 must be denied with permission_denied, not silently succeed: {write_frame}"
     );
 }
 

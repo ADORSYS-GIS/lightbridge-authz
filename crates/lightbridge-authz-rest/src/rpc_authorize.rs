@@ -13,9 +13,18 @@
 //! pass.
 //!
 //! The map below is the single source of truth for op-id -> required permission on the RPC surface.
-//! It is **fail-closed**: any op-id not listed here (unknown ops, `model.ProjectMember.*`,
-//! `model.ApiKey.create`, the `/rpc/batch` fan-out endpoint) is denied unconditionally, mirroring
-//! the pre-migration REST `authorize` middleware's documented behavior for unmapped routes.
+//! It is **fail-closed**: any unary op-id not listed here (unknown ops, `model.ProjectMember.*`,
+//! `model.ApiKey.create`) is denied unconditionally, mirroring the pre-migration REST `authorize`
+//! middleware's documented behavior for unmapped routes.
+//!
+//! `POST /rpc/batch` is a special case: it bundles multiple ops in its frame body, so there is no
+//! single op-id this coarse, URL-derived gate could check permission against. Rather than denying the
+//! endpoint wholesale, this gate only requires *some* valid, active caller up front (so a wholly
+//! unauthenticated batch call gets a clean top-level `401` rather than a `200` envelope full of
+//! per-frame `unauthenticated` errors) and defers the actual per-op permission check to
+//! `CratestackAuthProvider::authenticate`, which cratestack's batch dispatch calls once per frame —
+//! each time with that frame's own canonical `/rpc/<op_id>` path — so every frame is authorized
+//! individually against the *same* [`required_permission`] map used here for unary calls.
 
 use std::sync::Arc;
 
@@ -49,9 +58,14 @@ use serde_json::json;
 ///   mutation verbs; denied here too for defense in depth. Roster changes go through
 ///   `procedure.addProjectMember` / `procedure.removeProjectMember` / `procedure.setProjectMemberRole`
 ///   / `procedure.setProjectMemberQuotaTier`, which enforce the lead check in SQL.
-/// - `/rpc/batch` (op-id `batch`) — a batch bundles multiple ops in its frame body; the per-op
-///   permission cannot be evaluated from the URL path alone, so the whole endpoint is fail-closed.
-pub fn required_permission(op_id: &str) -> Option<Permission> {
+///
+/// `batch` (the op-id `op_id_from_path` extracts from `/rpc/batch`) is *not* denied here — it is
+/// intercepted earlier, in [`rpc_authorize`], before this map is even consulted. A batch bundles
+/// multiple ops in its frame body, so there is no single op-id this function could look up; per-frame
+/// permission is instead enforced once per frame, deeper in the dispatch pipeline, by
+/// `CratestackAuthProvider::authenticate` (see `auth_provider.rs`), which cratestack calls once per
+/// op — including once per batch frame, each time with that frame's own canonical `/rpc/<op_id>` path.
+pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
     use Permission::*;
     Some(match op_id {
         "procedure.createAccount" => AccountCreate,
@@ -134,18 +148,24 @@ fn deny(status: StatusCode, message: &str) -> Response {
 /// (`server.api.rpc_base_path`, e.g. `/api/rpc/<op_id>`). axum's `nest` normally strips the prefix
 /// before this middleware runs, but matching the substring keeps the gate correct regardless of
 /// layer ordering. Op-ids never contain `/rpc/` (they are dot-delimited, e.g. `model.Account.list`).
-fn op_id_from_path(path: &str) -> &str {
+pub(crate) fn op_id_from_path(path: &str) -> &str {
     match path.rfind("/rpc/") {
         Some(idx) => &path[idx + "/rpc/".len()..],
         None => "",
     }
 }
 
+/// The op-id `op_id_from_path` extracts from `POST /rpc/batch` — handled specially in
+/// [`rpc_authorize`] rather than through the [`required_permission`] map (see module docs).
+const BATCH_OP_ID: &str = "batch";
+
 /// Axum middleware enforcing the coarse RBAC gate ahead of cratestack's RPC dispatch. Wire it with
 /// [`axum::middleware::from_fn_with_state`], passing the bearer service as state, and layer it over
 /// the RPC router (see `build_api_router`).
 ///
 /// Behavior:
+/// - `batch` op-id -> only a valid, active bearer token is required here; per-frame permission is
+///   enforced deeper, once per frame, by `CratestackAuthProvider::authenticate` (see module docs);
 /// - unmapped op-id (fail-closed set above) -> `403` unconditionally, no token required;
 /// - mapped op-id, missing/invalid/inactive token -> `401` (matching the RPC `AuthProvider`'s
 ///   fail-closed posture; the provider re-validates on the allowed path);
@@ -158,6 +178,16 @@ pub async fn rpc_authorize(
     next: Next,
 ) -> Response {
     let op_id = op_id_from_path(request.uri().path()).to_owned();
+
+    if op_id == BATCH_OP_ID {
+        let Some(token) = extract_bearer(request.headers()) else {
+            return deny(StatusCode::UNAUTHORIZED, "missing bearer token");
+        };
+        return match bearer.validate_bearer_token(&token).await {
+            Ok(info) if info.active => next.run(request).await,
+            Ok(_) | Err(_) => deny(StatusCode::UNAUTHORIZED, "invalid bearer token"),
+        };
+    }
 
     let Some(required) = required_permission(&op_id) else {
         return deny(StatusCode::FORBIDDEN, "operation not permitted");
@@ -246,6 +276,9 @@ mod tests {
             "procedure.removeAccountMember",
             "procedure.setAccountMemberRole",
             "procedure.setDefaultAccount",
+            // Still correctly unmapped in this map — `rpc_authorize` no longer reaches this call for
+            // "batch" (it's intercepted earlier, see module docs), but the map itself has no entry
+            // for it either way, so this assertion stays valid on its own terms.
             "batch",
             "",
             "model.Account.frobnicate",

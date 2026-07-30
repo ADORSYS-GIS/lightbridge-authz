@@ -1,18 +1,25 @@
 //! `AuthProvider` bridging the existing bearer/JWKS validation into cratestack's RPC router
 //! (ADR-0003, "AuthProvider bridges the existing JWT/JWKS validation").
 //!
-//! The RPC router calls [`CratestackAuthProvider::authenticate`] once per request. It reuses the
-//! unchanged [`BearerTokenServiceTrait`] validation (JWKS fetch/cache, RS256 verification, audience
-//! matching — see `lightbridge-authz-bearer`, migrated to `authkestra-guard` in ADR-0004) and, on
-//! success, projects the validated subject into a [`CoolContext`] so the schema's `@@allow`/`@@deny`
-//! policies — all of which reference `auth().id` against `auth Principal { id String }` — resolve to
-//! the caller's subject. No new authentication logic lives here; this is glue.
+//! The RPC router calls [`CratestackAuthProvider::authenticate`] once per op — for a unary
+//! `POST /rpc/<op_id>` call that's once per request; for `POST /rpc/batch` it's once *per frame*,
+//! each time with that frame's own canonical `/rpc/<op_id>` path (see `docs/adr/0003-*`, "RPC
+//! transport"). It reuses the unchanged [`BearerTokenServiceTrait`] validation (JWKS fetch/cache,
+//! RS256 verification, audience matching — see `lightbridge-authz-bearer`, migrated to
+//! `authkestra-guard` in ADR-0004), enforces the same coarse role -> permission gate as
+//! [`crate::rpc_authorize`] (this is what gives `/rpc/batch` real per-frame RBAC: `rpc_authorize`
+//! can't evaluate a single op-id for a whole batch, but this provider is invoked once per frame with
+//! that frame's own op-id, so the check happens here instead), and on success projects the validated
+//! subject into a [`CoolContext`] so the schema's `@@allow`/`@@deny` policies — all of which reference
+//! `auth().id` against `auth Principal { id String }` — resolve to the caller's subject.
 
 use std::sync::Arc;
 
 use cratestack::axum::http;
 use cratestack::{AuthProvider, CoolContext, CoolError, RequestContext, Value};
 use lightbridge_authz_bearer::BearerTokenServiceTrait;
+
+use crate::rpc_authorize::{op_id_from_path, required_permission};
 
 /// Context key under which the validated caller's raw access token is stashed, so procedures that
 /// still need it (e.g. `rotateApiKey`'s downstream secret issuance / token exchange) can read it
@@ -58,7 +65,18 @@ impl AuthProvider for CratestackAuthProvider {
     ) -> impl core::future::Future<Output = Result<CoolContext, Self::Error>> + Send {
         let bearer = self.bearer.clone();
         let token = extract_bearer(request.headers);
+        // `request.path` is the canonical `/rpc/<op_id>` for whichever op is being dispatched right
+        // now — for a unary call that's the request's own path (already checked once by
+        // `rpc_authorize`, so this is a harmless second check); for a `POST /rpc/batch` frame it's
+        // that frame's own op-id, which `rpc_authorize` structurally cannot see. This is the sole
+        // permission enforcement point for batch frames.
+        let op_id = op_id_from_path(request.path).to_owned();
         async move {
+            // Unmapped op-id → 403 unconditionally, mirroring `rpc_authorize`'s fail-closed set
+            // (unknown ops, `model.ProjectMember.*`, `model.ApiKey.create`, ...).
+            let Some(required) = required_permission(&op_id) else {
+                return Err(CoolError::Forbidden("operation not permitted".to_owned()));
+            };
             // No bearer at all → 401, matching the prior middleware's fail-closed posture (rather
             // than an anonymous context, which would surface as a policy-driven empty read).
             let Some(token) = token else {
@@ -66,6 +84,9 @@ impl AuthProvider for CratestackAuthProvider {
             };
             match bearer.validate_bearer_token(&token).await {
                 Ok(info) if info.active => {
+                    if !info.has_permission(required) {
+                        return Err(CoolError::Forbidden("insufficient permissions".to_owned()));
+                    }
                     // Project the validated subject as `auth().id`.
                     let mut ctx = CoolContext::authenticated([(
                         "id".to_owned(),
