@@ -23,13 +23,28 @@ runs:
     # would try to run up to 12 concurrent link steps in a pod that can't back that. Without an
     # explicit cap this step had NO guard at all (unlike code-checks/tests), making it the least
     # safe of the cargo invocations on this runner.
+    # Lowered to 2 alongside code-checks/tests: this compiles `lightbridge-authz-api` too, the
+    # ~8 GB single-rustc `include_server_schema!` expansion that SIGTERMed code-checks at jobs 4
+    # on a 16 GB runner. This action is reached on PRs via `integration-test`, not only on main.
+    - name: Add swap headroom
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ ! -f /mnt/ci-swap ]; then
+          sudo fallocate -l 8G /mnt/ci-swap
+          sudo chmod 600 /mnt/ci-swap
+          sudo mkswap /mnt/ci-swap >/dev/null
+          sudo swapon /mnt/ci-swap
+        fi
+        free -h
+
     - name: Build release binaries
       shell: bash
       env:
         TARGET: ${{ inputs.target }}
         CC_x86_64_unknown_linux_musl: musl-gcc
         CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        CARGO_BUILD_JOBS: "4"
+        CARGO_BUILD_JOBS: "2"
         CARGO_INCREMENTAL: "0"
       run: |
         set -euo pipefail

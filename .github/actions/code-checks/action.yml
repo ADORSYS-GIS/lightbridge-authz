@@ -5,31 +5,42 @@ runs:
     - uses: ./.github/actions/rust-setup
       with:
         components: clippy,rustfmt
-    # Memory guards. `--all-targets --all-features` builds every integration-test binary plus the
-    # goose load-test tree, each statically linked against the whole graph; at cargo's default
-    # one-job-per-core the concurrent link steps exhausted RAM. Capping jobs bounds peak memory
-    # roughly linearly. CARGO_INCREMENTAL=0 is standard for CI — incremental state costs memory and
-    # disk and buys nothing on a cold checkout.
+    # One rustc process dominates this build and no job cap can split it up:
+    # `lightbridge-authz-api` is a single `cratestack::include_server_schema!` expansion of
+    # `schema/authz.cstack` into the entire CRUD surface, measured at ~8 GB RSS on a cold cache.
+    # `ubuntu-latest` has 16 GB, so that one crate is half the machine.
     #
-    # The `jobs: 2` this used to carry was tuned for the self-hosted runner's 8Gi pod, where cgroup
-    # limits were invisible from inside the container (`nproc`/`free -h` reported the host's 12
-    # cores / 31Gi) so cargo could not auto-tune and 4 still killed the agent. `ubuntu-latest` is a
-    # plain 4 vCPU / 16 GB VM with no such mismatch, so one job per core is both correct and roughly
-    # twice as fast.
+    # Raising jobs to 4 here (one per core) killed the job outright: `cargo check` was SIGTERMed
+    # two minutes after it reached that crate, surfacing as exit 143 and a *cancelled* job rather
+    # than a failure. Back to 2, which is what the self-hosted runner used.
     #
-    # Independent of job count: `lightbridge-authz-api` alone peaks around 8 GB in a single rustc
-    # process, because the cratestack codegen macro expands the whole CRUD surface from
-    # `schema/authz.cstack`. That is one job's worth of memory no cap can split up, and it is the
-    # real ceiling on this step — measured locally at ~8 GB RSS and 30+ minutes on a cold cache.
+    # Note this crate is normally invisible: with a warm sccache it is a cache hit and never
+    # actually compiles, which is why the 8Gi self-hosted pod coped. Only a cold cache — a fresh
+    # GHA cache, or any change to `authz.cstack` — pays the real cost, so the guard has to hold
+    # for the cold case even though most runs never hit it.
+    - name: Add swap headroom
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Backstop for the single oversized rustc above: if it overshoots, the kernel should swap
+        # rather than OOM-kill the runner agent (which reads as an unexplained cancellation).
+        # /mnt is the runner's large ephemeral disk.
+        if [ ! -f /mnt/ci-swap ]; then
+          sudo fallocate -l 8G /mnt/ci-swap
+          sudo chmod 600 /mnt/ci-swap
+          sudo mkswap /mnt/ci-swap >/dev/null
+          sudo swapon /mnt/ci-swap
+        fi
+        free -h
     - shell: bash
       env:
-        CARGO_BUILD_JOBS: "4"
+        CARGO_BUILD_JOBS: "2"
         CARGO_INCREMENTAL: "0"
       run: cargo check --all-targets --all-features
     - shell: bash
       run: cargo fmt --all -- --check
     - shell: bash
       env:
-        CARGO_BUILD_JOBS: "4"
+        CARGO_BUILD_JOBS: "2"
         CARGO_INCREMENTAL: "0"
       run: cargo clippy --all-targets --all-features -- -D warnings

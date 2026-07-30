@@ -34,16 +34,27 @@ runs:
         docker logs --tail 50 lightbridge-pg || true
         exit 1
 
-    # Same memory guard as code-checks: `cargo test --workspace` links the same 24 test binaries,
-    # so it hits the identical wall at cargo's default job count. `ubuntu-latest` is 4 vCPU / 16 GB,
-    # so 4 is one job per core here rather than the throttle it was on the 4-vCPU/8Gi self-hosted
-    # pod.
+    # Same memory guard as code-checks, for both reasons: this links the 24 test binaries AND it
+    # compiles `lightbridge-authz-api`, the ~8 GB single-rustc `include_server_schema!` expansion
+    # that made `jobs: 4` SIGTERM the code-checks job on a 16 GB runner.
+    - name: Add swap headroom
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ ! -f /mnt/ci-swap ]; then
+          sudo fallocate -l 8G /mnt/ci-swap
+          sudo chmod 600 /mnt/ci-swap
+          sudo mkswap /mnt/ci-swap >/dev/null
+          sudo swapon /mnt/ci-swap
+        fi
+        free -h
+
     - name: Run tests
       shell: bash
       run: cargo test --workspace
       env:
         DATABASE_URL: ${{ inputs.database-url }}
-        CARGO_BUILD_JOBS: "4"
+        CARGO_BUILD_JOBS: "2"
         CARGO_INCREMENTAL: "0"
 
     - name: Stop PostgreSQL
