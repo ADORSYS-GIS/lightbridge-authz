@@ -1,63 +1,30 @@
 name: Heavy Build Guard
 description: >-
-  Prepare a GitHub-hosted runner to survive this workspace's single outsized rustc process.
-  Used before every cargo invocation that compiles `lightbridge-authz-api`.
+  Swap headroom for the cargo steps. A backstop, not a fix — see the note below.
 
 runs:
   using: composite
   steps:
-    # Why this exists, established by measurement rather than inference after three failed
-    # attempts (`.github/actions/code-checks` carries the sampler that produced these numbers):
+    # Modest headroom so a spike in one compilation unit pages instead of taking the runner down.
+    # Individual units in this workspace still peak around 6 GB on a 16 GB runner, which is close
+    # enough to warrant a margin.
     #
-    #   21:07:00  used= 2648Mi  top-rss=1.3Gi rustc
-    #   21:07:30  used= 8660Mi  top-rss=4.3Gi rustc
-    #   21:08:00  used=14556Mi  top-rss=7.1Gi rustc   <- 15Gi RAM nearly gone
-    #   21:08:15  used=15762Mi  swap= 1362Mi          <- spilling to swap
-    #   21:09:15  used=15783Mi  swap=11249Mi          <- thrashing
-    #   21:09:53  exit 143
-    #
-    # The decisive line is 21:08:00: 14.5Gi in use while the LARGEST process is 7.1Gi, against a
-    # ~1.4Gi baseline. That leaves ~6Gi in a second rustc. Individual compilation units in this
-    # workspace reach ~7 GB — `lightbridge-authz-api` is one `include_server_schema!` expansion of
-    # `schema/authz.cstack` into the whole CRUD surface — so `CARGO_BUILD_JOBS: 2` puts two of them
-    # in flight together and exceeds a 16 GB runner. Hence jobs=1 at every call site.
-    #
-    # Two earlier diagnoses were wrong and are recorded so they are not retried: job concurrency
-    # (real, separately fixed, but not this) and systemd-oomd (the SIGTERM-not-SIGKILL signal
-    # pointed there, but the runner reports it inactive). The tell against a plain kernel OOM kill
-    # is that cargo prints no `(signal: 9, SIGKILL)` error of its own — the runner tears down the
-    # step once the box is thrashing, so it surfaces as `exit code 143` on the step and
-    # `cancelled` on the job, which reads as a scheduling artifact rather than a resource problem.
-    #
-    # Mostly invisible in practice: with a warm sccache these units are cache hits and never
-    # compile, which is why the old 8Gi self-hosted pod coped. Only a cold cache — a fresh GHA
-    # cache, or an edit to `authz.cstack` — pays the real cost.
+    # Deliberately NOT load-bearing. This existed at 32G while chasing a `code-checks` failure that
+    # turned out to be a schema problem, not a resource one: `ProjectMember` declared an
+    # `account Account @relation` that nothing used, which made it a second path between `Account`
+    # and `Project` (already directly connected). cratestack's relation codegen enumerates every
+    # acyclic path through the relation graph, so the extra edge multiplied the generated module
+    # until rustc needed >51 GB and never finished. Removing that one line took the crate to 4m42s
+    # under 6 GB. If a cargo step starts needing more than this again, treat it as a signal to look
+    # at `schema/authz.cstack`, not as a reason to raise the number.
     - name: Add swap headroom
       shell: bash
       run: |
         set -euo pipefail
-        # 32G, not 8G. At 8G the build died with swap 10.6G of ~12G total and rustc still growing:
-        # ~25G committed and not yet finished, so it ran out of somewhere to put the pages rather
-        # than plateauing. The point of sizing it this far above RAM is that this single rustc
-        # cannot be made smaller from here — no job cap divides one process — so the only way it
-        # completes on a 16 GB runner is by paging, slowly, to disk.
-        #
-        # /mnt is the runner's large ephemeral disk (~70G free), so a 32G file fits alongside the
-        # build. Guarded so repeated use within one job is a no-op.
         if ! swapon --show=NAME --noheadings 2>/dev/null | grep -q '/mnt/ci-swap'; then
-          avail_g=$(df -BG --output=avail /mnt | tail -1 | tr -dc '0-9')
-          want_g=32
-          if [ "${avail_g:-0}" -lt $((want_g + 15)) ]; then
-            want_g=$(( avail_g > 25 ? avail_g - 15 : 8 ))
-            echo "::warning::/mnt has only ${avail_g}G free; sizing swap at ${want_g}G instead of 32G."
-          fi
-          sudo fallocate -l "${want_g}G" /mnt/ci-swap
+          sudo fallocate -l 8G /mnt/ci-swap
           sudo chmod 600 /mnt/ci-swap
           sudo mkswap /mnt/ci-swap >/dev/null
           sudo swapon /mnt/ci-swap
-          # Prefer swapping the giant anonymous allocation over evicting the page cache, which the
-          # build is also leaning on for the ~1350 crates already compiled.
-          sudo sysctl -w vm.swappiness=80 >/dev/null || true
         fi
         free -h
-        df -h /mnt | tail -1

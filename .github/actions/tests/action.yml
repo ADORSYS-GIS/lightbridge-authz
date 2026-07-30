@@ -36,7 +36,7 @@ runs:
 
     # Same memory guard as code-checks, for both reasons: this links the 24 test binaries AND it
     # compiles `lightbridge-authz-api`, the ~8 GB single-rustc `include_server_schema!` expansion
-    # that reach ~7 GB each; jobs=1 because two concurrent units exceed a 16 GB runner.
+    # that reach ~6 GB each; jobs=2 keeps two of them from landing alongside each other.
     - uses: ./.github/actions/heavy-build-guard
 
     - name: Run tests
@@ -44,7 +44,7 @@ runs:
       run: cargo test --workspace
       env:
         DATABASE_URL: ${{ inputs.database-url }}
-        CARGO_BUILD_JOBS: "1"
+        CARGO_BUILD_JOBS: "2"
         CARGO_INCREMENTAL: "0"
 
     - name: Stop PostgreSQL

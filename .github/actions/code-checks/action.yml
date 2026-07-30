@@ -6,41 +6,18 @@ runs:
       with:
         components: clippy,rustfmt
     # `--all-targets --all-features` is the heaviest cargo invocation in the repo: it builds every
-    # integration-test binary plus the goose load-test tree. `CARGO_BUILD_JOBS: 1` because the
-    # individual compilation units here reach ~7 GB, so even two at once exceed a 16 GB runner —
-    # see `heavy-build-guard` for the measurements.
+    # integration-test binary plus the goose load-test tree. `CARGO_BUILD_JOBS: 2` keeps two ~6 GB
+    # compilation units from landing alongside each other on a 16 GB runner.
     - uses: ./.github/actions/heavy-build-guard
-    # Still instrumented: the sampler below is what identified the cause (see `heavy-build-guard`),
-    # and it is kept for one green run to confirm the fix holds, then removed. Cheap — one line
-    # every 15s.
-    - name: cargo check (instrumented)
-      shell: bash
+    - shell: bash
       env:
-        CARGO_BUILD_JOBS: "1"
+        CARGO_BUILD_JOBS: "2"
         CARGO_INCREMENTAL: "0"
-      run: |
-        set -o pipefail
-        (
-          while true; do
-            printf '[mem %s] %s | swap: %s | top-rss: %s\n' \
-              "$(date -u +%H:%M:%S)" \
-              "$(free -m | awk '/^Mem:/ {printf "used=%sMi avail=%sMi", $3, $7}')" \
-              "$(free -m | awk '/^Swap:/ {printf "used=%sMi", $3}')" \
-              "$(ps -eo rss,comm --sort=-rss | awk 'NR==2 {printf "%.1fGi %s", $1/1048576, $2}')"
-            sleep 15
-          done
-        ) &
-        sampler=$!
-        trap 'kill "$sampler" 2>/dev/null || true' EXIT
-        cargo check --all-targets --all-features
-        rc=$?
-        kill "$sampler" 2>/dev/null || true
-        echo "cargo check exited rc=${rc}"
-        exit "$rc"
+      run: cargo check --all-targets --all-features
     - shell: bash
       run: cargo fmt --all -- --check
     - shell: bash
       env:
-        CARGO_BUILD_JOBS: "1"
+        CARGO_BUILD_JOBS: "2"
         CARGO_INCREMENTAL: "0"
       run: cargo clippy --all-targets --all-features -- -D warnings
