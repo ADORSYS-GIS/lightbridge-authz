@@ -26,6 +26,32 @@ inputs:
 runs:
   using: composite
   steps:
+    # buildah was preinstalled on the self-hosted runner (rootless podman/buildah, no Docker
+    # daemon); `ubuntu-latest` ships the Docker daemon but not buildah. Installing it keeps the
+    # build script below byte-for-byte identical rather than porting it to buildx, and preserves
+    # the amd64-only, no-QEMU property AGENTS.md asks for.
+    - name: Install buildah
+      shell: bash
+      run: |
+        set -euo pipefail
+        if command -v buildah >/dev/null 2>&1; then
+          echo "buildah already present: $(buildah --version)"
+          exit 0
+        fi
+        sudo apt-get update
+        sudo apt-get install -y buildah
+        buildah --version
+
+    # AGENTS.md records these as the rootless settings this project builds under; they were
+    # exported by the self-hosted runner rather than set here, so they have to be made explicit
+    # now. `:-` keeps a runner-provided value winning, so self-hosted behaviour is unchanged.
+    - name: Configure rootless buildah
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "STORAGE_DRIVER=${STORAGE_DRIVER:-vfs}" >> "$GITHUB_ENV"
+        echo "BUILDAH_ISOLATION=${BUILDAH_ISOLATION:-chroot}" >> "$GITHUB_ENV"
+
     - name: Download prebuilt binaries
       uses: ./.github/actions/s3-artifact
       with:

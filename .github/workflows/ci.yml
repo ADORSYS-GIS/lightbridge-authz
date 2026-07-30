@@ -13,7 +13,7 @@ concurrency:
 jobs:
   sast:
     name: SAST Scan
-    runs-on: adorsys-gis-runner
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         checks: [advisories,"bans licenses sources"]
@@ -25,7 +25,7 @@ jobs:
           check: ${{ matrix.checks }}
 
   code-checks:
-    runs-on: adorsys-gis-runner
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v7
@@ -33,7 +33,7 @@ jobs:
 
   test:
     needs: code-checks
-    runs-on: adorsys-gis-runner
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v7
@@ -44,7 +44,7 @@ jobs:
   binaries:
     needs: code-checks
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: adorsys-gis-runner
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v7
@@ -52,7 +52,7 @@ jobs:
 
   integration-test:
     needs: code-checks
-    runs-on: adorsys-gis-runner
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout repo
@@ -66,7 +66,7 @@ jobs:
     # deployment gating (if any) lives downstream in GitOps, not here.
     needs: [binaries]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: adorsys-gis-runner
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
@@ -103,7 +103,7 @@ jobs:
           severity: 'HIGH,CRITICAL'
   release-please:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: adorsys-gis-runner
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
@@ -126,7 +126,7 @@ jobs:
     if: >-
       github.ref == 'refs/heads/main' && github.event_name == 'push'
       && needs.release-please.outputs.release_created == 'true'
-    runs-on: adorsys-gis-runner
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:

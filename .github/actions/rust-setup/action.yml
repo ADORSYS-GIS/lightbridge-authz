@@ -31,15 +31,54 @@ runs:
     - name: Rust Cache
       uses: Swatinem/rust-cache@11da8522bc3856a8fbc565f1d1530989c793d67d
 
-    - name: Verify sccache S3 credentials (mc)
+    # sccache's S3 bucket lived on the self-hosted runner's ambient environment, so on a public
+    # runner (where none of these are set, and no repo secret supplies them) every Rust job used to
+    # die right here on the `${VAR:?}` preflight. Detect instead of assuming.
+    #
+    # Do NOT read "no S3" as "no sccache". `Swatinem/rust-cache` above is not a substitute: it
+    # deliberately evicts workspace crates from its cache and keeps only dependencies, and the
+    # crate that dominates this build IS a workspace crate. `lightbridge-authz-api` is a single
+    # `cratestack::include_server_schema!` expansion of `schema/authz.cstack` into the entire CRUD
+    # surface — one rustc process, unsplittable and unparallelizable, measured locally at ~8 GB RSS
+    # and 30+ minutes cold. sccache is what kept CI at ~6 minutes, because it caches at the
+    # compiler level and so covers workspace crates too.
+    #
+    # So the fallback is sccache over the GitHub Actions cache backend, which needs no credentials,
+    # is free for public repos, and preserves that property. S3 stays the preferred backend when
+    # configured, keeping a self-hosted runner's behaviour byte-for-byte unchanged.
+    - name: Detect sccache backend
+      id: sccache-cfg
       shell: bash
       run: |
         set -euo pipefail
+        if [ -n "${SCCACHE_ENDPOINT:-}" ] && [ -n "${SCCACHE_BUCKET:-}" ] \
+           && [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+          echo "backend=s3" >> "$GITHUB_OUTPUT"
+          echo "sccache S3 configuration present — will verify and enable."
+        else
+          echo "backend=gha" >> "$GITHUB_OUTPUT"
+          echo "No sccache S3 configuration — using the GitHub Actions cache backend."
+        fi
 
-        : "${SCCACHE_ENDPOINT:?SCCACHE_ENDPOINT is not set on the runner}"
-        : "${SCCACHE_BUCKET:?SCCACHE_BUCKET is not set on the runner}"
-        : "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID is not set on the runner}"
-        : "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is not set on the runner}"
+    # Installs the sccache binary and, with the GHA backend, wires up the Actions cache tokens.
+    # On the S3 path the binary was preinstalled on the runner; installing it here is harmless and
+    # makes the action self-contained either way.
+    - name: Install sccache
+      uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+    - name: Enable sccache (GitHub Actions cache backend)
+      if: steps.sccache-cfg.outputs.backend == 'gha'
+      shell: bash
+      run: |
+        echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+        echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+        echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+
+    - name: Verify sccache S3 credentials (mc)
+      if: steps.sccache-cfg.outputs.backend == 's3'
+      shell: bash
+      run: |
+        set -euo pipefail
 
         if ! command -v mc >/dev/null 2>&1; then
           curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /tmp/mc
@@ -65,6 +104,7 @@ runs:
         echo "sccache S3 credentials OK — read+write verified on '${SCCACHE_BUCKET}' (${url})."
 
     - name: Enable sccache
+      if: steps.sccache-cfg.outputs.backend == 's3'
       shell: bash
       run: |
         echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"

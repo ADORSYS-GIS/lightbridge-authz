@@ -1,73 +1,61 @@
 name: Integration Tests
-description: Build binaries bare, then bring the compose stack up (rootless podman, prebuilt-binary images) and run the Authorino/servers IT suites.
+description: Build binaries bare, then bring the compose stack up (docker compose, prebuilt-binary images) and run the Authorino/servers IT suites.
 runs:
   using: composite
   steps:
     - uses: ./.github/actions/rust-setup
     - uses: ./.github/actions/build-binaries
 
-    - name: Integration tests (rootless podman compose)
+    - name: Integration tests (docker compose)
       shell: bash
       run: |
         set -eo pipefail
 
         chmod +x dist/* || true
 
-        # The self-hosted runner is rootless with no Docker daemon. `podman compose`
-        # delegates to the docker-compose provider, which talks to the podman API
-        # socket over the Docker protocol -- so that socket must be running first.
-        sock="$(podman info --format '{{.Host.RemoteSocket.Path}}')"
-        mkdir -p "$(dirname "$sock")"
-        podman system service --time=0 "unix://${sock}" >/tmp/podman-service.log 2>&1 &
-        svc=$!
-        for i in $(seq 1 40); do [ -S "$sock" ] && break; sleep 0.5; done
-        if [ ! -S "$sock" ]; then
-          echo "podman API socket did not come up:"; cat /tmp/podman-service.log || true; exit 1
-        fi
-
         # compose.ci.yaml builds the app images from ./dist via Dockerfile.dist
         # (a COPY, not a compile) -> fast and within the runner memory limit.
-        compose="podman compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml -f compose.ci.yaml"
-        trap '$compose ps || true; $compose logs || true; $compose down -v || true; kill "$svc" 2>/dev/null || true' EXIT
+        compose="docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml -f compose.ci.yaml"
+        trap '$compose ps || true; $compose logs || true; $compose down -v || true' EXIT
 
         cn() { echo "lightbridge-authz-$1-1"; }
 
         wait_ready() { # container cmd... : poll until the command succeeds inside the container
           local c; c="$(cn "$1")"; shift
           for _ in $(seq 1 90); do
-            podman exec "$c" "$@" >/dev/null 2>&1 && return 0
+            docker exec "$c" "$@" >/dev/null 2>&1 && return 0
             sleep 2
           done
-          echo "::error::$c not ready after timeout"; podman logs --tail 50 "$c" || true; return 1
+          echo "::error::$c not ready after timeout"; docker logs --tail 50 "$c" || true; return 1
         }
 
         wait_ready_hc() { # service port : poll the healthcheck binary inside the container
           local c; c="$(cn "$1")"; local port="$2"
           for _ in $(seq 1 90); do
-            podman exec "$c" /usr/local/bin/lightbridge-authz-healthcheck -r "$port" >/dev/null 2>&1 && return 0
+            docker exec "$c" /usr/local/bin/lightbridge-authz-healthcheck -r "$port" >/dev/null 2>&1 && return 0
             sleep 2
           done
-          echo "::error::$c (:$port) not ready"; podman logs --tail 60 "$c" || true; return 1
+          echo "::error::$c (:$port) not ready"; docker logs --tail 60 "$c" || true; return 1
         }
 
-        run_migration() { # service : one-shot; retry to ride out transient rootless DNS (EAI_AGAIN)
+        run_migration() { # service : one-shot; retry to ride out transient compose-network DNS failures
           local svc="$1" c; c="$(cn "$svc")"
           for attempt in 1 2 3; do
             $compose up -d --no-deps --force-recreate "$svc" >/dev/null 2>&1 || true
             for _ in $(seq 1 90); do
-              [ "$(podman inspect -f '{{.State.Status}}' "$c" 2>/dev/null)" = "exited" ] && break
+              [ "$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null)" = "exited" ] && break
               sleep 2
             done
-            [ "$(podman inspect -f '{{.State.ExitCode}}' "$c" 2>/dev/null)" = "0" ] && return 0
-            echo "migration $svc attempt $attempt failed (transient rootless DNS?); retrying"
-            podman logs --tail 15 "$c" || true
+            [ "$(docker inspect -f '{{.State.ExitCode}}' "$c" 2>/dev/null)" = "0" ] && return 0
+            echo "migration $svc attempt $attempt failed (transient DNS?); retrying"
+            docker logs --tail 15 "$c" || true
             sleep 5
           done
-          echo "::error::$svc failed after 3 attempts"; podman logs --tail 80 "$c" || true; return 1
+          echo "::error::$svc failed after 3 attempts"; docker logs --tail 80 "$c" || true; return 1
         }
 
         run_suite() { # service : the IT runners create unique resources per run, so retry to
-          # ride out transient rootless-timing flakes (e.g. MCP session store warmup).
+          # ride out transient startup-timing flakes (e.g. MCP session store warmup).
           for attempt in 1 2 3; do
             timeout 360 $compose run --rm --no-deps "$1" && return 0
             echo "suite $1 attempt $attempt failed; retrying"
@@ -79,22 +67,24 @@ runs:
         wait_completed() { # service : wait for a one-shot container to exit 0
           local c; c="$(cn "$1")"
           for _ in $(seq 1 90); do
-            if [ "$(podman inspect -f '{{.State.Status}}' "$c" 2>/dev/null)" = "exited" ]; then
-              [ "$(podman inspect -f '{{.State.ExitCode}}' "$c" 2>/dev/null)" = "0" ] && return 0
-              echo "::error::$c exited non-zero"; podman logs --tail 80 "$c" || true; return 1
+            if [ "$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null)" = "exited" ]; then
+              [ "$(docker inspect -f '{{.State.ExitCode}}' "$c" 2>/dev/null)" = "0" ] && return 0
+              echo "::error::$c exited non-zero"; docker logs --tail 80 "$c" || true; return 1
             fi
             sleep 2
           done
-          echo "::error::$c did not finish in time"; podman logs --tail 80 "$c" || true; return 1
+          echo "::error::$c did not finish in time"; docker logs --tail 80 "$c" || true; return 1
         }
 
         $compose version
         $compose build
 
-        # Rootless podman does not run container healthchecks (they need a systemd
-        # session), so compose `depends_on: service_healthy` never satisfies. Start
-        # services with --no-deps and gate readiness manually. Leaf services
-        # (jaeger/adminer/mcp-inspector) are never started -> fits the runner limits.
+        # Start services with --no-deps and gate readiness manually rather than relying on
+        # compose `depends_on: service_healthy`. This was originally forced by rootless podman,
+        # which cannot run container healthchecks (they need a systemd session); docker does run
+        # them, but the explicit polling is kept deliberately — it fails with the offending
+        # container's logs instead of an opaque compose timeout, which is worth more in CI than
+        # the few lines it saves. Leaf services (jaeger/adminer/mcp-inspector) are never started.
         echo "== starting datastores + tls + keycloak =="
         $compose up -d --no-deps postgresql timescaledb redis authz-tls keycloak
         wait_ready postgresql pg_isready -U postgres -d lightbridge_authz -h 127.0.0.1

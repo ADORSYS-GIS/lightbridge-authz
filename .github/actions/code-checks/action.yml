@@ -5,32 +5,31 @@ runs:
     - uses: ./.github/actions/rust-setup
       with:
         components: clippy,rustfmt
-    # Memory guards for the self-hosted runner. `--all-targets --all-features` builds every
-    # integration-test binary plus the goose load-test tree, each statically linked against the
-    # whole graph; at cargo's default one-job-per-core the concurrent link steps exhausted the
-    # runner's RAM, killing the agent mid-run ("lost communication with the server") and taking the
-    # logs with it, since it dies before uploading them. Capping jobs bounds peak memory roughly
-    # linearly. CARGO_INCREMENTAL=0 is standard for CI — incremental state costs memory and disk
-    # and buys nothing on a cold checkout.
+    # Memory guards. `--all-targets --all-features` builds every integration-test binary plus the
+    # goose load-test tree, each statically linked against the whole graph; at cargo's default
+    # one-job-per-core the concurrent link steps exhausted RAM. Capping jobs bounds peak memory
+    # roughly linearly. CARGO_INCREMENTAL=0 is standard for CI — incremental state costs memory and
+    # disk and buys nothing on a cold checkout.
     #
-    # `jobs: 4` (matching the pod's `cpu` limit) was NOT enough on its own -- this exact step still
-    # killed the runner's agent twice in a row (confirmed: `nproc`/`free -h` inside the runner pod
-    # report the HOST's 12 cores / 31Gi, not the pod's real 4 vCPU / 8Gi cgroup limit, so nothing
-    # in-container can see the actual ceiling to auto-tune against; a hard per-step memory cap via
-    # cgroups/systemd-run isn't available either -- the pod's cgroupfs is read-only from inside and
-    # there's no systemd manager to delegate to). Dropped to 2 to leave real headroom under the 8Gi
-    # limit for the runner agent + rootless podman alongside this, the heaviest of the three cargo
-    # invocations in this action (it alone builds `--all-features`, pulling in the goose load-test
-    # tree on top of every regular target).
+    # The `jobs: 2` this used to carry was tuned for the self-hosted runner's 8Gi pod, where cgroup
+    # limits were invisible from inside the container (`nproc`/`free -h` reported the host's 12
+    # cores / 31Gi) so cargo could not auto-tune and 4 still killed the agent. `ubuntu-latest` is a
+    # plain 4 vCPU / 16 GB VM with no such mismatch, so one job per core is both correct and roughly
+    # twice as fast.
+    #
+    # Independent of job count: `lightbridge-authz-api` alone peaks around 8 GB in a single rustc
+    # process, because the cratestack codegen macro expands the whole CRUD surface from
+    # `schema/authz.cstack`. That is one job's worth of memory no cap can split up, and it is the
+    # real ceiling on this step — measured locally at ~8 GB RSS and 30+ minutes on a cold cache.
     - shell: bash
       env:
-        CARGO_BUILD_JOBS: "2"
+        CARGO_BUILD_JOBS: "4"
         CARGO_INCREMENTAL: "0"
       run: cargo check --all-targets --all-features
     - shell: bash
       run: cargo fmt --all -- --check
     - shell: bash
       env:
-        CARGO_BUILD_JOBS: "2"
+        CARGO_BUILD_JOBS: "4"
         CARGO_INCREMENTAL: "0"
       run: cargo clippy --all-targets --all-features -- -D warnings
