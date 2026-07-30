@@ -211,7 +211,24 @@ model ProjectMember {
   quotaTier String?
   createdAt DateTime
   project Project @relation(fields:[projectId],references:[id])
-  account Account @relation(fields:[accountId],references:[id])
+  // `accountId` is deliberately a bare scalar with NO `account Account @relation`, mirroring how
+  // the `AccountMembership` this replaces carried `subject` as a plain string. The DB-level FK to
+  // `accounts` still exists -- it lives in the migration, not here, since this schema is
+  // source-only and does not drive DDL (ADR-0003).
+  //
+  // The relation was present initially and has to stay out. `Account` and `Project` are already
+  // directly connected (`Account.projects`), so declaring `ProjectMember.account` as well makes
+  // `ProjectMember` a SECOND path between them. cratestack's relation codegen walks every acyclic
+  // path through the relation graph to emit nested filter/order/include modules -- it guards
+  // against cycles with a `visited` set of `model.field` keys, so this does not recurse forever,
+  // but the number of distinct paths multiplies. That is enough to make the generated module large
+  // enough to defeat rustc: `cargo check` on this crate consumed ~51 GB (16 GB RAM + 36 GB swap)
+  // over 36 minutes and was still growing when the CI runner killed it.
+  //
+  // Nothing needs the relation: no `@@allow` here or elsewhere traverses `ProjectMember.account`
+  // (they use this scalar, or reach the owner via `project.account`), the repository layer is
+  // hand-written SQL against the column, and the generated client is not consuming it either.
+  // `Account` deliberately has no `members ProjectMember[]` back-reference for the same reason.
 
   @@paged
   @@allow("read", accountId == auth().id || project.account.id == auth().id)

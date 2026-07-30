@@ -845,7 +845,7 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "update-account",
-        description = "Update an account's billing_identity (RPC model.Account.update)"
+        description = "Update an account's default quota tier (RPC model.Account.update)"
     )]
     async fn update_account_tool(
         &self,
@@ -1053,7 +1053,6 @@ impl LightbridgeMcpHandler {
             billingPlan: params.billing_plan,
             billingIdentity: params.billing_identity,
             projectQuota: params.project_quota,
-            isDefault: false,
         };
         let project = bound
             .project()
@@ -1459,10 +1458,14 @@ async fn run_validate_api_key(
         ));
     };
 
+    // `account_id`, not a nested `account` object: introspection stopped fetching the account row
+    // in Phase E (ADR-0006) because the `api_key_validation` view already carries the id, so there
+    // is no `Account` here to embed and re-adding the query would undo that. Matches
+    // `IntrospectResponse.account_id` on the REST surface.
     to_json_value(json!({
         "api_key": validated.api_key,
         "project": validated.project,
-        "account": validated.account
+        "account_id": validated.account_id
     }))
 }
 
@@ -1484,7 +1487,7 @@ async fn run_validate_authorino(
     };
 
     let dynamic_metadata = AuthorinoMetadata {
-        account_id: validated.account.id.clone(),
+        account_id: validated.account_id.clone(),
         project_id: validated.project.id.clone(),
         api_key_id: validated.api_key.id.clone(),
         api_key_status: validated.api_key.status.to_string(),
@@ -1494,7 +1497,7 @@ async fn run_validate_authorino(
     to_json_value(json!({
         "api_key": validated.api_key,
         "project": validated.project,
-        "account": validated.account,
+        "account_id": validated.account_id,
         "dynamic_metadata": dynamic_metadata
     }))
 }
@@ -1843,6 +1846,8 @@ mod tests {
             allowed_models: None,
             default_limits: None,
             billing_plan: "free".to_string(),
+            billing_identity: "bill_1".to_string(),
+            project_quota: None,
             status: lightbridge_authz_core::ResourceStatus::Active,
             is_default: false,
             created_at: Utc::now(),
@@ -1853,10 +1858,8 @@ mod tests {
     fn fixture_account() -> Account {
         Account {
             id: "acct_1".to_string(),
-            billing_identity: "bill_1".to_string(),
-            owners_admins: vec!["owner".to_string()],
+            default_quota: None,
             status: lightbridge_authz_core::ResourceStatus::Active,
-            is_default: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

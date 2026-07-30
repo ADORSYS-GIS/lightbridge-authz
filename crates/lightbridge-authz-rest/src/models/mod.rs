@@ -71,6 +71,7 @@ impl IntrospectResponse {
             billing_plan_name: None,
             billing_plan_limits: None,
             allowed_models: None,
+            project_quota: None,
             exp: None,
         }
     }

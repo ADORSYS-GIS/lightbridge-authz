@@ -142,7 +142,6 @@ def main() -> int:
                 "defaultLimits": {"Map": {}},
                 "billingPlan": "free",
                 "billingIdentity": billing_identity,
-                "isDefault": False,
                 "status": "active",
             },
             headers=authz_headers,

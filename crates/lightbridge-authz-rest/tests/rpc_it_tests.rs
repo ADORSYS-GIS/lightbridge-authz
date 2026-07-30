@@ -238,7 +238,6 @@ fn project_input(
         billingPlan: "free".to_string(),
         billingIdentity: format!("bill-{}", cuid2()),
         projectQuota: None,
-        isDefault: false,
     }
 }
 
@@ -714,7 +713,6 @@ async fn crud_lifecycle_over_cbor() {
 
     // Account create → get → update → delete, all CBOR-encoded (no optional/null fields on this
     // path, so the CBOR codec's None-handling caveat never bites).
-    let billing_id = format!("tenant-cbor-{}", cuid2());
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.createAccount",
@@ -780,7 +778,6 @@ async fn crud_lifecycle_over_cbor() {
     // subject's default (first-ever) account, which `deleteAccountPermanently` now correctly
     // refuses (see `default_account_cannot_be_hard_deleted_only_suspended` below) -- exercised
     // against a second, non-default account instead.
-    let second_billing_id = format!("tenant-cbor-2nd-{}", cuid2());
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.createAccount",
@@ -1252,7 +1249,6 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
         CratestackAuthProvider::new(admin_bearer(&subject)),
     );
 
-    let good_billing = format!("tenant-batch-{}", cuid2());
     let batch = json!([
         { "id": 1, "op": "procedure.createAccount", "input": { "args": {} } },
         { "id": 2, "op": "model.Account.get", "input": {} }
