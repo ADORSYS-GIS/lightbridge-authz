@@ -1,6 +1,7 @@
 #![cfg(feature = "it-tests")]
 
 use lightbridge_authz_api_key::repo::StoreRepo;
+use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::DbPool;
 use lightbridge_authz_core::{CreateAccount, CreateProject, DefaultLimits, UpdateProject};
 use sqlx::PgPool;
