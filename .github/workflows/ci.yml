@@ -1,11 +1,23 @@
 name: CI/CD Pipeline
 on:
-  push: {}
+  # Deliberately NOT `push: {}`. A branch with an open PR fired both `push` and
+  # `pull_request`, and the concurrency group below resolves to the SAME key for both
+  # (`github.event.pull_request.head.ref` and `github.ref_name` are the same branch), so with
+  # `cancel-in-progress` the two runs raced to cancel each other. Usually the later survived;
+  # on 2026-07-30 both were cancelled and the PR was left with no result at all, which reads
+  # as "CI never ran" rather than as a failure.
+  #
+  # Restricting `push` to `main` removes the duplicate at the source instead of trying to
+  # de-duplicate it afterwards. PRs are covered by `pull_request`; `main` is covered by `push`,
+  # which is what the release/publish jobs already gate on
+  # (`github.ref == 'refs/heads/main' && github.event_name == 'push'`). The only behaviour lost
+  # is CI on a branch with no PR open.
+  push:
+    branches: [main]
   pull_request: {}
 
-# A branch with an open PR fires both `push` and `pull_request`, running the heavy
-# jobs (integration-test) twice concurrently on the self-hosted runner and starving
-# each other. Collapse duplicate runs per branch to a single in-flight run.
+# Still worth keeping: successive pushes to the same PR should not pile up heavy
+# `integration-test` runs against each other.
 concurrency:
   group: ci-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
