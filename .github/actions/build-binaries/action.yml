@@ -26,17 +26,7 @@ runs:
     # Lowered to 2 alongside code-checks/tests: this compiles `lightbridge-authz-api` too, the
     # ~8 GB single-rustc `include_server_schema!` expansion that SIGTERMed code-checks at jobs 4
     # on a 16 GB runner. This action is reached on PRs via `integration-test`, not only on main.
-    - name: Add swap headroom
-      shell: bash
-      run: |
-        set -euo pipefail
-        if [ ! -f /mnt/ci-swap ]; then
-          sudo fallocate -l 8G /mnt/ci-swap
-          sudo chmod 600 /mnt/ci-swap
-          sudo mkswap /mnt/ci-swap >/dev/null
-          sudo swapon /mnt/ci-swap
-        fi
-        free -h
+    - uses: ./.github/actions/heavy-build-guard
 
     - name: Build release binaries
       shell: bash

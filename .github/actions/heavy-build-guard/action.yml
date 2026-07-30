@@ -1,0 +1,52 @@
+name: Heavy Build Guard
+description: >-
+  Prepare a GitHub-hosted runner to survive this workspace's single outsized rustc process.
+  Used before every cargo invocation that compiles `lightbridge-authz-api`.
+
+runs:
+  using: composite
+  steps:
+    # `lightbridge-authz-api` is one `cratestack::include_server_schema!` expansion of
+    # `schema/authz.cstack` into the entire CRUD surface: a single rustc process, unsplittable and
+    # unparallelizable, measured at ~8 GB RSS on a cold cache. No `CARGO_BUILD_JOBS` cap can
+    # divide it, so the runner has to be able to absorb it.
+    #
+    # This is normally invisible. With a warm sccache the crate is a cache hit and never compiles,
+    # which is why the old 8Gi self-hosted pod coped. Only a cold cache — a fresh GHA cache, or any
+    # edit to `authz.cstack` — pays the real cost.
+    #
+    # systemd-oomd is the reason this needs handling at all, and it is worth being precise: the
+    # kernel OOM killer sends SIGKILL (exit 137), but these jobs died on SIGTERM (exit 143) with
+    # 15Gi RAM + 10Gi swap free and no cancellation from GitHub. That is systemd-oomd, which acts
+    # on PSI memory *pressure* rather than exhaustion — and swap makes pressure worse, not better,
+    # because thrashing is precisely what PSI measures. So swap alone made this more likely to
+    # fire, not less. Both halves are needed: headroom so the compile can finish, and oomd stood
+    # down so sustained pressure is not treated as a kill signal.
+    #
+    # The failure mode is nasty to diagnose: the step reports `exit code 143` while the *job*
+    # reports `cancelled`, which reads as a scheduling artifact rather than a resource problem.
+    - name: Stand down systemd-oomd
+      shell: bash
+      run: |
+        set -euo pipefail
+        if systemctl is-active --quiet systemd-oomd 2>/dev/null; then
+          sudo systemctl stop systemd-oomd || true
+          sudo systemctl mask systemd-oomd || true
+          echo "systemd-oomd stopped and masked for this job."
+        else
+          echo "systemd-oomd not active; nothing to do."
+        fi
+
+    - name: Add swap headroom
+      shell: bash
+      run: |
+        set -euo pipefail
+        # /mnt is the runner's large ephemeral disk. Guarded so repeated use within one job is a
+        # no-op.
+        if ! swapon --show=NAME --noheadings 2>/dev/null | grep -q '/mnt/ci-swap'; then
+          sudo fallocate -l 8G /mnt/ci-swap
+          sudo chmod 600 /mnt/ci-swap
+          sudo mkswap /mnt/ci-swap >/dev/null
+          sudo swapon /mnt/ci-swap
+        fi
+        free -h
