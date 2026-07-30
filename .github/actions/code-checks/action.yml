@@ -6,22 +6,17 @@ runs:
       with:
         components: clippy,rustfmt
     # `--all-targets --all-features` is the heaviest cargo invocation in the repo: it builds every
-    # integration-test binary plus the goose load-test tree. `CARGO_BUILD_JOBS: 2` bounds that
-    # concurrency; the guard below handles the one crate no job cap can bound. See
-    # `heavy-build-guard` for why both are needed.
+    # integration-test binary plus the goose load-test tree. `CARGO_BUILD_JOBS: 1` because the
+    # individual compilation units here reach ~7 GB, so even two at once exceed a 16 GB runner —
+    # see `heavy-build-guard` for the measurements.
     - uses: ./.github/actions/heavy-build-guard
-    # Instrumented deliberately. This step has died three times with `exit code 143` and a
-    # `cancelled` job, and two plausible-looking explanations (job concurrency, then systemd-oomd)
-    # were both wrong. Notably cargo prints NO error of its own — a kernel OOM kill of rustc would
-    # surface as "could not compile ... (signal: 9, SIGKILL)" — so the SIGTERM is arriving at the
-    # step process, not at a compiler. The sampler below records memory, swap and the largest RSS
-    # every 15s so the next failure is diagnosed from evidence rather than inference.
-    #
-    # Remove this once the cause is established and fixed.
+    # Still instrumented: the sampler below is what identified the cause (see `heavy-build-guard`),
+    # and it is kept for one green run to confirm the fix holds, then removed. Cheap — one line
+    # every 15s.
     - name: cargo check (instrumented)
       shell: bash
       env:
-        CARGO_BUILD_JOBS: "2"
+        CARGO_BUILD_JOBS: "1"
         CARGO_INCREMENTAL: "0"
       run: |
         set -o pipefail
@@ -46,6 +41,6 @@ runs:
       run: cargo fmt --all -- --check
     - shell: bash
       env:
-        CARGO_BUILD_JOBS: "2"
+        CARGO_BUILD_JOBS: "1"
         CARGO_INCREMENTAL: "0"
       run: cargo clippy --all-targets --all-features -- -D warnings

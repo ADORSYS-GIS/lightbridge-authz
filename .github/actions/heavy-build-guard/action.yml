@@ -6,37 +6,32 @@ description: >-
 runs:
   using: composite
   steps:
-    # `lightbridge-authz-api` is one `cratestack::include_server_schema!` expansion of
-    # `schema/authz.cstack` into the entire CRUD surface: a single rustc process, unsplittable and
-    # unparallelizable, measured at ~8 GB RSS on a cold cache. No `CARGO_BUILD_JOBS` cap can
-    # divide it, so the runner has to be able to absorb it.
+    # Why this exists, established by measurement rather than inference after three failed
+    # attempts (`.github/actions/code-checks` carries the sampler that produced these numbers):
     #
-    # This is normally invisible. With a warm sccache the crate is a cache hit and never compiles,
-    # which is why the old 8Gi self-hosted pod coped. Only a cold cache — a fresh GHA cache, or any
-    # edit to `authz.cstack` — pays the real cost.
+    #   21:07:00  used= 2648Mi  top-rss=1.3Gi rustc
+    #   21:07:30  used= 8660Mi  top-rss=4.3Gi rustc
+    #   21:08:00  used=14556Mi  top-rss=7.1Gi rustc   <- 15Gi RAM nearly gone
+    #   21:08:15  used=15762Mi  swap= 1362Mi          <- spilling to swap
+    #   21:09:15  used=15783Mi  swap=11249Mi          <- thrashing
+    #   21:09:53  exit 143
     #
-    # systemd-oomd is the reason this needs handling at all, and it is worth being precise: the
-    # kernel OOM killer sends SIGKILL (exit 137), but these jobs died on SIGTERM (exit 143) with
-    # 15Gi RAM + 10Gi swap free and no cancellation from GitHub. That is systemd-oomd, which acts
-    # on PSI memory *pressure* rather than exhaustion — and swap makes pressure worse, not better,
-    # because thrashing is precisely what PSI measures. So swap alone made this more likely to
-    # fire, not less. Both halves are needed: headroom so the compile can finish, and oomd stood
-    # down so sustained pressure is not treated as a kill signal.
+    # The decisive line is 21:08:00: 14.5Gi in use while the LARGEST process is 7.1Gi, against a
+    # ~1.4Gi baseline. That leaves ~6Gi in a second rustc. Individual compilation units in this
+    # workspace reach ~7 GB — `lightbridge-authz-api` is one `include_server_schema!` expansion of
+    # `schema/authz.cstack` into the whole CRUD surface — so `CARGO_BUILD_JOBS: 2` puts two of them
+    # in flight together and exceeds a 16 GB runner. Hence jobs=1 at every call site.
     #
-    # The failure mode is nasty to diagnose: the step reports `exit code 143` while the *job*
-    # reports `cancelled`, which reads as a scheduling artifact rather than a resource problem.
-    - name: Stand down systemd-oomd
-      shell: bash
-      run: |
-        set -euo pipefail
-        if systemctl is-active --quiet systemd-oomd 2>/dev/null; then
-          sudo systemctl stop systemd-oomd || true
-          sudo systemctl mask systemd-oomd || true
-          echo "systemd-oomd stopped and masked for this job."
-        else
-          echo "systemd-oomd not active; nothing to do."
-        fi
-
+    # Two earlier diagnoses were wrong and are recorded so they are not retried: job concurrency
+    # (real, separately fixed, but not this) and systemd-oomd (the SIGTERM-not-SIGKILL signal
+    # pointed there, but the runner reports it inactive). The tell against a plain kernel OOM kill
+    # is that cargo prints no `(signal: 9, SIGKILL)` error of its own — the runner tears down the
+    # step once the box is thrashing, so it surfaces as `exit code 143` on the step and
+    # `cancelled` on the job, which reads as a scheduling artifact rather than a resource problem.
+    #
+    # Mostly invisible in practice: with a warm sccache these units are cache hits and never
+    # compile, which is why the old 8Gi self-hosted pod coped. Only a cold cache — a fresh GHA
+    # cache, or an edit to `authz.cstack` — pays the real cost.
     - name: Add swap headroom
       shell: bash
       run: |
