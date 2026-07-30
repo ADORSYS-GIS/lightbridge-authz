@@ -319,7 +319,7 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn deleting_last_membership_deletes_account_projects_and_keys(pool: PgPool) {
+async fn deleting_an_account_deletes_its_projects_and_keys(pool: PgPool) {
     let repo = build_repo(pool.clone());
     let subject = "solo-owner";
 
@@ -358,11 +358,11 @@ async fn deleting_last_membership_deletes_account_projects_and_keys(pool: PgPool
         .await
         .unwrap();
 
-    sqlx::query("DELETE FROM account_memberships WHERE account_id = $1")
-        .bind(&account.id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    // Before ADR-0006 the cascade root was the membership table: deleting the last membership row
+    // orphaned and removed the account. Membership is gone, and the account row is now the root
+    // directly -- one account is one person, so deleting it is the same operation that used to be
+    // "remove the last member".
+    repo.delete_account(subject, &account.id).await.unwrap();
 
     assert!(repo.get_account_by_id(&account.id).await.unwrap().is_none());
     assert!(repo.get_project_by_id(&project.id).await.unwrap().is_none());

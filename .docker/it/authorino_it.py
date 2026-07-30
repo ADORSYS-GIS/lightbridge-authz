@@ -122,7 +122,7 @@ def main() -> int:
         status, account = request_json(
             "POST",
             f"{API_URL}/rpc/procedure.createAccount",
-            {"args": {"billingIdentity": billing_identity}},
+            {"args": {}},
             headers=authz_headers,
             insecure_tls=True,
         )
@@ -141,6 +141,8 @@ def main() -> int:
                 "allowedModels": {"List": [{"String": "gpt-4.1-mini"}]},
                 "defaultLimits": {"Map": {}},
                 "billingPlan": "free",
+                "billingIdentity": billing_identity,
+                "isDefault": False,
                 "status": "active",
             },
             headers=authz_headers,
