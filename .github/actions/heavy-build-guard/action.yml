@@ -36,12 +36,28 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        # /mnt is the runner's large ephemeral disk. Guarded so repeated use within one job is a
-        # no-op.
+        # 32G, not 8G. At 8G the build died with swap 10.6G of ~12G total and rustc still growing:
+        # ~25G committed and not yet finished, so it ran out of somewhere to put the pages rather
+        # than plateauing. The point of sizing it this far above RAM is that this single rustc
+        # cannot be made smaller from here — no job cap divides one process — so the only way it
+        # completes on a 16 GB runner is by paging, slowly, to disk.
+        #
+        # /mnt is the runner's large ephemeral disk (~70G free), so a 32G file fits alongside the
+        # build. Guarded so repeated use within one job is a no-op.
         if ! swapon --show=NAME --noheadings 2>/dev/null | grep -q '/mnt/ci-swap'; then
-          sudo fallocate -l 8G /mnt/ci-swap
+          avail_g=$(df -BG --output=avail /mnt | tail -1 | tr -dc '0-9')
+          want_g=32
+          if [ "${avail_g:-0}" -lt $((want_g + 15)) ]; then
+            want_g=$(( avail_g > 25 ? avail_g - 15 : 8 ))
+            echo "::warning::/mnt has only ${avail_g}G free; sizing swap at ${want_g}G instead of 32G."
+          fi
+          sudo fallocate -l "${want_g}G" /mnt/ci-swap
           sudo chmod 600 /mnt/ci-swap
           sudo mkswap /mnt/ci-swap >/dev/null
           sudo swapon /mnt/ci-swap
+          # Prefer swapping the giant anonymous allocation over evicting the page cache, which the
+          # build is also leaning on for the ~1350 crates already compiled.
+          sudo sysctl -w vm.swappiness=80 >/dev/null || true
         fi
         free -h
+        df -h /mnt | tail -1
