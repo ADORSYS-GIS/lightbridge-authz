@@ -51,9 +51,6 @@ SELECT
     k.key_hash      AS key_hash,
     k.project_id    AS project_id,
     p.account_id    AS account_id,
-    k.owner_account_id AS owner_account_id,
-    pm.role         AS owner_role,
-    pm.quota_tier   AS owner_quota_tier,
     k.status        AS api_key_status,
     p.status        AS project_status,
     a.status        AS account_status,
@@ -64,7 +61,15 @@ SELECT
         WHEN p.status <> 'active'                                    THEN 'project_suspended'
         WHEN a.status <> 'active'                                    THEN 'account_suspended'
         ELSE 'active'
-    END             AS effective_status
+    END             AS effective_status,
+    -- APPENDED, not inserted mid-list. `CREATE OR REPLACE VIEW` may only add columns to the END:
+    -- the replacement query has to generate the existing columns with the same names, order and
+    -- types, so slotting these in after `account_id` (where they read better) fails with
+    -- "cannot change name of view column". Column order is irrelevant to callers here — the
+    -- repository selects by name.
+    k.owner_account_id AS owner_account_id,
+    pm.role         AS owner_role,
+    pm.quota_tier   AS owner_quota_tier
 FROM api_keys k
 JOIN projects p ON p.id = k.project_id
 JOIN accounts a ON a.id = p.account_id
