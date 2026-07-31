@@ -12,7 +12,7 @@ use lightbridge_authz_core::config::{Billing, Oauth2, Oauth2Issuance};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey, Project,
-    ResourceStatus, RotateApiKey, hash_api_key,
+    ProjectMember, ResourceStatus, RotateApiKey, hash_api_key,
 };
 use lightbridge_authz_core::{
     db::DbPoolTrait,
@@ -515,6 +515,17 @@ impl AuthzStoreImpl {
         self.repo
             .set_project_member_quota_tier(subject, project_id, target_account_id, quota_tier)
             .await
+    }
+
+    /// List a project's roster. Backs `listProjectRoster`, the roster's only read path (the four
+    /// mutations above all return `Project`). Authorization is deliberately wider than theirs --
+    /// any member of the project may read it, not only leads -- and is enforced in SQL.
+    pub async fn list_project_roster(
+        &self,
+        subject: &str,
+        project_id: &str,
+    ) -> Result<Vec<ProjectMember>> {
+        self.repo.list_project_roster(subject, project_id).await
     }
 
     /// Permanently delete an account, cascading to its projects and api-keys. Backs

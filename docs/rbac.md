@@ -170,7 +170,7 @@ listed here is denied unconditionally (fail closed).**
 | `project:update`  | `model.Project.update`, `procedure.setDefaultProject` | `update-project`, `set-default-project` |
 | `project:delete`  | `model.Project.delete`                               | `delete-project`                    |
 | `project:disable` | `procedure.disableProject`, `procedure.enableProject`| `disable-project`, `enable-project` |
-| `project:member`  | `procedure.addProjectMember`, `procedure.removeProjectMember`, `procedure.setProjectMemberRole`, `procedure.setProjectMemberQuotaTier` | `add-project-member`, `remove-project-member`, `set-project-member-role`, `set-project-member-quota-tier` |
+| `project:member`  | `procedure.listProjectRoster`, `procedure.addProjectMember`, `procedure.removeProjectMember`, `procedure.setProjectMemberRole`, `procedure.setProjectMemberQuotaTier` | `list-project-roster`, `add-project-member`, `remove-project-member`, `set-project-member-role`, `set-project-member-quota-tier` |
 | `apikey:create`   | `procedure.createApiKey`                             | `create-api-key`                    |
 | `apikey:read`     | `model.ApiKey.list`, `model.ApiKey.get`              | `list-api-keys`, `get-api-key`      |
 | `apikey:update`   | `model.ApiKey.update`                                | `update-api-key`                    |
@@ -288,6 +288,14 @@ inserts a `project_members` row for it, so the "no membership concept on the def
 requirement falls out of the data model rather than needing a special case in policy.
 
 A caller holding `project:member` manages a roster directly (no invite/accept handshake):
+
+- `procedure.listProjectRoster` with `{ projectId }` — the roster's **only** read path. The four
+  mutations below all return `Project`, and the generic `model.ProjectMember.list`/`get` verbs are
+  fail-closed (the model is policy-traversal-only, and its `id` is synthetic — `project_members` is
+  keyed `(project_id, account_id)` with no `id` column), so this procedure is how a roster is read
+  at all. Its SQL check is deliberately **wider** than the mutations': any member of the project may
+  read it, plus the owning account — leads are not privileged here, since knowing who you work
+  alongside is not a management capability. A caller with no standing gets `404`, not `403`.
 
 - `procedure.addProjectMember` with `{ projectId, accountId, role? }` — add a member by their
   account id (which is their subject). `role` defaults to `"member"`. Idempotent on the membership

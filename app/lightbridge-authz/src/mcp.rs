@@ -372,7 +372,8 @@ fn required_tool_permission(tool: &str) -> Option<Permission> {
         // Roster management (ADR-0006). The capability moved with the concept: `project:member`,
         // not `account:member`. This is only the coarse gate — the lead check lives in the
         // procedures' hand-written SQL, as cratestack's policy layer cannot express it.
-        "add-project-member"
+        "list-project-roster"
+        | "add-project-member"
         | "remove-project-member"
         | "set-project-member-role"
         | "set-project-member-quota-tier" => Permission::ProjectMember,
@@ -630,6 +631,11 @@ struct UpdateAccountParams {
     /// field is `Option<Option<String>>`.
     #[serde(default)]
     default_quota: Option<Option<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ListProjectRosterParams {
+    project_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -930,6 +936,25 @@ impl LightbridgeMcpHandler {
             .map_err(to_tool_error)?;
 
         to_json_value(account)
+    }
+
+    #[tool(
+        name = "list-project-roster",
+        description = "List a project's roster (RPC procedure.listProjectRoster); readable by any member of the project and by the owning account"
+    )]
+    async fn list_project_roster_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ListProjectRosterParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let members = self
+            .issuer
+            .list_project_roster(&subject, &params.project_id)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(members)
     }
 
     #[tool(
@@ -2070,6 +2095,7 @@ mod tests {
             ),
             ("disable-account", json!({ "account_id": "acct_1" })),
             ("enable-account", json!({ "account_id": "acct_1" })),
+            ("list-project-roster", json!({ "project_id": "proj_1" })),
             (
                 "add-project-member",
                 json!({ "project_id": "proj_1", "account_id": "new-member" }),
@@ -2306,6 +2332,7 @@ mod tests {
             "get-project",
             "list-accounts",
             "list-api-keys",
+            "list-project-roster",
             "list-projects",
             "remove-project-member",
             "revoke-api-key",
@@ -2380,6 +2407,7 @@ mod tests {
     #[test]
     fn roster_tools_are_gated_by_project_member_permission() {
         for tool in [
+            "list-project-roster",
             "add-project-member",
             "remove-project-member",
             "set-project-member-role",

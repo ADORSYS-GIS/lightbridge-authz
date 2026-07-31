@@ -95,6 +95,12 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         // the coarse gate — the lead check ("the member row matching my subject must ALSO have
         // role=lead") lives in the procedures' hand-written SQL, since cratestack's policy layer
         // cannot express a compound condition on one related row.
+        // The roster's read path. Gated at `project:member` like the mutations rather than at
+        // `project:read`: the roster section is a single UI concern, and converse-frontends
+        // already gates its rendering on `project:member`, so splitting the read out would let a
+        // caller reach data the client never asks for at that grant. The finer "who may read"
+        // check (any member, not only leads) lives in the procedure's SQL.
+        "procedure.listProjectRoster" => ProjectMember,
         "procedure.addProjectMember" => ProjectMember,
         "procedure.removeProjectMember" => ProjectMember,
         "procedure.setProjectMemberRole" => ProjectMember,
@@ -237,6 +243,7 @@ mod tests {
             ("procedure.setDefaultProject", Permission::ProjectUpdate),
             ("procedure.addProjectMember", Permission::ProjectMember),
             ("procedure.removeProjectMember", Permission::ProjectMember),
+            ("procedure.listProjectRoster", Permission::ProjectMember),
             ("procedure.setProjectMemberRole", Permission::ProjectMember),
             (
                 "procedure.setProjectMemberQuotaTier",

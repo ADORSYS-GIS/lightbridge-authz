@@ -379,6 +379,30 @@ type SetProjectMemberQuotaTierInput {
 mutation procedure setProjectMemberQuotaTier(args: SetProjectMemberQuotaTierInput): Project
   @allow(auth() != null)
 
+// The roster's READ path, and the only one there is. The four mutations above all return
+// `Project`, so without this the roster could be changed but never listed.
+//
+// It has to be a procedure rather than the generic `model.ProjectMember.list` verb for two
+// independent reasons, either of which alone would be disqualifying:
+//   1. `ProjectMember.id` is synthetic. The real `project_members` table is keyed
+//      `PRIMARY KEY (project_id, account_id)` and has no `id` column at all (the field exists
+//      only because cratestack requires exactly one scalar `@id`), so a generated `SELECT id, ...`
+//      would reference a column that does not exist.
+//   2. `model.ProjectMember.*` is deliberately fail-closed in `rest/src/rpc_authorize.rs` and
+//      asserted so by test, because the model is policy-traversal-only.
+// The hand-written SQL therefore synthesises the id from the composite key.
+//
+// Declared `procedure` (not `mutation procedure`) so it parses as `ProcedureKind::Query` -- this
+// reads, it does not write. Authorization is in the SQL and is deliberately WIDER than the
+// mutations': any member of the project may read the roster, plus the owning account. Leads are
+// not privileged here; knowing who you are working with is not a management capability.
+type ListProjectRosterInput {
+  projectId String
+}
+
+procedure listProjectRoster(args: ListProjectRosterInput): ProjectMember[]
+  @allow(auth() != null)
+
 // Replaces the now-denied generic `model.Account.delete` verb (see the `Account` model's
 // `@@allow` comments). Per ADR-0006 there is no more owner/role concept to gate this with -- one
 // account is one person, so the hand-written SQL check simplifies to "the caller is this account"

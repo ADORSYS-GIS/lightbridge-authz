@@ -109,6 +109,58 @@ async fn a_plain_member_cannot_manage_the_roster_but_a_lead_can(pool: PgPool) {
         .expect("a lead may manage the roster");
 }
 
+/// The roster's read path is deliberately wider than its write paths: a plain member may list, not
+/// only a lead. This is the distinction most likely to be "tidied" into a lead check later, so it
+/// is asserted directly rather than left implicit.
+#[sqlx::test(migrations = "../../migrations")]
+async fn any_member_can_read_the_roster_not_only_a_lead(pool: PgPool) {
+    let repo = build_repo(pool);
+    let (_owner_account, project_id) = seed_account_and_project(&repo, "owner").await;
+    let member_account = seed_account(&repo, "plain-member").await;
+
+    repo.add_project_member("owner", &project_id, &member_account, Some("member"))
+        .await
+        .unwrap();
+
+    let by_owner = repo
+        .list_project_roster("owner", &project_id)
+        .await
+        .unwrap();
+    assert_eq!(by_owner.len(), 1);
+    assert_eq!(by_owner[0].account_id, member_account);
+    assert_eq!(by_owner[0].role, "member");
+
+    // The same read, by a member holding no lead standing at all — the mutations would reject this
+    // caller with Forbidden.
+    let by_member = repo
+        .list_project_roster("plain-member", &project_id)
+        .await
+        .expect("a plain member may read the roster they are on");
+    assert_eq!(by_member.len(), 1);
+    assert_eq!(by_member[0].account_id, member_account);
+}
+
+/// Reads leak no more than writes do: an outsider gets NotFound, never a Forbidden that would
+/// confirm the project exists.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reading_a_roster_without_standing_is_not_found(pool: PgPool) {
+    let repo = build_repo(pool);
+    let (_owner_account, project_id) = seed_account_and_project(&repo, "owner").await;
+    seed_account(&repo, "outsider").await;
+
+    let err = repo
+        .list_project_roster("outsider", &project_id)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotFound));
+
+    let unknown = repo
+        .list_project_roster("owner", "no-such-project")
+        .await
+        .unwrap_err();
+    assert!(matches!(unknown, Error::NotFound));
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_non_member_gets_not_found_rather_than_forbidden(pool: PgPool) {
     let repo = build_repo(pool);

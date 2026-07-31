@@ -1,6 +1,7 @@
 use axum::{Json, Router, http::StatusCode, routing::get};
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, RotateApiKey, async_trait,
+    Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
+    RotateApiKey, async_trait,
     config::{ApiServer, BasicAuth, Billing, Oauth2, OpaServer, Redis},
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
@@ -225,6 +226,24 @@ fn to_schema_project(p: Project) -> schema::Project {
         projectQuota: p.project_quota,
         status: p.status.to_string(),
         isDefault: p.is_default,
+    }
+}
+
+/// Maps a roster row onto the generated `ProjectMember`, synthesising the `id`.
+///
+/// `project_members` is keyed `(project_id, account_id)` and has no `id` column -- the schema
+/// field exists only because cratestack requires exactly one scalar `@id`. `"<project>:<account>"`
+/// is derived from the real composite key, so it is stable for a given row across calls, which is
+/// what clients need from a list key. Nothing parses it back; the mutating procedures all take
+/// `projectId` + `accountId` explicitly.
+fn to_schema_project_member(m: ProjectMember) -> schema::ProjectMember {
+    schema::ProjectMember {
+        id: format!("{}:{}", m.project_id, m.account_id),
+        projectId: m.project_id,
+        accountId: m.account_id,
+        role: m.role,
+        quotaTier: m.quota_tier,
+        createdAt: m.created_at,
     }
 }
 
@@ -575,6 +594,31 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 .await
                 .map_err(to_cool_error)?;
             Ok(to_schema_project(project))
+        }
+    }
+
+    /// The roster's only read path. Authorization is wider than the four mutations above -- any
+    /// member may read, not just leads -- and lives in the repository's SQL; see
+    /// `StoreRepo::list_project_roster`.
+    fn list_project_roster(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::list_project_roster::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::list_project_roster::Output, CoolError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let project_id = args.args.projectId;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let members = issuer
+                .list_project_roster(&subject, &project_id)
+                .await
+                .map_err(to_cool_error)?;
+            Ok(members.into_iter().map(to_schema_project_member).collect())
         }
     }
 

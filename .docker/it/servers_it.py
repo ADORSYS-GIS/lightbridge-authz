@@ -29,6 +29,7 @@ EXPECTED_MCP_TOOLS = {
     "delete-account",
     "disable-account",
     "enable-account",
+    "list-project-roster",
     "add-project-member",
     "remove-project-member",
     "set-project-member-role",

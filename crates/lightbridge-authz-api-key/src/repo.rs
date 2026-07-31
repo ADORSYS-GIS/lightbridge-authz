@@ -5,7 +5,8 @@ use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_core::error::{Error, Result};
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeyStatus, ApiKeyValidation, CreateAccount, CreateProject, DefaultLimits,
-    Project, ResolvedContext, ResourceStatus, UpdateAccount, UpdateApiKey, UpdateProject,
+    Project, ProjectMember, ResolvedContext, ResourceStatus, UpdateAccount, UpdateApiKey,
+    UpdateProject,
 };
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -20,6 +21,7 @@ use crate::entities::exchange_refresh_token_row::{
 use crate::entities::new_account_row::NewAccountRow;
 use crate::entities::new_api_key_row::NewApiKeyRow;
 use crate::entities::new_project_row::NewProjectRow;
+use crate::entities::project_member_row::ProjectMemberRow;
 use crate::entities::project_row::{ProjectChangeset, ProjectRow};
 use crate::entities::signing_key_row::{NewSigningKey, SigningKeyRow};
 
@@ -386,6 +388,58 @@ impl StoreRepo {
 
         let project = self.get_project_by_id(project_id).await?;
         project.ok_or(Error::NotFound)
+    }
+
+    /// Lists `project_id`'s roster. Backs `listProjectRoster`, the roster's only read path.
+    ///
+    /// Authorization is deliberately WIDER than the four mutations above: any member of the
+    /// project may read it, plus the owning account. Leads are not privileged here -- knowing who
+    /// you are working alongside is not a management capability, and gating it on `lead` would
+    /// leave plain members unable to see the roster they are on. A caller with no standing at all
+    /// gets `NotFound`, matching `authorize_project_lead`'s no-existence-leak contract rather than
+    /// distinguishing "no such project" from "not yours".
+    ///
+    /// `id` is synthesised from the composite primary key. The real `project_members` table is
+    /// keyed `(project_id, account_id)` and has no `id` column -- the schema's `ProjectMember.id`
+    /// exists only because cratestack requires exactly one scalar `@id` -- so this is the one
+    /// place that has to invent it, and it must stay stable for a given row because clients use
+    /// it as a list key.
+    #[instrument(skip(self))]
+    pub async fn list_project_roster(
+        &self,
+        subject: &str,
+        project_id: &str,
+    ) -> Result<Vec<ProjectMember>> {
+        let project_account_id: Option<String> =
+            sqlx::query_scalar(r#"SELECT account_id FROM projects WHERE id = $1"#)
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?;
+        let Some(project_account_id) = project_account_id else {
+            return Err(Error::NotFound);
+        };
+        if project_account_id != subject
+            && self
+                .project_member_role(project_id, subject)
+                .await?
+                .is_none()
+        {
+            return Err(Error::NotFound);
+        }
+
+        let rows = sqlx::query_as::<_, ProjectMemberRow>(
+            r#"
+            SELECT project_id, account_id, role, quota_tier, created_at
+            FROM project_members
+            WHERE project_id = $1
+            ORDER BY created_at ASC, account_id ASC
+            "#,
+        )
+        .bind(project_id)
+        .fetch_all(self.pool())
+        .await?;
+
+        Ok(rows.into_iter().map(ProjectMember::from).collect())
     }
 
     /// Removes `target_account_id` from `project_id`'s roster. Lead-gated via

@@ -309,10 +309,16 @@ mod tests {
     #[test]
     fn resource_wildcard_expands_to_resource_actions() {
         let project = expand_grant("project:*");
-        assert_eq!(project.len(), 5);
+        // Six since ADR-0006, not five: `project:member` joined the project group when roster
+        // management moved off the account. That makes `project:*` confer roster management --
+        // a deliberate privilege widening, called out in the PR and mirrored in
+        // converse-frontends' `DEFAULT_ROLE_PERMISSIONS`, where it reaches `lightbridge-editor`.
+        // Asserted explicitly so the widening cannot happen again silently.
+        assert_eq!(project.len(), 6);
         assert!(project.contains(&Permission::ProjectCreate));
         assert!(project.contains(&Permission::ProjectDelete));
         assert!(project.contains(&Permission::ProjectDisable));
+        assert!(project.contains(&Permission::ProjectMember));
         assert!(!project.contains(&Permission::AccountCreate));
     }
 
