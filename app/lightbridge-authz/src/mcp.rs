@@ -185,18 +185,20 @@ impl ServerHandler for LightbridgeMcpHandler {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult {
-            tools: self.advertised_tools(),
-            next_cursor: None,
-            meta: None,
-        })
+        // `with_all_items` (rmcp 3.0's replacement for a bare struct literal, which no longer
+        // compiles now that `ListToolsResult` also carries the SEP-2322/SEP-2549 `result_type` /
+        // `ttl_ms` / `cache_scope` fields) fills those in with the same no-op defaults a manual
+        // `..Default::default()` would: `result_type: Some(ResultType::COMPLETE)` (this is a
+        // complete, non-MRTR result), `ttl_ms: None` / `cache_scope: None` (this handler doesn't
+        // model result caching), `meta: None`, `next_cursor: None` (unchanged from before).
+        Ok(ListToolsResult::with_all_items(self.advertised_tools()))
     }
 
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<rmcp::model::CallToolResult, ErrorData> {
+    ) -> std::result::Result<rmcp::model::CallToolResponse, ErrorData> {
         let tool = request.name.clone();
 
         let token_info = token_info_from_request_context(&context)?;
@@ -212,9 +214,18 @@ impl ServerHandler for LightbridgeMcpHandler {
         }
 
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        // `ToolRouter::call` now returns `CallToolResponse` directly (rmcp 3.0's MRTR support,
+        // SEP-2322 — a tool call can also resolve to `InputRequired` or `Task`, not just
+        // `Complete`), so no conversion is needed here; only the `is_error` outcome-logging check
+        // below has to look inside the `Complete` variant, since `InputRequired`/`Task` aren't a
+        // completed result and therefore can't be an error outcome.
         let result = self.tool_router.call(tcc).await;
         let outcome = match &result {
-            Ok(call_result) if call_result.is_error.unwrap_or(false) => "error",
+            Ok(rmcp::model::CallToolResponse::Complete(call_result))
+                if call_result.is_error.unwrap_or(false) =>
+            {
+                "error"
+            }
             Ok(_) => "ok",
             Err(_) => "error",
         };
@@ -1529,16 +1540,21 @@ async fn run_validate_authorino(
 
 /// Build the streamable-HTTP transport config for the MCP server.
 ///
-/// Runs statelessly (`stateful_mode(false)` + `json_response(true)`) so any replica
-/// can serve any request. In stateful mode the session lives in each pod's in-memory
+/// Runs statelessly (`legacy_session_mode(false)` + `json_response(true)`) so any replica
+/// can serve any request. In legacy session mode the session lives in each pod's in-memory
 /// `LocalSessionManager`, so behind a round-robin LB the follow-up POST lands on a
 /// different replica and 404s ("Session not found"). This server is a stateless tool
 /// proxy — identity comes from the JWT on every request, no server-side session state —
 /// so stateless mode is safe and keeps multi-replica HA. `allowed_hosts` (DNS-rebinding
 /// protection) is applied on top when configured; unset keeps rmcp's localhost default.
+///
+/// rmcp 3.0 renamed `stateful_mode`/`with_stateful_mode` to `legacy_session_mode`/
+/// `with_legacy_session_mode` (SEP-2567 dropped sessions from the `2026-07-28` protocol
+/// version, so what used to be "the stateful/session mode" is now specifically "the legacy,
+/// pre-2026-07-28 session mode"); the boolean semantics (`false` = stateless) are unchanged.
 fn build_streamable_http_config(allowed_hosts: &Option<Vec<String>>) -> StreamableHttpServerConfig {
     let base_config = StreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
+        .with_legacy_session_mode(false)
         .with_json_response(true);
     match allowed_hosts {
         Some(hosts) if !hosts.is_empty() => base_config.with_allowed_hosts(hosts.clone()),
@@ -1758,9 +1774,9 @@ mod tests {
         let cfg = build_streamable_http_config(&Some(vec!["mcp.example.com".to_string()]));
         let dbg = format!("{cfg:?}");
         assert!(
-            dbg.contains("stateful_mode: false"),
+            dbg.contains("legacy_session_mode: false"),
             "MCP transport must run stateless so any replica can serve any request \
-             (stateful sessions live per-pod and 404 behind a round-robin LB): {dbg}"
+             (legacy-session-mode sessions live per-pod and 404 behind a round-robin LB): {dbg}"
         );
         assert!(
             dbg.contains("json_response: true"),
@@ -1773,7 +1789,7 @@ mod tests {
 
         let cfg_default = build_streamable_http_config(&None);
         assert!(
-            format!("{cfg_default:?}").contains("stateful_mode: false"),
+            format!("{cfg_default:?}").contains("legacy_session_mode: false"),
             "stateless mode must hold even when allowed_hosts is unset"
         );
     }
