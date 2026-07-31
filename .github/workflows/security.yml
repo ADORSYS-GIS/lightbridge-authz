@@ -11,9 +11,12 @@ permissions:
 
 jobs:
   scan:
-    # ADORSYS-GIS/ai-ops security-gates including the runs-on input (PR #148).
-    # Pinned to the merge commit (immutable) since v1.0.0 predates that input.
-    uses: ADORSYS-GIS/ai-ops/.github/workflows/security-gates.yml@ea7d6113b3be1038f55042d581d1afc0329af12b
+    # Hosted in ai-governance (public), not ai-ops (private) — ai-ops's Actions
+    # "Access" setting blocks all external callers outright, independent of the
+    # workflow file's content. Pinned to an immutable commit SHA, not @main or
+    # a movable tag, so a future push to ai-governance cannot change what runs
+    # here. ADORSYS-GIS/ai-governance#27.
+    uses: ADORSYS-GIS/ai-governance/.github/workflows/security-gates.yml@b0798a3b7218a21bd807405551fc6c73b63693b4
     secrets: inherit
     with:
       trivy-scan-type: 'fs'
