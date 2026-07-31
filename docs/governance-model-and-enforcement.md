@@ -235,6 +235,34 @@ flowchart TD
 > `tiers: []` / `projectEnvelope: {}` mean they do not currently render. See §5.
 
 
+### Filter order is per **listener**, and it is not the same on all of them
+
+Dumped live from `envoy-converse-gateway-core-gateway` (`/config_dump`, 2026-07-31). The diagram
+above describes the **external** chain, which is the one that matters for API-key traffic:
+
+```
+api.ai.camer.digital
+   1. ext_proc/aigateway            <- sets x-ai-eg-model
+   2-6. custom_response (MCP oauth metadata)
+   7. ext_authz  (Authorino)        <- model name already present
+   8. jwt_authn   9. rbac   10-11. ratelimit   12-14. compressor/hdr/router
+```
+
+The internal listener has the **opposite** order:
+
+```
+core-gateway-internal.envoy-gateway-system.svc.cluster.local
+   1. ext_authz  (Authorino)        <- runs FIRST
+   2. ext_proc/aigateway            <- x-ai-eg-model set AFTER
+   3-4. ratelimit  5-7. compressor/hdr/router
+```
+
+So on the internal plane `x-ai-eg-model` is **absent** when the allowlist predicate evaluates, its
+third escape hatch fires, and the check silently passes. See §5.
+
+(A third listener, `api.ai.kivoyo.com`, has no `ext_authz` at all — a deprecated endpoint, retained
+here only so the dump above is not read as incomplete.)
+
 ### Why introspection and not claims
 
 An earlier plan was to put everything in claims and reduce introspection to a single active-check.
@@ -259,6 +287,40 @@ identity), allowlist absent or empty (`NULL`/`[]` means all models — or intros
 no `x-ai-eg-model` (a non-model route).
 
 ---
+
+### The monthly budget window is not a calendar month
+
+Rule family 3 uses `unit: Month`. That does **not** mean "this calendar month". `envoyproxy/
+ratelimit` builds the counter key as `(now / divider) * divider` — the window start floored from the
+**Unix epoch** (`src/limiter/cache_key.go`) — and `MONTH` is a flat `60*60*24*30`, exactly 30 days
+(`src/utils/utilities.go`, `UnitToDivider`).
+
+A calendar month averages 30.44 days, so the boundary **walks backward roughly 11 days per year**:
+
+```
+window open 2026-07-06  ->  resets 2026-08-05
+2026-08-05 -> 2026-09-04 -> 2026-10-04 -> 2026-11-03
+2026-12-03 -> 2027-01-02 -> 2027-02-01 -> 2027-03-03
+```
+
+That is why budgets appear to reset "on the 5th or 6th" — it is anchored to 1970-01-01, not to
+anyone's signup date or the calendar.
+
+**Can it be made to reset on the 1st?** Not cleanly, today. The BTP owns both the window (`unit`)
+and the descriptor keys (`clientSelectors`); Authorino only supplies those headers' *values*. Adding
+a calendar-period descriptor (say `x-billing-period: 2026-08`) does **not** replace the 30-day
+boundary — the key contains both, so you would get resets on the 1st *and* on the drifting date,
+which is worse. Making the period descriptor the only boundary requires a unit whose window never
+rolls inside a month, i.e. `unit: Year`, which then misbehaves once a year when the year bucket
+rolls mid-month.
+
+The options, none free:
+
+| Approach | Cost |
+|---|---|
+| `unit: Year` + `x-billing-period` descriptor | one anomalous reset per year, at the year-bucket roll |
+| Scheduled reset of the RLS Redis keys on the 1st | does not remove the drifting boundary, only adds one; reaches into another component's keyspace |
+| Calendar-aligned units upstream | a change to `UnitToDivider` — fork or feature request |
 
 ## 4. Walkthroughs
 
@@ -292,6 +354,10 @@ Project *Atlas* has `allowed_models: ["gpt-4.1-mini"]`. The request asks for `gp
 
 The ordering is the whole trick, and it was verified against a live `config_dump` rather than
 assumed — an earlier assessment declared this impossible because it assumed Authorino ran first.
+
+**This holds on the external listener only.** On the internal one the two filters are in the
+opposite order, so the same request would pass the allowlist unchecked. See "Filter order is per
+listener" above and §5.
 
 Note what is *not* checked: `allowed_models` is the **project's**, read live from introspection. A
 lead narrowing the allowlist takes effect within the 30s cache window, without rotating keys.
@@ -381,6 +447,21 @@ So walkthrough 4.1 describes what happens *once a tier menu is configured*, not 
 Today Ana falls through to plan limits. Populating those two values is the remaining step, and it is
 a chart change, not code.
 
+### The model allowlist is not enforced on the internal listener
+
+Not a policy gap but a **filter-ordering** one, and independent of the human-plane gap below. On
+`core-gateway-internal…` Authorino runs *before* the AI Gateway's ext_proc, so `x-ai-eg-model` does
+not exist yet when the predicate evaluates and the "no model header" escape hatch passes it. Verified
+from a live `config_dump` on 2026-07-31.
+
+Fixing it means influencing filter order on that listener (Envoy Gateway orders ext_authz and
+ext_proc per-listener from the attached policies), not changing the CEL.
+
+### The monthly budget does not reset on the 1st
+
+30-day buckets anchored at the Unix epoch, drifting ~11 days backward per year. Full explanation and
+the (unattractive) options are in §3. Worth knowing before anyone reconciles a bill against it.
+
 ### The model allowlist does not apply to humans
 
 Walkthrough 4.7. The predicate is gated on `api_key_id`, and the Keycloak plane has no allowlist
@@ -418,6 +499,7 @@ The shared fix exists behind `sharedBudget.enabled`.
 | Pooled project ceiling | `projects.project_quota` | introspection → `x-project-quota` | header yes, **rule not configured** |
 | Per-member ceiling | `project_members.quota_tier` | introspection → `x-quota-tier` | header yes, **rule not configured** |
 | Key validity cascade | `api_key_validation.effective_status` | introspection `active` | yes |
+| Monthly budget window | `unit: Month` in the BTP | RLS counter key | yes, but **30-day epoch buckets, not calendar months** |
 | Account's own default-project tier | `accounts.default_quota` | *not currently stamped* | no |
 
 `accounts.default_quota` deserves a note: it is settable and validated, but nothing reads it at the
