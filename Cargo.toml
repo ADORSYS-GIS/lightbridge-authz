@@ -130,6 +130,16 @@ redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
 [profile.dev]
 debug = "line-tables-only"
 
+# Deliberately not the same as `[profile.release]` (cargo defaults: opt-level 3,
+# codegen-units 16, no LTO) — that stays cheap for local/CI `--release` runs.
+# `prod` is what `Dockerfile` actually builds (`cargo build --profile prod`), so it's
+# the one place fat LTO + a single codegen unit is worth its cost: measured on
+# cratestack-pg's own release pipeline (cratestack/cratestack#250), this combination
+# runs ~1.5-2.3x the peak build RAM of `lto = "thin"` in exchange for a meaningfully
+# smaller binary (66% smaller on a representative Postgres-backed service binary).
+# Worth it once per deploy build in a properly provisioned CI job; would not be worth
+# it as the blanket default profile — that's what caused prod build memory to climb
+# to 12Gi across every cratestack-based service before this split existed.
 [profile.prod]
 inherits = "release"
 lto = true
