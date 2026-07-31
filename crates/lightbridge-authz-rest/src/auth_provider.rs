@@ -6,7 +6,7 @@
 //! each time with that frame's own canonical `/rpc/<op_id>` path (see `docs/adr/0003-*`, "RPC
 //! transport"). It reuses the unchanged [`BearerTokenServiceTrait`] validation (JWKS fetch/cache,
 //! RS256 verification, audience matching — see `lightbridge-authz-bearer`, migrated to
-//! `authkestra-guard` in ADR-0004), enforces the same coarse role -> permission gate as
+//! `authkestra-resource` in ADR-0004), enforces the same coarse role -> permission gate as
 //! [`crate::rpc_authorize`] (this is what gives `/rpc/batch` real per-frame RBAC: `rpc_authorize`
 //! can't evaluate a single op-id for a whole batch, but this provider is invoked once per frame with
 //! that frame's own op-id, so the check happens here instead), and on success projects the validated

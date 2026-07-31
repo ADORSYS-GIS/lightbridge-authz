@@ -1,5 +1,5 @@
 use anyhow::{anyhow, ensure};
-use authkestra_guard::jwt::{JwksCache, ValidationConfig, validate_jwt_generic};
+use authkestra_resource::jwt::{JwksCache, ValidationConfig, validate_jwt_generic};
 use jsonwebtoken::{Algorithm, Validation, decode_header};
 use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::authz::{PermissionSet, permissions_for_roles};
@@ -105,7 +105,7 @@ impl Default for Audience {
 
 /// Default JWKS cache refresh interval, matching the previous hand-written cache's TTL.
 ///
-/// `authkestra_guard::jwt::ValidationConfigBuilder` defaults to one hour when unset; we keep the
+/// `authkestra_resource::jwt::ValidationConfigBuilder` defaults to one hour when unset; we keep the
 /// tighter five-minute interval this service shipped with so key rotation propagates promptly.
 const DEFAULT_JWKS_CACHE_TTL: Duration = Duration::from_secs(300);
 
@@ -128,8 +128,8 @@ pub trait BearerTokenServiceTrait: Send + Sync {
 
 /// Service responsible for validating bearer tokens.
 ///
-/// JWKS fetch/cache and JWT decode/verify are delegated to `authkestra_guard::jwt` (crate
-/// `authkestra-guard`, published separately on crates.io — see the module docs below for why).
+/// JWKS fetch/cache and JWT decode/verify are delegated to `authkestra_resource::jwt` (crate
+/// `authkestra-resource`, published separately on crates.io — see the module docs below for why).
 /// This service still owns: the `kid`-presence check (`authkestra`'s key lookup falls back to the
 /// JWKS's first key when a token omits `kid`, which this service intentionally does not allow),
 /// the accepted-algorithm allowlist, and the multi-value audience match (`authkestra`'s
@@ -199,8 +199,8 @@ impl BearerTokenServiceTrait for BearerTokenService {
     async fn validate_bearer_token(&self, token: &str) -> anyhow::Result<TokenInfo> {
         ensure!(!token.trim().is_empty(), anyhow!("unauthorized"));
 
-        // Decode the JWT header ourselves first, purely to require a `kid`: authkestra's key
-        // lookup (`Jwks::find_key`) falls back to the JWKS's first key when `kid` is absent,
+        // Decode the JWT header ourselves first, purely to require a `kid`: authkestra_resource's
+        // key lookup (`Jwks::find_key`) falls back to the JWKS's first key when `kid` is absent,
         // which this service does not allow (JWKS here may hold multiple keys during rotation).
         let header = decode_header(token).map_err(|e| {
             tracing::debug!("Failed to decode JWT header: {}", e);
@@ -229,7 +229,7 @@ impl BearerTokenServiceTrait for BearerTokenService {
         }
 
         // JWKS fetch/cache + kid lookup + signature/exp verification, delegated to
-        // authkestra_guard::jwt::validate_jwt_generic. Any failure (network, missing key,
+        // authkestra_resource::jwt::validate_jwt_generic. Any failure (network, missing key,
         // signature, expiry) is folded into a uniform "unauthorized" so callers never see which
         // step failed, matching this service's existing security posture.
         let claims: Claims = validate_jwt_generic(token, &self.cache, &validation)
@@ -371,7 +371,7 @@ mod tests {
         );
     }
 
-    /// Exercises the real `authkestra_guard::jwt::JwksCache` (this crate no longer hand-rolls
+    /// Exercises the real `authkestra_resource::jwt::JwksCache` (this crate no longer hand-rolls
     /// its own cache), preserving the coverage the previous hand-written cache had.
     #[tokio::test]
     async fn cache_reuses_jwks_within_ttl() {
@@ -410,7 +410,7 @@ mod tests {
     }
 
     /// The service must reject tokens with no `kid` header before ever consulting the JWKS
-    /// cache, because `authkestra_guard`'s own key lookup falls back to the JWKS's first key
+    /// cache, because `authkestra_resource`'s own key lookup falls back to the JWKS's first key
     /// when `kid` is absent (see `Jwks::find_key`) rather than rejecting outright.
     #[tokio::test]
     async fn missing_kid_falls_back_to_first_key_in_authkestra_but_this_service_rejects_it() {
