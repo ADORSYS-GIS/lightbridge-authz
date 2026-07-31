@@ -45,13 +45,13 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
         .create_account(
             owner,
             CreateAccount {
-                billing_identity: "tenant-a".to_string(),
+                default_quota: None,
             },
-            "acct_access".to_string(),
         )
         .await
         .unwrap();
-    assert!(account.owners_admins.iter().any(|m| m == owner));
+    // ADR-0006: an account IS its owner, so ownership is the id itself rather than a roster.
+    assert_eq!(account.id, owner);
 
     let outsider_accounts = repo.list_accounts(outsider, 0, 50).await.unwrap();
     assert!(outsider_accounts.is_empty());
@@ -67,8 +67,7 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
             outsider,
             &account.id,
             UpdateAccount {
-                billing_identity: Some("hijack".to_string()),
-                owners_admins: None,
+                default_quota: None,
             },
         )
         .await
@@ -80,14 +79,13 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
             owner,
             &account.id,
             UpdateAccount {
-                billing_identity: None,
-                owners_admins: Some(vec![invited.to_string()]),
+                default_quota: None,
             },
         )
         .await
         .unwrap();
-    assert!(invited_account.owners_admins.iter().any(|m| m == owner));
-    assert!(invited_account.owners_admins.iter().any(|m| m == invited));
+    // No account-level roster exists to invite into any more; sharing happens per project.
+    assert_eq!(invited_account.id, owner);
     assert_eq!(repo.list_accounts(invited, 0, 50).await.unwrap().len(), 1);
     assert_eq!(repo.list_accounts(invited, 1, 50).await.unwrap().len(), 0);
 
@@ -100,6 +98,8 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
                 allowed_models: Some(vec!["gpt-4.1-mini".to_string()]),
                 default_limits: None,
                 billing_plan: "pro".to_string(),
+                billing_identity: format!("bill-{}", cuid2()),
+                project_quota: None,
             },
             "proj_access".to_string(),
         )
@@ -115,6 +115,8 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
                 allowed_models: None,
                 default_limits: None,
                 billing_plan: "free".to_string(),
+                billing_identity: format!("bill-{}", cuid2()),
+                project_quota: None,
             },
             "proj_forbidden".to_string(),
         )
@@ -293,44 +295,31 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
         .await
         .unwrap_err();
     assert!(matches!(unauthorized_account_delete, Error::NotFound));
-    // Account deletion is owner-only (ADR-0005) -- `invited` was seeded with the default "member"
-    // role via the legacy `update_account` owners_admins-replace path (line ~84 above), so unlike
-    // api-key/project deletion (any member), a member-role account delete must be Forbidden. Only
-    // `owner` (the account's creator, seeded as "owner" by `create_account`) can actually delete it.
-    let member_account_delete = repo.delete_account(invited, &account.id).await.unwrap_err();
-    assert!(matches!(member_account_delete, Error::Forbidden(_)));
+    // ADR-0006 collapses this: there is no member/owner role on an account any more, because an
+    // account IS one person. `invited` is simply a different subject, so it gets the same NotFound
+    // an outsider does -- no existence leak, and nothing to distinguish "member but not owner".
+    let other_subject_delete = repo.delete_account(invited, &account.id).await.unwrap_err();
+    assert!(matches!(other_subject_delete, Error::NotFound));
 
-    // `account` is `owner`'s first-ever account (created above), so it is marked default and
-    // `delete_account` now correctly refuses it regardless of role -- exercised against a second,
-    // non-default account instead.
-    let default_account_delete = repo.delete_account(owner, &account.id).await.unwrap_err();
-    assert!(matches!(default_account_delete, Error::Conflict(_)));
-    assert!(repo.get_account_by_id(&account.id).await.unwrap().is_some());
-
-    let second_account = repo
+    // And a subject can only ever have one account: the id IS their subject, so a second
+    // createAccount is a Conflict rather than a second row.
+    let second_attempt = repo
         .create_account(
             owner,
             CreateAccount {
-                billing_identity: "tenant-a-2nd".to_string(),
+                default_quota: None,
             },
-            "acct_access_2nd".to_string(),
         )
         .await
-        .unwrap();
-    assert!(!second_account.is_default);
-    repo.delete_account(owner, &second_account.id)
-        .await
-        .unwrap();
-    assert!(
-        repo.get_account_by_id(&second_account.id)
-            .await
-            .unwrap()
-            .is_none()
-    );
+        .unwrap_err();
+    assert!(matches!(second_attempt, Error::Conflict(_)));
+
+    repo.delete_account(owner, &account.id).await.unwrap();
+    assert!(repo.get_account_by_id(&account.id).await.unwrap().is_none());
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn deleting_last_membership_deletes_account_projects_and_keys(pool: PgPool) {
+async fn deleting_an_account_deletes_its_projects_and_keys(pool: PgPool) {
     let repo = build_repo(pool.clone());
     let subject = "solo-owner";
 
@@ -338,9 +327,8 @@ async fn deleting_last_membership_deletes_account_projects_and_keys(pool: PgPool
         .create_account(
             subject,
             CreateAccount {
-                billing_identity: "tenant-cascade".to_string(),
+                default_quota: None,
             },
-            "acct_cascade".to_string(),
         )
         .await
         .unwrap();
@@ -354,6 +342,8 @@ async fn deleting_last_membership_deletes_account_projects_and_keys(pool: PgPool
                 allowed_models: None,
                 default_limits: None,
                 billing_plan: "starter".to_string(),
+                billing_identity: format!("bill-{}", cuid2()),
+                project_quota: None,
             },
             "proj_cascade".to_string(),
         )
@@ -368,11 +358,11 @@ async fn deleting_last_membership_deletes_account_projects_and_keys(pool: PgPool
         .await
         .unwrap();
 
-    sqlx::query("DELETE FROM account_memberships WHERE account_id = $1")
-        .bind(&account.id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    // Before ADR-0006 the cascade root was the membership table: deleting the last membership row
+    // orphaned and removed the account. Membership is gone, and the account row is now the root
+    // directly -- one account is one person, so deleting it is the same operation that used to be
+    // "remove the last member".
+    repo.delete_account(subject, &account.id).await.unwrap();
 
     assert!(repo.get_account_by_id(&account.id).await.unwrap().is_none());
     assert!(repo.get_project_by_id(&project.id).await.unwrap().is_none());

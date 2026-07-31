@@ -34,9 +34,11 @@ concurrency:
 
 jobs:
   cleanup:
-    # Self-hosted runner: the sccache S3 credentials + endpoint/bucket are only
-    # present in this runner's environment (arc-runner-secrets).
-    runs-on: adorsys-gis-runner
+    # The GitHub-artifact half works anywhere. The sccache S3 half needs the
+    # endpoint/bucket/credentials, which only ever existed in the self-hosted
+    # runner's environment (arc-runner-secrets) — on a public runner it has
+    # nothing to talk to, so it skips itself rather than failing the schedule.
+    runs-on: ubuntu-latest
     steps:
       - name: Delete old GitHub Actions artifacts
         if: ${{ github.event_name == 'schedule' || inputs.target == 'both' || inputs.target == 'github' }}
@@ -77,10 +79,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          : "${SCCACHE_ENDPOINT:?SCCACHE_ENDPOINT is not set on the runner}"
-          : "${SCCACHE_BUCKET:?SCCACHE_BUCKET is not set on the runner}"
-          : "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID is not set on the runner}"
-          : "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is not set on the runner}"
+          if [ -z "${SCCACHE_ENDPOINT:-}" ] || [ -z "${SCCACHE_BUCKET:-}" ] \
+             || [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+            echo "No sccache S3 configuration on this runner — nothing to prune, skipping."
+            exit 0
+          fi
 
           if ! command -v mc >/dev/null 2>&1; then
             curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /tmp/mc

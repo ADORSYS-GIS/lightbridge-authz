@@ -6,17 +6,29 @@ use tracing::instrument;
 use crate::OpaState;
 
 /// Context for a validated API key.
+///
+/// `account_id` is a bare id rather than a loaded `Account`: it comes straight off the
+/// `api_key_validation` view, and the only consumer (introspection) needs nothing else from the
+/// account row. Loading the whole account cost a third database round trip to re-fetch an id the
+/// first query had already returned.
 pub struct ValidatedApiKeyContext {
     pub api_key: lightbridge_authz_core::ApiKey,
     pub project: lightbridge_authz_core::Project,
-    pub account: lightbridge_authz_core::Account,
+    pub account_id: String,
 }
 
-/// Validates an API key and returns its context (project, account).
+/// Validates an API key and returns its context (project, account id).
 ///
 /// Gating is a single indexed read of the `api_key_validation` view: the account -> project -> key
 /// status cascade (revoked key, expired key, suspended project, suspended account) is resolved by
 /// the database, so disabling an account/project instantly invalidates every key beneath it.
+///
+/// Three round trips total, deliberately: the indexed view read above, the usage-telemetry UPDATE
+/// (which returns the api-key row, so it doubles as that fetch), and the project read that supplies
+/// `allowed_models`/`project_quota`. Authorino caches the result for 30s per `jti`, so this runs
+/// roughly twice a minute per active key per replica — cheap enough that keeping the database
+/// authoritative is worth more than shaving it further. Anything moved into JWT claims instead
+/// stops reflecting operator changes until the token is re-minted.
 #[instrument(skip(state, raw_api_key))]
 pub async fn validate_api_key_context(
     state: &Arc<OpaState>,
@@ -58,16 +70,12 @@ pub async fn validate_api_key_context(
         .get_project_by_id(&validation.project_id)
         .await?
         .ok_or_else(|| Error::NotFound)?;
-    let account = state
-        .repo
-        .get_account_by_id(&validation.account_id)
-        .await?
-        .ok_or_else(|| Error::NotFound)?;
+    let account_id = validation.account_id.clone();
 
     tracing::info!(
         active = true,
         api_key_id = %api_key.id,
-        account_id = %account.id,
+        account_id = %account_id,
         project_id = %project.id,
         "api key validated"
     );
@@ -75,6 +83,6 @@ pub async fn validate_api_key_context(
     Ok(Some(ValidatedApiKeyContext {
         api_key,
         project,
-        account,
+        account_id,
     }))
 }

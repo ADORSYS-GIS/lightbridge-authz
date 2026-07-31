@@ -1,0 +1,30 @@
+name: Heavy Build Guard
+description: >-
+  Swap headroom for the cargo steps. A backstop, not a fix — see the note below.
+
+runs:
+  using: composite
+  steps:
+    # Modest headroom so a spike in one compilation unit pages instead of taking the runner down.
+    # Individual units in this workspace still peak around 6 GB on a 16 GB runner, which is close
+    # enough to warrant a margin.
+    #
+    # Deliberately NOT load-bearing. This existed at 32G while chasing a `code-checks` failure that
+    # turned out to be a schema problem, not a resource one: `ProjectMember` declared an
+    # `account Account @relation` that nothing used, which made it a second path between `Account`
+    # and `Project` (already directly connected). cratestack's relation codegen enumerates every
+    # acyclic path through the relation graph, so the extra edge multiplied the generated module
+    # until rustc needed >51 GB and never finished. Removing that one line took the crate to 4m42s
+    # under 6 GB. If a cargo step starts needing more than this again, treat it as a signal to look
+    # at `schema/authz.cstack`, not as a reason to raise the number.
+    - name: Add swap headroom
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! swapon --show=NAME --noheadings 2>/dev/null | grep -q '/mnt/ci-swap'; then
+          sudo fallocate -l 8G /mnt/ci-swap
+          sudo chmod 600 /mnt/ci-swap
+          sudo mkswap /mnt/ci-swap >/dev/null
+          sudo swapon /mnt/ci-swap
+        fi
+        free -h

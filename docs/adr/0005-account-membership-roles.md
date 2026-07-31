@@ -1,6 +1,8 @@
 # ADR-0005: Account membership roles (owner/admin/member)
 
 - Status: Accepted
+- Superseded by: ADR-0006 (project membership replaces account-level membership and roles
+  entirely, once the epic ai-helm#531 product vision was fully articulated)
 - Date: 2026-07-22
 - Decision owners: Lightbridge Authz maintainers
 

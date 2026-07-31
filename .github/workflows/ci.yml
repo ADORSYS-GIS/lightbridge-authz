@@ -1,11 +1,23 @@
 name: CI/CD Pipeline
 on:
-  push: {}
+  # Deliberately NOT `push: {}`. A branch with an open PR fired both `push` and
+  # `pull_request`, and the concurrency group below resolves to the SAME key for both
+  # (`github.event.pull_request.head.ref` and `github.ref_name` are the same branch), so with
+  # `cancel-in-progress` the two runs raced to cancel each other. Usually the later survived;
+  # on 2026-07-30 both were cancelled and the PR was left with no result at all, which reads
+  # as "CI never ran" rather than as a failure.
+  #
+  # Restricting `push` to `main` removes the duplicate at the source instead of trying to
+  # de-duplicate it afterwards. PRs are covered by `pull_request`; `main` is covered by `push`,
+  # which is what the release/publish jobs already gate on
+  # (`github.ref == 'refs/heads/main' && github.event_name == 'push'`). The only behaviour lost
+  # is CI on a branch with no PR open.
+  push:
+    branches: [main]
   pull_request: {}
 
-# A branch with an open PR fires both `push` and `pull_request`, running the heavy
-# jobs (integration-test) twice concurrently on the self-hosted runner and starving
-# each other. Collapse duplicate runs per branch to a single in-flight run.
+# Still worth keeping: successive pushes to the same PR should not pile up heavy
+# `integration-test` runs against each other.
 concurrency:
   group: ci-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
@@ -13,7 +25,7 @@ concurrency:
 jobs:
   sast:
     name: SAST Scan
-    runs-on: adorsys-gis-runner
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         checks: [advisories,"bans licenses sources"]
@@ -25,7 +37,7 @@ jobs:
           check: ${{ matrix.checks }}
 
   code-checks:
-    runs-on: adorsys-gis-runner
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v7
@@ -33,7 +45,7 @@ jobs:
 
   test:
     needs: code-checks
-    runs-on: adorsys-gis-runner
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v7
@@ -44,7 +56,7 @@ jobs:
   binaries:
     needs: code-checks
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: adorsys-gis-runner
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v7
@@ -52,7 +64,7 @@ jobs:
 
   integration-test:
     needs: code-checks
-    runs-on: adorsys-gis-runner
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout repo
@@ -66,7 +78,7 @@ jobs:
     # deployment gating (if any) lives downstream in GitOps, not here.
     needs: [binaries]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: adorsys-gis-runner
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
@@ -103,7 +115,7 @@ jobs:
           severity: 'HIGH,CRITICAL'
   release-please:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: adorsys-gis-runner
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
@@ -126,7 +138,7 @@ jobs:
     if: >-
       github.ref == 'refs/heads/main' && github.event_name == 'push'
       && needs.release-please.outputs.release_created == 'true'
-    runs-on: adorsys-gis-runner
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:

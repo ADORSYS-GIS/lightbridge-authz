@@ -29,10 +29,11 @@ EXPECTED_MCP_TOOLS = {
     "delete-account",
     "disable-account",
     "enable-account",
-    "add-account-member",
-    "remove-account-member",
-    "set-account-member-role",
-    "set-default-account",
+    "list-project-roster",
+    "add-project-member",
+    "remove-project-member",
+    "set-project-member-role",
+    "set-project-member-quota-tier",
     "create-project",
     "list-projects",
     "get-project",
@@ -219,6 +220,43 @@ def fetch_token() -> str:
     return payload["access_token"]
 
 
+def account_id_from_token(token: str) -> str:
+    """The caller's account id, read straight off the JWT.
+
+    Since ADR-0006 `accounts.id` IS the authenticated subject, so the id needs no lookup.
+    """
+    payload = token.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))["sub"]
+
+
+def ensure_account(authz_headers: dict, token: str) -> str:
+    """Create the caller's account, tolerating the one that already exists.
+
+    `createAccount` is once-per-subject since ADR-0006 -- a second call is a 409, not a second
+    row. This suite hits that routinely rather than exceptionally: it shares a compose stack (and
+    therefore a database) with the authorino suite, both authenticate as the same Keycloak user,
+    and the CI runner retries a suite up to three times. So a 409 here means "already
+    provisioned", and the id is the subject.
+    """
+    try:
+        status, account, _ = request_json(
+            "POST",
+            f"{API_URL}/rpc/procedure.createAccount",
+            {"args": {}},
+            headers=authz_headers,
+            insecure_tls=True,
+        )
+        assert status == 200, f"create account failed: status={status}, body={account}"
+        return account["id"]
+    except urllib.error.HTTPError as err:
+        if err.code != 409:
+            raise
+        account_id = account_id_from_token(token)
+        log(f"account already exists for this subject; reusing {account_id}")
+        return account_id
+
+
 def assert_mcp_oauth_metadata() -> None:
     authorization_server_url = f"{MCP_URL}/.well-known/oauth-authorization-server"
     openid_configuration_url = f"{MCP_URL}/.well-known/openid-configuration"
@@ -312,15 +350,7 @@ def main() -> int:
         )
         log("api rejects missing bearer token")
 
-        status, account, _ = request_json(
-            "POST",
-            f"{API_URL}/rpc/procedure.createAccount",
-            {"args": {"billingIdentity": billing_identity}},
-            headers=authz_headers,
-            insecure_tls=True,
-        )
-        assert status == 200, f"create account failed: status={status}, body={account}"
-        account_id = account["id"]
+        account_id = ensure_account(authz_headers, token)
         log(f"api create-account passed ({account_id})")
 
         project_client_id = "c" + uuid.uuid4().hex[:24]
@@ -334,6 +364,7 @@ def main() -> int:
                 "allowedModels": {"List": [{"String": "gpt-4.1-mini"}]},
                 "defaultLimits": {"Map": {}},
                 "billingPlan": "free",
+                "billingIdentity": billing_identity,
                 "status": "active",
             },
             headers=authz_headers,

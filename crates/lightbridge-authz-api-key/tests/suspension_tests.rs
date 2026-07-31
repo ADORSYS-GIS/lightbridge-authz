@@ -24,9 +24,8 @@ async fn seed_key(
         .create_account(
             subject,
             CreateAccount {
-                billing_identity: format!("tenant-{}", cuid2()),
+                default_quota: None,
             },
-            cuid2(),
         )
         .await
         .expect("account creation should succeed");
@@ -39,6 +38,8 @@ async fn seed_key(
                 allowed_models: None,
                 default_limits: None,
                 billing_plan: "free".to_string(),
+                billing_identity: format!("bill-{}", cuid2()),
+                project_quota: None,
             },
             cuid2(),
         )

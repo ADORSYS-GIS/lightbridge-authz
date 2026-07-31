@@ -1,6 +1,7 @@
 use axum::{Json, Router, http::StatusCode, routing::get};
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, RotateApiKey, async_trait,
+    Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
+    RotateApiKey, async_trait,
     config::{ApiServer, BasicAuth, Billing, Oauth2, OpaServer, Redis},
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
@@ -177,9 +178,8 @@ fn to_schema_account(a: Account) -> schema::Account {
         createdAt: a.created_at,
         updatedAt: a.updated_at,
         id: a.id,
-        billingIdentity: a.billing_identity,
+        defaultQuota: a.default_quota,
         status: a.status.to_string(),
-        isDefault: a.is_default,
     }
 }
 
@@ -222,8 +222,28 @@ fn to_schema_project(p: Project) -> schema::Project {
         allowedModels: allowed_models,
         defaultLimits: default_limits,
         billingPlan: p.billing_plan,
+        billingIdentity: p.billing_identity,
+        projectQuota: p.project_quota,
         status: p.status.to_string(),
         isDefault: p.is_default,
+    }
+}
+
+/// Maps a roster row onto the generated `ProjectMember`, synthesising the `id`.
+///
+/// `project_members` is keyed `(project_id, account_id)` and has no `id` column -- the schema
+/// field exists only because cratestack requires exactly one scalar `@id`. `"<project>:<account>"`
+/// is derived from the real composite key, so it is stable for a given row across calls, which is
+/// what clients need from a list key. Nothing parses it back; the mutating procedures all take
+/// `projectId` + `accountId` explicitly.
+fn to_schema_project_member(m: ProjectMember) -> schema::ProjectMember {
+    schema::ProjectMember {
+        id: format!("{}:{}", m.project_id, m.account_id),
+        projectId: m.project_id,
+        accountId: m.account_id,
+        role: m.role,
+        quotaTier: m.quota_tier,
+        createdAt: m.created_at,
     }
 }
 
@@ -235,9 +255,9 @@ fn to_schema_api_key_secret(s: ApiKeySecret) -> schema::ApiKeySecret {
     }
 }
 
-/// RPC procedure registry (ADR-0003 item 4). All four procedures delegate to the reused,
-/// hand-written sqlx in `AuthzStoreImpl`/`StoreRepo` (tenant-scoped by the `account_memberships`
-/// CTE), never cratestack's `run_in_tx`, so the chained-write deadlock in cratestack-pg 0.4.9
+/// RPC procedure registry (ADR-0003 item 4). Every procedure delegates to the hand-written sqlx in
+/// `AuthzStoreImpl`/`StoreRepo` (tenant-scoped by account ownership or a `project_members` row,
+/// ADR-0006), never cratestack's `run_in_tx`, so the chained-write deadlock in cratestack-pg 0.4.9
 /// (ADR-0003, "Known cratestack-pg 0.4.9 bugs", item 1) cannot occur. `db` is intentionally unused:
 /// the generated CRUD client speaks over cratestack's own sqlx pool (a different sqlx major than
 /// this workspace's), so the procedures use the pre-migration repository pool for their writes.
@@ -263,12 +283,12 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
-        let billing_identity = args.args.billingIdentity;
+        let default_quota = args.args.defaultQuota;
         async move {
             let subject =
                 subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
             let account = issuer
-                .create_account(&subject, CreateAccount { billing_identity })
+                .create_account(&subject, CreateAccount { default_quota })
                 .await
                 .map_err(to_cool_error)?;
             Ok(to_schema_account(account))
@@ -427,28 +447,6 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         }
     }
 
-    fn set_default_account(
-        &self,
-        _db: &schema::Cratestack,
-        ctx: &CoolContext,
-        args: schema::procedures::set_default_account::Args,
-    ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::set_default_account::Output, CoolError>,
-    > + Send {
-        let issuer = self.issuer.clone();
-        let subject = subject_from_ctx(ctx);
-        let account_id = args.args.accountId;
-        async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
-            let account = issuer
-                .set_default_account(&subject, &account_id)
-                .await
-                .map_err(to_cool_error)?;
-            Ok(to_schema_account(account))
-        }
-    }
-
     fn set_default_project(
         &self,
         _db: &schema::Cratestack,
@@ -493,77 +491,134 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         }
     }
 
-    fn add_account_member(
+    fn add_project_member(
         &self,
         _db: &schema::Cratestack,
         ctx: &CoolContext,
-        args: schema::procedures::add_account_member::Args,
+        args: schema::procedures::add_project_member::Args,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::add_account_member::Output, CoolError>,
+        Output = std::result::Result<schema::procedures::add_project_member::Output, CoolError>,
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
-        let account_id = args.args.accountId;
-        let new_member = args.args.subject;
-        let role = args.args.role.unwrap_or_else(|| "member".to_owned());
+        let project_id = args.args.projectId;
+        let target_account_id = args.args.accountId;
+        let role = args.args.role;
         async move {
             let subject =
                 subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
-            let account = issuer
-                .add_account_member(&subject, &account_id, &new_member, &role)
+            let project = issuer
+                .add_project_member(&subject, &project_id, &target_account_id, role.as_deref())
                 .await
                 .map_err(to_cool_error)?;
-            Ok(to_schema_account(account))
+            Ok(to_schema_project(project))
         }
     }
 
-    fn remove_account_member(
+    fn remove_project_member(
         &self,
         _db: &schema::Cratestack,
         ctx: &CoolContext,
-        args: schema::procedures::remove_account_member::Args,
+        args: schema::procedures::remove_project_member::Args,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::remove_account_member::Output, CoolError>,
+        Output = std::result::Result<schema::procedures::remove_project_member::Output, CoolError>,
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
-        let account_id = args.args.accountId;
-        let member = args.args.subject;
+        let project_id = args.args.projectId;
+        let target_account_id = args.args.accountId;
         async move {
             let subject =
                 subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
-            let account = issuer
-                .remove_account_member(&subject, &account_id, &member)
+            let project = issuer
+                .remove_project_member(&subject, &project_id, &target_account_id)
                 .await
                 .map_err(to_cool_error)?;
-            Ok(to_schema_account(account))
+            Ok(to_schema_project(project))
         }
     }
 
-    fn set_account_member_role(
+    fn set_project_member_role(
         &self,
         _db: &schema::Cratestack,
         ctx: &CoolContext,
-        args: schema::procedures::set_account_member_role::Args,
+        args: schema::procedures::set_project_member_role::Args,
     ) -> impl core::future::Future<
         Output = std::result::Result<
-            schema::procedures::set_account_member_role::Output,
+            schema::procedures::set_project_member_role::Output,
             CoolError,
         >,
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
-        let account_id = args.args.accountId;
-        let target_subject = args.args.subject;
+        let project_id = args.args.projectId;
+        let target_account_id = args.args.accountId;
         let role = args.args.role;
         async move {
             let subject =
                 subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
-            let account = issuer
-                .set_account_member_role(&subject, &account_id, &target_subject, &role)
+            let project = issuer
+                .set_project_member_role(&subject, &project_id, &target_account_id, &role)
                 .await
                 .map_err(to_cool_error)?;
-            Ok(to_schema_account(account))
+            Ok(to_schema_project(project))
+        }
+    }
+
+    fn set_project_member_quota_tier(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::set_project_member_quota_tier::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::set_project_member_quota_tier::Output,
+            CoolError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let project_id = args.args.projectId;
+        let target_account_id = args.args.accountId;
+        let quota_tier = args.args.quotaTier;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let project = issuer
+                .set_project_member_quota_tier(
+                    &subject,
+                    &project_id,
+                    &target_account_id,
+                    quota_tier.as_deref(),
+                )
+                .await
+                .map_err(to_cool_error)?;
+            Ok(to_schema_project(project))
+        }
+    }
+
+    /// The roster's only read path. Authorization is wider than the four mutations above -- any
+    /// member may read, not just leads -- and lives in the repository's SQL; see
+    /// `StoreRepo::list_project_roster`.
+    fn list_project_roster(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::list_project_roster::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::list_project_roster::Output, CoolError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let project_id = args.args.projectId;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let members = issuer
+                .list_project_roster(&subject, &project_id)
+                .await
+                .map_err(to_cool_error)?;
+            Ok(members.into_iter().map(to_schema_project_member).collect())
         }
     }
 

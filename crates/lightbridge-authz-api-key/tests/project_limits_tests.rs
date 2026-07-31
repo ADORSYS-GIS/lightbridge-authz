@@ -1,6 +1,7 @@
 #![cfg(feature = "it-tests")]
 
 use lightbridge_authz_api_key::repo::StoreRepo;
+use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::DbPool;
 use lightbridge_authz_core::{CreateAccount, CreateProject, DefaultLimits, UpdateProject};
 use sqlx::PgPool;
@@ -18,9 +19,8 @@ async fn test_project_limits_persistence(pool: PgPool) {
         .create_account(
             subject,
             CreateAccount {
-                billing_identity: "test-limits-acct".to_string(),
+                default_quota: None,
             },
-            "acct_1".to_string(),
         )
         .await
         .unwrap();
@@ -41,6 +41,8 @@ async fn test_project_limits_persistence(pool: PgPool) {
                 allowed_models: None,
                 default_limits: Some(limits.clone()),
                 billing_plan: "pro".to_string(),
+                billing_identity: format!("bill-{}", cuid2()),
+                project_quota: None,
             },
             "proj_1".to_string(),
         )
@@ -100,9 +102,8 @@ async fn test_create_project_without_limits_uses_default(pool: PgPool) {
         .create_account(
             subject,
             CreateAccount {
-                billing_identity: "test-no-limits-acct".to_string(),
+                default_quota: None,
             },
-            "acct_default_limits".to_string(),
         )
         .await
         .unwrap();
@@ -116,6 +117,8 @@ async fn test_create_project_without_limits_uses_default(pool: PgPool) {
                 allowed_models: None,
                 default_limits: None,
                 billing_plan: "starter".to_string(),
+                billing_identity: format!("bill-{}", cuid2()),
+                project_quota: None,
             },
             "proj_default_limits".to_string(),
         )
@@ -136,9 +139,8 @@ async fn test_update_project_clears_allowed_models(pool: PgPool) {
         .create_account(
             subject,
             CreateAccount {
-                billing_identity: "test-clear-models-acct".to_string(),
+                default_quota: None,
             },
-            "acct_clear_models".to_string(),
         )
         .await
         .unwrap();
@@ -154,6 +156,8 @@ async fn test_update_project_clears_allowed_models(pool: PgPool) {
                 allowed_models: Some(initial_models.clone()),
                 default_limits: None,
                 billing_plan: "starter".to_string(),
+                billing_identity: format!("bill-{}", cuid2()),
+                project_quota: None,
             },
             "proj_clear_models".to_string(),
         )

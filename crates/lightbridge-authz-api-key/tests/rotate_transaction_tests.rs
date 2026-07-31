@@ -21,9 +21,8 @@ async fn rotate_rolls_back_on_create_failure(pool: PgPool) {
         .create_account(
             subject,
             CreateAccount {
-                billing_identity: "rollback-acct".to_string(),
+                default_quota: None,
             },
-            "acct_rollback".to_string(),
         )
         .await
         .unwrap();
@@ -37,6 +36,8 @@ async fn rotate_rolls_back_on_create_failure(pool: PgPool) {
                 allowed_models: None,
                 default_limits: None,
                 billing_plan: "starter".to_string(),
+                billing_identity: format!("bill-{}", cuid2()),
+                project_quota: None,
             },
             "proj_rollback".to_string(),
         )

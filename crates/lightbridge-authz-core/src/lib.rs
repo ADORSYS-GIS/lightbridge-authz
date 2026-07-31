@@ -17,8 +17,8 @@ pub use crate::authz::{Permission, PermissionSet, Rbac};
 pub use crate::config::{Config, load_from_path};
 pub use crate::crypto::hash_api_key;
 pub use crate::dto::{
-    Account, AddAccountMember, ApiKeyValidation, CreateAccount, CreateProject, DefaultLimits,
-    Project, ResolveContextRequest, ResolvedContext, ResourceStatus, UpdateAccount, UpdateProject,
+    Account, ApiKeyValidation, CreateAccount, CreateProject, DefaultLimits, Project, ProjectMember,
+    ResolveContextRequest, ResolvedContext, ResourceStatus, UpdateAccount, UpdateProject,
 };
 pub use crate::error::{Error, Result};
 

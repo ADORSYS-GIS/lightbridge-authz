@@ -34,7 +34,7 @@ pub async fn introspect_api_key(
     tracing::info!(
         active = true,
         api_key_id = %validated.api_key.id,
-        account_id = %validated.account.id,
+        account_id = %validated.account_id,
         project_id = %validated.project.id,
         "api key introspection resolved active"
     );
@@ -52,7 +52,7 @@ pub async fn introspect_api_key(
     let response = IntrospectResponse {
         active: true,
         sub: Some(validated.api_key.id.clone()),
-        account_id: Some(validated.account.id.clone()),
+        account_id: Some(validated.account_id.clone()),
         project_id: Some(validated.project.id.clone()),
         api_key_id: Some(validated.api_key.id.clone()),
         api_key_status: Some(validated.api_key.status.to_string()),
@@ -60,6 +60,7 @@ pub async fn introspect_api_key(
         billing_plan_name: plan.map(|p| p.name.clone()),
         billing_plan_limits: plan.and_then(|p| p.limits.clone()),
         allowed_models: validated.project.allowed_models.clone(),
+        project_quota: validated.project.project_quota.clone(),
         exp: validated.api_key.expires_at.map(|value| value.timestamp()),
     };
 

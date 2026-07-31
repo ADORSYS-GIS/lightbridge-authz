@@ -12,7 +12,7 @@ use lightbridge_authz_core::config::{Billing, Oauth2, Oauth2Issuance};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey, Project,
-    ResourceStatus, RotateApiKey, hash_api_key,
+    ProjectMember, ResourceStatus, RotateApiKey, hash_api_key,
 };
 use lightbridge_authz_core::{
     db::DbPoolTrait,
@@ -323,33 +323,32 @@ fn resolve_issued_expires_at(
 /// The four write operations the RPC procedures delegate to (ADR-0003 item 4). Everything else the
 /// old `AuthzStore` trait exposed (account/project/api-key list/read/create/update/delete) now runs
 /// through the generated cratestack CRUD client, so only these survive — as inherent methods, no
-/// trait. All four reuse the pre-migration hand-written sqlx in `StoreRepo` (tenant-scoped by the
-/// `account_memberships` CTE); none use cratestack's `run_in_tx`, per the deadlock finding in
+/// trait. They reuse the hand-written sqlx in `StoreRepo` (tenant-scoped by account ownership or a
+/// `project_members` row, ADR-0006); none use cratestack's `run_in_tx`, per the deadlock finding in
 /// ADR-0003 ("Known cratestack-pg 0.4.9 bugs", item 1).
 impl AuthzStoreImpl {
-    /// Create an account and seed the creator's membership in one transaction. Backs the
-    /// `createAccount` procedure. The generic `model.Account.create` verb only inserts the
-    /// `accounts` row and never seeds `account_memberships`, which locks the creator out of every
-    /// membership-scoped `@@allow` policy; this reuses the pre-migration
-    /// `StoreRepo::create_account` (insert account + creator membership atomically), so the creator
-    /// is immediately a member and can read/extend the account. The server generates the account id.
+    /// Create the caller's account. Backs the `createAccount` procedure. Since ADR-0006 the account
+    /// id **is** the caller's JWT subject — one account per person — so no id is generated and none
+    /// may be supplied: the generic `model.Account.create` verb stays denied precisely because a
+    /// caller-chosen id would let one subject create an account keyed to another. Calling this twice
+    /// for the same subject is a `Conflict`, not a second account.
     pub async fn create_account(&self, subject: &str, input: CreateAccount) -> Result<Account> {
-        let account = self.repo.create_account(subject, input, cuid2()).await?;
+        let account = self.repo.create_account(subject, input).await?;
         tracing::info!(
             operation = "create_account",
             subject = %subject,
             account_id = %account.id,
-            "account created and creator membership seeded"
+            "account created"
         );
         Ok(account)
     }
 
     /// Create an API key: validate the requested `billing_plan` against the operator-configured
     /// catalogue (before any DB write), issue a fresh secret (generation/hashing unchanged from
-    /// before the migration), and insert the row via hand-written sqlx (tenant-scoped by the
-    /// `account_memberships` CTE). Backs the `createApiKey` procedure. This restores the
-    /// pre-migration `create_api_key` path verbatim; the only change is that it is now an inherent
-    /// method invoked by the RPC procedure instead of the deleted `AuthzStore` trait.
+    /// before the migration), and insert the row via hand-written sqlx. Backs the `createApiKey`
+    /// procedure. Since ADR-0006 this path is **lead-gated** in SQL: the caller must own the
+    /// project's account or hold `role = 'lead'` on it, because a key is live spending power with
+    /// no per-request human in the loop.
     pub async fn create_api_key(
         &self,
         subject: &str,
@@ -432,15 +431,8 @@ impl AuthzStoreImpl {
             .await
     }
 
-    /// Promote `account_id` to be `subject`'s new default account. Backs `setDefaultAccount`. Thin
-    /// wrapper over `StoreRepo::set_default_account` (membership + atomic unset/set enforced in
-    /// SQL).
-    pub async fn set_default_account(&self, subject: &str, account_id: &str) -> Result<Account> {
-        self.repo.set_default_account(subject, account_id).await
-    }
-
     /// Promote `project_id` to be its account's new default project. Backs `setDefaultProject`.
-    /// Thin wrapper over `StoreRepo::set_default_project` (membership + atomic unset/set enforced
+    /// Thin wrapper over `StoreRepo::set_default_project` (ownership + atomic unset/set enforced
     /// in SQL).
     pub async fn set_default_project(&self, subject: &str, project_id: &str) -> Result<Project> {
         self.repo.set_default_project(subject, project_id).await
@@ -468,49 +460,77 @@ impl AuthzStoreImpl {
         Ok(api_key)
     }
 
-    /// Add a member to an account (idempotent), authorised by the acting `subject` already being a
-    /// member. Backs `addAccountMember`.
-    pub async fn add_account_member(
+    /// Add an account to a project's roster (idempotent). Backs `addProjectMember`. Lead-gated in
+    /// SQL: the acting `subject` must own the project's account or hold `role = 'lead'` on it.
+    pub async fn add_project_member(
         &self,
         subject: &str,
-        account_id: &str,
-        new_member: &str,
+        project_id: &str,
+        target_account_id: &str,
+        role: Option<&str>,
+    ) -> Result<Project> {
+        self.repo
+            .add_project_member(subject, project_id, target_account_id, role)
+            .await
+    }
+
+    /// Remove an account from a project's roster. Backs `removeProjectMember`. Lead-gated in SQL.
+    /// Unlike the account-membership model it replaces, there is no last-member invariant to
+    /// enforce: the project's owning account is a standing authority over the roster, so a project
+    /// can never be left without one.
+    pub async fn remove_project_member(
+        &self,
+        subject: &str,
+        project_id: &str,
+        target_account_id: &str,
+    ) -> Result<Project> {
+        self.repo
+            .remove_project_member(subject, project_id, target_account_id)
+            .await
+    }
+
+    /// Change a roster member's role (`lead`/`member`). Backs `setProjectMemberRole`. Lead-gated in
+    /// SQL.
+    pub async fn set_project_member_role(
+        &self,
+        subject: &str,
+        project_id: &str,
+        target_account_id: &str,
         role: &str,
-    ) -> Result<Account> {
+    ) -> Result<Project> {
         self.repo
-            .add_account_member(subject, account_id, new_member, role)
+            .set_project_member_role(subject, project_id, target_account_id, role)
             .await
     }
 
-    /// Remove a member from an account, refusing to remove the last remaining member or the last
-    /// remaining owner. Backs `removeAccountMember`.
-    pub async fn remove_account_member(
+    /// Set a roster member's per-project spending ceiling. Backs `setProjectMemberQuotaTier`.
+    /// Lead-gated in SQL, and the tier is validated against the configured catalogue at write time.
+    pub async fn set_project_member_quota_tier(
         &self,
         subject: &str,
-        account_id: &str,
-        member: &str,
-    ) -> Result<Account> {
+        project_id: &str,
+        target_account_id: &str,
+        quota_tier: Option<&str>,
+    ) -> Result<Project> {
         self.repo
-            .remove_account_member(subject, account_id, member)
+            .set_project_member_quota_tier(subject, project_id, target_account_id, quota_tier)
             .await
     }
 
-    /// Change a member's role (owner-only), refusing to demote the last remaining owner. Backs
-    /// `setAccountMemberRole`.
-    pub async fn set_account_member_role(
+    /// List a project's roster. Backs `listProjectRoster`, the roster's only read path (the four
+    /// mutations above all return `Project`). Authorization is deliberately wider than theirs --
+    /// any member of the project may read it, not only leads -- and is enforced in SQL.
+    pub async fn list_project_roster(
         &self,
         subject: &str,
-        account_id: &str,
-        target_subject: &str,
-        role: &str,
-    ) -> Result<Account> {
-        self.repo
-            .set_account_member_role(subject, account_id, target_subject, role)
-            .await
+        project_id: &str,
+    ) -> Result<Vec<ProjectMember>> {
+        self.repo.list_project_roster(subject, project_id).await
     }
 
-    /// Permanently delete an account (owner-only), cascading to its projects/api-keys/memberships.
-    /// Backs `deleteAccountPermanently`.
+    /// Permanently delete an account, cascading to its projects and api-keys. Backs
+    /// `deleteAccountPermanently`. Since ADR-0006 the authorization is simply "the caller is this
+    /// account" — there is no role concept left to gate on.
     pub async fn delete_account(&self, subject: &str, account_id: &str) -> Result<Account> {
         self.repo.delete_account(subject, account_id).await
     }

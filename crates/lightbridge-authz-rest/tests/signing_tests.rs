@@ -1,5 +1,5 @@
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use lightbridge_authz_core::config::{Billing, BillingPlan, JwtSigning};
+use lightbridge_authz_core::config::JwtSigning;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::signing::{ApiKeyJwtSigner, capped_expiry, generate_rs256_key};
 use serde::{Deserialize, Serialize};
@@ -183,7 +183,10 @@ mod db {
     use super::*;
     use chrono::{Duration, Utc};
     use lightbridge_authz_api_key::repo::StoreRepo;
-    use lightbridge_authz_core::config::Oauth2;
+    // `Billing`/`BillingPlan` are imported HERE, not at file scope: they are used only by this
+    // `it-tests`-gated module, so a file-level import reads as unused on a build without the
+    // feature (which is what `cargo fix` acted on) while being required with it.
+    use lightbridge_authz_core::config::{Billing, BillingPlan, Oauth2};
     use lightbridge_authz_core::cuid::cuid2;
     use lightbridge_authz_core::{CreateAccount, CreateApiKey, CreateProject};
     use lightbridge_authz_rest::handlers::AuthzStoreImpl;
@@ -372,7 +375,7 @@ mod db {
             .create_account(
                 subject,
                 CreateAccount {
-                    billing_identity: "t".to_string(),
+                    default_quota: None,
                 },
             )
             .await
@@ -390,6 +393,8 @@ mod db {
                     allowed_models: Some(vec!["gpt-4.1-mini".to_string()]),
                     default_limits: None,
                     billing_plan: "free".to_string(),
+                    billing_identity: format!("bill-{}", cuid2()),
+                    project_quota: None,
                 },
                 cuid2(),
             )

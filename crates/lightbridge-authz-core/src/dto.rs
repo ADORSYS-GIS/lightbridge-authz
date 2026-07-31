@@ -49,39 +49,41 @@ pub struct DefaultLimits {
     pub concurrent_requests: Option<i32>,
 }
 
+/// Per ADR-0006, `id` IS the account's owning JWT subject -- one account, one person, with no
+/// account-level membership of any kind. `billing_identity`/`owners_admins`/`is_default` are gone
+/// (billing identity moved to `Project`; membership moved to `ProjectMember`; "default account" has
+/// no meaning once a subject can only ever have one account). `default_quota` is the new
+/// tier-catalog-validated governance ceiling for usage under the account's own default project
+/// (which has no roster to hang a per-member quota on).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Account {
     pub id: String,
-    pub billing_identity: String,
     #[serde(default)]
-    pub owners_admins: Vec<String>,
+    pub default_quota: Option<String>,
     #[serde(default)]
     pub status: ResourceStatus,
-    #[serde(default)]
-    pub is_default: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
+/// Body for `createAccount`. No `id` -- the caller's JWT subject is used directly (never trusted
+/// from the request body). `default_quota` is optional and, like `Project.billing_plan`, validated
+/// against the operator-configured tier catalogue at write time; an empty/absent catalogue accepts
+/// any value.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateAccount {
-    pub billing_identity: String,
+    #[serde(default)]
+    pub default_quota: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpdateAccount {
-    pub billing_identity: Option<String>,
-    pub owners_admins: Option<Vec<String>>,
+    pub default_quota: Option<String>,
 }
 
-/// Body for adding a member to an account. `subject` is the member's identity (the Keycloak `sub`),
-/// the same value carried on their bearer token. Must be non-empty (enforced by the store).
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AddAccountMember {
-    #[schema(min_length = 1)]
-    pub subject: String,
-}
-
+/// Per ADR-0006, `Project` gains `billing_identity` (moved from `Account` -- one project, one
+/// billing identity, so a single account can bill several projects to different parties) and
+/// `project_quota` (the pooled, tier-catalog-validated ceiling shared by everyone on the project).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Project {
     pub id: String,
@@ -92,6 +94,9 @@ pub struct Project {
     #[serde(default)]
     pub default_limits: Option<DefaultLimits>,
     pub billing_plan: String,
+    pub billing_identity: String,
+    #[serde(default)]
+    pub project_quota: Option<String>,
     #[serde(default)]
     pub status: ResourceStatus,
     #[serde(default)]
@@ -108,6 +113,25 @@ pub struct CreateProject {
     #[serde(default)]
     pub default_limits: Option<DefaultLimits>,
     pub billing_plan: String,
+    pub billing_identity: String,
+    #[serde(default)]
+    pub project_quota: Option<String>,
+}
+
+/// A single `project_members` row (ADR-0006, replacing `AccountMembership`): `{project, account,
+/// role: lead|member, quotaTier}`. Unlike the old `account_memberships`, `account_id` is a real FK
+/// to `Account` -- a project member IS an account, per the vision. Read-only from the RPC surface
+/// (no create/update/delete `@@allow` on the schema model); roster mutations go exclusively through
+/// the hand-written `addProjectMember`/`removeProjectMember`/`setProjectMemberRole`/
+/// `setProjectMemberQuotaTier` procedures.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProjectMember {
+    pub project_id: String,
+    pub account_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub quota_tier: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

@@ -369,10 +369,14 @@ fn required_tool_permission(tool: &str) -> Option<Permission> {
         "update-account" => Permission::AccountUpdate,
         "delete-account" => Permission::AccountDelete,
         "disable-account" | "enable-account" => Permission::AccountDisable,
-        "add-account-member" | "remove-account-member" | "set-account-member-role" => {
-            Permission::AccountMember
-        }
-        "set-default-account" => Permission::AccountUpdate,
+        // Roster management (ADR-0006). The capability moved with the concept: `project:member`,
+        // not `account:member`. This is only the coarse gate — the lead check lives in the
+        // procedures' hand-written SQL, as cratestack's policy layer cannot express it.
+        "list-project-roster"
+        | "add-project-member"
+        | "remove-project-member"
+        | "set-project-member-role"
+        | "set-project-member-quota-tier" => Permission::ProjectMember,
         "create-project" => Permission::ProjectCreate,
         "list-projects" | "get-project" => Permission::ProjectRead,
         "update-project" => Permission::ProjectUpdate,
@@ -599,7 +603,11 @@ async fn oauth_register_handler(
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct CreateAccountParams {
-    billing_identity: String,
+    /// A governance tier for the account's own default-project usage, validated against the
+    /// operator-configured catalogue. Since ADR-0006 `billingIdentity` lives on `Project`, and the
+    /// account's id is taken from the caller's JWT subject rather than any input field.
+    #[serde(default)]
+    default_quota: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -618,32 +626,49 @@ struct AccountByIdParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct UpdateAccountParams {
     account_id: String,
+    /// Nested like `UpdateProjectParams::allowed_models`: absent leaves the tier untouched, an
+    /// explicit `null` clears it. `defaultQuota` is nullable in the schema, so the generated patch
+    /// field is `Option<Option<String>>`.
     #[serde(default)]
-    billing_identity: Option<String>,
+    default_quota: Option<Option<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct AddAccountMemberParams {
+struct ListProjectRosterParams {
+    project_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AddProjectMemberParams {
+    project_id: String,
+    /// The account being added. Since ADR-0006 an account id *is* the member's JWT subject.
     account_id: String,
-    subject: String,
-    /// "owner" | "admin" | "member"; defaults to "member" if omitted. Granting "owner" requires
-    /// the caller to already be an "owner".
+    /// "lead" | "member"; defaults to "member" if omitted.
     #[serde(default)]
     role: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct RemoveAccountMemberParams {
+struct RemoveProjectMemberParams {
+    project_id: String,
     account_id: String,
-    member: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct SetAccountMemberRoleParams {
+struct SetProjectMemberRoleParams {
+    project_id: String,
     account_id: String,
-    subject: String,
-    /// "owner" | "admin" | "member". Owner-only.
+    /// "lead" | "member". Lead-only.
     role: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetProjectMemberQuotaTierParams {
+    project_id: String,
+    account_id: String,
+    /// A tier drawn from the operator-configured catalogue, or omitted to clear the ceiling.
+    #[serde(default)]
+    quota_tier: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -655,6 +680,12 @@ struct CreateProjectParams {
     #[serde(default)]
     default_limits: Option<DefaultLimitsInput>,
     billing_plan: String,
+    /// Who is paying for this project. Moved here from `Account` by ADR-0006 so one account can
+    /// bill several projects to different parties; unique across all projects.
+    billing_identity: String,
+    /// The pooled, tier-catalogue-validated ceiling shared by everyone on the project.
+    #[serde(default)]
+    project_quota: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -760,7 +791,7 @@ impl LightbridgeMcpHandler {
             .create_account(
                 &subject,
                 CreateAccount {
-                    billing_identity: params.billing_identity,
+                    default_quota: params.default_quota,
                 },
             )
             .await
@@ -820,7 +851,7 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "update-account",
-        description = "Update an account's billing_identity (RPC model.Account.update)"
+        description = "Update an account's default quota tier (RPC model.Account.update)"
     )]
     async fn update_account_tool(
         &self,
@@ -832,8 +863,8 @@ impl LightbridgeMcpHandler {
             .cratestack_db
             .bind_context(cool_context_from_token_info(&token_info));
         let mut input = schema::inputs::UpdateAccountInput::default();
-        if let Some(billing_identity) = params.billing_identity {
-            input.billingIdentity = Some(billing_identity);
+        if let Some(default_quota) = params.default_quota {
+            input.defaultQuota = Some(default_quota);
         }
         let account = bound
             .account()
@@ -908,80 +939,113 @@ impl LightbridgeMcpHandler {
     }
 
     #[tool(
-        name = "add-account-member",
-        description = "Add a member to an account (RPC procedure.addAccountMember); grants access to the account and all its projects"
+        name = "list-project-roster",
+        description = "List a project's roster (RPC procedure.listProjectRoster); readable by any member of the project and by the owning account"
     )]
-    async fn add_account_member_tool(
+    async fn list_project_roster_tool(
         &self,
         context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<AddAccountMemberParams>,
+        Parameters(params): Parameters<ListProjectRosterParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let subject = subject_from_request_context(&context)?;
-        let role = params.role.unwrap_or_else(|| "member".to_string());
-        let account = self
+        let members = self
             .issuer
-            .add_account_member(&subject, &params.account_id, &params.subject, &role)
+            .list_project_roster(&subject, &params.project_id)
             .await
             .map_err(to_tool_error)?;
 
-        to_json_value(account)
+        to_json_value(members)
     }
 
     #[tool(
-        name = "remove-account-member",
-        description = "Remove a member from an account (RPC procedure.removeAccountMember); refuses to remove the last member or the last owner"
+        name = "add-project-member",
+        description = "Add an account to a project's roster (RPC procedure.addProjectMember); idempotent, lead-only"
     )]
-    async fn remove_account_member_tool(
+    async fn add_project_member_tool(
         &self,
         context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<RemoveAccountMemberParams>,
+        Parameters(params): Parameters<AddProjectMemberParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let subject = subject_from_request_context(&context)?;
-        let account = self
+        let project = self
             .issuer
-            .remove_account_member(&subject, &params.account_id, &params.member)
+            .add_project_member(
+                &subject,
+                &params.project_id,
+                &params.account_id,
+                params.role.as_deref(),
+            )
             .await
             .map_err(to_tool_error)?;
 
-        to_json_value(account)
+        to_json_value(project)
     }
 
     #[tool(
-        name = "set-account-member-role",
-        description = "Change a member's role (RPC procedure.setAccountMemberRole); owner-only, refuses to demote the last owner"
+        name = "remove-project-member",
+        description = "Remove an account from a project's roster (RPC procedure.removeProjectMember); lead-only"
     )]
-    async fn set_account_member_role_tool(
+    async fn remove_project_member_tool(
         &self,
         context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<SetAccountMemberRoleParams>,
+        Parameters(params): Parameters<RemoveProjectMemberParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let subject = subject_from_request_context(&context)?;
-        let account = self
+        let project = self
             .issuer
-            .set_account_member_role(&subject, &params.account_id, &params.subject, &params.role)
+            .remove_project_member(&subject, &params.project_id, &params.account_id)
             .await
             .map_err(to_tool_error)?;
 
-        to_json_value(account)
+        to_json_value(project)
     }
 
     #[tool(
-        name = "set-default-account",
-        description = "Promote a different account to be the caller's default (RPC procedure.setDefaultAccount); frees the old default account up for permanent deletion"
+        name = "set-project-member-role",
+        description = "Change a roster member's role between lead and member (RPC procedure.setProjectMemberRole); lead-only"
     )]
-    async fn set_default_account_tool(
+    async fn set_project_member_role_tool(
         &self,
         context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<AccountByIdParams>,
+        Parameters(params): Parameters<SetProjectMemberRoleParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let subject = subject_from_request_context(&context)?;
-        let account = self
+        let project = self
             .issuer
-            .set_default_account(&subject, &params.account_id)
+            .set_project_member_role(
+                &subject,
+                &params.project_id,
+                &params.account_id,
+                &params.role,
+            )
             .await
             .map_err(to_tool_error)?;
 
-        to_json_value(account)
+        to_json_value(project)
+    }
+
+    #[tool(
+        name = "set-project-member-quota-tier",
+        description = "Set a roster member's per-project spending ceiling (RPC procedure.setProjectMemberQuotaTier); lead-only, tier validated against the configured catalogue"
+    )]
+    async fn set_project_member_quota_tier_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SetProjectMemberQuotaTierParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let project = self
+            .issuer
+            .set_project_member_quota_tier(
+                &subject,
+                &params.project_id,
+                &params.account_id,
+                params.quota_tier.as_deref(),
+            )
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(project)
     }
 
     #[tool(
@@ -1012,6 +1076,8 @@ impl LightbridgeMcpHandler {
                 .map(|models| cratestack_json(json!(models))),
             defaultLimits: cratestack_json(default_limits_json),
             billingPlan: params.billing_plan,
+            billingIdentity: params.billing_identity,
+            projectQuota: params.project_quota,
         };
         let project = bound
             .project()
@@ -1417,10 +1483,14 @@ async fn run_validate_api_key(
         ));
     };
 
+    // `account_id`, not a nested `account` object: introspection stopped fetching the account row
+    // in Phase E (ADR-0006) because the `api_key_validation` view already carries the id, so there
+    // is no `Account` here to embed and re-adding the query would undo that. Matches
+    // `IntrospectResponse.account_id` on the REST surface.
     to_json_value(json!({
         "api_key": validated.api_key,
         "project": validated.project,
-        "account": validated.account
+        "account_id": validated.account_id
     }))
 }
 
@@ -1442,7 +1512,7 @@ async fn run_validate_authorino(
     };
 
     let dynamic_metadata = AuthorinoMetadata {
-        account_id: validated.account.id.clone(),
+        account_id: validated.account_id.clone(),
         project_id: validated.project.id.clone(),
         api_key_id: validated.api_key.id.clone(),
         api_key_status: validated.api_key.status.to_string(),
@@ -1452,7 +1522,7 @@ async fn run_validate_authorino(
     to_json_value(json!({
         "api_key": validated.api_key,
         "project": validated.project,
-        "account": validated.account,
+        "account_id": validated.account_id,
         "dynamic_metadata": dynamic_metadata
     }))
 }
@@ -1801,6 +1871,8 @@ mod tests {
             allowed_models: None,
             default_limits: None,
             billing_plan: "free".to_string(),
+            billing_identity: "bill_1".to_string(),
+            project_quota: None,
             status: lightbridge_authz_core::ResourceStatus::Active,
             is_default: false,
             created_at: Utc::now(),
@@ -1811,10 +1883,8 @@ mod tests {
     fn fixture_account() -> Account {
         Account {
             id: "acct_1".to_string(),
-            billing_identity: "bill_1".to_string(),
-            owners_admins: vec!["owner".to_string()],
+            default_quota: None,
             status: lightbridge_authz_core::ResourceStatus::Active,
-            is_default: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -2016,27 +2086,35 @@ mod tests {
     /// router by `every_tool_dispatches_and_maps_backend_errors_through_the_real_mcp_router`.
     fn crud_and_validation_tool_cases() -> Vec<(&'static str, Value)> {
         vec![
-            ("create-account", json!({ "billing_identity": "acme" })),
+            ("create-account", json!({ "default_quota": "small" })),
             ("list-accounts", json!({})),
             ("get-account", json!({ "account_id": "acct_1" })),
             (
                 "update-account",
-                json!({ "account_id": "acct_1", "billing_identity": "acme2" }),
+                json!({ "account_id": "acct_1", "default_quota": "medium" }),
             ),
             ("disable-account", json!({ "account_id": "acct_1" })),
             ("enable-account", json!({ "account_id": "acct_1" })),
+            ("list-project-roster", json!({ "project_id": "proj_1" })),
             (
-                "add-account-member",
-                json!({ "account_id": "acct_1", "subject": "new-member" }),
+                "add-project-member",
+                json!({ "project_id": "proj_1", "account_id": "new-member" }),
             ),
             (
-                "remove-account-member",
-                json!({ "account_id": "acct_1", "member": "old-member" }),
+                "remove-project-member",
+                json!({ "project_id": "proj_1", "account_id": "old-member" }),
             ),
-            ("set-default-account", json!({ "account_id": "acct_1" })),
+            (
+                "set-project-member-role",
+                json!({ "project_id": "proj_1", "account_id": "acct_2", "role": "lead" }),
+            ),
+            (
+                "set-project-member-quota-tier",
+                json!({ "project_id": "proj_1", "account_id": "acct_2", "quota_tier": "small" }),
+            ),
             (
                 "create-project",
-                json!({ "account_id": "acct_1", "name": "proj", "billing_plan": "free" }),
+                json!({ "account_id": "acct_1", "name": "proj", "billing_plan": "free", "billing_identity": "acme" }),
             ),
             ("list-projects", json!({ "account_id": "acct_1" })),
             ("get-project", json!({ "project_id": "proj_1" })),
@@ -2238,7 +2316,7 @@ mod tests {
         tool_names.sort();
 
         let mut expected = vec![
-            "add-account-member",
+            "add-project-member",
             "create-account",
             "create-api-key",
             "create-project",
@@ -2254,13 +2332,14 @@ mod tests {
             "get-project",
             "list-accounts",
             "list-api-keys",
+            "list-project-roster",
             "list-projects",
-            "remove-account-member",
+            "remove-project-member",
             "revoke-api-key",
             "rotate-api-key",
-            "set-account-member-role",
-            "set-default-account",
             "set-default-project",
+            "set-project-member-quota-tier",
+            "set-project-member-role",
             "update-account",
             "update-api-key",
             "update-project",
@@ -2326,15 +2405,39 @@ mod tests {
     }
 
     #[test]
-    fn member_tools_are_gated_by_account_member_permission() {
-        assert_eq!(
-            required_tool_permission("add-account-member"),
-            Some(Permission::AccountMember)
-        );
-        assert_eq!(
-            required_tool_permission("remove-account-member"),
-            Some(Permission::AccountMember)
-        );
+    fn roster_tools_are_gated_by_project_member_permission() {
+        for tool in [
+            "list-project-roster",
+            "add-project-member",
+            "remove-project-member",
+            "set-project-member-role",
+            "set-project-member-quota-tier",
+        ] {
+            assert_eq!(
+                required_tool_permission(tool),
+                Some(Permission::ProjectMember),
+                "tool `{tool}` should require project:member"
+            );
+        }
+    }
+
+    /// ADR-0006 removed account-level membership and the default-*account* feature. Their tool
+    /// names must not linger as mapped permissions, or a stale client would fail open into
+    /// `call_tool` rather than being rejected by the fail-closed default.
+    #[test]
+    fn removed_account_member_tools_are_unmapped() {
+        for tool in [
+            "add-account-member",
+            "remove-account-member",
+            "set-account-member-role",
+            "set-default-account",
+        ] {
+            assert_eq!(
+                required_tool_permission(tool),
+                None,
+                "removed tool `{tool}` must be unmapped (fail closed)"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2372,6 +2475,15 @@ mod tests {
         assert!(
             !properties.contains_key("owners_admins"),
             "owners_admins should not be accepted on account creation"
+        );
+        assert!(
+            !properties.contains_key("id"),
+            "the account id is the caller's JWT subject (ADR-0006); accepting it as input would be \
+             an impersonation primitive"
+        );
+        assert!(
+            !properties.contains_key("billing_identity"),
+            "billing_identity moved to Project (ADR-0006) and must not linger on account creation"
         );
     }
 
@@ -2453,7 +2565,9 @@ mod tests {
 
         let output = result.0.result;
 
-        assert_eq!(output["account"]["id"], "acct_1");
+        // `account_id`, not a nested `account` object: Phase E (ADR-0006) dropped the redundant
+        // account fetch from introspection, so `ValidatedApiKeyContext` carries only the id.
+        assert_eq!(output["account_id"], "acct_1");
         assert_eq!(output["project"]["id"], "proj_1");
         assert_eq!(output["api_key"]["id"], "key_1");
         assert_eq!(output["dynamic_metadata"]["account_id"], "acct_1");

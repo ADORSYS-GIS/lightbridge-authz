@@ -1,10 +1,13 @@
-name: S3 Artifact
+name: CI Artifact
 description: >-
-  Upload/download/cleanup a build artifact on the CI S3 (MinIO) bucket, reusing the
-  ambient sccache credentials on the runner. Replaces actions/upload-artifact +
-  actions/download-artifact, which fail once the org GitHub Actions artifact-storage
-  quota is exhausted ("Failed to CreateArtifact: Artifact storage quota has been hit").
-  Objects are namespaced per workflow run so jobs in the same run share them.
+  Upload/download/cleanup a build artifact between jobs in a run. Prefers the CI S3 (MinIO)
+  bucket, reusing the ambient sccache credentials when a runner provides them; otherwise falls
+  back to actions/upload-artifact + actions/download-artifact. The S3 path exists because those
+  actions fail once the org GitHub Actions artifact-storage quota is exhausted ("Failed to
+  CreateArtifact: Artifact storage quota has been hit") — a private-repo constraint that does not
+  apply now the repo is public, which is what makes the fallback viable on public runners.
+  S3 objects are namespaced per workflow run so jobs in the same run share them; GitHub artifacts
+  are already run-scoped by construction.
 
 inputs:
   mode:
@@ -18,18 +21,43 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Detect artifact backend
+      id: backend
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -n "${SCCACHE_ENDPOINT:-}" ] && [ -n "${SCCACHE_BUCKET:-}" ] \
+           && [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+          echo "kind=s3" >> "$GITHUB_OUTPUT"
+        else
+          echo "kind=gha" >> "$GITHUB_OUTPUT"
+        fi
+
+    # GitHub-artifact fallback. `cleanup` is intentionally unimplemented here: run-scoped
+    # artifacts expire on their own retention schedule, so there is nothing to reclaim.
+    - name: Upload (GitHub artifact)
+      if: steps.backend.outputs.kind == 'gha' && inputs.mode == 'upload'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.name }}
+        if-no-files-found: error
+        retention-days: 1
+
+    - name: Download (GitHub artifact)
+      if: steps.backend.outputs.kind == 'gha' && inputs.mode == 'download'
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: ${{ inputs.name }}
+
     - name: Transfer via mc
+      if: steps.backend.outputs.kind == 's3'
       shell: bash
       env:
         MODE: ${{ inputs.mode }}
         NAME: ${{ inputs.name }}
       run: |
         set -euo pipefail
-
-        : "${SCCACHE_ENDPOINT:?SCCACHE_ENDPOINT is not set on the runner}"
-        : "${SCCACHE_BUCKET:?SCCACHE_BUCKET is not set on the runner}"
-        : "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID is not set on the runner}"
-        : "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is not set on the runner}"
 
         # mc may already be on PATH (rust-setup installs it); otherwise fetch it.
         if ! command -v mc >/dev/null 2>&1; then

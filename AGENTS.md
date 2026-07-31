@@ -236,8 +236,15 @@ Primary local stack is in `compose.yaml`:
 
 Tables (see `migrations/`):
 
-- `accounts`: includes `billing_identity` (unique).
-- `projects` (belongs to `accounts`)
+- `accounts`: **`id` is the caller's JWT `sub`** — one account is one person (ADR-0006). Carries
+  `default_quota` (the governance tier for work in the account's own default project).
+- `projects` (belongs to `accounts`): includes `billing_identity` (unique — "who is paying" moved
+  here from `accounts`, so one person can bill projects to different parties), `project_quota` (the
+  pooled ceiling), and `is_default` (the auto-provisioned, roster-less project; server-computed by a
+  `BEFORE INSERT` trigger, undeletable).
+- `project_members` (`{project_id, account_id, role: lead|member, quota_tier}`): the project roster.
+  Default projects have none by construction. Replaces `account_memberships`, which was dropped
+  entirely — there is no account-level membership of any kind.
 - `api_keys` (belongs to `projects`): includes `allowed_models`.
 
 API keys are stored as:
@@ -288,7 +295,9 @@ These are implemented in `crates/lightbridge-authz-rest/src/handlers/authorino.r
 
 Backs the `lightbridge-keycloak-spi` IdP adapter, which seals `account_id`/`project_id` into JWTs at token-exchange time. The adapter reads the authenticated `subject` and a `project_id` form param on the exchange, resolves the context, and a dumb protocol mapper copies it into claims. Stateless — no store.
 
-- Resolve — `POST /idp/v1/resolve-context` on the OPA/validation server, **Basic-auth protected** (the adapter presents the OPA credentials; the endpoint returns tenant context so it must not be publicly reachable). Body `{subject, project_id}` → `{account_id, project_id}`. Authorized by the `account_memberships` CTE (a `SELECT … JOIN account_memberships WHERE projects.id = $1 AND subject = $2`); a non-member or unknown project is a uniform `404`. Handler: `crates/lightbridge-authz-rest/src/handlers/idp.rs`; repo method `resolve_context` in `crates/lightbridge-authz-api-key/src/repo.rs`.
+- Resolve — `POST /idp/v1/resolve-context` on the OPA/validation server, **Basic-auth protected** (the adapter presents the OPA credentials; the endpoint returns tenant context so it must not be publicly reachable). Body `{subject, project_id}` → `{account_id, project_id}`. Since ADR-0006 a project resolves when the subject owns its account (`projects.account_id = $2`, the account id being the subject itself) **or** holds a `project_members` row for it; a non-member or unknown project is a uniform `404` — deliberately indistinguishable, so the endpoint never leaks which projects exist. Handler: `crates/lightbridge-authz-rest/src/handlers/idp.rs`; repo method `resolve_context` in `crates/lightbridge-authz-api-key/src/repo.rs`.
+
+This exchange is also where project context is **sealed into the JWT** for the human plane (`role`, `quota_tier`, `project_quota` alongside `account_id`/`project_id`), which is what lets Authorino read them as claims instead of calling back per request. The consequence is that switching project means requesting a new token, not sending a different header.
 
 ## Rust Workspace and Crates
 

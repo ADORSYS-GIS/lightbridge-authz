@@ -1,0 +1,21 @@
+-- ADR-0006, decision 2 (2026-07-26): the default-*account* feature (landed upstream in
+-- #148/#152/#156 as `accounts.is_default`, the `setDefaultAccount` procedure, its repo method,
+-- its RBAC entry, and its tests) is removed outright. It only ever made sense under the
+-- pre-pivot model where one subject could hold several accounts and needed a way to say which
+-- one was "the" default; decision 1 of this same ADR
+-- (20260727000004_accounts_id_becomes_subject.sql) collapses that down to exactly one account
+-- per person, at which point "default account" is meaningless -- there is nothing left to
+-- default AWAY FROM.
+--
+-- `projects.is_default` is a completely separate feature (the default-*project* concept, kept
+-- per decision 2) and is untouched here: its column, `set_project_is_default` trigger, and the
+-- `projects_account_id_default_uidx` partial unique index (all from
+-- 20260725000001_default_account_project.sql) continue to work exactly as before. Only the
+-- account-level flag goes away.
+--
+-- This supersedes the account-level backfills in 20260725000001_default_account_project.sql
+-- (`UPDATE accounts SET is_default = true;`) and 20260726000001_fix_multi_default_account_backfill.sql
+-- (the per-subject correction of that backfill) -- both migrations stay in place unedited
+-- (migrations are never edited after landing upstream), their account-level work is simply moot
+-- once the column they wrote to no longer exists.
+ALTER TABLE accounts DROP COLUMN is_default;

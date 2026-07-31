@@ -1,5 +1,5 @@
 name: Workspace Tests
-description: Start a Postgres backend (rootless podman) and run the workspace test suite.
+description: Start a Postgres backend (docker) and run the workspace test suite.
 inputs:
   database-url:
     description: Postgres connection string
@@ -9,40 +9,45 @@ runs:
   steps:
     - uses: ./.github/actions/rust-setup
 
-    - name: Start PostgreSQL (rootless podman)
+    - name: Start PostgreSQL (docker)
       shell: bash
       run: |
         set -euo pipefail
-        # The self-hosted runner is rootless (podman/buildah, no Docker daemon),
-        # so GitHub `services:` containers are unavailable; run Postgres directly.
-        podman run -d --name lightbridge-pg \
+        # Run Postgres directly rather than via a job-level `services:` block, so this composite
+        # stays self-contained and callable from any job. The public runner has a Docker daemon;
+        # the self-hosted one was rootless podman with no daemon, which is why this used to shell
+        # out to podman.
+        docker run -d --name lightbridge-pg \
           -e POSTGRES_PASSWORD=postgres \
           -e POSTGRES_DB=lightbridge_authz \
           -p 5432:5432 \
           docker.io/library/postgres:17
         echo "Waiting for Postgres to accept connections..."
         for i in $(seq 1 60); do
-          if podman exec lightbridge-pg pg_isready -U postgres -d lightbridge_authz >/dev/null 2>&1; then
+          if docker exec lightbridge-pg pg_isready -U postgres -d lightbridge_authz >/dev/null 2>&1; then
             echo "Postgres is ready."
             exit 0
           fi
           sleep 2
         done
         echo "Postgres did not become ready in time; recent logs:"
-        podman logs --tail 50 lightbridge-pg || true
+        docker logs --tail 50 lightbridge-pg || true
         exit 1
 
-    # Same memory guard as code-checks: `cargo test --workspace` links the same 24 test binaries,
-    # so it hits the identical wall at cargo's default job count.
+    # Same memory guard as code-checks, for both reasons: this links the 24 test binaries AND it
+    # compiles `lightbridge-authz-api`, the ~8 GB single-rustc `include_server_schema!` expansion
+    # that reach ~6 GB each; jobs=2 keeps two of them from landing alongside each other.
+    - uses: ./.github/actions/heavy-build-guard
+
     - name: Run tests
       shell: bash
       run: cargo test --workspace
       env:
         DATABASE_URL: ${{ inputs.database-url }}
-        CARGO_BUILD_JOBS: "4"
+        CARGO_BUILD_JOBS: "2"
         CARGO_INCREMENTAL: "0"
 
     - name: Stop PostgreSQL
       if: always()
       shell: bash
-      run: podman rm -f lightbridge-pg || true
+      run: docker rm -f lightbridge-pg || true

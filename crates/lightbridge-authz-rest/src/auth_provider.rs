@@ -73,7 +73,7 @@ impl AuthProvider for CratestackAuthProvider {
         let op_id = op_id_from_path(request.path).to_owned();
         async move {
             // Unmapped op-id → 403 unconditionally, mirroring `rpc_authorize`'s fail-closed set
-            // (unknown ops, `model.AccountMembership.*`, `model.ApiKey.create`, ...).
+            // (unknown ops, `model.ProjectMember.*`, `model.ApiKey.create`, ...).
             let Some(required) = required_permission(&op_id) else {
                 return Err(CoolError::Forbidden("operation not permitted".to_owned()));
             };

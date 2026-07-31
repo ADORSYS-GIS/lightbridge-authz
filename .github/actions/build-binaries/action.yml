@@ -23,13 +23,18 @@ runs:
     # would try to run up to 12 concurrent link steps in a pod that can't back that. Without an
     # explicit cap this step had NO guard at all (unlike code-checks/tests), making it the least
     # safe of the cargo invocations on this runner.
+    # Lowered to 2 alongside code-checks/tests: this compiles `lightbridge-authz-api` too, the
+    # ~6 GB compilation units; jobs=2 keeps two from landing alongside each other
+    # This action is reached on PRs via `integration-test`, not only on main.
+    - uses: ./.github/actions/heavy-build-guard
+
     - name: Build release binaries
       shell: bash
       env:
         TARGET: ${{ inputs.target }}
         CC_x86_64_unknown_linux_musl: musl-gcc
         CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        CARGO_BUILD_JOBS: "4"
+        CARGO_BUILD_JOBS: "2"
         CARGO_INCREMENTAL: "0"
       run: |
         set -euo pipefail

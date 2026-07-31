@@ -18,7 +18,11 @@ use lightbridge_authz_rest::codec::LenientCborCodec;
 fn frontend_frame_with_undefined_allowed_models() -> Vec<u8> {
     let mut out = Vec::new();
     let mut e = minicbor::Encoder::new(&mut out);
-    e.map(6).unwrap();
+    // Seven fields, not six: ADR-0006 moved `billingIdentity` from `Account` onto `Project` and it
+    // is non-optional there, so the real frontend now sends it on every create (added in
+    // `buildCreateProjectInput` alongside the optional `projectQuota`, which stays omitted here —
+    // it is nullable, so its absence is not what this regression is about).
+    e.map(7).unwrap();
     e.str("id").unwrap();
     e.str("abc123def456").unwrap();
     e.str("accountId").unwrap();
@@ -33,6 +37,8 @@ fn frontend_frame_with_undefined_allowed_models() -> Vec<u8> {
     e.map(0).unwrap();
     e.str("billingPlan").unwrap();
     e.str("free").unwrap();
+    e.str("billingIdentity").unwrap();
+    e.str("acme-corp").unwrap();
     out
 }
 
