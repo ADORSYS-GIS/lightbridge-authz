@@ -556,6 +556,9 @@ In Compose, `authz-migrate` runs before API/OPA start.
 - Authorino endpoint usage + integration test: `docs/authorino-usage.md`
 - Usage ingest/query API: `docs/usage-api.md`
 - RBAC (JWT claim → permission mapping): `docs/rbac.md`
+- Governance data model + how quotas/allowlists are actually enforced at the gateway (accounts,
+  projects, roster, keys; introspection, Authorino claim extraction, BackendTrafficPolicy rule
+  families; worked scenarios and the gaps that remain): `docs/governance-model-and-enforcement.md`
 - CRUD API migration to cratestack (routing/policy generation, Swagger UI removal, CBOR-in-prod): `docs/adr/0003-cratestack-crud-migration.md`
 
 ## Helm / deployment notes
