@@ -183,7 +183,10 @@ mod db {
     use super::*;
     use chrono::{Duration, Utc};
     use lightbridge_authz_api_key::repo::StoreRepo;
-    use lightbridge_authz_core::config::Oauth2;
+    // `Billing`/`BillingPlan` are imported HERE, not at file scope: they are used only by this
+    // `it-tests`-gated module, so a file-level import reads as unused on a build without the
+    // feature (which is what `cargo fix` acted on) while being required with it.
+    use lightbridge_authz_core::config::{Billing, BillingPlan, Oauth2};
     use lightbridge_authz_core::cuid::cuid2;
     use lightbridge_authz_core::{CreateAccount, CreateApiKey, CreateProject};
     use lightbridge_authz_rest::handlers::AuthzStoreImpl;
