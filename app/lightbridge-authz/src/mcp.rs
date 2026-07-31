@@ -1800,6 +1800,11 @@ mod tests {
                 key_hash: self.api_key.key_hash.clone(),
                 project_id: self.project.id.clone(),
                 account_id: self.account.id.clone(),
+                // Owner-owned key: the project's owning account holds no `project_members` row, so
+                // role/tier are legitimately absent and no per-member ceiling applies.
+                owner_account_id: self.account.id.clone(),
+                owner_role: None,
+                owner_quota_tier: None,
                 api_key_status: self.api_key.status.to_string(),
                 project_status: self.project.status.to_string(),
                 account_status: self.account.status.to_string(),

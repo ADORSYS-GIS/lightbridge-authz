@@ -15,6 +15,15 @@ pub struct ValidatedApiKeyContext {
     pub api_key: lightbridge_authz_core::ApiKey,
     pub project: lightbridge_authz_core::Project,
     pub account_id: String,
+    /// The key OWNER's roster standing (ADR-0006 follow-up). Distinct from `account_id`, which is
+    /// the project's owning account: a lead who is not the owner may mint keys, and it is their
+    /// per-member ceiling that bounds the key. Both are `None` when the owner holds no
+    /// `project_members` row, which is the normal case for the project's owning account.
+    ///
+    /// Costs no extra round trip — the `api_key_validation` view resolves them via a LEFT JOIN
+    /// alongside the status cascade it already computes.
+    pub owner_role: Option<String>,
+    pub owner_quota_tier: Option<String>,
 }
 
 /// Validates an API key and returns its context (project, account id).
@@ -84,5 +93,7 @@ pub async fn validate_api_key_context(
         api_key,
         project,
         account_id,
+        owner_role: validation.owner_role.clone(),
+        owner_quota_tier: validation.owner_quota_tier.clone(),
     }))
 }

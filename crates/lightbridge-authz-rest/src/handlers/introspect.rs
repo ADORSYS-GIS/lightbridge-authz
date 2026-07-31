@@ -61,6 +61,8 @@ pub async fn introspect_api_key(
         billing_plan_limits: plan.and_then(|p| p.limits.clone()),
         allowed_models: validated.project.allowed_models.clone(),
         project_quota: validated.project.project_quota.clone(),
+        role: validated.owner_role.clone(),
+        quota_tier: validated.owner_quota_tier.clone(),
         exp: validated.api_key.expires_at.map(|value| value.timestamp()),
     };
 
