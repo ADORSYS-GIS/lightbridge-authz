@@ -1975,6 +1975,9 @@ mod tests {
 
     fn lazy_pool() -> Arc<dyn DbPoolTrait> {
         let pool = PgPoolOptions::new()
+            // Bounded so a deliberately-dead pool fails fast: sqlx's default
+            // `acquire_timeout` is 30s, and every test that touches one paid it in full.
+            .acquire_timeout(std::time::Duration::from_millis(250))
             .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
             .expect("lazy pool should be constructible");
         Arc::new(lightbridge_authz_core::db::DbPool::from_pool(pool))
@@ -1989,6 +1992,9 @@ mod tests {
     /// coverage for the CRUD surface lives in the RPC integration tests, not here.
     fn lazy_cratestack_db() -> schema::Cratestack {
         let pool = cratestack::sqlx::postgres::PgPoolOptions::new()
+            // Bounded so a deliberately-dead pool fails fast: sqlx's default
+            // `acquire_timeout` is 30s, and every test that touches one paid it in full.
+            .acquire_timeout(std::time::Duration::from_millis(250))
             .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
             .expect("lazy cratestack pool should be constructible");
         schema::Cratestack::builder(pool).build()

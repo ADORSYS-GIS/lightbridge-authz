@@ -44,6 +44,9 @@ const DEAD_REDIS: &str = "redis://127.0.0.1:6379";
 
 fn lazy_core_pool() -> Arc<dyn DbPoolTrait> {
     let pool = PgPoolOptions::new()
+        // Bounded so a deliberately-dead pool fails fast: sqlx's default
+        // `acquire_timeout` is 30s, and every test that touches one paid it in full.
+        .acquire_timeout(std::time::Duration::from_millis(250))
         .connect_lazy(DEAD_PG)
         .expect("lazy core pool");
     Arc::new(DbPool::from_pool(pool))
@@ -55,6 +58,9 @@ fn lazy_store_repo() -> Arc<StoreRepo> {
 
 fn lazy_cratestack_db() -> schema::Cratestack {
     let pool = cratestack::sqlx::postgres::PgPoolOptions::new()
+        // Bounded so a deliberately-dead pool fails fast: sqlx's default
+        // `acquire_timeout` is 30s, and every test that touches one paid it in full.
+        .acquire_timeout(std::time::Duration::from_millis(250))
         .connect_lazy(DEAD_PG)
         .expect("lazy cratestack pool");
     schema::Cratestack::builder(pool).build()
@@ -62,6 +68,9 @@ fn lazy_cratestack_db() -> schema::Cratestack {
 
 fn lazy_idempotency() -> Arc<SqlxIdempotencyStore> {
     let pool = cratestack::sqlx::postgres::PgPoolOptions::new()
+        // Bounded so a deliberately-dead pool fails fast: sqlx's default
+        // `acquire_timeout` is 30s, and every test that touches one paid it in full.
+        .acquire_timeout(std::time::Duration::from_millis(250))
         .connect_lazy(DEAD_PG)
         .expect("lazy cratestack pool");
     Arc::new(SqlxIdempotencyStore::new(pool))

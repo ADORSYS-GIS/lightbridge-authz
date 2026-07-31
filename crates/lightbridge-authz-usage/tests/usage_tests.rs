@@ -63,6 +63,9 @@ fn base_request() -> UsageQueryRequest {
 
 fn lazy_pool() -> Arc<dyn DbPoolTrait> {
     let pool = PgPoolOptions::new()
+        // Bounded so a deliberately-dead pool fails fast: sqlx's default
+        // `acquire_timeout` is 30s, and every test that touches one paid it in full.
+        .acquire_timeout(std::time::Duration::from_millis(250))
         .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz_usage")
         .expect("lazy pool should be constructible");
     Arc::new(DbPool::from_pool(pool))
