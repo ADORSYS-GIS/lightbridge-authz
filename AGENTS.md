@@ -255,6 +255,12 @@ API keys are stored as:
 - `expires_at`: optional expiration.
 - `allowed_models`: list of permitted models. `NULL` or `[]` (empty list) are interpreted as "all models allowed".
 - usage telemetry: `last_used_at`, `last_ip`.
+- `owner_account_id`: the member the key belongs to, set from the acting subject on create/rotate.
+  Distinct from the project's owning account -- a lead who is not the owner may mint keys. This is
+  what lets introspection resolve the owner's `project_members.quota_tier`, which Authorino stamps
+  as `x-quota-tier` and ai-helm's per-member rate-limit rules match on. A key owned by the project's
+  account normally has no roster row, so its tier is `NULL` -- meaning no per-member ceiling, only
+  the pooled `projects.project_quota`.
 
 ### Service Responsibilities
 

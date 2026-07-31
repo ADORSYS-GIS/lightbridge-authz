@@ -10,6 +10,15 @@ pub struct ApiKeyValidationRow {
     pub key_hash: String,
     pub project_id: String,
     pub account_id: String,
+    /// The member this key belongs to (ADR-0006 follow-up). Distinct from `account_id`, which is
+    /// the project's OWNING account: a lead who is not the owner may create keys, and their
+    /// per-member ceiling is the one that applies.
+    pub owner_account_id: String,
+    /// The owner's roster role/tier on this project, `None` when they hold no `project_members`
+    /// row -- which is the normal case for the project's owning account, since ownership and
+    /// roster membership are separate standings.
+    pub owner_role: Option<String>,
+    pub owner_quota_tier: Option<String>,
     pub api_key_status: String,
     pub project_status: String,
     pub account_status: String,

@@ -990,9 +990,9 @@ impl StoreRepo {
             r#"
             INSERT INTO api_keys (
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, revoked_at, billing_plan
+              last_used_at, last_ip, revoked_at, billing_plan, owner_account_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             RETURNING
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
               last_used_at, last_ip, revoked_at, billing_plan, updated_at
@@ -1010,6 +1010,9 @@ impl StoreRepo {
         .bind(input.last_ip)
         .bind(input.revoked_at)
         .bind(input.billing_plan)
+        // The acting subject, not the project's owning account: a lead who is not the owner may
+        // mint keys, and it is THEIR per-member ceiling that should bound the key.
+        .bind(subject)
         .fetch_one(self.pool())
         .await?;
         Ok(Self::to_api_key(row))
@@ -1301,6 +1304,9 @@ impl StoreRepo {
               key_hash,
               project_id,
               account_id,
+              owner_account_id,
+              owner_role,
+              owner_quota_tier,
               api_key_status,
               project_status,
               account_status,
@@ -1318,6 +1324,9 @@ impl StoreRepo {
             key_hash: row.key_hash,
             project_id: row.project_id,
             account_id: row.account_id,
+            owner_account_id: row.owner_account_id,
+            owner_role: row.owner_role,
+            owner_quota_tier: row.owner_quota_tier,
             api_key_status: row.api_key_status,
             project_status: row.project_status,
             account_status: row.account_status,
@@ -1430,9 +1439,12 @@ impl StoreRepo {
             )
             INSERT INTO api_keys (
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
-              last_used_at, last_ip, revoked_at, billing_plan
+              last_used_at, last_ip, revoked_at, billing_plan, owner_account_id
             )
-            SELECT $3, project_auth.project_id, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+            -- `$2` is the rotating subject, reused as the new key's owner: rotation re-mints for
+            -- whoever performs it, so the per-member ceiling follows the rotator rather than being
+            -- inherited from the key being replaced.
+            SELECT $3, project_auth.project_id, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $2
             FROM project_auth
             RETURNING
               api_keys.id, api_keys.project_id, api_keys.name, api_keys.key_prefix, api_keys.key_hash, api_keys.created_at, api_keys.expires_at, api_keys.status,

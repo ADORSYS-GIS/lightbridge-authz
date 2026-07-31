@@ -71,6 +71,12 @@ impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
                 .as_ref()
                 .map(|a| a.id.clone())
                 .unwrap_or_default(),
+            // A key owned by a roster member rather than the project's owning account, so the
+            // per-member tier is populated and reaches `IntrospectResponse.quota_tier`. The
+            // owner-owned case (both `None`) is the other half, covered by the mcp fixture.
+            owner_account_id: "member-subject".to_string(),
+            owner_role: Some("member".to_string()),
+            owner_quota_tier: Some("t-s".to_string()),
             api_key_status: api_key.status.to_string(),
             project_status: self
                 .project
@@ -231,6 +237,13 @@ async fn introspect_returns_active_with_context_and_records_usage() {
         serde_json::json!(["gpt-4.1-mini"])
     );
     assert_eq!(payload["exp"], expires_at.timestamp());
+
+    // The per-member governance tier, resolved from the key OWNER's `project_members` row. This is
+    // the field Authorino stamps as `x-quota-tier`, which ai-helm's ADR-0094 rate-limit rules match
+    // with an `Exact` selector — if it stops being returned those rules silently never fire, and
+    // per-member ceilings go unenforced with nothing failing. Hence asserted here explicitly.
+    assert_eq!(payload["quota_tier"], "t-s");
+    assert_eq!(payload["role"], "member");
 
     let calls = usage_calls.lock().expect("lock should work").clone();
     assert_eq!(calls.len(), 1);

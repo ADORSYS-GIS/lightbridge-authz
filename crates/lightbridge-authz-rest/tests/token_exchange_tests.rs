@@ -66,6 +66,9 @@ impl BearerTokenServiceTrait for ErrBearer {
 
 fn lazy_repo() -> Arc<StoreRepo> {
     let pool = sqlx::postgres::PgPoolOptions::new()
+        // Bounded so a deliberately-dead pool fails fast: sqlx's default
+        // `acquire_timeout` is 30s, and every test that touches one paid it in full.
+        .acquire_timeout(std::time::Duration::from_millis(250))
         .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
         .expect("lazy pool should be constructible");
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));

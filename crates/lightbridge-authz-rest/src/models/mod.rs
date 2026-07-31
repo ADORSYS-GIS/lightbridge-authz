@@ -52,6 +52,18 @@ pub struct IntrospectResponse {
     /// a claim frozen at mint time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_quota: Option<String>,
+    /// The key owner's roster role on the project (`lead`/`member`), absent when they hold no
+    /// `project_members` row — normal for the project's owning account, since ownership and roster
+    /// membership are separate standings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// The key owner's per-member ceiling from the governance tier catalogue. Absent means no
+    /// per-member ceiling applies and the caller is bounded by `project_quota` alone.
+    ///
+    /// This is what lets Authorino stamp a non-empty `x-quota-tier`, which ai-helm's ADR-0094
+    /// rate-limit rules match with an `Exact` selector — without it those rules can never fire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_tier: Option<String>,
     /// Expiry as a Unix timestamp, when the key has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exp: Option<i64>,
@@ -72,6 +84,8 @@ impl IntrospectResponse {
             billing_plan_limits: None,
             allowed_models: None,
             project_quota: None,
+            role: None,
+            quota_tier: None,
             exp: None,
         }
     }
