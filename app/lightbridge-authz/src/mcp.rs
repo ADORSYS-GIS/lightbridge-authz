@@ -2537,7 +2537,9 @@ mod tests {
 
         let output = result.0.result;
 
-        assert_eq!(output["account"]["id"], "acct_1");
+        // `account_id`, not a nested `account` object: Phase E (ADR-0006) dropped the redundant
+        // account fetch from introspection, so `ValidatedApiKeyContext` carries only the id.
+        assert_eq!(output["account_id"], "acct_1");
         assert_eq!(output["project"]["id"], "proj_1");
         assert_eq!(output["api_key"]["id"], "key_1");
         assert_eq!(output["dynamic_metadata"]["account_id"], "acct_1");
