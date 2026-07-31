@@ -16,6 +16,48 @@ way). This document is about the **data plane**: what happens to an inference re
 
 ## 1. The entities
 
+```mermaid
+erDiagram
+    ACCOUNT ||--o{ PROJECT : "owns (account_id)"
+    ACCOUNT ||--o{ PROJECT_MEMBER : "holds a seat"
+    ACCOUNT ||--o{ API_KEY : "owns (owner_account_id)"
+    PROJECT ||--o{ PROJECT_MEMBER : "roster"
+    PROJECT ||--o{ API_KEY : "scopes"
+
+    ACCOUNT {
+        text id PK "IS the person's JWT sub"
+        text default_quota "tier catalogue; not yet stamped"
+        text status "active | suspended"
+    }
+    PROJECT {
+        text id PK
+        text account_id FK "the OWNING account"
+        text billing_identity UK "who is paying"
+        json allowed_models "NULL or [] means ALL"
+        text project_quota "pooled ceiling"
+        text billing_plan
+        bool is_default "trigger-set; undeletable"
+        text status
+    }
+    PROJECT_MEMBER {
+        text project_id PK "composite PK with account_id -- no id column"
+        text account_id PK
+        text role "lead | member"
+        text quota_tier "THIS person on THIS project"
+    }
+    API_KEY {
+        text id PK
+        text project_id FK
+        text owner_account_id FK "the minter, not the project owner"
+        text key_hash UK "SHA-256; plaintext never stored"
+        text billing_plan
+        text status "+ expires_at, revoked_at, deleted_at"
+    }
+```
+
+> The owning account of a project normally holds **no** `PROJECT_MEMBER` row. Ownership and roster
+> membership are separate standings, which is why an owner's `quota_tier` is legitimately `NULL`.
+
 ### Account — a person
 
 | Column | Notes |
@@ -92,11 +134,25 @@ per-member ceiling. It is `NOT NULL` deliberately: an unattributable key is prec
 
 Introspection reads one indexed view rather than assembling the picture with joins per request:
 
+```sql
+SELECT api_key_id, key_hash, project_id, account_id,
+       api_key_status, project_status, account_status, expires_at,
+       effective_status,                              -- the cascade, resolved by the DB
+       owner_account_id, owner_role, owner_quota_tier -- LEFT JOIN project_members
+FROM   api_key_validation WHERE key_hash = $1
 ```
-api_key_id, key_hash, project_id, account_id,
-api_key_status, project_status, account_status, expires_at,
-effective_status,                       -- the cascade, resolved by the DB
-owner_account_id, owner_role, owner_quota_tier   -- LEFT JOIN project_members
+
+```mermaid
+flowchart LR
+    K["api_keys<br/>status, expires_at"] --> E{{"effective_status"}}
+    P["projects<br/>status"] --> E
+    A["accounts<br/>status"] --> E
+    PM["project_members<br/>role, quota_tier<br/><i>LEFT JOIN</i>"] -.->|"NULL for an owner-minted key"| E
+    E --> R1["key_revoked"]
+    E --> R2["key_expired"]
+    E --> R3["project_suspended"]
+    E --> R4["account_suspended"]
+    E --> R5["active"]
 ```
 
 `effective_status` collapses the whole chain — `key_revoked` → `key_expired` → `project_suspended` →
@@ -128,36 +184,56 @@ sending a different header.**
 
 ## 3. How a request gets governed
 
+```mermaid
+flowchart TD
+    C(["client<br/><code>Authorization: Bearer &lt;api-key JWT | keycloak token&gt;</code>"])
+
+    subgraph ENVOY["Envoy — HTTP filter chain (order verified from a live config_dump)"]
+        direction TB
+        F1["<b>filter #1</b> — ext_proc / AI Gateway<br/>parses the body, sets <code>x-ai-eg-model</code>"]
+        F7["<b>filter #7</b> — ext_authz / Authorino"]
+        F1 --> F7
+    end
+
+    C --> F1
+
+    F7 -->|"has api_key_id?"| PLANE{identity plane}
+    PLANE -->|"API key"| INTRO["POST /v1/authorino/validate/introspect<br/>Basic auth · <b>cached 30s per jti</b>"]
+    PLANE -->|"Keycloak"| CLAIMS["read auth.identity.*<br/>sealed at token-exchange time"]
+
+    INTRO --> RESP["active, account_id, project_id, api_key_status,<br/>billing_plan (+name, +limits), allowed_models,<br/>project_quota, role, quota_tier, exp"]
+
+    RESP --> ALLOW{"model allowlist<br/>CEL predicate"}
+    CLAIMS --> HDR
+    ALLOW -->|"model not in list"| DENY(["403 denied"])
+    ALLOW -->|"allowed, or any<br/>fail-open escape hatch"| HDR
+
+    HDR["response headers stamped:<br/><code>x-account-id</code> · <code>x-project-id</code> · <code>x-project-role</code><br/><code>x-quota-tier</code> · <code>x-project-quota</code> · <code>x-billing-plan</code>"]
+
+    HDR --> BTP
+
+    subgraph BTP["BackendTrafficPolicy (per model) — Envoy denies if ANY matched bucket is exhausted"]
+        direction TB
+        R1["<b>1.</b> burst requests/min<br/>x-account-id + x-billing-plan"]
+        R2["<b>2.</b> burst tokens/min<br/>same key · cost = llm_total_token · skipped for image models"]
+        R3["<b>3.</b> monthly budget<br/>micro-USD · cost = llm_custom_total_cost"]
+        R4["<b>4.</b> quota tiers<br/>x-project-id + x-account-id (Distinct) + x-quota-tier (Exact)"]
+        R5["<b>5.</b> project envelope<br/>x-project-id (Distinct) + x-project-quota (Exact)"]
+    end
+
+    BTP -->|"any bucket exhausted"| R429(["429 rate limited"])
+    BTP -->|"all within budget"| BACKEND(["model backend"])
+
+    style DENY fill:#7f1d1d,color:#fff
+    style R429 fill:#7f1d1d,color:#fff
+    style BACKEND fill:#14532d,color:#fff
+    style R4 stroke-dasharray: 5 5
+    style R5 stroke-dasharray: 5 5
 ```
-client
-  │  Authorization: Bearer <api key JWT | keycloak token>
-  ▼
-Envoy — HTTP filter chain (order verified from a live config_dump)
-  │
-  ├─ 1. ext_proc / AI Gateway  ── parses the body, sets x-ai-eg-model
-  │                               (this is WHY the allowlist check is possible at all:
-  │                                the model name exists six filters before Authorino)
-  │
-  ├─ 7. ext_authz / Authorino
-  │      ├─ identify the plane
-  │      ├─ API key?  → POST /v1/authorino/validate/introspect   (Basic auth)
-  │      │              cached 30s per `jti`
-  │      │              ← active, account_id, project_id, api_key_status,
-  │      │                billing_plan(+name,+limits), allowed_models,
-  │      │                project_quota, role, quota_tier, exp
-  │      ├─ authorization: model allowlist predicate (CEL)
-  │      └─ response headers: x-account-id, x-project-id, x-project-role,
-  │                           x-quota-tier, x-project-quota, x-billing-plan
-  ▼
-BackendTrafficPolicy (per model) — Envoy denies if ANY matched bucket is exhausted
-  1. burst requests/min   x-account-id + x-billing-plan
-  2. burst tokens/min     same key, cost = llm_total_token   (skipped for image models)
-  3. monthly budget       micro-USD, cost = llm_custom_total_cost
-  4. quota tiers          x-project-id + x-account-id (Distinct) + x-quota-tier (Exact)
-  5. project envelope     x-project-id (Distinct) + x-project-quota (Exact)
-  ▼
-model backend
-```
+
+> Rule families **4** and **5** are drawn dashed: the header pipeline feeding them is live, but
+> `tiers: []` / `projectEnvelope: {}` mean they do not currently render. See §5.
+
 
 ### Why introspection and not claims
 
