@@ -32,7 +32,8 @@ base64 = "0.23"
 # Bumping this alone to 11.0 (#159, #166, #170) put BOTH majors in the lockfile and broke `main`
 # with `error[E0308]: mismatched types` — the types are nominally identical but come from
 # different crate versions. This can only move when authkestra-resource supports 11, or when the
-# bearer crate stops sharing jsonwebtoken types across that boundary.
+# bearer crate stops sharing jsonwebtoken types across that boundary. Tracked upstream:
+# marcjazz/authkestra#175.
 jsonwebtoken = { version = "10.4" }
 # Resource-server JWT/JWKS validation (see crates/lightbridge-authz-bearer). `authkestra-resource`
 # (crate `authkestra_resource`, module `jwt`) is the published crate ADR-0004 originally referred
