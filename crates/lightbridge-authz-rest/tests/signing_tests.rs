@@ -1,3 +1,9 @@
+// Integration tests are their own crates, so clippy's `allow-unwrap-in-tests`
+// (clippy.toml) does not reach their free helper functions. Unwrapping in a test
+// is a deliberate assertion that the setup held; the workspace gate stays `deny`
+// for shipping code.
+#![allow(clippy::unwrap_used)]
+
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use lightbridge_authz_core::config::JwtSigning;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};

@@ -1,3 +1,9 @@
+// Integration tests are their own crates, so clippy's `allow-unwrap-in-tests`
+// (clippy.toml) does not reach their free helper functions. Unwrapping in a test
+// is a deliberate assertion that the setup held; the workspace gate stays `deny`
+// for shipping code.
+#![allow(clippy::unwrap_used)]
+
 //! Hermetic tests for the assembled authz-api RPC router (`build_api_router`), re-porting the
 //! route-shape coverage the deleted `router_tests.rs`/`controllers_tests.rs` had (health probes,
 //! dev-CORS, the well-known / token-exchange merges) onto the cratestack RPC surface, plus the

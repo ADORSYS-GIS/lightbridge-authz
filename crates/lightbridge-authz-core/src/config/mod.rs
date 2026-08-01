@@ -10,7 +10,7 @@ use utoipa::ToSchema;
 
 static RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)|\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?:(:-|-)([^}]*))?\}")
-        .unwrap()
+        .expect("env-interpolation regex is a compile-time constant and always parses")
 });
 
 #[derive(Debug, Clone, Deserialize)]
@@ -556,10 +556,17 @@ fn interpolate_env_vars(content: &str) -> String {
                     Ok(value) if !value.is_empty() => value,
                     _ => default_value.to_string(),
                 },
-                Some(_) => caps.get(0).unwrap().as_str().to_string(),
+                Some(_) => caps
+                    .get(0)
+                    .expect("capture group 0 always exists on a match")
+                    .as_str()
+                    .to_string(),
             }
         } else {
-            caps.get(0).unwrap().as_str().to_string()
+            caps.get(0)
+                .expect("capture group 0 always exists on a match")
+                .as_str()
+                .to_string()
         }
     })
     .to_string()
