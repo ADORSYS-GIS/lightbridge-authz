@@ -130,6 +130,69 @@ redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
 # `line-tables-only` keeps what debugging actually needs day to day — panic backtraces with file
 # and line numbers — and drops variable/type DWARF. Set `debug = true` locally when stepping
 # through a debugger.
+# ─────────────────────────────────────────────────────────────────────────────
+# Lints. Levels live here; the knobs individual lints read live in clippy.toml.
+#
+# ⚠️ CI runs `cargo clippy --all-targets --all-features -- -D warnings`, so
+# there is NO advisory tier in this repo: `warn` and `deny` both fail the build.
+# Every level below was MEASURED at zero on this workspace before being set.
+#
+# Measure before you add one, and `cargo clean -p <crate>` before believing the
+# number: a cached clippy run reports clean without having looked. Verified
+# here — a warm run reported 0 `unwrap_used` against a tree that has 55 of them.
+#
+# DELIBERATELY NOT ENABLED, with the measured reason:
+#   clippy::pedantic  — 178 hits (doc_markdown 8, default_trait_access 7,
+#                       too_many_lines 6, match_same_arms 6, cast_* 6, …).
+#                       Under -D warnings this would break the build, not advise.
+#   unwrap_used       — 3 hits, all in crates/lightbridge-authz-core/src/config/mod.rs
+#                       (a LazyLock-wrapped compile-constant `Regex::new`, and two
+#                       `caps.get(0)` on an already-matched capture). All three are
+#                       genuine impossibility proofs and want `.expect("<invariant>")`
+#                       rather than deletion — a small follow-up, not a bug.
+#   panic             — 3 hits outside this crate, same treatment pending.
+#   map_unwrap_or     — 4 hits.
+#   unnecessary_wraps — 2 hits.
+# ─────────────────────────────────────────────────────────────────────────────
+[workspace.lints.rust]
+future_incompatible = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+
+#   unsafe_code       — NOT enabled, and this one is worth wanting: this is the
+#                       authentication boundary for every protected service on the
+#                       platform. Measured 13+ `unsafe` blocks, ALL in test code and
+#                       all the same cause — `std::env::set_var`/`remove_var` became
+#                       unsafe in edition 2024 (not thread-safe). There is no
+#                       `allow-unsafe-in-tests` knob, so enabling it workspace-wide
+#                       needs `#[expect(unsafe_code, reason = ...)]` on every affected
+#                       test, or a test helper that centralises the env mutation.
+#                       Shipping code has ZERO unsafe — verify with:
+#                         grep -rn "unsafe {" crates/*/src app/*/src
+
+[workspace.lints.clippy]
+# correctness + suspicious + style + complexity + perf. Already at zero, since
+# CI has run `-D warnings` for a while — so this pins the status quo.
+all = { level = "deny", priority = -1 }
+
+# Apollo §2.3's table, each verified at zero on this workspace.
+#
+# NOTE `redundant_clone` is absent on purpose: it is a *nursery* lint (so it is
+# not covered by a `clippy::pedantic` measurement, which is how it was initially
+# mis-recorded as zero here) and it has 4 real hits in `app/lightbridge-authz`.
+# Nursery lints carry known false positives; fixing those four is a deliberate
+# perf change, not a gate to switch on blind.
+needless_borrow = "deny"
+manual_ok_or = "deny"
+large_enum_variant = "deny"
+clone_on_copy = "deny"
+needless_collect = "deny"
+
+# Hygiene, all at zero.
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+missing_safety_doc = "deny"
+
 [profile.dev]
 debug = "line-tables-only"
 
