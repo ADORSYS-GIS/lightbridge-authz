@@ -25,22 +25,27 @@ serde_json = "1.0"
 sha2 = "0.11"
 hex = "0.4"
 base64 = "0.23"
-# Held at 10.x on purpose: `authkestra-resource` 0.2.1 (below), via its `authkestra-engine`
-# dependency, requires `jsonwebtoken ^10.3.0` (ground-truthed from authkestra-engine's own
-# Cargo.toml — same constraint `authkestra-guard` 0.1.0 carried before this crate replaced it),
-# and `lightbridge-authz-bearer` passes `Validation`/`Algorithm` values straight into its API.
-# Bumping this alone to 11.0 (#159, #166, #170) put BOTH majors in the lockfile and broke `main`
-# with `error[E0308]: mismatched types` — the types are nominally identical but come from
-# different crate versions. This can only move when authkestra-resource supports 11, or when the
-# bearer crate stops sharing jsonwebtoken types across that boundary. Tracked upstream:
-# marcjazz/authkestra#175.
-jsonwebtoken = { version = "10.4" }
+# ⚠️ THIS VERSION IS COUPLED TO `authkestra-resource` BELOW. Bump them together or not at all.
+#
+# `lightbridge-authz-bearer` passes `Validation`/`Algorithm` values straight into authkestra's
+# API, so both crates must resolve to the SAME jsonwebtoken major. When they don't, the lockfile
+# carries both majors and the build fails with `error[E0308]: mismatched types` — the types are
+# nominally identical but come from different crate versions. That broke `main` three times
+# (#159, #166, #170) while authkestra-engine still required `^10.3.0`.
+#
+# Unblocked 2026-08-01: authkestra 0.3.2 moved to jsonwebtoken 11, which is what this pair now
+# tracks (upstream marcjazz/authkestra#175). Verified before merging that the lockfile contains
+# exactly ONE jsonwebtoken entry — `grep -A1 '^name = "jsonwebtoken"' Cargo.lock` must show a
+# single 11.x. If you ever see two, that is the old failure recurring.
+jsonwebtoken = { version = "11.0" }
 # Resource-server JWT/JWKS validation (see crates/lightbridge-authz-bearer). `authkestra-resource`
 # (crate `authkestra_resource`, module `jwt`) is the published crate ADR-0004 originally referred
 # to as unreleased — it is now live on crates.io, so this is no longer a stand-in via
 # `authkestra-guard`. API shape (`ValidationConfig`/`JwksCache`/`validate_jwt_generic`) is
-# identical to the `authkestra-guard` 0.1.0 it replaces, ground-truthed from source.
-authkestra-resource = "0.2.1"
+# identical to the `authkestra-guard` 0.1.0 it replaced, ground-truthed from source.
+#
+# ⚠️ Coupled to `jsonwebtoken` above — see that comment before moving either.
+authkestra-resource = "0.3.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "tracing", "net", "time"] }
 thiserror = "2"
 anyhow = "1"
