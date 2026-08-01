@@ -1,3 +1,9 @@
+// Integration tests are their own crates, so clippy's `allow-unwrap-in-tests`
+// (clippy.toml) does not reach their free helper functions. Unwrapping in a test
+// is a deliberate assertion that the setup held; the workspace gate stays `deny`
+// for shipping code.
+#![allow(clippy::unwrap_used)]
+
 //! Shared helpers for the RPC-surface integration tests (`rpc_router_tests.rs`,
 //! `rpc_it_tests.rs`). Not a test binary itself (subdir `mod.rs`), so nothing here is discovered as
 //! a test. `dead_code` is allowed because each including binary uses a different subset.

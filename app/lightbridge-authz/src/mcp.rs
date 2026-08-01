@@ -367,7 +367,7 @@ fn normalize_list_pagination(offset: u32, limit: u32) -> (u32, u32) {
 fn subject_from_request_context(
     context: &RequestContext<RoleServer>,
 ) -> std::result::Result<String, ErrorData> {
-    Ok(token_info_from_request_context(context)?.sub.clone())
+    Ok(token_info_from_request_context(context)?.sub)
 }
 
 /// The permission a tool requires, keyed by tool name. Single source of truth for RBAC on the MCP
@@ -1593,17 +1593,17 @@ fn build_mcp_router(
     let http_config = build_streamable_http_config(&api.allowed_hosts);
     let mcp_service: StreamableHttpService<LightbridgeMcpHandler, LocalSessionManager> =
         StreamableHttpService::new(
-            {
-                let handler = handler.clone();
-                move || Ok(handler.clone())
-            },
+            // `handler` is not used after this point, so it moves straight into the
+            // factory closure; the per-connection clone inside is the one that matters.
+            move || Ok(handler.clone()),
             Default::default(),
             http_config,
         );
 
     let metadata_state = oauth_proxy_state.clone();
     let openid_state = oauth_proxy_state.clone();
-    let register_state = oauth_proxy_state.clone();
+    // Last of the three handler states — `oauth_proxy_state` is not used again, so move.
+    let register_state = oauth_proxy_state;
     let public =
         Router::new()
             .route("/", get(root_handler))
@@ -1644,7 +1644,8 @@ fn build_mcp_router(
         .nest_service("/mcp", mcp_service)
         .with_state(app_state.clone())
         .layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
+            // Last use of `app_state`; the `with_state` clone above still needs its own.
+            app_state,
             bearer_auth,
         ));
 

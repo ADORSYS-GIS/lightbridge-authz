@@ -1,3 +1,9 @@
+// Integration tests are their own crates, so clippy's `allow-unwrap-in-tests`
+// (clippy.toml) does not reach their free helper functions. Unwrapping in a test
+// is a deliberate assertion that the setup held; the workspace gate stays `deny`
+// for shipping code.
+#![allow(clippy::unwrap_used)]
+
 //! Regression test for the CBOR `undefined`-vs-`null` bug that broke project creation in
 //! production (see `lightbridge_authz_rest::codec`). The TS client's cborg-based CBOR encoder
 //! (`converse-frontends/packages/authz-rpc/src/codec.ts`) encodes a JS `undefined` property

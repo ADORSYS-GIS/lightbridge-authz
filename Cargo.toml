@@ -145,11 +145,11 @@ redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
 #   clippy::pedantic  — 178 hits (doc_markdown 8, default_trait_access 7,
 #                       too_many_lines 6, match_same_arms 6, cast_* 6, …).
 #                       Under -D warnings this would break the build, not advise.
-#   unwrap_used       — 3 hits, all in crates/lightbridge-authz-core/src/config/mod.rs
-#                       (a LazyLock-wrapped compile-constant `Regex::new`, and two
-#                       `caps.get(0)` on an already-matched capture). All three are
-#                       genuine impossibility proofs and want `.expect("<invariant>")`
-#                       rather than deletion — a small follow-up, not a bug.
+#   expect_used       — 3 hits, and they are the three that used to be `unwrap`
+#                       (see below). Each is an impossibility proof carrying its
+#                       invariant in the message, which is exactly the carve-out
+#                       the guide allows — so this stays off deliberately rather
+#                       than pending.
 #   panic             — 3 hits outside this crate, same treatment pending.
 #   map_unwrap_or     — 4 hits.
 #   unnecessary_wraps — 2 hits.
@@ -176,16 +176,23 @@ all = { level = "deny", priority = -1 }
 
 # Apollo §2.3's table, each verified at zero on this workspace.
 #
-# NOTE `redundant_clone` is absent on purpose: it is a *nursery* lint (so it is
-# not covered by a `clippy::pedantic` measurement, which is how it was initially
-# mis-recorded as zero here) and it has 4 real hits in `app/lightbridge-authz`.
-# Nursery lints carry known false positives; fixing those four is a deliberate
-# perf change, not a gate to switch on blind.
+# `redundant_clone` is a *nursery* lint, so a `clippy::pedantic` measurement does
+# NOT cover it — which is how it was initially mis-recorded as zero here. It had
+# 4 real hits in app/lightbridge-authz/src/mcp.rs; all four were last-use clones
+# (the value was dropped immediately after) and are now moves. Enabled.
+redundant_clone = "deny"
 needless_borrow = "deny"
 manual_ok_or = "deny"
 large_enum_variant = "deny"
 clone_on_copy = "deny"
 needless_collect = "deny"
+
+# Apollo §4.2: no `unwrap` in shipping code. The three that existed — a
+# LazyLock-wrapped compile-constant `Regex::new` and two `caps.get(0)` on an
+# already-matched capture, all in config/mod.rs — are now `.expect()` carrying
+# the invariant in the message, which is the form the guide asks for. Tests are
+# exempted via `allow-unwrap-in-tests` in clippy.toml.
+unwrap_used = "deny"
 
 # Hygiene, all at zero.
 todo = "deny"

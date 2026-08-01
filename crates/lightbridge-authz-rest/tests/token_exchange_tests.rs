@@ -1,3 +1,8 @@
+// Integration tests are their own crates, so clippy's `allow-unwrap-in-tests`
+// (clippy.toml) does not reach their free helper functions. Unwrapping in a test
+// is a deliberate assertion that the setup held; the workspace gate stays `deny`
+// for shipping code.
+#![allow(clippy::unwrap_used)]
 #![cfg(feature = "it-tests")]
 
 use std::sync::Arc;

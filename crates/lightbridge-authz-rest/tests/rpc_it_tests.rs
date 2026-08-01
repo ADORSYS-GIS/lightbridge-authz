@@ -1,3 +1,9 @@
+// Integration tests are their own crates, so clippy's `allow-unwrap-in-tests`
+// (clippy.toml) does not reach their free helper functions. Unwrapping in a test
+// is a deliberate assertion that the setup held; the workspace gate stays `deny`
+// for shipping code.
+#![allow(clippy::unwrap_used)]
+
 //! Live-database integration tests for the cratestack RPC CRUD surface (ADR-0003). Gated behind
 //! `it-tests` and `just it-tests` (needs a migrated Postgres via `DATABASE_URL` *and* Redis via
 //! `AUTHZ_REDIS_URL`/localhost, both reached by the assembled `build_api_router`).
