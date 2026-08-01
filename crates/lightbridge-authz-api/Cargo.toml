@@ -6,6 +6,9 @@ publish.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 # Schema-first CRUD codegen: this crate owns `schema/authz.cstack` and emits the generated
 # `cratestack_schema` module (models, inputs, the RPC `axum::rpc_router`, and the

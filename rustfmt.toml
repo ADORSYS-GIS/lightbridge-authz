@@ -1,0 +1,18 @@
+# rustfmt configuration — Apollo Rust best-practices §1.7 "Use Declarations".
+#
+# ⚠️ `imports_granularity` and `group_imports` are NIGHTLY-ONLY. On stable,
+# `cargo fmt` warns "can't set ... unstable", IGNORES them, and exits 0 — so a
+# stable `cargo fmt --check` does NOT enforce them. This repo's CI currently
+# runs the fmt check on STABLE (.github/actions/code-checks), so today these two
+# options are enforced only when a human runs `cargo +nightly fmt` locally.
+# Moving the CI step to nightly is tracked as a follow-up; until then, treat
+# import grouping as advisory here, not gated.
+#
+# Verified rather than assumed: planting a `std` import after the external ones
+# in a sibling repo, stable `--check` PASSED it and nightly CAUGHT it.
+#
+# `edition` is deliberately not set: `cargo fmt` derives it from Cargo.toml.
+
+reorder_imports = true
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"

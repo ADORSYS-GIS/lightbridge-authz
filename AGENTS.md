@@ -114,6 +114,93 @@ cargo test -p lightbridge-authz-api-key --features it-tests <test-name>
 
 ## Code Style Guidelines
 
+### What the linter enforces — don't hand-review it
+
+`rustfmt.toml`, `clippy.toml` and `[workspace.lints]` in the root `Cargo.toml` cover the
+mechanical layer. Flagging these by hand in review is noise: `todo!`/`unimplemented!`/`dbg!`,
+`needless_borrow`, `manual_ok_or`, `clone_on_copy`, `large_enum_variant`, `needless_collect`,
+and everything in `clippy::all`. Supply-chain policy lives in `deny.toml`.
+
+Three things to know before editing that config:
+
+- **There is no advisory tier.** CI runs `clippy … -- -D warnings`, so `warn` and `deny` both
+  fail the build. Every level set there was measured at zero on this workspace first.
+- **Measure before adding a lint, and `cargo clean -p <crate>` before believing the number.**
+  A cached clippy run reports clean without having looked — verified here: a warm run reported
+  **0** `unwrap_used` against a tree containing 55 of them.
+- **A `pedantic` measurement does not cover nursery lints.** `redundant_clone` is nursery; it
+  was mis-recorded as zero from a pedantic-only run and actually has 4 hits.
+
+The root `Cargo.toml` records, with counts, which lints are deliberately *not* enabled and why
+(`pedantic` at 178, `unwrap_used` at 3, `unsafe_code` at 13-in-tests, …). Read that before
+proposing to turn one on.
+
+⚠️ **`imports_granularity`/`group_imports` in `rustfmt.toml` are nightly-only.** This repo's CI
+runs the fmt check on **stable**, where rustfmt warns and exits 0 — so those two options are
+*not* gated here today; they apply only when a human runs `cargo +nightly fmt`. Treat import
+grouping as advisory in this repo until the CI step moves to nightly.
+
+### Spend review attention here instead
+
+What no lint can judge, in order of damage done:
+
+1. **Failure modes — does the unavailable branch become the permissive branch?** This is the
+   authentication boundary for every protected service on the platform, so it is the highest-yield
+   question in any review here. When a dependency is unreachable the answer is *withhold*, never
+   *allow*: `unwrap_or(false)` on an authorization check is how an outage becomes a bypass. A
+   missing or unparseable claim is **not** a default — it is "unknown", and unknown routes to the
+   strictest branch. Write a test per dependency (Redis down, JWKS unreachable, Keycloak slow)
+   asserting the operation is *refused*.
+2. **Ownership shape.** Does a function take `T` where `&T` would do, forcing callers to clone?
+   Any clone in a per-request path? `Arc::clone` to satisfy a `'static` boundary is a refcount
+   bump, not a defect — write `Arc::clone(&x)` so that reads as deliberate.
+3. **Error types.** Can a caller distinguish the cases they must handle? Keep variants at *this*
+   crate's abstraction level; leaking a dependency's error into a public enum makes every
+   dependency bump a breaking change.
+4. **Do the tests test anything?** Would they fail if the logic were wrong?
+5. **Concurrency.** Anything holding a lock across an `.await` (`clippy::await_holding_lock`)?
+
+State the **mechanism**, not the verdict. "This clones per request" is actionable; "non-idiomatic"
+is not.
+
+### Testing rules that have caught real bugs here
+
+- **Prove the test catches the bug.** A test written after the fix, that passes, has shown
+  nothing. Break the code, watch it fail *for the predicted reason*, restore it, and say you did.
+- **Green does not mean tested.** A test that returns early when an env var is missing reports as
+  *passed* — if CI never sets it, the job is green having run nothing. This repo has already been
+  bitten by the related failure: shared-database integration tests running in parallel wiping each
+  other's rows, papered over by retries. **Investigate flakes; don't raise the retry budget until
+  you know what you're riding out** (see `.github/actions/integration-test` — the retry budget
+  there is documented against a specific, diagnosed DNS flake, which is the bar).
+- Prefer a real containerised Postgres over mocks. The bugs that matter live in the seam.
+
+### Suppressions and declined changes
+
+`#[expect(lint, reason = "…")]`, never `#[allow(…)]` — `expect` fails once the suppression is no
+longer needed, so it cleans itself up. ⚠️ Note the corollary: an `#[expect]` for a lint that is
+*not* enabled becomes an unfulfilled expectation, which under `-D warnings` fails the build.
+
+When you decline something non-obvious, **write the reason in the manifest, not just the PR body** —
+the person hitting the confusion in six months is reading `Cargo.toml`, and a PR description is
+unreachable from there. This repo already does this well; keep it up. Two live examples worth
+copying: the `jsonwebtoken` 10.x pin (with the upstream tracking issue linked) and the cratestack
+family lockstep warning.
+
+### Where the fuller rules live
+
+Two corpora, deliberately kept separate rather than merged into one mush:
+
+- **"Is there a rule for X?"** → the `rust-skills` catalogue (265 single-topic rules, each naming
+  the clippy lint that catches it).
+- **"Which do I pick, and what does it cost?"** → the `rust-coding` skill's decision procedures —
+  borrow/clone/`Cow`, which smart pointer, static vs dynamic dispatch, when type-state earns its
+  complexity.
+
+Where they conflict, the house rules above win, because each exists because something broke. Two
+concrete divergences: the catalogue's own exemplary test uses **float money** (this repo uses
+integer micro-units), and it prints `#[allow]` in four rules and `#[expect]` in none of 265.
+
 ### Import Conventions
 
 1. **Group imports in this order:**
