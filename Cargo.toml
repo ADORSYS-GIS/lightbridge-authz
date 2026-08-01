@@ -37,7 +37,16 @@ base64 = "0.23"
 # tracks (upstream marcjazz/authkestra#175). Verified before merging that the lockfile contains
 # exactly ONE jsonwebtoken entry — `grep -A1 '^name = "jsonwebtoken"' Cargo.lock` must show a
 # single 11.x. If you ever see two, that is the old failure recurring.
-jsonwebtoken = { version = "11.0" }
+# ⚠️ `rust_crypto` is declared EXPLICITLY, not inherited. jsonwebtoken makes the
+# crypto backend a required feature choice (`rust_crypto` or `aws_lc_rs`; neither
+# is in `default`), and with neither selected, signing PANICS at runtime — this
+# workspace signs in `lightbridge-authz-rest::signing` (RFC 8693 token exchange).
+# It previously worked only because `authkestra-engine` happens to declare
+# `features = ["rust_crypto"]` and Cargo unifies features across the graph. That
+# made our signing path depend on someone else's feature choice: had authkestra
+# switched to `aws_lc_rs` or dropped the dep, this would still compile and then
+# panic on the first signing call. Declare what we need.
+jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
 # Resource-server JWT/JWKS validation (see crates/lightbridge-authz-bearer). `authkestra-resource`
 # (crate `authkestra_resource`, module `jwt`) is the published crate ADR-0004 originally referred
 # to as unreleased — it is now live on crates.io, so this is no longer a stand-in via
