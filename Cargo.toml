@@ -117,21 +117,26 @@ mimalloc = "0"
 # `grep -rnE "::[A-Za-z_]+_(eq|ne|in_|lt|lte|gt|gte|contains|starts_with|is_null|is_not_null|is_true|is_false|asc|desc)\("`
 # across `crates/` and `app/` returning zero matches.
 #
+# 0.5.1 is a plain patch — cratestack/cratestack#257 only adds a relation-connectivity regression
+# test fixture inside cratestack's own test suite (closing the coverage gap #253 left: no example or
+# fixture anywhere in that repo was relation-dense enough to have caught #252 before it shipped).
+# No API/schema-surface change.
+#
 # THE LOCKSTEP IS LOAD-BEARING, not stylistic. Dependabot moved four of these to 0.4.16
 # (#158/#161/#162) and left the rest at 0.4.13, which broke `main`: 0.4.16's `cratestack-core` adds a
 # `TransportStyle::Grpc` variant that 0.4.13's `cratestack-macros` does not cover, so the workspace
 # stopped compiling with `error[E0004]: non-exhaustive patterns`. Bump every line below together, or
 # none of them — a partial bump within a semver-compatible range is exactly the failure mode.
-cratestack-core = "0.5.0"
-cratestack-axum = "0.5.0"
-cratestack-redis = "0.5.0"
+cratestack-core = "0.5.1"
+cratestack-axum = "0.5.1"
+cratestack-redis = "0.5.1"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
 # `include_server_schema!` macro emits `::cratestack::*` paths (see cratestack-pg lib docs). The
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
 # it to build the RPC router (ADR-0003).
-cratestack = { package = "cratestack-pg", version = "0.5.0" }
-cratestack-codec-cbor = "0.5.0"
-cratestack-codec-json = "0.5.0"
+cratestack = { package = "cratestack-pg", version = "0.5.1" }
+cratestack-codec-cbor = "0.5.1"
+cratestack-codec-json = "0.5.1"
 # Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
