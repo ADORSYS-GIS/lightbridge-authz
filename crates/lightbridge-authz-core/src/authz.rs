@@ -67,12 +67,42 @@ pub enum Permission {
     ApiKeyRotate,
     #[serde(rename = "apikey:validate")]
     ApiKeyValidate,
+
+    #[serde(rename = "budget:read")]
+    BudgetRead,
+    /// Request a self-service budget top-up for the caller's own account.
+    #[serde(rename = "budget:self-refill")]
+    BudgetSelfRefill,
+    /// Review a pending budget augmentation request (approve/cap/deny it).
+    #[serde(rename = "budget:review")]
+    BudgetReview,
+    /// Grant budget directly, bypassing self-service policy evaluation.
+    #[serde(rename = "budget:grant")]
+    BudgetGrant,
+    #[serde(rename = "budget:revoke")]
+    BudgetRevoke,
+    #[serde(rename = "budget:audit-read")]
+    BudgetAuditRead,
+    #[serde(rename = "budget:policy-read")]
+    BudgetPolicyRead,
+    /// Author (write) budget policy rules. Kept distinct from
+    /// [`Permission::BudgetPolicyActivate`] per ADR-0007: with arbitrary Rego, writing means
+    /// shipping executable code into the decision path, which should not be the same identity
+    /// that activates it.
+    #[serde(rename = "budget:policy-write")]
+    BudgetPolicyWrite,
+    #[serde(rename = "budget:policy-simulate")]
+    BudgetPolicySimulate,
+    /// Activate a budget policy revision. Kept distinct from [`Permission::BudgetPolicyWrite`];
+    /// see that variant's doc comment.
+    #[serde(rename = "budget:policy-activate")]
+    BudgetPolicyActivate,
 }
 
 impl Permission {
     /// Every permission, in declaration order. The single source of truth for wildcard expansion
     /// and documentation.
-    pub const ALL: [Permission; 18] = [
+    pub const ALL: [Permission; 28] = [
         Permission::AccountCreate,
         Permission::AccountRead,
         Permission::AccountUpdate,
@@ -91,6 +121,16 @@ impl Permission {
         Permission::ApiKeyRevoke,
         Permission::ApiKeyRotate,
         Permission::ApiKeyValidate,
+        Permission::BudgetRead,
+        Permission::BudgetSelfRefill,
+        Permission::BudgetReview,
+        Permission::BudgetGrant,
+        Permission::BudgetRevoke,
+        Permission::BudgetAuditRead,
+        Permission::BudgetPolicyRead,
+        Permission::BudgetPolicyWrite,
+        Permission::BudgetPolicySimulate,
+        Permission::BudgetPolicyActivate,
     ];
 
     /// Canonical `resource:action` string.
@@ -114,6 +154,16 @@ impl Permission {
             Permission::ApiKeyRevoke => "apikey:revoke",
             Permission::ApiKeyRotate => "apikey:rotate",
             Permission::ApiKeyValidate => "apikey:validate",
+            Permission::BudgetRead => "budget:read",
+            Permission::BudgetSelfRefill => "budget:self-refill",
+            Permission::BudgetReview => "budget:review",
+            Permission::BudgetGrant => "budget:grant",
+            Permission::BudgetRevoke => "budget:revoke",
+            Permission::BudgetAuditRead => "budget:audit-read",
+            Permission::BudgetPolicyRead => "budget:policy-read",
+            Permission::BudgetPolicyWrite => "budget:policy-write",
+            Permission::BudgetPolicySimulate => "budget:policy-simulate",
+            Permission::BudgetPolicyActivate => "budget:policy-activate",
         }
     }
 
@@ -208,6 +258,14 @@ pub struct Rbac {
     /// built-in [`default_role_permissions`] mapping is used instead.
     #[serde(default)]
     pub role_permissions: HashMap<String, Vec<String>>,
+    /// Grant strings applied on behalf of any role string that appears in a caller's claim but
+    /// does not match an entry in `role_permissions`. Empty by default -- an existing config that
+    /// never sets this keeps today's behavior exactly (an unrecognized role contributes nothing).
+    /// Populate it (e.g. `default_grants: ["budget:read"]`) to give every authenticated caller a
+    /// safe minimum even when their specific role isn't configured -- this is what lets an
+    /// unrecognized/garbled role still see their own budget rather than nothing at all.
+    #[serde(default)]
+    pub default_grants: Vec<String>,
 }
 
 impl Default for Rbac {
@@ -215,21 +273,31 @@ impl Default for Rbac {
         Self {
             roles_claim: default_roles_claim(),
             role_permissions: HashMap::new(),
+            default_grants: Vec::new(),
         }
     }
 }
 
+/// The result of [`Rbac::compile`]: each configured role's expanded permission set, plus the
+/// expanded `default_grants` set applied to any role string that matches none of them.
+#[derive(Debug, Clone)]
+pub struct CompiledRbac {
+    pub roles: HashMap<String, PermissionSet>,
+    pub default: PermissionSet,
+}
+
 impl Rbac {
     /// Compile the configured (or default) role → grant mapping into concrete permission sets,
-    /// expanding wildcards once. Unknown grant strings are logged and skipped.
-    pub fn compile(&self) -> HashMap<String, PermissionSet> {
+    /// expanding wildcards once, plus the compiled `default_grants` fallback set. Unknown grant
+    /// strings are logged and skipped.
+    pub fn compile(&self) -> CompiledRbac {
         let source = if self.role_permissions.is_empty() {
             default_role_permissions()
         } else {
             self.role_permissions.clone()
         };
 
-        source
+        let roles = source
             .into_iter()
             .map(|(role, grants)| {
                 let mut set = PermissionSet::new();
@@ -248,7 +316,41 @@ impl Rbac {
                 }
                 (role, set)
             })
-            .collect()
+            .collect();
+
+        let mut default = PermissionSet::new();
+        for grant in &self.default_grants {
+            let expanded = expand_grant(grant);
+            if expanded.is_empty() {
+                tracing::warn!(
+                    grant = %grant,
+                    "rbac: ignoring unknown default permission grant"
+                );
+            }
+            for permission in expanded {
+                default.insert(permission);
+            }
+        }
+
+        CompiledRbac { roles, default }
+    }
+
+    /// Validates `default_grants`: every grant string must expand to at least one real
+    /// permission. Does NOT retroactively validate the pre-existing `role_permissions` map's
+    /// tolerant behavior (an unknown grant there is still just logged and skipped, unchanged) --
+    /// this method exists specifically because an operator who configures `default_grants` wrong
+    /// should find out at startup, not discover it later as "some users can't see their own
+    /// budget". An unset/empty `default_grants` is always valid (there's nothing to misconfigure
+    /// if you haven't configured anything).
+    pub fn validate(&self) -> Result<(), Error> {
+        for grant in &self.default_grants {
+            if expand_grant(grant).is_empty() {
+                return Err(Error::Server(format!(
+                    "oauth2.rbac.default_grants contains an unrecognized grant: '{grant}'"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -281,16 +383,23 @@ pub fn default_role_permissions() -> HashMap<String, Vec<String>> {
 }
 
 /// Resolve the permission set for a caller given the raw role strings extracted from their JWT and
-/// a precompiled role → permission map.
-pub fn permissions_for_roles(
-    roles: &[String],
-    compiled: &HashMap<String, PermissionSet>,
-) -> PermissionSet {
+/// a precompiled [`CompiledRbac`]. Applied per role: a role string matching a configured entry
+/// contributes that role's permissions; a role string matching none of them contributes
+/// `compiled.default` instead. A caller holding a mix of recognized and unrecognized roles gets
+/// the union of both -- the fallback composes per unmatched role, not all-or-nothing.
+pub fn permissions_for_roles(roles: &[String], compiled: &CompiledRbac) -> PermissionSet {
     let mut set = PermissionSet::new();
     for role in roles {
-        if let Some(role_permissions) = compiled.get(role) {
-            for permission in role_permissions.iter() {
-                set.insert(permission);
+        match compiled.roles.get(role) {
+            Some(role_permissions) => {
+                for permission in role_permissions.iter() {
+                    set.insert(permission);
+                }
+            }
+            None => {
+                for permission in compiled.default.iter() {
+                    set.insert(permission);
+                }
             }
         }
     }
@@ -341,6 +450,7 @@ mod tests {
     fn default_admin_role_grants_everything() {
         let compiled = Rbac::default().compile();
         let admin = compiled
+            .roles
             .get("lightbridge-admin")
             .expect("admin role present");
         assert_eq!(admin.len(), Permission::ALL.len());
@@ -351,6 +461,7 @@ mod tests {
     fn viewer_role_is_read_only() {
         let compiled = Rbac::default().compile();
         let viewer = compiled
+            .roles
             .get("lightbridge-viewer")
             .expect("viewer role present");
         assert!(viewer.contains(Permission::ProjectRead));
@@ -366,10 +477,11 @@ mod tests {
                 "billing".to_string(),
                 vec!["account:read".to_string()],
             )]),
+            default_grants: Vec::new(),
         };
         let compiled = rbac.compile();
-        assert!(!compiled.contains_key("lightbridge-admin"));
-        let billing = compiled.get("billing").expect("billing role present");
+        assert!(!compiled.roles.contains_key("lightbridge-admin"));
+        let billing = compiled.roles.get("billing").expect("billing role present");
         assert!(billing.contains(Permission::AccountRead));
         assert_eq!(billing.len(), 1);
     }
@@ -392,5 +504,80 @@ mod tests {
         let err = set.require(Permission::AccountDelete).unwrap_err();
         assert!(matches!(err, Error::Forbidden(_)));
         assert!(err.to_string().contains("account:delete"));
+    }
+
+    #[test]
+    fn empty_default_grants_matches_todays_behavior() {
+        let rbac = Rbac {
+            roles_claim: "roles".to_string(),
+            role_permissions: HashMap::new(),
+            default_grants: Vec::new(),
+        };
+        let compiled = rbac.compile();
+        let set = permissions_for_roles(&["totally-unrecognized-role".to_string()], &compiled);
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn unknown_role_falls_back_to_default_grants() {
+        let rbac = Rbac {
+            roles_claim: "roles".to_string(),
+            role_permissions: HashMap::new(),
+            default_grants: vec!["budget:read".to_string()],
+        };
+        let compiled = rbac.compile();
+        let set = permissions_for_roles(&["totally-unrecognized-role".to_string()], &compiled);
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(Permission::BudgetRead));
+    }
+
+    #[test]
+    fn recognized_role_does_not_receive_default_grants_it_wasnt_given() {
+        let rbac = Rbac {
+            roles_claim: "roles".to_string(),
+            role_permissions: HashMap::new(),
+            default_grants: vec!["budget:read".to_string()],
+        };
+        let compiled = rbac.compile();
+        let set = permissions_for_roles(&["lightbridge-viewer".to_string()], &compiled);
+        assert!(set.contains(Permission::ProjectRead));
+        assert!(!set.contains(Permission::BudgetRead));
+    }
+
+    #[test]
+    fn mixed_recognized_and_unrecognized_roles_compose() {
+        let rbac = Rbac {
+            roles_claim: "roles".to_string(),
+            role_permissions: HashMap::new(),
+            default_grants: vec!["budget:read".to_string()],
+        };
+        let compiled = rbac.compile();
+        let set = permissions_for_roles(
+            &[
+                "lightbridge-viewer".to_string(),
+                "totally-unrecognized-role".to_string(),
+            ],
+            &compiled,
+        );
+        assert!(set.contains(Permission::ProjectRead));
+        assert!(set.contains(Permission::AccountRead));
+        assert!(set.contains(Permission::ApiKeyRead));
+        assert!(set.contains(Permission::BudgetRead));
+        assert!(!set.contains(Permission::ProjectDelete));
+    }
+
+    #[test]
+    fn malformed_default_grants_fails_validation() {
+        let rbac = Rbac {
+            roles_claim: "roles".to_string(),
+            role_permissions: HashMap::new(),
+            default_grants: vec!["not:a:real:permission".to_string()],
+        };
+        assert!(rbac.validate().is_err());
+    }
+
+    #[test]
+    fn empty_default_grants_always_validates() {
+        assert!(Rbac::default().validate().is_ok());
     }
 }

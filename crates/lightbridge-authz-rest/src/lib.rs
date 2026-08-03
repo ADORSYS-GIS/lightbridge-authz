@@ -799,6 +799,7 @@ pub async fn start_api_server(
     redis: &Option<Redis>,
 ) -> Result<()> {
     billing.validate()?;
+    oauth2.rbac.validate()?;
     let readiness_pool = pool.clone();
     let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
     if oauth2.is_self_signed() {
