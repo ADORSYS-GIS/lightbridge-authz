@@ -647,6 +647,8 @@ In Compose, `authz-migrate` runs before API/OPA start.
   projects, roster, keys; introspection, Authorino claim extraction, BackendTrafficPolicy rule
   families; worked scenarios and the gaps that remain): `docs/governance-model-and-enforcement.md`
 - CRUD API migration to cratestack (routing/policy generation, Swagger UI removal, CBOR-in-prod): `docs/adr/0003-cratestack-crud-migration.md`
+- Budget refill decision contract (the `Facts`/`Decision`/`PolicyEngine` seam a rule-data
+  evaluator and, later, an OPA-Wasm evaluator both sit behind; the fail-closed rule): `docs/budget-decision-contract.md`
 
 ## Helm / deployment notes
 
