@@ -5,3 +5,15 @@
 //! policy engine code directly instead of relying on generated CRUD. This is a skeleton: no
 //! ledger types, repository, or policy engine yet -- those land in later PRs in the epic's
 //! delivery sequence.
+
+pub mod amount;
+pub mod error;
+pub mod period;
+pub mod source;
+pub mod tier;
+
+pub use amount::AmountMicros;
+pub use error::BudgetError;
+pub use period::Period;
+pub use source::GrantSource;
+pub use tier::BudgetTier;
