@@ -2601,6 +2601,7 @@ dependencies = [
 name = "lightbridge-authz-budget"
 version = "0.8.1"
 dependencies = [
+ "chrono",
  "lightbridge-authz-core",
  "sqlx",
  "thiserror",
