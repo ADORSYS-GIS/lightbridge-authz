@@ -83,8 +83,8 @@ permissionMapping:
 
 ## Risks and unknowns
 
-- ⚠️ The tier re-key must land near a period boundary; the window is a 30-day epoch bucket,
-  not a calendar month (ADR-0008, and the cutover runbook).
+- ⚠️ The tier re-key must land near a period boundary; the period is a calendar month
+  (`YYYY-MM`, UTC), with the boundary on the 1st (ADR-0008, and the cutover runbook).
 - ⚠️ Re-validate hard limits in application and SQL after the policy returns. A policy that
   recommends an amount above the platform cap must be clamped or denied by the backend, not
   trusted.

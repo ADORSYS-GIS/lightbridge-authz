@@ -11,21 +11,27 @@ the rendered list. So every account's counter moves to a new key and starts at z
 
 That is not avoidable. It is *timed* instead.
 
-## 1. Know where the window boundary is — it is not the 1st
+## 1. Know where the period boundary is — it's the 1st of the month, UTC
 
-The budget window is a fixed 30-day epoch bucket, `floor(now / 2592000) * 2592000`. It has
-nothing to do with calendar months, despite `unit: Month` in the rendered rule.
+The budget period is a calendar month, `YYYY-MM` in UTC, carried as the `x-billing-period`
+key component (ai-helm ADR-0111) and rotated as the **only** rotation on that key (ADR-0112:
+`unit: Year` on the calendar marker). The 30-day epoch bucket that used to live alongside it
+in the key is gone — it was retired once it was found to be rotating every counter a second
+time, silently, on top of the calendar marker. `unit: Month` in the rendered rule refers to
+this calendar period, not to a fixed-length window.
 
 ```bash
 python3 -c "
-import datetime; W=2592000
-now=int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-f=lambda t: datetime.datetime.fromtimestamp(t,datetime.timezone.utc)
-print('current window starts', f((now//W)*W))
-print('next window starts   ', f((now//W)*W + W))"
+import calendar, datetime
+now = datetime.datetime.now(datetime.timezone.utc)
+this_period = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+days = calendar.monthrange(this_period.year, this_period.month)[1]
+next_period = this_period + datetime.timedelta(days=days)
+print('current period starts', this_period.isoformat())
+print('next period starts   ', next_period.isoformat())"
 ```
 
-Confirm against reality rather than arithmetic — the live keys carry the window:
+Confirm against reality rather than arithmetic — the live keys carry the period:
 
 ```bash
 kubectl -n redis-system exec deploy/redis-ha-haproxy -- \
@@ -35,7 +41,8 @@ kubectl -n redis-system exec deploy/redis-ha-haproxy -- \
 
 **Deploy shortly BEFORE a boundary, not on it and not just after.** Landing a few days
 before means the boundary absorbs the reset; landing just after means everyone carries an
-extra full budget for nearly 30 days. Deploying exactly at 00:00 UTC is needlessly fiddly.
+extra full budget for nearly a month. Deploying exactly at 00:00 UTC on the 1st is needlessly
+fiddly.
 
 ## 2. Same PR, or the quota dashboard goes blank
 
@@ -51,8 +58,11 @@ One PR must cover:
 - the ServiceMonitor `metricRelabelings` (they parse `plan` out of the key);
 - `tools/dashboards/.../ratelimit_quota.py`, regenerated and committed.
 
-⚠️ Keep `window` as a label. Dropping it collides two buckets at rollover and produces a
-duplicate-sample scrape error.
+⚠️ Write this against the **`billing_period`** label that ai-helm#866 already shipped for
+`gateway_ratelimit_spend_micro_usd`. Re-introducing a `window` label here is now a
+**regression**: `window` was the old 30-day-epoch rotation, and reviving it alongside
+`billing_period` reintroduces the exact double-rotation bug (ai-helm ADR-0111/ADR-0112) that
+this correction exists to avoid.
 
 ## 3. Before you deploy
 
