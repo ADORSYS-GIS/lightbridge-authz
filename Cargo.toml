@@ -7,6 +7,7 @@ members = [
     "crates/lightbridge-authz-api",
     "crates/lightbridge-authz-api-key",
     "crates/lightbridge-authz-bearer",
+    "crates/lightbridge-authz-budget",
     "crates/lightbridge-authz-usage",
 ]
 resolver = "3"
@@ -17,6 +18,7 @@ lightbridge-authz-rest = { path = "./crates/lightbridge-authz-rest" }
 lightbridge-authz-api = { path = "./crates/lightbridge-authz-api" }
 lightbridge-authz-api-key = { path = "./crates/lightbridge-authz-api-key" }
 lightbridge-authz-bearer = { path = "./crates/lightbridge-authz-bearer" }
+lightbridge-authz-budget = { path = "./crates/lightbridge-authz-budget" }
 lightbridge-authz-usage-rest = { path = "./crates/lightbridge-authz-usage" }
 
 serde = { version = "1.0", features = ["derive"] }
