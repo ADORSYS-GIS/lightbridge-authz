@@ -44,6 +44,23 @@ impl Period {
         }
         Ok(Self(format!("{year:04}-{month:02}")))
     }
+
+    /// The calendar year, e.g. `2026` for `"2026-08"`. Infallible: `Period` only ever holds a
+    /// string that already passed `parse`'s digit/width validation, so the first 4 bytes are
+    /// always ASCII digits.
+    pub fn year(&self) -> u32 {
+        self.0[0..4]
+            .parse()
+            .expect("Period invariant: first 4 chars are always ASCII digits")
+    }
+
+    /// The calendar month (`1..=12`), e.g. `8` for `"2026-08"`. Infallible for the same reason as
+    /// `year` above.
+    pub fn month(&self) -> u8 {
+        self.0[5..7]
+            .parse()
+            .expect("Period invariant: last 2 chars are always ASCII digits in 1..=12")
+    }
 }
 
 impl fmt::Display for Period {
@@ -97,5 +114,12 @@ mod tests {
     fn from_ymd_rejects_invalid_month() {
         assert!(Period::from_ymd(2026, 0).is_err());
         assert!(Period::from_ymd(2026, 13).is_err());
+    }
+
+    #[test]
+    fn year_and_month_accessors_roundtrip() {
+        let period = Period::parse("2026-08").expect("valid period must parse");
+        assert_eq!(period.year(), 2026);
+        assert_eq!(period.month(), 8);
     }
 }
