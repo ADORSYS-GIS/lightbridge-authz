@@ -1660,6 +1660,7 @@ pub async fn start_mcp_server(
     pool: Arc<dyn DbPoolTrait>,
 ) -> Result<()> {
     billing.validate()?;
+    oauth2.rbac.validate()?;
     let readiness_pool = pool.clone();
     if oauth2.is_self_signed() {
         let signing = oauth2.signing.as_ref().ok_or_else(|| {

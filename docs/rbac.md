@@ -109,6 +109,13 @@ oauth2:
         - "account:read"
         - "project:read"
         - "apikey:read"
+
+    # Applied on behalf of any role string present in the caller's claim that matches none of
+    # the entries above. Empty by default -- an unrecognized role then contributes nothing,
+    # exactly as before this field existed. Populate it to give every authenticated caller a
+    # safe minimum even when their specific role isn't configured.
+    default_grants:
+      - "budget:read"
 ```
 
 A **grant** is one of:
@@ -120,7 +127,31 @@ A **grant** is one of:
 | `<resource>:<action>` | a single permission                        | `account:delete` |
 
 Unknown grant strings are logged and ignored — they never widen access. A role present in the JWT
-but absent from the map grants nothing.
+but absent from the map grants nothing, **unless** `oauth2.rbac.default_grants` is configured (see
+below), in which case that role contributes the default grants instead.
+
+### `default_grants`: a floor for unrecognized roles
+
+`role_permissions` alone means a caller whose role string doesn't match any configured entry gets
+*no* permissions at all — not even to see their own budget status. `default_grants` (`Vec<String>`,
+empty by default) fixes that: it is compiled the same way as any role's grants (wildcards expanded,
+unknown grants logged and skipped), and applied **per unmatched role string**, not as an
+unconditional floor added to every caller. Concretely, for each role string in the caller's claim:
+
+- if it matches an entry in `role_permissions`, that role's compiled permissions are unioned in;
+- if it matches **no** entry, `default_grants`'s compiled permissions are unioned in instead.
+
+A caller holding a mix of recognized and unrecognized roles gets the union of both — the fallback
+composes per unmatched role rather than being all-or-nothing. A caller holding only recognized
+roles never receives `default_grants` on top, even if those roles don't happen to include
+whatever `default_grants` lists.
+
+Leaving `default_grants` empty/unset reproduces today's exact behavior (an unrecognized role
+contributes nothing). Configuring it wrong is a startup-time error, not a silent gap: `Rbac::validate()`
+rejects any `default_grants` entry that doesn't expand to a real permission, and is wired into the
+same startup path as `Billing::validate()` (`start_api_server` / `start_mcp_server`), so a bad
+`default_grants` value fails server startup rather than surfacing later as "some users can't see
+their own budget."
 
 > **Wildcards expand dynamically over the whole permission set.** `<resource>:*` and `*` include
 > **every** action on that resource — that means `project:*` grants `project:disable` (suspend a
@@ -180,6 +211,37 @@ listed here is denied unconditionally (fail closed).**
 | `apikey:validate` | — (OPA server, Basic-auth)                           | `validate-api-key`, `validate-authorino-api-key` |
 
 `read` covers both the list and get operations for a resource.
+
+### Budget permissions (reserved, not yet gating any operation)
+
+`RFC-0001` (`docs/rfc/0001-budget-refill.md`) sketches a `budget:*` permission surface for the
+upcoming budget domain. The ten permissions below exist in `Permission::ALL` and are usable in
+`role_permissions`/`default_grants` today, but **no RPC `op_id` or MCP tool maps to any of them
+yet** — Wave 3 of issue #188 hasn't wired up the budget domain's RPC/MCP surface. They are reserved
+here so the permission strings, and the RBAC machinery around them (wildcard expansion,
+`default_grants`), are settled ahead of that surface landing in a later PR.
+
+| Permission               | Meaning                                                              |
+| ------------------------ | --------------------------------------------------------------------- |
+| `budget:read`            | Read budget/balance status (typically via `default_grants`, see below). |
+| `budget:self-refill`     | Request a self-service budget top-up for the caller's own account.  |
+| `budget:review`          | Review a pending budget augmentation request (approve/cap/deny).    |
+| `budget:grant`           | Grant budget directly, bypassing self-service policy evaluation.    |
+| `budget:revoke`          | Revoke previously granted budget.                                    |
+| `budget:audit-read`      | Read the budget audit trail (grants, decisions, policy revisions).  |
+| `budget:policy-read`     | Read budget policy rules/revisions.                                  |
+| `budget:policy-write`    | Author (write) budget policy rules.                                  |
+| `budget:policy-simulate` | Dry-run a budget policy against facts without applying it.          |
+| `budget:policy-activate` | Activate a budget policy revision.                                   |
+
+`budget:policy-write` and `budget:policy-activate` are deliberately kept separate (ADR-0007): with
+arbitrary Rego, writing a policy means shipping executable code into the decision path, so the
+identity that authors a policy should not be the same one that activates it. The generic
+`budget:*` resource wildcard, once something grants it, expands to **all ten** including both of
+these together — consistent with how `project:*`/`apikey:*` already behave for their resources
+(see the wildcard note above). Operators wanting the write/activate separation enforced should list
+the individual grants rather than the wildcard, exactly as already advised for the existing
+resources.
 
 **Deliberately unmapped → denied (defense in depth):**
 

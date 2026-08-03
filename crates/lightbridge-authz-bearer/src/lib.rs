@@ -2,12 +2,12 @@ use anyhow::{anyhow, ensure};
 use authkestra_resource::jwt::{JwksCache, ValidationConfig, validate_jwt_generic};
 use jsonwebtoken::{Algorithm, Validation, decode_header};
 use lightbridge_authz_core::async_trait;
-use lightbridge_authz_core::authz::{PermissionSet, permissions_for_roles};
+use lightbridge_authz_core::authz::{CompiledRbac, PermissionSet, permissions_for_roles};
 use lightbridge_authz_core::config::Oauth2;
 use lightbridge_authz_core::{Error, Permission};
 use serde::Deserialize;
 use serde_json::Value;
-use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 /// Token information returned by JWT validation.
 #[derive(Clone, Deserialize)]
@@ -141,8 +141,9 @@ pub struct BearerTokenService {
     cache: Arc<JwksCache>,
     /// JWT claim carrying the caller's roles.
     roles_claim: String,
-    /// Precompiled role → permission map (wildcards already expanded).
-    role_permissions: HashMap<String, PermissionSet>,
+    /// Precompiled role → permission map (wildcards already expanded), plus the compiled
+    /// `default_grants` fallback applied to roles that match none of it.
+    role_permissions: CompiledRbac,
 }
 
 impl fmt::Debug for BearerTokenService {
