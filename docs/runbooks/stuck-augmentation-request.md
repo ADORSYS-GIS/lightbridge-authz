@@ -76,5 +76,5 @@ governance-ctl budget verify --account <id> --period <period>   # or the equival
 ```
 
 ⚠️ If they diverge: **stop mutating and reconcile.** Do not "fix" the balance — it is a
-materialized view of the ledger (ADR-0006), so the divergence is evidence of a bug, and
+materialized view of the ledger (ADR-0009), so the divergence is evidence of a bug, and
 overwriting it destroys the evidence while leaving the bug.

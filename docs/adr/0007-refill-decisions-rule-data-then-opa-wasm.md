@@ -87,5 +87,5 @@ On any compile, load, evaluation or schema-validation failure the safe default i
 
 ## Related
 
-- ADR-0006 (the ledger the decision writes into), ADR-0008 (enforcement)
+- ADR-0009 (the ledger the decision writes into), ADR-0008 (enforcement)
 - Runbook: `docs/runbooks/roll-back-a-budget-policy.md`

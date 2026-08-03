@@ -6,4 +6,4 @@ usually produces several ADRs.
 
 | # | Title | Status | Produced |
 |---|---|---|---|
-| [0001](./0001-budget-refill.md) | Dynamic budget refill and policy | Draft | ADR-0006, ADR-0007, ADR-0008 |
+| [0001](./0001-budget-refill.md) | Dynamic budget refill and policy | Draft | ADR-0007, ADR-0008, ADR-0009 |
