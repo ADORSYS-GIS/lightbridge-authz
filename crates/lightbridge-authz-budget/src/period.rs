@@ -61,6 +61,25 @@ impl Period {
             .parse()
             .expect("Period invariant: last 2 chars are always ASCII digits in 1..=12")
     }
+
+    /// The calendar month immediately before this one, e.g. `"2026-08"` -> `"2026-07"`, and
+    /// `"2026-01"` -> `"2025-12"` (mirroring the December/January rollover already handled by
+    /// `spend.rs`'s `period_bounds_utc`). Infallible: `Period` only ever holds an
+    /// already-validated `'YYYY-MM'`, and stepping one month back from any valid year/month
+    /// always yields another valid year/month.
+    pub fn previous(&self) -> Period {
+        let year = self.year();
+        let month = self.month();
+
+        let (prev_year, prev_month) = if month == 1 {
+            (year - 1, 12)
+        } else {
+            (year, month - 1)
+        };
+
+        Period::from_ymd(prev_year, prev_month)
+            .expect("Period invariant: stepping one month back always yields a valid period")
+    }
 }
 
 impl fmt::Display for Period {
@@ -121,5 +140,23 @@ mod tests {
         let period = Period::parse("2026-08").expect("valid period must parse");
         assert_eq!(period.year(), 2026);
         assert_eq!(period.month(), 8);
+    }
+
+    #[test]
+    fn previous_steps_back_one_month_within_a_year() {
+        let period = Period::parse("2026-08").expect("valid period must parse");
+        assert_eq!(
+            period.previous(),
+            Period::parse("2026-07").expect("valid period must parse")
+        );
+    }
+
+    #[test]
+    fn previous_rolls_january_back_into_december_of_prior_year() {
+        let period = Period::parse("2026-01").expect("valid period must parse");
+        assert_eq!(
+            period.previous(),
+            Period::parse("2025-12").expect("valid period must parse")
+        );
     }
 }
