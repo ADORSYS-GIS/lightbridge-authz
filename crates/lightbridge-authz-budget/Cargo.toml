@@ -11,6 +11,18 @@ workspace = true
 
 [dependencies]
 thiserror.workspace = true
+sqlx.workspace = true
 
 [dependencies.lightbridge-authz-core]
 workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[features]
+it-tests = []
+
+[[test]]
+name = "budget_grants_migration_tests"
+path = "tests/budget_grants_migration_tests.rs"
+required-features = ["it-tests"]

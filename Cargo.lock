@@ -2602,7 +2602,9 @@ name = "lightbridge-authz-budget"
 version = "0.8.1"
 dependencies = [
  "lightbridge-authz-core",
+ "sqlx",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
