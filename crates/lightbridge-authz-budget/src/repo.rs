@@ -69,6 +69,62 @@ pub struct BudgetGrant {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
+/// A `budget_balances` row recomputed directly from `budget_grants`, using the exact same
+/// source-to-bucket mapping [`BudgetRepo::grant`]'s balance `UPDATE` uses. Deliberately
+/// unconditional -- it does not filter on `expires_at`/`revoked_at`, because [`BudgetRepo::grant`]
+/// does not either: the stored `budget_balances` totals already include amounts from grants that
+/// carry an `expires_at` (even a past one) or, in the rare historical-import case, a `revoked_at`
+/// set at insert time. Reproducing the raw stored projection bit-for-bit requires reproducing
+/// that same unconditional behavior. Expiry/revocation-aware reads are a separate, narrower
+/// concern -- see [`BudgetRepo::effective_balance`].
+///
+/// Deliberately does NOT carry `version`/`updated_at` -- those are mutation bookkeeping (how many
+/// times the row changed, and when), not ledger-derived facts, and are out of scope for the
+/// replay equality check (#189).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct DerivedBalance {
+    pub budget_account_id: String,
+    /// Raw string, not a parsed [`Period`] -- this is compared directly against
+    /// `budget_balances.period`, which is also raw `TEXT`. Forcing a `Period::parse` round-trip
+    /// here could fail on data this function must handle unconditionally.
+    pub period: String,
+    pub base_total_micros: i64,
+    pub self_service_total_micros: i64,
+    pub admin_total_micros: i64,
+    pub automatic_total_micros: i64,
+    pub refund_total_micros: i64,
+    pub effective_budget_micros: i64,
+    pub self_service_grant_count: i32,
+    pub automatic_grant_count: i32,
+}
+
+const REBUILD_ALL_BALANCES_SQL: &str = "SELECT \
+     budget_account_id, \
+     period, \
+     COALESCE(SUM(CASE WHEN source IN ('base','migration') THEN amount_micros ELSE 0 END), 0)::bigint \
+        AS base_total_micros, \
+     COALESCE(SUM(CASE WHEN source = 'self_service' THEN amount_micros ELSE 0 END), 0)::bigint \
+        AS self_service_total_micros, \
+     COALESCE(SUM(CASE WHEN source IN ('admin','manual_approval','promotion') THEN amount_micros ELSE 0 END), 0)::bigint \
+        AS admin_total_micros, \
+     COALESCE(SUM(CASE WHEN source = 'automatic' THEN amount_micros ELSE 0 END), 0)::bigint \
+        AS automatic_total_micros, \
+     COALESCE(SUM(CASE WHEN source = 'refund' THEN amount_micros ELSE 0 END), 0)::bigint \
+        AS refund_total_micros, \
+     COALESCE(SUM(amount_micros), 0)::bigint AS effective_budget_micros, \
+     COALESCE(SUM(CASE WHEN source = 'self_service' THEN 1 ELSE 0 END), 0)::int \
+        AS self_service_grant_count, \
+     COALESCE(SUM(CASE WHEN source = 'automatic' THEN 1 ELSE 0 END), 0)::int \
+        AS automatic_grant_count \
+     FROM budget_grants \
+     GROUP BY budget_account_id, period";
+
+const EFFECTIVE_BALANCE_SQL: &str = "SELECT COALESCE(SUM(amount_micros), 0)::bigint \
+     FROM budget_grants \
+     WHERE budget_account_id = $1 AND period = $2 \
+       AND (expires_at IS NULL OR expires_at > $3) \
+       AND revoked_at IS NULL";
+
 #[derive(Debug, sqlx::FromRow)]
 struct BudgetGrantRow {
     id: String,
@@ -255,5 +311,53 @@ impl BudgetRepo {
         tx.commit().await.map_err(storage_failed)?;
 
         BudgetGrant::try_from(grant_row)
+    }
+
+    /// Replays the whole `budget_grants` ledger into the same shape `budget_balances` stores,
+    /// using the identical source-to-bucket mapping [`BudgetRepo::grant`]'s `UPDATE` applies.
+    /// This is #189's "replay" proof: the ledger is authoritative rather than decorative only if
+    /// reconstructing balances from entries reproduces the live, stored projection exactly.
+    ///
+    /// Deliberately unconditional -- no `expires_at`/`revoked_at` filtering. `grant()` updates
+    /// `budget_balances` unconditionally on every successful insert, so an exact replay of that
+    /// stored state must be equally unconditional. Expiry/revocation-aware reads belong to
+    /// [`BudgetRepo::effective_balance`], a separate, narrower concern -- not this function.
+    pub async fn rebuild_all_balances(&self) -> Result<Vec<DerivedBalance>, BudgetError> {
+        sqlx::query_as(REBUILD_ALL_BALANCES_SQL)
+            .fetch_all(self.pool())
+            .await
+            .map_err(storage_failed)
+    }
+
+    /// The expiry- and revocation-aware read: the actual amount an (account, period) may spend
+    /// right now, as of the caller-supplied `as_of`, excluding grants whose `expires_at` has
+    /// passed or whose `revoked_at` is set. A real consumer (a policy evaluator, an admin-facing
+    /// "how much can this account actually spend" view) should call this instead of trusting the
+    /// raw `budget_balances.effective_budget_micros` column directly, since that column does not
+    /// account for expiry.
+    ///
+    /// `as_of` is a parameter, not read from the clock internally -- the same discipline this
+    /// crate already applies elsewhere (`Period` is clock-free; the spend adapter takes bounds as
+    /// parameters).
+    ///
+    /// Makes zero writes -- a pure `SELECT`, so "without any entry being mutated" holds trivially
+    /// by construction; nothing in `budget_grants` or `budget_balances` is touched.
+    pub async fn effective_balance(
+        &self,
+        budget_account_id: &str,
+        period: &Period,
+        as_of: DateTime<Utc>,
+    ) -> Result<i64, BudgetError> {
+        let period_str = period.to_string();
+
+        let (total,): (i64,) = sqlx::query_as(EFFECTIVE_BALANCE_SQL)
+            .bind(budget_account_id)
+            .bind(&period_str)
+            .bind(as_of)
+            .fetch_one(self.pool())
+            .await
+            .map_err(storage_failed)?;
+
+        Ok(total)
     }
 }
