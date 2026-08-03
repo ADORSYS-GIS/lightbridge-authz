@@ -20,7 +20,7 @@ human in the path of a decision that is usually mechanical.
 
 ## Design
 
-### Domain (ADR-0006)
+### Domain (ADR-0009)
 
 `budget_grants` (immutable) -> `budget_balances` (materialized, rebuildable by replay), plus
 `budget_augmentation_requests` carrying the request state machine: `created`, `evaluating`,
@@ -101,6 +101,6 @@ permissionMapping:
 
 ## Decisions produced
 
-- [ADR-0006](../adr/0006-budget-grants-are-an-immutable-ledger.md)
+- [ADR-0009](../adr/0009-budget-grants-are-an-immutable-ledger.md)
 - [ADR-0007](../adr/0007-refill-decisions-rule-data-then-opa-wasm.md)
 - [ADR-0008](../adr/0008-refills-are-discrete-budget-tiers.md)

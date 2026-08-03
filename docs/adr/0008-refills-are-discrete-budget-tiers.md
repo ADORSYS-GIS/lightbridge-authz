@@ -87,6 +87,6 @@ keep plan-level budgets.
 
 ## Related
 
-- ADR-0006 (ledger), ADR-0007 (decisions)
+- ADR-0007 (decisions), ADR-0009 (ledger)
 - Runbook: `docs/runbooks/budget-tier-rekey-cutover.md`
 - ai-helm ADR-0021, **ADR-0084**, ADR-0110, ADR-0070

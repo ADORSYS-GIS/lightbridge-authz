@@ -1,4 +1,4 @@
-# ADR-0006: Budget grants are an immutable ledger with a materialized balance
+# ADR-0009: Budget grants are an immutable ledger with a materialized balance
 
 - Status: Proposed
 - Date: 2026-07-31

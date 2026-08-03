@@ -50,7 +50,7 @@ Simulation never writes a grant or touches a balance. Use the scenario that misb
 
 ## 3. Clean up what the bad revision did
 
-Grants are immutable (ADR-0006), so a wrong grant is corrected by a **compensating
+Grants are immutable (ADR-0009), so a wrong grant is corrected by a **compensating
 `correction` row**, never by editing or deleting:
 
 ```sql
