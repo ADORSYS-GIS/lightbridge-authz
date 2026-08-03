@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 thiserror.workspace = true
 sqlx.workspace = true
+chrono.workspace = true
 
 [dependencies.lightbridge-authz-core]
 workspace = true
@@ -25,4 +26,9 @@ it-tests = []
 [[test]]
 name = "budget_grants_migration_tests"
 path = "tests/budget_grants_migration_tests.rs"
+required-features = ["it-tests"]
+
+[[test]]
+name = "spend_reader_tests"
+path = "tests/spend_reader_tests.rs"
 required-features = ["it-tests"]

@@ -25,6 +25,13 @@ pub struct Config {
     /// still loads.
     #[serde(default)]
     pub redis: Option<Redis>,
+    /// Connection to the usage-events database (`lightbridge_authz_usage`, Timescale-compatible;
+    /// see `lightbridge-authz-usage`'s own `database.url`), used by the budget domain's spend
+    /// adapter to read `usage_events.total_cost` directly rather than calling the usage service's
+    /// own (unprotected) query API. Optional, like `redis` above: only the budget domain's spend
+    /// reads need it, so a config file that omits it entirely still loads.
+    #[serde(default)]
+    pub usage_database: Option<Database>,
     pub oauth2: Oauth2,
     pub otel: Otel,
     /// Billing plans a caller may attach to an API key at creation time. The catalogue is defined
@@ -747,5 +754,84 @@ mod tests {
         let ok: Billing =
             from_str("plans:\n  - id: free\n    name: Free\n  - id: pro\n    name: Pro\n").unwrap();
         assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn config_without_redis_or_usage_database_still_loads() {
+        let yaml = "\
+server:
+  api:
+    address: \"0.0.0.0\"
+    port: 3000
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+  opa:
+    address: \"0.0.0.0\"
+    port: 3001
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+    basic_auth:
+      username: \"u\"
+      password: \"p\"
+logging:
+  level: \"info\"
+database:
+  url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz\"
+oauth2:
+  type: self
+  jwks_url: \"http://localhost/jwks\"
+otel:
+  enabled: true
+  otlp_endpoint: \"http://localhost:4317\"
+  service_name: \"svc\"
+";
+        let cfg: Config = from_str(yaml).expect("config omitting redis/usage_database must load");
+        assert!(cfg.redis.is_none());
+        assert!(cfg.usage_database.is_none());
+    }
+
+    #[test]
+    fn config_with_usage_database_parses_it() {
+        let yaml = "\
+server:
+  api:
+    address: \"0.0.0.0\"
+    port: 3000
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+  opa:
+    address: \"0.0.0.0\"
+    port: 3001
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+    basic_auth:
+      username: \"u\"
+      password: \"p\"
+logging:
+  level: \"info\"
+database:
+  url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz\"
+usage_database:
+  url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz_usage\"
+  pool_size: 5
+oauth2:
+  type: self
+  jwks_url: \"http://localhost/jwks\"
+otel:
+  enabled: true
+  otlp_endpoint: \"http://localhost:4317\"
+  service_name: \"svc\"
+";
+        let cfg: Config = from_str(yaml).expect("config with usage_database must load");
+        let usage_db = cfg.usage_database.expect("usage_database must be set");
+        assert_eq!(
+            usage_db.url,
+            "postgres://postgres:postgres@localhost:5432/lightbridge_authz_usage"
+        );
+        assert_eq!(usage_db.pool_size, Some(5));
     }
 }

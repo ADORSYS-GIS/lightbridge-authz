@@ -10,10 +10,12 @@ pub mod amount;
 pub mod error;
 pub mod period;
 pub mod source;
+pub mod spend;
 pub mod tier;
 
 pub use amount::AmountMicros;
 pub use error::BudgetError;
 pub use period::Period;
 pub use source::GrantSource;
+pub use spend::{Spend, SpendReader, TimescaleSpendReader};
 pub use tier::BudgetTier;
