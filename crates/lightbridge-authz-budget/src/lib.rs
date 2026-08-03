@@ -9,6 +9,7 @@
 pub mod amount;
 pub mod error;
 pub mod period;
+pub mod repo;
 pub mod source;
 pub mod spend;
 pub mod tier;

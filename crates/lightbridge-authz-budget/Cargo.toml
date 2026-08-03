@@ -29,6 +29,11 @@ path = "tests/budget_grants_migration_tests.rs"
 required-features = ["it-tests"]
 
 [[test]]
+name = "budget_repo_grant_tests"
+path = "tests/budget_repo_grant_tests.rs"
+required-features = ["it-tests"]
+
+[[test]]
 name = "spend_reader_tests"
 path = "tests/spend_reader_tests.rs"
 required-features = ["it-tests"]
