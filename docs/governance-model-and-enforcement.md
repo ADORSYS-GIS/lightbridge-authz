@@ -499,7 +499,7 @@ The shared fix exists behind `sharedBudget.enabled`.
 | Pooled project ceiling | `projects.project_quota` | introspection → `x-project-quota` | header yes, **rule not configured** |
 | Per-member ceiling | `project_members.quota_tier` | introspection → `x-quota-tier` | header yes, **rule not configured** |
 | Key validity cascade | `api_key_validation.effective_status` | introspection `active` | yes |
-| Monthly budget window | `unit: Month` in the BTP | RLS counter key | yes, but **30-day epoch buckets, not calendar months** |
+| Monthly budget window | `unit: Month` in the BTP | RLS counter key | yes, **calendar month (`YYYY-MM`, UTC), not a 30-day epoch bucket** |
 | Account's own default-project tier | `accounts.default_quota` | *not currently stamped* | no |
 
 `accounts.default_quota` deserves a note: it is settable and validated, but nothing reads it at the

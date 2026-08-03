@@ -72,8 +72,11 @@ keep plan-level budgets.
 - ⚠️ The ladder is **append-only**. `b-2000` may be added; no rung may ever be reordered or
   removed. This is ADR-0084's rule and it applies unchanged.
 - ⚠️ The cutover retiring the per-plan rules moves every counter and **must land near a
-  period boundary**. The window is a fixed 30-day epoch bucket (`floor(now/2592000)*2592000`),
-  **not** a calendar month. See the runbook.
+  period boundary**. The period **is** a calendar month (`YYYY-MM`, UTC) -- the boundary is the
+  1st of the month. ai-helm ADR-0111 folded a calendar `x-billing-period` marker into the
+  rate-limit key; ADR-0112 then set `unit: Year` so that marker is the **only** rotation, once
+  the 30-day epoch bucket that used to live alongside it in the key was found to be rotating
+  every counter a second time, silently. See the runbook.
 
 ## Alternatives considered
 
