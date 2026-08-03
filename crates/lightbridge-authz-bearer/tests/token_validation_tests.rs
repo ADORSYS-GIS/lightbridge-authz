@@ -74,6 +74,7 @@ fn default_rbac() -> Rbac {
     Rbac {
         roles_claim: "roles".to_string(),
         role_permissions: HashMap::new(),
+        default_grants: Vec::new(),
     }
 }
 
@@ -429,6 +430,7 @@ async fn custom_roles_claim_is_honored() {
     let rbac = Rbac {
         roles_claim: "lightbridge_api_roles".to_string(),
         role_permissions: HashMap::new(),
+        default_grants: Vec::new(),
     };
     let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, rbac));
 

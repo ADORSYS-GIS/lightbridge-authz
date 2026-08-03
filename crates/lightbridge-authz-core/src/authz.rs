@@ -481,10 +481,7 @@ mod tests {
         };
         let compiled = rbac.compile();
         assert!(!compiled.roles.contains_key("lightbridge-admin"));
-        let billing = compiled
-            .roles
-            .get("billing")
-            .expect("billing role present");
+        let billing = compiled.roles.get("billing").expect("billing role present");
         assert!(billing.contains(Permission::AccountRead));
         assert_eq!(billing.len(), 1);
     }
