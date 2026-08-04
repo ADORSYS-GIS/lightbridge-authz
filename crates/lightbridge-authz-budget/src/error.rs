@@ -20,6 +20,8 @@ pub enum BudgetError {
     PolicyDenied(String),
     #[error("storage operation failed: {0}")]
     StorageFailed(String),
+    #[error("invalid rule data: {0}")]
+    InvalidRuleData(String),
 }
 
 pub type Result<T> = std::result::Result<T, BudgetError>;
@@ -57,6 +59,11 @@ mod tests {
         assert_eq!(
             BudgetError::StorageFailed("connection reset".to_string()).to_string(),
             "storage operation failed: connection reset"
+        );
+        assert_eq!(
+            BudgetError::InvalidRuleData("policy_revision must not be empty".to_string())
+                .to_string(),
+            "invalid rule data: policy_revision must not be empty"
         );
     }
 }

@@ -5,8 +5,9 @@
 //! policy engine code directly instead of relying on generated CRUD.
 //!
 //! Per ADR-0007, [`decision`]/[`facts`] define the decision contract and fact set that any
-//! policy engine sits behind (the [`decision::PolicyEngine`] trait); no evaluator implementation
-//! lives in this crate yet -- see `docs/budget-decision-contract.md`.
+//! policy engine sits behind (the [`decision::PolicyEngine`] trait); [`rule_data`] is the first
+//! (rule-data-driven) evaluator against it, with an OPA-Wasm evaluator planned for a later PR --
+//! see `docs/budget-decision-contract.md`.
 
 pub mod amount;
 pub mod decision;
@@ -14,6 +15,7 @@ pub mod error;
 pub mod facts;
 pub mod period;
 pub mod repo;
+pub mod rule_data;
 pub mod source;
 pub mod spend;
 pub mod tier;
@@ -23,6 +25,9 @@ pub use decision::{Decision, Effect, Obligations, PolicyEngine};
 pub use error::BudgetError;
 pub use facts::Facts;
 pub use period::Period;
+pub use rule_data::{
+    Condition, Field, Operator, Rule, RuleDataEngine, RuleSet, default_rule_set_json,
+};
 pub use source::GrantSource;
 pub use spend::{Spend, SpendReader, TimescaleSpendReader};
 pub use tier::BudgetTier;
