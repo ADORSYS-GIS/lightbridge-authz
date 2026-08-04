@@ -12,6 +12,7 @@ use sqlx::PgPool;
 
 const SEEDED_POLICY_SET_ID: &str = "budget-refill";
 const SEEDED_POLICY_REVISION: &str = "budget-policy-v1";
+const SEEDED_REVISION_ID: &str = "budget-refill-v1";
 const EVALUATION_BUDGET: usize = 1_000;
 
 /// Deliberately valid JSON *syntax* (so a JSONB column would happily store it) but invalid rule
@@ -219,5 +220,109 @@ async fn missing_policy_set_is_a_loud_error(pool: PgPool) {
         matches!(result, Err(BudgetError::StorageFailed(_))),
         "a policy set id that doesn't exist must be a clear, typed error, not a panic or a \
          silently-empty default engine: {result:?}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn activate_by_revision_id_rolls_back_to_an_existing_revision(pool: PgPool) {
+    let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
+
+    let store = PolicyStore::load_active_from_db(
+        Arc::clone(&db_pool),
+        SEEDED_POLICY_SET_ID,
+        EVALUATION_BUDGET,
+    )
+    .await
+    .expect("seeded policy set loads");
+
+    // Activate a brand-new revision first, so there is genuinely something to roll back FROM.
+    let new_revision_data = valid_replacement_rule_data("budget-policy-v2-test", 5);
+    store
+        .activate(&new_revision_data, Some("tester"))
+        .await
+        .expect("valid rule data must activate");
+    assert_eq!(store.active_policy_revision(), "budget-policy-v2-test");
+
+    let count_before_rollback = revision_count(&pool, SEEDED_POLICY_SET_ID).await;
+
+    // Roll back to the original seeded revision by id -- this must NOT insert a new row, unlike
+    // resubmitting the same rule data through `activate` (which would collide with the
+    // `UNIQUE (policy_set_id, policy_revision)` constraint).
+    let reactivated_revision = store
+        .activate_by_revision_id(SEEDED_REVISION_ID)
+        .await
+        .expect("rolling back to an existing revision id must succeed");
+    assert_eq!(reactivated_revision, SEEDED_POLICY_REVISION);
+
+    assert_eq!(
+        store.active_policy_revision(),
+        SEEDED_POLICY_REVISION,
+        "the live engine on the same store instance must reflect the reactivated revision \
+         immediately"
+    );
+
+    let count_after_rollback = revision_count(&pool, SEEDED_POLICY_SET_ID).await;
+    assert_eq!(
+        count_after_rollback, count_before_rollback,
+        "rollback-by-id must never insert a new revision row -- it only re-points \
+         active_revision_id at the one that already exists"
+    );
+
+    let active_id = active_revision_id(&pool, SEEDED_POLICY_SET_ID)
+        .await
+        .expect("active_revision_id must be set");
+    assert_eq!(
+        active_id, SEEDED_REVISION_ID,
+        "active_revision_id must point back at the original seeded revision row"
+    );
+
+    let restarted_store = PolicyStore::load_active_from_db(
+        Arc::clone(&db_pool),
+        SEEDED_POLICY_SET_ID,
+        EVALUATION_BUDGET,
+    )
+    .await
+    .expect("a fresh load simulating a restart must succeed");
+    assert_eq!(
+        restarted_store.active_policy_revision(),
+        SEEDED_POLICY_REVISION,
+        "a fresh PolicyStore built after the rollback must also see the original revision"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn activate_by_revision_id_rejects_an_unknown_revision(pool: PgPool) {
+    let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
+
+    let store = PolicyStore::load_active_from_db(
+        Arc::clone(&db_pool),
+        SEEDED_POLICY_SET_ID,
+        EVALUATION_BUDGET,
+    )
+    .await
+    .expect("seeded policy set loads");
+
+    let active_id_before = active_revision_id(&pool, SEEDED_POLICY_SET_ID).await;
+
+    let result = store
+        .activate_by_revision_id("some-revision-id-that-was-never-created")
+        .await;
+
+    assert!(
+        matches!(result, Err(BudgetError::StorageFailed(_))),
+        "rolling back to a nonexistent revision id must be a clear, typed error, not a panic or \
+         a silent no-op: {result:?}"
+    );
+
+    assert_eq!(
+        store.active_policy_revision(),
+        SEEDED_POLICY_REVISION,
+        "the live engine must be untouched by a rejected rollback"
+    );
+
+    let active_id_after = active_revision_id(&pool, SEEDED_POLICY_SET_ID).await;
+    assert_eq!(
+        active_id_after, active_id_before,
+        "a rejected rollback must not repoint active_revision_id"
     );
 }

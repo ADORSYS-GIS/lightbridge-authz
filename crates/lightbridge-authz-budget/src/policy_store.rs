@@ -37,6 +37,9 @@ const INSERT_REVISION_SQL: &str = "INSERT INTO budget_policy_revisions \
 const ACTIVATE_REVISION_SQL: &str =
     "UPDATE budget_policy_sets SET active_revision_id = $1 WHERE id = $2";
 
+const SELECT_REVISION_BY_ID_SQL: &str = "SELECT policy_revision, rule_data_json::text \
+     FROM budget_policy_revisions WHERE id = $1 AND policy_set_id = $2";
+
 /// Ties one DB-persisted policy set (identified by `policy_set_id`) to one live
 /// [`RuleDataEngine`]. Cheaply `Clone` -- `pool` and `engine` are both `Arc`s, so cloning a
 /// `PolicyStore` shares the same live engine rather than constructing a second, independent one.
@@ -158,6 +161,81 @@ impl PolicyStore {
         })?;
 
         Ok(rule_set.policy_revision)
+    }
+
+    /// Reactivates an *existing* revision by id -- the rollback path
+    /// (`docs/runbooks/roll-back-a-budget-policy.md`). Unlike [`Self::activate`], this never
+    /// inserts a new `budget_policy_revisions` row: it looks up the row's already-stored
+    /// `rule_data_json`, re-points `active_revision_id` at it, and hot-swaps the engine to that
+    /// same content. Returns the reactivated revision's `policy_revision` string.
+    ///
+    /// `revision_id` is looked up scoped to this store's own `policy_set_id` -- a revision id that
+    /// belongs to a different policy set must not be reactivatable through this store, even if the
+    /// id string happens to exist in the table. Not found is a clear, loud
+    /// [`BudgetError::StorageFailed`] (this is a caller error -- rolling back to a revision id that
+    /// doesn't exist -- not a storage failure in the literal sense, but this crate's current error
+    /// taxonomy has no dedicated "not found" variant, and `StorageFailed`'s message carries the
+    /// distinction clearly without growing the enum for one caller).
+    ///
+    /// Mirrors [`Self::activate`]'s ordering: the DB repoint commits first, then the in-memory
+    /// engine is hot-swapped via [`RuleDataEngine::load`]. If that hot-swap somehow fails despite
+    /// the content having already been validated once (when it was first inserted), the same
+    /// "DB and engine now disagree" [`BudgetError::StorageFailed`] is returned as `activate` uses,
+    /// for the same reason: the transaction already committed, so there is nothing to roll back to.
+    pub async fn activate_by_revision_id(&self, revision_id: &str) -> Result<String, BudgetError> {
+        let row: Option<(String, String)> = sqlx::query_as(SELECT_REVISION_BY_ID_SQL)
+            .bind(revision_id)
+            .bind(&self.policy_set_id)
+            .fetch_optional(self.pool.pool())
+            .await
+            .map_err(storage_failed)?;
+
+        let (policy_revision, rule_data_json) = row.ok_or_else(|| {
+            BudgetError::StorageFailed(format!(
+                "no revision '{revision_id}' found for policy set '{}' -- cannot roll back to a \
+                 revision that does not exist",
+                self.policy_set_id
+            ))
+        })?;
+
+        sqlx::query(ACTIVATE_REVISION_SQL)
+            .bind(revision_id)
+            .bind(&self.policy_set_id)
+            .execute(self.pool.pool())
+            .await
+            .map_err(storage_failed)?;
+
+        self.engine.load(&rule_data_json).map_err(|load_err| {
+            BudgetError::StorageFailed(format!(
+                "DB and engine now disagree on the active policy revision: revision \
+                 '{policy_revision}' (id '{revision_id}') committed to the database for policy \
+                 set '{}' but the in-memory engine failed to hot-swap to it ({load_err}) -- this \
+                 is a serious, unusual state that needs manual reconciliation, not a retry",
+                self.policy_set_id
+            ))
+        })?;
+
+        Ok(policy_revision)
+    }
+
+    /// Constructs a `PolicyStore` directly from an already-built [`RuleDataEngine`], performing no
+    /// I/O and no verification that `engine`'s content matches anything persisted for
+    /// `policy_set_id`. Exists for callers that need a `PolicyStore` to satisfy an API surface
+    /// (e.g. `lightbridge-authz-rest`'s `Procedures::new`) in a context with no live database
+    /// connection to query -- concretely, this workspace's hermetic, fully-offline router-assembly
+    /// tests, which build every other dependency against a lazily-connected, deliberately
+    /// unreachable Postgres address and never query it. Production startup code must always use
+    /// [`Self::load_active_from_db`] instead, which actually verifies against the database.
+    pub fn from_engine(
+        pool: Arc<dyn DbPoolTrait>,
+        policy_set_id: &str,
+        engine: RuleDataEngine,
+    ) -> Self {
+        Self {
+            pool,
+            policy_set_id: policy_set_id.to_string(),
+            engine: Arc::new(engine),
+        }
     }
 
     /// The live, hot-swappable engine this store activates against. A later PR's request-handling

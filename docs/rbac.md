@@ -209,17 +209,34 @@ listed here is denied unconditionally (fail closed).**
 | `apikey:revoke`   | `procedure.revokeApiKey`                             | `revoke-api-key`                    |
 | `apikey:rotate`   | `procedure.rotateApiKey`                             | `rotate-api-key`                    |
 | `apikey:validate` | — (OPA server, Basic-auth)                           | `validate-api-key`, `validate-authorino-api-key` |
+| `budget:policy-activate` | `procedure.activateBudgetPolicy`                | — (no MCP tool yet)                 |
+| `budget:policy-read`     | `procedure.getBudgetPolicyStatus`               | — (no MCP tool yet)                 |
 
 `read` covers both the list and get operations for a resource.
 
-### Budget permissions (reserved, not yet gating any operation)
+### Budget policy lifecycle (ADR-0007)
+
+`procedure.activateBudgetPolicy` activates a budget policy: either brand-new rule data
+(`ruleDataJson`) or a rollback to an already-existing revision (`revisionId`, the
+`docs/runbooks/roll-back-a-budget-policy.md` flow) — exactly one of the two must be supplied.
+`procedure.getBudgetPolicyStatus` reports the revision genuinely serving `evaluate()` calls right
+now, which can differ from the one most recently *attempted* if that attempt was rejected (a
+failed load leaves the previous revision in force). Both procedures are gated only by
+`@allow(auth() != null)` in the schema — there is no per-tenant ownership check, because the budget
+policy is a single, platform-wide singleton, not owned by any particular account. The entire
+authorization story for these two op-ids is therefore the RBAC gate above:
+`budget:policy-activate` (coarser action, changes what's serving) and `budget:policy-read` (coarser
+gate, only reads it).
+
+### Budget permissions (remaining eight reserved, not yet gating any operation)
 
 `RFC-0001` (`docs/rfc/0001-budget-refill.md`) sketches a `budget:*` permission surface for the
-upcoming budget domain. The ten permissions below exist in `Permission::ALL` and are usable in
-`role_permissions`/`default_grants` today, but **no RPC `op_id` or MCP tool maps to any of them
-yet** — Wave 3 of issue #188 hasn't wired up the budget domain's RPC/MCP surface. They are reserved
-here so the permission strings, and the RBAC machinery around them (wildcard expansion,
-`default_grants`), are settled ahead of that surface landing in a later PR.
+budget domain. `budget:policy-activate` and `budget:policy-read` are wired up as of the budget
+policy lifecycle above; the eight permissions below still exist in `Permission::ALL` and are usable
+in `role_permissions`/`default_grants` today, but **no RPC `op_id` or MCP tool maps to any of them
+yet** — later PRs in issue #188 haven't wired up the rest of the budget domain's RPC/MCP surface.
+They are reserved here so the permission strings, and the RBAC machinery around them (wildcard
+expansion, `default_grants`), are settled ahead of that surface landing.
 
 | Permission               | Meaning                                                              |
 | ------------------------ | --------------------------------------------------------------------- |
@@ -229,19 +246,17 @@ here so the permission strings, and the RBAC machinery around them (wildcard exp
 | `budget:grant`           | Grant budget directly, bypassing self-service policy evaluation.    |
 | `budget:revoke`          | Revoke previously granted budget.                                    |
 | `budget:audit-read`      | Read the budget audit trail (grants, decisions, policy revisions).  |
-| `budget:policy-read`     | Read budget policy rules/revisions.                                  |
 | `budget:policy-write`    | Author (write) budget policy rules.                                  |
 | `budget:policy-simulate` | Dry-run a budget policy against facts without applying it.          |
-| `budget:policy-activate` | Activate a budget policy revision.                                   |
 
 `budget:policy-write` and `budget:policy-activate` are deliberately kept separate (ADR-0007): with
 arbitrary Rego, writing a policy means shipping executable code into the decision path, so the
 identity that authors a policy should not be the same one that activates it. The generic
-`budget:*` resource wildcard, once something grants it, expands to **all ten** including both of
-these together — consistent with how `project:*`/`apikey:*` already behave for their resources
-(see the wildcard note above). Operators wanting the write/activate separation enforced should list
-the individual grants rather than the wildcard, exactly as already advised for the existing
-resources.
+`budget:*` resource wildcard, once something grants it, expands to **all ten** budget permissions
+including both of these together — consistent with how `project:*`/`apikey:*` already behave for
+their resources (see the wildcard note above). Operators wanting the write/activate separation
+enforced should list the individual grants rather than the wildcard, exactly as already advised for
+the existing resources.
 
 **Deliberately unmapped → denied (defense in depth):**
 

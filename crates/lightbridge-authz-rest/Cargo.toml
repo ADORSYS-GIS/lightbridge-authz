@@ -28,6 +28,7 @@ lightbridge-authz-api.workspace = true
 lightbridge-authz-core = { workspace = true, features = ["axum"] }
 lightbridge-authz-api-key.workspace = true
 lightbridge-authz-bearer.workspace = true
+lightbridge-authz-budget.workspace = true
 jsonwebtoken.workspace = true
 rsa.workspace = true
 rand_core.workspace = true

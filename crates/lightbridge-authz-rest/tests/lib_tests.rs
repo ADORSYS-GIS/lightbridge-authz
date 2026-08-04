@@ -265,7 +265,7 @@ mod db {
         );
     }
 
-    /// Drives the settled 11-arg `build_api_router` (the RPC surface replaced the old REST mount).
+    /// Drives the settled `build_api_router` (the RPC surface replaced the old REST mount).
     /// The cratestack CRUD client / idempotency store / rate-limit store are lazily-connected to an
     /// unreachable address and never touched — the `/healthz/ready` probe sits on the un-wrapped
     /// public router and only consults `readiness_pool`, the real `sqlx::test` database.
@@ -289,10 +289,22 @@ mod db {
         let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(NoopBearer);
         let issuer = Arc::new(AuthzStoreImpl::with_pool(db_pool.clone()));
         let signing_repo = Arc::new(StoreRepo::new(db_pool.clone()));
+        // The migration this test's `sqlx::test` runs seeds an active `budget-refill` revision,
+        // so a real `load_active_from_db` (not the offline `from_engine` helper) works here.
+        let policy_store = Arc::new(
+            lightbridge_authz_budget::PolicyStore::load_active_from_db(
+                db_pool.clone(),
+                "budget-refill",
+                10_000,
+            )
+            .await
+            .expect("migration seeds an active budget-refill revision"),
+        );
         let router = lightbridge_authz_rest::build_api_router(
             &external_oauth2(),
             bearer,
             issuer,
+            policy_store,
             lazy_cratestack_db(),
             db_pool.clone(),
             signing_repo,

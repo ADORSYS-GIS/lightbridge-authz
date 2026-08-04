@@ -45,6 +45,14 @@ const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 3600);
 /// limiting (Redis-backed)"). Generous burst with steady refill; tune via deployment as needed.
 const RATE_LIMIT_BURST: u32 = 120;
 const RATE_LIMIT_REFILL_PER_SECOND: f64 = 60.0;
+/// The node-count evaluation budget passed to the [`lightbridge_authz_budget::RuleDataEngine`]
+/// this server's [`lightbridge_authz_budget::PolicyStore`] wraps. See
+/// [`lightbridge_authz_budget::RuleDataEngine`]'s own doc comment for why this is a deterministic
+/// node-count budget rather than a wall-clock request timeout.
+const BUDGET_POLICY_EVALUATION_BUDGET: usize = 10_000;
+/// The one budget policy set this epic needs (ADR-0007; `PolicyStore` is bound to it once at
+/// server startup). See `migrations/20260804000001_budget_policy_sets_and_revisions.sql`.
+const BUDGET_POLICY_SET_ID: &str = "budget-refill";
 
 #[derive(Serialize, Deserialize)]
 struct RootResponse {
@@ -134,6 +142,24 @@ fn to_cool_error(err: Error) -> CoolError {
         Error::Conflict(m) => CoolError::Conflict(m),
         Error::BadRequest(m) => CoolError::BadRequest(m),
         other => CoolError::Internal(other.to_string()),
+    }
+}
+
+/// Maps a [`lightbridge_authz_budget::BudgetError`] into cratestack's `CoolError`, mirroring
+/// [`to_cool_error`] above for the (unrelated) core `Error` type. Exhaustive match, no wildcard
+/// arm, so a new `BudgetError` variant fails this crate's build until it is triaged here rather
+/// than silently falling into some default status.
+fn budget_error_to_cool_error(err: lightbridge_authz_budget::BudgetError) -> CoolError {
+    use lightbridge_authz_budget::BudgetError;
+    match err {
+        BudgetError::InvalidRuleData(m) => CoolError::BadRequest(m),
+        BudgetError::InvalidAmount(_)
+        | BudgetError::InvalidPeriod(_)
+        | BudgetError::UnknownSource(_)
+        | BudgetError::UnknownTier(_) => CoolError::BadRequest(err.to_string()),
+        BudgetError::AlreadyGranted => CoolError::Conflict(err.to_string()),
+        BudgetError::PolicyDenied(_) => CoolError::Forbidden(err.to_string()),
+        BudgetError::StorageFailed(m) => CoolError::Internal(m),
     }
 }
 
@@ -261,14 +287,26 @@ fn to_schema_api_key_secret(s: ApiKeySecret) -> schema::ApiKeySecret {
 /// (ADR-0003, "Known cratestack-pg 0.4.9 bugs", item 1) cannot occur. `db` is intentionally unused:
 /// the generated CRUD client speaks over cratestack's own sqlx pool (a different sqlx major than
 /// this workspace's), so the procedures use the pre-migration repository pool for their writes.
+///
+/// `policy_store` (ADR-0007) is the one exception to "delegates to `AuthzStoreImpl`/`StoreRepo`" --
+/// the budget policy activation/status procedures below delegate to
+/// [`lightbridge_authz_budget::PolicyStore`] instead, which owns its own persistence against the
+/// same underlying database.
 #[derive(Clone)]
 pub struct Procedures {
     issuer: Arc<AuthzStoreImpl>,
+    policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
 }
 
 impl Procedures {
-    pub fn new(issuer: Arc<AuthzStoreImpl>) -> Self {
-        Self { issuer }
+    pub fn new(
+        issuer: Arc<AuthzStoreImpl>,
+        policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
+    ) -> Self {
+        Self {
+            issuer,
+            policy_store,
+        }
     }
 }
 
@@ -646,6 +684,107 @@ impl schema::procedures::ProcedureRegistry for Procedures {
             Ok(to_schema_account(account))
         }
     }
+
+    /// Activates a budget policy (ADR-0007): either brand-new rule data (`ruleDataJson`) or a
+    /// rollback to an already-existing revision (`revisionId`) --
+    /// `docs/runbooks/roll-back-a-budget-policy.md`'s rollback flow needs the latter, since
+    /// resubmitting the same rule data through the "new revision" path would collide with
+    /// `budget_policy_revisions`' `UNIQUE (policy_set_id, policy_revision)` constraint. Exactly
+    /// one of the two must be supplied.
+    ///
+    /// `policy_store` is bound once at server startup to [`BUDGET_POLICY_SET_ID`] -- there is
+    /// genuinely only one policy set today. Rather than silently ignoring a caller-supplied
+    /// `policySetId` that doesn't match it, this rejects the mismatch with a clear `BadRequest`:
+    /// a caller who typos the policy set id should be told, not silently redirected to the one
+    /// real set.
+    fn activate_budget_policy(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::activate_budget_policy::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::activate_budget_policy::Output, CoolError>,
+    > + Send {
+        let policy_store = self.policy_store.clone();
+        let subject = subject_from_ctx(ctx);
+        let policy_set_id = args.args.policySetId;
+        let rule_data_json = args.args.ruleDataJson;
+        let revision_id = args.args.revisionId;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+
+            if policy_set_id != BUDGET_POLICY_SET_ID {
+                return Err(CoolError::BadRequest(format!(
+                    "unknown policySetId '{policy_set_id}' -- only '{BUDGET_POLICY_SET_ID}' \
+                     exists today"
+                )));
+            }
+
+            let active_revision = match (rule_data_json, revision_id) {
+                (Some(json), None) => policy_store
+                    .activate(&json, Some(&subject))
+                    .await
+                    .map_err(budget_error_to_cool_error)?,
+                (None, Some(revision_id)) => policy_store
+                    .activate_by_revision_id(&revision_id)
+                    .await
+                    .map_err(budget_error_to_cool_error)?,
+                (Some(_), Some(_)) => {
+                    return Err(CoolError::BadRequest(
+                        "exactly one of ruleDataJson or revisionId must be provided, not both"
+                            .to_owned(),
+                    ));
+                }
+                (None, None) => {
+                    return Err(CoolError::BadRequest(
+                        "exactly one of ruleDataJson or revisionId must be provided".to_owned(),
+                    ));
+                }
+            };
+
+            Ok(schema::procedures::activate_budget_policy::Output {
+                policySetId: policy_set_id,
+                activePolicyRevision: active_revision,
+            })
+        }
+    }
+
+    /// Reports the revision genuinely serving `evaluate()` calls right now -- reads the live
+    /// in-memory engine state directly (`PolicyStore::active_policy_revision`), no database
+    /// round-trip needed. See the schema's `getBudgetPolicyStatus` doc comment for why this
+    /// distinction (serving vs. most-recently-attempted) matters for the rollback runbook.
+    fn get_budget_policy_status(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::get_budget_policy_status::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::get_budget_policy_status::Output,
+            CoolError,
+        >,
+    > + Send {
+        let policy_store = self.policy_store.clone();
+        let subject = subject_from_ctx(ctx);
+        let policy_set_id = args.args.policySetId;
+        async move {
+            let _subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+
+            if policy_set_id != BUDGET_POLICY_SET_ID {
+                return Err(CoolError::BadRequest(format!(
+                    "unknown policySetId '{policy_set_id}' -- only '{BUDGET_POLICY_SET_ID}' \
+                     exists today"
+                )));
+            }
+
+            Ok(schema::procedures::get_budget_policy_status::Output {
+                policySetId: policy_set_id,
+                activePolicyRevision: policy_store.active_policy_revision(),
+            })
+        }
+    }
 }
 
 /// Assembles the API server router: public probes, OIDC discovery/JWKS (when signing is enabled),
@@ -662,6 +801,7 @@ pub fn build_api_router(
     oauth2: &Oauth2,
     bearer: Arc<dyn BearerTokenServiceTrait>,
     issuer: Arc<AuthzStoreImpl>,
+    policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
     cratestack_db: schema::Cratestack,
     readiness_pool: Arc<dyn DbPoolTrait>,
     signing_repo: Arc<StoreRepo>,
@@ -712,7 +852,7 @@ pub fn build_api_router(
     // additive gate that shares no state with the provider.
     let rpc = schema::axum::rpc_router(
         cratestack_db,
-        Procedures::new(issuer),
+        Procedures::new(issuer, policy_store),
         CodecSet::new(LenientCborCodec::default(), JsonCodec),
         CratestackAuthProvider::new(bearer.clone()),
     )
@@ -800,6 +940,21 @@ pub async fn start_api_server(
 ) -> Result<()> {
     billing.validate()?;
     oauth2.rbac.validate()?;
+
+    // ADR-0007: load whatever is genuinely active in the DB right now, so a fresh startup always
+    // agrees with the last successful activation -- this is what proves "no restart needed to see
+    // a policy change AND still correct if you do restart" holds for the real running server, not
+    // just at the `PolicyStore` unit level.
+    let policy_store = Arc::new(
+        lightbridge_authz_budget::PolicyStore::load_active_from_db(
+            pool.clone(),
+            BUDGET_POLICY_SET_ID,
+            BUDGET_POLICY_EVALUATION_BUDGET,
+        )
+        .await
+        .map_err(|e| Error::Server(format!("failed to load active budget policy: {e}")))?,
+    );
+
     let readiness_pool = pool.clone();
     let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
     if oauth2.is_self_signed() {
@@ -863,6 +1018,7 @@ pub async fn start_api_server(
         oauth2,
         bearer_service,
         issuer,
+        policy_store,
         cratestack_db,
         readiness_pool,
         signing_repo,

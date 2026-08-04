@@ -461,3 +461,43 @@ type SetDefaultProjectInput {
 
 mutation procedure setDefaultProject(args: SetDefaultProjectInput): Project
   @allow(auth() != null)
+
+// Budget policy lifecycle (ADR-0007; storage in `lightbridge-authz-budget`'s `PolicyStore`).
+// `activePolicyRevision` is the revision genuinely serving `evaluate()` calls right now -- not
+// necessarily the one most recently activated, since a rejected load leaves the previous
+// revision in force (see `PolicyStore::activate`/`activate_by_revision_id`).
+type BudgetPolicyStatus {
+  policySetId String
+  activePolicyRevision String
+}
+
+// Activates a budget policy: either brand-new rule data (`ruleDataJson`) or a rollback to an
+// already-existing revision (`revisionId`) -- `docs/runbooks/roll-back-a-budget-policy.md`'s
+// rollback flow needs the latter, since resubmitting the same rule data through the "new
+// revision" path would collide with the revisions table's uniqueness constraint. Exactly one of
+// the two must be supplied; the procedure implementation validates this and rejects both-or-
+// neither with a clear `BadRequest`. `@allow(auth() != null)` only asserts an authenticated
+// caller -- there is no per-tenant ownership check here (budget policy is a single, platform-wide
+// singleton, not owned by any particular account), so the real authorization is entirely the
+// coarse `budget:policy-activate` RBAC gate (crates/lightbridge-authz-rest/src/rpc_authorize.rs).
+type ActivateBudgetPolicyInput {
+  policySetId String
+  ruleDataJson String?
+  revisionId String?
+}
+
+mutation procedure activateBudgetPolicy(args: ActivateBudgetPolicyInput): BudgetPolicyStatus
+  @allow(auth() != null)
+
+// Reports the revision genuinely serving `evaluate()` calls right now -- not the one someone most
+// recently tried to activate, which may have been rejected and left the previous one in force
+// (`docs/runbooks/roll-back-a-budget-policy.md` step 0 depends on this distinction). Reads the
+// live in-memory engine state directly, no database round-trip needed. Gated at
+// `budget:policy-read`, coarser than `budget:policy-activate` -- reading status should not
+// require the ability to change it.
+type GetBudgetPolicyStatusInput {
+  policySetId String
+}
+
+procedure getBudgetPolicyStatus(args: GetBudgetPolicyStatusInput): BudgetPolicyStatus
+  @allow(auth() != null)
