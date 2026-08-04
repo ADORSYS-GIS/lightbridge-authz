@@ -8,6 +8,12 @@ Companion to [`rbac.md`](./rbac.md) (which permission gates which *operation* on
 [ADR-0006](./adr/0006-project-membership-supersedes-account-roles.md) (why the model is shaped this
 way). This document is about the **data plane**: what happens to an inference request.
 
+> **"Budget" here means the static, per-plan Envoy/BackendTrafficPolicy rate-limit window** (§3,
+> §5). It is a different mechanism from the newer per-account ledger + self-service refill system
+> (`crates/lightbridge-authz-budget/`, [`rbac.md`](./rbac.md)'s budget sections,
+> [`budget-decision-contract.md`](./budget-decision-contract.md)) — see the "A second, newer
+> budget system exists" entry in §5 for how the two relate today.
+
 > **Read the "Where this is not yet true" section before trusting any of the enforcement
 > walkthroughs.** Parts of this chain are live; one link is built but not yet configured, and the
 > document says which.
@@ -487,6 +493,20 @@ always empty, mirroring its existing `x-billing-plan` behaviour.
 Envoy Gateway namespaces the monthly-budget counter **per HTTPRoute**, so despite a model-agnostic
 descriptor the budget is enforced per model, not shared (a heavy user held ~29 separate counters).
 The shared fix exists behind `sharedBudget.enabled`.
+
+### A second, newer budget system exists and is not yet connected here
+
+`crates/lightbridge-authz-budget/` (epic #188) adds a per-account **ledger** of budget grants, a
+hot-swappable policy engine, and self-service refill + an admin review queue —
+`requestBudgetRefill`, exposed as an RPC procedure on `authz-api`. As of this writing it grants,
+records, and queues correctly (see [`rbac.md`](./rbac.md)'s budget sections), but has **zero
+effect on anything this document describes**: it does not write `x-quota-tier`, does not touch
+`project_members.quota_tier` or `projects.project_quota`, and nothing in §3's header pipeline reads
+from it. Connecting the two is Phase 6a (re-key the enforcement rules onto the tier ladder,
+`docs/runbooks/budget-tier-rekey-cutover.md`) and Phase 6b (write the granted tier back to
+Keycloak so it reaches a token's claims) — both still open. Until then, a successful
+`requestBudgetRefill` call changes the ledger and nothing a request actually experiences at the
+gateway.
 
 ---
 
