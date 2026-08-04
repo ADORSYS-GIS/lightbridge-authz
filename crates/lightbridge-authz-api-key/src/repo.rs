@@ -565,7 +565,7 @@ impl StoreRepo {
         let row: Option<ProjectRow> = sqlx::query_as(
             r#"
             WITH account_auth AS (
-                SELECT account_id
+                SELECT id AS account_id
                 FROM accounts
                 WHERE id = $1
                   AND id = $2

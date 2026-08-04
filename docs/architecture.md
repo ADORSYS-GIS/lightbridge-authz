@@ -52,7 +52,7 @@ the security and scaling boundary that must be preserved during restructuring.
 
 ## Cargo workspace
 
-The workspace has eight active packages. Package edges are shown below; development-only edges
+The workspace has nine active packages. Package edges are shown below; development-only edges
 are omitted.
 
 ```mermaid
@@ -65,6 +65,7 @@ flowchart TB
     Api[lightbridge-authz-api]
     Repo[lightbridge-authz-api-key]
     Bearer[lightbridge-authz-bearer]
+    Budget[lightbridge-authz-budget]
     Core[lightbridge-authz-core]
 
     AuthzBin --> Rest
@@ -78,11 +79,13 @@ flowchart TB
     Rest --> Api
     Rest --> Repo
     Rest --> Bearer
+    Rest --> Budget
     Rest --> Core
     Api --> Bearer
     Api --> Core
     Repo --> Core
     Bearer --> Core
+    Budget --> Core
     Usage --> Core
 ```
 
@@ -90,9 +93,14 @@ The package names do not consistently match their responsibilities:
 
 - `lightbridge-authz-core` contains domain DTOs, configuration, SQLx pool handling, errors, API-key
   hashing, TLS serving, and tracing.
-- `lightbridge-authz-api-key` persists accounts, memberships, projects, API keys, signing keys, and
-  refresh tokens.
+- `lightbridge-authz-api-key` persists accounts, projects, project members, API keys, signing keys,
+  and refresh tokens.
 - `lightbridge-authz-rest` contains application behavior in addition to HTTP transport code.
+- `lightbridge-authz-budget` is the budget domain: the grant ledger, the policy engine contract and
+  its rule-data implementation, and self-service refill/review orchestration. A sibling to
+  `lightbridge-authz-api-key`, not a layer beneath `lightbridge-authz-api` — it is called directly
+  by hand-written `Procedures` methods in `lightbridge-authz-rest`, deliberately bypassing the
+  cratestack model-generation path the CRUD surface uses (ADR-0010).
 - The MCP module in `lightbridge-authz` still depends on REST types and handlers to reuse
   application behavior, which preserves a transport-to-transport dependency until the application
   layer is extracted.
@@ -104,48 +112,58 @@ The package names do not consistently match their responsibilities:
 The authz database contains:
 
 - `accounts`
-- `account_memberships`
 - `projects`
+- `project_members`
 - `api_keys`
 - `signing_keys`
 - `exchange_refresh_tokens`
+- `budget_grants`, `budget_balances`, `budget_policy_sets`, `budget_policy_revisions`,
+  `budget_augmentation_requests` (the budget domain — see below)
+
+There is no account-level membership of any kind (`account_memberships` was dropped entirely by
+ADR-0006 in favor of `project_members`, the project roster).
 
 Relationships and notable behavior:
 
 ```mermaid
 erDiagram
-    accounts ||--o{ account_memberships : has
     accounts ||--o{ projects : owns
-    projects ||--o{ api_keys : contains
+    accounts ||--o{ project_members : "holds a seat"
+    projects ||--o{ project_members : roster
+    projects ||--o{ api_keys : scopes
     accounts ||--o{ exchange_refresh_tokens : scopes
     projects ||--o{ exchange_refresh_tokens : scopes
 
     accounts {
-        text id PK
-        text billing_identity UK
+        text id PK "IS the caller's JWT sub"
+        text default_quota
         timestamptz created_at
         timestamptz updated_at
     }
-    account_memberships {
-        text account_id PK,FK
-        text subject PK
-        timestamptz created_at
-    }
     projects {
         text id PK
-        text account_id FK
-        text name
+        text account_id FK "the OWNING account"
+        text billing_identity UK "who is paying"
         jsonb allowed_models
-        jsonb default_limits
+        text project_quota "pooled ceiling"
         text billing_plan
+        bool is_default "trigger-set; undeletable; roster-less by construction"
+    }
+    project_members {
+        text project_id PK,FK
+        text account_id PK,FK
+        text role "lead | member"
+        text quota_tier "per-member ceiling; nullable"
     }
     api_keys {
         text id PK
         text project_id FK
+        text owner_account_id "the member the key belongs to"
         text key_prefix
         text key_hash UK
         text status
         text billing_plan
+        jsonb allowed_models
         timestamptz expires_at
         timestamptz last_used_at
     }
@@ -165,9 +183,6 @@ erDiagram
         timestamptz expires_at
     }
 ```
-
-Account creation adds the caller as an account member. Account updates keep the current caller in
-the membership set. A database trigger deletes an account if its final membership is removed.
 
 `projects.allowed_models` uses these semantics:
 
@@ -236,9 +251,11 @@ flowchart LR
 
 ### Subject and project context resolution
 
-`POST /idp/v1/resolve-context` resolves a subject and project to account/project context. The query
-joins `projects` to `account_memberships`; an unknown project and a non-member both return the same
-`404`. See [ADR-0001](adr/0001-resolve-context-by-subject-and-project.md).
+`POST /idp/v1/resolve-context` resolves a subject and project to account/project context. Since
+ADR-0006 a project resolves when the subject owns its account or holds a `project_members` row for
+it; an unknown project and a non-member both return the same `404`. See
+[ADR-0001](adr/0001-resolve-context-by-subject-and-project.md) and
+[ADR-0006](adr/0006-project-membership-supersedes-account-roles.md).
 
 ### Native token exchange
 
@@ -252,9 +269,11 @@ persisted.
 
 ## MCP surface
 
-The MCP server exposes the seventeen admin CRUD operations plus two API-key validation tools. It
-calls the same `AuthzStore` interface as HTTP controllers, but constructs the implementation through
-the REST package.
+The MCP server exposes the admin CRUD operations plus API-key validation tools (the exact set is
+generated from `#[tool]`-annotated methods in `app/lightbridge-authz/src/mcp.rs`, not duplicated
+here to avoid drift). It calls the same `AuthzStore` interface as HTTP controllers, but constructs
+the implementation through the REST package. The budget domain (below) is not yet exposed over MCP
+— only over the `/rpc/*` RPC surface.
 
 It also exposes public OAuth metadata and proxies dynamic client registration to a configured
 upstream registration endpoint. Public registration URLs are currently derived from forwarded or
@@ -281,6 +300,35 @@ flowchart LR
 The usage schema becomes a Timescale hypertable when the extension is available and requests a
 thirty-day retention policy. The query endpoint always aggregates by time bucket and can group by
 tenant, user, model, metric, and signal dimensions.
+
+## Budget domain
+
+`authz-api` also hosts a per-account **ledger** of budget grants, a hot-swappable rule-data policy
+engine, and self-service refill + an admin review queue, all exposed as `/rpc/*` procedures on the
+same RPC surface as the CRUD API (`activateBudgetPolicy`, `getBudgetPolicyStatus`,
+`simulateBudgetPolicy`, `requestBudgetRefill`, `listPendingAugmentationRequests`,
+`approveAugmentationRequest`, `rejectAugmentationRequest`). Unlike the CRUD surface, these
+procedures are hand-written, not generated by cratestack (ADR-0010), because the domain's core
+invariant — grants are an append-only ledger, never updated in place (ADR-0009) — does not fit a
+CRUD-model shape.
+
+```mermaid
+flowchart LR
+    Caller[Caller] -->|requestBudgetRefill| RefillService
+    RefillService -->|Facts| PolicyEngine[PolicyEngine\nrule-data today, OPA-Wasm later - ADR-0007]
+    PolicyEngine -->|Decision| RefillService
+    RefillService -->|auto_approve| BudgetRepo[(budget_grants\nbudget_balances)]
+    RefillService -->|manual_review| AugmentationRepo[(budget_augmentation_requests)]
+    Reviewer[Admin] -->|approve or reject| ReviewService
+    ReviewService --> BudgetRepo
+    ReviewService --> AugmentationRepo
+```
+
+This is upstream of, and today has **no effect** on, the Envoy/Authorino-side rate limiting
+described in `docs/governance-model-and-enforcement.md` — see that document's "A second, newer
+budget system exists" entry. See `docs/rbac.md`'s budget sections for the permission model,
+`docs/budget-decision-contract.md` for the `Facts`/`Decision`/`PolicyEngine` contract, and
+`docs/budget-refill-ui-contract.md` for the RPC shapes and UI-relevant behaviors.
 
 ## Deployment and operations
 

@@ -123,6 +123,25 @@ Detailed usage + integration test guide:
 - `docs/authorino-usage.md`
 - `docs/usage-api.md`
 
+**Budget domain (RPC, OAuth2, same surface as the CRUD API)**
+
+A per-account ledger of budget grants, a hot-swappable policy engine, and self-service refill +
+an admin review queue — so a user who runs out of budget can ask for more and either get it
+immediately or have it queued for a human, instead of a maintainer hand-editing config. Exposed as
+`/rpc/*` procedures (cratestack), gated by `budget:*` permissions:
+
+- Policy administration: `activateBudgetPolicy`, `getBudgetPolicyStatus`, `simulateBudgetPolicy`
+- Self-service refill: `requestBudgetRefill`
+- Admin review queue: `listPendingAugmentationRequests`, `approveAugmentationRequest`, `rejectAugmentationRequest`
+
+This is upstream of, and today has no effect on, the Envoy/Authorino-side rate limiting described
+in `docs/governance-model-and-enforcement.md` — see that document's "Where this is not yet true"
+section.
+
+See `docs/rbac.md` for the full permission mapping, `docs/budget-decision-contract.md` for the
+policy-engine contract, and `docs/budget-refill-ui-contract.md` for the RPC shapes and
+UI-relevant behaviors (reset-not-add semantics, token-refresh delay).
+
 **Usage API (No auth on ingest/query endpoints)**
 - `POST /v1/otel/traces` (OTLP/HTTP traces, protobuf or JSON)
 - `POST /v1/otel/metrics` (OTLP/HTTP metrics, protobuf or JSON)

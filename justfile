@@ -143,7 +143,7 @@ load-test:
 # and runs migrations against the shared DB (the rest crate's RPC integration tests connect the
 # cratestack pool directly to DATABASE_URL, unlike the api-key crate's ephemeral sqlx::test DBs).
 it-tests:
-	@bash -ec 'set -euo pipefail; cmd="docker compose -p lightbridge-authz -f compose.yaml"; ${cmd} up -d postgresql redis; ${cmd} up authz-migrate --exit-code-from authz-migrate; trap "${cmd} down postgresql redis authz-migrate" EXIT; sleep 2; export DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"; export AUTHZ_REDIS_URL="redis://127.0.0.1:6379"; cargo test -p lightbridge-authz-api-key --features it-tests --tests; cargo test -p lightbridge-authz-rest --features it-tests'
+	@bash -ec 'set -euo pipefail; cmd="docker compose -p lightbridge-authz -f compose.yaml"; ${cmd} up -d postgresql redis; ${cmd} up authz-migrate --exit-code-from authz-migrate; trap "${cmd} down postgresql redis authz-migrate" EXIT; sleep 2; export DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"; export AUTHZ_REDIS_URL="redis://127.0.0.1:6379"; cargo test -p lightbridge-authz-api-key --features it-tests --tests; cargo test -p lightbridge-authz-budget --features it-tests --tests; cargo test -p lightbridge-authz-rest --features it-tests'
 
 all-checks:
 	@echo "Running Rust formatting, lint, and checks"

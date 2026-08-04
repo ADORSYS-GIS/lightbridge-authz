@@ -11,8 +11,17 @@ The authz services (`authz-api`, `authz-opa`):
 
 - share the same Postgres database
 - share the same SQL migrations
-- expose OpenAPI/Swagger docs
 - run with TLS (self-signed certs in local Compose)
+- `authz-opa` still exposes OpenAPI/Swagger docs; `authz-api`'s CRUD/RPC surface does not (see
+  "OpenAPI docs" under Development Workflows)
+
+`authz-api` also hosts the **budget domain**: a per-account ledger of budget grants
+(`crates/lightbridge-authz-budget/`), a hot-swappable rule-data policy engine that decides refill
+requests, and self-service refill + an admin review queue, all exposed as `/rpc/*` procedures on
+the same RPC surface as the CRUD API. See `docs/rbac.md`'s budget sections and
+`docs/budget-decision-contract.md` for the full picture; this is upstream of, and today has no
+effect on, the Envoy/Authorino-side rate limiting `docs/governance-model-and-enforcement.md`
+describes.
 
 This file documents structure, architecture, workflows, and practices for contributors and agents working on this codebase.
 
@@ -289,6 +298,11 @@ use crate::repo::StoreRepo;
   - `crates/lightbridge-authz-api-key/`: DB entities + repository implementation (SQLx).
   - `crates/lightbridge-authz-rest/`: Axum server glue (TLS bind, modular layout with handlers, routers, models, and middleware).
   - `crates/lightbridge-authz-bearer/`: JWT validation via JWKS (Keycloak in local compose).
+  - `crates/lightbridge-authz-budget/`: budget domain — ledger (`BudgetRepo`), spend readers, the
+    `PolicyEngine`/`Facts`/`Decision` contract and its rule-data implementation, `PolicyStore`
+    (DB-backed, hot-swappable), and the self-service refill/review orchestration
+    (`RefillService`/`ReviewService`). Deliberately hand-written procedures, not cratestack models
+    — see ADR-0010.
   - `crates/lightbridge-authz-usage/`: Axum usage server (OTEL ingest handlers, usage query models/routers, TLS bind, OpenAPI).
   - `crates/lightbridge-authz-proto/`: proto-related exports (currently minimal).
 - `migrations/`: SQLx migrations.
@@ -349,12 +363,32 @@ API keys are stored as:
   account normally has no roster row, so its tier is `NULL` -- meaning no per-member ceiling, only
   the pooled `projects.project_quota`.
 
+**Budget domain** (see `crates/lightbridge-authz-budget/`, `docs/rbac.md`,
+`docs/budget-decision-contract.md`):
+
+- `budget_grants`: append-only ledger of every grant/correction, enforced by a DB trigger — never
+  updated or deleted, only inserted (ADR-0009). The source of truth; balances are a replayable
+  projection over it.
+- `budget_balances`: the current-balance projection per `(budget_account_id, period)`, maintained
+  transactionally alongside each grant write, and rebuildable from `budget_grants` alone.
+- `budget_policy_sets` / `budget_policy_revisions`: versioned rule-data policy documents. Exactly
+  one revision per set is active at a time; activation validates before writing, so a bad revision
+  never displaces a good one (`PolicyStore`).
+- `budget_augmentation_requests`: one row per self-service refill request, from creation through
+  auto-approval or admin approve/reject — the audit trail for "who asked, what decided, who
+  reviewed."
+
 ### Service Responsibilities
 
 - CRUD API (`authz-api`)
   - Provides create/read/update/delete lifecycle for accounts/projects/api keys.
   - Protected by OAuth2/JWT bearer token middleware.
   - Used by internal services/operators to provision keys.
+  - Also hosts the budget domain's RPC procedures on the same surface: policy administration
+    (`activateBudgetPolicy`, `getBudgetPolicyStatus`, `simulateBudgetPolicy`), self-service refill
+    (`requestBudgetRefill`), and the admin review queue (`listPendingAugmentationRequests`,
+    `approveAugmentationRequest`, `rejectAugmentationRequest`). Gated by `budget:*` permissions —
+    see `docs/rbac.md`.
 
 - Validation API (`authz-opa`)
   - Validates presented API key secrets by hashing and matching against `key_hash`.
@@ -402,6 +436,10 @@ Workspace manifest: `Cargo.toml`
   - `api` defines the CRUD surface: routers + controllers + OpenAPI.
   - `rest` wires everything into real Axum servers with middleware and TLS.
   - `bearer` validates JWT bearer tokens via JWKS.
+  - `budget` is a sibling to `api-key`, not a layer beneath `api`/`rest`: it owns its own
+    persistence (`BudgetRepo`, `AugmentationRepo`) and is called directly by hand-written
+    `Procedures` methods in `rest`, deliberately bypassing the cratestack model-generation path
+    the CRUD surface uses (ADR-0010).
 
 ### Key Code Paths
 
@@ -414,6 +452,12 @@ Workspace manifest: `Cargo.toml`
 - CRUD API:
   - routing/controllers are generated via cratestack (`cratestack-pg`) from a schema definition in `crates/lightbridge-authz-api`, replacing the previous hand-written `routers.rs`/`controllers/*`; there is no longer a hand-authored OpenAPI module (`openapi.rs` was removed — see "OpenAPI docs" under Development Workflows and `docs/adr/0003-cratestack-crud-migration.md`).
 
+- Budget domain RPC procedures:
+  - schema (types + `procedure`/`mutation procedure` declarations): `crates/lightbridge-authz-api/schema/authz.cstack`
+  - hand-written procedure bodies (not cratestack-generated — ADR-0010): `Procedures` impl in `crates/lightbridge-authz-rest/src/lib.rs`
+  - domain logic: `crates/lightbridge-authz-budget/src/{repo,refill,review,rule_data,policy_store,facts,decision,spend}.rs`
+  - permission gating: `crates/lightbridge-authz-rest/src/rpc_authorize.rs`
+
 - OPA/Authorino endpoints:
   - handlers: `crates/lightbridge-authz-rest/src/handlers/*`
   - routers: `crates/lightbridge-authz-rest/src/routers/*`
@@ -423,6 +467,7 @@ Workspace manifest: `Cargo.toml`
 - Repository:
   - `crates/lightbridge-authz-api-key/src/repo.rs`
   - `crates/lightbridge-authz-usage/src/repo.rs`
+  - `crates/lightbridge-authz-budget/src/repo.rs` (`BudgetRepo`), `crates/lightbridge-authz-budget/src/augmentation.rs` (`AugmentationRepo`)
 
 - MCP endpoints/tools:
   - server + tool handlers: `app/lightbridge-authz/src/mcp.rs`
@@ -541,9 +586,15 @@ These tests include:
 
 ### Persistence tests (it-tests)
 
-The Postgres-backed `lightbridge-authz-api-key` tests (rotate/limits) are now guarded by the `it-tests` feature so they only compile/run when requested. This keeps the default `cargo test` free of database setup, and lets us treat these as Docker-backed integration tests.
+The Postgres-backed `lightbridge-authz-api-key` tests (rotate/limits) and `lightbridge-authz-budget` tests (ledger writes, replay, policy store, refill/review services) are guarded by the `it-tests` feature so they only compile/run when requested. This keeps the default `cargo test` free of database setup, and lets us treat these as Docker-backed integration tests.
 
-Run them with `just it-tests`, which brings up the `postgresql` service, waits a moment, then sets `DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"` before invoking the crate tests with `--features it-tests`. These tests exercise the migrations under `sqlx::test`.
+Run them with `just it-tests`, which brings up the `postgresql`/`redis` services, waits a moment, then sets `DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"` before invoking `lightbridge-authz-api-key`, `lightbridge-authz-budget`, and `lightbridge-authz-rest` with `--features it-tests`. These tests exercise the migrations under `sqlx::test`.
+
+**Known failing tests, tracked separately (do not assume your change caused these):**
+`crates/lightbridge-authz-rest/tests/rpc_it_tests.rs` has 7 tests that fail deterministically even
+against a freshly migrated database — confirmed unrelated to any specific change, see #219 for the
+full list and reproduction steps. `crates/lightbridge-authz-api-key/tests/access_control_scenarios_tests.rs::access_control_allows_members_and_rejects_non_members`
+tests an account-level "invited member" scenario ADR-0006 removed; see #220.
 
 ### Load Tests
 
@@ -647,11 +698,21 @@ In Compose, `authz-migrate` runs before API/OPA start.
   projects, roster, keys; introspection, Authorino claim extraction, BackendTrafficPolicy rule
   families; worked scenarios and the gaps that remain): `docs/governance-model-and-enforcement.md`
 - CRUD API migration to cratestack (routing/policy generation, Swagger UI removal, CBOR-in-prod): `docs/adr/0003-cratestack-crud-migration.md`
+- Dynamic budget refill RFC — the original design proposal for the whole budget domain (ledger,
+  policy engine, self-service refill, discrete tiers): `docs/rfc/0001-budget-refill.md`
 - Budget refill decision contract (the `Facts`/`Decision`/`PolicyEngine` seam a rule-data
   evaluator and, later, an OPA-Wasm evaluator both sit behind; the fail-closed rule): `docs/budget-decision-contract.md`
 - Budget refill UI contract (RPC shapes for self-service refill and the admin review queue, the
   reset-not-add and token-refresh-delay behaviors, status values, oriented for the `lightbridge-ss`
   frontend team): `docs/budget-refill-ui-contract.md`
+- Budget domain ADRs: why decisions come from rule-data first, OPA-Wasm later, behind one contract
+  (`docs/adr/0007-refill-decisions-rule-data-then-opa-wasm.md`); why refills are discrete tiers, not
+  arbitrary amounts (`docs/adr/0008-refills-are-discrete-budget-tiers.md`); why grants are an
+  immutable ledger with a materialized balance (`docs/adr/0009-budget-grants-are-an-immutable-ledger.md`);
+  why the domain is hand-written procedures, not cratestack models
+  (`docs/adr/0010-budget-domain-uses-procedures-not-cratestack-models.md`).
+- Operational runbooks (budget tier re-key cutover, a stuck refill request, rolling back a bad
+  policy revision): `docs/runbooks/README.md`
 
 ## Helm / deployment notes
 
