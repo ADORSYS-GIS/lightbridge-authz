@@ -57,6 +57,24 @@ impl BudgetTier {
             BudgetTier::B1000 => None,
         }
     }
+
+    /// The inverse of [`Self::amount`]: the tier whose `.amount().get()` exactly equals
+    /// `amount`, or `None` if `amount` doesn't match any known rung. Used by
+    /// [`crate::refill::RefillService`] to resolve an account's current tier from the raw
+    /// `amount_micros` of its most recent tier-representing grant -- see that module's doc
+    /// comment for why a `None` here is a defensive fallback, not an expected case.
+    pub fn from_amount_micros(amount: i64) -> Option<BudgetTier> {
+        match amount {
+            15_000_000 => Some(BudgetTier::B15),
+            30_000_000 => Some(BudgetTier::B30),
+            60_000_000 => Some(BudgetTier::B60),
+            120_000_000 => Some(BudgetTier::B120),
+            250_000_000 => Some(BudgetTier::B250),
+            500_000_000 => Some(BudgetTier::B500),
+            1_000_000_000 => Some(BudgetTier::B1000),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for BudgetTier {
@@ -165,5 +183,21 @@ mod tests {
         assert_eq!(BudgetTier::B15.label(), "b-15");
         assert_eq!(BudgetTier::B1000.label(), "b-1000");
         assert_eq!(BudgetTier::B15.to_string(), "b-15");
+    }
+
+    #[test]
+    fn every_tier_round_trips_through_amount_and_from_amount_micros() {
+        for tier in LADDER {
+            assert_eq!(
+                BudgetTier::from_amount_micros(tier.amount().get()),
+                Some(tier),
+                "{tier:?} must round-trip through .amount() -> from_amount_micros"
+            );
+        }
+    }
+
+    #[test]
+    fn from_amount_micros_rejects_a_non_tier_amount() {
+        assert_eq!(BudgetTier::from_amount_micros(12_345), None);
     }
 }

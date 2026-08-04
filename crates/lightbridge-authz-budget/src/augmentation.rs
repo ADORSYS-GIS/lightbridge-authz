@@ -435,6 +435,26 @@ impl AugmentationRepo {
         AugmentationRequest::try_from(row)
     }
 
+    /// Looks up a request by `idempotency_key`, returning `None` if nothing matches. This is
+    /// what lets [`crate::refill::RefillService::request_refill`] short-circuit a genuine retry
+    /// *before* doing any evaluation work at all -- distinct from [`Self::create`]'s own
+    /// idempotency handling, which resolves duplicates at the database level (via
+    /// `INSERT ... ON CONFLICT ... DO NOTHING` plus a fallback `SELECT`) but has no way to tell
+    /// its caller whether the row it returned was freshly inserted or already existed.
+    pub async fn find_by_idempotency_key(
+        &self,
+        key: &str,
+    ) -> Result<Option<AugmentationRequest>, BudgetError> {
+        let row: Option<AugmentationRequestRow> =
+            sqlx::query_as(REQUEST_SELECT_BY_IDEMPOTENCY_KEY_SQL)
+                .bind(key)
+                .fetch_optional(self.pool())
+                .await
+                .map_err(storage_failed)?;
+
+        row.map(AugmentationRequest::try_from).transpose()
+    }
+
     /// The ONE place `policy_effect`/`policy_reason_codes`/`matched_rule_ids`/`policy_revision`/
     /// `status`/`approved_amount_micros`/`grant_id` ever get written after creation. See
     /// [`RecordedDecision`] for the outcome shapes this accepts.

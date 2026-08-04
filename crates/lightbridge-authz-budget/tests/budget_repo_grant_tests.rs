@@ -272,3 +272,48 @@ async fn invalid_amount_is_rejected_before_hitting_the_database(pool: PgPool) {
 
     assert!(matches!(result, Err(BudgetError::InvalidAmount(-1))));
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_balance_returns_none_when_no_balance_row_exists(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    let repo = BudgetRepo::new(Arc::new(DbPool::from_pool(pool)));
+
+    let balance = repo
+        .get_balance(&account_id, &Period::parse(PERIOD).expect("valid period"))
+        .await
+        .expect("lookup must succeed");
+
+    assert_eq!(
+        balance, None,
+        "an account with no grant this period must not be conflated with a zero-valued balance"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_balance_returns_the_stored_row_after_a_grant(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    let repo = BudgetRepo::new(Arc::new(DbPool::from_pool(pool)));
+    repo.grant(base_request(
+        &account_id,
+        GrantSource::SelfService,
+        15_000_000,
+    ))
+    .await
+    .expect("self_service grant must succeed");
+
+    let balance = repo
+        .get_balance(&account_id, &Period::parse(PERIOD).expect("valid period"))
+        .await
+        .expect("lookup must succeed")
+        .expect("a balance row must exist after a grant");
+
+    assert_eq!(balance.budget_account_id, account_id);
+    assert_eq!(balance.period, Period::parse(PERIOD).expect("valid period"));
+    assert_eq!(balance.self_service_total_micros, 15_000_000);
+    assert_eq!(balance.self_service_grant_count, 1);
+    assert_eq!(balance.effective_budget_micros, 15_000_000);
+}
