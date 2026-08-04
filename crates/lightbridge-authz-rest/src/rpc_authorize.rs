@@ -129,6 +129,10 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         // gate is the entire authorization story for these two op-ids.
         "procedure.activateBudgetPolicy" => BudgetPolicyActivate,
         "procedure.getBudgetPolicyStatus" => BudgetPolicyRead,
+        // Simulation (#190): evaluates a proposed policy against a caller-supplied scenario
+        // entirely in memory, no database read or write. Gated separately from both
+        // `budget:policy-read` and `budget:policy-activate` -- it is neither.
+        "procedure.simulateBudgetPolicy" => BudgetPolicySimulate,
 
         _ => return None,
     })
@@ -273,6 +277,10 @@ mod tests {
             (
                 "procedure.getBudgetPolicyStatus",
                 Permission::BudgetPolicyRead,
+            ),
+            (
+                "procedure.simulateBudgetPolicy",
+                Permission::BudgetPolicySimulate,
             ),
         ];
         for (op_id, expected) in cases {

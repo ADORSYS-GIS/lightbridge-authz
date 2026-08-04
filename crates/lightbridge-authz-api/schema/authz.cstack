@@ -501,3 +501,62 @@ type GetBudgetPolicyStatusInput {
 
 procedure getBudgetPolicyStatus(args: GetBudgetPolicyStatusInput): BudgetPolicyStatus
   @allow(auth() != null)
+
+// Obligations a Decision attaches beyond auto/deny (ADR-0007's decision contract). Mirrors
+// `lightbridge_authz_budget::decision::Obligations` field-for-field: the one obligation kind
+// that's textually justified today is which role must review a `manual_review` decision.
+type Obligations {
+  requiredApproverRole String?
+}
+
+// The one decision shape every policy engine returns (ADR-0007). Mirrors
+// `lightbridge_authz_budget::decision::Decision` field-for-field. `effect` carries the
+// snake_case wire value of `lightbridge_authz_budget::Effect` (that Rust enum already derives
+// `#[serde(rename_all = "snake_case")]`, e.g. `"auto_approve"`/`"manual_review"`/`"deny"`) as a
+// plain `String` rather than a schema-level enum: no enum-like field exists elsewhere in this
+// schema to confirm cratestack's representation for one, so a `String` carrying the exact wire
+// value already produced by the Rust `Serialize` impl is the lowest-risk choice -- a caller reads
+// the same string a direct `serde_json` serialization of `Effect` would produce, no separate
+// mapping to keep in sync by hand.
+type Decision {
+  effect String
+  approvedAmountMicros String
+  maximumAmountMicros String
+  reasonCodes String[]
+  matchedRuleIds String[]
+  policyRevision String
+  obligations Obligations
+}
+
+// Evaluates a proposed rule-data policy against a caller-supplied scenario, entirely in memory
+// -- no database read or write of any kind (see PolicyStore/RuleDataEngine; this procedure never
+// touches either). "What would this policy decide for this account?" without granting anything,
+// without persisting the proposed rule data, and without touching the currently active policy at
+// all. `scenarioJson` is a JSON-encoded `Facts` (see crates/lightbridge-authz-budget/src/facts.rs
+// for the shape -- `Serialize`/`Deserialize` derived specifically so this procedure can accept
+// it). `requestedAmountMicros`, and the `Decision` fields that carry `i64` micro-USD amounts
+// (`approvedAmountMicros`/`maximumAmountMicros`), are all passed/returned as decimal strings --
+// matching `ruleDataJson`'s existing string-encoding precedent elsewhere in this schema -- rather
+// than the schema's native `Int`. Checked directly against cratestack's own codegen
+// (`crates/cratestack-macros/src/shared/types.rs`): `Int` maps to a full-range Rust `i64`, so the
+// *Rust* side is safe, but the generated TypeScript client types `Int` as a bare `number`
+// (`crates/cratestack-client-typescript/src/types.rs`), a JS `double` that silently loses
+// precision above 2^53 -- exactly the class of client-side truncation risk `ruleDataJson`'s own
+// string-encoding already avoids for large values. There is no existing large-integer `Int`
+// field anywhere in this schema to point to as a safe precedent, so this follows the
+// string-encoding pattern rather than guessing that a native `Int` is safe here.
+type SimulateBudgetPolicyInput {
+  ruleDataJson String
+  scenarioJson String
+  requestedAmountMicros String
+}
+
+// Gated at `budget:policy-simulate` (`Permission::BudgetPolicySimulate`), distinct from both
+// `budget:policy-read` and `budget:policy-activate` -- simulating a proposed policy is neither
+// "read what's active" nor "change what's active". `@allow(auth() != null)` only, matching
+// `activateBudgetPolicy`/`getBudgetPolicyStatus`: this is a stateless, platform-wide capability,
+// not scoped to any account or policy set (note there is deliberately no `policySetId` argument
+// here at all -- simulation never reads or writes any stored policy set, so there is nothing to
+// scope it to).
+procedure simulateBudgetPolicy(args: SimulateBudgetPolicyInput): Decision
+  @allow(auth() != null)
