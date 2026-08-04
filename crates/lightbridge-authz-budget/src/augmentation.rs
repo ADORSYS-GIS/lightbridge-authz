@@ -277,9 +277,20 @@ const REQUEST_UPDATE_DECISION_SQL: &str = "UPDATE budget_augmentation_requests S
      policy_revision, approved_amount_micros, grant_id, idempotency_key, reviewed_by, \
      rejection_reason, created_at, reviewed_at";
 
+// The `AND status = 'pending_review'` guard is the fix for a real concurrency gap (PR 3.3,
+// #191): without it, two concurrent review actions on the same row -- two admins racing an
+// approve and a reject, or a genuine double-submit -- would both succeed unconditionally, and
+// whichever write landed last would silently overwrite the other's decision with no error at
+// all. With the guard, a call that loses the race matches zero rows, `RETURNING` yields nothing,
+// and `record_review` (below) turns that `None` into a loud, typed [`BudgetError::AlreadyReviewed`]
+// instead of a silent double-write.
+//
+// `grant_id = $5` lets an approval record which grant it actually produced -- before PR 3.3
+// nothing could ever populate this column even though it exists specifically for this; a
+// rejection always binds `None` here, which is a no-op against a column that was already NULL.
 const REQUEST_UPDATE_REVIEW_SQL: &str = "UPDATE budget_augmentation_requests SET \
-     status = $2, reviewed_by = $3, rejection_reason = $4, reviewed_at = now() \
-     WHERE id = $1 \
+     status = $2, reviewed_by = $3, rejection_reason = $4, reviewed_at = now(), grant_id = $5 \
+     WHERE id = $1 AND status = 'pending_review' \
      RETURNING id, budget_account_id, account_id, project_id, period, requested_tier, \
      requested_amount_micros, status, policy_effect, policy_reason_codes, matched_rule_ids, \
      policy_revision, approved_amount_micros, grant_id, idempotency_key, reviewed_by, \
@@ -496,12 +507,22 @@ impl AugmentationRepo {
     /// without a reason turns into a support conversation."). This is validated in Rust, before
     /// the database is touched at all, so a caller error never leaves a partial write -- the
     /// row's status stays whatever it was if validation fails.
+    ///
+    /// `grant_id` is only ever `Some` for an approval (the grant it produced) and always `None`
+    /// for a rejection; see [`REQUEST_UPDATE_REVIEW_SQL`]'s doc comment.
+    ///
+    /// The `WHERE status = 'pending_review'` guard in [`REQUEST_UPDATE_REVIEW_SQL`] means this
+    /// can lose a race: if the row was already reviewed (by a concurrent call, or a stale retry)
+    /// between the caller reading it and calling this method, the `UPDATE` matches zero rows and
+    /// this returns [`BudgetError::AlreadyReviewed`] -- distinct from [`BudgetError::NotFound`],
+    /// which means no row with that id exists at all.
     pub async fn record_review(
         &self,
         id: &str,
         status: AugmentationStatus,
         reviewed_by: &str,
         rejection_reason: Option<&str>,
+        grant_id: Option<&str>,
     ) -> Result<AugmentationRequest, BudgetError> {
         if !matches!(
             status,
@@ -522,12 +543,12 @@ impl AugmentationRepo {
             .bind(status.as_str())
             .bind(reviewed_by)
             .bind(rejection_reason)
+            .bind(grant_id)
             .fetch_optional(self.pool())
             .await
             .map_err(storage_failed)?;
 
-        let row =
-            updated.ok_or_else(|| BudgetError::NotFound(format!("augmentation request '{id}'")))?;
+        let row = updated.ok_or_else(|| BudgetError::AlreadyReviewed(id.to_string()))?;
 
         AugmentationRequest::try_from(row)
     }

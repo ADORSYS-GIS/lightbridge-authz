@@ -12,7 +12,7 @@ use lightbridge_authz_budget::error::BudgetError;
 use lightbridge_authz_budget::period::Period;
 use lightbridge_authz_budget::tier::BudgetTier;
 use lightbridge_authz_core::cuid::cuid2;
-use lightbridge_authz_core::db::DbPool;
+use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use sqlx::PgPool;
 
 const PERIOD: &str = "2026-08";
@@ -183,7 +183,13 @@ async fn record_review_requires_a_rejection_reason(pool: PgPool) {
         .expect("moving the request to pending_review must succeed");
 
     let result = repo
-        .record_review(&created.id, AugmentationStatus::Denied, "reviewer-1", None)
+        .record_review(
+            &created.id,
+            AugmentationStatus::Denied,
+            "reviewer-1",
+            None,
+            None,
+        )
         .await;
 
     assert!(
@@ -224,6 +230,7 @@ async fn record_review_succeeds_with_a_reason(pool: PgPool) {
             AugmentationStatus::Denied,
             "reviewer-2",
             Some("account already exceeded its unaided rungs this period"),
+            None,
         )
         .await
         .expect("a denial with a real reason must succeed");
@@ -235,6 +242,126 @@ async fn record_review_succeeds_with_a_reason(pool: PgPool) {
         Some("account already exceeded its unaided rungs this period".to_string())
     );
     assert!(reviewed.reviewed_at.is_some());
+    assert_eq!(reviewed.grant_id, None);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_review_approval_records_the_grant_id(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let grant_id = insert_grant(&pool, &account_id).await;
+
+    let repo = AugmentationRepo::new(Arc::new(DbPool::from_pool(pool)));
+    let created = repo
+        .create(base_new_request(&account_id, 30_000_000))
+        .await
+        .expect("create must succeed");
+    repo.record_decision(&created.id, pending_review_decision())
+        .await
+        .expect("moving the request to pending_review must succeed");
+
+    let reviewed = repo
+        .record_review(
+            &created.id,
+            AugmentationStatus::Approved,
+            "reviewer-3",
+            None,
+            Some(&grant_id),
+        )
+        .await
+        .expect("an approval with a grant id must succeed");
+
+    assert_eq!(reviewed.status, AugmentationStatus::Approved);
+    assert_eq!(reviewed.grant_id, Some(grant_id));
+}
+
+/// The concurrency fix at the heart of PR 3.3 (#191): [`REQUEST_UPDATE_REVIEW_SQL`]'s
+/// `AND status = 'pending_review'` guard means that when two review actions race on the same
+/// row, exactly one `UPDATE` matches and the other gets zero rows back -- surfaced here as
+/// [`BudgetError::AlreadyReviewed`], never a silent double-write.
+///
+/// Proven by breaking it first: with the guard removed (see the comment this test's author left
+/// in the PR description -- verified manually, not committed here since the fix must always be
+/// in place on `main`), both concurrent calls succeed and the row silently reflects whichever
+/// write happened to commit last. With the guard restored, exactly one call succeeds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_review_of_the_same_request_results_in_exactly_one_outcome(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    // `grant_id` carries a real FK to `budget_grants(id)` -- the approving task must reference
+    // an actual grant row, not an arbitrary string, or the FK violation would masquerade as the
+    // very "already reviewed" error this test is trying to isolate.
+    let grant_id = insert_grant(&pool, &account_id).await;
+
+    let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
+    let repo = AugmentationRepo::new(Arc::clone(&db_pool));
+    let created = repo
+        .create(base_new_request(&account_id, 30_000_000))
+        .await
+        .expect("create must succeed");
+    repo.record_decision(&created.id, pending_review_decision())
+        .await
+        .expect("moving the request to pending_review must succeed");
+
+    let repo_approve = AugmentationRepo::new(Arc::clone(&db_pool));
+    let repo_reject = AugmentationRepo::new(Arc::clone(&db_pool));
+    let id_for_approve = created.id.clone();
+    let id_for_reject = created.id.clone();
+
+    let grant_id_for_assertion = grant_id.clone();
+    let approve_task = tokio::spawn(async move {
+        repo_approve
+            .record_review(
+                &id_for_approve,
+                AugmentationStatus::Approved,
+                "reviewer-approve",
+                None,
+                Some(&grant_id),
+            )
+            .await
+    });
+    let reject_task = tokio::spawn(async move {
+        repo_reject
+            .record_review(
+                &id_for_reject,
+                AugmentationStatus::Denied,
+                "reviewer-reject",
+                Some("racing rejection"),
+                None,
+            )
+            .await
+    });
+
+    let (approve_result, reject_result) =
+        tokio::try_join!(approve_task, reject_task).expect("neither task must panic");
+
+    let outcomes = [approve_result.is_ok(), reject_result.is_ok()];
+    assert_eq!(
+        outcomes.iter().filter(|ok| **ok).count(),
+        1,
+        "exactly one of the two racing review actions must succeed, got approve={:?} reject={:?}",
+        approve_result,
+        reject_result
+    );
+
+    if let Err(err) = &approve_result {
+        assert!(matches!(err, BudgetError::AlreadyReviewed(_)));
+    }
+    if let Err(err) = &reject_result {
+        assert!(matches!(err, BudgetError::AlreadyReviewed(_)));
+    }
+
+    let final_row = repo.get(&created.id).await.expect("row must still exist");
+    if approve_result.is_ok() {
+        assert_eq!(final_row.status, AugmentationStatus::Approved);
+        assert_eq!(final_row.grant_id, Some(grant_id_for_assertion));
+    } else {
+        assert_eq!(final_row.status, AugmentationStatus::Denied);
+        assert_eq!(
+            final_row.rejection_reason,
+            Some("racing rejection".to_string())
+        );
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]

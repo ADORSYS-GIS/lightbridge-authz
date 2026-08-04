@@ -60,3 +60,8 @@ required-features = ["it-tests"]
 name = "refill_service_tests"
 path = "tests/refill_service_tests.rs"
 required-features = ["it-tests"]
+
+[[test]]
+name = "review_service_tests"
+path = "tests/review_service_tests.rs"
+required-features = ["it-tests"]
