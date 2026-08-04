@@ -9,6 +9,12 @@
 //! reviewing one, needs to distinguish "no such request" from "you asked for a review outcome
 //! that isn't a legitimate review outcome" from "a rejection must carry a reason" -- three
 //! genuinely different caller errors, not one generic failure.
+//!
+//! `AlreadyReviewed` is added by PR 3.3 (#191) for the review queue's concurrency guard: it is
+//! distinct from `NotFound` (no row with that id exists at all) -- it means the row exists but
+//! lost the `WHERE status = 'pending_review'` race, i.e. it was already reviewed (or resolved
+//! some other way) by the time this call's `UPDATE` ran. An admin who just lost that race needs
+//! a legible reason, not a generic failure indistinguishable from a typo'd id.
 
 #[derive(Debug, thiserror::Error)]
 pub enum BudgetError {
@@ -36,6 +42,10 @@ pub enum BudgetError {
     InvalidReviewOutcome(String),
     #[error("a rejection must carry a non-empty rejection reason")]
     MissingRejectionReason,
+    #[error(
+        "augmentation request '{0}' is not pending review (already reviewed, or does not exist)"
+    )]
+    AlreadyReviewed(String),
 }
 
 pub type Result<T> = std::result::Result<T, BudgetError>;
@@ -94,6 +104,10 @@ mod tests {
         assert_eq!(
             BudgetError::MissingRejectionReason.to_string(),
             "a rejection must carry a non-empty rejection reason"
+        );
+        assert_eq!(
+            BudgetError::AlreadyReviewed("req-1".to_string()).to_string(),
+            "augmentation request 'req-1' is not pending review (already reviewed, or does not exist)"
         );
     }
 }
