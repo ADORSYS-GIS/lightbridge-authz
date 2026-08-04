@@ -253,13 +253,31 @@ conversation.
 All four procedures are gated only by `@allow(auth() != null)` in the schema, same pattern as the
 rest of the budget domain — the real authorization is entirely the RBAC permission gate.
 
-> **Known gap:** #191's own acceptance criteria require refusing `requestBudgetRefill` for an
-> internal/API-key-derived caller ("refills are OIDC users only"). That refusal is **not**
-> implemented as of this permission wiring — there is currently no reliable signal on this RPC
-> surface that distinguishes an OIDC-human caller from an internal/API-key-derived one. See
-> `Procedures::request_budget_refill`'s doc comment
-> (`crates/lightbridge-authz-rest/src/lib.rs`) and the PR that added this section for the full
-> investigation and the tracking follow-up issue.
+> **Internal/API-key-client refusal (#191/#216):** `requestBudgetRefill` refuses any caller whose
+> validated token carries the `lightbridge_caller_kind` claim set to `api_key`
+> (`lightbridge_authz_bearer::CALLER_KIND_CLAIM` / `API_KEY_CALLER_KIND`), projected into the
+> `Procedures` layer by `CratestackAuthProvider` as `auth_provider::CALLER_KIND_CONTEXT_KEY`.
+> Absence of the claim is treated as "unknown, not API-key", so ordinary human callers (who never
+> carry it) are unaffected.
+>
+> Coverage differs by `oauth2.type`, investigated at length in #216:
+> - **`self`** (this repo's shipped default — `config/default.yaml`,
+>   `.docker/authz/container.yaml`): fully closed. `ApiKeyJwtSigner`
+>   (`crates/lightbridge-authz-rest/src/signing.rs`) stamps this claim on every self-signed
+>   API-key JWT it mints, unconditionally, so it is present exactly when the caller is
+>   API-key-derived.
+> - **`external`**: **not yet closed**. Tokens minted by the upstream IdP's own API-key
+>   token-exchange flow do not carry this claim until that flow — outside this repo — is updated
+>   to stamp it. Until then, an `external`-mode API-key-derived caller is indistinguishable from a
+>   human one at this layer and is **not** refused. This is why #216 stays open even though this
+>   change closes its `self`-mode acceptance criterion.
+>
+> See `Procedures::request_budget_refill`'s doc comment (`crates/lightbridge-authz-rest/src/lib.rs`)
+> for the code-level detail, and #216 for the full investigation of why no pre-existing claim
+> (`aud` included — this deployment's own `oauth2.audience` config requires every valid token,
+> human or API-key, to carry `lightbridge-api-key`, which is why that particular claim could never
+> have worked as a distinguishing signal) reliably distinguished the two caller kinds before this
+> dedicated claim was added.
 
 ### Budget permissions (remaining five reserved, not yet gating any operation)
 

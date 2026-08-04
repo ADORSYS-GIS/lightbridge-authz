@@ -1983,6 +1983,7 @@ mod tests {
             aud: vec![],
             roles: vec![],
             permissions,
+            caller_kind: None,
             access_token: "test-access-token".to_string(),
         }
     }

@@ -33,7 +33,7 @@
 
 use std::sync::Arc;
 
-use cratestack::{CoolContext, Value};
+use cratestack::{CoolContext, CoolError, Value};
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api::schema::procedures::ProcedureRegistry;
 use lightbridge_authz_budget::PolicyStore;
@@ -48,6 +48,7 @@ use lightbridge_authz_budget::tier::BudgetTier;
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::Procedures;
+use lightbridge_authz_rest::auth_provider;
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
 use sqlx::PgPool;
 
@@ -77,6 +78,19 @@ async fn insert_account(pool: &PgPool, account_id: &str) {
 
 fn ctx_for(subject: &str) -> CoolContext {
     CoolContext::authenticated([("id".to_owned(), Value::String(subject.to_owned()))])
+}
+
+/// Like [`ctx_for`], but stamped with [`auth_provider::CALLER_KIND_CONTEXT_KEY`] as
+/// [`lightbridge_authz_rest::auth_provider::CratestackAuthProvider::authenticate`] would for a
+/// token carrying `lightbridge_authz_bearer::API_KEY_CALLER_KIND` -- i.e. an `oauth2.type: self`
+/// self-signed API-key JWT (#191/#216).
+fn ctx_for_api_key_caller(subject: &str) -> CoolContext {
+    let mut ctx = ctx_for(subject);
+    ctx.extensions.insert(
+        auth_provider::CALLER_KIND_CONTEXT_KEY.to_owned(),
+        Value::String(lightbridge_authz_bearer::API_KEY_CALLER_KIND.to_owned()),
+    );
+    ctx
 }
 
 /// Builds a real `Procedures` instance against `pool` (a genuinely migrated, seeded database),
@@ -234,6 +248,49 @@ async fn request_refill_exhausting_allowance_returns_pending_review(pool: PgPool
         output.requestedTier, "b-60",
         "resolves from the latest tier grant (B30) -> next is B60"
     );
+}
+
+/// #191/#216: an `oauth2.type: self` self-signed API-key JWT carries
+/// `lightbridge_authz_bearer::API_KEY_CALLER_KIND`, which `CratestackAuthProvider` projects into
+/// the context as `auth_provider::CALLER_KIND_CONTEXT_KEY` -- `request_budget_refill` must refuse
+/// it before ever reaching `RefillService`, regardless of whether the request would otherwise have
+/// been auto-approved.
+#[sqlx::test(migrations = "../../migrations")]
+async fn request_refill_refuses_api_key_derived_caller(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let (procedures, _human_ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let ctx = ctx_for_api_key_caller(&account_id);
+    let db = lazy_cratestack_db();
+
+    let err = procedures
+        .request_budget_refill(&db, &ctx, refill_args(&account_id, None))
+        .await
+        .expect_err("an API-key-derived caller must be refused, not served");
+
+    assert!(
+        matches!(err, CoolError::Forbidden(_)),
+        "expected Forbidden, got {err:?}"
+    );
+}
+
+/// Regression guard for the refusal added above: a caller whose token carries no caller-kind
+/// signal at all (the ordinary case for a human OIDC login, and for every caller before this
+/// PR) must still be served normally -- absence of the claim must never be treated as "is an
+/// API key" (see `TokenInfo::caller_kind`'s doc comment).
+#[sqlx::test(migrations = "../../migrations")]
+async fn request_refill_still_serves_caller_with_no_caller_kind_signal(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let (procedures, ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let db = lazy_cratestack_db();
+
+    let output = procedures
+        .request_budget_refill(&db, &ctx, refill_args(&account_id, None))
+        .await
+        .expect("a caller with no caller-kind signal must not be refused");
+
+    assert_eq!(output.status, "auto_approved");
 }
 
 #[sqlx::test(migrations = "../../migrations")]

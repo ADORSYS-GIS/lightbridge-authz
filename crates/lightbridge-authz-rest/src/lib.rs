@@ -19,7 +19,7 @@ pub mod rpc_authorize;
 pub mod signing;
 pub mod token_exchange;
 
-use auth_provider::{ACCESS_TOKEN_CONTEXT_KEY, CratestackAuthProvider};
+use auth_provider::{ACCESS_TOKEN_CONTEXT_KEY, CALLER_KIND_CONTEXT_KEY, CratestackAuthProvider};
 use codec::LenientCborCodec;
 use handlers::AuthzStoreImpl;
 use ratelimit_redis::build_redis_rate_limit_store;
@@ -245,6 +245,16 @@ fn subject_from_ctx(ctx: &CoolContext) -> Option<String> {
 /// rotate procedure's downstream secret issuance can reuse it (email profile / token exchange).
 fn access_token_from_ctx(ctx: &CoolContext) -> Option<String> {
     match ctx.extensions.get(ACCESS_TOKEN_CONTEXT_KEY) {
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// The caller-kind signal stashed into the context by [`CratestackAuthProvider`], when the
+/// validated token carried [`lightbridge_authz_bearer::CALLER_KIND_CLAIM`]. `None` means the claim
+/// was absent, which must be treated as "unknown" -- see that constant's docs.
+fn caller_kind_from_ctx(ctx: &CoolContext) -> Option<String> {
+    match ctx.extensions.get(CALLER_KIND_CONTEXT_KEY) {
         Some(Value::String(s)) => Some(s.clone()),
         _ => None,
     }
@@ -933,27 +943,25 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     /// request handling (not a pure, unit-testable domain function -- `RefillRequest.as_of` is a
     /// caller-supplied parameter for exactly this reason, per that struct's own doc comment).
     ///
-    /// ## KNOWN GAP: no internal/API-key-client refusal
+    /// ## Internal/API-key-client refusal (#191/#216)
     ///
     /// #191's own acceptance criteria require this operation to be refused for an internal or
-    /// API-key-derived caller -- "refills are OIDC users only". That check is deliberately NOT
-    /// implemented here. Investigated at length before writing this procedure (see this PR's
-    /// description for the full writeup): as of this commit there is no reliable,
-    /// already-plumbed-through signal available inside a `Procedures` method that distinguishes
-    /// an OIDC-human caller from an internal/API-key-derived one --
-    /// [`subject_from_ctx`]/[`CoolContext::auth_field`] expose only the validated JWT subject,
-    /// nothing about how that JWT was minted. `lightbridge_authz_bearer::TokenInfo` does carry an
-    /// `aud` claim, but it never reaches this layer (`CratestackAuthProvider::authenticate` only
-    /// projects `id`/`access_token`/`roles` into `CoolContext`, not `aud`), and even if it were
-    /// threaded through, this deployment's own dev realm config
-    /// (`.docker/keycloak_config/realm.json`) attaches the `lightbridge-api-key` audience mapper
-    /// to `test-client` unconditionally -- every token that client issues carries that audience,
-    /// human logins included -- so `aud` would not reliably distinguish the two caller kinds
-    /// anyway. Inventing a check against an unreliable proxy (a role name, an audience value that
-    /// isn't actually exclusive to API-key tokens) would be worse than no check: it would look
-    /// like this acceptance criterion is met when it is not. See the PR description's "Known gap"
-    /// section for the two remediation options considered, and the follow-up ticket tracking this:
-    /// <https://github.com/ADORSYS-GIS/lightbridge-authz/issues/216>.
+    /// API-key-derived caller -- "refills are OIDC users only". This is enforced by refusing
+    /// whenever the validated token carries [`lightbridge_authz_bearer::CALLER_KIND_CLAIM`] equal
+    /// to [`lightbridge_authz_bearer::API_KEY_CALLER_KIND`] (projected into the context by
+    /// [`CratestackAuthProvider`] as [`auth_provider::CALLER_KIND_CONTEXT_KEY`]).
+    ///
+    /// **Coverage differs by `oauth2.type`** (see #216's investigation for the full analysis of
+    /// why no existing claim -- `aud` included -- reliably distinguished the two caller kinds):
+    /// - `oauth2.type: self`: fully closed. `lightbridge_authz_rest::signing::ApiKeyJwtSigner`
+    ///   stamps this claim on every self-signed API-key JWT it mints, unconditionally, so it is
+    ///   present precisely when the caller is API-key-derived. This is the mode this repo ships by
+    ///   default (`config/default.yaml`, `.docker/authz/container.yaml`).
+    /// - `oauth2.type: external`: **not yet closed**. Tokens minted by the upstream IdP's own
+    ///   API-key token-exchange flow do not carry this claim until that flow (outside this repo --
+    ///   see `docs/rbac.md`) is updated to stamp it. Until then, an API-key-derived caller
+    ///   authenticated under `external` is indistinguishable from a human one at this layer, and
+    ///   is not refused. Tracked as the remaining scope of #216.
     fn request_budget_refill(
         &self,
         _db: &schema::Cratestack,
@@ -964,10 +972,16 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     > + Send {
         let refill_service = self.refill_service.clone();
         let subject = subject_from_ctx(ctx);
+        let caller_kind = caller_kind_from_ctx(ctx);
         let input = args.args;
         async move {
             let _subject =
                 subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            if caller_kind.as_deref() == Some(lightbridge_authz_bearer::API_KEY_CALLER_KIND) {
+                return Err(CoolError::Forbidden(
+                    "self-service budget refills are for OIDC human callers only".to_owned(),
+                ));
+            }
 
             let period = lightbridge_authz_budget::Period::parse(&input.period)
                 .map_err(budget_error_to_cool_error)?;

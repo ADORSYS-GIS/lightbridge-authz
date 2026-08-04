@@ -215,6 +215,8 @@ mod db {
         email_verified: Option<bool>,
         typ: Option<String>,
         scope: Option<String>,
+        #[serde(rename = "lightbridge_caller_kind")]
+        caller_kind: Option<String>,
     }
 
     fn repo(pool: PgPool) -> Arc<StoreRepo> {
@@ -337,6 +339,13 @@ mod db {
         assert_eq!(
             claims.allowed_models,
             Some(vec!["gpt-4.1-mini".to_string()])
+        );
+        // #191/#216: every self-signed API-key JWT must carry this claim so
+        // `requestBudgetRefill` can refuse API-key-derived callers by a real, intentional
+        // signal rather than by JWKS separation happening to reject the token first.
+        assert_eq!(
+            claims.caller_kind.as_deref(),
+            Some(lightbridge_authz_bearer::API_KEY_CALLER_KIND)
         );
     }
 
