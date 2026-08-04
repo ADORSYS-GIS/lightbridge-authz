@@ -15,12 +15,38 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::error::BudgetError;
 use crate::period::Period;
 
 /// The result of summing `total_cost` for a scope/period.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// ## Wire shape (`Serialize`/`Deserialize`)
+///
+/// Adjacently tagged (`#[serde(tag = "status", content = "amount_micros")]`), matching the
+/// snake_case convention `rule_data.rs`'s own hand-editable JSON already uses (this crate has no
+/// camelCase JSON anywhere -- that convention belongs to the RPC schema layer, not this domain's
+/// own rule-data/scenario JSON). A `Known` value round-trips as:
+///
+/// ```json
+/// { "status": "known", "amount_micros": 5000000 }
+/// ```
+///
+/// and `Unavailable` as:
+///
+/// ```json
+/// { "status": "unavailable" }
+/// ```
+///
+/// An internally tagged representation (`#[serde(tag = "status")]` alone) was considered and
+/// rejected: like `rule_data.rs`'s `Condition::All`/`Condition::Any` (see that module's doc
+/// comment), internal tagging requires every variant's payload to serialize as a map, and a bare
+/// `i64` does not. Adjacently tagged is the smallest change that keeps `Known`/`Unavailable` as
+/// plain Rust tuple/unit variants (so every existing `match`/`matches!` call site in this crate
+/// is untouched) while still producing a shape a human can write by hand for `simulateBudgetPolicy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", content = "amount_micros", rename_all = "snake_case")]
 pub enum Spend {
     /// `SUM(total_cost)` over at least one matching row, converted to non-negative micro-USD.
     /// Zero is a legitimate, common value here (e.g. an account whose only logged events cost
@@ -193,5 +219,23 @@ mod tests {
         let (start, end) = period_bounds_utc(&period);
         assert_eq!(start.to_rfc3339(), "2026-12-01T00:00:00+00:00");
         assert_eq!(end.to_rfc3339(), "2027-01-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn spend_known_round_trips_through_json_with_the_documented_shape() {
+        let spend = Spend::Known(5_000_000);
+        let json = serde_json::to_string(&spend).expect("spend must serialize");
+        assert_eq!(json, r#"{"status":"known","amount_micros":5000000}"#);
+        let parsed: Spend = serde_json::from_str(&json).expect("spend must deserialize");
+        assert_eq!(parsed, spend);
+    }
+
+    #[test]
+    fn spend_unavailable_round_trips_through_json_with_the_documented_shape() {
+        let spend = Spend::Unavailable;
+        let json = serde_json::to_string(&spend).expect("spend must serialize");
+        assert_eq!(json, r#"{"status":"unavailable"}"#);
+        let parsed: Spend = serde_json::from_str(&json).expect("spend must deserialize");
+        assert_eq!(parsed, spend);
     }
 }

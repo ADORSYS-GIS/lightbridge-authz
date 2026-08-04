@@ -9,12 +9,19 @@
 //! together) -- that belongs to whichever later PR builds the request-handling procedure. This
 //! module only defines the shape.
 
+use serde::{Deserialize, Serialize};
+
 use crate::spend::Spend;
 
 /// Everything a [`crate::decision::PolicyEngine`] needs to evaluate one refill request, gathered
 /// by the host ahead of time. See `docs/budget-decision-contract.md` for where each field comes
 /// from and how a caller assembles one of these.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize`/`Deserialize` are derived directly (no `rename_all`) so the wire shape matches this
+/// struct's own already-snake_case Rust field names, the same convention `rule_data.rs`'s
+/// hand-editable rule-data JSON uses. This is what lets `simulateBudgetPolicy`'s `scenarioJson`
+/// argument accept a `Facts` value verbatim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Facts {
     /// The account's expiry/revocation-aware effective balance for the requested period, from
     /// `BudgetRepo::effective_balance`.
@@ -65,5 +72,19 @@ mod tests {
 
         assert!(matches!(facts.spend_this_period, Spend::Unavailable));
         assert!(matches!(facts.spend_last_period, Spend::Unavailable));
+    }
+
+    #[test]
+    fn facts_round_trip_through_json() {
+        let facts = Facts {
+            effective_balance_micros: 42_000_000,
+            self_service_grant_count: 1,
+            spend_this_period: Spend::Known(10_000_000),
+            spend_last_period: Spend::Unavailable,
+        };
+
+        let json = serde_json::to_string(&facts).expect("facts must serialize");
+        let parsed: Facts = serde_json::from_str(&json).expect("facts must deserialize");
+        assert_eq!(parsed, facts);
     }
 }

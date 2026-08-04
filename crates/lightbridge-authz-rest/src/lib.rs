@@ -163,6 +163,38 @@ fn budget_error_to_cool_error(err: lightbridge_authz_budget::BudgetError) -> Coo
     }
 }
 
+/// Renders a [`lightbridge_authz_budget::Effect`] as the exact snake_case wire value its own
+/// `Serialize` impl (`#[serde(rename_all = "snake_case")]`) produces, e.g. `"auto_approve"` /
+/// `"manual_review"`. Used to fill the schema `Decision.effect` `String` field (see the schema's
+/// doc comment on `type Decision` for why that field is a `String` rather than a schema-level
+/// enum) without a second, hand-maintained mapping that could drift from `Effect`'s own derive.
+fn effect_to_wire_string(effect: lightbridge_authz_budget::Effect) -> String {
+    serde_json::to_string(&effect)
+        .expect("Effect always serializes to a JSON string")
+        .trim_matches('"')
+        .to_owned()
+}
+
+/// Maps a domain [`lightbridge_authz_budget::Decision`] into the schema's wire `Decision` shape
+/// (ADR-0007's decision contract, mirrored field-for-field in `authz.cstack`'s `type Decision`).
+/// The two `i64` micro-USD amounts are stringified per that type's documented 64-bit-safety
+/// rationale (matching `ruleDataJson`'s existing string-encoding precedent).
+fn to_schema_decision(
+    decision: lightbridge_authz_budget::Decision,
+) -> schema::procedures::simulate_budget_policy::Output {
+    schema::procedures::simulate_budget_policy::Output {
+        effect: effect_to_wire_string(decision.effect),
+        approvedAmountMicros: decision.approved_amount_micros.to_string(),
+        maximumAmountMicros: decision.maximum_amount_micros.to_string(),
+        reasonCodes: decision.reason_codes,
+        matchedRuleIds: decision.matched_rule_ids,
+        policyRevision: decision.policy_revision,
+        obligations: schema::Obligations {
+            requiredApproverRole: decision.obligations.required_approver_role,
+        },
+    }
+}
+
 /// The validated caller's subject, projected as `auth().id` by [`CratestackAuthProvider`].
 fn subject_from_ctx(ctx: &CoolContext) -> Option<String> {
     match ctx.auth_field("id") {
@@ -783,6 +815,62 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 policySetId: policy_set_id,
                 activePolicyRevision: policy_store.active_policy_revision(),
             })
+        }
+    }
+
+    /// Evaluates a proposed rule-data policy against a caller-supplied scenario, entirely in
+    /// memory (#190, ADR-0007). Deliberately does NOT touch `self.policy_store` -- unlike every
+    /// other method on this `impl`, this one constructs its own short-lived
+    /// [`lightbridge_authz_budget::RuleDataEngine`] directly from the caller's `ruleDataJson`,
+    /// calls `evaluate()` on it once, and discards it. There is no code path here capable of
+    /// writing to `budget_policy_sets`/`budget_policy_revisions` (no `PolicyStore` reference to
+    /// do so through) or to `budget_grants`/`budget_balances` (no repository reference to do so
+    /// through either) -- "no side effects" holds by construction, not by discipline. See
+    /// `crates/lightbridge-authz-rest/tests/budget_policy_simulate_tests.rs` for the row-count
+    /// proof.
+    fn simulate_budget_policy(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::simulate_budget_policy::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::simulate_budget_policy::Output, CoolError>,
+    > + Send {
+        let subject = subject_from_ctx(ctx);
+        let rule_data_json = args.args.ruleDataJson;
+        let scenario_json = args.args.scenarioJson;
+        let requested_amount_str = args.args.requestedAmountMicros;
+        async move {
+            let _subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+
+            let requested_amount_micros: i64 = requested_amount_str.trim().parse().map_err(|_| {
+                CoolError::BadRequest(format!(
+                    "requestedAmountMicros must be a valid integer, got '{requested_amount_str}'"
+                ))
+            })?;
+
+            let facts: lightbridge_authz_budget::Facts = serde_json::from_str(&scenario_json)
+                .map_err(|e| CoolError::BadRequest(format!("invalid scenarioJson: {e}")))?;
+
+            // A short-lived engine, constructed and discarded within this one call -- never
+            // wired into `self.policy_store`, never persisted, never touches
+            // budget_policy_sets/budget_policy_revisions.
+            let engine = lightbridge_authz_budget::RuleDataEngine::new(
+                &rule_data_json,
+                BUDGET_POLICY_EVALUATION_BUDGET,
+            )
+            .map_err(budget_error_to_cool_error)?;
+
+            let decision = lightbridge_authz_budget::PolicyEngine::evaluate(
+                &engine,
+                &facts,
+                requested_amount_micros,
+            )
+            .await
+            .map_err(budget_error_to_cool_error)?;
+
+            Ok(to_schema_decision(decision))
         }
     }
 }
