@@ -115,11 +115,28 @@ async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, CoolCon
     let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
     let issuer = Arc::new(AuthzStoreImpl::with_pool(db_pool.clone()));
     let policy_store = Arc::new(
-        PolicyStore::load_active_from_db(db_pool, SEEDED_POLICY_SET_ID, EVALUATION_BUDGET)
+        PolicyStore::load_active_from_db(db_pool.clone(), SEEDED_POLICY_SET_ID, EVALUATION_BUDGET)
             .await
             .expect("migrations seed an active budget-refill revision"),
     );
-    let procedures = Procedures::new(issuer, policy_store);
+    // `simulate_budget_policy` itself never touches `refill_service`/`review_service` either (see
+    // the module doc), but `Procedures::new` still requires both to construct -- same reasoning
+    // as `budget_policy_procedure_tests.rs`.
+    let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
+        db_pool.clone(),
+    ));
+    let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(db_pool));
+    let refill_service = Arc::new(lightbridge_authz_budget::RefillService::new(
+        budget_repo.clone(),
+        augmentation_repo.clone(),
+        policy_store.engine(),
+        Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
+    ));
+    let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
+        budget_repo,
+        augmentation_repo,
+    ));
+    let procedures = Procedures::new(issuer, policy_store, refill_service, review_service);
     let ctx = CoolContext::authenticated([("id".to_owned(), Value::String(subject.to_owned()))]);
     (procedures, ctx)
 }

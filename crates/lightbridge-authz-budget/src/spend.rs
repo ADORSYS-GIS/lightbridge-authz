@@ -169,9 +169,48 @@ impl SpendReader for TimescaleSpendReader {
     }
 }
 
+/// A [`SpendReader`] that always reports [`Spend::Unavailable`], never touching any database.
+///
+/// Used by `lightbridge-authz-rest`'s `start_api_server` (PR 3.4, #191) when
+/// `Config.usage_database` is not configured for a given deployment. `RefillService` genuinely
+/// needs *some* `SpendReader` to construct (see its constructor), but the usage-events database
+/// is documented as optional (`crates/lightbridge-authz-core/src/config/mod.rs`'s
+/// `usage_database` doc comment) -- a deployment that has not wired it up yet should not be
+/// unable to start the self-service refill RPC surface at all. This degrades instead of failing
+/// startup: every spend-dependent rule-data fact resolves to `Unavailable`, and per this module's
+/// own "never collapse no rows into `Known(0)`" rule (and `rule_data.rs`'s
+/// `EvalAbort::FieldUnavailable` handling), any policy rule that reads `spend_this_period`/
+/// `spend_last_period` already fails closed on `Unavailable` -- routing to `manual_review`, never
+/// to `auto_approve`. So the missing configuration narrows what self-service refill can decide
+/// automatically; it does not silently grant more than a correctly-configured deployment would.
+#[derive(Debug, Clone, Default)]
+pub struct UnavailableSpendReader;
+
+#[lightbridge_authz_core::async_trait]
+impl SpendReader for UnavailableSpendReader {
+    async fn spend_for_account(
+        &self,
+        _account_id: &str,
+        _period: &Period,
+    ) -> Result<Spend, BudgetError> {
+        Ok(Spend::Unavailable)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unavailable_spend_reader_always_reports_unavailable() {
+        let reader = UnavailableSpendReader;
+        let period = Period::parse("2026-08").expect("valid period");
+        let spend = reader
+            .spend_for_account("acct_1", &period)
+            .await
+            .expect("unavailable reader never errors");
+        assert_eq!(spend, Spend::Unavailable);
+    }
 
     #[test]
     fn cost_to_micros_zero_is_zero() {

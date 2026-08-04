@@ -1,0 +1,381 @@
+// Integration tests are their own crates, so clippy's `allow-unwrap-in-tests`
+// (clippy.toml) does not reach their free helper functions. Unwrapping in a test
+// is a deliberate assertion that the setup held; the workspace gate stays `deny`
+// for shipping code.
+#![allow(clippy::unwrap_used)]
+
+//! Direct-call coverage for the self-service refill and admin review-queue procedures (#191, PR
+//! 3.4; `Procedures::request_budget_refill` / `list_pending_augmentation_requests` /
+//! `approve_augmentation_request` / `reject_augmentation_request`, backed by
+//! `lightbridge_authz_budget::refill::RefillService` / `review::ReviewService`).
+//!
+//! Same rationale as `budget_policy_procedure_tests.rs` for calling `Procedures` methods directly
+//! rather than standing up the full HTTP router: it keeps this file independent of Redis (needed
+//! only by the rate-limiting middleware `rpc_it_tests.rs` exercises) while still proving the real
+//! `Procedures` -> `RefillService`/`ReviewService` -> `BudgetRepo`/`AugmentationRepo` code path a
+//! genuine RPC call would take past `rpc_authorize` and cratestack's own dispatch.
+//!
+//! No Redis needed here despite the new `SpendReader` dependency `RefillService` now carries:
+//! `UnavailableSpendReader` (no usage-events database, no network of any kind) stands in, which is
+//! also what a real deployment falls back to when `Config.usage_database` is not configured -- see
+//! that type's own doc comment in `lightbridge-authz-budget`. The seeded default policy
+//! (`budget-policy-v1`, migrated by `migrations/20260804000001_budget_policy_sets_and_revisions.sql`)
+//! only reads `self_service_grant_count`, never `spend_this_period`/`spend_last_period`, so
+//! `Spend::Unavailable` never actually changes any outcome in this file -- it is simply the
+//! correct, honest choice of reader for a test that seeds no usage data.
+//!
+//! `rpc_authorize.rs`'s own `every_mapped_op_id_maps_to_the_documented_permission` test is where
+//! the RBAC-gate-matters case for these four op-ids lives (`procedure.requestBudgetRefill` ->
+//! `BudgetSelfRefill`, the other three -> `BudgetReview`) -- `Procedures` itself never enforces
+//! RBAC (that is `rpc_authorize`'s job, a layer above the direct calls this file makes), so there
+//! is nothing for a direct-call test here to usefully assert about permission denial.
+#![cfg(feature = "it-tests")]
+
+use std::sync::Arc;
+
+use cratestack::{CoolContext, Value};
+use lightbridge_authz_api::schema;
+use lightbridge_authz_api::schema::procedures::ProcedureRegistry;
+use lightbridge_authz_budget::PolicyStore;
+use lightbridge_authz_budget::augmentation::AugmentationRepo;
+use lightbridge_authz_budget::period::Period;
+use lightbridge_authz_budget::refill::RefillService;
+use lightbridge_authz_budget::repo::{BudgetRepo, GrantRequest};
+use lightbridge_authz_budget::review::ReviewService;
+use lightbridge_authz_budget::source::GrantSource;
+use lightbridge_authz_budget::spend::UnavailableSpendReader;
+use lightbridge_authz_budget::tier::BudgetTier;
+use lightbridge_authz_core::cuid::cuid2;
+use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
+use lightbridge_authz_rest::Procedures;
+use lightbridge_authz_rest::handlers::AuthzStoreImpl;
+use sqlx::PgPool;
+
+const SEEDED_POLICY_SET_ID: &str = "budget-refill";
+const EVALUATION_BUDGET: usize = 10_000;
+const PERIOD: &str = "2026-08";
+
+/// A `schema::Cratestack` lazily wired to an unreachable address -- every procedure under test
+/// takes `_db: &schema::Cratestack` but never uses it (they delegate entirely to
+/// `RefillService`/`ReviewService`), so this is never actually queried, matching the pattern
+/// already used for the same purpose in `budget_policy_procedure_tests.rs`.
+fn lazy_cratestack_db() -> schema::Cratestack {
+    let pool = cratestack::sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(250))
+        .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
+        .expect("lazy cratestack pool should be constructible");
+    schema::Cratestack::builder(pool).build()
+}
+
+async fn insert_account(pool: &PgPool, account_id: &str) {
+    sqlx::query("INSERT INTO accounts (id) VALUES ($1)")
+        .bind(account_id)
+        .execute(pool)
+        .await
+        .expect("inserting a test account must succeed");
+}
+
+fn ctx_for(subject: &str) -> CoolContext {
+    CoolContext::authenticated([("id".to_owned(), Value::String(subject.to_owned()))])
+}
+
+/// Builds a real `Procedures` instance against `pool` (a genuinely migrated, seeded database),
+/// mirroring `budget_policy_procedure_tests.rs::procedures_and_ctx` but also wiring the new
+/// `refill_service`/`review_service` fields this PR adds. Returns the `Procedures`, a `CoolContext`
+/// sealed to `subject`, and the raw `BudgetRepo` handle so tests can pre-seed grants directly
+/// (mirroring `lightbridge-authz-budget`'s own `refill_service_tests.rs` pattern for exercising
+/// the "allowance exhausted" branch).
+async fn procedures_and_ctx(
+    pool: PgPool,
+    subject: &str,
+) -> (Procedures, CoolContext, Arc<BudgetRepo>) {
+    let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+    let issuer = Arc::new(AuthzStoreImpl::with_pool(db_pool.clone()));
+    let policy_store = Arc::new(
+        PolicyStore::load_active_from_db(db_pool.clone(), SEEDED_POLICY_SET_ID, EVALUATION_BUDGET)
+            .await
+            .expect("migrations seed an active budget-refill revision"),
+    );
+    let budget_repo = Arc::new(BudgetRepo::new(db_pool.clone()));
+    let augmentation_repo = Arc::new(AugmentationRepo::new(db_pool));
+    let refill_service = Arc::new(RefillService::new(
+        budget_repo.clone(),
+        augmentation_repo.clone(),
+        policy_store.engine(),
+        Arc::new(UnavailableSpendReader),
+    ));
+    let review_service = Arc::new(ReviewService::new(budget_repo.clone(), augmentation_repo));
+    let procedures = Procedures::new(issuer, policy_store, refill_service, review_service);
+    let ctx = ctx_for(subject);
+    (procedures, ctx, budget_repo)
+}
+
+fn refill_args(
+    budget_account_id: &str,
+    idempotency_key: Option<String>,
+) -> schema::procedures::request_budget_refill::Args {
+    schema::procedures::request_budget_refill::Args {
+        args: schema::RequestBudgetRefillInput {
+            budgetAccountId: budget_account_id.to_string(),
+            accountId: budget_account_id.to_string(),
+            projectId: None,
+            period: PERIOD.to_string(),
+            idempotencyKey: idempotency_key,
+        },
+    }
+}
+
+fn list_pending_args(
+    budget_account_id: Option<&str>,
+) -> schema::procedures::list_pending_augmentation_requests::Args {
+    schema::procedures::list_pending_augmentation_requests::Args {
+        args: schema::ListPendingAugmentationRequestsInput {
+            budgetAccountId: budget_account_id.map(str::to_string),
+        },
+    }
+}
+
+fn approve_args(request_id: &str) -> schema::procedures::approve_augmentation_request::Args {
+    schema::procedures::approve_augmentation_request::Args {
+        args: schema::ApproveAugmentationRequestInput {
+            requestId: request_id.to_string(),
+        },
+    }
+}
+
+fn reject_args(
+    request_id: &str,
+    reason: &str,
+) -> schema::procedures::reject_augmentation_request::Args {
+    schema::procedures::reject_augmentation_request::Args {
+        args: schema::RejectAugmentationRequestInput {
+            requestId: request_id.to_string(),
+            reason: reason.to_string(),
+        },
+    }
+}
+
+/// Directly grants `amount_micros` via `BudgetRepo`, bypassing the RPC surface entirely -- used to
+/// pre-seed an account's self-service grant history so a subsequent `requestBudgetRefill` call
+/// exercises the "allowance exhausted" branch, mirroring
+/// `lightbridge-authz-budget`'s own `refill_service_tests.rs::exhausting_unaided_allowance_routes_to_pending_review`.
+async fn seed_self_service_grant(budget_repo: &BudgetRepo, account_id: &str, tier: BudgetTier) {
+    budget_repo
+        .grant(GrantRequest {
+            budget_account_id: account_id.to_string(),
+            account_id: account_id.to_string(),
+            project_id: None,
+            period: Period::parse(PERIOD).expect("valid period"),
+            amount_micros: tier.amount().get(),
+            source: GrantSource::SelfService,
+            actor_id: None,
+            reason: None,
+            policy_revision: None,
+            matched_rule_ids: None,
+            idempotency_key: None,
+            trigger_key: None,
+            expires_at: None,
+        })
+        .await
+        .expect("seed grant must succeed");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn request_refill_auto_approves_and_the_response_reflects_it(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let (procedures, ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let db = lazy_cratestack_db();
+
+    let output = procedures
+        .request_budget_refill(&db, &ctx, refill_args(&account_id, None))
+        .await
+        .expect("a fresh account's first refill must be auto-approved");
+
+    assert_eq!(
+        output.status, "auto_approved",
+        "the seeded default policy auto-approves the first two self-service refills per period"
+    );
+    assert!(
+        output.grantId.is_some(),
+        "an auto-approved request must carry the grant it produced"
+    );
+    // A fresh account with no grant history this period is treated as currently on the lowest
+    // rung (`BudgetTier::B15`, see `RefillService::current_tier`'s own doc comment for why that
+    // default is deliberate), so the first refill requests the NEXT rung up, `B30`.
+    assert_eq!(output.requestedTier, "b-30");
+    assert_eq!(output.approvedAmountMicros.as_deref(), Some("30000000"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn request_refill_exhausting_allowance_returns_pending_review(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let (procedures, ctx, budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let db = lazy_cratestack_db();
+
+    // The seeded default policy auto-approves only the first two self-service refills per period
+    // (`self_service_grant_count < 2`); pre-seed exactly that many so the next request is the
+    // third and must route to `pending_review`.
+    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
+    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
+
+    let output = procedures
+        .request_budget_refill(&db, &ctx, refill_args(&account_id, None))
+        .await
+        .expect("an exhausted-allowance refill must still succeed (queued, not erroring)");
+
+    assert_eq!(output.status, "pending_review");
+    assert_eq!(
+        output.grantId, None,
+        "a pending_review outcome must not carry a grant"
+    );
+    assert_eq!(
+        output.requestedTier, "b-60",
+        "resolves from the latest tier grant (B30) -> next is B60"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_pending_returns_queued_requests(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let (procedures, ctx, budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let db = lazy_cratestack_db();
+
+    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
+    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
+
+    let queued = procedures
+        .request_budget_refill(&db, &ctx, refill_args(&account_id, None))
+        .await
+        .expect("exhausted-allowance refill must queue");
+    assert_eq!(queued.status, "pending_review");
+
+    let pending = procedures
+        .list_pending_augmentation_requests(&db, &ctx, list_pending_args(Some(&account_id)))
+        .await
+        .expect("listing the review queue must succeed");
+
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, queued.id);
+    assert_eq!(pending[0].status, "pending_review");
+
+    let pending_global = procedures
+        .list_pending_augmentation_requests(&db, &ctx, list_pending_args(None))
+        .await
+        .expect("listing the whole queue must succeed");
+    assert!(
+        pending_global.iter().any(|r| r.id == queued.id),
+        "the global (unscoped) queue must include this account's pending request too"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn approve_grants_and_updates_status(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let reviewer_id = cuid2();
+    insert_account(&pool, &reviewer_id).await;
+    let (procedures, ctx, budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let reviewer_ctx = ctx_for(&reviewer_id);
+    let db = lazy_cratestack_db();
+
+    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
+    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
+
+    let queued = procedures
+        .request_budget_refill(&db, &ctx, refill_args(&account_id, None))
+        .await
+        .expect("exhausted-allowance refill must queue");
+    assert_eq!(queued.status, "pending_review");
+
+    let approved = procedures
+        .approve_augmentation_request(&db, &reviewer_ctx, approve_args(&queued.id))
+        .await
+        .expect("approving a pending request must succeed");
+
+    assert_eq!(approved.status, "approved");
+    assert!(
+        approved.grantId.is_some(),
+        "an approval must carry the grant it produced"
+    );
+    assert_eq!(approved.reviewedBy.as_deref(), Some(reviewer_id.as_str()));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn reject_without_a_reason_is_rejected_at_the_schema_or_procedure_layer(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let reviewer_id = cuid2();
+    insert_account(&pool, &reviewer_id).await;
+    let (procedures, ctx, budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let reviewer_ctx = ctx_for(&reviewer_id);
+    let db = lazy_cratestack_db();
+
+    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
+    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
+
+    let queued = procedures
+        .request_budget_refill(&db, &ctx, refill_args(&account_id, None))
+        .await
+        .expect("exhausted-allowance refill must queue");
+
+    // The schema's `reason` field is non-optional, so a caller cannot omit it entirely through
+    // the typed `Args` this direct-call test constructs -- a caller who did (e.g. a raw JSON
+    // request missing the field) would be rejected by cratestack's own schema deserialization
+    // before ever reaching this procedure. What this direct-call test CAN, and does, prove is the
+    // procedure layer's own defense in depth: `ReviewService::reject` validates the reason is
+    // non-empty (not just present) before touching the database at all, so an empty string --
+    // which the schema type alone cannot rule out -- is still refused here.
+    let result = procedures
+        .reject_augmentation_request(&db, &reviewer_ctx, reject_args(&queued.id, ""))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "an empty rejection reason must be refused, not silently accepted: {result:?}"
+    );
+
+    let still_pending = procedures
+        .list_pending_augmentation_requests(&db, &ctx, list_pending_args(Some(&account_id)))
+        .await
+        .expect("listing the review queue must succeed");
+    assert!(
+        still_pending.iter().any(|r| r.id == queued.id),
+        "a rejected-at-validation reject call must not have changed the row's status"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn reject_with_a_reason_succeeds_and_records_it(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let reviewer_id = cuid2();
+    insert_account(&pool, &reviewer_id).await;
+    let (procedures, ctx, budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let reviewer_ctx = ctx_for(&reviewer_id);
+    let db = lazy_cratestack_db();
+
+    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
+    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
+
+    let queued = procedures
+        .request_budget_refill(&db, &ctx, refill_args(&account_id, None))
+        .await
+        .expect("exhausted-allowance refill must queue");
+
+    let reason = "over the account's approved discretionary ceiling for this quarter";
+    let rejected = procedures
+        .reject_augmentation_request(&db, &reviewer_ctx, reject_args(&queued.id, reason))
+        .await
+        .expect("rejecting with a non-empty reason must succeed");
+
+    assert_eq!(rejected.status, "denied");
+    assert_eq!(
+        rejected.grantId, None,
+        "a rejection must never carry a grant"
+    );
+    assert_eq!(rejected.rejectionReason.as_deref(), Some(reason));
+    assert_eq!(rejected.reviewedBy.as_deref(), Some(reviewer_id.as_str()));
+}

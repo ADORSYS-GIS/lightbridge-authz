@@ -2,8 +2,8 @@ use axum::{Json, Router, http::StatusCode, routing::get};
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
     RotateApiKey, async_trait,
-    config::{ApiServer, BasicAuth, Billing, Oauth2, OpaServer, Redis},
-    db::{DbPoolTrait, is_database_ready},
+    config::{ApiServer, BasicAuth, Billing, Database, Oauth2, OpaServer, Redis},
+    db::{DbPool, DbPoolTrait, is_database_ready},
     error::{Error, Result},
     server::{dev_cors_enabled, serve_tls},
 };
@@ -201,6 +201,38 @@ fn to_schema_decision(
     }
 }
 
+/// Maps a domain [`lightbridge_authz_budget::AugmentationRequest`] into the schema's wire
+/// `AugmentationRequest` shape (see `authz.cstack`'s `type AugmentationRequest` doc comment for
+/// the field-by-field reasoning, in particular why `policyReasonCodes`/`matchedRuleIds` are
+/// required `String[]` rather than the `Option<Vec<String>>` the domain type carries -- both
+/// `unwrap_or_default()` calls below are the "never actually `None` by the time a procedure
+/// returns a value" case that comment documents, not a silent-loss compromise).
+fn to_schema_augmentation_request(
+    request: lightbridge_authz_budget::AugmentationRequest,
+) -> schema::AugmentationRequest {
+    schema::AugmentationRequest {
+        id: request.id,
+        budgetAccountId: request.budget_account_id,
+        accountId: request.account_id,
+        projectId: request.project_id,
+        period: request.period.to_string(),
+        requestedTier: request.requested_tier.to_string(),
+        requestedAmountMicros: request.requested_amount_micros.to_string(),
+        status: request.status.to_string(),
+        policyEffect: request.policy_effect.map(effect_to_wire_string),
+        policyReasonCodes: request.policy_reason_codes.unwrap_or_default(),
+        matchedRuleIds: request.matched_rule_ids.unwrap_or_default(),
+        policyRevision: request.policy_revision,
+        approvedAmountMicros: request.approved_amount_micros.map(|a| a.to_string()),
+        grantId: request.grant_id,
+        idempotencyKey: request.idempotency_key,
+        reviewedBy: request.reviewed_by,
+        rejectionReason: request.rejection_reason,
+        createdAt: request.created_at,
+        reviewedAt: request.reviewed_at,
+    }
+}
+
 /// The validated caller's subject, projected as `auth().id` by [`CratestackAuthProvider`].
 fn subject_from_ctx(ctx: &CoolContext) -> Option<String> {
     match ctx.auth_field("id") {
@@ -330,20 +362,33 @@ fn to_schema_api_key_secret(s: ApiKeySecret) -> schema::ApiKeySecret {
 /// the budget policy activation/status procedures below delegate to
 /// [`lightbridge_authz_budget::PolicyStore`] instead, which owns its own persistence against the
 /// same underlying database.
+///
+/// `refill_service`/`review_service` (#191, PR 3.4) are the same shape of exception: the
+/// self-service refill and admin review-queue procedures delegate to
+/// [`lightbridge_authz_budget::RefillService`]/[`lightbridge_authz_budget::ReviewService`], which
+/// each own their own persistence (`BudgetRepo`/`AugmentationRepo`) against the same underlying
+/// database, constructed once at server startup alongside `policy_store` -- see
+/// `start_api_server`.
 #[derive(Clone)]
 pub struct Procedures {
     issuer: Arc<AuthzStoreImpl>,
     policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
+    refill_service: Arc<lightbridge_authz_budget::RefillService>,
+    review_service: Arc<lightbridge_authz_budget::ReviewService>,
 }
 
 impl Procedures {
     pub fn new(
         issuer: Arc<AuthzStoreImpl>,
         policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
+        refill_service: Arc<lightbridge_authz_budget::RefillService>,
+        review_service: Arc<lightbridge_authz_budget::ReviewService>,
     ) -> Self {
         Self {
             issuer,
             policy_store,
+            refill_service,
+            review_service,
         }
     }
 }
@@ -879,6 +924,169 @@ impl schema::procedures::ProcedureRegistry for Procedures {
             Ok(to_schema_decision(decision))
         }
     }
+
+    /// Self-service refill (#191, PR 3.4): a caller asks for more budget for
+    /// `budgetAccountId`/`period`, and [`lightbridge_authz_budget::RefillService::request_refill`]
+    /// decides -- immediately, or by queuing for a human -- without anyone hand-editing config.
+    /// `as_of` is read from the real wall clock here, deliberately: this is the one place in the
+    /// whole refill call chain a live `chrono::Utc::now()` read belongs, because this is live
+    /// request handling (not a pure, unit-testable domain function -- `RefillRequest.as_of` is a
+    /// caller-supplied parameter for exactly this reason, per that struct's own doc comment).
+    ///
+    /// ## KNOWN GAP: no internal/API-key-client refusal
+    ///
+    /// #191's own acceptance criteria require this operation to be refused for an internal or
+    /// API-key-derived caller -- "refills are OIDC users only". That check is deliberately NOT
+    /// implemented here. Investigated at length before writing this procedure (see this PR's
+    /// description for the full writeup): as of this commit there is no reliable,
+    /// already-plumbed-through signal available inside a `Procedures` method that distinguishes
+    /// an OIDC-human caller from an internal/API-key-derived one --
+    /// [`subject_from_ctx`]/[`CoolContext::auth_field`] expose only the validated JWT subject,
+    /// nothing about how that JWT was minted. `lightbridge_authz_bearer::TokenInfo` does carry an
+    /// `aud` claim, but it never reaches this layer (`CratestackAuthProvider::authenticate` only
+    /// projects `id`/`access_token`/`roles` into `CoolContext`, not `aud`), and even if it were
+    /// threaded through, this deployment's own dev realm config
+    /// (`.docker/keycloak_config/realm.json`) attaches the `lightbridge-api-key` audience mapper
+    /// to `test-client` unconditionally -- every token that client issues carries that audience,
+    /// human logins included -- so `aud` would not reliably distinguish the two caller kinds
+    /// anyway. Inventing a check against an unreliable proxy (a role name, an audience value that
+    /// isn't actually exclusive to API-key tokens) would be worse than no check: it would look
+    /// like this acceptance criterion is met when it is not. See the PR description's "Known gap"
+    /// section for the two remediation options considered, and the follow-up ticket tracking this:
+    /// <https://github.com/ADORSYS-GIS/lightbridge-authz/issues/216>.
+    fn request_budget_refill(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::request_budget_refill::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::request_budget_refill::Output, CoolError>,
+    > + Send {
+        let refill_service = self.refill_service.clone();
+        let subject = subject_from_ctx(ctx);
+        let input = args.args;
+        async move {
+            let _subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+
+            let period = lightbridge_authz_budget::Period::parse(&input.period)
+                .map_err(budget_error_to_cool_error)?;
+
+            let request = lightbridge_authz_budget::RefillRequest {
+                budget_account_id: input.budgetAccountId,
+                account_id: input.accountId,
+                project_id: input.projectId,
+                period,
+                idempotency_key: input.idempotencyKey,
+                as_of: chrono::Utc::now(),
+            };
+
+            let created = refill_service
+                .request_refill(request)
+                .await
+                .map_err(budget_error_to_cool_error)?;
+
+            Ok(to_schema_augmentation_request(created))
+        }
+    }
+
+    /// The admin review queue's read path (#191, PR 3.4), delegating to
+    /// [`lightbridge_authz_budget::ReviewService::list_pending`]. `budgetAccountId: None` lists
+    /// the whole cross-account queue; `Some` scopes to one account -- see that method's own doc
+    /// comment.
+    fn list_pending_augmentation_requests(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::list_pending_augmentation_requests::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::list_pending_augmentation_requests::Output,
+            CoolError,
+        >,
+    > + Send {
+        let review_service = self.review_service.clone();
+        let subject = subject_from_ctx(ctx);
+        let budget_account_id = args.args.budgetAccountId;
+        async move {
+            let _subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+
+            let requests = review_service
+                .list_pending(budget_account_id.as_deref())
+                .await
+                .map_err(budget_error_to_cool_error)?;
+
+            Ok(requests
+                .into_iter()
+                .map(to_schema_augmentation_request)
+                .collect())
+        }
+    }
+
+    /// Approves a `pending_review` request (#191, PR 3.4), delegating to
+    /// [`lightbridge_authz_budget::ReviewService::approve`]. The reviewing identity is the
+    /// authenticated caller's own subject -- there is no separate "act on behalf of" input here,
+    /// matching every other procedure in this file.
+    fn approve_augmentation_request(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::approve_augmentation_request::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::approve_augmentation_request::Output,
+            CoolError,
+        >,
+    > + Send {
+        let review_service = self.review_service.clone();
+        let subject = subject_from_ctx(ctx);
+        let request_id = args.args.requestId;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+
+            let reviewed = review_service
+                .approve(&request_id, &subject)
+                .await
+                .map_err(budget_error_to_cool_error)?;
+
+            Ok(to_schema_augmentation_request(reviewed))
+        }
+    }
+
+    /// Rejects a `pending_review` request (#191, PR 3.4), delegating to
+    /// [`lightbridge_authz_budget::ReviewService::reject`]. `reason` is non-optional in the
+    /// schema (see `authz.cstack`'s `RejectAugmentationRequestInput` doc comment) as well as
+    /// validated at runtime by `ReviewService::reject` itself -- this procedure adds no
+    /// additional validation of its own, deliberately: one place owns the mandatory-reason rule.
+    fn reject_augmentation_request(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::reject_augmentation_request::Args,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::reject_augmentation_request::Output,
+            CoolError,
+        >,
+    > + Send {
+        let review_service = self.review_service.clone();
+        let subject = subject_from_ctx(ctx);
+        let request_id = args.args.requestId;
+        let reason = args.args.reason;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+
+            let reviewed = review_service
+                .reject(&request_id, &subject, &reason)
+                .await
+                .map_err(budget_error_to_cool_error)?;
+
+            Ok(to_schema_augmentation_request(reviewed))
+        }
+    }
 }
 
 /// Assembles the API server router: public probes, OIDC discovery/JWKS (when signing is enabled),
@@ -896,6 +1104,8 @@ pub fn build_api_router(
     bearer: Arc<dyn BearerTokenServiceTrait>,
     issuer: Arc<AuthzStoreImpl>,
     policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
+    refill_service: Arc<lightbridge_authz_budget::RefillService>,
+    review_service: Arc<lightbridge_authz_budget::ReviewService>,
     cratestack_db: schema::Cratestack,
     readiness_pool: Arc<dyn DbPoolTrait>,
     signing_repo: Arc<StoreRepo>,
@@ -946,7 +1156,7 @@ pub fn build_api_router(
     // additive gate that shares no state with the provider.
     let rpc = schema::axum::rpc_router(
         cratestack_db,
-        Procedures::new(issuer, policy_store),
+        Procedures::new(issuer, policy_store, refill_service, review_service),
         CodecSet::new(LenientCborCodec::default(), JsonCodec),
         CratestackAuthProvider::new(bearer.clone()),
     )
@@ -1031,6 +1241,7 @@ pub async fn start_api_server(
     oauth2: &Oauth2,
     billing: &Billing,
     redis: &Option<Redis>,
+    usage_database: &Option<Database>,
 ) -> Result<()> {
     billing.validate()?;
     oauth2.rbac.validate()?;
@@ -1048,6 +1259,62 @@ pub async fn start_api_server(
         .await
         .map_err(|e| Error::Server(format!("failed to load active budget policy: {e}")))?,
     );
+
+    // Self-service refill and the admin review queue (#191, PR 3.4). `budget_repo`/
+    // `augmentation_repo` are fresh handles against the same `pool` every other hand-written
+    // repository on this server uses; `policy_store.engine()` is the SAME live, hot-swappable
+    // engine `activateBudgetPolicy`/`getBudgetPolicyStatus` above read/write, so a policy
+    // activated at runtime takes effect for refills immediately, with no restart, exactly as it
+    // already does for `simulateBudgetPolicy`'s sibling procedures.
+    //
+    // `usage_database` (`Config.usage_database`) is optional -- see that field's own doc comment.
+    // When it is not configured, this degrades to `UnavailableSpendReader` rather than failing
+    // server startup: every spend-dependent policy fact then reads `Spend::Unavailable`, which
+    // the rule-data evaluator already treats as a fail-closed signal (routes to `manual_review`,
+    // never `auto_approve` -- see `UnavailableSpendReader`'s own doc comment for the full
+    // reasoning). Choosing to degrade rather than hard-fail (unlike `policy_store` above, which
+    // DOES fail startup loudly on a bad load) is deliberate: a missing `usage_database` narrows
+    // what self-service refill can decide automatically, it does not make the RPC surface
+    // unsafe to serve -- so a deployment that has not wired up the usage-events database yet can
+    // still start, just with every refill routing to manual review until it does.
+    let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
+        pool.clone(),
+    ));
+    let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(
+        pool.clone(),
+    ));
+    let policy_engine: Arc<dyn lightbridge_authz_budget::PolicyEngine> = policy_store.engine();
+    let spend_reader: Arc<dyn lightbridge_authz_budget::SpendReader> = match usage_database {
+        Some(usage_db) => {
+            let usage_pool: Arc<dyn DbPoolTrait> =
+                Arc::new(DbPool::new(usage_db).await.map_err(|e| {
+                    Error::Server(format!(
+                        "failed to open usage database pool for budget spend reads: {e}"
+                    ))
+                })?);
+            Arc::new(lightbridge_authz_budget::TimescaleSpendReader::new(
+                usage_pool,
+            ))
+        }
+        None => {
+            tracing::warn!(
+                "usage_database is not configured -- budget refill spend facts will report \
+                 Unavailable, and self-service refill decisions that depend on them will fail \
+                 closed to manual review"
+            );
+            Arc::new(lightbridge_authz_budget::UnavailableSpendReader)
+        }
+    };
+    let refill_service = Arc::new(lightbridge_authz_budget::RefillService::new(
+        budget_repo.clone(),
+        augmentation_repo.clone(),
+        policy_engine,
+        spend_reader,
+    ));
+    let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
+        budget_repo,
+        augmentation_repo,
+    ));
 
     let readiness_pool = pool.clone();
     let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
@@ -1113,6 +1380,8 @@ pub async fn start_api_server(
         bearer_service,
         issuer,
         policy_store,
+        refill_service,
+        review_service,
         cratestack_db,
         readiness_pool,
         signing_repo,

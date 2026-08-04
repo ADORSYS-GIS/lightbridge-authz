@@ -649,6 +649,9 @@ In Compose, `authz-migrate` runs before API/OPA start.
 - CRUD API migration to cratestack (routing/policy generation, Swagger UI removal, CBOR-in-prod): `docs/adr/0003-cratestack-crud-migration.md`
 - Budget refill decision contract (the `Facts`/`Decision`/`PolicyEngine` seam a rule-data
   evaluator and, later, an OPA-Wasm evaluator both sit behind; the fail-closed rule): `docs/budget-decision-contract.md`
+- Budget refill UI contract (RPC shapes for self-service refill and the admin review queue, the
+  reset-not-add and token-refresh-delay behaviors, status values, oriented for the `lightbridge-ss`
+  frontend team): `docs/budget-refill-ui-contract.md`
 
 ## Helm / deployment notes
 

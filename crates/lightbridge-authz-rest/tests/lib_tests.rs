@@ -76,6 +76,7 @@ async fn start_api_server_fails_fast_when_tls_certs_are_missing() {
         &external_oauth2(),
         &sample_billing(),
         &sample_redis(),
+        &None,
     )
     .await;
     assert!(
@@ -123,6 +124,7 @@ async fn start_api_server_rejects_self_signed_oauth2_without_signing_block() {
         &oauth2,
         &sample_billing(),
         &sample_redis(),
+        &None,
     )
     .await;
     assert!(
@@ -153,6 +155,7 @@ async fn start_api_server_warns_when_dev_cors_is_enabled() {
         &external_oauth2(),
         &sample_billing(),
         &sample_redis(),
+        &None,
     )
     .await;
     unsafe {
@@ -251,6 +254,7 @@ mod db {
             &self_signed_oauth2(),
             &sample_billing(),
             &sample_redis(),
+            &None,
         )
         .await;
         assert!(
@@ -300,11 +304,33 @@ mod db {
             .await
             .expect("migration seeds an active budget-refill revision"),
         );
+        // This test never reaches a budget-refill procedure (only `/healthz/ready`), so a real
+        // `budget_repo`/`augmentation_repo` against the same live `db_pool` plus the offline
+        // `UnavailableSpendReader` is enough to construct `Procedures` -- mirroring how
+        // `policy_store` above is real but never evaluated by this test either.
+        let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
+            db_pool.clone(),
+        ));
+        let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(
+            db_pool.clone(),
+        ));
+        let refill_service = Arc::new(lightbridge_authz_budget::RefillService::new(
+            budget_repo.clone(),
+            augmentation_repo.clone(),
+            policy_store.engine(),
+            Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
+        ));
+        let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
+            budget_repo,
+            augmentation_repo,
+        ));
         let router = lightbridge_authz_rest::build_api_router(
             &external_oauth2(),
             bearer,
             issuer,
             policy_store,
+            refill_service,
+            review_service,
             lazy_cratestack_db(),
             db_pool.clone(),
             signing_repo,

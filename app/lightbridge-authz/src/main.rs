@@ -73,6 +73,7 @@ async fn main() -> Result<()> {
                     &config_clone.oauth2,
                     &config_clone.billing,
                     &config_clone.redis,
+                    &config_clone.usage_database,
                 )
                 .await
                 {
@@ -109,6 +110,7 @@ async fn main() -> Result<()> {
                 &config.oauth2,
                 &config.billing,
                 &config.redis,
+                &config.usage_database,
             )
             .await?;
             Ok(())
