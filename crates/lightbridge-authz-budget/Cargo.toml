@@ -45,3 +45,8 @@ required-features = ["it-tests"]
 name = "budget_replay_and_expiry_tests"
 path = "tests/budget_replay_and_expiry_tests.rs"
 required-features = ["it-tests"]
+
+[[test]]
+name = "policy_store_tests"
+path = "tests/policy_store_tests.rs"
+required-features = ["it-tests"]

@@ -103,6 +103,12 @@ pub struct RuleSet {
 /// The threshold (`2`) and the field it compares are rule data -- changeable without a deploy,
 /// exactly as the ADR requires. Used by this module's own tests and available for whatever later
 /// PR wires a real default into config.
+///
+/// ⚠️ KEEP IN SYNC WITH the seed `rule_data_json` literal in
+/// `migrations/20260804000001_budget_policy_sets_and_revisions.sql` -- that migration seeds the
+/// `budget-refill` policy set's first revision with this exact JSON, byte-for-byte, because a SQL
+/// migration cannot call this function. If you change this literal, change the migration's copy
+/// in the same PR.
 pub fn default_rule_set_json() -> &'static str {
     r#"{
   "policy_revision": "budget-policy-v1",
@@ -155,7 +161,12 @@ fn validate(rule_set: &RuleSet) -> Result<(), BudgetError> {
     Ok(())
 }
 
-fn parse_and_validate(rule_data_json: &str) -> Result<RuleSet, BudgetError> {
+/// Parses `rule_data_json` into a [`RuleSet`] and runs [`validate`] against it. Public so that
+/// [`crate::policy_store::PolicyStore`] can run the exact same check `RuleDataEngine::new`/
+/// [`RuleDataEngine::load`] use before ever writing an activation attempt to the database --
+/// there must be exactly one place this logic lives, not a second, possibly-drifted copy in the
+/// storage layer.
+pub fn validate_rule_data(rule_data_json: &str) -> Result<RuleSet, BudgetError> {
     let rule_set: RuleSet = serde_json::from_str(rule_data_json).map_err(|err| {
         BudgetError::InvalidRuleData(format!("failed to parse rule data JSON: {err}"))
     })?;
@@ -369,7 +380,7 @@ impl RuleDataEngine {
         initial_rule_data_json: &str,
         evaluation_budget: usize,
     ) -> Result<Self, BudgetError> {
-        let rule_set = parse_and_validate(initial_rule_data_json)?;
+        let rule_set = validate_rule_data(initial_rule_data_json)?;
         Ok(Self {
             active: RwLock::new(Arc::new(rule_set)),
             evaluation_budget,
@@ -383,7 +394,7 @@ impl RuleDataEngine {
     /// caller (a later PR's activation RPC) can propagate it -- the loud log here is this
     /// function's own responsibility, not deferred to a caller that might not log it.
     pub fn load(&self, new_rule_data_json: &str) -> Result<(), BudgetError> {
-        match parse_and_validate(new_rule_data_json) {
+        match validate_rule_data(new_rule_data_json) {
             Ok(rule_set) => {
                 let mut active = self
                     .active
