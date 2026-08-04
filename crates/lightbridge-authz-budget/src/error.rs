@@ -3,6 +3,12 @@
 //! validation variants (`InvalidAmount`, `InvalidPeriod`, `UnknownSource`, `UnknownTier`), but
 //! the ledger/policy variants are included now so later PRs in the #188 epic have a stable
 //! taxonomy to grow into rather than reshaping this enum mid-epic.
+//!
+//! `NotFound`, `UnknownStatus`, `InvalidReviewOutcome`, and `MissingRejectionReason` are added by
+//! PR 3.1 (#191) for `augmentation`: a caller looking up an augmentation request by id, or
+//! reviewing one, needs to distinguish "no such request" from "you asked for a review outcome
+//! that isn't a legitimate review outcome" from "a rejection must carry a reason" -- three
+//! genuinely different caller errors, not one generic failure.
 
 #[derive(Debug, thiserror::Error)]
 pub enum BudgetError {
@@ -22,6 +28,14 @@ pub enum BudgetError {
     StorageFailed(String),
     #[error("invalid rule data: {0}")]
     InvalidRuleData(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("unknown augmentation request status: {0}")]
+    UnknownStatus(String),
+    #[error("'{0}' is not a legitimate review outcome")]
+    InvalidReviewOutcome(String),
+    #[error("a rejection must carry a non-empty rejection reason")]
+    MissingRejectionReason,
 }
 
 pub type Result<T> = std::result::Result<T, BudgetError>;
@@ -64,6 +78,22 @@ mod tests {
             BudgetError::InvalidRuleData("policy_revision must not be empty".to_string())
                 .to_string(),
             "invalid rule data: policy_revision must not be empty"
+        );
+        assert_eq!(
+            BudgetError::NotFound("augmentation request req-1".to_string()).to_string(),
+            "not found: augmentation request req-1"
+        );
+        assert_eq!(
+            BudgetError::UnknownStatus("bogus".to_string()).to_string(),
+            "unknown augmentation request status: bogus"
+        );
+        assert_eq!(
+            BudgetError::InvalidReviewOutcome("cancelled".to_string()).to_string(),
+            "'cancelled' is not a legitimate review outcome"
+        );
+        assert_eq!(
+            BudgetError::MissingRejectionReason.to_string(),
+            "a rejection must carry a non-empty rejection reason"
         );
     }
 }
