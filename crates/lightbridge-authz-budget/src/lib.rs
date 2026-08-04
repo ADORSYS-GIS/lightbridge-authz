@@ -10,6 +10,7 @@
 //! see `docs/budget-decision-contract.md`.
 
 pub mod amount;
+pub mod augmentation;
 pub mod decision;
 pub mod error;
 pub mod facts;
@@ -22,6 +23,10 @@ pub mod spend;
 pub mod tier;
 
 pub use amount::AmountMicros;
+pub use augmentation::{
+    ApprovedDecision, AugmentationRepo, AugmentationRequest, AugmentationStatus,
+    NewAugmentationRequest, RecordedDecision, UnapprovedDecision,
+};
 pub use decision::{Decision, Effect, Obligations, PolicyEngine};
 pub use error::BudgetError;
 pub use facts::Facts;

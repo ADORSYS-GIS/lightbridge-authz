@@ -156,9 +156,13 @@ fn budget_error_to_cool_error(err: lightbridge_authz_budget::BudgetError) -> Coo
         BudgetError::InvalidAmount(_)
         | BudgetError::InvalidPeriod(_)
         | BudgetError::UnknownSource(_)
-        | BudgetError::UnknownTier(_) => CoolError::BadRequest(err.to_string()),
+        | BudgetError::UnknownTier(_)
+        | BudgetError::UnknownStatus(_)
+        | BudgetError::InvalidReviewOutcome(_)
+        | BudgetError::MissingRejectionReason => CoolError::BadRequest(err.to_string()),
         BudgetError::AlreadyGranted => CoolError::Conflict(err.to_string()),
         BudgetError::PolicyDenied(_) => CoolError::Forbidden(err.to_string()),
+        BudgetError::NotFound(m) => CoolError::NotFound(m),
         BudgetError::StorageFailed(m) => CoolError::Internal(m),
     }
 }

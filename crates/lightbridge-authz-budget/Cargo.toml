@@ -50,3 +50,8 @@ required-features = ["it-tests"]
 name = "policy_store_tests"
 path = "tests/policy_store_tests.rs"
 required-features = ["it-tests"]
+
+[[test]]
+name = "augmentation_repo_tests"
+path = "tests/augmentation_repo_tests.rs"
+required-features = ["it-tests"]
