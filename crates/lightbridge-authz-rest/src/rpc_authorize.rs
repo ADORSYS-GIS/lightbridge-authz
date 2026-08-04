@@ -134,6 +134,14 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         // `budget:policy-read` and `budget:policy-activate` -- it is neither.
         "procedure.simulateBudgetPolicy" => BudgetPolicySimulate,
 
+        // Self-service refill and the admin review queue (#191, PR 3.4). Requesting a refill is
+        // gated separately from reviewing one -- a caller who can ask for more budget should not
+        // thereby be able to approve/reject requests (including their own), and vice versa.
+        "procedure.requestBudgetRefill" => BudgetSelfRefill,
+        "procedure.listPendingAugmentationRequests" => BudgetReview,
+        "procedure.approveAugmentationRequest" => BudgetReview,
+        "procedure.rejectAugmentationRequest" => BudgetReview,
+
         _ => return None,
     })
 }
@@ -281,6 +289,22 @@ mod tests {
             (
                 "procedure.simulateBudgetPolicy",
                 Permission::BudgetPolicySimulate,
+            ),
+            (
+                "procedure.requestBudgetRefill",
+                Permission::BudgetSelfRefill,
+            ),
+            (
+                "procedure.listPendingAugmentationRequests",
+                Permission::BudgetReview,
+            ),
+            (
+                "procedure.approveAugmentationRequest",
+                Permission::BudgetReview,
+            ),
+            (
+                "procedure.rejectAugmentationRequest",
+                Permission::BudgetReview,
             ),
         ];
         for (op_id, expected) in cases {

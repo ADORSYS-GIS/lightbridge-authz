@@ -211,6 +211,9 @@ listed here is denied unconditionally (fail closed).**
 | `apikey:validate` | — (OPA server, Basic-auth)                           | `validate-api-key`, `validate-authorino-api-key` |
 | `budget:policy-activate` | `procedure.activateBudgetPolicy`                | — (no MCP tool yet)                 |
 | `budget:policy-read`     | `procedure.getBudgetPolicyStatus`               | — (no MCP tool yet)                 |
+| `budget:policy-simulate` | `procedure.simulateBudgetPolicy`                | — (no MCP tool yet)                 |
+| `budget:self-refill`     | `procedure.requestBudgetRefill`                 | — (no MCP tool yet)                 |
+| `budget:review`          | `procedure.listPendingAugmentationRequests`, `procedure.approveAugmentationRequest`, `procedure.rejectAugmentationRequest` | — (no MCP tool yet) |
 
 `read` covers both the list and get operations for a resource.
 
@@ -221,19 +224,50 @@ listed here is denied unconditionally (fail closed).**
 `docs/runbooks/roll-back-a-budget-policy.md` flow) — exactly one of the two must be supplied.
 `procedure.getBudgetPolicyStatus` reports the revision genuinely serving `evaluate()` calls right
 now, which can differ from the one most recently *attempted* if that attempt was rejected (a
-failed load leaves the previous revision in force). Both procedures are gated only by
-`@allow(auth() != null)` in the schema — there is no per-tenant ownership check, because the budget
-policy is a single, platform-wide singleton, not owned by any particular account. The entire
-authorization story for these two op-ids is therefore the RBAC gate above:
-`budget:policy-activate` (coarser action, changes what's serving) and `budget:policy-read` (coarser
-gate, only reads it).
+failed load leaves the previous revision in force). `procedure.simulateBudgetPolicy` evaluates a
+proposed rule-data policy against a caller-supplied scenario entirely in memory, with no
+side effects of any kind (#190). All three procedures are gated only by `@allow(auth() != null)`
+in the schema — there is no per-tenant ownership check, because the budget policy is a single,
+platform-wide singleton, not owned by any particular account. The entire authorization story for
+these op-ids is therefore the RBAC gate above: `budget:policy-activate` (coarser action, changes
+what's serving), `budget:policy-read` (coarser gate, only reads it), and `budget:policy-simulate`
+(neither — a proposed policy that is never applied).
 
-### Budget permissions (remaining eight reserved, not yet gating any operation)
+### Self-service refill and the admin review queue (#191)
+
+`procedure.requestBudgetRefill` is the RPC surface over
+`lightbridge_authz_budget::refill::RefillService::request_refill`: a caller asks for more budget
+for `budgetAccountId`/`period`, and the service decides — immediately (auto-grant, possibly
+capped), or by queuing the request for a human (`pending_review`) — without anyone hand-editing
+policy config. Gated at `budget:self-refill`.
+
+`procedure.listPendingAugmentationRequests` / `procedure.approveAugmentationRequest` /
+`procedure.rejectAugmentationRequest` are the admin review queue over
+`lightbridge_authz_budget::review::ReviewService`, all three gated at `budget:review` — listing the
+queue and acting on it are both "the reviewer capability" here, unlike the budget-policy trio above
+where read/write/simulate are three separate permissions. A rejection requires a non-empty `reason`
+at both the schema layer (the field is non-optional) and the service layer (`ReviewService::reject`)
+— see #191's own implementation note: a rejection without a visible reason turns into a support
+conversation.
+
+All four procedures are gated only by `@allow(auth() != null)` in the schema, same pattern as the
+rest of the budget domain — the real authorization is entirely the RBAC permission gate.
+
+> **Known gap:** #191's own acceptance criteria require refusing `requestBudgetRefill` for an
+> internal/API-key-derived caller ("refills are OIDC users only"). That refusal is **not**
+> implemented as of this permission wiring — there is currently no reliable signal on this RPC
+> surface that distinguishes an OIDC-human caller from an internal/API-key-derived one. See
+> `Procedures::request_budget_refill`'s doc comment
+> (`crates/lightbridge-authz-rest/src/lib.rs`) and the PR that added this section for the full
+> investigation and the tracking follow-up issue.
+
+### Budget permissions (remaining five reserved, not yet gating any operation)
 
 `RFC-0001` (`docs/rfc/0001-budget-refill.md`) sketches a `budget:*` permission surface for the
-budget domain. `budget:policy-activate` and `budget:policy-read` are wired up as of the budget
-policy lifecycle above; the eight permissions below still exist in `Permission::ALL` and are usable
-in `role_permissions`/`default_grants` today, but **no RPC `op_id` or MCP tool maps to any of them
+budget domain. `budget:policy-activate`, `budget:policy-read`, `budget:policy-simulate`,
+`budget:self-refill`, and `budget:review` are wired up as of the sections above; the five
+permissions below still exist in `Permission::ALL` and are usable in
+`role_permissions`/`default_grants` today, but **no RPC `op_id` or MCP tool maps to any of them
 yet** — later PRs in issue #188 haven't wired up the rest of the budget domain's RPC/MCP surface.
 They are reserved here so the permission strings, and the RBAC machinery around them (wildcard
 expansion, `default_grants`), are settled ahead of that surface landing.
@@ -241,13 +275,10 @@ expansion, `default_grants`), are settled ahead of that surface landing.
 | Permission               | Meaning                                                              |
 | ------------------------ | --------------------------------------------------------------------- |
 | `budget:read`            | Read budget/balance status (typically via `default_grants`, see below). |
-| `budget:self-refill`     | Request a self-service budget top-up for the caller's own account.  |
-| `budget:review`          | Review a pending budget augmentation request (approve/cap/deny).    |
 | `budget:grant`           | Grant budget directly, bypassing self-service policy evaluation.    |
 | `budget:revoke`          | Revoke previously granted budget.                                    |
 | `budget:audit-read`      | Read the budget audit trail (grants, decisions, policy revisions).  |
 | `budget:policy-write`    | Author (write) budget policy rules.                                  |
-| `budget:policy-simulate` | Dry-run a budget policy against facts without applying it.          |
 
 `budget:policy-write` and `budget:policy-activate` are deliberately kept separate (ADR-0007): with
 arbitrary Rego, writing a policy means shipping executable code into the decision path, so the

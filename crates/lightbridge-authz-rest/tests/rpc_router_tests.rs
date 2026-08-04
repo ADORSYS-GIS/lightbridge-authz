@@ -102,6 +102,34 @@ fn lazy_policy_store(core: Arc<dyn DbPoolTrait>) -> Arc<lightbridge_authz_budget
     ))
 }
 
+/// A `RefillService`/`ReviewService` pair built with no live database query at all -- matching
+/// how every other dependency in this file is lazily wired to an unreachable Postgres and never
+/// actually queried (none of this file's tests reach a budget-refill procedure).
+/// `UnavailableSpendReader` needs no database at all, so it needs no "lazy" qualifier.
+fn lazy_refill_and_review_services(
+    core: Arc<dyn DbPoolTrait>,
+    policy_store: &lightbridge_authz_budget::PolicyStore,
+) -> (
+    Arc<lightbridge_authz_budget::RefillService>,
+    Arc<lightbridge_authz_budget::ReviewService>,
+) {
+    let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
+        core.clone(),
+    ));
+    let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(core));
+    let refill_service = Arc::new(lightbridge_authz_budget::RefillService::new(
+        budget_repo.clone(),
+        augmentation_repo.clone(),
+        policy_store.engine(),
+        Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
+    ));
+    let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
+        budget_repo,
+        augmentation_repo,
+    ));
+    (refill_service, review_service)
+}
+
 fn signing_cfg() -> JwtSigning {
     JwtSigning {
         issuer: "https://authz.example.test".to_string(),
@@ -137,11 +165,16 @@ fn build_router(
 ) -> Router {
     let core = lazy_core_pool();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()));
+    let policy_store = lazy_policy_store(core.clone());
+    let (refill_service, review_service) =
+        lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
         oauth2,
         bearer,
         issuer,
-        lazy_policy_store(core.clone()),
+        policy_store,
+        refill_service,
+        review_service,
         lazy_cratestack_db(),
         core,
         lazy_store_repo(),
@@ -164,11 +197,16 @@ fn build_router_at(
 ) -> Router {
     let core = lazy_core_pool();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()));
+    let policy_store = lazy_policy_store(core.clone());
+    let (refill_service, review_service) =
+        lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
         oauth2,
         bearer,
         issuer,
-        lazy_policy_store(core.clone()),
+        policy_store,
+        refill_service,
+        review_service,
         lazy_cratestack_db(),
         core,
         lazy_store_repo(),

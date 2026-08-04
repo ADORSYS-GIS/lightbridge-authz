@@ -560,3 +560,124 @@ type SimulateBudgetPolicyInput {
 // scope it to).
 procedure simulateBudgetPolicy(args: SimulateBudgetPolicyInput): Decision
   @allow(auth() != null)
+
+// Self-service refill and the admin review queue (#191, PR 3.4) -- the RPC surface over
+// `lightbridge_authz_budget::refill::RefillService`/`review::ReviewService`. Mirrors
+// `lightbridge_authz_budget::augmentation::AugmentationRequest` field-for-field (see that module
+// for the authoritative shape); this type is the request/decision ledger row for ONE refill
+// attempt, auto-approved or queued alike -- as distinct from `Decision` above, which is
+// `simulateBudgetPolicy`'s stateless, nothing-persisted evaluation result.
+//
+// `requestedAmountMicros`/`approvedAmountMicros` are decimal strings, the same 64-bit-safety
+// rationale `SimulateBudgetPolicyInput`/`Decision` already established above (cratestack's `Int`
+// is a full-range Rust `i64` server-side but a lossy JS `number` in the generated TypeScript
+// client past 2^53).
+//
+// `status`/`policyEffect`/`requestedTier` are plain `String`s carrying their Rust `Display`/serde
+// wire values, matching `Decision.effect`'s own precedent above -- `AugmentationStatus` and
+// `Effect` both already derive stable snake_case (`Effect`) or hand-written (`AugmentationStatus
+// ::as_str`) string forms; a schema-level enum would be a second, hand-maintained mapping of the
+// same values with no existing precedent in this schema to justify the extra machinery.
+//
+// `policyReasonCodes`/`matchedRuleIds` are required `String[]`, not `String[]?`: cratestack's own
+// type-reference grammar (`cratestack-parser`'s `TypeArity`) only allows a field to be a List OR
+// Optional, never both, so a nullable array cannot be expressed in this schema language at all.
+// This is not a loss in practice -- both fields are `Option<Vec<String>>` in the Rust domain type
+// only because they are unset for the fleeting instant between `AugmentationRepo::create` and the
+// first `record_decision` call; every procedure below only ever returns a request AFTER
+// `record_decision`/`record_review` has run (see `RefillService::request_refill`/
+// `ReviewService::approve`/`reject`), at which point both fields are always `Some(vec)` (possibly
+// empty, never absent). The conversion in `lightbridge-authz-rest` maps that `None` case (which a
+// caller of this RPC surface can never actually observe) to an empty list defensively rather than
+// treating it as reachable.
+type AugmentationRequest {
+  id String
+  budgetAccountId String
+  accountId String
+  projectId String?
+  period String
+  requestedTier String
+  requestedAmountMicros String
+  status String
+  policyEffect String?
+  policyReasonCodes String[]
+  matchedRuleIds String[]
+  policyRevision String?
+  approvedAmountMicros String?
+  grantId String?
+  idempotencyKey String?
+  reviewedBy String?
+  rejectionReason String?
+  createdAt DateTime
+  reviewedAt DateTime?
+}
+
+// Self-service refill (#191's own reason this epic exists): a user asks for more budget for
+// `budgetAccountId`/`period`, and `RefillService::request_refill` decides -- immediately (auto
+// grant), or by queuing for a human (`pending_review`) -- without anyone hand-editing config.
+// `period` is the `'YYYY-MM'` calendar-month string (`lightbridge_authz_budget::Period`).
+// `idempotencyKey`, when supplied, makes a genuine client retry return the SAME
+// `AugmentationRequest` rather than evaluating the request a second time (see
+// `RefillService::find_existing`).
+//
+// Gated at `budget:self-refill` (`Permission::BudgetSelfRefill`). `@allow(auth() != null)` only
+// -- same pattern as the rest of the budget domain (`activateBudgetPolicy` et al.): no per-tenant
+// ownership check at the schema-policy layer, because the real authorization is the coarse RBAC
+// permission gate (`crates/lightbridge-authz-rest/src/rpc_authorize.rs`).
+//
+// KNOWN GAP (see this PR's description for the full investigation): #191's own acceptance
+// criteria require refusing this operation for an internal/API-key-derived caller, refills being
+// OIDC-human-only. That refusal is NOT implemented in this PR -- there is no reliable,
+// already-plumbed-through signal on this RPC surface today that distinguishes an OIDC-human
+// caller from an internal/API-key-derived one (see `Procedures::request_budget_refill`'s own doc
+// comment, and this PR's description, for exactly what was checked and why).
+type RequestBudgetRefillInput {
+  budgetAccountId String
+  accountId String
+  projectId String?
+  period String
+  idempotencyKey String?
+}
+
+mutation procedure requestBudgetRefill(args: RequestBudgetRefillInput): AugmentationRequest
+  @allow(auth() != null)
+
+// The admin review queue's read path (#191, PR 3.3's `ReviewService::list_pending`). `budgetAccountId:
+// String?` mirrors `list_pending`'s own `Option<&str>` scoping precisely: omitted/`null` lists the
+// whole cross-account queue (a global admin view), `Some` scopes to one account's pending requests.
+// Gated at `budget:review` (`Permission::BudgetReview`), same permission as the two mutations
+// below -- reading the queue and acting on it are both "the reviewer capability" here, unlike the
+// budget-policy pair above where read and write are deliberately split into two permissions;
+// there is no separate "read the review queue" capability in RFC-0001's sketch to split it into.
+type ListPendingAugmentationRequestsInput {
+  budgetAccountId String?
+}
+
+procedure listPendingAugmentationRequests(args: ListPendingAugmentationRequestsInput): AugmentationRequest[]
+  @allow(auth() != null)
+
+// Approves a `pending_review` request: grants the requested amount and records the outcome
+// (`ReviewService::approve`). Concurrency-safe against a racing `approve`/`reject` on the same
+// `requestId` -- see that method's own doc comment for the advisory-lock design. Gated at
+// `budget:review`.
+type ApproveAugmentationRequestInput {
+  requestId String
+}
+
+mutation procedure approveAugmentationRequest(args: ApproveAugmentationRequestInput): AugmentationRequest
+  @allow(auth() != null)
+
+// Rejects a `pending_review` request: no grant, just the review outcome plus a mandatory reason
+// (`ReviewService::reject`). `reason` is a non-optional schema field -- the mandatory-reason rule
+// is already enforced at runtime by `ReviewService::reject`/`AugmentationRepo::record_review`
+// (#191's own implementation note: "a rejection without a visible reason turns into a support
+// conversation"), but making the schema field non-optional too means a caller omitting it
+// entirely gets a clean schema-validation error before the request ever reaches the procedure,
+// rather than relying solely on the runtime check to catch it. Gated at `budget:review`.
+type RejectAugmentationRequestInput {
+  requestId String
+  reason String
+}
+
+mutation procedure rejectAugmentationRequest(args: RejectAugmentationRequestInput): AugmentationRequest
+  @allow(auth() != null)

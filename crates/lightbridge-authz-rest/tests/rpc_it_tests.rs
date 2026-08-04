@@ -116,6 +116,8 @@ struct Ctx {
     verify: sqlx::PgPool,
     issuer: Arc<AuthzStoreImpl>,
     policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
+    refill_service: Arc<lightbridge_authz_budget::RefillService>,
+    review_service: Arc<lightbridge_authz_budget::ReviewService>,
 }
 
 // `SqlxIdempotencyStore::ensure_schema()` issues its `CREATE TYPE`/`CREATE TABLE` DDL without
@@ -171,11 +173,33 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
         .expect("migrations seed an active budget-refill revision"),
     );
 
+    // Real budget-refill dependencies against the same live `core` pool (PR 3.4, #191). No
+    // `usage_database` is configured for this test file (it does not exercise spend-dependent
+    // policy rules), so `UnavailableSpendReader` stands in -- see that type's own doc comment.
+    let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
+        core.clone(),
+    ));
+    let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(
+        core.clone(),
+    ));
+    let refill_service = Arc::new(lightbridge_authz_budget::RefillService::new(
+        budget_repo.clone(),
+        augmentation_repo.clone(),
+        policy_store.engine(),
+        Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
+    ));
+    let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
+        budget_repo,
+        augmentation_repo,
+    ));
+
     let router = lightbridge_authz_rest::build_api_router(
         &external_oauth2(),
         bearer,
         issuer.clone(),
         policy_store.clone(),
+        refill_service.clone(),
+        review_service.clone(),
         cdb,
         core.clone(),
         signing_repo,
@@ -199,6 +223,8 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
         verify,
         issuer,
         policy_store,
+        refill_service,
+        review_service,
     }
 }
 
@@ -1265,7 +1291,12 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
     let cdb = schema::Cratestack::builder(ctx.cratestack_pool.clone()).build();
     let bare: Router = schema::axum::rpc_router(
         cdb,
-        Procedures::new(ctx.issuer.clone(), ctx.policy_store.clone()),
+        Procedures::new(
+            ctx.issuer.clone(),
+            ctx.policy_store.clone(),
+            ctx.refill_service.clone(),
+            ctx.review_service.clone(),
+        ),
         CodecSet::new(CborCodec, JsonCodec),
         CratestackAuthProvider::new(admin_bearer(&subject)),
     );
