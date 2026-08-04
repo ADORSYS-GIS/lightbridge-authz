@@ -34,6 +34,10 @@ fn build_new_api_key_row(project_id: &str, name: &str, key_hash: &str) -> NewApi
     }
 }
 
+#[ignore = "tests an account-level 'invited member' scenario ADR-0006 removed entirely -- \
+            the assertions below were left stale by commit a12cda38's account_memberships \
+            removal (comment updated, assertions were not); see #220 for the full diagnosis \
+            and the redesign decision this needs before re-enabling"]
 #[sqlx::test(migrations = "../../migrations")]
 async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
     let repo = build_repo(pool.clone());

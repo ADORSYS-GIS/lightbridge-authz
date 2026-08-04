@@ -26,7 +26,13 @@ use tower::ServiceExt;
 
 const ISSUER: &str = "https://authz.example.test";
 const SUBJECT: &str = "kc-user-123";
-const ACCOUNT_ID: &str = "acct_xchg";
+// `create_account` always sets the account's id to the creating subject (ADR-0006: an account IS
+// its owner) -- there is no independent account-id parameter to seed a different value with, so
+// this must alias `SUBJECT` rather than an arbitrary string. Using a distinct literal here was a
+// pre-ADR-0006 leftover that made every test seeding through `seed()` fail with `NotFound` on
+// `create_project` (it authorizes on `subject == account_id`), since `ACCOUNT_ID` never matched
+// any account that actually existed.
+const ACCOUNT_ID: &str = SUBJECT;
 const PROJECT_ID: &str = "proj_xchg";
 const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
