@@ -9,6 +9,20 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::{fmt, sync::Arc, time::Duration};
 
+/// Claim name carrying the caller-kind signal (see [`API_KEY_CALLER_KIND`]). Custom (not a
+/// standard OIDC claim) and namespaced like the existing `lightbridge_api_roles` roles claim, so
+/// it cannot collide with an IdP's own claims.
+pub const CALLER_KIND_CLAIM: &str = "lightbridge_caller_kind";
+
+/// The [`CALLER_KIND_CLAIM`] value stamped onto a token minted for an API key, as opposed to a
+/// human OIDC login. Under `oauth2.type: self` this repo's own [`ApiKeyJwtSigner`]
+/// (`lightbridge-authz-rest::signing`) mints it unconditionally on every self-signed API-key JWT.
+/// Under `oauth2.type: external` it must be minted by whatever IdP-side flow performs the API-key
+/// token exchange (see `docs/rbac.md`'s "Self-service refill and the admin review queue" section)
+/// -- this repo cannot mint it on the IdP's behalf, so callers authenticated under `external` do
+/// not carry it until that flow is updated to stamp it.
+pub const API_KEY_CALLER_KIND: &str = "api_key";
+
 /// Token information returned by JWT validation.
 #[derive(Clone, Deserialize)]
 pub struct TokenInfo {
@@ -24,6 +38,13 @@ pub struct TokenInfo {
     /// Permissions derived from `roles` via the configured RBAC mapping.
     #[serde(default)]
     pub permissions: PermissionSet,
+    /// The [`CALLER_KIND_CLAIM`] value, if the token carries one. `None` means "unknown" -- most
+    /// tokens today (every human OIDC login, and every `external`-mode token until the IdP-side
+    /// exchange flow is updated) carry no such claim at all, so `None` must not be read as "not an
+    /// API key"; it only means this signal is unavailable for this token. Callers that need to
+    /// exclude API-key-derived tokens should compare against [`API_KEY_CALLER_KIND`] explicitly.
+    #[serde(default)]
+    pub caller_kind: Option<String>,
     #[serde(default)]
     pub access_token: String,
 }
@@ -37,6 +58,7 @@ impl std::fmt::Debug for TokenInfo {
             .field("aud", &self.aud)
             .field("roles", &self.roles)
             .field("permissions", &self.permissions)
+            .field("caller_kind", &self.caller_kind)
             .field("access_token", &"<redacted>")
             .finish()
     }
@@ -52,6 +74,13 @@ impl TokenInfo {
     /// (HTTP 403). Handlers call this before performing a gated operation.
     pub fn require(&self, permission: Permission) -> Result<(), Error> {
         self.permissions.require(permission)
+    }
+
+    /// Whether this token was minted for an API key rather than a human OIDC login, per the
+    /// [`CALLER_KIND_CLAIM`] claim. See that constant's docs for why the absence of the claim
+    /// (the common case today) means "unknown", not "human".
+    pub fn is_api_key_derived(&self) -> bool {
+        self.caller_kind.as_deref() == Some(API_KEY_CALLER_KIND)
     }
 }
 
@@ -277,6 +306,11 @@ impl BearerTokenServiceTrait for BearerTokenService {
 
         let roles = roles_from_claim(claims.extra.get(&self.roles_claim));
         let permissions = permissions_for_roles(&roles, &self.role_permissions);
+        let caller_kind = claims
+            .extra
+            .get(CALLER_KIND_CLAIM)
+            .and_then(Value::as_str)
+            .map(str::to_owned);
 
         tracing::debug!(
             "JWT claims validated. Subject: {}, Audience: {:?}, Roles: {:?}, Permissions: {}",
@@ -293,6 +327,7 @@ impl BearerTokenServiceTrait for BearerTokenService {
             aud: token_audience,
             roles,
             permissions,
+            caller_kind,
             access_token: token.to_string(),
         })
     }

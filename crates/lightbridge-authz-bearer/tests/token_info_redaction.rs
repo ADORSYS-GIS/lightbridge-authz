@@ -9,6 +9,7 @@ fn token_info_debug_never_leaks_the_access_token() {
         aud: vec!["lightbridge-api-key".to_string()],
         roles: vec![],
         permissions: Default::default(),
+        caller_kind: None,
         access_token: "eyJ.super-secret-bearer.value".to_string(),
     };
 

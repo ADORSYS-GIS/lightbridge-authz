@@ -122,6 +122,13 @@ struct ApiKeyClaims<'a> {
     aud: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     azp: Option<&'a str>,
+    /// [`lightbridge_authz_bearer::CALLER_KIND_CLAIM`]: this signer only ever mints tokens for API
+    /// keys, so it is stamped unconditionally (#191/#216 -- lets `requestBudgetRefill` refuse
+    /// API-key-derived callers by a real signal instead of relying on `oauth2.type: self` API-key
+    /// JWTs happening to fail signature verification against the RPC bearer middleware's own,
+    /// separate JWKS).
+    #[serde(rename = "lightbridge_caller_kind")]
+    caller_kind: &'static str,
     sid: String,
     scope: &'static str,
     api_key_id: &'a str,
@@ -215,6 +222,7 @@ impl ApiKeyJwtSigner {
             typ: TOKEN_TYP,
             aud: self.audience.as_deref(),
             azp: self.audience.as_deref(),
+            caller_kind: lightbridge_authz_bearer::API_KEY_CALLER_KIND,
             sid: cuid2(),
             scope: TOKEN_SCOPE,
             api_key_id,

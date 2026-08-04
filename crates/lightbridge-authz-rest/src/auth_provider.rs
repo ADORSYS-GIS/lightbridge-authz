@@ -30,6 +30,13 @@ pub const ACCESS_TOKEN_CONTEXT_KEY: &str = "access_token";
 /// schema authorizes on `auth().id` membership, not roles).
 pub const ROLES_CONTEXT_KEY: &str = "roles";
 
+/// Context key under which [`TokenInfo::caller_kind`] is stashed, when present, so procedures that
+/// need to exclude API-key-derived callers (`requestBudgetRefill`, #191/#216) can read it. Absent
+/// from the context entirely when the token carries no such claim -- see
+/// [`lightbridge_authz_bearer::TokenInfo::caller_kind`]'s docs for why that must be treated as
+/// "unknown", not "human".
+pub const CALLER_KIND_CONTEXT_KEY: &str = "caller_kind";
+
 #[derive(Clone)]
 pub struct CratestackAuthProvider {
     bearer: Arc<dyn BearerTokenServiceTrait>,
@@ -100,6 +107,12 @@ impl AuthProvider for CratestackAuthProvider {
                         ctx.extensions.insert(
                             ROLES_CONTEXT_KEY.to_owned(),
                             Value::List(info.roles.iter().cloned().map(Value::String).collect()),
+                        );
+                    }
+                    if let Some(caller_kind) = info.caller_kind {
+                        ctx.extensions.insert(
+                            CALLER_KIND_CONTEXT_KEY.to_owned(),
+                            Value::String(caller_kind),
                         );
                     }
                     Ok(ctx)

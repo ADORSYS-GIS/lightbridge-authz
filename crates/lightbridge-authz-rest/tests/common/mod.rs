@@ -66,7 +66,19 @@ pub fn token_info(subject: &str, perms: PermissionSet) -> TokenInfo {
         aud: vec![],
         roles: vec![],
         permissions: perms,
+        caller_kind: None,
         access_token: format!("access-{subject}"),
+    }
+}
+
+/// Like [`token_info`], but stamped with [`lightbridge_authz_bearer::API_KEY_CALLER_KIND`], as an
+/// `oauth2.type: self` self-signed API-key JWT would be (see `ApiKeyClaims` in
+/// `lightbridge-authz-rest::signing`). Used to exercise the caller-kind refusal in
+/// `requestBudgetRefill` (#191/#216).
+pub fn api_key_token_info(subject: &str, perms: PermissionSet) -> TokenInfo {
+    TokenInfo {
+        caller_kind: Some(lightbridge_authz_bearer::API_KEY_CALLER_KIND.to_owned()),
+        ..token_info(subject, perms)
     }
 }
 
