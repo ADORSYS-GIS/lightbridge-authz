@@ -16,6 +16,7 @@ pub mod error;
 pub mod facts;
 pub mod period;
 pub mod policy_store;
+pub mod refill;
 pub mod repo;
 pub mod rule_data;
 pub mod source;
@@ -32,6 +33,7 @@ pub use error::BudgetError;
 pub use facts::Facts;
 pub use period::Period;
 pub use policy_store::PolicyStore;
+pub use refill::{RefillRequest, RefillService};
 pub use rule_data::{
     Condition, Field, Operator, Rule, RuleDataEngine, RuleSet, default_rule_set_json,
     validate_rule_data,

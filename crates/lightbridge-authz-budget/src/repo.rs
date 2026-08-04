@@ -125,6 +125,77 @@ const EFFECTIVE_BALANCE_SQL: &str = "SELECT COALESCE(SUM(amount_micros), 0)::big
        AND (expires_at IS NULL OR expires_at > $3) \
        AND revoked_at IS NULL";
 
+const GET_BALANCE_SQL: &str = "SELECT \
+     budget_account_id, period, base_total_micros, self_service_total_micros, \
+     admin_total_micros, automatic_total_micros, refund_total_micros, \
+     effective_budget_micros, self_service_grant_count, automatic_grant_count, \
+     version, updated_at \
+     FROM budget_balances WHERE budget_account_id = $1 AND period = $2";
+
+/// A single `budget_balances` row, read directly (not replayed from the ledger like
+/// [`DerivedBalance`], and not filtered by expiry like [`BudgetRepo::effective_balance`]). `None`
+/// from [`BudgetRepo::get_balance`] means no balance row exists yet for that (account, period) --
+/// meaningfully different from a zero-valued row: an account that has never had any grant this
+/// period, versus one that has but with zero self-service grants specifically.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BalanceSnapshot {
+    pub budget_account_id: String,
+    pub period: Period,
+    pub base_total_micros: i64,
+    pub self_service_total_micros: i64,
+    pub admin_total_micros: i64,
+    pub automatic_total_micros: i64,
+    pub refund_total_micros: i64,
+    pub effective_budget_micros: i64,
+    /// How many *unaided* (auto-approved) self-service refills this account has used this
+    /// period -- the field [`crate::refill::RefillService`] actually reads.
+    pub self_service_grant_count: i32,
+    pub automatic_grant_count: i32,
+    pub version: i64,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct BalanceRow {
+    budget_account_id: String,
+    period: String,
+    base_total_micros: i64,
+    self_service_total_micros: i64,
+    admin_total_micros: i64,
+    automatic_total_micros: i64,
+    refund_total_micros: i64,
+    effective_budget_micros: i64,
+    self_service_grant_count: i32,
+    automatic_grant_count: i32,
+    version: i64,
+    updated_at: DateTime<Utc>,
+}
+
+impl TryFrom<BalanceRow> for BalanceSnapshot {
+    type Error = BudgetError;
+
+    fn try_from(row: BalanceRow) -> Result<Self, Self::Error> {
+        let period = Period::parse(&row.period).map_err(|err| {
+            BudgetError::StorageFailed(format!("stored budget_balances.period is invalid: {err}"))
+        })?;
+
+        Ok(Self {
+            budget_account_id: row.budget_account_id,
+            period,
+            base_total_micros: row.base_total_micros,
+            self_service_total_micros: row.self_service_total_micros,
+            admin_total_micros: row.admin_total_micros,
+            automatic_total_micros: row.automatic_total_micros,
+            refund_total_micros: row.refund_total_micros,
+            effective_budget_micros: row.effective_budget_micros,
+            self_service_grant_count: row.self_service_grant_count,
+            automatic_grant_count: row.automatic_grant_count,
+            version: row.version,
+            updated_at: row.updated_at,
+        })
+    }
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct BudgetGrantRow {
     id: String,
@@ -215,7 +286,12 @@ impl BudgetRepo {
         Self { pool }
     }
 
-    fn pool(&self) -> &PgPool {
+    /// `pub(crate)`, not private: [`crate::refill::RefillService`] needs a plain read against
+    /// `budget_grants` (the most recent tier-representing grant) that doesn't fit any existing
+    /// `BudgetRepo` method, and per this module's own docs "reads don't need to go through
+    /// `BudgetRepo`, only writes do" -- exposing the pool within the crate is the smallest change
+    /// that allows that read without adding a single-purpose method here for one caller.
+    pub(crate) fn pool(&self) -> &PgPool {
         self.pool.pool()
     }
 
@@ -359,5 +435,27 @@ impl BudgetRepo {
             .map_err(storage_failed)?;
 
         Ok(total)
+    }
+
+    /// A plain, single-row read of the stored `budget_balances` projection for `(budget_account_id,
+    /// period)` -- not [`Self::rebuild_all_balances`] (which replays the whole ledger) and not
+    /// [`Self::effective_balance`] (which sums `budget_grants` directly, filtered by expiry). `None`
+    /// means no balance row exists yet for this (account, period) -- see [`BalanceSnapshot`]'s doc
+    /// comment for why that is meaningfully different from a zero-valued row.
+    pub async fn get_balance(
+        &self,
+        budget_account_id: &str,
+        period: &Period,
+    ) -> Result<Option<BalanceSnapshot>, BudgetError> {
+        let period_str = period.to_string();
+
+        let row: Option<BalanceRow> = sqlx::query_as(GET_BALANCE_SQL)
+            .bind(budget_account_id)
+            .bind(&period_str)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(storage_failed)?;
+
+        row.map(BalanceSnapshot::try_from).transpose()
     }
 }

@@ -327,3 +327,41 @@ async fn get_of_unknown_id_is_a_loud_error(pool: PgPool) {
 
     assert!(matches!(result, Err(BudgetError::NotFound(_))));
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_by_idempotency_key_returns_none_when_nothing_matches(pool: PgPool) {
+    let repo = AugmentationRepo::new(Arc::new(DbPool::from_pool(pool)));
+
+    let found = repo
+        .find_by_idempotency_key("does-not-exist")
+        .await
+        .expect("lookup must succeed");
+
+    assert_eq!(found, None);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_by_idempotency_key_returns_the_matching_request(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    let repo = AugmentationRepo::new(Arc::new(DbPool::from_pool(pool)));
+    let idempotency_key = cuid2();
+
+    let mut request = base_new_request(&account_id, 30_000_000);
+    request.idempotency_key = Some(idempotency_key.clone());
+
+    let created = repo
+        .create(request)
+        .await
+        .expect("creating a fresh request must succeed");
+
+    let found = repo
+        .find_by_idempotency_key(&idempotency_key)
+        .await
+        .expect("lookup must succeed")
+        .expect("the request must be found");
+
+    assert_eq!(found.id, created.id);
+    assert_eq!(found.idempotency_key, Some(idempotency_key));
+}
