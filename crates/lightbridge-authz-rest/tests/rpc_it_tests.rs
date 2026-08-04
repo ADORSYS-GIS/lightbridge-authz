@@ -115,6 +115,7 @@ struct Ctx {
     cratestack_pool: cratestack::sqlx::PgPool,
     verify: sqlx::PgPool,
     issuer: Arc<AuthzStoreImpl>,
+    policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
 }
 
 // `SqlxIdempotencyStore::ensure_schema()` issues its `CREATE TYPE`/`CREATE TABLE` DDL without
@@ -158,10 +159,23 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
         build_redis_rate_limit_store(&redis_url(), format!("authz-api-it-{}", cuid2()))
             .expect("redis rate-limit store");
 
+    // Migrations seed an active `budget-refill` revision (ADR-0007), so a real
+    // `load_active_from_db` against this test's live Postgres works here.
+    let policy_store = Arc::new(
+        lightbridge_authz_budget::PolicyStore::load_active_from_db(
+            core.clone(),
+            "budget-refill",
+            10_000,
+        )
+        .await
+        .expect("migrations seed an active budget-refill revision"),
+    );
+
     let router = lightbridge_authz_rest::build_api_router(
         &external_oauth2(),
         bearer,
         issuer.clone(),
+        policy_store.clone(),
         cdb,
         core.clone(),
         signing_repo,
@@ -184,6 +198,7 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
         cratestack_pool: cpool,
         verify,
         issuer,
+        policy_store,
     }
 }
 
@@ -1250,7 +1265,7 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
     let cdb = schema::Cratestack::builder(ctx.cratestack_pool.clone()).build();
     let bare: Router = schema::axum::rpc_router(
         cdb,
-        Procedures::new(ctx.issuer.clone()),
+        Procedures::new(ctx.issuer.clone(), ctx.policy_store.clone()),
         CodecSet::new(CborCodec, JsonCodec),
         CratestackAuthProvider::new(admin_bearer(&subject)),
     );

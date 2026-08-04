@@ -122,6 +122,14 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         // future cratestack exposes views over RPC, the correct coarse gate is already in place.
         "model.AccountSummary.list" | "model.AccountSummary.get" => AccountRead,
 
+        // Budget policy lifecycle (ADR-0007). `getBudgetPolicyStatus` is gated coarser than
+        // `activateBudgetPolicy` -- reading what's serving should not require the ability to
+        // change it. Both are `@allow(auth() != null)` only in the schema (no per-tenant
+        // ownership check -- the policy set is a single, platform-wide singleton), so this coarse
+        // gate is the entire authorization story for these two op-ids.
+        "procedure.activateBudgetPolicy" => BudgetPolicyActivate,
+        "procedure.getBudgetPolicyStatus" => BudgetPolicyRead,
+
         _ => return None,
     })
 }
@@ -258,6 +266,14 @@ mod tests {
             ("procedure.rotateApiKey", Permission::ApiKeyRotate),
             ("model.AccountSummary.list", Permission::AccountRead),
             ("model.AccountSummary.get", Permission::AccountRead),
+            (
+                "procedure.activateBudgetPolicy",
+                Permission::BudgetPolicyActivate,
+            ),
+            (
+                "procedure.getBudgetPolicyStatus",
+                Permission::BudgetPolicyRead,
+            ),
         ];
         for (op_id, expected) in cases {
             assert_eq!(

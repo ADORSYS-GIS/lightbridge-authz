@@ -9,8 +9,18 @@ Not what was last activated — what is **serving**. Those differ precisely when
 gone wrong, because a failed load leaves the previous revision in place (by design).
 
 ```bash
-curl -s https://<host>/health | jq '{activePolicyRevision, bundleChecksum, lastLoadError}'
+curl -s -X POST https://<host>/rpc/getBudgetPolicyStatus \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"policySetId":"budget-refill"}'
+# -> {"policySetId":"budget-refill","activePolicyRevision":"<revision>"}
 ```
+
+There is no separate `/health` field for this today — the rule-data engine this procedure reads
+has no bundle to checksum and no separate load-error state to expose (`bundleChecksum`/
+`lastLoadError` are OPA-Wasm-engine concepts, a later phase; nothing in this service produces them
+yet). `getBudgetPolicyStatus` reads the live in-memory engine directly (no DB round-trip), so it
+always reflects what a real request would see right now, not what was last *attempted*.
 
 ```sql
 SELECT policy_revision, policy_effect, COUNT(*)
@@ -28,15 +38,18 @@ Deactivating is faster than fixing, and a revision that is denying everything is
 harm than one approving everything — triage accordingly.
 
 ```bash
-# Reactivate the previous revision
+# Reactivate the previous revision (by id, not by resubmitting its rule data -- resubmission
+# would collide with the revisions table's uniqueness constraint on policy_revision).
 curl -X POST https://<host>/rpc/activateBudgetPolicy \
   -H "Authorization: Bearer $TOKEN" \
-  -d '{"policySetId":"<id>","revisionId":"<previous>"}'
+  -H "Content-Type: application/json" \
+  -d '{"policySetId":"budget-refill","revisionId":"<previous>"}'
+# -> {"policySetId":"budget-refill","activePolicyRevision":"<the previous revision's policy_revision>"}
 ```
 
-Activation is atomic: the running evaluator keeps serving until the new bundle is fully
-loaded and validated. A failed rollback therefore leaves the **bad** revision serving — so
-re-check `/health` rather than assuming the call worked.
+Activation is atomic: the running evaluator keeps serving the old revision until the new one is
+fully loaded and validated. A failed rollback therefore leaves the **bad** revision serving — so
+re-check with `getBudgetPolicyStatus` (step 0) rather than assuming the call worked.
 
 ## 2. Confirm with a simulation, not a live request
 

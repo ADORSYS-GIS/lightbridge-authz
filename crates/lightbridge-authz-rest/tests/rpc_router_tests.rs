@@ -86,6 +86,22 @@ fn lazy_rate_limit() -> Arc<dyn RateLimitStore> {
     build_redis_rate_limit_store(DEAD_REDIS, "authz-api-test").expect("rate limit store")
 }
 
+/// A `PolicyStore` built with no database query at all (`PolicyStore::from_engine`), matching how
+/// every other dependency in this file is lazily wired to an unreachable Postgres and never
+/// actually queried -- none of this file's tests reach a budget-policy procedure.
+fn lazy_policy_store(core: Arc<dyn DbPoolTrait>) -> Arc<lightbridge_authz_budget::PolicyStore> {
+    let engine = lightbridge_authz_budget::RuleDataEngine::new(
+        lightbridge_authz_budget::default_rule_set_json(),
+        10_000,
+    )
+    .expect("default rule set is valid");
+    Arc::new(lightbridge_authz_budget::PolicyStore::from_engine(
+        core,
+        "budget-refill",
+        engine,
+    ))
+}
+
 fn signing_cfg() -> JwtSigning {
     JwtSigning {
         issuer: "https://authz.example.test".to_string(),
@@ -125,6 +141,7 @@ fn build_router(
         oauth2,
         bearer,
         issuer,
+        lazy_policy_store(core.clone()),
         lazy_cratestack_db(),
         core,
         lazy_store_repo(),
@@ -151,6 +168,7 @@ fn build_router_at(
         oauth2,
         bearer,
         issuer,
+        lazy_policy_store(core.clone()),
         lazy_cratestack_db(),
         core,
         lazy_store_repo(),
