@@ -900,9 +900,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-core"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "177e927a951ec848245db64f894577c7c07a3fbf5669f6b92f005882f77b2657"
+checksum = "60fd79a26ef90253e62d9cac6ef4c906e9e3c95faea3fdef5bdaa78b25c69906"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4997,7 +4997,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
