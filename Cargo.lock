@@ -835,9 +835,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-axum"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98a7a31d365123beeaafeaedd9fce445fb795ff3095acc3640d81a89dafc9395"
+checksum = "87a2116d6dc82f898f3c4c4d48b5d0c650c86703f584ff7a04347134dad52812"
 dependencies = [
  "async-trait",
  "axum",
@@ -900,9 +900,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-core"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "177e927a951ec848245db64f894577c7c07a3fbf5669f6b92f005882f77b2657"
+checksum = "60fd79a26ef90253e62d9cac6ef4c906e9e3c95faea3fdef5bdaa78b25c69906"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1447,7 +1447,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3567,7 +3567,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4079,7 +4079,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4137,7 +4137,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4997,10 +4997,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
