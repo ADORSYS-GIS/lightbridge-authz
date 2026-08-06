@@ -137,7 +137,7 @@ cratestack-redis = "0.5.1"
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
 # it to build the RPC router (ADR-0003).
 cratestack = { package = "cratestack-pg", version = "0.5.1" }
-cratestack-codec-cbor = "0.5.1"
+cratestack-codec-cbor = "0.7.1"
 cratestack-codec-json = "0.6.5"
 # Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token

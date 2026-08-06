@@ -884,7 +884,7 @@ checksum = "1aad0170939336d356b228fa7cab4cfc33b8f35d8cbb4f28736cdaccd1f06ce6"
 dependencies = [
  "bytes",
  "chrono",
- "cratestack-codec-cbor",
+ "cratestack-codec-cbor 0.5.1",
  "cratestack-codec-json 0.5.1",
  "cratestack-core 0.5.1",
  "futures-util",
@@ -906,6 +906,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a40dd8ab51a8262782e2a2de7bb36c701e7cc36a9718e895cff43bddc7f7987"
 dependencies = [
  "cratestack-core 0.5.1",
+ "minicbor-serde",
+ "serde",
+]
+
+[[package]]
+name = "cratestack-codec-cbor"
+version = "0.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03ff6f1d8ede326cbbfedb30d1feb8a44b16945319180437abc22b150aad08d5"
+dependencies = [
+ "cratestack-core 0.7.5",
  "minicbor-serde",
  "serde",
 ]
@@ -2728,7 +2739,7 @@ dependencies = [
  "base64 0.23.0",
  "chrono",
  "cratestack-axum 0.7.5",
- "cratestack-codec-cbor",
+ "cratestack-codec-cbor 0.7.5",
  "cratestack-codec-json 0.6.8",
  "cratestack-core 0.5.1",
  "cratestack-pg",
