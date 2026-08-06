@@ -1073,13 +1073,13 @@ dependencies = [
 
 [[package]]
 name = "cratestack-redis"
-version = "0.5.1"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00289393004dbb7f3ed530926b909a9f15f342ac8a18957d9c0b610869db8a66"
+checksum = "b5a31184aa88ca0bd1e1d1f25c93504ceee3e88f7fd42e4528e43928e6788141"
 dependencies = [
  "async-trait",
- "cratestack-axum 0.5.1",
- "cratestack-core 0.5.1",
+ "cratestack-axum 0.7.5",
+ "cratestack-core 0.7.5",
  "redis",
  "sha2 0.10.9",
  "tokio",
