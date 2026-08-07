@@ -129,7 +129,7 @@ mimalloc = "0"
 # `TransportStyle::Grpc` variant that 0.4.13's `cratestack-macros` does not cover, so the workspace
 # stopped compiling with `error[E0004]: non-exhaustive patterns`. Bump every line below together, or
 # none of them — a partial bump within a semver-compatible range is exactly the failure mode.
-cratestack-core = "0.5.1"
+cratestack-core = "0.7.1"
 cratestack-axum = "0.7.1"
 cratestack-redis = "0.7.1"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
