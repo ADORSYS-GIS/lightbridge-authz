@@ -1,5 +1,40 @@
 # Changelog
 
+## [2.1.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v2.0.0...v2.1.0) (2026-08-07)
+
+
+### Features
+
+* **authz:** add budget:* permissions and RBAC default-grants fallback ([#207](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/207)) ([952bd73](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/952bd73df8ba468e86369199cbc81f769926e361))
+* **budget:** add admin review queue (approve/reject) ([#215](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/215)) ([1016450](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/1016450fee2a7334e1f6050e877273513a327ebe))
+* **budget:** add ADR-0010 and lightbridge-authz-budget crate skeleton ([#199](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/199)) ([7eccd77](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/7eccd7761c38d66d84433c4ebdeee4584498b667))
+* **budget:** add augmentation-request ledger and repository ([#213](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/213)) ([938f976](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/938f976016226d46394b2fb28754fab14b38a55d))
+* **budget:** add budget_balances table and transactional grant-write path ([#203](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/203)) ([0b9aeaf](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/0b9aeafdaadce43f65b637770b36ac9bf9e77ea7))
+* **budget:** add budget_grants ledger migration with append-only enforcement ([#202](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/202)) ([284f8d5](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/284f8d57317cf8ad4068a9718ef3cbfd7df50ead))
+* **budget:** add core domain types (AmountMicros, Period, GrantSource, BudgetTier, BudgetError) ([#201](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/201)) ([c642c8a](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/c642c8a072ddae1d68ef9bc0459a3922fabd707b))
+* **budget:** add DB-backed policy storage tied to the rule-data engine ([#209](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/209)) ([f8211d0](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/f8211d041f21b52b4078025e4badc6fa70df678f))
+* **budget:** add decision contract, facts, and PolicyEngine trait ([#206](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/206)) ([8dade72](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/8dade72f03f3f70f3db8843abfb297f9a0140ec8))
+* **budget:** add ledger replay and expiry-aware balance read ([#205](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/205)) ([15ddf57](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/15ddf5710f89a05c260b33a885f5a560984b0ef6))
+* **budget:** add rule-data policy evaluator ([#208](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/208)) ([bf405b0](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/bf405b03cdc16384f4dbf38e7729223c8b284ed8))
+* **budget:** add self-service refill orchestration (RefillService) ([#214](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/214)) ([523abe7](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/523abe7b0be5a03b7653f6d31087b86e894b43c7))
+* **budget:** add simulateBudgetPolicy RPC procedure ([#212](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/212)) ([2508aa2](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/2508aa2a3c193daf4c5e9cdbcbda64f611f8b45a))
+* **budget:** add spend adapter reading usage_events directly ([#204](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/204)) ([3d0cdf1](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/3d0cdf10fe70eb8eef2144e160edb5cc2d9219b2))
+* **budget:** stamp and enforce a caller-kind claim to close [#216](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/216) for oauth2.type: self ([#218](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/218)) ([52bc3aa](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/52bc3aaf5f3fd6e93b1807965eb80b788dc4a785))
+* **budget:** wire policy activation and status into the RPC surface ([#210](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/210)) ([e0e658a](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/e0e658a287482cd19213f8b15057108219451c9b))
+* **budget:** wire self-service refill and review queue into the RPC surface ([#217](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/217)) ([1924413](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/1924413f15c85b4dc31e9400b649b291fa26b3a7))
+
+
+### Bug Fixes
+
+* **deps:** declare jsonwebtoken's crypto backend explicitly ([#186](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/186)) ([84f08dc](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/84f08dc3fe1c7fe22a37cb8abc0ca537ae3124d6))
+
+
+### Documentation
+
+* **adr,rfc,runbook:** correct budget period to calendar month ([#200](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/200)) ([581fb48](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/581fb483609eebe8dd03b228b202248de71cf41a))
+* **adr:** renumber budget-grants ledger ADR 0006 -&gt; 0009 ([#198](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/198)) ([2dfdc39](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/2dfdc39e46940019bbc44a76f0ccadd39418763e))
+* budget domain visibility across AGENTS.md/README/architecture.md + fix create_project SQL bug (closes [#211](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/211)) ([#221](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/221)) ([c21b95e](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/c21b95eb2d56d8e7ae5952f835a1953bf269fd27))
+
 ## [2.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v1.1.0...v2.0.0) (2026-08-01)
 
 
