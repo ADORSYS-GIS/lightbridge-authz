@@ -131,7 +131,7 @@ mimalloc = "0"
 # none of them — a partial bump within a semver-compatible range is exactly the failure mode.
 cratestack-core = "0.5.1"
 cratestack-axum = "0.7.1"
-cratestack-redis = "0.5.1"
+cratestack-redis = "0.7.1"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
 # `include_server_schema!` macro emits `::cratestack::*` paths (see cratestack-pg lib docs). The
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
