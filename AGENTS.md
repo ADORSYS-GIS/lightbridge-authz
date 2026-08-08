@@ -295,7 +295,9 @@ use crate::repo::StoreRepo;
 - `crates/`
   - `crates/lightbridge-authz-core/`: shared types, config, errors, crypto, DB pool.
   - `crates/lightbridge-authz-api/`: CRUD API routing/controllers + OpenAPI.
-  - `crates/lightbridge-authz-api-key/`: DB entities + repository implementation (SQLx).
+  - `crates/lightbridge-authz-api-key/`: DB entities + hand-written repository implementation
+    (SQLx) — the pre-cratestack layer, retained as an ADR-0038 exception, not new-code guidance
+    (see "Persistence" below).
   - `crates/lightbridge-authz-rest/`: Axum server glue (TLS bind, modular layout with handlers, routers, models, and middleware).
   - `crates/lightbridge-authz-bearer/`: JWT validation via JWKS (Keycloak in local compose).
   - `crates/lightbridge-authz-budget/`: budget domain — ledger (`BudgetRepo`), spend readers, the
@@ -674,6 +676,41 @@ Migrations are run with SQLx embedded migrations in the owning binary packages:
 - usage: `app/lightbridge-authz-usage/src/migrate.rs`
 
 In Compose, `authz-migrate` runs before API/OPA start.
+
+This is a documented ADR-0038 exception (see "Persistence" below), not the target state — new
+schema goes through `crates/lightbridge-authz-api/schema/authz.cstack` and cratestack's migration
+generator where it can.
+
+## Persistence: cratestack is the only sanctioned database API (ADR-0038)
+
+webank-context [ADR-0038](https://github.com/ADORSYS-GIS/webank-context/blob/master/decisions/0038-cratestack-is-the-only-database-api.md)
+makes cratestack's generated model client the only sanctioned database API estate-wide and bans
+hand-written SQL and direct `sqlx` dependencies.
+
+- New queries go through the generated client (`crates/lightbridge-authz-api/schema/authz.cstack` +
+  cratestack codegen). Do not add new hand-written SQL, and do not add `sqlx` to any further
+  `Cargo.toml`.
+- This repo is the estate's largest ADR-0038 exception. The existing `sqlx = "0.9"` surface —
+  declared in the root workspace `Cargo.toml` and consumed by eight further crate/app manifests,
+  alongside cratestack's own internal sqlx 0.8 (the two-major split rationale is at
+  `app/lightbridge-authz/Cargo.toml:31-34`) — is not being removed as part of this rule. ADR-0038
+  does not authorise starting that removal here; it needs its own scoping pass. The two-major
+  arrangement is load-bearing today.
+- Cases that are genuinely not migratable to cratestack today, so nobody burns a day
+  rediscovering them:
+  - `signing_keys`: a table entirely outside `authz.cstack`, rotated under
+    `pg_advisory_xact_lock` for cross-replica JWT key rotation
+    (`ensure_active_signing_key` in `crates/lightbridge-authz-api-key/src/repo.rs`).
+  - `project_members`: composite primary key `(project_id, account_id)`; modelled in
+    `authz.cstack` only as a relation target with a synthetic `id`, explicitly barred from
+    cratestack's migration generator (see the `ProjectMember` model comment in
+    `crates/lightbridge-authz-api/schema/authz.cstack`).
+  - `exchange_refresh_tokens`: CAS rotation via `SELECT ... FOR UPDATE`
+    (`rotate_exchange_refresh_token` in `crates/lightbridge-authz-api-key/src/repo.rs`).
+  - `lightbridge-authz-usage`: dynamic `QueryBuilder` aggregates against the Timescale-backed
+    `usage_events` table (`query_usage` in `crates/lightbridge-authz-usage/src/repo.rs`).
+- This repo runs cratestack (`cratestack-pg`) 0.5.1; ADR-0038's capability findings were verified
+  against 0.7.8. Re-verify any capability claim against 0.5.1 here before relying on it.
 
 ## Troubleshooting and Gotchas
 
