@@ -378,6 +378,29 @@ API keys are stored as:
   auto-approval or admin approve/reject — the audit trail for "who asked, what decided, who
   reviewed."
 
+### Identifier Format (CUID2)
+
+Every id this service mints — `projects.id`, `api_keys.id`, budget grant/ledger/policy-revision
+ids, token-exchange session ids, signing `kid`, `jti` — is a CUID2 (24 chars, lowercase `a-z0-9`,
+starts with a letter), minted through the one chokepoint, `lightbridge_authz_core::cuid::cuid2()`
+(re-exported from the `cuid` crate). Never write a new UUID-generating call site (`Uuid::new_v4`,
+`gen_random_uuid()`, …) or a second import path into `cuid2()`. Source: ADR 0039,
+https://github.com/ADORSYS-GIS/webank-context/blob/master/decisions/0039-cuid2-is-the-house-id-format.md.
+
+This bans *minting*, not *storing*. `accounts.id` is the caller's JWT `sub` (above) — an id this
+service does not mint, sourced from Keycloak/whatever IdP is configured — and it stays exactly as
+issued. The same goes for any OIDC claim: JWT `jti`, `sub`, `aud`, `iss` from an external IdP are
+read, never rewritten, never regenerated into our own format.
+
+- **Never validate an id's shape** — no regex, no parse, no length check, no `starts_with('c')`/
+  hyphen branching. Ids are opaque strings. This is a correctness requirement here, not style: this
+  repo already shipped and fixed exactly this failure mode once — cratestack's `Cuid` schema scalar
+  rejected any id not starting with `'c'` (regression test:
+  `crates/lightbridge-authz-rest/tests/rpc_it_tests.rs:712`). The same mistake applied to `sub`
+  would break federation with any IdP that doesn't happen to issue UUID- or CUID2-shaped subjects.
+- **Never sort or paginate by id** — CUID2 has no ordering. Use `created_at`.
+- **Store as `TEXT`**; no native `uuid` columns, no `DEFAULT gen_random_uuid()`.
+
 ### Service Responsibilities
 
 - CRUD API (`authz-api`)
