@@ -862,7 +862,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
- "cratestack-core 0.7.5",
+ "cratestack-core 0.7.10",
  "futures-util",
  "http",
  "minicbor",
@@ -916,7 +916,7 @@ version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03ff6f1d8ede326cbbfedb30d1feb8a44b16945319180437abc22b150aad08d5"
 dependencies = [
- "cratestack-core 0.7.5",
+ "cratestack-core 0.7.10",
  "minicbor-serde",
  "serde",
 ]
@@ -989,9 +989,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-core"
-version = "0.7.5"
+version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5a90773bf4c6811f5041d0b1e4adc4c6acbe9a2d4304223a61001d2ace46687"
+checksum = "61638dffe06fe7a9e0447e379baf3e5b1e9156db6b24e6a788d0212808b81958"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1090,7 +1090,7 @@ checksum = "b5a31184aa88ca0bd1e1d1f25c93504ceee3e88f7fd42e4528e43928e6788141"
 dependencies = [
  "async-trait",
  "cratestack-axum 0.7.5",
- "cratestack-core 0.7.5",
+ "cratestack-core 0.7.10",
  "redis",
  "sha2 0.10.9",
  "tokio",
@@ -2741,7 +2741,7 @@ dependencies = [
  "cratestack-axum 0.7.5",
  "cratestack-codec-cbor 0.7.5",
  "cratestack-codec-json 0.6.8",
- "cratestack-core 0.7.5",
+ "cratestack-core 0.7.10",
  "cratestack-pg",
  "cratestack-redis",
  "getrandom 0.4.3",
