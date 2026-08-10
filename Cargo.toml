@@ -138,7 +138,7 @@ cratestack-redis = "0.7.1"
 # it to build the RPC router (ADR-0003).
 cratestack = { package = "cratestack-pg", version = "0.5.1" }
 cratestack-codec-cbor = "0.7.1"
-cratestack-codec-json = "0.6.5"
+cratestack-codec-json = "0.7.6"
 # Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
