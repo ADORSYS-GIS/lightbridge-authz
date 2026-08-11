@@ -912,9 +912,9 @@ dependencies = [
 
 [[package]]
 name = "cratestack-codec-cbor"
-version = "0.7.5"
+version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03ff6f1d8ede326cbbfedb30d1feb8a44b16945319180437abc22b150aad08d5"
+checksum = "7f0cc9fb7abe9d954afac16ac3f0880c7fffe05d5956fb66f62d3aa3a6550ee8"
 dependencies = [
  "cratestack-core 0.7.10",
  "minicbor-serde",
@@ -2717,7 +2717,7 @@ dependencies = [
  "base64 0.23.0",
  "chrono",
  "cratestack-axum 0.7.5",
- "cratestack-codec-cbor 0.7.5",
+ "cratestack-codec-cbor 0.7.10",
  "cratestack-codec-json 0.7.10",
  "cratestack-core 0.7.10",
  "cratestack-pg",
@@ -5064,7 +5064,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
