@@ -6,6 +6,16 @@ updates:
     interval: daily
     time: "08:00"
   open-pull-requests-limit: 5
+  groups:
+    # The cratestack-* family must move in lockstep (see the comment above the pins in root
+    # Cargo.toml) -- a partial bump within a semver-compatible range has broken `main` twice now
+    # (#158/#161/#162, then a second occurrence where `cratestack` (package `cratestack-pg`) was
+    # left behind at 0.5.1 while its five siblings moved to 0.7.x). Grouping forces every matched
+    # crate into ONE Dependabot PR, so a future update can no longer land partially regardless of
+    # why the second occurrence happened.
+    cratestack:
+      patterns:
+        - "cratestack*"
 - package-ecosystem: github-actions
   directory: "/"
   schedule:

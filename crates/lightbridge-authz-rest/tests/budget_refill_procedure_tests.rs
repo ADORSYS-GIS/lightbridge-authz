@@ -124,6 +124,91 @@ async fn procedures_and_ctx(
     (procedures, ctx, budget_repo)
 }
 
+/// Thin `invoke_with_db` wrappers (cratestack#512: `ProcedureRegistry` methods now require an
+/// `Authorized` witness only `authorize_with_db`/`invoke_with_db` can produce). Each of the four
+/// budget-refill/review procedures below declares only `@allow(auth() != null)`, so this runs
+/// that check before invoking the registry method, matching what the generated RPC dispatch
+/// handler does for a real request -- see `budget_policy_procedure_tests.rs`'s identical pattern.
+async fn request_refill(
+    procedures: &Procedures,
+    db: &schema::Cratestack,
+    ctx: &CoolContext,
+    args: schema::procedures::request_budget_refill::Args,
+) -> Result<schema::procedures::request_budget_refill::Output, CoolError> {
+    let call_args = args.clone();
+    schema::procedures::request_budget_refill::invoke_with_db(
+        db,
+        &args,
+        ctx,
+        |authorized| async move {
+            procedures
+                .request_budget_refill(db, ctx, call_args, authorized)
+                .await
+        },
+    )
+    .await
+}
+
+async fn list_pending(
+    procedures: &Procedures,
+    db: &schema::Cratestack,
+    ctx: &CoolContext,
+    args: schema::procedures::list_pending_augmentation_requests::Args,
+) -> Result<schema::procedures::list_pending_augmentation_requests::Output, CoolError> {
+    let call_args = args.clone();
+    schema::procedures::list_pending_augmentation_requests::invoke_with_db(
+        db,
+        &args,
+        ctx,
+        |authorized| async move {
+            procedures
+                .list_pending_augmentation_requests(db, ctx, call_args, authorized)
+                .await
+        },
+    )
+    .await
+}
+
+async fn approve(
+    procedures: &Procedures,
+    db: &schema::Cratestack,
+    ctx: &CoolContext,
+    args: schema::procedures::approve_augmentation_request::Args,
+) -> Result<schema::procedures::approve_augmentation_request::Output, CoolError> {
+    let call_args = args.clone();
+    schema::procedures::approve_augmentation_request::invoke_with_db(
+        db,
+        &args,
+        ctx,
+        |authorized| async move {
+            procedures
+                .approve_augmentation_request(db, ctx, call_args, authorized)
+                .await
+        },
+    )
+    .await
+}
+
+async fn reject(
+    procedures: &Procedures,
+    db: &schema::Cratestack,
+    ctx: &CoolContext,
+    args: schema::procedures::reject_augmentation_request::Args,
+) -> Result<schema::procedures::reject_augmentation_request::Output, CoolError> {
+    let call_args = args.clone();
+    schema::procedures::reject_augmentation_request::invoke_with_db(
+        db,
+        &args,
+        ctx,
+        |authorized| async move {
+            procedures
+                .reject_augmentation_request(db, ctx, call_args, authorized)
+                .await
+        },
+    )
+    .await
+}
+
 fn refill_args(
     budget_account_id: &str,
     idempotency_key: Option<String>,
@@ -201,8 +286,7 @@ async fn request_refill_auto_approves_and_the_response_reflects_it(pool: PgPool)
     let (procedures, ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
     let db = lazy_cratestack_db();
 
-    let output = procedures
-        .request_budget_refill(&db, &ctx, refill_args(&account_id, None))
+    let output = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
         .await
         .expect("a fresh account's first refill must be auto-approved");
 
@@ -234,8 +318,7 @@ async fn request_refill_exhausting_allowance_returns_pending_review(pool: PgPool
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
 
-    let output = procedures
-        .request_budget_refill(&db, &ctx, refill_args(&account_id, None))
+    let output = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
         .await
         .expect("an exhausted-allowance refill must still succeed (queued, not erroring)");
 
@@ -263,8 +346,7 @@ async fn request_refill_refuses_api_key_derived_caller(pool: PgPool) {
     let ctx = ctx_for_api_key_caller(&account_id);
     let db = lazy_cratestack_db();
 
-    let err = procedures
-        .request_budget_refill(&db, &ctx, refill_args(&account_id, None))
+    let err = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
         .await
         .expect_err("an API-key-derived caller must be refused, not served");
 
@@ -285,8 +367,7 @@ async fn request_refill_still_serves_caller_with_no_caller_kind_signal(pool: PgP
     let (procedures, ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
     let db = lazy_cratestack_db();
 
-    let output = procedures
-        .request_budget_refill(&db, &ctx, refill_args(&account_id, None))
+    let output = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
         .await
         .expect("a caller with no caller-kind signal must not be refused");
 
@@ -303,14 +384,12 @@ async fn list_pending_returns_queued_requests(pool: PgPool) {
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
 
-    let queued = procedures
-        .request_budget_refill(&db, &ctx, refill_args(&account_id, None))
+    let queued = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
         .await
         .expect("exhausted-allowance refill must queue");
     assert_eq!(queued.status, "pending_review");
 
-    let pending = procedures
-        .list_pending_augmentation_requests(&db, &ctx, list_pending_args(Some(&account_id)))
+    let pending = list_pending(&procedures, &db, &ctx, list_pending_args(Some(&account_id)))
         .await
         .expect("listing the review queue must succeed");
 
@@ -318,8 +397,7 @@ async fn list_pending_returns_queued_requests(pool: PgPool) {
     assert_eq!(pending[0].id, queued.id);
     assert_eq!(pending[0].status, "pending_review");
 
-    let pending_global = procedures
-        .list_pending_augmentation_requests(&db, &ctx, list_pending_args(None))
+    let pending_global = list_pending(&procedures, &db, &ctx, list_pending_args(None))
         .await
         .expect("listing the whole queue must succeed");
     assert!(
@@ -341,14 +419,12 @@ async fn approve_grants_and_updates_status(pool: PgPool) {
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
 
-    let queued = procedures
-        .request_budget_refill(&db, &ctx, refill_args(&account_id, None))
+    let queued = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
         .await
         .expect("exhausted-allowance refill must queue");
     assert_eq!(queued.status, "pending_review");
 
-    let approved = procedures
-        .approve_augmentation_request(&db, &reviewer_ctx, approve_args(&queued.id))
+    let approved = approve(&procedures, &db, &reviewer_ctx, approve_args(&queued.id))
         .await
         .expect("approving a pending request must succeed");
 
@@ -373,8 +449,7 @@ async fn reject_without_a_reason_is_rejected_at_the_schema_or_procedure_layer(po
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
 
-    let queued = procedures
-        .request_budget_refill(&db, &ctx, refill_args(&account_id, None))
+    let queued = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
         .await
         .expect("exhausted-allowance refill must queue");
 
@@ -385,17 +460,14 @@ async fn reject_without_a_reason_is_rejected_at_the_schema_or_procedure_layer(po
     // procedure layer's own defense in depth: `ReviewService::reject` validates the reason is
     // non-empty (not just present) before touching the database at all, so an empty string --
     // which the schema type alone cannot rule out -- is still refused here.
-    let result = procedures
-        .reject_augmentation_request(&db, &reviewer_ctx, reject_args(&queued.id, ""))
-        .await;
+    let result = reject(&procedures, &db, &reviewer_ctx, reject_args(&queued.id, "")).await;
 
     assert!(
         result.is_err(),
         "an empty rejection reason must be refused, not silently accepted: {result:?}"
     );
 
-    let still_pending = procedures
-        .list_pending_augmentation_requests(&db, &ctx, list_pending_args(Some(&account_id)))
+    let still_pending = list_pending(&procedures, &db, &ctx, list_pending_args(Some(&account_id)))
         .await
         .expect("listing the review queue must succeed");
     assert!(
@@ -417,16 +489,19 @@ async fn reject_with_a_reason_succeeds_and_records_it(pool: PgPool) {
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
 
-    let queued = procedures
-        .request_budget_refill(&db, &ctx, refill_args(&account_id, None))
+    let queued = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
         .await
         .expect("exhausted-allowance refill must queue");
 
     let reason = "over the account's approved discretionary ceiling for this quarter";
-    let rejected = procedures
-        .reject_augmentation_request(&db, &reviewer_ctx, reject_args(&queued.id, reason))
-        .await
-        .expect("rejecting with a non-empty reason must succeed");
+    let rejected = reject(
+        &procedures,
+        &db,
+        &reviewer_ctx,
+        reject_args(&queued.id, reason),
+    )
+    .await
+    .expect("rejecting with a non-empty reason must succeed");
 
     assert_eq!(rejected.status, "denied");
     assert_eq!(
