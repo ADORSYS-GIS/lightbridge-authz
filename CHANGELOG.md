@@ -1,5 +1,28 @@
 # Changelog
 
+## [3.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v2.1.1...v3.0.0) (2026-08-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* **security:** enforce model allowlists -- untag legacy cratestack Value JSON, bump family to 0.7.16 ([#283](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/283))
+
+### Features
+
+* **oauth2:** adopt authkestra-op's handle_token dispatch with a real client registry (ADR-0011 phase 2) ([#288](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/288)) ([70b0a88](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/70b0a8851fd66e356c273fad6cf3cfa69279f9dd))
+* **oauth2:** issue a full derived OIDC token object via token-exchange (ADR-0011 phase 1) ([#286](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/286)) ([7194f6b](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/7194f6b4232ce704aaaa378895f9c19bbcd72b45))
+
+
+### Bug Fixes
+
+* **security:** enforce model allowlists -- untag legacy cratestack Value JSON, bump family to 0.7.16 ([#283](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/283)) ([c043a64](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/c043a64152617f042828051e36f75b869d56bc17))
+
+
+### Documentation
+
+* **adr:** ADR-0011 — authz issues a derived OIDC token object via token-exchange ([#279](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/279)) ([b723c79](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/b723c79abcb2384352379b7ba084ef822bd2648e))
+* **adr:** ADR-0011 — reverse Decision 6, allow offline_access for all clients ([#281](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/281)) ([65fc495](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/65fc49579a474d664753e70ac9dfd5a79e3dc24b))
+
 ## [2.1.1](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v2.1.0...v2.1.1) (2026-08-14)
 
 
