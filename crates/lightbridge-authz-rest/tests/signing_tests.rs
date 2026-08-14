@@ -108,7 +108,7 @@ async fn well_known_serves_cors_headers() {
     use lightbridge_authz_rest::signing::well_known_router;
     use tower::ServiceExt;
 
-    let response = well_known_router::<()>(ISSUER, lazy_repo(), false)
+    let response = well_known_router::<()>(ISSUER, lazy_repo(), None)
         .oneshot(
             Request::builder()
                 .uri("/.well-known/openid-configuration")
@@ -136,7 +136,7 @@ async fn jwks_endpoint_returns_server_error_when_repo_is_unreachable() {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    let response = well_known_router::<()>(ISSUER, lazy_repo(), false)
+    let response = well_known_router::<()>(ISSUER, lazy_repo(), None)
         .oneshot(
             Request::builder()
                 .uri("/.well-known/jwks.json")
@@ -185,6 +185,35 @@ fn capped_expiry_ignores_past_request_to_avoid_dead_token() {
     let cap = now + chrono::Duration::seconds(CAP_TTL_SECONDS);
     let past = now - chrono::Duration::days(1);
     assert_eq!(capped_expiry(now, CAP_TTL_SECONDS, Some(past)), cap);
+}
+
+/// OIDC Core §3.1.3.6 `at_hash`: SHA-256 the access token octets, take the left-most half, base64url
+/// (no padding) encode it. Independently computed via Python (NOT this crate's implementation) so
+/// this is a real known-vector test, not a self-check:
+///
+/// ```python
+/// import hashlib, base64
+/// d = hashlib.sha256(b"hello-world-access-token").digest()
+/// base64.urlsafe_b64encode(d[:16]).rstrip(b"=").decode()
+/// # => "7bwQYIKkMUJvb0oGYN1JlA"
+/// ```
+#[test]
+fn at_hash_matches_independently_computed_vector() {
+    use lightbridge_authz_rest::signing::compute_at_hash;
+    assert_eq!(
+        compute_at_hash("hello-world-access-token"),
+        "7bwQYIKkMUJvb0oGYN1JlA"
+    );
+}
+
+#[test]
+fn at_hash_changes_with_the_access_token() {
+    use lightbridge_authz_rest::signing::compute_at_hash;
+    assert_ne!(
+        compute_at_hash("token-a"),
+        compute_at_hash("token-b"),
+        "at_hash must actually bind to the access token, not return a constant"
+    );
 }
 
 #[cfg(feature = "it-tests")]
@@ -349,6 +378,326 @@ mod db {
         );
     }
 
+    /// The exact claim shape `signing.rs`'s hand-rolled `jsonwebtoken::encode` produced before
+    /// ADR-0011 replaced it with `TokenManager` -- reconstructed here (not imported: the real
+    /// struct is gone) so this test is a genuine diff against the old wire contract, not a
+    /// description of it written after the fact.
+    #[derive(serde::Serialize)]
+    struct OldApiKeyClaims<'a> {
+        iss: &'a str,
+        sub: &'a str,
+        jti: String,
+        iat: i64,
+        exp: i64,
+        typ: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aud: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        azp: Option<&'a str>,
+        #[serde(rename = "lightbridge_caller_kind")]
+        caller_kind: &'static str,
+        sid: String,
+        scope: &'static str,
+        api_key_id: &'a str,
+        project_id: &'a str,
+        account_id: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        email: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        email_verified: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allowed_models: Option<Vec<String>>,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn old_signer_token(
+        active_key_pem: &str,
+        kid: &str,
+        owner: &KeyOwner,
+        api_key_id: &str,
+        project_id: &str,
+        account_id: &str,
+        allowed_models: Option<Vec<String>>,
+        now: chrono::DateTime<Utc>,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> String {
+        let encoding_key = EncodingKey::from_rsa_pem(active_key_pem.as_bytes()).unwrap();
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.to_string());
+        let claims = OldApiKeyClaims {
+            iss: ISSUER,
+            sub: &owner.subject,
+            jti: format!("lgbr:{}", cuid2()),
+            iat: now.timestamp(),
+            exp: expires_at.timestamp(),
+            typ: "Bearer",
+            aud: Some("lightbridge-api-key"),
+            azp: Some("lightbridge-api-key"),
+            caller_kind: lightbridge_authz_bearer::API_KEY_CALLER_KIND,
+            sid: cuid2(),
+            scope: "profile email",
+            api_key_id,
+            project_id,
+            account_id,
+            email: owner.email.as_deref(),
+            email_verified: owner.email_verified,
+            allowed_models,
+        };
+        encode(&header, &claims, &encoding_key).unwrap()
+    }
+
+    /// Decodes a JWT's full claim set into an untyped `serde_json::Value`, verifying its
+    /// signature against `jwk` -- unlike the typed `ApiKeyClaims` test helper above, this sees
+    /// every key on the wire, not just the ones a fixed struct happens to declare.
+    fn decode_untyped(jwk: &Value, token: &str) -> Value {
+        let decoding = DecodingKey::from_rsa_components(
+            jwk["n"].as_str().unwrap(),
+            jwk["e"].as_str().unwrap(),
+        )
+        .unwrap();
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_audience(&["lightbridge-api-key"]);
+        validation.set_issuer(&[ISSUER]);
+        decode::<Value>(token, &decoding, &validation)
+            .expect("verify")
+            .claims
+    }
+
+    /// ADR-0011 Decision 2 non-regression requirement: the access token's claim set produced
+    /// through the new `TokenManager` path must be EQUIVALENT to the old hand-rolled
+    /// `jsonwebtoken::encode` path -- same claim names, same values, same omissions -- with any
+    /// deviation stated explicitly rather than silently shipped.
+    ///
+    /// Verified finding (not assumed): `TokenManager::issue_user_token_with_extra` is not a
+    /// drop-in replacement at the wire level. It unconditionally adds two claims this signer never
+    /// emitted before (`nbf`, and a nested `identity` object duplicating `sub`/`email`), and it
+    /// mints `jti` as a UUIDv4 rather than this repo's `lgbr:`-prefixed CUID2 -- with no clean way
+    /// to override it (an `extra["jti"]` entry collides with `Claims`' own top-level `jti` field
+    /// and produces a JWT payload with a duplicate `jti` key on the wire, which is
+    /// technically-malformed JSON that only happens to decode via `serde_json`'s last-wins
+    /// behavior; not something to rely on). This test pins that finding precisely rather than
+    /// letting it silently drift, per this repo's "stop and report, don't silently change the wire
+    /// contract" rule.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn new_signer_claim_set_is_a_documented_superset_of_the_old_signer(pool: PgPool) {
+        let repo = repo(pool);
+        bootstrap_signing_key(&repo, &signing_cfg(3600))
+            .await
+            .unwrap();
+        let active = repo.get_active_signing_key().await.unwrap().unwrap();
+
+        let owner = KeyOwner {
+            subject: "kc-user-old-vs-new".to_string(),
+            email: Some("dev@example.test".to_string()),
+            email_verified: Some(true),
+        };
+        let allowed_models = Some(vec!["gpt-4.1-mini".to_string()]);
+        let now = Utc::now();
+        let expires_at = now + Duration::seconds(3600);
+
+        let old_token = old_signer_token(
+            &active.private_key_pem,
+            &active.kid,
+            &owner,
+            "key_1",
+            "proj_1",
+            "acct_1",
+            allowed_models.clone(),
+            now,
+            expires_at,
+        );
+        let old_claims = decode_untyped(&active.public_jwk, &old_token);
+
+        let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
+        let signed = signer
+            .sign(
+                &owner,
+                "key_1",
+                "proj_1",
+                "acct_1",
+                allowed_models,
+                now,
+                None,
+            )
+            .await
+            .unwrap();
+        let new_claims = decode_untyped(&active.public_jwk, &signed.token);
+
+        let old_obj = old_claims.as_object().unwrap();
+        let new_obj = new_claims.as_object().unwrap();
+
+        for (key, value) in old_obj {
+            // `jti`/`sid` are freshly random per call by design (a session identifier and a
+            // token identifier respectively), so an exact-value comparison across two independent
+            // signing calls would always fail regardless of this signer swap; `iat`/`exp` differ
+            // because `TokenManager` stamps its own internal `now()` (documented above).
+            if matches!(key.as_str(), "jti" | "sid" | "iat" | "exp") {
+                continue;
+            }
+            assert_eq!(
+                new_obj.get(key),
+                Some(value),
+                "claim `{key}` regressed: old={value:?} new={:?}",
+                new_obj.get(key)
+            );
+        }
+
+        let old_keys: std::collections::BTreeSet<&str> =
+            old_obj.keys().map(String::as_str).collect();
+        let new_keys: std::collections::BTreeSet<&str> =
+            new_obj.keys().map(String::as_str).collect();
+        let added: std::collections::BTreeSet<&str> =
+            new_keys.difference(&old_keys).copied().collect();
+        assert_eq!(
+            added,
+            std::collections::BTreeSet::from(["identity", "nbf"]),
+            "the new signer must add exactly `identity` + `nbf` and nothing else beyond the old \
+             claim set -- any other addition/removal is an undocumented wire-contract change"
+        );
+
+        assert!(
+            new_obj["sid"].is_string() && !new_obj["sid"].as_str().unwrap().is_empty(),
+            "sid must still be present and non-empty on the new signer"
+        );
+
+        let old_jti = old_obj["jti"].as_str().unwrap();
+        let new_jti = new_obj["jti"].as_str().unwrap();
+        assert!(
+            old_jti.starts_with("lgbr:"),
+            "sanity check on the reconstructed old shape"
+        );
+        assert!(
+            !new_jti.starts_with("lgbr:")
+                && new_jti.len() == 36
+                && new_jti.matches('-').count() == 4,
+            "new jti must be authkestra's own UUIDv4 (documented deviation from the AGENTS.md \
+             \"every minted id is CUID2\" rule -- see the doc comment on this test): {new_jti}"
+        );
+
+        // The nested `identity` object mirrors `sub`/`email`, not new authority.
+        assert_eq!(new_obj["identity"]["external_id"], "kc-user-old-vs-new");
+        assert_eq!(new_obj["identity"]["email"], "dev@example.test");
+    }
+
+    /// ADR-0011, Decision 7: the id_token carries upstream identity snapshots + `at_hash`/`azp`,
+    /// and never tenant context or role/quota data (that stays access-token-only, matching
+    /// `docs/governance-model-and-enforcement.md`).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn sign_id_token_carries_upstream_claims_and_no_tenant_context(pool: PgPool) {
+        let repo = repo(pool);
+        bootstrap_signing_key(&repo, &signing_cfg(3600))
+            .await
+            .unwrap();
+        let active = repo.get_active_signing_key().await.unwrap().unwrap();
+
+        let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
+        let owner = KeyOwner {
+            subject: "kc-user-id-token".to_string(),
+            email: Some("dev@example.test".to_string()),
+            email_verified: Some(true),
+        };
+        let now = Utc::now();
+        let expires_at = now + Duration::seconds(900);
+        let access_token = "fake-access-token-for-at-hash-binding".to_string();
+
+        let id_token = signer
+            .sign_id_token(
+                &owner,
+                &access_token,
+                Some(1_700_000_000),
+                Some("nonce-abc".to_string()),
+                now,
+                expires_at,
+            )
+            .await
+            .unwrap();
+
+        let claims = decode_untyped(&active.public_jwk, &id_token);
+        assert_eq!(claims["sub"], "kc-user-id-token");
+        assert_eq!(claims["email"], "dev@example.test");
+        assert_eq!(claims["email_verified"], true);
+        assert_eq!(claims["auth_time"], 1_700_000_000);
+        assert_eq!(claims["nonce"], "nonce-abc");
+        assert_eq!(claims["azp"], "lightbridge-api-key");
+        assert_eq!(
+            claims["at_hash"],
+            lightbridge_authz_rest::signing::compute_at_hash(&access_token)
+        );
+        for tenant_claim in [
+            "api_key_id",
+            "project_id",
+            "account_id",
+            "lightbridge_caller_kind",
+        ] {
+            assert!(
+                claims.get(tenant_claim).is_none(),
+                "id_token must never carry tenant context ({tenant_claim}): {claims}"
+            );
+        }
+    }
+
+    /// `auth_time`/`nonce` must be OMITTED, never a fabricated value, when the upstream token
+    /// carried none -- the failure mode this repo's rules explicitly call out ("a fabricated
+    /// value is the failure mode").
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn sign_id_token_omits_auth_time_and_nonce_when_absent(pool: PgPool) {
+        let repo = repo(pool);
+        bootstrap_signing_key(&repo, &signing_cfg(3600))
+            .await
+            .unwrap();
+        let active = repo.get_active_signing_key().await.unwrap().unwrap();
+
+        let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
+        let owner = KeyOwner {
+            subject: "kc-user-no-auth-time".to_string(),
+            email: None,
+            email_verified: None,
+        };
+        let now = Utc::now();
+        let id_token = signer
+            .sign_id_token(&owner, "tok", None, None, now, now + Duration::seconds(900))
+            .await
+            .unwrap();
+
+        let claims = decode_untyped(&active.public_jwk, &id_token);
+        assert!(
+            claims.get("auth_time").is_none(),
+            "auth_time must be omitted, not null/fabricated, when absent upstream: {claims}"
+        );
+        assert!(
+            claims.get("nonce").is_none(),
+            "nonce must be omitted, not null/fabricated, when absent upstream: {claims}"
+        );
+    }
+
+    /// Failure mode: this phase has no real per-client audience (ADR-0011 Decision 5 is phase 2),
+    /// so `id_token.aud` falls back to `oauth2.signing.audience`. When that is unconfigured there
+    /// is no value to stamp as `aud` -- refusing to mint a spec-invalid id_token (no `aud` at all)
+    /// is the fail-closed answer, not silently omitting the claim.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn sign_id_token_refuses_when_audience_is_not_configured(pool: PgPool) {
+        let mut cfg = signing_cfg(3600);
+        cfg.audience = None;
+        let repo = repo(pool);
+        bootstrap_signing_key(&repo, &cfg).await.unwrap();
+        let signer = ApiKeyJwtSigner::from_config(&cfg, repo.clone()).unwrap();
+        let owner = KeyOwner {
+            subject: "kc-user-no-aud".to_string(),
+            email: None,
+            email_verified: None,
+        };
+        let now = Utc::now();
+
+        let err = signer
+            .sign_id_token(&owner, "tok", None, None, now, now + Duration::seconds(60))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("audience"),
+            "must refuse (fail closed), not issue an id_token missing `aud`: {err}"
+        );
+    }
+
     fn signing_oauth2() -> Oauth2 {
         Oauth2 {
             oauth2_type: lightbridge_authz_core::config::Oauth2Type::SelfSigned,
@@ -472,7 +821,7 @@ mod db {
         .await
         .unwrap();
 
-        let jwks = well_known_router::<()>(ISSUER, repo.clone(), false)
+        let jwks = well_known_router::<()>(ISSUER, repo.clone(), None)
             .oneshot(
                 Request::builder()
                     .uri("/.well-known/jwks.json")
@@ -491,7 +840,8 @@ mod db {
         );
         assert_eq!(payload["keys"][0]["alg"], "RS256");
 
-        let discovery = well_known_router::<()>(ISSUER, repo, true)
+        let scopes = vec!["openid".to_string(), "offline_access".to_string()];
+        let discovery = well_known_router::<()>(ISSUER, repo, Some(scopes))
             .oneshot(
                 Request::builder()
                     .uri("/.well-known/openid-configuration")
@@ -520,16 +870,41 @@ mod db {
                 .any(|g| g == "urn:ietf:params:oauth:grant-type:token-exchange"),
             "discovery must advertise the token-exchange grant"
         );
+        let scopes_supported = payload["scopes_supported"].as_array().unwrap();
+        assert!(scopes_supported.iter().any(|s| s == "openid"));
+        assert!(scopes_supported.iter().any(|s| s == "offline_access"));
+        let auth_methods = payload["token_endpoint_auth_methods_supported"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            auth_methods,
+            &[Value::String("none".to_string())],
+            "must never advertise client_secret_basic/client_secret_post -- \
+             this service never accepts secret-based client auth"
+        );
+        let claims_supported = payload["claims_supported"].as_array().unwrap();
+        for claim in ["sub", "email", "email_verified", "auth_time", "at_hash"] {
+            assert!(
+                claims_supported.iter().any(|c| c == claim),
+                "claims_supported must list {claim}: {claims_supported:?}"
+            );
+        }
     }
 
+    /// ADR-0011, Decision 9: `OidcDiscovery`'s `token_endpoint`/`grant_types_supported`/
+    /// `response_types_supported` fields are required (not `Option`), unlike the previous
+    /// hand-built document which omitted them entirely when token-exchange was disabled. This
+    /// replaces `discovery_omits_token_endpoint_when_exchange_disabled`, which asserted the old,
+    /// now-impossible-to-preserve behavior -- see `discovery_document`'s doc comment in
+    /// `signing.rs` for why.
     #[tokio::test]
-    async fn discovery_omits_token_endpoint_when_exchange_disabled() {
+    async fn discovery_advertises_no_grants_when_exchange_disabled() {
         use axum::body::{Body, to_bytes};
         use axum::http::{Request, StatusCode};
         use lightbridge_authz_rest::signing::well_known_router;
         use tower::ServiceExt;
 
-        let discovery = well_known_router::<()>(ISSUER, lazy_repo(), false)
+        let discovery = well_known_router::<()>(ISSUER, lazy_repo(), None)
             .oneshot(
                 Request::builder()
                     .uri("/.well-known/openid-configuration")
@@ -542,8 +917,22 @@ mod db {
         let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
         let payload: Value = serde_json::from_slice(&body).unwrap();
         assert!(
-            payload.get("token_endpoint").is_none(),
-            "token_endpoint must be absent when token-exchange is disabled"
+            payload["grant_types_supported"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "no grants must be advertised when token-exchange is disabled: {payload}"
+        );
+        assert!(
+            payload["response_types_supported"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "no response types must be advertised when token-exchange is disabled: {payload}"
+        );
+        assert!(
+            payload["scopes_supported"].as_array().unwrap().is_empty(),
+            "no scopes must be advertised when token-exchange is disabled: {payload}"
         );
     }
 }

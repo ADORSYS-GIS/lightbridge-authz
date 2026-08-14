@@ -23,10 +23,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::signing::{ApiKeyJwtSigner, KeyOwner};
 
-const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
-const REFRESH_TOKEN_GRANT: &str = "refresh_token";
+/// Also referenced from `crate::signing::discovery_document` so the discovery document's
+/// `grant_types_supported` stays in lockstep with what this endpoint actually dispatches.
+pub(crate) const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+pub(crate) const REFRESH_TOKEN_GRANT: &str = "refresh_token";
 const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 const OFFLINE_ACCESS_SCOPE: &str = "offline_access";
+const OPENID_SCOPE: &str = "openid";
 const REFRESH_TOKEN_PREFIX: &str = "lgbr_rt_";
 const REFRESH_TOKEN_BYTES: usize = 32;
 
@@ -74,6 +77,10 @@ struct TokenResponse {
     refresh_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     scope: Option<String>,
+    /// ADR-0011, Decision 1: present when the granted scope set includes `openid`, absent
+    /// otherwise. Never present on a grant that did not request/receive `openid`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id_token: Option<String>,
 }
 
 /// RFC 6749 §5.2 error body.
@@ -179,8 +186,10 @@ async fn handle_exchange(state: &TokenExchangeState, request: TokenRequest) -> R
 
     let granted_scopes = grant_scopes(&request.scope, &state.cfg.allowed_scopes);
     let offline = granted_scopes.iter().any(|s| s == OFFLINE_ACCESS_SCOPE);
+    let openid = granted_scopes.iter().any(|s| s == OPENID_SCOPE);
 
     let (email, email_verified) = decode_email(subject_token);
+    let (auth_time, nonce) = decode_auth_time_and_nonce(subject_token);
     let owner = KeyOwner {
         subject: subject.clone(),
         email,
@@ -189,6 +198,7 @@ async fn handle_exchange(state: &TokenExchangeState, request: TokenRequest) -> R
 
     let now = Utc::now();
     let session_id = cuid2();
+    let access_expires_at = now + Duration::seconds(state.cfg.access_ttl_seconds);
     let signed = match state
         .signer
         .sign(
@@ -198,7 +208,7 @@ async fn handle_exchange(state: &TokenExchangeState, request: TokenRequest) -> R
             &context.account_id,
             allowed_models,
             now,
-            Some(now + Duration::seconds(state.cfg.access_ttl_seconds)),
+            Some(access_expires_at),
         )
         .await
     {
@@ -212,6 +222,32 @@ async fn handle_exchange(state: &TokenExchangeState, request: TokenRequest) -> R
         }
     };
 
+    let id_token = if openid {
+        match state
+            .signer
+            .sign_id_token(
+                &owner,
+                &signed.token,
+                auth_time,
+                nonce,
+                now,
+                access_expires_at,
+            )
+            .await
+        {
+            Ok(id_token) => Some(id_token),
+            Err(_) => {
+                return oauth_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "id token signing failed",
+                );
+            }
+        }
+    } else {
+        None
+    };
+
     let scope_str = scope_to_string(&granted_scopes);
     let refresh_token = if offline {
         let secret = generate_refresh_secret();
@@ -222,6 +258,9 @@ async fn handle_exchange(state: &TokenExchangeState, request: TokenRequest) -> R
             project_id: context.project_id.clone(),
             token_hash: hash_api_key(&secret),
             scope: scope_str.clone(),
+            email: owner.email.clone(),
+            email_verified: owner.email_verified,
+            auth_time,
             created_at: now,
             expires_at: now + Duration::seconds(state.cfg.refresh_ttl_seconds),
         };
@@ -244,6 +283,7 @@ async fn handle_exchange(state: &TokenExchangeState, request: TokenRequest) -> R
         account_id = %context.account_id,
         project_id = %context.project_id,
         offline,
+        openid,
         "token-exchange issued access token"
     );
 
@@ -254,6 +294,7 @@ async fn handle_exchange(state: &TokenExchangeState, request: TokenRequest) -> R
         refresh_token,
         scope_str,
         signed.token,
+        id_token,
     )
 }
 
@@ -298,6 +339,13 @@ async fn handle_refresh(state: &TokenExchangeState, request: TokenRequest) -> Re
     mint_from_refresh(state, &rotated, new_secret, now).await
 }
 
+/// Re-mints access + id_token (when the stored session's scope includes `openid`) through the
+/// exact same signer calls `handle_exchange` uses -- the ADR-0011 Decision 1 fix for the
+/// `mint_from_refresh` email-dropping bug: `owner` is built from what was persisted on the
+/// refresh-token row at exchange time (`email`/`email_verified`/`auth_time`), not hardcoded
+/// `None`s. `nonce` is always omitted on a refresh: a refresh presents no upstream `subject_token`
+/// to propagate one from (ADR-0011 ties `nonce` to "what the client sent in the authorization
+/// request", and a refresh is not a fresh authorization request).
 async fn mint_from_refresh(
     state: &TokenExchangeState,
     session: &ExchangeRefreshTokenRow,
@@ -308,12 +356,19 @@ async fn mint_from_refresh(
         Ok(Some(project)) => project.allowed_models,
         _ => None,
     };
+    let openid = session
+        .scope
+        .as_deref()
+        .unwrap_or("")
+        .split_whitespace()
+        .any(|s| s == OPENID_SCOPE);
     let owner = KeyOwner {
         subject: session.subject.clone(),
-        email: None,
-        email_verified: None,
+        email: session.email.clone(),
+        email_verified: session.email_verified,
     };
     let session_id = cuid2();
+    let access_expires_at = now + Duration::seconds(state.cfg.access_ttl_seconds);
     let signed = match state
         .signer
         .sign(
@@ -323,7 +378,7 @@ async fn mint_from_refresh(
             &session.account_id,
             allowed_models,
             now,
-            Some(now + Duration::seconds(state.cfg.access_ttl_seconds)),
+            Some(access_expires_at),
         )
         .await
     {
@@ -337,10 +392,37 @@ async fn mint_from_refresh(
         }
     };
 
+    let id_token = if openid {
+        match state
+            .signer
+            .sign_id_token(
+                &owner,
+                &signed.token,
+                session.auth_time,
+                None,
+                now,
+                access_expires_at,
+            )
+            .await
+        {
+            Ok(id_token) => Some(id_token),
+            Err(_) => {
+                return oauth_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "id token signing failed",
+                );
+            }
+        }
+    } else {
+        None
+    };
+
     tracing::info!(
         subject = %session.subject,
         account_id = %session.account_id,
         project_id = %session.project_id,
+        openid,
         "token-exchange refreshed access token"
     );
 
@@ -351,9 +433,11 @@ async fn mint_from_refresh(
         Some(new_secret),
         session.scope.clone(),
         signed.token,
+        id_token,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn token_response(
     expires_at: &DateTime<Utc>,
     now: DateTime<Utc>,
@@ -361,6 +445,7 @@ fn token_response(
     refresh_token: Option<String>,
     scope: Option<String>,
     access_token: String,
+    id_token: Option<String>,
 ) -> Response {
     let expires_in = (*expires_at - now).num_seconds().max(0);
     (
@@ -372,6 +457,7 @@ fn token_response(
             issued_token_type,
             refresh_token,
             scope,
+            id_token,
         }),
     )
         .into_response()
@@ -418,16 +504,22 @@ fn generate_refresh_secret() -> String {
     )
 }
 
+/// Best-effort, unverified decode of a JWT's payload segment into JSON. Used only to snapshot
+/// specific claims off the already-`validate_bearer_token`-verified `subject_token` -- the
+/// signature has already been checked by the time either caller below runs, this just re-reads
+/// the payload since `TokenInfo` does not carry every upstream claim.
+fn decode_payload(bearer_token: &str) -> Option<serde_json::Value> {
+    let payload = bearer_token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 /// Snapshots `email`/`email_verified` from the presented upstream token so the exchanged JWT
 /// mirrors a Keycloak access token. Best-effort: a token without these claims yields `None`.
 fn decode_email(bearer_token: &str) -> (Option<String>, Option<bool>) {
-    let Some(payload) = bearer_token.split('.').nth(1) else {
-        return (None, None);
-    };
-    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
-        return (None, None);
-    };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+    let Some(value) = decode_payload(bearer_token) else {
         return (None, None);
     };
     let email = value
@@ -438,4 +530,20 @@ fn decode_email(bearer_token: &str) -> (Option<String>, Option<bool>) {
         .get("email_verified")
         .and_then(serde_json::Value::as_bool);
     (email, email_verified)
+}
+
+/// Snapshots `auth_time`/`nonce` from the presented upstream token for the derived `id_token`
+/// (ADR-0011, Decision 7). Both are propagate-if-present-else-omit, never synthesized: `auth_time`
+/// because this service never authenticates anyone itself (no authentication instant of its own to
+/// report), `nonce` because a token exchange runs no authorization request for a nonce to bind to.
+fn decode_auth_time_and_nonce(bearer_token: &str) -> (Option<i64>, Option<String>) {
+    let Some(value) = decode_payload(bearer_token) else {
+        return (None, None);
+    };
+    let auth_time = value.get("auth_time").and_then(serde_json::Value::as_i64);
+    let nonce = value
+        .get("nonce")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    (auth_time, nonce)
 }
