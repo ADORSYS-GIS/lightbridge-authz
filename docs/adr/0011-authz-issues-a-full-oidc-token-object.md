@@ -18,7 +18,7 @@ issued, and the same house rule states plainly that any OIDC claim sourced from 
 `jti`, `sub`, `aud`, `iss` — is "read, never rewritten, never regenerated into our own format"
 (`AGENTS.md:392-395`). This ADR extends that rule, unchanged, to every further claim it introduces:
 `sub` is copied from the upstream `subject_token`, never re-minted; `auth_time`/`nonce`/
-`email`/`email_verified` are upstream snapshots or clean omissions, never invented. Decision 8
+`email`/`email_verified` are upstream snapshots or clean omissions, never invented. Decision 7
 works through each claim.
 
 `crates/lightbridge-authz-rest/src/signing.rs:275-276` already advertises
@@ -278,13 +278,13 @@ oauth2:
   clients:
     - client_id: lightbridge-ss
       type: public          # no client_secret_hash, require_pkce: true
-      scopes: [openid, profile, email]   # no offline_access — see Decision 6
-      grant_types: [urn:ietf:params:oauth:grant-type:token-exchange]
+      scopes: [openid, profile, email, offline_access]
+      grant_types: [urn:ietf:params:oauth:grant-type:token-exchange, refresh_token]
       allowed_audiences: [lightbridge-ss]
     - client_id: lightbridge-mcp
       type: confidential     # token_endpoint_auth_method: private_key_jwt
       jwks: { keys: [ { kty: RSA, kid: "...", n: "...", e: "..." } ] }
-      scopes: [openid, profile, email, offline_access]   # confidential, so allowed — Decision 6
+      scopes: [openid, profile, email, offline_access]
       grant_types: [urn:ietf:params:oauth:grant-type:token-exchange, refresh_token]
       allowed_audiences: [lightbridge-mcp]
 ```
@@ -304,35 +304,9 @@ makes "audiences are clients" a native concept here rather than something bolted
 trigger is self-service client registration: the moment that is needed, it needs a real table, and
 *that* is where a cratestack model earns its place in this feature (the only other place, besides
 the already-committed lockstep repair in Decision 4, where cratestack enters this ADR at all — see
-Decision 9).
+Decision 8).
 
-### 6. Public clients never get `offline_access` — refresh tokens are confidential-client-only
-
-The example client list above deliberately does not grant `lightbridge-ss` (public) the
-`offline_access` scope. This has to be a stated decision, not a silent omission, because the
-alternative is a real gap: a public client authenticates via `(Some(NoAuth), NoCredential) =>
-Ok(())` (`token.rs:385`) — zero proof of anything beyond knowing the (deliberately public)
-`client_id` — and RFC 8693 token-exchange has no PKCE equivalent to fall back on. PKCE binds an
-`authorization_code` request to whoever started it; there is no authorization request in a token
-exchange for a proof-of-possession value to bind to. So a public client granted `offline_access`
-would let anyone who knows `client_id: lightbridge-ss` and holds *any* valid `subject_token` walk
-away with a long-lived, rotating refresh token, no barrier beyond what the exchange already
-requires for a short-lived access token.
-
-Per this repo's own first review priority — the unavailable/unauthenticated branch must never
-become the permissive one — this is a rule, not a runtime gate that could silently pass:
-**`offline_access` is granted only to confidential clients, authenticated via `private_key_jwt`
-(Decision 7); no public client registration in this service's config may carry it**, and scope
-intersection (Decision 1) must enforce that regardless of what an operator mistakenly writes into a
-public client's `scopes` list in config.
-
-Honest consequence: a browser SPA like `lightbridge-ss` never receives a refresh token and must
-re-run the token exchange against its upstream Keycloak session every time the access token
-expires. That is a real UX/traffic cost, accepted deliberately in exchange for never handing a
-long-lived credential to a client type with no proof-of-possession. This decision was made on the
-decision owner's behalf while drafting this ADR and should be confirmed, not assumed.
-
-### 7. Confidential clients authenticate with `private_key_jwt` only — no client secrets, ever
+### 6. Confidential clients authenticate with `private_key_jwt` only — no client secrets, ever
 
 Two client types: **public** (`TokenEndpointAuthMethod::NoAuth`, `client.rs:70-85`, serializes as
 `"none"`; `authenticate_client` accepts `(Some(NoAuth), NoCredential) => Ok(())` at `token.rs:385`)
@@ -343,6 +317,23 @@ and never store or accept a `client_secret_hash` — `ClientRegistration.client_
 stays `None` for every client this service registers. `verify_secret` (`client.rs:148-165`) uses
 real argon2 and unconditionally returns `false` when the hash is `None`, so omitting secrets can
 never accidentally authenticate a client that has none.
+
+**Accepted risk: public clients receive refresh tokens with no proof-of-possession behind them.**
+A public client authenticates via `(Some(NoAuth), NoCredential) => Ok(())` (`token.rs:385`) — no
+credential at all beyond knowing the (deliberately public) `client_id` — and RFC 8693
+token-exchange has no PKCE equivalent to bind possession: PKCE binds an `authorization_code`
+request to whoever started it, and there is no authorization request in a token exchange for a
+proof-of-possession value to bind to. Refresh tokens are nonetheless issued to public clients
+(Decision 1), so a caller holding a valid upstream `subject_token` and knowing the public
+`client_id` can obtain one. That is accepted, not overlooked, on the strength of three properties
+of the refresh token itself: it is opaque and stored hashed at rest (`token_hash` on
+`exchange_refresh_tokens`, never the raw value), single-use and rotated on every redemption
+(`rotate_exchange_refresh_token`, `crates/lightbridge-authz-api-key/src/repo.rs:701` — a `SELECT
+... FOR UPDATE` CAS that flips the presented token to `rotated` and mints a successor, so a
+replayed token is rejected), and bounded by `refresh_ttl_seconds`
+(`crates/lightbridge-authz-core/src/config/mod.rs:498`). The upstream `subject_token` is the actual
+security boundary here: holding a valid one is already the precondition for everything else this
+endpoint does, including the short-lived access token every exchange returns regardless of scope.
 
 A confidential client's public key is a **static inline JWK Set** on `ClientRegistration.jwks:
 Option<serde_json::Value>` (`client.rs:122-133`) — there is deliberately **no `jwks_uri`**
@@ -394,7 +385,7 @@ credential. The honest operational cost: every confidential client needs keypair
 way to publish/rotate its public key into config, which is strictly more work than rotating a
 shared secret.
 
-### 8. The id_token is not a second home for authorization data — and asserts nothing beyond what upstream told us
+### 7. The id_token is not a second home for authorization data — and asserts nothing beyond what upstream told us
 
 `docs/governance-model-and-enforcement.md:272-282` already made this call deliberately for the
 existing access-token/introspection split: `project_quota`, `role`, and `quota_tier` ride on the
@@ -437,7 +428,7 @@ carries it today. Role/quota data stays out of **both** JWTs — introspection r
 source, matching how Authorino already distinguishes the two identity planes by `api_key_id`
 presence (`docs/governance-model-and-enforcement.md:177-179`).
 
-### 9. cratestack's role here is minimal, and stated honestly
+### 8. cratestack's role here is minimal, and stated honestly
 
 `id_token`s are not persisted, so this feature adds no tables and needs no new cratestack models.
 cratestack enters this ADR exactly twice: (a) the lockstep repair to `0.7.16` in Decision 4, which
@@ -446,12 +437,12 @@ trigger in Decision 5 — if self-service client registration is ever built, tha
 cratestack model would earn its place, because it would then be genuine persisted, queried domain
 data. No cratestack work is manufactured beyond those two, real, narrow points.
 
-### 10. The discovery document is corrected
+### 9. The discovery document is corrected
 
 `response_types_supported` (`signing.rs:276`) gains id_token-bearing values reflecting the grants we
 actually serve, and `scopes_supported`/`claims_supported` are published rather than omitted.
 `well_known_router`'s hand-built `serde_json::json!` document is replaced by
-`authkestra_op::handlers::discovery::OidcDiscovery` (`.with_private_key_jwt()` per Decision 7) and
+`authkestra_op::handlers::discovery::OidcDiscovery` (`.with_private_key_jwt()` per Decision 6) and
 `handlers::jwks::JwksResponse` as the document types, so the shapes stay spec-correct — worth taking
 from authkestra even though `handle_token_exchange` itself is not (yet) reachable through the
 `OpStore` seam per Decision 3.
@@ -496,10 +487,6 @@ from authkestra even though `handle_token_exchange` itself is not (yet) reachabl
 - Every confidential client's public key lives in plaintext config (not a secret, but still an
   artifact that must be kept in sync with the client's actual key and cannot be rotated without a
   redeploy).
-- Public clients (Decision 6) never get a refresh token, by rule. A browser SPA like
-  `lightbridge-ss` must re-run the token exchange against its upstream Keycloak session on every
-  access-token expiry — extra request volume and a real UX cost, accepted in exchange for never
-  handing a long-lived credential to a client type with no proof-of-possession.
 
 ### Neutral / follow-ups
 
@@ -519,7 +506,7 @@ from authkestra even though `handle_token_exchange` itself is not (yet) reachabl
   deserialize that, so `validate_token` fails closed on every real token issued today, not merely on
   an edge case. None of the three is guaranteed a release date on this side — see Negative
   consequences.
-- `ClientAssertionStore::record_jti` (Decision 7) must be implemented and wired via
+- `ClientAssertionStore::record_jti` (Decision 6) must be implemented and wired via
   `CompositeOpStore::with_client_assertion_store` before any confidential client can authenticate at
   all — tracked as a hard implementation requirement, not follow-up polish.
 - `AGENTS.md:452` claims project context including `role`/`quota_tier`/`project_quota` is "sealed
