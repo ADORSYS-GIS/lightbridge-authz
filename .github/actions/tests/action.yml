@@ -1,5 +1,7 @@
 name: Workspace Tests
-description: Start a Postgres backend (docker) and run the workspace test suite.
+description: >-
+  Start Postgres + Redis (docker), run the workspace test suite, then the Postgres/Redis-backed
+  `it-tests` feature suite (api-key, budget, rest) against the same containers.
 inputs:
   database-url:
     description: Postgres connection string
@@ -34,6 +36,27 @@ runs:
         docker logs --tail 50 lightbridge-pg || true
         exit 1
 
+    # Only the it-tests suite needs Redis (RequestScopedOpStore's client-assertion replay store,
+    # `TokenExchangeOpStore`'s refresh-token bits, `rpc_it_tests.rs`/`token_exchange_tests.rs` --
+    # see their `AUTHZ_REDIS_URL` doc comments). `cargo test --workspace` alone doesn't touch it,
+    # but starting it upfront keeps this one composite self-contained.
+    - name: Start Redis (docker)
+      shell: bash
+      run: |
+        set -euo pipefail
+        docker run -d --name lightbridge-redis -p 6379:6379 docker.io/library/redis:7
+        echo "Waiting for Redis to accept connections..."
+        for i in $(seq 1 30); do
+          if docker exec lightbridge-redis redis-cli ping 2>/dev/null | grep -q PONG; then
+            echo "Redis is ready."
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "Redis did not become ready in time; recent logs:"
+        docker logs --tail 50 lightbridge-redis || true
+        exit 1
+
     # Same memory guard as code-checks, for both reasons: this links the 24 test binaries AND it
     # compiles `lightbridge-authz-api`, the ~8 GB single-rustc `include_server_schema!` expansion
     # that reach ~6 GB each; jobs=2 keeps two of them from landing alongside each other.
@@ -47,7 +70,61 @@ runs:
         CARGO_BUILD_JOBS: "2"
         CARGO_INCREMENTAL: "0"
 
-    - name: Stop PostgreSQL
+    # it-tests (api-key/budget/rest, `just it-tests`'s three crates -- `lightbridge-authz-usage`'s
+    # it-tests needs Timescale, out of scope here) exercise real migrations against a live
+    # DATABASE_URL, unlike the sqlx::test-isolated suites above. Mirrors `just it-tests`'s own
+    # migration step (`authz-migrate`) via the binary directly, since there's no compose stack in
+    # this job. #219 tracks 7 tests in rpc_it_tests.rs that fail deterministically even against a
+    # freshly migrated DB (marked `#[ignore = "tracked in #219"]`); #220 tracks one already-ignored
+    # test in access_control_scenarios_tests.rs. Both are pre-existing, known, out of scope here --
+    # this step exists so the other ~20+ it-tests genuinely run and stay green, instead of being
+    # silently absent from CI's build graph the way they were before.
+    - name: Run DB migrations (for it-tests)
+      shell: bash
+      run: cargo run -p lightbridge-authz --bin lightbridge-authz -- migrate --config-path config/default.yaml
+      env:
+        DATABASE_URL: ${{ inputs.database-url }}
+        CARGO_BUILD_JOBS: "2"
+        CARGO_INCREMENTAL: "0"
+
+    # `rpc_it_tests.rs` is run separately, `--test-threads=1`: unlike every other it-tests file
+    # here (all `#[sqlx::test]`-isolated, one ephemeral DB per test), it shares one
+    # `DATABASE_URL`-backed database across its whole binary by design (#219's own repro uses the
+    # same flag) -- verified locally that its default-parallel run throws a spurious failure
+    # (`list_projects_tolerates_legacy_jsonb_null_allowed_models`, cross-test interference, not a
+    # real bug: passes alone and passes serialized) that vanishes entirely under
+    # `--test-threads=1`. This is the exact "shared-database integration tests running in
+    # parallel wiping each other's rows" failure mode AGENTS.md's testing rules already warn
+    # about -- serializing this one binary avoids reintroducing it, rather than papering over it
+    # with a retry.
+    - name: Run it-tests (api-key, budget, rest)
+      shell: bash
+      run: |
+        set -euo pipefail
+        cargo test -p lightbridge-authz-api-key --features it-tests --tests
+        cargo test -p lightbridge-authz-budget --features it-tests --tests
+        cargo test -p lightbridge-authz-rest --features it-tests --test rpc_it_tests -- --test-threads=1
+        cargo test -p lightbridge-authz-rest --features it-tests \
+          --lib \
+          --test budget_policy_procedure_tests \
+          --test budget_policy_simulate_tests \
+          --test budget_refill_procedure_tests \
+          --test codec_undefined_regression_tests \
+          --test lib_tests \
+          --test opa_tests \
+          --test ratelimit_redis_tests \
+          --test rpc_router_tests \
+          --test signing_tests \
+          --test token_exchange_tests
+      env:
+        DATABASE_URL: ${{ inputs.database-url }}
+        AUTHZ_REDIS_URL: redis://127.0.0.1:6379
+        CARGO_BUILD_JOBS: "2"
+        CARGO_INCREMENTAL: "0"
+
+    - name: Stop PostgreSQL and Redis
       if: always()
       shell: bash
-      run: docker rm -f lightbridge-pg || true
+      run: |
+        docker rm -f lightbridge-pg || true
+        docker rm -f lightbridge-redis || true
