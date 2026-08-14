@@ -67,6 +67,7 @@ fn oauth2_config(jwks_url: String, audience: Option<Vec<String>>, rbac: Rbac) ->
         signing: None,
         token_exchange: None,
         rbac,
+        clients: Vec::new(),
     }
 }
 

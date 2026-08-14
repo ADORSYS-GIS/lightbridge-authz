@@ -53,6 +53,7 @@ fn external_oauth2() -> Oauth2 {
         signing: None,
         token_exchange: None,
         rbac: Default::default(),
+        clients: Vec::new(),
     }
 }
 

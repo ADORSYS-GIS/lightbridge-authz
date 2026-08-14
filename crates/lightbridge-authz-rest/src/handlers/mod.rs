@@ -640,6 +640,7 @@ mod tests {
             signing: None,
             token_exchange: None,
             rbac: Default::default(),
+            clients: Vec::new(),
             issuance: None,
         }
     }
@@ -790,6 +791,7 @@ mod tests {
             signing: None,
             token_exchange: None,
             rbac: Default::default(),
+            clients: Vec::new(),
             issuance: Some(Oauth2Issuance {
                 grant_type: Some("urn:ietf:params:oauth:grant-type:token-exchange".to_string()),
                 client_id: "test-client".to_string(),
@@ -830,6 +832,7 @@ mod tests {
             signing: None,
             token_exchange: None,
             rbac: Default::default(),
+            clients: Vec::new(),
             issuance: Some(Oauth2Issuance {
                 grant_type: None,
                 client_id: client_id.to_string(),
@@ -857,6 +860,7 @@ mod tests {
             signing: None,
             token_exchange: None,
             rbac: Default::default(),
+            clients: Vec::new(),
             issuance: None,
         };
         let err = OAuth2TokenIssuer::from_config(&cfg).unwrap_err();

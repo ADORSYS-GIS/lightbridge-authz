@@ -2223,6 +2223,7 @@ mod tests {
             signing: None,
             token_exchange: None,
             rbac: Default::default(),
+            clients: Vec::new(),
         }
     }
 

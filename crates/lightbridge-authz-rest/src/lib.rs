@@ -2,7 +2,7 @@ use axum::{Json, Router, http::StatusCode, routing::get};
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
     RotateApiKey, async_trait,
-    config::{ApiServer, BasicAuth, Billing, Database, Oauth2, OpaServer, Redis},
+    config::{ApiServer, BasicAuth, Billing, Database, Oauth2, OauthClientType, OpaServer, Redis},
     db::{DbPool, DbPoolTrait, is_database_ready},
     error::{Error, Result},
     server::{dev_cors_enabled, serve_tls},
@@ -13,6 +13,7 @@ pub mod codec;
 pub mod handlers;
 pub mod middleware;
 pub mod models;
+pub mod oauth2_op;
 pub mod ratelimit_redis;
 pub mod routers;
 pub mod rpc_authorize;
@@ -1165,9 +1166,15 @@ pub fn build_api_router(
             }),
         );
 
-    let token_exchange_scopes = token_exchange
+    let token_exchange_scopes = oauth2
+        .token_exchange
         .as_ref()
-        .map(|state| state.cfg.allowed_scopes.clone());
+        .filter(|t| t.enabled)
+        .map(|t| t.allowed_scopes.clone());
+    let private_key_jwt_supported = oauth2
+        .clients
+        .iter()
+        .any(|c| c.client_type == OauthClientType::Confidential);
     if oauth2.is_self_signed()
         && let Some(signing) = oauth2.signing.as_ref()
     {
@@ -1175,6 +1182,7 @@ pub fn build_api_router(
             &signing.issuer,
             signing_repo,
             token_exchange_scopes,
+            private_key_jwt_supported,
         ));
     }
 
@@ -1247,13 +1255,22 @@ fn normalize_rpc_base_path(raw: Option<&str>) -> Option<String> {
     })
 }
 
+/// Redis key prefix for the `private_key_jwt` replay-tracking store (ADR-0011, Decision 6).
+/// Namespaced separately from `ratelimit_redis`'s bucket keys in the same Redis instance.
+const CLIENT_ASSERTION_JTI_KEY_PREFIX: &str = "authz-api:client-assertion-jti:";
+
 /// Builds the native token-exchange state. Enabled only when `token_exchange.enabled` is set, and
 /// it REQUIRES `oauth2.type: self` (the exchanged access token is a self-signed JWT). Returns
 /// `Ok(None)` when the feature is off; errors on invalid config so startup fails fast.
+///
+/// ADR-0011 phase 2: builds the config-defined `ClientStore` (Decision 5) and the Redis-backed
+/// `ClientAssertionStore` (Decision 6) that together let `oauth2_op::store::TokenExchangeOpStore`
+/// implement `authkestra_op::store::OpStore`.
 fn build_token_exchange_state(
     oauth2: &Oauth2,
     repo: Arc<StoreRepo>,
     bearer: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait>,
+    redis_url: &str,
 ) -> Result<Option<token_exchange::TokenExchangeState>> {
     let Some(cfg) = oauth2.token_exchange.as_ref().filter(|t| t.enabled) else {
         return Ok(None);
@@ -1273,12 +1290,36 @@ fn build_token_exchange_state(
         ));
     }
     let signer = signing::ApiKeyJwtSigner::from_config(signing, repo.clone())?;
-    Ok(Some(token_exchange::TokenExchangeState {
+
+    let client_store = oauth2_op::client_store::ConfigClientStore::from_config(&oauth2.clients);
+    let assertions = oauth2_op::client_assertion_store::RedisClientAssertionStore::connect(
+        redis_url,
+        CLIENT_ASSERTION_JTI_KEY_PREFIX,
+    )?;
+    let op_store = Arc::new(oauth2_op::store::TokenExchangeOpStore::new(
+        client_store,
+        assertions,
         repo,
-        signer,
         bearer,
-        cfg: cfg.clone(),
-    }))
+        cfg.clone(),
+    ));
+    let op_config = authkestra_op::config::OpConfig {
+        issuer: signing.issuer.clone(),
+        scopes_supported: cfg.allowed_scopes.clone(),
+        response_types_supported: vec!["token".to_string()],
+        grant_types_supported: vec![
+            token_exchange::TOKEN_EXCHANGE_GRANT.to_string(),
+            token_exchange::REFRESH_TOKEN_GRANT.to_string(),
+        ],
+        id_token_signing_alg: "RS256".to_string(),
+        authorization_code_ttl_secs: 0,
+        access_token_ttl_secs: cfg.access_ttl_seconds.max(0) as u64,
+        device_code_ttl_secs: 0,
+        token_exchange_enabled: cfg.enabled,
+    };
+    Ok(Some(token_exchange::TokenExchangeState::new(
+        signer, op_config, op_store,
+    )))
 }
 
 pub async fn start_api_server(
@@ -1380,8 +1421,22 @@ pub async fn start_api_server(
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
 
-    let token_exchange_state =
-        build_token_exchange_state(oauth2, signing_repo.clone(), bearer_service.clone())?;
+    // Redis is required unconditionally for authz-api rate limiting (see the rate-limit-store
+    // construction further below), so it is already a hard startup dependency; pulling the
+    // required-ness check up here just lets token-exchange's `ClientAssertionStore` (ADR-0011,
+    // Decision 6) share the same `redis.url` instead of re-deriving it.
+    let redis = redis.as_ref().ok_or_else(|| {
+        Error::Server(
+            "redis config is required for authz-api rate limiting (set `redis.url`)".to_string(),
+        )
+    })?;
+
+    let token_exchange_state = build_token_exchange_state(
+        oauth2,
+        signing_repo.clone(),
+        bearer_service.clone(),
+        &redis.url,
+    )?;
     let token_exchange_enabled = token_exchange_state.is_some();
 
     // cratestack runs on its own sqlx major (0.8, vs this workspace's 0.9), so its CRUD client and
@@ -1413,11 +1468,7 @@ pub async fn start_api_server(
     // The URL comes from the already-loaded `Config.redis.url` (YAML `redis: url:`, itself
     // populated from `REDIS_URL` via env interpolation — see `config/default.yaml`), not a
     // separately-read raw env var, mirroring how every other config value reaches this function.
-    let redis = redis.as_ref().ok_or_else(|| {
-        Error::Server(
-            "redis config is required for authz-api rate limiting (set `redis.url`)".to_string(),
-        )
-    })?;
+    // `redis` itself was already required further up, ahead of `build_token_exchange_state`.
     let rate_limit_store = build_redis_rate_limit_store(&redis.url, "authz-api")?;
 
     let dev_cors = dev_cors_enabled();
@@ -1628,8 +1679,13 @@ mod tests {
             signing: None,
             token_exchange: None,
             rbac: Default::default(),
+            clients: Vec::new(),
         }
     }
+
+    /// Unreachable but syntactically valid -- `RedisClientAssertionStore::connect` is lazy (see
+    /// its own doc comment), so building `TokenExchangeState` never actually dials this.
+    const UNREACHABLE_REDIS_URL: &str = "redis://127.0.0.1:1";
 
     fn exchange_cfg() -> Oauth2TokenExchange {
         Oauth2TokenExchange {
@@ -1652,8 +1708,13 @@ mod tests {
     #[tokio::test]
     async fn build_token_exchange_state_is_none_when_disabled() {
         let oauth2 = base_oauth2(Oauth2Type::SelfSigned);
-        let result =
-            build_token_exchange_state(&oauth2, lazy_signing_repo(), noop_bearer()).unwrap();
+        let result = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+        )
+        .unwrap();
         assert!(result.is_none());
     }
 
@@ -1661,8 +1722,12 @@ mod tests {
     async fn build_token_exchange_state_rejects_external_oauth2() {
         let mut oauth2 = base_oauth2(Oauth2Type::External);
         oauth2.token_exchange = Some(exchange_cfg());
-        let Err(err) = build_token_exchange_state(&oauth2, lazy_signing_repo(), noop_bearer())
-        else {
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+        ) else {
             panic!("expected an error for external oauth2 with token_exchange enabled");
         };
         assert!(format!("{err}").contains("requires oauth2.type: self"));
@@ -1672,8 +1737,12 @@ mod tests {
     async fn build_token_exchange_state_rejects_missing_signing_block() {
         let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
         oauth2.token_exchange = Some(exchange_cfg());
-        let Err(err) = build_token_exchange_state(&oauth2, lazy_signing_repo(), noop_bearer())
-        else {
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+        ) else {
             panic!("expected an error for a missing signing block");
         };
         assert!(format!("{err}").contains("requires oauth2.signing"));
@@ -1686,8 +1755,12 @@ mod tests {
         let mut cfg = exchange_cfg();
         cfg.access_ttl_seconds = 0;
         oauth2.token_exchange = Some(cfg);
-        let Err(err) = build_token_exchange_state(&oauth2, lazy_signing_repo(), noop_bearer())
-        else {
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+        ) else {
             panic!("expected an error for a non-positive ttl");
         };
         assert!(format!("{err}").contains("must be positive"));
@@ -1698,8 +1771,13 @@ mod tests {
         let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
         oauth2.signing = Some(signing_cfg());
         oauth2.token_exchange = Some(exchange_cfg());
-        let result =
-            build_token_exchange_state(&oauth2, lazy_signing_repo(), noop_bearer()).unwrap();
+        let result = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+        )
+        .unwrap();
         assert!(result.is_some());
     }
 

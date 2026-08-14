@@ -155,6 +155,46 @@ fn exchange_cfg() -> Oauth2TokenExchange {
     }
 }
 
+/// Builds a `TokenExchangeState` for router-wiring tests that only need the route to be *merged*
+/// -- no real client list, no reachable Redis (the `ClientAssertionStore` connection is lazy; see
+/// `RedisClientAssertionStore::connect`'s own doc comment).
+fn token_exchange_state(bearer: Arc<dyn BearerTokenServiceTrait>) -> TokenExchangeState {
+    let signer = ApiKeyJwtSigner::from_config(&signing_cfg(), lazy_store_repo())
+        .expect("signer builds from config");
+    let client_store =
+        lightbridge_authz_rest::oauth2_op::client_store::ConfigClientStore::from_config(&[]);
+    let assertions =
+        lightbridge_authz_rest::oauth2_op::client_assertion_store::RedisClientAssertionStore::connect(
+            "redis://127.0.0.1:1",
+            "test:",
+        )
+        .expect("lazy connection manager always builds");
+    let op_store = Arc::new(
+        lightbridge_authz_rest::oauth2_op::store::TokenExchangeOpStore::new(
+            client_store,
+            assertions,
+            lazy_store_repo(),
+            bearer,
+            exchange_cfg(),
+        ),
+    );
+    let op_config = authkestra_op::config::OpConfig {
+        issuer: signing_cfg().issuer,
+        scopes_supported: exchange_cfg().allowed_scopes,
+        response_types_supported: vec!["token".to_string()],
+        grant_types_supported: vec![
+            "urn:ietf:params:oauth:grant-type:token-exchange".to_string(),
+            "refresh_token".to_string(),
+        ],
+        id_token_signing_alg: "RS256".to_string(),
+        authorization_code_ttl_secs: 0,
+        access_token_ttl_secs: 900,
+        device_code_ttl_secs: 0,
+        token_exchange_enabled: true,
+    };
+    TokenExchangeState::new(signer, op_config, op_store)
+}
+
 /// Assemble the full API router with a caller-supplied bearer and (optional) token-exchange state,
 /// everything else lazily wired to unreachable backends.
 fn build_router(
@@ -340,14 +380,7 @@ async fn well_known_discovery_is_merged_only_for_self_signed_oauth2() {
 
 #[tokio::test]
 async fn token_exchange_route_is_merged_when_configured() {
-    let signer = ApiKeyJwtSigner::from_config(&signing_cfg(), lazy_store_repo())
-        .expect("signer builds from config");
-    let te = TokenExchangeState {
-        repo: lazy_store_repo(),
-        signer,
-        bearer: admin_bearer(),
-        cfg: exchange_cfg(),
-    };
+    let te = token_exchange_state(admin_bearer());
     let router = build_router(admin_bearer(), &self_signed_oauth2(), Some(te), false);
 
     // The route is merged: a POST reaches the handler (Form extraction fails on an empty body →

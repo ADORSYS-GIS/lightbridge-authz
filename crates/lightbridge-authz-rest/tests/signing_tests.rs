@@ -108,7 +108,7 @@ async fn well_known_serves_cors_headers() {
     use lightbridge_authz_rest::signing::well_known_router;
     use tower::ServiceExt;
 
-    let response = well_known_router::<()>(ISSUER, lazy_repo(), None)
+    let response = well_known_router::<()>(ISSUER, lazy_repo(), None, false)
         .oneshot(
             Request::builder()
                 .uri("/.well-known/openid-configuration")
@@ -136,7 +136,7 @@ async fn jwks_endpoint_returns_server_error_when_repo_is_unreachable() {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    let response = well_known_router::<()>(ISSUER, lazy_repo(), None)
+    let response = well_known_router::<()>(ISSUER, lazy_repo(), None, false)
         .oneshot(
             Request::builder()
                 .uri("/.well-known/jwks.json")
@@ -579,124 +579,20 @@ mod db {
         assert_eq!(new_obj["identity"]["email"], "dev@example.test");
     }
 
-    /// ADR-0011, Decision 7: the id_token carries upstream identity snapshots + `at_hash`/`azp`,
-    /// and never tenant context or role/quota data (that stays access-token-only, matching
-    /// `docs/governance-model-and-enforcement.md`).
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn sign_id_token_carries_upstream_claims_and_no_tenant_context(pool: PgPool) {
-        let repo = repo(pool);
-        bootstrap_signing_key(&repo, &signing_cfg(3600))
-            .await
-            .unwrap();
-        let active = repo.get_active_signing_key().await.unwrap().unwrap();
-
-        let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
-        let owner = KeyOwner {
-            subject: "kc-user-id-token".to_string(),
-            email: Some("dev@example.test".to_string()),
-            email_verified: Some(true),
-        };
-        let now = Utc::now();
-        let expires_at = now + Duration::seconds(900);
-        let access_token = "fake-access-token-for-at-hash-binding".to_string();
-
-        let id_token = signer
-            .sign_id_token(
-                &owner,
-                &access_token,
-                Some(1_700_000_000),
-                Some("nonce-abc".to_string()),
-                now,
-                expires_at,
-            )
-            .await
-            .unwrap();
-
-        let claims = decode_untyped(&active.public_jwk, &id_token);
-        assert_eq!(claims["sub"], "kc-user-id-token");
-        assert_eq!(claims["email"], "dev@example.test");
-        assert_eq!(claims["email_verified"], true);
-        assert_eq!(claims["auth_time"], 1_700_000_000);
-        assert_eq!(claims["nonce"], "nonce-abc");
-        assert_eq!(claims["azp"], "lightbridge-api-key");
-        assert_eq!(
-            claims["at_hash"],
-            lightbridge_authz_rest::signing::compute_at_hash(&access_token)
-        );
-        for tenant_claim in [
-            "api_key_id",
-            "project_id",
-            "account_id",
-            "lightbridge_caller_kind",
-        ] {
-            assert!(
-                claims.get(tenant_claim).is_none(),
-                "id_token must never carry tenant context ({tenant_claim}): {claims}"
-            );
-        }
-    }
-
-    /// `auth_time`/`nonce` must be OMITTED, never a fabricated value, when the upstream token
-    /// carried none -- the failure mode this repo's rules explicitly call out ("a fabricated
-    /// value is the failure mode").
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn sign_id_token_omits_auth_time_and_nonce_when_absent(pool: PgPool) {
-        let repo = repo(pool);
-        bootstrap_signing_key(&repo, &signing_cfg(3600))
-            .await
-            .unwrap();
-        let active = repo.get_active_signing_key().await.unwrap().unwrap();
-
-        let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
-        let owner = KeyOwner {
-            subject: "kc-user-no-auth-time".to_string(),
-            email: None,
-            email_verified: None,
-        };
-        let now = Utc::now();
-        let id_token = signer
-            .sign_id_token(&owner, "tok", None, None, now, now + Duration::seconds(900))
-            .await
-            .unwrap();
-
-        let claims = decode_untyped(&active.public_jwk, &id_token);
-        assert!(
-            claims.get("auth_time").is_none(),
-            "auth_time must be omitted, not null/fabricated, when absent upstream: {claims}"
-        );
-        assert!(
-            claims.get("nonce").is_none(),
-            "nonce must be omitted, not null/fabricated, when absent upstream: {claims}"
-        );
-    }
-
-    /// Failure mode: this phase has no real per-client audience (ADR-0011 Decision 5 is phase 2),
-    /// so `id_token.aud` falls back to `oauth2.signing.audience`. When that is unconfigured there
-    /// is no value to stamp as `aud` -- refusing to mint a spec-invalid id_token (no `aud` at all)
-    /// is the fail-closed answer, not silently omitting the claim.
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn sign_id_token_refuses_when_audience_is_not_configured(pool: PgPool) {
-        let mut cfg = signing_cfg(3600);
-        cfg.audience = None;
-        let repo = repo(pool);
-        bootstrap_signing_key(&repo, &cfg).await.unwrap();
-        let signer = ApiKeyJwtSigner::from_config(&cfg, repo.clone()).unwrap();
-        let owner = KeyOwner {
-            subject: "kc-user-no-aud".to_string(),
-            email: None,
-            email_verified: None,
-        };
-        let now = Utc::now();
-
-        let err = signer
-            .sign_id_token(&owner, "tok", None, None, now, now + Duration::seconds(60))
-            .await
-            .unwrap_err();
-        assert!(
-            format!("{err}").contains("audience"),
-            "must refuse (fail closed), not issue an id_token missing `aud`: {err}"
-        );
-    }
+    // `sign_id_token` was removed from `ApiKeyJwtSigner` in ADR-0011 phase 2: id_token minting for
+    // the token-exchange grant now lives in `oauth2_op::store` (per-client `azp`/`aud`, via
+    // `TokenManager::issue_id_token_with_extra` directly), not on the plain CRUD signer, which has
+    // no id_token concept of its own. The claim-shape assertions this file used to make here
+    // (`sub`/`email`/`email_verified`/`auth_time`/`nonce`/`azp`/`at_hash` present, tenant context
+    // absent; `auth_time`/`nonce` omitted-not-fabricated when absent upstream) now live in
+    // `token_exchange_tests.rs`'s `exchange_issues_id_token_when_openid_granted`,
+    // `exchange_id_token_propagates_auth_time_and_nonce_when_present`, and
+    // `exchange_id_token_omits_auth_time_and_nonce_when_absent`, exercised end to end through the
+    // real `/oauth2/token` endpoint rather than the deleted method directly. The third deleted
+    // test (refusing to mint when `oauth2.signing.audience` is unset) has no replacement: `azp`/
+    // `aud` on the new path is always the authenticated client's `client_id`, which is guaranteed
+    // present by the time id_token minting runs (client authentication already resolved it), so
+    // the "no audience configured" failure mode this test covered no longer exists.
 
     fn signing_oauth2() -> Oauth2 {
         Oauth2 {
@@ -712,6 +608,7 @@ mod db {
             signing: Some(signing_cfg(3600)),
             token_exchange: None,
             rbac: Default::default(),
+            clients: Vec::new(),
         }
     }
 
@@ -821,7 +718,7 @@ mod db {
         .await
         .unwrap();
 
-        let jwks = well_known_router::<()>(ISSUER, repo.clone(), None)
+        let jwks = well_known_router::<()>(ISSUER, repo.clone(), None, false)
             .oneshot(
                 Request::builder()
                     .uri("/.well-known/jwks.json")
@@ -841,7 +738,7 @@ mod db {
         assert_eq!(payload["keys"][0]["alg"], "RS256");
 
         let scopes = vec!["openid".to_string(), "offline_access".to_string()];
-        let discovery = well_known_router::<()>(ISSUER, repo, Some(scopes))
+        let discovery = well_known_router::<()>(ISSUER, repo, Some(scopes), false)
             .oneshot(
                 Request::builder()
                     .uri("/.well-known/openid-configuration")
@@ -904,7 +801,7 @@ mod db {
         use lightbridge_authz_rest::signing::well_known_router;
         use tower::ServiceExt;
 
-        let discovery = well_known_router::<()>(ISSUER, lazy_repo(), None)
+        let discovery = well_known_router::<()>(ISSUER, lazy_repo(), None, false)
             .oneshot(
                 Request::builder()
                     .uri("/.well-known/openid-configuration")

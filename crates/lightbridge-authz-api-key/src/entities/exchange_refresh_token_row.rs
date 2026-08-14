@@ -8,6 +8,11 @@ pub struct ExchangeRefreshTokenRow {
     pub subject: String,
     pub account_id: String,
     pub project_id: String,
+    /// The registered client (ADR-0011, Decision 5) this refresh token was issued to. Checked
+    /// again on every refresh -- a token presented by a different client is rejected (and burned,
+    /// not silently ignored), matching `authkestra_op::handlers::token::default_handle_refresh_token`'s
+    /// own `old_rt.client_id != client_id` check.
+    pub client_id: String,
     pub token_hash: String,
     pub scope: Option<String>,
     pub status: String,
@@ -32,6 +37,7 @@ pub struct NewExchangeRefreshToken {
     pub subject: String,
     pub account_id: String,
     pub project_id: String,
+    pub client_id: String,
     pub token_hash: String,
     pub scope: Option<String>,
     pub email: Option<String>,

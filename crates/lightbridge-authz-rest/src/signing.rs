@@ -155,8 +155,12 @@ pub fn capped_expiry(
 }
 
 /// Builds the `Identity` every derived token (access or id) is minted for. `sub`/`email` are
-/// upstream snapshots -- never re-minted (ADR-0011, Context and Decision 7).
-fn identity_for(owner: &KeyOwner) -> Identity {
+/// upstream snapshots -- never re-minted (ADR-0011, Context and Decision 7). `attributes` starts
+/// empty here; `oauth2_op`'s refresh-token store uses it as the only extension point
+/// `authkestra_op::refresh::RefreshToken` offers to round-trip `account_id`/`project_id` (which
+/// have no dedicated field on `Identity`) through the `RefreshTokenStore` trait boundary -- see
+/// that module for the full round trip.
+pub(crate) fn identity_for(owner: &KeyOwner) -> Identity {
     Identity {
         provider_id: IDENTITY_PROVIDER_ID.to_string(),
         external_id: owner.subject.clone(),
@@ -164,6 +168,87 @@ fn identity_for(owner: &KeyOwner) -> Identity {
         username: None,
         attributes: HashMap::new(),
     }
+}
+
+/// Builds the `extra` claim map every minted *access* token carries, shared between the plain
+/// CRUD API-key signer ([`ApiKeyJwtSigner::sign`]) and the token-exchange grant
+/// (`oauth2_op::store`) -- the two differ only in `azp` (a fixed `oauth2.signing.audience` for the
+/// former, the authenticated client's `client_id` for the latter) and in the `api_key_id`/`sid`
+/// values each supplies. See [`ApiKeyJwtSigner::sign`]'s doc comment for the full claim-by-claim
+/// provenance; this is that same set, factored out so it is defined exactly once.
+pub(crate) fn access_token_extra(
+    owner: &KeyOwner,
+    api_key_id: &str,
+    project_id: &str,
+    account_id: &str,
+    allowed_models: Option<Vec<String>>,
+    azp: Option<&str>,
+) -> HashMap<String, Value> {
+    let mut extra = HashMap::new();
+    extra.insert("typ".to_string(), Value::String(TOKEN_TYP.to_string()));
+    if let Some(azp) = azp {
+        extra.insert("azp".to_string(), Value::String(azp.to_string()));
+    }
+    extra.insert(
+        "lightbridge_caller_kind".to_string(),
+        Value::String(lightbridge_authz_bearer::API_KEY_CALLER_KIND.to_string()),
+    );
+    extra.insert("sid".to_string(), Value::String(cuid2()));
+    extra.insert(
+        "api_key_id".to_string(),
+        Value::String(api_key_id.to_string()),
+    );
+    extra.insert(
+        "project_id".to_string(),
+        Value::String(project_id.to_string()),
+    );
+    extra.insert(
+        "account_id".to_string(),
+        Value::String(account_id.to_string()),
+    );
+    if let Some(email) = owner.email.as_deref() {
+        extra.insert("email".to_string(), Value::String(email.to_string()));
+    }
+    if let Some(verified) = owner.email_verified {
+        extra.insert("email_verified".to_string(), Value::Bool(verified));
+    }
+    if let Some(models) = allowed_models {
+        extra.insert(
+            "allowed_models".to_string(),
+            Value::Array(models.into_iter().map(Value::String).collect()),
+        );
+    }
+    extra
+}
+
+/// Builds the `extra` claim map every derived `id_token` carries (ADR-0011, Decision 7):
+/// `email`/`email_verified` upstream snapshots, `auth_time` propagated only when the upstream
+/// token carried one (never defaulted to "now"), `azp` naming the client the tokens were issued
+/// to, and `at_hash` binding this `id_token` to the `access_token` minted alongside it in the same
+/// response. Tenant context (`api_key_id`/`project_id`/`account_id`) and role/quota data never
+/// appear here -- see [`compute_at_hash`].
+pub(crate) fn id_token_extra(
+    owner: &KeyOwner,
+    access_token: &str,
+    auth_time: Option<i64>,
+    azp: &str,
+) -> HashMap<String, Value> {
+    let mut extra = HashMap::new();
+    if let Some(email) = owner.email.as_deref() {
+        extra.insert("email".to_string(), Value::String(email.to_string()));
+    }
+    if let Some(verified) = owner.email_verified {
+        extra.insert("email_verified".to_string(), Value::Bool(verified));
+    }
+    if let Some(auth_time) = auth_time {
+        extra.insert("auth_time".to_string(), Value::from(auth_time));
+    }
+    extra.insert("azp".to_string(), Value::String(azp.to_string()));
+    extra.insert(
+        "at_hash".to_string(),
+        Value::String(compute_at_hash(access_token)),
+    );
+    extra
 }
 
 impl ApiKeyJwtSigner {
@@ -189,11 +274,16 @@ impl ApiKeyJwtSigner {
         })
     }
 
-    /// Fetches the active signing key and builds a `TokenManager` from it. Shared by both
-    /// `sign` and `sign_id_token` so both tokens in a token-exchange response are always signed
-    /// by the same key, and so key rotation is picked up per-call exactly as the previous
-    /// hand-rolled `jsonwebtoken::encode` path did.
-    async fn token_manager(&self) -> Result<TokenManager> {
+    /// Fetches the active signing key and builds a `TokenManager` from it. Used by `sign` for the
+    /// plain CRUD API-key issuance path, and by `oauth2_op`'s axum handler (via
+    /// `TokenExchangeState::token_manager`) to build the single `TokenManager` a whole
+    /// token-exchange request shares -- `authkestra_op::handlers::token::handle_token` takes one
+    /// `&TokenManager` per call, and the exchange/refresh grant overrides mint both the access and
+    /// id token from it, so both tokens in a response are always signed by the same key. Key
+    /// rotation is picked up per-call exactly as the previous hand-rolled `jsonwebtoken::encode`
+    /// path did. `pub(crate)` rather than private: `oauth2_op` lives in this crate but a different
+    /// module.
+    pub(crate) async fn token_manager(&self) -> Result<TokenManager> {
         let active = self
             .repo
             .get_active_signing_key()
@@ -250,40 +340,14 @@ impl ApiKeyJwtSigner {
         // single-`now`-for-everything implementation.
         let expires_in_secs = (expires_at - now).num_seconds().max(0) as u64;
 
-        let mut extra = HashMap::new();
-        extra.insert("typ".to_string(), Value::String(TOKEN_TYP.to_string()));
-        if let Some(azp) = self.audience.as_deref() {
-            extra.insert("azp".to_string(), Value::String(azp.to_string()));
-        }
-        extra.insert(
-            "lightbridge_caller_kind".to_string(),
-            Value::String(lightbridge_authz_bearer::API_KEY_CALLER_KIND.to_string()),
+        let extra = access_token_extra(
+            owner,
+            api_key_id,
+            project_id,
+            account_id,
+            allowed_models,
+            self.audience.as_deref(),
         );
-        extra.insert("sid".to_string(), Value::String(cuid2()));
-        extra.insert(
-            "api_key_id".to_string(),
-            Value::String(api_key_id.to_string()),
-        );
-        extra.insert(
-            "project_id".to_string(),
-            Value::String(project_id.to_string()),
-        );
-        extra.insert(
-            "account_id".to_string(),
-            Value::String(account_id.to_string()),
-        );
-        if let Some(email) = owner.email.as_deref() {
-            extra.insert("email".to_string(), Value::String(email.to_string()));
-        }
-        if let Some(verified) = owner.email_verified {
-            extra.insert("email_verified".to_string(), Value::Bool(verified));
-        }
-        if let Some(models) = allowed_models {
-            extra.insert(
-                "allowed_models".to_string(),
-                Value::Array(models.into_iter().map(Value::String).collect()),
-            );
-        }
 
         let token = manager
             .issue_user_token_with_extra(
@@ -302,69 +366,6 @@ impl ApiKeyJwtSigner {
             "issued api-key jwt"
         );
         Ok(SignedApiKey { token, expires_at })
-    }
-
-    /// Issues a derived `id_token` (ADR-0011, Decisions 1 and 7) via
-    /// `TokenManager::issue_id_token_with_extra`. Only ever called from the token-exchange grant
-    /// when the granted scope set includes `openid` -- never from the CRUD API-key issuance path,
-    /// which has no OIDC `id_token` concept.
-    ///
-    /// Claim-by-claim provenance, matching ADR-0011 Decision 7 exactly:
-    /// - `iss`/`sub`/`aud`/`exp`/`iat` are set by `TokenManager` itself. `sub` is `owner.subject`,
-    ///   the upstream `subject_token`'s own `sub` -- never re-minted.
-    /// - `nonce` is the dedicated parameter, merged by `TokenManager` only when `Some`; pass `None`
-    ///   to omit it. Callers must not synthesize one.
-    /// - `auth_time` is supplied via `extra` only when `Some`, so it is omitted (never defaulted to
-    ///   "now") when the upstream token carried none.
-    /// - `email`/`email_verified` are upstream snapshots, mirroring the access token.
-    /// - `at_hash` is computed by the caller (see `compute_at_hash`) over the access token minted
-    ///   alongside this id_token in the same response, and passed in via `extra`.
-    /// - `azp` is `self.audience` -- the only "client" concept this phase has (ADR-0011 Decision 5,
-    ///   a real per-client audience, is out of scope until phase 2).
-    ///
-    /// Tenant context (`api_key_id`/`project_id`/`account_id`) and role/quota data never appear on
-    /// the id_token, matching ADR-0011 Decision 7's "not a second home for authorization data".
-    #[allow(clippy::too_many_arguments)]
-    pub async fn sign_id_token(
-        &self,
-        owner: &KeyOwner,
-        access_token: &str,
-        auth_time: Option<i64>,
-        nonce: Option<String>,
-        now: DateTime<Utc>,
-        expires_at: DateTime<Utc>,
-    ) -> Result<String> {
-        let client_id = self.audience.as_deref().ok_or_else(|| {
-            Error::Server("oauth2.signing.audience is required to issue an id_token".to_string())
-        })?;
-        let manager = self.token_manager().await?;
-        let expires_in_secs = (expires_at - now).num_seconds().max(0) as u64;
-
-        let mut extra = HashMap::new();
-        if let Some(email) = owner.email.as_deref() {
-            extra.insert("email".to_string(), Value::String(email.to_string()));
-        }
-        if let Some(verified) = owner.email_verified {
-            extra.insert("email_verified".to_string(), Value::Bool(verified));
-        }
-        if let Some(auth_time) = auth_time {
-            extra.insert("auth_time".to_string(), Value::from(auth_time));
-        }
-        extra.insert("azp".to_string(), Value::String(client_id.to_string()));
-        extra.insert(
-            "at_hash".to_string(),
-            Value::String(compute_at_hash(access_token)),
-        );
-
-        manager
-            .issue_id_token_with_extra(
-                identity_for(owner),
-                client_id,
-                nonce,
-                expires_in_secs,
-                extra,
-            )
-            .map_err(|e| Error::Server(format!("id token signing failed: {e}")))
     }
 }
 
@@ -388,11 +389,21 @@ fn to_jwks(raw: Vec<Value>) -> Vec<authkestra_engine::token::jwk::Jwk> {
 /// to call it. `userinfo_endpoint` is genuinely optional on the type and is nulled out below,
 /// since this service does not serve one.
 ///
-/// `token_endpoint_auth_methods_supported` is set explicitly to `["none"]`, not
-/// `OidcDiscovery::from_config`'s default (`client_secret_basic`/`client_secret_post`/`none`) --
-/// this service never accepts secret-based client auth, and phase 1 (this ADR) does not yet
-/// authenticate clients at all (that is Decision 6/Decision 3, phase 2).
-fn discovery_document(issuer: &str, token_exchange_scopes: Option<&[String]>) -> serde_json::Value {
+/// `token_endpoint_auth_methods_supported` is set explicitly to `["none"]`, plus `private_key_jwt`
+/// when `private_key_jwt_supported` (at least one registered client is `confidential` -- ADR-0011
+/// Decision 6/9) -- never `OidcDiscovery::from_config`'s default (`client_secret_basic`/
+/// `client_secret_post`/`none`), since this service never accepts secret-based client auth at all.
+///
+/// `authorization_endpoint` is dropped from the serialized document entirely (ADR-0011 Decision 9,
+/// item 8): `OidcDiscovery`'s field is a required `String` with no way to omit it via the type
+/// itself, but this service never serves `/authorize` (no authorization_code flow -- ADR-0011
+/// Context) and `response_types_supported` never advertises `"code"`, so publishing a URL for it
+/// would promise a capability nothing here provides.
+fn discovery_document(
+    issuer: &str,
+    token_exchange_scopes: Option<&[String]>,
+    private_key_jwt_supported: bool,
+) -> serde_json::Value {
     let enabled = token_exchange_scopes.is_some();
     let scopes_supported = token_exchange_scopes
         .map(<[String]>::to_vec)
@@ -430,7 +441,11 @@ fn discovery_document(issuer: &str, token_exchange_scopes: Option<&[String]>) ->
     doc.token_endpoint = format!("{issuer}/oauth2/token");
     doc.userinfo_endpoint = None;
     doc.response_modes_supported = Vec::new();
-    doc.token_endpoint_auth_methods_supported = vec!["none".to_string()];
+    doc.token_endpoint_auth_methods_supported = if private_key_jwt_supported {
+        vec!["none".to_string(), "private_key_jwt".to_string()]
+    } else {
+        vec!["none".to_string()]
+    };
     doc.claims_supported = [
         "iss",
         "sub",
@@ -459,7 +474,12 @@ fn discovery_document(issuer: &str, token_exchange_scopes: Option<&[String]>) ->
     .map(String::from)
     .collect();
 
-    serde_json::to_value(&doc).unwrap_or_else(|_| serde_json::json!({ "issuer": issuer }))
+    let mut value =
+        serde_json::to_value(&doc).unwrap_or_else(|_| serde_json::json!({ "issuer": issuer }));
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("authorization_endpoint");
+    }
+    value
 }
 
 /// Public OIDC discovery + JWKS routes for Authorino's `jwt` identity. JWKS is served live from
@@ -479,6 +499,7 @@ pub fn well_known_router<S>(
     issuer: &str,
     repo: Arc<StoreRepo>,
     token_exchange_scopes: Option<Vec<String>>,
+    private_key_jwt_supported: bool,
 ) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -493,7 +514,13 @@ where
             get(move || {
                 let issuer = discovery_issuer.clone();
                 let scopes = token_exchange_scopes.clone();
-                async move { Json(discovery_document(&issuer, scopes.as_deref())) }
+                async move {
+                    Json(discovery_document(
+                        &issuer,
+                        scopes.as_deref(),
+                        private_key_jwt_supported,
+                    ))
+                }
             }),
         )
         .route(
