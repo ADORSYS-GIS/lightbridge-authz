@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.1.1](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v2.1.0...v2.1.1) (2026-08-14)
+
+
+### Documentation
+
+* **agents:** add ADR-0038 persistence rule, correct SQLx-as-design spots ([#235](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/235)) ([653d2da](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/653d2da7d535cecf329cda5c00b33a6a45299993))
+* **agents:** add house CUID2 identifier rule (ADR 0039) ([#234](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/234)) ([d4efea9](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/d4efea92063586b08310cf3e5b90019a834a12b9))
+
 ## [2.1.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v2.0.0...v2.1.0) (2026-08-07)
 
 
