@@ -1,6 +1,6 @@
 # ADR-0011: authz issues a derived OIDC token object via token-exchange, minted and dispatched through authkestra
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-14
 - Decision owners: @stephane-segning
 
