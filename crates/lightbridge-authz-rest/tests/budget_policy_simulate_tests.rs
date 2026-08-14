@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use cratestack::{CoolContext, Value};
+use cratestack::{CoolContext, CoolError, Value};
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api::schema::procedures::ProcedureRegistry;
 use lightbridge_authz_budget::PolicyStore;
@@ -141,6 +141,53 @@ async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, CoolCon
     (procedures, ctx)
 }
 
+/// Thin `invoke_with_db` wrapper (cratestack#512: `ProcedureRegistry` methods now require an
+/// `Authorized` witness only `authorize_with_db`/`invoke_with_db` can produce). `simulateBudgetPolicy`
+/// declares only `@allow(auth() != null)`, so this runs that check before invoking the registry
+/// method, matching what the generated RPC dispatch handler does for a real request -- see
+/// `budget_policy_procedure_tests.rs`'s identical pattern.
+async fn simulate(
+    procedures: &Procedures,
+    db: &schema::Cratestack,
+    ctx: &CoolContext,
+    args: schema::procedures::simulate_budget_policy::Args,
+) -> Result<schema::procedures::simulate_budget_policy::Output, CoolError> {
+    let call_args = args.clone();
+    schema::procedures::simulate_budget_policy::invoke_with_db(
+        db,
+        &args,
+        ctx,
+        |authorized| async move {
+            procedures
+                .simulate_budget_policy(db, ctx, call_args, authorized)
+                .await
+        },
+    )
+    .await
+}
+
+/// Same wrapper as [`simulate`], for `getBudgetPolicyStatus` (also `@allow(auth() != null)`),
+/// used by this file's "simulation writes nothing" test to read status before/after simulating.
+async fn get_status(
+    procedures: &Procedures,
+    db: &schema::Cratestack,
+    ctx: &CoolContext,
+    args: schema::procedures::get_budget_policy_status::Args,
+) -> Result<schema::procedures::get_budget_policy_status::Output, CoolError> {
+    let call_args = args.clone();
+    schema::procedures::get_budget_policy_status::invoke_with_db(
+        db,
+        &args,
+        ctx,
+        |authorized| async move {
+            procedures
+                .get_budget_policy_status(db, ctx, call_args, authorized)
+                .await
+        },
+    )
+    .await
+}
+
 fn simulate_args(
     rule_data_json: &str,
     scenario_json: &str,
@@ -190,18 +237,18 @@ async fn simulation_reports_the_decision_a_proposed_policy_would_make(pool: PgPo
     let db = lazy_cratestack_db();
 
     let proposed_revision = "budget-policy-simulated-v1";
-    let decision = procedures
-        .simulate_budget_policy(
-            &db,
-            &ctx,
-            simulate_args(
-                &proposed_rule_data_json(proposed_revision),
-                SCENARIO_GRANT_COUNT_5_JSON,
-                "5000000",
-            ),
-        )
-        .await
-        .expect("a valid simulation must succeed");
+    let decision = simulate(
+        &procedures,
+        &db,
+        &ctx,
+        simulate_args(
+            &proposed_rule_data_json(proposed_revision),
+            SCENARIO_GRANT_COUNT_5_JSON,
+            "5000000",
+        ),
+    )
+    .await
+    .expect("a valid simulation must succeed");
 
     assert_eq!(
         decision.effect, "auto_approve",
@@ -230,18 +277,18 @@ async fn simulation_writes_nothing_to_the_ledger_or_policy_tables(pool: PgPool) 
     let (procedures, ctx) = procedures_and_ctx(pool.clone(), "tester-simulate-no-write").await;
     let db = lazy_cratestack_db();
 
-    let decision = procedures
-        .simulate_budget_policy(
-            &db,
-            &ctx,
-            simulate_args(
-                &proposed_rule_data_json("budget-policy-simulated-would-persist"),
-                SCENARIO_GRANT_COUNT_5_JSON,
-                "5000000",
-            ),
-        )
-        .await
-        .expect("a valid simulation must succeed");
+    let decision = simulate(
+        &procedures,
+        &db,
+        &ctx,
+        simulate_args(
+            &proposed_rule_data_json("budget-policy-simulated-would-persist"),
+            SCENARIO_GRANT_COUNT_5_JSON,
+            "5000000",
+        ),
+    )
+    .await
+    .expect("a valid simulation must succeed");
     assert_eq!(
         decision.effect, "auto_approve",
         "sanity check that the simulated policy really would have produced a grant-worthy \
@@ -262,28 +309,26 @@ async fn get_budget_policy_status_is_unaffected_by_a_simulation_run(pool: PgPool
     let (procedures, ctx) = procedures_and_ctx(pool, "tester-simulate-status").await;
     let db = lazy_cratestack_db();
 
-    let status_before = procedures
-        .get_budget_policy_status(&db, &ctx, status_args(SEEDED_POLICY_SET_ID))
+    let status_before = get_status(&procedures, &db, &ctx, status_args(SEEDED_POLICY_SET_ID))
         .await
         .expect("status read must succeed");
     assert_eq!(status_before.activePolicyRevision, SEEDED_POLICY_REVISION);
 
     // A different `policy_revision` than what's active, so a leak would be unmissable.
-    procedures
-        .simulate_budget_policy(
-            &db,
-            &ctx,
-            simulate_args(
-                &proposed_rule_data_json("budget-policy-simulated-should-not-leak"),
-                SCENARIO_GRANT_COUNT_5_JSON,
-                "5000000",
-            ),
-        )
-        .await
-        .expect("a valid simulation must succeed");
+    simulate(
+        &procedures,
+        &db,
+        &ctx,
+        simulate_args(
+            &proposed_rule_data_json("budget-policy-simulated-should-not-leak"),
+            SCENARIO_GRANT_COUNT_5_JSON,
+            "5000000",
+        ),
+    )
+    .await
+    .expect("a valid simulation must succeed");
 
-    let status_after = procedures
-        .get_budget_policy_status(&db, &ctx, status_args(SEEDED_POLICY_SET_ID))
+    let status_after = get_status(&procedures, &db, &ctx, status_args(SEEDED_POLICY_SET_ID))
         .await
         .expect("status read must succeed");
     assert_eq!(
@@ -299,17 +344,17 @@ async fn malformed_scenario_json_is_rejected(pool: PgPool) {
     let (procedures, ctx) = procedures_and_ctx(pool.clone(), "tester-simulate-bad-scenario").await;
     let db = lazy_cratestack_db();
 
-    let result = procedures
-        .simulate_budget_policy(
-            &db,
-            &ctx,
-            simulate_args(
-                &proposed_rule_data_json("budget-policy-simulated-bad-scenario"),
-                MALFORMED_SCENARIO_JSON,
-                "5000000",
-            ),
-        )
-        .await;
+    let result = simulate(
+        &procedures,
+        &db,
+        &ctx,
+        simulate_args(
+            &proposed_rule_data_json("budget-policy-simulated-bad-scenario"),
+            MALFORMED_SCENARIO_JSON,
+            "5000000",
+        ),
+    )
+    .await;
 
     match result {
         Err(cratestack::CoolError::BadRequest(_)) => {}
@@ -329,13 +374,13 @@ async fn malformed_rule_data_is_rejected(pool: PgPool) {
     let (procedures, ctx) = procedures_and_ctx(pool.clone(), "tester-simulate-bad-ruledata").await;
     let db = lazy_cratestack_db();
 
-    let result = procedures
-        .simulate_budget_policy(
-            &db,
-            &ctx,
-            simulate_args(MALFORMED_RULE_DATA, SCENARIO_GRANT_COUNT_5_JSON, "5000000"),
-        )
-        .await;
+    let result = simulate(
+        &procedures,
+        &db,
+        &ctx,
+        simulate_args(MALFORMED_RULE_DATA, SCENARIO_GRANT_COUNT_5_JSON, "5000000"),
+    )
+    .await;
 
     match result {
         Err(cratestack::CoolError::BadRequest(_)) => {}

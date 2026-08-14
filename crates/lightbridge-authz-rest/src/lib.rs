@@ -27,7 +27,9 @@ use routers::opa_router;
 
 use cratestack::idempotency::IdempotencyLayer;
 use cratestack::ratelimit::{RateLimitConfig, RateLimitLayer, RateLimitStore};
-use cratestack::{CodecSet, CoolContext, CoolError, SqlxIdempotencyStore, Value};
+use cratestack::{
+    CodecSet, CoolContext, CoolError, DEFAULT_BODY_LIMIT_BYTES, SqlxIdempotencyStore, Value,
+};
 use cratestack_codec_json::JsonCodec;
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
@@ -409,6 +411,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::create_account::Args,
+        _authorized: schema::procedures::create_account::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<schema::procedures::create_account::Output, CoolError>,
     > + Send {
@@ -431,6 +434,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::rotate_api_key::Args,
+        _authorized: schema::procedures::rotate_api_key::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<schema::procedures::rotate_api_key::Output, CoolError>,
     > + Send {
@@ -463,6 +467,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::create_api_key::Args,
+        _authorized: schema::procedures::create_api_key::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<schema::procedures::create_api_key::Output, CoolError>,
     > + Send {
@@ -495,6 +500,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::disable_account::Args,
+        _authorized: schema::procedures::disable_account::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<schema::procedures::disable_account::Output, CoolError>,
     > + Send {
@@ -517,6 +523,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::enable_account::Args,
+        _authorized: schema::procedures::enable_account::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<schema::procedures::enable_account::Output, CoolError>,
     > + Send {
@@ -539,6 +546,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::disable_project::Args,
+        _authorized: schema::procedures::disable_project::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<schema::procedures::disable_project::Output, CoolError>,
     > + Send {
@@ -561,6 +569,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::enable_project::Args,
+        _authorized: schema::procedures::enable_project::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<schema::procedures::enable_project::Output, CoolError>,
     > + Send {
@@ -583,6 +592,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::set_default_project::Args,
+        _authorized: schema::procedures::set_default_project::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<schema::procedures::set_default_project::Output, CoolError>,
     > + Send {
@@ -605,6 +615,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::revoke_api_key::Args,
+        _authorized: schema::procedures::revoke_api_key::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<schema::procedures::revoke_api_key::Output, CoolError>,
     > + Send {
@@ -627,6 +638,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::add_project_member::Args,
+        _authorized: schema::procedures::add_project_member::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<schema::procedures::add_project_member::Output, CoolError>,
     > + Send {
@@ -651,6 +663,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::remove_project_member::Args,
+        _authorized: schema::procedures::remove_project_member::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<schema::procedures::remove_project_member::Output, CoolError>,
     > + Send {
@@ -674,6 +687,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::set_project_member_role::Args,
+        _authorized: schema::procedures::set_project_member_role::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<
             schema::procedures::set_project_member_role::Output,
@@ -701,6 +715,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::set_project_member_quota_tier::Args,
+        _authorized: schema::procedures::set_project_member_quota_tier::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<
             schema::procedures::set_project_member_quota_tier::Output,
@@ -736,6 +751,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::list_project_roster::Args,
+        _authorized: schema::procedures::list_project_roster::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<schema::procedures::list_project_roster::Output, CoolError>,
     > + Send {
@@ -758,6 +774,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::delete_account_permanently::Args,
+        _authorized: schema::procedures::delete_account_permanently::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<
             schema::procedures::delete_account_permanently::Output,
@@ -795,6 +812,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::activate_budget_policy::Args,
+        _authorized: schema::procedures::activate_budget_policy::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<schema::procedures::activate_budget_policy::Output, CoolError>,
     > + Send {
@@ -852,6 +870,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::get_budget_policy_status::Args,
+        _authorized: schema::procedures::get_budget_policy_status::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<
             schema::procedures::get_budget_policy_status::Output,
@@ -894,6 +913,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::simulate_budget_policy::Args,
+        _authorized: schema::procedures::simulate_budget_policy::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<schema::procedures::simulate_budget_policy::Output, CoolError>,
     > + Send {
@@ -967,6 +987,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::request_budget_refill::Args,
+        _authorized: schema::procedures::request_budget_refill::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<schema::procedures::request_budget_refill::Output, CoolError>,
     > + Send {
@@ -1013,6 +1034,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::list_pending_augmentation_requests::Args,
+        _authorized: schema::procedures::list_pending_augmentation_requests::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<
             schema::procedures::list_pending_augmentation_requests::Output,
@@ -1047,6 +1069,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::approve_augmentation_request::Args,
+        _authorized: schema::procedures::approve_augmentation_request::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<
             schema::procedures::approve_augmentation_request::Output,
@@ -1079,6 +1102,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         _db: &schema::Cratestack,
         ctx: &CoolContext,
         args: schema::procedures::reject_augmentation_request::Args,
+        _authorized: schema::procedures::reject_augmentation_request::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<
             schema::procedures::reject_augmentation_request::Output,
@@ -1173,6 +1197,12 @@ pub fn build_api_router(
         Procedures::new(issuer, policy_store, refill_service, review_service),
         CodecSet::new(LenientCborCodec::default(), JsonCodec),
         CratestackAuthProvider::new(bearer.clone()),
+        // cratestack 0.7.12 (#413) made this request-body-size bound an explicit parameter instead
+        // of an axum implementation detail. `DEFAULT_BODY_LIMIT_BYTES` (2 MiB) is the value the
+        // changelog documents as reproducing the pre-0.7.12 runtime behavior exactly — this call
+        // site accepted no larger body before this bump either, since axum's own `Bytes` extractor
+        // already refused anything over 2 MiB with no layer required.
+        DEFAULT_BODY_LIMIT_BYTES,
     )
     .layer(IdempotencyLayer::new(idempotency_store, IDEMPOTENCY_TTL))
     .layer(RateLimitLayer::new(

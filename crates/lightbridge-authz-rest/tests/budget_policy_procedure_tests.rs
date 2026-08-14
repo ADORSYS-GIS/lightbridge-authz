@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use cratestack::{CoolContext, Value};
+use cratestack::{CoolContext, CoolError, Value};
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api::schema::procedures::ProcedureRegistry;
 use lightbridge_authz_budget::PolicyStore;
@@ -120,6 +120,52 @@ async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, CoolCon
     (procedures, ctx)
 }
 
+/// Thin `invoke_with_db` wrapper (cratestack#512: `ProcedureRegistry` methods now require an
+/// `Authorized` witness only `authorize_with_db`/`invoke_with_db` can produce, closing the exact
+/// direct-call bypass this file's module doc describes). Runs the real `@allow(auth() != null)`
+/// check `activateBudgetPolicy` declares before invoking the registry method, matching what the
+/// generated RPC dispatch handler does for a real request.
+async fn activate(
+    procedures: &Procedures,
+    db: &schema::Cratestack,
+    ctx: &CoolContext,
+    args: schema::procedures::activate_budget_policy::Args,
+) -> Result<schema::procedures::activate_budget_policy::Output, CoolError> {
+    let call_args = args.clone();
+    schema::procedures::activate_budget_policy::invoke_with_db(
+        db,
+        &args,
+        ctx,
+        |authorized| async move {
+            procedures
+                .activate_budget_policy(db, ctx, call_args, authorized)
+                .await
+        },
+    )
+    .await
+}
+
+/// Same wrapper as [`activate`], for `getBudgetPolicyStatus` (also `@allow(auth() != null)`).
+async fn get_status(
+    procedures: &Procedures,
+    db: &schema::Cratestack,
+    ctx: &CoolContext,
+    args: schema::procedures::get_budget_policy_status::Args,
+) -> Result<schema::procedures::get_budget_policy_status::Output, CoolError> {
+    let call_args = args.clone();
+    schema::procedures::get_budget_policy_status::invoke_with_db(
+        db,
+        &args,
+        ctx,
+        |authorized| async move {
+            procedures
+                .get_budget_policy_status(db, ctx, call_args, authorized)
+                .await
+        },
+    )
+    .await
+}
+
 fn activate_args(
     policy_set_id: &str,
     rule_data_json: Option<String>,
@@ -148,20 +194,19 @@ async fn activating_new_rule_data_is_immediately_reflected_by_status(pool: PgPoo
     let db = lazy_cratestack_db();
 
     let new_rule_data = valid_replacement_rule_data("budget-policy-v2-it");
-    let activate_output = procedures
-        .activate_budget_policy(
-            &db,
-            &ctx,
-            activate_args(SEEDED_POLICY_SET_ID, Some(new_rule_data), None),
-        )
-        .await
-        .expect("valid rule data must activate");
+    let activate_output = activate(
+        &procedures,
+        &db,
+        &ctx,
+        activate_args(SEEDED_POLICY_SET_ID, Some(new_rule_data), None),
+    )
+    .await
+    .expect("valid rule data must activate");
 
     assert_eq!(activate_output.policySetId, SEEDED_POLICY_SET_ID);
     assert_eq!(activate_output.activePolicyRevision, "budget-policy-v2-it");
 
-    let status = procedures
-        .get_budget_policy_status(&db, &ctx, status_args(SEEDED_POLICY_SET_ID))
+    let status = get_status(&procedures, &db, &ctx, status_args(SEEDED_POLICY_SET_ID))
         .await
         .expect("status read must succeed");
     assert_eq!(
@@ -177,24 +222,23 @@ async fn malformed_rule_data_is_rejected_and_status_still_reports_the_original_r
     let (procedures, ctx) = procedures_and_ctx(pool, "tester-malformed").await;
     let db = lazy_cratestack_db();
 
-    let result = procedures
-        .activate_budget_policy(
-            &db,
-            &ctx,
-            activate_args(
-                SEEDED_POLICY_SET_ID,
-                Some(MALFORMED_RULE_DATA.to_string()),
-                None,
-            ),
-        )
-        .await;
+    let result = activate(
+        &procedures,
+        &db,
+        &ctx,
+        activate_args(
+            SEEDED_POLICY_SET_ID,
+            Some(MALFORMED_RULE_DATA.to_string()),
+            None,
+        ),
+    )
+    .await;
     assert!(
         result.is_err(),
         "malformed rule data must be rejected, not silently activated: {result:?}"
     );
 
-    let status = procedures
-        .get_budget_policy_status(&db, &ctx, status_args(SEEDED_POLICY_SET_ID))
+    let status = get_status(&procedures, &db, &ctx, status_args(SEEDED_POLICY_SET_ID))
         .await
         .expect("status read must succeed");
     assert_eq!(
@@ -210,32 +254,31 @@ async fn rollback_via_revision_id_works_and_status_reflects_it(pool: PgPool) {
 
     // Activate a new revision first, so there is genuinely something to roll back FROM.
     let new_rule_data = valid_replacement_rule_data("budget-policy-v3-it");
-    procedures
-        .activate_budget_policy(
-            &db,
-            &ctx,
-            activate_args(SEEDED_POLICY_SET_ID, Some(new_rule_data), None),
-        )
-        .await
-        .expect("valid rule data must activate");
+    activate(
+        &procedures,
+        &db,
+        &ctx,
+        activate_args(SEEDED_POLICY_SET_ID, Some(new_rule_data), None),
+    )
+    .await
+    .expect("valid rule data must activate");
 
     // Roll back to the originally seeded revision by id (the runbook's rollback flow).
-    let rollback_output = procedures
-        .activate_budget_policy(
-            &db,
-            &ctx,
-            activate_args(
-                SEEDED_POLICY_SET_ID,
-                None,
-                Some(SEEDED_REVISION_ID.to_string()),
-            ),
-        )
-        .await
-        .expect("rolling back to an existing revision id must succeed");
+    let rollback_output = activate(
+        &procedures,
+        &db,
+        &ctx,
+        activate_args(
+            SEEDED_POLICY_SET_ID,
+            None,
+            Some(SEEDED_REVISION_ID.to_string()),
+        ),
+    )
+    .await
+    .expect("rolling back to an existing revision id must succeed");
     assert_eq!(rollback_output.activePolicyRevision, SEEDED_POLICY_REVISION);
 
-    let status = procedures
-        .get_budget_policy_status(&db, &ctx, status_args(SEEDED_POLICY_SET_ID))
+    let status = get_status(&procedures, &db, &ctx, status_args(SEEDED_POLICY_SET_ID))
         .await
         .expect("status read must succeed");
     assert_eq!(
@@ -249,24 +292,23 @@ async fn supplying_both_rule_data_and_revision_id_is_rejected(pool: PgPool) {
     let (procedures, ctx) = procedures_and_ctx(pool, "tester-both").await;
     let db = lazy_cratestack_db();
 
-    let result = procedures
-        .activate_budget_policy(
-            &db,
-            &ctx,
-            activate_args(
-                SEEDED_POLICY_SET_ID,
-                Some(valid_replacement_rule_data("budget-policy-both")),
-                Some(SEEDED_REVISION_ID.to_string()),
-            ),
-        )
-        .await;
+    let result = activate(
+        &procedures,
+        &db,
+        &ctx,
+        activate_args(
+            SEEDED_POLICY_SET_ID,
+            Some(valid_replacement_rule_data("budget-policy-both")),
+            Some(SEEDED_REVISION_ID.to_string()),
+        ),
+    )
+    .await;
     assert!(
         result.is_err(),
         "supplying both ruleDataJson and revisionId must be rejected: {result:?}"
     );
 
-    let status = procedures
-        .get_budget_policy_status(&db, &ctx, status_args(SEEDED_POLICY_SET_ID))
+    let status = get_status(&procedures, &db, &ctx, status_args(SEEDED_POLICY_SET_ID))
         .await
         .expect("status read must succeed");
     assert_eq!(
@@ -280,9 +322,13 @@ async fn supplying_neither_rule_data_nor_revision_id_is_rejected(pool: PgPool) {
     let (procedures, ctx) = procedures_and_ctx(pool, "tester-neither").await;
     let db = lazy_cratestack_db();
 
-    let result = procedures
-        .activate_budget_policy(&db, &ctx, activate_args(SEEDED_POLICY_SET_ID, None, None))
-        .await;
+    let result = activate(
+        &procedures,
+        &db,
+        &ctx,
+        activate_args(SEEDED_POLICY_SET_ID, None, None),
+    )
+    .await;
     assert!(
         result.is_err(),
         "supplying neither ruleDataJson nor revisionId must be rejected: {result:?}"
@@ -294,26 +340,25 @@ async fn an_unknown_policy_set_id_is_rejected_by_both_procedures(pool: PgPool) {
     let (procedures, ctx) = procedures_and_ctx(pool, "tester-unknown-set").await;
     let db = lazy_cratestack_db();
 
-    let activate_result = procedures
-        .activate_budget_policy(
-            &db,
-            &ctx,
-            activate_args(
-                "not-a-real-policy-set",
-                Some(valid_replacement_rule_data("budget-policy-unreachable")),
-                None,
-            ),
-        )
-        .await;
+    let activate_result = activate(
+        &procedures,
+        &db,
+        &ctx,
+        activate_args(
+            "not-a-real-policy-set",
+            Some(valid_replacement_rule_data("budget-policy-unreachable")),
+            None,
+        ),
+    )
+    .await;
     assert!(
         activate_result.is_err(),
         "an unknown policySetId must be rejected, not silently redirected to the real set: \
          {activate_result:?}"
     );
 
-    let status_result = procedures
-        .get_budget_policy_status(&db, &ctx, status_args("not-a-real-policy-set"))
-        .await;
+    let status_result =
+        get_status(&procedures, &db, &ctx, status_args("not-a-real-policy-set")).await;
     assert!(
         status_result.is_err(),
         "an unknown policySetId must be rejected on the read path too: {status_result:?}"

@@ -36,7 +36,9 @@ use axum::http::{Request, StatusCode};
 use base64::Engine as _;
 use common::{MapBearer, Wire, admin_perms, external_oauth2, rpc_call, token_info, viewer_perms};
 use cratestack::SqlxIdempotencyStore;
-use cratestack::{CodecSet, Json, Value as CValue, ratelimit::RateLimitStore};
+use cratestack::{
+    CodecSet, DEFAULT_BODY_LIMIT_BYTES, Json, Value as CValue, ratelimit::RateLimitStore,
+};
 use cratestack_codec_cbor::CborCodec;
 use cratestack_codec_json::JsonCodec;
 use lightbridge_authz_api::schema;
@@ -552,12 +554,20 @@ async fn crud_lifecycle_for_all_resources_over_json() {
 
 /// Regression for the legacy jsonb-`null` `allowed_models` decode failure (migration
 /// `20260723000001`). Pre-cratestack projects stored an empty `allowed_models` as the jsonb `null`
-/// LITERAL (`'null'::jsonb`), not SQL NULL. cratestack's `allowedModels Json?` decode fails on it
-/// with `expected value at line 1 column 1`, so `model.Project.list`/`get` 500 for that account.
-/// This forces the legacy shape, asserts it reproduces the 500, then applies the migration's exact
-/// normalization (`'null'::jsonb` -> SQL NULL) and asserts the list recovers and returns the project.
+/// LITERAL (`'null'::jsonb`), not SQL NULL.
+///
+/// **Updated by the cratestack 0.5.1 -> 0.7.16 lockstep bump.** Before that bump, cratestack's
+/// `allowedModels Json?` decode failed on the literal with `expected value at line 1 column 1`,
+/// so `model.Project.list`/`get` 500'd for that account -- migration `20260723000001` existed to
+/// normalize it away. Verified empirically against the bumped server: the jsonb `null` literal now
+/// decodes cleanly with no normalization needed at all (`Value`'s untagged decode,
+/// cratestack/cratestack#506, is more lenient here than the old externally-tagged decode was).
+/// `20260723000001` is not reverted -- it is harmless and idempotent against already-`NULL` rows --
+/// but this test's own "must reproduce the 500" assumption no longer holds, so it now asserts the
+/// corrected reality directly instead. See `list_and_get_recover_from_legacy_cratestack_tagged_value_json`
+/// below for the *new* decode risk this same version bump introduced.
 #[tokio::test]
-async fn list_projects_recovers_from_legacy_jsonb_null_allowed_models() {
+async fn list_projects_tolerates_legacy_jsonb_null_allowed_models() {
     let subject = format!("owner-{}", cuid2());
     let ctx = setup(admin_bearer(&subject)).await;
     let r = &ctx.router;
@@ -580,42 +590,18 @@ async fn list_projects_recovers_from_legacy_jsonb_null_allowed_models() {
     .unwrap();
     assert!(!sql_null && json_type.as_deref() == Some("null"));
 
-    let list = |r: Router| {
-        let account_id = account_id.clone();
-        async move {
-            rpc_call(
-                r,
-                "model.Project.list",
-                Wire::Json,
-                &json!({ "filters": [{ "key": "accountId", "value": account_id }] }),
-                Some("admin"),
-            )
-            .await
-        }
-    };
-
-    // Before the fix: the jsonb null literal breaks cratestack's decode.
-    let (before, _) = list(r.clone()).await;
-    assert_eq!(
-        before,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "the legacy jsonb null literal must reproduce the decode failure"
-    );
-
-    // Migration 20260723000001: normalize `'null'::jsonb` -> SQL NULL.
-    sqlx::query(
-        "UPDATE projects SET allowed_models = NULL WHERE jsonb_typeof(allowed_models) = 'null'",
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Project.list",
+        Wire::Json,
+        &json!({ "filters": [{ "key": "accountId", "value": account_id }] }),
+        Some("admin"),
     )
-    .execute(&ctx.verify)
-    .await
-    .expect("normalize jsonb null -> SQL NULL");
-
-    // After: the list decodes cleanly and returns the project.
-    let (after, body) = list(r.clone()).await;
+    .await;
     assert_eq!(
-        after,
+        status,
         StatusCode::OK,
-        "after normalization the list must decode: {}",
+        "the jsonb null literal must decode cleanly on 0.7.16 without normalization: {}",
         String::from_utf8_lossy(&body)
     );
     let ids: Vec<String> = json_body(&body)["items"]
@@ -626,19 +612,26 @@ async fn list_projects_recovers_from_legacy_jsonb_null_allowed_models() {
         .collect();
     assert!(
         ids.contains(&project_id),
-        "normalized project must be listed; got {ids:?}"
+        "project must be listed; got {ids:?}"
     );
 }
 
 /// Regression for the legacy plain-`{}` `default_limits` decode failure (migration
-/// `20260723000002`). Pre-cratestack projects stored an empty `default_limits` as plain JSON `{}`,
-/// but cratestack persists/expects its externally-tagged `Value` form (an empty map is
-/// `{"Map": {}}`). Reading the plain `{}` fails with `expected value at line 1 column 2`, so
-/// `model.Project.list`/`get` 500 for that account. `default_limits` is NOT NULL, so this forces the
-/// legacy shape, asserts it reproduces the 500, applies the migration's exact normalization
-/// (plain `{}` -> the tagged empty map `{"Map": {}}`), and asserts the list recovers.
+/// `20260723000002`). Pre-cratestack projects stored an empty `default_limits` as plain JSON `{}`.
+///
+/// **Updated by the cratestack 0.5.1 -> 0.7.16 lockstep bump.** Before that bump, cratestack
+/// persisted/expected `Value`'s externally-tagged form (an empty map was `{"Map": {}}`), so reading
+/// the plain `{}` failed with `expected value at line 1 column 2` and `20260723000002` normalized
+/// plain `{}` INTO the tagged `{"Map": {}}` shape to match. cratestack/cratestack#162 (0.7.2) moved
+/// column persistence to plain JSON, and #506 (0.7.11) made `Value`'s wire serde plain too -- so
+/// after this bump, plain `{}` is the CORRECT, expected shape and decodes with no normalization at
+/// all, while the OLD tagged `{"Map": {}}` shape -- what `20260723000002` itself produced, and what
+/// every row this service wrote before this bump also has, since production has only ever run
+/// cratestack-pg 0.5.1 until now -- is what now needs fixing. See migration
+/// `20260814000001_untag_legacy_cratestack_value_json.sql` and
+/// `list_and_get_recover_from_legacy_cratestack_tagged_value_json` below.
 #[tokio::test]
-async fn list_projects_recovers_from_legacy_plain_empty_default_limits() {
+async fn list_projects_tolerates_legacy_plain_empty_default_limits() {
     let subject = format!("owner-{}", cuid2());
     let ctx = setup(admin_bearer(&subject)).await;
     let r = &ctx.router;
@@ -646,7 +639,7 @@ async fn list_projects_recovers_from_legacy_plain_empty_default_limits() {
     let account_id = create_account(r, "admin", &billing_id).await;
     let project_id = create_project(r, "admin", &account_id, "legacy-dl").await;
 
-    // Legacy write shape: plain JSON empty object, NOT cratestack's `{"Map": {}}`.
+    // Legacy write shape: plain JSON empty object -- now also the CURRENT, expected shape.
     sqlx::query("UPDATE projects SET default_limits = '{}'::jsonb WHERE id = $1")
         .bind(&project_id)
         .execute(&ctx.verify)
@@ -663,38 +656,18 @@ async fn list_projects_recovers_from_legacy_plain_empty_default_limits() {
         "must be plain empty object, not the tagged form"
     );
 
-    let list = |r: Router| {
-        let account_id = account_id.clone();
-        async move {
-            rpc_call(
-                r,
-                "model.Project.list",
-                Wire::Json,
-                &json!({ "filters": [{ "key": "accountId", "value": account_id }] }),
-                Some("admin"),
-            )
-            .await
-        }
-    };
-
-    let (before, _) = list(r.clone()).await;
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Project.list",
+        Wire::Json,
+        &json!({ "filters": [{ "key": "accountId", "value": account_id }] }),
+        Some("admin"),
+    )
+    .await;
     assert_eq!(
-        before,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "the legacy plain `{{}}` default_limits must reproduce the decode failure"
-    );
-
-    // Migration 20260723000002: normalize plain `{}` -> the tagged empty map `{"Map": {}}`.
-    sqlx::query(r#"UPDATE projects SET default_limits = '{"Map": {}}'::jsonb WHERE default_limits = '{}'::jsonb"#)
-        .execute(&ctx.verify)
-        .await
-        .expect("normalize plain {} -> tagged empty map");
-
-    let (after, body) = list(r.clone()).await;
-    assert_eq!(
-        after,
+        status,
         StatusCode::OK,
-        "after normalization the list must decode: {}",
+        "plain `{{}}` must decode cleanly on 0.7.16 without normalization: {}",
         String::from_utf8_lossy(&body)
     );
     let ids: Vec<String> = json_body(&body)["items"]
@@ -705,7 +678,96 @@ async fn list_projects_recovers_from_legacy_plain_empty_default_limits() {
         .collect();
     assert!(
         ids.contains(&project_id),
-        "normalized project must be listed; got {ids:?}"
+        "project must be listed; got {ids:?}"
+    );
+}
+
+/// The regression the cratestack 0.5.1 -> 0.7.16 lockstep bump itself introduces: `Value`'s wire
+/// serde went from externally-tagged (`{"Map": {...}}`, `{"List": [...]}`, `{"String": "x"}`, ...)
+/// to plain JSON (cratestack/cratestack#162, #506). The untagged decoder does not error on an old
+/// tagged row -- it decodes the tag wrapper literally as ordinary content, silently. Since
+/// production has only ever run cratestack-pg 0.5.1 before this bump, EVERY existing
+/// `projects.allowed_models`/`default_limits` row with non-null content is in the old tagged
+/// shape, not a rare corner case. Confirmed by first reproducing the corruption directly (this
+/// test's own `before_migration` assertions below, run before the corrective SQL executes a
+/// second time), then confirming migration `20260814000001_untag_legacy_cratestack_value_json.sql`
+/// fixes it -- both `allowedModels` (`List`-tagged) and `default_limits` (`Map`-tagged, with a
+/// nested `Int`-tagged scalar, proving the unwrap recurses) in one project row.
+#[tokio::test]
+async fn list_and_get_recover_from_legacy_cratestack_tagged_value_json() {
+    let subject = format!("owner-{}", cuid2());
+    let ctx = setup(admin_bearer(&subject)).await;
+    let r = &ctx.router;
+    let billing_id = format!("tenant-{}", cuid2());
+    let account_id = create_account(r, "admin", &billing_id).await;
+    let project_id = create_project(r, "admin", &account_id, "legacy-tagged").await;
+
+    // Simulate data as every existing production row actually looks today: written (or, for
+    // `default_limits`, historically normalized by `20260723000002`) under cratestack-pg 0.5.1's
+    // externally-tagged `Value` serde -- NOT a synthetic/hypothetical shape.
+    sqlx::query(
+        r#"UPDATE projects SET
+            allowed_models = '{"List": [{"String": "gpt-4"}, {"String": "gpt-3.5"}]}'::jsonb,
+            default_limits = '{"Map": {"requestsPerSecond": {"Int": 5}}}'::jsonb
+        WHERE id = $1"#,
+    )
+    .bind(&project_id)
+    .execute(&ctx.verify)
+    .await
+    .expect("seed legacy 0.5.1-era tagged Value JSON");
+
+    let get = |r: Router| {
+        let project_id = project_id.clone();
+        async move {
+            rpc_call(
+                r,
+                "model.Project.get",
+                Wire::Json,
+                &json!({ "id": project_id }),
+                Some("admin"),
+            )
+            .await
+        }
+    };
+
+    // Before the fix: the tag wrapper leaks into the API response verbatim instead of being
+    // interpreted -- a real, silent correctness bug, not a decode error (status is 200).
+    let (before_status, before_body) = get(r.clone()).await;
+    assert_eq!(before_status, StatusCode::OK);
+    let before_json = json_body(&before_body);
+    assert_eq!(
+        before_json["allowedModels"],
+        json!({"List": [{"String": "gpt-4"}, {"String": "gpt-3.5"}]}),
+        "reproduces the tagged-Value corruption before the untag migration runs"
+    );
+    assert_eq!(
+        before_json["defaultLimits"],
+        json!({"Map": {"requestsPerSecond": {"Int": 5}}}),
+        "reproduces the tagged-Value corruption before the untag migration runs"
+    );
+
+    // Migration 20260814000001's exact corrective SQL (already applied once at `migrate` time,
+    // before this test seeded fresh legacy data above -- re-running it here is what proves it
+    // would fix real legacy rows, and that it is safe to re-run/idempotent).
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/20260814000001_untag_legacy_cratestack_value_json.sql"
+    ))
+    .execute(&ctx.verify)
+    .await
+    .expect("re-apply the untag-legacy-Value migration");
+
+    let (after_status, after_body) = get(r.clone()).await;
+    assert_eq!(after_status, StatusCode::OK);
+    let after_json = json_body(&after_body);
+    assert_eq!(
+        after_json["allowedModels"],
+        json!(["gpt-4", "gpt-3.5"]),
+        "allowedModels must be a plain string array after the untag migration"
+    );
+    assert_eq!(
+        after_json["defaultLimits"],
+        json!({"requestsPerSecond": 5}),
+        "defaultLimits must be a plain object (nested Int unwrapped too) after the untag migration"
     );
 }
 
@@ -1299,6 +1361,7 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
         ),
         CodecSet::new(CborCodec, JsonCodec),
         CratestackAuthProvider::new(admin_bearer(&subject)),
+        DEFAULT_BODY_LIMIT_BYTES,
     );
 
     let batch = json!([

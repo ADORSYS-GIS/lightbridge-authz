@@ -129,16 +129,36 @@ mimalloc = "0"
 # `TransportStyle::Grpc` variant that 0.4.13's `cratestack-macros` does not cover, so the workspace
 # stopped compiling with `error[E0004]: non-exhaustive patterns`. Bump every line below together, or
 # none of them — a partial bump within a semver-compatible range is exactly the failure mode.
-cratestack-core = "0.7.1"
-cratestack-axum = "0.7.1"
-cratestack-redis = "0.7.1"
+#
+# SECOND OCCURRENCE (2026-08-14, this bump): Dependabot again moved `cratestack-core`/`-axum`/
+# `-redis`/`-codec-cbor` to 0.7.1 and `cratestack-codec-json` to 0.7.6 (#227/#228/#229/#230 plus
+# follow-on codec-json bumps, commits 6918d7c/a27df05/38e2bb1/eb5815a/5de5491/5d9f6e6) while leaving
+# `cratestack` (`cratestack-pg`) pinned at 0.5.1 — the one line among these six whose `version =`
+# sits inside a `{ package = "cratestack-pg", ... }` table instead of a bare `name = "x.y.z"` line.
+# Not independently confirmed as Dependabot's actual root cause (no access to its updater internals
+# from here), but it is the one structural difference between the line that got left behind and the
+# five that didn't, twice in a row now. Result: two incompatible major lines resolved simultaneously
+# (`cratestack-core` 0.5.2 AND 0.7.10, `cratestack-axum` 0.5.1 AND 0.7.5, both codecs duplicated),
+# breaking `cargo check -p lightbridge-authz-rest` with `CodecSet<LenientCborCodec, JsonCodec>:
+# HttpTransport` not satisfied plus a second `RateLimitStore` mismatch, both rooted in
+# `crates/lightbridge-authz-api/src/lib.rs`'s `cratestack::include_server_schema!`. New baseline:
+# every line below is 0.7.16, and `.github/dependabot.yml` now groups every `cratestack*` package
+# into one PR so a future bump can no longer land partially regardless of the root cause above.
+# Verify with `cargo metadata --format-version 1 | jq` (or equivalent) that every `cratestack-*`
+# package name resolves to exactly one version — `cargo tree -d | grep cratestack` is NOT that
+# check: it also prints single-version `cratestack-*` crates as leaves of other, unrelated
+# already-duplicated packages (e.g. `bytes`, `windows_x86_64_msvc`), so it is not zero even on a
+# fully consistent tree; don't use it as the pass/fail gate for this failure mode.
+cratestack-core = "0.7.16"
+cratestack-axum = "0.7.16"
+cratestack-redis = "0.7.16"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
 # `include_server_schema!` macro emits `::cratestack::*` paths (see cratestack-pg lib docs). The
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
 # it to build the RPC router (ADR-0003).
-cratestack = { package = "cratestack-pg", version = "0.5.1" }
-cratestack-codec-cbor = "0.7.1"
-cratestack-codec-json = "0.7.6"
+cratestack = { package = "cratestack-pg", version = "0.7.16" }
+cratestack-codec-cbor = "0.7.16"
+cratestack-codec-json = "0.7.16"
 # Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
