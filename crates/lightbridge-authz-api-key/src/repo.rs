@@ -653,15 +653,16 @@ impl StoreRepo {
         let row: ExchangeRefreshTokenRow = sqlx::query_as(
             r#"
             INSERT INTO exchange_refresh_tokens
-              (id, subject, account_id, project_id, token_hash, scope, status, email, email_verified, auth_time, created_at, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8, $9, $10, $11)
-            RETURNING id, subject, account_id, project_id, token_hash, scope, status, email, email_verified, auth_time, created_at, expires_at, last_used_at
+              (id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, created_at, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, $10, $11, $12)
+            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, created_at, expires_at, last_used_at
             "#,
         )
         .bind(input.id)
         .bind(input.subject)
         .bind(input.account_id)
         .bind(input.project_id)
+        .bind(input.client_id)
         .bind(input.token_hash)
         .bind(input.scope)
         .bind(input.email)
@@ -681,7 +682,7 @@ impl StoreRepo {
     ) -> Result<Option<ExchangeRefreshTokenRow>> {
         let row = sqlx::query_as(
             r#"
-            SELECT id, subject, account_id, project_id, token_hash, scope, status, email, email_verified, auth_time, created_at, expires_at, last_used_at
+            SELECT id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, created_at, expires_at, last_used_at
             FROM exchange_refresh_tokens
             WHERE token_hash = $1
               AND status = 'active'
@@ -695,76 +696,55 @@ impl StoreRepo {
         Ok(row)
     }
 
-    /// Atomically consumes a refresh token (single-use rotation): under a row lock, flips the
-    /// presented token to `rotated` and inserts a successor that copies the session context
-    /// (subject/account/project/scope/email/email_verified/auth_time), returning the successor.
-    /// Returns `None` if the presented token is no longer active/live (already used, revoked,
-    /// expired) so the caller can reject replay. Copying context inside the transaction keeps
-    /// rotation race-safe without the caller needing a separate lookup.
-    pub async fn rotate_exchange_refresh_token(
+    /// Atomically consumes a refresh token (single-use enforcement, backing
+    /// `authkestra_op::refresh::RefreshTokenStore::consume_token`): flips the presented token from
+    /// `active` to `rotated` and returns the row that was consumed, or `None` if it was not
+    /// active/live (already used, revoked, expired) so the caller rejects those cases uniformly.
+    /// A single `UPDATE ... WHERE status = 'active' ... RETURNING` is its own compare-and-swap --
+    /// Postgres holds the row lock for the statement's duration, so two concurrent presentations
+    /// of the same token can never both observe `status = 'active'` and both succeed. Unlike the
+    /// combined rotate-and-insert this replaces, minting the successor is a separate call
+    /// (`create_exchange_refresh_token`, driving `RefreshTokenStore::store_token`) -- the trait
+    /// splits "atomically revoke" from "store a new one" into two methods, so this mirrors that
+    /// shape rather than reintroducing the old single-transaction combo.
+    pub async fn consume_exchange_refresh_token(
         &self,
         presented_hash: &str,
-        new_id: &str,
-        new_token_hash: &str,
-        new_expires_at: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<Option<ExchangeRefreshTokenRow>> {
-        let mut tx = self.pool().begin().await?;
-        let existing: Option<ExchangeRefreshTokenRow> = sqlx::query_as(
+        let row: Option<ExchangeRefreshTokenRow> = sqlx::query_as(
             r#"
-            SELECT id, subject, account_id, project_id, token_hash, scope, status, email, email_verified, auth_time, created_at, expires_at, last_used_at
-            FROM exchange_refresh_tokens
+            UPDATE exchange_refresh_tokens
+            SET status = 'rotated', last_used_at = $2
             WHERE token_hash = $1
               AND status = 'active'
               AND expires_at > $2
-            FOR UPDATE
+            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, created_at, expires_at, last_used_at
             "#,
         )
         .bind(presented_hash)
         .bind(now)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(self.pool())
         .await?;
+        Ok(row)
+    }
 
-        let Some(existing) = existing else {
-            tx.rollback().await?;
-            return Ok(None);
-        };
-
+    /// Unconditionally revokes a refresh token by its hash (backing
+    /// `authkestra_op::refresh::RefreshTokenStore::revoke_token`). A no-op (not an error) when the
+    /// hash does not match an active row -- revoking something already gone is not a failure.
+    pub async fn revoke_exchange_refresh_token(&self, token_hash: &str) -> Result<()> {
         sqlx::query(
             r#"
             UPDATE exchange_refresh_tokens
-            SET status = 'rotated', last_used_at = $2
-            WHERE id = $1
+            SET status = 'revoked'
+            WHERE token_hash = $1
+              AND status = 'active'
             "#,
         )
-        .bind(&existing.id)
-        .bind(now)
-        .execute(&mut *tx)
+        .bind(token_hash)
+        .execute(self.pool())
         .await?;
-
-        let inserted: ExchangeRefreshTokenRow = sqlx::query_as(
-            r#"
-            INSERT INTO exchange_refresh_tokens
-              (id, subject, account_id, project_id, token_hash, scope, status, email, email_verified, auth_time, created_at, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8, $9, $10, $11)
-            RETURNING id, subject, account_id, project_id, token_hash, scope, status, email, email_verified, auth_time, created_at, expires_at, last_used_at
-            "#,
-        )
-        .bind(new_id)
-        .bind(&existing.subject)
-        .bind(&existing.account_id)
-        .bind(&existing.project_id)
-        .bind(new_token_hash)
-        .bind(&existing.scope)
-        .bind(&existing.email)
-        .bind(existing.email_verified)
-        .bind(existing.auth_time)
-        .bind(now)
-        .bind(new_expires_at)
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(Some(inserted))
+        Ok(())
     }
 
     /// Project-scoped rule (see the module-level mechanical rescoping this whole file follows):

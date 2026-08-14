@@ -84,6 +84,35 @@ oauth2:
       - profile
       - email
       - offline_access
+  # Real, config-sourced OAuth2/OIDC clients permitted to use the token-exchange endpoint above
+  # (ADR-0011, Decision 5). Empty here by default -- with no clients registered, every exchange
+  # fails client authentication (invalid_client), it is not left unprotected. Uncomment/adapt when
+  # enabling token_exchange for a real client. `public` clients present no credential beyond
+  # client_id; `confidential` clients authenticate via `private_key_jwt` only (ADR-0011, Decision
+  # 6 -- never client_secret_basic/client_secret_post) and need their public key inline as `jwks`
+  # (a JWK Set: `{"keys": [...]}`) -- there is deliberately no `jwks_uri`.
+  # clients:
+  #   - client_id: lightbridge-ss
+  #     type: public
+  #     scopes: [openid, profile, email, offline_access]
+  #     grant_types:
+  #       - "urn:ietf:params:oauth:grant-type:token-exchange"
+  #       - refresh_token
+  #     allowed_audiences: [lightbridge-ss]
+  #   - client_id: lightbridge-mcp
+  #     type: confidential
+  #     scopes: [openid, profile, email, offline_access]
+  #     grant_types:
+  #       - "urn:ietf:params:oauth:grant-type:token-exchange"
+  #       - refresh_token
+  #     allowed_audiences: [lightbridge-mcp]
+  #     jwks:
+  #       keys:
+  #         - kty: RSA
+  #           kid: "lightbridge-mcp-2026-08"
+  #           alg: RS256
+  #           n: "<base64url-encoded RSA modulus of lightbridge-mcp's public key>"
+  #           e: "AQAB"
   # Role-based access control. Roles arrive on the JWT in a single, flat, top-level claim
   # (`roles_claim`, configurable). Each role maps to the permissions it grants; a grant is `*`
   # (everything), `<resource>:*` (all actions on a resource), or `<resource>:<action>`. These

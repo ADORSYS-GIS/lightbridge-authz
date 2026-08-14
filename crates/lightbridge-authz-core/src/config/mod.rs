@@ -429,6 +429,65 @@ pub struct Oauth2 {
     /// (`crate::authz::default_role_permissions`).
     #[serde(default)]
     pub rbac: crate::authz::Rbac,
+    /// Real, config-sourced OAuth2/OIDC clients permitted to use the native token-exchange
+    /// endpoint (ADR-0011, Decision 5). Sourced from YAML only -- no database table, no
+    /// cratestack model (see that decision's revisit trigger: self-service client registration,
+    /// not needed today). Empty by default: token-exchange with no registered clients means every
+    /// request fails client authentication (`invalid_client`), not that the endpoint is
+    /// unprotected. Mapped onto `authkestra_op::client::ClientRegistration` in
+    /// `lightbridge_authz_rest::oauth2_op` (kept out of this crate so `core` never depends on
+    /// `authkestra-op`).
+    #[serde(default)]
+    pub clients: Vec<OauthClient>,
+}
+
+/// A registered OAuth2/OIDC client (ADR-0011, Decision 5). Mirrors
+/// `authkestra_op::client::ClientRegistration`'s 9 fields minus the two this service never needs:
+/// `client_secret_hash` (always `None` -- Decision 6 bans secret-based client auth outright) and
+/// `redirect_uris` (always empty -- these are machine clients presenting a `subject_token` they
+/// already hold, never a browser running the authorization-code flow this service structurally
+/// never serves; see ADR-0011 Context).
+#[derive(Debug, Clone, Deserialize)]
+pub struct OauthClient {
+    pub client_id: String,
+    /// `public` (no client authentication beyond the `client_id` itself) or `confidential`
+    /// (`private_key_jwt` only -- ADR-0011 Decision 6 bans `client_secret_basic`/
+    /// `client_secret_post` for every client this service registers).
+    #[serde(rename = "type")]
+    pub client_type: OauthClientType,
+    /// Scopes this client may request. Intersected with `Oauth2TokenExchange.allowed_scopes` (the
+    /// server-wide ceiling) at exchange/refresh time -- neither list alone is authoritative.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Grant types this client may use, as raw RFC 8693/OAuth2 grant-type strings (e.g.
+    /// `"urn:ietf:params:oauth:grant-type:token-exchange"`, `"refresh_token"`). Only those two are
+    /// ever meaningful here -- this service never runs `authorization_code` or the device flow (no
+    /// user store, ADR-0011 Context) -- but the list is not restricted at the config-parsing layer
+    /// so an operator typo surfaces as "client not authorized for this grant type" at request time
+    /// rather than a silent config-load failure.
+    #[serde(default)]
+    pub grant_types: Vec<String>,
+    /// Downstream audiences this client may request via the token-exchange `audience` parameter.
+    /// Per ADR-0011 Decision 5 the minted access token's `aud`/`azp` default to this client's own
+    /// `client_id` when no `audience` is requested; requesting anything else requires it to be
+    /// listed here.
+    #[serde(default)]
+    pub allowed_audiences: Vec<String>,
+    /// Inline JWK Set (`{"keys": [...]}`) -- the public half of a `confidential` client's keypair,
+    /// used to verify its `private_key_jwt` client assertions (RFC 7523 §2.2). Required for
+    /// `confidential` clients, ignored for `public` ones. Deliberately no `jwks_uri` counterpart
+    /// (ADR-0011 Decision 6): this service takes no HTTP-client dependency for client
+    /// authentication, so a confidential client's public key is a config value, not a fetch.
+    #[serde(default)]
+    pub jwks: Option<serde_json::Value>,
+}
+
+/// A client's authentication method at the token endpoint (ADR-0011, Decision 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OauthClientType {
+    Public,
+    Confidential,
 }
 
 impl Oauth2 {

@@ -2752,6 +2752,7 @@ dependencies = [
  "lightbridge-authz-core",
  "minicbor",
  "rand_core 0.6.4",
+ "redis",
  "reqwest 0.13.4",
  "rsa",
  "rustls",

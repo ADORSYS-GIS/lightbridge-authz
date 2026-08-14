@@ -41,6 +41,10 @@ tower-http.workspace = true
 cratestack-core.workspace = true
 cratestack-axum.workspace = true
 cratestack-redis.workspace = true
+# Direct client for `oauth2_op::client_assertion_store` (ADR-0011 phase 2): `ClientAssertionStore`
+# needs raw `SET NX PX` semantics, which `cratestack-redis` (a `RateLimitStore` implementation,
+# not a general-purpose client) does not expose.
+redis.workspace = true
 # Server facade + wire codecs: rest builds the generated RPC router, implements the
 # ProcedureRegistry, and wraps it with the CBOR/JSON codec set (ADR-0003).
 cratestack = { workspace = true }

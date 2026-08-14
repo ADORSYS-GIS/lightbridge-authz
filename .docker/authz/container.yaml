@@ -79,6 +79,21 @@ oauth2:
       - profile
       - email
       - offline_access
+  # Real, config-sourced OAuth2/OIDC clients permitted to use the token-exchange endpoint above
+  # (ADR-0011, Decision 5). Empty here by default -- with no clients registered, every exchange
+  # fails client authentication (invalid_client), it is not left unprotected. `public` clients
+  # present no credential beyond client_id; `confidential` clients authenticate via
+  # `private_key_jwt` only (ADR-0011, Decision 6) and need their public key inline as `jwks` (a
+  # JWK Set) -- there is deliberately no `jwks_uri`. See config/default.yaml for the same example
+  # with per-field comments.
+  # clients:
+  #   - client_id: lightbridge-ss
+  #     type: public
+  #     scopes: [openid, profile, email, offline_access]
+  #     grant_types:
+  #       - "urn:ietf:params:oauth:grant-type:token-exchange"
+  #       - refresh_token
+  #     allowed_audiences: [lightbridge-ss]
   # Role-based access control. Roles arrive on the JWT in a single, flat, top-level claim
   # (`roles_claim`, configurable). Each role maps to the permissions it grants; a grant is `*`
   # (everything), `<resource>:*` (all actions on a resource), or `<resource>:<action>`. These
