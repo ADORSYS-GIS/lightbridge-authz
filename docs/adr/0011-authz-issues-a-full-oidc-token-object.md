@@ -119,8 +119,28 @@ This repository already hand-rolls, badly and partially, several things `authkes
 as a maintained surface: client concept (none today — see Decision 5), refresh-token rotation
 (`rotate_exchange_refresh_token`, `crates/lightbridge-authz-api-key/src/repo.rs:701`, a `SELECT ...
 FOR UPDATE` CAS), JWKS publication, and the discovery document. Adopting `authkestra-op::handle_token`
-(`authkestra crates/authkestra-op/src/handlers/token.rs:96-189`) deletes that duplication rather
-than adding to it.
+(`authkestra crates/authkestra-op/src/handlers/token.rs:96-189`) as the entry point deletes that
+duplication — client authentication, discovery/JWKS document shapes, and the refresh-token-store
+seam are genuinely adopted from upstream, not reimplemented.
+
+**Correction (added when phase 2 landed, PR #288):** that "deletes duplication" framing does not
+hold for the exchange and refresh *grant bodies themselves*. At the pinned rev, `OpStore`'s
+`handle_token_exchange`/`handle_refresh_token` are real, overridable trait methods — but their
+*default* bodies (`authkestra_op::handlers::token::default_handle_token_exchange`/
+`default_handle_refresh_token`) are `pub(crate)` inside `authkestra-op`, unreachable from this
+crate, and neither one calls `issue_user_token_with_extra`/`issue_id_token_with_extra` — so there
+is no default implementation to delegate to, even setting visibility aside, that could stamp
+`account_id`/`project_id`/`api_key_id`/`allowed_models` onto the minted token. `TokenExchangeOpStore`'s
+overrides of both methods (`crates/lightbridge-authz-rest/src/oauth2_op/store.rs`,
+`handle_token_exchange` at lines 100–289, 190 lines; `handle_refresh_token` at lines 298–452, 155
+lines) are therefore full from-scratch reimplementations of the RFC 8693 exchange/refresh logic —
+subject-token validation, audience binding, scope intersection, token minting — not thin
+delegations to shared upstream code, and together they are the majority of #288's new code. The
+module's own doc comment (`store.rs:1–24`) documents this in detail, including the one further
+deliberate divergence from upstream's own default (validating the presented `subject_token` via
+this service's Keycloak-JWKS validator, not `tokens.validate_token` against our own signing key).
+What genuinely delegates, per the paragraph above, is client authentication, discovery/JWKS shapes,
+and the refresh-token storage seam — not the grant-body logic itself.
 
 We implement `OpStore` (`store.rs:13-100`, a supertrait requiring `ClientStore` + `RefreshTokenStore`
 + `AuthorizationCodeStore` + `DeviceCodeStore`, 13 required methods total — 1 + 4 + 2 + 6):
@@ -471,6 +491,15 @@ from authkestra even though `handle_token_exchange` itself is not (yet) reachabl
 - `OpStore` costs 13 required methods to implement 2 grant types; 8 of those (the
   `AuthorizationCodeStore`/`DeviceCodeStore` slots) are permanent no-op stubs. That is real,
   reviewable surface carried for a supertrait we use a third of.
+- Adopting `handle_token` as the dispatch entry point did **not** end up deleting the exchange- and
+  refresh-grant logic itself, contrary to Decision 3's original framing — see that decision's
+  correction. `TokenExchangeOpStore::handle_token_exchange`/`handle_refresh_token`
+  (`crates/lightbridge-authz-rest/src/oauth2_op/store.rs`, 190 and 155 lines respectively) are
+  full RFC 8693 reimplementations against the `OpStore` seam, carried entirely by this codebase,
+  because the upstream default bodies are both unreachable (`pub(crate)`) and incapable of
+  stamping our custom claims even if they were reachable. What this ADR actually deleted is client
+  authentication, discovery/JWKS document construction, and the refresh-token storage seam — real
+  wins, just smaller than "the whole dispatch is now upstream's problem."
 - This ADR's headline feature (id_token + custom claims on token-exchange) is blocked on **two**
   separate upstream `authkestra-op` changes that do not exist yet (Decision 3): the missing
   `extra`/`id_token` seam, and `Claims.aud` needing multi-value support before this repo's own
@@ -509,10 +538,11 @@ from authkestra even though `handle_token_exchange` itself is not (yet) reachabl
 - `ClientAssertionStore::record_jti` (Decision 6) must be implemented and wired via
   `CompositeOpStore::with_client_assertion_store` before any confidential client can authenticate at
   all — tracked as a hard implementation requirement, not follow-up polish.
-- `AGENTS.md:452` claims project context including `role`/`quota_tier`/`project_quota` is "sealed
-  into the JWT" for the human plane. That contradicts both the code (`ApiKeyClaims` has no such
-  fields) and the more authoritative `docs/governance-model-and-enforcement.md:272-282`. Flagged as
-  a stale-doc fix to be made separately — not corrected as part of this ADR.
+- `AGENTS.md`'s "Identity context resolution" section claimed project context including
+  `role`/`quota_tier`/`project_quota` was "sealed into the JWT" for the human plane. That
+  contradicted both the code (no such fields in the signed claims) and the more authoritative
+  `docs/governance-model-and-enforcement.md:272-282`. Flagged here as a stale-doc fix to be made
+  separately — corrected in the consolidated token-exchange-followups PR, not as part of this ADR.
 - `authkestra-op`'s exchange handler already accepts `subject_token_type: id_token`
   (`token.rs:1007-1016`); our own current hand-rolled dispatch only accepts `access_token`
   (`token_exchange.rs:119-127`). Whether to accept an upstream-issued id_token as a `subject_token`
