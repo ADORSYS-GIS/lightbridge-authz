@@ -19,3 +19,13 @@ ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2026-0214",
 ]
+
+# Temporary pin: root Cargo.toml pins authkestra-engine/authkestra-op/authkestra-resource to a git
+# rev (marcjazz/authkestra @ a19cdd2d984094a11b7c7546ae81d5d4de39da73) pending a crates.io release
+# carrying upstream PRs #207/#208 — see the "GIT PIN, not a crates.io version" comment on those
+# three lines in root Cargo.toml for the full rationale. This is the sole exemption: any OTHER git
+# dependency must fail `cargo deny check sources`, not warn silently. Remove this allow-git entry
+# in the same change that swaps those three lines back to a crates.io version pin.
+[sources]
+unknown-git = "deny"
+allow-git = ["https://github.com/marcjazz/authkestra"]
