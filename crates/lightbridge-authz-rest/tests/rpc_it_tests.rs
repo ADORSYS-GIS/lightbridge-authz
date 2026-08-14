@@ -1102,23 +1102,30 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
 // Section 3: soft-delete + api_key_validation view security fix.
 // ---------------------------------------------------------------------------------------------
 
-/// Build the OPA introspection router backed by a real `StoreRepo` on the live pool, so a POST to
-/// `/v1/authorino/validate/introspect` exercises exactly the validation SQL view authz-opa reads.
-fn opa_router(core: Arc<dyn DbPoolTrait>) -> Router {
-    let repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(core.clone()));
-    let state = Arc::new(OpaState {
+/// Shared OPA state backed by a real `StoreRepo` on the live pool, so both the assembled router
+/// and a direct call into `handlers::opa::validate_api_key_context` exercise exactly the same
+/// validation SQL authz-opa reads.
+fn opa_state(core: Arc<dyn DbPoolTrait>) -> Arc<OpaState> {
+    let repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(core));
+    Arc::new(OpaState {
         repo,
         basic_auth: BasicAuth {
             username: "authorino".to_string(),
             password: "secret".to_string(),
         },
         billing: Arc::new(billing()),
-    });
+    })
+}
+
+/// Build the OPA introspection router backed by a real `StoreRepo` on the live pool, so a POST to
+/// `/v1/authorino/validate/introspect` exercises exactly the validation SQL view authz-opa reads.
+fn opa_router(core: Arc<dyn DbPoolTrait>) -> Router {
+    let state = opa_state(core.clone());
     lightbridge_authz_rest::build_opa_router(state, core)
 }
 
-/// Introspect `secret` through the OPA endpoint; returns the `active` flag.
-async fn introspect_active(router: &Router, secret: &str) -> bool {
+/// Introspect `secret` through the OPA endpoint; returns the full decoded JSON body.
+async fn introspect_response(router: &Router, secret: &str) -> Value {
     let creds = base64::engine::general_purpose::STANDARD.encode("authorino:secret");
     let response = router
         .clone()
@@ -1139,8 +1146,16 @@ async fn introspect_active(router: &Router, secret: &str) -> bool {
         "introspect should be 200"
     );
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap();
-    v["active"].as_bool().unwrap_or(false)
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Introspect `secret` through the OPA endpoint; returns the `active` flag.
+async fn introspect_active(router: &Router, secret: &str) -> bool {
+    introspect_response(router, secret)
+        .await
+        .get("active")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 #[tokio::test]
@@ -1188,6 +1203,136 @@ async fn soft_deleted_api_key_is_excluded_and_fails_opa_validation() {
     assert!(
         !introspect_active(&opa, &secret).await,
         "a soft-deleted api-key must NOT validate at the OPA layer"
+    );
+}
+
+/// PATH B REGRESSION -- guards a fail-open, not a cosmetic response-shape bug.
+///
+/// `list_and_get_recover_from_legacy_cratestack_tagged_value_json` above covers Path A: the
+/// cratestack CRUD client leaking the tag wrapper into `model.Project.get`/`list` responses. This
+/// test covers the distinct Path B: the hand-written sqlx path
+/// (`StoreRepo::get_project_by_id` -> `StoreRepo::json_to_vec`,
+/// `crates/lightbridge-authz-api-key/src/repo.rs`), which every OPA/Authorino/introspect/MCP/
+/// token-exchange consumer reads through `handlers::opa::validate_api_key_context`
+/// (`crates/lightbridge-authz-rest/src/handlers/opa.rs:77-81`) and
+/// `handlers::introspect::introspect_api_key` (`crates/lightbridge-authz-rest/src/handlers/
+/// introspect.rs:62`).
+///
+/// `json_to_vec` decodes `allowed_models` by calling `serde_json::Value::as_array()`. A legacy
+/// 0.5.1-era tagged value (`{"List": [...]}`) is a JSON *object*, not an array, so `as_array()`
+/// returns `None` -- indistinguishable from SQL NULL, the documented "no restriction" sentinel
+/// (see `opa_tests.rs::introspect_omits_allowed_models_when_null`, which shows `None` == "omit the
+/// field == unrestricted"). Without migration
+/// `20260814000001_untag_legacy_cratestack_value_json.sql`, a project restricted to
+/// `["gpt-4.1-mini"]` silently reports UNRESTRICTED through every enforcement path: a model-
+/// allowlist bypass.
+#[tokio::test]
+async fn legacy_tagged_allowed_models_still_enforces_allowlist() {
+    let subject = format!("owner-legacy-am-{}", cuid2());
+    let ctx = setup(admin_bearer(&subject)).await;
+    let r = &ctx.router;
+    let opa = opa_router(ctx.core.clone());
+    let state = opa_state(ctx.core.clone());
+
+    let account_id = create_account(r, "admin", &format!("tenant-legacy-am-{}", cuid2())).await;
+
+    // Restricted project: seed 0.5.1-era externally-tagged `Value` JSON, the exact shape
+    // `list_and_get_recover_from_legacy_cratestack_tagged_value_json` seeds for `allowedModels`
+    // above, so both tests agree on what "legacy tagged data" looks like on disk.
+    let restricted_project_id =
+        create_project(r, "admin", &account_id, "legacy-am-restricted").await;
+    sqlx::query(
+        r#"UPDATE projects SET allowed_models = '{"List": [{"String": "gpt-4.1-mini"}]}'::jsonb WHERE id = $1"#,
+    )
+    .bind(&restricted_project_id)
+    .execute(&ctx.verify)
+    .await
+    .expect("seed legacy 0.5.1-era tagged allowed_models");
+
+    // Companion project: genuinely NULL `allowed_models` (the real "no restriction" sentinel),
+    // so the test distinguishes the two states rather than merely checking non-null.
+    let unrestricted_project_id =
+        create_project(r, "admin", &account_id, "legacy-am-unrestricted").await;
+    let unrestricted_raw: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT allowed_models FROM projects WHERE id = $1")
+            .bind(&unrestricted_project_id)
+            .fetch_one(&ctx.verify)
+            .await
+            .expect("fetch unrestricted project allowed_models");
+    assert!(
+        unrestricted_raw.is_none(),
+        "a newly created project must default allowed_models to SQL NULL, not jsonb null"
+    );
+
+    // Migration `20260814000001_untag_legacy_cratestack_value_json.sql`'s exact corrective SQL,
+    // re-applied here for the same reason `list_and_get_recover_from_legacy_cratestack_tagged_value_json`
+    // re-applies it above: this test's seed simulates a row that predates the migration, so
+    // running the migration's own fix against it (rather than relying on the one pass that ran at
+    // `migrate` time, before this row existed) is what proves the fix actually reaches rows like
+    // this one in production. Temporarily commenting out this block reproduces the pre-fix
+    // fail-open (see the PR description's captured `cargo test` output).
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/20260814000001_untag_legacy_cratestack_value_json.sql"
+    ))
+    .execute(&ctx.verify)
+    .await
+    .expect("re-apply the untag-legacy-Value migration");
+
+    let (_, restricted_secret) =
+        create_api_key(r, "admin", &restricted_project_id, "k-legacy-am-restricted").await;
+    let (_, unrestricted_secret) = create_api_key(
+        r,
+        "admin",
+        &unrestricted_project_id,
+        "k-legacy-am-unrestricted",
+    )
+    .await;
+
+    // Path 1: the OPA/Authorino validate path -- call `validate_api_key_context` directly (the
+    // shared function at opa.rs:77-81 every consumer above sits on top of).
+    let restricted_ctx = lightbridge_authz_rest::handlers::opa::validate_api_key_context(
+        &state,
+        &restricted_secret,
+        None,
+    )
+    .await
+    .expect("validate restricted key")
+    .expect("restricted key must be active");
+    assert_eq!(
+        restricted_ctx.project.allowed_models,
+        Some(vec!["gpt-4.1-mini".to_string()]),
+        "legacy tagged allowed_models must still resolve to the restricted list, not None \
+         (the fail-open under test)"
+    );
+
+    let unrestricted_ctx = lightbridge_authz_rest::handlers::opa::validate_api_key_context(
+        &state,
+        &unrestricted_secret,
+        None,
+    )
+    .await
+    .expect("validate unrestricted key")
+    .expect("unrestricted key must be active");
+    assert_eq!(
+        unrestricted_ctx.project.allowed_models, None,
+        "a genuinely NULL allowed_models must still resolve to None (unrestricted)"
+    );
+
+    // Path 2: the introspection path -- the real `/v1/authorino/validate/introspect` HTTP
+    // endpoint (introspect.rs:62), asserting the concrete field value on the wire.
+    let restricted_body = introspect_response(&opa, &restricted_secret).await;
+    assert_eq!(restricted_body["active"], true);
+    assert_eq!(
+        restricted_body["allowed_models"],
+        json!(["gpt-4.1-mini"]),
+        "introspection must report the restricted allowlist, not an absent/empty field: {restricted_body}"
+    );
+
+    let unrestricted_body = introspect_response(&opa, &unrestricted_secret).await;
+    assert_eq!(unrestricted_body["active"], true);
+    assert!(
+        unrestricted_body.get("allowed_models").is_none(),
+        "introspection must omit allowed_models for a genuinely unrestricted project: {unrestricted_body}"
     );
 }
 
