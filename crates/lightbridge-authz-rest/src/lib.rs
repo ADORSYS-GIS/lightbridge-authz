@@ -1165,14 +1165,16 @@ pub fn build_api_router(
             }),
         );
 
-    let token_exchange_enabled = token_exchange.is_some();
+    let token_exchange_scopes = token_exchange
+        .as_ref()
+        .map(|state| state.cfg.allowed_scopes.clone());
     if oauth2.is_self_signed()
         && let Some(signing) = oauth2.signing.as_ref()
     {
         public = public.merge(signing::well_known_router(
             &signing.issuer,
             signing_repo,
-            token_exchange_enabled,
+            token_exchange_scopes,
         ));
     }
 
