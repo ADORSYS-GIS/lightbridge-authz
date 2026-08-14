@@ -1165,6 +1165,91 @@ mod tests {
         }
     }
 
+    #[test]
+    fn extract_log_events_should_capture_real_envoy_access_log_json_keys() {
+        // Field names copied verbatim from ai-helm's
+        // charts/core-gateway/templates/envoy-proxy.yaml accessLog JSON format
+        // block (api_key_id/project_id/account_id/user_id/gen_ai.request.model),
+        // NOT from this file's own PROJECT_KEYS/ACCOUNT_KEYS/etc. lists.
+        let payload: ExportLogsServiceRequest = serde_json::from_value(json!({
+            "resourceLogs": [
+                {
+                    "scopeLogs": [
+                        {
+                            "logRecords": [
+                                {
+                                    "timeUnixNano": "1735689601000000000",
+                                    "attributes": [
+                                        {"key": "account_id", "value": {"stringValue": "acct_1"}},
+                                        {"key": "project_id", "value": {"stringValue": "proj_1"}},
+                                        {"key": "api_key_id", "value": {"stringValue": "key_1"}},
+                                        {"key": "user_id", "value": {"stringValue": "user_1"}},
+                                        {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4.1"}}
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("valid log payload");
+
+        let events = extract_log_events(payload);
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.account_id.as_deref(), Some("acct_1"));
+        assert_eq!(event.project_id.as_deref(), Some("proj_1"));
+        assert_eq!(event.api_key_id.as_deref(), Some("key_1"));
+        assert_eq!(event.user_id.as_deref(), Some("user_1"));
+        assert_eq!(event.model.as_deref(), Some("gpt-4.1"));
+    }
+
+    #[test]
+    fn extract_log_events_should_capture_real_envoy_access_log_keys_over_protobuf_wire() {
+        // Same as the JSON probe above, but goes through an actual protobuf
+        // encode -> decode -> extract_log_events roundtrip, exactly like
+        // production traffic (Content-Type: application/x-protobuf), to rule
+        // out any serde_json-specific artifact in the JSON probe above.
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![opentelemetry_proto::tonic::logs::v1::ResourceLogs {
+                resource: None,
+                scope_logs: vec![opentelemetry_proto::tonic::logs::v1::ScopeLogs {
+                    scope: None,
+                    log_records: vec![opentelemetry_proto::tonic::logs::v1::LogRecord {
+                        time_unix_nano: 1_735_689_601_000_000_000,
+                        severity_text: "INFO".to_string(),
+                        attributes: vec![
+                            string_kv("account_id", "acct_1"),
+                            string_kv("project_id", "proj_1"),
+                            string_kv("api_key_id", "key_1"),
+                            string_kv("user_id", "user_1"),
+                            string_kv("gen_ai.request.model", "gpt-4.1"),
+                        ],
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let mut encoded = Vec::new();
+        request.encode(&mut encoded).expect("should encode");
+
+        let decoded = ExportLogsServiceRequest::decode(encoded.as_slice()).expect("should decode");
+        let events = extract_log_events(decoded);
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.account_id.as_deref(), Some("acct_1"));
+        assert_eq!(event.project_id.as_deref(), Some("proj_1"));
+        assert_eq!(event.api_key_id.as_deref(), Some("key_1"));
+        assert_eq!(event.user_id.as_deref(), Some("user_1"));
+        assert_eq!(event.model.as_deref(), Some("gpt-4.1"));
+    }
+
     fn base_usage_event() -> UsageEvent {
         UsageEvent {
             observed_at: Utc::now(),
