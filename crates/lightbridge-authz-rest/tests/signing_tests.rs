@@ -216,6 +216,196 @@ fn at_hash_changes_with_the_access_token() {
     );
 }
 
+/// Regression test for the empty-`grant_types_supported`/`scopes_supported`/
+/// `response_types_supported` discovery document served in production
+/// (`https://auth.ai.camer.digital/.well-known/openid-configuration`). Does NOT need `it-tests` --
+/// `well_known_router`'s discovery route never touches the DB (only `/.well-known/jwks.json`
+/// does), so this runs in the default `cargo test -p lightbridge-authz-rest`.
+///
+/// Asserts the exact set `discovery_document` promises when token-exchange is enabled -- these
+/// values must stay in lockstep with what `token_exchange::TOKEN_EXCHANGE_GRANT`/
+/// `REFRESH_TOKEN_GRANT` and `handle_token`'s real dispatch accept (see `token_exchange.rs`), not
+/// just "non-empty".
+#[tokio::test]
+async fn discovery_advertises_exact_token_exchange_metadata_when_enabled() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use lightbridge_authz_rest::signing::well_known_router;
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    let scopes = vec![
+        "openid".to_string(),
+        "profile".to_string(),
+        "email".to_string(),
+        "offline_access".to_string(),
+    ];
+    let discovery = well_known_router::<()>(ISSUER, lazy_repo(), Some(scopes), false)
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(discovery.status(), StatusCode::OK);
+    let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        payload["grant_types_supported"],
+        json!([
+            "urn:ietf:params:oauth:grant-type:token-exchange",
+            "refresh_token",
+        ]),
+        "grant_types_supported must exactly match what handle_token dispatches: {payload}"
+    );
+    assert_eq!(
+        payload["scopes_supported"],
+        json!(["openid", "profile", "email", "offline_access"]),
+        "scopes_supported must exactly match oauth2.token_exchange.allowed_scopes: {payload}"
+    );
+    assert_eq!(
+        payload["response_types_supported"],
+        json!(["token", "id_token", "id_token token"]),
+        "response_types_supported must reflect the token-exchange response shapes: {payload}"
+    );
+    assert_eq!(
+        payload["token_endpoint"],
+        format!("{ISSUER}/oauth2/token"),
+        "token_endpoint must be advertised once token-exchange is actually mounted: {payload}"
+    );
+    assert_eq!(
+        payload["token_endpoint_auth_methods_supported"],
+        json!(["none"]),
+        "must never advertise client_secret_basic/client_secret_post (ADR-0011 Decision 6): {payload}"
+    );
+}
+
+/// Companion to the "enabled" case above: when token-exchange is off (`token_exchange_scopes` is
+/// `None` -- either `oauth2.token_exchange.enabled: false`, or the block is absent from config
+/// entirely, as in the live regression), the document must not claim capabilities the server
+/// doesn't have. Empty arrays for grant/response/scope metadata are the honest RFC 8414 way to say
+/// "no grants offered"; they are deliberately NOT hardcoded to non-empty regardless of config --
+/// see `discovery_document`'s doc comment for why that would be inventing a capability.
+#[tokio::test]
+async fn discovery_advertises_no_grants_when_exchange_disabled() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use lightbridge_authz_rest::signing::well_known_router;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    let discovery = well_known_router::<()>(ISSUER, lazy_repo(), None, false)
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(discovery.status(), StatusCode::OK);
+    let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        payload["grant_types_supported"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "no grants must be advertised when token-exchange is disabled: {payload}"
+    );
+    assert!(
+        payload["response_types_supported"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "no response types must be advertised when token-exchange is disabled: {payload}"
+    );
+    assert!(
+        payload["scopes_supported"].as_array().unwrap().is_empty(),
+        "no scopes must be advertised when token-exchange is disabled: {payload}"
+    );
+}
+
+/// Regression test, restored: this exact test (`discovery_omits_token_endpoint_when_exchange_disabled`)
+/// existed against the pre-ADR-0011 hand-built discovery document (added in #95) and was deleted
+/// during the authkestra swap (#286/#288) on the belief that `OidcDiscovery`'s required (non-`Option`)
+/// `token_endpoint` field made omitting it "impossible to preserve" -- see the now-removed doc
+/// comment this replaced. That was wrong: `discovery_document` already had the pattern for exactly
+/// this (`authorization_endpoint` is dropped from the serialized JSON post-hoc, for the identical
+/// reason), it just was not applied to `token_endpoint`. This is the live bug behind
+/// `https://auth.ai.camer.digital/.well-known/openid-configuration` serving a `token_endpoint` URL
+/// alongside empty `grant_types_supported` -- a spec-reading client sees an endpoint that accepts
+/// nothing. Run against unmodified code (before the `obj.remove("token_endpoint")` fix in
+/// `discovery_document`), this test fails: `token_endpoint` is present. Restoring the fix passes it.
+#[tokio::test]
+async fn discovery_omits_token_endpoint_when_exchange_disabled() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use lightbridge_authz_rest::signing::well_known_router;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    let discovery = well_known_router::<()>(ISSUER, lazy_repo(), None, false)
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(discovery.status(), StatusCode::OK);
+    let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        payload.get("token_endpoint").is_none(),
+        "token_endpoint must be absent when token-exchange is disabled -- \
+         a live token_endpoint URL advertising zero grants is worse than none: {payload}"
+    );
+    assert!(
+        payload.get("authorization_endpoint").is_none(),
+        "authorization_endpoint must always be absent -- this service never serves /authorize: {payload}"
+    );
+}
+
+/// ADR-0011 Decision 6: a `confidential` client authenticates via `private_key_jwt` only, never
+/// `client_secret_basic`/`client_secret_post`. This must hold with or without token-exchange being
+/// enabled -- confidentiality of client auth is independent of whether the grant itself is live.
+#[tokio::test]
+async fn discovery_advertises_private_key_jwt_only_when_a_confidential_client_is_registered() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use lightbridge_authz_rest::signing::well_known_router;
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    let discovery = well_known_router::<()>(ISSUER, lazy_repo(), None, true)
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(discovery.status(), StatusCode::OK);
+    let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    let methods = payload["token_endpoint_auth_methods_supported"]
+        .as_array()
+        .unwrap();
+    assert!(methods.contains(&json!("none")));
+    assert!(methods.contains(&json!("private_key_jwt")));
+    assert!(
+        !methods.contains(&json!("client_secret_basic"))
+            && !methods.contains(&json!("client_secret_post")),
+        "must never advertise secret-based client auth, confidential clients or not: {payload}"
+    );
+}
+
 #[cfg(feature = "it-tests")]
 mod db {
     use super::*;
@@ -786,50 +976,5 @@ mod db {
                 "claims_supported must list {claim}: {claims_supported:?}"
             );
         }
-    }
-
-    /// ADR-0011, Decision 9: `OidcDiscovery`'s `token_endpoint`/`grant_types_supported`/
-    /// `response_types_supported` fields are required (not `Option`), unlike the previous
-    /// hand-built document which omitted them entirely when token-exchange was disabled. This
-    /// replaces `discovery_omits_token_endpoint_when_exchange_disabled`, which asserted the old,
-    /// now-impossible-to-preserve behavior -- see `discovery_document`'s doc comment in
-    /// `signing.rs` for why.
-    #[tokio::test]
-    async fn discovery_advertises_no_grants_when_exchange_disabled() {
-        use axum::body::{Body, to_bytes};
-        use axum::http::{Request, StatusCode};
-        use lightbridge_authz_rest::signing::well_known_router;
-        use tower::ServiceExt;
-
-        let discovery = well_known_router::<()>(ISSUER, lazy_repo(), None, false)
-            .oneshot(
-                Request::builder()
-                    .uri("/.well-known/openid-configuration")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(discovery.status(), StatusCode::OK);
-        let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
-        let payload: Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            payload["grant_types_supported"]
-                .as_array()
-                .unwrap()
-                .is_empty(),
-            "no grants must be advertised when token-exchange is disabled: {payload}"
-        );
-        assert!(
-            payload["response_types_supported"]
-                .as_array()
-                .unwrap()
-                .is_empty(),
-            "no response types must be advertised when token-exchange is disabled: {payload}"
-        );
-        assert!(
-            payload["scopes_supported"].as_array().unwrap().is_empty(),
-            "no scopes must be advertised when token-exchange is disabled: {payload}"
-        );
     }
 }
