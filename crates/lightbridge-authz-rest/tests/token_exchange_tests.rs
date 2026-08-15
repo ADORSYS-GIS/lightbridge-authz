@@ -638,6 +638,42 @@ async fn aud_is_the_requesting_client_id_and_varies_between_clients(pool: PgPool
     assert_ne!(claims_a["aud"], claims_b["aud"]);
 }
 
+/// Real Keycloak-issued subject tokens carry a multi-valued `aud` (one entry per
+/// `oidc-audience-mapper` on the realm, e.g. `["lightbridge-api-key", "converse-frontend"]`) --
+/// the requesting client only needs to be ONE member of that array, not its sole value. This is
+/// the array-membership semantics `token_info.aud.iter().any(|a| a == &client_id)`
+/// (`oauth2_op/store.rs`) already implements; this test pins that behavior so a future edit
+/// cannot silently narrow it back to string equality against a single-valued `aud`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn subject_token_aud_array_containing_client_id_among_others_is_accepted(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let state = state_with(
+        repo.clone(),
+        Arc::new(MockBearer::new(
+            true,
+            vec![
+                "converse-frontend".to_string(),
+                PUBLIC_CLIENT_ID.to_string(),
+            ],
+        )),
+        vec![public_client(PUBLIC_CLIENT_ID)],
+        &redis_url(),
+    );
+
+    let (status, body) = post_token(
+        state,
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn subject_token_aud_not_naming_the_requesting_client_is_invalid_grant(pool: PgPool) {
     let repo = repo(pool);
@@ -957,8 +993,12 @@ async fn exchange_with_inactive_subject_token_is_unauthorized(pool: PgPool) {
     assert_eq!(body["error"], "invalid_token");
 }
 
+/// `seed()` gives `SUBJECT` a single project (`PROJECT_ID`), which the
+/// `projects_set_is_default` trigger therefore marks as that account's default -- so an omitted
+/// `project_id` must resolve to exactly it (`StoreRepo::find_default_project_id`), and the minted
+/// access token's `project_id` claim must reflect that resolution, not just a bare 200.
 #[sqlx::test(migrations = "../../migrations")]
-async fn missing_project_id_is_invalid_request(pool: PgPool) {
+async fn missing_project_id_resolves_caller_default_project(pool: PgPool) {
     let repo = repo(pool);
     bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
     seed(&repo).await;
@@ -969,8 +1009,47 @@ async fn missing_project_id_is_invalid_request(pool: PgPool) {
     )
     .await;
 
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let claims = decode_access_token_claims(
+        &repo,
+        body["access_token"].as_str().unwrap(),
+        PUBLIC_CLIENT_ID,
+    )
+    .await;
+    assert_eq!(
+        claims["project_id"], PROJECT_ID,
+        "an omitted project_id must resolve to the caller's auto-provisioned default project"
+    );
+}
+
+/// The fallback only ever resolves *the caller's own* default project -- it must never leak or
+/// substitute a different account's project, even one `SUBJECT` cannot see. Distinct from
+/// `exchange_for_non_member_project_is_denied` below, which covers an explicit, wrong
+/// `project_id`; this covers the *default-resolution* path finding nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn missing_project_id_with_no_projects_is_denied(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    // Deliberately account-only: create_account never provisions a project by itself (that is a
+    // separate "ensure default project" bootstrap call), so this subject legitimately has zero
+    // projects and therefore no default to fall back to.
+    repo.create_account(
+        SUBJECT,
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .expect("seed account");
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["error"], "access_denied");
 }
 
 #[sqlx::test(migrations = "../../migrations")]

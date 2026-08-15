@@ -608,6 +608,33 @@ impl StoreRepo {
         Ok(Self::to_project(row))
     }
 
+    /// Resolves `subject`'s own auto-provisioned default project (`projects.is_default`), used by
+    /// the native token-exchange grant (`oauth2_op::store::TokenExchangeOpStore::handle_token_exchange`)
+    /// when the caller omits `project_id` -- a first-time caller has no way to know their project
+    /// id yet. Since `accounts.id` IS the subject (ADR-0006), "subject's own default project" is
+    /// exactly the project row with `account_id = subject AND is_default = true`; at most one such
+    /// row can exist (`projects_account_id_default_uidx`, migration
+    /// `20260725000001_default_account_project.sql`), so `fetch_optional` is unambiguous. Returns
+    /// `None` when the account has zero projects yet -- a real, reachable state (account creation
+    /// and the bootstrap "ensure default project" flow are two separate calls) -- callers must
+    /// treat that identically to `resolve_context`'s own `NotFound`, not as a distinct error class,
+    /// to preserve the same non-leaking behavior.
+    #[instrument(skip(self, subject))]
+    pub async fn find_default_project_id(&self, subject: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            r#"
+            SELECT id
+            FROM projects
+            WHERE account_id = $1
+              AND is_default = true
+            "#,
+        )
+        .bind(subject)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(|(id,)| id))
+    }
+
     /// Resolves the `{account_id, project_id}` context for a subject + project on behalf of the
     /// `lightbridge-keycloak-spi` token-exchange adapter. Authorized when `subject` is the
     /// project's account owner OR holds ANY `project_members` row on it (not lead-gated -- this is

@@ -112,7 +112,10 @@ impl TokenExchangeOpStore {
 
     /// The RFC 8693 token-exchange grant (ADR-0011, Decisions 1, 5, 7). `project_id` is this
     /// crate's own extension to the request, threaded in by `RequestScopedOpStore` since it is
-    /// not a field `authkestra_op::handlers::token::TokenRequest` has room for.
+    /// not a field `authkestra_op::handlers::token::TokenRequest` has room for. Optional: a
+    /// first-time caller has no way to know their project id, so an absent `project_id` falls back
+    /// to `subject`'s auto-provisioned default project (`StoreRepo::find_default_project_id`) once
+    /// the subject is known from the validated `subject_token`.
     async fn handle_token_exchange(
         &self,
         req: TokenRequest,
@@ -162,9 +165,7 @@ impl TokenExchangeOpStore {
         else {
             return Err(oauth_err("invalid_request", "subject_token is required"));
         };
-        let Some(project_id) = project_id.map(str::trim).filter(|s| !s.is_empty()) else {
-            return Err(oauth_err("invalid_request", "project_id is required"));
-        };
+        let requested_project_id = project_id.map(str::trim).filter(|s| !s.is_empty());
 
         let token_info = match self.bearer.validate_bearer_token(subject_token).await {
             Ok(info) if info.active => info,
@@ -191,7 +192,34 @@ impl TokenExchangeOpStore {
             ));
         }
 
-        let context = match self.repo.resolve_context(&subject, project_id).await {
+        // No `project_id` on the request: resolve to the subject's own auto-provisioned default
+        // project instead of rejecting -- see this method's doc comment. A subject with zero
+        // projects yet (a real, reachable state: account creation and the bootstrap "ensure
+        // default project" flow are separate calls) has no default to fall back to; that resolves
+        // identically to `resolve_context`'s own `NotFound` below, not as a distinct error class,
+        // so this endpoint never leaks "you have no projects" any more than it leaks "that project
+        // doesn't exist".
+        let effective_project_id = match requested_project_id {
+            Some(project_id) => project_id.to_string(),
+            None => match self.repo.find_default_project_id(&subject).await {
+                Ok(Some(project_id)) => project_id,
+                Ok(None) => {
+                    return Err(oauth_err(
+                        "access_denied",
+                        "subject is not a member of the requested project",
+                    ));
+                }
+                Err(_) => {
+                    return Err(oauth_err("server_error", "context resolution failed"));
+                }
+            },
+        };
+
+        let context = match self
+            .repo
+            .resolve_context(&subject, &effective_project_id)
+            .await
+        {
             Ok(context) => context,
             Err(Error::NotFound) => {
                 return Err(oauth_err(
