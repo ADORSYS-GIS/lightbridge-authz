@@ -11,7 +11,7 @@ linked throughout below rather than restated. Design rationale (why a full OIDC 
 the client registry looks the way it does, why nonce/auth_time are propagate-or-omit) lives in
 [ADR-0011](https://github.com/ADORSYS-GIS/lightbridge-authz/blob/main/docs/adr/0011-authz-issues-a-full-oidc-token-object.md).
 
-Everything in this doc was verified against code on `main` as of this writing (commit `72efa5d`).
+Everything in this doc was verified against code on `main` as of this writing (commit `9f095e0`).
 Every failure mode below is one the exchange handler can actually produce, cross-checked against
 `crates/lightbridge-authz-rest/tests/token_exchange_tests.rs`.
 
@@ -180,7 +180,7 @@ not repeated here. What matters for integrating against it:
 | 401 | `invalid_token` | `subject_token validation failed` | Check (a) above (audience mismatch), OR a JWKS/issuer mismatch. The API log line names the underlying `jsonwebtoken` error, so `InvalidAudience` vs a signature/issuer error tells them apart — see "How to debug" | Fix the Keycloak client's audience mapper (a), or confirm `oauth2.jwks_url`/issuer match the IdP that signed the token |
 | 401 | `invalid_token` | `subject_token is not active` | Bearer validation succeeded but the token reports inactive (`bearer_validation_error_is_unauthorized`-style path) | Get a fresh subject token |
 | 400 | `invalid_grant` | `Client is not authorized to exchange this token` | Check (b) above — `client_id` not in `subject_token.aud` | Add/fix the second audience mapper (Option 1), or use Option 2 |
-| 400 | `invalid_grant` | `refresh_token is invalid, expired, or already used` | Refresh token already consumed (single-use), expired, or issued to a different `client_id` | Use the most recent refresh token, or re-exchange from a fresh subject token |
+| 400 | `invalid_grant` | `refresh_token is invalid, expired, or already used` | One message, several causes, all indistinguishable on the wire (by design): the token was already consumed (single-use) or is expired or unknown; it was issued to a different `client_id`; its **chain** is past the 90-day absolute cap; or re-validation failed — the subject lost project membership, or the resolved project/account is suspended or the project no longer exists. See "Refresh" below for the re-validation and absolute-cap details | Use the most recent refresh token; if the session is legitimately older than the absolute cap or the subject's access changed, re-exchange from a fresh subject token instead of retrying the same refresh token |
 | 403 | `access_denied` | `subject is not a member of the requested project` | The subject neither owns nor is a member of `project_id`. Deliberately identical to "project does not exist" — this endpoint never leaks which projects exist | Confirm the subject's actual project membership; do not use this response to probe for valid project ids |
 | 401 | `invalid_client` | `Client authentication failed` | `client_id` missing, unregistered in `oauth2.clients`, or (confidential clients) `client_assertion` missing/invalid/replayed | Register the client, or fix the client assertion |
 | 400 | `unauthorized_client` | `Client is not authorized to use token_exchange grant type` (or `refresh_token`) | The registered client's `grant_types` doesn't include the grant you're using | Add the grant type to the client's config entry |
@@ -256,12 +256,97 @@ refresh_token=<the refresh_token from the previous response>
 Same endpoint, same client authentication rules as the original exchange. The refresh token is
 **single-use with rotation**: each successful refresh consumes the presented token and returns a new
 one in its place (`refresh_rotates_and_rejects_replay`,
-`crates/lightbridge-authz-rest/tests/token_exchange_tests.rs:976-1024`); replaying an
+`crates/lightbridge-authz-rest/tests/token_exchange_tests.rs:1133-1186`); replaying an
 already-consumed refresh token fails with `400 invalid_grant`. A refresh token presented by a
 different `client_id` than the one it was issued to is likewise burned, not honored
 (`refresh_token_issued_to_client_a_is_rejected_when_presented_by_client_b`). The re-minted access/
 id_token carry the *original* grant's scope verbatim — a refresh request cannot widen or narrow
 scope; there is no `scope` parameter on this grant to do so.
+
+The field-by-field dictionary for `chain_id`/`chain_expires_at`/`exchange_refresh_tokens.status` is
+[`docs/auth-reference.md` §4](https://github.com/ADORSYS-GIS/lightbridge-authz/blob/main/docs/auth-reference.md#4-refresh-token-chain--lifecycle) —
+what follows here is the task-oriented version of the same material.
+
+### Every refresh re-validates — it is not just a token-row lookup
+
+`handle_refresh_token` (`crates/lightbridge-authz-rest/src/oauth2_op/store.rs:422-616`) re-runs, on
+**every** refresh, the same checks the original exchange used:
+
+1. **Membership/ownership** — `resolve_context(subject, project_id)`, the same query
+   `/idp/v1/resolve-context` uses (ADR-0006: owns the project OR holds a `project_members` row). A
+   subject removed from the project's roster between refreshes loses the ability to refresh
+   immediately, even though the presented refresh token is individually still unexpired
+   (`refresh_after_member_removed_from_project_is_invalid_grant`,
+   `crates/lightbridge-authz-rest/tests/token_exchange_tests.rs:1821-1854`).
+2. **Project status** — the resolved project must be `Active`
+   (`refresh_after_project_suspended_is_invalid_grant`, `token_exchange_tests.rs:1900-1936`).
+3. **Account status** — the resolved account must be `Active`
+   (`refresh_after_account_suspended_is_invalid_grant`, `token_exchange_tests.rs:1938-1976`).
+
+Any failure in any of these three refuses the refresh with a plain `invalid_grant` — never a
+permissive fallback. **A deleted or otherwise-unresolvable project now fails closed, and did not
+always.** Before this hardening, a refresh whose project could not be resolved fell through to
+`allowed_models = None`, which this codebase reads as *"no restriction"* — a genuine fail-open bug
+that would have handed back an unrestricted access token against a project that no longer exists.
+It is now a hard refusal, locked by a regression test named for exactly that:
+`refresh_after_project_deleted_is_invalid_grant_not_fail_open`
+(`crates/lightbridge-authz-rest/tests/token_exchange_tests.rs:1861-1899`).
+
+### The refresh chain has a 90-day absolute cap — rotating does not reset it
+
+**This is the behavioral change to plan around.** Before this hardening, a session that refreshed
+at least once before every individual token's expiry stayed alive indefinitely — each rotation only
+ever reset that token's own `expires_at`, never a session-level ceiling. Refreshing monthly, forever,
+kept the session alive forever.
+
+Every refresh-token row now belongs to a **chain**: `chain_id`/`chain_expires_at`. `chain_id` is
+minted once, at the offline-scope exchange grant that gives the chain its first token, and every
+subsequent rotation **inherits it unchanged** rather than getting a fresh one. `chain_expires_at` is
+likewise set once, at chain birth, to `now + oauth2.token_exchange.refresh_absolute_ttl_seconds`
+(default `7_776_000` seconds / 90 days — see
+[`docs/auth-reference.md`](https://github.com/ADORSYS-GIS/lightbridge-authz/blob/main/docs/auth-reference.md)
+for the config row), and inherited unchanged by every rotation after that — never extended, never
+reset, regardless of how recently the chain was last refreshed.
+
+A chain that has crossed its `chain_expires_at` refuses the very next refresh outright, even if the
+presented token's own individual `expires_at` has not passed
+(`refresh_after_absolute_cap_is_invalid_grant`,
+`crates/lightbridge-authz-rest/tests/token_exchange_tests.rs:1705-1755`); the inheritance itself is
+asserted across two consecutive rotations, not just one, so a bug that only shows up on the second
+inheritance cannot hide behind a single-rotation check
+(`chain_id_and_absolute_cap_survive_multiple_rotations`, `token_exchange_tests.rs:1763-1813`). A
+client whose user needs a session to outlive 90 days has to re-exchange from a fresh Keycloak
+subject token — there is no way to extend or reset a chain's cap from within the refresh grant
+itself.
+
+### Replaying an already-rotated token revokes its entire chain
+
+Presenting a refresh token that has already been rotated away (superseded by a later token in the
+same chain) is treated as the strongest signal this codebase has that the token was stolen (RFC
+6819 §5.2.2.3): the **entire chain** is revoked, including the current, otherwise-still-valid
+successor token — not just the replayed one
+(`replaying_a_rotated_refresh_token_revokes_the_whole_chain`,
+`crates/lightbridge-authz-rest/tests/token_exchange_tests.rs:1978-2026`).
+
+An **unknown** token (never issued), or a token that is merely expired or already explicitly
+revoked, is a plain `400 invalid_grant` with **no** cascade — it never touches any other chain
+(`unknown_refresh_token_is_invalid_grant_without_cascading`, `token_exchange_tests.rs:2032-2065`).
+Explicit revocation (`/oauth2/revoke`, below) and this automatic cascade compose safely: replaying a
+token that was *explicitly* revoked is never mistaken for the cascade's own "already rotated"
+trigger (`replaying_an_explicitly_revoked_token_does_not_trigger_the_reuse_cascade`,
+`token_exchange_tests.rs:2508-2547`).
+
+### The honest limit: refresh does not call Keycloak
+
+None of the re-validation above talks to the upstream IdP. `handle_refresh_token` re-checks only
+this service's own `resolve_context` plus project/account status — **a user disabled directly in
+Keycloak, but still active on this service's own roster, is not detected by a refresh.** That
+session is bounded only by the 90-day absolute cap above and by an explicit revoke (`/oauth2/revoke`
+below, or the `revokeOwnSessions`/`revokeSubjectSessions` RPC procedures —
+[`docs/auth-reference.md` §5](https://github.com/ADORSYS-GIS/lightbridge-authz/blob/main/docs/auth-reference.md#5-permissions--procedures)
+has both). If a user being disabled in the IdP needs to take effect immediately rather than waiting
+out the cap, pair that with an explicit `revokeSubjectSessions` call — do not rely on refresh
+re-validation to catch it.
 
 ## Revocation
 
