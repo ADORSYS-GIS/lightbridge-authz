@@ -105,6 +105,7 @@ oauth2:
         - "account:read"
         - "project:*"        # every project action
         - "apikey:*"         # every api-key action
+        - "budget:self-refill" # self-refill own budget, capped by policy (#294)
       lightbridge-viewer:
         - "account:read"
         - "project:read"
@@ -278,6 +279,14 @@ rest of the budget domain — the real authorization is entirely the RBAC permis
 > human or API-key, to carry `lightbridge-api-key`, which is why that particular claim could never
 > have worked as a distinguishing signal) reliably distinguished the two caller kinds before this
 > dedicated claim was added.
+
+**Role grant (#294):** `lightbridge-editor` holds `budget:self-refill` in the shipped configs
+(`config/default.yaml`, `.docker/authz/container.yaml`) — a caller with any budget role can
+self-refill their own budget, capped by the active policy's `self_service_grant_count` threshold
+(see `crates/lightbridge-authz-budget/src/rule_data.rs`'s `default_rule_set_json`); going past that
+ceiling routes to `pending_review` rather than being denied outright. `lightbridge-viewer` does
+**not** get it — self-refill spends budget, which is inconsistent with a read-only role. Neither
+role holds `budget:review`: only `lightbridge-admin` (via `*`) can act on the review queue.
 
 ### Budget permissions (remaining five reserved, not yet gating any operation)
 
