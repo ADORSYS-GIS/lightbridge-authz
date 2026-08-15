@@ -670,3 +670,53 @@ async fn editor_role_can_self_refill_but_not_review() {
         );
     }
 }
+
+/// The real, effective permission set for `role` as configured in the shipped
+/// `config/default.yaml`, loaded and compiled through the exact same `Rbac::compile()` path a
+/// running server takes at startup. Mirrors `editor_perms_from_shipped_config` above, generalized
+/// to any role name so it also covers `lightbridge-viewer`.
+fn perms_from_shipped_config(role: &str) -> lightbridge_authz_core::authz::PermissionSet {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/default.yaml");
+    let config = lightbridge_authz_core::config::load_from_path(path)
+        .expect("shipped config/default.yaml must parse");
+    config
+        .oauth2
+        .rbac
+        .compile()
+        .roles
+        .get(role)
+        .cloned()
+        .unwrap_or_else(|| panic!("config/default.yaml must configure role `{role}`"))
+}
+
+/// A first-time `lightbridge-viewer`/`lightbridge-editor` caller must be able to self-provision
+/// their own account (`procedure.createAccount`, gated by `account:create`) -- without it,
+/// `project_members.account_id`'s FK to `accounts` can never be satisfied for them, so no project
+/// lead can ever add them to a roster (discovered diagnosing FK-violation test failures, #219).
+/// Loads the grant from the *shipped* `config/default.yaml` (like
+/// `editor_role_can_self_refill_but_not_review` above) so this fails for the right reason -- a
+/// `permission_denied` 403 -- if the grant is ever reverted, instead of silently passing against a
+/// stale, hand-copied permission set.
+#[tokio::test]
+async fn viewer_and_editor_roles_are_granted_account_create_by_shipped_config() {
+    for role in ["lightbridge-viewer", "lightbridge-editor"] {
+        let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with(
+            "caller",
+            token_info(&format!("{role}-subject"), perms_from_shipped_config(role)),
+        ));
+        let router = build_router(bearer, &external_oauth2(), None, false);
+        let (status, body) = rpc_call(
+            router,
+            "procedure.createAccount",
+            Wire::Json,
+            &json!({ "args": {} }),
+            Some("caller"),
+        )
+        .await;
+        assert!(
+            status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+            "{role} must be granted procedure.createAccount by the RBAC gate, got {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}

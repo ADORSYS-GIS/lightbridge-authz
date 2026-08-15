@@ -381,6 +381,7 @@ pub fn default_role_permissions() -> HashMap<String, Vec<String>> {
         (
             "lightbridge-editor".to_string(),
             vec![
+                "account:create".to_string(),
                 "account:read".to_string(),
                 "project:*".to_string(),
                 "apikey:*".to_string(),
@@ -390,6 +391,7 @@ pub fn default_role_permissions() -> HashMap<String, Vec<String>> {
         (
             "lightbridge-viewer".to_string(),
             vec![
+                "account:create".to_string(),
                 "account:read".to_string(),
                 "project:read".to_string(),
                 "apikey:read".to_string(),
