@@ -182,6 +182,12 @@ is not.
   other's rows, papered over by retries. **Investigate flakes; don't raise the retry budget until
   you know what you're riding out** (see `.github/actions/integration-test` — the retry budget
   there is documented against a specific, diagnosed DNS flake, which is the bar).
+- **An `#[ignore]`d test is not "known failing" — it's absent coverage.** It doesn't run, so it
+  can't fail; CI stays green while that assertion silently stops existing. Say "ignored" in docs
+  and comments, not "fails deterministically" — the latter reads as "runs and goes red," which is
+  a different, much less dangerous thing. A tracking issue number next to `#[ignore]` is not a
+  substitute for actually running the test; go run it (#219 sat on 7 silently-absent tests this
+  way).
 - Prefer a real containerised Postgres over mocks. The bugs that matter live in the seam.
 
 ### Suppressions and declined changes
@@ -617,12 +623,6 @@ These tests include:
 The Postgres-backed `lightbridge-authz-api-key` tests (rotate/limits) and `lightbridge-authz-budget` tests (ledger writes, replay, policy store, refill/review services) are guarded by the `it-tests` feature so they only compile/run when requested. This keeps the default `cargo test` free of database setup, and lets us treat these as Docker-backed integration tests.
 
 Run them with `just it-tests`, which brings up the `postgresql`/`redis` services, waits a moment, then sets `DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"` before invoking `lightbridge-authz-api-key`, `lightbridge-authz-budget`, and `lightbridge-authz-rest` with `--features it-tests`. These tests exercise the migrations under `sqlx::test`.
-
-**Known failing tests, tracked separately (do not assume your change caused these):**
-`crates/lightbridge-authz-rest/tests/rpc_it_tests.rs` has 7 tests that fail deterministically even
-against a freshly migrated database — confirmed unrelated to any specific change, see #219 for the
-full list and reproduction steps. `crates/lightbridge-authz-api-key/tests/access_control_scenarios_tests.rs::access_control_allows_members_and_rejects_non_members`
-tests an account-level "invited member" scenario ADR-0006 removed; see #220.
 
 ### Load Tests
 
