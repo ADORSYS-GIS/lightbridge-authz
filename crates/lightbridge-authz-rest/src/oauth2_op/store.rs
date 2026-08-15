@@ -113,6 +113,37 @@ impl TokenExchangeOpStore {
         self.clients.has_confidential_client()
     }
 
+    /// Revokes a single refresh token by its plaintext value, scoped to the presented
+    /// `client_id` (RFC 7009 -- a client may only revoke tokens issued to it). Backs
+    /// `POST /oauth2/revoke` (`token_exchange::revoke_endpoint`).
+    pub async fn revoke_refresh_token_for_client(
+        &self,
+        token: &str,
+        client_id: &str,
+    ) -> Result<(), OpError> {
+        let hash = lightbridge_authz_core::crypto::hash_api_key(token);
+        self.repo
+            .revoke_exchange_refresh_token_for_client(&hash, client_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to revoke refresh token for client");
+                OpError::Storage
+            })
+    }
+
+    /// Spends a `private_key_jwt` client assertion's `jti` (ADR-0011, Decision 6). Exposed
+    /// directly on `TokenExchangeOpStore` -- not only reachable through the `OpStore` trait on
+    /// `RequestScopedOpStore` -- because `POST /oauth2/revoke` has no per-request `project_id` to
+    /// wrap in a `RequestScopedOpStore` and still needs to authenticate a confidential client the
+    /// same way the token endpoint does.
+    pub async fn record_client_assertion_jti(
+        &self,
+        jti: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<bool, OpError> {
+        self.assertions.record_jti(jti, expires_at).await
+    }
+
     /// The RFC 8693 token-exchange grant (ADR-0011, Decisions 1, 5, 7). `project_id` is this
     /// crate's own extension to the request, threaded in by `RequestScopedOpStore` since it is
     /// not a field `authkestra_op::handlers::token::TokenRequest` has room for. Optional: a

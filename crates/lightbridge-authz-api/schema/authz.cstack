@@ -681,3 +681,42 @@ type RejectAugmentationRequestInput {
 
 mutation procedure rejectAugmentationRequest(args: RejectAugmentationRequestInput): AugmentationRequest
   @allow(auth() != null)
+
+// Refresh-token session revocation. There was previously no way to kill a live session short of a
+// manual SQL UPDATE against `exchange_refresh_tokens` in prod -- these two procedures are the
+// operator-facing surface over the same mechanism RFC 7009's `POST /oauth2/revoke`
+// (`crates/lightbridge-authz-rest/src/token_exchange.rs`) uses for a single token: flipping
+// `status` from `active` to `revoked`, which `find_active_exchange_refresh_token`/
+// `consume_exchange_refresh_token` both already filter on, so it takes effect on the very next
+// refresh attempt.
+//
+// Split into two permissions, same shape as the self-refill/review split above: a caller managing
+// their own sessions is a distinct capability from an operator managing someone else's
+// (`session:revoke-own` vs `session:revoke`, `docs/rbac.md`). Both are `@allow(auth() != null)`
+// only -- no per-tenant `@@allow` ownership predicate makes sense here (there is no "owning
+// account" relation on a bare subject string the way there is on `Project`/`ApiKey`), so the real
+// authorization for both is entirely the RBAC permission gate
+// (`crates/lightbridge-authz-rest/src/rpc_authorize.rs`). `revokeOwnSessions` takes no target
+// subject at all -- the subject to revoke is `auth().id`, never a caller-supplied value, which is
+// what makes it structurally impossible for this procedure to be aimed at anyone but the caller.
+type SessionRevocationResult {
+  revokedCount Int
+}
+
+type RevokeOwnSessionsInput {
+  reason String?
+}
+
+mutation procedure revokeOwnSessions(args: RevokeOwnSessionsInput): SessionRevocationResult
+  @allow(auth() != null)
+
+// The offboarding kill switch: an operator revokes every active session for `accountId` (which is
+// that subject's JWT `sub`, per ADR-0006 -- `accounts.id` holds it verbatim). Gated at
+// `session:revoke`, held only via `lightbridge-admin`'s `*` in the default role mapping.
+type RevokeSubjectSessionsInput {
+  accountId String
+  reason String?
+}
+
+mutation procedure revokeSubjectSessions(args: RevokeSubjectSessionsInput): SessionRevocationResult
+  @allow(auth() != null)

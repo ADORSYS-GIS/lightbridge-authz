@@ -142,6 +142,11 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         "procedure.approveAugmentationRequest" => BudgetReview,
         "procedure.rejectAugmentationRequest" => BudgetReview,
 
+        // Refresh-token session revocation (the offboarding kill switch). Same self/admin split
+        // as the budget refill pair above -- see docs/rbac.md.
+        "procedure.revokeOwnSessions" => SessionRevokeOwn,
+        "procedure.revokeSubjectSessions" => SessionRevoke,
+
         _ => return None,
     })
 }
@@ -306,6 +311,8 @@ mod tests {
                 "procedure.rejectAugmentationRequest",
                 Permission::BudgetReview,
             ),
+            ("procedure.revokeOwnSessions", Permission::SessionRevokeOwn),
+            ("procedure.revokeSubjectSessions", Permission::SessionRevoke),
         ];
         for (op_id, expected) in cases {
             assert_eq!(

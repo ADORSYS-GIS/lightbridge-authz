@@ -2131,3 +2131,308 @@ async fn migration_backfill_gives_existing_rows_a_chain_and_a_backdated_cap(pool
          not from migration time: got {chain_expires_at}, expected ~{expected}"
     );
 }
+
+// ============================================================================================
+// RFC 7009 OAuth 2.0 Token Revocation (`POST /oauth2/revoke`). There was previously no HTTP path
+// to `revoke_exchange_refresh_token` at all -- every call site was a test. These are the first
+// tests exercising it through a real caller.
+// ============================================================================================
+
+async fn post_revoke(state: TokenExchangeState, body: &str) -> (StatusCode, Value) {
+    let response = token_exchange_router::<()>(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth2/revoke")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, json)
+}
+
+/// Obtains a real, persisted refresh token via the exchange grant, for `client_id` (which must be
+/// present in `state`'s own client registry and in `state`'s `MockBearer` audience).
+async fn issue_refresh_token(state: TokenExchangeState, client_id: &str) -> String {
+    let (status, body) = post_token(
+        state,
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={client_id}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    body["refresh_token"].as_str().unwrap().to_string()
+}
+
+/// Test 1: revoking a valid refresh token makes the very next refresh attempt fail. Proves
+/// `revoke_endpoint` is actually wired to `TokenExchangeOpStore::revoke_refresh_token_for_client`
+/// and not just returning `200` unconditionally without touching storage -- the follow-up refresh
+/// attempt is what would catch a "revoke that doesn't revoke" regression.
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoking_a_valid_refresh_token_blocks_the_next_refresh(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let refresh_token = issue_refresh_token(state(repo.clone(), true), PUBLIC_CLIENT_ID).await;
+
+    let (status, body) = post_revoke(
+        state(repo.clone(), true),
+        &format!("token={refresh_token}&client_id={PUBLIC_CLIENT_ID}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={refresh_token}"
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a revoked refresh token must not still work: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+}
+
+/// Test 2 (RFC 7009 §2.2): revoking an unknown/garbage token returns 200, not an error -- the
+/// endpoint must never become an oracle for "does this token string exist".
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoking_an_unknown_token_returns_200(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_revoke(
+        state(repo.clone(), true),
+        &format!("token=totally-made-up-garbage&client_id={PUBLIC_CLIENT_ID}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
+/// Test 3 (RFC 7009 §2.2): revoking an already-revoked token is idempotent -- still 200, not an
+/// error, the second time.
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoking_an_already_revoked_token_is_idempotent(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let refresh_token = issue_refresh_token(state(repo.clone(), true), PUBLIC_CLIENT_ID).await;
+
+    let (status, _) = post_revoke(
+        state(repo.clone(), true),
+        &format!("token={refresh_token}&client_id={PUBLIC_CLIENT_ID}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = post_revoke(
+        state(repo.clone(), true),
+        &format!("token={refresh_token}&client_id={PUBLIC_CLIENT_ID}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "revoking an already-revoked token must still be 200: {body}"
+    );
+}
+
+/// Test 4: client A cannot revoke client B's token. Presenting client B's own token to a revoke
+/// request authenticated as client A must be a no-op (still 200 per §2.2 -- see test 2's doc
+/// comment for why this can't be an error), and the token must still work afterward, proving it
+/// was never actually touched.
+#[sqlx::test(migrations = "../../migrations")]
+async fn client_a_cannot_revoke_client_bs_token(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let client_a = "client-a";
+    let client_b = "client-b";
+    let redis = redis_url();
+    let clients = || vec![public_client(client_a), public_client(client_b)];
+
+    let state_b = state_with(
+        repo.clone(),
+        Arc::new(MockBearer::new(true, vec![client_b.to_string()])),
+        clients(),
+        &redis,
+    );
+    let refresh_token = issue_refresh_token(state_b, client_b).await;
+
+    // Authenticated as client_a, attempting to revoke a token issued to client_b.
+    let state_a = state_with(
+        repo.clone(),
+        Arc::new(MockBearer::new(true, vec![client_a.to_string()])),
+        clients(),
+        &redis,
+    );
+    let (status, body) = post_revoke(
+        state_a,
+        &format!("token={refresh_token}&client_id={client_a}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // The token must still be live: client_b can still refresh with it.
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![client_b.to_string()])),
+            clients(),
+            &redis,
+        ),
+        &format!("grant_type=refresh_token&client_id={client_b}&refresh_token={refresh_token}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "client_a's revoke call must not have touched client_b's token: {body}"
+    );
+}
+
+/// Test 5: client-authentication failure DOES return an error -- the one case RFC 7009 §2.2 does
+/// NOT carve out as a bare 200. An unregistered `client_id` must be rejected with `invalid_client`
+/// before the token itself is ever looked up.
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoke_with_unknown_client_is_rejected(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_revoke(
+        state(repo.clone(), true),
+        "token=whatever&client_id=never-registered",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"], "invalid_client");
+}
+
+/// A confidential client presenting no assertion at all is also a client-authentication failure,
+/// not a bare 200 -- same polarity as test 5, exercised through the `private_key_jwt` path this
+/// deployment's confidential clients actually use.
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoke_confidential_client_with_missing_assertion_is_rejected(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let fixture = confidential_client(CONFIDENTIAL_CLIENT_ID);
+    let bearer = Arc::new(MockBearer::new(
+        true,
+        vec![CONFIDENTIAL_CLIENT_ID.to_string()],
+    ));
+    let state = state_with(repo.clone(), bearer, vec![fixture.client], &redis_url());
+
+    let (status, body) = post_revoke(
+        state,
+        &format!("token=whatever&client_id={CONFIDENTIAL_CLIENT_ID}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"], "invalid_client");
+}
+
+/// A missing `token` form field is a malformed *request*, distinct from a malformed *token
+/// value* -- `invalid_request` (400), not the RFC 7009 §2.2 bare-200 case, since that carve-out
+/// is specifically about the token's *content*, not the request's shape.
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoke_with_missing_token_field_is_invalid_request(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_revoke(
+        state(repo.clone(), true),
+        &format!("client_id={PUBLIC_CLIENT_ID}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_request");
+}
+
+/// A confidential client authenticating with a valid `private_key_jwt` assertion CAN revoke its
+/// own token -- the success path through the mirrored `authenticate_revoke_client` branch that
+/// `revoke_confidential_client_with_missing_assertion_is_rejected` only exercises the failure
+/// side of.
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoke_confidential_client_with_valid_assertion_succeeds(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let fixture = confidential_client(CONFIDENTIAL_CLIENT_ID);
+    let bearer = Arc::new(MockBearer::new(
+        true,
+        vec![CONFIDENTIAL_CLIENT_ID.to_string()],
+    ));
+
+    // A confidential client is `PrivateKeyJwt`-bound at the token endpoint too (ADR-0011,
+    // Decision 5) -- issuing its own refresh token needs a client assertion here, not the bare
+    // `client_id` the public-client `issue_refresh_token` helper sends.
+    let issue_assertion = sign_client_assertion(
+        &fixture.private_key_pem,
+        &fixture.kid,
+        CONFIDENTIAL_CLIENT_ID,
+        &cuid2(),
+        300,
+    );
+    let issue_state = state_with(
+        repo.clone(),
+        bearer.clone(),
+        vec![fixture.client.clone()],
+        &redis_url(),
+    );
+    let (status, body) = post_token(
+        issue_state,
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}\
+             &client_assertion={issue_assertion}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let refresh_token = body["refresh_token"].as_str().unwrap().to_string();
+
+    // A fresh `jti` for the revoke call's own assertion -- `record_client_assertion_jti` refuses
+    // a repeat, and the issuance call above already spent `issue_assertion`'s.
+    let revoke_assertion = sign_client_assertion(
+        &fixture.private_key_pem,
+        &fixture.kid,
+        CONFIDENTIAL_CLIENT_ID,
+        &cuid2(),
+        300,
+    );
+    let revoke_state = state_with(repo.clone(), bearer, vec![fixture.client], &redis_url());
+    let (status, body) = post_revoke(
+        revoke_state,
+        &format!(
+            "token={refresh_token}&client_assertion_type={CLIENT_ASSERTION_TYPE}&client_assertion={revoke_assertion}"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+}

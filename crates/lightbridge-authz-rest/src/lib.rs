@@ -364,6 +364,15 @@ fn to_schema_api_key_secret(s: ApiKeySecret) -> schema::ApiKeySecret {
     }
 }
 
+fn to_schema_session_revocation_result(revoked_count: u64) -> schema::SessionRevocationResult {
+    // `revokedCount` is a schema `Int` (Rust `i64`, see `authz.cstack`'s `Int` mapping note on
+    // `SimulateBudgetPolicyInput`) -- `rows_affected()` is `u64`, so this is a lossy cast only in
+    // the astronomically unreachable case of revoking over i64::MAX rows in one call.
+    schema::SessionRevocationResult {
+        revokedCount: revoked_count as i64,
+    }
+}
+
 /// RPC procedure registry (ADR-0003 item 4). Every procedure delegates to the hand-written sqlx in
 /// `AuthzStoreImpl`/`StoreRepo` (tenant-scoped by account ownership or a `project_members` row,
 /// ADR-0006), never cratestack's `run_in_tx`, so the chained-write deadlock in cratestack-pg 0.4.9
@@ -1124,6 +1133,70 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 .map_err(budget_error_to_cool_error)?;
 
             Ok(to_schema_augmentation_request(reviewed))
+        }
+    }
+
+    /// "Log out everywhere": revokes every active refresh-token session belonging to the
+    /// authenticated caller. `input.reason` is accepted for audit-trail purposes only (not
+    /// persisted anywhere today -- there is no session-revocation audit table, unlike the budget
+    /// ledger) and never changes which subject is targeted. There is deliberately no subject
+    /// field on this procedure's input at all: the target is always `auth().id`, never a
+    /// caller-supplied value, which is what makes this procedure structurally incapable of being
+    /// aimed at anyone but the caller -- see `revokeSubjectSessions` for the admin equivalent.
+    /// Gated at `session:revoke-own` (`rpc_authorize.rs`).
+    fn revoke_own_sessions(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        _args: schema::procedures::revoke_own_sessions::Args,
+        _authorized: schema::procedures::revoke_own_sessions::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::revoke_own_sessions::Output, CoolError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let revoked_count = issuer
+                .revoke_sessions(&subject)
+                .await
+                .map_err(to_cool_error)?;
+            Ok(to_schema_session_revocation_result(revoked_count))
+        }
+    }
+
+    /// The offboarding kill switch: revokes every active refresh-token session for
+    /// `input.accountId`, an operator-supplied target subject (`accounts.id` holds the JWT `sub`
+    /// verbatim, ADR-0006). Previously the only way to do this was a manual SQL `UPDATE` against
+    /// prod. `@allow(auth() != null)` only in the schema, same as the budget-policy/review
+    /// procedures above -- there is no per-tenant ownership relation between an admin and an
+    /// arbitrary target subject for a schema `@@allow` to check, so the entire authorization
+    /// story is the RBAC gate: `session:revoke`, held only via `lightbridge-admin`'s `*` in the
+    /// default role mapping (`docs/rbac.md`).
+    fn revoke_subject_sessions(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::revoke_subject_sessions::Args,
+        _authorized: schema::procedures::revoke_subject_sessions::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::revoke_subject_sessions::Output,
+            CoolError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let target_account_id = args.args.accountId;
+        async move {
+            let _subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let revoked_count = issuer
+                .revoke_sessions(&target_account_id)
+                .await
+                .map_err(to_cool_error)?;
+            Ok(to_schema_session_revocation_result(revoked_count))
         }
     }
 }

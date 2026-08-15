@@ -431,6 +431,18 @@ impl AuthzStoreImpl {
             .await
     }
 
+    /// Revokes every active refresh-token session for `subject`, returning how many were
+    /// revoked. Backs both `revokeOwnSessions` (`subject` is the caller's own, from
+    /// `auth().id`) and `revokeSubjectSessions` (`subject` is an operator-supplied target) --
+    /// the operation is identical either way; only which `subject` reaches this method differs,
+    /// and that choice is made entirely by the two procedures' own RBAC gates
+    /// (`session:revoke-own` vs `session:revoke`, `docs/rbac.md`), not by anything in this method.
+    pub async fn revoke_sessions(&self, subject: &str) -> Result<u64> {
+        self.repo
+            .revoke_active_exchange_refresh_tokens_for_subject(subject)
+            .await
+    }
+
     /// Promote `project_id` to be its account's new default project. Backs `setDefaultProject`.
     /// Thin wrapper over `StoreRepo::set_default_project` (ownership + atomic unset/set enforced
     /// in SQL).

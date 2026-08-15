@@ -215,8 +215,38 @@ listed here is denied unconditionally (fail closed).**
 | `budget:policy-simulate` | `procedure.simulateBudgetPolicy`                | — (no MCP tool yet)                 |
 | `budget:self-refill`     | `procedure.requestBudgetRefill`                 | — (no MCP tool yet)                 |
 | `budget:review`          | `procedure.listPendingAugmentationRequests`, `procedure.approveAugmentationRequest`, `procedure.rejectAugmentationRequest` | — (no MCP tool yet) |
+| `session:revoke-own`     | `procedure.revokeOwnSessions`                        | — (no MCP tool yet)                 |
+| `session:revoke`         | `procedure.revokeSubjectSessions`                    | — (no MCP tool yet)                 |
 
 `read` covers both the list and get operations for a resource.
+
+### Refresh-token session revocation
+
+There was previously no way to kill a live session short of a manual SQL `UPDATE` against
+`exchange_refresh_tokens` in prod. Two surfaces now exist, both flipping the same rows'
+`status` from `active` to `revoked` (`StoreRepo::revoke_active_exchange_refresh_tokens_for_subject`),
+which `find_active_exchange_refresh_token`/`consume_exchange_refresh_token` already filter on, so
+revocation takes effect on the very next refresh attempt:
+
+- **`POST /oauth2/revoke`** (RFC 7009) — a client-facing, single-token revoke. Not gated by RBAC at
+  all (it authenticates the way `/oauth2/token` does — `client_id`/`client_assertion`, no bearer
+  token); see `crates/lightbridge-authz-rest/src/token_exchange.rs`.
+- **The RPC procedures above** — operator/self-service, gated the same self/admin way the budget
+  refill pair is (`budget:self-refill` vs `budget:review`): `procedure.revokeOwnSessions` (gated
+  `session:revoke-own`) revokes every active session for `auth().id` only — there is no subject
+  field on its input at all, so it is structurally incapable of targeting anyone but the caller.
+  `procedure.revokeSubjectSessions` (gated `session:revoke`, admin-only via `lightbridge-admin`'s
+  `*`) revokes every active session for an operator-supplied `accountId` — the offboarding kill
+  switch. Both return `{ revokedCount }` so the caller gets confirmation the kill switch actually
+  did something. Both are `@allow(auth() != null)` only in the schema, same pattern as the budget
+  procedures above — there is no per-tenant ownership relation between a caller and an arbitrary
+  target subject for a schema `@@allow` to check, so the entire authorization story is the RBAC
+  gate.
+
+`session:revoke-own` is granted to every default role (including `lightbridge-viewer`) in
+`default_role_permissions` — logging yourself out everywhere is self-protective, not a write
+capability inconsistent with a read-only role, unlike `budget:self-refill` (which spends budget and
+so is withheld from `lightbridge-viewer`).
 
 ### Budget policy lifecycle (ADR-0007)
 

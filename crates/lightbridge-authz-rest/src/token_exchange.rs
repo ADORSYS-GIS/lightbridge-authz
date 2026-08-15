@@ -12,6 +12,10 @@
 
 use std::sync::Arc;
 
+use authkestra_op::client::{ClientRegistration, ClientStore, TokenEndpointAuthMethod};
+use authkestra_op::client_assertion::{
+    CLIENT_ASSERTION_TYPE_JWT_BEARER, peek_client_assertion_subject, verify_client_assertion,
+};
 use authkestra_op::config::OpConfig;
 use authkestra_op::handlers::token::{
     TokenErrorResponse as AkTokenErrorResponse, TokenRequest as AkTokenRequest,
@@ -59,15 +63,22 @@ impl TokenExchangeState {
     }
 }
 
-/// Public `/oauth2/token` route. Public because the presented `subject_token` (or `refresh_token`,
-/// or `client_assertion`) is itself the credential -- no bearer middleware. Provides its own state
-/// so it merges into any parent router.
+/// Public `/oauth2/token` and `/oauth2/revoke` routes. Public because the presented
+/// `subject_token`/`refresh_token`/`client_assertion`/revocation `token` is itself the credential
+/// -- no bearer middleware. Provides its own state so it merges into any parent router.
+///
+/// `/oauth2/revoke` (RFC 7009) is mounted here, not discoverable, and not dormant: it is live and
+/// functional the moment this router is merged in, it is simply absent from
+/// `/.well-known/openid-configuration` because `authkestra_op::handlers::discovery::OidcDiscovery`
+/// has no `revocation_endpoint` field to advertise it in -- see `signing::discovery_document`'s
+/// doc comment for the filed upstream issue.
 pub fn token_exchange_router<S>(state: TokenExchangeState) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     Router::new()
         .route("/oauth2/token", post(token_endpoint))
+        .route("/oauth2/revoke", post(revoke_endpoint))
         .with_state(state)
 }
 
@@ -222,4 +233,277 @@ fn status_for_oauth_error(error: &str) -> StatusCode {
         "server_error" => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_REQUEST,
     }
+}
+
+// --- RFC 7009 OAuth 2.0 Token Revocation (`POST /oauth2/revoke`) -----------------------------
+//
+// Only refresh tokens are ever revocable here: access tokens are stateless self-signed JWTs with
+// no server-side record to flip, so a presented access token (or `token_type_hint=access_token`)
+// simply never matches a row below -- indistinguishable, on the wire, from an unknown token. RFC
+// 7009 §2.1 explicitly allows a server to ignore `token_type_hint` "particularly if it is able to
+// detect the token type automatically", which describes this deployment exactly: there is only
+// one revocable token type to look up, so the hint changes nothing about how the lookup runs.
+
+/// RFC 7009 §2.1 request body.
+#[derive(Debug, Deserialize)]
+struct RevokeRequest {
+    token: Option<String>,
+    #[serde(default)]
+    token_type_hint: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    client_assertion: Option<String>,
+    client_assertion_type: Option<String>,
+}
+
+/// The client-authentication credential a `/oauth2/revoke` request presents. A mirror of
+/// `authkestra_op::handlers::token::PresentedCredential` (`pub(crate)` to `authkestra-op`, and so
+/// unreachable from this crate), narrowed to the two methods any client registered in this
+/// deployment ever uses -- see `oauth2_op::client_store::to_registration`: every configured
+/// client is `NoAuth` (public) or `PrivateKeyJwt` (confidential), and `client_secret_hash` is
+/// always `None`, so a presented `client_secret` (Basic or POST) can never verify regardless of
+/// which registration it is checked against. `Secret` exists so a presented-but-doomed-to-fail
+/// secret is still routed through the same "at most one credential" and "unknown method ->
+/// invalid_client" logic real upstream code applies, rather than silently ignored.
+enum RevokeCredential {
+    NoCredential,
+    Secret { client_id: Option<String> },
+    Assertion(String),
+}
+
+/// A `/oauth2/revoke` failure, kept small and `Response`-free until the final conversion at the
+/// handler boundary (`RevokeError::into_response`) -- returning `axum::response::Response`
+/// directly from a `Result::Err` trips `clippy::result_large_err` (a `Response` is well over the
+/// 128-byte threshold), the same reason `authkestra_op::handlers::token`'s own error path uses a
+/// small `TokenErrorResponse` struct instead of building a `Response` early.
+struct RevokeError {
+    status: StatusCode,
+    error: &'static str,
+    description: String,
+}
+
+impl RevokeError {
+    fn new(status: StatusCode, error: &'static str, description: impl Into<String>) -> Self {
+        Self {
+            status,
+            error,
+            description: description.into(),
+        }
+    }
+
+    fn into_response(self) -> Response {
+        oauth_error(self.status, self.error, &self.description)
+    }
+}
+
+fn invalid_client() -> RevokeError {
+    RevokeError::new(
+        StatusCode::UNAUTHORIZED,
+        "invalid_client",
+        "Client authentication failed",
+    )
+}
+
+/// Mirrors `authkestra_op::handlers::token::extract_credential` for the subset of
+/// [`RevokeCredential`] this deployment's clients ever present. Returns `Err` for a malformed
+/// *request* -- more than one credential presented at once (RFC 6749 §2.3 / RFC 7521 §4.2), or a
+/// `client_assertion` with a missing/wrong `client_assertion_type` -- which is distinct from a
+/// malformed *token value*, the case RFC 7009 §2.2 requires to be a bare 200 (see
+/// `revoke_endpoint`).
+fn extract_revoke_credential(
+    client_secret: Option<&str>,
+    client_assertion: Option<&str>,
+    client_assertion_type: Option<&str>,
+    auth_header: Option<&str>,
+) -> Result<RevokeCredential, RevokeError> {
+    let basic = auth_header
+        .and_then(|auth| auth.strip_prefix("Basic "))
+        .and_then(|stripped| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(stripped)
+                .ok()
+        })
+        .and_then(|decoded| String::from_utf8(decoded).ok())
+        .and_then(|creds| creds.split_once(':').map(|(id, _secret)| id.to_string()));
+
+    let post = client_secret.filter(|s| !s.is_empty()).map(str::to_string);
+
+    let assertion = match client_assertion {
+        Some(assertion) => match client_assertion_type {
+            Some(CLIENT_ASSERTION_TYPE_JWT_BEARER) => Some(assertion.to_string()),
+            _ => {
+                return Err(RevokeError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    format!("client_assertion_type must be {CLIENT_ASSERTION_TYPE_JWT_BEARER}"),
+                ));
+            }
+        },
+        None => None,
+    };
+
+    let presented =
+        u8::from(basic.is_some()) + u8::from(post.is_some()) + u8::from(assertion.is_some());
+    if presented > 1 {
+        return Err(RevokeError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Only one client authentication method may be used per request",
+        ));
+    }
+
+    Ok(match (basic, post, assertion) {
+        (Some(client_id), _, _) => RevokeCredential::Secret {
+            client_id: Some(client_id),
+        },
+        (_, Some(_), _) => RevokeCredential::Secret { client_id: None },
+        (_, _, Some(assertion)) => RevokeCredential::Assertion(assertion),
+        (None, None, None) => RevokeCredential::NoCredential,
+    })
+}
+
+/// Mirrors `authkestra_op::handlers::token::resolve_client_id`.
+fn resolve_revoke_client_id(
+    req_client_id: Option<&str>,
+    credential: &RevokeCredential,
+) -> Option<String> {
+    match credential {
+        RevokeCredential::Secret {
+            client_id: Some(id),
+        } => Some(id.clone()),
+        RevokeCredential::Assertion(assertion) => req_client_id
+            .map(str::to_string)
+            .or_else(|| peek_client_assertion_subject(assertion)),
+        _ => req_client_id.map(str::to_string),
+    }
+}
+
+/// Mirrors `authkestra_op::handlers::token::authenticate_client` for the two methods any client
+/// in this deployment ever registers (see [`RevokeCredential`]'s doc comment). Any other
+/// combination -- a presented secret, or a method/credential mismatch -- is an authentication
+/// failure. This is the one case RFC 7009 §2.2 carves out as NOT a bare 200: client-authentication
+/// failure is the only outcome this endpoint reports as an error.
+async fn authenticate_revoke_client(
+    client: &ClientRegistration,
+    credential: &RevokeCredential,
+    op_config: &OpConfig,
+    op_store: &TokenExchangeOpStore,
+) -> Result<(), RevokeError> {
+    match (client.token_endpoint_auth_method, credential) {
+        (Some(TokenEndpointAuthMethod::NoAuth), RevokeCredential::NoCredential) => Ok(()),
+        (Some(TokenEndpointAuthMethod::PrivateKeyJwt), RevokeCredential::Assertion(assertion)) => {
+            let verified = verify_client_assertion(
+                assertion,
+                client,
+                &[op_config.token_endpoint(), op_config.issuer.clone()],
+            )
+            .map_err(|_| invalid_client())?;
+            match op_store
+                .record_client_assertion_jti(&verified.jti, verified.expires_at)
+                .await
+            {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    tracing::warn!(
+                        client_id = %client.client_id,
+                        "client assertion jti has already been spent -- replay refused"
+                    );
+                    Err(invalid_client())
+                }
+                Err(_) => Err(RevokeError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "internal error",
+                )),
+            }
+        }
+        _ => Err(invalid_client()),
+    }
+}
+
+/// `POST /oauth2/revoke` (RFC 7009). Client authentication mirrors the token endpoint's own
+/// (`handle_token`'s `extract_credential`/`resolve_client_id`/`authenticate_client`, all
+/// `pub(crate)` to `authkestra-op` and so unreachable from this crate -- mirrored above instead
+/// of reimplemented from scratch for their full generality, narrowed to the methods this
+/// deployment's clients actually register).
+///
+/// RFC 7009 §2.2, the counter-intuitive part: an unknown, already-revoked, or malformed *token*
+/// always gets `200 OK` with an empty body -- never an error -- so this endpoint can never be
+/// used as an oracle to probe whether a given token string is currently valid. The ONLY error
+/// this handler ever returns is client-authentication failure (missing/invalid credential, or an
+/// unknown client), which happens entirely before the token itself is even looked up. A missing
+/// `token` form field is a malformed *request*, not a malformed *token value*, so that alone is
+/// `invalid_request` (400) -- RFC 7009 §2.1 marks `token` REQUIRED.
+async fn revoke_endpoint(
+    State(state): State<TokenExchangeState>,
+    headers: HeaderMap,
+    Form(raw): Form<RevokeRequest>,
+) -> Response {
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    let Some(token) = raw.token.as_deref().filter(|s| !s.trim().is_empty()) else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "token is required",
+        );
+    };
+    // Accepted per RFC 7009 §2.1's request shape, deliberately not branched on -- see this
+    // module's header comment for why the hint changes nothing about how the lookup runs.
+    tracing::debug!(
+        token_type_hint = raw.token_type_hint.as_deref().unwrap_or("none"),
+        "revocation request received"
+    );
+
+    let credential = match extract_revoke_credential(
+        raw.client_secret.as_deref(),
+        raw.client_assertion.as_deref(),
+        raw.client_assertion_type.as_deref(),
+        auth_header,
+    ) {
+        Ok(credential) => credential,
+        Err(err) => return err.into_response(),
+    };
+
+    let Some(client_id) = resolve_revoke_client_id(raw.client_id.as_deref(), &credential) else {
+        return invalid_client().into_response();
+    };
+
+    let client = match state.op_store.find_client(&client_id).await {
+        Ok(Some(client)) => client,
+        Ok(None) => return invalid_client().into_response(),
+        Err(_) => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "internal error",
+            );
+        }
+    };
+
+    if let Err(err) =
+        authenticate_revoke_client(&client, &credential, &state.op_config, &state.op_store).await
+    {
+        return err.into_response();
+    }
+
+    if let Err(err) = state
+        .op_store
+        .revoke_refresh_token_for_client(token, &client_id)
+        .await
+    {
+        tracing::error!(error = ?err, "refresh token revocation storage failure");
+        return oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "revocation failed",
+        );
+    }
+
+    // RFC 7009 §2.2: success, uniformly, whether a live token was actually revoked, was already
+    // dead, never existed, or belonged to a different client -- see this function's doc comment.
+    StatusCode::OK.into_response()
 }

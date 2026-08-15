@@ -442,6 +442,18 @@ fn to_jwks(raw: Vec<Value>) -> Vec<authkestra_engine::token::jwk::Jwk> {
 ///    `OidcDiscovery`'s field is a required `String` with no way to omit it via the type itself, so
 ///    the value is removed post-serialization below (`obj.remove`), same pattern PR #301 used for
 ///    `token_endpoint`.
+///
+/// **`revocation_endpoint` is absent, on purpose, not an oversight -- it cannot be added here.**
+/// `POST /oauth2/revoke` (RFC 7009) is real, mounted, and live
+/// (`crate::token_exchange::token_exchange_router`), but `authkestra_op::handlers::discovery::
+/// OidcDiscovery` (0.5.0) has no `revocation_endpoint` field to populate, and RFC 8414 §2 defines
+/// it as a standard authorization-server metadata field this document should otherwise carry.
+/// Filed upstream: <https://github.com/marcjazz/authkestra/issues/220>. Once that field exists,
+/// wire it in here the same way `token_endpoint` is set below, gated on `enabled` (revocation only
+/// makes sense once the token-exchange grant surface -- the only source of revocable refresh
+/// tokens -- is actually mounted). A previous round of confusion over silently-empty discovery
+/// fields cost real debugging time (see `response_types_supported` in the paragraph above), which
+/// is why this omission gets its own explicit callout rather than just not appearing.
 fn discovery_document(
     issuer: &str,
     token_exchange_scopes: Option<&[String]>,
