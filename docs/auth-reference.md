@@ -5,7 +5,7 @@ A lookup layer over the auth/token surface of `authz-api`, `authz-opa`, `lightbr
 and get a `file:line` citation, not prose. This does **not** replace `docs/rbac.md` (the RBAC
 model in full) or the ADRs (the *why*) — it points at them instead of restating them.
 
-Verified against commit `1c2fc6e` on `origin/main` (2026-08-15). Every row below was checked
+Verified against commit `9f095e0` on `origin/main` (2026-08-15). Every row below was checked
 against the code at that commit; anything that could not be confirmed by reading source or a
 passing test was left out rather than guessed.
 
@@ -43,7 +43,8 @@ out separately where it differs.
 | `oauth2.token_exchange` | `Option<Oauth2TokenExchange>` | default `None` | Native RFC 8693 token-exchange (`POST /oauth2/token`) | Absent/`enabled: false` → `/oauth2/token` is not mounted and discovery advertises no `token_endpoint` at all |
 | `oauth2.token_exchange.enabled` | `bool` | default `false` | Whether the exchange grant is mounted | **`enabled: true` under `oauth2.type: external` fails server startup hard** — `Error::Server("oauth2.token_exchange is enabled but requires oauth2.type: self")` (`lib.rs:1278-1282`, test `build_token_exchange_state_rejects_external_oauth2` at `lib.rs:1722-1731`) |
 | `oauth2.token_exchange.access_ttl_seconds` | `i64` | default `900` (15 min) | Exchanged access-JWT lifetime | `<= 0` → startup fails (`lib.rs:1286-1290`) |
-| `oauth2.token_exchange.refresh_ttl_seconds` | `i64` | default `2_592_000` (30 days) | Refresh-token lifetime | `<= 0` → startup fails, same check as above |
+| `oauth2.token_exchange.refresh_ttl_seconds` | `i64` | default `2_592_000` (30 days) | Per-**token** lifetime, reset on every rotation (`new_row.expires_at = now + refresh_ttl_seconds`, `oauth2_op/store.rs:581`) — this is not a session-level ceiling by itself; see `refresh_absolute_ttl_seconds` immediately below for the field that actually bounds a session | `<= 0` → startup fails, same check as above |
+| `oauth2.token_exchange.refresh_absolute_ttl_seconds` | `i64` | default `7_776_000` (90 days) | Absolute cap on a refresh-token **chain** (every token minted across one rotation lineage), not the individual token above. Set once, at chain birth (the offline-scope exchange grant), to `now + refresh_absolute_ttl_seconds` (`chain_expires_at`, `oauth2_op/store.rs:330-332`), and inherited unchanged by every subsequent rotation (`store.rs:578-579`) — this is what stops a session that keeps refreshing before every individual `expires_at` from living forever. See §4 below for the full chain/status model | **Not startup-validated**, unlike `access_ttl_seconds`/`refresh_ttl_seconds` above (`lib.rs:1754-1758` only checks those two). A `<= 0` value is silently clamped to `0` via `.max(0)`, so every new chain is born already past its cap and the first refresh attempt on it fails `invalid_grant` — not a startup crash |
 | `oauth2.token_exchange.allowed_scopes` | `Vec<String>` | default `["openid","profile","email","offline_access"]` | Server-wide scope ceiling, intersected with each client's own `scopes` at request time (`oauth2_op/mod.rs:44-76`) | A scope omitted here can never be granted regardless of client config |
 | `oauth2.rbac` | `Rbac` | default: `roles_claim="roles"`, empty maps | RBAC config — see below | — |
 | `oauth2.rbac.roles_claim` | `String` | struct default `"roles"` (`authz.rs:357-359`) when the key is absent; **shipped config sets** `"${RBAC_ROLES_CLAIM:-lightbridge_api_roles}"` (`config/default.yaml:122`) | JWT claim carrying the caller's roles (array or space-delimited string) | Wrong claim name → every caller resolves to zero permissions (no error, just silent 403s) |
@@ -114,7 +115,7 @@ when the block is present *and* `enabled: true`.
 | `scopes_supported` | `[]` when disabled; `oauth2.token_exchange.allowed_scopes` verbatim when enabled | `enabled` |
 | `id_token_signing_alg_values_supported` | hardcoded `["RS256"]` — `ALGORITHM` const (`signing.rs:30`) fed into `op_config.id_token_signing_alg` (`signing.rs:468`), wrapped into a single-element array by `OidcDiscovery::from_config` (`authkestra_op` 0.5.0) | always |
 | `claims_supported` | hardcoded static list: `iss, sub, aud, exp, iat, nbf, jti, typ, azp, lightbridge_caller_kind, sid, scope, api_key_id, project_id, account_id, email, email_verified, allowed_models, identity, nonce, auth_time, at_hash` (`signing.rs:492-518`) | always, regardless of `enabled` — lists claims that *can* appear, not ones guaranteed on every token |
-| `revocation_endpoint` | **Not emitted — the field does not exist on `OidcDiscovery`.** `POST /oauth2/revoke` (RFC 7009) is real and mounted (see §5), but `authkestra_op::handlers::discovery::OidcDiscovery` (0.5.0) has no field to carry it; RFC 8414 §2 lists it as standard metadata this document should otherwise have. Filed upstream: `marcjazz/authkestra#220`. See the doc comment directly above `discovery_document` in `signing.rs` | n/a — structurally absent, not gated by any config |
+| `revocation_endpoint` | **Not emitted — the field does not exist on `OidcDiscovery`.** `POST /oauth2/revoke` (RFC 7009) is real and mounted (see §6), but `authkestra_op::handlers::discovery::OidcDiscovery` (0.5.0) has no field to carry it; RFC 8414 §2 lists it as standard metadata this document should otherwise have. Filed upstream: `marcjazz/authkestra#220`. See the doc comment directly above `discovery_document` in `signing.rs` | n/a — structurally absent, not gated by any config |
 
 **A second, unrelated discovery surface exists on `lightbridge-mcp`.** `GET
 /.well-known/oauth-authorization-server` and `GET /.well-known/openid-configuration` on the MCP
@@ -178,7 +179,46 @@ for a token to expire. (`IntrospectResponse` struct: `crates/lightbridge-authz-r
 > above) nothing inserts those three into a JWT anywhere in the codebase. `AGENTS.md` should be
 > corrected to match the introspection-based design described above.
 
-## 4. Permissions → procedures
+## 4. Refresh-token chain & lifecycle
+
+Covers `exchange_refresh_tokens` columns added/changed by the refresh-token hardening
+(`crates/lightbridge-authz-rest/src/oauth2_op/store.rs:422-616` `handle_refresh_token`, migration
+`20260815000001_exchange_refresh_tokens_add_chain.sql`). **None of the fields in this section are
+JWT claims** — they live only on the server-side `exchange_refresh_tokens` row and are never
+serialized into the access/id token (contrast with §3 above).
+
+| Field | What it is | Source | Notes |
+|---|---|---|---|
+| `chain_id` | Shared by every token minted across one rotation lineage | Minted once via the sanctioned `cuid2()` chokepoint at chain birth — the offline-scope exchange grant (`store.rs:330`) — and inherited **unchanged** by every rotation thereafter (`store.rs:578`), never regenerated | Used to cascade-revoke a whole family in one `UPDATE` on reuse detection (`revoke_exchange_refresh_token_chain`, `crates/lightbridge-authz-api-key/src/repo.rs:758-771`) |
+| `chain_expires_at` | Absolute deadline for the whole chain | Set once at birth to `now + oauth2.token_exchange.refresh_absolute_ttl_seconds` (`store.rs:331-332`), inherited unchanged by every rotation (`store.rs:579`) | Checked before every rotation (`old_row.chain_expires_at`, `store.rs:475`); a chain past this deadline refuses to rotate even if the presented token's own `expires_at` has not passed |
+| `exchange_refresh_tokens.status` | Lifecycle state of one token row | `active` (minted, usable, set by `create_exchange_refresh_token`, `repo.rs:684`) → `rotated` (consumed by a successful refresh — the CAS single-use marker, `consume_exchange_refresh_token`, `repo.rs:792`) → `revoked` (killed by `/oauth2/revoke`, `revokeOwnSessions`/`revokeSubjectSessions`, or the reuse cascade, `repo.rs:762,813`) | Terminal once `rotated` or `revoked` — no transition ever moves a row backward. Only `find_exchange_refresh_token_by_hash`'s unconditional lookup (`repo.rs:735-750`) ever reads a non-`active` row; every honoring path filters on `status = 'active'` |
+
+**Every refresh re-validates, not just checks the token row.** `handle_refresh_token` re-runs the
+same `resolve_context(subject, project_id)` ownership/membership check `/idp/v1/resolve-context`
+uses (ADR-0006: owns the project OR holds a `project_members` row, `store.rs:487-497`), then
+requires the resolved project (`store.rs:498-504`) and account (`store.rs:505-511`) to both be
+`Active`. Any failure refuses the refresh as a plain `invalid_grant` — never a permissive fallback.
+Before this hardening, a refresh whose project could not be resolved fell through to
+`allowed_models = None`, which this codebase reads as "no restriction" — a real fail-open bug,
+closed by this re-validation (regression test
+`refresh_after_project_deleted_is_invalid_grant_not_fail_open`,
+`crates/lightbridge-authz-rest/tests/token_exchange_tests.rs:1861-1899`).
+
+**Replaying an already-rotated token (`status = 'rotated'`) revokes its entire chain** — RFC 6819
+§5.2.2.3 reuse detection (`revoke_chain_on_reuse`, `store.rs:625-652`). An unknown, expired, or
+already-`revoked` token is a plain `invalid_grant` with **no** cascade
+(`unknown_refresh_token_is_invalid_grant_without_cascading`, `token_exchange_tests.rs:2032-2065`).
+
+**The honest limit:** none of this calls back to Keycloak. `handle_refresh_token` re-checks only
+this service's own `resolve_context` plus project/account status — a user disabled directly in the
+IdP but still active on this service's roster is not detected by a refresh; that session is bounded
+only by `chain_expires_at` above and by an explicit revoke (§5's `session:revoke*` rows, or §6's
+`/oauth2/revoke` row).
+
+The task-oriented walkthrough of all of the above, with the request/response shapes, lives in
+[`docs/token-exchange-integration.md`'s "Refresh" section](https://github.com/ADORSYS-GIS/lightbridge-authz/blob/main/docs/token-exchange-integration.md#refresh).
+
+## 5. Permissions → procedures
 
 The full permission catalogue, the RPC `op_id`/MCP-tool mapping, and the default role→permission
 table already live in `docs/rbac.md` — this section only adds the budget self-refill model that
@@ -226,11 +266,11 @@ catalogue + RBAC compilation), `app/lightbridge-authz/src/mcp.rs:378-403` (MCP t
   `lightbridge-admin`'s `*`; not granted to `lightbridge-editor`/`lightbridge-viewer`.
 - Both delegate to `StoreRepo::revoke_active_exchange_refresh_tokens_for_subject`, the same
   `status = 'active' -> 'revoked'` flip `POST /oauth2/revoke` (RFC 7009) uses for a single token —
-  see §5's `/oauth2/revoke` row. `find_active_exchange_refresh_token`/
+  see §6's `/oauth2/revoke` row. `find_active_exchange_refresh_token`/
   `consume_exchange_refresh_token` both filter on `status = 'active'`, so revocation from either
   surface takes effect on the very next refresh attempt.
 
-## 5. Endpoints
+## 6. Endpoints
 
 | Server | Route | Auth | Purpose |
 |---|---|---|---|
@@ -267,7 +307,7 @@ longer be exposed"). `README.md` (lines 20, 93-94, 108, 117) and `docs/test-prot
 line 5 and lines 68/85 still reference `/v1/authorino/validate`, while lines 118/212/256 correctly
 use `/v1/authorino/validate/introspect`. All three should be updated to match the code.
 
-## 6. Gotchas
+## 7. Gotchas
 
 - **Ids are opaque strings — never shape-validate, regex, or sort/paginate by them.** CUID2 has no
   ordering; this already broke once when cratestack's `Cuid` schema scalar rejected any id not

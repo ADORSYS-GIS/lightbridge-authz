@@ -133,19 +133,43 @@ period no longer counts against the new ceiling.
 absolute statement — never a running total that implies addition. If you show spend-so-far
 alongside the new ceiling, make clear the ceiling reset, not accumulated.
 
-### 2. The refill has no gateway effect until the next token refresh
+### 2. Today, a refill has no gateway effect at all — not "until the next token refresh," none
 
-A `grantId` on an `auto_approved`/`approved` response means the grant is **recorded on the
-ledger**, not that the increased budget is enforced at the gateway yet. The enforcement re-key
-(Phase 6a) and writing the Keycloak attribute (Phase 6b) are out of scope for the work this doc
-describes — until those land, the gateway keeps enforcing whatever ceiling was already in the
-user's current token, and the new tier takes effect only after that token is refreshed (a new
-login, or whatever refresh mechanism the app already uses).
+**Present-tense, as of this writing: a successful `requestBudgetRefill` changes the ledger and
+nothing else.** A `grantId` on an `auto_approved`/`approved` response means the grant is
+**recorded**, full stop. Nothing at the gateway reads the budget ledger — `requestBudgetRefill`
+does not write `x-quota-tier`, does not touch `project_members.quota_tier` or
+`projects.project_quota`, and no code path anywhere in this repo writes a budget-tier claim to
+Keycloak (confirmed against `crates/lightbridge-authz-budget/src/refill.rs`,
+`crates/lightbridge-authz-rest/src/lib.rs`'s `Procedures` impl, and
+[`docs/governance-model-and-enforcement.md`](./governance-model-and-enforcement.md)'s "A second,
+newer budget system exists and is not yet connected here" section, which states this in full: *"…
+has zero effect on anything this document describes: it does not write `x-quota-tier` … and
+nothing in §3's header pipeline reads from it."*). **There is no token-refresh delay to describe,
+because there is no path from a grant to gateway enforcement at all yet** — describing this as "it
+takes effect on your next token refresh" would be actively wrong: refreshing changes nothing, since
+nothing downstream of the ledger is watching it.
 
-**UI implication:** immediately after a successful refill, say so explicitly — e.g. "Granted. This
-takes effect the next time your session refreshes, not immediately." Do not show a success state
-that implies the user can go spend the new amount right now; that is the single fastest way to
-generate a "it didn't work" support ticket per #191's own risk callout.
+**UI implication:** immediately after a successful refill, say so plainly and do not promise a
+timeline for enforcement — e.g. "Granted. This increases your recorded budget; it does not change
+what's enforced yet." Do not show a success state that implies the user can go spend the new amount
+soon, on refresh or otherwise, and do not use language like "takes effect on your next login" —
+that promises something the system does not do today and would itself generate the "it didn't
+work" support ticket per #191's own risk callout, just delayed instead of immediate.
+
+**Planned (not yet implemented) — for context, not for present-tense UI copy.** Connecting the
+ledger to gateway enforcement is a two-phase, both-still-open plan:
+
+- **Phase 6a** — re-key the enforcement `BackendTrafficPolicy` rules from the current per-plan
+  rules onto the `x-budget-tier` ladder (ADR-0008). Runbook:
+  [`docs/runbooks/budget-tier-rekey-cutover.md`](./runbooks/budget-tier-rekey-cutover.md).
+- **Phase 6b** — write the granted tier back to Keycloak (a group attribute or similar) so it
+  reaches a token's claims at all, which is the precondition for "takes effect on refresh" ever
+  becoming true.
+
+Full picture, including the "quick reference — what governs what" table showing the budget ledger's
+row as not-yet-live:
+[`docs/governance-model-and-enforcement.md`](./governance-model-and-enforcement.md).
 
 ## Rejection reasons must always be shown
 
