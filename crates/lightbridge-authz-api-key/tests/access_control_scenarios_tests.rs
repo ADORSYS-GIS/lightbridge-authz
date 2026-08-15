@@ -34,12 +34,21 @@ fn build_new_api_key_row(project_id: &str, name: &str, key_hash: &str) -> NewApi
     }
 }
 
-#[ignore = "tests an account-level 'invited member' scenario ADR-0006 removed entirely -- \
-            the assertions below were left stale by commit a12cda38's account_memberships \
-            removal (comment updated, assertions were not); see #220 for the full diagnosis \
-            and the redesign decision this needs before re-enabling"]
+/// Rewritten per #220: the pre-ADR-0006 version of this test exercised an account-level
+/// "invited member" concept (`account_memberships`) that no longer exists -- an account IS its
+/// owner, full stop (see the account-scoped assertions below, which are still valid and kept).
+/// Project-scoped sharing since ADR-0006 happens exclusively through `project_members`, so
+/// "invited" here is seeded as a genuine roster row via `add_project_member` rather than assumed
+/// from account co-location. This closes the coverage gap #220 identified: no existing test
+/// exercised the full `Project`/`ApiKey` CRUD surface for a real project member against a true
+/// outsider (`project_membership_tests.rs` covers roster management and a single-operation
+/// (`get_project`) visibility toggle, not this).
+///
+/// `invited` is seeded as a `lead` (not a plain `member`) specifically so this test also reaches
+/// `create_api_key`'s lead gate (`authorize_project_lead`) -- the one operation on this surface
+/// that is not "any member", matching production behavior rather than glossing over it.
 #[sqlx::test(migrations = "../../migrations")]
-async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
+async fn access_control_allows_project_members_and_rejects_non_members(pool: PgPool) {
     let repo = build_repo(pool.clone());
     let owner = "owner-sub";
     let invited = "invited-sub";
@@ -78,7 +87,7 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
         .unwrap_err();
     assert!(matches!(unauthorized_account_update, Error::NotFound));
 
-    let invited_account = repo
+    let self_account_update = repo
         .update_account(
             owner,
             &account.id,
@@ -89,13 +98,26 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
         .await
         .unwrap();
     // No account-level roster exists to invite into any more; sharing happens per project.
-    assert_eq!(invited_account.id, owner);
-    assert_eq!(repo.list_accounts(invited, 0, 50).await.unwrap().len(), 1);
-    assert_eq!(repo.list_accounts(invited, 1, 50).await.unwrap().len(), 0);
+    assert_eq!(self_account_update.id, owner);
+    assert!(repo.list_accounts(owner, 0, 50).await.unwrap().len() == 1);
+
+    // `invited` needs its own account row: `project_members.account_id` is a real FK (ADR-0006 --
+    // a project member IS an account, not a raw subject string), so seeding the roster requires a
+    // real account to point at first.
+    let invited_account = repo
+        .create_account(
+            invited,
+            CreateAccount {
+                default_quota: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(invited_account.id, invited);
 
     let project = repo
         .create_project(
-            invited,
+            owner,
             &account.id,
             CreateProject {
                 name: "proj-a".to_string(),
@@ -110,23 +132,70 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
         .await
         .unwrap();
 
-    let unauthorized_project_create = repo
+    // `create_project` is owner-only -- no `project_members` check exists on it at all -- so
+    // neither `invited` (not yet on the roster) nor `outsider` may create a project under
+    // `owner`'s account.
+    let unauthorized_project_create_by_invited = repo
         .create_project(
-            outsider,
+            invited,
             &account.id,
             CreateProject {
-                name: "proj-nope".to_string(),
+                name: "proj-nope-invited".to_string(),
                 allowed_models: None,
                 default_limits: None,
                 billing_plan: "free".to_string(),
                 billing_identity: format!("bill-{}", cuid2()),
                 project_quota: None,
             },
-            "proj_forbidden".to_string(),
+            "proj_forbidden_invited".to_string(),
         )
         .await
         .unwrap_err();
-    assert!(matches!(unauthorized_project_create, Error::NotFound));
+    assert!(matches!(
+        unauthorized_project_create_by_invited,
+        Error::NotFound
+    ));
+    let unauthorized_project_create_by_outsider = repo
+        .create_project(
+            outsider,
+            &account.id,
+            CreateProject {
+                name: "proj-nope-outsider".to_string(),
+                allowed_models: None,
+                default_limits: None,
+                billing_plan: "free".to_string(),
+                billing_identity: format!("bill-{}", cuid2()),
+                project_quota: None,
+            },
+            "proj_forbidden_outsider".to_string(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        unauthorized_project_create_by_outsider,
+        Error::NotFound
+    ));
+
+    // Before `invited` is added to the roster, they see nothing -- identical to `outsider`.
+    assert!(
+        repo.get_project(invited, &project.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repo.get_project(outsider, &project.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        repo.list_projects(invited, &account.id, 0, 50)
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
     assert_eq!(
         repo.list_projects(outsider, &account.id, 0, 50)
             .await
@@ -134,11 +203,39 @@ async fn access_control_allows_members_and_rejects_non_members(pool: PgPool) {
             .len(),
         0
     );
+
+    // The owner (or an existing lead -- there is none yet, so it must be the owner) grants
+    // `invited` a real roster row. This is the ADR-0006 mechanism this test exists to exercise.
+    repo.add_project_member(owner, &project.id, &invited_account.id, Some("lead"))
+        .await
+        .unwrap();
+
+    let seen_by_invited = repo
+        .get_project(invited, &project.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seen_by_invited.id, project.id);
+    assert_eq!(
+        repo.list_projects(invited, &account.id, 0, 50)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    // `outsider` is still not on the roster and remains rejected identically to before.
     assert!(
         repo.get_project(outsider, &project.id)
             .await
             .unwrap()
             .is_none()
+    );
+    assert_eq!(
+        repo.list_projects(outsider, &account.id, 0, 50)
+            .await
+            .unwrap()
+            .len(),
+        0
     );
 
     let updated_project = repo
