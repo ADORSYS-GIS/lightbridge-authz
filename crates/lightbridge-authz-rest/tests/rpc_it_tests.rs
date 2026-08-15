@@ -2065,11 +2065,15 @@ async fn set_default_project_rejects_a_project_the_caller_is_not_a_member_of() {
 /// can assert on which specific rows a revocation touched.
 async fn seed_active_session(pool: &sqlx::PgPool, subject: &str) -> String {
     let id = cuid2();
+    // `chain_id`/`chain_expires_at` (migration `20260815000001_exchange_refresh_tokens_add_chain`)
+    // are `NOT NULL` with no default -- mirrors that migration's own backfill convention for a
+    // pre-existing row: a single-member chain (`chain_id = id`) with a cap far enough out that
+    // none of these tests' assertions ever race it.
     sqlx::query(
         r#"
         INSERT INTO exchange_refresh_tokens
-          (id, subject, account_id, project_id, client_id, token_hash, status, created_at, expires_at)
-        VALUES ($1, $2, $2, $3, 'test-client', $4, 'active', now(), now() + interval '30 days')
+          (id, subject, account_id, project_id, client_id, token_hash, status, chain_id, chain_expires_at, created_at, expires_at)
+        VALUES ($1, $2, $2, $3, 'test-client', $4, 'active', $1, now() + interval '90 days', now(), now() + interval '30 days')
         "#,
     )
     .bind(&id)

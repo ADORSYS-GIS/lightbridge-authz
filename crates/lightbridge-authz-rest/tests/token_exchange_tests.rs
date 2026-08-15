@@ -2436,3 +2436,112 @@ async fn revoke_confidential_client_with_valid_assertion_succeeds(pool: PgPool) 
 
     assert_eq!(status, StatusCode::OK, "body: {body}");
 }
+
+// ============================================================================================
+// Composition: this file's own RFC 7009 revoke path vs. the reuse-detection cascade
+// (`TokenExchangeOpStore::revoke_chain_on_reuse`, hardening PR #316). The two mechanisms flip
+// `status` on the SAME rows via DIFFERENT triggers (explicit client action vs. automatic replay
+// detection), so it is worth proving directly, not just by inspection, that neither confuses the
+// other: an explicit revoke is never mistaken for a "stolen token" signal, and the cascade's own
+// SQL tolerates a chain that already has no active member left.
+// ============================================================================================
+
+/// The cascade must still run cleanly -- no error, no panic, a plain `invalid_grant` -- when the
+/// chain's current tip was already killed through `/oauth2/revoke` rather than through rotation.
+/// Sequence: exchange (token1, chain born) -> refresh (token1 rotates to token2) -> explicitly
+/// revoke token2 via `/oauth2/revoke` (the chain now has ZERO active rows: token1 is `rotated`,
+/// token2 is `revoked`) -> replay the older, already-rotated token1. `consume_exchange_refresh_
+/// token`'s CAS fails (token1 isn't `active`), `revoke_chain_on_reuse` fires because token1's
+/// status is `rotated`, and `revoke_exchange_refresh_token_chain`'s `WHERE status = 'active'`
+/// update matches nothing -- a documented no-op, not an error. The replay must still be a clean
+/// `400 invalid_grant`, proving the cascade composes safely with a chain this file's own revoke
+/// path already fully drained.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reuse_cascade_is_a_clean_noop_on_a_chain_already_drained_by_explicit_revoke(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let token1 = issue_refresh_token(state(repo.clone(), true), PUBLIC_CLIENT_ID).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={token1}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let token2 = body["refresh_token"].as_str().unwrap().to_string();
+
+    // Explicitly revoke the chain's current (only active) tip via this file's own RFC 7009
+    // endpoint -- NOT via rotation. The chain now has no `active` row at all.
+    let (status, body) = post_revoke(
+        state(repo.clone(), true),
+        &format!("token={token2}&client_id={PUBLIC_CLIENT_ID}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Replay the OLDER, already-rotated token1 -- this is what makes `revoke_chain_on_reuse`
+    // fire (its trigger is `status == "rotated"`, which token1 satisfies regardless of what has
+    // since happened to the rest of its chain).
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={token1}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "replaying an old, already-rotated token must stay a clean invalid_grant even when the \
+         chain's tip was already killed by an explicit revoke, not an error: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+}
+
+/// The other direction: an explicitly-revoked token (never rotated -- a single-member chain) is
+/// NOT treated as a reuse-of-a-stolen-token signal when replayed. `revoke_chain_on_reuse` only
+/// cascades when the presented token's own row has `status == "rotated"`; an explicit
+/// `/oauth2/revoke` call sets `status = "revoked"`, a different value, so replaying it must be a
+/// plain `invalid_grant` with no cascade side effects -- verified here by confirming a second,
+/// completely unrelated chain for the SAME subject is untouched by the replay attempt.
+#[sqlx::test(migrations = "../../migrations")]
+async fn replaying_an_explicitly_revoked_token_does_not_trigger_the_reuse_cascade(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let revoked = issue_refresh_token(state(repo.clone(), true), PUBLIC_CLIENT_ID).await;
+    let (status, _) = post_revoke(
+        state(repo.clone(), true),
+        &format!("token={revoked}&client_id={PUBLIC_CLIENT_ID}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // An unrelated, still-live chain for the same subject.
+    let unrelated = issue_refresh_token(state(repo.clone(), true), PUBLIC_CLIENT_ID).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={revoked}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "replaying an explicitly-revoked token must be invalid_grant: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={unrelated}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an explicit revoke's status ('revoked') must never be mistaken for the cascade's \
+         ('rotated') trigger -- an unrelated chain for the same subject must be unaffected: {body}"
+    );
+}
