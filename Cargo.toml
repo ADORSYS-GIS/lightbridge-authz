@@ -66,31 +66,35 @@ jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
 # three lines below MUST move together, exactly like the cratestack lockstep block further down —
 # a partial bump within this trio reproduces that exact failure mode.
 #
-# ⚠️ GIT PIN, not a crates.io version — deliberately, and temporarily. ADR-0011's Decision 3 needs
-# two upstream changes this repo's decision owner (an authkestra collaborator, not maintainer) does
-# not control the release timing of: upstream PR #207 (`Claims.aud` gains multi-value `Audience`
-# support — required because this repo's Keycloak realm already stamps two simultaneous audiences
-# on every access token, which a single-valued `Option<String>` cannot deserialize) and PR #208 (a
-# token-exchange `OpStore::handle_token_exchange` override seam + `extra`/`id_token` support on the
-# exchange grant, mirroring the seam PR #191 already gave the refresh-token grant). Both merged to
-# `marcjazz/authkestra` main as of commit `a19cdd2d984094a11b7c7546ae81d5d4de39da73`
-# (2026-08-14) but are NOT yet in a crates.io release — `git show a19cdd2:Cargo.toml` still reports
-# `version = "0.4.0"`, the same as the last published tag. Verified this rev actually carries both:
-# `git show a19cdd2:crates/authkestra-engine/src/token/mod.rs` shows `pub enum Audience { Single,
-# Multiple }` and `Claims.aud: Option<Audience>` (PR #207); `git show
-# a19cdd2:crates/authkestra-op/src/store.rs` shows `OpStore::handle_token_exchange` as a real,
-# overridable trait method (PR #208), not the unconditional direct call the ADR's Context section
-# describes on the 0.4.0 tag. Also verified `authkestra-resource`'s source is byte-identical between
-# the `authkestra-resource-v0.4.0` tag and this rev (`git diff authkestra-resource-v0.4.0 a19cdd2 --
-# crates/authkestra-resource/` is empty) — pinning it to the same rev as the other two is required
-# for the lockstep above, not because it changed.
+# The git-pin era is over. `marcjazz/authkestra` cut a real crates.io release, 0.5.0, on
+# 2026-08-15, containing everything the previous git-rev pin (`a19cdd2`) carried (PR #207 —
+# multi-value `Claims.aud`; PR #208 — the `OpStore::handle_token_exchange` override seam) plus
+# three more merged fixes verified as ancestors of the `authkestra-op-v0.5.0` tag before this bump:
+# PR #214 (`OidcDiscovery::authorization_endpoint` becomes `Option<String>`, omitted unless
+# `authorization_code` is in `grant_types_supported`; `handle_authorization_code` now gates on
+# `client.allows_grant_type` like every sibling grant handler), PR #215 (`extra["jti"]` is honored
+# as a `jti` override across all four `TokenManager` issuance paths instead of producing an
+# undecodable duplicate-key JWT — this repo now uses it to mint `lgbr:`-prefixed CUID2 `jti`s
+# instead of authkestra's generated UUIDv4, closing the ADR-0039 gap `signing.rs`/`signing_tests.rs`
+# used to document), and PR #217 (RFC 8693 §2.2.1's REQUIRED `issued_token_type` added to
+# `TokenResponse`, and `default_handle_token_exchange` made `pub`). `authkestra-resource`'s source
+# is unchanged across the whole `a19cdd2..authkestra-resource-v0.5.0` range (verified: `git diff`
+# between them over `crates/authkestra-resource/` is empty) — it stays in the lockstep below only
+# because every crate in the upstream workspace shares one `version.workspace = true`, not because
+# it moved.
 #
-# FOLLOW-UP, tracked here so it isn't lost: swap all three lines below back to a plain crates.io
-# `version = "0.4.x"` pin (or later) the moment marcjazz cuts a release containing this commit —
-# git-rev pins are not what this repo ships long-term. Noted in the PR body too.
-authkestra-resource = { git = "https://github.com/marcjazz/authkestra", rev = "a19cdd2d984094a11b7c7546ae81d5d4de39da73" }
-authkestra-op = { git = "https://github.com/marcjazz/authkestra", rev = "a19cdd2d984094a11b7c7546ae81d5d4de39da73" }
-authkestra-engine = { git = "https://github.com/marcjazz/authkestra", rev = "a19cdd2d984094a11b7c7546ae81d5d4de39da73" }
+# `default_handle_token_exchange` being `pub` does NOT let this repo delete its own override in
+# `crates/lightbridge-authz-rest/src/oauth2_op/store.rs` — evaluated and rejected, not overlooked.
+# See that file's header comment for the two independent reasons delegation would silently break
+# every real request.
+#
+# ⚠️ Every crate in the upstream authkestra workspace still shares one `version.workspace = true`,
+# so all three lines below MUST move together on any future bump, exactly like the cratestack
+# lockstep block further down — a partial bump within this trio reproduces the exact failure mode
+# the old git-pin comment (see git history) documented for jsonwebtoken majors.
+authkestra-resource = "0.5.0"
+authkestra-op = "0.5.0"
+authkestra-engine = "0.5.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "tracing", "net", "time"] }
 thiserror = "2"
 anyhow = "1"

@@ -468,16 +468,16 @@ mod db {
     /// `jsonwebtoken::encode` path -- same claim names, same values, same omissions -- with any
     /// deviation stated explicitly rather than silently shipped.
     ///
-    /// Verified finding (not assumed): `TokenManager::issue_user_token_with_extra` is not a
-    /// drop-in replacement at the wire level. It unconditionally adds two claims this signer never
-    /// emitted before (`nbf`, and a nested `identity` object duplicating `sub`/`email`), and it
-    /// mints `jti` as a UUIDv4 rather than this repo's `lgbr:`-prefixed CUID2 -- with no clean way
-    /// to override it (an `extra["jti"]` entry collides with `Claims`' own top-level `jti` field
-    /// and produces a JWT payload with a duplicate `jti` key on the wire, which is
-    /// technically-malformed JSON that only happens to decode via `serde_json`'s last-wins
-    /// behavior; not something to rely on). This test pins that finding precisely rather than
-    /// letting it silently drift, per this repo's "stop and report, don't silently change the wire
-    /// contract" rule.
+    /// `TokenManager::issue_user_token_with_extra` is not a drop-in replacement at the wire level:
+    /// it unconditionally adds one claim this signer never emitted before (a nested `identity`
+    /// object duplicating `sub`/`email`) plus `nbf`. `jti` used to be a third, similar deviation --
+    /// authkestra minted it as a UUIDv4 with no clean way to override it, since an `extra["jti"]`
+    /// entry collided with `Claims`' own top-level `jti` field and produced a JWT payload with a
+    /// duplicate `jti` key on the wire. authkestra 0.5.0 (PR #215) closed that gap:
+    /// `TokenManager::take_jti` now removes a string-valued `extra["jti"]` and uses it verbatim,
+    /// so `signing.rs`'s `access_token_extra` supplies this repo's own `lgbr:`-prefixed CUID2
+    /// through it -- this test now asserts `jti` is back to matching the old signer's format, not
+    /// diverging from it.
     #[sqlx::test(migrations = "../../migrations")]
     async fn new_signer_claim_set_is_a_documented_superset_of_the_old_signer(pool: PgPool) {
         let repo = repo(pool);
@@ -567,11 +567,11 @@ mod db {
             "sanity check on the reconstructed old shape"
         );
         assert!(
-            !new_jti.starts_with("lgbr:")
-                && new_jti.len() == 36
-                && new_jti.matches('-').count() == 4,
-            "new jti must be authkestra's own UUIDv4 (documented deviation from the AGENTS.md \
-             \"every minted id is CUID2\" rule -- see the doc comment on this test): {new_jti}"
+            new_jti.starts_with("lgbr:") && new_jti != old_jti,
+            "new jti must use this repo's own `lgbr:`-prefixed CUID2 format, now that authkestra \
+             0.5.0 (#215) honors `extra[\"jti\"]` as an override instead of always generating a \
+             UUIDv4 (see the doc comment on this test) -- and must still be freshly minted per \
+             call, not a fixed/reused value: {new_jti}"
         );
 
         // The nested `identity` object mirrors `sub`/`email`, not new authority.
