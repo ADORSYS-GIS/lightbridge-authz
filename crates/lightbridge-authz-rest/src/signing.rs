@@ -401,40 +401,47 @@ fn to_jwks(raw: Vec<Value>) -> Vec<authkestra_engine::token::jwk::Jwk> {
 /// Builds the OIDC discovery document via `authkestra_op::handlers::discovery::OidcDiscovery`
 /// (ADR-0011, Decision 9) rather than the previous hand-built `serde_json::json!`. `OidcDiscovery`
 /// models a full OP (authorization_code + device flows included), which this service structurally
-/// never runs (ADR-0011, Context -- no user store, no login flow) -- `authorization_endpoint`
-/// is therefore a required-but-unreachable URL (the type has no way to omit it), mitigated by
-/// `response_types_supported` never advertising `"code"`, so no spec-compliant client has a reason
-/// to call it. `userinfo_endpoint` is genuinely optional on the type and is nulled out below,
-/// since this service does not serve one.
+/// never runs (ADR-0011, Context -- no user store, no login flow). `userinfo_endpoint` is
+/// genuinely optional on the type and is nulled out below, since this service does not serve one.
 ///
-/// `token_endpoint_auth_methods_supported` is set explicitly to `["none"]`, plus `private_key_jwt`
-/// when `private_key_jwt_supported` (at least one registered client is `confidential` -- ADR-0011
-/// Decision 6/9) -- never `OidcDiscovery::from_config`'s default (`client_secret_basic`/
-/// `client_secret_post`/`none`), since this service never accepts secret-based client auth at all.
+/// The document is built from three **independent** gates, not one flag driving everything --
+/// this function used to conflate them, which is how `response_types_supported` ended up
+/// advertising `["token", "id_token", "id_token token"]` in production the moment
+/// `oauth2.token_exchange.enabled` flipped to `true`, even though nothing about enabling
+/// token-exchange stood up an authorization endpoint:
 ///
-/// `authorization_endpoint` is dropped from the serialized document entirely (ADR-0011 Decision 9,
-/// item 8): `OidcDiscovery`'s field is a required `String` with no way to omit it via the type
-/// itself, but this service never serves `/authorize` (no authorization_code flow -- ADR-0011
-/// Context) and `response_types_supported` never advertises `"code"`, so publishing a URL for it
-/// would promise a capability nothing here provides.
-///
-/// `token_endpoint` is dropped the same way when `token_exchange_scopes` is `None`
-/// (`oauth2.token_exchange.enabled` is off, or the deployment's config never wired the block at
-/// all -- both collapse to the same "no grants served" state upstream, since
-/// `build_token_exchange_state` never mounts `POST /oauth2/token` in that case either). Advertising
-/// a live-looking `token_endpoint` next to empty `grant_types_supported`/`scopes_supported` is
-/// exactly what the hand-built document this replaced (ADR-0011, Decision 9) never did -- it
-/// omitted `token_endpoint` outright when the feature was off, and a spec-reading client seeing a
-/// URL with nothing behind it is worse than seeing no URL at all. Restored here.
-///
-/// `grant_types_supported`/`response_types_supported`/`scopes_supported` themselves stay legitimately
-/// empty arrays (not also dropped) in the disabled case -- OIDC discovery treats these as always-
-/// present metadata (RFC 8414 §2), and an empty array is the honest way to say "no grants offered",
-/// same as any OP that structurally serves none. They are **not** hardcoded to advertise
-/// token-exchange support regardless of config: this service genuinely does not accept any grant at
-/// `/oauth2/token` when `token_exchange_scopes` is `None`, since the route is not mounted at all
-/// (see `build_token_exchange_state`) -- advertising the grant anyway would be inventing a
-/// capability this deployment does not have.
+/// 1. **Issuer identity** -- true whenever this function is even called, i.e. whenever
+///    `well_known_router` is mounted (`oauth2.type: self` + `oauth2.signing` configured, see the
+///    call site in `lib.rs`). `ApiKeyJwtSigner` mints self-signed API-key JWTs through that path
+///    regardless of token-exchange, so `issuer`, `jwks_uri`, `subject_types_supported`,
+///    `id_token_signing_alg_values_supported`, `token_endpoint_auth_methods_supported`, and
+///    `claims_supported` are set unconditionally below and never touch `enabled`.
+/// 2. **Grant surface** -- what `/oauth2/token` actually accepts, which is nothing at all unless
+///    `oauth2.token_exchange.enabled` mounts it (`build_token_exchange_state`). So
+///    `grant_types_supported` and `token_endpoint` are gated on `enabled`, dropping to
+///    empty/absent when it's off. `scopes_supported` is gated the same way, deliberately: the
+///    plain API-key-issuance path (`ApiKeyJwtSigner::sign`) stamps a fixed, non-negotiable
+///    `scope: "profile email"` claim (`TOKEN_SCOPE`) and never mints an `id_token` -- there is no
+///    client-facing scope *request* to describe outside the token-exchange grant, where
+///    `openid`/`offline_access` genuinely gate id_token/refresh-token issuance
+///    (`oauth2.token_exchange.allowed_scopes`). Advertising scopes with no grant that honours them
+///    would invent a capability this deployment does not have, same reasoning as `grant_types_supported`.
+/// 3. **Authorization endpoint** -- never advertised, in either state. This service has no
+///    `/authorize` route, no `AuthorizationCodeStore` beyond a permanent no-op stub, and never
+///    redirects a user-agent (token-exchange is a direct machine-to-machine POST/response, not a
+///    redirect flow) -- see ADR-0011, Context. So `authorization_endpoint`,
+///    `response_types_supported`, and `response_modes_supported` are all unconditionally
+///    empty/absent below, independent of `enabled`. Per OIDC Discovery 1.0 §3,
+///    `response_types_supported` is REQUIRED to be present as a JSON array, but the "MUST support
+///    code/id_token/id_token token" clause binds only "Dynamic OpenID Providers" (ones that also
+///    advertise a `registration_endpoint` for dynamic client registration); this deployment
+///    registers clients from static YAML only (ADR-0011, Decision 5) and serves no
+///    `registration_endpoint`, so an empty array here is spec-compliant, not merely tidy.
+///    `response_modes_supported` is OPTIONAL per the same section, so empty is unambiguously fine.
+///    `authorization_endpoint` itself is dropped from the serialized document entirely:
+///    `OidcDiscovery`'s field is a required `String` with no way to omit it via the type itself, so
+///    the value is removed post-serialization below (`obj.remove`), same pattern PR #301 used for
+///    `token_endpoint`.
 fn discovery_document(
     issuer: &str,
     token_exchange_scopes: Option<&[String]>,
@@ -444,26 +451,19 @@ fn discovery_document(
     let scopes_supported = token_exchange_scopes
         .map(<[String]>::to_vec)
         .unwrap_or_default();
-    let (response_types_supported, grant_types_supported) = if enabled {
-        (
-            vec![
-                "token".to_string(),
-                "id_token".to_string(),
-                "id_token token".to_string(),
-            ],
-            vec![
-                crate::token_exchange::TOKEN_EXCHANGE_GRANT.to_string(),
-                crate::token_exchange::REFRESH_TOKEN_GRANT.to_string(),
-            ],
-        )
+    let grant_types_supported = if enabled {
+        vec![
+            crate::token_exchange::TOKEN_EXCHANGE_GRANT.to_string(),
+            crate::token_exchange::REFRESH_TOKEN_GRANT.to_string(),
+        ]
     } else {
-        (Vec::new(), Vec::new())
+        Vec::new()
     };
 
     let op_config = OpConfig {
         issuer: issuer.to_string(),
         scopes_supported,
-        response_types_supported,
+        response_types_supported: Vec::new(),
         grant_types_supported,
         id_token_signing_alg: ALGORITHM.to_string(),
         authorization_code_ttl_secs: 0,

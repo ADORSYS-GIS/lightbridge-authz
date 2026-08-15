@@ -216,16 +216,20 @@ fn at_hash_changes_with_the_access_token() {
     );
 }
 
-/// Regression test for the empty-`grant_types_supported`/`scopes_supported`/
-/// `response_types_supported` discovery document served in production
-/// (`https://auth.ai.camer.digital/.well-known/openid-configuration`). Does NOT need `it-tests` --
-/// `well_known_router`'s discovery route never touches the DB (only `/.well-known/jwks.json`
-/// does), so this runs in the default `cargo test -p lightbridge-authz-rest`.
+/// Regression test for the empty-`grant_types_supported`/`scopes_supported` discovery document
+/// served in production (`https://auth.ai.camer.digital/.well-known/openid-configuration`). Does
+/// NOT need `it-tests` -- `well_known_router`'s discovery route never touches the DB (only
+/// `/.well-known/jwks.json` does), so this runs in the default `cargo test -p
+/// lightbridge-authz-rest`.
 ///
 /// Asserts the exact set `discovery_document` promises when token-exchange is enabled -- these
 /// values must stay in lockstep with what `token_exchange::TOKEN_EXCHANGE_GRANT`/
 /// `REFRESH_TOKEN_GRANT` and `handle_token`'s real dispatch accept (see `token_exchange.rs`), not
-/// just "non-empty".
+/// just "non-empty". `response_types_supported` is asserted empty here too, not merely omitted
+/// from this list -- see `discovery_never_advertises_response_types_or_modes` below for why that
+/// must hold regardless of the token-exchange gate, and for the regression this guards (this
+/// service served `["token", "id_token", "id_token token"]` here in production once token-exchange
+/// was enabled, claiming an authorization endpoint that has never existed).
 #[tokio::test]
 async fn discovery_advertises_exact_token_exchange_metadata_when_enabled() {
     use axum::body::{Body, to_bytes};
@@ -268,8 +272,10 @@ async fn discovery_advertises_exact_token_exchange_metadata_when_enabled() {
     );
     assert_eq!(
         payload["response_types_supported"],
-        json!(["token", "id_token", "id_token token"]),
-        "response_types_supported must reflect the token-exchange response shapes: {payload}"
+        json!([]),
+        "response_types_supported describes the AUTHORIZATION endpoint (OIDC Discovery 1.0 §3), \
+         which this service never serves, on or off -- token-exchange is a direct token-endpoint \
+         grant (RFC 8693), not a redirect-based response_type negotiation: {payload}"
     );
     assert_eq!(
         payload["token_endpoint"],
@@ -289,6 +295,15 @@ async fn discovery_advertises_exact_token_exchange_metadata_when_enabled() {
 /// doesn't have. Empty arrays for grant/response/scope metadata are the honest RFC 8414 way to say
 /// "no grants offered"; they are deliberately NOT hardcoded to non-empty regardless of config --
 /// see `discovery_document`'s doc comment for why that would be inventing a capability.
+///
+/// Also proves the other half of the same design point: `well_known_router` is only mounted at all
+/// when `oauth2.type: self` + `oauth2.signing` are configured (see call site in `lib.rs`), which
+/// makes this service an OIDC *issuer* independent of whether the token-exchange grant is enabled
+/// -- `ApiKeyJwtSigner` mints self-signed API-key JWTs through that path regardless. So the
+/// issuer-identity fields (`issuer`, `jwks_uri`, `subject_types_supported`,
+/// `id_token_signing_alg_values_supported`) must stay populated even with token-exchange disabled;
+/// only the grant-surface fields (`grant_types_supported`, `scopes_supported`, `token_endpoint`)
+/// go empty/absent. Two independent gates, not one flag driving everything.
 #[tokio::test]
 async fn discovery_advertises_no_grants_when_exchange_disabled() {
     use axum::body::{Body, to_bytes};
@@ -326,6 +341,32 @@ async fn discovery_advertises_no_grants_when_exchange_disabled() {
     assert!(
         payload["scopes_supported"].as_array().unwrap().is_empty(),
         "no scopes must be advertised when token-exchange is disabled: {payload}"
+    );
+    assert!(
+        payload.get("token_endpoint").is_none(),
+        "token_endpoint must stay absent when token-exchange is disabled: {payload}"
+    );
+
+    assert_eq!(
+        payload["issuer"], ISSUER,
+        "issuer identity is true independent of the token-exchange grant: {payload}"
+    );
+    assert_eq!(
+        payload["jwks_uri"],
+        format!("{ISSUER}/.well-known/jwks.json"),
+        "JWKS is served whenever signing is configured, whether or not token-exchange is enabled \
+         -- ApiKeyJwtSigner mints self-signed API-key JWTs through this path regardless: {payload}"
+    );
+    assert_eq!(
+        payload["subject_types_supported"],
+        serde_json::json!(["public"]),
+        "subject type is an issuer property, not a token-exchange one: {payload}"
+    );
+    assert_eq!(
+        payload["id_token_signing_alg_values_supported"],
+        serde_json::json!(["RS256"]),
+        "the signing algorithm is fixed by this deployment's key material, not by whether \
+         token-exchange is enabled: {payload}"
     );
 }
 
@@ -404,6 +445,72 @@ async fn discovery_advertises_private_key_jwt_only_when_a_confidential_client_is
             && !methods.contains(&json!("client_secret_post")),
         "must never advertise secret-based client auth, confidential clients or not: {payload}"
     );
+}
+
+/// This service never serves `/authorize` (ADR-0011, Context) regardless of whether
+/// `oauth2.token_exchange.enabled` is on: token-exchange is a direct token-endpoint grant
+/// (RFC 8693), not a redirect-based authorization flow. `response_types_supported` and
+/// `response_modes_supported` describe the authorization endpoint (OIDC Discovery 1.0 §3 --
+/// `response_types_supported` is REQUIRED to be present as a JSON array, but the spec's
+/// "MUST support code/id_token/id_token token" clause binds only "Dynamic OpenID Providers",
+/// meaning ones that also advertise a `registration_endpoint`; this deployment has none, so an
+/// empty array is spec-compliant, not merely tidy). So both must stay empty/absent on *both*
+/// sides of the token-exchange gate -- unlike `grant_types_supported`/`scopes_supported`/
+/// `token_endpoint`, which correctly describe the token-endpoint grant surface and are gated on
+/// it. Checked against both states in one test specifically because the enabled/disabled tests
+/// above each only prove one side; a gate wired to the wrong field (as `response_types_supported`
+/// was before this test was added -- it flipped to `["token", "id_token", "id_token token"]`
+/// purely because `oauth2.token_exchange.enabled` went from `false` to `true` in production) would
+/// still pass a test that only checks one state.
+#[tokio::test]
+async fn discovery_never_advertises_response_types_or_modes() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use lightbridge_authz_rest::signing::well_known_router;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    for (label, scopes) in [
+        ("disabled", None),
+        (
+            "enabled",
+            Some(vec!["openid".to_string(), "offline_access".to_string()]),
+        ),
+    ] {
+        let discovery = well_known_router::<()>(ISSUER, lazy_repo(), scopes, false)
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/openid-configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(discovery.status(), StatusCode::OK);
+        let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(
+            payload["response_types_supported"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "[{label}] no authorization endpoint exists in this deployment -- \
+             response_types_supported must stay empty: {payload}"
+        );
+        assert!(
+            payload["response_modes_supported"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "[{label}] no redirect-based flow is ever served -- response_modes_supported must \
+             stay empty: {payload}"
+        );
+        assert!(
+            payload.get("authorization_endpoint").is_none(),
+            "[{label}] authorization_endpoint must stay absent: {payload}"
+        );
+    }
 }
 
 #[cfg(feature = "it-tests")]
