@@ -102,11 +102,13 @@ oauth2:
       lightbridge-admin:
         - "*"                # every permission
       lightbridge-editor:
+        - "account:create"   # self-provision own account (#321)
         - "account:read"
         - "project:*"        # every project action
         - "apikey:*"         # every api-key action
         - "budget:self-refill" # self-refill own budget, capped by policy (#294)
       lightbridge-viewer:
+        - "account:create"   # self-provision own account (#321)
         - "account:read"
         - "project:read"
         - "apikey:read"
@@ -177,8 +179,8 @@ Used when `oauth2.rbac.role_permissions` is not configured
 | Role                 | Grants                                | Effective permissions                              |
 | -------------------- | ------------------------------------- | -------------------------------------------------- |
 | `lightbridge-admin`  | `*`                                   | all permissions                                    |
-| `lightbridge-editor` | `account:read`, `project:*`, `apikey:*` | read accounts; full project + api-key lifecycle   |
-| `lightbridge-viewer` | `account:read`, `project:read`, `apikey:read` | read-only                                    |
+| `lightbridge-editor` | `account:create`, `account:read`, `project:*`, `apikey:*` | self-provision own account; read accounts; full project + api-key lifecycle |
+| `lightbridge-viewer` | `account:create`, `account:read`, `project:read`, `apikey:read` | self-provision own account; otherwise read-only |
 
 ## Permissions and the operations they gate
 
@@ -192,7 +194,7 @@ listed here is denied unconditionally (fail closed).**
 
 | Permission        | RPC `op_id`                                          | MCP tool                            |
 | ----------------- | ---------------------------------------------------- | ----------------------------------- |
-| `account:create`  | `model.Account.create`                               | `create-account`                    |
+| `account:create`  | `procedure.createAccount`                            | `create-account`                    |
 | `account:read`    | `model.Account.list`, `model.Account.get`, `model.AccountSummary.list`, `model.AccountSummary.get` | `list-accounts`, `get-account` |
 | `account:update`  | `model.Account.update`                               | `update-account`                    |
 | `account:delete`  | `procedure.deleteAccountPermanently`                 | `delete-account`                    |

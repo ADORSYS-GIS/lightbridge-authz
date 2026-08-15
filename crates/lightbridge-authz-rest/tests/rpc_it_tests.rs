@@ -2296,3 +2296,84 @@ async fn revoke_subject_sessions_reports_zero_when_nothing_is_active() {
     let parsed = as_json(Wire::Json, &body);
     assert_eq!(parsed["revokedCount"], 0);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Section: self-provisioning -- lightbridge-viewer/lightbridge-editor must be able to create their
+// own account (#219: the account row must exist before `project_members.account_id`'s FK to
+// `accounts` can be satisfied, so a low-privilege first-time caller who lacks `account:create`
+// can never be added to a project roster by anyone).
+// ---------------------------------------------------------------------------------------------
+
+/// The real, effective permission set for `role` as configured in the shipped
+/// `config/default.yaml`, loaded and compiled through the exact same `Rbac::compile()` path a
+/// running server takes at startup -- mirrors `editor_perms_from_shipped_config` in
+/// `rpc_router_tests.rs`, duplicated here rather than shared via `common` to keep each test file's
+/// edit surface independent.
+fn perms_from_shipped_config(role: &str) -> lightbridge_authz_core::authz::PermissionSet {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/default.yaml");
+    let config = lightbridge_authz_core::config::load_from_path(path)
+        .expect("shipped config/default.yaml must parse");
+    config
+        .oauth2
+        .rbac
+        .compile()
+        .roles
+        .get(role)
+        .cloned()
+        .unwrap_or_else(|| panic!("config/default.yaml must configure role `{role}`"))
+}
+
+/// A genuine first-time `lightbridge-viewer`/`lightbridge-editor` caller must be able to
+/// self-provision their own account over the real RPC dispatch, against real Postgres. Also
+/// asserts the two invariants that make this safe to grant (ADR-0006, one account is one person):
+/// the created account's id is always the caller's own JWT subject -- `CreateAccountInput` carries
+/// no id/accountId field at all, so creating an account "for a different subject" is structurally
+/// unreachable, not merely denied -- and a second `createAccount` for that same subject conflicts
+/// rather than minting a second account.
+#[tokio::test]
+async fn viewer_and_editor_can_self_provision_their_own_account() {
+    for role in ["lightbridge-viewer", "lightbridge-editor"] {
+        let subject = format!("{role}-selfprovision-{}", cuid2());
+        let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with(
+            "caller",
+            token_info(&subject, perms_from_shipped_config(role)),
+        ));
+        let ctx = setup(bearer).await;
+
+        let (status, body) = rpc_call(
+            ctx.router.clone(),
+            "procedure.createAccount",
+            Wire::Json,
+            &json!({ "args": {} }),
+            Some("caller"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{role} must be able to create their own account: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let created = json_body(&body);
+        assert_eq!(
+            created["id"], subject,
+            "{role}'s created account id must equal their own JWT subject"
+        );
+
+        let (status, body) = rpc_call(
+            ctx.router.clone(),
+            "procedure.createAccount",
+            Wire::Json,
+            &json!({ "args": {} }),
+            Some("caller"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{role}'s second createAccount for the same subject must conflict, not mint a \
+             second account: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}

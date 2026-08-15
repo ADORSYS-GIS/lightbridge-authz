@@ -108,11 +108,13 @@ oauth2:
       lightbridge-admin:
         - "*"
       lightbridge-editor:
+        - "account:create"
         - "account:read"
         - "project:*"
         - "apikey:*"
         - "budget:self-refill"
       lightbridge-viewer:
+        - "account:create"
         - "account:read"
         - "project:read"
         - "apikey:read"
