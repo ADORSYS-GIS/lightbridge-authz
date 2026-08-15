@@ -1,5 +1,26 @@
 # Changelog
 
+## [3.2.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.1.0...v3.2.0) (2026-08-15)
+
+
+### Features
+
+* **budget:** wire up the five inert budget:* permissions ([#325](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/325)) ([9f095e0](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/9f095e0a3eeddc817bbd8d46b72b11f9e563fbac))
+
+
+### Bug Fixes
+
+* **rbac:** grant account:create to lightbridge-viewer/lightbridge-editor ([#322](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/322)) ([95327d6](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/95327d67632b72acfa21f87c713f74d2a4c7c0b2))
+* **rest:** validate refresh_absolute_ttl_seconds at startup ([#335](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/335)) ([5c4db33](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/5c4db334d54191087c086e0cb5d6d534e1fd83da))
+
+
+### Documentation
+
+* **architecture:** add auth-flows document with mermaid sequence diagrams ([#331](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/331)) ([22b5854](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/22b5854c644bf7e4be68956bc263f2788a79c3b7))
+* **architecture:** add system architecture and deployment docs ([#328](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/328)) ([edcc788](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/edcc7885d4f63a34503f1a39bbc133146da7e0f5)), closes [#327](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/327)
+* **architecture:** document data model and budget domain with Mermaid diagrams ([#329](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/329)) ([f22e1e5](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/f22e1e5be2d8454495701bec3c4b446afdc2b828))
+* **oauth2:** fix stale refresh-token + budget-refill-delay docs ([#333](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/333)) ([c33bcc4](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/c33bcc49ee776c16baeebe8b41ae9812ef2ea028)), closes [#332](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/332)
+
 ## [3.1.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.0.0...v3.1.0) (2026-08-15)
 
 
