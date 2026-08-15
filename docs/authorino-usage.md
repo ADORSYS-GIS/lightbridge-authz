@@ -2,13 +2,27 @@
 
 This document explains how to use the Authorino-oriented validation endpoint exposed by `authz-opa`:
 
-- `POST /v1/authorino/validate`
+- `POST /v1/authorino/validate/introspect` — RFC 7662 token introspection
+
+This is the **only** key-validation route `authz-opa` exposes today. It's locked in place by
+`introspect_endpoint_should_exist_in_opa_openapi`
+(`crates/lightbridge-authz-rest/src/lib.rs:1788-1807`), which asserts the OPA server's OpenAPI
+document excludes two earlier paths: `POST /v1/opa/validate` and `POST /v1/authorino/validate`.
+Both were removed with no direct HTTP successor — `/v1/authorino/validate` in particular used to
+accept a JSON body with an arbitrary `metadata` object and echo it back inside an enriched
+`dynamic_metadata` response. That same account/project/key context plus metadata-enrichment shape
+still exists in this codebase, but only as the `validate-authorino-api-key` MCP tool exposed by
+`lightbridge-mcp`'s `/mcp` endpoint (bearer-JWT + RBAC gated, see `app/lightbridge-authz/src/mcp.rs`)
+— it is not reachable by Authorino's `AuthConfig`, which needs a plain HTTP call, not an MCP
+client. For the actual gateway integration, Authorino uses the introspection endpoint below for
+liveness, and gets its per-request metadata from its own `AuthConfig` instead (see "AuthConfig
+wiring" further down).
 
 This endpoint is designed for policy engines and external auth services that need:
 
-- API key validation
+- API key validation (liveness / revocation / expiry, checked against the live `api_keys` row —
+  no denylist, no stored credential, no provider round-trip)
 - account/project/key context in the response
-- dynamic metadata passthrough + enrichment
 
 ## Endpoint Contract
 
@@ -18,42 +32,41 @@ Base URL (local compose):
 
 Authentication:
 
-- HTTP Basic auth (`authorino:change-me` by default)
+- HTTP Basic auth, credentials from `server.opa.basic_auth` in the config YAML (in the local
+  compose stack these default to `authorino` / the placeholder password set in
+  `.docker/authz/container.yaml`)
 
-Request body:
+Request body (form-encoded, per RFC 7662):
+
+```
+token=<opaque-api-key>&token_type_hint=access_token
+```
+
+`token_type_hint` is accepted but ignored — only access tokens are supported.
+
+Successful response (`200`, active key):
 
 ```json
 {
-  "api_key": "lbk_secret_xxx",
-  "ip": "203.0.113.10",
-  "metadata": {
-    "tenant": "acme",
-    "request_id": "req-123"
-  }
+  "active": true,
+  "sub": "key_...",
+  "account_id": "acct_...",
+  "project_id": "proj_...",
+  "api_key_id": "key_...",
+  "api_key_status": "active",
+  "billing_plan": "free",
+  "allowed_models": ["gpt-4.1-mini"],
+  "exp": 1767225600
 }
 ```
 
-`metadata` supports arbitrary keys (dynamic object).
-
-Successful response (`200`):
+Deleted / revoked / expired / unknown key (canonical inactive form — still a `200`, per RFC 7662):
 
 ```json
-{
-  "api_key": { "...": "..." },
-  "project": { "...": "..." },
-  "account": { "...": "..." },
-  "dynamic_metadata": {
-    "tenant": "acme",
-    "request_id": "req-123",
-    "account_id": "acct_...",
-    "project_id": "proj_...",
-    "api_key_id": "key_...",
-    "api_key_status": "active"
-  }
-}
+{ "active": false }
 ```
 
-Unauthorized response (`401`):
+Wrong Basic-auth credentials (`401`):
 
 ```json
 {
@@ -61,13 +74,19 @@ Unauthorized response (`401`):
 }
 ```
 
+Because the check hashes the presented key and reads the live `api_keys` row on every call, a
+deleted or revoked key flips to `active: false` on the very next request.
+
 ## Curl Example
 
+`$OPA_USER`/`$OPA_PASSWORD` are the `server.opa.basic_auth` credentials from the config YAML
+(locally, `.docker/authz/container.yaml`'s defaults).
+
 ```bash
-curl -k -u authorino:change-me \
-  https://localhost:13001/v1/authorino/validate \
-  -H 'Content-Type: application/json' \
-  -d '{"api_key":"<plain_api_key>","ip":"203.0.113.10","metadata":{"tenant":"acme","request_id":"req-123"}}'
+curl -k -u "$OPA_USER:$OPA_PASSWORD" \
+  https://localhost:13001/v1/authorino/validate/introspect \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'token=<plain_api_key>&token_type_hint=access_token'
 ```
 
 ## Integration Test Setup (Docker Compose)
@@ -81,10 +100,12 @@ The test runner performs:
 
 1. wait for API and OPA readiness
 2. fetch OAuth token from Keycloak
-3. create account/project/api-key via CRUD API
-4. call `/v1/authorino/validate` with dynamic metadata
-5. assert metadata passthrough + enrichment keys
-6. assert invalid key returns `401`
+3. create account/project/api-key via the CRUD RPC surface (`POST /rpc/{op_id}` — e.g.
+   `procedure.createAccount`, `model.Project.create`, `procedure.createApiKey`)
+4. call `/v1/authorino/validate/introspect` for the minted key
+5. assert `active: true` plus the `account_id`/`project_id`/`api_key_id`/`api_key_status` fields
+6. call it again for an invalid key and assert `active: false` (still `200` — RFC 7662 has no
+   401-for-invalid-token case; only a wrong Basic-auth credential returns `401`)
 
 Run:
 
@@ -101,54 +122,14 @@ docker compose -f compose.yaml -f compose.it.yaml down -v
 
 ## Notes for Authorino Integration
 
-When configuring Authorino to call this API, forward:
+Authorino does not call this endpoint as an identity provider — it calls it as a `metadata`
+provider, after its own `jwt` (or `oauth2Introspection`) identity phase has already run. Forward:
 
-- presented API key value as `api_key`
-- request source IP as `ip` (if available)
-- any request-scoped attributes you want to preserve as `metadata`
+- the presented API key/token value as `token` (form-encoded, per RFC 7662)
 
-Then consume `dynamic_metadata` fields in downstream policy decisions or for audit/telemetry.
-
-## Token Introspection (RFC 7662)
-
-Whatever the API-key format, revocation is enforced by a single RFC 7662 endpoint that
-checks the live `api_keys` row (delete/revoke takes effect on the very next request — no
-denylist, no stored credential, no provider round-trip):
-
-- `POST /v1/authorino/validate/introspect`
-
-Request (form-encoded, per RFC 7662; the endpoint sits behind the same Basic auth as
-`/validate`):
-
-```
-token=<opaque-api-key>&token_type_hint=access_token
-```
-
-Response — active key:
-
-```json
-{
-  "active": true,
-  "sub": "key_...",
-  "account_id": "acct_...",
-  "project_id": "proj_...",
-  "api_key_id": "key_...",
-  "api_key_status": "active",
-  "billing_plan": "free",
-  "allowed_models": ["gpt-4.1-mini"],
-  "exp": 1767225600
-}
-```
-
-Response — deleted / revoked / expired / unknown key (canonical inactive form):
-
-```json
-{ "active": false }
-```
-
-Because the check hashes the presented key and reads the live `api_keys` row, a
-deleted or revoked key returns `active: false` on the very next request — no denylist,
-no stored credential, no provider round-trip.
+Then gate the request on the response's `active` field in an authorization `patternMatching`
+rule, and read the account/project/key fields via `auth.metadata[...]` selectors for header
+mapping. See "AuthConfig wiring" below for the full example.
 
 ## Self-signed JWT API keys (enterprise default)
 

@@ -17,7 +17,9 @@ the `resolve-context` + Authorino validation flows (mermaid diagrams).
   - Protected routes under `/api/v1` (OAuth2 bearer token).
 - **authz-opa** (Authorino, basic auth)
   - TLS on `:3001` inside the container, exposed as `:13001` via compose.
-  - `POST /v1/opa/validate` (basic auth).
+  - `POST /v1/authorino/validate/introspect` (basic auth, RFC 7662 introspection) — the only
+    key-validation route; see `docs/authorino-usage.md`.
+  - `POST /idp/v1/resolve-context` (basic auth) — resolves tenant context for token-exchange.
   - Probe routes: `GET /health`, `GET /health/startup`, `GET /health/ready`
 - **authz-migrate**
   - Runs SQL migrations before the API services start.
@@ -90,33 +92,29 @@ Default container config is mounted from `.docker/authz/container.yaml`:
 - OpenAPI docs: removed (CRUD API is now generated via cratestack, which has no OpenAPI/Swagger UI generation). The generated cratestack Rust client is the primary integration contract; see `docs/adr/0003-cratestack-crud-migration.md`.
 
 **Internal Authz/Authorino validation API (Basic Auth)**
-- `POST /v1/opa/validate`
-- `POST /v1/authorino/validate` (supports dynamic metadata passthrough/enrichment)
+- `POST /v1/authorino/validate/introspect` — RFC 7662 token introspection; the only key-validation
+  route (the earlier JSON `POST /v1/authorino/validate` endpoint, with a `metadata`
+  passthrough/enrichment field, was removed — see `docs/authorino-usage.md`).
 - `POST /idp/v1/resolve-context` — resolves the tenant context for a subject scoped to a project (body `{subject, project_id}`) → `{account_id, project_id}`. Membership-enforced; any miss is a uniform `404`. Called by the Keycloak IdP adapter during token exchange; Basic-auth protected (the adapter presents the OPA credentials).
 - OpenAPI docs: `https://localhost:13001/v1/opa/docs`
 
 This backend is intended to be called by Authorino, not by end users or client
-applications directly. Authorino sends the presented credential and request
-metadata, and the validation backend rejects revoked or expired credentials before
-returning enriched `api_key`, `project`, and `account` context for policy and
-upstream request metadata.
+applications directly. Authorino calls the introspection endpoint with the presented
+credential as a `metadata` provider; the response's `active` field plus account/project/key
+context feed an authorization rule in Authorino's own `AuthConfig`. Per-request metadata
+enrichment happens entirely inside that `AuthConfig` now (`auth.identity.*` /
+`auth.metadata[...]` selectors), not this API — see `docs/authorino-usage.md`'s "AuthConfig
+wiring" section.
 
-Manual validation example:
-
-```bash
-curl -k -u authorino:change-me \
-  https://localhost:13001/v1/opa/validate \
-  -H 'Content-Type: application/json' \
-  -d '{"api_key":"<plain_api_key>","ip":"203.0.113.10"}'
-```
-
-Authorino-oriented example with metadata:
+Manual validation example (`$OPA_USER`/`$OPA_PASSWORD` are the `server.opa.basic_auth`
+credentials from the config YAML; locally these default to `authorino` / the placeholder
+password in `.docker/authz/container.yaml`):
 
 ```bash
-curl -k -u authorino:change-me \
-  https://localhost:13001/v1/authorino/validate \
-  -H 'Content-Type: application/json' \
-  -d '{"api_key":"<plain_api_key>","ip":"203.0.113.10","metadata":{"tenant":"acme"}}'
+curl -k -u "$OPA_USER:$OPA_PASSWORD" \
+  https://localhost:13001/v1/authorino/validate/introspect \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'token=<plain_api_key>&token_type_hint=access_token'
 ```
 
 Detailed usage + integration test guide:

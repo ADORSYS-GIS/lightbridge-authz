@@ -74,6 +74,13 @@ pub async fn bearer_auth(
     }
 }
 
+// dead: no router mounts /api/v1 since the cratestack migration (see ADR-0003). Neither
+// `required_permission` nor `authorize` below is wired into any router in `lib.rs` or
+// `app/lightbridge-authz/src/mcp.rs` — only `bearer_auth` from this module is (into MCP). The
+// CRUD surface's RBAC gate today is `rpc_authorize::rpc_authorize`. Kept for now behind their own
+// unit tests rather than deleted, since removing a permission map is a behaviour-adjacent change
+// that deserves its own review; do not use this map to debug a live 403 (read `rpc_authorize.rs`
+// instead).
 /// The permission a CRUD endpoint requires, keyed by HTTP method and the axum `MatchedPath`
 /// route pattern (nested under `/api/v1`). This is the single source of truth for RBAC on the
 /// REST surface and mirrors the tool → permission map on the MCP server; keep both in sync with
