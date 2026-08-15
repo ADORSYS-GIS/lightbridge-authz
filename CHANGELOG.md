@@ -1,5 +1,31 @@
 # Changelog
 
+## [3.1.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.0.0...v3.1.0) (2026-08-15)
+
+
+### Features
+
+* **oauth2:** refresh-token revocation surface (RFC 7009 + self/admin RPC) ([#318](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/318)) ([43c26be](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/43c26be01d8441f1007d24c040485f5e84fc0222))
+* **rbac:** grant budget:self-refill to lightbridge-editor ([#294](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/294)) ([#299](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/299)) ([4adbe4f](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/4adbe4f5fb13d8f19e6ade2d4a83dd08432ae84e))
+
+
+### Bug Fixes
+
+* consolidate ADR-0011 token-exchange work-stream follow-ups ([#290](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/290)) ([2ec252f](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/2ec252fe90862067afdea4158f2591fe11b4992e))
+* **oauth2:** drop token_endpoint from OIDC discovery when token-exchange is disabled ([#301](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/301)) ([3f00ca6](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/3f00ca69dad9aa5ec91a18caf376999fcb68b928)), closes [#300](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/300)
+* **oauth2:** harden refresh-token grant with absolute cap, re-validation, reuse cascade ([#316](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/316)) ([7c7e0ab](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/7c7e0ab61b57a1e1f733d2132899df0eb556b981))
+* **oauth2:** resolve caller's default project when token-exchange omits project_id ([#309](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/309)) ([e34c3ca](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/e34c3ca230292f86849176ab4ee061503d1689f4))
+* **oauth2:** stop discovery from advertising an authorization endpoint that never existed ([#305](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/305)) ([1f05b4d](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/1f05b4d6368721327fa6ed77c9912ba58c80794d))
+
+
+### Documentation
+
+* add auth/token surface reference dictionary ([#307](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/307)) ([72efa5d](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/72efa5de534a18b24c28569b1d11575cbbb12418))
+* add RFC 8693 token-exchange integration guide ([#313](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/313)) ([14b17a1](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/14b17a172e31d8afb1f35ab097e6b208763a3fcb))
+* **auth-reference:** fix response_types_supported gating claim ([#314](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/314)) ([7c77511](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/7c775117ed9156c5865bdb0f939861a2c4339d04))
+* fix stale OPA/Authorino validate endpoint references ([#311](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/311)) ([aa63dfb](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/aa63dfb050d634ddb3eb0875b1145ffbf74d21a5))
+* **usage:** fix dangerous usage-query base URL, warn about no auth ([#298](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/298)) ([c86f5e0](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/c86f5e059f488b7a822578c5402bcdfce8011330)), closes [#297](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/297)
+
 ## [3.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v2.1.1...v3.0.0) (2026-08-14)
 
 
