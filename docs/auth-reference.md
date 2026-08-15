@@ -110,9 +110,9 @@ when the block is present *and* `enabled: true`.
 | `response_modes_supported` | n/a | always `[]` regardless of `enabled` (`signing.rs:486`) — no redirect flow ever applies |
 | `token_endpoint_auth_methods_supported` | `["none"]`, or `["none","private_key_jwt"]` | second form iff `oauth2.clients` contains at least one `type: confidential` entry (`private_key_jwt_supported`, computed at `lib.rs:1174-1177`) |
 | `grant_types_supported` | `[]` when disabled; `[token-exchange URN, refresh_token URN]` when enabled | `enabled` |
-| `response_types_supported` | `[]` when disabled; `["token","id_token","id_token token"]` when enabled | `enabled` |
+| `response_types_supported` | **always `[]`** — literal `Vec::new()` in `op_config` (`signing.rs:466`), never touched afterward on either side of `enabled` | **never gated by `enabled` — always empty.** This service has no `/authorize` endpoint (no authorization_code/implicit flow, ADR-0011), so no response type is ever advertised. This field previously *was* wired to `enabled` in production and briefly advertised `["token","id_token","id_token token"]` the moment token-exchange was turned on, even though nothing about token-exchange stands up an authorization endpoint; pinned by regression test `discovery_never_advertises_response_types_or_modes` in `signing_tests.rs` |
 | `scopes_supported` | `[]` when disabled; `oauth2.token_exchange.allowed_scopes` verbatim when enabled | `enabled` |
-| `id_token_signing_alg` | hardcoded `"RS256"` (`ALGORITHM` const, `signing.rs:30`) | always |
+| `id_token_signing_alg_values_supported` | hardcoded `["RS256"]` — `ALGORITHM` const (`signing.rs:30`) fed into `op_config.id_token_signing_alg` (`signing.rs:468`), wrapped into a single-element array by `OidcDiscovery::from_config` (`authkestra_op` 0.5.0) | always |
 | `claims_supported` | hardcoded static list: `iss, sub, aud, exp, iat, nbf, jti, typ, azp, lightbridge_caller_kind, sid, scope, api_key_id, project_id, account_id, email, email_verified, allowed_models, identity, nonce, auth_time, at_hash` (`signing.rs:492-518`) | always, regardless of `enabled` — lists claims that *can* appear, not ones guaranteed on every token |
 
 **A second, unrelated discovery surface exists on `lightbridge-mcp`.** `GET
