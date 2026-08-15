@@ -195,7 +195,7 @@ their `budget:*` permission gates** (`docs/rbac.md` already sketches `budget:rea
 no procedure wired to them yet) — this document does not enumerate those procedures, since they had
 not landed as of this writing.
 
-## Spend dependency: what happens when spend data is unavailable
+## Spend dependency: which reader is active, and what happens when spend data is unavailable
 
 `Facts.spend_this_period`/`spend_last_period` come from a `SpendReader`
 (`crates/lightbridge-authz-budget/src/spend.rs`), which is one of two implementations, chosen once
@@ -206,13 +206,28 @@ at server startup (`start_api_server` in `crates/lightbridge-authz-rest/src/lib.
 - **`UnavailableSpendReader`** — never touches any database; always reports `Spend::Unavailable`.
   Used when `Config.usage_database` is `None`.
 
-**Traced, not guessed: as configured in this repository today (`config/default.yaml`,
-`.docker/authz/container.yaml`, and the umbrella Helm chart under `charts/`), `usage_database` is
-never set anywhere** — grep confirms no YAML in this repo populates that key. That means
-`start_api_server` degrades to `UnavailableSpendReader` for every deployment built from this
-repo's own config templates, unless something outside this repository's tracked config layers
-overrides it. `TimescaleSpendReader` exists and is wired to activate automatically the moment
-`usage_database` is configured; nothing else needs to change.
+**`TimescaleSpendReader` is active in production.** Prod does not consume this repo's
+`config/default.yaml`/`.docker/authz/container.yaml` at all — the `api` component's Helm values in
+the separate `ai-helm-values` repo
+(`environments/prod/values/lightbridge-app.yaml`) replace `config.yaml` **wholesale** with a full
+inline document, which sets `usage_database.url: "${USAGE_DATABASE_URL}"`; the same file's `env:`
+block defines `USAGE_DATABASE_URL` as a real `postgresql://` connection string (reusing the
+existing `usage` role/credential, `lightbridge-usage-db-role`) pointed at the in-cluster
+`lightbridge-main-db-rw.converse.svc.cluster.local` Postgres instance's `usage` database. That
+wiring was completed and verified recently. So in prod, `start_api_server` constructs a real
+`TimescaleSpendReader` and every spend-dependent policy fact reflects actual `usage_events` data.
+
+**This repo's own tracked config is a different story, and matters for local runs and tests.**
+Grepping `config/default.yaml`, `.docker/authz/container.yaml`, and the umbrella Helm chart under
+`charts/` in *this* repository finds `usage_database` set nowhere — none of them are what prod
+actually deploys, but they are what a local `docker compose up`/`cargo run` or a CI integration
+test uses. For those, `start_api_server` degrades to `UnavailableSpendReader`, exactly as
+described below. **The general trap this is worth naming explicitly:** asking "is X configured?"
+by grepping only this repo answers "is X configured in this repo's own defaults," not "is X
+configured in production" — prod's values repo can and does override the entire `config.yaml`
+wholesale, so an absent key here says nothing about what's actually running. `TimescaleSpendReader`
+itself needs no further code change to activate anywhere else `usage_database` gets set; it is
+already wired to do so automatically.
 
 **This fails closed, not open.** `Spend` is a two-variant enum (`Known(i64)` /
 `Unavailable`) specifically so a policy rule can never mistake "we don't know" for "spent zero".
