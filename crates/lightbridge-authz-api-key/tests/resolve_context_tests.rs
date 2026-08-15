@@ -92,3 +92,39 @@ async fn rejects_unknown_project(pool: PgPool) {
         .expect_err("an unknown project must not resolve");
     assert!(matches!(err, Error::NotFound));
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_default_project_id_returns_the_auto_provisioned_project(pool: PgPool) {
+    let repo = build_repo(pool);
+    let subject = "user-1";
+    let (_account_id, project_id) = seed_project(&repo, subject).await;
+
+    let default_project_id = repo
+        .find_default_project_id(subject)
+        .await
+        .expect("query succeeds")
+        .expect("the subject's first project is its auto-provisioned default");
+    assert_eq!(default_project_id, project_id);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_default_project_id_is_none_without_any_projects(pool: PgPool) {
+    let repo = build_repo(pool);
+    repo.create_account(
+        "user-1",
+        lightbridge_authz_core::CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .expect("account creation should succeed");
+
+    let default_project_id = repo
+        .find_default_project_id("user-1")
+        .await
+        .expect("query succeeds");
+    assert_eq!(
+        default_project_id, None,
+        "an account with zero projects has no default project to resolve"
+    );
+}
