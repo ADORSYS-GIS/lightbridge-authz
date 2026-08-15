@@ -599,3 +599,73 @@ async fn rbac_gate_requires_a_valid_token_on_mapped_ops() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "invalid token → 401");
 }
+
+/// The real, effective permission set for `lightbridge-editor` as configured in the shipped
+/// `config/default.yaml` -- loaded and compiled through the exact same `Rbac::compile()` path a
+/// running server takes at startup, rather than hand-copied into this test file. This is what lets
+/// `editor_role_can_self_refill_but_not_review` fail for the right reason (a `permission_denied`
+/// 403 on `requestBudgetRefill`) if the `budget:self-refill` grant is ever reverted from that file,
+/// instead of silently continuing to pass against a stale, hand-maintained snapshot of the grant.
+fn editor_perms_from_shipped_config() -> lightbridge_authz_core::authz::PermissionSet {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/default.yaml");
+    let config = lightbridge_authz_core::config::load_from_path(path)
+        .expect("shipped config/default.yaml must parse");
+    config
+        .oauth2
+        .rbac
+        .compile()
+        .roles
+        .get("lightbridge-editor")
+        .cloned()
+        .expect("config/default.yaml must configure a lightbridge-editor role")
+}
+
+/// #294: a caller holding a budget role (here, `lightbridge-editor`) must be able to self-refill
+/// their own budget (`budget:self-refill` -> `procedure.requestBudgetRefill`), but the same grant
+/// must NOT let them reach the admin review queue (`budget:review` ->
+/// `procedure.listPendingAugmentationRequests`/`approveAugmentationRequest`/
+/// `rejectAugmentationRequest`). The second half matters more: a too-broad grant that leaks
+/// `budget:review` into a non-admin role is the failure mode worth guarding, not merely the
+/// presence of the first permission.
+#[tokio::test]
+async fn editor_role_can_self_refill_but_not_review() {
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with(
+        "editor",
+        token_info("editor-subject", editor_perms_from_shipped_config()),
+    ));
+
+    // requestBudgetRefill: the RBAC gate must let this through. This file's routers are all
+    // lazily wired to an unreachable Postgres (module docs), so a granted call still fails once it
+    // reaches dispatch -- the only thing assertable here without a live DB is that the gate itself
+    // did not stop it with 401/403, mirroring
+    // `rbac_gate_on_the_batch_endpoint_requires_a_valid_token_then_forwards` above. The
+    // permission-granted -> 200 case (reaching real dispatch) lives in `rpc_it_tests.rs`.
+    let router = build_router(bearer.clone(), &external_oauth2(), None, false);
+    let (status, _) = rpc_call(
+        router,
+        "procedure.requestBudgetRefill",
+        Wire::Json,
+        &json!({}),
+        Some("editor"),
+    )
+    .await;
+    assert!(
+        status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+        "editor must be granted requestBudgetRefill by the RBAC gate, got {status}"
+    );
+
+    // The three admin-review procedures must stay refused -- budget:review must not leak in.
+    for op in [
+        "procedure.listPendingAugmentationRequests",
+        "procedure.approveAugmentationRequest",
+        "procedure.rejectAugmentationRequest",
+    ] {
+        let router = build_router(bearer.clone(), &external_oauth2(), None, false);
+        let (status, _) = rpc_call(router, op, Wire::Json, &json!({}), Some("editor")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "editor must be denied `{op}` (budget:review must not leak into lightbridge-editor)"
+        );
+    }
+}

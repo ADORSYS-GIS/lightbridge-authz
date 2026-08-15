@@ -108,6 +108,7 @@ oauth2:
         - "account:read"
         - "project:*"
         - "apikey:*"
+        - "budget:self-refill"
       lightbridge-viewer:
         - "account:read"
         - "project:read"
