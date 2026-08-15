@@ -3,24 +3,40 @@
 //! per-request wrapper that closes over the one field `handle_token`'s dispatch has no room to
 //! carry -- see that type's doc comment for why.
 //!
-//! **How much RFC 8693 logic this file hand-writes, and why:** at the pinned rev
-//! (`authkestra-op`/`authkestra-engine` git rev `a19cdd2`), `OpStore::handle_token_exchange` and
-//! `OpStore::handle_refresh_token` are real, overridable, defaulted trait methods -- so this store
-//! reaches `handle_token` (the entry point) and overrides both here rather than forking anything.
-//! But the *default bodies* those methods fall back to
-//! (`handlers::token::default_handle_token_exchange`/`default_handle_refresh_token`) are
-//! `pub(crate)` to `authkestra-op` -- unreachable from this crate -- and neither one ever calls
-//! `issue_user_token_with_extra`/`issue_id_token_with_extra`, so neither could stamp
-//! `account_id`/`project_id`/`api_key_id`/`allowed_models` even if this crate could call them.
-//! Both overrides below are therefore full reimplementations of the RFC 8693 exchange/refresh
-//! logic (subject-token validation, audience binding, scope intersection, token minting), not
-//! thin wrappers -- everything from "validate the subject_token" onward is hand-written here. The
-//! one further, deliberate divergence from upstream's own default: `default_handle_token_exchange`
-//! validates the presented `subject_token` via `tokens.validate_token` (i.e. against *this
-//! service's own* signing key), which cannot be right for us -- our `subject_token` is a Keycloak
-//! access token signed by a completely different key. This override validates it via
-//! `BearerTokenServiceTrait::validate_bearer_token` (the existing JWKS-backed Keycloak validator)
-//! instead, exactly as the phase-1 hand-rolled dispatch already did.
+//! **How much RFC 8693 logic this file hand-writes, and why:** on `authkestra-op`/
+//! `authkestra-engine` 0.5.0, `OpStore::handle_token_exchange` and `OpStore::handle_refresh_token`
+//! are real, overridable, defaulted trait methods -- so this store reaches `handle_token` (the
+//! entry point) and overrides both here rather than forking anything. Both overrides below are
+//! full reimplementations of the RFC 8693 exchange/refresh logic (subject-token validation,
+//! audience binding, scope intersection, token minting), not thin wrappers -- everything from
+//! "validate the subject_token" onward is hand-written here.
+//!
+//! **Re-evaluated on the 0.5.0 bump, not just carried forward:** upstream PR #217 made
+//! `handlers::token::default_handle_token_exchange` `pub` specifically so external `OpStore`
+//! overrides could delegate to it and post-process the result instead of reimplementing RFC 8693
+//! from scratch. Delegating here was evaluated and rejected for two independent, sufficient
+//! reasons, either alone enough to keep the full reimplementation:
+//!
+//! 1. `default_handle_token_exchange` validates the presented `subject_token` via
+//!    `tokens.validate_token` -- i.e. against *this service's own* `TokenManager` signing key.
+//!    Our `subject_token` is a Keycloak access token signed by a completely different key (a
+//!    different issuer's JWKS), so delegating would make every real exchange request fail
+//!    validation with `invalid_grant`. This override validates it via
+//!    `BearerTokenServiceTrait::validate_bearer_token` (the existing JWKS-backed Keycloak
+//!    validator) instead, exactly as the phase-1 hand-rolled dispatch already did.
+//! 2. Even setting (1) aside, `default_handle_token_exchange`'s returned `TokenResponse` does not
+//!    expose the `Identity`/claims it resolved internally -- only the final `scope` and the
+//!    already-signed `access_token`. Stamping `account_id`/`project_id`/`api_key_id`/
+//!    `allowed_models`/`at_hash`/`azp` requires those onto the token *at mint time*
+//!    (`issue_user_token_with_extra`/`issue_id_token_with_extra`); a signed JWT cannot be
+//!    "post-processed" to add claims afterward. Doing this correctly means independently
+//!    resolving `resolve_context`/`get_project_by_id`/decoding the subject token -- i.e. most of
+//!    what this override already does -- so delegating would not remove that work, only add a
+//!    second, unusable token-minting call on top of it.
+//!
+//! `default_handle_refresh_token` remains `pub(crate)` to `authkestra-op` in 0.5.0 (PR #217 only
+//! touched the token-exchange default) -- unreachable from this crate regardless, so the
+//! `handle_refresh_token` override below has no delegation option to evaluate at all.
 
 use std::sync::Arc;
 
@@ -285,6 +301,9 @@ impl TokenExchangeOpStore {
             id_token,
             refresh_token,
             scope: scope_str,
+            // RFC 8693 §2.2.1: REQUIRED on a token-exchange grant response, mirroring
+            // `default_handle_token_exchange`'s own value for this field.
+            issued_token_type: Some("urn:ietf:params:oauth:token-type:access_token".to_string()),
         })
     }
 
@@ -448,6 +467,10 @@ impl TokenExchangeOpStore {
             id_token,
             refresh_token: Some(new_plaintext),
             scope: scope_str,
+            // Not a token-exchange response -- `default_handle_refresh_token` likewise leaves
+            // this `None` on the plain `refresh_token` grant; RFC 8693 §2.2.1 only requires it on
+            // a token-exchange response.
+            issued_token_type: None,
         })
     }
 }

@@ -176,6 +176,13 @@ pub(crate) fn identity_for(owner: &KeyOwner) -> Identity {
 /// former, the authenticated client's `client_id` for the latter) and in the `api_key_id`/`sid`
 /// values each supplies. See [`ApiKeyJwtSigner::sign`]'s doc comment for the full claim-by-claim
 /// provenance; this is that same set, factored out so it is defined exactly once.
+///
+/// Stamps `extra["jti"]` with this repo's own `lgbr:`-prefixed CUID2 (ADR-0039: every id this
+/// service mints is a CUID2). `TokenManager` (authkestra-engine 0.5.0, PR #215) removes a
+/// string-valued `extra["jti"]` and uses it verbatim as the token's `jti` claim instead of
+/// generating a UUIDv4 -- see `take_jti` in `authkestra_engine::token`. Before 0.5.0 this override
+/// was not possible: `extra["jti"]` and `Claims::jti` both serialized under the same flattened
+/// key, producing an undecodable duplicate-key JWT.
 pub(crate) fn access_token_extra(
     owner: &KeyOwner,
     api_key_id: &str,
@@ -185,6 +192,10 @@ pub(crate) fn access_token_extra(
     azp: Option<&str>,
 ) -> HashMap<String, Value> {
     let mut extra = HashMap::new();
+    extra.insert(
+        "jti".to_string(),
+        Value::String(format!("lgbr:{}", cuid2())),
+    );
     extra.insert("typ".to_string(), Value::String(TOKEN_TYP.to_string()));
     if let Some(azp) = azp {
         extra.insert("azp".to_string(), Value::String(azp.to_string()));
@@ -226,7 +237,8 @@ pub(crate) fn access_token_extra(
 /// token carried one (never defaulted to "now"), `azp` naming the client the tokens were issued
 /// to, and `at_hash` binding this `id_token` to the `access_token` minted alongside it in the same
 /// response. Tenant context (`api_key_id`/`project_id`/`account_id`) and role/quota data never
-/// appear here -- see [`compute_at_hash`].
+/// appear here -- see [`compute_at_hash`]. `jti` is stamped as this repo's own `lgbr:`-prefixed
+/// CUID2, same as [`access_token_extra`] and for the same ADR-0039 reason.
 pub(crate) fn id_token_extra(
     owner: &KeyOwner,
     access_token: &str,
@@ -234,6 +246,10 @@ pub(crate) fn id_token_extra(
     azp: &str,
 ) -> HashMap<String, Value> {
     let mut extra = HashMap::new();
+    extra.insert(
+        "jti".to_string(),
+        Value::String(format!("lgbr:{}", cuid2())),
+    );
     if let Some(email) = owner.email.as_deref() {
         extra.insert("email".to_string(), Value::String(email.to_string()));
     }
@@ -305,19 +321,21 @@ impl ApiKeyJwtSigner {
     /// Signing itself goes through `authkestra_engine::token::TokenManager::issue_user_token_with_extra`
     /// (ADR-0011, Decision 2) rather than hand-rolled `jsonwebtoken::encode`. Every claim this
     /// service minted before (`typ`, `azp`, `lightbridge_caller_kind`, `sid`, `api_key_id`,
-    /// `project_id`, `account_id`, `email`, `email_verified`, `allowed_models`) is preserved
-    /// byte-for-byte via `extra`, with the same `skip_serializing_if`-style omission (simply not
-    /// inserting the key when the value is absent). `TokenManager` itself unconditionally adds two
-    /// claims this signer never emitted before -- `nbf` and a nested `identity` object mirroring
-    /// `sub`/`email` -- and mints `jti` as a UUIDv4 rather than this repo's `lgbr:`-prefixed
-    /// CUID2. Both are documented, deliberate consequences of adopting `TokenManager` as ADR-0011
-    /// Decision 2 mandates; see `crates/lightbridge-authz-rest/tests/signing_tests.rs`'s
+    /// `project_id`, `account_id`, `email`, `email_verified`, `allowed_models`, and -- since the
+    /// authkestra 0.5.0 bump (PR #215) -- `jti` too) is preserved byte-for-byte via `extra`, with
+    /// the same `skip_serializing_if`-style omission (simply not inserting the key when the value
+    /// is absent). `TokenManager` itself unconditionally adds one claim this signer never emitted
+    /// before -- `nbf` and a nested `identity` object mirroring `sub`/`email`; documented,
+    /// deliberate consequences of adopting `TokenManager` as ADR-0011 Decision 2 mandates. See
+    /// `crates/lightbridge-authz-rest/tests/signing_tests.rs`'s
     /// `new_signer_claim_set_is_a_documented_superset_of_the_old_signer` for the exact diff this
-    /// was verified against, and the ADR-0011 phase-1 PR description for why `jti` could not be
-    /// held to the AGENTS.md "every minted id is CUID2" rule here (`extra` cannot cleanly override
-    /// `jti`: it collides with `Claims`' own top-level field and produces a JWT payload with a
-    /// duplicate `jti` key, which is technically-malformed JSON even though `serde_json` happens
-    /// to take last-wins on decode).
+    /// was verified against. `jti` no longer needs an exception to the AGENTS.md "every minted id
+    /// is CUID2" rule: before authkestra 0.5.0, `extra["jti"]` collided with `Claims`' own
+    /// top-level `jti` field and produced a JWT payload with a duplicate `jti` key (technically
+    /// malformed JSON that only happened to decode via `serde_json`'s last-wins behavior); 0.5.0's
+    /// `TokenManager::take_jti` now removes a string-valued `extra["jti"]` and uses it verbatim
+    /// instead of generating a UUIDv4, so [`access_token_extra`]/[`id_token_extra`] supply this
+    /// repo's own `lgbr:`-prefixed CUID2 through that seam.
     #[allow(clippy::too_many_arguments)]
     pub async fn sign(
         &self,
