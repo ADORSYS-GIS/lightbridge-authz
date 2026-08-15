@@ -125,18 +125,24 @@ SECRET=$(echo "$KEY_JSON" | /usr/bin/python3 -c "import sys, json; print(json.lo
 
 ## 6) Validate through the internal Authorino backend
 
+`$OPA_USER`/`$OPA_PASSWORD` are the `server.opa.basic_auth` credentials from the config YAML
+(locally, `.docker/authz/container.yaml`'s defaults).
+
 ```bash
-curl -k -u authorino:change-me https://localhost:13001/v1/opa/validate \
-  -H 'Content-Type: application/json' \
-  -d "{\"api_key\":\"$SECRET\",\"ip\":\"203.0.113.10\"}"
+curl -k -u "$OPA_USER:$OPA_PASSWORD" https://localhost:13001/v1/authorino/validate/introspect \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d "token=$SECRET&token_type_hint=access_token"
 ```
 
-Expected: `200` with `api_key`, `project`, and `account` fields, and `last_used_at` populated.
+Expected: `200` with `{"active": true, ...}` plus `account_id`, `project_id`, `api_key_id`, and
+`api_key_status` fields (RFC 7662 introspection — see `docs/authorino-usage.md`). `last_used_at`
+is updated on the underlying `api_keys` row as part of this call.
 
-In a deployed path, callers do not invoke this backend directly. Authorino calls
-the validation endpoint using basic auth, then uses the returned context to enrich
-the authorized request with account, project, API key, and any preserved request
-metadata.
+In a deployed path, callers do not invoke this backend directly. Authorino's `AuthConfig` calls
+the introspection endpoint using basic auth as a `metadata` provider, then gates the request on
+the returned `active` field via an authorization rule — see `docs/authorino-usage.md`'s "AuthConfig
+wiring" section for the exact wiring and how per-request metadata is handled now (inside
+Authorino's own `AuthConfig`, not this API).
 
 ## Cleanup (optional)
 

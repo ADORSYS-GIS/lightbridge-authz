@@ -418,9 +418,8 @@ read, never rewritten, never regenerated into our own format.
 - Validation API (`authz-opa`)
   - Validates presented API key secrets by hashing and matching against `key_hash`.
   - Rejects revoked/expired keys.
-  - Records usage telemetry (last IP + timestamp).
-  - Returns key/project/account context to callers.
-  - Provides an Authorino-oriented endpoint that supports dynamic metadata.
+  - Records usage telemetry (last used timestamp).
+  - Returns key/project/account context via RFC 7662 introspection.
 
 - MCP API (`lightbridge-mcp`)
   - Exposes authz CRUD and validation operations as MCP tools under `/mcp`.
@@ -431,17 +430,21 @@ read, never rewritten, never regenerated into our own format.
 
 On the OPA server:
 
-- `POST /v1/opa/validate`
-  - Minimal validation endpoint returning `{ api_key, project, account }` on success.
+- `POST /v1/authorino/validate/introspect`
+  - RFC 7662 token introspection, form-encoded (`token`/`token_type_hint`), Basic-auth protected.
+  - The only key-validation route `authz-opa` exposes. Two earlier endpoints — `POST
+    /v1/opa/validate` and a JSON-bodied `POST /v1/authorino/validate` that accepted an arbitrary
+    `metadata` object and echoed it back inside a `dynamic_metadata` response — were removed with
+    no direct HTTP successor; this is asserted by
+    `introspect_endpoint_should_exist_in_opa_openapi` (`crates/lightbridge-authz-rest/src/lib.rs:1788-1807`).
+    The same metadata-enrichment shape still exists as the `validate-authorino-api-key` MCP tool
+    on `lightbridge-mcp` (bearer-JWT + RBAC gated), but that is not reachable by Authorino's
+    `AuthConfig`, which needs a plain HTTP call — see `docs/authorino-usage.md`.
+  - Returns `{ active, account_id, project_id, api_key_id, api_key_status, ... }` on success,
+    `{ active: false }` (still `200`) for a deleted/revoked/expired/unknown key.
 
-- `POST /v1/authorino/validate`
-  - Designed for Authorino/external auth integrations.
-  - Accepts a typed `AuthorinoMetadata` struct in the request.
-  - Returns `dynamic_metadata` in the response which:
-    - preserves request metadata keys
-    - enriches with `account_id`, `project_id`, `api_key_id`, and `api_key_status`
-
-These are implemented in `crates/lightbridge-authz-rest/src/handlers/authorino.rs`.
+Implemented in `crates/lightbridge-authz-rest/src/handlers/introspect.rs` (shared validation
+lookup lives in `crates/lightbridge-authz-rest/src/handlers/opa.rs`).
 
 ### Identity context resolution (`subject` + `project` → context)
 
