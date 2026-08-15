@@ -112,6 +112,7 @@ fn lazy_refill_and_review_services(
 ) -> (
     Arc<lightbridge_authz_budget::RefillService>,
     Arc<lightbridge_authz_budget::ReviewService>,
+    Arc<lightbridge_authz_budget::repo::BudgetRepo>,
 ) {
     let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
         core.clone(),
@@ -124,10 +125,10 @@ fn lazy_refill_and_review_services(
         Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
     ));
     let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
-        budget_repo,
+        budget_repo.clone(),
         augmentation_repo,
     ));
-    (refill_service, review_service)
+    (refill_service, review_service, budget_repo)
 }
 
 fn signing_cfg() -> JwtSigning {
@@ -207,7 +208,7 @@ fn build_router(
     let core = lazy_core_pool();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()));
     let policy_store = lazy_policy_store(core.clone());
-    let (refill_service, review_service) =
+    let (refill_service, review_service, budget_repo) =
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
         oauth2,
@@ -216,6 +217,7 @@ fn build_router(
         policy_store,
         refill_service,
         review_service,
+        budget_repo,
         lazy_cratestack_db(),
         core,
         lazy_store_repo(),
@@ -239,7 +241,7 @@ fn build_router_at(
     let core = lazy_core_pool();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()));
     let policy_store = lazy_policy_store(core.clone());
-    let (refill_service, review_service) =
+    let (refill_service, review_service, budget_repo) =
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
         oauth2,
@@ -248,6 +250,7 @@ fn build_router_at(
         policy_store,
         refill_service,
         review_service,
+        budget_repo,
         lazy_cratestack_db(),
         core,
         lazy_store_repo(),

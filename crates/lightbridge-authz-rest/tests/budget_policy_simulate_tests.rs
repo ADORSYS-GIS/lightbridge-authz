@@ -133,10 +133,16 @@ async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, CoolCon
         Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
     ));
     let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
-        budget_repo,
+        budget_repo.clone(),
         augmentation_repo,
     ));
-    let procedures = Procedures::new(issuer, policy_store, refill_service, review_service);
+    let procedures = Procedures::new(
+        issuer,
+        policy_store,
+        refill_service,
+        review_service,
+        budget_repo,
+    );
     let ctx = CoolContext::authenticated([("id".to_owned(), Value::String(subject.to_owned()))]);
     (procedures, ctx)
 }

@@ -132,6 +132,30 @@ const GET_BALANCE_SQL: &str = "SELECT \
      version, updated_at \
      FROM budget_balances WHERE budget_account_id = $1 AND period = $2";
 
+const GET_GRANT_BY_ID_SQL: &str = "SELECT \
+     id, budget_account_id, account_id, project_id, period, amount_micros, source, \
+     actor_id, reason, policy_revision, matched_rule_ids, idempotency_key, trigger_key, \
+     created_at, expires_at, revoked_at \
+     FROM budget_grants WHERE id = $1";
+
+// `period` is `$2::text` -- an untyped `NULL` bind for an omitted period filter would otherwise
+// require sqlx to infer the parameter's Postgres type from context, which it cannot always do
+// reliably for a bare `IS NULL OR =` predicate; the explicit cast pins it. `created_at < $3` (not
+// `<=`) makes the cursor exclusive, matching the "return rows strictly older than `before`"
+// contract this module's callers document -- see [`BudgetRepo::list_grants`]. Ordered `DESC` by
+// `created_at` ONLY (per ADR-0039: never sort or paginate by id -- ids are opaque CUID2 strings
+// with no defined ordering, so `id` appears nowhere in this query, not even as a tie-breaker).
+const LIST_GRANTS_SQL: &str = "SELECT \
+     id, budget_account_id, account_id, project_id, period, amount_micros, source, \
+     actor_id, reason, policy_revision, matched_rule_ids, idempotency_key, trigger_key, \
+     created_at, expires_at, revoked_at \
+     FROM budget_grants \
+     WHERE budget_account_id = $1 \
+       AND ($2::text IS NULL OR period = $2) \
+       AND ($3::timestamptz IS NULL OR created_at < $3) \
+     ORDER BY created_at DESC \
+     LIMIT $4";
+
 /// A single `budget_balances` row, read directly (not replayed from the ledger like
 /// [`DerivedBalance`], and not filtered by expiry like [`BudgetRepo::effective_balance`]). `None`
 /// from [`BudgetRepo::get_balance`] means no balance row exists yet for that (account, period) --
@@ -169,6 +193,34 @@ struct BalanceRow {
     automatic_grant_count: i32,
     version: i64,
     updated_at: DateTime<Utc>,
+}
+
+impl BalanceSnapshot {
+    /// A zero-valued snapshot for `(budget_account_id, period)`, used when
+    /// [`BudgetRepo::get_balance`] returns `None` -- i.e. this account has never had a grant this
+    /// period. Distinct from [`BudgetRepo::get_balance`] itself returning `None` (see that
+    /// method's own doc comment for why the two are meaningfully different at the repo layer): a
+    /// balance *read* procedure synthesizes this rather than surfacing "no row" as an error,
+    /// because "you have zero budget this period" is a legitimate, common answer, not a fault.
+    /// `updated_at` is set to `created_at`-less `Utc::now()` at call time -- there is no real
+    /// "last updated" for a projection that was never written, so this is a synthesized
+    /// placeholder, not a stored value.
+    pub fn zero(budget_account_id: &str, period: &Period) -> Self {
+        Self {
+            budget_account_id: budget_account_id.to_string(),
+            period: period.clone(),
+            base_total_micros: 0,
+            self_service_total_micros: 0,
+            admin_total_micros: 0,
+            automatic_total_micros: 0,
+            refund_total_micros: 0,
+            effective_budget_micros: 0,
+            self_service_grant_count: 0,
+            automatic_grant_count: 0,
+            version: 0,
+            updated_at: Utc::now(),
+        }
+    }
 }
 
 impl TryFrom<BalanceRow> for BalanceSnapshot {
@@ -458,4 +510,53 @@ impl BudgetRepo {
 
         row.map(BalanceSnapshot::try_from).transpose()
     }
+
+    /// Fetches one `budget_grants` row by id, for [`crate::repo`]'s revoke-by-correction callers
+    /// that need to read the original grant's exact `(budget_account_id, account_id, project_id,
+    /// period, amount_micros)` before writing a compensating row against it. Not-found is a loud,
+    /// typed [`BudgetError::NotFound`], mirroring [`crate::augmentation::AugmentationRepo::get`].
+    pub async fn get_grant_by_id(&self, id: &str) -> Result<BudgetGrant, BudgetError> {
+        let row: Option<BudgetGrantRow> = sqlx::query_as(GET_GRANT_BY_ID_SQL)
+            .bind(id)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(storage_failed)?;
+
+        let row = row.ok_or_else(|| BudgetError::NotFound(format!("budget grant '{id}'")))?;
+
+        BudgetGrant::try_from(row)
+    }
+
+    /// The ledger's audit-read path (ADR-0039: paginated by `created_at`, never by id -- CUID2 has
+    /// no defined ordering). Returns up to `limit` grants for `budget_account_id`, optionally
+    /// scoped to one `period`, newest-first, strictly older than `before` when supplied (the
+    /// caller's cursor: pass the `created_at` of the last row from the previous page). `limit` is
+    /// clamped to `[1, MAX_LIST_GRANTS_LIMIT]` here -- a caller-supplied `0` or a very large value
+    /// would otherwise either return nothing or force an unbounded scan.
+    pub async fn list_grants(
+        &self,
+        budget_account_id: &str,
+        period: Option<&Period>,
+        before: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<BudgetGrant>, BudgetError> {
+        let period_str = period.map(ToString::to_string);
+        let clamped_limit = limit.clamp(1, MAX_LIST_GRANTS_LIMIT);
+
+        let rows: Vec<BudgetGrantRow> = sqlx::query_as(LIST_GRANTS_SQL)
+            .bind(budget_account_id)
+            .bind(&period_str)
+            .bind(before)
+            .bind(clamped_limit)
+            .fetch_all(self.pool())
+            .await
+            .map_err(storage_failed)?;
+
+        rows.into_iter().map(BudgetGrant::try_from).collect()
+    }
 }
+
+/// Upper bound on [`BudgetRepo::list_grants`]'s page size, independent of whatever the RPC
+/// procedure layer additionally defaults/clamps to -- this repo method must never be made to scan
+/// an unbounded page regardless of what a caller (procedure or test) asks for.
+const MAX_LIST_GRANTS_LIMIT: i64 = 200;

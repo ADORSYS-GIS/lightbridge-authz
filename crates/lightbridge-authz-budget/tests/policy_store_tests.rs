@@ -326,3 +326,114 @@ async fn activate_by_revision_id_rejects_an_unknown_revision(pool: PgPool) {
         "a rejected rollback must not repoint active_revision_id"
     );
 }
+
+/// `budget:policy-write`'s domain method: a new revision is inserted, but the previously active
+/// revision is untouched -- both by id (`active_revision_id` unchanged) and by what the live
+/// engine actually serves. This is the "a bad revision never displaces a good one" property
+/// applied to the write path: even a genuinely valid new revision must not go live just because
+/// it was authored.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_revision_inserts_without_activating(pool: PgPool) {
+    let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
+
+    let store = PolicyStore::load_active_from_db(
+        Arc::clone(&db_pool),
+        SEEDED_POLICY_SET_ID,
+        EVALUATION_BUDGET,
+    )
+    .await
+    .expect("seeded policy set loads");
+
+    let active_id_before = active_revision_id(&pool, SEEDED_POLICY_SET_ID)
+        .await
+        .expect("active_revision_id must be set");
+    let count_before = revision_count(&pool, SEEDED_POLICY_SET_ID).await;
+
+    let candidate_data = valid_replacement_rule_data("budget-policy-authored-not-activated", 7);
+    let new_revision = store
+        .create_revision(&candidate_data, Some("policy-author"))
+        .await
+        .expect("valid rule data must be writable as a new revision");
+
+    assert_eq!(
+        new_revision.policy_revision,
+        "budget-policy-authored-not-activated"
+    );
+
+    // The row genuinely exists...
+    let (persisted_revision,): (String,) =
+        sqlx::query_as("SELECT policy_revision FROM budget_policy_revisions WHERE id = $1")
+            .bind(&new_revision.id)
+            .fetch_one(&pool)
+            .await
+            .expect("the newly written revision row must exist");
+    assert_eq!(persisted_revision, "budget-policy-authored-not-activated");
+    let count_after = revision_count(&pool, SEEDED_POLICY_SET_ID).await;
+    assert_eq!(
+        count_after,
+        count_before + 1,
+        "exactly one new revision row must be inserted"
+    );
+
+    // ...but nothing about what's active changed, at either layer.
+    assert_eq!(
+        store.active_policy_revision(),
+        SEEDED_POLICY_REVISION,
+        "the live engine on the same store instance must still serve the original revision"
+    );
+    let active_id_after = active_revision_id(&pool, SEEDED_POLICY_SET_ID)
+        .await
+        .expect("active_revision_id must still be set");
+    assert_eq!(
+        active_id_after, active_id_before,
+        "create_revision must never repoint active_revision_id"
+    );
+
+    // A separate activate_by_revision_id call is what would later make it serve -- proving the
+    // row really is a legitimate, activatable revision, not a malformed write that merely looks
+    // like one.
+    let activated = store
+        .activate_by_revision_id(&new_revision.id)
+        .await
+        .expect("the written-but-not-yet-active revision must be activatable by id");
+    assert_eq!(activated, "budget-policy-authored-not-activated");
+    assert_eq!(
+        store.active_policy_revision(),
+        "budget-policy-authored-not-activated"
+    );
+}
+
+/// Mirrors `activate_with_malformed_rule_data_leaves_everything_unchanged`: `create_revision`
+/// validates BEFORE writing, so a rejected candidate leaves no trace in
+/// `budget_policy_revisions` at all -- not even a "rejected" row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_revision_with_malformed_rule_data_writes_nothing(pool: PgPool) {
+    let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
+
+    let store = PolicyStore::load_active_from_db(
+        Arc::clone(&db_pool),
+        SEEDED_POLICY_SET_ID,
+        EVALUATION_BUDGET,
+    )
+    .await
+    .expect("seeded policy set loads");
+
+    let count_before = revision_count(&pool, SEEDED_POLICY_SET_ID).await;
+
+    let result = store.create_revision(MALFORMED_RULE_DATA, None).await;
+    assert!(
+        matches!(result, Err(BudgetError::InvalidRuleData(_))),
+        "malformed rule data must be rejected as InvalidRuleData: {result:?}"
+    );
+
+    let count_after = revision_count(&pool, SEEDED_POLICY_SET_ID).await;
+    assert_eq!(
+        count_after, count_before,
+        "a rejected create_revision call must not insert any row, not even a rejected one"
+    );
+    assert_eq!(
+        store.active_policy_revision(),
+        SEEDED_POLICY_REVISION,
+        "the live engine must be completely untouched by a rejected write"
+    );
+}

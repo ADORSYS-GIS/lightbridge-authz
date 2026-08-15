@@ -107,11 +107,13 @@ oauth2:
         - "project:*"        # every project action
         - "apikey:*"         # every api-key action
         - "budget:self-refill" # self-refill own budget, capped by policy (#294)
+        - "budget:read-own"  # see own budget balance/history
       lightbridge-viewer:
         - "account:create"   # self-provision own account (#321)
         - "account:read"
         - "project:read"
         - "apikey:read"
+        - "budget:read-own"  # see own budget balance/history
 
     # Applied on behalf of any role string present in the caller's claim that matches none of
     # the entries above. Empty by default -- an unrecognized role then contributes nothing,
@@ -179,8 +181,8 @@ Used when `oauth2.rbac.role_permissions` is not configured
 | Role                 | Grants                                | Effective permissions                              |
 | -------------------- | ------------------------------------- | -------------------------------------------------- |
 | `lightbridge-admin`  | `*`                                   | all permissions                                    |
-| `lightbridge-editor` | `account:create`, `account:read`, `project:*`, `apikey:*` | self-provision own account; read accounts; full project + api-key lifecycle |
-| `lightbridge-viewer` | `account:create`, `account:read`, `project:read`, `apikey:read` | self-provision own account; otherwise read-only |
+| `lightbridge-editor` | `account:create`, `account:read`, `project:*`, `apikey:*`, `session:revoke-own`, `budget:read-own` | self-provision own account; read accounts; full project + api-key lifecycle; log out own sessions; see own budget |
+| `lightbridge-viewer` | `account:create`, `account:read`, `project:read`, `apikey:read`, `session:revoke-own`, `budget:read-own` | self-provision own account; otherwise read-only, plus log out own sessions and see own budget |
 
 ## Permissions and the operations they gate
 
@@ -217,6 +219,12 @@ listed here is denied unconditionally (fail closed).**
 | `budget:policy-simulate` | `procedure.simulateBudgetPolicy`                | — (no MCP tool yet)                 |
 | `budget:self-refill`     | `procedure.requestBudgetRefill`                 | — (no MCP tool yet)                 |
 | `budget:review`          | `procedure.listPendingAugmentationRequests`, `procedure.approveAugmentationRequest`, `procedure.rejectAugmentationRequest` | — (no MCP tool yet) |
+| `budget:read-own`        | `procedure.getMyBudgetBalance`, `procedure.listMyBudgetGrants` | — (no MCP tool yet)         |
+| `budget:read`            | `procedure.getBudgetBalance`                    | — (no MCP tool yet)                 |
+| `budget:audit-read`      | `procedure.listBudgetGrants`                    | — (no MCP tool yet)                 |
+| `budget:grant`           | `procedure.grantBudget`                         | — (no MCP tool yet)                 |
+| `budget:revoke`          | `procedure.revokeBudgetGrant`                   | — (no MCP tool yet)                 |
+| `budget:policy-write`    | `procedure.createBudgetPolicyRevision`          | — (no MCP tool yet)                 |
 | `session:revoke-own`     | `procedure.revokeOwnSessions`                        | — (no MCP tool yet)                 |
 | `session:revoke`         | `procedure.revokeSubjectSessions`                    | — (no MCP tool yet)                 |
 
@@ -320,33 +328,72 @@ ceiling routes to `pending_review` rather than being denied outright. `lightbrid
 **not** get it — self-refill spends budget, which is inconsistent with a read-only role. Neither
 role holds `budget:review`: only `lightbridge-admin` (via `*`) can act on the review queue.
 
-### Budget permissions (remaining five reserved, not yet gating any operation)
+### Direct budget-balance/ledger reads, and admin grant/revoke/policy-write
 
 `RFC-0001` (`docs/rfc/0001-budget-refill.md`) sketches a `budget:*` permission surface for the
 budget domain. `budget:policy-activate`, `budget:policy-read`, `budget:policy-simulate`,
-`budget:self-refill`, and `budget:review` are wired up as of the sections above; the five
-permissions below still exist in `Permission::ALL` and are usable in
-`role_permissions`/`default_grants` today, but **no RPC `op_id` or MCP tool maps to any of them
-yet** — later PRs in issue #188 haven't wired up the rest of the budget domain's RPC/MCP surface.
-They are reserved here so the permission strings, and the RBAC machinery around them (wildcard
-expansion, `default_grants`), are settled ahead of that surface landing.
+`budget:self-refill`, and `budget:review` were wired up first (sections above); this section
+covers the remaining five permissions plus `budget:read-own` (added alongside them), all now wired
+to real `op_id`s. Before this, `budget_balances` (maintained transactionally on every grant) and
+`budget_grants` (the append-only ledger, ADR-0009) had no reader at all — not even for an admin.
 
-| Permission               | Meaning                                                              |
-| ------------------------ | --------------------------------------------------------------------- |
-| `budget:read`            | Read budget/balance status (typically via `default_grants`, see below). |
-| `budget:grant`           | Grant budget directly, bypassing self-service policy evaluation.    |
-| `budget:revoke`          | Revoke previously granted budget.                                    |
-| `budget:audit-read`      | Read the budget audit trail (grants, decisions, policy revisions).  |
-| `budget:policy-write`    | Author (write) budget policy rules.                                  |
+**Self vs admin is split into two pairs of procedures**, the same shape
+`revokeOwnSessions`/`revokeSubjectSessions` already established for session revocation, rather than
+one procedure with an optional/defaulted target:
 
-`budget:policy-write` and `budget:policy-activate` are deliberately kept separate (ADR-0007): with
-arbitrary Rego, writing a policy means shipping executable code into the decision path, so the
-identity that authors a policy should not be the same one that activates it. The generic
-`budget:*` resource wildcard, once something grants it, expands to **all ten** budget permissions
-including both of these together — consistent with how `project:*`/`apikey:*` already behave for
-their resources (see the wildcard note above). Operators wanting the write/activate separation
-enforced should list the individual grants rather than the wildcard, exactly as already advised for
-the existing resources.
+- `procedure.getMyBudgetBalance` / `procedure.listMyBudgetGrants` take no target subject or account
+  at all — the target is always the caller's own budget account, mirroring
+  `RevokeOwnSessionsInput` having no subject field. Gated at **`budget:read-own`**, a permission
+  added specifically for this: granting the existing `budget:read`/`budget:audit-read` broadly so
+  every caller could see their own budget would also let them read every OTHER account's budget —
+  exactly the "quietly conflating self and admin access" a permission review should catch. Reading
+  your own balance/history is a read-only capability with no spend risk, so `budget:read-own` is
+  granted to every default role (`lightbridge-admin` via `*`, and explicitly to `lightbridge-editor`
+  and `lightbridge-viewer` in the shipped configs), the same posture `session:revoke-own` already
+  has and unlike `budget:self-refill` (which spends budget and so is withheld from
+  `lightbridge-viewer`).
+- `procedure.getBudgetBalance` / `procedure.listBudgetGrants` take an explicit `budgetAccountId`
+  and read ANY account's balance/ledger. Gated at the admin **`budget:read`** /
+  **`budget:audit-read`** respectively — reading a balance and reading the full ledger history
+  behind it are kept as separate permissions, not collapsed into one, mirroring the existing
+  `budget:policy-read` vs `budget:policy-write` split rather than the `budget:review` precedent
+  (which bundles list + act into one permission). Neither default role holds these; only
+  `lightbridge-admin` (via `*`) can read another account's budget.
+
+`listMyBudgetGrants`/`listBudgetGrants` paginate strictly by `createdAt`, never by id (ADR-0039 —
+CUID2 has no defined ordering): the response's `nextCursor` is the last entry's `createdAt`, passed
+back as `before` to page further into the past; a short page (fewer than the requested `limit`)
+means there is nothing further.
+
+**Admin grant/revoke** (`procedure.grantBudget` / `procedure.revokeBudgetGrant`, gated at
+**`budget:grant`** / **`budget:revoke`**) delegate to the exact same transactional write path
+(`BudgetRepo::grant`) every other grant source already uses — one ledger insert plus one
+`budget_balances` update, atomically, under the same per-`(account, period)` row lock. Per ADR-0009
+the ledger is append-only (a DB trigger rejects any `UPDATE`/`DELETE` outright, even for a
+superuser): `revokeBudgetGrant` never mutates the original row, it looks it up and writes a NEW
+`source = "correction"` row for the same `(budgetAccountId, accountId, projectId, period)` carrying
+the negated amount, which nets the original grant out of `effective_budget_micros` while leaving
+the original completely visible and unchanged. The correction's idempotency key is derived from the
+target `grantId` server-side, so calling `revokeBudgetGrant` twice for the same grant is idempotent
+rather than double-negating.
+
+**Authoring a policy revision** (`procedure.createBudgetPolicyRevision`, gated at
+**`budget:policy-write`**) is deliberately kept separate from `activateBudgetPolicy`
+(`budget:policy-activate`) per ADR-0007: with arbitrary rule data, writing a policy means shipping
+executable logic into the decision path, so the identity authoring it should not be the same one
+that activates it. It delegates to `PolicyStore::create_revision`, which validates
+`ruleDataJson` with the exact same `validate_rule_data` `activateBudgetPolicy` uses BEFORE writing
+anything, and never touches `active_revision_id` or the live in-memory engine — the currently
+active revision keeps serving exactly as before, and a separate `activateBudgetPolicy { revisionId
+}` call is what would later make the new revision live.
+
+All seven procedures above are gated only by `@allow(auth() != null)` in the schema, same pattern
+as the rest of the budget domain — the real authorization is entirely the RBAC permission gate. The
+generic `budget:*` resource wildcard, once something grants it, expands to **all eleven** budget
+permissions (including `budget:read-own` and both halves of the write/activate split) — consistent
+with how `project:*`/`apikey:*` already behave for their resources (see the wildcard note above).
+Operators wanting the finer separations enforced should list the individual grants rather than the
+wildcard, exactly as already advised for the existing resources.
 
 **Deliberately unmapped → denied (defense in depth):**
 

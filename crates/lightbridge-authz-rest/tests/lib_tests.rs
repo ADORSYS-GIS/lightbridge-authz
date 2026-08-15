@@ -322,7 +322,7 @@ mod db {
             Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
         ));
         let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
-            budget_repo,
+            budget_repo.clone(),
             augmentation_repo,
         ));
         let router = lightbridge_authz_rest::build_api_router(
@@ -332,6 +332,7 @@ mod db {
             policy_store,
             refill_service,
             review_service,
+            budget_repo,
             lazy_cratestack_db(),
             db_pool.clone(),
             signing_repo,
