@@ -1,5 +1,29 @@
 # Lightbridge Usage Query API
 
+> [!WARNING]
+> **This service has no authentication and no ownership check on `scope_id`.** The
+> `lightbridge-authz-usage` router
+> ([`crates/lightbridge-authz-usage/src/routers/mod.rs`](../crates/lightbridge-authz-usage/src/routers/mod.rs))
+> applies no JWT or Basic-auth middleware to any route, including
+> `/usage/v1/usage/query`. The handler
+> ([`crates/lightbridge-authz-usage/src/handlers/query.rs`](../crates/lightbridge-authz-usage/src/handlers/query.rs))
+> validates only the time range, that `scope_id` is non-empty, and `limit` — it does
+> **not** bind `scope`/`scope_id` to any caller identity. Concretely: anyone who can
+> reach this endpoint and knows a valid CUID2 `scope_id` can read that tenant's usage
+> data, cross-tenant, with no credential. `scope_id` values are unguessable (CUID2,
+> 24 chars) and the API offers no enumeration, but ids do leak through other
+> channels (URLs, logs, JWT claims, error messages), so "unguessable" is not a
+> substitute for authorization.
+>
+> The `/v1/otel/traces`, `/v1/otel/metrics`, and `/v1/otel/logs` ingest endpoints are
+> unauthenticated by design too — an unauthenticated write path there means anyone
+> who can reach it can fabricate usage/billing records for any account or project.
+>
+> `lightbridge-authz-usage` is `ClusterIP`-only in prod today, by design — see the
+> **Service** section below. **Do not add an external route (Ingress/HTTPRoute/
+> Gateway) to this service without first putting real authorization in front of it.**
+> See "Recommended direction" below.
+
 ## Why?
 
 Usage and cost reporting in Lightbridge depends on a single query surface.
@@ -16,9 +40,27 @@ This document describes the query endpoint as implemented in this repository.
 
 The query endpoint is exposed by the `lightbridge-authz-usage` service.
 
-Base URL:
+In prod, `lightbridge-authz-usage` is deployed `ClusterIP`-only, in the `converse`
+namespace, listening on TLS (self-signed, internal CA) — same pattern as
+`lightbridge-opa` (`ai-helm-values`
+[`environments/base/deps/security-policies/certificate.yaml`](https://github.com/ADORSYS-GIS/ai-helm-values/blob/main/environments/base/deps/security-policies/certificate.yaml)
+documents `https://lightbridge-opa.converse.svc.cluster.local:3000`; the usage
+subchart's own config in
+[`environments/prod/values/lightbridge-app.yaml`](https://github.com/ADORSYS-GIS/ai-helm-values/blob/main/environments/prod/values/lightbridge-app.yaml)
+sets `server.usage.port: 3000` plus `server.usage.tls.{cert_path,key_path}` and
+reuses the same `authz-tls`-derived secret via `persistence.tls.name: authz-tls`).
+There is no Ingress/HTTPRoute/Gateway anywhere in `ai-helm-values` that routes to
+it — in particular, `https://self-service.ai.camer.digital` (an earlier, incorrect
+version of this doc) does **not** reach this service: that hostname only routes
+`/api/v2` to `lightbridge-api` and `/` to the `converse-ui` SPA, so a request to
+that URL for this path would hit the SPA's nginx, not `lightbridge-authz-usage`.
 
-- `https://self-service.ai.camer.digital`
+In-cluster base URL:
+
+- `https://lightbridge-usage.converse.svc.cluster.local:3000`
+
+This is only reachable from inside the cluster today. There is deliberately no
+externally reachable base URL — see the warning above.
 
 ### Endpoint
 
@@ -49,7 +91,7 @@ The request is JSON and matches the `UsageQueryRequest` model.
 
 | Field | Type | Required | Default | Meaning |
 |---|---|---:|---|---|
-| `scope` | enum: `user` \| `project` \| `account` | yes | none | Primary scoping dimension. Adds a mandatory equality filter based on `scope_id`. |
+| `scope` | enum: `user` \| `api_key` \| `project` \| `account` | yes | none | Primary scoping dimension. Adds a mandatory equality filter based on `scope_id`. |
 | `scope_id` | string | yes | none | The ID value for the chosen `scope`. Must be non-empty. |
 | `start_time` | RFC3339 datetime | yes | none | Inclusive start of the time window (`observed_at >= start_time`). |
 | `end_time` | RFC3339 datetime | yes | none | Exclusive end of the time window (`observed_at < end_time`). Must be after `start_time`. |
@@ -66,7 +108,9 @@ The request is JSON and matches the `UsageQueryRequest` model.
 |---|---|---:|---|
 | `account_id` | string | no | Adds `AND account_id = <value>` |
 | `project_id` | string | no | Adds `AND project_id = <value>` |
+| `api_key_id` | string | no | Adds `AND api_key_id = <value>` |
 | `user_id` | string | no | Adds `AND user_id = <value>` |
+| `user_name` | string | no | Adds `AND user_name = <value>` |
 | `model` | string | no | Adds `AND model = <value>` |
 | `metric_name` | string | no | Adds `AND metric_name = <value>` |
 | `signal_type` | string | no | Adds `AND signal_type = <value>` |
@@ -85,7 +129,9 @@ Supported values:
 
 - `account_id`
 - `project_id`
+- `api_key_id`
 - `user_id`
+- `user_name`
 - `model`
 - `metric_name`
 - `signal_type`
@@ -105,7 +151,9 @@ Successful response is HTTP `200` with JSON:
       "bucket_start": "2026-02-20T00:00:00Z",
       "account_id": null,
       "project_id": "proj_123",
+      "api_key_id": null,
       "user_id": null,
+      "user_name": null,
       "model": "gpt-4.1-mini",
       "metric_name": null,
       "signal_type": "metric",
@@ -134,7 +182,9 @@ Each point is an aggregate across matching `usage_events` rows for:
 | `bucket_start` | RFC3339 datetime | yes | Start of the bucket produced by Postgres `date_bin`.
 | `account_id` | string or null | yes | Present when `group_by` includes `account_id`, else null.
 | `project_id` | string or null | yes | Present when `group_by` includes `project_id`, else null.
+| `api_key_id` | string or null | yes | Present when `group_by` includes `api_key_id`, else null.
 | `user_id` | string or null | yes | Present when `group_by` includes `user_id`, else null.
+| `user_name` | string or null | yes | Present when `group_by` includes `user_name`, else null.
 | `model` | string or null | yes | Present when `group_by` includes `model`, else null.
 | `metric_name` | string or null | yes | Present when `group_by` includes `metric_name`, else null.
 | `signal_type` | string or null | yes | Present when `group_by` includes `signal_type`, else null.
@@ -173,6 +223,29 @@ Database error: start_time must be before end_time
 - Pagination is limited to a simple `limit`; there is no `offset`.
 - Filters are equality filters only.
 
+## Security: recommended fix direction
+
+This section exists because the warning at the top of this document needs somewhere
+to point. Before this endpoint is given any externally reachable route, it needs
+real authorization in front of it. Two directions, without over-specifying which:
+
+- **Basic-auth, same pattern as `authz-opa`.** Cheapest to add, and consistent with
+  how `authz-opa`'s validation endpoints are gated today. Does not solve
+  cross-tenant reads by itself — a shared Basic-auth credential authenticates the
+  *caller* (e.g. a gateway component), not which `scope_id` that caller is entitled
+  to see.
+- **Fold the query behind `authz-api`'s JWT middleware, with an ownership check.**
+  Resolve the caller's `account_id`/`project_id` from their JWT (the same claims
+  `/idp/v1/resolve-context` already resolves and seals into tokens — see
+  [`crates/lightbridge-authz-rest/src/handlers/idp.rs`](../crates/lightbridge-authz-rest/src/handlers/idp.rs)),
+  and require the requested `scope`/`scope_id` to match — or be owned by — that
+  identity before running the query. This is the stronger option because it fixes
+  the actual gap (no ownership check), not just "who can call the endpoint at all."
+
+Either direction needs a corresponding fix on the ingest side
+(`/v1/otel/traces`, `/v1/otel/metrics`, `/v1/otel/logs`) before it is safe to expose
+externally, since those are unauthenticated writes today.
+
 ## Findings
 
 ### Integration notes
@@ -191,7 +264,7 @@ Database error: start_time must be before end_time
 ### Example 1: Total cost for a project over the last 30 days
 
 ```bash
-curl -k https://self-service.ai.camer.digital/usage/v1/usage/query \
+curl -k https://lightbridge-usage.converse.svc.cluster.local:3000/usage/v1/usage/query \
   -H 'Content-Type: application/json' \
   -d '{
     "scope": "project",
@@ -239,7 +312,7 @@ If this returns an empty result like `{ "points": [] }`, it means the database h
 When you are unsure whether `account_id` is being ingested, try the same query with `scope=project` (project IDs are often easier to propagate), or temporarily remove `filters`.
 
 ```bash
-curl -k https://self-service.ai.camer.digital/usage/v1/usage/query \
+curl -k https://lightbridge-usage.converse.svc.cluster.local:3000/usage/v1/usage/query \
   -H 'Content-Type: application/json' \
   -d '{
     "scope": "account",
@@ -291,7 +364,7 @@ This only works if your ingested telemetry actually sets `user_id`.
 If your telemetry does not provide one of those keys, stored `user_id` will be null and any `scope=user` query will return `{ "points": [] }`.
 
 ```bash
-curl -k https://self-service.ai.camer.digital/usage/v1/usage/query \
+curl -k https://lightbridge-usage.converse.svc.cluster.local:3000/usage/v1/usage/query \
   -H 'Content-Type: application/json' \
   -d '{
     "scope": "user",
@@ -310,7 +383,7 @@ curl -k https://self-service.ai.camer.digital/usage/v1/usage/query \
 The API does not support ordering by `total_cost`. Use a coarse bucket (for example `"30 days"`) and sort client-side.
 
 ```bash
-curl -k https://self-service.ai.camer.digital/usage/v1/usage/query \
+curl -k https://lightbridge-usage.converse.svc.cluster.local:3000/usage/v1/usage/query \
   -H 'Content-Type: application/json' \
   -d '{
     "scope": "account",
@@ -331,7 +404,7 @@ Then sort the returned points by `total_cost` descending and take the first N.
 This API is always aggregated; it cannot return raw per-event rows. The closest approximation is using the smallest practical bucket (for example `"1 second"`) and grouping by as many dimensions as you have.
 
 ```bash
-curl -k https://self-service.ai.camer.digital/usage/v1/usage/query \
+curl -k https://lightbridge-usage.converse.svc.cluster.local:3000/usage/v1/usage/query \
   -H 'Content-Type: application/json' \
   -d '{
     "scope": "project",

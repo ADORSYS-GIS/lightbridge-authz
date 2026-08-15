@@ -2,12 +2,26 @@
 
 `lightbridge-authz-usage` ingests OTLP/HTTP traces + metrics from AI Envoy/OpenTelemetry exporters and stores normalized usage events in Timescale/Postgres.
 
+> [!WARNING]
+> **No endpoint in this service is authenticated, and the query endpoint does not
+> check ownership of `scope_id`.** `usage_router()`
+> ([`crates/lightbridge-authz-usage/src/routers/mod.rs`](../crates/lightbridge-authz-usage/src/routers/mod.rs))
+> applies no JWT or Basic-auth middleware. Anyone who can reach `/usage/v1/usage/query`
+> and knows a valid `scope_id` can read that tenant's usage data cross-tenant; anyone
+> who can reach the `/v1/otel/*` ingest routes can write fabricated usage/billing
+> records for any account or project. This service is `ClusterIP`-only in prod with
+> no external route — see [`docs/lightbridge-query-api.md`](lightbridge-query-api.md)
+> for the full detail (base URL, blast radius, recommended fix direction) before
+> giving this service any external route.
+
 ## Endpoints
 
 - `POST /v1/otel/traces`
   - Accepts `application/x-protobuf` or OTLP JSON payloads compatible with `ExportTraceServiceRequest`.
 - `POST /v1/otel/metrics`
   - Accepts `application/x-protobuf` or OTLP JSON payloads compatible with `ExportMetricsServiceRequest`.
+- `POST /v1/otel/logs`
+  - Accepts `application/x-protobuf` or OTLP JSON payloads compatible with `ExportLogsServiceRequest`.
 - `POST /usage/v1/usage/query`
   - Single query endpoint for scoped, bucketed usage retrieval.
 
@@ -32,8 +46,15 @@
 ## Scope semantics
 
 - `scope=user` filters by `user_id = scope_id`
+- `scope=api_key` filters by `api_key_id = scope_id`
 - `scope=project` filters by `project_id = scope_id`
 - `scope=account` filters by `account_id = scope_id`
+
+`filters` also accepts `api_key_id` and `user_name` (in addition to `account_id`,
+`project_id`, `user_id`, `model`, `metric_name`, `signal_type`), and `group_by`
+accepts the same set of dimensions. See
+[`docs/lightbridge-query-api.md`](lightbridge-query-api.md) for the full field
+reference.
 
 ## Migrations
 
