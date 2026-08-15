@@ -119,7 +119,13 @@ async fn procedures_and_ctx(
         Arc::new(UnavailableSpendReader),
     ));
     let review_service = Arc::new(ReviewService::new(budget_repo.clone(), augmentation_repo));
-    let procedures = Procedures::new(issuer, policy_store, refill_service, review_service);
+    let procedures = Procedures::new(
+        issuer,
+        policy_store,
+        refill_service,
+        review_service,
+        budget_repo.clone(),
+    );
     let ctx = ctx_for(subject);
     (procedures, ctx, budget_repo)
 }

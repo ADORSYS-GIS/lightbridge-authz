@@ -147,6 +147,21 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         "procedure.revokeOwnSessions" => SessionRevokeOwn,
         "procedure.revokeSubjectSessions" => SessionRevoke,
 
+        // Direct budget-balance/ledger reads. Self/admin split the same shape as the session-
+        // revocation pair above: the "my own budget only" procedures take no target at all and
+        // are gated at the narrower `budget:read-own`; the admin, arbitrary-target procedures are
+        // gated at `budget:read`/`budget:audit-read` -- see docs/rbac.md and the schema doc
+        // comments on these four procedures for the full self-vs-admin reasoning.
+        "procedure.getMyBudgetBalance" => BudgetReadOwn,
+        "procedure.listMyBudgetGrants" => BudgetReadOwn,
+        "procedure.getBudgetBalance" => BudgetRead,
+        "procedure.listBudgetGrants" => BudgetAuditRead,
+        // Direct admin grant/revoke, bypassing self-service policy evaluation entirely.
+        "procedure.grantBudget" => BudgetGrant,
+        "procedure.revokeBudgetGrant" => BudgetRevoke,
+        // Authoring a new policy revision, kept distinct from `budget:policy-activate` (ADR-0007).
+        "procedure.createBudgetPolicyRevision" => BudgetPolicyWrite,
+
         _ => return None,
     })
 }
@@ -313,6 +328,16 @@ mod tests {
             ),
             ("procedure.revokeOwnSessions", Permission::SessionRevokeOwn),
             ("procedure.revokeSubjectSessions", Permission::SessionRevoke),
+            ("procedure.getMyBudgetBalance", Permission::BudgetReadOwn),
+            ("procedure.listMyBudgetGrants", Permission::BudgetReadOwn),
+            ("procedure.getBudgetBalance", Permission::BudgetRead),
+            ("procedure.listBudgetGrants", Permission::BudgetAuditRead),
+            ("procedure.grantBudget", Permission::BudgetGrant),
+            ("procedure.revokeBudgetGrant", Permission::BudgetRevoke),
+            (
+                "procedure.createBudgetPolicyRevision",
+                Permission::BudgetPolicyWrite,
+            ),
         ];
         for (op_id, expected) in cases {
             assert_eq!(

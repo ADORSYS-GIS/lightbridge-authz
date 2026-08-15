@@ -720,3 +720,200 @@ type RevokeSubjectSessionsInput {
 
 mutation procedure revokeSubjectSessions(args: RevokeSubjectSessionsInput): SessionRevocationResult
   @allow(auth() != null)
+
+// Direct budget-balance/ledger reads (docs/rbac.md "Budget permissions (remaining five reserved,
+// not yet gating any operation)" -- this section wires up the reads). `budget_balances` is
+// maintained transactionally on every grant (`BudgetRepo::grant`) but had no reader at all before
+// this; `budget_grants` is the append-only ledger (ADR-0009) and was equally unreadable.
+//
+// Self vs admin is split into TWO PAIRS of procedures rather than one procedure with an
+// optional/defaulted target, the same shape `revokeOwnSessions`/`revokeSubjectSessions` already
+// established for session revocation: `getMyBudgetBalance`/`listMyBudgetGrants` take no target
+// subject/account at all -- the target is always the caller's own budget account (mirroring
+// `RevokeOwnSessionsInput` having no subject field) -- gated at `budget:read-own`, a permission
+// added specifically so a caller can see their own budget without also being handed the ability
+// to read anyone else's (see `Permission::BudgetReadOwn`'s own doc comment for why granting
+// `budget:read` broadly to satisfy this would be a real privilege escalation, not a shortcut).
+// `getBudgetBalance`/`listBudgetGrants` take an explicit `budgetAccountId`, gated at the admin
+// `budget:read`/`budget:audit-read` respectively -- reading a balance and reading the ledger
+// history behind it are kept as separate permissions, mirroring the `budget:policy-read` vs
+// `budget:policy-write` precedent of not collapsing "read" and "the more detailed read" into one
+// grant.
+//
+// All four are `@allow(auth() != null)` only, same pattern as the rest of the budget domain --
+// there is no per-tenant `@@allow` predicate that could express "budgetAccountId belongs to
+// auth().id" here (ADR-0008: `budget_account_id` is always identical to `account_id`, i.e. the
+// caller's own JWT `sub` for the self-scoped pair, and cratestack's schema policy language has no
+// way to compare an arbitrary string *input* field against `auth().id` for the admin pair
+// either), so the coarse RBAC permission gate (`crates/lightbridge-authz-rest/src/rpc_authorize.rs`)
+// is the entire authorization story, exactly as documented for `activateBudgetPolicy` et al.
+//
+// Amount fields are decimal strings, not the schema's native `Int` -- the same 64-bit-safety
+// rationale `Decision`/`AugmentationRequest` above already established (cratestack's `Int` is a
+// full-range `i64` server-side but a lossy JS `number` past 2^53 in the generated TypeScript
+// client). Counts (`selfServiceGrantCount`/`automaticGrantCount`/`version`) stay `Int` -- they are
+// small counters, not monetary amounts, matching `SessionRevocationResult.revokedCount`'s own
+// precedent just above.
+type BudgetBalance {
+  budgetAccountId String
+  period String
+  baseTotalMicros String
+  selfServiceTotalMicros String
+  adminTotalMicros String
+  automaticTotalMicros String
+  refundTotalMicros String
+  effectiveBudgetMicros String
+  selfServiceGrantCount Int
+  automaticGrantCount Int
+  version Int
+  updatedAt DateTime
+}
+
+type GetMyBudgetBalanceInput {
+  period String
+}
+
+// Reads the caller's own current budget balance for `period`. An account that has never had a
+// grant this period gets a zero-valued `BudgetBalance` back, not an error -- see
+// `BalanceSnapshot::zero`'s own doc comment for why "no row yet" and "zero budget" are the same
+// answer from a caller's point of view even though the repository layer distinguishes them.
+// Gated at `budget:read-own` (`Permission::BudgetReadOwn`).
+procedure getMyBudgetBalance(args: GetMyBudgetBalanceInput): BudgetBalance
+  @allow(auth() != null)
+
+type GetBudgetBalanceInput {
+  budgetAccountId String
+  period String
+}
+
+// The admin equivalent of `getMyBudgetBalance`: reads any account's balance, not only the
+// caller's own. Gated at `budget:read` (`Permission::BudgetRead`) -- the highest-value permission
+// this PR wires up, since `budget_balances` was previously unreadable by anyone, admin included.
+procedure getBudgetBalance(args: GetBudgetBalanceInput): BudgetBalance
+  @allow(auth() != null)
+
+// One page of the `budget_grants` append-only ledger (ADR-0009). `nextCursor` is the `createdAt`
+// of the last entry on this page -- pass it back as `before` on the next call to page further
+// back in time; `null` means there is no further page. Ordered strictly newest-first by
+// `createdAt` -- per ADR-0039, ids are opaque CUID2 strings with no defined ordering, so
+// pagination is by `createdAt` only, never by id (see `BudgetRepo::list_grants`'s own doc
+// comment). `matchedRuleIds` is a required `String[]`, not `String[]?`, for the same
+// TypeArity-grammar reason `AugmentationRequest.matchedRuleIds` already documents above --
+// `budget_grants.matched_rule_ids` is `NULL` for any grant a policy engine didn't attach rule ids
+// to (i.e. every grant that isn't an auto-approved self-service refill), mapped to an empty list
+// here rather than losing the ability to express "no matched rules" as a nullable array.
+type BudgetGrantEntry {
+  id String
+  budgetAccountId String
+  accountId String
+  projectId String?
+  period String
+  amountMicros String
+  source String
+  actorId String?
+  reason String?
+  policyRevision String?
+  matchedRuleIds String[]
+  idempotencyKey String?
+  triggerKey String?
+  createdAt DateTime
+  expiresAt DateTime?
+  revokedAt DateTime?
+}
+
+type BudgetGrantPage {
+  entries BudgetGrantEntry[]
+  nextCursor DateTime?
+}
+
+type ListMyBudgetGrantsInput {
+  period String?
+  before DateTime?
+  limit Int?
+}
+
+// The caller's own ledger history -- `budget:audit-read`'s self-scoped counterpart, folded into
+// `budget:read-own` (see that permission's doc comment: reading your own balance and reading your
+// own history are one "see your own budget" capability here, the same way `budget:review` bundles
+// listing the review queue with acting on it, rather than a fifth permission for one narrower
+// slice). `period: null` lists across every period for this account; `limit` is clamped server-side
+// (`BudgetRepo::list_grants`) regardless of what is requested.
+procedure listMyBudgetGrants(args: ListMyBudgetGrantsInput): BudgetGrantPage
+  @allow(auth() != null)
+
+type ListBudgetGrantsInput {
+  budgetAccountId String
+  period String?
+  before DateTime?
+  limit Int?
+}
+
+// The admin equivalent of `listMyBudgetGrants`: the audit trail for any account. Gated at
+// `budget:audit-read` (`Permission::BudgetAuditRead`) -- this is what makes the append-only ledger
+// actually readable by anyone, not just written.
+procedure listBudgetGrants(args: ListBudgetGrantsInput): BudgetGrantPage
+  @allow(auth() != null)
+
+// A direct admin grant, bypassing self-service policy evaluation entirely (`budget:grant`,
+// `Permission::BudgetGrant`) -- e.g. a support-driven top-up. Delegates to the exact same
+// `BudgetRepo::grant` transactional write path every other grant source already uses (ledger
+// insert + balance-projection update, atomically, under the same per-(account,period) row lock),
+// with `source = "admin"`. `idempotencyKey`, when supplied, makes a genuine client retry return
+// the SAME grant rather than granting twice -- the same idempotency contract
+// `requestBudgetRefill` already documents. The ledger is append-only (ADR-0009): this inserts a
+// new row, never mutates one.
+type GrantBudgetInput {
+  budgetAccountId String
+  accountId String
+  projectId String?
+  period String
+  amountMicros String
+  reason String?
+  idempotencyKey String?
+}
+
+mutation procedure grantBudget(args: GrantBudgetInput): BudgetGrantEntry
+  @allow(auth() != null)
+
+// The compensating-correction counterpart to `grantBudget` (`budget:revoke`,
+// `Permission::BudgetRevoke`). Per ADR-0009, an already-committed `budget_grants` row can never be
+// updated or deleted (the DB trigger `budget_grants_forbid_mutation` rejects it outright) -- this
+// procedure never attempts to; it looks up `grantId`, and writes a NEW `source = "correction"` row
+// for the SAME `(budgetAccountId, accountId, projectId, period)` carrying the negated
+// `amountMicros`, which nets the original grant's effect out of `effective_budget_micros` (per
+// `budget_balances`' bucket-mapping doc comment: a correction adjusts `effective_budget_micros`
+// only, never the original source's bucket) while leaving the original row completely unchanged
+// and still visible in `listBudgetGrants`/`listMyBudgetGrants`. The correction's idempotency key is
+// derived from `grantId` server-side (`"revoke:{grantId}"`), so calling this twice for the same
+// `grantId` returns the SAME correction rather than negating twice.
+type RevokeBudgetGrantInput {
+  grantId String
+  reason String
+}
+
+mutation procedure revokeBudgetGrant(args: RevokeBudgetGrantInput): BudgetGrantEntry
+  @allow(auth() != null)
+
+// Authors a new budget-policy revision WITHOUT activating it (`budget:policy-write`,
+// `Permission::BudgetPolicyWrite`) -- deliberately kept separate from `activateBudgetPolicy`
+// (`budget:policy-activate`) per ADR-0007: with arbitrary rule data, writing a policy is shipping
+// executable logic into the decision path, so the identity authoring it should not be the same one
+// that puts it live. Delegates to `PolicyStore::create_revision`, which validates
+// `ruleDataJson` with the exact same `validate_rule_data` `activateBudgetPolicy` uses BEFORE
+// writing anything -- a revision that fails validation is never persisted at all, preserving "a
+// bad revision never displaces a good one" for the write path too. The currently active revision
+// is completely untouched by this call; a separate `activateBudgetPolicy { revisionId }` call
+// (the existing rollback/promote path) is what would later make this new revision serve.
+type CreateBudgetPolicyRevisionInput {
+  policySetId String
+  ruleDataJson String
+}
+
+type BudgetPolicyRevisionRef {
+  policySetId String
+  revisionId String
+  policyRevision String
+}
+
+mutation procedure createBudgetPolicyRevision(args: CreateBudgetPolicyRevisionInput): BudgetPolicyRevisionRef
+  @allow(auth() != null)

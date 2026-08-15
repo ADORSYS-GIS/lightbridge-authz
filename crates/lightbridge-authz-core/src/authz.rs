@@ -68,8 +68,23 @@ pub enum Permission {
     #[serde(rename = "apikey:validate")]
     ApiKeyValidate,
 
+    /// Read any budget account's balance/history (admin). Kept distinct from
+    /// [`Permission::BudgetReadOwn`] -- same self/admin split as
+    /// [`Permission::SessionRevokeOwn`] vs [`Permission::SessionRevoke`] -- because reading your
+    /// own budget is a materially different, much lower-risk capability than reading anyone
+    /// else's.
     #[serde(rename = "budget:read")]
     BudgetRead,
+    /// Read the caller's own current budget balance and own grant-ledger history only. Added
+    /// alongside [`Permission::BudgetRead`]/[`Permission::BudgetAuditRead`] rather than reusing
+    /// either: those two are the admin, arbitrary-target read permissions (`getBudgetBalance`/
+    /// `listBudgetGrants`), and granting either one to every authenticated caller so they could
+    /// see their own budget would also let them read every OTHER account's budget -- exactly the
+    /// "quietly conflating self and admin access" this permission exists to avoid. Structurally
+    /// mirrors [`Permission::SessionRevokeOwn`]: gates `getMyBudgetBalance`/`listMyBudgetGrants`,
+    /// procedures with no caller-suppliable target subject at all (see `authz.cstack`).
+    #[serde(rename = "budget:read-own")]
+    BudgetReadOwn,
     /// Request a self-service budget top-up for the caller's own account.
     #[serde(rename = "budget:self-refill")]
     BudgetSelfRefill,
@@ -113,7 +128,7 @@ pub enum Permission {
 impl Permission {
     /// Every permission, in declaration order. The single source of truth for wildcard expansion
     /// and documentation.
-    pub const ALL: [Permission; 30] = [
+    pub const ALL: [Permission; 31] = [
         Permission::AccountCreate,
         Permission::AccountRead,
         Permission::AccountUpdate,
@@ -133,6 +148,7 @@ impl Permission {
         Permission::ApiKeyRotate,
         Permission::ApiKeyValidate,
         Permission::BudgetRead,
+        Permission::BudgetReadOwn,
         Permission::BudgetSelfRefill,
         Permission::BudgetReview,
         Permission::BudgetGrant,
@@ -168,6 +184,7 @@ impl Permission {
             Permission::ApiKeyRotate => "apikey:rotate",
             Permission::ApiKeyValidate => "apikey:validate",
             Permission::BudgetRead => "budget:read",
+            Permission::BudgetReadOwn => "budget:read-own",
             Permission::BudgetSelfRefill => "budget:self-refill",
             Permission::BudgetReview => "budget:review",
             Permission::BudgetGrant => "budget:grant",
@@ -386,6 +403,7 @@ pub fn default_role_permissions() -> HashMap<String, Vec<String>> {
                 "project:*".to_string(),
                 "apikey:*".to_string(),
                 "session:revoke-own".to_string(),
+                "budget:read-own".to_string(),
             ],
         ),
         (
@@ -396,6 +414,7 @@ pub fn default_role_permissions() -> HashMap<String, Vec<String>> {
                 "project:read".to_string(),
                 "apikey:read".to_string(),
                 "session:revoke-own".to_string(),
+                "budget:read-own".to_string(),
             ],
         ),
     ])

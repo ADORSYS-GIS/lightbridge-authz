@@ -236,6 +236,71 @@ fn to_schema_augmentation_request(
     }
 }
 
+/// Maps a domain [`lightbridge_authz_budget::repo::BalanceSnapshot`] into the schema's wire
+/// `BudgetBalance` shape (see `authz.cstack`'s `type BudgetBalance` doc comment for the
+/// string-vs-`Int` field reasoning).
+fn to_schema_budget_balance(
+    snapshot: lightbridge_authz_budget::repo::BalanceSnapshot,
+) -> schema::BudgetBalance {
+    schema::BudgetBalance {
+        budgetAccountId: snapshot.budget_account_id,
+        period: snapshot.period.to_string(),
+        baseTotalMicros: snapshot.base_total_micros.to_string(),
+        selfServiceTotalMicros: snapshot.self_service_total_micros.to_string(),
+        adminTotalMicros: snapshot.admin_total_micros.to_string(),
+        automaticTotalMicros: snapshot.automatic_total_micros.to_string(),
+        refundTotalMicros: snapshot.refund_total_micros.to_string(),
+        effectiveBudgetMicros: snapshot.effective_budget_micros.to_string(),
+        selfServiceGrantCount: i64::from(snapshot.self_service_grant_count),
+        automaticGrantCount: i64::from(snapshot.automatic_grant_count),
+        version: snapshot.version,
+        updatedAt: snapshot.updated_at,
+    }
+}
+
+/// Maps a domain [`lightbridge_authz_budget::repo::BudgetGrant`] into the schema's wire
+/// `BudgetGrantEntry` shape (see `authz.cstack`'s `type BudgetGrantEntry` doc comment).
+fn to_schema_budget_grant_entry(
+    grant: lightbridge_authz_budget::repo::BudgetGrant,
+) -> schema::BudgetGrantEntry {
+    schema::BudgetGrantEntry {
+        id: grant.id,
+        budgetAccountId: grant.budget_account_id,
+        accountId: grant.account_id,
+        projectId: grant.project_id,
+        period: grant.period.to_string(),
+        amountMicros: grant.amount_micros.to_string(),
+        source: grant.source.to_string(),
+        actorId: grant.actor_id,
+        reason: grant.reason,
+        policyRevision: grant.policy_revision,
+        matchedRuleIds: grant.matched_rule_ids.unwrap_or_default(),
+        idempotencyKey: grant.idempotency_key,
+        triggerKey: grant.trigger_key,
+        createdAt: grant.created_at,
+        expiresAt: grant.expires_at,
+        revokedAt: grant.revoked_at,
+    }
+}
+
+/// Default/max page size for `listMyBudgetGrants`/`listBudgetGrants`. `BudgetRepo::list_grants`
+/// independently clamps to its own `MAX_LIST_GRANTS_LIMIT` (200) regardless of what this layer
+/// passes -- this constant is this procedure layer's own default when a caller omits `limit`, and
+/// its own tighter ceiling (50) when a caller supplies one, so a single caller-supplied `limit`
+/// cannot force a 200-row page by accident.
+const DEFAULT_BUDGET_GRANTS_PAGE_SIZE: i64 = 20;
+const MAX_BUDGET_GRANTS_PAGE_SIZE: i64 = 50;
+
+/// Resolves a caller-supplied, optional `limit` into a page size clamped to
+/// `[1, MAX_BUDGET_GRANTS_PAGE_SIZE]`, defaulting to [`DEFAULT_BUDGET_GRANTS_PAGE_SIZE`] when
+/// omitted.
+fn resolve_budget_grants_page_size(limit: Option<i64>) -> i64 {
+    match limit {
+        Some(requested) => requested.clamp(1, MAX_BUDGET_GRANTS_PAGE_SIZE),
+        None => DEFAULT_BUDGET_GRANTS_PAGE_SIZE,
+    }
+}
+
 /// The validated caller's subject, projected as `auth().id` by [`CratestackAuthProvider`].
 fn subject_from_ctx(ctx: &CoolContext) -> Option<String> {
     match ctx.auth_field("id") {
@@ -397,6 +462,14 @@ pub struct Procedures {
     policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
     refill_service: Arc<lightbridge_authz_budget::RefillService>,
     review_service: Arc<lightbridge_authz_budget::ReviewService>,
+    /// The direct-read/grant/revoke surface (`getMyBudgetBalance`/`getBudgetBalance`/
+    /// `listMyBudgetGrants`/`listBudgetGrants`/`grantBudget`/`revokeBudgetGrant`) shares this
+    /// `BudgetRepo` handle rather than going through `refill_service`/`review_service` -- those
+    /// two own their own private `BudgetRepo` internally for the self-service/review flows, but
+    /// neither exposes a read-only balance/ledger query surface, so this field is a second,
+    /// independent handle against the SAME underlying database (constructed once at server
+    /// startup, see `start_api_server`).
+    budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
 }
 
 impl Procedures {
@@ -405,12 +478,14 @@ impl Procedures {
         policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
         refill_service: Arc<lightbridge_authz_budget::RefillService>,
         review_service: Arc<lightbridge_authz_budget::ReviewService>,
+        budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
     ) -> Self {
         Self {
             issuer,
             policy_store,
             refill_service,
             review_service,
+            budget_repo,
         }
     }
 }
@@ -1199,6 +1274,319 @@ impl schema::procedures::ProcedureRegistry for Procedures {
             Ok(to_schema_session_revocation_result(revoked_count))
         }
     }
+
+    /// Reads the caller's own current budget balance for `input.period`. There is no target
+    /// field on this input at all -- the target is always `auth().id`, the same structural
+    /// guarantee `revokeOwnSessions` gives for session revocation. Gated at `budget:read-own`.
+    /// See `BalanceSnapshot::zero`'s doc comment for why "no balance row yet" synthesizes a
+    /// zero-valued response rather than an error.
+    fn get_my_budget_balance(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::get_my_budget_balance::Args,
+        _authorized: schema::procedures::get_my_budget_balance::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::get_my_budget_balance::Output, CoolError>,
+    > + Send {
+        let budget_repo = self.budget_repo.clone();
+        let subject = subject_from_ctx(ctx);
+        let period_str = args.args.period;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let period = lightbridge_authz_budget::Period::parse(&period_str)
+                .map_err(budget_error_to_cool_error)?;
+
+            let snapshot = budget_repo
+                .get_balance(&subject, &period)
+                .await
+                .map_err(budget_error_to_cool_error)?
+                .unwrap_or_else(|| {
+                    lightbridge_authz_budget::repo::BalanceSnapshot::zero(&subject, &period)
+                });
+
+            Ok(to_schema_budget_balance(snapshot))
+        }
+    }
+
+    /// The admin equivalent of `getMyBudgetBalance`: reads any account's balance. Gated at
+    /// `budget:read`.
+    fn get_budget_balance(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::get_budget_balance::Args,
+        _authorized: schema::procedures::get_budget_balance::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::get_budget_balance::Output, CoolError>,
+    > + Send {
+        let budget_repo = self.budget_repo.clone();
+        let subject = subject_from_ctx(ctx);
+        let budget_account_id = args.args.budgetAccountId;
+        let period_str = args.args.period;
+        async move {
+            let _subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let period = lightbridge_authz_budget::Period::parse(&period_str)
+                .map_err(budget_error_to_cool_error)?;
+
+            let snapshot = budget_repo
+                .get_balance(&budget_account_id, &period)
+                .await
+                .map_err(budget_error_to_cool_error)?
+                .unwrap_or_else(|| {
+                    lightbridge_authz_budget::repo::BalanceSnapshot::zero(
+                        &budget_account_id,
+                        &period,
+                    )
+                });
+
+            Ok(to_schema_budget_balance(snapshot))
+        }
+    }
+
+    /// The caller's own ledger history, paginated by `createdAt` (ADR-0039 -- never by id). No
+    /// target field on this input, same structural guarantee as `getMyBudgetBalance`. Gated at
+    /// `budget:read-own`.
+    fn list_my_budget_grants(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::list_my_budget_grants::Args,
+        _authorized: schema::procedures::list_my_budget_grants::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::list_my_budget_grants::Output, CoolError>,
+    > + Send {
+        let budget_repo = self.budget_repo.clone();
+        let subject = subject_from_ctx(ctx);
+        let input = args.args;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let page = list_budget_grants_page(
+                &budget_repo,
+                &subject,
+                input.period,
+                input.before,
+                input.limit,
+            )
+            .await?;
+            Ok(page)
+        }
+    }
+
+    /// The admin equivalent of `listMyBudgetGrants`: any account's ledger history. Gated at
+    /// `budget:audit-read`.
+    fn list_budget_grants(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::list_budget_grants::Args,
+        _authorized: schema::procedures::list_budget_grants::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::list_budget_grants::Output, CoolError>,
+    > + Send {
+        let budget_repo = self.budget_repo.clone();
+        let subject = subject_from_ctx(ctx);
+        let input = args.args;
+        async move {
+            let _subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let page = list_budget_grants_page(
+                &budget_repo,
+                &input.budgetAccountId,
+                input.period,
+                input.before,
+                input.limit,
+            )
+            .await?;
+            Ok(page)
+        }
+    }
+
+    /// A direct admin grant, bypassing self-service policy evaluation. Delegates to the same
+    /// `BudgetRepo::grant` transactional write path every other grant source uses, with
+    /// `source = admin`. Gated at `budget:grant`.
+    fn grant_budget(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::grant_budget::Args,
+        _authorized: schema::procedures::grant_budget::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::grant_budget::Output, CoolError>,
+    > + Send {
+        let budget_repo = self.budget_repo.clone();
+        let subject = subject_from_ctx(ctx);
+        let input = args.args;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+
+            let period = lightbridge_authz_budget::Period::parse(&input.period)
+                .map_err(budget_error_to_cool_error)?;
+            let amount_micros: i64 = input.amountMicros.trim().parse().map_err(|_| {
+                CoolError::BadRequest(format!(
+                    "amountMicros must be a valid integer, got '{}'",
+                    input.amountMicros
+                ))
+            })?;
+
+            let grant = budget_repo
+                .grant(lightbridge_authz_budget::repo::GrantRequest {
+                    budget_account_id: input.budgetAccountId,
+                    account_id: input.accountId,
+                    project_id: input.projectId,
+                    period,
+                    amount_micros,
+                    source: lightbridge_authz_budget::GrantSource::Admin,
+                    actor_id: Some(subject),
+                    reason: input.reason,
+                    policy_revision: None,
+                    matched_rule_ids: None,
+                    idempotency_key: input.idempotencyKey,
+                    trigger_key: None,
+                    expires_at: None,
+                })
+                .await
+                .map_err(budget_error_to_cool_error)?;
+
+            Ok(to_schema_budget_grant_entry(grant))
+        }
+    }
+
+    /// The compensating-correction counterpart to `grantBudget` (ADR-0009: the ledger is
+    /// append-only, so this never mutates `input.grantId`'s row -- it looks it up and writes a
+    /// NEW `source = correction` row negating its amount). The correction's idempotency key is
+    /// derived from `grantId` (`"revoke:{grantId}"`), so a repeated call for the same grant is
+    /// idempotent rather than double-negating. Gated at `budget:revoke`.
+    fn revoke_budget_grant(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::revoke_budget_grant::Args,
+        _authorized: schema::procedures::revoke_budget_grant::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::revoke_budget_grant::Output, CoolError>,
+    > + Send {
+        let budget_repo = self.budget_repo.clone();
+        let subject = subject_from_ctx(ctx);
+        let grant_id = args.args.grantId;
+        let reason = args.args.reason;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+
+            let original = budget_repo
+                .get_grant_by_id(&grant_id)
+                .await
+                .map_err(budget_error_to_cool_error)?;
+
+            let correction = budget_repo
+                .grant(lightbridge_authz_budget::repo::GrantRequest {
+                    budget_account_id: original.budget_account_id,
+                    account_id: original.account_id,
+                    project_id: original.project_id,
+                    period: original.period,
+                    amount_micros: -original.amount_micros,
+                    source: lightbridge_authz_budget::GrantSource::Correction,
+                    actor_id: Some(subject),
+                    reason: Some(reason),
+                    policy_revision: None,
+                    matched_rule_ids: None,
+                    idempotency_key: Some(format!("revoke:{grant_id}")),
+                    trigger_key: None,
+                    expires_at: None,
+                })
+                .await
+                .map_err(budget_error_to_cool_error)?;
+
+            Ok(to_schema_budget_grant_entry(correction))
+        }
+    }
+
+    /// Authors a new budget-policy revision WITHOUT activating it (ADR-0007). Delegates to
+    /// `PolicyStore::create_revision`, which validates before writing, exactly mirroring
+    /// `activateBudgetPolicy`'s "a bad revision never displaces a good one" property for the
+    /// write path. Gated at `budget:policy-write`, kept distinct from `budget:policy-activate`.
+    fn create_budget_policy_revision(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::create_budget_policy_revision::Args,
+        _authorized: schema::procedures::create_budget_policy_revision::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::create_budget_policy_revision::Output,
+            CoolError,
+        >,
+    > + Send {
+        let policy_store = self.policy_store.clone();
+        let subject = subject_from_ctx(ctx);
+        let policy_set_id = args.args.policySetId;
+        let rule_data_json = args.args.ruleDataJson;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+
+            if policy_set_id != BUDGET_POLICY_SET_ID {
+                return Err(CoolError::BadRequest(format!(
+                    "unknown policySetId '{policy_set_id}' -- only '{BUDGET_POLICY_SET_ID}' \
+                     exists today"
+                )));
+            }
+
+            let new_revision = policy_store
+                .create_revision(&rule_data_json, Some(&subject))
+                .await
+                .map_err(budget_error_to_cool_error)?;
+
+            Ok(schema::procedures::create_budget_policy_revision::Output {
+                policySetId: policy_set_id,
+                revisionId: new_revision.id,
+                policyRevision: new_revision.policy_revision,
+            })
+        }
+    }
+}
+
+/// Shared page-fetch for `listMyBudgetGrants`/`listBudgetGrants`: parses the optional `period`,
+/// resolves the page size, reads one page from `BudgetRepo::list_grants`, and maps it to the
+/// schema's `BudgetGrantPage` (`nextCursor` = the last entry's `createdAt`, or `None` when the
+/// page came back short of a full page -- i.e. there is nothing further to page to).
+async fn list_budget_grants_page(
+    budget_repo: &lightbridge_authz_budget::repo::BudgetRepo,
+    budget_account_id: &str,
+    period_str: Option<String>,
+    before: Option<chrono::DateTime<chrono::Utc>>,
+    limit: Option<i64>,
+) -> std::result::Result<schema::BudgetGrantPage, CoolError> {
+    let period = period_str
+        .as_deref()
+        .map(lightbridge_authz_budget::Period::parse)
+        .transpose()
+        .map_err(budget_error_to_cool_error)?;
+    let page_size = resolve_budget_grants_page_size(limit);
+
+    let grants = budget_repo
+        .list_grants(budget_account_id, period.as_ref(), before, page_size)
+        .await
+        .map_err(budget_error_to_cool_error)?;
+
+    let next_cursor = if grants.len() == usize::try_from(page_size).unwrap_or(usize::MAX) {
+        grants.last().map(|g| g.created_at)
+    } else {
+        None
+    };
+
+    Ok(schema::BudgetGrantPage {
+        entries: grants
+            .into_iter()
+            .map(to_schema_budget_grant_entry)
+            .collect(),
+        nextCursor: next_cursor,
+    })
 }
 
 /// Assembles the API server router: public probes, OIDC discovery/JWKS (when signing is enabled),
@@ -1218,6 +1606,7 @@ pub fn build_api_router(
     policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
     refill_service: Arc<lightbridge_authz_budget::RefillService>,
     review_service: Arc<lightbridge_authz_budget::ReviewService>,
+    budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
     cratestack_db: schema::Cratestack,
     readiness_pool: Arc<dyn DbPoolTrait>,
     signing_repo: Arc<StoreRepo>,
@@ -1277,7 +1666,13 @@ pub fn build_api_router(
     // additive gate that shares no state with the provider.
     let rpc = schema::axum::rpc_router(
         cratestack_db,
-        Procedures::new(issuer, policy_store, refill_service, review_service),
+        Procedures::new(
+            issuer,
+            policy_store,
+            refill_service,
+            review_service,
+            budget_repo,
+        ),
         CodecSet::new(LenientCborCodec::default(), JsonCodec),
         CratestackAuthProvider::new(bearer.clone()),
         // cratestack 0.7.12 (#413) made this request-body-size bound an explicit parameter instead
@@ -1472,7 +1867,7 @@ pub async fn start_api_server(
         spend_reader,
     ));
     let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
-        budget_repo,
+        budget_repo.clone(),
         augmentation_repo,
     ));
 
@@ -1552,6 +1947,7 @@ pub async fn start_api_server(
         policy_store,
         refill_service,
         review_service,
+        budget_repo,
         cratestack_db,
         readiness_pool,
         signing_repo,

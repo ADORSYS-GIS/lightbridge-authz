@@ -25,6 +25,16 @@ fn storage_failed(err: sqlx::Error) -> BudgetError {
     BudgetError::StorageFailed(err.to_string())
 }
 
+/// The result of [`PolicyStore::create_revision`]: the newly inserted row's own `id`
+/// (`budget_policy_revisions.id`, the value [`PolicyStore::activate_by_revision_id`] later takes
+/// to actually activate it) and the human-readable `policy_revision` string parsed out of the
+/// submitted rule data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRevision {
+    pub id: String,
+    pub policy_revision: String,
+}
+
 const LOAD_ACTIVE_REVISION_SQL: &str = "SELECT r.rule_data_json::text AS rule_data_json \
      FROM budget_policy_sets s \
      JOIN budget_policy_revisions r ON r.id = s.active_revision_id \
@@ -39,6 +49,11 @@ const ACTIVATE_REVISION_SQL: &str =
 
 const SELECT_REVISION_BY_ID_SQL: &str = "SELECT policy_revision, rule_data_json::text \
      FROM budget_policy_revisions WHERE id = $1 AND policy_set_id = $2";
+
+const INSERT_REVISION_RETURNING_ID_SQL: &str = "INSERT INTO budget_policy_revisions \
+     (id, policy_set_id, policy_revision, rule_data_json, created_by) \
+     VALUES ($1, $2, $3, $4::jsonb, $5) \
+     RETURNING id";
 
 /// Ties one DB-persisted policy set (identified by `policy_set_id`) to one live
 /// [`RuleDataEngine`]. Cheaply `Clone` -- `pool` and `engine` are both `Arc`s, so cloning a
@@ -216,6 +231,41 @@ impl PolicyStore {
         })?;
 
         Ok(policy_revision)
+    }
+
+    /// Authors a new revision WITHOUT activating it (ADR-0007's `budget:policy-write` vs
+    /// `budget:policy-activate` split -- see that permission's own doc comment for the "writing
+    /// means shipping executable code, activation is a separate decision" rationale). Validates
+    /// `new_rule_data_json` with the exact same [`validate_rule_data`] [`Self::activate`] uses,
+    /// then inserts the row and returns, deliberately never touching `active_revision_id` and
+    /// never calling [`RuleDataEngine::load`] -- the live in-memory engine keeps serving whatever
+    /// revision was already active. This is what "a bad revision never displaces a good one"
+    /// means for the write path specifically: a revision that fails validation here is never
+    /// written at all, and a revision that IS written here still never displaces the active one
+    /// until a separate `Self::activate_by_revision_id` call names it.
+    pub async fn create_revision(
+        &self,
+        new_rule_data_json: &str,
+        actor_id: Option<&str>,
+    ) -> Result<NewRevision, BudgetError> {
+        let rule_set = validate_rule_data(new_rule_data_json)?;
+
+        let revision_id = cuid2();
+
+        let (id,): (String,) = sqlx::query_as(INSERT_REVISION_RETURNING_ID_SQL)
+            .bind(&revision_id)
+            .bind(&self.policy_set_id)
+            .bind(&rule_set.policy_revision)
+            .bind(new_rule_data_json)
+            .bind(actor_id)
+            .fetch_one(self.pool.pool())
+            .await
+            .map_err(storage_failed)?;
+
+        Ok(NewRevision {
+            id,
+            policy_revision: rule_set.policy_revision,
+        })
     }
 
     /// Constructs a `PolicyStore` directly from an already-built [`RuleDataEngine`], performing no

@@ -113,11 +113,13 @@ oauth2:
         - "project:*"
         - "apikey:*"
         - "budget:self-refill"
+        - "budget:read-own"
       lightbridge-viewer:
         - "account:create"
         - "account:read"
         - "project:read"
         - "apikey:read"
+        - "budget:read-own"
 otel:
   enabled: true
   otlp_endpoint: "http://jaeger:4317"
