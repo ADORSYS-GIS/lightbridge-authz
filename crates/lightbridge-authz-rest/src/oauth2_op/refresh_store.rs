@@ -30,7 +30,7 @@ use std::sync::Arc;
 use authkestra_engine::auth::state::Identity;
 use authkestra_op::OpError;
 use authkestra_op::refresh::{RefreshToken, RefreshTokenStore};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use lightbridge_authz_api_key::entities::exchange_refresh_token_row::{
     ExchangeRefreshTokenRow, NewExchangeRefreshToken,
 };
@@ -47,6 +47,14 @@ const ATTR_ACCOUNT_ID: &str = "account_id";
 const ATTR_PROJECT_ID: &str = "project_id";
 const ATTR_EMAIL_VERIFIED: &str = "email_verified";
 const ATTR_AUTH_TIME: &str = "auth_time";
+/// Round-trips `exchange_refresh_tokens.chain_id`/`chain_expires_at` (the rotation-family and its
+/// absolute cap -- see that table's migration) through `Identity.attributes`, same convention as
+/// `account_id`/`project_id` above. Only exercised by `store_token`, since this store's own
+/// `consume_token`/`get_token` are no longer on the path `TokenExchangeOpStore::handle_refresh_token`
+/// uses (it reads `ExchangeRefreshTokenRow` directly for the typed chain fields); they still round
+/// these attributes through correctly for any other `RefreshTokenStore` caller.
+const ATTR_CHAIN_ID: &str = "chain_id";
+const ATTR_CHAIN_EXPIRES_AT: &str = "chain_expires_at";
 
 pub struct DbRefreshTokenStore {
     repo: Arc<StoreRepo>,
@@ -68,6 +76,11 @@ fn row_to_refresh_token(row: ExchangeRefreshTokenRow) -> RefreshToken {
     if let Some(auth_time) = row.auth_time {
         attributes.insert(ATTR_AUTH_TIME.to_string(), auth_time.to_string());
     }
+    attributes.insert(ATTR_CHAIN_ID.to_string(), row.chain_id);
+    attributes.insert(
+        ATTR_CHAIN_EXPIRES_AT.to_string(),
+        row.chain_expires_at.to_rfc3339(),
+    );
     RefreshToken {
         // See this module's doc comment: the plaintext was never stored, so this is the hash --
         // never read back as a real secret by anything in this codebase.
@@ -110,6 +123,24 @@ impl RefreshTokenStore for DbRefreshTokenStore {
             .attributes
             .get(ATTR_AUTH_TIME)
             .and_then(|v| v.parse::<i64>().ok());
+        // Fail closed, unlike account_id/project_id above: a chain with no id or no cap is not a
+        // meaningful "unknown" to default away -- every caller of `store_token` in this codebase
+        // (`TokenExchangeOpStore::handle_token_exchange`) always sets both, so a missing/
+        // unparseable value here means a caller bug, and persisting a chain-less row would let
+        // that row dodge both the reuse cascade and the absolute cap it exists to enforce.
+        let chain_id = token
+            .identity
+            .attributes
+            .get(ATTR_CHAIN_ID)
+            .cloned()
+            .ok_or(OpError::Storage)?;
+        let chain_expires_at = token
+            .identity
+            .attributes
+            .get(ATTR_CHAIN_EXPIRES_AT)
+            .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+            .ok_or(OpError::Storage)?;
         let new = NewExchangeRefreshToken {
             id: cuid2(),
             subject: token.identity.external_id,
@@ -125,6 +156,8 @@ impl RefreshTokenStore for DbRefreshTokenStore {
             email: token.identity.email,
             email_verified,
             auth_time,
+            chain_id,
+            chain_expires_at,
             created_at: Utc::now(),
             expires_at: token.expires_at,
         };

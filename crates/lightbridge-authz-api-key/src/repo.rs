@@ -680,9 +680,9 @@ impl StoreRepo {
         let row: ExchangeRefreshTokenRow = sqlx::query_as(
             r#"
             INSERT INTO exchange_refresh_tokens
-              (id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, created_at, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, $10, $11, $12)
-            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, created_at, expires_at, last_used_at
+              (id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, chain_id, chain_expires_at, created_at, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, $10, $11, $12, $13, $14)
+            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, chain_id, chain_expires_at, created_at, expires_at, last_used_at
             "#,
         )
         .bind(input.id)
@@ -695,6 +695,8 @@ impl StoreRepo {
         .bind(input.email)
         .bind(input.email_verified)
         .bind(input.auth_time)
+        .bind(input.chain_id)
+        .bind(input.chain_expires_at)
         .bind(input.created_at)
         .bind(input.expires_at)
         .fetch_one(self.pool())
@@ -709,7 +711,7 @@ impl StoreRepo {
     ) -> Result<Option<ExchangeRefreshTokenRow>> {
         let row = sqlx::query_as(
             r#"
-            SELECT id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, created_at, expires_at, last_used_at
+            SELECT id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, chain_id, chain_expires_at, created_at, expires_at, last_used_at
             FROM exchange_refresh_tokens
             WHERE token_hash = $1
               AND status = 'active'
@@ -721,6 +723,51 @@ impl StoreRepo {
         .fetch_optional(self.pool())
         .await?;
         Ok(row)
+    }
+
+    /// Unconditional lookup by hash -- no `status`/`expires_at` filter. Used only to classify why
+    /// a CAS consume (`consume_exchange_refresh_token`) just returned `None`: distinguishing "this
+    /// hash names a token that was already rotated" (a replay of a superseded token -- RFC 6819
+    /// §5.2.2.3 reuse detection, which must cascade-revoke the whole chain) from "no such token" /
+    /// "expired" / "already revoked" (a plain `invalid_grant`, no cascade). Never used to decide
+    /// whether to honor a refresh -- the CAS `UPDATE ... WHERE status = 'active'` remains the only
+    /// source of truth for that.
+    pub async fn find_exchange_refresh_token_by_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<ExchangeRefreshTokenRow>> {
+        let row = sqlx::query_as(
+            r#"
+            SELECT id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, chain_id, chain_expires_at, created_at, expires_at, last_used_at
+            FROM exchange_refresh_tokens
+            WHERE token_hash = $1
+            "#,
+        )
+        .bind(token_hash)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// Cascade-revokes an entire refresh-token family (RFC 6819 §5.2.2.3): flips every
+    /// still-`active` row sharing `chain_id` to `revoked`. Called when a token that was already
+    /// rotated (superseded) is presented again -- the strongest signal this codebase has that a
+    /// refresh token was stolen, since a legitimate client never re-presents a token it already
+    /// exchanged for a successor. A no-op (not an error) when nothing in the chain is still
+    /// active, matching `revoke_exchange_refresh_token`'s own idempotent-no-op convention.
+    pub async fn revoke_exchange_refresh_token_chain(&self, chain_id: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE exchange_refresh_tokens
+            SET status = 'revoked'
+            WHERE chain_id = $1
+              AND status = 'active'
+            "#,
+        )
+        .bind(chain_id)
+        .execute(self.pool())
+        .await?;
+        Ok(())
     }
 
     /// Atomically consumes a refresh token (single-use enforcement, backing
@@ -746,7 +793,7 @@ impl StoreRepo {
             WHERE token_hash = $1
               AND status = 'active'
               AND expires_at > $2
-            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, created_at, expires_at, last_used_at
+            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, chain_id, chain_expires_at, created_at, expires_at, last_used_at
             "#,
         )
         .bind(presented_hash)

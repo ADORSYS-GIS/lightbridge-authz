@@ -52,11 +52,14 @@ use authkestra_op::handlers::token::{TokenErrorResponse, TokenRequest, TokenResp
 use authkestra_op::refresh::{RefreshToken, RefreshTokenStore};
 use authkestra_op::store::OpStore;
 use chrono::{DateTime, Duration, Utc};
+use lightbridge_authz_api_key::entities::exchange_refresh_token_row::NewExchangeRefreshToken;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::BearerTokenServiceTrait;
 use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::config::Oauth2TokenExchange;
+use lightbridge_authz_core::crypto::hash_api_key;
 use lightbridge_authz_core::cuid::cuid2;
+use lightbridge_authz_core::dto::ResourceStatus;
 use lightbridge_authz_core::error::Error;
 
 use crate::signing::{KeyOwner, access_token_extra, id_token_extra, identity_for};
@@ -290,8 +293,20 @@ impl TokenExchangeOpStore {
 
         let refresh_token = if offline {
             let plaintext = generate_refresh_secret();
-            let identity =
-                refresh_identity(&owner, &context.account_id, &context.project_id, auth_time);
+            // A brand-new chain is born here (ADR: refresh-token absolute cap): every rotation of
+            // this token inherits `chain_id`/`chain_expires_at` unchanged from this point on --
+            // see `handle_refresh_token`.
+            let chain_id = cuid2();
+            let chain_expires_at =
+                now + Duration::seconds(self.cfg.refresh_absolute_ttl_seconds.max(0));
+            let identity = refresh_identity(
+                &owner,
+                &context.account_id,
+                &context.project_id,
+                auth_time,
+                &chain_id,
+                chain_expires_at,
+            );
             let rt = RefreshToken {
                 token: plaintext.clone(),
                 client_id: client_id.clone(),
@@ -338,10 +353,41 @@ impl TokenExchangeOpStore {
     /// The `refresh_token` grant (ADR-0011, Decision 1): re-mints access + id_token symmetrically
     /// with the exchange grant above, through the same signing calls, which is what fixes the
     /// phase-1-era `mint_from_refresh` email-dropping bug by construction (there is only one
-    /// minting path now). Consumes-then-validates client ownership, matching
-    /// `default_handle_refresh_token`'s own shape: a refresh token presented by a different
-    /// client than the one it was issued to is burned (single-use, already consumed) rather than
-    /// silently honored -- see `exchange_refresh_tokens_add_client_id` migration.
+    /// minting path now).
+    ///
+    /// Hardened against three gaps a security review found (all three needed the same new
+    /// `chain_id`/`chain_expires_at` schema, hence one change):
+    ///
+    /// 1. **Re-validation.** The pre-hardening version's only DB read here was an unfiltered
+    ///    `get_project_by_id` -- a subject removed from the project's roster, or whose account/
+    ///    project was suspended, could keep refreshing forever, and a project that could not be
+    ///    resolved fell through to `allowed_models = None`, which this codebase reads as "no
+    ///    restriction" (fail-open on a deleted project). This now re-runs the same
+    ///    `resolve_context` ownership/membership check the exchange grant uses, plus the same
+    ///    project/account `status == active` cascade `api_key_validation` enforces for API keys,
+    ///    and refuses (`invalid_grant`) on any resolution failure rather than falling through.
+    ///    Scope limit: this does NOT re-validate against Keycloak -- no Keycloak credential is
+    ///    held at refresh time, so a subject *disabled in Keycloak* (as opposed to removed from
+    ///    this service's own roster) is bounded only by the absolute cap below and an operator's
+    ///    revoke action, not by this check.
+    /// 2. **Absolute cap.** Each rotation used to reset `expires_at` to `now() +
+    ///    refresh_ttl_seconds` with nothing bounding how many times that could repeat, so a
+    ///    session that kept refreshing before every expiry never actually ended. `chain_expires_at`
+    ///    (`Oauth2TokenExchange::refresh_absolute_ttl_seconds`, set once when the chain is born
+    ///    and inherited unchanged by every rotation) is now checked here and refused past its
+    ///    deadline.
+    /// 3. **Reuse cascade.** The single-use CAS (`WHERE status = 'active'`) already rejected a
+    ///    replay of a superseded token, but did nothing to the live token that superseded it --
+    ///    RFC 6819 §5.2.2.3 calls this out by name: a reused refresh token is the strongest signal
+    ///    this codebase has that a token was stolen, and the whole family must die, not just the
+    ///    replayed member. `find_exchange_refresh_token_by_hash` distinguishes "already rotated"
+    ///    (cascade) from "unknown/expired/revoked" (plain `invalid_grant`, no cascade) after the
+    ///    CAS fails, and `revoke_exchange_refresh_token_chain` performs the cascade.
+    ///
+    /// Still matches `default_handle_refresh_token`'s own client-binding shape: a refresh token
+    /// presented by a different client than the one it was issued to is burned (single-use,
+    /// already consumed) rather than silently honored -- see `exchange_refresh_tokens_add_client_id`
+    /// migration.
     async fn handle_refresh_token(
         &self,
         req: TokenRequest,
@@ -363,78 +409,98 @@ impl TokenExchangeOpStore {
             return Err(oauth_err("invalid_request", "refresh_token is required"));
         };
 
-        let old_rt = match self.refresh.consume_token(presented).await {
-            Ok(Some(rt)) => rt,
+        let now = Utc::now();
+        let presented_hash = hash_api_key(presented);
+        let invalid_grant = || {
+            oauth_err(
+                "invalid_grant",
+                "refresh_token is invalid, expired, or already used",
+            )
+        };
+
+        let old_row = match self
+            .repo
+            .consume_exchange_refresh_token(&presented_hash, now)
+            .await
+        {
+            Ok(Some(row)) => row,
             Ok(None) => {
-                return Err(oauth_err(
-                    "invalid_grant",
-                    "refresh_token is invalid, expired, or already used",
-                ));
+                self.revoke_chain_on_reuse(&presented_hash).await;
+                return Err(invalid_grant());
             }
             Err(_) => {
                 return Err(oauth_err("server_error", "refresh token rotation failed"));
             }
         };
 
-        if old_rt.client_id != client_id {
+        if old_row.client_id != client_id {
             tracing::warn!(
                 client_id = %client_id,
                 "refresh token was issued to a different client; burned, not honored"
             );
-            return Err(oauth_err(
-                "invalid_grant",
-                "refresh_token is invalid, expired, or already used",
-            ));
+            return Err(invalid_grant());
         }
 
-        let account_id = old_rt
-            .identity
-            .attributes
-            .get("account_id")
-            .cloned()
-            .unwrap_or_default();
-        let project_id = old_rt
-            .identity
-            .attributes
-            .get("project_id")
-            .cloned()
-            .unwrap_or_default();
-        let email_verified = old_rt
-            .identity
-            .attributes
-            .get("email_verified")
-            .and_then(|v| v.parse::<bool>().ok());
-        let auth_time = old_rt
-            .identity
-            .attributes
-            .get("auth_time")
-            .and_then(|v| v.parse::<i64>().ok());
+        if now >= old_row.chain_expires_at {
+            tracing::warn!(
+                subject = %old_row.subject,
+                chain_id = %old_row.chain_id,
+                "refresh token chain past its absolute cap; refusing to rotate"
+            );
+            return Err(invalid_grant());
+        }
+
+        // Re-validation (gap 1 above): the same ownership/membership check the exchange grant
+        // uses, plus the account/project suspension cascade `resolve_context` alone does not
+        // cover. Any failure here refuses the refresh -- no permissive fallback.
+        let context = match self
+            .repo
+            .resolve_context(&old_row.subject, &old_row.project_id)
+            .await
+        {
+            Ok(context) => context,
+            Err(Error::NotFound) => return Err(invalid_grant()),
+            Err(_) => {
+                return Err(oauth_err("server_error", "context resolution failed"));
+            }
+        };
+        let project = match self.repo.get_project_by_id(&context.project_id).await {
+            Ok(Some(project)) if project.status == ResourceStatus::Active => project,
+            Ok(_) => return Err(invalid_grant()),
+            Err(_) => {
+                return Err(oauth_err("server_error", "context resolution failed"));
+            }
+        };
+        match self.repo.get_account_by_id(&context.account_id).await {
+            Ok(Some(account)) if account.status == ResourceStatus::Active => {}
+            Ok(_) => return Err(invalid_grant()),
+            Err(_) => {
+                return Err(oauth_err("server_error", "context resolution failed"));
+            }
+        }
+
         let owner = KeyOwner {
-            subject: old_rt.identity.external_id.clone(),
-            email: old_rt.identity.email.clone(),
-            email_verified,
+            subject: old_row.subject.clone(),
+            email: old_row.email.clone(),
+            email_verified: old_row.email_verified,
         };
+        let allowed_models = project.allowed_models;
+        let openid = old_row
+            .scope
+            .as_deref()
+            .unwrap_or_default()
+            .split_whitespace()
+            .any(|s| s == OPENID_SCOPE);
 
-        let allowed_models = match self.repo.get_project_by_id(&project_id).await {
-            Ok(Some(project)) => project.allowed_models,
-            _ => None,
-        };
-        let openid = old_rt.scope.split_whitespace().any(|s| s == OPENID_SCOPE);
-
-        let now = Utc::now();
         let session_id = cuid2();
         let expires_in_secs = self.cfg.access_ttl_seconds.max(0) as u64;
-        let scope_str = if old_rt.scope.is_empty() {
-            None
-        } else {
-            Some(old_rt.scope.clone())
-        };
+        let scope_str = old_row.scope.clone();
 
         let access_extra = access_token_extra(
             &owner,
             &session_id,
-            &project_id,
-            &account_id,
+            &context.project_id,
+            &context.account_id,
             allowed_models,
             Some(&client_id),
         );
@@ -449,7 +515,7 @@ impl TokenExchangeOpStore {
             .map_err(|_| oauth_err("server_error", "access token signing failed"))?;
 
         let id_token = if openid {
-            let extra = id_token_extra(&owner, &access_token, auth_time, &client_id);
+            let extra = id_token_extra(&owner, &access_token, old_row.auth_time, &client_id);
             match tokens.issue_id_token_with_extra(
                 identity_for(&owner),
                 &client_id,
@@ -465,15 +531,30 @@ impl TokenExchangeOpStore {
         };
 
         let new_plaintext = generate_refresh_secret();
-        let new_identity = refresh_identity(&owner, &account_id, &project_id, auth_time);
-        let new_rt = RefreshToken {
-            token: new_plaintext.clone(),
+        let new_row = NewExchangeRefreshToken {
+            id: cuid2(),
+            subject: old_row.subject.clone(),
+            account_id: context.account_id.clone(),
+            project_id: context.project_id.clone(),
             client_id: client_id.clone(),
-            identity: new_identity,
-            scope: old_rt.scope.clone(),
+            token_hash: hash_api_key(&new_plaintext),
+            scope: old_row.scope.clone(),
+            email: old_row.email.clone(),
+            email_verified: old_row.email_verified,
+            auth_time: old_row.auth_time,
+            // Inherited unchanged from the token just consumed -- this is what makes it one
+            // chain, not a new one born on every rotation.
+            chain_id: old_row.chain_id.clone(),
+            chain_expires_at: old_row.chain_expires_at,
+            created_at: now,
             expires_at: now + Duration::seconds(self.cfg.refresh_ttl_seconds),
         };
-        if self.refresh.store_token(new_rt).await.is_err() {
+        if self
+            .repo
+            .create_exchange_refresh_token(new_row)
+            .await
+            .is_err()
+        {
             return Err(oauth_err(
                 "server_error",
                 "refresh token persistence failed",
@@ -482,8 +563,9 @@ impl TokenExchangeOpStore {
 
         tracing::info!(
             client_id = %client_id,
-            account_id = %account_id,
-            project_id = %project_id,
+            account_id = %context.account_id,
+            project_id = %context.project_id,
+            chain_id = %old_row.chain_id,
             openid,
             "token-exchange refreshed access token"
         );
@@ -501,16 +583,57 @@ impl TokenExchangeOpStore {
             issued_token_type: None,
         })
     }
+
+    /// RFC 6819 §5.2.2.3 reuse-detection cascade: called after a CAS consume
+    /// (`consume_exchange_refresh_token`) has already returned `None` for `presented_hash`, to
+    /// decide whether that `None` means "replay of an already-rotated token" (revoke the whole
+    /// chain) or something else (unknown/expired/already-revoked -- no cascade, see
+    /// `find_exchange_refresh_token_by_hash`'s own doc comment for why only `status == "rotated"`
+    /// triggers this). Never logs the token or its hash -- only `subject`/`chain_id`, matching
+    /// this repo's existing rule against logging secret-shaped material.
+    async fn revoke_chain_on_reuse(&self, presented_hash: &str) {
+        let Ok(Some(row)) = self
+            .repo
+            .find_exchange_refresh_token_by_hash(presented_hash)
+            .await
+        else {
+            return;
+        };
+        if row.status != "rotated" {
+            return;
+        }
+        tracing::warn!(
+            subject = %row.subject,
+            chain_id = %row.chain_id,
+            "refresh token reuse detected (an already-rotated token was replayed); revoking its chain"
+        );
+        if let Err(e) = self
+            .repo
+            .revoke_exchange_refresh_token_chain(&row.chain_id)
+            .await
+        {
+            tracing::error!(
+                error = %e,
+                chain_id = %row.chain_id,
+                "failed to revoke refresh token chain after reuse detection"
+            );
+        }
+    }
 }
 
 /// Builds the `Identity` a refresh-token row round-trips through `RefreshTokenStore` (see
-/// `refresh_store`'s doc comment for why `account_id`/`project_id`/`email_verified`/`auth_time`
-/// live in `attributes`).
+/// `refresh_store`'s doc comment for why `account_id`/`project_id`/`email_verified`/`auth_time`/
+/// `chain_id`/`chain_expires_at` live in `attributes`). Only used for the initial
+/// offline-scope mint in `handle_token_exchange` -- `handle_refresh_token` mints rotations
+/// directly against `StoreRepo`, reading/writing the typed `ExchangeRefreshTokenRow` columns
+/// instead of round-tripping through this string-keyed map.
 fn refresh_identity(
     owner: &KeyOwner,
     account_id: &str,
     project_id: &str,
     auth_time: Option<i64>,
+    chain_id: &str,
+    chain_expires_at: DateTime<Utc>,
 ) -> Identity {
     let mut attributes = std::collections::HashMap::new();
     attributes.insert("account_id".to_string(), account_id.to_string());
@@ -521,6 +644,11 @@ fn refresh_identity(
     if let Some(auth_time) = auth_time {
         attributes.insert("auth_time".to_string(), auth_time.to_string());
     }
+    attributes.insert("chain_id".to_string(), chain_id.to_string());
+    attributes.insert(
+        "chain_expires_at".to_string(),
+        chain_expires_at.to_rfc3339(),
+    );
     Identity {
         provider_id: "keycloak".to_string(),
         external_id: owner.subject.clone(),

@@ -74,6 +74,9 @@ oauth2:
     enabled: ${TOKEN_EXCHANGE_ENABLED:-false}
     access_ttl_seconds: ${TOKEN_EXCHANGE_ACCESS_TTL_SECONDS:-900}
     refresh_ttl_seconds: ${TOKEN_EXCHANGE_REFRESH_TTL_SECONDS:-2592000}
+    # Absolute cap on a refresh-token chain's lifetime, independent of the per-rotation TTL above
+    # -- see Oauth2TokenExchange::refresh_absolute_ttl_seconds's doc comment for why this exists.
+    refresh_absolute_ttl_seconds: ${TOKEN_EXCHANGE_REFRESH_ABSOLUTE_TTL_SECONDS:-7776000}
     allowed_scopes:
       - openid
       - profile

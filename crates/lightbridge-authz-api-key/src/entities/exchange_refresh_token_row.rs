@@ -26,6 +26,15 @@ pub struct ExchangeRefreshTokenRow {
     /// describes when the original authentication happened, which does not change on refresh
     /// (unlike `nonce`, deliberately not persisted here -- see `mint_from_refresh`'s doc comment).
     pub auth_time: Option<i64>,
+    /// The rotation-chain family this token belongs to (RFC 6819 §5.2.2.3 reuse-detection
+    /// cascade): shared by every token minted across one chain, starting at the offline_access
+    /// exchange grant that gave birth to it. Replaying an already-rotated token revokes every
+    /// still-active row sharing this value.
+    pub chain_id: String,
+    /// Absolute deadline for this token's whole chain, set once when the chain was born and
+    /// inherited unchanged by every rotation since -- independent of, and typically longer-lived
+    /// than, this individual row's own `expires_at`.
+    pub chain_expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
@@ -43,6 +52,8 @@ pub struct NewExchangeRefreshToken {
     pub email: Option<String>,
     pub email_verified: Option<bool>,
     pub auth_time: Option<i64>,
+    pub chain_id: String,
+    pub chain_expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }

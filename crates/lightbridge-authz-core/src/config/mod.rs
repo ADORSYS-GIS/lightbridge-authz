@@ -558,6 +558,19 @@ pub struct Oauth2TokenExchange {
     /// Scopes a client may request on exchange. `offline_access` gates refresh-token issuance.
     #[serde(default = "default_exchange_allowed_scopes")]
     pub allowed_scopes: Vec<String>,
+    /// Absolute cap on a refresh-token *chain*'s lifetime, in seconds, independent of
+    /// `refresh_ttl_seconds`. Each rotation resets the individual token's own `expires_at` to
+    /// `now() + refresh_ttl_seconds`, so without this a session that keeps refreshing before
+    /// every expiry never actually ends -- this is the ceiling that stops it. Set once, when a
+    /// chain is born (the offline-scope exchange grant), and inherited unchanged by every
+    /// rotation thereafter (`exchange_refresh_tokens.chain_expires_at`); a refresh presented
+    /// after this deadline is refused with `invalid_grant` regardless of the individual token's
+    /// own remaining `expires_at`. Defaults to 90 days -- longer than `refresh_ttl_seconds`'
+    /// 30-day default (a session that refreshes at least once a month lives up to 3 rotations
+    /// past the individual TTL before hitting the cap), short enough that a forgotten/leaked
+    /// session cannot outlive it indefinitely.
+    #[serde(default = "default_exchange_refresh_absolute_ttl_seconds")]
+    pub refresh_absolute_ttl_seconds: i64,
 }
 
 fn default_exchange_access_ttl_seconds() -> i64 {
@@ -566,6 +579,10 @@ fn default_exchange_access_ttl_seconds() -> i64 {
 
 fn default_exchange_refresh_ttl_seconds() -> i64 {
     2_592_000
+}
+
+fn default_exchange_refresh_absolute_ttl_seconds() -> i64 {
+    7_776_000
 }
 
 fn default_exchange_allowed_scopes() -> Vec<String> {
