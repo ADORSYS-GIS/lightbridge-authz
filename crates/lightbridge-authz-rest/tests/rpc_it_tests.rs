@@ -34,7 +34,9 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
-use common::{MapBearer, Wire, admin_perms, external_oauth2, rpc_call, token_info, viewer_perms};
+use common::{
+    MapBearer, Wire, admin_perms, as_json, external_oauth2, rpc_call, token_info, viewer_perms,
+};
 use cratestack::SqlxIdempotencyStore;
 use cratestack::{
     CodecSet, DEFAULT_BODY_LIMIT_BYTES, Json, Value as CValue, ratelimit::RateLimitStore,
@@ -2050,4 +2052,234 @@ async fn set_default_project_rejects_a_project_the_caller_is_not_a_member_of() {
         "a non-member must be refused promoting someone else's project to default (got {status}: {})",
         String::from_utf8_lossy(&body)
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Refresh-token session revocation RPC (`revokeOwnSessions` / `revokeSubjectSessions`).
+// `exchange_refresh_tokens` carries no foreign keys to accounts/projects, so these tests seed rows
+// directly against `ctx.verify` rather than driving a real token-exchange grant (this file's
+// router is built with `token_exchange: None`, see `setup`'s `external_oauth2()`).
+// ---------------------------------------------------------------------------------------------
+
+/// Inserts one active `exchange_refresh_tokens` row for `subject` and returns its `id`, so a test
+/// can assert on which specific rows a revocation touched.
+async fn seed_active_session(pool: &sqlx::PgPool, subject: &str) -> String {
+    let id = cuid2();
+    // `chain_id`/`chain_expires_at` (migration `20260815000001_exchange_refresh_tokens_add_chain`)
+    // are `NOT NULL` with no default -- mirrors that migration's own backfill convention for a
+    // pre-existing row: a single-member chain (`chain_id = id`) with a cap far enough out that
+    // none of these tests' assertions ever race it.
+    sqlx::query(
+        r#"
+        INSERT INTO exchange_refresh_tokens
+          (id, subject, account_id, project_id, client_id, token_hash, status, chain_id, chain_expires_at, created_at, expires_at)
+        VALUES ($1, $2, $2, $3, 'test-client', $4, 'active', $1, now() + interval '90 days', now(), now() + interval '30 days')
+        "#,
+    )
+    .bind(&id)
+    .bind(subject)
+    .bind(cuid2())
+    .bind(cuid2())
+    .execute(pool)
+    .await
+    .expect("seed active session");
+    id
+}
+
+/// The `status` of the `exchange_refresh_tokens` row with `id`.
+async fn session_status(pool: &sqlx::PgPool, id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM exchange_refresh_tokens WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("session row exists")
+}
+
+/// Test 6 (task list): the self-service procedure revokes only the caller's own sessions, and
+/// cannot be aimed at another subject -- proven two ways at once: the caller's own two sessions
+/// both flip to `revoked`, and a bystander subject's session, seeded in the very same test, is
+/// left untouched (there is no field on this procedure's input the caller could have used to name
+/// the bystander even if they wanted to -- see `authz.cstack`'s `RevokeOwnSessionsInput`).
+#[tokio::test]
+async fn revoke_own_sessions_revokes_only_the_callers_sessions() {
+    use lightbridge_authz_core::authz::{Permission, PermissionSet};
+
+    let caller = format!("self-revoke-{}", cuid2());
+    let bystander = format!("self-revoke-bystander-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with(
+        "caller",
+        token_info(
+            &caller,
+            PermissionSet::from_iter([Permission::SessionRevokeOwn]),
+        ),
+    ));
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let caller_session_a = seed_active_session(&ctx.verify, &caller).await;
+    let caller_session_b = seed_active_session(&ctx.verify, &caller).await;
+    let bystander_session = seed_active_session(&ctx.verify, &bystander).await;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.revokeOwnSessions",
+        Wire::Json,
+        &json!({ "args": {} }),
+        Some("caller"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let parsed = as_json(Wire::Json, &body);
+    assert_eq!(
+        parsed["revokedCount"], 2,
+        "must report exactly the two sessions it revoked: {parsed}"
+    );
+
+    assert_eq!(
+        session_status(&ctx.verify, &caller_session_a).await,
+        "revoked"
+    );
+    assert_eq!(
+        session_status(&ctx.verify, &caller_session_b).await,
+        "revoked"
+    );
+    assert_eq!(
+        session_status(&ctx.verify, &bystander_session).await,
+        "active",
+        "a bystander's session must never be touched by another subject's self-service call"
+    );
+}
+
+/// A caller lacking `session:revoke-own` gets 403 from `revokeOwnSessions` -- proves the
+/// permission gate is actually wired, not merely present in `rpc_authorize`'s map with nothing
+/// enforcing it.
+#[tokio::test]
+async fn revoke_own_sessions_without_permission_is_forbidden() {
+    let caller = format!("self-revoke-denied-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("caller", token_info(&caller, viewer_perms())));
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let (status, _) = rpc_call(
+        r.clone(),
+        "procedure.revokeOwnSessions",
+        Wire::Json,
+        &json!({ "args": {} }),
+        Some("caller"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "viewer_perms holds no session:revoke-own"
+    );
+}
+
+/// Test 7 (task list): the admin procedure revokes a target subject's sessions, and a caller
+/// without `session:revoke` is refused with 403.
+#[tokio::test]
+async fn revoke_subject_sessions_admin_revokes_target_others_get_403() {
+    let admin_subject = format!("session-admin-{}", cuid2());
+    let editor_subject = format!("session-editor-{}", cuid2());
+    let target = format!("offboarded-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("admin", token_info(&admin_subject, admin_perms()))
+            // An editor holds `session:revoke-own` (see `default_role_permissions`) but not the
+            // admin-only `session:revoke` -- exactly the boundary this test asserts.
+            .with(
+                "editor",
+                token_info(
+                    &editor_subject,
+                    lightbridge_authz_core::authz::PermissionSet::from_iter([
+                        lightbridge_authz_core::authz::Permission::SessionRevokeOwn,
+                    ]),
+                ),
+            ),
+    );
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let target_session_a = seed_active_session(&ctx.verify, &target).await;
+    let target_session_b = seed_active_session(&ctx.verify, &target).await;
+    let target_session_c = seed_active_session(&ctx.verify, &target).await;
+
+    // A caller holding only `session:revoke-own` cannot reach the admin procedure at all.
+    let (status, _) = rpc_call(
+        r.clone(),
+        "procedure.revokeSubjectSessions",
+        Wire::Json,
+        &json!({ "args": { "accountId": target } }),
+        Some("editor"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "session:revoke-own must not also grant the admin session:revoke capability"
+    );
+    assert_eq!(
+        session_status(&ctx.verify, &target_session_a).await,
+        "active",
+        "the forbidden call above must not have touched anything"
+    );
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.revokeSubjectSessions",
+        Wire::Json,
+        &json!({ "args": { "accountId": target } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let parsed = as_json(Wire::Json, &body);
+    assert_eq!(
+        parsed["revokedCount"], 3,
+        "the offboarding kill switch must report the true count: {parsed}"
+    );
+
+    for id in [target_session_a, target_session_b, target_session_c] {
+        assert_eq!(session_status(&ctx.verify, &id).await, "revoked");
+    }
+}
+
+/// A second call to `revokeSubjectSessions` for an already-fully-revoked subject reports `0`, not
+/// an error -- there being nothing left to revoke is not a failure.
+#[tokio::test]
+async fn revoke_subject_sessions_reports_zero_when_nothing_is_active() {
+    let admin_subject = format!("session-admin-noop-{}", cuid2());
+    let target = format!("already-clean-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.revokeSubjectSessions",
+        Wire::Json,
+        &json!({ "args": { "accountId": target } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let parsed = as_json(Wire::Json, &body);
+    assert_eq!(parsed["revokedCount"], 0);
 }

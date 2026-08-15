@@ -97,12 +97,23 @@ pub enum Permission {
     /// see that variant's doc comment.
     #[serde(rename = "budget:policy-activate")]
     BudgetPolicyActivate,
+
+    /// Revoke all of the caller's own refresh-token sessions ("log out everywhere"). Kept
+    /// distinct from [`Permission::SessionRevoke`] -- same self/admin split as
+    /// [`Permission::BudgetSelfRefill`] vs [`Permission::BudgetReview`] -- because acting on your
+    /// own sessions is a materially different capability from acting on someone else's.
+    #[serde(rename = "session:revoke-own")]
+    SessionRevokeOwn,
+    /// Revoke every active refresh-token session for another subject: the offboarding kill switch
+    /// that otherwise requires a manual SQL `UPDATE` against prod.
+    #[serde(rename = "session:revoke")]
+    SessionRevoke,
 }
 
 impl Permission {
     /// Every permission, in declaration order. The single source of truth for wildcard expansion
     /// and documentation.
-    pub const ALL: [Permission; 28] = [
+    pub const ALL: [Permission; 30] = [
         Permission::AccountCreate,
         Permission::AccountRead,
         Permission::AccountUpdate,
@@ -131,6 +142,8 @@ impl Permission {
         Permission::BudgetPolicyWrite,
         Permission::BudgetPolicySimulate,
         Permission::BudgetPolicyActivate,
+        Permission::SessionRevokeOwn,
+        Permission::SessionRevoke,
     ];
 
     /// Canonical `resource:action` string.
@@ -164,6 +177,8 @@ impl Permission {
             Permission::BudgetPolicyWrite => "budget:policy-write",
             Permission::BudgetPolicySimulate => "budget:policy-simulate",
             Permission::BudgetPolicyActivate => "budget:policy-activate",
+            Permission::SessionRevokeOwn => "session:revoke-own",
+            Permission::SessionRevoke => "session:revoke",
         }
     }
 
@@ -369,6 +384,7 @@ pub fn default_role_permissions() -> HashMap<String, Vec<String>> {
                 "account:read".to_string(),
                 "project:*".to_string(),
                 "apikey:*".to_string(),
+                "session:revoke-own".to_string(),
             ],
         ),
         (
@@ -377,6 +393,7 @@ pub fn default_role_permissions() -> HashMap<String, Vec<String>> {
                 "account:read".to_string(),
                 "project:read".to_string(),
                 "apikey:read".to_string(),
+                "session:revoke-own".to_string(),
             ],
         ),
     ])
@@ -467,6 +484,36 @@ mod tests {
         assert!(viewer.contains(Permission::ProjectRead));
         assert!(!viewer.contains(Permission::ProjectCreate));
         assert!(!viewer.contains(Permission::AccountDelete));
+    }
+
+    #[test]
+    fn session_wildcard_expands_to_both_actions() {
+        let session = expand_grant("session:*");
+        assert_eq!(session.len(), 2);
+        assert!(session.contains(&Permission::SessionRevokeOwn));
+        assert!(session.contains(&Permission::SessionRevoke));
+    }
+
+    #[test]
+    fn editor_and_viewer_get_self_revoke_but_not_admin_revoke() {
+        let compiled = Rbac::default().compile();
+        for role in ["lightbridge-editor", "lightbridge-viewer"] {
+            let set = compiled.roles.get(role).expect("role present");
+            assert!(
+                set.contains(Permission::SessionRevokeOwn),
+                "{role} should be able to log itself out everywhere"
+            );
+            assert!(
+                !set.contains(Permission::SessionRevoke),
+                "{role} must not be able to revoke another subject's sessions"
+            );
+        }
+        let admin = compiled
+            .roles
+            .get("lightbridge-admin")
+            .expect("admin role present");
+        assert!(admin.contains(Permission::SessionRevokeOwn));
+        assert!(admin.contains(Permission::SessionRevoke));
     }
 
     #[test]

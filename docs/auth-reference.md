@@ -114,6 +114,7 @@ when the block is present *and* `enabled: true`.
 | `scopes_supported` | `[]` when disabled; `oauth2.token_exchange.allowed_scopes` verbatim when enabled | `enabled` |
 | `id_token_signing_alg_values_supported` | hardcoded `["RS256"]` — `ALGORITHM` const (`signing.rs:30`) fed into `op_config.id_token_signing_alg` (`signing.rs:468`), wrapped into a single-element array by `OidcDiscovery::from_config` (`authkestra_op` 0.5.0) | always |
 | `claims_supported` | hardcoded static list: `iss, sub, aud, exp, iat, nbf, jti, typ, azp, lightbridge_caller_kind, sid, scope, api_key_id, project_id, account_id, email, email_verified, allowed_models, identity, nonce, auth_time, at_hash` (`signing.rs:492-518`) | always, regardless of `enabled` — lists claims that *can* appear, not ones guaranteed on every token |
+| `revocation_endpoint` | **Not emitted — the field does not exist on `OidcDiscovery`.** `POST /oauth2/revoke` (RFC 7009) is real and mounted (see §5), but `authkestra_op::handlers::discovery::OidcDiscovery` (0.5.0) has no field to carry it; RFC 8414 §2 lists it as standard metadata this document should otherwise have. Filed upstream: `marcjazz/authkestra#220`. See the doc comment directly above `discovery_document` in `signing.rs` | n/a — structurally absent, not gated by any config |
 
 **A second, unrelated discovery surface exists on `lightbridge-mcp`.** `GET
 /.well-known/oauth-authorization-server` and `GET /.well-known/openid-configuration` on the MCP
@@ -214,6 +215,21 @@ catalogue + RBAC compilation), `app/lightbridge-authz/src/mcp.rs:378-403` (MCP t
   `lightbridge_caller_kind: api_key` — see `docs/rbac.md`'s "#191/#216" note for the `self` vs
   `external` coverage gap (fully closed under `self`, not yet closed under `external`).
 
+### `session:revoke-own` / `session:revoke`
+
+- `session:revoke-own` gates `procedure.revokeOwnSessions` (`rpc_authorize.rs`) — "log out
+  everywhere" for the caller's own subject only; there is no subject field on the input, so this
+  cannot target anyone else. Granted to every default role (`default_role_permissions`,
+  `crates/lightbridge-authz-core/src/authz.rs`), including `lightbridge-viewer`.
+- `session:revoke` gates `procedure.revokeSubjectSessions` — the offboarding kill switch, revoking
+  every active refresh-token session for an operator-supplied `accountId`. Held only via
+  `lightbridge-admin`'s `*`; not granted to `lightbridge-editor`/`lightbridge-viewer`.
+- Both delegate to `StoreRepo::revoke_active_exchange_refresh_tokens_for_subject`, the same
+  `status = 'active' -> 'revoked'` flip `POST /oauth2/revoke` (RFC 7009) uses for a single token —
+  see §5's `/oauth2/revoke` row. `find_active_exchange_refresh_token`/
+  `consume_exchange_refresh_token` both filter on `status = 'active'`, so revocation from either
+  surface takes effect on the very next refresh attempt.
+
 ## 5. Endpoints
 
 | Server | Route | Auth | Purpose |
@@ -221,6 +237,7 @@ catalogue + RBAC compilation), `app/lightbridge-authz/src/mcp.rs:378-403` (MCP t
 | `authz-api` | `GET /`, `GET /healthz`, `GET /healthz/startup`, `GET /healthz/ready` | none | liveness/startup/readiness probes |
 | `authz-api` | `GET /.well-known/openid-configuration`, `GET /.well-known/jwks.json` | none | OIDC discovery + JWKS; only mounted under `oauth2.type: self` with `signing` set (see §2) |
 | `authz-api` | `POST /oauth2/token` | client auth (public `client_id` or `private_key_jwt`), no bearer | RFC 8693 token-exchange + refresh grant; only mounted when `oauth2.token_exchange.enabled` |
+| `authz-api` | `POST /oauth2/revoke` | client auth, same as `/oauth2/token` (public `client_id` or `private_key_jwt`), no bearer | RFC 7009 token revocation for `exchange_refresh_tokens` rows; mounted alongside `/oauth2/token` by the same `token_exchange_router` (`crates/lightbridge-authz-rest/src/token_exchange.rs`). **Not advertised in discovery** — see §2's `revocation_endpoint` row. §2.2: an unknown/already-revoked/out-of-scope token is `200`, never an error; only client-authentication failure is |
 | `authz-api` | `POST /rpc/{op_id}`, `POST /rpc/batch` | Bearer JWT + RBAC (`rpc_authorize` outer gate, `CratestackAuthProvider` inner gate, then cratestack `@@allow` membership policy) | Generated CRUD + hand-written budget-domain procedures; base path configurable via `server.api.rpc_base_path` |
 | `authz-opa` | `GET /`, `GET /healthz`, `GET /healthz/startup`, `GET /healthz/ready` | none | probes |
 | `authz-opa` | `GET /v1/opa/docs`, `GET /v1/opa/openapi.json` | none | Swagger UI (`lib.rs:1525`) |

@@ -821,6 +821,58 @@ impl StoreRepo {
         Ok(())
     }
 
+    /// Revokes a refresh token by its hash, scoped to `client_id` (backs `POST /oauth2/revoke`,
+    /// RFC 7009). Same idempotent, no-op-if-no-match semantics as
+    /// [`Self::revoke_exchange_refresh_token`], with one addition: a hash that matches a row
+    /// belonging to a *different* client is also treated as "nothing to do", never as an error --
+    /// RFC 7009 §2.2 requires the endpoint to return success uniformly for an unknown, already-
+    /// revoked, *or* out-of-scope token, so a client can never use this endpoint to probe whether
+    /// a given token string belongs to another client.
+    pub async fn revoke_exchange_refresh_token_for_client(
+        &self,
+        token_hash: &str,
+        client_id: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE exchange_refresh_tokens
+            SET status = 'revoked'
+            WHERE token_hash = $1
+              AND client_id = $2
+              AND status = 'active'
+            "#,
+        )
+        .bind(token_hash)
+        .bind(client_id)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Revokes every currently-active refresh-token session for `subject` in one statement,
+    /// backing both the self-service "log out everywhere" RPC procedure and the admin offboarding
+    /// kill switch (`docs/rbac.md`'s `session:revoke-own`/`session:revoke`) -- previously the only
+    /// way to do this was a manual SQL `UPDATE` against prod. Returns how many rows were actually
+    /// flipped, so the caller gets confirmation the kill switch did something; `0` (not an error)
+    /// when the subject has no active sessions.
+    pub async fn revoke_active_exchange_refresh_tokens_for_subject(
+        &self,
+        subject: &str,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE exchange_refresh_tokens
+            SET status = 'revoked'
+            WHERE subject = $1
+              AND status = 'active'
+            "#,
+        )
+        .bind(subject)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Project-scoped rule (see the module-level mechanical rescoping this whole file follows):
     /// visible when `subject` owns the project's account OR holds ANY `project_members` row on it,
     /// matching the schema's `@@allow("read", account.id==auth().id || members.some.accountId==

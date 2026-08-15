@@ -263,6 +263,41 @@ different `client_id` than the one it was issued to is likewise burned, not hono
 id_token carry the *original* grant's scope verbatim — a refresh request cannot widen or narrow
 scope; there is no `scope` parameter on this grant to do so.
 
+## Revocation
+
+```
+POST https://<issuer>/oauth2/revoke
+Content-Type: application/x-www-form-urlencoded
+
+token=<the refresh_token to kill>
+client_id=lightbridge-ss
+```
+
+RFC 7009. Same client-authentication rules as `/oauth2/token` and `/oauth2/refresh` above (public
+`client_id` alone, or `client_assertion`/`client_assertion_type` for a confidential client) — a
+confidential client revoking its own token needs a **fresh** assertion `jti`, distinct from
+whichever one it last used to obtain a token; a replayed `jti` is refused the same way it is at
+`/oauth2/token`.
+
+A successful call is `200 OK` with an empty body. **The counter-intuitive part (RFC 7009 §2.2):**
+an unknown token, an already-revoked token, or a token issued to a *different* client than the one
+authenticating the request is **also** `200 OK` — never an error. This is deliberate: it denies an
+attacker an oracle for probing whether a given token string is currently valid, or which client it
+belongs to. The only error this endpoint ever returns is client-authentication failure itself
+(unknown `client_id`, missing/invalid assertion) — `401 invalid_client` — which happens entirely
+before the token is even looked up. A request missing the `token` field altogether is
+`400 invalid_request` (a malformed *request*, not a malformed *token value*).
+
+Revocation flips the token's row from `active` to `revoked`; the very next presentation to
+`grant_type=refresh_token` fails with `400 invalid_grant`, same as an already-consumed
+(rotated-away) refresh token — the two are indistinguishable on the wire, by design (see the
+Refresh section above). There is no access-token revocation: access tokens are stateless
+self-signed JWTs with no server-side record, so this endpoint only ever touches
+`exchange_refresh_tokens` rows regardless of `token_type_hint`.
+
+Tests: `crates/lightbridge-authz-rest/tests/token_exchange_tests.rs`, the "RFC 7009" section near
+the end of the file.
+
 ## Discovery
 
 `GET https://<issuer>/.well-known/openid-configuration` is public, unauthenticated, wide-open CORS.
@@ -287,6 +322,11 @@ client that parses it:
 - `grant_types_supported`, `token_endpoint`, and `scopes_supported` are the three fields actually
   gated on `oauth2.token_exchange.enabled`, empty/absent when it's off — don't infer token-exchange
   availability from the presence of `issuer`/`jwks_uri` alone; check those three instead.
+- **`/oauth2/revoke` is not in this document at all** — `revocation_endpoint` isn't a field
+  `OidcDiscovery` (from `authkestra-op` 0.5.0) has room for, even though the endpoint above is real
+  and live. This is a known upstream gap (`marcjazz/authkestra#220`, RFC 8414 §2), not a bug in this
+  service — a client integrating revocation needs the hardcoded path (`{issuer}/oauth2/revoke`), the
+  same way `token_endpoint`'s literal `{issuer}/oauth2/token` shape is already assumed above.
 
 Source: `discovery_document`, `crates/lightbridge-authz-rest/src/signing.rs:401-529`.
 
