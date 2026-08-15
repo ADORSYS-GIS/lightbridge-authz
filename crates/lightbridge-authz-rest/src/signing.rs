@@ -399,6 +399,24 @@ fn to_jwks(raw: Vec<Value>) -> Vec<authkestra_engine::token::jwk::Jwk> {
 /// itself, but this service never serves `/authorize` (no authorization_code flow -- ADR-0011
 /// Context) and `response_types_supported` never advertises `"code"`, so publishing a URL for it
 /// would promise a capability nothing here provides.
+///
+/// `token_endpoint` is dropped the same way when `token_exchange_scopes` is `None`
+/// (`oauth2.token_exchange.enabled` is off, or the deployment's config never wired the block at
+/// all -- both collapse to the same "no grants served" state upstream, since
+/// `build_token_exchange_state` never mounts `POST /oauth2/token` in that case either). Advertising
+/// a live-looking `token_endpoint` next to empty `grant_types_supported`/`scopes_supported` is
+/// exactly what the hand-built document this replaced (ADR-0011, Decision 9) never did -- it
+/// omitted `token_endpoint` outright when the feature was off, and a spec-reading client seeing a
+/// URL with nothing behind it is worse than seeing no URL at all. Restored here.
+///
+/// `grant_types_supported`/`response_types_supported`/`scopes_supported` themselves stay legitimately
+/// empty arrays (not also dropped) in the disabled case -- OIDC discovery treats these as always-
+/// present metadata (RFC 8414 §2), and an empty array is the honest way to say "no grants offered",
+/// same as any OP that structurally serves none. They are **not** hardcoded to advertise
+/// token-exchange support regardless of config: this service genuinely does not accept any grant at
+/// `/oauth2/token` when `token_exchange_scopes` is `None`, since the route is not mounted at all
+/// (see `build_token_exchange_state`) -- advertising the grant anyway would be inventing a
+/// capability this deployment does not have.
 fn discovery_document(
     issuer: &str,
     token_exchange_scopes: Option<&[String]>,
@@ -440,6 +458,13 @@ fn discovery_document(
     doc.jwks_uri = format!("{issuer}/.well-known/jwks.json");
     doc.token_endpoint = format!("{issuer}/oauth2/token");
     doc.userinfo_endpoint = None;
+    // `response_modes_supported` is unconditionally empty regardless of `enabled`: response modes
+    // (`query`/`fragment`/`form_post`) describe how an authorization *response* is delivered back
+    // to a browser redirect URI. This service never redirects a user-agent at all -- the
+    // token-exchange grant is a direct machine-to-machine POST/response, not a redirect flow -- so
+    // no response mode ever applies, on or off. `from_config` defaults this to `["query"]`
+    // (appropriate for the authorization_code flow it also models), which would misrepresent a
+    // capability this service never had regardless of token-exchange config.
     doc.response_modes_supported = Vec::new();
     doc.token_endpoint_auth_methods_supported = if private_key_jwt_supported {
         vec!["none".to_string(), "private_key_jwt".to_string()]
@@ -478,6 +503,9 @@ fn discovery_document(
         serde_json::to_value(&doc).unwrap_or_else(|_| serde_json::json!({ "issuer": issuer }));
     if let Some(obj) = value.as_object_mut() {
         obj.remove("authorization_endpoint");
+        if !enabled {
+            obj.remove("token_endpoint");
+        }
     }
     value
 }
@@ -489,12 +517,10 @@ fn discovery_document(
 /// clients must be able to fetch them cross-origin, as any standard OIDC provider allows.
 ///
 /// `token_exchange_scopes` is `Some(allowed_scopes)` when the token-exchange grant is enabled
-/// (`oauth2.token_exchange.enabled`), `None` when it is off. Because `OidcDiscovery`'s
-/// `token_endpoint`/`grant_types_supported`/`response_types_supported` fields are not all
-/// `Option` (unlike the previous hand-built document, which omitted `token_endpoint` entirely when
-/// disabled), the disabled case now advertises a `token_endpoint` URL with empty
-/// `grant_types_supported`/`response_types_supported` instead of omitting the field -- see
-/// `discovery_document`'s doc comment.
+/// (`oauth2.token_exchange.enabled`), `None` when it is off (including when the whole
+/// `oauth2.token_exchange` block is absent from config, which deserializes to `None` the same
+/// way). `discovery_document` drops `token_endpoint` from the disabled document entirely, matching
+/// the previous hand-built document -- see its doc comment for the full rationale.
 pub fn well_known_router<S>(
     issuer: &str,
     repo: Arc<StoreRepo>,
