@@ -1757,6 +1757,19 @@ fn build_token_exchange_state(
                 .to_string(),
         ));
     }
+    if cfg.refresh_absolute_ttl_seconds <= 0 {
+        return Err(Error::Server(
+            "token_exchange refresh_absolute_ttl_seconds must be positive".to_string(),
+        ));
+    }
+    if cfg.refresh_absolute_ttl_seconds <= cfg.refresh_ttl_seconds {
+        return Err(Error::Server(
+            "token_exchange refresh_absolute_ttl_seconds must be greater than \
+             refresh_ttl_seconds, otherwise the chain's absolute cap is reached no later than \
+             every individual token's own expiry and refresh_ttl_seconds never takes effect"
+                .to_string(),
+        ));
+    }
     let signer = signing::ApiKeyJwtSigner::from_config(signing, repo.clone())?;
 
     let client_store = oauth2_op::client_store::ConfigClientStore::from_config(&oauth2.clients);
@@ -2234,6 +2247,69 @@ mod tests {
             panic!("expected an error for a non-positive ttl");
         };
         assert!(format!("{err}").contains("must be positive"));
+    }
+
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_zero_refresh_absolute_ttl() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        let mut cfg = exchange_cfg();
+        cfg.refresh_absolute_ttl_seconds = 0;
+        oauth2.token_exchange = Some(cfg);
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+        ) else {
+            panic!("expected an error for a zero refresh_absolute_ttl_seconds");
+        };
+        let message = format!("{err}");
+        assert!(message.contains("refresh_absolute_ttl_seconds"));
+        assert!(message.contains("must be positive"));
+    }
+
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_negative_refresh_absolute_ttl() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        let mut cfg = exchange_cfg();
+        cfg.refresh_absolute_ttl_seconds = -1;
+        oauth2.token_exchange = Some(cfg);
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+        ) else {
+            panic!("expected an error for a negative refresh_absolute_ttl_seconds");
+        };
+        let message = format!("{err}");
+        assert!(message.contains("refresh_absolute_ttl_seconds"));
+        assert!(message.contains("must be positive"));
+    }
+
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_refresh_absolute_ttl_not_longer_than_refresh_ttl() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        let mut cfg = exchange_cfg();
+        cfg.refresh_ttl_seconds = 2_592_000;
+        cfg.refresh_absolute_ttl_seconds = 2_592_000;
+        oauth2.token_exchange = Some(cfg);
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+        ) else {
+            panic!(
+                "expected an error when refresh_absolute_ttl_seconds does not exceed refresh_ttl_seconds"
+            );
+        };
+        let message = format!("{err}");
+        assert!(message.contains("refresh_absolute_ttl_seconds"));
+        assert!(message.contains("refresh_ttl_seconds"));
     }
 
     #[tokio::test]
