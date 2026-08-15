@@ -1693,6 +1693,7 @@ mod tests {
             access_ttl_seconds: 900,
             refresh_ttl_seconds: 2_592_000,
             allowed_scopes: vec!["openid".to_string()],
+            refresh_absolute_ttl_seconds: 7_776_000,
         }
     }
 

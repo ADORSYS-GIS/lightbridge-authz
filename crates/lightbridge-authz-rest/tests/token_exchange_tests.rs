@@ -29,7 +29,7 @@ use lightbridge_authz_core::config::{
 };
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
-use lightbridge_authz_core::{CreateAccount, CreateProject};
+use lightbridge_authz_core::{CreateAccount, CreateProject, ResourceStatus, hash_api_key};
 use lightbridge_authz_rest::oauth2_op::client_assertion_store::RedisClientAssertionStore;
 use lightbridge_authz_rest::oauth2_op::client_store::ConfigClientStore;
 use lightbridge_authz_rest::oauth2_op::store::TokenExchangeOpStore;
@@ -47,6 +47,12 @@ const SUBJECT: &str = "kc-user-123";
 // this must alias `SUBJECT` rather than an arbitrary string.
 const ACCOUNT_ID: &str = SUBJECT;
 const PROJECT_ID: &str = "proj_xchg";
+// Refresh-token hardening fixtures (chain_id/chain_expires_at): a second account that owns a
+// project SUBJECT is only a roster *member* of, not the owner -- distinct from `seed()`'s
+// PROJECT_ID, which SUBJECT owns directly and which `resolve_context`'s ownership branch alone
+// would already admit regardless of roster state.
+const OWNER_ACCOUNT: &str = "kc-owner-999";
+const MEMBER_PROJECT_ID: &str = "proj_member_scope";
 const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const PUBLIC_CLIENT_ID: &str = "lightbridge-ss";
@@ -132,6 +138,7 @@ fn exchange_cfg() -> Oauth2TokenExchange {
             "email".to_string(),
             "offline_access".to_string(),
         ],
+        refresh_absolute_ttl_seconds: 7_776_000,
     }
 }
 
@@ -245,6 +252,83 @@ async fn seed(repo: &StoreRepo) {
     .expect("seed project");
 }
 
+/// A second account (`OWNER_ACCOUNT`) owning `MEMBER_PROJECT_ID`, with `SUBJECT` added as a plain
+/// roster *member* -- not the owner. Used by refresh-hardening tests that need "subject's standing
+/// comes from `project_members`, not `projects.account_id`" (see the `OWNER_ACCOUNT` doc comment),
+/// so removing the membership is the only thing that can revoke SUBJECT's access.
+async fn seed_member_project(repo: &StoreRepo) {
+    repo.create_account(
+        OWNER_ACCOUNT,
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .expect("seed owner account");
+    repo.create_account(
+        SUBJECT,
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .expect("seed member account");
+    repo.create_project(
+        OWNER_ACCOUNT,
+        OWNER_ACCOUNT,
+        CreateProject {
+            name: "member-scope-project".to_string(),
+            allowed_models: None,
+            default_limits: None,
+            billing_plan: "free".to_string(),
+            billing_identity: format!("bill-{}", cuid2()),
+            project_quota: None,
+        },
+        MEMBER_PROJECT_ID.to_string(),
+    )
+    .await
+    .expect("seed member project");
+    repo.add_project_member(OWNER_ACCOUNT, MEMBER_PROJECT_ID, SUBJECT, Some("member"))
+        .await
+        .expect("add subject as a roster member");
+}
+
+/// Builds `TokenExchangeState` for a given client registry, bearer, Redis URL, AND an explicit
+/// `Oauth2TokenExchange` -- [`state_with`] is a thin wrapper over this using [`exchange_cfg`];
+/// tests that need a non-default `refresh_absolute_ttl_seconds` (the absolute-cap tests) call this
+/// directly.
+fn state_with_cfg(
+    repo: Arc<StoreRepo>,
+    bearer: Arc<dyn BearerTokenServiceTrait>,
+    clients: Vec<OauthClient>,
+    redis_url: &str,
+    cfg: Oauth2TokenExchange,
+) -> TokenExchangeState {
+    let signer = ApiKeyJwtSigner::from_config(&signing_cfg(), repo.clone()).unwrap();
+    let client_store = ConfigClientStore::from_config(&clients);
+    let assertions = RedisClientAssertionStore::connect(redis_url, "test:token-exchange-jti:")
+        .expect("lazy connection manager always builds");
+    let op_config = authkestra_op::config::OpConfig {
+        issuer: ISSUER.to_string(),
+        scopes_supported: cfg.allowed_scopes.clone(),
+        response_types_supported: vec!["token".to_string()],
+        grant_types_supported: client_grant_types(),
+        id_token_signing_alg: "RS256".to_string(),
+        authorization_code_ttl_secs: 0,
+        access_token_ttl_secs: 900,
+        device_code_ttl_secs: 0,
+        token_exchange_enabled: true,
+    };
+    let op_store = Arc::new(TokenExchangeOpStore::new(
+        client_store,
+        assertions,
+        repo,
+        bearer,
+        cfg,
+    ));
+    TokenExchangeState::new(signer, op_config, op_store)
+}
+
 /// Builds `TokenExchangeState` for a given client registry, bearer, and Redis URL. Most tests use
 /// [`state`] (one public client, real reachable Redis); tests exercising confidential-client auth
 /// or Redis failure modes call this directly.
@@ -254,29 +338,22 @@ fn state_with(
     clients: Vec<OauthClient>,
     redis_url: &str,
 ) -> TokenExchangeState {
-    let signer = ApiKeyJwtSigner::from_config(&signing_cfg(), repo.clone()).unwrap();
-    let client_store = ConfigClientStore::from_config(&clients);
-    let assertions = RedisClientAssertionStore::connect(redis_url, "test:token-exchange-jti:")
-        .expect("lazy connection manager always builds");
-    let op_store = Arc::new(TokenExchangeOpStore::new(
-        client_store,
-        assertions,
-        repo,
-        bearer,
-        exchange_cfg(),
-    ));
-    let op_config = authkestra_op::config::OpConfig {
-        issuer: ISSUER.to_string(),
-        scopes_supported: exchange_cfg().allowed_scopes,
-        response_types_supported: vec!["token".to_string()],
-        grant_types_supported: client_grant_types(),
-        id_token_signing_alg: "RS256".to_string(),
-        authorization_code_ttl_secs: 0,
-        access_token_ttl_secs: 900,
-        device_code_ttl_secs: 0,
-        token_exchange_enabled: true,
-    };
-    TokenExchangeState::new(signer, op_config, op_store)
+    state_with_cfg(repo, bearer, clients, redis_url, exchange_cfg())
+}
+
+/// Presented-token plaintext -> its `(chain_id, chain_expires_at)` off the real DB row, for tests
+/// asserting the rotation-family metadata (not observable from the `TokenResponse` JSON itself).
+async fn chain_metadata(
+    repo: &StoreRepo,
+    plaintext_refresh_token: &str,
+) -> (String, chrono::DateTime<chrono::Utc>) {
+    let hash = hash_api_key(plaintext_refresh_token);
+    let row = repo
+        .find_exchange_refresh_token_by_hash(&hash)
+        .await
+        .unwrap()
+        .expect("refresh token row exists");
+    (row.chain_id, row.chain_expires_at)
 }
 
 /// One public client (`PUBLIC_CLIENT_ID`), a `MockBearer` whose `aud` already contains it (so the
@@ -1562,5 +1639,495 @@ async fn refresh_reissues_id_token_and_preserves_email(pool: PgPool) {
         id_claims.get("nonce").is_none(),
         "a refresh presents no authorization request, so the reissued id_token must never carry \
          the original exchange's nonce: {id_claims}"
+    );
+}
+
+// ============================================================================================
+// Refresh-token hardening: absolute cap, re-validation on refresh, and reuse-cascade revocation
+// (`chain_id`/`chain_expires_at`, migration `20260815000001_exchange_refresh_tokens_add_chain`).
+// See `oauth2_op::store::TokenExchangeOpStore::handle_refresh_token`'s own doc comment for the
+// three gaps these close.
+// ============================================================================================
+
+/// Regression guard (also exercised, less directly, by `refresh_rotates_and_rejects_replay`
+/// above): a normal refresh still succeeds, still rotates, AND the new chain metadata this PR
+/// introduces is actually populated -- a freshly exchanged offline-scope token is born into a
+/// real, non-empty chain with a future absolute cap.
+#[sqlx::test(migrations = "../../migrations")]
+async fn refresh_succeeds_and_rotates_the_refresh_token(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let first = body["refresh_token"].as_str().unwrap().to_string();
+    let (chain_id, chain_expires_at) = chain_metadata(&repo, &first).await;
+    assert!(
+        !chain_id.is_empty(),
+        "a freshly exchanged offline-scope token must be born into a real chain"
+    );
+    assert!(
+        chain_expires_at > chrono::Utc::now(),
+        "a freshly born chain's absolute cap must be in the future"
+    );
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={first}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let second = body["refresh_token"].as_str().unwrap().to_string();
+    assert_ne!(first, second, "refresh token must rotate");
+
+    let claims = verify_access_token(
+        &repo,
+        body["access_token"].as_str().unwrap(),
+        PUBLIC_CLIENT_ID,
+    )
+    .await;
+    assert_eq!(claims.project_id, PROJECT_ID);
+    assert_eq!(claims.account_id, ACCOUNT_ID);
+}
+
+/// Gap 2 (absolute cap): a refresh presented after `chain_expires_at` is refused even though the
+/// individual token's own `expires_at` (30-day default) is nowhere near expiry -- the two limits
+/// are independent, and the chain-level one must win. `refresh_absolute_ttl_seconds: 1` makes the
+/// cap trivially reachable with a short, deterministic sleep instead of a mocked clock.
+#[sqlx::test(migrations = "../../migrations")]
+async fn refresh_after_absolute_cap_is_invalid_grant(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let cfg = Oauth2TokenExchange {
+        refresh_absolute_ttl_seconds: 1,
+        ..exchange_cfg()
+    };
+    let bearer = || Arc::new(MockBearer::new(true, vec![PUBLIC_CLIENT_ID.to_string()]));
+
+    let (status, body) = post_token(
+        state_with_cfg(
+            repo.clone(),
+            bearer(),
+            vec![public_client(PUBLIC_CLIENT_ID)],
+            &redis_url(),
+            cfg.clone(),
+        ),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let refresh_token = body["refresh_token"].as_str().unwrap().to_string();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    let (status, body) = post_token(
+        state_with_cfg(
+            repo.clone(),
+            bearer(),
+            vec![public_client(PUBLIC_CLIENT_ID)],
+            &redis_url(),
+            cfg,
+        ),
+        &format!(
+            "grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={refresh_token}"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a refresh past the chain's absolute cap must be refused even though the individual \
+         token itself has not expired: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+}
+
+/// Gap 2, continued: `chain_id`/`chain_expires_at` must be INHERITED unchanged across rotations,
+/// not regenerated -- otherwise the absolute cap above would never actually bind anything (every
+/// rotation would just mint itself a fresh 90-day runway). Asserted across two consecutive
+/// rotations (three tokens total) so a bug that only shows up on the second inheritance (e.g.
+/// reading the wrong row) cannot hide behind a single-rotation check.
+#[sqlx::test(migrations = "../../migrations")]
+async fn chain_id_and_absolute_cap_survive_multiple_rotations(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let first = body["refresh_token"].as_str().unwrap().to_string();
+    let (chain_id_1, chain_expires_at_1) = chain_metadata(&repo, &first).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={first}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let second = body["refresh_token"].as_str().unwrap().to_string();
+    let (chain_id_2, chain_expires_at_2) = chain_metadata(&repo, &second).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={second}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let third = body["refresh_token"].as_str().unwrap().to_string();
+    let (chain_id_3, chain_expires_at_3) = chain_metadata(&repo, &third).await;
+
+    assert_eq!(
+        chain_id_1, chain_id_2,
+        "chain_id must survive the first rotation"
+    );
+    assert_eq!(
+        chain_id_2, chain_id_3,
+        "chain_id must survive the second rotation"
+    );
+    assert_eq!(
+        chain_expires_at_1, chain_expires_at_2,
+        "the absolute cap must not move on the first rotation"
+    );
+    assert_eq!(
+        chain_expires_at_2, chain_expires_at_3,
+        "the absolute cap must not move on the second rotation"
+    );
+}
+
+/// Gap 1 (re-validation): a subject removed from `project_members` between exchange and refresh
+/// must lose the ability to refresh, even though their refresh token itself is still individually
+/// valid. Uses `seed_member_project`/`MEMBER_PROJECT_ID`, not `seed`/`PROJECT_ID`, because SUBJECT
+/// owning the project directly would make `resolve_context`'s ownership branch admit them
+/// regardless of roster state -- this test needs standing that comes ONLY from `project_members`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn refresh_after_member_removed_from_project_is_invalid_grant(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed_member_project(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={MEMBER_PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let refresh_token = body["refresh_token"].as_str().unwrap().to_string();
+
+    repo.remove_project_member(OWNER_ACCOUNT, MEMBER_PROJECT_ID, SUBJECT)
+        .await
+        .expect("owner removes the member");
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={refresh_token}"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a subject removed from the project's roster must not be able to refresh: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+}
+
+/// Gap 1, continued -- and the fail-open fix specifically: before this change, a refresh whose
+/// project could not be resolved fell through to `allowed_models = None`, which this codebase
+/// reads as "no restriction," and still minted a token. A deleted project must instead refuse the
+/// refresh outright.
+#[sqlx::test(migrations = "../../migrations")]
+async fn refresh_after_project_deleted_is_invalid_grant_not_fail_open(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let refresh_token = body["refresh_token"].as_str().unwrap().to_string();
+
+    repo.delete_project(SUBJECT, PROJECT_ID)
+        .await
+        .expect("owner deletes the project");
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={refresh_token}"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a deleted project must refuse the refresh, not fail open to an unrestricted token: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+}
+
+/// Gap 1, continued: the same account/project suspension cascade `api_key_validation` enforces for
+/// API keys must also gate a refresh -- `resolve_context` alone only checks ownership/membership,
+/// not status, so this exercises the extra check `handle_refresh_token` adds on top of it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn refresh_after_project_suspended_is_invalid_grant(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let refresh_token = body["refresh_token"].as_str().unwrap().to_string();
+
+    repo.set_project_status(SUBJECT, PROJECT_ID, ResourceStatus::Suspended)
+        .await
+        .expect("owner suspends the project");
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={refresh_token}"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a suspended project must not be able to refresh: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+}
+
+/// Gap 1, continued: same as the project-suspension test above, for the account half of the
+/// cascade.
+#[sqlx::test(migrations = "../../migrations")]
+async fn refresh_after_account_suspended_is_invalid_grant(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let refresh_token = body["refresh_token"].as_str().unwrap().to_string();
+
+    repo.set_account_status(SUBJECT, ACCOUNT_ID, ResourceStatus::Suspended)
+        .await
+        .expect("owner suspends the account");
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={refresh_token}"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a suspended account must not be able to refresh: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+}
+
+/// Gap 3 (reuse cascade): replaying a token that was already rotated must revoke the WHOLE chain,
+/// not just reject the replay -- the newer, still-live successor must stop working too. This is
+/// the RFC 6819 §5.2.2.3 behavior the single-use CAS alone does not provide (it only ever rejects
+/// the presented token, never touches what superseded it).
+#[sqlx::test(migrations = "../../migrations")]
+async fn replaying_a_rotated_refresh_token_revokes_the_whole_chain(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let first = body["refresh_token"].as_str().unwrap().to_string();
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={first}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let second = body["refresh_token"].as_str().unwrap().to_string();
+
+    // Replay the SUPERSEDED (already-rotated) first token.
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={first}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "replay of a superseded token must fail: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+
+    // The newer, previously-valid token must now be dead too -- the whole chain was revoked.
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={second}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the successor token must be revoked by the reuse cascade: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+}
+
+/// Gap 3, continued -- the negative space: a refresh token that was never issued must be a plain
+/// `invalid_grant` and must NOT cascade-revoke anything. An unrelated, real, still-active chain
+/// must keep working afterward.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unknown_refresh_token_is_invalid_grant_without_cascading(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let real = body["refresh_token"].as_str().unwrap().to_string();
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        "grant_type=refresh_token&client_id=lightbridge-ss&refresh_token=lgbr_rt_never_issued_garbage",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_grant");
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={real}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an unrecognized refresh token must not revoke an unrelated, real chain: {body}"
+    );
+}
+
+/// Migration backfill (`20260815000001_exchange_refresh_tokens_add_chain`): a row created under
+/// the PRE-hardening schema (no `chain_id`/`chain_expires_at` columns at all) must survive the
+/// migration and receive `chain_id = id` plus a `chain_expires_at` BACKDATED from its own
+/// `created_at` -- not from migration time, which would silently extend every existing session's
+/// cap by however long it had already been alive. Runs the pre-hardening migrations, inserts a row
+/// exactly as the old schema shape would have, then applies only the new migration and inspects
+/// the result -- this is the one test in this file that cannot go through `#[sqlx::test(migrations
+/// = "../../migrations")]`, since that would apply the hardening migration before any row exists.
+#[sqlx::test(migrations = false)]
+async fn migration_backfill_gives_existing_rows_a_chain_and_a_backdated_cap(pool: PgPool) {
+    let migrator = sqlx::migrate::Migrator::new(std::path::Path::new("../../migrations"))
+        .await
+        .expect("migrator loads from the workspace migrations directory");
+    // The migration immediately preceding the hardening one (`exchange_refresh_tokens_add_chain`)
+    // -- everything up to and including client_id, but no chain_id/chain_expires_at yet.
+    migrator
+        .run_to(20260814000003, &pool)
+        .await
+        .expect("pre-hardening migrations apply");
+
+    let old_created_at = chrono::Utc::now() - chrono::Duration::days(400);
+    let old_expires_at = old_created_at + chrono::Duration::days(30);
+    let id = cuid2();
+    sqlx::query(
+        r#"
+        INSERT INTO exchange_refresh_tokens
+          (id, subject, account_id, project_id, client_id, token_hash, scope, status, created_at, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, NULL, 'active', $7, $8)
+        "#,
+    )
+    .bind(&id)
+    .bind(SUBJECT)
+    .bind(ACCOUNT_ID)
+    .bind(PROJECT_ID)
+    .bind(PUBLIC_CLIENT_ID)
+    .bind("legacy-hash")
+    .bind(old_created_at)
+    .bind(old_expires_at)
+    .execute(&pool)
+    .await
+    .expect("legacy-shaped row inserts under the pre-hardening schema");
+
+    migrator
+        .run(&pool)
+        .await
+        .expect("the hardening migration applies on top of an existing row");
+
+    let (chain_id, chain_expires_at): (String, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+        "SELECT chain_id, chain_expires_at FROM exchange_refresh_tokens WHERE id = $1",
+    )
+    .bind(&id)
+    .fetch_one(&pool)
+    .await
+    .expect("the row survives the migration");
+
+    assert_eq!(
+        chain_id, id,
+        "backfill must give a pre-existing row its own single-member chain (chain_id = id)"
+    );
+    let expected = old_created_at + chrono::Duration::days(90);
+    let drift = (chain_expires_at - expected).num_seconds().abs();
+    assert!(
+        drift < 5,
+        "chain_expires_at must be backdated from the row's own created_at ({old_created_at}), \
+         not from migration time: got {chain_expires_at}, expected ~{expected}"
     );
 }
