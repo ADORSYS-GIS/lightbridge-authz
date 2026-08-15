@@ -46,6 +46,7 @@ use cratestack_codec_json::JsonCodec;
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::BearerTokenServiceTrait;
+use lightbridge_authz_core::authz::Permission;
 use lightbridge_authz_core::config::{BasicAuth, Billing, BillingPlan};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
@@ -346,7 +347,6 @@ async fn create_api_key(
 // Section 2: full CRUD lifecycle over the RPC router, JSON and CBOR.
 // ---------------------------------------------------------------------------------------------
 
-#[ignore = "tracked in #219 -- fails deterministically against a fresh DB, not flaky"]
 #[tokio::test]
 async fn crud_lifecycle_for_all_resources_over_json() {
     let subject = format!("owner-{}", cuid2());
@@ -523,11 +523,10 @@ async fn crud_lifecycle_for_all_resources_over_json() {
         "a soft-deleted api-key must not appear in list"
     );
 
-    // Project + account hard delete. `project_id`/`account_id` above are this subject's/account's
-    // defaults (first-ever), which `model.Project.delete`/`deleteAccountPermanently` now correctly
-    // refuse (see `default_project_cannot_be_hard_deleted_only_suspended` /
-    // `default_account_cannot_be_hard_deleted_only_suspended` below) -- so hard-delete is exercised
-    // against a second, non-default project/account instead.
+    // Project hard delete. `project_id` above is this account's default (first-ever) project,
+    // which `model.Project.delete` now correctly refuses (see
+    // `default_project_cannot_be_hard_deleted_only_suspended` below) -- so hard-delete is
+    // exercised against a second, non-default project instead.
     let second_project_id = create_project(r, "admin", &account_id, "proj-2").await;
     let (status, _) = rpc_call(
         r.clone(),
@@ -539,16 +538,18 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
+    // Account hard delete. Unlike `Project`, `Account` carries no default-project-style
+    // protection at all post-ADR-0006 -- since `accounts.id` IS the caller's subject (one account
+    // = one person), a second `createAccount` for the same subject conflicts rather than minting
+    // a second, non-default account to delete instead (see
+    // `a_second_account_for_the_same_subject_is_refused`), so this deletes `account_id` itself.
     // Account deletion is owner-only and no longer the generic `model.Account.delete` verb
-    // (ADR-0005) -- `create_account` below seeds "admin" as owner of its own second account, same
-    // as it did for `account_id`, so this still succeeds.
-    let second_account_id =
-        create_account(r, "admin", &format!("tenant2-hard-delete-{}", cuid2())).await;
+    // (ADR-0005); "admin" is this account's owner.
     let (status, _) = rpc_call(
         r.clone(),
         "procedure.deleteAccountPermanently",
         Wire::Json,
-        &json!({ "args": { "accountId": second_account_id } }),
+        &json!({ "args": { "accountId": account_id } }),
         Some("admin"),
     )
     .await;
@@ -817,7 +818,6 @@ async fn list_projects_filtered_by_a_cuid2_account_id_is_accepted() {
     );
 }
 
-#[ignore = "tracked in #219 -- fails deterministically against a fresh DB, not flaky"]
 #[tokio::test]
 async fn crud_lifecycle_over_cbor() {
     let subject = format!("owner-cbor-{}", cuid2());
@@ -887,29 +887,17 @@ async fn crud_lifecycle_over_cbor() {
 
     // Account deletion is owner-only and no longer the generic `model.Account.delete` verb
     // (ADR-0005) -- the account's creator ("admin", the token subject used throughout this test)
-    // was seeded as "owner" by `createAccount`, so this still succeeds. `account_id` above is this
-    // subject's default (first-ever) account, which `deleteAccountPermanently` now correctly
-    // refuses (see `default_account_cannot_be_hard_deleted_only_suspended` below) -- exercised
-    // against a second, non-default account instead.
-    let (status, body) = rpc_call(
-        r.clone(),
-        "procedure.createAccount",
-        Wire::Cbor,
-        &json!({ "args": {} }),
-        Some("admin"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let second_account_id = Wire::Cbor.decode::<Value>(&body)["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
+    // was seeded as "owner" by `createAccount`, so this still succeeds. Unlike `Project`,
+    // `Account` carries no default-project-style undeletable-default protection post-ADR-0006
+    // (see `account_has_no_default_protection_and_is_freely_suspendable_and_hard_deletable`), and
+    // since `accounts.id` IS the caller's subject, a second `createAccount` call for the same
+    // "admin" subject would conflict rather than mint a second account (see
+    // `a_second_account_for_the_same_subject_is_refused`) -- so this deletes `account_id` itself.
     let (status, _) = rpc_call(
         r.clone(),
         "procedure.deleteAccountPermanently",
         Wire::Cbor,
-        &json!({ "args": { "accountId": second_account_id } }),
+        &json!({ "args": { "accountId": account_id } }),
         Some("admin"),
     )
     .await;
@@ -928,7 +916,12 @@ fn raw_cbor_create_project_with_undefined_allowed_models(
 ) -> Vec<u8> {
     let mut out = Vec::new();
     let mut e = minicbor::Encoder::new(&mut out);
-    e.map(6).unwrap();
+    // Seven fields, not six: ADR-0006 moved `billingIdentity` from `Account` onto `Project` and
+    // it is non-optional there (matches `codec_undefined_regression_tests.rs`'s
+    // `frontend_frame_with_undefined_allowed_models`, the real frontend's own wire shape) -- an
+    // omitted `billingIdentity` fails decode with the same generic "invalid request payload" this
+    // test is trying to prove is fixed for `allowedModels`, masking the real regression.
+    e.map(7).unwrap();
     e.str("id").unwrap();
     e.str(id).unwrap();
     e.str("accountId").unwrap();
@@ -943,6 +936,8 @@ fn raw_cbor_create_project_with_undefined_allowed_models(
     e.map(0).unwrap();
     e.str("billingPlan").unwrap();
     e.str("free").unwrap();
+    e.str("billingIdentity").unwrap();
+    e.str(&format!("bill-{}", cuid2())).unwrap();
     out
 }
 
@@ -975,7 +970,6 @@ async fn rpc_call_raw(
     (status, bytes.to_vec())
 }
 
-#[ignore = "tracked in #219 -- fails deterministically against a fresh DB, not flaky"]
 #[tokio::test]
 async fn cbor_project_create_accepts_the_frontends_undefined_allowed_models() {
     // Regression test for the prod-only "invalid_argument" / "invalid request payload" bug: the
@@ -1016,7 +1010,6 @@ async fn cbor_project_create_accepts_the_frontends_undefined_allowed_models() {
 // but cannot write.
 // ---------------------------------------------------------------------------------------------
 
-#[ignore = "tracked in #219 -- fails deterministically against a fresh DB, not flaky"]
 #[tokio::test]
 async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
     let admin_subject = format!("admin-{}", cuid2());
@@ -1024,7 +1017,14 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
     let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
         MapBearer::new()
             .with("admin", token_info(&admin_subject, admin_perms()))
-            .with("viewer", token_info(&viewer_subject, viewer_perms())),
+            .with("viewer", token_info(&viewer_subject, viewer_perms()))
+            .with(
+                "viewer-bootstrap",
+                token_info(
+                    &viewer_subject,
+                    [Permission::AccountCreate].into_iter().collect(),
+                ),
+            ),
     );
     let ctx = setup(bearer).await;
     let r = &ctx.router;
@@ -1032,7 +1032,20 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
     // Admin (all perms + creator membership) builds a tenant and adds the viewer as a member.
     let account_id = create_account(r, "admin", &format!("tenant-rbac-{}", cuid2())).await;
     let project_id = create_project(r, "admin", &account_id, "proj-rbac").await;
-    let (status, _) = rpc_call(
+    // `project_members.account_id` carries a real FK to `accounts` (ADR-0006 -- "a project member
+    // IS an account", migration `20260727000001_create_project_members.sql`), so the viewer must
+    // already have an account of their own before anyone can add them to a roster. In production
+    // this happens once, at account self-provisioning time (`account:create`); `viewer_perms()`
+    // deliberately excludes it (a pure viewer never mints an account of their own once created), so
+    // a one-off elevated bootstrap token creates it here, distinct from the read-only "viewer" token
+    // used for every assertion below.
+    let viewer_account_id = create_account(
+        r,
+        "viewer-bootstrap",
+        &format!("tenant-rbac-viewer-{}", cuid2()),
+    )
+    .await;
+    let (status, body) = rpc_call(
         r.clone(),
         "procedure.addProjectMember",
         Wire::Json,
@@ -1040,14 +1053,23 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
         Some("admin"),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "admin adds viewer as member");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "admin adds viewer as member: {}",
+        String::from_utf8_lossy(&body)
+    );
 
-    // Viewer (a legitimate member) may READ (gate + membership both pass) → 200.
+    // Viewer (a legitimate project member) may READ the project (gate + `members.some.accountId
+    // == auth().id` membership policy both pass) → 200. `Account.list` also passes the gate; per
+    // ADR-0006 (`@@allow("read", id == auth().id)` on `Account`, schema comment "no more
+    // membership/role concept") it is filtered to the caller's own account, so it still 200s
+    // (returning just the viewer's own row, not admin's) rather than being rejected outright.
     for (op, input) in [
-        ("model.Account.get", json!({ "id": account_id })),
         ("model.Project.get", json!({ "id": project_id })),
         ("model.Account.list", json!({})),
         ("model.Project.list", json!({})),
+        ("model.Account.get", json!({ "id": viewer_account_id })),
     ] {
         let (status, body) = rpc_call(r.clone(), op, Wire::Json, &input, Some("viewer")).await;
         assert_eq!(
@@ -1057,6 +1079,25 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
             String::from_utf8_lossy(&body)
         );
     }
+
+    // Project membership does NOT extend to reading the project's *owning account* — since
+    // ADR-0006 dropped account-level membership entirely, `Account` visibility is owner-only
+    // (`id == auth().id`), unlike `Project`'s `members.some.accountId == auth().id` clause. A
+    // member reading someone else's account gets the policy's uniform not-found, not a 200.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Account.get",
+        Wire::Json,
+        &json!({ "id": account_id }),
+        Some("viewer"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a project member must not be able to read the project's owning account: {}",
+        String::from_utf8_lossy(&body)
+    );
 
     // Viewer is blocked by the coarse RBAC gate (403) on every mutating op — even though membership
     // would otherwise permit it. This is the privilege-escalation regression under test.
@@ -1429,14 +1470,12 @@ async fn audit_rows_land_on_create_update_delete_for_an_audited_model() {
 // Section 3: idempotency replay under a repeated Idempotency-Key.
 // ---------------------------------------------------------------------------------------------
 
-#[ignore = "tracked in #219 -- fails deterministically against a fresh DB, not flaky"]
 #[tokio::test]
 async fn idempotent_replay_does_not_double_a_mutation() {
     let subject = format!("owner-idem-{}", cuid2());
     let ctx = setup(admin_bearer(&subject)).await;
     let r = &ctx.router;
 
-    let billing_id = format!("tenant-idem-{}", cuid2());
     let body = Wire::Json.encode(&json!({ "args": {} }));
     let idem_key = format!("idem-{}", cuid2());
 
@@ -1481,13 +1520,16 @@ async fn idempotent_replay_does_not_double_a_mutation() {
         "a replayed idempotent request must return the cached response, not re-create"
     );
 
-    // Exactly one account row exists for that (unique) billing identity — the mutation ran once.
-    let count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM accounts WHERE billing_identity = $1")
-            .bind(&billing_id)
-            .fetch_one(&ctx.verify)
-            .await
-            .unwrap();
+    // Exactly one account row exists for that id — the mutation ran once, not twice.
+    // `accounts` carries no `billing_identity` column (that moved to `projects` under
+    // ADR-0006 -- "billing_identity (unique -- 'who is paying' moved here from accounts, so one
+    // person can bill projects to different parties)"), so this checks DB state directly by the
+    // id the replayed create returned rather than a since-removed column.
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts WHERE id = $1")
+        .bind(&id1)
+        .fetch_one(&ctx.verify)
+        .await
+        .unwrap();
     assert_eq!(count, 1, "the mutation must have executed exactly once");
 }
 
@@ -1564,7 +1606,6 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
 /// forbidden write — against the *real*, fully-assembled router (`rpc_authorize` included, not the
 /// bare bypass router `batch_rpc_frames_succeed_and_fail_independently` uses above). Both frames must
 /// be authorized independently, against the same op-id -> permission map unary calls use.
-#[ignore = "tracked in #219 -- fails deterministically against a fresh DB, not flaky"]
 #[tokio::test]
 async fn batch_rpc_frames_enforce_permission_per_frame() {
     let admin_subject = format!("admin-batch-rbac-{}", cuid2());
@@ -1572,14 +1613,30 @@ async fn batch_rpc_frames_enforce_permission_per_frame() {
     let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
         MapBearer::new()
             .with("admin", token_info(&admin_subject, admin_perms()))
-            .with("viewer", token_info(&viewer_subject, viewer_perms())),
+            .with("viewer", token_info(&viewer_subject, viewer_perms()))
+            .with(
+                "viewer-bootstrap",
+                token_info(
+                    &viewer_subject,
+                    [Permission::AccountCreate].into_iter().collect(),
+                ),
+            ),
     );
     let ctx = setup(bearer).await;
     let r = &ctx.router;
 
     let account_id = create_account(r, "admin", &format!("tenant-batch-rbac-{}", cuid2())).await;
     let project_id = create_project(r, "admin", &account_id, "proj-batch-rbac").await;
-    let (status, _) = rpc_call(
+    // See `rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write`'s comment: the
+    // viewer needs an account of their own before `addProjectMember` can satisfy
+    // `project_members.account_id`'s FK to `accounts` (ADR-0006).
+    let _viewer_account_id = create_account(
+        r,
+        "viewer-bootstrap",
+        &format!("tenant-batch-rbac-viewer-{}", cuid2()),
+    )
+    .await;
+    let (status, body) = rpc_call(
         r.clone(),
         "procedure.addProjectMember",
         Wire::Json,
@@ -1587,7 +1644,12 @@ async fn batch_rpc_frames_enforce_permission_per_frame() {
         Some("admin"),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "admin adds viewer as member");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "admin adds viewer as member: {}",
+        String::from_utf8_lossy(&body)
+    );
 
     let batch = json!([
         { "id": 1, "op": "model.Project.get", "input": { "id": project_id } },
@@ -1676,67 +1738,33 @@ async fn create_account_seeds_membership_enabling_project_create() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Section 4: the default account/project (the one `createAccount` / the account's first project
-// seed) can be suspended but never hard-deleted -- a second account/project stays freely
-// deletable. Prevents a tenant from accidentally deleting their only account/project and losing
-// every API key underneath it.
+// Section 4: the default *project* (an account's first-ever project) can be suspended but never
+// hard-deleted -- a second project stays freely deletable. Prevents a tenant from accidentally
+// deleting their only project and losing every API key underneath it.
+//
+// There is a sibling concept for *accounts* pre-ADR-0006 -- see the now-corrected
+// `account_has_no_default_protection_and_is_freely_suspendable_and_hard_deletable` below, which
+// used to assert an "undeletable default account," a concept ADR-0006 removed on purpose: once
+// `accounts.id` IS the caller's subject (one account = one person), there is no longer a second,
+// non-default account for that subject to compare against, so "default" stopped being a
+// meaningful distinction for `Account` -- only `Project` keeps it (an account can still have
+// several projects). The `Account` model in `authz.cstack` has no `isDefault` field and no
+// `@@allow("delete", ...)` restriction at all; its own comment says so explicitly.
 // ---------------------------------------------------------------------------------------------
 
-#[ignore = "tracked in #219 -- fails deterministically against a fresh DB, not flaky"]
 #[tokio::test]
-async fn default_account_cannot_be_hard_deleted_only_suspended() {
+async fn account_has_no_default_protection_and_is_freely_suspendable_and_hard_deletable() {
     let subject = format!("owner-default-acct-{}", cuid2());
     let ctx = setup(admin_bearer(&subject)).await;
     let r = &ctx.router;
 
-    // This subject's first-ever account -- is_default is computed true server-side.
+    // This subject's one-and-only account (ADR-0006: `accounts.id` IS the subject, so a second
+    // `createAccount` for the same subject conflicts -- see
+    // `a_second_account_for_the_same_subject_is_refused`). `Account` carries no `isDefault`
+    // field at all (unlike `Project`), so there is nothing to assert about default-ness here.
     let account_id = create_account(r, "admin", &format!("tenant-default-{}", cuid2())).await;
 
-    let (status, body) = rpc_call(
-        r.clone(),
-        "model.Account.get",
-        Wire::Json,
-        &json!({ "id": account_id }),
-        Some("admin"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        json_body(&body)["isDefault"],
-        true,
-        "the account created for a brand-new subject must be marked default"
-    );
-
-    let (status, body) = rpc_call(
-        r.clone(),
-        "procedure.deleteAccountPermanently",
-        Wire::Json,
-        &json!({ "args": { "accountId": account_id } }),
-        Some("admin"),
-    )
-    .await;
-    assert!(
-        !status.is_success(),
-        "deleting the default account must be refused (got {status}: {})",
-        String::from_utf8_lossy(&body)
-    );
-
-    // Still there.
-    let (status, _) = rpc_call(
-        r.clone(),
-        "model.Account.get",
-        Wire::Json,
-        &json!({ "id": account_id }),
-        Some("admin"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the default account must survive the refused delete"
-    );
-
-    // Suspend still works on it.
+    // Suspend works on it.
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.disableAccount",
@@ -1748,40 +1776,25 @@ async fn default_account_cannot_be_hard_deleted_only_suspended() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "the default account must still be suspendable: {}",
+        "the account must be suspendable: {}",
         String::from_utf8_lossy(&body)
     );
     assert_eq!(json_body(&body)["status"], "suspended");
 
-    // A second account for the SAME subject is NOT default, and stays freely deletable.
-    let second_account_id =
-        create_account(r, "admin", &format!("tenant-default-2nd-{}", cuid2())).await;
-    let (status, body) = rpc_call(
-        r.clone(),
-        "model.Account.get",
-        Wire::Json,
-        &json!({ "id": second_account_id }),
-        Some("admin"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        json_body(&body)["isDefault"],
-        false,
-        "a subject's second account must not be marked default"
-    );
+    // ...and, unlike a default *project*, hard delete is never refused for an account -- there is
+    // no undeletable-default concept at the account level post-ADR-0006.
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.deleteAccountPermanently",
         Wire::Json,
-        &json!({ "args": { "accountId": second_account_id } }),
+        &json!({ "args": { "accountId": account_id } }),
         Some("admin"),
     )
     .await;
     assert_eq!(
         status,
         StatusCode::OK,
-        "a non-default account must still be hard-deletable: {}",
+        "an account's own sole account must still be hard-deletable, suspended or not: {}",
         String::from_utf8_lossy(&body)
     );
 }
