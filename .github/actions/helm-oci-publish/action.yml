@@ -38,6 +38,42 @@ runs:
         echo "${GITHUB_TOKEN}" | helm registry login "${{ inputs.registry }}" \
           --username "${{ github.actor }}" --password-stdin
 
+    - name: Refuse to republish an already-published chart version
+      shell: bash
+      env:
+        CHARTS_DIR: ${{ inputs.charts-dir }}
+        REGISTRY: ${{ inputs.registry }}
+        OWNER: ${{ inputs.repository-owner }}
+      run: |
+        set -euo pipefail
+
+        owner="$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')"
+        oci_repo="oci://${REGISTRY}/${owner}/charts"
+        failed=0
+
+        for chart in "${CHARTS_DIR}"/*/; do
+          [ -f "${chart}Chart.yaml" ] || continue
+          name="$(awk -F'[[:space:]]*:[[:space:]]*' '/^name:/{print $2; exit}' "${chart}Chart.yaml")"
+          version="$(awk -F'[[:space:]]*:[[:space:]]*' '/^version:/{print $2; exit}' "${chart}Chart.yaml")"
+          ref="${oci_repo}/${name}"
+
+          echo "Checking whether ${name}:${version} is already published at ${ref} ..."
+          if error_output="$(helm show chart "${ref}" --version "${version}" 2>&1 >/dev/null)"; then
+            echo "::error::Chart '${name}' version '${version}' is already published at ${ref}:${version}. Refusing to overwrite an already-published chart version — bump 'version' (and 'appVersion' if applicable) in ${chart}Chart.yaml before publishing."
+            failed=1
+          elif echo "${error_output}" | grep -qiE "not found|404|manifest unknown|NAME_UNKNOWN|NAME_INVALID"; then
+            echo "OK: ${name}:${version} is not yet published."
+          else
+            echo "::error::Could not verify registry state for ${ref}:${version}: ${error_output}"
+            failed=1
+          fi
+        done
+
+        if [ "${failed}" -ne 0 ]; then
+          echo "::error::One or more charts failed the pre-publish version check — see above. No charts were pushed."
+          exit 1
+        fi
+
     - name: Package and push charts
       shell: bash
       env:
