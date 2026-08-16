@@ -16,9 +16,9 @@
 //! genuine RPC call would take past `rpc_authorize` and cratestack's own dispatch.
 //!
 //! No Redis needed here despite the new `SpendReader` dependency `RefillService` now carries:
-//! `UnavailableSpendReader` (no usage-events database, no network of any kind) stands in, which is
-//! also what a real deployment falls back to when `Config.usage_database` is not configured -- see
-//! that type's own doc comment in `lightbridge-authz-budget`. The seeded default policy
+//! `UnavailableSpendReader` (no HTTP calls, no network of any kind) stands in, which is also what
+//! a real deployment falls back to when `Config.usage_service` is not configured -- see that
+//! type's own doc comment in `lightbridge-authz-budget`. The seeded default policy
 //! (`budget-policy-v1`, migrated by `migrations/20260804000001_budget_policy_sets_and_revisions.sql`)
 //! only reads `self_service_grant_count`, never `spend_this_period`/`spend_last_period`, so
 //! `Spend::Unavailable` never actually changes any outcome in this file -- it is simply the

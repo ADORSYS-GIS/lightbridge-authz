@@ -25,13 +25,17 @@ pub struct Config {
     /// still loads.
     #[serde(default)]
     pub redis: Option<Redis>,
-    /// Connection to the usage-events database (`lightbridge_authz_usage`, Timescale-compatible;
-    /// see `lightbridge-authz-usage`'s own `database.url`), used by the budget domain's spend
-    /// adapter to read `usage_events.total_cost` directly rather than calling the usage service's
-    /// own (unprotected) query API. Optional, like `redis` above: only the budget domain's spend
-    /// reads need it, so a config file that omits it entirely still loads.
+    /// HTTP client config for calling `lightbridge-authz-usage`'s `/usage/v1/spend/query`
+    /// endpoint, used by the budget domain's `UsageServiceSpendReader`
+    /// (`crates/lightbridge-authz-budget/src/spend.rs`) to read `usage_events.total_cost` sums
+    /// without either service reaching into the other's database directly. Unauthenticated today
+    /// (no Basic auth, no mTLS yet — see `UsageServiceSpendReader`'s own doc comment for that
+    /// deliberate, tracked-as-a-follow-up tradeoff). Optional, like `redis` above: only the
+    /// budget domain's spend reads need it, so a config file that omits it entirely still loads
+    /// (and budget refill spend facts report `Spend::Unavailable`, per `UnavailableSpendReader`'s
+    /// doc comment).
     #[serde(default)]
-    pub usage_database: Option<Database>,
+    pub usage_service: Option<UsageServiceClient>,
     pub oauth2: Oauth2,
     pub otel: Otel,
     /// Billing plans a caller may attach to an API key at creation time. The catalogue is defined
@@ -320,7 +324,7 @@ pub struct Server {
     pub opa: OpaServer,
     /// `authz-idp`'s server block (ADR-0012 Phase 1): address/port/TLS for the OIDC broker
     /// service that carries discovery/JWKS/token-exchange off `authz-api`. Optional, like
-    /// `redis`/`usage_database` above — `authz-api`, `authz-opa`, `lightbridge-mcp`, and the
+    /// `redis`/`usage_service` above — `authz-api`, `authz-opa`, `lightbridge-mcp`, and the
     /// usage service all load this same `Config` type but never read this field, so a config
     /// file written before `authz-idp` existed keeps loading unchanged. Only `Commands::Idp`
     /// requires it to be `Some`, and fails fast with a clear error at startup if it is missing
@@ -390,6 +394,33 @@ pub struct Logging {
 pub struct Database {
     pub url: String,
     pub pool_size: Option<u32>,
+}
+
+/// HTTP client config for `lightbridge-authz-budget`'s `UsageServiceSpendReader` to call
+/// `lightbridge-authz-usage`'s `/usage/v1/spend/query` endpoint. See `Config::usage_service`'s
+/// doc comment for why this replaced a direct database connection. Carries no credential —
+/// this call is unauthenticated today (no Basic auth, no mTLS yet); see
+/// `UsageServiceSpendReader`'s own doc comment for the deliberate security-posture tradeoff and
+/// the follow-up tracking mTLS.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageServiceClient {
+    /// Base URL of the usage service, e.g. `https://authz-usage:3002`. A trailing slash is
+    /// stripped if present.
+    pub base_url: String,
+    /// Skip TLS certificate verification when calling the usage service. Local Compose serves
+    /// every authz service over a self-signed certificate (see `AGENTS.md`'s Security Notes), so
+    /// a client that verifies certificates strictly can never reach it there. Defaults to
+    /// `false` — production deployments terminate real (e.g. cert-manager-issued) certificates
+    /// and must never set this.
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+    /// Per-request timeout in milliseconds. Defaults to 5000 (5s).
+    #[serde(default = "default_usage_service_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_usage_service_timeout_ms() -> u64 {
+    5_000
 }
 
 /// Redis connection settings. `url` is a standard `redis://[:password@]host:port[/db]`
@@ -854,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn config_without_redis_or_usage_database_still_loads() {
+    fn config_without_redis_or_usage_service_still_loads() {
         let yaml = "\
 server:
   api:
@@ -884,9 +915,9 @@ otel:
   otlp_endpoint: \"http://localhost:4317\"
   service_name: \"svc\"
 ";
-        let cfg: Config = from_str(yaml).expect("config omitting redis/usage_database must load");
+        let cfg: Config = from_str(yaml).expect("config omitting redis/usage_service must load");
         assert!(cfg.redis.is_none());
-        assert!(cfg.usage_database.is_none());
+        assert!(cfg.usage_service.is_none());
         assert!(
             cfg.server.idp.is_none(),
             "a config file written before authz-idp existed must keep loading, with idp unset"
@@ -939,7 +970,7 @@ otel:
     }
 
     #[test]
-    fn config_with_usage_database_parses_it() {
+    fn config_with_usage_service_parses_it() {
         let yaml = "\
 server:
   api:
@@ -961,9 +992,10 @@ logging:
   level: \"info\"
 database:
   url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz\"
-usage_database:
-  url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz_usage\"
-  pool_size: 5
+usage_service:
+  base_url: \"https://authz-usage:3002\"
+  insecure_skip_verify: true
+  timeout_ms: 2500
 oauth2:
   type: self
   jwks_url: \"http://localhost/jwks\"
@@ -972,12 +1004,49 @@ otel:
   otlp_endpoint: \"http://localhost:4317\"
   service_name: \"svc\"
 ";
-        let cfg: Config = from_str(yaml).expect("config with usage_database must load");
-        let usage_db = cfg.usage_database.expect("usage_database must be set");
-        assert_eq!(
-            usage_db.url,
-            "postgres://postgres:postgres@localhost:5432/lightbridge_authz_usage"
-        );
-        assert_eq!(usage_db.pool_size, Some(5));
+        let cfg: Config = from_str(yaml).expect("config with usage_service must load");
+        let usage_service = cfg.usage_service.expect("usage_service must be set");
+        assert_eq!(usage_service.base_url, "https://authz-usage:3002");
+        assert!(usage_service.insecure_skip_verify);
+        assert_eq!(usage_service.timeout_ms, 2500);
+    }
+
+    #[test]
+    fn config_with_usage_service_defaults_insecure_skip_verify_and_timeout() {
+        let yaml = "\
+server:
+  api:
+    address: \"0.0.0.0\"
+    port: 3000
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+  opa:
+    address: \"0.0.0.0\"
+    port: 3001
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+    basic_auth:
+      username: \"u\"
+      password: \"p\"
+logging:
+  level: \"info\"
+database:
+  url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz\"
+usage_service:
+  base_url: \"https://authz-usage:3002\"
+oauth2:
+  type: self
+  jwks_url: \"http://localhost/jwks\"
+otel:
+  enabled: true
+  otlp_endpoint: \"http://localhost:4317\"
+  service_name: \"svc\"
+";
+        let cfg: Config = from_str(yaml).expect("config with usage_service must load");
+        let usage_service = cfg.usage_service.expect("usage_service must be set");
+        assert!(!usage_service.insecure_skip_verify);
+        assert_eq!(usage_service.timeout_ms, 5_000);
     }
 }

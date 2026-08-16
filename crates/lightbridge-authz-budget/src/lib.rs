@@ -41,5 +41,5 @@ pub use rule_data::{
     validate_rule_data,
 };
 pub use source::GrantSource;
-pub use spend::{Spend, SpendReader, TimescaleSpendReader, UnavailableSpendReader};
+pub use spend::{Spend, SpendReader, UnavailableSpendReader, UsageServiceSpendReader};
 pub use tier::BudgetTier;

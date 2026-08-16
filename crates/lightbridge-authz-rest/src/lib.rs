@@ -3,10 +3,10 @@ use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
     RotateApiKey, async_trait,
     config::{
-        ApiServer, BasicAuth, Billing, Database, IdpServer, Oauth2, OauthClientType, OpaServer,
-        Redis,
+        ApiServer, BasicAuth, Billing, IdpServer, Oauth2, OauthClientType, OpaServer, Redis,
+        UsageServiceClient,
     },
-    db::{DbPool, DbPoolTrait, is_database_ready},
+    db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
     server::{dev_cors_enabled, serve_tls},
 };
@@ -1837,7 +1837,7 @@ pub async fn start_api_server(
     oauth2: &Oauth2,
     billing: &Billing,
     redis: &Option<Redis>,
-    usage_database: &Option<Database>,
+    usage_service: &Option<UsageServiceClient>,
 ) -> Result<()> {
     billing.validate()?;
     oauth2.rbac.validate()?;
@@ -1863,16 +1863,23 @@ pub async fn start_api_server(
     // activated at runtime takes effect for refills immediately, with no restart, exactly as it
     // already does for `simulateBudgetPolicy`'s sibling procedures.
     //
-    // `usage_database` (`Config.usage_database`) is optional -- see that field's own doc comment.
+    // `usage_service` (`Config.usage_service`) is optional -- see that field's own doc comment.
     // When it is not configured, this degrades to `UnavailableSpendReader` rather than failing
     // server startup: every spend-dependent policy fact then reads `Spend::Unavailable`, which
     // the rule-data evaluator already treats as a fail-closed signal (routes to `manual_review`,
     // never `auto_approve` -- see `UnavailableSpendReader`'s own doc comment for the full
     // reasoning). Choosing to degrade rather than hard-fail (unlike `policy_store` above, which
-    // DOES fail startup loudly on a bad load) is deliberate: a missing `usage_database` narrows
+    // DOES fail startup loudly on a bad load) is deliberate: a missing `usage_service` narrows
     // what self-service refill can decide automatically, it does not make the RPC surface
-    // unsafe to serve -- so a deployment that has not wired up the usage-events database yet can
-    // still start, just with every refill routing to manual review until it does.
+    // unsafe to serve -- so a deployment that has not wired up the usage service yet can still
+    // start, just with every refill routing to manual review until it does. When it IS
+    // configured, `UsageServiceSpendReader` calls the usage service's `/usage/v1/spend/query`
+    // over HTTP instead of opening a second database connection (see
+    // `crates/lightbridge-authz-budget/src/spend.rs`'s module doc comment for why); every way
+    // that HTTP call can fail -- unreachable, timeout, non-2xx, unparseable body -- also resolves
+    // to `Spend::Unavailable`, never a hard error, so a flaky or down usage service degrades
+    // refill decisions the same way a missing config does, rather than failing this server's own
+    // requests.
     let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
         pool.clone(),
     ));
@@ -1880,21 +1887,20 @@ pub async fn start_api_server(
         pool.clone(),
     ));
     let policy_engine: Arc<dyn lightbridge_authz_budget::PolicyEngine> = policy_store.engine();
-    let spend_reader: Arc<dyn lightbridge_authz_budget::SpendReader> = match usage_database {
-        Some(usage_db) => {
-            let usage_pool: Arc<dyn DbPoolTrait> =
-                Arc::new(DbPool::new(usage_db).await.map_err(|e| {
-                    Error::Server(format!(
-                        "failed to open usage database pool for budget spend reads: {e}"
-                    ))
-                })?);
-            Arc::new(lightbridge_authz_budget::TimescaleSpendReader::new(
-                usage_pool,
-            ))
-        }
+    let spend_reader: Arc<dyn lightbridge_authz_budget::SpendReader> = match usage_service {
+        Some(usage_service) => Arc::new(
+            lightbridge_authz_budget::UsageServiceSpendReader::new(
+                usage_service.base_url.clone(),
+                usage_service.insecure_skip_verify,
+                std::time::Duration::from_millis(usage_service.timeout_ms),
+            )
+            .map_err(|e| {
+                Error::Server(format!("failed to build usage-service spend reader: {e}"))
+            })?,
+        ),
         None => {
             tracing::warn!(
-                "usage_database is not configured -- budget refill spend facts will report \
+                "usage_service is not configured -- budget refill spend facts will report \
                  Unavailable, and self-service refill decisions that depend on them will fail \
                  closed to manual review"
             );

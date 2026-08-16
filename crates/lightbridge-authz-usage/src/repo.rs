@@ -97,6 +97,36 @@ impl StoreRepo {
             .map_err(|_| Error::Database("rows_affected overflowed usize".to_string()))
     }
 
+    /// Sums `usage_events.total_cost` for one account over a half-open `[start, end)` interval.
+    /// This is the exact query `lightbridge-authz-budget`'s (now-removed) `TimescaleSpendReader`
+    /// ran directly against this same table before the spend-query dependency was inverted onto
+    /// this HTTP endpoint -- see `crates/lightbridge-authz-budget/src/spend.rs`. `None` means SQL
+    /// `SUM` over zero matching rows (`NULL`), never collapsed to `0.0` here: that distinction is
+    /// load-bearing for the budget domain's `Spend::Known`/`Spend::Unavailable` split.
+    #[instrument(skip(self))]
+    pub async fn spend_for_account(
+        &self,
+        account_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Option<f64>> {
+        debug!(
+            "querying spend for account_id={} start={} end={}",
+            account_id, start, end
+        );
+        let total_cost: Option<f64> = sqlx::query_scalar::<_, Option<f64>>(
+            "SELECT SUM(total_cost)::double precision FROM usage_events \
+             WHERE account_id = $1 AND observed_at >= $2 AND observed_at < $3",
+        )
+        .bind(account_id)
+        .bind(start)
+        .bind(end)
+        .fetch_one(self.pool())
+        .await?;
+
+        Ok(total_cost)
+    }
+
     #[instrument(skip(self))]
     pub async fn query_usage(&self, input: &UsageQueryRequest) -> Result<Vec<UsageSeriesPoint>> {
         debug!(

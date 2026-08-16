@@ -58,14 +58,23 @@ out separately where it differs.
 | `oauth2.clients[].allowed_audiences` | `Vec<String>` | default empty | Downstream `audience` values this client may request; unrequested `aud`/`azp` default to the client's own `client_id` | Requesting an unlisted audience is rejected |
 | `oauth2.clients[].jwks` | `Option<serde_json::Value>` | default `None` | Inline JWK Set verifying a `confidential` client's `private_key_jwt` assertions | **Required for `confidential`**, ignored for `public` |
 
-### `database.*` / `usage_database.*`
+### `database.*` / `usage_service.*`
 
 | YAML path | Rust type | Required / default | Controls | Breaks when unset/wrong |
 |---|---|---|---|---|
 | `database.url` | `String` | **Required** | Main Postgres connection (accounts/projects/api_keys/budget tables) | Every server fails to start |
 | `database.pool_size` | `Option<u32>` | default `None` (pool default) | Connection pool size | — |
-| `usage_database` | `Option<Database>` | default `None` (`config/mod.rs:33-34`) | Connection to the Timescale-backed usage-events DB, read by the budget domain's spend adapter (`usage_events.total_cost`) rather than calling the usage service's own unauthenticated query API | Absent → budget spend reads that need it are unavailable; config still loads fine otherwise (`config_without_redis_or_usage_database_still_loads` test, `config/mod.rs:818-852`) |
-| `usage_database.url` / `.pool_size` | same as `database.*` | — | — | — |
+| `usage_service` | `Option<UsageServiceClient>` | default `None` (`config/mod.rs:34`) | HTTP client (base URL only — **unauthenticated**, see below) for the budget domain's `UsageServiceSpendReader` to call the usage service's `/usage/v1/spend/query` endpoint | Absent → budget spend reads report `Spend::Unavailable` (fails closed to manual review); config still loads fine otherwise (`config_without_redis_or_usage_service_still_loads` test) |
+| `usage_service.base_url` | `String` | required if `usage_service` is set | Usage service origin, e.g. `https://authz-usage:3002` | Wrong host/port → every spend read fails closed to `Spend::Unavailable` (connection refused/DNS failure), not an error |
+| `usage_service.insecure_skip_verify` | `bool` | default `false` | Skip TLS cert verification — only ever `true` in local Compose, where the usage service serves a self-signed cert | Left `false` against a self-signed deployment → every spend read fails closed (TLS handshake failure treated as unreachable) |
+| `usage_service.timeout_ms` | `u64` | default `5000` | Per-request timeout for the spend-query call | A usage service that's merely slow (not down) still fails closed to `Spend::Unavailable` once this elapses |
+
+**No credential field exists on `usage_service` — this call is deliberately unauthenticated.**
+mTLS is the intended service-to-service auth mechanism for this call (and for the pre-existing
+`/usage/v1/usage/query`), tracked as a follow-up rather than added here as interim Basic-auth
+scaffolding. Safe only because `lightbridge-authz-usage` is ClusterIP-only with no ingress in
+every real deployment — see `AGENTS.md`'s Security Notes and `docs/architecture/budget.md`'s
+"Spend dependency" section for the explicit statement of that risk.
 
 ### Env-var interpolation (`interpolate_env_vars`, `config/mod.rs:607-639`)
 

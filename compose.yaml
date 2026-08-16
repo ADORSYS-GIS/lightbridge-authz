@@ -168,6 +168,13 @@ services:
         condition: service_completed_successfully
       authz-tls:
         condition: service_started
+      # Budget refill spend facts call authz-usage's /usage/v1/spend/query over HTTP (see
+      # .docker/authz/container.yaml's usage_service block) -- wait for it to be healthy so
+      # authz-api doesn't start racing a usage service that isn't listening yet. Not a hard
+      # requirement for authz-api to start at all (usage_service degrades to Spend::Unavailable
+      # when unreachable), just for avoiding a spurious warm-up failure window.
+      authz-usage:
+        condition: service_healthy
     deploy:
       replicas: 1
       resources:

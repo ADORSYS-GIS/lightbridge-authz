@@ -1,4 +1,5 @@
 use axum::{Json, Router, http::StatusCode, routing::get};
+use chrono::{DateTime, Utc};
 use lightbridge_authz_core::{
     Result, async_trait,
     config::Database,
@@ -29,6 +30,12 @@ struct RootResponse {
     message: String,
 }
 
+/// No auth gate on this state -- `/usage/v1/spend/query` is unauthenticated, same as every other
+/// route this server serves. Safe only because the usage service is ClusterIP-only with no
+/// ingress (see `AGENTS.md`'s Security Notes and `docs/architecture/budget.md`'s "Spend
+/// dependency" section for the explicit statement of that risk). mTLS between `authz-api`/the
+/// budget domain and this service is tracked as a follow-up -- see the PR that introduced this
+/// endpoint for the tracking issue.
 pub struct UsageState {
     pub repo: Arc<dyn UsageRepoTrait>,
 }
@@ -37,6 +44,12 @@ pub struct UsageState {
 pub trait UsageRepoTrait: Send + Sync {
     async fn insert_usage_events(&self, events: &[UsageEvent]) -> Result<usize>;
     async fn query_usage(&self, input: &UsageQueryRequest) -> Result<Vec<UsageSeriesPoint>>;
+    async fn spend_for_account(
+        &self,
+        account_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Option<f64>>;
 }
 
 #[async_trait]
@@ -47,6 +60,15 @@ impl UsageRepoTrait for StoreRepo {
 
     async fn query_usage(&self, input: &UsageQueryRequest) -> Result<Vec<UsageSeriesPoint>> {
         StoreRepo::query_usage(self, input).await
+    }
+
+    async fn spend_for_account(
+        &self,
+        account_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Option<f64>> {
+        StoreRepo::spend_for_account(self, account_id, start, end).await
     }
 }
 
@@ -76,6 +98,7 @@ pub fn build_usage_router(
                 .url("/usage/v1/usage/openapi.json", UsageDoc::openapi()),
         )
         .merge(routers::usage_router())
+        .merge(routers::spend_router())
         .with_state(state);
 
     if dev_cors {
@@ -134,7 +157,8 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
         crate::handlers::ingest::ingest_traces,
         crate::handlers::ingest::ingest_metrics,
         crate::handlers::ingest::ingest_logs,
-        crate::handlers::query::query_usage
+        crate::handlers::query::query_usage,
+        crate::handlers::spend::query_spend
     ),
     components(
         schemas(
@@ -145,12 +169,15 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
             crate::models::UsageQueryFilters,
             crate::models::UsageSeriesPoint,
             crate::models::UsageScope,
-            crate::models::UsageGroupBy
+            crate::models::UsageGroupBy,
+            crate::models::SpendQueryRequest,
+            crate::models::SpendQueryResponse
         )
     ),
     tags(
         (name = "ingest", description = "OTEL ingest endpoints"),
-        (name = "usage", description = "Timeseries usage query endpoint")
+        (name = "usage", description = "Timeseries usage query endpoint"),
+        (name = "spend", description = "Internal spend-query endpoint used by the budget domain (unauthenticated, like the rest of this server -- see AGENTS.md's Security Notes)")
     )
 )]
 struct UsageDoc;
@@ -187,6 +214,10 @@ mod tests {
         assert!(
             paths.contains_key("/v1/otel/logs"),
             "expected logs ingest endpoint in openapi paths"
+        );
+        assert!(
+            paths.contains_key("/usage/v1/spend/query"),
+            "expected spend query endpoint in openapi paths"
         );
     }
 

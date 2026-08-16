@@ -1884,6 +1884,15 @@ mod tests {
             ) -> Result<Vec<crate::models::UsageSeriesPoint>> {
                 Ok(vec![])
             }
+
+            async fn spend_for_account(
+                &self,
+                _account_id: &str,
+                _start: chrono::DateTime<chrono::Utc>,
+                _end: chrono::DateTime<chrono::Utc>,
+            ) -> Result<Option<f64>> {
+                Ok(None)
+            }
         }
 
         let state = crate::UsageState {
