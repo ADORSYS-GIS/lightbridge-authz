@@ -31,6 +31,16 @@ server:
     tls:
       cert_path: "${IDP_TLS_CERT_PATH:-/tls/idp.crt}"
       key_path: "${IDP_TLS_KEY_PATH:-/tls/idp.key}"
+  # authz-budget: the budget-domain microservice carrying every budget:*-gated RPC procedure off
+  # authz-api (hard cutover, not a transitional duplication like idp above -- see
+  # docs/architecture/budget.md). Its RPC surface is mounted under a fixed /budget prefix
+  # (/budget/rpc/<op_id>), not the configurable rpc_base_path authz-api uses.
+  budget:
+    address: "0.0.0.0"
+    port: 3005
+    tls:
+      cert_path: "${BUDGET_TLS_CERT_PATH:-/tls/budget.crt}"
+      key_path: "${BUDGET_TLS_KEY_PATH:-/tls/budget.key}"
 logging:
   level: "info"
 database:

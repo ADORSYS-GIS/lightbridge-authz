@@ -3,7 +3,9 @@ mod utils;
 
 use clap::Parser;
 use lightbridge_authz_core::Result;
-use lightbridge_authz_rest::{start_api_server, start_idp_server, start_opa_server};
+use lightbridge_authz_rest::{
+    start_api_server, start_budget_server, start_idp_server, start_opa_server,
+};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
@@ -30,6 +32,7 @@ async fn main() -> Result<()> {
         Some(Commands::Api { config_path }) => Some(config_path),
         Some(Commands::Opa { config_path }) => Some(config_path),
         Some(Commands::Idp { config_path }) => Some(config_path),
+        Some(Commands::Budget { config_path }) => Some(config_path),
         Some(Commands::Migrate { config_path }) => Some(config_path),
         Some(Commands::Config { config_path }) => Some(config_path),
         None => None,
@@ -141,6 +144,30 @@ async fn main() -> Result<()> {
                 )
             })?;
             start_idp_server(idp, pool, &config.oauth2, &config.redis).await?;
+            Ok(())
+        }
+        Some(Commands::Budget { config_path }) => {
+            info!("{}", BANNER);
+
+            let config = load_from_path(&config_path)?;
+
+            info!("Connecting to DB...");
+            let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(&config.database).await?);
+
+            let budget = config.server.budget.as_ref().ok_or_else(|| {
+                lightbridge_authz_core::Error::Server(
+                    "server.budget config is required to run the budget command".to_string(),
+                )
+            })?;
+            start_budget_server(
+                budget,
+                pool,
+                &config.oauth2,
+                &config.billing,
+                &config.redis,
+                &config.usage_service,
+            )
+            .await?;
             Ok(())
         }
         Some(Commands::Migrate { config_path }) => {

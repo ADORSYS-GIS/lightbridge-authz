@@ -9,7 +9,9 @@ writing, the code wins — see "Corrections to prior docs" at the end.
 ## `authz-api`
 
 **Responsibility:** account/project/API-key CRUD, native OAuth2/OIDC token issuance (self-signed
-JWT mode), RFC 8693 token exchange, RFC 7009 revocation, and the budget domain's RPC procedures.
+JWT mode), RFC 8693 token exchange, and RFC 7009 revocation. The budget domain's RPC procedures
+moved off this service onto `authz-budget` (hard cutover, not a transitional duplication) — see
+below.
 **Owns:** the `authz` Postgres database (all tables), plus Redis for rate limiting, request
 idempotency, and `private_key_jwt` replay tracking.
 
@@ -22,25 +24,61 @@ Router assembly: `build_api_router` in `crates/lightbridge-authz-rest/src/lib.rs
 | `/.well-known/jwks.json` | GET | none | Same gate as above. |
 | `/oauth2/token` | POST | none (credential is the presented token) | RFC 8693 token exchange + `refresh_token` grant. Only mounted when `token_exchange.enabled`. `project_id` is an optional form param — the caller's default project resolves when omitted. |
 | `/oauth2/revoke` | POST | none (credential is the presented token) | RFC 7009. Live and functional the moment the router is merged, but absent from `/.well-known/openid-configuration` — `authkestra-op`'s `OidcDiscovery` has no `revocation_endpoint` field yet (upstream issue filed, see `signing.rs`). |
-| `/rpc/{op_id}` | POST | Bearer JWT, then `rpc_authorize` RBAC gate, then cratestack's own per-model `@@allow` | The generated CRUD surface (accounts, projects, api-keys, project members) plus every hand-written procedure below. |
-| `/rpc/batch` | POST | same as above, per-frame | Batched RPC calls; each frame is authorized individually (#165). |
+| `/rpc/{op_id}` | POST | Bearer JWT, then `rpc_authorize` RBAC gate (`RpcScope::Crud`), then cratestack's own per-model `@@allow` | The generated CRUD surface (accounts, projects, api-keys, project members) plus the hand-written procedures below. Any `budget:*`-gated op-id 404s here — moved to `authz-budget`. |
+| `/rpc/batch` | POST | same as above, per-frame | Batched RPC calls; each frame is authorized individually (#165), including the out-of-scope check — a batch frame aimed at a budget op-id 404s too (`CratestackAuthProvider::authenticate`, not merely the outer gate). |
 
 Hand-written procedures reachable only via `/rpc/{op_id}` (not cratestack-generated —
 `crates/lightbridge-authz-api/schema/authz.cstack` declares them, `Procedures` in
 `crates/lightbridge-authz-rest/src/lib.rs` implements them):
 
-- Budget domain: `activateBudgetPolicy`, `getBudgetPolicyStatus`, `simulateBudgetPolicy`,
-  `requestBudgetRefill`, `listPendingAugmentationRequests`, `approveAugmentationRequest`,
-  `rejectAugmentationRequest` — see [`budget.md`](./budget.md).
 - Session revocation: `revokeOwnSessions` (self-service "log out everywhere," no subject field on
   the input — structurally incapable of targeting anyone else), `revokeSubjectSessions` (admin
   offboarding kill switch, gated on `session:revoke`) — see [`auth-flows.md`](./auth-flows.md) and
   [`../rbac.md`](../rbac.md).
 
 `build_api_router`'s outermost layer on the RPC surface is `rpc_authorize::rpc_authorize` —
-rejected there with `403` before the request consumes idempotency/rate-limit budget or reaches
-cratestack's own membership `@@allow` dispatch (comment at `lib.rs:1272-1277`). The wire codec is
-CBOR-primary/JSON-secondary in production, JSON-only in dev/CI (`AGENTS.md`, `server.api.codec`).
+rejected there with `403`/`404` before the request consumes idempotency/rate-limit budget or
+reaches cratestack's own membership `@@allow` dispatch. The wire codec is CBOR-primary/JSON-
+secondary in production, JSON-only in dev/CI (`AGENTS.md`, `server.api.codec`).
+
+## `authz-budget`
+
+**Responsibility:** the budget domain's RPC procedures — policy lifecycle, self-service refill,
+the admin review queue, and direct balance/ledger reads/writes — carried off `authz-api` as a hard
+cutover (not a transitional duplication like `authz-idp` below). See
+[`budget.md`](./budget.md) for the full domain writeup and
+[`../rbac.md`](../rbac.md) for the permission mapping.
+**Owns:** nothing of its own — reads/writes the same `authz` Postgres database as `authz-api`
+(`budget_grants`, `budget_balances`, `budget_policy_sets`/`budget_policy_revisions`,
+`budget_augmentation_requests`), plus Redis for rate limiting and request idempotency (its own
+key-prefixed token buckets, isolated from `authz-api`'s).
+
+Router assembly: `build_budget_router` in `crates/lightbridge-authz-rest/src/lib.rs`.
+
+| Route | Method | Protection | Notes |
+| --- | --- | --- | --- |
+| `/`, `/healthz`, `/healthz/startup`, `/healthz/ready` | GET | none | Same probe wiring as every other server (`probe_router`), `/healthz/ready` checks DB reachability. |
+| `/budget/rpc/{op_id}` | POST | Bearer JWT, then `rpc_authorize` RBAC gate (`RpcScope::Budget`), then cratestack's own per-model `@@allow` | Mounted under a **fixed** `/budget` prefix (not the configurable `rpc_base_path` `authz-api` uses — see `config::BudgetServer`'s doc comment). Any non-`budget:*` op-id 404s here, including the whole CRUD surface. |
+| `/budget/rpc/batch` | POST | same as above, per-frame | Same per-frame scope + permission enforcement as `authz-api`'s batch endpoint. |
+
+Reachable procedures (all hand-written — ADR-0010 — declared in
+`crates/lightbridge-authz-api/schema/authz.cstack`, implemented on the same `Procedures` type
+`authz-api` uses; `RpcScope::Budget` is what actually restricts this server to only these 14):
+
+- Policy lifecycle: `activateBudgetPolicy`, `getBudgetPolicyStatus`, `simulateBudgetPolicy`,
+  `createBudgetPolicyRevision`.
+- Self-service refill + admin review: `requestBudgetRefill`, `listPendingAugmentationRequests`,
+  `approveAugmentationRequest`, `rejectAugmentationRequest`.
+- Direct balance/ledger reads: `getMyBudgetBalance`, `listMyBudgetGrants`, `getBudgetBalance`,
+  `listBudgetGrants`.
+- Direct admin grant/revoke: `grantBudget`, `revokeBudgetGrant`.
+
+Every procedure keeps its exact `docs/rbac.md`-mandated permission unchanged by the move — the
+split only changes *which host and path prefix* serves it, not what a caller needs to hold to call
+it. `authz-budget` constructs its own `AuthzStoreImpl`/cratestack pool/idempotency store the same
+way `authz-api` does, purely because `Procedures::new` requires them as a type-level obligation
+(the CRUD op-ids they back are never actually dispatchable here) — see `build_budget_router`'s doc
+comment for why this is not a real dependency on the CRUD domain.
 
 ## `authz-opa`
 
@@ -170,3 +208,11 @@ sibling `lightbridge-authz-usage-rest` crate — note the crate directory is
 `crates/lightbridge-authz-usage` but its declared package name is
 `lightbridge-authz-usage-rest` — and `core`). Both are independent of the diagram above; the usage
 service shares no crate with `authz-api`/`authz-opa`/`lightbridge-mcp` beyond `core`.
+
+`authz-budget` (and `authz-idp` before it) adds no node to this diagram at all — it is the same
+`lightbridge-authz` binary, gated behind its own `Commands::Budget` subcommand
+(`app/lightbridge-authz/src/main.rs`), calling `build_budget_router`/`start_budget_server` in the
+same `rest` crate that already depended on `budget`/`api-key`/`api`/`bearer`/`core` for
+`authz-api`. Splitting the *service* did not require splitting a single crate — see
+[`budget.md`](./budget.md), "Why one `Procedures` impl, not a second schema/crate", for why the
+RPC-surface split is enforced at the routing layer (`RpcScope`) instead.

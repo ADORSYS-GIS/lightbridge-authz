@@ -19,7 +19,7 @@ use cratestack::axum::http;
 use cratestack::{AuthProvider, CoolContext, CoolError, RequestContext, Value};
 use lightbridge_authz_bearer::BearerTokenServiceTrait;
 
-use crate::rpc_authorize::{op_id_from_path, required_permission};
+use crate::rpc_authorize::{RpcScope, op_id_from_path, required_permission};
 
 /// Context key under which the validated caller's raw access token is stashed, so procedures that
 /// still need it (e.g. `rotateApiKey`'s downstream secret issuance / token exchange) can read it
@@ -40,11 +40,16 @@ pub const CALLER_KIND_CONTEXT_KEY: &str = "caller_kind";
 #[derive(Clone)]
 pub struct CratestackAuthProvider {
     bearer: Arc<dyn BearerTokenServiceTrait>,
+    /// Which half of the RPC surface this provider's router serves (see [`RpcScope`]). Checked
+    /// first, ahead of even the bearer/permission checks below — this is the sole place that
+    /// closes the `POST /rpc/batch` gap `rpc_authorize`'s own out-of-scope check cannot reach
+    /// (that check only sees the outer `/rpc/batch` request, never an individual frame's op-id).
+    scope: RpcScope,
 }
 
 impl CratestackAuthProvider {
-    pub fn new(bearer: Arc<dyn BearerTokenServiceTrait>) -> Self {
-        Self { bearer }
+    pub fn new(bearer: Arc<dyn BearerTokenServiceTrait>, scope: RpcScope) -> Self {
+        Self { bearer, scope }
     }
 }
 
@@ -71,6 +76,7 @@ impl AuthProvider for CratestackAuthProvider {
         request: &RequestContext<'_>,
     ) -> impl core::future::Future<Output = Result<CoolContext, Self::Error>> + Send {
         let bearer = self.bearer.clone();
+        let scope = self.scope;
         let token = extract_bearer(request.headers);
         // `request.path` is the canonical `/rpc/<op_id>` for whichever op is being dispatched right
         // now — for a unary call that's the request's own path (already checked once by
@@ -79,6 +85,12 @@ impl AuthProvider for CratestackAuthProvider {
         // permission enforcement point for batch frames.
         let op_id = op_id_from_path(request.path).to_owned();
         async move {
+            // Out-of-scope op-id (moved to the other service) → 404, before even looking at the
+            // bearer token, mirroring `rpc_authorize`'s own scope check for unary calls. For a
+            // batch frame this is the ONLY place that check happens at all.
+            if !scope.permits(&op_id) {
+                return Err(CoolError::NotFound(format!("unknown RPC op `{op_id}`")));
+            }
             // Unmapped op-id → 403 unconditionally, mirroring `rpc_authorize`'s fail-closed set
             // (unknown ops, `model.ProjectMember.*`, `model.ApiKey.create`, ...).
             let Some(required) = required_permission(&op_id) else {

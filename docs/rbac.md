@@ -194,6 +194,16 @@ delete`) for generated model CRUD and `procedure.<name>` for the hand-written pr
 This table is the source of truth for `rpc_authorize::required_permission`. **Any RPC `op_id` not
 listed here is denied unconditionally (fail closed).**
 
+**Every `budget:*` row below is served at `POST /budget/rpc/{op_id}` on the separate
+`authz-budget` service, not `POST /rpc/{op_id}` on `authz-api`** (hard cutover — see
+[`docs/architecture/budget.md`](./architecture/budget.md#service-boundary-authz-budget-hard-cutover)).
+The permission each op-id requires is unchanged by that move; only the host and path prefix
+differ. A third gate, `RpcScope` (`rpc_authorize.rs`), sits ahead of the RBAC/membership pair
+described above and enforces this split: `authz-api` 404s every `budget:*` op-id before the RBAC
+gate even runs, and `authz-budget` 404s everything else the same way — including per-frame inside
+a `/rpc/batch` call, via the same `CratestackAuthProvider::authenticate` mechanism "Batch RPC:
+per-frame RBAC" above describes for the permission check.
+
 | Permission        | RPC `op_id`                                          | MCP tool                            |
 | ----------------- | ---------------------------------------------------- | ----------------------------------- |
 | `account:create`  | `procedure.createAccount`                            | `create-account`                    |

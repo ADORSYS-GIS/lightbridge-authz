@@ -25,6 +25,10 @@ pub enum Commands {
         #[arg(long, short, env = "CONFIG_PATH")]
         config_path: String,
     },
+    Budget {
+        #[arg(long, short, env = "CONFIG_PATH")]
+        config_path: String,
+    },
     Config {
         #[arg(long, short, env = "CONFIG_PATH")]
         config_path: String,
