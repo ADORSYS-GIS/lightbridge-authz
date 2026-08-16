@@ -83,6 +83,44 @@ impl GeneratedKey {
 
 /// Ensures an active signing key exists, generating one on first boot and auto-rotating when
 /// the active key is older than `max_key_age_days`. Idempotent and safe across replicas.
+///
+/// ## Signing-key ownership (ADR-0012, "signing-key bootstrap")
+///
+/// Three services now call this function at startup: `authz-api` (`start_api_server`),
+/// `lightbridge-mcp`, and, since ADR-0012 Phase 1, `authz-idp` (`start_idp_server`). All three
+/// bootstrap rather than only read — deliberately: an `authz-idp` that only ever *read* the
+/// active key (via [`StoreRepo::get_active_signing_key`]) would depend on some other service
+/// having bootstrapped one first, an implicit startup-ordering dependency this repo does not
+/// otherwise have between its services. Bootstrapping independently means `authz-idp` (like
+/// `authz-api` and `lightbridge-mcp` today) can cold-start against an empty `signing_keys` table
+/// on its own.
+///
+/// **Why a third concurrent bootstrapper is exactly as safe as the two that already exist.**
+/// This function's only DB-mutating call, [`StoreRepo::ensure_active_signing_key`], takes a
+/// transaction-scoped `pg_advisory_xact_lock` before it ever reads or writes `signing_keys` (see
+/// that function's own doc comment) — every caller serializes on the same lock regardless of how
+/// many there are. The first caller to acquire it inserts the key and commits; every other
+/// caller, whether it arrived a microsecond later or was already blocked on the lock, observes
+/// the just-inserted row as `active`, decides `needs_rotation == false`, and returns it unchanged.
+/// This holds identically for two callers or three (or more) — the lock, not the caller count, is
+/// what guarantees exactly one active key. See
+/// `concurrent_bootstraps_from_multiple_services_produce_exactly_one_active_key`
+/// (`tests/signing_tests.rs`) for the proof against a real database with three concurrent callers.
+///
+/// **What happens if services disagree on `max_key_age_days`.** Each caller computes its own
+/// rotation cutoff from its own `cfg.max_key_age_days` before taking the lock (see this
+/// function's body). If `authz-idp` is configured with a shorter value than `authz-api`,
+/// `authz-idp`'s check can decide `needs_rotation == true` earlier than `authz-api`'s would have
+/// on its own — but because rotation itself is still gated by the same advisory lock, this only
+/// changes *when* the next rotation happens, never whether more than one key ends up active.
+/// Disagreement is a rotation-*cadence* imprecision (a key might retire a few days earlier or
+/// later than any single service's own config alone would suggest), not a correctness hazard —
+/// there is no interleaving of any number of differently-configured callers that produces two
+/// simultaneously active keys. Operationally, this repo's Compose stack sidesteps the question
+/// entirely: `authz-api`, `authz-opa`, `authz-mcp`, and `authz-idp` all mount the *same*
+/// `.docker/authz/container.yaml` (`compose.yaml`), so `oauth2.signing.max_key_age_days` is
+/// always one value, not three. A deployment that ever does split this config per service
+/// inherits the cadence-only consequence above, not a safety one.
 pub async fn bootstrap_signing_key(repo: &StoreRepo, cfg: &JwtSigning) -> Result<()> {
     let now = Utc::now();
     let cutoff = now - Duration::days(cfg.max_key_age_days.max(1));

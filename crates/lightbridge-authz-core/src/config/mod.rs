@@ -318,6 +318,15 @@ pub struct Otel {
 pub struct Server {
     pub api: ApiServer,
     pub opa: OpaServer,
+    /// `authz-idp`'s server block (ADR-0012 Phase 1): address/port/TLS for the OIDC broker
+    /// service that carries discovery/JWKS/token-exchange off `authz-api`. Optional, like
+    /// `redis`/`usage_database` above — `authz-api`, `authz-opa`, `lightbridge-mcp`, and the
+    /// usage service all load this same `Config` type but never read this field, so a config
+    /// file written before `authz-idp` existed keeps loading unchanged. Only `Commands::Idp`
+    /// requires it to be `Some`, and fails fast with a clear error at startup if it is missing
+    /// when that command actually runs (see `app/lightbridge-authz/src/main.rs`).
+    #[serde(default)]
+    pub idp: Option<IdpServer>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -346,6 +355,18 @@ pub struct OpaServer {
     pub port: u16,
     pub tls: Tls,
     pub basic_auth: BasicAuth,
+}
+
+/// `authz-idp`'s server block (ADR-0012 Phase 1). Deliberately narrower than [`OpaServer`]: every
+/// route this server mounts (`.well-known/*`, `/oauth2/token`, `/oauth2/revoke`, the health
+/// probes) is public by design — the presented `subject_token`/`client_assertion` is itself the
+/// credential (see `token_exchange.rs`'s module doc comment) — so there is no `basic_auth` block
+/// to carry, unlike [`OpaServer`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdpServer {
+    pub address: String,
+    pub port: u16,
+    pub tls: Tls,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -866,6 +887,55 @@ otel:
         let cfg: Config = from_str(yaml).expect("config omitting redis/usage_database must load");
         assert!(cfg.redis.is_none());
         assert!(cfg.usage_database.is_none());
+        assert!(
+            cfg.server.idp.is_none(),
+            "a config file written before authz-idp existed must keep loading, with idp unset"
+        );
+    }
+
+    #[test]
+    fn config_with_idp_server_parses_it() {
+        let yaml = "\
+server:
+  api:
+    address: \"0.0.0.0\"
+    port: 3000
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+  opa:
+    address: \"0.0.0.0\"
+    port: 3001
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+    basic_auth:
+      username: \"u\"
+      password: \"p\"
+  idp:
+    address: \"0.0.0.0\"
+    port: 3004
+    tls:
+      cert_path: \"idp.crt\"
+      key_path: \"idp.key\"
+logging:
+  level: \"info\"
+database:
+  url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz\"
+oauth2:
+  type: self
+  jwks_url: \"http://localhost/jwks\"
+otel:
+  enabled: true
+  otlp_endpoint: \"http://localhost:4317\"
+  service_name: \"svc\"
+";
+        let cfg: Config = from_str(yaml).expect("config with server.idp must load");
+        let idp = cfg.server.idp.expect("server.idp must be set");
+        assert_eq!(idp.address, "0.0.0.0");
+        assert_eq!(idp.port, 3004);
+        assert_eq!(idp.tls.cert_path, "idp.crt");
+        assert_eq!(idp.tls.key_path, "idp.key");
     }
 
     #[test]

@@ -1693,7 +1693,10 @@ impl StoreRepo {
 
     /// Idempotently ensures there is an active signing key, rotating (marking the current
     /// active stale + activating `candidate`) when it is missing or older than `max_age_cutoff`.
-    /// A transaction-scoped advisory lock serializes this across replicas so only one key wins.
+    /// A transaction-scoped advisory lock serializes this across replicas so only one key wins --
+    /// this is the chokepoint every bootstrapping caller shares (`authz-api`, `lightbridge-mcp`,
+    /// and, since ADR-0012, `authz-idp`; see `lightbridge_authz_rest::signing::bootstrap_signing_key`'s
+    /// doc comment for the full concurrent-bootstrap and `max_key_age_days`-disagreement analysis).
     #[instrument(skip(self, candidate))]
     pub async fn ensure_active_signing_key(
         &self,

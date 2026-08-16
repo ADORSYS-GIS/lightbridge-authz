@@ -591,6 +591,47 @@ mod db {
         assert_eq!(repo.list_verification_jwks().await.unwrap().len(), 1);
     }
 
+    /// ADR-0012 Phase 1's signing-key ownership decision: `authz-idp` bootstraps its own active
+    /// key at startup, exactly as `authz-api` and `lightbridge-mcp` already do, making this the
+    /// *third* concurrent bootstrapper against the shared `signing_keys` table. Simulates all
+    /// three cold-starting against an empty table at the same instant -- `bootstrap_signing_key`'s
+    /// own doc comment argues this is safe because every caller serializes on the same
+    /// transaction-scoped `pg_advisory_xact_lock` (`StoreRepo::ensure_active_signing_key`)
+    /// regardless of caller count; this test is the proof against a real database rather than
+    /// just the argument. `tokio::join!` polls all three futures concurrently on one task, so
+    /// each one's `BEGIN; SELECT pg_advisory_xact_lock(...)` genuinely races the others at the
+    /// database, which is exactly the interleaving three real services cold-starting at once
+    /// would produce.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn concurrent_bootstraps_from_multiple_services_produce_exactly_one_active_key(
+        pool: PgPool,
+    ) {
+        let repo = repo(pool);
+        let cfg = signing_cfg(3600);
+        assert!(repo.get_active_signing_key().await.unwrap().is_none());
+
+        let (authz_api, lightbridge_mcp, authz_idp) = tokio::join!(
+            bootstrap_signing_key(&repo, &cfg),
+            bootstrap_signing_key(&repo, &cfg),
+            bootstrap_signing_key(&repo, &cfg),
+        );
+        authz_api.unwrap();
+        lightbridge_mcp.unwrap();
+        authz_idp.unwrap();
+
+        let jwks = repo.list_verification_jwks().await.unwrap();
+        assert_eq!(
+            jwks.len(),
+            1,
+            "three concurrent bootstraps (authz-api, lightbridge-mcp, authz-idp) must produce \
+             exactly one signing key, never one per caller"
+        );
+        assert!(
+            repo.get_active_signing_key().await.unwrap().is_some(),
+            "exactly one key must be active after the race settles"
+        );
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn rotation_stales_old_key_and_publishes_both(pool: PgPool) {
         let repo = repo(pool);
