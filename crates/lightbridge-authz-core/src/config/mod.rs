@@ -408,12 +408,33 @@ pub struct UsageServiceClient {
     /// stripped if present.
     pub base_url: String,
     /// Skip TLS certificate verification when calling the usage service. Local Compose serves
-    /// every authz service over a self-signed certificate (see `AGENTS.md`'s Security Notes), so
-    /// a client that verifies certificates strictly can never reach it there. Defaults to
-    /// `false` — production deployments terminate real (e.g. cert-manager-issued) certificates
-    /// and must never set this.
+    /// every authz service over a self-signed certificate with no shared CA bundle available to
+    /// mount, so a client that verifies certificates strictly can never reach it there. Defaults
+    /// to `false`.
+    ///
+    /// This must NOT be set in production. The doc comment here previously claimed production
+    /// "must never set this" on the assumption that production terminates a publicly-trusted
+    /// certificate — it does not: production terminates a cert-manager-issued *self-signed*
+    /// certificate (`ClusterIssuer/self-signed-ca`), the same shape as local Compose. The correct
+    /// production mechanism is `ca_bundle_path` below, which verifies against that specific CA
+    /// instead of either trusting nothing (`insecure_skip_verify`) or falling back to a system
+    /// trust store that was never going to contain this private CA anyway.
     #[serde(default)]
     pub insecure_skip_verify: bool,
+    /// Path to a PEM-encoded CA bundle used to verify the usage service's certificate, e.g.
+    /// `/etc/lightbridge/tls/ca.crt` (the `ca.crt` cert-manager writes into the same `authz-tls`
+    /// Secret this service already mounts for its own server certificate — see
+    /// `crates/lightbridge-authz-core/src/config/mod.rs`'s `Tls` type). This is the production
+    /// mechanism: it verifies the usage service's certificate is signed by the cluster's own CA,
+    /// rather than skipping verification entirely. Optional — when unset, verification falls
+    /// back to the platform's default trust store (or, if `insecure_skip_verify` is `true`, to no
+    /// verification at all, for local Compose only). An unreadable path or a bundle that fails to
+    /// parse as PEM is a hard startup failure naming the path — never a silent fallback to
+    /// skip-verify or to the system trust store (an unusable trust anchor is "unknown", which per
+    /// this codebase's fail-closed rule must route to the strictest branch: refuse to start,
+    /// rather than start with a weaker guarantee than configured).
+    #[serde(default)]
+    pub ca_bundle_path: Option<String>,
     /// Per-request timeout in milliseconds. Defaults to 5000 (5s).
     #[serde(default = "default_usage_service_timeout_ms")]
     pub timeout_ms: u64,
@@ -1009,6 +1030,52 @@ otel:
         assert_eq!(usage_service.base_url, "https://authz-usage:3002");
         assert!(usage_service.insecure_skip_verify);
         assert_eq!(usage_service.timeout_ms, 2500);
+        assert_eq!(usage_service.ca_bundle_path, None);
+    }
+
+    #[test]
+    fn config_with_usage_service_ca_bundle_path_parses_it() {
+        let yaml = "\
+server:
+  api:
+    address: \"0.0.0.0\"
+    port: 3000
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+  opa:
+    address: \"0.0.0.0\"
+    port: 3001
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+    basic_auth:
+      username: \"u\"
+      password: \"p\"
+logging:
+  level: \"info\"
+database:
+  url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz\"
+usage_service:
+  base_url: \"https://lightbridge-usage.converse.svc:3000\"
+  insecure_skip_verify: false
+  ca_bundle_path: \"/etc/lightbridge/tls/ca.crt\"
+oauth2:
+  type: self
+  jwks_url: \"http://localhost/jwks\"
+otel:
+  enabled: true
+  otlp_endpoint: \"http://localhost:4317\"
+  service_name: \"svc\"
+";
+        let cfg: Config =
+            from_str(yaml).expect("config with usage_service.ca_bundle_path must load");
+        let usage_service = cfg.usage_service.expect("usage_service must be set");
+        assert!(!usage_service.insecure_skip_verify);
+        assert_eq!(
+            usage_service.ca_bundle_path.as_deref(),
+            Some("/etc/lightbridge/tls/ca.crt")
+        );
     }
 
     #[test]
@@ -1048,5 +1115,6 @@ otel:
         let usage_service = cfg.usage_service.expect("usage_service must be set");
         assert!(!usage_service.insecure_skip_verify);
         assert_eq!(usage_service.timeout_ms, 5_000);
+        assert_eq!(usage_service.ca_bundle_path, None);
     }
 }

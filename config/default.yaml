@@ -49,12 +49,18 @@ redis:
 # Unauthenticated on purpose -- no Basic auth, no mTLS yet (mTLS is the intended mechanism,
 # tracked separately; a per-endpoint credential was deliberately not added as interim scaffolding).
 # Safe only because the usage service is ClusterIP-only with no ingress in every real deployment
-# -- see AGENTS.md's Security Notes. insecure_skip_verify is only safe because the usage service
-# serves a self-signed cert locally (see config/usage.yaml's tls block) -- never set it true
-# against a real deployment.
+# -- see AGENTS.md's Security Notes.
+#
+# insecure_skip_verify: true is only for this local, non-container config, which has no shared CA
+# bundle to point at. Real deployments (including in-cluster ones) must set insecure_skip_verify:
+# false and instead set ca_bundle_path to the cluster's own CA bundle (e.g.
+# /etc/lightbridge/tls/ca.crt, the ca.crt cert-manager writes alongside this service's own TLS
+# cert/key -- see Config::usage_service's doc comment in crates/lightbridge-authz-core). An
+# unreadable or unparseable ca_bundle_path is a hard startup failure, never a silent fallback.
 usage_service:
   base_url: "https://localhost:13002"
   insecure_skip_verify: true
+  # ca_bundle_path: /etc/lightbridge/tls/ca.crt
   timeout_ms: 5000
 oauth2:
   # REQUIRED credential-issuance mode — no default; you must state it.

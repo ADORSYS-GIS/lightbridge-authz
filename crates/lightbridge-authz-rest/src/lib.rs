@@ -1892,6 +1892,7 @@ pub async fn start_api_server(
             lightbridge_authz_budget::UsageServiceSpendReader::new(
                 usage_service.base_url.clone(),
                 usage_service.insecure_skip_verify,
+                usage_service.ca_bundle_path.as_deref(),
                 std::time::Duration::from_millis(usage_service.timeout_ms),
             )
             .map_err(|e| {
