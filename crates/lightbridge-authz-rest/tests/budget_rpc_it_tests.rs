@@ -303,7 +303,8 @@ async fn every_moved_procedure_is_reachable_on_authz_budget() {
         )
         .await;
         assert!(
-            status != axum::http::StatusCode::UNAUTHORIZED && status != axum::http::StatusCode::FORBIDDEN,
+            status != axum::http::StatusCode::UNAUTHORIZED
+                && status != axum::http::StatusCode::FORBIDDEN,
             "{op} must be reachable (not unauthorized/forbidden) on authz-budget, got {status}: {}",
             String::from_utf8_lossy(&body)
         );
