@@ -24,6 +24,11 @@ workspace = true
 [dev-dependencies]
 httpmock.workspace = true
 tokio.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+time.workspace = true
 
 [features]
 it-tests = []
@@ -46,6 +51,10 @@ required-features = ["it-tests"]
 [[test]]
 name = "usage_service_spend_reader_tests"
 path = "tests/usage_service_spend_reader_tests.rs"
+
+[[test]]
+name = "usage_service_ca_bundle_tests"
+path = "tests/usage_service_ca_bundle_tests.rs"
 
 [[test]]
 name = "budget_replay_and_expiry_tests"

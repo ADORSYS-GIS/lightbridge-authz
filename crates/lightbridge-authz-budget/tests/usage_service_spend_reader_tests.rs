@@ -18,7 +18,7 @@ use lightbridge_authz_budget::{Period, Spend, SpendReader, UsageServiceSpendRead
 use std::time::Duration;
 
 fn reader_for(base_url: &str) -> UsageServiceSpendReader {
-    UsageServiceSpendReader::new(base_url, false, Duration::from_secs(5))
+    UsageServiceSpendReader::new(base_url, false, None, Duration::from_secs(5))
         .expect("reader construction must succeed")
 }
 
@@ -122,8 +122,9 @@ async fn usage_service_timeout_yields_spend_unavailable() {
             .json_body(serde_json::json!({ "total_cost": 1.0 }));
     });
 
-    let reader = UsageServiceSpendReader::new(server.base_url(), false, Duration::from_millis(20))
-        .expect("reader construction must succeed");
+    let reader =
+        UsageServiceSpendReader::new(server.base_url(), false, None, Duration::from_millis(20))
+            .expect("reader construction must succeed");
 
     let spend = reader
         .spend_for_account("acct_1", &period())

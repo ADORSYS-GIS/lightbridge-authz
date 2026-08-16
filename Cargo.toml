@@ -116,6 +116,19 @@ cuid = { version = "2", default-features = false, features = ["v2"] }
 getrandom = "0.4"
 goose = "0.18"
 httpmock = "0.8"
+# Dev-only: generates throwaway CA/leaf TLS keypairs at test runtime so tests can exercise real
+# TLS handshakes (crates/lightbridge-authz-budget/tests/usage_service_ca_bundle_tests.rs) without
+# ever committing a private key PEM to the repo -- gitleaks' `private-key` rule flags any committed
+# RSA/EC private key by content regardless of whether it's a real secret, so a checked-in test
+# fixture key is a guaranteed CI secret-scan failure. Same crate/version httpmock already vendors
+# internally for its own "https" feature (unused here), so this doesn't add a new supply-chain
+# surface to research.
+rcgen = { version = "0.13", features = ["pem"] }
+# Dev-only, alongside rcgen above: computes ATS-compliant (<=825 day) leaf-certificate validity
+# windows relative to "now" so the generated test certs never go stale. Already resolved as
+# rcgen's own transitive dependency; declared directly only so the test can call
+# `OffsetDateTime::now_utc()` itself.
+time = { version = "0.3", features = ["std"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors"] }
 rsa = { version = "0.9", features = ["pem", "std"] }

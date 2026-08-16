@@ -45,11 +45,21 @@ redis:
 # -> budget refill spend facts report Spend::Unavailable (fails closed to manual review), not a
 # startup failure. Unauthenticated on purpose -- no Basic auth, no mTLS yet; safe only because
 # authz-usage is ClusterIP-only with no ingress in every real deployment (see AGENTS.md's Security
-# Notes). insecure_skip_verify is only safe because authz-usage serves a self-signed cert in this
-# Compose stack (see authz-tls above) -- never set it true against a real deployment.
+# Notes).
+#
+# insecure_skip_verify: true is only for this local Compose stack, which has no shared CA bundle
+# mounted anywhere. Real (e.g. in-cluster) deployments must set insecure_skip_verify: false and
+# set ca_bundle_path to the deployment's own CA bundle instead -- e.g. in a cluster where
+# cert-manager issues this service's own TLS secret with a CA-type issuer, that secret already
+# carries a ca.crt alongside tls.crt/tls.key, and this pod already mounts the whole secret at
+# /etc/lightbridge/tls, so no new Secret/volume/mount is needed to point ca_bundle_path at it (see
+# Config::usage_service's doc comment in crates/lightbridge-authz-core). An unreadable or
+# unparseable ca_bundle_path is a hard startup failure, never a silent fallback to skip-verify or
+# to the system trust store.
 usage_service:
   base_url: "https://authz-usage:3002"
   insecure_skip_verify: true
+  # ca_bundle_path: /etc/lightbridge/tls/ca.crt
   timeout_ms: 5000
 oauth2:
   # REQUIRED credential-issuance mode — no default; must be stated explicitly.

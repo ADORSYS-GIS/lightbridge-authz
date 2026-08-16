@@ -209,22 +209,62 @@ pub struct UsageServiceSpendReader {
 impl UsageServiceSpendReader {
     /// Builds a reader against `base_url` (e.g. `https://authz-usage:3002`, no trailing slash
     /// required). `insecure_skip_verify` should only ever be `true` in local Compose, where every
-    /// authz service serves a self-signed certificate (see `AGENTS.md`'s Security Notes) --
-    /// production deployments terminate real certificates and must leave it `false`.
+    /// authz service serves a self-signed certificate with no shared CA bundle available to
+    /// mount (see `AGENTS.md`'s Security Notes) -- production deployments must leave it `false`
+    /// and set `ca_bundle_path` instead.
+    ///
+    /// `ca_bundle_path`, when `Some`, names a PEM file the client adds as a trusted root so it
+    /// verifies the usage service's certificate against that specific CA (e.g. the
+    /// cert-manager-issued `ca.crt` production mounts at `/etc/lightbridge/tls/ca.crt` -- see
+    /// `Config::usage_service`'s doc comment). An unreadable path or a bundle that fails to parse
+    /// as PEM is a hard error naming the path: per this codebase's fail-closed rule, a
+    /// misconfigured trust anchor must refuse to start, never silently fall back to
+    /// `insecure_skip_verify` or to the platform's default trust store -- either would turn a
+    /// configuration mistake into weaker verification than the operator asked for.
     pub fn new(
         base_url: impl Into<String>,
         insecure_skip_verify: bool,
+        ca_bundle_path: Option<&str>,
         timeout: std::time::Duration,
     ) -> Result<Self, BudgetError> {
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(timeout)
-            .danger_accept_invalid_certs(insecure_skip_verify)
-            .build()
-            .map_err(|err| {
+            .danger_accept_invalid_certs(insecure_skip_verify);
+
+        if let Some(path) = ca_bundle_path {
+            let pem = std::fs::read(path).map_err(|err| {
                 BudgetError::StorageFailed(format!(
-                    "failed to build usage-service HTTP client: {err}"
+                    "failed to read usage-service CA bundle at '{path}': {err}"
                 ))
             })?;
+            // `from_pem_bundle` (rather than `from_pem`) so an empty result -- zero
+            // `-----BEGIN CERTIFICATE-----` blocks found -- is distinguishable from "one valid
+            // cert": reqwest's rustls backend parses PEM/DER lazily (bytes are only actually
+            // decoded once the client is built), so neither this call nor `from_pem` alone would
+            // otherwise fail on content that merely contains no certificates.
+            let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|err| {
+                BudgetError::StorageFailed(format!(
+                    "failed to parse usage-service CA bundle at '{path}' as PEM: {err}"
+                ))
+            })?;
+            if certs.is_empty() {
+                return Err(BudgetError::StorageFailed(format!(
+                    "usage-service CA bundle at '{path}' contains no PEM certificates"
+                )));
+            }
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+
+        let client = builder.build().map_err(|err| {
+            let bundle_context = ca_bundle_path
+                .map(|path| format!(" (CA bundle '{path}')"))
+                .unwrap_or_default();
+            BudgetError::StorageFailed(format!(
+                "failed to build usage-service HTTP client{bundle_context}: {err}"
+            ))
+        })?;
 
         Ok(Self {
             client,
@@ -408,6 +448,7 @@ mod tests {
         let reader = UsageServiceSpendReader::new(
             "https://authz-usage:3002",
             false,
+            None,
             std::time::Duration::from_secs(1),
         );
         assert!(
