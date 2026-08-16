@@ -3,8 +3,8 @@ use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
     RotateApiKey, async_trait,
     config::{
-        ApiServer, BasicAuth, Billing, IdpServer, Oauth2, OauthClientType, OpaServer, Redis,
-        UsageServiceClient,
+        ApiServer, BasicAuth, Billing, BudgetServer, IdpServer, Oauth2, OauthClientType, OpaServer,
+        Redis, UsageServiceClient,
     },
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
@@ -28,6 +28,7 @@ use codec::LenientCborCodec;
 use handlers::AuthzStoreImpl;
 use ratelimit_redis::build_redis_rate_limit_store;
 use routers::opa_router;
+use rpc_authorize::{RpcAuthorizeState, RpcScope};
 
 use cratestack::idempotency::IdempotencyLayer;
 use cratestack::ratelimit::{RateLimitConfig, RateLimitLayer, RateLimitStore};
@@ -1702,7 +1703,7 @@ pub fn build_api_router(
             budget_repo,
         ),
         CodecSet::new(LenientCborCodec::default(), JsonCodec),
-        CratestackAuthProvider::new(bearer.clone()),
+        CratestackAuthProvider::new(bearer.clone(), RpcScope::Crud),
         // cratestack 0.7.12 (#413) made this request-body-size bound an explicit parameter instead
         // of an axum implementation detail. `DEFAULT_BODY_LIMIT_BYTES` (2 MiB) is the value the
         // changelog documents as reproducing the pre-0.7.12 runtime behavior exactly — this call
@@ -1716,7 +1717,10 @@ pub fn build_api_router(
         RateLimitConfig::new(RATE_LIMIT_BURST, RATE_LIMIT_REFILL_PER_SECOND),
     ))
     .layer(axum::middleware::from_fn_with_state(
-        bearer,
+        RpcAuthorizeState {
+            bearer,
+            scope: RpcScope::Crud,
+        },
         rpc_authorize::rpc_authorize,
     ));
 
@@ -2172,6 +2176,229 @@ pub async fn start_idp_server(
     );
 
     serve_tls("IDP", &idp.address, idp.port, &idp.tls, app).await
+}
+
+/// The fixed base path `authz-budget`'s RPC surface is nested under. Not configurable, unlike
+/// `ApiServer.rpc_base_path` — the prefix is what makes this service reachable behind a shared
+/// gateway origin alongside `authz-api` (see [`config::BudgetServer`]'s doc comment and
+/// `docs/architecture/budget.md`), not an operator preference.
+const BUDGET_RPC_BASE_PATH: &str = "/budget";
+
+/// Assembles the `authz-budget` server router: public probes plus the exact `budget:*`-gated RPC
+/// procedures `build_api_router` used to serve, now mounted under [`BUDGET_RPC_BASE_PATH`] and
+/// reachable ONLY here — a hard cutover, not the transitional duplication `build_idp_router` still
+/// carries for `authz-idp` (see that function's own doc comment for the contrast). Both the outer
+/// `rpc_authorize` gate and the per-op `CratestackAuthProvider` are constructed with
+/// `RpcScope::Budget`, so every non-budget op-id — the whole CRUD surface included — 404s here,
+/// exactly as every budget op-id now 404s on `build_api_router` (`RpcScope::Crud`). Separated from
+/// `start_budget_server` for testability, mirroring `build_api_router`/`build_idp_router`.
+///
+/// Reuses the SAME `Procedures` type `build_api_router` does (ADR-0010: budget procedures are
+/// hand-written, not cratestack-generated, but they still live inside the one
+/// `schema::procedures::ProcedureRegistry` impl cratestack's single-schema-module-per-crate
+/// constraint requires — see `docs/architecture/budget.md`, "Why one `Procedures` impl, not a
+/// second schema/crate"). `issuer` is still required to construct it even though this router never
+/// dispatches a CRUD op-id (`RpcScope::Budget` refuses them before dispatch) — `Procedures::new`
+/// takes it unconditionally, and constructing an `AuthzStoreImpl` is cheap (no I/O; see its own
+/// doc comment), so this is a type-level obligation, not a real dependency on the CRUD domain.
+#[allow(clippy::too_many_arguments)]
+pub fn build_budget_router(
+    issuer: Arc<AuthzStoreImpl>,
+    policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
+    refill_service: Arc<lightbridge_authz_budget::RefillService>,
+    review_service: Arc<lightbridge_authz_budget::ReviewService>,
+    budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+    cratestack_db: schema::Cratestack,
+    readiness_pool: Arc<dyn DbPoolTrait>,
+    bearer: Arc<dyn BearerTokenServiceTrait>,
+    idempotency_store: Arc<SqlxIdempotencyStore>,
+    rate_limit_store: Arc<dyn RateLimitStore>,
+    dev_cors: bool,
+) -> Router {
+    let public = probe_router(readiness_pool);
+
+    let rpc = schema::axum::rpc_router(
+        cratestack_db,
+        Procedures::new(
+            issuer,
+            policy_store,
+            refill_service,
+            review_service,
+            budget_repo,
+        ),
+        CodecSet::new(LenientCborCodec::default(), JsonCodec),
+        CratestackAuthProvider::new(bearer.clone(), RpcScope::Budget),
+        DEFAULT_BODY_LIMIT_BYTES,
+    )
+    .layer(IdempotencyLayer::new(idempotency_store, IDEMPOTENCY_TTL))
+    .layer(RateLimitLayer::new(
+        rate_limit_store,
+        RateLimitConfig::new(RATE_LIMIT_BURST, RATE_LIMIT_REFILL_PER_SECOND),
+    ))
+    .layer(axum::middleware::from_fn_with_state(
+        RpcAuthorizeState {
+            bearer,
+            scope: RpcScope::Budget,
+        },
+        rpc_authorize::rpc_authorize,
+    ));
+
+    let router = public.nest(BUDGET_RPC_BASE_PATH, rpc);
+    if dev_cors {
+        router.layer(CorsLayer::permissive())
+    } else {
+        router
+    }
+}
+
+/// Starts `authz-budget`: the budget-domain microservice carrying every `budget:*`-gated RPC
+/// procedure off `authz-api` (hard cutover — see `build_budget_router`'s own doc comment,
+/// `docs/architecture/budget.md`). Mirrors `start_api_server`'s budget-domain wiring
+/// (`policy_store`/`budget_repo`/`refill_service`/`review_service`/spend-reader selection)
+/// line-for-line intentionally — this server owns exactly that half of what `start_api_server`
+/// used to build, nothing added, nothing dropped. What it deliberately does NOT carry:
+/// `well_known_router`/token-exchange (an `authz-idp` concern, unrelated to budget), and signing-
+/// key bootstrap (this server only ever validates bearer tokens via `oauth2.jwks_url`, never
+/// issues or rotates one — `rotateApiKey`/`createApiKey` are CRUD op-ids, refused here by
+/// `RpcScope::Budget` before they could reach `AuthzStoreImpl`'s signer).
+pub async fn start_budget_server(
+    budget: &BudgetServer,
+    pool: Arc<dyn DbPoolTrait>,
+    oauth2: &Oauth2,
+    billing: &Billing,
+    redis: &Option<Redis>,
+    usage_service: &Option<UsageServiceClient>,
+) -> Result<()> {
+    billing.validate()?;
+    oauth2.rbac.validate()?;
+
+    // ADR-0007: load whatever is genuinely active in the DB right now, so a fresh startup always
+    // agrees with the last successful activation, exactly like `start_api_server`'s identical load
+    // did before the cutover.
+    let policy_store = Arc::new(
+        lightbridge_authz_budget::PolicyStore::load_active_from_db(
+            pool.clone(),
+            BUDGET_POLICY_SET_ID,
+            BUDGET_POLICY_EVALUATION_BUDGET,
+        )
+        .await
+        .map_err(|e| Error::Server(format!("failed to load active budget policy: {e}")))?,
+    );
+
+    // Self-service refill and the admin review queue (#191, PR 3.4) -- see `start_api_server`'s
+    // identical construction for the full spend-reader degrade-not-fail reasoning
+    // (`UnavailableSpendReader` on a missing/unreachable `usage_service`, never a hard startup
+    // failure or an auto-approve).
+    let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
+        pool.clone(),
+    ));
+    let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(
+        pool.clone(),
+    ));
+    let policy_engine: Arc<dyn lightbridge_authz_budget::PolicyEngine> = policy_store.engine();
+    let spend_reader: Arc<dyn lightbridge_authz_budget::SpendReader> = match usage_service {
+        Some(usage_service) => Arc::new(
+            lightbridge_authz_budget::UsageServiceSpendReader::new(
+                usage_service.base_url.clone(),
+                usage_service.insecure_skip_verify,
+                std::time::Duration::from_millis(usage_service.timeout_ms),
+            )
+            .map_err(|e| {
+                Error::Server(format!("failed to build usage-service spend reader: {e}"))
+            })?,
+        ),
+        None => {
+            tracing::warn!(
+                "usage_service is not configured -- budget refill spend facts will report \
+                 Unavailable, and self-service refill decisions that depend on them will fail \
+                 closed to manual review"
+            );
+            Arc::new(lightbridge_authz_budget::UnavailableSpendReader)
+        }
+    };
+    let refill_service = Arc::new(lightbridge_authz_budget::RefillService::new(
+        budget_repo.clone(),
+        augmentation_repo.clone(),
+        policy_engine,
+        spend_reader,
+    ));
+    let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
+        budget_repo.clone(),
+        augmentation_repo,
+    ));
+
+    let readiness_pool = pool.clone();
+    // Hand-written sqlx on the core `DbPool` (sqlx 0.9), same as `start_api_server` -- required to
+    // construct `Procedures` (see `build_budget_router`'s doc comment for why this is a type-level
+    // obligation, not a real CRUD dependency for this server).
+    let issuer = Arc::new(AuthzStoreImpl::with_pool_and_oauth2(
+        pool.clone(),
+        oauth2,
+        billing,
+    )?);
+    let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
+        Arc::new(BearerTokenService::new(oauth2.clone()));
+
+    // Redis is required unconditionally for authz-budget rate limiting, mirroring authz-api's own
+    // hard requirement (see `start_api_server`'s identical check).
+    let redis = redis.as_ref().ok_or_else(|| {
+        Error::Server(
+            "redis config is required for authz-budget rate limiting (set `redis.url`)".to_string(),
+        )
+    })?;
+
+    // cratestack runs on its own sqlx major (0.8, vs this workspace's 0.9), so its CRUD client and
+    // Postgres-backed idempotency store need a separate pool built with cratestack's sqlx, exactly
+    // like `start_api_server`'s identical pool.
+    let database_url = std::env::var("DATABASE_URL").map_err(|_| {
+        Error::Server(
+            "DATABASE_URL must be set for the cratestack CRUD pool (authz-budget RPC surface)"
+                .to_string(),
+        )
+    })?;
+    let cratestack_pool = cratestack::sqlx::postgres::PgPoolOptions::new()
+        .connect(&database_url)
+        .await
+        .map_err(|e| Error::Server(format!("failed to open cratestack Postgres pool: {e}")))?;
+    let cratestack_db = schema::Cratestack::builder(cratestack_pool.clone()).build();
+
+    let idempotency_store = Arc::new(SqlxIdempotencyStore::new(cratestack_pool.clone()));
+    idempotency_store
+        .ensure_schema()
+        .await
+        .map_err(|e| Error::Server(format!("failed to ensure idempotency schema: {e}")))?;
+
+    // Own key prefix ("authz-budget", not "authz-api") so the two services' token buckets never
+    // share state, even though they may point at the same Redis instance.
+    let rate_limit_store = build_redis_rate_limit_store(&redis.url, "authz-budget")?;
+
+    let dev_cors = dev_cors_enabled();
+    let app = build_budget_router(
+        issuer,
+        policy_store,
+        refill_service,
+        review_service,
+        budget_repo,
+        cratestack_db,
+        readiness_pool,
+        bearer_service,
+        idempotency_store,
+        rate_limit_store,
+        dev_cors,
+    );
+
+    if dev_cors {
+        tracing::warn!("AUTHZ_DEV_CORS is set — budget server allows any CORS origin (dev only)");
+    }
+    tracing::info!(
+        server = "authz-budget",
+        address = %budget.address,
+        port = budget.port,
+        rpc_base_path = BUDGET_RPC_BASE_PATH,
+        "starting budget server"
+    );
+
+    serve_tls("BUDGET", &budget.address, budget.port, &budget.tls, app).await
 }
 
 async fn root_handler() -> (StatusCode, Json<RootResponse>) {

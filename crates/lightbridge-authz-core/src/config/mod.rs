@@ -331,6 +331,16 @@ pub struct Server {
     /// when that command actually runs (see `app/lightbridge-authz/src/main.rs`).
     #[serde(default)]
     pub idp: Option<IdpServer>,
+    /// `authz-budget`'s server block: address/port/TLS for the budget-domain microservice that
+    /// carries the `budget:*`-gated RPC procedures off `authz-api` (hard cutover, not a
+    /// transitional duplication like `idp` above — see `docs/architecture/budget.md`). Optional
+    /// for the same reason `idp` is: every other command loads this same `Config` type but never
+    /// reads this field, so a config file written before `authz-budget` existed keeps loading
+    /// unchanged. Only `Commands::Budget` requires it to be `Some`, and fails fast with a clear
+    /// error at startup if it is missing when that command actually runs (see
+    /// `app/lightbridge-authz/src/main.rs`).
+    #[serde(default)]
+    pub budget: Option<BudgetServer>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -368,6 +378,20 @@ pub struct OpaServer {
 /// to carry, unlike [`OpaServer`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct IdpServer {
+    pub address: String,
+    pub port: u16,
+    pub tls: Tls,
+}
+
+/// `authz-budget`'s server block. Shaped like [`IdpServer`] (address/port/TLS, no `basic_auth`):
+/// every route this server mounts is behind the same bearer-JWT `rpc_authorize` gate `authz-api`
+/// already uses, not Basic auth like [`OpaServer`]. Unlike `idp`, this server's RPC surface is
+/// mounted under a fixed `/budget` path prefix (`build_budget_router`) rather than at the
+/// configurable root `authz-api` uses — there is no `rpc_base_path` field here because the prefix
+/// is not optional, it is what makes the service reachable behind a shared gateway origin
+/// alongside `authz-api` (see `docs/architecture/budget.md`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct BudgetServer {
     pub address: String,
     pub port: u16,
     pub tls: Tls,
@@ -922,6 +946,55 @@ otel:
             cfg.server.idp.is_none(),
             "a config file written before authz-idp existed must keep loading, with idp unset"
         );
+        assert!(
+            cfg.server.budget.is_none(),
+            "a config file written before authz-budget existed must keep loading, with budget unset"
+        );
+    }
+
+    #[test]
+    fn config_with_budget_server_parses_it() {
+        let yaml = "\
+server:
+  api:
+    address: \"0.0.0.0\"
+    port: 3000
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+  opa:
+    address: \"0.0.0.0\"
+    port: 3001
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+    basic_auth:
+      username: \"u\"
+      password: \"p\"
+  budget:
+    address: \"0.0.0.0\"
+    port: 3005
+    tls:
+      cert_path: \"budget.crt\"
+      key_path: \"budget.key\"
+logging:
+  level: \"info\"
+database:
+  url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz\"
+oauth2:
+  type: self
+  jwks_url: \"http://localhost/jwks\"
+otel:
+  enabled: true
+  otlp_endpoint: \"http://localhost:4317\"
+  service_name: \"svc\"
+";
+        let cfg: Config = from_str(yaml).expect("config with server.budget must load");
+        let budget = cfg.server.budget.expect("server.budget must be set");
+        assert_eq!(budget.address, "0.0.0.0");
+        assert_eq!(budget.port, 3005);
+        assert_eq!(budget.tls.cert_path, "budget.crt");
+        assert_eq!(budget.tls.key_path, "budget.key");
     }
 
     #[test]

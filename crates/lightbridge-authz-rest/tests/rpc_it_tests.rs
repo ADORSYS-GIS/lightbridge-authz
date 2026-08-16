@@ -53,6 +53,7 @@ use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::auth_provider::CratestackAuthProvider;
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
 use lightbridge_authz_rest::ratelimit_redis::build_redis_rate_limit_store;
+use lightbridge_authz_rest::rpc_authorize::RpcScope;
 use lightbridge_authz_rest::{OpaRepoTrait, OpaState, Procedures};
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -1558,7 +1559,7 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
             ctx.budget_repo.clone(),
         ),
         CodecSet::new(CborCodec, JsonCodec),
-        CratestackAuthProvider::new(admin_bearer(&subject)),
+        CratestackAuthProvider::new(admin_bearer(&subject), RpcScope::Crud),
         DEFAULT_BODY_LIMIT_BYTES,
     );
 
@@ -2383,525 +2384,95 @@ async fn viewer_and_editor_can_self_provision_their_own_account() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Section 9: the five previously-inert `budget:*` permissions -- direct balance/ledger reads,
-// admin grant/revoke, and policy-revision authoring. `budget_grants`/`budget_balances` carry a
-// real FK to `accounts`, so every test here seeds an `accounts` row directly (mirroring
-// `lightbridge-authz-budget`'s own `budget_repo_grant_tests.rs::insert_account`) rather than
-// driving a real `createAccount` RPC call.
+// Section 9 (formerly): the budget:*-gated procedures. Moved off this file onto
+// `budget_rpc_it_tests.rs` (`authz-budget`'s own real-DB integration coverage, exercised through
+// `build_budget_router` at `/budget/rpc/{op_id}` instead of `build_api_router`'s `/rpc/{op_id}`)
+// as part of the budget-domain microservice split -- see docs/architecture/budget.md, "Service
+// boundary". What stays here is the cutover proof: every budget:*-gated op-id must now be
+// unreachable on `authz-api`, for ANY caller, permission included.
 // ---------------------------------------------------------------------------------------------
 
-async fn seed_budget_account(pool: &sqlx::PgPool, id: &str) {
-    sqlx::query("INSERT INTO accounts (id) VALUES ($1)")
-        .bind(id)
-        .execute(pool)
-        .await
-        .expect("seed account for budget FK");
-}
+/// Every op-id `rpc_authorize.rs`'s `required_permission` map gates on a `budget:*` permission
+/// (the 14 procedures enumerated in `docs/architecture/budget.md`). Hand-copied here deliberately
+/// -- unlike the hermetic `rpc_authorize.rs`-internal unit tests, which re-derive this list from
+/// the map itself, this integration test exists specifically to catch drift between "what the map
+/// says is a budget op" and "what the real router, wired exactly like production, actually
+/// refuses" -- a hand-copied list is the point, not a shortcut.
+const MOVED_BUDGET_OP_IDS: [&str; 14] = [
+    "procedure.activateBudgetPolicy",
+    "procedure.getBudgetPolicyStatus",
+    "procedure.simulateBudgetPolicy",
+    "procedure.requestBudgetRefill",
+    "procedure.listPendingAugmentationRequests",
+    "procedure.approveAugmentationRequest",
+    "procedure.rejectAugmentationRequest",
+    "procedure.getMyBudgetBalance",
+    "procedure.listMyBudgetGrants",
+    "procedure.getBudgetBalance",
+    "procedure.listBudgetGrants",
+    "procedure.grantBudget",
+    "procedure.revokeBudgetGrant",
+    "procedure.createBudgetPolicyRevision",
+];
 
-/// Test 1 (task list): reading your own balance succeeds with the self-scoped permission, and
-/// reports the zero-valued default before any grant exists -- then reflects an admin grant made
-/// against the same account, proving `getMyBudgetBalance` reads live data, not a cached/stale
-/// value.
+/// Proves the hard cutover against the REAL, fully-wired `authz-api` router (live Postgres +
+/// Redis, exactly as production runs it) -- not just the hermetic, lazily-wired coverage in
+/// `rpc_router_tests.rs`. An admin bearer (every permission, including all `budget:*` ones) is
+/// used deliberately: if any of these 404s were actually a `403`, an admin token would unmask it,
+/// proving the refusal is the `RpcScope::Crud` scope gate, not a permission gate that merely
+/// happens to look the same from a non-admin caller.
 #[tokio::test]
-async fn get_my_budget_balance_reads_own_zero_then_granted_balance() {
-    use lightbridge_authz_core::authz::PermissionSet;
+async fn budget_gated_op_ids_are_unreachable_on_authz_api_even_for_an_admin() {
+    let subject = format!("budget-moved-admin-{}", cuid2());
+    let ctx = setup(admin_bearer(&subject)).await;
 
-    let subject = format!("budget-self-{}", cuid2());
-    let admin_subject = format!("budget-self-admin-{}", cuid2());
-    let period = "2026-08";
-    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
-        MapBearer::new()
-            .with(
-                "caller",
-                token_info(
-                    &subject,
-                    PermissionSet::from_iter([Permission::BudgetReadOwn]),
-                ),
-            )
-            .with("admin", token_info(&admin_subject, admin_perms())),
-    );
-    let ctx = setup(bearer).await;
-    let r = &ctx.router;
-    seed_budget_account(&ctx.verify, &subject).await;
-
-    let (status, body) = rpc_call(
-        r.clone(),
-        "procedure.getMyBudgetBalance",
-        Wire::Json,
-        &json!({ "args": { "period": period } }),
-        Some("caller"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "body: {}",
-        String::from_utf8_lossy(&body)
-    );
-    let parsed = as_json(Wire::Json, &body);
-    assert_eq!(
-        parsed["effectiveBudgetMicros"], "0",
-        "no grant exists yet this period -- must read as zero, not an error"
-    );
-    assert_eq!(parsed["budgetAccountId"], subject);
-
-    let (status, body) = rpc_call(
-        r.clone(),
-        "procedure.grantBudget",
-        Wire::Json,
-        &json!({ "args": {
-            "budgetAccountId": subject,
-            "accountId": subject,
-            "period": period,
-            "amountMicros": "5000000"
-        } }),
-        Some("admin"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "body: {}",
-        String::from_utf8_lossy(&body)
-    );
-
-    let (status, body) = rpc_call(
-        r.clone(),
-        "procedure.getMyBudgetBalance",
-        Wire::Json,
-        &json!({ "args": { "period": period } }),
-        Some("caller"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let parsed = as_json(Wire::Json, &body);
-    assert_eq!(
-        parsed["effectiveBudgetMicros"], "5000000",
-        "the caller's own read must reflect the admin grant: {parsed}"
-    );
-}
-
-/// Test 2 (task list): reading ANOTHER subject's balance requires the admin `budget:read`
-/// permission -- `budget:read-own` alone must not also unlock it. Proven both ways in one test:
-/// the self-scoped-only caller is refused, and an admin succeeds against the exact same input.
-#[tokio::test]
-async fn get_budget_balance_requires_budget_read_not_merely_read_own() {
-    use lightbridge_authz_core::authz::PermissionSet;
-
-    let target = format!("budget-target-{}", cuid2());
-    let bystander_subject = format!("budget-bystander-{}", cuid2());
-    let admin_subject = format!("budget-admin-{}", cuid2());
-    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
-        MapBearer::new()
-            .with(
-                "self-only",
-                token_info(
-                    &bystander_subject,
-                    PermissionSet::from_iter([Permission::BudgetReadOwn]),
-                ),
-            )
-            .with("admin", token_info(&admin_subject, admin_perms())),
-    );
-    let ctx = setup(bearer).await;
-    let r = &ctx.router;
-    seed_budget_account(&ctx.verify, &target).await;
-
-    let (status, _) = rpc_call(
-        r.clone(),
-        "procedure.getBudgetBalance",
-        Wire::Json,
-        &json!({ "args": { "budgetAccountId": target, "period": "2026-08" } }),
-        Some("self-only"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "budget:read-own must not also grant the admin budget:read capability"
-    );
-
-    let (status, body) = rpc_call(
-        r.clone(),
-        "procedure.getBudgetBalance",
-        Wire::Json,
-        &json!({ "args": { "budgetAccountId": target, "period": "2026-08" } }),
-        Some("admin"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an admin holding budget:read must succeed against the same input: {}",
-        String::from_utf8_lossy(&body)
-    );
-}
-
-/// Test 3 (task list): the ledger's audit-read path returns entries newest-first and paginates
-/// correctly -- proven end-to-end over real HTTP, on top of the exhaustive repo-level pagination
-/// coverage in `lightbridge-authz-budget`'s `budget_repo_query_tests.rs`.
-#[tokio::test]
-async fn list_budget_grants_returns_ledger_history_newest_first_and_paginates() {
-    let target = format!("budget-audit-{}", cuid2());
-    let admin_subject = format!("budget-audit-admin-{}", cuid2());
-    let bearer: Arc<dyn BearerTokenServiceTrait> =
-        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
-    let ctx = setup(bearer).await;
-    let r = &ctx.router;
-    seed_budget_account(&ctx.verify, &target).await;
-
-    for amount in ["1000000", "2000000", "3000000"] {
+    for op in MOVED_BUDGET_OP_IDS {
         let (status, body) = rpc_call(
-            r.clone(),
-            "procedure.grantBudget",
+            ctx.router.clone(),
+            op,
             Wire::Json,
-            &json!({ "args": {
-                "budgetAccountId": target,
-                "accountId": target,
-                "period": "2026-08",
-                "amountMicros": amount
-            } }),
+            &json!({}),
             Some("admin"),
         )
         .await;
         assert_eq!(
             status,
-            StatusCode::OK,
-            "body: {}",
+            StatusCode::NOT_FOUND,
+            "{op} must be unreachable on authz-api (moved to authz-budget), even for an admin \
+             holding every permission: {}",
             String::from_utf8_lossy(&body)
         );
     }
 
+    // Same op-ids, bundled into ONE `/rpc/batch` call -- proves the scope check also closes the
+    // batch-frame bypass (`CratestackAuthProvider::authenticate`), not merely the outer unary gate.
+    let frames: Vec<Value> = MOVED_BUDGET_OP_IDS
+        .iter()
+        .enumerate()
+        .map(|(i, op)| json!({ "id": i, "op": op, "input": {} }))
+        .collect();
     let (status, body) = rpc_call(
-        r.clone(),
-        "procedure.listBudgetGrants",
+        ctx.router.clone(),
+        "batch",
         Wire::Json,
-        &json!({ "args": { "budgetAccountId": target, "limit": 2 } }),
+        &json!(frames),
         Some("admin"),
     )
     .await;
     assert_eq!(
         status,
         StatusCode::OK,
-        "body: {}",
+        "the outer batch endpoint only requires a valid caller -- per-frame scope is enforced \
+         deeper: {}",
         String::from_utf8_lossy(&body)
     );
     let parsed = as_json(Wire::Json, &body);
-    let entries = parsed["entries"].as_array().expect("entries array");
-    assert_eq!(entries.len(), 2, "the requested page size must be honored");
-    assert_eq!(
-        entries[0]["amountMicros"], "3000000",
-        "newest grant must be first: {parsed}"
-    );
-    assert_eq!(entries[1]["amountMicros"], "2000000");
-    let cursor = parsed["nextCursor"]
-        .as_str()
-        .expect("a full page must carry a nextCursor -- there is a third, older grant");
-
-    let (status, body) = rpc_call(
-        r.clone(),
-        "procedure.listBudgetGrants",
-        Wire::Json,
-        &json!({ "args": { "budgetAccountId": target, "limit": 2, "before": cursor } }),
-        Some("admin"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let parsed = as_json(Wire::Json, &body);
-    let entries = parsed["entries"].as_array().expect("entries array");
-    assert_eq!(
-        entries.len(),
-        1,
-        "the second page must return exactly the one remaining, oldest grant"
-    );
-    assert_eq!(entries[0]["amountMicros"], "1000000");
-    assert!(
-        parsed["nextCursor"].is_null(),
-        "a short page must report no further cursor"
-    );
-}
-
-/// Test 4 (task list): a direct admin grant appends a ledger row AND updates the balance
-/// projection, in the one transactional write path `BudgetRepo::grant` already uses for every
-/// other grant source.
-#[tokio::test]
-async fn grant_budget_appends_ledger_row_and_updates_balance_atomically() {
-    let target = format!("budget-grant-{}", cuid2());
-    let admin_subject = format!("budget-grant-admin-{}", cuid2());
-    let bearer: Arc<dyn BearerTokenServiceTrait> =
-        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
-    let ctx = setup(bearer).await;
-    let r = &ctx.router;
-    seed_budget_account(&ctx.verify, &target).await;
-
-    let (status, body) = rpc_call(
-        r.clone(),
-        "procedure.grantBudget",
-        Wire::Json,
-        &json!({ "args": {
-            "budgetAccountId": target,
-            "accountId": target,
-            "period": "2026-08",
-            "amountMicros": "7000000",
-            "reason": "support top-up"
-        } }),
-        Some("admin"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "body: {}",
-        String::from_utf8_lossy(&body)
-    );
-    let parsed = as_json(Wire::Json, &body);
-    assert_eq!(parsed["source"], "admin");
-    let grant_id = parsed["id"].as_str().expect("grant id").to_string();
-
-    let (stored_amount,): (i64,) =
-        sqlx::query_as("SELECT amount_micros FROM budget_grants WHERE id = $1")
-            .bind(&grant_id)
-            .fetch_one(&ctx.verify)
-            .await
-            .expect("the ledger row must exist");
-    assert_eq!(stored_amount, 7_000_000);
-
-    let (effective,): (i64,) = sqlx::query_as(
-        "SELECT effective_budget_micros FROM budget_balances \
-         WHERE budget_account_id = $1 AND period = '2026-08'",
-    )
-    .bind(&target)
-    .fetch_one(&ctx.verify)
-    .await
-    .expect("the balance projection row must exist in the same transaction as the grant");
-    assert_eq!(
-        effective, 7_000_000,
-        "the balance projection must reflect the grant immediately"
-    );
-}
-
-/// Test 5 (task list): the compensating-correction counterpart writes a NEW row and leaves the
-/// original completely unchanged -- proven directly against the DB (the append-only trigger is
-/// what actually enforces this; this asserts the observable effect, not just the response shape).
-#[tokio::test]
-async fn revoke_budget_grant_writes_a_compensating_row_and_leaves_the_original_unchanged() {
-    let target = format!("budget-revoke-{}", cuid2());
-    let admin_subject = format!("budget-revoke-admin-{}", cuid2());
-    let bearer: Arc<dyn BearerTokenServiceTrait> =
-        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
-    let ctx = setup(bearer).await;
-    let r = &ctx.router;
-    seed_budget_account(&ctx.verify, &target).await;
-
-    let (status, body) = rpc_call(
-        r.clone(),
-        "procedure.grantBudget",
-        Wire::Json,
-        &json!({ "args": {
-            "budgetAccountId": target,
-            "accountId": target,
-            "period": "2026-08",
-            "amountMicros": "4000000"
-        } }),
-        Some("admin"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let grant_id = as_json(Wire::Json, &body)["id"]
-        .as_str()
-        .expect("grant id")
-        .to_string();
-
-    let (amount_before, created_at_before): (i64, chrono::DateTime<chrono::Utc>) =
-        sqlx::query_as("SELECT amount_micros, created_at FROM budget_grants WHERE id = $1")
-            .bind(&grant_id)
-            .fetch_one(&ctx.verify)
-            .await
-            .expect("the original row must exist before revocation");
-
-    let (status, body) = rpc_call(
-        r.clone(),
-        "procedure.revokeBudgetGrant",
-        Wire::Json,
-        &json!({ "args": { "grantId": grant_id, "reason": "issued in error" } }),
-        Some("admin"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "body: {}",
-        String::from_utf8_lossy(&body)
-    );
-    let parsed = as_json(Wire::Json, &body);
-    assert_eq!(parsed["source"], "correction");
-    assert_eq!(parsed["amountMicros"], "-4000000");
-    assert_ne!(
-        parsed["id"], grant_id,
-        "the correction must be a NEW row, not a mutation of the original"
-    );
-
-    let (amount_after, created_at_after): (i64, chrono::DateTime<chrono::Utc>) =
-        sqlx::query_as("SELECT amount_micros, created_at FROM budget_grants WHERE id = $1")
-            .bind(&grant_id)
-            .fetch_one(&ctx.verify)
-            .await
-            .expect("the original row must still exist, untouched");
-    assert_eq!(
-        amount_after, amount_before,
-        "the append-only DB trigger means the original row's amount must be unchanged"
-    );
-    assert_eq!(created_at_after, created_at_before);
-
-    let (effective,): (i64,) = sqlx::query_as(
-        "SELECT effective_budget_micros FROM budget_balances \
-         WHERE budget_account_id = $1 AND period = '2026-08'",
-    )
-    .bind(&target)
-    .fetch_one(&ctx.verify)
-    .await
-    .expect("balance row must exist");
-    assert_eq!(
-        effective, 0,
-        "the correction must net the original grant out of the effective balance"
-    );
-}
-
-/// Test 6 (task list): authoring a new budget-policy revision must not activate it -- the
-/// previously active revision keeps serving. Complements `lightbridge-authz-budget`'s
-/// `policy_store_tests.rs::create_revision_inserts_without_activating`, which asserts the same
-/// property directly against `PolicyStore`; this proves the RPC wiring preserves it too.
-#[tokio::test]
-async fn create_budget_policy_revision_does_not_activate_it() {
-    let admin_subject = format!("budget-policy-write-admin-{}", cuid2());
-    let bearer: Arc<dyn BearerTokenServiceTrait> =
-        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
-    let ctx = setup(bearer).await;
-    let r = &ctx.router;
-
-    let (status, body) = rpc_call(
-        r.clone(),
-        "procedure.getBudgetPolicyStatus",
-        Wire::Json,
-        &json!({ "args": { "policySetId": "budget-refill" } }),
-        Some("admin"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let before = as_json(Wire::Json, &body)["activePolicyRevision"]
-        .as_str()
-        .expect("active revision string")
-        .to_string();
-
-    let rule_data = format!(
-        r#"{{
-          "policy_revision": "authored-not-activated-{}",
-          "rules": [
-            {{
-              "id": "r1",
-              "condition": {{ "type": "threshold", "field": "self_service_grant_count", "operator": "lt", "value": 9 }},
-              "effect": "auto_approve",
-              "reason_code": "ok"
-            }}
-          ],
-          "default_effect": "manual_review",
-          "default_reason_code": "no"
-        }}"#,
-        cuid2()
-    );
-
-    let (status, body) = rpc_call(
-        r.clone(),
-        "procedure.createBudgetPolicyRevision",
-        Wire::Json,
-        &json!({ "args": { "policySetId": "budget-refill", "ruleDataJson": rule_data } }),
-        Some("admin"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "body: {}",
-        String::from_utf8_lossy(&body)
-    );
-
-    let (status, body) = rpc_call(
-        r.clone(),
-        "procedure.getBudgetPolicyStatus",
-        Wire::Json,
-        &json!({ "args": { "policySetId": "budget-refill" } }),
-        Some("admin"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let after = as_json(Wire::Json, &body)["activePolicyRevision"]
-        .as_str()
-        .expect("active revision string")
-        .to_string();
-    assert_eq!(
-        before, after,
-        "authoring a new revision must not change what's currently serving"
-    );
-}
-
-/// Test 7 (task list): a caller holding none of the six wired-up budget permissions
-/// (`budget:read-own`/`budget:read`/`budget:audit-read`/`budget:grant`/`budget:revoke`/
-/// `budget:policy-write`) is refused 403 on every one of the seven procedures they gate --
-/// proves the RBAC gate is actually wired for each, not merely present in `rpc_authorize`'s map.
-#[tokio::test]
-async fn each_budget_permission_is_actually_enforced() {
-    let subject = format!("budget-noperm-{}", cuid2());
-    let bearer: Arc<dyn BearerTokenServiceTrait> =
-        Arc::new(MapBearer::new().with("no-budget-perms", token_info(&subject, viewer_perms())));
-    let ctx = setup(bearer).await;
-    let r = &ctx.router;
-    seed_budget_account(&ctx.verify, &subject).await;
-
-    let cases: [(&str, Value); 7] = [
-        (
-            "procedure.getMyBudgetBalance",
-            json!({ "period": "2026-08" }),
-        ),
-        ("procedure.listMyBudgetGrants", json!({})),
-        (
-            "procedure.getBudgetBalance",
-            json!({ "budgetAccountId": subject, "period": "2026-08" }),
-        ),
-        (
-            "procedure.listBudgetGrants",
-            json!({ "budgetAccountId": subject }),
-        ),
-        (
-            "procedure.grantBudget",
-            json!({
-                "budgetAccountId": subject,
-                "accountId": subject,
-                "period": "2026-08",
-                "amountMicros": "1000000"
-            }),
-        ),
-        (
-            "procedure.revokeBudgetGrant",
-            json!({ "grantId": "whatever", "reason": "x" }),
-        ),
-        (
-            "procedure.createBudgetPolicyRevision",
-            json!({ "policySetId": "budget-refill", "ruleDataJson": "{}" }),
-        ),
-    ];
-
-    for (op, args) in cases {
-        let (status, _) = rpc_call(
-            r.clone(),
-            op,
-            Wire::Json,
-            &json!({ "args": args }),
-            Some("no-budget-perms"),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::FORBIDDEN,
-            "{op} must be 403 for a caller holding none of the budget:* permissions"
+    let results = parsed.as_array().expect("batch results array");
+    assert_eq!(results.len(), MOVED_BUDGET_OP_IDS.len());
+    for (op, frame) in MOVED_BUDGET_OP_IDS.iter().zip(results) {
+        assert!(
+            frame.get("error").is_some(),
+            "{op}'s batch frame must carry an error (moved off authz-api): {frame}"
         );
     }
 }

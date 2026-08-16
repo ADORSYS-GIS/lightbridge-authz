@@ -3,7 +3,7 @@
 Front door for the system-level architecture docs. If you are new to this repository, read this
 page first, then follow the links below into whichever area you need next.
 
-This repo builds **API-key management plus usage analytics** as four independently deployable
+This repo builds **API-key management plus usage analytics** as five independently deployable
 services sharing two databases. See the root [`AGENTS.md`](../../AGENTS.md) for build/test
 commands and repo-wide conventions; this directory is about *shape*, not commands.
 
@@ -22,6 +22,7 @@ flowchart LR
     subgraph system["lightbridge-authz"]
         API["authz-api"]
         OPA["authz-opa"]
+        Budget["authz-budget"]
         MCP["lightbridge-mcp"]
         Usage["lightbridge-authz-usage"]
     end
@@ -34,18 +35,23 @@ flowchart LR
     end
 
     Frontend -->|"Bearer JWT"| API
+    Frontend -->|"Bearer JWT"| Budget
     Gateway -->|"Basic auth: introspect"| OPA
     KcAdapter -->|"Basic auth: resolve-context"| OPA
     McpClient -->|"Bearer JWT"| MCP
     OtelExporters -->|"OTLP/HTTP, unauthenticated"| Usage
 
     API -->|"validate via JWKS"| Keycloak
+    Budget -->|"validate via JWKS"| Keycloak
     MCP -->|"validate via JWKS"| Keycloak
 
     API --> Postgres
     OPA --> Postgres
+    Budget --> Postgres
     MCP --> Postgres
     API --> Redis
+    Budget --> Redis
+    Budget -->|"HTTP: spend query"| Usage
     Usage --> Timescale
 ```
 
@@ -59,15 +65,20 @@ Notes grounded in code, not intent:
   protocol mapper copies the result into the JWT it issues. `authz-api` and `lightbridge-mcp`
   independently validate whatever JWT they receive against Keycloak's JWKS — the SPI call and the
   JWKS validation are two separate relationships with Keycloak, not one.
-- **Redis is `authz-api`-only** today: RPC rate-limiting, the idempotency store, and the
-  `private_key_jwt` replay-tracking store for token exchange
+- **`authz-budget` carries the budget domain's RPC procedures off `authz-api`** (hard cutover, see
+  [`budget.md`](./budget.md#service-boundary-authz-budget-hard-cutover)) — it validates bearer JWTs
+  against the same Keycloak JWKS, reads/writes the same `authz` Postgres database, has its own
+  Redis-backed rate limiting, and calls `lightbridge-authz-usage`'s spend-query endpoint over HTTP
+  the same way `authz-api` used to before the move.
+- **Redis is `authz-api`/`authz-budget`-only** today: RPC rate-limiting, the idempotency store, and
+  (on `authz-api`) the `private_key_jwt` replay-tracking store for token exchange
   (`crates/lightbridge-authz-rest/src/lib.rs`). `authz-opa`, `lightbridge-mcp`, and
   `lightbridge-authz-usage` have no Redis dependency.
 - **`lightbridge-authz-usage` has no auth on ingest or query** — `/v1/otel/{traces,metrics,logs}`
   and `/usage/v1/usage/query` are all unprotected. Safe only because the service is not
   externally routable in the deployed topology; see `docs/architecture/deployment.md`.
 
-## Containers: the four deployables
+## Containers: the five deployables
 
 ```mermaid
 flowchart TB
@@ -79,6 +90,7 @@ flowchart TB
 
     API["authz-api\nport 3000"]
     OPA["authz-opa\nport 3001"]
+    Budget["authz-budget\nport 3005"]
     MCP["lightbridge-mcp\nport 3000"]
     Usage["lightbridge-authz-usage\nport 3002"]
 
@@ -86,26 +98,29 @@ flowchart TB
     UsageDB[("Timescale/Postgres - usage db")]
 
     C1 -->|"Bearer JWT"| API
+    C1 -->|"Bearer JWT"| Budget
     C1 -->|"Bearer JWT"| MCP
     C2 -->|"Basic auth"| OPA
     C3 -->|"unprotected"| Usage
 
     API --> AuthzDB
     OPA --> AuthzDB
+    Budget --> AuthzDB
     MCP --> AuthzDB
     Usage --> UsageDB
 ```
 
-`authz-api` and `authz-opa` are **the same compiled binary** (`lightbridge-authz`) run with
-different subcommands (`api` / `opa`) from the same `runtime` container-image target — they are
-two deployables, not two images. `lightbridge-mcp` and `lightbridge-authz-usage` are each their own
-binary and image target (`mcp-runtime`, `usage-runtime`). See
-[`docs/architecture/services.md`](./services.md) for routes and
-[`docs/architecture/deployment.md`](./deployment.md) for how the three images are built, signed,
-and promoted.
+`authz-api`, `authz-opa`, and `authz-budget` are **the same compiled binary** (`lightbridge-authz`)
+run with different subcommands (`api` / `opa` / `budget`) from the same `runtime` container-image
+target — they are three deployables, not three images. `lightbridge-mcp` and
+`lightbridge-authz-usage` are each their own binary and image target (`mcp-runtime`,
+`usage-runtime`). See [`docs/architecture/services.md`](./services.md) for routes and
+[`docs/architecture/deployment.md`](./deployment.md) for how the images are built, signed, and
+promoted.
 
 Local ports (`compose.yaml`, matching the health-check URLs in the root `AGENTS.md`): API `13000`,
-OPA `13001`, usage `13002`, MCP `13003` — all mapped to the in-container ports shown above.
+OPA `13001`, usage `13002`, MCP `13003`, budget `13005` — all mapped to the in-container ports
+shown above.
 
 ## Where the rest of the picture lives
 

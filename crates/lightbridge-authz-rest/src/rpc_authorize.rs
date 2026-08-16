@@ -65,6 +65,50 @@ use serde_json::json;
 /// permission is instead enforced once per frame, deeper in the dispatch pipeline, by
 /// `CratestackAuthProvider::authenticate` (see `auth_provider.rs`), which cratestack calls once per
 /// op — including once per batch frame, each time with that frame's own canonical `/rpc/<op_id>` path.
+/// Which half of the RPC surface a given server instance serves — the mechanism the budget-domain
+/// microservice split (see `docs/architecture/budget.md`) uses to make the cutover a *hard* one:
+/// every `budget:*`-gated op-id moves OFF `authz-api` (`RpcScope::Crud` denies it) and becomes
+/// reachable ONLY on `authz-budget` (`RpcScope::Budget` denies everything else), never both at
+/// once. Derived from [`required_permission`]/[`Permission::as_str`] rather than a second,
+/// hand-maintained op-id list — the same single-source-of-truth reasoning `required_permission`
+/// itself already documents — so a new budget procedure automatically falls on the right side of
+/// the split the moment its permission mapping is added there, with nothing else to update.
+///
+/// Enforced in TWO places, mirroring the existing permission gate's own dual enforcement
+/// (`rpc_authorize` for unary calls, [`crate::auth_provider::CratestackAuthProvider::authenticate`]
+/// for `POST /rpc/batch` frames, which `rpc_authorize` cannot see individually): a batch frame
+/// aimed at an out-of-scope op-id must 404 exactly like a unary call would, or the "hard cutover"
+/// claim would be false for any caller willing to wrap the call in a batch envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcScope {
+    /// `authz-api`: every mapped op-id EXCEPT `budget:*`.
+    Crud,
+    /// `authz-budget`: ONLY `budget:*` op-ids.
+    Budget,
+}
+
+impl RpcScope {
+    /// Whether `op_id` is servable under this scope. Unmapped op-ids (including `"batch"`, which
+    /// callers must check separately before consulting this) are never budget op-ids, so they pass
+    /// `Crud` and fail `Budget` — `required_permission`'s own fail-closed set decides what happens
+    /// to them next.
+    pub(crate) fn permits(self, op_id: &str) -> bool {
+        let is_budget = is_budget_op_id(op_id);
+        match self {
+            RpcScope::Crud => !is_budget,
+            RpcScope::Budget => is_budget,
+        }
+    }
+}
+
+/// Whether `op_id` requires a `budget:*` permission — the single predicate [`RpcScope::permits`]
+/// is built from. `resource()` on [`Permission`] is deliberately private to `authz.rs` (not part
+/// of its public API), so this reads the canonical `"budget:…"` wire string via the already-public
+/// [`Permission::as_str`] instead of exposing a second accessor just for this one caller.
+pub(crate) fn is_budget_op_id(op_id: &str) -> bool {
+    required_permission(op_id).is_some_and(|permission| permission.as_str().starts_with("budget:"))
+}
+
 pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
     use Permission::*;
     Some(match op_id {
@@ -205,13 +249,28 @@ pub(crate) fn op_id_from_path(path: &str) -> &str {
 /// [`rpc_authorize`] rather than through the [`required_permission`] map (see module docs).
 const BATCH_OP_ID: &str = "batch";
 
+/// State for [`rpc_authorize`]: the bearer service plus which half of the RPC surface (see
+/// [`RpcScope`]) this particular router instance serves. Bundled into one `Clone` struct rather
+/// than a tuple so `axum::middleware::from_fn_with_state`'s call site (`build_api_router`/
+/// `build_budget_router`) reads as named fields, not positional state.
+#[derive(Clone)]
+pub struct RpcAuthorizeState {
+    pub bearer: Arc<dyn BearerTokenServiceTrait>,
+    pub scope: RpcScope,
+}
+
 /// Axum middleware enforcing the coarse RBAC gate ahead of cratestack's RPC dispatch. Wire it with
-/// [`axum::middleware::from_fn_with_state`], passing the bearer service as state, and layer it over
-/// the RPC router (see `build_api_router`).
+/// [`axum::middleware::from_fn_with_state`], passing an [`RpcAuthorizeState`], and layer it over
+/// the RPC router (see `build_api_router`/`build_budget_router`).
 ///
 /// Behavior:
-/// - `batch` op-id -> only a valid, active bearer token is required here; per-frame permission is
-///   enforced deeper, once per frame, by `CratestackAuthProvider::authenticate` (see module docs);
+/// - op-id out of this server's [`RpcScope`] -> `404` unconditionally, no token required — this is
+///   what makes a moved procedure genuinely unreachable on the server it moved off, not merely
+///   permission-denied (see `RpcScope`'s own doc comment for why this alone does not close the
+///   `POST /rpc/batch` gap, and where the other half of the enforcement lives);
+/// - `batch` op-id -> only a valid, active bearer token is required here; per-frame permission
+///   AND per-frame scope are both enforced deeper, once per frame, by
+///   `CratestackAuthProvider::authenticate` (see module docs);
 /// - unmapped op-id (fail-closed set above) -> `403` unconditionally, no token required;
 /// - mapped op-id, missing/invalid/inactive token -> `401` (matching the RPC `AuthProvider`'s
 ///   fail-closed posture; the provider re-validates on the allowed path);
@@ -219,7 +278,7 @@ const BATCH_OP_ID: &str = "batch";
 /// - mapped op-id, valid token holding the permission -> forwarded to dispatch, where cratestack's
 ///   membership `@@allow` policy applies as the second gate.
 pub async fn rpc_authorize(
-    State(bearer): State<Arc<dyn BearerTokenServiceTrait>>,
+    State(state): State<RpcAuthorizeState>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -229,10 +288,14 @@ pub async fn rpc_authorize(
         let Some(token) = extract_bearer(request.headers()) else {
             return deny(StatusCode::UNAUTHORIZED, "missing bearer token");
         };
-        return match bearer.validate_bearer_token(&token).await {
+        return match state.bearer.validate_bearer_token(&token).await {
             Ok(info) if info.active => next.run(request).await,
             Ok(_) | Err(_) => deny(StatusCode::UNAUTHORIZED, "invalid bearer token"),
         };
+    }
+
+    if !state.scope.permits(&op_id) {
+        return deny(StatusCode::NOT_FOUND, "unknown RPC op");
     }
 
     let Some(required) = required_permission(&op_id) else {
@@ -243,7 +306,7 @@ pub async fn rpc_authorize(
         return deny(StatusCode::UNAUTHORIZED, "missing bearer token");
     };
 
-    match bearer.validate_bearer_token(&token).await {
+    match state.bearer.validate_bearer_token(&token).await {
         Ok(info) if info.active => {
             if info.has_permission(required) {
                 next.run(request).await
@@ -415,5 +478,146 @@ mod tests {
         assert_eq!(extract_bearer(&headers).as_deref(), Some("xyz"));
         headers.insert("authorization", "Bearer   ".parse().unwrap());
         assert_eq!(extract_bearer(&headers), None);
+    }
+
+    /// The exact 14 op-ids moved off `authz-api` onto `authz-budget` (derived from the
+    /// `budget:*`-permission entries in `required_permission` above — this is the same list the
+    /// PR description enumerates as "derived from the code", not from memory). If a future PR
+    /// adds a 15th `budget:*` op-id and forgets to add it here, `all_and_only_the_budget_gated_op_ids_are_in_budget_scope`
+    /// below still passes for it automatically (since it re-derives from `required_permission`
+    /// instead of this literal), but this list existing at all is what lets a reviewer diff "the
+    /// procedures that moved" without re-deriving them by hand.
+    const BUDGET_OP_IDS: [&str; 14] = [
+        "procedure.activateBudgetPolicy",
+        "procedure.getBudgetPolicyStatus",
+        "procedure.simulateBudgetPolicy",
+        "procedure.requestBudgetRefill",
+        "procedure.listPendingAugmentationRequests",
+        "procedure.approveAugmentationRequest",
+        "procedure.rejectAugmentationRequest",
+        "procedure.getMyBudgetBalance",
+        "procedure.listMyBudgetGrants",
+        "procedure.getBudgetBalance",
+        "procedure.listBudgetGrants",
+        "procedure.grantBudget",
+        "procedure.revokeBudgetGrant",
+        "procedure.createBudgetPolicyRevision",
+    ];
+
+    #[test]
+    fn is_budget_op_id_recognizes_exactly_the_fourteen_moved_procedures() {
+        for op_id in BUDGET_OP_IDS {
+            assert!(is_budget_op_id(op_id), "{op_id} must be a budget op-id");
+        }
+        for op_id in [
+            "procedure.createAccount",
+            "model.Account.list",
+            "procedure.createApiKey",
+            "procedure.revokeOwnSessions",
+            "procedure.revokeSubjectSessions",
+            "batch",
+            "",
+            "procedure.unknown",
+        ] {
+            assert!(
+                !is_budget_op_id(op_id),
+                "{op_id} must NOT be a budget op-id — session revocation and CRUD stay on authz-api"
+            );
+        }
+    }
+
+    /// Every `budget:*`-permission op-id in [`required_permission`] is a budget op-id, and nothing
+    /// else is — cross-checks [`is_budget_op_id`] against the map by construction instead of by a
+    /// second hand-copied list, so a future permission added to `required_permission` under a
+    /// `budget:` string is automatically picked up without touching this test.
+    #[test]
+    fn all_and_only_the_budget_gated_op_ids_are_in_budget_scope() {
+        let all_mapped_op_ids: Vec<&str> = BUDGET_OP_IDS
+            .iter()
+            .copied()
+            .chain([
+                "procedure.createAccount",
+                "model.Account.list",
+                "model.Account.get",
+                "model.Account.update",
+                "procedure.disableAccount",
+                "procedure.enableAccount",
+                "procedure.deleteAccountPermanently",
+                "model.Project.create",
+                "model.Project.list",
+                "model.Project.get",
+                "model.Project.update",
+                "model.Project.delete",
+                "procedure.disableProject",
+                "procedure.enableProject",
+                "procedure.setDefaultProject",
+                "procedure.addProjectMember",
+                "procedure.removeProjectMember",
+                "procedure.listProjectRoster",
+                "procedure.setProjectMemberRole",
+                "procedure.setProjectMemberQuotaTier",
+                "procedure.createApiKey",
+                "model.ApiKey.list",
+                "model.ApiKey.get",
+                "model.ApiKey.update",
+                "model.ApiKey.delete",
+                "procedure.revokeApiKey",
+                "procedure.rotateApiKey",
+                "model.AccountSummary.list",
+                "model.AccountSummary.get",
+                "procedure.revokeOwnSessions",
+                "procedure.revokeSubjectSessions",
+            ])
+            .collect();
+        for op_id in all_mapped_op_ids {
+            let expected = BUDGET_OP_IDS.contains(&op_id);
+            assert_eq!(
+                is_budget_op_id(op_id),
+                expected,
+                "{op_id}: is_budget_op_id should be {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_scope_crud_permits_everything_except_budget_op_ids() {
+        for op_id in BUDGET_OP_IDS {
+            assert!(
+                !RpcScope::Crud.permits(op_id),
+                "authz-api (RpcScope::Crud) must refuse the moved op {op_id}"
+            );
+        }
+        for op_id in [
+            "procedure.createAccount",
+            "model.Account.list",
+            "procedure.revokeOwnSessions",
+            "procedure.unknown",
+        ] {
+            assert!(
+                RpcScope::Crud.permits(op_id),
+                "authz-api (RpcScope::Crud) must still permit {op_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_scope_budget_permits_only_budget_op_ids() {
+        for op_id in BUDGET_OP_IDS {
+            assert!(
+                RpcScope::Budget.permits(op_id),
+                "authz-budget (RpcScope::Budget) must permit {op_id}"
+            );
+        }
+        for op_id in [
+            "procedure.createAccount",
+            "model.Account.list",
+            "procedure.revokeOwnSessions",
+            "procedure.unknown",
+        ] {
+            assert!(
+                !RpcScope::Budget.permits(op_id),
+                "authz-budget (RpcScope::Budget) must refuse the CRUD-side op {op_id}"
+            );
+        }
     }
 }

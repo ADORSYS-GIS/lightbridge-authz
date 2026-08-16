@@ -16,6 +16,43 @@ rule-data first, OPA-Wasm later, behind one contract), [ADR-0008](../adr/0008-re
 [`docs/rfc/0001-budget-refill.md`](../rfc/0001-budget-refill.md), and the full engine-swap contract
 in [`docs/budget-decision-contract.md`](../budget-decision-contract.md).
 
+## Service boundary: `authz-budget` (hard cutover)
+
+Every `budget:*`-gated RPC procedure moved off `authz-api` onto its own `authz-budget`
+microservice — same binary (`lightbridge-authz`), a `budget` subcommand, own address/port/TLS
+(`config::BudgetServer`), own container in `compose.yaml`. **Hard cutover, not the transitional
+duplication `authz-idp` still carries**: `authz-api` no longer serves any budget op-id at all, on
+either the unary `/rpc/{op_id}` path or a `/rpc/batch` frame — see
+[`services.md`](./services.md#authz-budget) for the full route table and the exact 14 procedures
+that moved.
+
+**Why one `Procedures` impl, not a second schema/crate.** cratestack's `include_server_schema!`
+macro emits a single `cratestack_schema` module per crate — "the schemas are mutually-exclusive
+within a single crate" (`cratestack-macros`' own module doc). Splitting the budget procedures into
+a genuinely separate schema/generated-client would mean a second crate with its own
+`schema/budget.cstack`, which is exactly the "new crate" shape the split deliberately avoided.
+Instead, `authz-budget` reuses the SAME generated `ProcedureRegistry`/`Procedures` type
+`authz-api` does, mounted at a different path (`/budget`, fixed, not `ApiServer.rpc_base_path`)
+and restricted at the routing layer by `RpcScope` (`crates/lightbridge-authz-rest/src/rpc_authorize.rs`):
+
+- `RpcScope::Crud` (authz-api) refuses every `budget:*` op-id.
+- `RpcScope::Budget` (authz-budget) refuses everything else.
+
+Enforced in **two** places, mirroring how the permission gate itself is already dual-enforced: the
+outer `rpc_authorize` Axum middleware (unary calls, and a fast 404 before even looking at the
+bearer token) and `CratestackAuthProvider::authenticate` (every op, including once per `/rpc/batch`
+frame — the only place a batch frame's own op-id is visible at all, which is what closes the batch
+bypass a middleware-only check would leave open). Both derive `is_budget_op_id` from the same
+`required_permission` map `rpc_authorize.rs` already used for the permission gate, not a second
+hand-maintained list — a future budget permission is automatically scoped correctly the moment its
+`required_permission` entry lands.
+
+Authorization is unchanged by the move: every procedure keeps its exact permission from
+[`docs/rbac.md`](../rbac.md), default-deny stays default-deny, and the self-vs-admin split
+(`budget:read-own`'s procedures take no target field, structurally incapable of reading anyone
+else's budget) survives verbatim — the split only changes which host and path prefix serves a
+call, never what a caller needs to hold to make it.
+
 ## Augmentation request lifecycle
 
 `budget_augmentation_requests` carries the exact state machine from the RFC's "Domain (ADR-0009)"
@@ -183,23 +220,33 @@ present to the `lightbridge-ss` frontend.
   `PolicyEngine` implementation that exists; the trait boundary is designed to accept a second one
   without changing callers, but no work toward it has begun.
 
-**RPC surface, as of `origin/main` at the time this document was written:** `activateBudgetPolicy`,
-`getBudgetPolicyStatus`, `simulateBudgetPolicy` (policy lifecycle), `requestBudgetRefill`
-(self-service refill), `listPendingAugmentationRequests`, `approveAugmentationRequest`,
-`rejectAugmentationRequest` (admin review queue) — gated by the `budget:policy-activate`,
-`budget:policy-read`, `budget:policy-simulate`, `budget:self-refill`, and `budget:review`
-permissions respectively; see [`docs/rbac.md`](../rbac.md) for the authoritative table. **A
-separate, actively in-flight change is adding further budget read/audit/admin RPC procedures and
-their `budget:*` permission gates** (`docs/rbac.md` already sketches `budget:read`,
-`budget:audit-read`, `budget:grant`, `budget:revoke`, and `budget:policy-write` as permissions with
-no procedure wired to them yet) — this document does not enumerate those procedures, since they had
-not landed as of this writing.
+**RPC surface, as of `origin/main` at the time this document was written:** all 14 procedures below
+are reachable on `authz-budget` (`POST /budget/rpc/{op_id}`) and refused (404) on `authz-api` —
+see "Service boundary" above.
+
+- Policy lifecycle: `activateBudgetPolicy` (`budget:policy-activate`), `getBudgetPolicyStatus`
+  (`budget:policy-read`), `simulateBudgetPolicy` (`budget:policy-simulate`),
+  `createBudgetPolicyRevision` (`budget:policy-write`).
+- Self-service refill + admin review: `requestBudgetRefill` (`budget:self-refill`),
+  `listPendingAugmentationRequests` / `approveAugmentationRequest` / `rejectAugmentationRequest`
+  (all `budget:review`).
+- Direct balance/ledger reads: `getMyBudgetBalance` / `listMyBudgetGrants` (`budget:read-own` —
+  no target field, structurally scoped to the caller's own account), `getBudgetBalance`
+  (`budget:read`) / `listBudgetGrants` (`budget:audit-read`) (both admin, arbitrary-target).
+- Direct admin grant/revoke: `grantBudget` (`budget:grant`), `revokeBudgetGrant`
+  (`budget:revoke`).
+
+See [`docs/rbac.md`](../rbac.md) for the authoritative permission table and the full self-vs-admin
+reasoning; the list here is derived from `rpc_authorize.rs`'s `required_permission` map, not
+maintained by hand.
 
 ## Spend dependency: which reader is active, and what happens when spend data is unavailable
 
 `Facts.spend_this_period`/`spend_last_period` come from a `SpendReader`
 (`crates/lightbridge-authz-budget/src/spend.rs`), which is one of two implementations, chosen once
-at server startup (`start_api_server` in `crates/lightbridge-authz-rest/src/lib.rs`):
+at server startup (`start_budget_server` in `crates/lightbridge-authz-rest/src/lib.rs` — this
+selection moved here from `start_api_server` along with the rest of the budget domain's RPC
+surface; the two functions build it identically):
 
 - **`UsageServiceSpendReader`** — calls `lightbridge-authz-usage`'s `/usage/v1/spend/query`
   endpoint over HTTPS for the account/period being evaluated, instead of querying `usage_events`
@@ -223,7 +270,7 @@ owns the query too, and `UsageServiceSpendReader` calls it like any other client
 `lightbridge-usage-db-role` credential — i.e. prod was running a real `TimescaleSpendReader`. Once
 this repo's `Config` type drops the `usage_database` field, that stale key in prod's YAML is
 silently ignored (unknown YAML keys don't fail config load), `Config.usage_service` reads as
-`None`, and `start_api_server` degrades to `UnavailableSpendReader` — **every spend-dependent
+`None`, and `start_budget_server` degrades to `UnavailableSpendReader` — **every spend-dependent
 refill decision routes to manual review** until `ai-helm-values` is updated to set `usage_service`
 instead (just a `base_url` — no credential, see "Security posture" below). This degrades safely
 (fails closed, never opens a bypass) but is a real operational regression for self-service refill

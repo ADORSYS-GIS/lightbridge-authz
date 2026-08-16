@@ -6,6 +6,15 @@ this repo's PRs cannot produce the screenshot evidence #191's own Verification s
 that story for the full picture. This doc orients a frontend engineer on the RPC shapes and the
 behaviors that need explicit copy, without duplicating the schema.
 
+**⚠️ Breaking change: these four RPCs, and every other `budget:*`-gated procedure, moved off
+`authz-api` onto a separate `authz-budget` service, mounted under a fixed `/budget` path prefix
+(`POST /budget/rpc/{op_id}` instead of `POST /rpc/{op_id}`) — see
+[`docs/architecture/budget.md`](./architecture/budget.md#service-boundary-authz-budget-hard-cutover).
+This is a hard cutover: `authz-api` no longer serves these op-ids at all. A generated client
+pointed at `authz-api`'s base URL will get `404` on every one of them. `converse-frontends` needs a
+second cratestack client instance configured with `authz-budget`'s base URL + `/budget` prefix —
+see the tracking issue filed in `ADORSYS-GIS/converse-frontends` for the exact URLs.**
+
 Source of truth: `crates/lightbridge-authz-api/schema/authz.cstack` (search for
 `AugmentationRequest`, `requestBudgetRefill`, `listPendingAugmentationRequests`,
 `approveAugmentationRequest`, `rejectAugmentationRequest`) is the authoritative field list. This doc

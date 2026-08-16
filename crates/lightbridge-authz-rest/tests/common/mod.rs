@@ -159,9 +159,24 @@ pub async fn rpc_call<T: Serialize + ?Sized>(
     body: &T,
     token: Option<&str>,
 ) -> (StatusCode, Vec<u8>) {
+    rpc_call_at(router, "", op_id, wire, body, token).await
+}
+
+/// Like [`rpc_call`], but against `POST {base_path}/rpc/{op_id}` — for a router mounted under a
+/// prefix, e.g. `authz-budget`'s fixed `/budget` (`build_budget_router`) or `authz-api`'s
+/// configurable `rpc_base_path`. `base_path` is used verbatim (no leading-slash normalization —
+/// callers pass `""` for a root mount, matching [`rpc_call`]'s own behavior).
+pub async fn rpc_call_at<T: Serialize + ?Sized>(
+    router: Router,
+    base_path: &str,
+    op_id: &str,
+    wire: Wire,
+    body: &T,
+    token: Option<&str>,
+) -> (StatusCode, Vec<u8>) {
     let mut builder = Request::builder()
         .method("POST")
-        .uri(format!("/rpc/{op_id}"))
+        .uri(format!("{base_path}/rpc/{op_id}"))
         .header("content-type", wire.content_type())
         .header("accept", wire.content_type());
     if let Some(token) = token {
