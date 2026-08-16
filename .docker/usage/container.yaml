@@ -5,6 +5,11 @@ server:
     tls:
       cert_path: "/tls/usage.crt"
       key_path: "/tls/usage.key"
+    # Basic-auth credentials gating /usage/v1/spend/query only -- must match authz-api's
+    # usage_service.basic_auth in .docker/authz/container.yaml.
+    basic_auth:
+      username: "usage-internal"
+      password: "change-me"
 logging:
   level: "info"
 database:

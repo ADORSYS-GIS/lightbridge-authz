@@ -2,6 +2,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::{Json, body::Bytes, http::HeaderMap};
 use chrono::{Duration, Utc};
+use lightbridge_authz_core::config::BasicAuth;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_core::{Error, Result, async_trait};
 use lightbridge_authz_usage_rest::UsageRepoTrait;
@@ -28,10 +29,11 @@ use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use tower::ServiceExt;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct MockUsageRepo {
     points: Vec<UsageSeriesPoint>,
     inserted_events: usize,
+    spend: Option<f64>,
 }
 
 #[async_trait]
@@ -42,6 +44,22 @@ impl UsageRepoTrait for MockUsageRepo {
 
     async fn query_usage(&self, _input: &UsageQueryRequest) -> Result<Vec<UsageSeriesPoint>> {
         Ok(self.points.clone())
+    }
+
+    async fn spend_for_account(
+        &self,
+        _account_id: &str,
+        _start: chrono::DateTime<Utc>,
+        _end: chrono::DateTime<Utc>,
+    ) -> Result<Option<f64>> {
+        Ok(self.spend)
+    }
+}
+
+fn test_basic_auth() -> BasicAuth {
+    BasicAuth {
+        username: "usage-internal".to_string(),
+        password: "change-me".to_string(),
     }
 }
 
@@ -76,7 +94,9 @@ fn usage_app(dev_cors: bool) -> axum::Router {
         repo: Arc::new(MockUsageRepo {
             points: vec![],
             inserted_events: 0,
+            spend: None,
         }),
+        basic_auth: test_basic_auth(),
     });
     build_usage_router(state, lazy_pool(), dev_cors)
 }
@@ -157,7 +177,9 @@ async fn query_usage_returns_bad_request_when_time_window_is_invalid() {
         repo: Arc::new(MockUsageRepo {
             points: vec![],
             inserted_events: 0,
+            spend: None,
         }),
+        basic_auth: test_basic_auth(),
     });
 
     let result = query_usage(axum::extract::State(state), Json(req)).await;
@@ -191,7 +213,9 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
                 completion_tokens: 40,
                 total_tokens: 120,
             }],
+            spend: None,
         }),
+        basic_auth: test_basic_auth(),
     });
 
     let req = base_request();
@@ -210,7 +234,9 @@ async fn ingest_logs_treats_noop_insert_as_success() {
         repo: Arc::new(MockUsageRepo {
             points: vec![],
             inserted_events: 0,
+            spend: None,
         }),
+        basic_auth: test_basic_auth(),
     });
 
     let response = ingest_logs(
@@ -231,7 +257,9 @@ async fn ingest_logs_rejects_invalid_protobuf_as_bad_request() {
         repo: Arc::new(MockUsageRepo {
             points: vec![],
             inserted_events: 0,
+            spend: None,
         }),
+        basic_auth: test_basic_auth(),
     });
 
     let result = ingest_logs(
@@ -369,7 +397,9 @@ async fn ingest_traces_treats_noop_insert_as_success() {
         repo: Arc::new(MockUsageRepo {
             points: vec![],
             inserted_events: 0,
+            spend: None,
         }),
+        basic_auth: test_basic_auth(),
     });
 
     let response = ingest_traces(
@@ -390,7 +420,9 @@ async fn ingest_traces_rejects_invalid_protobuf_as_bad_request() {
         repo: Arc::new(MockUsageRepo {
             points: vec![],
             inserted_events: 0,
+            spend: None,
         }),
+        basic_auth: test_basic_auth(),
     });
 
     let result = ingest_traces(
@@ -413,7 +445,9 @@ async fn ingest_metrics_treats_noop_insert_as_success() {
         repo: Arc::new(MockUsageRepo {
             points: vec![],
             inserted_events: 0,
+            spend: None,
         }),
+        basic_auth: test_basic_auth(),
     });
 
     let response = ingest_metrics(
@@ -434,7 +468,9 @@ async fn ingest_metrics_rejects_invalid_protobuf_as_bad_request() {
         repo: Arc::new(MockUsageRepo {
             points: vec![],
             inserted_events: 0,
+            spend: None,
         }),
+        basic_auth: test_basic_auth(),
     });
 
     let result = ingest_metrics(
@@ -457,7 +493,9 @@ async fn ingest_logs_accepts_json_content_type_payload() {
         repo: Arc::new(MockUsageRepo {
             points: vec![],
             inserted_events: 0,
+            spend: None,
         }),
+        basic_auth: test_basic_auth(),
     });
 
     let body = serde_json::json!({
@@ -503,7 +541,9 @@ async fn ingest_logs_accepts_gzip_encoded_body() {
         repo: Arc::new(MockUsageRepo {
             points: vec![],
             inserted_events: 0,
+            spend: None,
         }),
+        basic_auth: test_basic_auth(),
     });
 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());

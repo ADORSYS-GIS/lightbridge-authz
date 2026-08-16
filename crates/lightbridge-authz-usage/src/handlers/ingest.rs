@@ -1884,10 +1884,23 @@ mod tests {
             ) -> Result<Vec<crate::models::UsageSeriesPoint>> {
                 Ok(vec![])
             }
+
+            async fn spend_for_account(
+                &self,
+                _account_id: &str,
+                _start: chrono::DateTime<chrono::Utc>,
+                _end: chrono::DateTime<chrono::Utc>,
+            ) -> Result<Option<f64>> {
+                Ok(None)
+            }
         }
 
         let state = crate::UsageState {
             repo: Arc::new(PartialInsertRepo { persisted: 1 }),
+            basic_auth: lightbridge_authz_core::config::BasicAuth {
+                username: "usage-internal".to_string(),
+                password: "change-me".to_string(),
+            },
         };
         let events = vec![base_usage_event(), base_usage_event()];
 

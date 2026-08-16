@@ -281,7 +281,13 @@ async fn query_usage_rejects_an_unsupported_bucket_interval(pool: PgPool) {
 async fn healthz_ready_reports_ok_against_a_live_database(pool: PgPool) {
     let readiness_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
     let repo = Arc::new(build_repo(pool));
-    let state = Arc::new(UsageState { repo });
+    let state = Arc::new(UsageState {
+        repo,
+        basic_auth: lightbridge_authz_core::config::BasicAuth {
+            username: "usage-internal".to_string(),
+            password: "change-me".to_string(),
+        },
+    });
     let app = build_usage_router(state, readiness_pool, false);
 
     let response = app

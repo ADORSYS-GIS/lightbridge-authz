@@ -201,33 +201,41 @@ not landed as of this writing.
 (`crates/lightbridge-authz-budget/src/spend.rs`), which is one of two implementations, chosen once
 at server startup (`start_api_server` in `crates/lightbridge-authz-rest/src/lib.rs`):
 
-- **`TimescaleSpendReader`** — reads `SUM(total_cost)` from `usage_events` in the usage-events
-  database, for the account/period being evaluated. Used when `Config.usage_database` is set.
-- **`UnavailableSpendReader`** — never touches any database; always reports `Spend::Unavailable`.
-  Used when `Config.usage_database` is `None`.
+- **`UsageServiceSpendReader`** — calls `lightbridge-authz-usage`'s Basic-auth-protected
+  `/usage/v1/spend/query` endpoint over HTTPS for the account/period being evaluated, instead of
+  querying `usage_events` directly. Used when `Config.usage_service` is set.
+- **`UnavailableSpendReader`** — never touches the network; always reports `Spend::Unavailable`.
+  Used when `Config.usage_service` is `None`.
 
-**`TimescaleSpendReader` is active in production.** Prod does not consume this repo's
-`config/default.yaml`/`.docker/authz/container.yaml` at all — the `api` component's Helm values in
-the separate `ai-helm-values` repo
-(`environments/prod/values/lightbridge-app.yaml`) replace `config.yaml` **wholesale** with a full
-inline document, which sets `usage_database.url: "${USAGE_DATABASE_URL}"`; the same file's `env:`
-block defines `USAGE_DATABASE_URL` as a real `postgresql://` connection string (reusing the
-existing `usage` role/credential, `lightbridge-usage-db-role`) pointed at the in-cluster
-`lightbridge-main-db-rw.converse.svc.cluster.local` Postgres instance's `usage` database. That
-wiring was completed and verified recently. So in prod, `start_api_server` constructs a real
-`TimescaleSpendReader` and every spend-dependent policy fact reflects actual `usage_events` data.
+This inverted a prior direct-database dependency: before the PR that introduced
+`UsageServiceSpendReader`, this crate's `TimescaleSpendReader` opened its own connection straight
+to the usage-events database and ran `SELECT SUM(total_cost) ...` against `usage_events` itself —
+two services querying one service's tables. `lightbridge-authz-usage` owns `usage_events`; it now
+owns the query too, and `UsageServiceSpendReader` calls it like any other client would.
 
-**This repo's own tracked config is a different story, and matters for local runs and tests.**
-Grepping `config/default.yaml`, `.docker/authz/container.yaml`, and the umbrella Helm chart under
-`charts/` in *this* repository finds `usage_database` set nowhere — none of them are what prod
-actually deploys, but they are what a local `docker compose up`/`cargo run` or a CI integration
-test uses. For those, `start_api_server` degrades to `UnavailableSpendReader`, exactly as
-described below. **The general trap this is worth naming explicitly:** asking "is X configured?"
-by grepping only this repo answers "is X configured in this repo's own defaults," not "is X
-configured in production" — prod's values repo can and does override the entire `config.yaml`
-wholesale, so an absent key here says nothing about what's actually running. `TimescaleSpendReader`
-itself needs no further code change to activate anywhere else `usage_database` gets set; it is
-already wired to do so automatically.
+**⚠️ This inversion is a breaking config-key rename, and it needs a companion change in
+`ai-helm-values` to keep working in production.** As of the PR that introduced this section, prod's
+`api` component Helm values (`environments/prod/values/lightbridge-app.yaml` in the separate
+`ai-helm-values` repo) replaced `config.yaml` **wholesale** with a full inline document setting
+`usage_database.url: "${USAGE_DATABASE_URL}"`, pointed at the in-cluster
+`lightbridge-main-db-rw.converse.svc.cluster.local` Postgres instance's `usage` database via the
+`lightbridge-usage-db-role` credential — i.e. prod was running a real `TimescaleSpendReader`. Once
+this repo's `Config` type drops the `usage_database` field, that stale key in prod's YAML is
+silently ignored (unknown YAML keys don't fail config load), `Config.usage_service` reads as
+`None`, and `start_api_server` degrades to `UnavailableSpendReader` — **every spend-dependent
+refill decision routes to manual review** until `ai-helm-values` is updated to set `usage_service`
+instead (base URL + Basic-auth credentials matching what `lightbridge-authz-usage`'s own Helm
+values configure at `server.usage.basic_auth`). This degrades safely (fails closed, never opens a
+bypass) but is a real operational regression for self-service refill until that companion change
+ships — see the PR that introduced this section for the exact diff needed.
+
+**This repo's own tracked config is what local runs and tests exercise.**
+`config/default.yaml`/`.docker/authz/container.yaml` set `usage_service` pointed at
+`authz-usage`/`localhost:13002` respectively, with `insecure_skip_verify: true` (both serve a
+self-signed cert, matching `AGENTS.md`'s Security Notes). The general trap named in earlier
+revisions of this doc still applies in the other direction now: prod's values repo can and does
+override the entire `config.yaml` wholesale, so this repo's own defaults say nothing about what's
+actually running in prod until the config keys agree.
 
 **This fails closed, not open.** `Spend` is a two-variant enum (`Known(i64)` /
 `Unavailable`) specifically so a policy rule can never mistake "we don't know" for "spent zero".
@@ -238,6 +246,12 @@ When a rule-data `Condition::Threshold` references a spend-backed field
 `Effect::ManualReview` with reason code `required_fact_unavailable` — never to `auto_approve`, and
 never silently coerced to `Spend::Known(0)` (verified by
 `rule_data.rs::spend_unavailable_for_a_referenced_field_routes_to_manual_review_not_auto_approve`).
+`UsageServiceSpendReader` extends this same fail-closed rule to every way its HTTP call to
+`lightbridge-authz-usage` can go wrong — unreachable, timeout, non-2xx status, or a body that
+doesn't parse all resolve to `Spend::Unavailable`, never a propagated error and never
+`Spend::Known(0)` (see that reader's doc comment and
+`crates/lightbridge-authz-budget/tests/usage_service_spend_reader_tests.rs`, one test per failure
+mode).
 
 One important qualifier: **the currently-seeded policy doesn't reference spend at all** — its one
 rule keys on `self_service_grant_count`, not on either spend field — so today, an unavailable

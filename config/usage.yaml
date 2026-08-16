@@ -5,6 +5,12 @@ server:
     tls:
       cert_path: "./config/tls/usage.crt"
       key_path: "./config/tls/usage.key"
+    # Basic-auth credentials gating /usage/v1/spend/query only -- every other route on this
+    # server (OTEL ingest, /usage/v1/usage/query, health probes, docs) stays unauthenticated.
+    # Must match server.api's `usage_service.basic_auth` in config/default.yaml.
+    basic_auth:
+      username: "usage-internal"
+      password: "change-me"
 logging:
   level: "info"
 database:

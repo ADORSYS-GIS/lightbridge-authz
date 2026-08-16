@@ -180,7 +180,7 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
     );
 
     // Real budget-refill dependencies against the same live `core` pool (PR 3.4, #191). No
-    // `usage_database` is configured for this test file (it does not exercise spend-dependent
+    // `usage_service` is configured for this test file (it does not exercise spend-dependent
     // policy rules), so `UnavailableSpendReader` stands in -- see that type's own doc comment.
     let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
         core.clone(),

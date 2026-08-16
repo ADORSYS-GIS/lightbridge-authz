@@ -13,6 +13,7 @@ workspace = true
 thiserror.workspace = true
 sqlx.workspace = true
 chrono.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -21,6 +22,8 @@ tracing.workspace = true
 workspace = true
 
 [dev-dependencies]
+base64.workspace = true
+httpmock.workspace = true
 tokio.workspace = true
 
 [features]
@@ -42,9 +45,8 @@ path = "tests/budget_repo_query_tests.rs"
 required-features = ["it-tests"]
 
 [[test]]
-name = "spend_reader_tests"
-path = "tests/spend_reader_tests.rs"
-required-features = ["it-tests"]
+name = "usage_service_spend_reader_tests"
+path = "tests/usage_service_spend_reader_tests.rs"
 
 [[test]]
 name = "budget_replay_and_expiry_tests"

@@ -40,6 +40,20 @@ database:
 # "Rate limiting (Redis-backed)"). Optional: authz-opa/lightbridge-mcp/usage ignore this block.
 redis:
   url: "${REDIS_URL:-redis://redis:6379}"
+# HTTP client for authz-api's budget domain to call the usage service's Basic-auth-protected
+# /usage/v1/spend/query endpoint (see crates/lightbridge-authz-budget/src/spend.rs). Optional,
+# like redis above. Absent -> budget refill spend facts report Spend::Unavailable (fails closed
+# to manual review), not a startup failure. Credentials here must match authz-usage's
+# server.usage.basic_auth in .docker/usage/container.yaml. insecure_skip_verify is only safe
+# because authz-usage serves a self-signed cert in this Compose stack (see authz-tls above) --
+# never set it true against a real deployment.
+usage_service:
+  base_url: "https://authz-usage:3002"
+  basic_auth:
+    username: "usage-internal"
+    password: "change-me"
+  insecure_skip_verify: true
+  timeout_ms: 5000
 oauth2:
   # REQUIRED credential-issuance mode — no default; must be stated explicitly.
   #   self     → mint self-signed JWT API keys (uses `signing`). external → Keycloak-exchanged

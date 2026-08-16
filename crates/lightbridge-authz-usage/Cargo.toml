@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 axum.workspace = true
 axum-server.workspace = true
+base64.workspace = true
 chrono.workspace = true
 prost.workspace = true
 opentelemetry-proto.workspace = true
@@ -48,4 +49,9 @@ it-tests = []
 [[test]]
 name = "repo_it_tests"
 path = "tests/repo_it_tests.rs"
+required-features = ["it-tests"]
+
+[[test]]
+name = "spend_query_it_tests"
+path = "tests/spend_query_it_tests.rs"
 required-features = ["it-tests"]

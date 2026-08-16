@@ -1,7 +1,8 @@
-use axum::{Json, Router, http::StatusCode, routing::get};
+use axum::{Json, Router, http::StatusCode, middleware::from_fn_with_state, routing::get};
+use chrono::{DateTime, Utc};
 use lightbridge_authz_core::{
     Result, async_trait,
-    config::Database,
+    config::{BasicAuth, Database},
     db::{DbPool, DbPoolTrait, is_database_ready},
     server::{dev_cors_enabled, serve_tls},
 };
@@ -15,6 +16,7 @@ use utoipa_swagger_ui::SwaggerUi;
 pub mod config;
 pub mod handlers;
 pub mod instrumentation;
+pub mod middleware;
 pub mod models;
 pub mod repo;
 pub mod routers;
@@ -31,12 +33,20 @@ struct RootResponse {
 
 pub struct UsageState {
     pub repo: Arc<dyn UsageRepoTrait>,
+    /// Basic-auth credentials gating `/usage/v1/spend/query` only -- see `middleware::basic_auth`.
+    pub basic_auth: BasicAuth,
 }
 
 #[async_trait]
 pub trait UsageRepoTrait: Send + Sync {
     async fn insert_usage_events(&self, events: &[UsageEvent]) -> Result<usize>;
     async fn query_usage(&self, input: &UsageQueryRequest) -> Result<Vec<UsageSeriesPoint>>;
+    async fn spend_for_account(
+        &self,
+        account_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Option<f64>>;
 }
 
 #[async_trait]
@@ -47,6 +57,15 @@ impl UsageRepoTrait for StoreRepo {
 
     async fn query_usage(&self, input: &UsageQueryRequest) -> Result<Vec<UsageSeriesPoint>> {
         StoreRepo::query_usage(self, input).await
+    }
+
+    async fn spend_for_account(
+        &self,
+        account_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Option<f64>> {
+        StoreRepo::spend_for_account(self, account_id, start, end).await
     }
 }
 
@@ -60,6 +79,9 @@ pub fn build_usage_router(
     readiness_pool: Arc<dyn DbPoolTrait>,
     dev_cors: bool,
 ) -> Router {
+    let spend_routes = routers::spend_router()
+        .route_layer(from_fn_with_state(state.clone(), middleware::basic_auth));
+
     let router = Router::new()
         .route("/", get(root_handler))
         .route("/healthz", get(health_handler))
@@ -76,6 +98,7 @@ pub fn build_usage_router(
                 .url("/usage/v1/usage/openapi.json", UsageDoc::openapi()),
         )
         .merge(routers::usage_router())
+        .merge(spend_routes)
         .with_state(state);
 
     if dev_cors {
@@ -89,7 +112,10 @@ pub async fn start_usage_server(usage: &UsageServer, database: &Database) -> Res
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(database).await?);
     let readiness_pool = pool.clone();
     let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool));
-    let state = Arc::new(UsageState { repo });
+    let state = Arc::new(UsageState {
+        repo,
+        basic_auth: usage.basic_auth.clone(),
+    });
 
     let dev_cors = dev_cors_enabled();
     let app = build_usage_router(state, readiness_pool, dev_cors);
@@ -134,7 +160,8 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
         crate::handlers::ingest::ingest_traces,
         crate::handlers::ingest::ingest_metrics,
         crate::handlers::ingest::ingest_logs,
-        crate::handlers::query::query_usage
+        crate::handlers::query::query_usage,
+        crate::handlers::spend::query_spend
     ),
     components(
         schemas(
@@ -145,12 +172,15 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
             crate::models::UsageQueryFilters,
             crate::models::UsageSeriesPoint,
             crate::models::UsageScope,
-            crate::models::UsageGroupBy
+            crate::models::UsageGroupBy,
+            crate::models::SpendQueryRequest,
+            crate::models::SpendQueryResponse
         )
     ),
     tags(
         (name = "ingest", description = "OTEL ingest endpoints"),
-        (name = "usage", description = "Timeseries usage query endpoint")
+        (name = "usage", description = "Timeseries usage query endpoint"),
+        (name = "spend", description = "Internal, Basic-auth-protected spend-query endpoint used by the budget domain")
     )
 )]
 struct UsageDoc;
@@ -187,6 +217,10 @@ mod tests {
         assert!(
             paths.contains_key("/v1/otel/logs"),
             "expected logs ingest endpoint in openapi paths"
+        );
+        assert!(
+            paths.contains_key("/usage/v1/spend/query"),
+            "expected spend query endpoint in openapi paths"
         );
     }
 
