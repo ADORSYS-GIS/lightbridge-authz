@@ -25,13 +25,15 @@ pub struct Config {
     /// still loads.
     #[serde(default)]
     pub redis: Option<Redis>,
-    /// HTTP client config for calling `lightbridge-authz-usage`'s Basic-auth-protected
-    /// `/usage/v1/spend/query` endpoint, used by the budget domain's `UsageServiceSpendReader`
+    /// HTTP client config for calling `lightbridge-authz-usage`'s `/usage/v1/spend/query`
+    /// endpoint, used by the budget domain's `UsageServiceSpendReader`
     /// (`crates/lightbridge-authz-budget/src/spend.rs`) to read `usage_events.total_cost` sums
-    /// without either service reaching into the other's database directly. Optional, like
-    /// `redis` above: only the budget domain's spend reads need it, so a config file that omits
-    /// it entirely still loads (and budget refill spend facts report `Spend::Unavailable`, per
-    /// `UnavailableSpendReader`'s doc comment).
+    /// without either service reaching into the other's database directly. Unauthenticated today
+    /// (no Basic auth, no mTLS yet — see `UsageServiceSpendReader`'s own doc comment for that
+    /// deliberate, tracked-as-a-follow-up tradeoff). Optional, like `redis` above: only the
+    /// budget domain's spend reads need it, so a config file that omits it entirely still loads
+    /// (and budget refill spend facts report `Spend::Unavailable`, per `UnavailableSpendReader`'s
+    /// doc comment).
     #[serde(default)]
     pub usage_service: Option<UsageServiceClient>,
     pub oauth2: Oauth2,
@@ -395,16 +397,16 @@ pub struct Database {
 }
 
 /// HTTP client config for `lightbridge-authz-budget`'s `UsageServiceSpendReader` to call
-/// `lightbridge-authz-usage`'s Basic-auth-protected `/usage/v1/spend/query` endpoint. See
-/// `Config::usage_service`'s doc comment for why this replaced a direct database connection.
+/// `lightbridge-authz-usage`'s `/usage/v1/spend/query` endpoint. See `Config::usage_service`'s
+/// doc comment for why this replaced a direct database connection. Carries no credential —
+/// this call is unauthenticated today (no Basic auth, no mTLS yet); see
+/// `UsageServiceSpendReader`'s own doc comment for the deliberate security-posture tradeoff and
+/// the follow-up tracking mTLS.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsageServiceClient {
     /// Base URL of the usage service, e.g. `https://authz-usage:3002`. A trailing slash is
     /// stripped if present.
     pub base_url: String,
-    /// Shared Basic-auth credentials the usage service's spend-query endpoint expects — mirrors
-    /// `server.opa.basic_auth`'s mechanism exactly.
-    pub basic_auth: BasicAuth,
     /// Skip TLS certificate verification when calling the usage service. Local Compose serves
     /// every authz service over a self-signed certificate (see `AGENTS.md`'s Security Notes), so
     /// a client that verifies certificates strictly can never reach it there. Defaults to
@@ -992,9 +994,6 @@ database:
   url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz\"
 usage_service:
   base_url: \"https://authz-usage:3002\"
-  basic_auth:
-    username: \"usage-internal\"
-    password: \"s3cret\"
   insecure_skip_verify: true
   timeout_ms: 2500
 oauth2:
@@ -1008,8 +1007,6 @@ otel:
         let cfg: Config = from_str(yaml).expect("config with usage_service must load");
         let usage_service = cfg.usage_service.expect("usage_service must be set");
         assert_eq!(usage_service.base_url, "https://authz-usage:3002");
-        assert_eq!(usage_service.basic_auth.username, "usage-internal");
-        assert_eq!(usage_service.basic_auth.password, "s3cret");
         assert!(usage_service.insecure_skip_verify);
         assert_eq!(usage_service.timeout_ms, 2500);
     }
@@ -1039,9 +1036,6 @@ database:
   url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz\"
 usage_service:
   base_url: \"https://authz-usage:3002\"
-  basic_auth:
-    username: \"usage-internal\"
-    password: \"s3cret\"
 oauth2:
   type: self
   jwks_url: \"http://localhost/jwks\"

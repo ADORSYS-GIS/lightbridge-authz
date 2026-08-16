@@ -2,9 +2,7 @@
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
-use base64::Engine;
 use chrono::{DateTime, Utc};
-use lightbridge_authz_core::config::BasicAuth;
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_usage_rest::UsageState;
@@ -16,22 +14,6 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use tower::ServiceExt;
 
-const USERNAME: &str = "usage-internal";
-const PASSWORD: &str = "change-me";
-
-fn test_basic_auth() -> BasicAuth {
-    BasicAuth {
-        username: USERNAME.to_string(),
-        password: PASSWORD.to_string(),
-    }
-}
-
-fn basic_auth_header(username: &str, password: &str) -> String {
-    let encoded =
-        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
-    format!("Basic {encoded}")
-}
-
 fn parse_timestamp(value: &str) -> DateTime<Utc> {
     value
         .parse()
@@ -41,10 +23,7 @@ fn parse_timestamp(value: &str) -> DateTime<Utc> {
 async fn app(pool: PgPool) -> axum::Router {
     let readiness_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
     let repo = Arc::new(StoreRepo::new(Arc::new(DbPool::from_pool(pool))));
-    let state = Arc::new(UsageState {
-        repo,
-        basic_auth: test_basic_auth(),
-    });
+    let state = Arc::new(UsageState { repo });
     build_usage_router(state, readiness_pool, false)
 }
 
@@ -83,26 +62,23 @@ async fn insert(pool: &PgPool, event: &UsageEvent) {
     .expect("inserting a test usage_events row must succeed");
 }
 
+/// This endpoint is deliberately unauthenticated (see `crate::routers::spend_router`'s doc
+/// comment in the usage crate) -- no credentials are sent here, matching what a real caller does.
 async fn query_spend(
     router: axum::Router,
     account_id: &str,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-    auth_header: Option<String>,
 ) -> (StatusCode, serde_json::Value) {
-    let mut builder = Request::builder()
-        .method("POST")
-        .uri("/usage/v1/spend/query")
-        .header(header::CONTENT_TYPE, "application/json");
-    if let Some(auth) = auth_header {
-        builder = builder.header(header::AUTHORIZATION, auth);
-    }
     let body = json!({
         "account_id": account_id,
         "start": start.to_rfc3339(),
         "end": end.to_rfc3339(),
     });
-    let request = builder
+    let request = Request::builder()
+        .method("POST")
+        .uri("/usage/v1/spend/query")
+        .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
             serde_json::to_vec(&body).expect("request body must serialize"),
         ))
@@ -149,14 +125,7 @@ async fn spend_query_matches_direct_sql_sum_for_seeded_data(pool: PgPool) {
 
     let start = parse_timestamp("2026-08-01T00:00:00Z");
     let end = parse_timestamp("2026-09-01T00:00:00Z");
-    let (status, body) = query_spend(
-        app(pool).await,
-        &account_id,
-        start,
-        end,
-        Some(basic_auth_header(USERNAME, PASSWORD)),
-    )
-    .await;
+    let (status, body) = query_spend(app(pool).await, &account_id, start, end).await;
 
     assert_eq!(status, StatusCode::OK);
     let response: SpendQueryResponse =
@@ -176,14 +145,7 @@ async fn spend_query_half_open_interval_includes_start_excludes_end(pool: PgPool
     insert(&pool, &sample_event(&account_id, start, 1.0)).await;
     insert(&pool, &sample_event(&account_id, end, 100.0)).await;
 
-    let (status, body) = query_spend(
-        app(pool).await,
-        &account_id,
-        start,
-        end,
-        Some(basic_auth_header(USERNAME, PASSWORD)),
-    )
-    .await;
+    let (status, body) = query_spend(app(pool).await, &account_id, start, end).await;
 
     assert_eq!(status, StatusCode::OK);
     let response: SpendQueryResponse =
@@ -206,14 +168,7 @@ async fn spend_query_reports_known_zero_not_null_for_a_zero_cost_row(pool: PgPoo
 
     let start = parse_timestamp("2026-08-01T00:00:00Z");
     let end = parse_timestamp("2026-09-01T00:00:00Z");
-    let (status, body) = query_spend(
-        app(pool).await,
-        &account_id,
-        start,
-        end,
-        Some(basic_auth_header(USERNAME, PASSWORD)),
-    )
-    .await;
+    let (status, body) = query_spend(app(pool).await, &account_id, start, end).await;
 
     assert_eq!(status, StatusCode::OK);
     let response: SpendQueryResponse =
@@ -227,14 +182,7 @@ async fn spend_query_reports_null_when_no_rows_match(pool: PgPool) {
     let start = parse_timestamp("2026-08-01T00:00:00Z");
     let end = parse_timestamp("2026-09-01T00:00:00Z");
 
-    let (status, body) = query_spend(
-        app(pool).await,
-        &account_id,
-        start,
-        end,
-        Some(basic_auth_header(USERNAME, PASSWORD)),
-    )
-    .await;
+    let (status, body) = query_spend(app(pool).await, &account_id, start, end).await;
 
     assert_eq!(status, StatusCode::OK);
     let response: SpendQueryResponse =
@@ -242,39 +190,8 @@ async fn spend_query_reports_null_when_no_rows_match(pool: PgPool) {
     assert_eq!(response.total_cost, None);
 }
 
-/// Test 3 (minimum test list): an unauthenticated request must be rejected.
-#[sqlx::test(migrations = "../../migrations-usage")]
-async fn spend_query_rejects_request_with_no_credentials(pool: PgPool) {
-    let account_id = cuid2();
-    let start = parse_timestamp("2026-08-01T00:00:00Z");
-    let end = parse_timestamp("2026-09-01T00:00:00Z");
-
-    let (status, _body) = query_spend(app(pool).await, &account_id, start, end, None).await;
-
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-}
-
-/// Test 3 (minimum test list): a request with the wrong credentials must be rejected.
-#[sqlx::test(migrations = "../../migrations-usage")]
-async fn spend_query_rejects_request_with_wrong_credentials(pool: PgPool) {
-    let account_id = cuid2();
-    let start = parse_timestamp("2026-08-01T00:00:00Z");
-    let end = parse_timestamp("2026-09-01T00:00:00Z");
-
-    let (status, _body) = query_spend(
-        app(pool).await,
-        &account_id,
-        start,
-        end,
-        Some(basic_auth_header(USERNAME, "wrong-password")),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-}
-
-/// The existing unauthenticated `/usage/v1/usage/query` endpoint must stay reachable with no
-/// credentials at all -- this PR deliberately does not gate it (see the PR body).
+/// The pre-existing unauthenticated `/usage/v1/usage/query` endpoint must stay reachable with no
+/// credentials -- unaffected by this PR either way, since neither endpoint is authenticated.
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn usage_query_endpoint_stays_unauthenticated(pool: PgPool) {
     let router = app(pool).await;
@@ -297,9 +214,5 @@ async fn usage_query_endpoint_stays_unauthenticated(pool: PgPool) {
         .oneshot(request)
         .await
         .expect("router must produce a response");
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "the pre-existing usage-query endpoint must remain unauthenticated in this PR"
-    );
+    assert_eq!(response.status(), StatusCode::OK);
 }

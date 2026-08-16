@@ -1,8 +1,8 @@
-use axum::{Json, Router, http::StatusCode, middleware::from_fn_with_state, routing::get};
+use axum::{Json, Router, http::StatusCode, routing::get};
 use chrono::{DateTime, Utc};
 use lightbridge_authz_core::{
     Result, async_trait,
-    config::{BasicAuth, Database},
+    config::Database,
     db::{DbPool, DbPoolTrait, is_database_ready},
     server::{dev_cors_enabled, serve_tls},
 };
@@ -16,7 +16,6 @@ use utoipa_swagger_ui::SwaggerUi;
 pub mod config;
 pub mod handlers;
 pub mod instrumentation;
-pub mod middleware;
 pub mod models;
 pub mod repo;
 pub mod routers;
@@ -31,10 +30,14 @@ struct RootResponse {
     message: String,
 }
 
+/// No auth gate on this state -- `/usage/v1/spend/query` is unauthenticated, same as every other
+/// route this server serves. Safe only because the usage service is ClusterIP-only with no
+/// ingress (see `AGENTS.md`'s Security Notes and `docs/architecture/budget.md`'s "Spend
+/// dependency" section for the explicit statement of that risk). mTLS between `authz-api`/the
+/// budget domain and this service is tracked as a follow-up -- see the PR that introduced this
+/// endpoint for the tracking issue.
 pub struct UsageState {
     pub repo: Arc<dyn UsageRepoTrait>,
-    /// Basic-auth credentials gating `/usage/v1/spend/query` only -- see `middleware::basic_auth`.
-    pub basic_auth: BasicAuth,
 }
 
 #[async_trait]
@@ -79,9 +82,6 @@ pub fn build_usage_router(
     readiness_pool: Arc<dyn DbPoolTrait>,
     dev_cors: bool,
 ) -> Router {
-    let spend_routes = routers::spend_router()
-        .route_layer(from_fn_with_state(state.clone(), middleware::basic_auth));
-
     let router = Router::new()
         .route("/", get(root_handler))
         .route("/healthz", get(health_handler))
@@ -98,7 +98,7 @@ pub fn build_usage_router(
                 .url("/usage/v1/usage/openapi.json", UsageDoc::openapi()),
         )
         .merge(routers::usage_router())
-        .merge(spend_routes)
+        .merge(routers::spend_router())
         .with_state(state);
 
     if dev_cors {
@@ -112,10 +112,7 @@ pub async fn start_usage_server(usage: &UsageServer, database: &Database) -> Res
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(database).await?);
     let readiness_pool = pool.clone();
     let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool));
-    let state = Arc::new(UsageState {
-        repo,
-        basic_auth: usage.basic_auth.clone(),
-    });
+    let state = Arc::new(UsageState { repo });
 
     let dev_cors = dev_cors_enabled();
     let app = build_usage_router(state, readiness_pool, dev_cors);
@@ -180,7 +177,7 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
     tags(
         (name = "ingest", description = "OTEL ingest endpoints"),
         (name = "usage", description = "Timeseries usage query endpoint"),
-        (name = "spend", description = "Internal, Basic-auth-protected spend-query endpoint used by the budget domain")
+        (name = "spend", description = "Internal spend-query endpoint used by the budget domain (unauthenticated, like the rest of this server -- see AGENTS.md's Security Notes)")
     )
 )]
 struct UsageDoc;

@@ -64,11 +64,17 @@ out separately where it differs.
 |---|---|---|---|---|
 | `database.url` | `String` | **Required** | Main Postgres connection (accounts/projects/api_keys/budget tables) | Every server fails to start |
 | `database.pool_size` | `Option<u32>` | default `None` (pool default) | Connection pool size | — |
-| `usage_service` | `Option<UsageServiceClient>` | default `None` (`config/mod.rs:34`) | HTTP client (base URL + Basic-auth credentials) for the budget domain's `UsageServiceSpendReader` to call the usage service's Basic-auth-protected `/usage/v1/spend/query` endpoint | Absent → budget spend reads report `Spend::Unavailable` (fails closed to manual review); config still loads fine otherwise (`config_without_redis_or_usage_service_still_loads` test) |
+| `usage_service` | `Option<UsageServiceClient>` | default `None` (`config/mod.rs:34`) | HTTP client (base URL only — **unauthenticated**, see below) for the budget domain's `UsageServiceSpendReader` to call the usage service's `/usage/v1/spend/query` endpoint | Absent → budget spend reads report `Spend::Unavailable` (fails closed to manual review); config still loads fine otherwise (`config_without_redis_or_usage_service_still_loads` test) |
 | `usage_service.base_url` | `String` | required if `usage_service` is set | Usage service origin, e.g. `https://authz-usage:3002` | Wrong host/port → every spend read fails closed to `Spend::Unavailable` (connection refused/DNS failure), not an error |
-| `usage_service.basic_auth.{username,password}` | `BasicAuth` | required if `usage_service` is set | Must match the usage service's own `server.usage.basic_auth` | Mismatch → usage service returns `401`; spend reads fail closed to `Spend::Unavailable` |
 | `usage_service.insecure_skip_verify` | `bool` | default `false` | Skip TLS cert verification — only ever `true` in local Compose, where the usage service serves a self-signed cert | Left `false` against a self-signed deployment → every spend read fails closed (TLS handshake failure treated as unreachable) |
 | `usage_service.timeout_ms` | `u64` | default `5000` | Per-request timeout for the spend-query call | A usage service that's merely slow (not down) still fails closed to `Spend::Unavailable` once this elapses |
+
+**No credential field exists on `usage_service` — this call is deliberately unauthenticated.**
+mTLS is the intended service-to-service auth mechanism for this call (and for the pre-existing
+`/usage/v1/usage/query`), tracked as a follow-up rather than added here as interim Basic-auth
+scaffolding. Safe only because `lightbridge-authz-usage` is ClusterIP-only with no ingress in
+every real deployment — see `AGENTS.md`'s Security Notes and `docs/architecture/budget.md`'s
+"Spend dependency" section for the explicit statement of that risk.
 
 ### Env-var interpolation (`interpolate_env_vars`, `config/mod.rs:607-639`)
 

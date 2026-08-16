@@ -1897,10 +1897,6 @@ mod tests {
 
         let state = crate::UsageState {
             repo: Arc::new(PartialInsertRepo { persisted: 1 }),
-            basic_auth: lightbridge_authz_core::config::BasicAuth {
-                username: "usage-internal".to_string(),
-                password: "change-me".to_string(),
-            },
         };
         let events = vec![base_usage_event(), base_usage_event()];
 

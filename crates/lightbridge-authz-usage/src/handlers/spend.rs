@@ -5,18 +5,19 @@ use lightbridge_authz_core::{Error, Result};
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
-/// Internal, Basic-auth-protected endpoint answering exactly the spend question
-/// `lightbridge-authz-budget`'s `SpendReader` asks: the summed `usage_events.total_cost` for one
-/// account over a half-open `[start, end)` interval. See `crate::repo::StoreRepo::spend_for_account`
-/// for why `total_cost` stays nullable rather than collapsing to `0.0`.
+/// Internal endpoint answering exactly the spend question `lightbridge-authz-budget`'s
+/// `SpendReader` asks: the summed `usage_events.total_cost` for one account over a half-open
+/// `[start, end)` interval. See `crate::repo::StoreRepo::spend_for_account` for why `total_cost`
+/// stays nullable rather than collapsing to `0.0`. Deliberately unauthenticated -- see
+/// `crate::routers::spend_router`'s doc comment for the risk this carries and why it's accepted
+/// for now.
 #[utoipa::path(
     post,
     path = "/usage/v1/spend/query",
     request_body = SpendQueryRequest,
     responses(
         (status = 200, body = SpendQueryResponse),
-        (status = 400, body = UsageErrorResponse),
-        (status = 401, description = "missing or invalid Basic-auth credentials")
+        (status = 400, body = UsageErrorResponse)
     ),
     tag = "spend"
 )]

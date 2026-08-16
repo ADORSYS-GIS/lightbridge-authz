@@ -22,7 +22,6 @@ tracing.workspace = true
 workspace = true
 
 [dev-dependencies]
-base64.workspace = true
 httpmock.workspace = true
 tokio.workspace = true
 

@@ -201,9 +201,10 @@ not landed as of this writing.
 (`crates/lightbridge-authz-budget/src/spend.rs`), which is one of two implementations, chosen once
 at server startup (`start_api_server` in `crates/lightbridge-authz-rest/src/lib.rs`):
 
-- **`UsageServiceSpendReader`** — calls `lightbridge-authz-usage`'s Basic-auth-protected
-  `/usage/v1/spend/query` endpoint over HTTPS for the account/period being evaluated, instead of
-  querying `usage_events` directly. Used when `Config.usage_service` is set.
+- **`UsageServiceSpendReader`** — calls `lightbridge-authz-usage`'s `/usage/v1/spend/query`
+  endpoint over HTTPS for the account/period being evaluated, instead of querying `usage_events`
+  directly. Used when `Config.usage_service` is set. **Unauthenticated** — see "Security posture"
+  below.
 - **`UnavailableSpendReader`** — never touches the network; always reports `Spend::Unavailable`.
   Used when `Config.usage_service` is `None`.
 
@@ -224,10 +225,21 @@ this repo's `Config` type drops the `usage_database` field, that stale key in pr
 silently ignored (unknown YAML keys don't fail config load), `Config.usage_service` reads as
 `None`, and `start_api_server` degrades to `UnavailableSpendReader` — **every spend-dependent
 refill decision routes to manual review** until `ai-helm-values` is updated to set `usage_service`
-instead (base URL + Basic-auth credentials matching what `lightbridge-authz-usage`'s own Helm
-values configure at `server.usage.basic_auth`). This degrades safely (fails closed, never opens a
-bypass) but is a real operational regression for self-service refill until that companion change
-ships — see the PR that introduced this section for the exact diff needed.
+instead (just a `base_url` — no credential, see "Security posture" below). This degrades safely
+(fails closed, never opens a bypass) but is a real operational regression for self-service refill
+until that companion change ships — see the PR that introduced this section for the exact diff
+needed.
+
+**Security posture: this call is unauthenticated, stated plainly.** `UsageServiceSpendReader`
+sends no credential — no Basic auth, no mTLS. mTLS between the budget domain (and `authz-api`
+generally) and the usage service is the intended long-term mechanism and is tracked as a
+follow-up; a per-endpoint Basic-auth credential was deliberately not added in the meantime, since
+that would just be more interim scaffolding to retire once mTLS lands. This endpoint returns
+per-account spend figures and is safe **only** while `lightbridge-authz-usage` remains
+ClusterIP-only with no ingress — exactly the same condition that already makes the pre-existing,
+also-unauthenticated `/usage/v1/usage/query` endpoint acceptable (see `AGENTS.md`'s Security
+Notes). If anyone ever routes the usage service externally, both endpoints leak per-account
+spend/usage data to anything that can reach them.
 
 **This repo's own tracked config is what local runs and tests exercise.**
 `config/default.yaml`/`.docker/authz/container.yaml` set `usage_service` pointed at

@@ -2688,7 +2688,6 @@ dependencies = [
 name = "lightbridge-authz-budget"
 version = "0.8.1"
 dependencies = [
- "base64 0.23.1",
  "chrono",
  "httpmock",
  "lightbridge-authz-core",
@@ -2796,7 +2795,6 @@ dependencies = [
  "anyhow",
  "axum",
  "axum-server",
- "base64 0.23.1",
  "chrono",
  "flate2",
  "hex",

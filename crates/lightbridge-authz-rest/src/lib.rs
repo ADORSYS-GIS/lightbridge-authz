@@ -1891,7 +1891,6 @@ pub async fn start_api_server(
         Some(usage_service) => Arc::new(
             lightbridge_authz_budget::UsageServiceSpendReader::new(
                 usage_service.base_url.clone(),
-                usage_service.basic_auth.clone(),
                 usage_service.insecure_skip_verify,
                 std::time::Duration::from_millis(usage_service.timeout_ms),
             )

@@ -1,7 +1,8 @@
 //! Reads actual spend (`SUM(usage_events.total_cost)`) for a given account/period from
-//! `lightbridge-authz-usage`'s Basic-auth-protected `/usage/v1/spend/query` endpoint, so the
-//! budget domain's self-service augmentation logic (Phase 5) can compare spend against a grant
-//! balance.
+//! `lightbridge-authz-usage`'s `/usage/v1/spend/query` endpoint, so the budget domain's
+//! self-service augmentation logic (Phase 5) can compare spend against a grant balance. This
+//! endpoint is unauthenticated -- see `UsageServiceSpendReader`'s own doc comment for the
+//! deliberate security-posture tradeoff and the mTLS follow-up tracking it.
 //!
 //! Until this module was inverted (see the PR that introduced `UsageServiceSpendReader`), this
 //! crate opened its own connection directly to the usage-events database and ran
@@ -24,7 +25,6 @@
 //! are all "we don't know", exactly like a `NULL` sum -- see `UsageServiceSpendReader` below.
 
 use chrono::{DateTime, NaiveDate, Utc};
-use lightbridge_authz_core::config::BasicAuth;
 use serde::{Deserialize, Serialize};
 
 use crate::error::BudgetError;
@@ -162,19 +162,32 @@ struct SpendQueryResponse {
     total_cost: Option<f64>,
 }
 
-/// Reads spend by calling `lightbridge-authz-usage`'s Basic-auth-protected
-/// `/usage/v1/spend/query` endpoint over HTTPS, instead of opening a direct database connection
-/// (see this module's doc comment for why).
+/// Reads spend by calling `lightbridge-authz-usage`'s `/usage/v1/spend/query` endpoint over
+/// HTTPS, instead of opening a direct database connection (see this module's doc comment for
+/// why).
+///
+/// ## Security posture: unauthenticated, deliberately, for now
+///
+/// This call carries no credential -- no Basic auth, no mTLS yet. That mirrors the pre-existing
+/// `/usage/v1/usage/query` endpoint's own posture: safe only because `lightbridge-authz-usage` is
+/// ClusterIP-only with no ingress (see `AGENTS.md`'s Security Notes). If that ever changes, both
+/// endpoints leak per-account spend/usage figures to anything that can reach the service. mTLS
+/// between the budget domain and the usage service is tracked as a follow-up, not implemented
+/// here -- see the PR that introduced this reader for the tracking issue. A per-endpoint
+/// Basic-auth credential was deliberately not added as interim scaffolding: mTLS is the intended
+/// mechanism, and a Basic-auth credential would just be more surface to retire later.
 ///
 /// ## Fail-closed contract
 ///
 /// Every way this HTTP call can fail is treated as "we don't know", never as an error that
-/// propagates out of [`SpendReader::spend_for_account`] and never as `Spend::Known(0)`:
+/// propagates out of [`SpendReader::spend_for_account`] and never as `Spend::Known(0)`. This
+/// holds regardless of the endpoint being unauthenticated -- an unexpected response (including a
+/// `401`/`403` the usage service might return for reasons unrelated to credentials, since none
+/// are sent) is still "unknown", not "assume success":
 ///
 /// - the request itself fails (DNS failure, connection refused, TLS handshake failure, the
 ///   request timing out)
-/// - the response status is not `2xx` (a `401` from a credential mismatch, a `5xx` from the
-///   usage service itself failing)
+/// - the response status is not `2xx` (any non-2xx, including `401`/`403`/`5xx`)
 /// - the response body cannot be decoded as the expected JSON shape
 /// - the decoded `total_cost` value is itself unusable (`cost_to_micros` rejects non-finite,
 ///   negative, or overflowing values)
@@ -187,32 +200,19 @@ struct SpendQueryResponse {
 /// not abort the caller's request with a different error shape. See `rule_data.rs`'s
 /// `EvalAbort::FieldUnavailable` handling for what a caller does with `Spend::Unavailable`: it
 /// routes to `Effect::ManualReview`, never `auto_approve`.
+#[derive(Debug)]
 pub struct UsageServiceSpendReader {
     client: reqwest::Client,
     base_url: String,
-    username: String,
-    password: String,
-}
-
-impl std::fmt::Debug for UsageServiceSpendReader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UsageServiceSpendReader")
-            .field("base_url", &self.base_url)
-            .field("username", &self.username)
-            .field("password", &"<redacted>")
-            .finish()
-    }
 }
 
 impl UsageServiceSpendReader {
     /// Builds a reader against `base_url` (e.g. `https://authz-usage:3002`, no trailing slash
-    /// required) using `basic_auth` as the shared credential (mirrors `server.opa.basic_auth`'s
-    /// mechanism exactly). `insecure_skip_verify` should only ever be `true` in local Compose,
-    /// where every authz service serves a self-signed certificate (see `AGENTS.md`'s Security
-    /// Notes) -- production deployments terminate real certificates and must leave it `false`.
+    /// required). `insecure_skip_verify` should only ever be `true` in local Compose, where every
+    /// authz service serves a self-signed certificate (see `AGENTS.md`'s Security Notes) --
+    /// production deployments terminate real certificates and must leave it `false`.
     pub fn new(
         base_url: impl Into<String>,
-        basic_auth: BasicAuth,
         insecure_skip_verify: bool,
         timeout: std::time::Duration,
     ) -> Result<Self, BudgetError> {
@@ -229,8 +229,6 @@ impl UsageServiceSpendReader {
         Ok(Self {
             client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            username: basic_auth.username,
-            password: basic_auth.password,
         })
     }
 }
@@ -250,14 +248,7 @@ impl SpendReader for UsageServiceSpendReader {
             end,
         };
 
-        let response = match self
-            .client
-            .post(&url)
-            .basic_auth(&self.username, Some(&self.password))
-            .json(&request)
-            .send()
-            .await
-        {
+        let response = match self.client.post(&url).json(&request).send().await {
             Ok(response) => response,
             Err(err) => {
                 tracing::warn!(
@@ -413,20 +404,15 @@ mod tests {
     }
 
     #[test]
-    fn usage_service_spend_reader_debug_redacts_the_password() {
+    fn usage_service_spend_reader_constructs_with_only_a_base_url() {
         let reader = UsageServiceSpendReader::new(
             "https://authz-usage:3002",
-            BasicAuth {
-                username: "usage-internal".to_string(),
-                password: "super-secret".to_string(),
-            },
             false,
             std::time::Duration::from_secs(1),
-        )
-        .expect("reader construction must succeed");
-
-        let debug = format!("{reader:?}");
-        assert!(!debug.contains("super-secret"));
-        assert!(debug.contains("<redacted>"));
+        );
+        assert!(
+            reader.is_ok(),
+            "constructing the reader must not require a credential"
+        );
     }
 }

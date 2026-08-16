@@ -1,7 +1,5 @@
 use lightbridge_authz_core::Result;
-use lightbridge_authz_core::config::{
-    BasicAuth, Database, Logging, Otel, Tls, load_yaml_from_path,
-};
+use lightbridge_authz_core::config::{Database, Logging, Otel, Tls, load_yaml_from_path};
 use serde::Deserialize;
 use tracing::debug;
 
@@ -23,12 +21,6 @@ pub struct UsageServer {
     pub address: String,
     pub port: u16,
     pub tls: Tls,
-    /// Basic-auth credentials gating the internal `/usage/v1/spend/query` endpoint (mirrors
-    /// `server.opa.basic_auth`'s mechanism exactly -- see `middleware::basic_auth` in this
-    /// crate). Every other route on this server (`/v1/otel/*`, `/usage/v1/usage/query`, the
-    /// health probes, the OpenAPI docs) stays unauthenticated; only the spend-query route is
-    /// gated by this credential.
-    pub basic_auth: BasicAuth,
 }
 
 pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<UsageConfig> {
@@ -64,9 +56,6 @@ server:
     tls:
       cert_path: "/tls/usage.crt"
       key_path: "/tls/usage.key"
-    basic_auth:
-      username: "usage-internal"
-      password: "change-me"
 logging:
   level: "info"
 database:

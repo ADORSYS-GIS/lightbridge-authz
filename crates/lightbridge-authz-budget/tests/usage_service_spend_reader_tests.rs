@@ -3,29 +3,22 @@
 //! parse a correct response the way the removed `TimescaleSpendReader` parsed a direct SQL
 //! result, and does every way the HTTP call can fail route to `Spend::Unavailable` rather than
 //! propagating an error or silently reporting zero. The endpoint's own SQL semantics (matching
-//! the direct-SQL figure, half-open interval boundaries, Basic-auth rejection) are covered
-//! end-to-end against a real database in
-//! `crates/lightbridge-authz-usage/tests/spend_query_it_tests.rs`.
+//! the direct-SQL figure, half-open interval boundaries) are covered end-to-end against a real
+//! database in `crates/lightbridge-authz-usage/tests/spend_query_it_tests.rs`.
+//!
+//! The reader sends no credential of any kind (no Basic auth, no mTLS yet -- see
+//! `UsageServiceSpendReader`'s own doc comment for the deliberate security-posture tradeoff).
+//! `usage_service_returns_401_yields_spend_unavailable` below is kept precisely because of that:
+//! the reader must not assume `2xx` just because it isn't authenticating -- an unexpected `401`
+//! (or any other non-2xx) from the usage service is still "unknown", not "assume success".
 
-use base64::Engine;
 use httpmock::Method::POST;
 use httpmock::MockServer;
 use lightbridge_authz_budget::{Period, Spend, SpendReader, UsageServiceSpendReader};
-use lightbridge_authz_core::config::BasicAuth;
 use std::time::Duration;
 
-const USERNAME: &str = "usage-internal";
-const PASSWORD: &str = "change-me";
-
-fn basic_auth() -> BasicAuth {
-    BasicAuth {
-        username: USERNAME.to_string(),
-        password: PASSWORD.to_string(),
-    }
-}
-
 fn reader_for(base_url: &str) -> UsageServiceSpendReader {
-    UsageServiceSpendReader::new(base_url, basic_auth(), false, Duration::from_secs(5))
+    UsageServiceSpendReader::new(base_url, false, Duration::from_secs(5))
         .expect("reader construction must succeed")
 }
 
@@ -95,33 +88,6 @@ async fn null_total_cost_becomes_spend_unavailable() {
     assert_eq!(spend, Spend::Unavailable);
 }
 
-/// The reader must send the configured Basic-auth credentials on every request -- proves the
-/// client-side half of "mirror `server.opa.basic_auth`'s mechanism."
-#[tokio::test]
-async fn reader_sends_the_configured_basic_auth_credentials() {
-    let server = MockServer::start();
-    let expected_header = format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(format!("{USERNAME}:{PASSWORD}"))
-    );
-    let mock = server.mock(|when, then| {
-        when.method(POST)
-            .path("/usage/v1/spend/query")
-            .header("authorization", &expected_header);
-        then.status(200)
-            .json_body(serde_json::json!({ "total_cost": 1.0 }));
-    });
-
-    let reader = reader_for(&server.base_url());
-    let spend = reader
-        .spend_for_account("acct_1", &period())
-        .await
-        .expect("reader never returns Err");
-
-    mock.assert();
-    assert_eq!(spend, Spend::Known(1_000_000));
-}
-
 /// Fail-closed mode 1/5 (minimum test list): the usage service is unreachable (nothing listening
 /// on the target port). Prove-fail-first: before this test's assertion existed, an unreachable
 /// server produced a `reqwest::Error` that this reader's caller (`RefillService::load_facts`)
@@ -156,13 +122,8 @@ async fn usage_service_timeout_yields_spend_unavailable() {
             .json_body(serde_json::json!({ "total_cost": 1.0 }));
     });
 
-    let reader = UsageServiceSpendReader::new(
-        server.base_url(),
-        basic_auth(),
-        false,
-        Duration::from_millis(20),
-    )
-    .expect("reader construction must succeed");
+    let reader = UsageServiceSpendReader::new(server.base_url(), false, Duration::from_millis(20))
+        .expect("reader construction must succeed");
 
     let spend = reader
         .spend_for_account("acct_1", &period())
@@ -190,7 +151,10 @@ async fn usage_service_returns_500_yields_spend_unavailable() {
     assert_eq!(spend, Spend::Unavailable);
 }
 
-/// Fail-closed mode 4/5: the usage service returns a `401` (credential mismatch).
+/// Fail-closed mode 4/5: the usage service returns a `401`. The reader sends no credential, so
+/// this isn't a real credential mismatch on this endpoint today -- but the reader must not
+/// special-case "unauthenticated, so any response must be fine": any non-2xx, including this one,
+/// is still "unknown" and must still fail closed, not be silently treated as `Known`.
 #[tokio::test]
 async fn usage_service_returns_401_yields_spend_unavailable() {
     let server = MockServer::start();
