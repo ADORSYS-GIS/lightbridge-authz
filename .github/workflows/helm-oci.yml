@@ -1,12 +1,22 @@
 name: Helm Charts Publish
 
+# Publishing is gated on an actual release tag (cut by release-please on
+# main, mirroring the release_created/tag_name gate ci.yml already uses for
+# binary/container releases — see the `release-please` and `release` jobs in
+# .github/workflows/ci.yml), NOT on every push to main that happens to touch
+# charts/**. Chart.yaml's `version` only advances on a release-please
+# release, so a plain feature push touching charts/** (e.g. #342) used to
+# re-trigger this workflow and silently republish — overwriting — the
+# already-published OCI tag for the current version with newer, unreleased
+# content. See the incident PR for the full writeup.
+#
+# workflow_dispatch is kept for operator-triggered recovery re-runs (e.g. a
+# transient GHCR push failure on a real release tag); the composite action's
+# preflight check still refuses to overwrite an already-published version
+# even on a manual run.
 on:
   push:
-    branches: ["main"]
-    paths:
-      - 'charts/**'
-      - '.github/workflows/helm-oci.yml'
-      - '.github/actions/helm-oci-publish/**'
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
