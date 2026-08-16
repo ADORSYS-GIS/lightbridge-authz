@@ -1,8 +1,8 @@
 apiVersion: v2
 name: lightbridge-authz-stack
 description: >-
-  Umbrella chart deploying the full lightbridge-authz stack (api, opa, usage,
-  mcp)
+  Umbrella chart deploying the full lightbridge-authz stack (api, opa, idp,
+  usage, mcp)
 type: application
 version: 3.2.0
 appVersion: 3.2.0
@@ -29,6 +29,11 @@ dependencies:
     repository: file://../lightbridge-authz
     alias: opa
     condition: opa.enabled
+  - name: lightbridge-authz
+    version: '*'
+    repository: file://../lightbridge-authz
+    alias: idp
+    condition: idp.enabled
   - name: lightbridge-authz-usage
     version: '*'
     repository: file://../lightbridge-authz-usage
