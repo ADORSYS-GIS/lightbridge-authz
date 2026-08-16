@@ -21,6 +21,10 @@ pub enum Commands {
         #[arg(long, short, env = "CONFIG_PATH")]
         config_path: String,
     },
+    Idp {
+        #[arg(long, short, env = "CONFIG_PATH")]
+        config_path: String,
+    },
     Config {
         #[arg(long, short, env = "CONFIG_PATH")]
         config_path: String,

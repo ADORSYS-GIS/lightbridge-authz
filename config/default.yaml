@@ -24,6 +24,15 @@ server:
     basic_auth:
       username: "authorino"
       password: "change-me"
+  # authz-idp (ADR-0012 Phase 1): the OIDC broker service carrying discovery/JWKS/token-exchange
+  # off authz-api. Transitional -- authz-api keeps serving the same surface too until the
+  # auth.ai.camer.digital ingress is repointed at authz-idp (a separate, later cutover PR).
+  idp:
+    address: "0.0.0.0"
+    port: 3004
+    tls:
+      cert_path: "./config/tls/idp.crt"
+      key_path: "./config/tls/idp.key"
 logging:
   level: "info"
 database:

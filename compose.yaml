@@ -9,7 +9,7 @@ services:
         set -e
         mkdir -p /tls /host_tls
         apk add --no-cache openssl
-        for host_file in api.key api.crt opa.key opa.crt usage.key usage.crt mcp.key mcp.crt; do
+        for host_file in api.key api.crt opa.key opa.crt usage.key usage.crt mcp.key mcp.crt idp.key idp.crt; do
           if [ -f /host_tls/$$host_file ]; then
             cp /host_tls/$$host_file /tls/$$host_file
           fi
@@ -34,7 +34,12 @@ services:
             -keyout /tls/mcp.key -out /tls/mcp.crt \
             -subj "/CN=authz-mcp"
         fi
-        for tls_file in api.crt api.key opa.crt opa.key usage.crt usage.key mcp.crt mcp.key; do
+        if [ ! -f /tls/idp.key ]; then
+          openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -keyout /tls/idp.key -out /tls/idp.crt \
+            -subj "/CN=authz-idp"
+        fi
+        for tls_file in api.crt api.key opa.crt opa.key usage.crt usage.key mcp.crt mcp.key idp.crt idp.key; do
           chmod 644 /tls/$$tls_file
           chown 65532:65532 /tls/$$tls_file
           if [ -f /tls/$$tls_file ]; then
@@ -220,6 +225,40 @@ services:
       - opa
     healthcheck:
       test: ["CMD", "/usr/local/bin/lightbridge-authz-healthcheck", "-r", "3001"]
+      interval: 30s
+      timeout: 3s
+      start_period: 1s
+      retries: 3
+
+  authz-idp:
+    image: lightbridge-authz
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      authz-migrate:
+        condition: service_completed_successfully
+      authz-tls:
+        condition: service_started
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 1G
+          cpus: "0.5"
+    volumes:
+      - ./.docker/authz/container.yaml:/tmp/config.yaml:ro
+      - "authz_tls:/tls:ro"
+    environment:
+      RUST_LOG: "debug,opentelemetry_sdk=warn,opentelemetry_otlp=warn,h2=warn,hyper_util=warn,tower=warn"
+      CONFIG_PATH: "/tmp/config.yaml"
+      IDP_TLS_CERT_PATH: "/tls/idp.crt"
+      IDP_TLS_KEY_PATH: "/tls/idp.key"
+    ports:
+      - "13004:3004"
+    command:
+      - idp
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/lightbridge-authz-healthcheck", "-r", "3004"]
       interval: 30s
       timeout: 3s
       start_period: 1s

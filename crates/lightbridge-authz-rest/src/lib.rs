@@ -2,7 +2,10 @@ use axum::{Json, Router, http::StatusCode, routing::get};
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
     RotateApiKey, async_trait,
-    config::{ApiServer, BasicAuth, Billing, Database, Oauth2, OauthClientType, OpaServer, Redis},
+    config::{
+        ApiServer, BasicAuth, Billing, Database, IdpServer, Oauth2, OauthClientType, OpaServer,
+        Redis,
+    },
     db::{DbPool, DbPoolTrait, is_database_ready},
     error::{Error, Result},
     server::{dev_cors_enabled, serve_tls},
@@ -1589,6 +1592,49 @@ async fn list_budget_grants_page(
     })
 }
 
+/// Shared `/`, `/healthz`, `/healthz/startup`, `/healthz/ready` mount, reused by every server
+/// router (`build_api_router`/`build_opa_router`/`build_idp_router`) so the probe surface — and
+/// its DB-readiness semantics (`readiness_handler`/`is_database_ready`) — can never drift between
+/// them. Generic over `S` the same way `well_known_router`/`token_exchange_router` are, so it
+/// merges into any router regardless of that router's own state type.
+fn probe_router<S>(readiness_pool: Arc<dyn DbPoolTrait>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    Router::new()
+        .route("/", get(root_handler))
+        .route("/healthz", get(health_handler))
+        .route("/healthz/startup", get(startup_handler))
+        .route(
+            "/healthz/ready",
+            get(move || {
+                let readiness_pool = readiness_pool.clone();
+                async move { readiness_handler(readiness_pool).await }
+            }),
+        )
+}
+
+/// Derives the two `well_known_router` mount parameters (`token_exchange_scopes`,
+/// `private_key_jwt_supported`) from `oauth2`. Shared by `build_api_router` and
+/// `build_idp_router` so the discovery document each serves is computed from the exact same
+/// inputs and can never diverge — this is what makes
+/// `idp_and_api_routers_serve_byte_identical_discovery_and_jwks`
+/// (`tests/idp_server_tests.rs`) hold, and what the ADR-0012 Phase 1 routing cutover depends on:
+/// `authz-api` and `authz-idp` must resolve `https://auth.ai.camer.digital/.well-known/*`
+/// identically for as long as both serve it.
+fn well_known_mount_params(oauth2: &Oauth2) -> (Option<Vec<String>>, bool) {
+    let token_exchange_scopes = oauth2
+        .token_exchange
+        .as_ref()
+        .filter(|t| t.enabled)
+        .map(|t| t.allowed_scopes.clone());
+    let private_key_jwt_supported = oauth2
+        .clients
+        .iter()
+        .any(|c| c.client_type == OauthClientType::Confidential);
+    (token_exchange_scopes, private_key_jwt_supported)
+}
+
 /// Assembles the API server router: public probes, OIDC discovery/JWKS (when signing is enabled),
 /// native token-exchange, and the generated cratestack RPC CRUD surface (`POST /rpc/{op_id}`,
 /// `POST /rpc/batch`) wrapped in idempotency + rate-limit middleware. Separated from
@@ -1616,27 +1662,9 @@ pub fn build_api_router(
     dev_cors: bool,
     rpc_base_path: Option<&str>,
 ) -> Router {
-    let mut public = Router::new()
-        .route("/", get(root_handler))
-        .route("/healthz", get(health_handler))
-        .route("/healthz/startup", get(startup_handler))
-        .route(
-            "/healthz/ready",
-            get(move || {
-                let readiness_pool = readiness_pool.clone();
-                async move { readiness_handler(readiness_pool).await }
-            }),
-        );
+    let mut public = probe_router(readiness_pool);
 
-    let token_exchange_scopes = oauth2
-        .token_exchange
-        .as_ref()
-        .filter(|t| t.enabled)
-        .map(|t| t.allowed_scopes.clone());
-    let private_key_jwt_supported = oauth2
-        .clients
-        .iter()
-        .any(|c| c.client_type == OauthClientType::Confidential);
+    let (token_exchange_scopes, private_key_jwt_supported) = well_known_mount_params(oauth2);
     if oauth2.is_self_signed()
         && let Some(signing) = oauth2.signing.as_ref()
     {
@@ -1993,17 +2021,7 @@ pub async fn start_api_server(
 /// Assembles the OPA server router (public probes + Basic-auth introspection/resolve routes).
 /// Separated from `start_opa_server` for testability.
 pub fn build_opa_router(state: Arc<OpaState>, readiness_pool: Arc<dyn DbPoolTrait>) -> Router {
-    let public = Router::new()
-        .route("/", get(root_handler))
-        .route("/healthz", get(health_handler))
-        .route("/healthz/startup", get(startup_handler))
-        .route(
-            "/healthz/ready",
-            get(move || {
-                let readiness_pool = readiness_pool.clone();
-                async move { readiness_handler(readiness_pool).await }
-            }),
-        )
+    let public = probe_router(readiness_pool)
         .merge(SwaggerUi::new("/v1/opa/docs").url("/v1/opa/openapi.json", OpaDoc::openapi()));
 
     let protected = opa_router(state.clone()).with_state(state.clone());
@@ -2034,6 +2052,120 @@ pub async fn start_opa_server(
     );
 
     serve_tls("OPA", &opa.address, opa.port, &opa.tls, app).await
+}
+
+/// Assembles the `authz-idp` server router (ADR-0012 Phase 1): public probes plus the exact same
+/// OIDC discovery/JWKS/token-exchange surface `build_api_router` mounts, built from the same
+/// `well_known_mount_params` helper so the two can never compute different discovery documents.
+/// Separated from `start_idp_server` for testability, mirroring `build_api_router`/
+/// `build_opa_router`.
+///
+/// **Transitional duplication, not a permanent parallel path.** `authz-api` keeps serving this
+/// exact surface too, unchanged, until the `auth.ai.camer.digital` ingress is repointed at
+/// `authz-idp` — a separate, later PR (see `start_idp_server`'s doc comment for the full routing
+/// risk this defers against).
+pub fn build_idp_router(
+    oauth2: &Oauth2,
+    signing_repo: Arc<StoreRepo>,
+    token_exchange: Option<token_exchange::TokenExchangeState>,
+    readiness_pool: Arc<dyn DbPoolTrait>,
+) -> Router {
+    let mut router = probe_router(readiness_pool);
+
+    let (token_exchange_scopes, private_key_jwt_supported) = well_known_mount_params(oauth2);
+    if oauth2.is_self_signed()
+        && let Some(signing) = oauth2.signing.as_ref()
+    {
+        router = router.merge(signing::well_known_router(
+            &signing.issuer,
+            signing_repo,
+            token_exchange_scopes,
+            private_key_jwt_supported,
+        ));
+    }
+
+    if let Some(te_state) = token_exchange {
+        router = router.merge(token_exchange::token_exchange_router(te_state));
+    }
+
+    router
+}
+
+/// Starts `authz-idp` (ADR-0012 Phase 1): the OIDC broker service carrying `/oauth2/token`,
+/// `/oauth2/revoke`, and `.well-known/*` off `authz-api`. Deliberately thin next to
+/// `start_api_server` — no RPC CRUD surface, no budget domain, no idempotency/rate-limit layers —
+/// because `well_known_router`/`token_exchange_router` need none of that; every route this server
+/// mounts is public (see [`config::IdpServer`]'s doc comment).
+///
+/// **Transitional duplication, not a permanent parallel path.** `authz-api` keeps serving this
+/// exact surface too (`build_api_router`'s own calls to `well_known_router`/
+/// `token_exchange_router`) until the `auth.ai.camer.digital` ingress is repointed at
+/// `authz-idp` — that repointing is a separate, later PR. `https://auth.ai.camer.digital` is a
+/// live, trusted issuer in `security-policies.yaml` today (every in-circulation API-key JWT
+/// carries it as `iss`), so discovery/JWKS must never stop resolving there, even transiently,
+/// during the cutover (ADR-0012, "Routing risk"). Both routers are built from the same
+/// `well_known_mount_params` helper and read the exact same `signing_keys` rows, which is what
+/// makes running both side by side safe — see
+/// `idp_and_api_routers_serve_byte_identical_discovery_and_jwks`
+/// (`tests/idp_server_tests.rs`), the test this cutover's safety depends on.
+///
+/// ## Signing-key ownership decision (ADR-0012, "signing-key bootstrap")
+///
+/// `authz-idp` calls [`signing::bootstrap_signing_key`] on startup, exactly as `authz-api`
+/// (`start_api_server`) and `lightbridge-mcp` already do — making this the *third* concurrent
+/// bootstrapper against the shared `signing_keys` table, not a new kind of participant. See
+/// [`signing::bootstrap_signing_key`]'s own doc comment for why a third caller is exactly as safe
+/// as the two that already exist, and for the `max_key_age_days`-disagreement analysis.
+pub async fn start_idp_server(
+    idp: &IdpServer,
+    pool: Arc<dyn DbPoolTrait>,
+    oauth2: &Oauth2,
+    redis: &Option<Redis>,
+) -> Result<()> {
+    if !oauth2.is_self_signed() {
+        return Err(Error::Server(
+            "authz-idp requires oauth2.type: self -- it only ever serves the self-signed-JWT \
+             discovery/JWKS/token-exchange surface, never the external-issuance path"
+                .to_string(),
+        ));
+    }
+    let signing = oauth2.signing.as_ref().ok_or_else(|| {
+        Error::Server("oauth2.type is 'self' but oauth2.signing is missing".to_string())
+    })?;
+
+    let readiness_pool = pool.clone();
+    let signing_repo = Arc::new(StoreRepo::new(pool));
+    signing::bootstrap_signing_key(&signing_repo, signing).await?;
+
+    let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
+        Arc::new(BearerTokenService::new(oauth2.clone()));
+
+    let token_exchange_state = match oauth2.token_exchange.as_ref().filter(|t| t.enabled) {
+        Some(_) => {
+            let redis = redis.as_ref().ok_or_else(|| {
+                Error::Server(
+                    "redis config is required for authz-idp when oauth2.token_exchange is \
+                     enabled (set `redis.url`)"
+                        .to_string(),
+                )
+            })?;
+            build_token_exchange_state(oauth2, signing_repo.clone(), bearer_service, &redis.url)?
+        }
+        None => None,
+    };
+    let token_exchange_enabled = token_exchange_state.is_some();
+
+    let app = build_idp_router(oauth2, signing_repo, token_exchange_state, readiness_pool);
+
+    tracing::info!(
+        server = "authz-idp",
+        address = %idp.address,
+        port = idp.port,
+        token_exchange_enabled,
+        "starting idp server"
+    );
+
+    serve_tls("IDP", &idp.address, idp.port, &idp.tls, app).await
 }
 
 async fn root_handler() -> (StatusCode, Json<RootResponse>) {
