@@ -1,5 +1,22 @@
 # Changelog
 
+## [3.6.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.5.0...v3.6.0) (2026-08-17)
+
+
+### Features
+
+* **rest:** add listBillingPlans RPC procedure ([#368](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/368)) ([e248cba](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/e248cbaf3052c4fcd765fe0a7b268cbc3593a8f7))
+
+
+### Bug Fixes
+
+* **charts:** rolling-update deployments instead of Recreate ([#369](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/369)) ([69cd2d8](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/69cd2d8d966df158567cc5fcf0a55e698f93af18))
+
+
+### Code Refactoring
+
+* **rest:** CBOR is the only transport codec for the RPC/CRUD surface (ADR-0013) ([#366](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/366)) ([c912be2](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/c912be2580e10321cced5512bc09ea3fd28f60f5))
+
 ## [3.5.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.4.0...v3.5.0) (2026-08-17)
 
 
