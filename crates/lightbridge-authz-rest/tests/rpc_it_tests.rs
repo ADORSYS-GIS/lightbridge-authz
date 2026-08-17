@@ -11,7 +11,7 @@
 //! Covers, over the real HTTP RPC transport:
 //!   * full create/read/update/delete/list for accounts/projects/api-keys, over CBOR — the only
 //!     wire format the router accepts post-ADR-0013 (`Wire::Json` still exists in `common` but only
-//!     as a negative-path probe, see `json_content_type_is_rejected_with_415` below);
+//!     as a negative-path probe, see `json_content_type_is_rejected` below);
 //!   * the RBAC gate end-to-end (admin succeeds on every mapped op; a viewer who is a legitimate
 //!     account member still 403s on writes but 200s on reads) — the privilege-escalation regression;
 //!   * the soft-delete + `api_key_validation`-view security fix (a soft-deleted key must not
