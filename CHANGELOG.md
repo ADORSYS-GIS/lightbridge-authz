@@ -1,5 +1,31 @@
 # Changelog
 
+## [3.3.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.2.0...v3.3.0) (2026-08-17)
+
+
+### Features
+
+* **budget:** split the budget domain into its own authz-budget microservice ([#351](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/351)) ([7e99fd9](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/7e99fd9711828f8e020f94aadfce75b8f7f54e38))
+* **budget:** verify usage-service TLS cert via ca_bundle_path ([#352](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/352)) ([#353](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/353)) ([3d9d69c](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/3d9d69cdef5a96a7de2871fe4d80237eb1d8f0e5))
+* **charts:** add authz-idp workload to lightbridge-authz-stack ([#342](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/342)) ([b30c421](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/b30c42179adfca39b599a62659365ab034a21273))
+* **idp:** stand up authz-idp OIDC broker server (ADR-0012 Phase 1) ([#344](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/344)) ([22f335f](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/22f335f7246057fae4fa879b9e02e2ca62380b0d))
+
+
+### Bug Fixes
+
+* **ci:** gate helm chart publish on release tags, refuse to overwrite published versions ([#349](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/349)) ([c749111](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/c74911197907dcf390020042a9bd0250d3de4507))
+* **rest:** pass ca_bundle_path at the authz-budget UsageServiceSpendReader call site ([#355](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/355)) ([3c7d7bf](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/3c7d7bf5af14d79b37adb35b41223edacf2673b8)), closes [#354](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/354)
+
+
+### Code Refactoring
+
+* **budget:** invert spend-data dependency onto usage service HTTP API ([#346](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/346)) ([3b34de2](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/3b34de20bf5d8125645aa561542c144bad799f50))
+
+
+### Documentation
+
+* **adr:** ADR-0012 — device authorization grant brokered via a new IdP microservice ([#339](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/339)) ([a965efc](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/a965efc05ea39b856e0e9b2ee0625e7c4fddb03c))
+
 ## [3.2.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.1.0...v3.2.0) (2026-08-15)
 
 
