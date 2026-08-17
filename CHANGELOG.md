@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.5.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.4.0...v3.5.0) (2026-08-17)
+
+
+### Features
+
+* **authz:** make Redis mandatory for api/idp/budget, freed for opa/mcp ([#365](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/365)) ([7e79e0c](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/7e79e0cb3509112a5ee50ce60d9d048c633b84fc)), closes [#364](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/364)
+* **usage:** require mTLS on the usage service's query listener ([#347](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/347)) ([#361](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/361)) ([a5c7716](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/a5c7716f40f78b0ec57ade722558d2e156ce59a1))
+
 ## [3.4.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.3.0...v3.4.0) (2026-08-17)
 
 
