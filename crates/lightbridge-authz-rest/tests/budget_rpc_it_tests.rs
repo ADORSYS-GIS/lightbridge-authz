@@ -300,7 +300,7 @@ async fn every_moved_procedure_is_reachable_on_authz_budget() {
         let (status, body) = rpc_call(
             ctx.router.clone(),
             op,
-            Wire::Json,
+            Wire::Cbor,
             &json!({ "args": args }),
             Some("admin"),
         )
@@ -342,7 +342,7 @@ async fn non_budget_op_ids_are_unreachable_on_authz_budget() {
         let (status, body) = rpc_call(
             ctx.router.clone(),
             op,
-            Wire::Json,
+            Wire::Cbor,
             &json!({}),
             Some("admin"),
         )
@@ -390,7 +390,7 @@ async fn get_my_budget_balance_reads_own_zero_then_granted_balance() {
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.getMyBudgetBalance",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "period": period } }),
         Some("caller"),
     )
@@ -401,7 +401,7 @@ async fn get_my_budget_balance_reads_own_zero_then_granted_balance() {
         "body: {}",
         String::from_utf8_lossy(&body)
     );
-    let parsed = as_json(Wire::Json, &body);
+    let parsed = as_json(Wire::Cbor, &body);
     assert_eq!(
         parsed["effectiveBudgetMicros"], "0",
         "no grant exists yet this period -- must read as zero, not an error"
@@ -411,7 +411,7 @@ async fn get_my_budget_balance_reads_own_zero_then_granted_balance() {
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.grantBudget",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": {
             "budgetAccountId": subject,
             "accountId": subject,
@@ -431,13 +431,13 @@ async fn get_my_budget_balance_reads_own_zero_then_granted_balance() {
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.getMyBudgetBalance",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "period": period } }),
         Some("caller"),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
-    let parsed = as_json(Wire::Json, &body);
+    let parsed = as_json(Wire::Cbor, &body);
     assert_eq!(
         parsed["effectiveBudgetMicros"], "5000000",
         "the caller's own read must reflect the admin grant: {parsed}"
@@ -472,7 +472,7 @@ async fn get_budget_balance_requires_budget_read_not_merely_read_own() {
     let (status, _) = rpc_call(
         r.clone(),
         "procedure.getBudgetBalance",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "budgetAccountId": target, "period": "2026-08" } }),
         Some("self-only"),
     )
@@ -486,7 +486,7 @@ async fn get_budget_balance_requires_budget_read_not_merely_read_own() {
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.getBudgetBalance",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "budgetAccountId": target, "period": "2026-08" } }),
         Some("admin"),
     )
@@ -516,7 +516,7 @@ async fn list_budget_grants_returns_ledger_history_newest_first_and_paginates() 
         let (status, body) = rpc_call(
             r.clone(),
             "procedure.grantBudget",
-            Wire::Json,
+            Wire::Cbor,
             &json!({ "args": {
                 "budgetAccountId": target,
                 "accountId": target,
@@ -537,7 +537,7 @@ async fn list_budget_grants_returns_ledger_history_newest_first_and_paginates() 
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.listBudgetGrants",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "budgetAccountId": target, "limit": 2 } }),
         Some("admin"),
     )
@@ -548,7 +548,7 @@ async fn list_budget_grants_returns_ledger_history_newest_first_and_paginates() 
         "body: {}",
         String::from_utf8_lossy(&body)
     );
-    let parsed = as_json(Wire::Json, &body);
+    let parsed = as_json(Wire::Cbor, &body);
     let entries = parsed["entries"].as_array().expect("entries array");
     assert_eq!(entries.len(), 2, "the requested page size must be honored");
     assert_eq!(
@@ -563,13 +563,13 @@ async fn list_budget_grants_returns_ledger_history_newest_first_and_paginates() 
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.listBudgetGrants",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "budgetAccountId": target, "limit": 2, "before": cursor } }),
         Some("admin"),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
-    let parsed = as_json(Wire::Json, &body);
+    let parsed = as_json(Wire::Cbor, &body);
     let entries = parsed["entries"].as_array().expect("entries array");
     assert_eq!(
         entries.len(),
@@ -598,7 +598,7 @@ async fn grant_budget_appends_ledger_row_and_updates_balance_atomically() {
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.grantBudget",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": {
             "budgetAccountId": target,
             "accountId": target,
@@ -615,7 +615,7 @@ async fn grant_budget_appends_ledger_row_and_updates_balance_atomically() {
         "body: {}",
         String::from_utf8_lossy(&body)
     );
-    let parsed = as_json(Wire::Json, &body);
+    let parsed = as_json(Wire::Cbor, &body);
     assert_eq!(parsed["source"], "admin");
     let grant_id = parsed["id"].as_str().expect("grant id").to_string();
 
@@ -658,7 +658,7 @@ async fn revoke_budget_grant_writes_a_compensating_row_and_leaves_the_original_u
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.grantBudget",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": {
             "budgetAccountId": target,
             "accountId": target,
@@ -669,7 +669,7 @@ async fn revoke_budget_grant_writes_a_compensating_row_and_leaves_the_original_u
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
-    let grant_id = as_json(Wire::Json, &body)["id"]
+    let grant_id = as_json(Wire::Cbor, &body)["id"]
         .as_str()
         .expect("grant id")
         .to_string();
@@ -684,7 +684,7 @@ async fn revoke_budget_grant_writes_a_compensating_row_and_leaves_the_original_u
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.revokeBudgetGrant",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "grantId": grant_id, "reason": "issued in error" } }),
         Some("admin"),
     )
@@ -695,7 +695,7 @@ async fn revoke_budget_grant_writes_a_compensating_row_and_leaves_the_original_u
         "body: {}",
         String::from_utf8_lossy(&body)
     );
-    let parsed = as_json(Wire::Json, &body);
+    let parsed = as_json(Wire::Cbor, &body);
     assert_eq!(parsed["source"], "correction");
     assert_eq!(parsed["amountMicros"], "-4000000");
     assert_ne!(
@@ -745,13 +745,13 @@ async fn create_budget_policy_revision_does_not_activate_it() {
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.getBudgetPolicyStatus",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "policySetId": "budget-refill" } }),
         Some("admin"),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
-    let before = as_json(Wire::Json, &body)["activePolicyRevision"]
+    let before = as_json(Wire::Cbor, &body)["activePolicyRevision"]
         .as_str()
         .expect("active revision string")
         .to_string();
@@ -776,7 +776,7 @@ async fn create_budget_policy_revision_does_not_activate_it() {
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.createBudgetPolicyRevision",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "policySetId": "budget-refill", "ruleDataJson": rule_data } }),
         Some("admin"),
     )
@@ -791,13 +791,13 @@ async fn create_budget_policy_revision_does_not_activate_it() {
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.getBudgetPolicyStatus",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "policySetId": "budget-refill" } }),
         Some("admin"),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
-    let after = as_json(Wire::Json, &body)["activePolicyRevision"]
+    let after = as_json(Wire::Cbor, &body)["activePolicyRevision"]
         .as_str()
         .expect("active revision string")
         .to_string();
@@ -856,7 +856,7 @@ async fn each_budget_permission_is_actually_enforced() {
         let (status, _) = rpc_call(
             r.clone(),
             op,
-            Wire::Json,
+            Wire::Cbor,
             &json!({ "args": args }),
             Some("no-budget-perms"),
         )
@@ -937,7 +937,7 @@ async fn spend_unavailable_routes_self_service_refill_to_manual_review_never_aut
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.activateBudgetPolicy",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "policySetId": "budget-refill", "ruleDataJson": spend_referencing_policy } }),
         Some("admin"),
     )
@@ -952,7 +952,7 @@ async fn spend_unavailable_routes_self_service_refill_to_manual_review_never_aut
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.requestBudgetRefill",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": {
             "budgetAccountId": subject,
             "accountId": subject,
@@ -967,7 +967,7 @@ async fn spend_unavailable_routes_self_service_refill_to_manual_review_never_aut
         "body: {}",
         String::from_utf8_lossy(&body)
     );
-    let parsed = as_json(Wire::Json, &body);
+    let parsed = as_json(Wire::Cbor, &body);
     assert_eq!(
         parsed["status"], "pending_review",
         "spend unavailable + a policy that references it must fail closed to manual review, \

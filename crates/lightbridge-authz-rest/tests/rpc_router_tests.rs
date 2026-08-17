@@ -453,7 +453,7 @@ async fn rbac_gate_denies_viewer_on_every_mutating_op() {
         "procedure.rotateApiKey",
     ] {
         let router = build_router(admin_and_viewer_bearer(), &external_oauth2(), None, false);
-        let (status, _) = rpc_call(router, op, Wire::Json, &json!({}), Some("viewer")).await;
+        let (status, _) = rpc_call(router, op, Wire::Cbor, &json!({}), Some("viewer")).await;
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,
@@ -476,7 +476,7 @@ async fn rbac_gate_denies_unmapped_and_locked_ops_even_for_admin() {
         "",
     ] {
         let router = build_router(admin_bearer(), &external_oauth2(), None, false);
-        let (status, _) = rpc_call(router, op, Wire::Json, &json!({}), Some("admin")).await;
+        let (status, _) = rpc_call(router, op, Wire::Cbor, &json!({}), Some("admin")).await;
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,
@@ -501,7 +501,7 @@ async fn rbac_gate_on_the_batch_endpoint_requires_a_valid_token_then_forwards() 
         let mut builder = Request::builder()
             .method("POST")
             .uri("/rpc/batch")
-            .header("content-type", "application/json");
+            .header("content-type", "application/cbor");
         if let Some(token) = token {
             builder = builder.header("authorization", format!("Bearer {token}"));
         }
@@ -543,7 +543,7 @@ async fn rpc_surface_honours_configured_base_path() {
         Request::builder()
             .method("POST")
             .uri(uri)
-            .header("content-type", "application/json")
+            .header("content-type", "application/cbor")
             .body(Body::from("{}"))
             .unwrap()
     };
@@ -589,14 +589,14 @@ async fn rpc_surface_honours_configured_base_path() {
 #[tokio::test]
 async fn rbac_gate_requires_a_valid_token_on_mapped_ops() {
     let router = build_router(admin_bearer(), &external_oauth2(), None, false);
-    let (status, _) = rpc_call(router, "model.Account.list", Wire::Json, &json!({}), None).await;
+    let (status, _) = rpc_call(router, "model.Account.list", Wire::Cbor, &json!({}), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "missing token → 401");
 
     let router = build_router(admin_bearer(), &external_oauth2(), None, false);
     let (status, _) = rpc_call(
         router,
         "model.Account.list",
-        Wire::Json,
+        Wire::Cbor,
         &json!({}),
         Some("bogus-token"),
     )
@@ -633,7 +633,7 @@ async fn budget_gated_op_ids_are_unreachable_on_authz_api_regardless_of_permissi
     ];
     for op in op_ids {
         let router = build_router(admin_bearer(), &external_oauth2(), None, false);
-        let (status, body) = rpc_call(router, op, Wire::Json, &json!({}), Some("admin")).await;
+        let (status, body) = rpc_call(router, op, Wire::Cbor, &json!({}), Some("admin")).await;
         assert_eq!(
             status,
             StatusCode::NOT_FOUND,
@@ -681,7 +681,7 @@ async fn viewer_and_editor_roles_are_granted_account_create_by_shipped_config() 
         let (status, body) = rpc_call(
             router,
             "procedure.createAccount",
-            Wire::Json,
+            Wire::Cbor,
             &json!({ "args": {} }),
             Some("caller"),
         )

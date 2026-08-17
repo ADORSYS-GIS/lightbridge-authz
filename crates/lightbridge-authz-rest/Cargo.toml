@@ -45,11 +45,11 @@ cratestack-redis.workspace = true
 # needs raw `SET NX PX` semantics, which `cratestack-redis` (a `RateLimitStore` implementation,
 # not a general-purpose client) does not expose.
 redis.workspace = true
-# Server facade + wire codecs: rest builds the generated RPC router, implements the
-# ProcedureRegistry, and wraps it with the CBOR/JSON codec set (ADR-0003).
+# Server facade + wire codec: rest builds the generated RPC router, implements the
+# ProcedureRegistry, and wraps it with the lenient CBOR codec (ADR-0013 — CBOR is the only
+# transport codec; no JSON encoder ships in this crate's production code).
 cratestack = { workspace = true }
 cratestack-codec-cbor.workspace = true
-cratestack-codec-json.workspace = true
 minicbor.workspace = true
 
 [dev-dependencies]
@@ -62,6 +62,9 @@ sqlx.workspace = true
 httpmock.workspace = true
 tower.workspace = true
 tracing-subscriber.workspace = true
+# Dev-only: tests use this to prove a JSON-Content-Type request is now rejected (415) and to keep
+# `common::Wire::Json` as that negative-path probe. Never a production dependency post-ADR-0013.
+cratestack-codec-json.workspace = true
 
 [features]
 load-tests = []
