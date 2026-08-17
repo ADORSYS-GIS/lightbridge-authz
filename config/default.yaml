@@ -48,8 +48,12 @@ logging:
 database:
   url: "postgres://postgres:postgres@localhost:5432/lightbridge_authz"
   pool_size: 10
-# Redis-backed rate limiting for authz-api (see docs/adr/0003-cratestack-crud-migration.md,
-# "Rate limiting (Redis-backed)"). Optional: authz-opa/lightbridge-mcp/usage ignore this block.
+# Mandatory for authz-api, authz-idp, and authz-budget -- each refuses to start without it (see
+# AGENTS.md's "Redis is a mandatory dependency" house rule). Used for Redis-backed rate limiting
+# on authz-api/authz-budget (docs/adr/0003-cratestack-crud-migration.md, "Rate limiting
+# (Redis-backed)") and for authz-idp's private_key_jwt replay-protection store (ADR-0011,
+# Decision 6). authz-opa, lightbridge-mcp, and the usage service are explicitly freed from this
+# requirement and ignore this block entirely.
 redis:
   url: "${REDIS_URL:-redis://localhost:6379}"
 # HTTP client for authz-api's budget domain to call the usage service's mTLS-required query

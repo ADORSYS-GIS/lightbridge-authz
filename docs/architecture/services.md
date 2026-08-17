@@ -12,8 +12,9 @@ writing, the code wins — see "Corrections to prior docs" at the end.
 JWT mode), RFC 8693 token exchange, and RFC 7009 revocation. The budget domain's RPC procedures
 moved off this service onto `authz-budget` (hard cutover, not a transitional duplication) — see
 below.
-**Owns:** the `authz` Postgres database (all tables), plus Redis for rate limiting, request
-idempotency, and `private_key_jwt` replay tracking.
+**Owns:** the `authz` Postgres database (all tables), plus Redis (mandatory — `start_api_server`
+refuses to start without `redis.url` configured; see AGENTS.md's "Redis is a mandatory dependency"
+house rule) for rate limiting and `private_key_jwt` replay tracking.
 
 Router assembly: `build_api_router` in `crates/lightbridge-authz-rest/src/lib.rs`.
 
@@ -50,8 +51,9 @@ cutover (not a transitional duplication like `authz-idp` below). See
 [`../rbac.md`](../rbac.md) for the permission mapping.
 **Owns:** nothing of its own — reads/writes the same `authz` Postgres database as `authz-api`
 (`budget_grants`, `budget_balances`, `budget_policy_sets`/`budget_policy_revisions`,
-`budget_augmentation_requests`), plus Redis for rate limiting and request idempotency (its own
-key-prefixed token buckets, isolated from `authz-api`'s).
+`budget_augmentation_requests`), plus Redis (mandatory — `start_budget_server` refuses to start
+without `redis.url` configured; see AGENTS.md's "Redis is a mandatory dependency" house rule) for
+rate limiting (its own key-prefixed token buckets, isolated from `authz-api`'s).
 
 Router assembly: `build_budget_router` in `crates/lightbridge-authz-rest/src/lib.rs`.
 
@@ -89,8 +91,11 @@ start otherwise (`start_idp_server` rejects the external-issuance path outright 
 ever serves the self-signed-JWT surface).
 **Owns:** nothing of its own — reads/writes the same `signing_keys` table as `authz-api` and
 `lightbridge-mcp` via `StoreRepo`, and is a third concurrent bootstrapper against it
-(`signing::bootstrap_signing_key`); plus Redis for `private_key_jwt` replay tracking when
-`oauth2.token_exchange.enabled`.
+(`signing::bootstrap_signing_key`); plus Redis, mandatory unconditionally (not only when
+`oauth2.token_exchange.enabled`) — see AGENTS.md's "Redis is a mandatory dependency" house rule.
+`start_idp_server` refuses to start with no `redis.url` configured, regardless of whether token
+exchange is enabled; when it is enabled, that same Redis instance also backs the `private_key_jwt`
+client-assertion replay-protection store (ADR-0011, Decision 6).
 
 **Transitional duplication, not a permanent parallel path — unlike `authz-budget` above, this is
 not a hard cutover.** `authz-api` keeps serving this exact surface too, byte-identical
@@ -107,7 +112,7 @@ Router assembly: `build_idp_router`/`start_idp_server` in `crates/lightbridge-au
 | `/`, `/healthz`, `/healthz/startup`, `/healthz/ready` | GET | none | Same probe wiring as every other server (`probe_router`), `/healthz/ready` checks DB reachability. |
 | `/.well-known/openid-configuration` | GET | none | Only mounted when `oauth2.type: self` — same `signing::well_known_router` call `authz-api` makes, same `signing_keys` rows. |
 | `/.well-known/jwks.json` | GET | none | Same gate as above. |
-| `/oauth2/token` | POST | none (credential is the presented token/assertion) | RFC 8693 token exchange + `refresh_token` grant. Only mounted when `oauth2.token_exchange.enabled`; requires `redis.url` in that case (`start_idp_server` errors at startup otherwise). `project_id` is an optional form param, as on `authz-api`. |
+| `/oauth2/token` | POST | none (credential is the presented token/assertion) | RFC 8693 token exchange + `refresh_token` grant. Only mounted when `oauth2.token_exchange.enabled` — but `redis.url` is required for this server to start at all regardless of that flag (`start_idp_server` errors at startup otherwise). `project_id` is an optional form param, as on `authz-api`. |
 | `/oauth2/revoke` | POST | none (credential is the presented token) | RFC 7009. Same caveat as `authz-api`'s copy: absent from `/.well-known/openid-configuration` pending an upstream `authkestra-op` `OidcDiscovery` field. |
 
 Deliberately thin next to `authz-api`: no RPC CRUD surface, no budget domain, no idempotency/rate-

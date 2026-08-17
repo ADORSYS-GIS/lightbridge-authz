@@ -537,6 +537,41 @@ Key config fields:
 - `server.usage`: address/port/tls paths for usage service
 - `database.url`: Postgres connection string
 - `oauth2.jwks_url`: JWKS endpoint (Keycloak in local compose)
+- `redis.url`: mandatory for `authz-api`, `authz-idp`, `authz-budget` — see below.
+
+### Redis is a mandatory dependency for authz-api / authz-idp / authz-budget
+
+**House rule, from the repo owner:** *"Redis MUST be a default in this system from now on. No
+possibility to disable it for the lightbridge-authz components. `-mcp` and `-opa` can be freed from
+it. All roles in lightbridge-authz need caching. If caching is required somewhere, we'll enforce
+Redis."* Concretely:
+
+- `authz-api`, `authz-idp`, and `authz-budget` **refuse to start** when `redis.url` is absent —
+  loudly, at startup, never a silent degradation. This applies to `authz-idp` unconditionally, not
+  only when `oauth2.token_exchange` happens to be enabled — do not reintroduce that conditional.
+- `authz-opa` and `lightbridge-mcp` are explicitly and permanently freed from this requirement:
+  neither takes a `redis` parameter in its `start_*` function at all. Do not add one "for
+  consistency" — that is the whole point of freeing them.
+- **There is no neutralisation escape hatch.** A deployment that used to "disable" Redis via a
+  bogus `REDIS_URL` value (e.g. `"unused"`) for `authz-idp`/`authz-opa` config sharing must instead
+  supply a real, reachable-in-principle Redis for every required component — an absent or
+  malformed `redis.url` is a hard startup failure for `authz-api`/`authz-idp`/`authz-budget`, by
+  design.
+- **Enforcement is presence-only, not a startup-time reachability check (no `PING`).** The
+  `redis::Client`/`RedisRateLimitStore`/`RedisClientAssertionStore` constructors this codebase uses
+  are all lazy — they never dial out until the first real command — so "redis config is required"
+  only means "the config key must be set and well-formed," not "a live Redis must already be
+  reachable at process startup." This was a deliberate choice: presence-only avoids a hard
+  startup-ordering dependency on Redis already being up (simpler, and consistent with how
+  `authz-api`/`authz-budget` already behaved before this rule existed); it trades away catching a
+  genuinely-unreachable-but-well-formed URL until the first request hits it. If that trade-off ever
+  needs revisiting, do it explicitly (a real `PING` in the startup path) rather than accidentally
+  via a different constructor.
+- `Config.redis` stays `Option<Redis>` at the type level (not `Redis`) because `authz-opa`,
+  `lightbridge-mcp`, and the usage service all load the same `Config` type and must keep starting
+  with `redis` entirely absent from their YAML. Enforcement lives per-component inside
+  `start_api_server`/`start_idp_server`/`start_budget_server`
+  (`crates/lightbridge-authz-rest/src/lib.rs`), not on the shared config struct.
 
 ### Environment Variable Interpolation
 

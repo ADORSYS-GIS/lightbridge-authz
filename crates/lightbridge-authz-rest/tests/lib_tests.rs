@@ -106,6 +106,32 @@ async fn start_opa_server_fails_fast_when_tls_certs_are_missing() {
     );
 }
 
+/// Regression guard for the "authz-opa is freed from the mandatory-Redis requirement" half of
+/// AGENTS.md's "Redis is a mandatory dependency" house rule: `start_opa_server` doesn't even take
+/// a `redis` parameter (unlike `start_api_server`/`start_idp_server`/`start_budget_server`, which
+/// all now hard-require `Config.redis`), so it must run its whole startup sequence to completion
+/// with no Redis configured anywhere, failing only for the TLS reason this test deliberately
+/// induces -- never anything Redis-shaped.
+#[tokio::test]
+async fn start_opa_server_starts_fine_with_no_redis_configured() {
+    let opa = OpaServer {
+        address: "127.0.0.1".to_string(),
+        port: 0,
+        tls: bad_tls(),
+        basic_auth: BasicAuth {
+            username: "authorino".to_string(),
+            password: "change-me".to_string(),
+        },
+    };
+    let result =
+        lightbridge_authz_rest::start_opa_server(&opa, lazy_pool(), &sample_billing()).await;
+    let err = result.expect_err("missing TLS cert paths must surface as an error");
+    assert!(
+        !format!("{err}").to_lowercase().contains("redis"),
+        "authz-opa must never fail for a redis-shaped reason: got {err}"
+    );
+}
+
 /// `oauth2.type: self` with a missing `signing` block must fail before ever touching the
 /// database (the `ok_or_else` short-circuits ahead of `bootstrap_signing_key`), so this stays
 /// fully offline like the tests above.
@@ -177,13 +203,43 @@ mod db {
     use lightbridge_authz_api::schema;
     use lightbridge_authz_api_key::repo::StoreRepo;
     use lightbridge_authz_bearer::BearerTokenServiceTrait;
-    use lightbridge_authz_core::config::JwtSigning;
+    use lightbridge_authz_core::config::{BudgetServer, JwtSigning, Oauth2Issuance};
     use lightbridge_authz_core::cuid::cuid2;
     use lightbridge_authz_core::{CreateAccount, CreateApiKey, CreateProject};
     use lightbridge_authz_rest::OpaRepoTrait;
     use lightbridge_authz_rest::handlers::AuthzStoreImpl;
     use lightbridge_authz_rest::ratelimit_redis::build_redis_rate_limit_store;
     use sqlx::PgPool;
+
+    /// Unreachable but syntactically valid -- AGENTS.md's "Redis is a mandatory dependency" house
+    /// rule enforces presence, not startup-time reachability (no `PING`): every constructor a
+    /// well-formed `redis.url` reaches here (`RedisRateLimitStore::open`) is lazy and never dials
+    /// out at construction time, so this never actually connects.
+    fn unreachable_redis() -> Option<Redis> {
+        Some(Redis {
+            url: "redis://127.0.0.1:1".to_string(),
+        })
+    }
+
+    /// `external_oauth2()` (top-level, shared by every offline test in this file) deliberately
+    /// leaves `issuance`/`oauth2_url` unset -- fine for tests that only assert `result.is_err()`,
+    /// but `AuthzStoreImpl::with_pool_and_oauth2` validates both eagerly, ahead of the
+    /// mandatory-redis check this module's redis-specific tests need to actually reach. This adds
+    /// the minimum valid `external` config to get past that validation.
+    fn external_oauth2_with_issuance() -> Oauth2 {
+        let mut oauth2 = external_oauth2();
+        oauth2.oauth2_url = Some("http://keycloak.example.test/token".to_string());
+        oauth2.issuance = Some(Oauth2Issuance {
+            grant_type: None,
+            client_id: "lightbridge-token-issuer".to_string(),
+            client_secret: None,
+            subject_token_type: None,
+            requested_token_type: None,
+            audience: None,
+            scope: None,
+        });
+        oauth2
+    }
 
     fn repo(pool: PgPool) -> Arc<StoreRepo> {
         let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
@@ -268,6 +324,116 @@ mod db {
         assert!(
             repo.get_active_signing_key().await.unwrap().is_some(),
             "start_api_server must bootstrap a signing key before failing on TLS load"
+        );
+    }
+
+    /// AGENTS.md's "Redis is a mandatory dependency" house rule: `authz-api` must refuse to start
+    /// with no `redis.url` configured. `external_oauth2_with_issuance()` skips the self-signed
+    /// signing-key bootstrap branch, so the real database is only touched by `policy_store`'s
+    /// active-revision load (which the `sqlx::test` migrations seed) before the redis check is
+    /// reached.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_api_server_requires_redis(pool: PgPool) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let api = ApiServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+            allowed_hosts: None,
+            rpc_base_path: None,
+        };
+        let err = lightbridge_authz_rest::start_api_server(
+            &api,
+            db_pool,
+            &external_oauth2_with_issuance(),
+            &sample_billing(),
+            &None,
+            &None,
+        )
+        .await
+        .expect_err("authz-api must refuse to start with no redis config");
+        let message = format!("{err}");
+        assert!(message.contains("authz-api"), "got: {message}");
+        assert!(message.to_lowercase().contains("redis"), "got: {message}");
+    }
+
+    /// Presence-only enforcement (AGENTS.md's "Redis is a mandatory dependency" house rule): a
+    /// syntactically valid but unreachable `redis.url` must NOT be rejected by the mandatory-redis
+    /// check -- it must proceed and fail only for the deliberately-bogus TLS cert path.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_api_server_does_not_require_redis_to_be_reachable(pool: PgPool) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let api = ApiServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+            allowed_hosts: None,
+            rpc_base_path: None,
+        };
+        let result = lightbridge_authz_rest::start_api_server(
+            &api,
+            db_pool,
+            &external_oauth2_with_issuance(),
+            &sample_billing(),
+            &unreachable_redis(),
+            &None,
+        )
+        .await;
+        let err = result.expect_err("missing TLS cert paths must surface as an error");
+        assert!(
+            !format!("{err}").to_lowercase().contains("redis"),
+            "an unreachable-but-well-formed redis.url must not fail the mandatory-redis check: \
+             got {err}"
+        );
+    }
+
+    fn budget_server() -> BudgetServer {
+        BudgetServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+        }
+    }
+
+    /// AGENTS.md's "Redis is a mandatory dependency" house rule: `authz-budget` must refuse to
+    /// start with no `redis.url` configured -- mirrors `start_api_server_requires_redis` above.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_budget_server_requires_redis(pool: PgPool) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let err = lightbridge_authz_rest::start_budget_server(
+            &budget_server(),
+            db_pool,
+            &external_oauth2_with_issuance(),
+            &sample_billing(),
+            &None,
+            &None,
+        )
+        .await
+        .expect_err("authz-budget must refuse to start with no redis config");
+        let message = format!("{err}");
+        assert!(message.contains("authz-budget"), "got: {message}");
+        assert!(message.to_lowercase().contains("redis"), "got: {message}");
+    }
+
+    /// Presence-only enforcement, mirroring
+    /// `start_api_server_does_not_require_redis_to_be_reachable` above.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_budget_server_does_not_require_redis_to_be_reachable(pool: PgPool) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let result = lightbridge_authz_rest::start_budget_server(
+            &budget_server(),
+            db_pool,
+            &external_oauth2_with_issuance(),
+            &sample_billing(),
+            &unreachable_redis(),
+            &None,
+        )
+        .await;
+        let err = result.expect_err("missing TLS cert paths must surface as an error");
+        assert!(
+            !format!("{err}").to_lowercase().contains("redis"),
+            "an unreachable-but-well-formed redis.url must not fail the mandatory-redis check: \
+             got {err}"
         );
     }
 

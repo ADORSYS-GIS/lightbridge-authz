@@ -18,11 +18,21 @@ pub struct Config {
     pub server: Server,
     pub logging: Logging,
     pub database: Database,
-    /// Redis connection used for `authz-api`'s Redis-backed rate limiting (see
-    /// `docs/adr/0003-cratestack-crud-migration.md`, "Rate limiting (Redis-backed)").
-    /// Optional: `authz-opa`, `lightbridge-mcp`, and the usage service load this same
-    /// `Config` type but do not need Redis, so a config file that omits `redis` entirely
-    /// still loads.
+    /// Redis connection. **Mandatory at startup for `authz-api`, `authz-idp`, and
+    /// `authz-budget`** (see `start_api_server`/`start_idp_server`/`start_budget_server` in
+    /// `crates/lightbridge-authz-rest/src/lib.rs`, and AGENTS.md's "Redis is a mandatory
+    /// dependency" house rule) -- each of those three refuses to start with this unset, loudly,
+    /// rather than degrade. Used for Redis-backed rate limiting on `authz-api`/`authz-budget`
+    /// (see `docs/adr/0003-cratestack-crud-migration.md`, "Rate limiting (Redis-backed)") and for
+    /// `authz-idp`'s `private_key_jwt` client-assertion replay-protection store (ADR-0011,
+    /// Decision 6) whenever `oauth2.token_exchange` is enabled.
+    ///
+    /// The field itself stays `Option` at the `Config` level -- not `Redis` -- because
+    /// `authz-opa`, `lightbridge-mcp`, and the usage service load this same `Config` type and are
+    /// deliberately freed from needing Redis at all, so a config file that omits `redis` entirely
+    /// must still load for them. Enforcement of "mandatory for api/idp/budget" therefore happens
+    /// per-component at server startup, not by making this field required for every consumer of
+    /// `Config`.
     #[serde(default)]
     pub redis: Option<Redis>,
     /// HTTP client config for calling `lightbridge-authz-usage`'s `/usage/v1/spend/query`

@@ -311,6 +311,7 @@ async fn start_idp_server_rejects_self_signed_oauth2_without_signing_block() {
 #[cfg(feature = "it-tests")]
 mod db {
     use super::*;
+    use lightbridge_authz_core::config::Redis;
     use lightbridge_authz_rest::build_api_router;
     use sqlx::PgPool;
 
@@ -319,9 +320,22 @@ mod db {
         Arc::new(StoreRepo::new(pool))
     }
 
+    /// Unreachable but syntactically valid -- `start_idp_server`'s mandatory-redis check is
+    /// presence-only (AGENTS.md's "Redis is a mandatory dependency" house rule): it only requires
+    /// `redis.url` to be set, never that a live Redis already be reachable at process startup.
+    /// Every constructor this URL eventually reaches (`RedisClientAssertionStore::connect`) is
+    /// lazy and never dials out at construction time, so this never actually connects.
+    fn unreachable_redis_cfg() -> Option<Redis> {
+        Some(Redis {
+            url: "redis://127.0.0.1:1".to_string(),
+        })
+    }
+
     /// Proves the signing-key-ownership decision documented on
     /// `lightbridge_authz_rest::signing::bootstrap_signing_key`: `authz-idp` bootstraps its own
     /// active key rather than depending on `authz-api`/`lightbridge-mcp` to have done so first.
+    /// Supplies a (deliberately unreachable, but well-formed) redis config so the mandatory-redis
+    /// check further down `start_idp_server` doesn't intercept this before it reaches TLS load --
     /// TLS cert paths are bogus, so `serve_tls` fails right after bootstrap without binding a
     /// socket -- same shape as `start_api_server_bootstraps_signing_key_for_self_signed_oauth2`
     /// in `tests/lib_tests.rs`.
@@ -342,10 +356,18 @@ mod db {
             port: 0,
             tls: bad_tls(),
         };
-        let result = start_idp_server(&idp, db_pool, &self_signed_oauth2(), &None).await;
+        let result = start_idp_server(
+            &idp,
+            db_pool,
+            &self_signed_oauth2(),
+            &unreachable_redis_cfg(),
+        )
+        .await;
+        let err = result.expect_err("missing TLS cert paths must surface as an error");
         assert!(
-            result.is_err(),
-            "missing TLS cert paths must surface as an error"
+            !format!("{err}").to_lowercase().contains("redis"),
+            "must fail on TLS load, not on the redis check, given a well-formed redis config: \
+             got {err}"
         );
 
         assert!(
@@ -367,6 +389,58 @@ mod db {
             .await
             .expect_err("token_exchange enabled with no redis config must be rejected");
         assert!(format!("{err}").contains("redis"), "got: {err}");
+    }
+
+    /// The unconditional half of the "Redis is a mandatory dependency" house rule (AGENTS.md):
+    /// `authz-idp` must refuse to start with no `redis.url` configured even when
+    /// `oauth2.token_exchange` is disabled -- this used to be the one case that tolerated a
+    /// missing redis config (the check lived inside the `token_exchange.enabled` branch); it no
+    /// longer does.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_idp_server_requires_redis_without_token_exchange(pool: PgPool) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let idp = IdpServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+        };
+        let err = start_idp_server(&idp, db_pool, &self_signed_oauth2(), &None)
+            .await
+            .expect_err(
+                "authz-idp must refuse to start with no redis config even without token_exchange",
+            );
+        let message = format!("{err}");
+        assert!(message.contains("authz-idp"), "got: {message}");
+        assert!(message.to_lowercase().contains("redis"), "got: {message}");
+    }
+
+    /// Enforcement is presence-only, not a startup-time reachability check (AGENTS.md's "Redis is
+    /// a mandatory dependency" house rule): a syntactically valid but unreachable `redis.url` must
+    /// NOT be rejected by the mandatory-redis check. With `token_exchange` enabled, this actually
+    /// exercises `RedisClientAssertionStore::connect` (lazy, per its own doc comment), so the
+    /// unreachable address never surfaces as an error here either -- the only failure is the
+    /// deliberately-bogus TLS cert path further down.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_idp_server_does_not_require_redis_to_be_reachable(pool: PgPool) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let idp = IdpServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+        };
+        let result = start_idp_server(
+            &idp,
+            db_pool,
+            &token_exchange_oauth2(),
+            &unreachable_redis_cfg(),
+        )
+        .await;
+        let err = result.expect_err("missing TLS cert paths must surface as an error");
+        assert!(
+            !format!("{err}").to_lowercase().contains("redis"),
+            "an unreachable-but-well-formed redis.url must not fail the mandatory-redis check: \
+             got {err}"
+        );
     }
 
     /// The routing-cutover safety property ADR-0012 names explicitly: `authz-api` and

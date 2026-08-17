@@ -256,6 +256,8 @@ services:
     depends_on:
       postgresql:
         condition: service_healthy
+      redis:
+        condition: service_healthy
       authz-migrate:
         condition: service_completed_successfully
       authz-tls:
