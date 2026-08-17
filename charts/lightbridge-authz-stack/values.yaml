@@ -20,6 +20,7 @@ global:
     apiCommonName: lightbridge-authz-api
     opaCommonName: lightbridge-authz-opa
     idpCommonName: lightbridge-authz-idp
+    budgetCommonName: lightbridge-authz-budget
     usageCommonName: lightbridge-authz-usage
     job:
       enabled: true
@@ -101,6 +102,46 @@ idp:
       enabled: false
       hosts:
         - host: auth.ai.camer.digital
+          paths:
+            - path: /
+              pathType: Prefix
+              service:
+                identifier: authz
+                port: 3000
+      tls: []
+
+# budget — the budget-domain RPC surface (`/budget/rpc/{op_id}`) PR #351 carried off `authz-api`
+# as a hard cutover (not a transitional duplication like `idp` above): every `budget:*`-gated
+# procedure now 404s on `authz-api` and only answers here. Same image + shared lightbridge-authz
+# subchart as api/opa/idp, started with the `budget` subcommand instead. Budget RPCs will
+# eventually need frontend exposure, but enabling that is a separate deliberate decision — the
+# frontend can't call the new `/budget` prefix until converse-frontends#175 lands, so this gets an
+# optional Ingress, default OFF, exactly like idp's. Host below is a best-effort placeholder (no
+# real DNS convention exists for this surface yet) — confirm/replace before ever flipping
+# `enabled: true`.
+budget:
+  enabled: true
+  controllers:
+    main:
+      replicas: 1
+      containers:
+        authz:
+          args:
+            - budget
+            - --config-path
+            - /etc/lightbridge/config.yaml
+    # Inherits the subchart's `migrate` Job unchanged, same as api/opa/idp (each aliased instance
+    # already runs its own idempotent `migrate` against the shared DB today — pre-existing
+    # redundancy, not something introduced here).
+  persistence:
+    tls:
+      name: lightbridge-authz-tls
+  ingress:
+    main:
+      # Default OFF on purpose — see the block comment above.
+      enabled: false
+      hosts:
+        - host: budget.ai.camer.digital
           paths:
             - path: /
               pathType: Prefix

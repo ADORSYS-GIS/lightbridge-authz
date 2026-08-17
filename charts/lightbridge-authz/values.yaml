@@ -188,6 +188,23 @@ configMaps:
             tls:
               cert_path: /etc/lightbridge/tls/idp.crt
               key_path: /etc/lightbridge/tls/idp.key
+          # Budget-domain RPC surface (`/budget/rpc/{op_id}`, PR #351's hard cutover off authz-api).
+          # No basic_auth (unlike opa) — every route here is behind the same bearer-JWT
+          # rpc_authorize gate authz-api already uses, per `BudgetServer`'s doc comment in
+          # crates/lightbridge-authz-core/src/config/mod.rs. redis (above) is a hard requirement
+          # for this server's rate limiting, already present in this shared config block. No
+          # `oauth2.signing` dependency: this server never bootstraps a signing key, only validates
+          # bearer tokens via `oauth2.jwks_url` (mirrors opa, unlike api/idp). `usage_service` is
+          # intentionally not configured here yet — spend reads degrade to `Spend::Unavailable`
+          # and refill decisions that depend on them fail closed to manual review; wiring a real
+          # `usage_service.base_url` is a follow-up once the in-cluster usage-service address is
+          # settled.
+          budget:
+            address: 0.0.0.0
+            port: 3000
+            tls:
+              cert_path: /etc/lightbridge/tls/budget.crt
+              key_path: /etc/lightbridge/tls/budget.key
         otel:
           enabled: true
           otlp_endpoint: "http://localhost:4317"

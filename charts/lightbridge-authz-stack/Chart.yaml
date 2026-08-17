@@ -2,7 +2,7 @@ apiVersion: v2
 name: lightbridge-authz-stack
 description: >-
   Umbrella chart deploying the full lightbridge-authz stack (api, opa, idp,
-  usage, mcp)
+  budget, usage, mcp)
 type: application
 version: 3.3.0
 appVersion: 3.3.0
@@ -34,6 +34,11 @@ dependencies:
     repository: file://../lightbridge-authz
     alias: idp
     condition: idp.enabled
+  - name: lightbridge-authz
+    version: '*'
+    repository: file://../lightbridge-authz
+    alias: budget
+    condition: budget.enabled
   - name: lightbridge-authz-usage
     version: '*'
     repository: file://../lightbridge-authz-usage

@@ -1,18 +1,21 @@
 dependencies:
 - name: lightbridge-authz
   repository: file://../lightbridge-authz
-  version: 3.2.0
+  version: 3.3.0
 - name: lightbridge-authz
   repository: file://../lightbridge-authz
-  version: 3.2.0
+  version: 3.3.0
 - name: lightbridge-authz
   repository: file://../lightbridge-authz
-  version: 3.2.0
+  version: 3.3.0
+- name: lightbridge-authz
+  repository: file://../lightbridge-authz
+  version: 3.3.0
 - name: lightbridge-authz-usage
   repository: file://../lightbridge-authz-usage
-  version: 3.2.0
+  version: 3.3.0
 - name: lightbridge-mcp
   repository: file://../lightbridge-mcp
-  version: 3.2.0
-digest: sha256:d27101cf1db1f726b9112ddffa446162176406af6cae3e140fee4b7b59cc22f8
-generated: "2026-08-16T14:56:36.096791+02:00"
+  version: 3.3.0
+digest: sha256:1b7ea42363438ed18f54aa6243d56b92568439f94b27c5411f5249058912bd99
+generated: "2026-08-17T09:35:50.007308+02:00"
