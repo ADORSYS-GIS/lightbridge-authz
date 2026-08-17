@@ -3,11 +3,18 @@
 This repository provides API key management plus usage analytics:
 
 - `authz-api`: OAuth2/JWT-protected CRUD API for Accounts, Projects, and API keys.
+- `authz-budget`: OAuth2/JWT-protected RPC API for the budget domain (policy lifecycle,
+  self-service refill, the admin review queue, and direct balance/ledger reads/writes) — carried
+  off `authz-api` as a hard cutover (ADR-0010, #351).
 - `authz-opa`: Basic-auth protected validation API intended to be called by Authorino (or similar external auth components). It validates API keys and returns rich context plus dynamic metadata.
+- `authz-idp`: OIDC broker server (ADR-0012 Phase 1) exposing `.well-known/openid-configuration`,
+  `.well-known/jwks.json`, `/oauth2/token`, and `/oauth2/revoke` — every route is public, the
+  presented token/assertion is itself the credential. Transitional: `authz-api` keeps serving the
+  identical surface until the public issuer is repointed at `authz-idp` in a later PR.
 - `lightbridge-mcp`: OAuth2/JWT-protected MCP server exposing the authz surface as MCP tools over streamable HTTP (`/mcp`).
 - `lightbridge-authz-usage`: unprotected OTLP/HTTP ingest API (`/v1/otel/traces`, `/v1/otel/metrics`) plus a single usage query API (`/usage/v1/usage/query`) backed by Timescale/Postgres.
 
-The authz services (`authz-api`, `authz-opa`):
+The authz services (`authz-api`, `authz-budget`, `authz-opa`, `authz-idp`):
 
 - share the same Postgres database
 - share the same SQL migrations
@@ -15,13 +22,13 @@ The authz services (`authz-api`, `authz-opa`):
 - `authz-opa` still exposes OpenAPI/Swagger docs; `authz-api`'s CRUD/RPC surface does not (see
   "OpenAPI docs" under Development Workflows)
 
-`authz-api` also hosts the **budget domain**: a per-account ledger of budget grants
-(`crates/lightbridge-authz-budget/`), a hot-swappable rule-data policy engine that decides refill
-requests, and self-service refill + an admin review queue, all exposed as `/rpc/*` procedures on
-the same RPC surface as the CRUD API. See `docs/rbac.md`'s budget sections and
-`docs/budget-decision-contract.md` for the full picture; this is upstream of, and today has no
-effect on, the Envoy/Authorino-side rate limiting `docs/governance-model-and-enforcement.md`
-describes.
+The **budget domain** (`crates/lightbridge-authz-budget/`) — a per-account ledger of budget
+grants, a hot-swappable rule-data policy engine that decides refill requests, and self-service
+refill + an admin review queue — is exposed as `/budget/rpc/*` procedures on `authz-budget`, not
+`authz-api` (hard cutover; see `docs/architecture/budget.md`). See `docs/rbac.md`'s budget
+sections and `docs/budget-decision-contract.md` for the full picture; this is upstream of, and
+today has no effect on, the Envoy/Authorino-side rate limiting
+`docs/governance-model-and-enforcement.md` describes.
 
 This file documents structure, architecture, workflows, and practices for contributors and agents working on this codebase.
 
@@ -562,6 +569,8 @@ Check health:
 - `curl -k https://localhost:13003/healthz`
 - `curl -k https://localhost:13003/healthz/ready`
 - `curl -k https://localhost:13003/healthz/startup`
+- `curl -k https://localhost:13004/healthz` (`authz-idp`)
+- `curl -k https://localhost:13005/healthz` (`authz-budget`)
 
 OpenAPI docs:
 
