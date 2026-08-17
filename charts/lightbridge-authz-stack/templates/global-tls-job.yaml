@@ -53,6 +53,8 @@ spec:
               openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
                 -keyout /tls/idp.key -out /tls/idp.crt -subj "/CN={{ .Values.global.tls.idpCommonName }}"
               openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+                -keyout /tls/budget.key -out /tls/budget.crt -subj "/CN={{ .Values.global.tls.budgetCommonName }}"
+              openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
                 -keyout /tls/usage.key -out /tls/usage.crt -subj "/CN={{ .Values.global.tls.usageCommonName }}"
               kubectl create secret generic "$SECRET" \
                 --from-file=api.crt=/tls/api.crt \
@@ -61,6 +63,8 @@ spec:
                 --from-file=opa.key=/tls/opa.key \
                 --from-file=idp.crt=/tls/idp.crt \
                 --from-file=idp.key=/tls/idp.key \
+                --from-file=budget.crt=/tls/budget.crt \
+                --from-file=budget.key=/tls/budget.key \
                 --from-file=usage.crt=/tls/usage.crt \
                 --from-file=usage.key=/tls/usage.key >/dev/null
 {{- end }}
