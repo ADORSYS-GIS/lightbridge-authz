@@ -159,6 +159,7 @@ async fn setup(
             lightbridge_authz_budget::UsageServiceSpendReader::new(
                 usage_service.base_url,
                 usage_service.insecure_skip_verify,
+                usage_service.ca_bundle_path.as_deref(),
                 std::time::Duration::from_millis(usage_service.timeout_ms),
             )
             .expect("valid usage-service spend reader config"),
@@ -901,6 +902,7 @@ async fn spend_unavailable_routes_self_service_refill_to_manual_review_never_aut
     let unreachable_usage_service = UsageServiceClient {
         base_url: "https://192.0.2.1:9".to_string(),
         insecure_skip_verify: true,
+        ca_bundle_path: None,
         timeout_ms: 500,
     };
     let ctx = setup(bearer, Some(unreachable_usage_service)).await;
