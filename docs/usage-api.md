@@ -3,16 +3,22 @@
 `lightbridge-authz-usage` ingests OTLP/HTTP traces + metrics from AI Envoy/OpenTelemetry exporters and stores normalized usage events in Timescale/Postgres.
 
 > [!WARNING]
-> **No endpoint in this service is authenticated, and the query endpoint does not
-> check ownership of `scope_id`.** `usage_router()`
-> ([`crates/lightbridge-authz-usage/src/routers/mod.rs`](../crates/lightbridge-authz-usage/src/routers/mod.rs))
-> applies no JWT or Basic-auth middleware. Anyone who can reach `/usage/v1/usage/query`
-> and knows a valid `scope_id` can read that tenant's usage data cross-tenant; anyone
-> who can reach the `/v1/otel/*` ingest routes can write fabricated usage/billing
-> records for any account or project. This service is `ClusterIP`-only in prod with
-> no external route — see [`docs/lightbridge-query-api.md`](lightbridge-query-api.md)
-> for the full detail (base URL, blast radius, recommended fix direction) before
-> giving this service any external route.
+> **The ingest routes are unauthenticated, and `/usage/v1/usage/query` does not check
+> ownership of `scope_id`.** This service splits its TLS surface across two listeners
+> (#347, `UsageServerGroup` in
+> [`crates/lightbridge-authz-usage/src/config.rs`](../crates/lightbridge-authz-usage/src/config.rs)):
+> an **ingest listener** (`/v1/otel/*`, `routers::ingest_router()`) that applies no JWT,
+> Basic-auth, or mTLS check — its caller is an AI Envoy/OpenTelemetry exporter outside
+> this repo's deploy surface, so anyone who can reach it can write fabricated
+> usage/billing records for any account or project — and a **query listener**
+> (`/usage/v1/usage/query` + `/usage/v1/spend/query`, `routers::query_router()`) that
+> **requires and verifies a client certificate (mTLS)**. mTLS authenticates "a
+> legitimate lightbridge workload holding a CA-signed cert", not which `scope_id` the
+> caller is entitled to see — cross-tenant reads by an already-trusted caller are still
+> possible. This service is `ClusterIP`-only in prod with no external route regardless
+> — see [`docs/lightbridge-query-api.md`](lightbridge-query-api.md) for the full detail
+> (base URL, blast radius, recommended fix direction for the remaining ownership gap)
+> before giving this service any external route.
 
 ## Endpoints
 

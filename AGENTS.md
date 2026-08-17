@@ -702,6 +702,20 @@ Traces capture the full lifecycle of a validation request, including database lo
 - Local TLS certs are self-signed: use `curl -k` for local testing.
 - OAuth2 validation relies on JWKS (`oauth2.jwks_url`) and currently does not enforce `aud` (audience) in JWT validation.
 - Basic-auth credentials for OPA/Authorino are configured in YAML and should be rotated for non-dev deployments.
+- `lightbridge-authz-usage` splits its TLS surface across two listeners (#347): an ingest listener
+  (`/v1/otel/{traces,metrics,logs}`) that stays unauthenticated -- its caller is an AI Envoy/
+  OpenTelemetry exporter outside this repo's deploy surface, so it cannot be given a client
+  certificate without a coordinated change there; safe only because this service is `ClusterIP`-
+  only with no ingress -- and a query listener (`/usage/v1/usage/query`, `/usage/v1/spend/query`)
+  that **requires and verifies a client certificate (mTLS)**. `authz-api`/`authz-budget` present
+  their own TLS cert as that client identity (`Config.usage_service.client_cert_path`/
+  `client_key_path`), since the deployed `authz-tls` cert already carries both `serverAuth` and
+  `clientAuth` in its `extendedKeyUsage`. This authenticates "a legitimate lightbridge workload
+  holding a CA-signed cert", not a specific caller identity -- see
+  `crates/lightbridge-authz-core/src/server.rs`'s `build_mtls_config` and
+  `crates/lightbridge-authz-budget/src/spend.rs`'s `UsageServiceSpendReader` doc comments for the
+  full posture and the fail-closed contract (a rejected/missing/expired client cert resolves to
+  `Spend::Unavailable`, never a silent bypass).
 
 ## Migrations
 

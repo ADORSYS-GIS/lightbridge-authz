@@ -28,9 +28,10 @@ pub struct Config {
     /// HTTP client config for calling `lightbridge-authz-usage`'s `/usage/v1/spend/query`
     /// endpoint, used by the budget domain's `UsageServiceSpendReader`
     /// (`crates/lightbridge-authz-budget/src/spend.rs`) to read `usage_events.total_cost` sums
-    /// without either service reaching into the other's database directly. Unauthenticated today
-    /// (no Basic auth, no mTLS yet — see `UsageServiceSpendReader`'s own doc comment for that
-    /// deliberate, tracked-as-a-follow-up tradeoff). Optional, like `redis` above: only the
+    /// without either service reaching into the other's database directly. Carries no credential
+    /// by default; `client_cert_path`/`client_key_path` (#347) let it present a client
+    /// certificate for mTLS when the usage service's listener requires one — see
+    /// `UsageServiceSpendReader`'s own doc comment. Optional, like `redis` above: only the
     /// budget domain's spend reads need it, so a config file that omits it entirely still loads
     /// (and budget refill spend facts report `Spend::Unavailable`, per `UnavailableSpendReader`'s
     /// doc comment).
@@ -401,6 +402,24 @@ pub struct BudgetServer {
 pub struct Tls {
     pub cert_path: String,
     pub key_path: String,
+    /// Path to a PEM-encoded CA bundle used to require and verify a client certificate on every
+    /// connection to this listener (mTLS). Optional: when unset (every server today except
+    /// `authz-usage` once #347 lands), this listener behaves exactly as before -- server-only
+    /// TLS, no client-certificate check. When set, [`crate::server::serve_tls`] builds a
+    /// `rustls::ServerConfig` with a `WebPkiClientVerifier` over this trust store instead of
+    /// `with_no_client_auth`: a connection presenting no client certificate, an expired one, or
+    /// one not signed by a CA in this bundle is refused at the TLS handshake, before any
+    /// application code runs. There is no "accept but don't require" mode here deliberately --
+    /// `WebPkiClientVerifier`'s default (no `allow_unauthenticated()`) is fail-closed by
+    /// construction, matching this codebase's rule that an unknown/unverifiable caller routes to
+    /// the strictest branch, never a permissive default.
+    ///
+    /// An unreadable path, a bundle with zero parseable PEM certificates, or a bundle that fails
+    /// to build into a verifier is a hard startup failure naming the path -- the same
+    /// fail-closed convention `UsageServiceClient::ca_bundle_path` already uses on the client
+    /// side of this same call.
+    #[serde(default)]
+    pub client_ca_bundle_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -422,10 +441,9 @@ pub struct Database {
 
 /// HTTP client config for `lightbridge-authz-budget`'s `UsageServiceSpendReader` to call
 /// `lightbridge-authz-usage`'s `/usage/v1/spend/query` endpoint. See `Config::usage_service`'s
-/// doc comment for why this replaced a direct database connection. Carries no credential —
-/// this call is unauthenticated today (no Basic auth, no mTLS yet); see
-/// `UsageServiceSpendReader`'s own doc comment for the deliberate security-posture tradeoff and
-/// the follow-up tracking mTLS.
+/// doc comment for why this replaced a direct database connection. `client_cert_path`/
+/// `client_key_path` (#347) present a client certificate for mTLS when the usage service
+/// requires one; see `UsageServiceSpendReader`'s own doc comment for the full posture.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsageServiceClient {
     /// Base URL of the usage service, e.g. `https://authz-usage:3002`. A trailing slash is
@@ -459,6 +477,21 @@ pub struct UsageServiceClient {
     /// rather than start with a weaker guarantee than configured).
     #[serde(default)]
     pub ca_bundle_path: Option<String>,
+    /// Path to a PEM-encoded client certificate this reader presents to the usage service for
+    /// mTLS (#347), e.g. `/etc/lightbridge/tls/tls.crt` -- the same certificate this pod already
+    /// mounts for its own server listener (`Tls::cert_path`), reused as a client identity
+    /// because the deployed cert already carries both `serverAuth` and `clientAuth` in its
+    /// `extendedKeyUsage` (confirmed against the live cluster: `kubectl -n converse get
+    /// certificate authz-tls -o yaml` shows `usages: [server auth, client auth]`). Must be set
+    /// together with `client_key_path` below -- setting exactly one of the two is a hard
+    /// construction error, never a silent "connect without an identity" fallback. Both unset
+    /// (the default) means this reader presents no client certificate, exactly as before #347.
+    #[serde(default)]
+    pub client_cert_path: Option<String>,
+    /// Private key matching `client_cert_path` above, e.g. `/etc/lightbridge/tls/tls.key`. See
+    /// that field's doc comment.
+    #[serde(default)]
+    pub client_key_path: Option<String>,
     /// Per-request timeout in milliseconds. Defaults to 5000 (5s).
     #[serde(default = "default_usage_service_timeout_ms")]
     pub timeout_ms: u64,
@@ -1149,6 +1182,96 @@ otel:
             usage_service.ca_bundle_path.as_deref(),
             Some("/etc/lightbridge/tls/ca.crt")
         );
+    }
+
+    #[test]
+    fn config_with_usage_service_client_identity_parses_it() {
+        let yaml = "\
+server:
+  api:
+    address: \"0.0.0.0\"
+    port: 3000
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+  opa:
+    address: \"0.0.0.0\"
+    port: 3001
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+    basic_auth:
+      username: \"u\"
+      password: \"p\"
+logging:
+  level: \"info\"
+database:
+  url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz\"
+usage_service:
+  base_url: \"https://lightbridge-usage.converse.svc:3006\"
+  insecure_skip_verify: false
+  ca_bundle_path: \"/etc/lightbridge/tls/ca.crt\"
+  client_cert_path: \"/etc/lightbridge/tls/tls.crt\"
+  client_key_path: \"/etc/lightbridge/tls/tls.key\"
+oauth2:
+  type: self
+  jwks_url: \"http://localhost/jwks\"
+otel:
+  enabled: true
+  otlp_endpoint: \"http://localhost:4317\"
+  service_name: \"svc\"
+";
+        let cfg: Config =
+            from_str(yaml).expect("config with usage_service client identity must load");
+        let usage_service = cfg.usage_service.expect("usage_service must be set");
+        assert_eq!(
+            usage_service.client_cert_path.as_deref(),
+            Some("/etc/lightbridge/tls/tls.crt")
+        );
+        assert_eq!(
+            usage_service.client_key_path.as_deref(),
+            Some("/etc/lightbridge/tls/tls.key")
+        );
+    }
+
+    #[test]
+    fn config_with_usage_service_defaults_client_identity_to_unset() {
+        let yaml = "\
+server:
+  api:
+    address: \"0.0.0.0\"
+    port: 3000
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+  opa:
+    address: \"0.0.0.0\"
+    port: 3001
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+    basic_auth:
+      username: \"u\"
+      password: \"p\"
+logging:
+  level: \"info\"
+database:
+  url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz\"
+usage_service:
+  base_url: \"https://lightbridge-usage.converse.svc:3006\"
+oauth2:
+  type: self
+  jwks_url: \"http://localhost/jwks\"
+otel:
+  enabled: true
+  otlp_endpoint: \"http://localhost:4317\"
+  service_name: \"svc\"
+";
+        let cfg: Config =
+            from_str(yaml).expect("config with usage_service must load without client identity");
+        let usage_service = cfg.usage_service.expect("usage_service must be set");
+        assert_eq!(usage_service.client_cert_path, None);
+        assert_eq!(usage_service.client_key_path, None);
     }
 
     #[test]

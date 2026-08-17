@@ -57,6 +57,10 @@ name = "usage_service_ca_bundle_tests"
 path = "tests/usage_service_ca_bundle_tests.rs"
 
 [[test]]
+name = "usage_service_client_identity_tests"
+path = "tests/usage_service_client_identity_tests.rs"
+
+[[test]]
 name = "budget_replay_and_expiry_tests"
 path = "tests/budget_replay_and_expiry_tests.rs"
 required-features = ["it-tests"]

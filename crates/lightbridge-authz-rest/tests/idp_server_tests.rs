@@ -39,6 +39,7 @@ fn bad_tls() -> Tls {
     Tls {
         cert_path: "/nonexistent/idp-server-tests/cert.pem".to_string(),
         key_path: "/nonexistent/idp-server-tests/key.pem".to_string(),
+        client_ca_bundle_path: None,
     }
 }
 

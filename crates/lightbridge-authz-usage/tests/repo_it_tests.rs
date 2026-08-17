@@ -6,7 +6,7 @@ use chrono::{Duration, Utc};
 use lightbridge_authz_core::db::DbPool;
 use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_usage_rest::UsageState;
-use lightbridge_authz_usage_rest::build_usage_router;
+use lightbridge_authz_usage_rest::build_ingest_router;
 use lightbridge_authz_usage_rest::models::{
     UsageGroupBy, UsageQueryFilters, UsageQueryRequest, UsageScope,
 };
@@ -282,7 +282,7 @@ async fn healthz_ready_reports_ok_against_a_live_database(pool: PgPool) {
     let readiness_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
     let repo = Arc::new(build_repo(pool));
     let state = Arc::new(UsageState { repo });
-    let app = build_usage_router(state, readiness_pool, false);
+    let app = build_ingest_router(state, readiness_pool, false);
 
     let response = app
         .oneshot(

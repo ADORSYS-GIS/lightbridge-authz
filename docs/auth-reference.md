@@ -64,17 +64,21 @@ out separately where it differs.
 |---|---|---|---|---|
 | `database.url` | `String` | **Required** | Main Postgres connection (accounts/projects/api_keys/budget tables) | Every server fails to start |
 | `database.pool_size` | `Option<u32>` | default `None` (pool default) | Connection pool size | — |
-| `usage_service` | `Option<UsageServiceClient>` | default `None` (`config/mod.rs:34`) | HTTP client (base URL only — **unauthenticated**, see below) for the budget domain's `UsageServiceSpendReader` to call the usage service's `/usage/v1/spend/query` endpoint | Absent → budget spend reads report `Spend::Unavailable` (fails closed to manual review); config still loads fine otherwise (`config_without_redis_or_usage_service_still_loads` test) |
-| `usage_service.base_url` | `String` | required if `usage_service` is set | Usage service origin, e.g. `https://authz-usage:3002` | Wrong host/port → every spend read fails closed to `Spend::Unavailable` (connection refused/DNS failure), not an error |
-| `usage_service.insecure_skip_verify` | `bool` | default `false` | Skip TLS cert verification — only ever `true` in local Compose, where the usage service serves a self-signed cert | Left `false` against a self-signed deployment → every spend read fails closed (TLS handshake failure treated as unreachable) |
+| `usage_service` | `Option<UsageServiceClient>` | default `None` (`config/mod.rs:34`) | HTTP client for the budget domain's `UsageServiceSpendReader` to call the usage service's mTLS-required query listener (`/usage/v1/spend/query`, #347) | Absent → budget spend reads report `Spend::Unavailable` (fails closed to manual review); config still loads fine otherwise (`config_without_redis_or_usage_service_still_loads` test) |
+| `usage_service.base_url` | `String` | required if `usage_service` is set | Usage service query-listener origin, e.g. `https://authz-usage:3006` (the mTLS-required listener — distinct from the ingest listener's port) | Wrong host/port → every spend read fails closed to `Spend::Unavailable` (connection refused/DNS failure), not an error |
+| `usage_service.insecure_skip_verify` | `bool` | default `false` | Skip TLS server-cert verification — only ever `true` in local Compose | Left `false` against a self-signed deployment without `ca_bundle_path` set → every spend read fails closed (TLS handshake failure treated as unreachable) |
+| `usage_service.ca_bundle_path` | `Option<String>` | default `None` | PEM CA bundle verifying the usage service's own certificate (production mechanism, e.g. `/etc/lightbridge/tls/ca.crt`) | Unreadable/malformed path → hard startup failure naming the path (never a silent fallback to skip-verify) |
+| `usage_service.client_cert_path` | `Option<String>` | default `None` | PEM client certificate this reader presents for mTLS (#347), e.g. `/etc/lightbridge/tls/tls.crt` — must be set together with `client_key_path` | Set without `client_key_path` (or vice versa) → hard construction error naming the missing field; unreadable/malformed → hard error naming the path |
+| `usage_service.client_key_path` | `Option<String>` | default `None` | Private key matching `client_cert_path` | See `client_cert_path` |
 | `usage_service.timeout_ms` | `u64` | default `5000` | Per-request timeout for the spend-query call | A usage service that's merely slow (not down) still fails closed to `Spend::Unavailable` once this elapses |
 
-**No credential field exists on `usage_service` — this call is deliberately unauthenticated.**
-mTLS is the intended service-to-service auth mechanism for this call (and for the pre-existing
-`/usage/v1/usage/query`), tracked as a follow-up rather than added here as interim Basic-auth
-scaffolding. Safe only because `lightbridge-authz-usage` is ClusterIP-only with no ingress in
-every real deployment — see `AGENTS.md`'s Security Notes and `docs/architecture/budget.md`'s
-"Spend dependency" section for the explicit statement of that risk.
+**mTLS (#347) gates the usage service's query listener.** `/usage/v1/spend/query` and the
+pre-existing `/usage/v1/usage/query` both moved to a listener that requires and verifies a client
+certificate (`UsageServerGroup::query` in `crates/lightbridge-authz-usage/src/config.rs`) —
+`client_cert_path`/`client_key_path` above are what let this reader present one. The usage
+service's separate ingest listener (`/v1/otel/*`) stays unauthenticated, since its caller is an AI
+Envoy/OpenTelemetry exporter outside this repo's deploy surface — see `AGENTS.md`'s Security Notes
+and `docs/architecture/budget.md`'s "Spend dependency" section for the full posture.
 
 ### Env-var interpolation (`interpolate_env_vars`, `config/mod.rs:607-639`)
 

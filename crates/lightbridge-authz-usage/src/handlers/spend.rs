@@ -8,9 +8,9 @@ use tracing::{info, instrument, warn};
 /// Internal endpoint answering exactly the spend question `lightbridge-authz-budget`'s
 /// `SpendReader` asks: the summed `usage_events.total_cost` for one account over a half-open
 /// `[start, end)` interval. See `crate::repo::StoreRepo::spend_for_account` for why `total_cost`
-/// stays nullable rather than collapsing to `0.0`. Deliberately unauthenticated -- see
-/// `crate::routers::spend_router`'s doc comment for the risk this carries and why it's accepted
-/// for now.
+/// stays nullable rather than collapsing to `0.0`. This handler applies no auth check of its own
+/// -- it is mounted on the mTLS-required query listener (`crate::routers::query_router`,
+/// `UsageServerGroup::query`, #347), which is what actually gates it.
 #[utoipa::path(
     post,
     path = "/usage/v1/spend/query",

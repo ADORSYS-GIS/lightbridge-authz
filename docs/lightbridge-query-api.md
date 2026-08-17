@@ -1,28 +1,34 @@
 # Lightbridge Usage Query API
 
 > [!WARNING]
-> **This service has no authentication and no ownership check on `scope_id`.** The
-> `lightbridge-authz-usage` router
-> ([`crates/lightbridge-authz-usage/src/routers/mod.rs`](../crates/lightbridge-authz-usage/src/routers/mod.rs))
-> applies no JWT or Basic-auth middleware to any route, including
-> `/usage/v1/usage/query`. The handler
+> **This endpoint requires mTLS (#347) but still has no ownership check on
+> `scope_id`.** `/usage/v1/usage/query` moved to a dedicated query listener
+> (`UsageServerGroup::query` in
+> [`crates/lightbridge-authz-usage/src/config.rs`](../crates/lightbridge-authz-usage/src/config.rs),
+> `routers::query_router()`) that requires and verifies a client certificate before any
+> handler runs. That authenticates "a legitimate lightbridge workload holding a
+> CA-signed cert" — it does **not** bind `scope`/`scope_id` to a caller identity. The
+> handler
 > ([`crates/lightbridge-authz-usage/src/handlers/query.rs`](../crates/lightbridge-authz-usage/src/handlers/query.rs))
-> validates only the time range, that `scope_id` is non-empty, and `limit` — it does
-> **not** bind `scope`/`scope_id` to any caller identity. Concretely: anyone who can
-> reach this endpoint and knows a valid CUID2 `scope_id` can read that tenant's usage
-> data, cross-tenant, with no credential. `scope_id` values are unguessable (CUID2,
-> 24 chars) and the API offers no enumeration, but ids do leak through other
-> channels (URLs, logs, JWT claims, error messages), so "unguessable" is not a
-> substitute for authorization.
+> still validates only the time range, that `scope_id` is non-empty, and `limit`.
+> Concretely: any trusted caller (any workload presenting a cert signed by the
+> configured CA — today, that's `authz-api`/`authz-budget`, sharing one cert) that
+> knows a valid CUID2 `scope_id` can read that tenant's usage data, cross-tenant.
+> `scope_id` values are unguessable (CUID2, 24 chars) and the API offers no
+> enumeration, but ids do leak through other channels (URLs, logs, JWT claims, error
+> messages), so "unguessable" is not a substitute for authorization.
 >
-> The `/v1/otel/traces`, `/v1/otel/metrics`, and `/v1/otel/logs` ingest endpoints are
-> unauthenticated by design too — an unauthenticated write path there means anyone
-> who can reach it can fabricate usage/billing records for any account or project.
+> The `/v1/otel/traces`, `/v1/otel/metrics`, and `/v1/otel/logs` ingest endpoints stay
+> on a separate, unauthenticated listener (`UsageServerGroup::usage`) — their caller is
+> an AI Envoy/OpenTelemetry exporter outside this repo's deploy surface, which cannot
+> be given a client certificate without a coordinated change there (out of #347's
+> scope). An unauthenticated write path there means anyone who can reach it can
+> fabricate usage/billing records for any account or project.
 >
-> `lightbridge-authz-usage` is `ClusterIP`-only in prod today, by design — see the
-> **Service** section below. **Do not add an external route (Ingress/HTTPRoute/
-> Gateway) to this service without first putting real authorization in front of it.**
-> See "Recommended direction" below.
+> `lightbridge-authz-usage` is `ClusterIP`-only in prod today, by design, regardless of
+> mTLS — see the **Service** section below. **Do not add an external route
+> (Ingress/HTTPRoute/Gateway) to this service without first fixing the `scope_id`
+> ownership gap.** See "Recommended direction" below.
 
 ## Why?
 
@@ -61,6 +67,22 @@ In-cluster base URL:
 
 This is only reachable from inside the cluster today. There is deliberately no
 externally reachable base URL — see the warning above.
+
+**#347 needs a companion `ai-helm-values` change before this repo's image can deploy
+to prod.** `UsageServerGroup` (`crates/lightbridge-authz-usage/src/config.rs`) now
+requires a second, mandatory `server.query` block (address/port/TLS +
+`client_ca_bundle_path`) alongside the existing `server.usage` block — prod's current
+config sets only `server.usage.port: 3000`. Because this new field is required (not
+optional — a deliberate hard-cutover choice, not a dormant flag), `authz-usage` fails
+to parse its config and refuses to start entirely if the image rolls out before
+`ai-helm-values` adds the `query` block. **Deploy order:** update `ai-helm-values` to
+add `server.query` (a distinct port from `server.usage`, e.g. `3001` if unused
+locally, TLS reusing the same `authz-tls`-derived secret's `tls.crt`/`tls.key` plus
+`client_ca_bundle_path` pointed at that same secret's `ca.crt`) **and** set
+`usage_service.client_cert_path`/`client_key_path` on the `api`/`budget` components
+(reusing their own mounted cert) **in the same rollout** as this repo's image bump —
+not before (the config would reference a port the old image doesn't serve) and not
+long after (the new image won't start without it).
 
 ### Endpoint
 
@@ -226,25 +248,28 @@ Database error: start_time must be before end_time
 ## Security: recommended fix direction
 
 This section exists because the warning at the top of this document needs somewhere
-to point. Before this endpoint is given any externally reachable route, it needs
-real authorization in front of it. Two directions, without over-specifying which:
+to point. #347 answered "who can call this endpoint at all" with mTLS (client
+certificates, verified at the TLS layer, before this endpoint's own handler runs —
+see the warning above and `docs/architecture/budget.md`'s "Spend dependency" section).
+That is authentication, not authorization: it does not solve cross-tenant reads,
+because a shared client-certificate trust anchor authenticates *a caller* (any
+lightbridge workload holding a CA-signed cert), not which `scope_id` that caller is
+entitled to see. Before this endpoint is given any externally reachable route, it
+still needs an ownership check:
 
-- **Basic-auth, same pattern as `authz-opa`.** Cheapest to add, and consistent with
-  how `authz-opa`'s validation endpoints are gated today. Does not solve
-  cross-tenant reads by itself — a shared Basic-auth credential authenticates the
-  *caller* (e.g. a gateway component), not which `scope_id` that caller is entitled
-  to see.
 - **Fold the query behind `authz-api`'s JWT middleware, with an ownership check.**
   Resolve the caller's `account_id`/`project_id` from their JWT (the same claims
   `/idp/v1/resolve-context` already resolves and seals into tokens — see
   [`crates/lightbridge-authz-rest/src/handlers/idp.rs`](../crates/lightbridge-authz-rest/src/handlers/idp.rs)),
   and require the requested `scope`/`scope_id` to match — or be owned by — that
-  identity before running the query. This is the stronger option because it fixes
-  the actual gap (no ownership check), not just "who can call the endpoint at all."
+  identity before running the query. This is the option that actually fixes the
+  remaining gap; mTLS alone does not.
 
-Either direction needs a corresponding fix on the ingest side
-(`/v1/otel/traces`, `/v1/otel/metrics`, `/v1/otel/logs`) before it is safe to expose
-externally, since those are unauthenticated writes today.
+This still needs a corresponding fix on the ingest side (`/v1/otel/traces`,
+`/v1/otel/metrics`, `/v1/otel/logs`) before it is safe to expose externally — those
+stay on a separate, unauthenticated listener even after #347 (see the warning above
+for why: their caller cannot be given a client certificate without a coordinated
+change outside this repo).
 
 ## Findings
 

@@ -6,13 +6,13 @@ use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_core::{Error, Result, async_trait};
 use lightbridge_authz_usage_rest::UsageRepoTrait;
 use lightbridge_authz_usage_rest::UsageState;
-use lightbridge_authz_usage_rest::build_usage_router;
 use lightbridge_authz_usage_rest::handlers::ingest::{ingest_logs, ingest_metrics, ingest_traces};
 use lightbridge_authz_usage_rest::handlers::query::query_usage;
 use lightbridge_authz_usage_rest::models::{
     UsageGroupBy, UsageQueryFilters, UsageQueryRequest, UsageScope, UsageSeriesPoint,
 };
 use lightbridge_authz_usage_rest::repo::{StoreRepo, UsageEvent};
+use lightbridge_authz_usage_rest::{build_ingest_router, build_query_router};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
@@ -81,19 +81,33 @@ fn lazy_pool() -> Arc<dyn DbPoolTrait> {
     Arc::new(DbPool::from_pool(pool))
 }
 
-fn usage_app(dev_cors: bool) -> axum::Router {
-    let state = Arc::new(UsageState {
+fn mock_state() -> Arc<UsageState> {
+    Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
             points: vec![],
             inserted_events: 0,
             spend: None,
         }),
-    });
-    build_usage_router(state, lazy_pool(), dev_cors)
+    })
+}
+
+/// The ingest listener's router (#347 split): probes, Swagger docs, `/v1/otel/*` only --
+/// `/usage/v1/usage/query`/`/usage/v1/spend/query` moved to `query_app` below.
+fn usage_app(dev_cors: bool) -> axum::Router {
+    build_ingest_router(mock_state(), lazy_pool(), dev_cors)
+}
+
+/// The mTLS-required query listener's router (#347 split): `/usage/v1/usage/query` +
+/// `/usage/v1/spend/query`, plus its own probes. No TLS/client-cert layer here -- these tests
+/// exercise the router in isolation over plain HTTP, exactly like `usage_app` above; the
+/// client-certificate requirement is proven separately against a real TLS handshake in
+/// `crates/lightbridge-authz-usage/tests/spend_query_it_tests.rs`.
+fn query_app(dev_cors: bool) -> axum::Router {
+    build_query_router(mock_state(), lazy_pool(), dev_cors)
 }
 
 #[tokio::test]
-async fn build_usage_router_serves_probes() {
+async fn build_ingest_router_serves_probes() {
     let response = usage_app(false)
         .oneshot(
             Request::builder()
@@ -108,8 +122,27 @@ async fn build_usage_router_serves_probes() {
 }
 
 #[tokio::test]
-async fn build_usage_router_with_dev_cors_answers_preflight_with_any_origin() {
-    let preflight = usage_app(true)
+async fn build_query_router_serves_probes() {
+    let response = query_app(false)
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the query listener must serve its own health probes independently of the ingest listener"
+    );
+}
+
+#[tokio::test]
+async fn build_query_router_with_dev_cors_answers_preflight_with_any_origin() {
+    let preflight = query_app(true)
         .oneshot(
             Request::builder()
                 .method("OPTIONS")
@@ -134,7 +167,7 @@ async fn build_usage_router_with_dev_cors_answers_preflight_with_any_origin() {
 }
 
 #[tokio::test]
-async fn build_usage_router_without_dev_cors_omits_cors_headers() {
+async fn build_ingest_router_without_dev_cors_omits_cors_headers() {
     let response = usage_app(false)
         .oneshot(
             Request::builder()
@@ -153,6 +186,36 @@ async fn build_usage_router_without_dev_cors_omits_cors_headers() {
             .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
             .is_none(),
         "CORS headers must stay off unless AUTHZ_DEV_CORS enables them"
+    );
+}
+
+#[tokio::test]
+async fn build_ingest_router_no_longer_serves_the_query_routes() {
+    let response = usage_app(false)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/usage/v1/usage/query")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "scope": "project",
+                        "scope_id": "proj_1",
+                        "start_time": "2026-01-01T00:00:00Z",
+                        "end_time": "2026-01-01T01:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "#347 moved /usage/v1/usage/query off the unauthenticated ingest listener onto the \
+         mTLS-required query listener -- it must not still answer here"
     );
 }
 

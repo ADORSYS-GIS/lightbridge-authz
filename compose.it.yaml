@@ -68,13 +68,23 @@ services:
         condition: service_started
       keycloak:
         condition: service_started
+      authz-tls:
+        condition: service_started
     volumes:
       - "./.docker/it/servers_it.py:/it/servers_it.py:ro"
+      # Read-only access to the local CA + a CA-signed leaf (api.crt/api.key) so this test runner
+      # can present a client certificate against authz-usage's mTLS-required query listener
+      # (#347), the same way authz-api itself does (usage_service.client_cert_path/client_key_path
+      # in .docker/authz/container.yaml).
+      - "authz_tls:/tls:ro"
     environment:
       KEYCLOAK_URL: "http://keycloak:9100"
       API_URL: "https://authz-api:3000"
       OPA_URL: "https://authz-opa:3001"
       USAGE_URL: "https://authz-usage:3002"
+      USAGE_QUERY_URL: "https://authz-usage:3006"
+      USAGE_CLIENT_CERT: "/tls/api.crt"
+      USAGE_CLIENT_KEY: "/tls/api.key"
       MCP_URL: "https://authz-mcp:3000"
       CLIENT_ID: "test-client"
       USERNAME: "test@admin"

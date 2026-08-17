@@ -15,6 +15,12 @@ KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL", "http://keycloak:9100").rstrip("/"
 API_URL = os.environ.get("API_URL", "https://authz-api:3000").rstrip("/")
 OPA_URL = os.environ.get("OPA_URL", "https://authz-opa:3001").rstrip("/")
 USAGE_URL = os.environ.get("USAGE_URL", "https://authz-usage:3002").rstrip("/")
+# mTLS-required query listener (#347): /usage/v1/usage/query + /usage/v1/spend/query moved here,
+# off the unauthenticated USAGE_URL ingest listener above -- see UsageServerGroup::query's doc
+# comment in crates/lightbridge-authz-usage/src/config.rs.
+USAGE_QUERY_URL = os.environ.get("USAGE_QUERY_URL", "https://authz-usage:3006").rstrip("/")
+USAGE_CLIENT_CERT = os.environ.get("USAGE_CLIENT_CERT")
+USAGE_CLIENT_KEY = os.environ.get("USAGE_CLIENT_KEY")
 MCP_URL = os.environ.get("MCP_URL", "https://authz-mcp:3000").rstrip("/")
 CLIENT_ID = os.environ.get("CLIENT_ID", "test-client")
 USERNAME = os.environ.get("USERNAME", "test@admin")
@@ -58,6 +64,18 @@ INSECURE_TLS = ssl.create_default_context()
 INSECURE_TLS.check_hostname = False
 INSECURE_TLS.verify_mode = ssl.CERT_NONE
 
+# Presents a client certificate for the mTLS-required query listener (#347). Built only when
+# USAGE_CLIENT_CERT/USAGE_CLIENT_KEY are set (compose.it.yaml's it-servers service mounts the same
+# authz_tls volume authz-api reads its own client identity from -- see that service's environment
+# block) so this script still degrades gracefully to "no mTLS test" when run standalone without
+# those env vars.
+MTLS_CLIENT_TLS = None
+if USAGE_CLIENT_CERT and USAGE_CLIENT_KEY:
+    MTLS_CLIENT_TLS = ssl.create_default_context()
+    MTLS_CLIENT_TLS.check_hostname = False
+    MTLS_CLIENT_TLS.verify_mode = ssl.CERT_NONE
+    MTLS_CLIENT_TLS.load_cert_chain(certfile=USAGE_CLIENT_CERT, keyfile=USAGE_CLIENT_KEY)
+
 
 def log(message: str) -> None:
     print(f"[it-servers] {message}", flush=True)
@@ -69,6 +87,7 @@ def request_raw(
     body=None,
     headers=None,
     insecure_tls: bool = False,
+    ssl_context=None,
 ):
     encoded = None
     if body is not None:
@@ -82,7 +101,10 @@ def request_raw(
         for key, value in headers.items():
             req.add_header(key, value)
 
-    context = INSECURE_TLS if insecure_tls else None
+    if ssl_context is not None:
+        context = ssl_context
+    else:
+        context = INSECURE_TLS if insecure_tls else None
     with urllib.request.urlopen(req, timeout=30, context=context) as response:
         payload = response.read().decode("utf-8")
         return response.status, payload, dict(response.headers.items())
@@ -94,6 +116,7 @@ def request_json(
     body=None,
     headers=None,
     insecure_tls: bool = False,
+    ssl_context=None,
 ):
     status, payload, response_headers = request_raw(
         method=method,
@@ -101,6 +124,7 @@ def request_json(
         body=body,
         headers=headers,
         insecure_tls=insecure_tls,
+        ssl_context=ssl_context,
     )
     if not payload:
         return status, {}, response_headers
@@ -180,6 +204,14 @@ def wait_until_ready() -> None:
         f"{MCP_URL}/healthz/startup",
         f"{MCP_URL}/healthz/ready",
     ]
+    # The mTLS-required query listener (#347) serves its own probes too, but reaching them needs a
+    # client certificate -- see MTLS_CLIENT_TLS above. Only probed when one is configured, so this
+    # script degrades gracefully when run standalone.
+    mtls_probe_urls = [
+        f"{USAGE_QUERY_URL}/healthz",
+        f"{USAGE_QUERY_URL}/healthz/startup",
+        f"{USAGE_QUERY_URL}/healthz/ready",
+    ]
 
     start = time.time()
     last_error = "readiness checks have not run yet"
@@ -188,6 +220,13 @@ def wait_until_ready() -> None:
             for probe_url in probe_urls:
                 status, _, _ = request_raw("GET", probe_url, insecure_tls=True)
                 assert status == 200, f"probe failed {probe_url}: status={status}"
+
+            if MTLS_CLIENT_TLS is not None:
+                for probe_url in mtls_probe_urls:
+                    status, _, _ = request_raw(
+                        "GET", probe_url, ssl_context=MTLS_CLIENT_TLS
+                    )
+                    assert status == 200, f"mtls probe failed {probe_url}: status={status}"
 
             request_json(
                 "GET",
@@ -405,23 +444,56 @@ def main() -> int:
         assert opa_ok["project_id"] == project_id, f"unexpected opa project: {opa_ok}"
         log("opa introspect endpoint passed")
 
+        if MTLS_CLIENT_TLS is None:
+            raise AssertionError(
+                "USAGE_CLIENT_CERT/USAGE_CLIENT_KEY must be set to exercise the mTLS-required "
+                "query listener (#347) -- compose.it.yaml's it-servers service should always set "
+                "these"
+            )
+
+        usage_query_body = {
+            "scope": "project",
+            "scope_id": "proj_invalid",
+            "start_time": "2026-03-01T01:00:00Z",
+            "end_time": "2026-03-01T00:00:00Z",
+            "bucket": "5 minutes",
+            "group_by": ["model"],
+            "filters": {},
+            "limit": 100,
+        }
+
+        # #347, acceptance criterion 1: no client certificate -> rejected at the TLS layer, never
+        # reaching the router (so never an HTTPError with a JSON body -- a bare connection/TLS
+        # failure).
+        try:
+            request_raw(
+                "POST",
+                f"{USAGE_QUERY_URL}/usage/v1/usage/query",
+                body=usage_query_body,
+                insecure_tls=True,
+            )
+            raise AssertionError(
+                "usage query listener accepted a request with no client certificate"
+            )
+        except urllib.error.HTTPError as err:
+            raise AssertionError(
+                f"expected a TLS-layer rejection with no client certificate, got an HTTP "
+                f"response instead: {err.code}"
+            ) from err
+        except (ssl.SSLError, urllib.error.URLError, ConnectionError):
+            pass
+        log("usage query listener rejects a connection with no client certificate")
+
+        # #347, acceptance criterion 2: authz-api's configured client certificate -> succeeds
+        # (reaches the router; the invalid time window still gets its ordinary 400/500).
         usage_status = None
         usage_error_body = ""
         try:
             request_raw(
                 "POST",
-                f"{USAGE_URL}/usage/v1/usage/query",
-                body={
-                    "scope": "project",
-                    "scope_id": "proj_invalid",
-                    "start_time": "2026-03-01T01:00:00Z",
-                    "end_time": "2026-03-01T00:00:00Z",
-                    "bucket": "5 minutes",
-                    "group_by": ["model"],
-                    "filters": {},
-                    "limit": 100,
-                },
-                insecure_tls=True,
+                f"{USAGE_QUERY_URL}/usage/v1/usage/query",
+                body=usage_query_body,
+                ssl_context=MTLS_CLIENT_TLS,
             )
             raise AssertionError("usage query unexpectedly succeeded")
         except urllib.error.HTTPError as err:
@@ -434,7 +506,24 @@ def main() -> int:
             )
         if "start_time must be before end_time" not in usage_error_body:
             raise AssertionError(f"unexpected usage error body: {usage_error_body}")
-        log("usage endpoint responds without auth and rejects invalid request")
+        log("usage query listener accepts a trusted client certificate and rejects invalid request")
+
+        # #347 covers both routes named in its acceptance criteria -- prove /usage/v1/spend/query
+        # is reachable with the trusted client certificate too (no client cert -> same TLS-layer
+        # rejection mechanism as usage/query above, already proven at the listener level).
+        spend_status, spend_body, _ = request_json(
+            "POST",
+            f"{USAGE_QUERY_URL}/usage/v1/spend/query",
+            body={
+                "account_id": "acct_it_servers_probe",
+                "start": "2026-03-01T00:00:00Z",
+                "end": "2026-03-02T00:00:00Z",
+            },
+            ssl_context=MTLS_CLIENT_TLS,
+        )
+        assert spend_status == 200, f"spend query failed: status={spend_status}, body={spend_body}"
+        assert "total_cost" in spend_body, f"unexpected spend query body: {spend_body}"
+        log("spend query listener accepts a trusted client certificate")
 
         expect_http_error(
             401,

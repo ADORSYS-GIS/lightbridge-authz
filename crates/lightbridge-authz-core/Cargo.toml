@@ -36,6 +36,9 @@ opentelemetry_sdk.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "sync"] }
+reqwest.workspace = true
+rcgen.workspace = true
+time.workspace = true
 
 [features]
 default = []

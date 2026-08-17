@@ -36,6 +36,7 @@ fn bad_tls() -> Tls {
     Tls {
         cert_path: "/nonexistent/lightbridge-authz-rest-test/cert.pem".to_string(),
         key_path: "/nonexistent/lightbridge-authz-rest-test/key.pem".to_string(),
+        client_ca_bundle_path: None,
     }
 }
 

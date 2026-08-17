@@ -1897,6 +1897,8 @@ pub async fn start_api_server(
                 usage_service.base_url.clone(),
                 usage_service.insecure_skip_verify,
                 usage_service.ca_bundle_path.as_deref(),
+                usage_service.client_cert_path.as_deref(),
+                usage_service.client_key_path.as_deref(),
                 std::time::Duration::from_millis(usage_service.timeout_ms),
             )
             .map_err(|e| {
@@ -2303,6 +2305,8 @@ pub async fn start_budget_server(
                 usage_service.base_url.clone(),
                 usage_service.insecure_skip_verify,
                 usage_service.ca_bundle_path.as_deref(),
+                usage_service.client_cert_path.as_deref(),
+                usage_service.client_key_path.as_deref(),
                 std::time::Duration::from_millis(usage_service.timeout_ms),
             )
             .map_err(|e| {

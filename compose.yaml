@@ -9,42 +9,51 @@ services:
         set -e
         mkdir -p /tls /host_tls
         apk add --no-cache openssl
-        for host_file in api.key api.crt opa.key opa.crt usage.key usage.crt mcp.key mcp.crt idp.key idp.crt budget.key budget.crt; do
+        for host_file in ca.key ca.crt api.key api.crt opa.key opa.crt usage.key usage.crt mcp.key mcp.crt idp.key idp.crt budget.key budget.crt; do
           if [ -f /host_tls/$$host_file ]; then
             cp /host_tls/$$host_file /tls/$$host_file
           fi
         done
-        if [ ! -f /tls/api.key ]; then
+        # A single shared local CA, mirroring prod's ClusterIssuer/self-signed-ca: every service
+        # leaf below is signed by this CA (not self-signed independently, like before #347) so
+        # authz-usage's client_ca_bundle_path has something real to verify a presented client
+        # certificate against. ca.crt lives in the same /tls directory every app container
+        # mounts, exactly like the deployed authz-tls Secret carries ca.crt alongside
+        # tls.crt/tls.key in a single mount (see AGENTS.md's "Identity context resolution").
+        if [ ! -f /tls/ca.key ]; then
           openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-            -keyout /tls/api.key -out /tls/api.crt \
-            -subj "/CN=authz-api"
+            -keyout /tls/ca.key -out /tls/ca.crt \
+            -subj "/CN=lightbridge-local-ca" \
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign"
         fi
-        if [ ! -f /tls/opa.key ]; then
-          openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-            -keyout /tls/opa.key -out /tls/opa.crt \
-            -subj "/CN=authz-opa"
-        fi
-        if [ ! -f /tls/usage.key ]; then
-          openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-            -keyout /tls/usage.key -out /tls/usage.crt \
-            -subj "/CN=authz-usage"
-        fi
-        if [ ! -f /tls/mcp.key ]; then
-          openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-            -keyout /tls/mcp.key -out /tls/mcp.crt \
-            -subj "/CN=authz-mcp"
-        fi
-        if [ ! -f /tls/idp.key ]; then
-          openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-            -keyout /tls/idp.key -out /tls/idp.crt \
-            -subj "/CN=authz-idp"
-        fi
-        if [ ! -f /tls/budget.key ]; then
-          openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-            -keyout /tls/budget.key -out /tls/budget.crt \
-            -subj "/CN=authz-budget"
-        fi
-        for tls_file in api.crt api.key opa.crt opa.key usage.crt usage.key mcp.crt mcp.key idp.crt idp.key budget.crt budget.key; do
+        # Every leaf below carries both serverAuth and clientAuth EKU, matching the deployed
+        # authz-tls cert's actual shape (confirmed against the live cluster: `kubectl -n converse
+        # get certificate authz-tls -o yaml` shows `usages: [server auth, client auth]`) -- so any
+        # of these certs can serve as either a server identity (existing TLS) or a client identity
+        # for mTLS (#347) without needing a second cert-issuance mechanism.
+        issue_leaf() {
+          name="$$1"
+          cn="$$2"
+          if [ ! -f "/tls/$${name}.key" ]; then
+            openssl req -newkey rsa:2048 -nodes \
+              -keyout "/tls/$${name}.key" -out "/tls/$${name}.csr" \
+              -subj "/CN=$${cn}"
+            printf 'subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\n' "$${cn}" > "/tls/$${name}.ext"
+            openssl x509 -req -in "/tls/$${name}.csr" \
+              -CA /tls/ca.crt -CAkey /tls/ca.key -CAcreateserial \
+              -days 3650 -out "/tls/$${name}.crt" \
+              -extfile "/tls/$${name}.ext"
+            rm -f "/tls/$${name}.csr" "/tls/$${name}.ext"
+          fi
+        }
+        issue_leaf api authz-api
+        issue_leaf opa authz-opa
+        issue_leaf usage authz-usage
+        issue_leaf mcp authz-mcp
+        issue_leaf idp authz-idp
+        issue_leaf budget authz-budget
+        for tls_file in ca.crt ca.key api.crt api.key opa.crt opa.key usage.crt usage.key mcp.crt mcp.key idp.crt idp.key budget.crt budget.key; do
           chmod 644 /tls/$$tls_file
           chown 65532:65532 /tls/$$tls_file
           if [ -f /tls/$$tls_file ]; then
@@ -410,7 +419,8 @@ services:
       RUST_LOG: "debug,opentelemetry_sdk=warn,opentelemetry_otlp=warn,h2=warn,hyper_util=warn,tower=warn"
       CONFIG_PATH: "/tmp/config.yaml"
     ports:
-      - "13002:3002"
+      - "13002:3002" # ingest listener (unauthenticated, /v1/otel/*)
+      - "13006:3006" # query listener (mTLS-required, #347 -- /usage/v1/usage/query, /usage/v1/spend/query)
     depends_on:
       timescaledb:
         condition: service_healthy
