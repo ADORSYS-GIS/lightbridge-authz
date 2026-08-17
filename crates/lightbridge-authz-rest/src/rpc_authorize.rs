@@ -151,6 +151,10 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         "procedure.setProjectMemberQuotaTier" => ProjectMember,
 
         "procedure.createApiKey" => ApiKeyCreate,
+        // Read-only companion to `createApiKey`: the catalogue a caller picks `billingPlan` from.
+        // Gated at the same `apikey:create` permission (not a new, looser one) -- see the schema
+        // doc comment on `listBillingPlans` for why.
+        "procedure.listBillingPlans" => ApiKeyCreate,
         "model.ApiKey.list" => ApiKeyRead,
         "model.ApiKey.get" => ApiKeyRead,
         "model.ApiKey.update" => ApiKeyUpdate,
@@ -353,6 +357,7 @@ mod tests {
                 Permission::ProjectMember,
             ),
             ("procedure.createApiKey", Permission::ApiKeyCreate),
+            ("procedure.listBillingPlans", Permission::ApiKeyCreate),
             ("model.ApiKey.list", Permission::ApiKeyRead),
             ("model.ApiKey.get", Permission::ApiKeyRead),
             ("model.ApiKey.update", Permission::ApiKeyUpdate),
@@ -557,6 +562,7 @@ mod tests {
                 "procedure.setProjectMemberRole",
                 "procedure.setProjectMemberQuotaTier",
                 "procedure.createApiKey",
+                "procedure.listBillingPlans",
                 "model.ApiKey.list",
                 "model.ApiKey.get",
                 "model.ApiKey.update",

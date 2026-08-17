@@ -430,6 +430,30 @@ fn to_schema_api_key_secret(s: ApiKeySecret) -> schema::ApiKeySecret {
     }
 }
 
+/// Maps the operator-configured `config::Billing` catalogue onto the wire `BillingPlanInfo[]`
+/// shape `listBillingPlans` returns. `Int` fields are `i64` on the generated schema type
+/// (`authz.cstack`'s `Int` mapping) while `BillingLimits`' per-second/per-day/concurrent fields are
+/// `i32` in config -- the `i64::from` widenings below are exact, never lossy, in either direction.
+fn to_schema_billing_plans(billing: &Billing) -> Vec<schema::BillingPlanInfo> {
+    billing
+        .plans
+        .iter()
+        .map(|plan| schema::BillingPlanInfo {
+            id: plan.id.clone(),
+            name: plan.name.clone(),
+            limits: plan
+                .limits
+                .as_ref()
+                .map(|limits| schema::BillingPlanLimits {
+                    requestsPerSecond: limits.requests_per_second.map(i64::from),
+                    requestsPerDay: limits.requests_per_day.map(i64::from),
+                    requestsPerMonth: limits.requests_per_month,
+                    concurrentRequests: limits.concurrent_requests.map(i64::from),
+                }),
+        })
+        .collect()
+}
+
 fn to_schema_session_revocation_result(revoked_count: u64) -> schema::SessionRevocationResult {
     // `revokedCount` is a schema `Int` (Rust `i64`, see `authz.cstack`'s `Int` mapping note on
     // `SimulateBudgetPolicyInput`) -- `rows_affected()` is `u64`, so this is a lossy cast only in
@@ -578,6 +602,27 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 .await
                 .map_err(to_cool_error)?;
             Ok(to_schema_api_key_secret(secret))
+        }
+    }
+
+    /// Read-only: the operator-configured billing-plan catalogue `createApiKey` validates
+    /// `billingPlan` against (see that procedure's doc comment in `authz.cstack`). No DB access --
+    /// `AuthzStoreImpl::billing_plans` returns the in-memory `Billing` config loaded at startup.
+    fn list_billing_plans(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        _args: schema::procedures::list_billing_plans::Args,
+        _authorized: schema::procedures::list_billing_plans::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::list_billing_plans::Output, CoolError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        async move {
+            let _subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            Ok(to_schema_billing_plans(issuer.billing_plans()))
         }
     }
 

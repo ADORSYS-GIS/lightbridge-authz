@@ -217,7 +217,7 @@ per-frame RBAC" above describes for the permission check.
 | `project:delete`  | `model.Project.delete`                               | `delete-project`                    |
 | `project:disable` | `procedure.disableProject`, `procedure.enableProject`| `disable-project`, `enable-project` |
 | `project:member`  | `procedure.listProjectRoster`, `procedure.addProjectMember`, `procedure.removeProjectMember`, `procedure.setProjectMemberRole`, `procedure.setProjectMemberQuotaTier` | `list-project-roster`, `add-project-member`, `remove-project-member`, `set-project-member-role`, `set-project-member-quota-tier` |
-| `apikey:create`   | `procedure.createApiKey`                             | `create-api-key`                    |
+| `apikey:create`   | `procedure.createApiKey`, `procedure.listBillingPlans` | `create-api-key`                  |
 | `apikey:read`     | `model.ApiKey.list`, `model.ApiKey.get`              | `list-api-keys`, `get-api-key`      |
 | `apikey:update`   | `model.ApiKey.update`                                | `update-api-key`                    |
 | `apikey:delete`   | `model.ApiKey.delete`                                | `delete-api-key`                    |

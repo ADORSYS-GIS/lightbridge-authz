@@ -401,6 +401,13 @@ impl AuthzStoreImpl {
         })
     }
 
+    /// The operator-configured billing-plan catalogue `create_api_key` above validates
+    /// `billing_plan` against. Backs `listBillingPlans` -- a plain accessor, no DB round-trip,
+    /// since the catalogue is config (`Billing`), not a table.
+    pub fn billing_plans(&self) -> &Billing {
+        &self.billing
+    }
+
     /// Suspend an account (`status = 'suspended'`). Backs `disableAccount`. Thin wrapper over
     /// `StoreRepo::set_account_status` (membership enforced in SQL).
     pub async fn disable_account(&self, subject: &str, account_id: &str) -> Result<Account> {
@@ -725,6 +732,40 @@ mod tests {
                 "plan {plan:?} should be rejected before any DB access, got: {err}"
             );
         }
+    }
+
+    // Backs `listBillingPlans`: proves `billing_plans()` hands back the exact catalogue the store
+    // was constructed with (same plans, in order, `limits` intact including a plan with no limits
+    // at all) rather than e.g. a default-constructed `Billing` or a stale clone from before
+    // `with_billing` -- this would fail if `billing_plans()` returned `&Billing::default()` or
+    // otherwise didn't thread through the field `with_billing` sets.
+    #[tokio::test]
+    async fn billing_plans_returns_the_configured_catalogue_verbatim() {
+        use lightbridge_authz_core::config::{BillingLimits, BillingPlan};
+
+        let configured = Billing {
+            plans: vec![
+                BillingPlan {
+                    id: "free".to_string(),
+                    name: "Free".to_string(),
+                    limits: Some(BillingLimits {
+                        requests_per_second: Some(5),
+                        requests_per_day: Some(5000),
+                        requests_per_month: None,
+                        concurrent_requests: Some(5),
+                    }),
+                },
+                BillingPlan {
+                    id: "enterprise".to_string(),
+                    name: "Enterprise".to_string(),
+                    limits: None,
+                },
+            ],
+        };
+
+        let store = AuthzStoreImpl::with_pool(lazy_pool()).with_billing(configured.clone());
+
+        assert_eq!(store.billing_plans().plans, configured.plans);
     }
 
     #[test]
