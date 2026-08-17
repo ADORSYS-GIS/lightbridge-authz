@@ -52,25 +52,33 @@ database:
 # "Rate limiting (Redis-backed)"). Optional: authz-opa/lightbridge-mcp/usage ignore this block.
 redis:
   url: "${REDIS_URL:-redis://localhost:6379}"
-# HTTP client for authz-api's budget domain to call the usage service's /usage/v1/spend/query
-# endpoint (see crates/lightbridge-authz-budget/src/spend.rs). Optional, like redis above: only
-# authz-api reads this; authz-opa/lightbridge-mcp/usage ignore it. Absent -> budget refill spend
-# facts report Spend::Unavailable (fails closed to manual review), not a startup failure.
-# Unauthenticated on purpose -- no Basic auth, no mTLS yet (mTLS is the intended mechanism,
-# tracked separately; a per-endpoint credential was deliberately not added as interim scaffolding).
-# Safe only because the usage service is ClusterIP-only with no ingress in every real deployment
-# -- see AGENTS.md's Security Notes.
+# HTTP client for authz-api's budget domain to call the usage service's mTLS-required query
+# listener (UsageServerGroup::query, port 3006/host 13006 -- #347 split the old single usage port
+# into an unauthenticated ingest listener and this query listener; see
+# crates/lightbridge-authz-budget/src/spend.rs and crates/lightbridge-authz-usage/src/config.rs).
+# Optional, like redis above: only authz-api reads this; authz-opa/lightbridge-mcp/usage ignore
+# it. Absent -> budget refill spend facts report Spend::Unavailable (fails closed to manual
+# review), not a startup failure.
+#
+# client_cert_path/client_key_path (#347) present this process's own cert as a client identity for
+# mTLS. Commented out here (like ca_bundle_path below) since this non-container config has no
+# generated cert to point at by default -- see AGENTS.md's note that ./config/tls/* may not exist
+# without manual setup. Run via Compose (just up) for a working end-to-end mTLS example, where the
+# authz-tls service provisions a CA-signed cert with both serverAuth and clientAuth EKU.
 #
 # insecure_skip_verify: true is only for this local, non-container config, which has no shared CA
 # bundle to point at. Real deployments (including in-cluster ones) must set insecure_skip_verify:
 # false and instead set ca_bundle_path to the cluster's own CA bundle (e.g.
 # /etc/lightbridge/tls/ca.crt, the ca.crt cert-manager writes alongside this service's own TLS
 # cert/key -- see Config::usage_service's doc comment in crates/lightbridge-authz-core). An
-# unreadable or unparseable ca_bundle_path is a hard startup failure, never a silent fallback.
+# unreadable or unparseable ca_bundle_path, client_cert_path, or client_key_path is a hard startup
+# failure, never a silent fallback.
 usage_service:
-  base_url: "https://localhost:13002"
+  base_url: "https://localhost:13006"
   insecure_skip_verify: true
   # ca_bundle_path: /etc/lightbridge/tls/ca.crt
+  # client_cert_path: ./config/tls/api.crt
+  # client_key_path: ./config/tls/api.key
   timeout_ms: 5000
 oauth2:
   # REQUIRED credential-issuance mode — no default; you must state it.

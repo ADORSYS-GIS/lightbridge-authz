@@ -250,8 +250,8 @@ surface; the two functions build it identically):
 
 - **`UsageServiceSpendReader`** — calls `lightbridge-authz-usage`'s `/usage/v1/spend/query`
   endpoint over HTTPS for the account/period being evaluated, instead of querying `usage_events`
-  directly. Used when `Config.usage_service` is set. **Unauthenticated** — see "Security posture"
-  below.
+  directly. Used when `Config.usage_service` is set. Presents a client certificate for mTLS
+  (#347) — see "Security posture" below.
 - **`UnavailableSpendReader`** — never touches the network; always reports `Spend::Unavailable`.
   Used when `Config.usage_service` is `None`.
 
@@ -277,24 +277,38 @@ instead (just a `base_url` — no credential, see "Security posture" below). Thi
 until that companion change ships — see the PR that introduced this section for the exact diff
 needed.
 
-**Security posture: this call is unauthenticated, stated plainly.** `UsageServiceSpendReader`
-sends no credential — no Basic auth, no mTLS. mTLS between the budget domain (and `authz-api`
-generally) and the usage service is the intended long-term mechanism and is tracked as a
-follow-up; a per-endpoint Basic-auth credential was deliberately not added in the meantime, since
-that would just be more interim scaffolding to retire once mTLS lands. This endpoint returns
-per-account spend figures and is safe **only** while `lightbridge-authz-usage` remains
-ClusterIP-only with no ingress — exactly the same condition that already makes the pre-existing,
-also-unauthenticated `/usage/v1/usage/query` endpoint acceptable (see `AGENTS.md`'s Security
-Notes). If anyone ever routes the usage service externally, both endpoints leak per-account
-spend/usage data to anything that can reach them.
+**Security posture: mTLS (#347), stated plainly.** `lightbridge-authz-usage` splits its TLS
+surface across two listeners (`UsageServerGroup::usage`/`::query` in
+`crates/lightbridge-authz-usage/src/config.rs`): the ingest listener stays unauthenticated (its
+caller is an AI Envoy/OpenTelemetry exporter outside this repo's deploy surface, so it cannot be
+given a client certificate without a coordinated change there — out of #347's scope), while the
+query listener — carrying both `/usage/v1/usage/query` and `/usage/v1/spend/query` — **requires
+and verifies a client certificate**. `UsageServiceSpendReader` presents one via
+`Config.usage_service.client_cert_path`/`client_key_path`, reusing this pod's own TLS cert rather
+than minting a separate client-only one, since the deployed `authz-tls` cert already carries both
+`serverAuth` and `clientAuth` in its `extendedKeyUsage` (confirmed against the live cluster:
+`kubectl -n converse get certificate authz-tls -o yaml` shows `usages: [server auth, client
+auth]`). This authenticates "a legitimate lightbridge workload holding a CA-signed cert", not a
+specific caller identity — `authz-api` and `authz-budget` present the identical certificate, since
+both load it from the same mounted `authz-tls` Secret. A rejected/missing/expired client
+certificate is a TLS handshake failure, indistinguishable from "unreachable" to this reader, and
+resolves to `Spend::Unavailable` exactly like every other HTTP failure mode below — never a silent
+bypass. `lightbridge-authz-usage` also stays `ClusterIP`-only with no ingress regardless, same as
+before #347 (see `AGENTS.md`'s Security Notes) — mTLS is a second, independent layer, not a
+replacement for the network boundary.
 
 **This repo's own tracked config is what local runs and tests exercise.**
 `config/default.yaml`/`.docker/authz/container.yaml` set `usage_service` pointed at
-`authz-usage`/`localhost:13002` respectively, with `insecure_skip_verify: true` (both serve a
-self-signed cert, matching `AGENTS.md`'s Security Notes). The general trap named in earlier
-revisions of this doc still applies in the other direction now: prod's values repo can and does
-override the entire `config.yaml` wholesale, so this repo's own defaults say nothing about what's
-actually running in prod until the config keys agree.
+`authz-usage`/`localhost:13006` respectively (the mTLS-required query listener's port, `3006`/host
+`13006` — distinct from the ingest listener's `3002`/`13002`), with `insecure_skip_verify: true`
+for server-certificate verification (both serve a self-signed cert chain, matching `AGENTS.md`'s
+Security Notes) and `client_cert_path`/`client_key_path` set to this pod's own TLS cert/key. The
+general trap named in earlier revisions of this doc still applies in the other direction now:
+prod's values repo can and does override the entire `config.yaml` wholesale, so this repo's own
+defaults say nothing about what's actually running in prod until the config keys agree — and
+`ai-helm-values` needs its own companion change to add the `query` listener block and the
+`client_cert_path`/`client_key_path` fields before this lands there (see the PR that introduced
+this section for the exact deploy-ordering requirement).
 
 **This fails closed, not open.** `Spend` is a two-variant enum (`Known(i64)` /
 `Unavailable`) specifically so a policy rule can never mistake "we don't know" for "spent zero".

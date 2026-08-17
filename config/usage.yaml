@@ -1,10 +1,24 @@
 server:
+  # Ingest-only listener: /v1/otel/{traces,metrics,logs} + health probes + Swagger docs.
+  # Unauthenticated -- see UsageServerGroup::usage's doc comment (crates/lightbridge-authz-usage/src/config.rs).
   usage:
     address: "0.0.0.0"
     port: 3002
     tls:
       cert_path: "./config/tls/usage.crt"
       key_path: "./config/tls/usage.key"
+  # mTLS-required listener (#347): /usage/v1/usage/query + /usage/v1/spend/query. Required (not
+  # optional) -- see UsageServerGroup::query's doc comment. `client_ca_bundle_path` points at a CA
+  # bundle this non-Compose local run doesn't generate by default (see AGENTS.md's note that
+  # ./config/tls/* may not exist without manual setup); populate it the same way you would
+  # cert_path/key_path above, or run via Compose (just up) where authz-tls provisions it.
+  query:
+    address: "0.0.0.0"
+    port: 3006
+    tls:
+      cert_path: "./config/tls/usage.crt"
+      key_path: "./config/tls/usage.key"
+      client_ca_bundle_path: "./config/tls/ca.crt"
 logging:
   level: "info"
 database:

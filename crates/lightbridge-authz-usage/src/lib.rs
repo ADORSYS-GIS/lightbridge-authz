@@ -30,12 +30,11 @@ struct RootResponse {
     message: String,
 }
 
-/// No auth gate on this state -- `/usage/v1/spend/query` is unauthenticated, same as every other
-/// route this server serves. Safe only because the usage service is ClusterIP-only with no
-/// ingress (see `AGENTS.md`'s Security Notes and `docs/architecture/budget.md`'s "Spend
-/// dependency" section for the explicit statement of that risk). mTLS between `authz-api`/the
-/// budget domain and this service is tracked as a follow-up -- see the PR that introduced this
-/// endpoint for the tracking issue.
+/// Shared between both listeners `start_usage_server` binds (#347): the unauthenticated ingest
+/// listener (`UsageServerGroup::usage`) and the mTLS-required query listener
+/// (`UsageServerGroup::query`, `/usage/v1/usage/query` + `/usage/v1/spend/query`). This state
+/// carries no auth gate of its own -- the query listener's client-certificate requirement is
+/// enforced at the TLS layer (`Tls::client_ca_bundle_path`), before any handler here runs.
 pub struct UsageState {
     pub repo: Arc<dyn UsageRepoTrait>,
 }
@@ -72,17 +71,8 @@ impl UsageRepoTrait for StoreRepo {
     }
 }
 
-/// Assembles the usage server router (public probes, docs, OTEL ingest + usage query).
-/// Separated from `start_usage_server` so the composition can be tested without binding
-/// a socket. `dev_cors` (driven by `AUTHZ_DEV_CORS` in `start_usage_server`) layers a
-/// wide-open CORS policy over the whole router — preflights included — so browser SPAs
-/// on other origins can call the API in local dev; never enable it in production.
-pub fn build_usage_router(
-    state: Arc<UsageState>,
-    readiness_pool: Arc<dyn DbPoolTrait>,
-    dev_cors: bool,
-) -> Router {
-    let router = Router::new()
+fn health_routes(readiness_pool: Arc<dyn DbPoolTrait>) -> Router<Arc<UsageState>> {
+    Router::new()
         .route("/", get(root_handler))
         .route("/healthz", get(health_handler))
         .route("/healthz/startup", get(startup_handler))
@@ -93,12 +83,25 @@ pub fn build_usage_router(
                 async move { readiness_handler(readiness_pool).await }
             }),
         )
+}
+
+/// Assembles the ingest listener's router (public probes, Swagger docs, OTEL ingest only --
+/// `/usage/v1/usage/query` and `/usage/v1/spend/query` moved to `build_query_router` below,
+/// #347). Separated from `start_usage_server` so the composition can be tested without binding a
+/// socket. `dev_cors` (driven by `AUTHZ_DEV_CORS` in `start_usage_server`) layers a wide-open CORS
+/// policy over the whole router — preflights included — so browser SPAs on other origins can call
+/// the API in local dev; never enable it in production.
+pub fn build_ingest_router(
+    state: Arc<UsageState>,
+    readiness_pool: Arc<dyn DbPoolTrait>,
+    dev_cors: bool,
+) -> Router {
+    let router = health_routes(readiness_pool)
         .merge(
             SwaggerUi::new("/usage/v1/usage/docs")
                 .url("/usage/v1/usage/openapi.json", UsageDoc::openapi()),
         )
-        .merge(routers::usage_router())
-        .merge(routers::spend_router())
+        .merge(routers::ingest_router())
         .with_state(state);
 
     if dev_cors {
@@ -108,20 +111,73 @@ pub fn build_usage_router(
     }
 }
 
-pub async fn start_usage_server(usage: &UsageServer, database: &Database) -> Result<()> {
+/// Assembles the mTLS-required query listener's router (#347): `/usage/v1/usage/query` +
+/// `/usage/v1/spend/query`, plus its own health probes so it can be readiness-checked
+/// independently of the ingest listener. No auth middleware here -- the client-certificate
+/// requirement is enforced at the TLS layer by `Tls::client_ca_bundle_path`
+/// (`UsageServerGroup::query`), before any handler in this router runs.
+pub fn build_query_router(
+    state: Arc<UsageState>,
+    readiness_pool: Arc<dyn DbPoolTrait>,
+    dev_cors: bool,
+) -> Router {
+    let router = health_routes(readiness_pool)
+        .merge(routers::query_router())
+        .with_state(state);
+
+    if dev_cors {
+        router.layer(CorsLayer::permissive())
+    } else {
+        router
+    }
+}
+
+/// Binds both usage-service listeners concurrently (#347): the unauthenticated ingest listener
+/// (`usage`) and the mTLS-required query listener (`query`, `/usage/v1/usage/query` +
+/// `/usage/v1/spend/query`) -- see `UsageServerGroup`'s doc comment for why these are two ports,
+/// not one. Either listener failing to bind/serve fails this function; `tokio::try_join!` runs
+/// them concurrently rather than sequentially so one listener's lifetime never blocks the other's.
+pub async fn start_usage_server(
+    usage: &UsageServer,
+    query: &UsageServer,
+    database: &Database,
+) -> Result<()> {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(database).await?);
-    let readiness_pool = pool.clone();
-    let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool));
+    let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool.clone()));
     let state = Arc::new(UsageState { repo });
 
     let dev_cors = dev_cors_enabled();
-    let app = build_usage_router(state, readiness_pool, dev_cors);
-
     if dev_cors {
         warn!("AUTHZ_DEV_CORS is set — usage server allows any CORS origin (dev only)");
     }
-    info!("starting usage server on {}:{}", &usage.address, usage.port);
-    serve_tls("USAGE", &usage.address, usage.port, &usage.tls, app).await
+
+    let ingest_app = build_ingest_router(state.clone(), pool.clone(), dev_cors);
+    let query_app = build_query_router(state, pool, dev_cors);
+
+    info!(
+        "starting usage ingest listener on {}:{}",
+        &usage.address, usage.port
+    );
+    info!(
+        "starting usage query listener (mTLS) on {}:{}",
+        &query.address, query.port
+    );
+    let ingest = serve_tls(
+        "USAGE-INGEST",
+        &usage.address,
+        usage.port,
+        &usage.tls,
+        ingest_app,
+    );
+    let query = serve_tls(
+        "USAGE-QUERY",
+        &query.address,
+        query.port,
+        &query.tls,
+        query_app,
+    );
+    tokio::try_join!(ingest, query)?;
+    Ok(())
 }
 
 async fn root_handler() -> (StatusCode, Json<RootResponse>) {
@@ -175,9 +231,9 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
         )
     ),
     tags(
-        (name = "ingest", description = "OTEL ingest endpoints"),
-        (name = "usage", description = "Timeseries usage query endpoint"),
-        (name = "spend", description = "Internal spend-query endpoint used by the budget domain (unauthenticated, like the rest of this server -- see AGENTS.md's Security Notes)")
+        (name = "ingest", description = "OTEL ingest endpoints (unauthenticated, ClusterIP-only -- see AGENTS.md's Security Notes)"),
+        (name = "usage", description = "Timeseries usage query endpoint -- mTLS-required listener (#347), see UsageServerGroup::query"),
+        (name = "spend", description = "Internal spend-query endpoint used by the budget domain -- mTLS-required listener (#347), see UsageServerGroup::query")
     )
 )]
 struct UsageDoc;

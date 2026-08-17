@@ -2046,6 +2046,7 @@ mod tests {
             tls: lightbridge_authz_core::config::Tls {
                 cert_path: "unused".to_string(),
                 key_path: "unused".to_string(),
+                client_ca_bundle_path: None,
             },
             allowed_hosts: None,
             rpc_base_path: None,

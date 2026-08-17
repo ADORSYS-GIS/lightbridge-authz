@@ -1,8 +1,13 @@
 use crate::config::Tls;
 use crate::error::{Error, Result};
 use axum::Router;
+use axum_server::tls_rustls::RustlsConfig;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
+use rustls::{RootCertStore, ServerConfig};
 use std::net::SocketAddr;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
 const INSECURE_HTTP_ENV: &str = "AUTHZ_INSECURE_HTTP";
 const DEV_CORS_ENV: &str = "AUTHZ_DEV_CORS";
@@ -59,10 +64,12 @@ pub async fn serve_tls(name: &str, address: &str, port: u16, tls: &Tls, app: Rou
     ensure_rustls_provider();
 
     let addr: SocketAddr = format!("{}:{}", address, port).parse()?;
-    let rustls_config =
-        axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
+    let rustls_config = match &tls.client_ca_bundle_path {
+        Some(client_ca_bundle_path) => build_mtls_config(name, tls, client_ca_bundle_path)?,
+        None => RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
             .await
-            .map_err(|e| Error::Server(format!("Failed to load TLS config for {name}: {e}")))?;
+            .map_err(|e| Error::Server(format!("Failed to load TLS config for {name}: {e}")))?,
+    };
 
     tracing::info!("Starting {name} server with TLS on {}", addr);
     axum_server::bind_rustls(addr, rustls_config)
@@ -71,4 +78,86 @@ pub async fn serve_tls(name: &str, address: &str, port: u16, tls: &Tls, app: Rou
         .map_err(|e| Error::Server(format!("Failed to start {name} server: {e}")))?;
 
     Ok(())
+}
+
+/// Builds a `rustls::ServerConfig` that requires and verifies a client certificate against
+/// `client_ca_bundle_path` (mTLS, #347), then wraps it for `axum-server`. Every failure here —
+/// an unreadable file, a bundle with no parseable PEM certificates, or a verifier/config that
+/// fails to build — is a hard startup error naming the offending path: per this codebase's
+/// fail-closed rule, a misconfigured trust anchor must refuse to start, never silently fall back
+/// to `with_no_client_auth`.
+///
+/// `WebPkiClientVerifier::builder` without `allow_unauthenticated()` is fail-closed by
+/// construction: a connection presenting no certificate, an expired one, or one not signed by a
+/// CA in `client_ca_bundle_path` is rejected at the TLS handshake, before any application code
+/// (including this router's own auth middleware) ever runs.
+fn build_mtls_config(name: &str, tls: &Tls, client_ca_bundle_path: &str) -> Result<RustlsConfig> {
+    let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&tls.cert_path)
+        .map_err(|e| {
+            Error::Server(format!(
+                "Failed to read TLS cert for {name} at '{}': {e}",
+                tls.cert_path
+            ))
+        })?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| {
+            Error::Server(format!(
+                "Failed to parse TLS cert for {name} at '{}': {e}",
+                tls.cert_path
+            ))
+        })?;
+    let key = PrivateKeyDer::from_pem_file(&tls.key_path).map_err(|e| {
+        Error::Server(format!(
+            "Failed to read/parse TLS key for {name} at '{}': {e}",
+            tls.key_path
+        ))
+    })?;
+
+    let ca_certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_file_iter(client_ca_bundle_path)
+            .map_err(|e| {
+                Error::Server(format!(
+                    "Failed to read client-CA bundle for {name} at '{client_ca_bundle_path}': {e}"
+                ))
+            })?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| {
+                Error::Server(format!(
+                    "Failed to parse client-CA bundle for {name} at '{client_ca_bundle_path}': {e}"
+                ))
+            })?;
+    if ca_certs.is_empty() {
+        return Err(Error::Server(format!(
+            "client-CA bundle for {name} at '{client_ca_bundle_path}' contains no PEM certificates"
+        )));
+    }
+
+    let mut roots = RootCertStore::empty();
+    for cert in ca_certs {
+        roots.add(cert).map_err(|e| {
+            Error::Server(format!(
+                "Failed to add client-CA cert for {name} from '{client_ca_bundle_path}' to trust store: {e}"
+            ))
+        })?;
+    }
+
+    let client_verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|e| {
+            Error::Server(format!(
+                "Failed to build client-cert verifier for {name} from '{client_ca_bundle_path}': {e}"
+            ))
+        })?;
+
+    let mut server_config = ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(cert_chain, key)
+        .map_err(|e| {
+            Error::Server(format!(
+                "Failed to build mTLS server config for {name}: {e}"
+            ))
+        })?;
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    Ok(RustlsConfig::from_config(Arc::new(server_config)))
 }

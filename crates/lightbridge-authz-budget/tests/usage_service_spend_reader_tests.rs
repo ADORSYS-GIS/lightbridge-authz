@@ -6,11 +6,13 @@
 //! the direct-SQL figure, half-open interval boundaries) are covered end-to-end against a real
 //! database in `crates/lightbridge-authz-usage/tests/spend_query_it_tests.rs`.
 //!
-//! The reader sends no credential of any kind (no Basic auth, no mTLS yet -- see
-//! `UsageServiceSpendReader`'s own doc comment for the deliberate security-posture tradeoff).
-//! `usage_service_returns_401_yields_spend_unavailable` below is kept precisely because of that:
-//! the reader must not assume `2xx` just because it isn't authenticating -- an unexpected `401`
-//! (or any other non-2xx) from the usage service is still "unknown", not "assume success".
+//! Every reader built here presents no client identity and no CA bundle (all `None`) -- mTLS
+//! client-identity/CA-bundle behavior has its own dedicated test files
+//! (`usage_service_ca_bundle_tests.rs`, `usage_service_client_identity_tests.rs`), since neither
+//! can be exercised against `httpmock`'s plain (non-TLS) mock server.
+//! `usage_service_returns_401_yields_spend_unavailable` below is kept regardless: the reader must
+//! not assume `2xx` just because it isn't authenticating -- an unexpected `401` (or any other
+//! non-2xx) from the usage service is still "unknown", not "assume success".
 
 use httpmock::Method::POST;
 use httpmock::MockServer;
@@ -18,7 +20,7 @@ use lightbridge_authz_budget::{Period, Spend, SpendReader, UsageServiceSpendRead
 use std::time::Duration;
 
 fn reader_for(base_url: &str) -> UsageServiceSpendReader {
-    UsageServiceSpendReader::new(base_url, false, None, Duration::from_secs(5))
+    UsageServiceSpendReader::new(base_url, false, None, None, None, Duration::from_secs(5))
         .expect("reader construction must succeed")
 }
 
@@ -122,9 +124,15 @@ async fn usage_service_timeout_yields_spend_unavailable() {
             .json_body(serde_json::json!({ "total_cost": 1.0 }));
     });
 
-    let reader =
-        UsageServiceSpendReader::new(server.base_url(), false, None, Duration::from_millis(20))
-            .expect("reader construction must succeed");
+    let reader = UsageServiceSpendReader::new(
+        server.base_url(),
+        false,
+        None,
+        None,
+        None,
+        Duration::from_millis(20),
+    )
+    .expect("reader construction must succeed");
 
     let spend = reader
         .spend_for_account("acct_1", &period())

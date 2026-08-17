@@ -1,10 +1,26 @@
 server:
+  # Ingest-only listener: /v1/otel/{traces,metrics,logs} + health probes + Swagger docs.
+  # Unauthenticated, unchanged by #347 -- see UsageServerGroup::usage's doc comment for why this
+  # listener cannot require a client certificate (its caller is an AI Envoy/OpenTelemetry exporter
+  # outside this repo's deploy surface).
   usage:
     address: "0.0.0.0"
     port: 3002
     tls:
       cert_path: "/tls/usage.crt"
       key_path: "/tls/usage.key"
+  # mTLS-required listener (#347): /usage/v1/usage/query + /usage/v1/spend/query. Requires and
+  # verifies a client certificate signed by the same local CA the authz-tls compose service signs
+  # every service leaf with. This is live (not commented out, unlike ca_bundle_path elsewhere in
+  # this repo) because #347's acceptance criteria calls for Local Compose to actually exercise
+  # mTLS end-to-end, not just document the shape -- see UsageServerGroup::query's doc comment.
+  query:
+    address: "0.0.0.0"
+    port: 3006
+    tls:
+      cert_path: "/tls/usage.crt"
+      key_path: "/tls/usage.key"
+      client_ca_bundle_path: "/tls/ca.crt"
 logging:
   level: "info"
 database:

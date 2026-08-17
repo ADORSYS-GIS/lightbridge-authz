@@ -53,23 +53,38 @@ redis:
 # HTTP client for authz-api's budget domain to call the usage service's /usage/v1/spend/query
 # endpoint (see crates/lightbridge-authz-budget/src/spend.rs). Optional, like redis above. Absent
 # -> budget refill spend facts report Spend::Unavailable (fails closed to manual review), not a
-# startup failure. Unauthenticated on purpose -- no Basic auth, no mTLS yet; safe only because
-# authz-usage is ClusterIP-only with no ingress in every real deployment (see AGENTS.md's Security
-# Notes).
+# startup failure.
 #
-# insecure_skip_verify: true is only for this local Compose stack, which has no shared CA bundle
-# mounted anywhere. Real (e.g. in-cluster) deployments must set insecure_skip_verify: false and
-# set ca_bundle_path to the deployment's own CA bundle instead -- e.g. in a cluster where
-# cert-manager issues this service's own TLS secret with a CA-type issuer, that secret already
-# carries a ca.crt alongside tls.crt/tls.key, and this pod already mounts the whole secret at
-# /etc/lightbridge/tls, so no new Secret/volume/mount is needed to point ca_bundle_path at it (see
+# base_url points at authz-usage's mTLS-required query listener (port 3006, UsageServerGroup::query
+# -- #347 split the old single usage port into an unauthenticated ingest listener and this
+# mTLS-required query listener; see that type's doc comment in crates/lightbridge-authz-usage/src/config.rs).
+#
+# client_cert_path/client_key_path (#347) present this pod's own cert as a client identity --
+# reusing api.crt/api.key rather than minting a separate client-only cert, since the deployed
+# authz-tls cert already carries both serverAuth and clientAuth in its extendedKeyUsage (confirmed
+# against the live cluster: `kubectl -n converse get certificate authz-tls -o yaml` shows
+# `usages: [server auth, client auth]`) -- the same pattern this compose stack's authz-tls service
+# now mirrors locally (see that service's cert-generation script). authz-budget shares this same
+# config file and therefore presents the same identity when it calls the usage service; mTLS here
+# authenticates "a legitimate lightbridge workload holding a CA-signed cert", not a specific
+# service identity -- see the PR that introduced this for why per-caller authorization was not
+# implemented.
+#
+# insecure_skip_verify: true is only for this local Compose stack. Real (e.g. in-cluster)
+# deployments must set insecure_skip_verify: false and set ca_bundle_path to the deployment's own
+# CA bundle instead -- e.g. in a cluster where cert-manager issues this service's own TLS secret
+# with a CA-type issuer, that secret already carries a ca.crt alongside tls.crt/tls.key, and this
+# pod already mounts the whole secret at /etc/lightbridge/tls, so no new Secret/volume/mount is
+# needed to point ca_bundle_path (or client_cert_path/client_key_path) at it (see
 # Config::usage_service's doc comment in crates/lightbridge-authz-core). An unreadable or
-# unparseable ca_bundle_path is a hard startup failure, never a silent fallback to skip-verify or
-# to the system trust store.
+# unparseable ca_bundle_path, client_cert_path, or client_key_path is a hard startup failure,
+# never a silent fallback to skip-verify, no client identity, or the system trust store.
 usage_service:
-  base_url: "https://authz-usage:3002"
+  base_url: "https://authz-usage:3006"
   insecure_skip_verify: true
   # ca_bundle_path: /etc/lightbridge/tls/ca.crt
+  client_cert_path: "/tls/api.crt"
+  client_key_path: "/tls/api.key"
   timeout_ms: 5000
 oauth2:
   # REQUIRED credential-issuance mode — no default; must be stated explicitly.

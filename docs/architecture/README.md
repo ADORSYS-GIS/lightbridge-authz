@@ -86,9 +86,14 @@ Notes grounded in code, not intent:
   (`crates/lightbridge-authz-rest/src/lib.rs`) — `authz-idp` only reaches Redis when
   `oauth2.token_exchange.enabled`. `authz-opa`, `lightbridge-mcp`, and `lightbridge-authz-usage`
   have no Redis dependency.
-- **`lightbridge-authz-usage` has no auth on ingest or query** — `/v1/otel/{traces,metrics,logs}`
-  and `/usage/v1/usage/query` are all unprotected. Safe only because the service is not
-  externally routable in the deployed topology; see `docs/architecture/deployment.md`.
+- **`lightbridge-authz-usage` splits ingest and query auth (#347)** — `/v1/otel/{traces,metrics,logs}`
+  stays unprotected (its caller is an AI Envoy/OpenTelemetry exporter outside this repo's deploy
+  surface); `/usage/v1/usage/query` and `/usage/v1/spend/query` moved to a separate listener that
+  requires and verifies a client certificate (mTLS) — see `UsageServerGroup` in
+  `crates/lightbridge-authz-usage/src/config.rs`. Neither route has an ownership check on
+  `scope_id`/`account_id` — mTLS authenticates the caller, not what it's entitled to see. Safe
+  only because the service is not externally routable in the deployed topology regardless; see
+  `docs/architecture/deployment.md`.
 
 ## Containers: the six deployables
 

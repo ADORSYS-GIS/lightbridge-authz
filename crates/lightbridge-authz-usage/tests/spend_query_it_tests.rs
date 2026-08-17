@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_usage_rest::UsageState;
-use lightbridge_authz_usage_rest::build_usage_router;
+use lightbridge_authz_usage_rest::build_query_router;
 use lightbridge_authz_usage_rest::models::SpendQueryResponse;
 use lightbridge_authz_usage_rest::repo::{StoreRepo, UsageEvent};
 use serde_json::json;
@@ -20,11 +20,20 @@ fn parse_timestamp(value: &str) -> DateTime<Utc> {
         .expect("test timestamp literal must be a valid RFC3339 timestamp")
 }
 
+/// Builds the query listener's router directly (`build_query_router`), bypassing TLS entirely via
+/// `.oneshot()` -- these tests exercise `/usage/v1/spend/query`/`/usage/v1/usage/query`'s
+/// application logic in isolation, same as before #347. The mTLS client-certificate requirement
+/// (#347) lives at the TLS layer (`Tls::client_ca_bundle_path`,
+/// `lightbridge_authz_core::server::serve_tls`'s `build_mtls_config`), not in this router or its
+/// handlers, so it is proven separately -- see
+/// `crates/lightbridge-authz-core/tests/server_tests.rs` and
+/// `crates/lightbridge-authz-budget/tests/usage_service_client_identity_tests.rs` for the real
+/// TLS-handshake-level coverage.
 async fn app(pool: PgPool) -> axum::Router {
     let readiness_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
     let repo = Arc::new(StoreRepo::new(Arc::new(DbPool::from_pool(pool))));
     let state = Arc::new(UsageState { repo });
-    build_usage_router(state, readiness_pool, false)
+    build_query_router(state, readiness_pool, false)
 }
 
 fn sample_event(account_id: &str, observed_at: DateTime<Utc>, total_cost: f64) -> UsageEvent {
@@ -62,8 +71,9 @@ async fn insert(pool: &PgPool, event: &UsageEvent) {
     .expect("inserting a test usage_events row must succeed");
 }
 
-/// This endpoint is deliberately unauthenticated (see `crate::routers::spend_router`'s doc
-/// comment in the usage crate) -- no credentials are sent here, matching what a real caller does.
+/// This test helper sends no client certificate -- irrelevant here since `.oneshot()` never opens
+/// a real TLS connection (see `app`'s doc comment above for where the mTLS requirement actually
+/// lives and is actually tested).
 async fn query_spend(
     router: axum::Router,
     account_id: &str,
@@ -190,10 +200,11 @@ async fn spend_query_reports_null_when_no_rows_match(pool: PgPool) {
     assert_eq!(response.total_cost, None);
 }
 
-/// The pre-existing unauthenticated `/usage/v1/usage/query` endpoint must stay reachable with no
-/// credentials -- unaffected by this PR either way, since neither endpoint is authenticated.
+/// `/usage/v1/usage/query`'s application logic is unaffected by #347's mTLS requirement -- that
+/// requirement lives at the TLS layer, not in this handler, so exercising it directly via
+/// `.oneshot()` (no TLS, no client certificate) must still succeed. See `app`'s doc comment.
 #[sqlx::test(migrations = "../../migrations-usage")]
-async fn usage_query_endpoint_stays_unauthenticated(pool: PgPool) {
+async fn usage_query_endpoint_application_logic_is_unaffected_by_mtls(pool: PgPool) {
     let router = app(pool).await;
     let body = json!({
         "scope": "account",

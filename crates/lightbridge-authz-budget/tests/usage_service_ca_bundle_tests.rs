@@ -157,6 +157,8 @@ async fn valid_ca_bundle_verifies_the_server_certificate() {
         base_url,
         false,
         Some(ca_bundle_path.to_str().expect("temp path is valid UTF-8")),
+        None,
+        None,
         Duration::from_secs(5),
     )
     .expect("reader construction with a valid CA bundle must succeed");
@@ -197,6 +199,8 @@ async fn server_certificate_not_signed_by_the_configured_ca_is_rejected() {
                 .to_str()
                 .expect("temp path is valid UTF-8"),
         ),
+        None,
+        None,
         Duration::from_secs(5),
     )
     .expect("reader construction with a valid (if wrong) CA bundle must succeed");
@@ -224,6 +228,8 @@ async fn unreadable_ca_bundle_path_is_a_hard_construction_error() {
         "https://authz-usage:3002",
         false,
         Some(path),
+        None,
+        None,
         Duration::from_secs(1),
     )
     .expect_err("an unreadable CA bundle path must fail construction, not degrade silently");
@@ -246,6 +252,8 @@ async fn malformed_ca_bundle_is_a_hard_construction_error() {
         "https://authz-usage:3002",
         false,
         Some(path_str),
+        None,
+        None,
         Duration::from_secs(1),
     )
     .expect_err("a malformed PEM CA bundle must fail construction, not degrade silently");
@@ -268,8 +276,9 @@ async fn insecure_skip_verify_without_a_ca_bundle_still_connects_like_local_comp
     let (addr, server) = spawn_https_server(&ca_cert, &ca_key).await;
     let base_url = format!("https://{addr}");
 
-    let reader = UsageServiceSpendReader::new(base_url, true, None, Duration::from_secs(5))
-        .expect("reader construction must succeed");
+    let reader =
+        UsageServiceSpendReader::new(base_url, true, None, None, None, Duration::from_secs(5))
+            .expect("reader construction must succeed");
 
     let spend = reader
         .spend_for_account("acct_1", &period())

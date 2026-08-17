@@ -1,8 +1,8 @@
 //! Reads actual spend (`SUM(usage_events.total_cost)`) for a given account/period from
 //! `lightbridge-authz-usage`'s `/usage/v1/spend/query` endpoint, so the budget domain's
 //! self-service augmentation logic (Phase 5) can compare spend against a grant balance. This
-//! endpoint is unauthenticated -- see `UsageServiceSpendReader`'s own doc comment for the
-//! deliberate security-posture tradeoff and the mTLS follow-up tracking it.
+//! call presents a client certificate for mTLS (#347) when configured -- see
+//! `UsageServiceSpendReader`'s own doc comment for the full security posture.
 //!
 //! Until this module was inverted (see the PR that introduced `UsageServiceSpendReader`), this
 //! crate opened its own connection directly to the usage-events database and ran
@@ -166,16 +166,23 @@ struct SpendQueryResponse {
 /// HTTPS, instead of opening a direct database connection (see this module's doc comment for
 /// why).
 ///
-/// ## Security posture: unauthenticated, deliberately, for now
+/// ## Security posture: mTLS (#347)
 ///
-/// This call carries no credential -- no Basic auth, no mTLS yet. That mirrors the pre-existing
-/// `/usage/v1/usage/query` endpoint's own posture: safe only because `lightbridge-authz-usage` is
-/// ClusterIP-only with no ingress (see `AGENTS.md`'s Security Notes). If that ever changes, both
-/// endpoints leak per-account spend/usage figures to anything that can reach the service. mTLS
-/// between the budget domain and the usage service is tracked as a follow-up, not implemented
-/// here -- see the PR that introduced this reader for the tracking issue. A per-endpoint
-/// Basic-auth credential was deliberately not added as interim scaffolding: mTLS is the intended
-/// mechanism, and a Basic-auth credential would just be more surface to retire later.
+/// This reader presents a client certificate (`client_cert_path`/`client_key_path`) when the
+/// usage service's listener requires one -- see `crate::config::Tls::client_ca_bundle_path` on
+/// the server side and `lightbridge_authz_core::server::serve_tls`'s `build_mtls_config`. A
+/// deployment that has not wired up `client_cert_path`/`client_key_path` presents no client
+/// certificate at all, exactly as before #347; whether that is acceptable depends entirely on
+/// whether the usage service's own listener is configured to require one, which is the actual
+/// enforcement point -- this reader has no independent opinion about it. Every deployment that
+/// enables `Tls::client_ca_bundle_path` on the usage service's listener MUST also configure this
+/// reader's client identity, or every spend read fails closed to `Spend::Unavailable` (see "Fail-
+/// closed contract" below) once that flip happens -- see the deploy-ordering note in the PR that
+/// introduced this.
+///
+/// A per-endpoint Basic-auth credential was deliberately not added as interim scaffolding before
+/// mTLS landed: mTLS is the intended mechanism, and a Basic-auth credential would just have been
+/// more surface to retire later.
 ///
 /// ## Fail-closed contract
 ///
@@ -221,10 +228,21 @@ impl UsageServiceSpendReader {
     /// misconfigured trust anchor must refuse to start, never silently fall back to
     /// `insecure_skip_verify` or to the platform's default trust store -- either would turn a
     /// configuration mistake into weaker verification than the operator asked for.
+    ///
+    /// `client_cert_path`/`client_key_path` (#347), when both `Some`, name a PEM certificate and
+    /// its matching PEM private key this reader presents as its own identity for mTLS -- e.g. the
+    /// same `/etc/lightbridge/tls/tls.crt`/`tls.key` this pod already mounts for its own server
+    /// listener, since that certificate already carries `clientAuth` in its EKU. Setting exactly
+    /// one of the two is a hard construction error naming which one is missing -- never a silent
+    /// "connect without an identity" fallback. Both unset means this reader presents no client
+    /// certificate, which is only safe when the usage service's listener does not require one
+    /// (`Tls::client_ca_bundle_path` unset there).
     pub fn new(
         base_url: impl Into<String>,
         insecure_skip_verify: bool,
         ca_bundle_path: Option<&str>,
+        client_cert_path: Option<&str>,
+        client_key_path: Option<&str>,
         timeout: std::time::Duration,
     ) -> Result<Self, BudgetError> {
         let mut builder = reqwest::Client::builder()
@@ -257,6 +275,10 @@ impl UsageServiceSpendReader {
             }
         }
 
+        if let Some(identity) = load_client_identity(client_cert_path, client_key_path)? {
+            builder = builder.identity(identity);
+        }
+
         let client = builder.build().map_err(|err| {
             let bundle_context = ca_bundle_path
                 .map(|path| format!(" (CA bundle '{path}')"))
@@ -271,6 +293,55 @@ impl UsageServiceSpendReader {
             base_url: base_url.into().trim_end_matches('/').to_string(),
         })
     }
+}
+
+/// Loads the mTLS client identity named by `client_cert_path`/`client_key_path`, or returns
+/// `None` when both are unset. Setting exactly one is a hard construction error: a half-configured
+/// identity must never silently degrade to "present no certificate", since that would turn a
+/// configuration mistake into a weaker guarantee than the operator asked for (this codebase's
+/// fail-closed rule).
+fn load_client_identity(
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
+) -> Result<Option<reqwest::Identity>, BudgetError> {
+    let (cert_path, key_path) = match (client_cert_path, client_key_path) {
+        (None, None) => return Ok(None),
+        (Some(cert_path), Some(key_path)) => (cert_path, key_path),
+        (Some(cert_path), None) => {
+            return Err(BudgetError::StorageFailed(format!(
+                "usage-service client_cert_path '{cert_path}' is set but client_key_path is \
+                 missing -- both must be set together"
+            )));
+        }
+        (None, Some(key_path)) => {
+            return Err(BudgetError::StorageFailed(format!(
+                "usage-service client_key_path '{key_path}' is set but client_cert_path is \
+                 missing -- both must be set together"
+            )));
+        }
+    };
+
+    let mut pem = std::fs::read(cert_path).map_err(|err| {
+        BudgetError::StorageFailed(format!(
+            "failed to read usage-service client cert at '{cert_path}': {err}"
+        ))
+    })?;
+    let key_pem = std::fs::read(key_path).map_err(|err| {
+        BudgetError::StorageFailed(format!(
+            "failed to read usage-service client key at '{key_path}': {err}"
+        ))
+    })?;
+    pem.push(b'\n');
+    pem.extend_from_slice(&key_pem);
+
+    let identity = reqwest::Identity::from_pem(&pem).map_err(|err| {
+        BudgetError::StorageFailed(format!(
+            "failed to parse usage-service client identity from cert '{cert_path}' / key \
+             '{key_path}': {err}"
+        ))
+    })?;
+
+    Ok(Some(identity))
 }
 
 #[lightbridge_authz_core::async_trait]
@@ -448,6 +519,8 @@ mod tests {
         let reader = UsageServiceSpendReader::new(
             "https://authz-usage:3002",
             false,
+            None,
+            None,
             None,
             std::time::Duration::from_secs(1),
         );

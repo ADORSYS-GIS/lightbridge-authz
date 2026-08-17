@@ -170,21 +170,28 @@ endpoint.
 **Owns:** the usage database — a Timescale hypertable when the extension is available, plain
 Postgres table otherwise, independent of the `authz` database.
 
-Router assembly: `crates/lightbridge-authz-usage/src/{lib.rs,routers/mod.rs}`.
+Router assembly: `crates/lightbridge-authz-usage/src/{lib.rs,routers/mod.rs}`. Split across two
+listeners since #347 (`UsageServerGroup` in `crates/lightbridge-authz-usage/src/config.rs`): the
+ingest listener (`usage`) and the mTLS-required query listener (`query`) each serve their own
+health probes, plus whatever routes are theirs below.
 
-| Route | Method | Protection | Notes |
-| --- | --- | --- | --- |
-| `/`, `/healthz`, `/healthz/startup`, `/healthz/ready` | GET | none | |
-| `/usage/v1/usage/docs` | GET | none | OpenAPI/Swagger UI for the query endpoint. |
-| `/v1/otel/traces` | POST | **none** | OTLP trace ingest. |
-| `/v1/otel/metrics` | POST | **none** | OTLP metric ingest. |
-| `/v1/otel/logs` | POST | **none** | OTLP log ingest. |
-| `/usage/v1/usage/query` | POST | **none** | Scoped, date-bin-aggregated usage query; no `scope_id` ownership check either. |
+| Route | Method | Listener | Protection | Notes |
+| --- | --- | --- | --- | --- |
+| `/`, `/healthz`, `/healthz/startup`, `/healthz/ready` | GET | both | none | Each listener serves its own copy. |
+| `/usage/v1/usage/docs` | GET | `usage` (ingest) | none | OpenAPI/Swagger UI covering the whole service, including the query listener's routes. |
+| `/v1/otel/traces` | POST | `usage` (ingest) | **none** | OTLP trace ingest; caller is an AI Envoy/OpenTelemetry exporter outside this repo's deploy surface. |
+| `/v1/otel/metrics` | POST | `usage` (ingest) | **none** | OTLP metric ingest. |
+| `/v1/otel/logs` | POST | `usage` (ingest) | **none** | OTLP log ingest. |
+| `/usage/v1/usage/query` | POST | `query` | **mTLS (#347)** | Scoped, date-bin-aggregated usage query; TLS-layer client-cert requirement, no `scope_id` ownership check. |
+| `/usage/v1/spend/query` | POST | `query` | **mTLS (#347)** | Summed spend for an account/period, called by `lightbridge-authz-budget`'s `UsageServiceSpendReader`. |
 
-This service has no application-level authentication anywhere on its data-plane routes. That is a
-known, accepted gap today — see [`README.md`](./README.md)'s context-diagram notes and
-[`deployment.md`](./deployment.md) for why it is currently safe (network topology, not application
-auth) and what would need to change before it could be routed externally.
+This service has no application-level authentication anywhere on its data-plane routes — mTLS on
+the `query` listener authenticates the caller (any workload holding a CA-signed cert), not which
+`scope_id`/`account_id` it's entitled to see, and the `usage` (ingest) listener has none at all.
+That ownership gap is a known, accepted one today — see [`README.md`](./README.md)'s
+context-diagram notes and [`deployment.md`](./deployment.md) for why it is currently safe (network
+topology, not application auth) and what would need to change before it could be routed
+externally.
 
 ## Crate layering behind `authz-api` / `authz-opa`
 
