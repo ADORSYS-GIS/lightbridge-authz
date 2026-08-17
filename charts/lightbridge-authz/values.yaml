@@ -10,6 +10,35 @@ controllers:
   main:
     type: deployment
     replicas: 1
+    # bjw-s/common defaults an unset `strategy` to `Recreate` for Deployments (see the
+    # library chart's own values.yaml comment: "Recreate (default) and RollingUpdate").
+    # Nothing here ever set `strategy`, so every deploy of this controller (rendered 4x
+    # via the stack chart's api/opa/idp/budget aliases) terminated all existing pods
+    # before creating any replacement -- a full-availability gap on every rollout, not
+    # just a rounding edge case on single-replica controllers. `unavailable: 0` forces
+    # the replacement pod to be Ready before the old one is torn down; that needs one
+    # extra pod's worth of headroom during the roll (bounded by `surge: 1`).
+    #
+    # `unavailable` MUST be the string "0", not the bare int 0: bjw-s/common's Deployment
+    # template wraps it in `{{- with .unavailable }}`, and Go templates' `with` treats a
+    # numeric zero as empty and silently drops the whole `maxUnavailable` key -- verified
+    # by rendering with the int form: the key vanished from the output and Kubernetes'
+    # own apiserver default (25%, rounding down) took over instead, which happens to
+    # round to 0 at these replica counts today but isn't a promise. The quoted string
+    # has non-zero length, so `with` treats it as present and renders `maxUnavailable: 0`
+    # literally, which the IntOrString field accepts.
+    strategy: RollingUpdate
+    rollingUpdate:
+      unavailable: "0"
+      surge: 1
+    # No PodDisruptionBudget existed anywhere in this chart; prod compensated with a
+    # hand-maintained `rawRessources` PodDisruptionBudget for only 2 of the 6 workloads
+    # this chart family renders (see ai-helm-values `lightbridge-app.yaml`, which claims
+    # the upstream chart "doesn't support controller PDBs natively" -- untrue as of the
+    # vendored common 4.6.2: `controllers.<name>.podDisruptionBudget` is a native,
+    # schema-documented key). `maxUnavailable: 1` matches that existing prod convention.
+    podDisruptionBudget:
+      maxUnavailable: 1
     containers:
       authz:
         image:

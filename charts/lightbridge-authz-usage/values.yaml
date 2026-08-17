@@ -10,6 +10,19 @@ controllers:
   main:
     type: deployment
     replicas: 1
+    # Zero-downtime rollout -- see the matching comment in
+    # charts/lightbridge-authz/values.yaml for the mechanism this fixes (bjw-s/common
+    # defaults an unset `strategy` to `Recreate`, which killed all pods before creating
+    # replacements on every deploy).
+    # `unavailable` is quoted "0" (not bare int 0) -- see the full explanation in
+    # charts/lightbridge-authz/values.yaml: bjw-s/common's `with .unavailable` treats an
+    # int zero as empty and drops `maxUnavailable` from the render entirely.
+    strategy: RollingUpdate
+    rollingUpdate:
+      unavailable: "0"
+      surge: 1
+    podDisruptionBudget:
+      maxUnavailable: 1
     containers:
       authz:
         image:
