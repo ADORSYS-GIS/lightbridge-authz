@@ -2153,19 +2153,24 @@ pub async fn start_idp_server(
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
 
-    let token_exchange_state = match oauth2.token_exchange.as_ref().filter(|t| t.enabled) {
-        Some(_) => {
-            let redis = redis.as_ref().ok_or_else(|| {
-                Error::Server(
-                    "redis config is required for authz-idp when oauth2.token_exchange is \
-                     enabled (set `redis.url`)"
-                        .to_string(),
-                )
-            })?;
-            build_token_exchange_state(oauth2, signing_repo.clone(), bearer_service, &redis.url)?
-        }
-        None => None,
-    };
+    // Redis is required unconditionally for authz-idp -- every lightbridge-authz serving role
+    // that isn't explicitly freed from it (authz-opa, lightbridge-mcp) needs Redis-backed caching,
+    // not only when `oauth2.token_exchange` happens to be enabled today (that used to be the only
+    // gate; it no longer is -- see AGENTS.md's "Redis is a mandatory dependency" house rule).
+    // Mirrors start_api_server's/start_budget_server's identical unconditional check.
+    // `build_token_exchange_state` itself still no-ops to `Ok(None)` when token_exchange is
+    // disabled (see its own doc comment), so this changes only whether a *missing* redis config
+    // is tolerated, never whether token exchange itself is attempted.
+    let redis = redis.as_ref().ok_or_else(|| {
+        Error::Server(
+            "redis config is required for authz-idp (set `redis.url`) -- mandatory for every \
+             authz-idp deployment, not only when oauth2.token_exchange is enabled"
+                .to_string(),
+        )
+    })?;
+
+    let token_exchange_state =
+        build_token_exchange_state(oauth2, signing_repo.clone(), bearer_service, &redis.url)?;
     let token_exchange_enabled = token_exchange_state.is_some();
 
     let app = build_idp_router(oauth2, signing_repo, token_exchange_state, readiness_pool);
