@@ -319,6 +319,37 @@ type CreateApiKeyInput {
 mutation procedure createApiKey(args: CreateApiKeyInput): ApiKeySecret
   @allow(auth() != null)
 
+// The operator-configured billing-plan catalogue (`config.billing.plans`, `Billing` in
+// `lightbridge-authz-core`), read-only. Added so a caller building a `createApiKey` UI can build a
+// real selector instead of hardcoding plan ids client-side -- before this procedure, the only place
+// the catalogue was exposed anywhere on the wire was the MCP tool description string
+// (`LightbridgeMcpHandler::advertised_tools` appends "Valid billing_plan ids: ..." to
+// `create-api-key`'s description), which is not machine-readable and not reachable from the RPC
+// surface `createApiKey` itself lives on. `limits` mirrors `BillingLimits` field-for-field; an
+// absent field there means "no limit" (see that struct's doc comment) and stays absent here rather
+// than being coerced to a sentinel. Gated at the same `apikey:create` permission as `createApiKey`
+// (`rpc_authorize.rs`) -- a caller who cannot mint a key has no use for the plan list either, and
+// this keeps the two procedures' authorization stories identical rather than inventing a new,
+// looser permission for a one-field read.
+type BillingPlanLimits {
+  requestsPerSecond Int?
+  requestsPerDay Int?
+  requestsPerMonth Int?
+  concurrentRequests Int?
+}
+
+type BillingPlanInfo {
+  id String
+  name String
+  limits BillingPlanLimits?
+}
+
+type ListBillingPlansInput {
+}
+
+procedure listBillingPlans(args: ListBillingPlansInput): BillingPlanInfo[]
+  @allow(auth() != null)
+
 type RevokeApiKeyInput {
   keyId String
 }

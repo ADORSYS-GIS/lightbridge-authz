@@ -29,13 +29,17 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use common::{MapBearer, Wire, admin_perms, external_oauth2, rpc_call, token_info, viewer_perms};
+use common::{
+    MapBearer, Wire, admin_perms, as_json, external_oauth2, rpc_call, token_info, viewer_perms,
+};
 use cratestack::SqlxIdempotencyStore;
 use cratestack::ratelimit::RateLimitStore;
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::BearerTokenServiceTrait;
-use lightbridge_authz_core::config::{JwtSigning, Oauth2, Oauth2TokenExchange, Oauth2Type};
+use lightbridge_authz_core::config::{
+    Billing, JwtSigning, Oauth2, Oauth2TokenExchange, Oauth2Type,
+};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
 use lightbridge_authz_rest::ratelimit_redis::build_redis_rate_limit_store;
@@ -227,6 +231,34 @@ fn build_router(
         dev_cors,
         // Root mount (`/rpc/<op_id>`) for the shared helper; the configured-base-path mount is
         // exercised by `rpc_surface_honours_configured_base_path` via `build_router_at`.
+        None,
+    )
+}
+
+/// Like [`build_router`], but with a caller-supplied [`Billing`] catalogue instead of the
+/// default (empty) one -- for exercising `listBillingPlans`, the one procedure in this file whose
+/// response body actually depends on config rather than being uniformly unreachable/lazy DB.
+fn build_router_with_billing(bearer: Arc<dyn BearerTokenServiceTrait>, billing: Billing) -> Router {
+    let core = lazy_core_pool();
+    let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()).with_billing(billing));
+    let policy_store = lazy_policy_store(core.clone());
+    let (refill_service, review_service, budget_repo) =
+        lazy_refill_and_review_services(core.clone(), &policy_store);
+    lightbridge_authz_rest::build_api_router(
+        &external_oauth2(),
+        bearer,
+        issuer,
+        policy_store,
+        refill_service,
+        review_service,
+        budget_repo,
+        lazy_cratestack_db(),
+        core,
+        lazy_store_repo(),
+        None,
+        lazy_idempotency(),
+        lazy_rate_limit(),
+        false,
         None,
     )
 }
@@ -602,6 +634,74 @@ async fn rbac_gate_requires_a_valid_token_on_mapped_ops() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "invalid token → 401");
+}
+
+/// `listBillingPlans` is gated at the same `apikey:create` permission as `createApiKey` (not a
+/// new, looser one) -- a viewer (`account:read`/`project:read`/`apikey:read` only, no
+/// `apikey:create`) must be refused exactly like on `createApiKey` itself.
+#[tokio::test]
+async fn list_billing_plans_denied_for_caller_without_apikey_create() {
+    let router = build_router(admin_and_viewer_bearer(), &external_oauth2(), None, false);
+    let (status, _) = rpc_call(
+        router,
+        "procedure.listBillingPlans",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        Some("viewer"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "viewer must be denied listBillingPlans by the RBAC gate"
+    );
+}
+
+/// End-to-end proof that `listBillingPlans` reaches dispatch and answers from the router's actual
+/// configured `Billing` catalogue -- not a placeholder, not `Billing::default()` (which is empty
+/// and would make this assert an empty array instead). No DB access happens (this file's stores
+/// are all lazily wired to unreachable Postgres/Redis, see the module docs), because
+/// `AuthzStoreImpl::billing_plans` is a plain in-memory accessor.
+#[tokio::test]
+async fn list_billing_plans_returns_the_configured_catalogue_over_rpc() {
+    let billing = Billing {
+        plans: vec![
+            lightbridge_authz_core::config::BillingPlan {
+                id: "free".to_string(),
+                name: "Free".to_string(),
+                limits: Some(lightbridge_authz_core::config::BillingLimits {
+                    requests_per_second: Some(5),
+                    requests_per_day: Some(5000),
+                    requests_per_month: None,
+                    concurrent_requests: Some(5),
+                }),
+            },
+            lightbridge_authz_core::config::BillingPlan {
+                id: "enterprise".to_string(),
+                name: "Enterprise".to_string(),
+                limits: None,
+            },
+        ],
+    };
+    let router = build_router_with_billing(admin_bearer(), billing);
+    let (status, body) = rpc_call(
+        router,
+        "procedure.listBillingPlans",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "admin must reach dispatch");
+    let plans = as_json(Wire::Cbor, &body);
+    assert_eq!(
+        plans,
+        json!([
+            {"id": "free", "name": "Free", "limits": {"requestsPerSecond": 5, "requestsPerDay": 5000, "requestsPerMonth": null, "concurrentRequests": 5}},
+            {"id": "enterprise", "name": "Enterprise", "limits": null},
+        ]),
+        "listBillingPlans must echo the router's configured catalogue verbatim"
+    );
 }
 
 /// The budget-domain microservice split (see `docs/architecture/budget.md`, "Service boundary")
