@@ -1,5 +1,17 @@
 # Changelog
 
+## [3.4.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.3.0...v3.4.0) (2026-08-17)
+
+
+### Features
+
+* **charts:** add authz-budget workload to lightbridge-authz-stack ([#356](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/356)) ([#357](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/357)) ([d590aea](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/d590aea06bbdee2936734da9fadad519fef4d2ea))
+
+
+### Documentation
+
+* **architecture:** add authz-idp to service docs ([#344](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/344) follow-up) ([#358](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/358)) ([81db3a2](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/81db3a21d83692a515cc6e51586b06ba36ccba42))
+
 ## [3.3.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.2.0...v3.3.0) (2026-08-17)
 
 
