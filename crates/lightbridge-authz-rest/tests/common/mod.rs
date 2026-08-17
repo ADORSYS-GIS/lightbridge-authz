@@ -118,10 +118,15 @@ pub fn external_oauth2() -> Oauth2 {
     }
 }
 
-/// The two wire formats the `CodecSet` router serves. `encode`/`decode` go through the *exact* same
-/// codecs the server uses, so a round-trip is guaranteed faithful (no hand-rolled CBOR).
+/// `Cbor` is the only wire format the router actually serves (ADR-0013 — CBOR is the only
+/// transport codec). `Json` is kept solely as a negative-path probe: encoding a request with it
+/// and expecting the router to reject it (415) is how tests prove the cutover, rather than testing
+/// nothing by only ever sending the format the server accepts. `encode`/`decode` go through the
+/// *exact* same codecs the server/rejection path uses, so a round-trip is guaranteed faithful (no
+/// hand-rolled CBOR).
 #[derive(Clone, Copy)]
 pub enum Wire {
+    /// Rejected by every real router post-ADR-0013 — use only to assert a 415.
     Json,
     Cbor,
 }

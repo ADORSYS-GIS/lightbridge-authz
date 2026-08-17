@@ -10,6 +10,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import cbor_min
+
 
 KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL", "http://keycloak:9100").rstrip("/")
 API_URL = os.environ.get("API_URL", "https://authz-api:3000").rstrip("/")
@@ -108,6 +110,43 @@ def request_raw(
     with urllib.request.urlopen(req, timeout=30, context=context) as response:
         payload = response.read().decode("utf-8")
         return response.status, payload, dict(response.headers.items())
+
+
+def request_rpc(
+    method: str,
+    url: str,
+    body=None,
+    headers=None,
+    insecure_tls: bool = False,
+    ssl_context=None,
+):
+    """Like `request_json`, but for `authz-api`'s/`authz-budget`'s `/rpc/*` surfaces, which speak
+    CBOR only post-ADR-0013 (see `cbor_min.py`'s module doc). Every other endpoint this script
+    calls -- health probes, Keycloak, OPA (JSON and form-encoded), the usage query API, MCP -- is
+    untouched by that ADR and stays on `request_json`/`request_raw`.
+    """
+    encoded = None
+    if body is not None:
+        encoded = cbor_min.encode(body)
+
+    req = urllib.request.Request(url=url, method=method, data=encoded)
+    req.add_header("Accept", "application/cbor")
+    if body is not None:
+        req.add_header("Content-Type", "application/cbor")
+    if headers:
+        for key, value in headers.items():
+            req.add_header(key, value)
+
+    if ssl_context is not None:
+        context = ssl_context
+    else:
+        context = INSECURE_TLS if insecure_tls else None
+    with urllib.request.urlopen(req, timeout=30, context=context) as response:
+        payload = response.read()
+        response_headers = dict(response.headers.items())
+        if not payload:
+            return response.status, {}, response_headers
+        return response.status, cbor_min.decode(payload), response_headers
 
 
 def request_json(
@@ -279,7 +318,7 @@ def ensure_account(authz_headers: dict, token: str) -> str:
     provisioned", and the id is the subject.
     """
     try:
-        status, account, _ = request_json(
+        status, account, _ = request_rpc(
             "POST",
             f"{API_URL}/rpc/procedure.createAccount",
             {"args": {}},
@@ -378,8 +417,10 @@ def main() -> int:
         billing_identity = f"it-servers-{uuid.uuid4().hex[:12]}"
 
         # authz-api migrated to cratestack RPC transport (ADR-0003): CRUD dispatches via
-        # POST /rpc/{op_id}. A mapped op with no bearer is rejected by the coarse RBAC gate with 401
-        # (fail-closed) before dispatch.
+        # POST /rpc/{op_id}, CBOR-only since ADR-0013 (see `request_rpc`/`cbor_min.py`). A mapped
+        # op with no bearer is rejected by the coarse RBAC gate with 401 (fail-closed) before
+        # dispatch -- that gate runs before codec/Content-Type validation, so the plain
+        # JSON-encoded probe body below still exercises the right thing.
         expect_http_error(
             401,
             method="POST",
@@ -393,7 +434,7 @@ def main() -> int:
         log(f"api create-account passed ({account_id})")
 
         project_client_id = "c" + uuid.uuid4().hex[:24]
-        status, project, _ = request_json(
+        status, project, _ = request_rpc(
             "POST",
             f"{API_URL}/rpc/model.Project.create",
             {
@@ -412,7 +453,7 @@ def main() -> int:
         assert status == 201, f"create project failed: status={status}, body={project}"
         project_id = project["id"]
 
-        status, key_payload, _ = request_json(
+        status, key_payload, _ = request_rpc(
             "POST",
             f"{API_URL}/rpc/procedure.createApiKey",
             {"args": {"projectId": project_id, "name": "it-servers-key", "billingPlan": "free"}},

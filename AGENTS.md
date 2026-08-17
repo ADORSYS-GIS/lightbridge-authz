@@ -531,13 +531,28 @@ Local non-container config example:
 
 Key config fields:
 
-- `server.api`: address/port/tls paths
-- `server.api.codec` (name indicative — see `config/default.yaml`/container config for the exact key): selects the wire codec (`json` or `cbor`) for `authz-api`'s CRUD endpoints; production defaults to CBOR, dev/CI config keeps `json`. Scoped to `authz-api` only — `authz-opa`, the usage service, and the MCP server always speak JSON.
+- `server.api`: address/port/tls paths — carries no codec key; see below.
 - `server.opa`: address/port/tls paths + basic auth credentials
 - `server.usage`: address/port/tls paths for usage service
 - `database.url`: Postgres connection string
 - `oauth2.jwks_url`: JWKS endpoint (Keycloak in local compose)
 - `redis.url`: mandatory for `authz-api`, `authz-idp`, `authz-budget` — see below.
+
+### CBOR is the only transport codec for the RPC/CRUD surface (ADR-0013)
+
+`authz-api`'s CRUD/RPC surface and `authz-budget`'s RPC surface (both `cratestack::schema::axum::rpc_router`
+instances, `crates/lightbridge-authz-rest/src/lib.rs`) accept **only** `application/cbor`, via
+`LenientCborCodec` (`codec.rs` — normalizes wire-level `undefined` to `null`, see its doc comment).
+There is no `server.api.codec`/environment-driven codec config — never was, despite an ADR-0003
+section once describing one; it is a code-level decision, not a config value, so there is nothing to
+set in `config/default.yaml`, `.docker/authz/container.yaml`, or `ai-helm-values`. Sending
+`application/json` gets `415 Unsupported Media Type`.
+
+Excluded, each for a different external reason (ADR-0013 Decision 3 has the full evidence): OPA/
+Authorino endpoints (Authorino dictates the format), the usage service's OTLP ingest (spec'd
+protocol), `lightbridge-mcp` (MCP streamable HTTP is spec'd JSON-RPC, a different SDK entirely), and
+discovery/JWKS/`/oauth2/token`/`/oauth2/revoke` on both `authz-api` and `authz-idp` (RFC-mandated
+JSON, plain `axum::Json` handlers that never touched cratestack's codec to begin with).
 
 ### Redis is a mandatory dependency for authz-api / authz-idp / authz-budget
 

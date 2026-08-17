@@ -44,6 +44,10 @@ services:
         condition: service_started
     volumes:
       - "./.docker/it/authorino_it.py:/it/authorino_it.py:ro"
+      # ADR-0013: authz-api's RPC surface is CBOR-only now, so this script needs a CBOR codec to
+      # call it directly (see cbor_min.py's own module doc for why this is hand-rolled rather than
+      # a pip-installed dependency).
+      - "./.docker/it/cbor_min.py:/it/cbor_min.py:ro"
     environment:
       KEYCLOAK_URL: "http://keycloak:9100"
       API_URL: "https://authz-api:3000"
@@ -72,6 +76,9 @@ services:
         condition: service_started
     volumes:
       - "./.docker/it/servers_it.py:/it/servers_it.py:ro"
+      # ADR-0013: authz-api's/authz-budget's RPC surfaces are CBOR-only now (see cbor_min.py's own
+      # module doc for why this is hand-rolled rather than a pip-installed dependency).
+      - "./.docker/it/cbor_min.py:/it/cbor_min.py:ro"
       # Read-only access to the local CA + a CA-signed leaf (api.crt/api.key) so this test runner
       # can present a client certificate against authz-usage's mTLS-required query listener
       # (#347), the same way authz-api itself does (usage_service.client_cert_path/client_key_path

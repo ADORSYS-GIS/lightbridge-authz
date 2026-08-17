@@ -32,10 +32,7 @@ use rpc_authorize::{RpcAuthorizeState, RpcScope};
 
 use cratestack::idempotency::IdempotencyLayer;
 use cratestack::ratelimit::{RateLimitConfig, RateLimitLayer, RateLimitStore};
-use cratestack::{
-    CodecSet, CoolContext, CoolError, DEFAULT_BODY_LIMIT_BYTES, SqlxIdempotencyStore, Value,
-};
-use cratestack_codec_json::JsonCodec;
+use cratestack::{CoolContext, CoolError, DEFAULT_BODY_LIMIT_BYTES, SqlxIdempotencyStore, Value};
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait};
@@ -1681,12 +1678,15 @@ pub fn build_api_router(
         public = public.merge(token_exchange::token_exchange_router(te_state));
     }
 
-    // Generated RPC CRUD surface. Codec: a single `CodecSet` accepting both wire formats, dispatched
-    // on request `Content-Type` — CBOR primary (production default) with JSON secondary so
-    // `curl`/dev/CI stay usable on the same router instance (ADR-0003, "CBOR in production, JSON in
-    // dev/CI"; the ADR explicitly blesses the single-CodecSet form). Primary is `LenientCborCodec`,
-    // not the raw `cratestack_codec_cbor::CborCodec` — see `codec.rs` for why (CBOR clients that
-    // encode JS `undefined` as wire-level `undefined` instead of omitting the key, e.g. `cborg`).
+    // Generated RPC CRUD surface. Codec: CBOR is the ONLY wire format this router serves — no JSON
+    // fallback (ADR-0013, "CBOR is the only transport codec", reversing ADR-0003's "CBOR in
+    // production, JSON in dev/CI" split; a config-selected/environment-split codec is exactly the
+    // "tested path != shipped path" gap that produced two prod-only bugs invisible to a green CI).
+    // `LenientCborCodec`, not the raw `cratestack_codec_cbor::CborCodec` — see `codec.rs` for why
+    // (CBOR clients that encode JS `undefined` as wire-level `undefined` instead of omitting the
+    // key, e.g. `cborg`). A single `CoolCodec` implementor satisfies `rpc_router`'s transport bound
+    // directly via cratestack-axum's blanket `impl<C: CoolCodec> HttpTransport for C` — no
+    // `CodecSet` wrapper needed once there is only one codec to serve.
     // The coarse RBAC gate (docs/rbac.md) that cratestack's membership `@@allow` policies do not
     // express. Applied as the OUTERMOST layer so an unauthorized caller is rejected with 403 before
     // consuming idempotency/rate-limit budget or reaching cratestack's dispatch; the membership
@@ -1702,7 +1702,7 @@ pub fn build_api_router(
             review_service,
             budget_repo,
         ),
-        CodecSet::new(LenientCborCodec::default(), JsonCodec),
+        LenientCborCodec::default(),
         CratestackAuthProvider::new(bearer.clone(), RpcScope::Crud),
         // cratestack 0.7.12 (#413) made this request-body-size bound an explicit parameter instead
         // of an axum implementation detail. `DEFAULT_BODY_LIMIT_BYTES` (2 MiB) is the value the
@@ -2234,7 +2234,7 @@ pub fn build_budget_router(
             review_service,
             budget_repo,
         ),
-        CodecSet::new(LenientCborCodec::default(), JsonCodec),
+        LenientCborCodec::default(),
         CratestackAuthProvider::new(bearer.clone(), RpcScope::Budget),
         DEFAULT_BODY_LIMIT_BYTES,
     )

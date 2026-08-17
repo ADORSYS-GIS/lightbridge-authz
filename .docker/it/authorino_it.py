@@ -10,6 +10,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import cbor_min
+
 
 KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL", "http://keycloak:9100").rstrip("/")
 API_URL = os.environ.get("API_URL", "https://authz-api:3000").rstrip("/")
@@ -54,6 +56,37 @@ def request_json(
         if not payload:
             return resp.status, {}
         return resp.status, json.loads(payload.decode("utf-8"))
+
+
+def request_rpc(
+    method: str,
+    url: str,
+    body=None,
+    headers=None,
+    insecure_tls: bool = False,
+):
+    """Like `request_json`, but for `authz-api`'s `/rpc/*` surface, which speaks CBOR only
+    post-ADR-0013 (see `cbor_min.py`'s module doc). Everything else this script calls -- health
+    probes, Keycloak, OPA's introspect (form-encoded, unrelated to this codec) -- stays on
+    `request_json`/`post_form`.
+    """
+    encoded = None
+    if body is not None:
+        encoded = cbor_min.encode(body)
+    req = urllib.request.Request(url=url, method=method, data=encoded)
+    req.add_header("Accept", "application/cbor")
+    if body is not None:
+        req.add_header("Content-Type", "application/cbor")
+    if headers:
+        for k, v in headers.items():
+            req.add_header(k, v)
+
+    context = INSECURE_TLS if insecure_tls else None
+    with urllib.request.urlopen(req, timeout=30, context=context) as resp:
+        payload = resp.read()
+        if not payload:
+            return resp.status, {}
+        return resp.status, cbor_min.decode(payload)
 
 
 def post_form(url: str, form_data: dict, headers=None, insecure_tls: bool = False):
@@ -127,7 +160,7 @@ def ensure_account(authz_headers: dict, token: str) -> str:
     and the id is the subject.
     """
     try:
-        status, account = request_json(
+        status, account = request_rpc(
             "POST",
             f"{API_URL}/rpc/procedure.createAccount",
             {"args": {}},
@@ -151,16 +184,17 @@ def main() -> int:
         authz_headers = {"Authorization": f"Bearer {token}"}
 
         # authz-api migrated to cratestack RPC transport (ADR-0003): CRUD is dispatched via
-        # POST /rpc/{op_id} with the codec-encoded input as the body. The router serves JSON and
-        # CBOR from one CodecSet, so plain JSON works here. Model verbs use camelCase field names
-        # (the generated schema struct fields); the `Json` columns carry cratestack's own externally
-        # tagged `Value` enum, so `{}` is `{"Map": {}}` and a string list is `{"List": [...]}`.
+        # POST /rpc/{op_id} with the codec-encoded input as the body. The router serves CBOR only
+        # (ADR-0013 -- the JSON secondary codec was removed), so this script talks CBOR via
+        # `request_rpc`/`cbor_min.py`. Model verbs use camelCase field names (the generated schema
+        # struct fields); the `Json` columns carry cratestack's own externally tagged `Value` enum,
+        # so `{}` is `{"Map": {}}` and a string list is `{"List": [...]}`.
         billing_identity = f"acme-it-{uuid.uuid4().hex[:12]}"
         account_id = ensure_account(authz_headers, token)
         log(f"using account {account_id}")
 
         project_client_id = "c" + uuid.uuid4().hex[:24]
-        status, project = request_json(
+        status, project = request_rpc(
             "POST",
             f"{API_URL}/rpc/model.Project.create",
             {
@@ -180,7 +214,7 @@ def main() -> int:
         project_id = project["id"]
         log(f"created project {project_id}")
 
-        status, key_payload = request_json(
+        status, key_payload = request_rpc(
             "POST",
             f"{API_URL}/rpc/procedure.createApiKey",
             {"args": {"projectId": project_id, "name": "it-key", "billingPlan": "free"}},

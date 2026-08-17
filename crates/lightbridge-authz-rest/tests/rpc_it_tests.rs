@@ -4,12 +4,14 @@
 // for shipping code.
 #![allow(clippy::unwrap_used)]
 
-//! Live-database integration tests for the cratestack RPC CRUD surface (ADR-0003). Gated behind
-//! `it-tests` and `just it-tests` (needs a migrated Postgres via `DATABASE_URL` *and* Redis via
-//! `AUTHZ_REDIS_URL`/localhost, both reached by the assembled `build_api_router`).
+//! Live-database integration tests for the cratestack RPC CRUD surface (ADR-0003/ADR-0013). Gated
+//! behind `it-tests` and `just it-tests` (needs a migrated Postgres via `DATABASE_URL` *and* Redis
+//! via `AUTHZ_REDIS_URL`/localhost, both reached by the assembled `build_api_router`).
 //!
 //! Covers, over the real HTTP RPC transport:
-//!   * full create/read/update/delete/list for accounts/projects/api-keys, over JSON **and** CBOR;
+//!   * full create/read/update/delete/list for accounts/projects/api-keys, over CBOR — the only
+//!     wire format the router accepts post-ADR-0013 (`Wire::Json` still exists in `common` but only
+//!     as a negative-path probe, see `json_content_type_is_rejected` below);
 //!   * the RBAC gate end-to-end (admin succeeds on every mapped op; a viewer who is a legitimate
 //!     account member still 403s on writes but 200s on reads) — the privilege-escalation regression;
 //!   * the soft-delete + `api_key_validation`-view security fix (a soft-deleted key must not
@@ -38,11 +40,9 @@ use common::{
     MapBearer, Wire, admin_perms, as_json, external_oauth2, rpc_call, token_info, viewer_perms,
 };
 use cratestack::SqlxIdempotencyStore;
-use cratestack::{
-    CodecSet, DEFAULT_BODY_LIMIT_BYTES, Json, Value as CValue, ratelimit::RateLimitStore,
-};
+use cratestack::{DEFAULT_BODY_LIMIT_BYTES, Json, Value as CValue, ratelimit::RateLimitStore};
 use cratestack_codec_cbor::CborCodec;
-use cratestack_codec_json::JsonCodec;
+use cratestack_core::CoolCodec;
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::BearerTokenServiceTrait;
@@ -242,17 +242,18 @@ fn admin_bearer(subject: &str) -> Arc<dyn BearerTokenServiceTrait> {
     Arc::new(MapBearer::new().with("admin", token_info(subject, admin_perms())))
 }
 
-/// Decode a JSON RPC success body into `serde_json::Value`.
+/// Decode a CBOR RPC success body into `serde_json::Value` (CBOR is the only wire format the
+/// router accepts post-ADR-0013 — see `common::Wire`).
 fn json_body(bytes: &[u8]) -> Value {
-    serde_json::from_slice(bytes).expect("valid json body")
+    Wire::Cbor.decode(bytes)
 }
 
-/// Create an account over RPC (JSON) and return its id, asserting 200.
+/// Create an account over RPC and return its id, asserting 200.
 async fn create_account(router: &Router, token: &str, _unused: &str) -> String {
     let (status, body) = rpc_call(
         router.clone(),
         "procedure.createAccount",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": {} }),
         Some(token),
     )
@@ -297,14 +298,14 @@ fn project_input(
     }
 }
 
-/// Create a project over RPC (JSON) and return its id, asserting 200.
+/// Create a project over RPC and return its id, asserting 200.
 async fn create_project(router: &Router, token: &str, account_id: &str, name: &str) -> String {
     let project_id = cuid2();
     let input = project_input(&project_id, account_id, name, None);
     let (status, body) = rpc_call(
         router.clone(),
         "model.Project.create",
-        Wire::Json,
+        Wire::Cbor,
         &input,
         Some(token),
     )
@@ -320,7 +321,7 @@ async fn create_project(router: &Router, token: &str, account_id: &str, name: &s
         .to_string()
 }
 
-/// Create an api-key over RPC (JSON) and return (key_id, secret), asserting 200.
+/// Create an api-key over RPC and return (key_id, secret), asserting 200.
 async fn create_api_key(
     router: &Router,
     token: &str,
@@ -330,7 +331,7 @@ async fn create_api_key(
     let (status, body) = rpc_call(
         router.clone(),
         "procedure.createApiKey",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "projectId": project_id, "name": name, "billingPlan": "free" } }),
         Some(token),
     )
@@ -348,11 +349,11 @@ async fn create_api_key(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Section 2: full CRUD lifecycle over the RPC router, JSON and CBOR.
+// Section 2: full CRUD lifecycle over the RPC router (CBOR — the only wire format post-ADR-0013).
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn crud_lifecycle_for_all_resources_over_json() {
+async fn crud_lifecycle_for_all_resources() {
     let subject = format!("owner-{}", cuid2());
     let ctx = setup(admin_bearer(&subject)).await;
     let r = &ctx.router;
@@ -364,7 +365,7 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.Account.get",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": account_id }),
         Some("admin"),
     )
@@ -375,7 +376,7 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.Account.list",
-        Wire::Json,
+        Wire::Cbor,
         &json!({}),
         Some("admin"),
     )
@@ -398,7 +399,7 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.Account.update",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": account_id, "patch": { "defaultQuota": new_billing } }),
         Some("admin"),
     )
@@ -412,7 +413,7 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.get",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": project_id }),
         Some("admin"),
     )
@@ -423,7 +424,7 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.list",
-        Wire::Json,
+        Wire::Cbor,
         &json!({}),
         Some("admin"),
     )
@@ -445,7 +446,7 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.update",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": project_id, "patch": { "name": "proj-renamed" } }),
         Some("admin"),
     )
@@ -459,7 +460,7 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.ApiKey.get",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": key_id }),
         Some("admin"),
     )
@@ -474,7 +475,7 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.ApiKey.list",
-        Wire::Json,
+        Wire::Cbor,
         &json!({}),
         Some("admin"),
     )
@@ -491,7 +492,7 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.ApiKey.update",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": key_id, "patch": { "name": "k-renamed" } }),
         Some("admin"),
     )
@@ -502,7 +503,7 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     let (status, _) = rpc_call(
         r.clone(),
         "model.ApiKey.delete",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": key_id }),
         Some("admin"),
     )
@@ -512,7 +513,7 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.ApiKey.list",
-        Wire::Json,
+        Wire::Cbor,
         &json!({}),
         Some("admin"),
     )
@@ -535,7 +536,7 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     let (status, _) = rpc_call(
         r.clone(),
         "model.Project.delete",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": second_project_id }),
         Some("admin"),
     )
@@ -552,7 +553,7 @@ async fn crud_lifecycle_for_all_resources_over_json() {
     let (status, _) = rpc_call(
         r.clone(),
         "procedure.deleteAccountPermanently",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "accountId": account_id } }),
         Some("admin"),
     )
@@ -601,7 +602,7 @@ async fn list_projects_tolerates_legacy_jsonb_null_allowed_models() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.list",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "filters": [{ "key": "accountId", "value": account_id }] }),
         Some("admin"),
     )
@@ -667,7 +668,7 @@ async fn list_projects_tolerates_legacy_plain_empty_default_limits() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.list",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "filters": [{ "key": "accountId", "value": account_id }] }),
         Some("admin"),
     )
@@ -730,7 +731,7 @@ async fn list_and_get_recover_from_legacy_cratestack_tagged_value_json() {
             rpc_call(
                 r,
                 "model.Project.get",
-                Wire::Json,
+                Wire::Cbor,
                 &json!({ "id": project_id }),
                 Some("admin"),
             )
@@ -798,7 +799,7 @@ async fn list_projects_filtered_by_a_cuid2_account_id_is_accepted() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.list",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "filters": [{ "key": "accountId", "value": account_id }] }),
         Some("admin"),
     )
@@ -819,6 +820,59 @@ async fn list_projects_filtered_by_a_cuid2_account_id_is_accepted() {
     assert!(
         returned.contains(&project_id.as_str()),
         "the accountId-filtered list must return the created project; got {returned:?}"
+    );
+}
+
+/// Proves the ADR-0013 cutover, not just documents it: a well-formed request encoded with
+/// `Wire::Json` — the format this router served as a secondary codec before ADR-0013, and the
+/// format dev/CI defaulted to under the old, now-removed `server.api.codec` split — must now be
+/// refused, never dispatched. Without this test, a regression that accidentally re-widens the
+/// router back to a `CodecSet` would show up as nothing louder than "an extra content type is now
+/// accepted" — silent from every other test in this file, since they all speak CBOR.
+///
+/// Two distinct rejections, both proven: `rpc_call`/`Wire::Json` sets *both* `Content-Type` and
+/// `Accept` to `application/json`, and cratestack-axum's header validation checks `Accept` first
+/// (`validate_codec_request_headers` → `validate_accept_header` then `validate_content_type_header`,
+/// `cratestack-axum` 0.7.16's `codec/headers.rs`), so that combination fails on the *response*
+/// codec with `406 Not Acceptable` before the *request* codec is ever consulted — not the `415`
+/// intuition would suggest. The second call isolates the request-codec half specifically (a valid
+/// `Accept: application/cbor` paired with an invalid `Content-Type: application/json`), which does
+/// reach `415 Unsupported Media Type`. A regression that silently re-added JSON to only one side
+/// (encoder or decoder) would still be caught by whichever of these two continues to pass.
+#[tokio::test]
+async fn json_content_type_is_rejected() {
+    let subject = format!("owner-json-rejected-{}", cuid2());
+    let ctx = setup(admin_bearer(&subject)).await;
+    let r = &ctx.router;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.createAccount",
+        Wire::Json,
+        &json!({ "args": {} }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_ACCEPTABLE,
+        "a caller asking for a JSON response must be refused outright, not dispatched: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/rpc/procedure.createAccount")
+        .header("content-type", "application/json")
+        .header("accept", "application/cbor")
+        .header("authorization", "Bearer admin")
+        .body(Body::from(Wire::Json.encode(&json!({ "args": {} }))))
+        .unwrap();
+    let response = r.clone().oneshot(request).await.expect("router responds");
+    assert_eq!(
+        response.status(),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "a JSON-encoded request body must be refused outright, not dispatched"
     );
 }
 
@@ -1052,7 +1106,7 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.addProjectMember",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "projectId": project_id, "accountId": viewer_subject } }),
         Some("admin"),
     )
@@ -1075,7 +1129,7 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
         ("model.Project.list", json!({})),
         ("model.Account.get", json!({ "id": viewer_account_id })),
     ] {
-        let (status, body) = rpc_call(r.clone(), op, Wire::Json, &input, Some("viewer")).await;
+        let (status, body) = rpc_call(r.clone(), op, Wire::Cbor, &input, Some("viewer")).await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -1091,7 +1145,7 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.Account.get",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": account_id }),
         Some("viewer"),
     )
@@ -1129,7 +1183,7 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
             json!({ "args": { "accountId": account_id } }),
         ),
     ] {
-        let (status, _) = rpc_call(r.clone(), op, Wire::Json, &input, Some("viewer")).await;
+        let (status, _) = rpc_call(r.clone(), op, Wire::Cbor, &input, Some("viewer")).await;
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,
@@ -1141,7 +1195,7 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
     let (status, _) = rpc_call(
         r.clone(),
         "model.Account.update",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": account_id, "patch": { "defaultQuota": format!("t-{}", cuid2()) } }),
         Some("admin"),
     )
@@ -1230,7 +1284,7 @@ async fn soft_deleted_api_key_is_excluded_and_fails_opa_validation() {
     let (status, _) = rpc_call(
         r.clone(),
         "model.ApiKey.delete",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": key_id }),
         Some("admin"),
     )
@@ -1416,7 +1470,7 @@ async fn audit_rows_land_on_create_update_delete_for_an_audited_model() {
     let (status, _) = rpc_call(
         r.clone(),
         "model.Project.update",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": project_id, "patch": { "name": "renamed" } }),
         Some("admin"),
     )
@@ -1430,7 +1484,7 @@ async fn audit_rows_land_on_create_update_delete_for_an_audited_model() {
     let (status, _) = rpc_call(
         r.clone(),
         "model.Project.delete",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": second_project_id }),
         Some("admin"),
     )
@@ -1458,7 +1512,7 @@ async fn audit_rows_land_on_create_update_delete_for_an_audited_model() {
     let (status, _) = rpc_call(
         r.clone(),
         "model.ApiKey.delete",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": key_id }),
         Some("admin"),
     )
@@ -1480,7 +1534,7 @@ async fn idempotent_replay_does_not_double_a_mutation() {
     let ctx = setup(admin_bearer(&subject)).await;
     let r = &ctx.router;
 
-    let body = Wire::Json.encode(&json!({ "args": {} }));
+    let body = Wire::Cbor.encode(&json!({ "args": {} }));
     let idem_key = format!("idem-{}", cuid2());
 
     let send = |body: Vec<u8>, key: String| {
@@ -1489,8 +1543,8 @@ async fn idempotent_replay_does_not_double_a_mutation() {
             let request = Request::builder()
                 .method("POST")
                 .uri("/rpc/procedure.createAccount")
-                .header("content-type", "application/json")
-                .header("accept", "application/json")
+                .header("content-type", Wire::Cbor.content_type())
+                .header("accept", Wire::Cbor.content_type())
                 .header("authorization", "Bearer admin")
                 .header("idempotency-key", key)
                 .body(Body::from(body))
@@ -1558,7 +1612,7 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
             ctx.review_service.clone(),
             ctx.budget_repo.clone(),
         ),
-        CodecSet::new(CborCodec, JsonCodec),
+        CborCodec,
         CratestackAuthProvider::new(admin_bearer(&subject), RpcScope::Crud),
         DEFAULT_BODY_LIMIT_BYTES,
     );
@@ -1573,10 +1627,10 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
             Request::builder()
                 .method("POST")
                 .uri("/rpc/batch")
-                .header("content-type", "application/json")
-                .header("accept", "application/json")
+                .header("content-type", "application/cbor")
+                .header("accept", "application/cbor")
                 .header("authorization", "Bearer admin")
-                .body(Body::from(serde_json::to_vec(&batch).unwrap()))
+                .body(Body::from(CborCodec.encode(&batch).expect("cbor encode")))
                 .unwrap(),
         )
         .await
@@ -1589,8 +1643,9 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
         "batch envelope must be 200"
     );
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let frames: Vec<Value> =
-        serde_json::from_slice(&bytes).expect("batch response is a frame array");
+    let frames: Vec<Value> = CborCodec
+        .decode(&bytes)
+        .expect("batch response is a cbor frame array");
     assert_eq!(frames.len(), 2);
 
     let frame1 = frames.iter().find(|f| f["id"] == 1).expect("frame 1");
@@ -1644,7 +1699,7 @@ async fn batch_rpc_frames_enforce_permission_per_frame() {
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.addProjectMember",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "projectId": project_id, "accountId": viewer_subject } }),
         Some("admin"),
     )
@@ -1667,10 +1722,10 @@ async fn batch_rpc_frames_enforce_permission_per_frame() {
             Request::builder()
                 .method("POST")
                 .uri("/rpc/batch")
-                .header("content-type", "application/json")
-                .header("accept", "application/json")
+                .header("content-type", Wire::Cbor.content_type())
+                .header("accept", Wire::Cbor.content_type())
                 .header("authorization", "Bearer viewer")
-                .body(Body::from(serde_json::to_vec(&batch).unwrap()))
+                .body(Body::from(Wire::Cbor.encode(&batch)))
                 .unwrap(),
         )
         .await
@@ -1682,8 +1737,7 @@ async fn batch_rpc_frames_enforce_permission_per_frame() {
         "batch envelope must be 200 even though one frame is forbidden"
     );
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let frames: Vec<Value> =
-        serde_json::from_slice(&bytes).expect("batch response is a frame array");
+    let frames: Vec<Value> = Wire::Cbor.decode(&bytes);
     assert_eq!(frames.len(), 2);
 
     let read_frame = frames.iter().find(|f| f["id"] == 1).expect("frame 1");
@@ -1730,7 +1784,7 @@ async fn create_account_seeds_membership_enabling_project_create() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.create",
-        Wire::Json,
+        Wire::Cbor,
         &stranger_input,
         Some("stranger"),
     )
@@ -1773,7 +1827,7 @@ async fn account_has_no_default_protection_and_is_freely_suspendable_and_hard_de
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.disableAccount",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "accountId": account_id } }),
         Some("admin"),
     )
@@ -1791,7 +1845,7 @@ async fn account_has_no_default_protection_and_is_freely_suspendable_and_hard_de
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.deleteAccountPermanently",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "accountId": account_id } }),
         Some("admin"),
     )
@@ -1817,7 +1871,7 @@ async fn default_project_cannot_be_hard_deleted_only_suspended() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.get",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": project_id }),
         Some("admin"),
     )
@@ -1832,7 +1886,7 @@ async fn default_project_cannot_be_hard_deleted_only_suspended() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.delete",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": project_id }),
         Some("admin"),
     )
@@ -1847,7 +1901,7 @@ async fn default_project_cannot_be_hard_deleted_only_suspended() {
     let (status, _) = rpc_call(
         r.clone(),
         "model.Project.get",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": project_id }),
         Some("admin"),
     )
@@ -1862,7 +1916,7 @@ async fn default_project_cannot_be_hard_deleted_only_suspended() {
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.disableProject",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "projectId": project_id } }),
         Some("admin"),
     )
@@ -1880,7 +1934,7 @@ async fn default_project_cannot_be_hard_deleted_only_suspended() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.get",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": second_project_id }),
         Some("admin"),
     )
@@ -1894,7 +1948,7 @@ async fn default_project_cannot_be_hard_deleted_only_suspended() {
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.delete",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": second_project_id }),
         Some("admin"),
     )
@@ -1927,7 +1981,7 @@ async fn promoting_a_second_project_to_default_frees_the_old_default_for_deletio
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.get",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": first_project_id }),
         Some("admin"),
     )
@@ -1938,7 +1992,7 @@ async fn promoting_a_second_project_to_default_frees_the_old_default_for_deletio
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.setDefaultProject",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "projectId": second_project_id } }),
         Some("admin"),
     )
@@ -1956,7 +2010,7 @@ async fn promoting_a_second_project_to_default_frees_the_old_default_for_deletio
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.get",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": first_project_id }),
         Some("admin"),
     )
@@ -1972,7 +2026,7 @@ async fn promoting_a_second_project_to_default_frees_the_old_default_for_deletio
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.delete",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": first_project_id }),
         Some("admin"),
     )
@@ -1988,7 +2042,7 @@ async fn promoting_a_second_project_to_default_frees_the_old_default_for_deletio
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.delete",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "id": second_project_id }),
         Some("admin"),
     )
@@ -2014,7 +2068,7 @@ async fn a_second_account_for_the_same_subject_is_refused() {
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.createAccount",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": {} }),
         Some("admin"),
     )
@@ -2029,7 +2083,7 @@ async fn a_second_account_for_the_same_subject_is_refused() {
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.deleteAccountPermanently",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "accountId": account_id } }),
         Some("admin"),
     )
@@ -2060,7 +2114,7 @@ async fn set_default_project_rejects_a_project_the_caller_is_not_a_member_of() {
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.setDefaultProject",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "projectId": project_id } }),
         Some("stranger"),
     )
@@ -2141,7 +2195,7 @@ async fn revoke_own_sessions_revokes_only_the_callers_sessions() {
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.revokeOwnSessions",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": {} }),
         Some("caller"),
     )
@@ -2152,7 +2206,7 @@ async fn revoke_own_sessions_revokes_only_the_callers_sessions() {
         "body: {}",
         String::from_utf8_lossy(&body)
     );
-    let parsed = as_json(Wire::Json, &body);
+    let parsed = as_json(Wire::Cbor, &body);
     assert_eq!(
         parsed["revokedCount"], 2,
         "must report exactly the two sessions it revoked: {parsed}"
@@ -2187,7 +2241,7 @@ async fn revoke_own_sessions_without_permission_is_forbidden() {
     let (status, _) = rpc_call(
         r.clone(),
         "procedure.revokeOwnSessions",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": {} }),
         Some("caller"),
     )
@@ -2232,7 +2286,7 @@ async fn revoke_subject_sessions_admin_revokes_target_others_get_403() {
     let (status, _) = rpc_call(
         r.clone(),
         "procedure.revokeSubjectSessions",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "accountId": target } }),
         Some("editor"),
     )
@@ -2251,7 +2305,7 @@ async fn revoke_subject_sessions_admin_revokes_target_others_get_403() {
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.revokeSubjectSessions",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "accountId": target } }),
         Some("admin"),
     )
@@ -2262,7 +2316,7 @@ async fn revoke_subject_sessions_admin_revokes_target_others_get_403() {
         "body: {}",
         String::from_utf8_lossy(&body)
     );
-    let parsed = as_json(Wire::Json, &body);
+    let parsed = as_json(Wire::Cbor, &body);
     assert_eq!(
         parsed["revokedCount"], 3,
         "the offboarding kill switch must report the true count: {parsed}"
@@ -2287,7 +2341,7 @@ async fn revoke_subject_sessions_reports_zero_when_nothing_is_active() {
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.revokeSubjectSessions",
-        Wire::Json,
+        Wire::Cbor,
         &json!({ "args": { "accountId": target } }),
         Some("admin"),
     )
@@ -2298,7 +2352,7 @@ async fn revoke_subject_sessions_reports_zero_when_nothing_is_active() {
         "body: {}",
         String::from_utf8_lossy(&body)
     );
-    let parsed = as_json(Wire::Json, &body);
+    let parsed = as_json(Wire::Cbor, &body);
     assert_eq!(parsed["revokedCount"], 0);
 }
 
@@ -2348,7 +2402,7 @@ async fn viewer_and_editor_can_self_provision_their_own_account() {
         let (status, body) = rpc_call(
             ctx.router.clone(),
             "procedure.createAccount",
-            Wire::Json,
+            Wire::Cbor,
             &json!({ "args": {} }),
             Some("caller"),
         )
@@ -2368,7 +2422,7 @@ async fn viewer_and_editor_can_self_provision_their_own_account() {
         let (status, body) = rpc_call(
             ctx.router.clone(),
             "procedure.createAccount",
-            Wire::Json,
+            Wire::Cbor,
             &json!({ "args": {} }),
             Some("caller"),
         )
@@ -2430,7 +2484,7 @@ async fn budget_gated_op_ids_are_unreachable_on_authz_api_even_for_an_admin() {
         let (status, body) = rpc_call(
             ctx.router.clone(),
             op,
-            Wire::Json,
+            Wire::Cbor,
             &json!({}),
             Some("admin"),
         )
@@ -2454,7 +2508,7 @@ async fn budget_gated_op_ids_are_unreachable_on_authz_api_even_for_an_admin() {
     let (status, body) = rpc_call(
         ctx.router.clone(),
         "batch",
-        Wire::Json,
+        Wire::Cbor,
         &json!(frames),
         Some("admin"),
     )
@@ -2466,7 +2520,7 @@ async fn budget_gated_op_ids_are_unreachable_on_authz_api_even_for_an_admin() {
          deeper: {}",
         String::from_utf8_lossy(&body)
     );
-    let parsed = as_json(Wire::Json, &body);
+    let parsed = as_json(Wire::Cbor, &body);
     let results = parsed.as_array().expect("batch results array");
     assert_eq!(results.len(), MOVED_BUDGET_OP_IDS.len());
     for (op, frame) in MOVED_BUDGET_OP_IDS.iter().zip(results) {

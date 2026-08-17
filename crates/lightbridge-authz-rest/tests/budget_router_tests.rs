@@ -157,7 +157,7 @@ async fn rpc_call<T: serde::Serialize + ?Sized>(
     body: &T,
     token: Option<&str>,
 ) -> (StatusCode, Vec<u8>) {
-    rpc_call_at(router, BUDGET_BASE_PATH, op_id, Wire::Json, body, token).await
+    rpc_call_at(router, BUDGET_BASE_PATH, op_id, Wire::Cbor, body, token).await
 }
 
 // ---------------------------------------------------------------------------------------------
