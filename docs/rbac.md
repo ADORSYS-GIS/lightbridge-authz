@@ -229,7 +229,7 @@ per-frame RBAC" above describes for the permission check.
 | `budget:policy-simulate` | `procedure.simulateBudgetPolicy`                | — (no MCP tool yet)                 |
 | `budget:self-refill`     | `procedure.requestBudgetRefill`                 | — (no MCP tool yet)                 |
 | `budget:review`          | `procedure.listPendingAugmentationRequests`, `procedure.approveAugmentationRequest`, `procedure.rejectAugmentationRequest` | — (no MCP tool yet) |
-| `budget:read-own`        | `procedure.getMyBudgetBalance`, `procedure.listMyBudgetGrants` | — (no MCP tool yet)         |
+| `budget:read-own`        | `procedure.getMyBudgetBalance`, `procedure.listMyBudgetGrants`, `procedure.listMyAugmentationRequests` | — (no MCP tool yet) |
 | `budget:read`            | `procedure.getBudgetBalance`                    | — (no MCP tool yet)                 |
 | `budget:audit-read`      | `procedure.listBudgetGrants`                    | — (no MCP tool yet)                 |
 | `budget:grant`           | `procedure.grantBudget`                         | — (no MCP tool yet)                 |
@@ -351,17 +351,20 @@ to real `op_id`s. Before this, `budget_balances` (maintained transactionally on 
 `revokeOwnSessions`/`revokeSubjectSessions` already established for session revocation, rather than
 one procedure with an optional/defaulted target:
 
-- `procedure.getMyBudgetBalance` / `procedure.listMyBudgetGrants` take no target subject or account
-  at all — the target is always the caller's own budget account, mirroring
-  `RevokeOwnSessionsInput` having no subject field. Gated at **`budget:read-own`**, a permission
-  added specifically for this: granting the existing `budget:read`/`budget:audit-read` broadly so
-  every caller could see their own budget would also let them read every OTHER account's budget —
-  exactly the "quietly conflating self and admin access" a permission review should catch. Reading
-  your own balance/history is a read-only capability with no spend risk, so `budget:read-own` is
-  granted to every default role (`lightbridge-admin` via `*`, and explicitly to `lightbridge-editor`
-  and `lightbridge-viewer` in the shipped configs), the same posture `session:revoke-own` already
-  has and unlike `budget:self-refill` (which spends budget and so is withheld from
-  `lightbridge-viewer`).
+- `procedure.getMyBudgetBalance` / `procedure.listMyBudgetGrants` / `procedure.
+  listMyAugmentationRequests` take no target subject or account at all — the target is always the
+  caller's own budget account, mirroring `RevokeOwnSessionsInput` having no subject field. Gated
+  at **`budget:read-own`**, a permission added specifically for this: granting the existing
+  `budget:read`/`budget:audit-read` broadly so every caller could see their own budget would also
+  let them read every OTHER account's budget — exactly the "quietly conflating self and admin
+  access" a permission review should catch. Reading your own balance/history is a read-only
+  capability with no spend risk, so `budget:read-own` is granted to every default role
+  (`lightbridge-admin` via `*`, and explicitly to `lightbridge-editor` and `lightbridge-viewer` in
+  the shipped configs), the same posture `session:revoke-own` already has and unlike
+  `budget:self-refill` (which spends budget and so is withheld from `lightbridge-viewer`).
+  `listMyAugmentationRequests` (#295) is the caller's own `AugmentationRequest` history across
+  EVERY status — not filtered to `pending_review` the way `listPendingAugmentationRequests` is,
+  and not reviewer-scoped.
 - `procedure.getBudgetBalance` / `procedure.listBudgetGrants` take an explicit `budgetAccountId`
   and read ANY account's balance/ledger. Gated at the admin **`budget:read`** /
   **`budget:audit-read`** respectively — reading a balance and reading the full ledger history
@@ -370,10 +373,15 @@ one procedure with an optional/defaulted target:
   (which bundles list + act into one permission). Neither default role holds these; only
   `lightbridge-admin` (via `*`) can read another account's budget.
 
-`listMyBudgetGrants`/`listBudgetGrants` paginate strictly by `createdAt`, never by id (ADR-0039 —
-CUID2 has no defined ordering): the response's `nextCursor` is the last entry's `createdAt`, passed
-back as `before` to page further into the past; a short page (fewer than the requested `limit`)
-means there is nothing further.
+`listMyBudgetGrants`/`listBudgetGrants`/`listMyAugmentationRequests` paginate strictly by
+`createdAt`, never by id (ADR-0039 — CUID2 has no defined ordering): the response's `nextCursor` is
+the last entry's `createdAt`; a short page (fewer than the requested `limit`) means there is
+nothing further. `listMyAugmentationRequests` passes its cursor back as `before` (newest-first,
+matching `listMyBudgetGrants`/`listBudgetGrants`'s own convention) — but `listPendingAugmentationRequests`
+(#296) is the one exception: it keeps its pre-existing oldest-first order (a review queue, not a
+ledger — the longest-waiting request surfaces first), so its cursor is `after`, not `before`. See
+`authz.cstack`'s `ListPendingAugmentationRequestsInput`/`ListMyAugmentationRequestsInput` doc
+comments for the full reasoning.
 
 **Admin grant/revoke** (`procedure.grantBudget` / `procedure.revokeBudgetGrant`, gated at
 **`budget:grant`** / **`budget:revoke`**) delegate to the exact same transactional write path

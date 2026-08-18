@@ -638,6 +638,7 @@ async fn budget_gated_op_ids_are_unreachable_on_authz_api_regardless_of_permissi
         "procedure.rejectAugmentationRequest",
         "procedure.getMyBudgetBalance",
         "procedure.listMyBudgetGrants",
+        "procedure.listMyAugmentationRequests",
         "procedure.getBudgetBalance",
         "procedure.listBudgetGrants",
         "procedure.grantBudget",

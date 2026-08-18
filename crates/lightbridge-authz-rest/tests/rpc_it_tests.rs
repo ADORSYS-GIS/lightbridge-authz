@@ -2442,12 +2442,13 @@ async fn viewer_and_editor_can_self_provision_their_own_account() {
 // ---------------------------------------------------------------------------------------------
 
 /// Every op-id `rpc_authorize.rs`'s `required_permission` map gates on a `budget:*` permission
-/// (the 14 procedures enumerated in `docs/architecture/budget.md`). Hand-copied here deliberately
-/// -- unlike the hermetic `rpc_authorize.rs`-internal unit tests, which re-derive this list from
-/// the map itself, this integration test exists specifically to catch drift between "what the map
-/// says is a budget op" and "what the real router, wired exactly like production, actually
-/// refuses" -- a hand-copied list is the point, not a shortcut.
-const MOVED_BUDGET_OP_IDS: [&str; 14] = [
+/// (the 15 procedures enumerated in `docs/architecture/budget.md` -- `procedure.
+/// listMyAugmentationRequests` added by #295). Hand-copied here deliberately -- unlike the
+/// hermetic `rpc_authorize.rs`-internal unit tests, which re-derive this list from the map
+/// itself, this integration test exists specifically to catch drift between "what the map says
+/// is a budget op" and "what the real router, wired exactly like production, actually refuses"
+/// -- a hand-copied list is the point, not a shortcut.
+const MOVED_BUDGET_OP_IDS: [&str; 15] = [
     "procedure.activateBudgetPolicy",
     "procedure.getBudgetPolicyStatus",
     "procedure.simulateBudgetPolicy",
@@ -2457,6 +2458,7 @@ const MOVED_BUDGET_OP_IDS: [&str; 14] = [
     "procedure.rejectAugmentationRequest",
     "procedure.getMyBudgetBalance",
     "procedure.listMyBudgetGrants",
+    "procedure.listMyAugmentationRequests",
     "procedure.getBudgetBalance",
     "procedure.listBudgetGrants",
     "procedure.grantBudget",

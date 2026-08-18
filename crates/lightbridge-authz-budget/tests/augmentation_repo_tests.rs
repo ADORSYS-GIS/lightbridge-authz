@@ -554,3 +554,91 @@ async fn list_pending_review_pages_oldest_first_by_created_at(pool: PgPool) {
         "the final page must return exactly the one remaining, newest request"
     );
 }
+
+/// #295: `list_by_budget_account` returns every request for one account regardless of status --
+/// the gap `listPendingAugmentationRequests` (pending-only) leaves -- newest-first, paginated by
+/// `created_at` with a `before` cursor, matching `BudgetRepo::list_grants`'s own convention.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_by_budget_account_returns_every_status_newest_first_and_paginates(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    let repo = AugmentationRepo::new(Arc::new(DbPool::from_pool(pool)));
+
+    let first = repo
+        .create(base_new_request(&account_id, 10_000_000))
+        .await
+        .expect("create must succeed");
+    repo.record_decision(&first.id, denied_decision())
+        .await
+        .expect("must move to denied");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let second = repo
+        .create(base_new_request(&account_id, 20_000_000))
+        .await
+        .expect("create must succeed");
+    repo.record_decision(&second.id, pending_review_decision())
+        .await
+        .expect("must move to pending_review");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let third = repo
+        .create(base_new_request(&account_id, 30_000_000))
+        .await
+        .expect("create must succeed, left in `created` status");
+
+    let page1 = repo
+        .list_by_budget_account(&account_id, None, 2)
+        .await
+        .expect("first page must succeed");
+    assert_eq!(page1.len(), 2, "page size must be respected");
+    assert_eq!(
+        page1.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+        vec![third.id.clone(), second.id.clone()],
+        "must return the two newest requests first, regardless of status: {page1:?}"
+    );
+
+    let cursor = page1[1].created_at;
+    let page2 = repo
+        .list_by_budget_account(&account_id, Some(cursor), 2)
+        .await
+        .expect("second page must succeed");
+    assert_eq!(
+        page2.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+        vec![first.id.clone()],
+        "the second page must return exactly the one remaining, oldest (denied) request"
+    );
+}
+
+/// A caller with no requests at all -- or another account's own history alone -- must never leak
+/// another account's requests. Proves `list_by_budget_account` scopes strictly by
+/// `budget_account_id`, the same isolation `list_pending_review_scopes_to_one_account_when_given_an_id`
+/// already proves for the admin queue's optional scoping.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_by_budget_account_does_not_leak_another_accounts_requests(pool: PgPool) {
+    let account_a = cuid2();
+    let account_b = cuid2();
+    insert_account(&pool, &account_a).await;
+    insert_account(&pool, &account_b).await;
+
+    let repo = AugmentationRepo::new(Arc::new(DbPool::from_pool(pool)));
+
+    let request_a = repo
+        .create(base_new_request(&account_a, 30_000_000))
+        .await
+        .expect("create must succeed");
+
+    repo.create(base_new_request(&account_b, 30_000_000))
+        .await
+        .expect("create must succeed");
+
+    let scoped = repo
+        .list_by_budget_account(&account_a, None, 200)
+        .await
+        .expect("scoped listing must succeed");
+
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].id, request_a.id);
+    assert_eq!(scoped[0].budget_account_id, account_a);
+}

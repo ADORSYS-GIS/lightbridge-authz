@@ -714,6 +714,32 @@ type ListPendingAugmentationRequestsInput {
 procedure listPendingAugmentationRequests(args: ListPendingAugmentationRequestsInput): AugmentationRequestPage
   @allow(auth() != null)
 
+// A caller's own `AugmentationRequest` history (#295's remaining half -- `getMyBudgetBalance`/
+// `listMyBudgetGrants` shipped the balance/ledger half in PR #325). Returns every request the
+// caller has ever submitted, in ANY status (`pending_review`, `auto_approved`, `approved`,
+// `denied`, ...) -- not scoped to `pending_review` the way `listPendingAugmentationRequests` is,
+// and not reviewer-only. No target field at all, the same structural guarantee
+// `getMyBudgetBalance`/`listMyBudgetGrants` already give: the target is always the caller's own
+// budget account (`auth().id`), never a caller-supplied id, which is what makes it structurally
+// impossible for this procedure to read anyone else's requests. Gated at `budget:read-own`
+// (`Permission::BudgetReadOwn`), not `budget:review` -- seeing your own request history is the
+// same "see your own budget" capability `getMyBudgetBalance`/`listMyBudgetGrants` already gate
+// there, not the reviewer capability.
+//
+// Paginated the same shape as `listPendingAugmentationRequests` above (`AugmentationRequestPage`,
+// cursor by `createdAt`, never by id per ADR-0039) but ordered newest-first with a `before`
+// cursor, matching `listMyBudgetGrants`/`listBudgetGrants`'s own convention exactly -- unlike the
+// admin queue above, there is no pre-existing "oldest-first" contract for this brand-new
+// procedure to preserve, so it follows the closest sibling precedent (the other `budget:read-own`
+// list procedure) rather than the admin queue's ASC/`after` shape.
+type ListMyAugmentationRequestsInput {
+  before DateTime?
+  limit Int?
+}
+
+procedure listMyAugmentationRequests(args: ListMyAugmentationRequestsInput): AugmentationRequestPage
+  @allow(auth() != null)
+
 // Approves a `pending_review` request: grants the requested amount and records the outcome
 // (`ReviewService::approve`). Concurrency-safe against a racing `approve`/`reject` on the same
 // `requestId` -- see that method's own doc comment for the advisory-lock design. Gated at

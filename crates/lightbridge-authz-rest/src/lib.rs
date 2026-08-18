@@ -238,17 +238,20 @@ fn to_schema_augmentation_request(
     }
 }
 
-/// Default/max page size for `listPendingAugmentationRequests` (#296). Mirrors
-/// [`DEFAULT_BUDGET_GRANTS_PAGE_SIZE`]/[`MAX_BUDGET_GRANTS_PAGE_SIZE`] exactly -- same reasoning:
-/// this procedure layer's own default when a caller omits `limit`, and its own tighter ceiling
-/// when a caller supplies one, independent of whatever `AugmentationRepo` additionally clamps
-/// to.
+/// Default/max page size for `listPendingAugmentationRequests`/`listMyAugmentationRequests`
+/// (#296/#295). Mirrors [`DEFAULT_BUDGET_GRANTS_PAGE_SIZE`]/[`MAX_BUDGET_GRANTS_PAGE_SIZE`]
+/// exactly -- same reasoning: this procedure layer's own default when a caller omits `limit`,
+/// and its own tighter ceiling when a caller supplies one, independent of whatever
+/// `AugmentationRepo` additionally clamps to.
 const DEFAULT_AUGMENTATION_REQUESTS_PAGE_SIZE: i64 = 20;
 const MAX_AUGMENTATION_REQUESTS_PAGE_SIZE: i64 = 50;
 
 /// Resolves a caller-supplied, optional `limit` into a page size clamped to
 /// `[1, MAX_AUGMENTATION_REQUESTS_PAGE_SIZE]`, defaulting to
-/// [`DEFAULT_AUGMENTATION_REQUESTS_PAGE_SIZE`] when omitted.
+/// [`DEFAULT_AUGMENTATION_REQUESTS_PAGE_SIZE`] when omitted. Shared by
+/// `listPendingAugmentationRequests` and `listMyAugmentationRequests` -- both page the same
+/// `AugmentationRequest` entity, just in opposite directions (see each procedure's own doc
+/// comment).
 fn resolve_augmentation_requests_page_size(limit: Option<i64>) -> i64 {
     match limit {
         Some(requested) => requested.clamp(1, MAX_AUGMENTATION_REQUESTS_PAGE_SIZE),
@@ -257,9 +260,12 @@ fn resolve_augmentation_requests_page_size(limit: Option<i64>) -> i64 {
 }
 
 /// Maps one page of domain [`lightbridge_authz_budget::AugmentationRequest`] rows into the
-/// schema's `AugmentationRequestPage` (#296), mirroring `list_budget_grants_page`'s own
+/// schema's `AugmentationRequestPage` (#296/#295), mirroring `list_budget_grants_page`'s own
 /// `nextCursor` rule: the last entry's `createdAt` when the page came back exactly `page_size`
-/// long (there may be more), `None` when it came back short (nothing further).
+/// long (there may be more), `None` when it came back short (nothing further). This works
+/// identically regardless of which direction the underlying query walked (ASC for
+/// `listPendingAugmentationRequests`, DESC for `listMyAugmentationRequests`) -- "the last entry
+/// in this page" is always the correct cursor to continue that same walk, whichever way it goes.
 fn to_schema_augmentation_request_page(
     requests: Vec<lightbridge_authz_budget::AugmentationRequest>,
     page_size: i64,
@@ -1229,6 +1235,46 @@ impl schema::procedures::ProcedureRegistry for Procedures {
             let page_size = resolve_augmentation_requests_page_size(input.limit);
             let requests = review_service
                 .list_pending(input.budgetAccountId.as_deref(), input.after, page_size)
+                .await
+                .map_err(budget_error_to_cool_error)?;
+
+            Ok(to_schema_augmentation_request_page(requests, page_size))
+        }
+    }
+
+    /// The caller's own request history (#295's remaining half), delegating to
+    /// [`lightbridge_authz_budget::RefillService::list_own_history`]. No target field on this
+    /// input at all -- the target is always the caller's own budget account (`auth().id`), the
+    /// same structural IDOR guard `getMyBudgetBalance`/`listMyBudgetGrants` already give. Returns
+    /// every status, not filtered to `pending_review` the way
+    /// `listPendingAugmentationRequests` is. Gated at `budget:read-own`.
+    ///
+    /// Paginated by `createdAt`, newest-first, cursored via `before` -- matching
+    /// `listMyBudgetGrants`/`listBudgetGrants`'s own convention exactly (see
+    /// `authz.cstack`'s `ListMyAugmentationRequestsInput` doc comment for why this, unlike the
+    /// admin queue above, follows that precedent rather than the ASC/`after` shape).
+    fn list_my_augmentation_requests(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CoolContext,
+        args: schema::procedures::list_my_augmentation_requests::Args,
+        _authorized: schema::procedures::list_my_augmentation_requests::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::list_my_augmentation_requests::Output,
+            CoolError,
+        >,
+    > + Send {
+        let refill_service = self.refill_service.clone();
+        let subject = subject_from_ctx(ctx);
+        let input = args.args;
+        async move {
+            let subject =
+                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+
+            let page_size = resolve_augmentation_requests_page_size(input.limit);
+            let requests = refill_service
+                .list_own_history(&subject, input.before, page_size)
                 .await
                 .map_err(budget_error_to_cool_error)?;
 

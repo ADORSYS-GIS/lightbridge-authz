@@ -175,6 +175,26 @@ async fn list_pending(
     .await
 }
 
+async fn list_my(
+    procedures: &Procedures,
+    db: &schema::Cratestack,
+    ctx: &CoolContext,
+    args: schema::procedures::list_my_augmentation_requests::Args,
+) -> Result<schema::procedures::list_my_augmentation_requests::Output, CoolError> {
+    let call_args = args.clone();
+    schema::procedures::list_my_augmentation_requests::invoke_with_db(
+        db,
+        &args,
+        ctx,
+        |authorized| async move {
+            procedures
+                .list_my_augmentation_requests(db, ctx, call_args, authorized)
+                .await
+        },
+    )
+    .await
+}
+
 async fn approve(
     procedures: &Procedures,
     db: &schema::Cratestack,
@@ -247,6 +267,15 @@ fn list_pending_args_paged(
             after,
             limit,
         },
+    }
+}
+
+fn list_my_args(
+    before: Option<chrono::DateTime<chrono::Utc>>,
+    limit: Option<i64>,
+) -> schema::procedures::list_my_augmentation_requests::Args {
+    schema::procedures::list_my_augmentation_requests::Args {
+        args: schema::ListMyAugmentationRequestsInput { before, limit },
     }
 }
 
@@ -599,5 +628,96 @@ async fn list_pending_augmentation_requests_paginates_oldest_first(pool: PgPool)
     assert!(
         page2.nextCursor.is_none(),
         "a short page must report no further cursor"
+    );
+}
+
+/// #295: `listMyAugmentationRequests` returns the caller's own history across every status --
+/// not just `pending_review` -- newest-first.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_my_augmentation_requests_returns_own_history_across_statuses_newest_first(
+    pool: PgPool,
+) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let (procedures, ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let db = lazy_cratestack_db();
+
+    // The seeded default policy auto-approves the first two self-service refills per period, then
+    // queues the third -- so three plain calls (no pre-seeded grants) produce two distinct
+    // statuses without any direct repo access.
+    let mut submitted = Vec::new();
+    for _ in 0..3 {
+        let created = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
+            .await
+            .expect("request must succeed (auto-approved or queued, never erroring)");
+        submitted.push(created);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(submitted[0].status, "auto_approved");
+    assert_eq!(submitted[1].status, "auto_approved");
+    assert_eq!(
+        submitted[2].status, "pending_review",
+        "the third refill this period must exhaust the auto-approve allowance"
+    );
+
+    let history = list_my(&procedures, &db, &ctx, list_my_args(None, None))
+        .await
+        .expect("listing own history must succeed");
+
+    assert_eq!(
+        history.entries.len(),
+        3,
+        "every request must be returned regardless of status: {:?}",
+        history.entries
+    );
+    assert_eq!(
+        history
+            .entries
+            .iter()
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            submitted[2].id.clone(),
+            submitted[1].id.clone(),
+            submitted[0].id.clone(),
+        ],
+        "must be newest-first"
+    );
+    assert_eq!(history.entries[0].status, "pending_review");
+    assert_eq!(history.entries[1].status, "auto_approved");
+}
+
+/// The IDOR guard #295 explicitly calls for: `listMyAugmentationRequests` takes no target
+/// account/subject field at all, so a second caller with their own (empty) history must never see
+/// the first caller's requests -- proven here, not merely asserted from the schema shape.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_my_augmentation_requests_does_not_leak_another_callers_requests(pool: PgPool) {
+    let owner_id = cuid2();
+    let bystander_id = cuid2();
+    insert_account(&pool, &owner_id).await;
+    insert_account(&pool, &bystander_id).await;
+    let (procedures, owner_ctx, _budget_repo) = procedures_and_ctx(pool, &owner_id).await;
+    let bystander_ctx = ctx_for(&bystander_id);
+    let db = lazy_cratestack_db();
+
+    let created = request_refill(&procedures, &db, &owner_ctx, refill_args(&owner_id, None))
+        .await
+        .expect("owner's own refill request must succeed");
+
+    let owner_history = list_my(&procedures, &db, &owner_ctx, list_my_args(None, None))
+        .await
+        .expect("owner listing their own history must succeed");
+    assert!(
+        owner_history.entries.iter().any(|r| r.id == created.id),
+        "the owner must see their own request"
+    );
+
+    let bystander_history = list_my(&procedures, &db, &bystander_ctx, list_my_args(None, None))
+        .await
+        .expect("bystander listing their own (empty) history must succeed");
+    assert!(
+        bystander_history.entries.is_empty(),
+        "a caller with no requests of their own must never see another account's: {:?}",
+        bystander_history.entries
     );
 }

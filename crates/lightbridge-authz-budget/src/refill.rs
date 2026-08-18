@@ -94,6 +94,24 @@ impl RefillService {
         }
     }
 
+    /// The caller's own request history (#295's remaining half -- `getMyBudgetBalance`/
+    /// `listMyBudgetGrants` shipped the balance/ledger half in PR #325). Thin delegation to
+    /// [`AugmentationRepo::list_by_budget_account`], placed on `RefillService` rather than
+    /// [`crate::review::ReviewService`] -- this is a read over requests a caller made through
+    /// *this* service's [`Self::request_refill`], not the reviewer-facing queue `ReviewService`
+    /// wraps. Every status is returned, not filtered to `pending_review` the way
+    /// [`crate::review::ReviewService::list_pending`] is.
+    pub async fn list_own_history(
+        &self,
+        budget_account_id: &str,
+        before: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<AugmentationRequest>, BudgetError> {
+        self.augmentation_repo
+            .list_by_budget_account(budget_account_id, before, limit)
+            .await
+    }
+
     /// Resolves the tier an account is currently on for `period`, from the most recent
     /// tier-representing grant (see [`LATEST_TIER_GRANT_AMOUNT_SQL`]'s doc comment for exactly
     /// which sources count). A plain read against `budget_grants`, not routed through

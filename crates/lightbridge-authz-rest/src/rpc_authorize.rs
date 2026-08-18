@@ -202,6 +202,10 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         // comments on these four procedures for the full self-vs-admin reasoning.
         "procedure.getMyBudgetBalance" => BudgetReadOwn,
         "procedure.listMyBudgetGrants" => BudgetReadOwn,
+        // The caller's own augmentation-request history (#295), the same `budget:read-own`
+        // capability as the pair above -- not `budget:review`, which is the reviewer/admin
+        // capability `listPendingAugmentationRequests` gates.
+        "procedure.listMyAugmentationRequests" => BudgetReadOwn,
         "procedure.getBudgetBalance" => BudgetRead,
         "procedure.listBudgetGrants" => BudgetAuditRead,
         // Direct admin grant/revoke, bypassing self-service policy evaluation entirely.
@@ -398,6 +402,10 @@ mod tests {
             ("procedure.revokeSubjectSessions", Permission::SessionRevoke),
             ("procedure.getMyBudgetBalance", Permission::BudgetReadOwn),
             ("procedure.listMyBudgetGrants", Permission::BudgetReadOwn),
+            (
+                "procedure.listMyAugmentationRequests",
+                Permission::BudgetReadOwn,
+            ),
             ("procedure.getBudgetBalance", Permission::BudgetRead),
             ("procedure.listBudgetGrants", Permission::BudgetAuditRead),
             ("procedure.grantBudget", Permission::BudgetGrant),
@@ -485,14 +493,18 @@ mod tests {
         assert_eq!(extract_bearer(&headers), None);
     }
 
-    /// The exact 14 op-ids moved off `authz-api` onto `authz-budget` (derived from the
+    /// The exact 15 op-ids moved off `authz-api` onto `authz-budget` (derived from the
     /// `budget:*`-permission entries in `required_permission` above — this is the same list the
     /// PR description enumerates as "derived from the code", not from memory). If a future PR
-    /// adds a 15th `budget:*` op-id and forgets to add it here, `all_and_only_the_budget_gated_op_ids_are_in_budget_scope`
+    /// adds a 16th `budget:*` op-id and forgets to add it here, `all_and_only_the_budget_gated_op_ids_are_in_budget_scope`
     /// below still passes for it automatically (since it re-derives from `required_permission`
     /// instead of this literal), but this list existing at all is what lets a reviewer diff "the
     /// procedures that moved" without re-deriving them by hand.
-    const BUDGET_OP_IDS: [&str; 14] = [
+    ///
+    /// `procedure.listMyAugmentationRequests` (#295) is the 15th entry, added alongside the
+    /// original 14 -- it is a `budget:read-own` op-id like `getMyBudgetBalance`/
+    /// `listMyBudgetGrants` above it, so it was always going to land in this scope.
+    const BUDGET_OP_IDS: [&str; 15] = [
         "procedure.activateBudgetPolicy",
         "procedure.getBudgetPolicyStatus",
         "procedure.simulateBudgetPolicy",
@@ -502,6 +514,7 @@ mod tests {
         "procedure.rejectAugmentationRequest",
         "procedure.getMyBudgetBalance",
         "procedure.listMyBudgetGrants",
+        "procedure.listMyAugmentationRequests",
         "procedure.getBudgetBalance",
         "procedure.listBudgetGrants",
         "procedure.grantBudget",
@@ -510,7 +523,7 @@ mod tests {
     ];
 
     #[test]
-    fn is_budget_op_id_recognizes_exactly_the_fourteen_moved_procedures() {
+    fn is_budget_op_id_recognizes_exactly_the_fifteen_moved_procedures() {
         for op_id in BUDGET_OP_IDS {
             assert!(is_budget_op_id(op_id), "{op_id} must be a budget op-id");
         }

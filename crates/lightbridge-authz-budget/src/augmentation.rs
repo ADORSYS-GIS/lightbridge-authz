@@ -320,9 +320,27 @@ const REQUEST_LIST_PENDING_REVIEW_SQL: &str = "SELECT id, budget_account_id, acc
      ORDER BY created_at ASC \
      LIMIT $3";
 
-/// Upper bound on [`AugmentationRepo::list_pending_review`]'s page size, independent of whatever
-/// the RPC procedure layer additionally defaults/clamps to -- mirrors [`crate::repo::BudgetRepo`]'s
-/// own `MAX_LIST_GRANTS_LIMIT`. This repo method must never be made to scan an unbounded page
+// The caller's own request history (#295): every request for one `budget_account_id`, ANY
+// status -- unlike [`REQUEST_LIST_PENDING_REVIEW_SQL`] this has no `status = 'pending_review'`
+// filter at all. Ordered DESC/newest-first with an exclusive `before` cursor (`created_at < $2`),
+// matching `crate::repo::LIST_GRANTS_SQL`'s own convention exactly (see that query's doc
+// comment) -- this is a brand-new procedure with no pre-existing ordering contract to preserve,
+// so it follows the closest sibling precedent rather than the admin queue's ASC/`after` shape
+// above.
+const REQUEST_LIST_BY_BUDGET_ACCOUNT_SQL: &str = "SELECT id, budget_account_id, account_id, \
+     project_id, period, requested_tier, requested_amount_micros, status, policy_effect, \
+     policy_reason_codes, matched_rule_ids, policy_revision, approved_amount_micros, grant_id, \
+     idempotency_key, reviewed_by, rejection_reason, created_at, reviewed_at \
+     FROM budget_augmentation_requests \
+     WHERE budget_account_id = $1 \
+       AND ($2::timestamptz IS NULL OR created_at < $2) \
+     ORDER BY created_at DESC \
+     LIMIT $3";
+
+/// Upper bound on [`AugmentationRepo::list_pending_review`]/[`AugmentationRepo::
+/// list_by_budget_account`]'s page size, independent of whatever the RPC procedure layer
+/// additionally defaults/clamps to -- mirrors [`crate::repo::BudgetRepo`]'s own
+/// `MAX_LIST_GRANTS_LIMIT`. This repo method must never be made to scan an unbounded page
 /// regardless of what a caller (procedure or test) asks for.
 const MAX_LIST_REQUESTS_LIMIT: i64 = 200;
 
@@ -604,6 +622,33 @@ impl AugmentationRepo {
         let rows: Vec<AugmentationRequestRow> = sqlx::query_as(REQUEST_LIST_PENDING_REVIEW_SQL)
             .bind(budget_account_id)
             .bind(after)
+            .bind(clamped_limit)
+            .fetch_all(self.pool())
+            .await
+            .map_err(storage_failed)?;
+
+        rows.into_iter()
+            .map(AugmentationRequest::try_from)
+            .collect()
+    }
+
+    /// The caller's own request history (#295): every request for `budget_account_id`, in ANY
+    /// status -- not filtered to `pending_review` the way [`Self::list_pending_review`] is.
+    /// Newest-first, paginated by `created_at` ONLY (ADR-0039 -- never by id), with the same
+    /// `[1, MAX_LIST_REQUESTS_LIMIT]` clamp `list_pending_review` applies. `before`, when
+    /// supplied, returns rows strictly older than it -- the caller's cursor to page further into
+    /// the past, matching [`crate::repo::BudgetRepo::list_grants`]'s own `before` semantics.
+    pub async fn list_by_budget_account(
+        &self,
+        budget_account_id: &str,
+        before: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<AugmentationRequest>, BudgetError> {
+        let clamped_limit = limit.clamp(1, MAX_LIST_REQUESTS_LIMIT);
+
+        let rows: Vec<AugmentationRequestRow> = sqlx::query_as(REQUEST_LIST_BY_BUDGET_ACCOUNT_SQL)
+            .bind(budget_account_id)
+            .bind(before)
             .bind(clamped_limit)
             .fetch_all(self.pool())
             .await

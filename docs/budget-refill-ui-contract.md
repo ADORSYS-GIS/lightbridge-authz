@@ -6,7 +6,7 @@ this repo's PRs cannot produce the screenshot evidence #191's own Verification s
 that story for the full picture. This doc orients a frontend engineer on the RPC shapes and the
 behaviors that need explicit copy, without duplicating the schema.
 
-**⚠️ Breaking change: these four RPCs, and every other `budget:*`-gated procedure, moved off
+**⚠️ Breaking change: these five RPCs, and every other `budget:*`-gated procedure, moved off
 `authz-api` onto a separate `authz-budget` service, mounted under a fixed `/budget` path prefix
 (`POST /budget/rpc/{op_id}` instead of `POST /rpc/{op_id}`) — see
 [`docs/architecture/budget.md`](./architecture/budget.md#service-boundary-authz-budget-hard-cutover).
@@ -16,13 +16,14 @@ second cratestack client instance configured with `authz-budget`'s base URL + `/
 see the tracking issue filed in `ADORSYS-GIS/converse-frontends` for the exact URLs.**
 
 Source of truth: `crates/lightbridge-authz-api/schema/authz.cstack` (search for
-`AugmentationRequest`, `requestBudgetRefill`, `listPendingAugmentationRequests`,
-`approveAugmentationRequest`, `rejectAugmentationRequest`) is the authoritative field list. This doc
-explains what those fields *mean*; if it and the schema ever disagree, the schema wins.
+`AugmentationRequest`, `AugmentationRequestPage`, `requestBudgetRefill`,
+`listPendingAugmentationRequests`, `approveAugmentationRequest`, `rejectAugmentationRequest`,
+`listMyAugmentationRequests`) is the authoritative field list. This doc explains what those fields
+*mean*; if it and the schema ever disagree, the schema wins.
 
-## The four RPCs
+## The five RPCs
 
-All four require a bearer token (OIDC user session token). None accept an "act on behalf of"
+All five require a bearer token (OIDC user session token). None accept an "act on behalf of"
 parameter — the reviewing/requesting identity is always the authenticated caller.
 
 ### `requestBudgetRefill` — self-service ask for more budget
@@ -58,11 +59,21 @@ happen.
 ```
 procedure listPendingAugmentationRequests(args: {
   budgetAccountId?: string
-}): AugmentationRequest[]
+  after?: string          // cursor: an ISO-8601 `createdAt`, from a previous call's `nextCursor`
+  limit?: number           // defaults to 20, clamped to a max of 50
+}): AugmentationRequestPage   // { entries: AugmentationRequest[], nextCursor?: string }
 ```
 
 Omit `budgetAccountId` (or pass `null`) for the whole cross-account queue (an admin's global view);
 pass a specific account id to scope to one account. Requires `budget:review`.
+
+**Paginated, oldest-first** (⚠️ this queue keeps its pre-existing order — it is a FIFO queue, not a
+ledger, so the longest-waiting request surfaces first, unchanged by adding pagination). Omitting
+`after`/`limit` entirely reproduces the exact pre-pagination "whole queue from the start" behavior,
+just capped to one page. To fetch the next page, pass the previous response's `nextCursor` back as
+`after`; `nextCursor` is `null`/absent once there is nothing further. Note the cursor field is
+`after`, not `before` — deliberately different from `listMyAugmentationRequests` below, because this
+list walks oldest-to-newest while that one walks newest-to-oldest.
 
 ### `approveAugmentationRequest` — approve a queued request
 
@@ -89,6 +100,26 @@ mutation rejectAugmentationRequest(args: {
 `reason` is mandatory — the form must not let a reviewer submit a rejection with an empty reason
 field. The server validates this too (both in the schema and at the service layer), but a
 client-side check gives the reviewer immediate feedback instead of a round-trip error.
+
+### `listMyAugmentationRequests` — the caller's own request history (read)
+
+```
+procedure listMyAugmentationRequests(args: {
+  before?: string          // cursor: an ISO-8601 `createdAt`, from a previous call's `nextCursor`
+  limit?: number            // defaults to 20, clamped to a max of 50
+}): AugmentationRequestPage    // { entries: AugmentationRequest[], nextCursor?: string }
+```
+
+No target field at all — always the signed-in caller's own history, in **every** status
+(`pending_review`, `auto_approved`, `approved`, `denied`, ...), not just the still-queued requests
+`listPendingAugmentationRequests` returns. This is the "did my refill go through" screen: a user
+who submitted a refill and navigated away can come back and see what happened to it, without
+needing `budget:review`. Requires `budget:read-own` — the same permission `getMyBudgetBalance`/
+`listMyBudgetGrants` use, granted to every default role including `lightbridge-viewer`.
+
+**Paginated, newest-first**, matching `listMyBudgetGrants`'s own convention: pass the previous
+response's `nextCursor` back as `before` to page further into the past; `nextCursor` is
+`null`/absent once there is nothing further.
 
 ## Response shape: `AugmentationRequest`
 
@@ -125,7 +156,7 @@ for anything that gets sent back to an API.
 | `denied` | Refused — either by policy (e.g. already at the top rung) or by a human reviewer. | If `rejectionReason` is present, show it verbatim (a human rejected it). If not, this was a policy-level refusal (e.g. `policyReasonCodes` contains `"already_at_top_rung"`) — show a clear, specific message from your own reason-code copy table, not a generic "denied". |
 | `approved` | A queued request was approved by a reviewer and granted. | Same messaging as `auto_approved`/`partially_approved` — from the end user's perspective these all mean "you got more budget," just via different paths. |
 | `created` / `evaluating` | Transient states the RPC surface should never actually return to a caller (every procedure here only returns after evaluation/review has completed) — if you see one, treat it as unexpected and log it, don't build a screen for it. |
-| `cancelled` / `expired` / `applied` | Not reachable through any of the four RPCs in this PR — reserved for later phases (queue expiry, the Phase 6a/6b gateway-apply step). No UI needed yet. |
+| `cancelled` / `expired` / `applied` | Not produced by `requestBudgetRefill`/`approveAugmentationRequest`/`rejectAugmentationRequest` (the only RPCs that write a status) — reserved for later phases (queue expiry, the Phase 6a/6b gateway-apply step). `listMyAugmentationRequests` would surface one if it ever existed, but none can today. No UI needed yet. |
 
 ## Two behaviors that will look like bugs and are not
 
