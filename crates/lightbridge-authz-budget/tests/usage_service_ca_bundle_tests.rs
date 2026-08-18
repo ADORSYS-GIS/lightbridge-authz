@@ -22,7 +22,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use lightbridge_authz_budget::{Period, Spend, SpendReader, UsageServiceSpendReader};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, SanType,
+    Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::Once;
@@ -41,7 +41,10 @@ fn period() -> Period {
 }
 
 /// A self-signed CA certificate, proper `basicConstraints`/`keyUsage` CA extensions included.
-fn gen_ca(common_name: &str) -> (Certificate, KeyPair) {
+/// Returns the `Issuer` alongside the `Certificate` (rcgen 0.14's `signed_by` takes an
+/// `&Issuer`, built from `CertificateParams` + signing key, not a bare `&Certificate`/`&KeyPair`
+/// pair -- a `Certificate` alone does not expose the params needed to reconstruct one).
+fn gen_ca(common_name: &str) -> (Certificate, Issuer<'static, KeyPair>) {
     let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .expect("ECDSA P-256 key generation must succeed");
     let mut params =
@@ -54,13 +57,14 @@ fn gen_ca(common_name: &str) -> (Certificate, KeyPair) {
     let cert = params
         .self_signed(&key)
         .expect("self-signing a CA cert must succeed");
-    (cert, key)
+    let issuer = Issuer::new(params, key);
+    (cert, issuer)
 }
 
-/// A leaf certificate for `localhost`/`127.0.0.1`, signed by `issuer_cert`/`issuer_key`, with the
+/// A leaf certificate for `localhost`/`127.0.0.1`, signed by `issuer`, with the
 /// `serverAuth` EKU and an `authorityKeyIdentifier` extension real TLS stacks expect, and a
 /// 31-day validity window (well under Apple's 825-day ATS ceiling for leaf certificates).
-fn gen_leaf(issuer_cert: &Certificate, issuer_key: &KeyPair) -> (Certificate, KeyPair) {
+fn gen_leaf(issuer: &Issuer<'static, KeyPair>) -> (Certificate, KeyPair) {
     let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .expect("ECDSA P-256 key generation must succeed");
     let mut params = CertificateParams::new(vec!["localhost".to_string()])
@@ -81,7 +85,7 @@ fn gen_leaf(issuer_cert: &Certificate, issuer_key: &KeyPair) -> (Certificate, Ke
     params.not_before = OffsetDateTime::now_utc() - TimeDuration::days(1);
     params.not_after = OffsetDateTime::now_utc() + TimeDuration::days(31);
     let cert = params
-        .signed_by(&key, issuer_cert, issuer_key)
+        .signed_by(&key, issuer)
         .expect("signing a leaf cert with its issuer must succeed");
     (cert, key)
 }
@@ -105,16 +109,15 @@ async fn spend_query_handler() -> Json<serde_json::Value> {
 }
 
 /// Starts a real HTTPS server on an ephemeral loopback port, presenting a freshly generated
-/// `localhost`/`127.0.0.1` leaf certificate signed by `ca_cert`/`ca_key`, serving
+/// `localhost`/`127.0.0.1` leaf certificate signed by `ca_issuer`, serving
 /// `POST /usage/v1/spend/query`. Returns the bound address and the background task's handle --
 /// callers should `handle.abort()` once done.
 async fn spawn_https_server(
-    ca_cert: &Certificate,
-    ca_key: &KeyPair,
+    ca_issuer: &Issuer<'static, KeyPair>,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     ensure_rustls_provider();
 
-    let (leaf_cert, leaf_key) = gen_leaf(ca_cert, ca_key);
+    let (leaf_cert, leaf_key) = gen_leaf(ca_issuer);
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("must bind an ephemeral port");
     let addr = listener
@@ -148,8 +151,8 @@ async fn spawn_https_server(
 /// against a server presenting a cert issued by that CA.
 #[tokio::test]
 async fn valid_ca_bundle_verifies_the_server_certificate() {
-    let (ca_cert, ca_key) = gen_ca("lightbridge-test-ca");
-    let (addr, server) = spawn_https_server(&ca_cert, &ca_key).await;
+    let (ca_cert, ca_issuer) = gen_ca("lightbridge-test-ca");
+    let (addr, server) = spawn_https_server(&ca_issuer).await;
     let base_url = format!("https://{addr}");
     let ca_bundle_path = write_temp_pem(&ca_cert.pem(), "valid-ca");
 
@@ -185,9 +188,9 @@ async fn valid_ca_bundle_verifies_the_server_certificate() {
 /// wrong-CA scenario like this one could never even be constructed as a positive/negative pair.
 #[tokio::test]
 async fn server_certificate_not_signed_by_the_configured_ca_is_rejected() {
-    let (ca_cert, ca_key) = gen_ca("lightbridge-test-ca");
-    let (other_ca_cert, _other_ca_key) = gen_ca("unrelated-test-ca");
-    let (addr, server) = spawn_https_server(&ca_cert, &ca_key).await;
+    let (_ca_cert, ca_issuer) = gen_ca("lightbridge-test-ca");
+    let (other_ca_cert, _other_ca_issuer) = gen_ca("unrelated-test-ca");
+    let (addr, server) = spawn_https_server(&ca_issuer).await;
     let base_url = format!("https://{addr}");
     let wrong_ca_bundle_path = write_temp_pem(&other_ca_cert.pem(), "wrong-ca");
 
@@ -272,8 +275,8 @@ async fn malformed_ca_bundle_is_a_hard_construction_error() {
 /// certificate no configured CA vouches for, exactly as it did before `ca_bundle_path` existed.
 #[tokio::test]
 async fn insecure_skip_verify_without_a_ca_bundle_still_connects_like_local_compose() {
-    let (ca_cert, ca_key) = gen_ca("lightbridge-test-ca");
-    let (addr, server) = spawn_https_server(&ca_cert, &ca_key).await;
+    let (_ca_cert, ca_issuer) = gen_ca("lightbridge-test-ca");
+    let (addr, server) = spawn_https_server(&ca_issuer).await;
     let base_url = format!("https://{addr}");
 
     let reader =

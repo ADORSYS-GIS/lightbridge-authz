@@ -9,7 +9,7 @@ use lightbridge_authz_core::server::{
 };
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, SanType,
+    Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
@@ -285,7 +285,10 @@ fn ensure_rustls_provider_for_test() {
     });
 }
 
-fn gen_ca(common_name: &str) -> (Certificate, KeyPair) {
+/// Returns the `Issuer` alongside the `Certificate` (rcgen 0.14's `signed_by` takes an
+/// `&Issuer`, built from `CertificateParams` + signing key, not a bare `&Certificate`/`&KeyPair`
+/// pair -- a `Certificate` alone does not expose the params needed to reconstruct one).
+fn gen_ca(common_name: &str) -> (Certificate, Issuer<'static, KeyPair>) {
     let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .expect("ECDSA P-256 key generation must succeed");
     let mut params =
@@ -298,11 +301,12 @@ fn gen_ca(common_name: &str) -> (Certificate, KeyPair) {
     let cert = params
         .self_signed(&key)
         .expect("self-signing a CA cert must succeed");
-    (cert, key)
+    let issuer = Issuer::new(params, key);
+    (cert, issuer)
 }
 
-/// A `localhost`/`127.0.0.1` server leaf, `serverAuth` EKU, signed by `issuer_cert`/`issuer_key`.
-fn gen_server_leaf(issuer_cert: &Certificate, issuer_key: &KeyPair) -> (Certificate, KeyPair) {
+/// A `localhost`/`127.0.0.1` server leaf, `serverAuth` EKU, signed by `issuer`.
+fn gen_server_leaf(issuer: &Issuer<'static, KeyPair>) -> (Certificate, KeyPair) {
     let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .expect("ECDSA P-256 key generation must succeed");
     let mut params = CertificateParams::new(vec!["localhost".to_string()])
@@ -323,16 +327,16 @@ fn gen_server_leaf(issuer_cert: &Certificate, issuer_key: &KeyPair) -> (Certific
     params.not_before = OffsetDateTime::now_utc() - TimeDuration::days(1);
     params.not_after = OffsetDateTime::now_utc() + TimeDuration::days(31);
     let cert = params
-        .signed_by(&key, issuer_cert, issuer_key)
+        .signed_by(&key, issuer)
         .expect("signing a leaf cert with its issuer must succeed");
     (cert, key)
 }
 
-/// A client-identity leaf, `clientAuth` EKU, signed by `issuer_cert`/`issuer_key` -- matches the
+/// A client-identity leaf, `clientAuth` EKU, signed by `issuer` -- matches the
 /// deployed `authz-tls` cert's actual shape (confirmed against the live cluster: `kubectl -n
 /// converse get certificate authz-tls -o yaml` shows `usages: [server auth, client auth]` on one
 /// shared cert), modeled here as its own leaf for test clarity.
-fn gen_client_leaf(issuer_cert: &Certificate, issuer_key: &KeyPair) -> (Certificate, KeyPair) {
+fn gen_client_leaf(issuer: &Issuer<'static, KeyPair>) -> (Certificate, KeyPair) {
     let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .expect("ECDSA P-256 key generation must succeed");
     let mut params =
@@ -350,7 +354,7 @@ fn gen_client_leaf(issuer_cert: &Certificate, issuer_key: &KeyPair) -> (Certific
     params.not_before = OffsetDateTime::now_utc() - TimeDuration::days(1);
     params.not_after = OffsetDateTime::now_utc() + TimeDuration::days(31);
     let cert = params
-        .signed_by(&key, issuer_cert, issuer_key)
+        .signed_by(&key, issuer)
         .expect("signing a leaf cert with its issuer must succeed");
     (cert, key)
 }
@@ -366,18 +370,18 @@ fn write_temp_pem(pem: &str, label: &str) -> std::path::PathBuf {
     path
 }
 
-/// Starts a real `serve_tls` listener requiring client certs signed by `ca_cert`/`ca_key`.
+/// Starts a real `serve_tls` listener requiring client certs signed by `ca_cert`/`ca_issuer`.
 /// Returns the bound port and the background task's handle -- callers should `handle.abort()`.
 async fn spawn_mtls_serve_tls(
     ca_cert: &Certificate,
-    ca_key: &KeyPair,
+    ca_issuer: &Issuer<'static, KeyPair>,
 ) -> (
     u16,
     tokio::task::JoinHandle<Result<(), lightbridge_authz_core::Error>>,
 ) {
     ensure_rustls_provider_for_test();
 
-    let (server_leaf_cert, server_leaf_key) = gen_server_leaf(ca_cert, ca_key);
+    let (server_leaf_cert, server_leaf_key) = gen_server_leaf(ca_issuer);
     let cert_path = write_temp_pem(&server_leaf_cert.pem(), "server-leaf-cert");
     let key_path = write_temp_pem(&server_leaf_key.serialize_pem(), "server-leaf-key");
     let ca_bundle_path = write_temp_pem(&ca_cert.pem(), "client-ca");
@@ -410,8 +414,8 @@ async fn serve_tls_with_client_ca_bundle_rejects_a_connection_with_no_client_cer
         std::env::remove_var("AUTHZ_INSECURE_HTTP");
     }
 
-    let (ca_cert, ca_key) = gen_ca("lightbridge-test-ca");
-    let (port, server) = spawn_mtls_serve_tls(&ca_cert, &ca_key).await;
+    let (ca_cert, ca_issuer) = gen_ca("lightbridge-test-ca");
+    let (port, server) = spawn_mtls_serve_tls(&ca_cert, &ca_issuer).await;
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -440,10 +444,10 @@ async fn serve_tls_with_client_ca_bundle_accepts_a_certificate_signed_by_the_tru
         std::env::remove_var("AUTHZ_INSECURE_HTTP");
     }
 
-    let (ca_cert, ca_key) = gen_ca("lightbridge-test-ca");
-    let (port, server) = spawn_mtls_serve_tls(&ca_cert, &ca_key).await;
+    let (ca_cert, ca_issuer) = gen_ca("lightbridge-test-ca");
+    let (port, server) = spawn_mtls_serve_tls(&ca_cert, &ca_issuer).await;
 
-    let (client_leaf_cert, client_leaf_key) = gen_client_leaf(&ca_cert, &ca_key);
+    let (client_leaf_cert, client_leaf_key) = gen_client_leaf(&ca_issuer);
     let mut identity_pem = client_leaf_cert.pem().into_bytes();
     identity_pem.push(b'\n');
     identity_pem.extend_from_slice(client_leaf_key.serialize_pem().as_bytes());
@@ -479,11 +483,11 @@ async fn serve_tls_with_client_ca_bundle_rejects_a_certificate_from_an_untrusted
         std::env::remove_var("AUTHZ_INSECURE_HTTP");
     }
 
-    let (ca_cert, ca_key) = gen_ca("lightbridge-test-ca");
-    let (other_ca_cert, other_ca_key) = gen_ca("unrelated-test-ca");
-    let (port, server) = spawn_mtls_serve_tls(&ca_cert, &ca_key).await;
+    let (ca_cert, ca_issuer) = gen_ca("lightbridge-test-ca");
+    let (_other_ca_cert, other_ca_issuer) = gen_ca("unrelated-test-ca");
+    let (port, server) = spawn_mtls_serve_tls(&ca_cert, &ca_issuer).await;
 
-    let (client_leaf_cert, client_leaf_key) = gen_client_leaf(&other_ca_cert, &other_ca_key);
+    let (client_leaf_cert, client_leaf_key) = gen_client_leaf(&other_ca_issuer);
     let mut identity_pem = client_leaf_cert.pem().into_bytes();
     identity_pem.push(b'\n');
     identity_pem.extend_from_slice(client_leaf_key.serialize_pem().as_bytes());
@@ -569,8 +573,8 @@ async fn serve_tls_reports_unreadable_client_ca_bundle_as_server_error() {
     }
     ensure_rustls_provider_for_test();
 
-    let (ca_cert, ca_key) = gen_ca("lightbridge-test-ca");
-    let (server_leaf_cert, server_leaf_key) = gen_server_leaf(&ca_cert, &ca_key);
+    let (_ca_cert, ca_issuer) = gen_ca("lightbridge-test-ca");
+    let (server_leaf_cert, server_leaf_key) = gen_server_leaf(&ca_issuer);
     let cert_path = write_temp_pem(&server_leaf_cert.pem(), "server-leaf-cert");
     let key_path = write_temp_pem(&server_leaf_key.serialize_pem(), "server-leaf-key");
 

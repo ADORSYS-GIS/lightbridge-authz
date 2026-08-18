@@ -15,7 +15,7 @@
 use lightbridge_authz_rest::redis_tls::build_redis_client;
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, SanType,
+    Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Once;
@@ -34,8 +34,11 @@ fn ensure_rustls_provider() {
 }
 
 /// A self-signed CA certificate, proper `basicConstraints`/`keyUsage` CA extensions included --
-/// same shape as `usage_service_ca_bundle_tests.rs::gen_ca`.
-fn gen_ca(common_name: &str) -> (Certificate, KeyPair) {
+/// same shape as `usage_service_ca_bundle_tests.rs::gen_ca`. Returns the `Issuer` alongside the
+/// `Certificate` (rcgen 0.14's `signed_by` takes an `&Issuer`, built from `CertificateParams` +
+/// signing key, not a bare `&Certificate`/`&KeyPair` pair -- a `Certificate` alone does not
+/// expose the params needed to reconstruct one).
+fn gen_ca(common_name: &str) -> (Certificate, Issuer<'static, KeyPair>) {
     let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .expect("ECDSA P-256 key generation must succeed");
     let mut params =
@@ -48,13 +51,14 @@ fn gen_ca(common_name: &str) -> (Certificate, KeyPair) {
     let cert = params
         .self_signed(&key)
         .expect("self-signing a CA cert must succeed");
-    (cert, key)
+    let issuer = Issuer::new(params, key);
+    (cert, issuer)
 }
 
-/// A leaf certificate for `127.0.0.1`, signed by `issuer_cert`/`issuer_key` -- same shape as
+/// A leaf certificate for `127.0.0.1`, signed by `issuer` -- same shape as
 /// `usage_service_ca_bundle_tests.rs::gen_leaf`, minus the `localhost` DNS SAN (redis-rs's TLS
 /// connector is handed a bare IP host, not a DNS name).
-fn gen_leaf(issuer_cert: &Certificate, issuer_key: &KeyPair) -> (Certificate, KeyPair) {
+fn gen_leaf(issuer: &Issuer<'static, KeyPair>) -> (Certificate, KeyPair) {
     let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .expect("ECDSA P-256 key generation must succeed");
     let mut params =
@@ -75,7 +79,7 @@ fn gen_leaf(issuer_cert: &Certificate, issuer_key: &KeyPair) -> (Certificate, Ke
     params.not_before = OffsetDateTime::now_utc() - TimeDuration::days(1);
     params.not_after = OffsetDateTime::now_utc() + TimeDuration::days(31);
     let cert = params
-        .signed_by(&key, issuer_cert, issuer_key)
+        .signed_by(&key, issuer)
         .expect("signing a leaf cert with its issuer must succeed");
     (cert, key)
 }
@@ -93,17 +97,16 @@ fn write_temp_pem(pem: &str, label: &str) -> std::path::PathBuf {
 }
 
 /// Starts a raw TLS TCP server on an ephemeral loopback port, presenting a freshly generated
-/// `127.0.0.1` leaf certificate signed by `ca_cert`/`ca_key`. After completing the TLS
+/// `127.0.0.1` leaf certificate signed by `ca_issuer`. After completing the TLS
 /// handshake it just holds the connection open (replying `+PONG\r\n` to anything it reads, so it
 /// never blocks a client that does send something) -- proving the handshake succeeded is the
 /// whole point; this deliberately does not implement enough of RESP2 to serve a real client.
 async fn spawn_tls_redis_stub(
-    ca_cert: &Certificate,
-    ca_key: &KeyPair,
+    ca_issuer: &Issuer<'static, KeyPair>,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     ensure_rustls_provider();
 
-    let (leaf_cert, leaf_key) = gen_leaf(ca_cert, ca_key);
+    let (leaf_cert, leaf_key) = gen_leaf(ca_issuer);
     let key_der = PrivatePkcs8KeyDer::from(leaf_key.serialize_der());
 
     let server_config = ServerConfig::builder()
@@ -169,8 +172,8 @@ async fn try_connect(client: redis::Client) -> Result<(), redis::RedisError> {
 /// (handshake included) is established successfully.
 #[tokio::test]
 async fn valid_ca_bundle_establishes_the_tls_connection() {
-    let (ca_cert, ca_key) = gen_ca("lightbridge-redis-test-ca");
-    let (addr, server) = spawn_tls_redis_stub(&ca_cert, &ca_key).await;
+    let (ca_cert, ca_issuer) = gen_ca("lightbridge-redis-test-ca");
+    let (addr, server) = spawn_tls_redis_stub(&ca_issuer).await;
     let ca_bundle_path = write_temp_pem(&ca_cert.pem(), "valid-ca");
 
     let client = build_redis_client(
@@ -193,9 +196,9 @@ async fn valid_ca_bundle_establishes_the_tls_connection() {
 /// previously be constructed.
 #[tokio::test]
 async fn server_certificate_not_signed_by_the_configured_ca_is_rejected() {
-    let (ca_cert, ca_key) = gen_ca("lightbridge-redis-test-ca");
-    let (other_ca_cert, _other_ca_key) = gen_ca("unrelated-redis-test-ca");
-    let (addr, server) = spawn_tls_redis_stub(&ca_cert, &ca_key).await;
+    let (_ca_cert, ca_issuer) = gen_ca("lightbridge-redis-test-ca");
+    let (other_ca_cert, _other_ca_issuer) = gen_ca("unrelated-redis-test-ca");
+    let (addr, server) = spawn_tls_redis_stub(&ca_issuer).await;
     let wrong_ca_bundle_path = write_temp_pem(&other_ca_cert.pem(), "wrong-ca");
 
     let client = build_redis_client(
@@ -275,7 +278,7 @@ async fn plain_redis_url_ignores_ca_bundle_path() {
 /// failure rather than specifically a certificate one.
 #[tokio::test]
 async fn connection_refused_is_distinguishable_from_a_certificate_error() {
-    let (ca_cert, _ca_key) = gen_ca("lightbridge-redis-test-ca");
+    let (ca_cert, _ca_issuer) = gen_ca("lightbridge-redis-test-ca");
     let ca_bundle_path = write_temp_pem(&ca_cert.pem(), "unused-ca");
 
     // Bind and immediately drop a listener to get a genuinely closed port.
