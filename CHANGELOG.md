@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.6.1](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.6.0...v3.6.1) (2026-08-18)
+
+
+### Code Refactoring
+
+* **rest:** remove authz-api's OIDC discovery/token-exchange surface ([#370](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/370)) ([3ccf8d3](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/3ccf8d3d0eddb58e1718245f77e3dbc053219d8b))
+
 ## [3.6.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.5.0...v3.6.0) (2026-08-17)
 
 
