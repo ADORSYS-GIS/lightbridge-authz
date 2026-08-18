@@ -2,14 +2,26 @@ use lightbridge_authz_rest::ratelimit_redis::{RedisRateLimitStore, build_redis_r
 
 #[test]
 fn rejects_an_unparseable_redis_url() {
-    let result = build_redis_rate_limit_store("not-a-redis-url", "lightbridge");
+    let result = build_redis_rate_limit_store("not-a-redis-url", None, "lightbridge");
     assert!(result.is_err());
 }
 
 #[test]
 fn accepts_a_well_formed_redis_url_without_connecting() {
-    let result = build_redis_rate_limit_store("redis://127.0.0.1:6379", "lightbridge");
+    let result = build_redis_rate_limit_store("redis://127.0.0.1:6379", None, "lightbridge");
     assert!(result.is_ok());
+}
+
+/// lightbridge-authz#363: `rediss://` without a CA bundle must fail here too, not just in
+/// `redis_tls`'s own unit tests -- this is the actual call site `start_api_server`/
+/// `start_budget_server` use.
+#[test]
+fn rejects_rediss_url_without_ca_bundle_path() {
+    let result = build_redis_rate_limit_store("rediss://127.0.0.1:6379", None, "lightbridge");
+    let Err(err) = result else {
+        panic!("rediss:// with no ca_bundle_path must fail construction");
+    };
+    assert!(format!("{err}").contains("ca_bundle_path"));
 }
 
 #[test]

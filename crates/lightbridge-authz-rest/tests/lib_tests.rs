@@ -19,6 +19,7 @@ fn lazy_pool() -> Arc<dyn DbPoolTrait> {
 fn sample_redis() -> Option<Redis> {
     Some(Redis {
         url: "redis://127.0.0.1:6379".to_string(),
+        ca_bundle_path: None,
     })
 }
 
@@ -218,6 +219,7 @@ mod db {
     fn unreachable_redis() -> Option<Redis> {
         Some(Redis {
             url: "redis://127.0.0.1:1".to_string(),
+            ca_bundle_path: None,
         })
     }
 
@@ -273,7 +275,7 @@ mod db {
     }
 
     fn lazy_rate_limit_store() -> Arc<dyn RateLimitStore> {
-        build_redis_rate_limit_store("redis://127.0.0.1:6379", "authz-api-test")
+        build_redis_rate_limit_store("redis://127.0.0.1:6379", None, "authz-api-test")
             .expect("well-formed redis url constructs a store without connecting")
     }
 

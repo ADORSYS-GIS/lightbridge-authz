@@ -1936,9 +1936,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.15"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
+checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -2765,6 +2765,7 @@ dependencies = [
  "lightbridge-authz-core",
  "minicbor",
  "rand_core 0.6.4",
+ "rcgen",
  "redis",
  "reqwest 0.13.4",
  "rsa",
@@ -2773,7 +2774,9 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "sqlx",
+ "time",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tower-http 0.7.0",
  "tracing",
@@ -3835,10 +3838,13 @@ dependencies = [
  "num-bigint",
  "percent-encoding",
  "pin-project-lite",
+ "rustls",
+ "rustls-native-certs",
  "ryu",
  "sha1_smol",
  "socket2",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "url",
  "xxhash-rust",

@@ -82,7 +82,7 @@ fn lazy_idempotency() -> Arc<SqlxIdempotencyStore> {
 }
 
 fn lazy_rate_limit() -> Arc<dyn RateLimitStore> {
-    build_redis_rate_limit_store(DEAD_REDIS, "authz-api-test").expect("rate limit store")
+    build_redis_rate_limit_store(DEAD_REDIS, None, "authz-api-test").expect("rate limit store")
 }
 
 /// A `PolicyStore` built with no database query at all (`PolicyStore::from_engine`), matching how

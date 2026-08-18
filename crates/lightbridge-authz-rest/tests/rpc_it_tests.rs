@@ -162,7 +162,7 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
     // into the SAME token-bucket, so a big-enough test file blows through the shared burst budget
     // under `cargo test`'s default parallelism regardless of any single test's own call volume.
     let rate_limit: Arc<dyn RateLimitStore> =
-        build_redis_rate_limit_store(&redis_url(), format!("authz-api-it-{}", cuid2()))
+        build_redis_rate_limit_store(&redis_url(), None, format!("authz-api-it-{}", cuid2()))
             .expect("redis rate-limit store");
 
     // Migrations seed an active `budget-refill` revision (ADR-0007), so a real

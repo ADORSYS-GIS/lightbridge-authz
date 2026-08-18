@@ -54,8 +54,18 @@ database:
 # (Redis-backed)") and for authz-idp's private_key_jwt replay-protection store (ADR-0011,
 # Decision 6). authz-opa, lightbridge-mcp, and the usage service are explicitly freed from this
 # requirement and ignore this block entirely.
+#
+# Local Compose Redis is plaintext (redis://), so ca_bundle_path is left unset here. Real
+# deployments (including in-cluster ones) point url at rediss:// -- the cluster's redis-ha is
+# TLS-only -- and MUST set ca_bundle_path to the cluster's own CA bundle (e.g.
+# /etc/lightbridge/tls/ca.crt, the same ca.crt this service's own TLS cert/key are issued
+# alongside -- see the usage_service block below for the identical CA). lightbridge-authz#363;
+# see crates/lightbridge-authz-rest/src/redis_tls.rs for the fail-closed contract: a rediss://
+# url with a missing/unreadable ca_bundle_path is a hard startup failure, never a silent
+# fallback to plaintext or an unverified handshake.
 redis:
   url: "${REDIS_URL:-redis://localhost:6379}"
+  # ca_bundle_path: /etc/lightbridge/tls/ca.crt
 # HTTP client for authz-api's budget domain to call the usage service's mTLS-required query
 # listener (UsageServerGroup::query, port 3006/host 13006 -- #347 split the old single usage port
 # into an unauthenticated ingest listener and this query listener; see
