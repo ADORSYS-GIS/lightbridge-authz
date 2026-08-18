@@ -213,10 +213,11 @@ mimalloc = "0"
 # been the one left behind — if this recurs on the next bump, that is strong enough signal to stop
 # trusting Dependabot with this line at all and script a post-PR CI check that fails when it drifts
 # from its five siblings, rather than relying on a human noticing during review.
-# DO NOT run a bare `cargo update -p cratestack-<x>` (no `--precise`) on this family without first
-# re-running `just it-tests` and specifically watching `batch_rpc_frames_enforce_permission_per_frame`
-# / `batch_rpc_frames_succeed_and_fail_independently` / `budget_gated_op_ids_are_unreachable_on_authz_api_even_for_an_admin`
-# in `crates/lightbridge-authz-rest/tests/rpc_it_tests.rs`. cratestack 0.8.4's `rpc_batch_dispatch`
+# DO NOT widen any line below off `=0.8.0` (not even to a caret `"0.8.0"`) without first re-running
+# `just it-tests` and specifically watching `batch_rpc_frames_enforce_permission_per_frame` /
+# `batch_rpc_frames_succeed_and_fail_independently` /
+# `budget_gated_op_ids_are_unreachable_on_authz_api_even_for_an_admin` in
+# `crates/lightbridge-authz-rest/tests/rpc_it_tests.rs`. cratestack 0.8.4's `rpc_batch_dispatch`
 # rewrite (its own CHANGELOG.md, "0.8.4 (2026-08-18)") makes `POST /rpc/batch` authenticate the real
 # envelope exactly once (path `RPC_BATCH_PATH`) and thread that one `CratestackContext` through every
 # frame via a new `CachedAuthProvider`, instead of calling `AuthProvider::authenticate` once per frame
@@ -227,25 +228,32 @@ mimalloc = "0"
 # always the literal `/rpc/batch`, which isn't a mapped op-id, so `required_permission` returns `None`
 # and the ENTIRE batch envelope is rejected `403 Forbidden` — not per-frame, every batch call,
 # regardless of caller permissions. Confirmed by hand (2026-08-18): all three tests above pass at
-# exactly 0.8.0 and fail this exact way the moment any part of the family floats to 0.8.4. This is why
-# every line in this block is pinned in `Cargo.lock` to precisely 0.8.0 via repeated
-# `cargo update -p <pkg> --precise 0.8.0` rather than left to `cargo update`'s normal
-# newest-compatible-within-`^0.8.0` resolution — Cargo.toml's `"0.8.0"` requirement string alone would
-# not have caught this, since 0.8.1-0.8.4 are semver-compatible and cargo prefers the newest match.
+# exactly 0.8.0 and fail this exact way the moment any part of the family floats to 0.8.4.
+#
+# FOURTH OCCURRENCE, same day (2026-08-18): a caret `"0.8.0"` requirement string plus a `Cargo.lock`
+# pinned via repeated `cargo update -p <pkg> --precise 0.8.0` is not durable — it only constrains
+# resolution until the next `cargo update`, and Dependabot runs exactly that, unprompted, on its own
+# schedule. Nothing above stopped a routine dependency-update PR (this one included) from silently
+# floating the family to 0.8.4 and reintroducing the wholesale-403 regression with no compile error
+# to catch it, only the RPC tests failing at runtime. Fixed by switching every requirement string in
+# this block to an exact `=0.8.0` — Cargo will now hard-error resolution rather than silently select
+# 0.8.1-0.8.4, so a future Dependabot PR either bumps the requirement string itself (visible in the
+# diff, reviewable) or fails to resolve; it cannot land as a silent lockfile-only float again.
 # Landing past 0.8.0 needs `CratestackAuthProvider`/`rpc_authorize.rs` reworked against the new
 # once-per-envelope contract first (`CachedAuthProvider` or equivalent) — that is real, security-
-# critical surgery, not a lockfile bump, and deliberately out of scope for the 0.7.16->0.8.0 dependency
-# upgrade this pin block's history otherwise documents.
-cratestack-core = "0.8.0"
-cratestack-axum = "0.8.0"
-cratestack-redis = "0.8.0"
+# critical surgery, not a version bump, and deliberately out of scope for the 0.7.16->0.8.0 dependency
+# upgrade this pin block's history otherwise documents. See the tracking issue filed alongside this
+# exact pin for the reconciliation work itself.
+cratestack-core = "=0.8.0"
+cratestack-axum = "=0.8.0"
+cratestack-redis = "=0.8.0"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
 # `include_server_schema!` macro emits `::cratestack::*` paths (see cratestack-pg lib docs). The
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
 # it to build the RPC router (ADR-0003).
-cratestack = { package = "cratestack-pg", version = "0.8.0" }
-cratestack-codec-cbor = "0.8.0"
-cratestack-codec-json = "0.8.0"
+cratestack = { package = "cratestack-pg", version = "=0.8.0" }
+cratestack-codec-cbor = "=0.8.0"
+cratestack-codec-json = "=0.8.0"
 # Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
