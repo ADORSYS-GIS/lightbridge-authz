@@ -1270,28 +1270,28 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn get_my_budget_refill_ladder(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::get_my_budget_refill_ladder::Args,
         _authorized: schema::procedures::get_my_budget_refill_ladder::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<
             schema::procedures::get_my_budget_refill_ladder::Output,
-            CoolError,
+            CratestackError,
         >,
     > + Send {
         let refill_service = self.refill_service.clone();
         let subject = subject_from_ctx(ctx);
         let period_str = args.args.period;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let period = lightbridge_authz_budget::Period::parse(&period_str)
-                .map_err(budget_error_to_cool_error)?;
+                .map_err(budget_error_to_cratestack_error)?;
 
             let status = refill_service
                 .refill_status(&subject, &period)
                 .await
-                .map_err(budget_error_to_cool_error)?;
+                .map_err(budget_error_to_cratestack_error)?;
 
             Ok(to_schema_my_budget_refill_ladder(
                 subject, period_str, status,

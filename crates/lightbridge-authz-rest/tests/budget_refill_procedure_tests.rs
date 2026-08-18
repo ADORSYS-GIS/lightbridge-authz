@@ -253,9 +253,9 @@ fn refill_args(
 async fn get_ladder(
     procedures: &Procedures,
     db: &schema::Cratestack,
-    ctx: &CoolContext,
+    ctx: &CratestackContext,
     args: schema::procedures::get_my_budget_refill_ladder::Args,
-) -> Result<schema::procedures::get_my_budget_refill_ladder::Output, CoolError> {
+) -> Result<schema::procedures::get_my_budget_refill_ladder::Output, CratestackError> {
     let call_args = args.clone();
     schema::procedures::get_my_budget_refill_ladder::invoke_with_db(
         db,
