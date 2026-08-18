@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use lightbridge_authz::mcp::start_mcp_server;
 use lightbridge_authz_core::config::{
-    ApiServer, BasicAuth, Billing, BillingPlan, Oauth2, Oauth2Type, Tls,
+    ApiServer, BasicAuth, Billing, BillingPlan, Oauth2, Oauth2Type, QuotaTiers, Tls,
 };
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 
@@ -90,6 +90,7 @@ async fn start_mcp_server_runs_without_redis_and_never_fails_on_it() {
         &external_oauth2(),
         &basic_auth,
         &sample_billing(),
+        &QuotaTiers::default(),
         lazy_pool(),
     )
     .await;

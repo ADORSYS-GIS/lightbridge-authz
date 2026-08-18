@@ -8,7 +8,7 @@ use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
 use getrandom::fill;
 use lightbridge_authz_api_key::repo::StoreRepo;
-use lightbridge_authz_core::config::{Billing, Oauth2, Oauth2Issuance};
+use lightbridge_authz_core::config::{Billing, Oauth2, Oauth2Issuance, QuotaTiers};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey, Project,
@@ -27,6 +27,11 @@ pub struct AuthzStoreImpl {
     token_issuer: Option<OAuth2TokenIssuer>,
     jwt_signer: Option<Arc<crate::signing::ApiKeyJwtSigner>>,
     billing: Arc<Billing>,
+    /// Operator-configured governance quota-tier catalogue (#177). Validated the same way as
+    /// `billing` above -- `QuotaTiers::is_allowed` rejects a value absent from a non-empty
+    /// catalogue, and accepts everything (including `None`) when the catalogue is empty/absent
+    /// (see that type's own doc comment for why that default is deliberate, unlike `Billing`'s).
+    quota_tiers: Arc<QuotaTiers>,
 }
 
 impl std::fmt::Debug for AuthzStoreImpl {
@@ -43,6 +48,7 @@ impl AuthzStoreImpl {
             token_issuer: None,
             jwt_signer: None,
             billing: Arc::new(Billing::default()),
+            quota_tiers: Arc::new(QuotaTiers::default()),
         }
     }
 
@@ -53,10 +59,19 @@ impl AuthzStoreImpl {
         self
     }
 
+    /// Override the configured quota-tier catalogue. Primarily for tests that drive
+    /// `create_account`/`set_project_member_quota_tier` without going through the full
+    /// config-loading path -- mirrors `with_billing` above.
+    pub fn with_quota_tiers(mut self, quota_tiers: QuotaTiers) -> Self {
+        self.quota_tiers = Arc::new(quota_tiers);
+        self
+    }
+
     pub fn with_pool_and_oauth2(
         pool: Arc<dyn DbPoolTrait>,
         oauth2: &Oauth2,
         billing: &Billing,
+        quota_tiers: &QuotaTiers,
     ) -> Result<Self> {
         use lightbridge_authz_core::config::Oauth2Type;
         let repo = Arc::new(StoreRepo::new(pool));
@@ -75,6 +90,7 @@ impl AuthzStoreImpl {
             token_issuer,
             jwt_signer,
             billing: Arc::new(billing.clone()),
+            quota_tiers: Arc::new(quota_tiers.clone()),
         })
     }
 
@@ -332,7 +348,19 @@ impl AuthzStoreImpl {
     /// may be supplied: the generic `model.Account.create` verb stays denied precisely because a
     /// caller-chosen id would let one subject create an account keyed to another. Calling this twice
     /// for the same subject is a `Conflict`, not a second account.
+    ///
+    /// `input.default_quota` is validated against the operator-configured quota-tier catalogue
+    /// (#177) before any DB write, same pattern and error shape as `create_api_key`'s
+    /// `billing_plan` check below: `None` always passes, and an empty/absent catalogue accepts
+    /// any value (see `QuotaTiers::is_allowed`).
     pub async fn create_account(&self, subject: &str, input: CreateAccount) -> Result<Account> {
+        if !self.quota_tiers.is_allowed(input.default_quota.as_deref()) {
+            let tier = input.default_quota.as_deref().unwrap_or_default();
+            return Err(Error::BadRequest(format!(
+                "unknown defaultQuota '{tier}': must be one of the configured tiers [{}]",
+                self.quota_tiers.tier_ids().join(", ")
+            )));
+        }
         let account = self.repo.create_account(subject, input).await?;
         tracing::info!(
             operation = "create_account",
@@ -523,7 +551,11 @@ impl AuthzStoreImpl {
     }
 
     /// Set a roster member's per-project spending ceiling. Backs `setProjectMemberQuotaTier`.
-    /// Lead-gated in SQL, and the tier is validated against the configured catalogue at write time.
+    /// Lead-gated in SQL (`StoreRepo::authorize_project_lead`), and `quota_tier` is validated
+    /// against the operator-configured catalogue here, before the lead-gated SQL write (#177):
+    /// this is "where the request is first accepted" that repository's own doc comment on
+    /// `set_project_member_quota_tier` refers to. Same pattern/error shape as `create_account`'s
+    /// `default_quota` check and `create_api_key`'s `billing_plan` check.
     pub async fn set_project_member_quota_tier(
         &self,
         subject: &str,
@@ -531,6 +563,13 @@ impl AuthzStoreImpl {
         target_account_id: &str,
         quota_tier: Option<&str>,
     ) -> Result<Project> {
+        if !self.quota_tiers.is_allowed(quota_tier) {
+            return Err(Error::BadRequest(format!(
+                "unknown quotaTier '{}': must be one of the configured tiers [{}]",
+                quota_tier.unwrap_or_default(),
+                self.quota_tiers.tier_ids().join(", ")
+            )));
+        }
         self.repo
             .set_project_member_quota_tier(subject, project_id, target_account_id, quota_tier)
             .await
@@ -640,7 +679,7 @@ mod tests {
     };
     use chrono::{Duration, Utc};
     use httpmock::{Method::POST, MockServer};
-    use lightbridge_authz_core::config::{Billing, Oauth2, Oauth2Issuance, Oauth2Type};
+    use lightbridge_authz_core::config::{Billing, Oauth2, Oauth2Issuance, Oauth2Type, QuotaTiers};
     use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
@@ -680,6 +719,7 @@ mod tests {
             lazy_pool(),
             &base_oauth2(Oauth2Type::SelfSigned),
             &Billing::default(),
+            &QuotaTiers::default(),
         )
         .unwrap_err();
         assert!(format!("{err}").contains("oauth2.signing is missing"));
@@ -691,6 +731,7 @@ mod tests {
             lazy_pool(),
             &base_oauth2(Oauth2Type::External),
             &Billing::default(),
+            &QuotaTiers::default(),
         )
         .unwrap_err();
         assert!(format!("{err}").contains("oauth2.issuance is missing"));
@@ -732,6 +773,123 @@ mod tests {
                 "plan {plan:?} should be rejected before any DB access, got: {err}"
             );
         }
+    }
+
+    // #177: `defaultQuota` validation on `createAccount`, same shape as the billing-plan check
+    // above -- `AuthzStoreImpl::create_account` rejects a value absent from a non-empty configured
+    // catalogue before the DB write. Uses `lazy_pool()` (a dead connection) exactly like the
+    // billing test above: if the check did not run first, this would hang/time out on the DB call
+    // instead of returning `BadRequest` immediately, so a passing test proves the check is wired
+    // in, not merely that `QuotaTiers::is_allowed` itself works (that's covered directly in
+    // `lightbridge_authz_core::config::mod::tests`).
+    #[tokio::test]
+    async fn create_account_rejects_default_quota_not_in_configured_set() {
+        use lightbridge_authz_core::CreateAccount;
+        use lightbridge_authz_core::config::QuotaTier;
+
+        let store = AuthzStoreImpl::with_pool(lazy_pool()).with_quota_tiers(QuotaTiers {
+            tiers: vec![QuotaTier {
+                id: "gold".to_string(),
+                name: "Gold".to_string(),
+            }],
+        });
+
+        for tier in ["medim", ""] {
+            let err = store
+                .create_account(
+                    "subject",
+                    CreateAccount {
+                        default_quota: Some(tier.to_string()),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, lightbridge_authz_core::error::Error::BadRequest(ref m) if m.contains("unknown defaultQuota")),
+                "tier {tier:?} should be rejected before any DB access, got: {err}"
+            );
+        }
+    }
+
+    /// Mirrors the reject test above but proves `None` (the field left unset) is never rejected,
+    /// even against a non-empty catalogue -- requirement #2 of #177 ("NULL/absent stays valid").
+    /// Reaches the dead `lazy_pool()` connection and fails with a *connection* error (not
+    /// `BadRequest`), which is exactly the point: the quota-tier check let it through and the
+    /// failure came from further down the call chain instead.
+    #[tokio::test]
+    async fn create_account_allows_missing_default_quota_against_a_configured_catalogue() {
+        use lightbridge_authz_core::CreateAccount;
+        use lightbridge_authz_core::config::QuotaTier;
+
+        let store = AuthzStoreImpl::with_pool(lazy_pool()).with_quota_tiers(QuotaTiers {
+            tiers: vec![QuotaTier {
+                id: "gold".to_string(),
+                name: "Gold".to_string(),
+            }],
+        });
+
+        let err = store
+            .create_account(
+                "subject",
+                CreateAccount {
+                    default_quota: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(err, lightbridge_authz_core::error::Error::BadRequest(_)),
+            "a missing default_quota must not be rejected by the catalogue check, got: {err}"
+        );
+    }
+
+    // #177: `quotaTier` validation on `setProjectMemberQuotaTier`, same shape/reasoning as the two
+    // `create_account` tests above.
+    #[tokio::test]
+    async fn set_project_member_quota_tier_rejects_tier_not_in_configured_set() {
+        use lightbridge_authz_core::config::QuotaTier;
+
+        let store = AuthzStoreImpl::with_pool(lazy_pool()).with_quota_tiers(QuotaTiers {
+            tiers: vec![QuotaTier {
+                id: "gold".to_string(),
+                name: "Gold".to_string(),
+            }],
+        });
+
+        for tier in ["medim", ""] {
+            let err = store
+                .set_project_member_quota_tier("subject", "proj", "target", Some(tier))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, lightbridge_authz_core::error::Error::BadRequest(ref m) if m.contains("unknown quotaTier")),
+                "tier {tier:?} should be rejected before any DB access (including the lead-gate \
+                 check), got: {err}"
+            );
+        }
+    }
+
+    /// Mirrors `create_account_allows_missing_default_quota_against_a_configured_catalogue`:
+    /// `None` must pass the catalogue check and reach the (dead) DB connection, never `BadRequest`.
+    #[tokio::test]
+    async fn set_project_member_quota_tier_allows_none_against_a_configured_catalogue() {
+        use lightbridge_authz_core::config::QuotaTier;
+
+        let store = AuthzStoreImpl::with_pool(lazy_pool()).with_quota_tiers(QuotaTiers {
+            tiers: vec![QuotaTier {
+                id: "gold".to_string(),
+                name: "Gold".to_string(),
+            }],
+        });
+
+        let err = store
+            .set_project_member_quota_tier("subject", "proj", "target", None)
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(err, lightbridge_authz_core::error::Error::BadRequest(_)),
+            "None must not be rejected by the catalogue check, got: {err}"
+        );
     }
 
     // Backs `listBillingPlans`: proves `billing_plans()` hands back the exact catalogue the store

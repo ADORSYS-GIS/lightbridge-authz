@@ -505,9 +505,12 @@ impl StoreRepo {
     /// otherwise, same reasoning as `set_project_member_role`). The tier value itself is NOT
     /// validated against the operator-configured quota-tier catalogue here -- same as
     /// `Project.billing_plan`/`billingPlan`, that catalogue check happens where the request is
-    /// first accepted (the procedure/handler layer that holds the loaded `Config`), not in the
-    /// repository, so an empty/absent catalogue transparently accepts any value with no special
-    /// casing needed at this layer.
+    /// first accepted, not in the repository, so an empty/absent catalogue transparently accepts
+    /// any value with no special casing needed at this layer. As of #177 that check is real, not
+    /// aspirational: `AuthzStoreImpl::set_project_member_quota_tier` (the procedure/handler layer
+    /// that holds the loaded `Config`) calls `QuotaTiers::is_allowed` before ever reaching this
+    /// method -- see that call site for the enforcement itself and
+    /// `crates/lightbridge-authz-rest/tests/quota_tier_it_tests.rs` for live-DB coverage.
     #[instrument(skip(self))]
     pub async fn set_project_member_quota_tier(
         &self,
