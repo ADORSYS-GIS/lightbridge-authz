@@ -4,7 +4,7 @@ use lightbridge_authz_core::{
     RotateApiKey, async_trait,
     config::{
         ApiServer, BasicAuth, Billing, BudgetServer, IdpServer, Oauth2, OauthClientType, OpaServer,
-        Redis, UsageServiceClient,
+        QuotaTiers, Redis, UsageServiceClient,
     },
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
@@ -1874,6 +1874,7 @@ pub async fn start_api_server(
     pool: Arc<dyn DbPoolTrait>,
     oauth2: &Oauth2,
     billing: &Billing,
+    quota_tiers: &QuotaTiers,
     redis: &Option<Redis>,
     usage_service: &Option<UsageServiceClient>,
 ) -> Result<()> {
@@ -1977,6 +1978,7 @@ pub async fn start_api_server(
         pool.clone(),
         oauth2,
         billing,
+        quota_tiers,
     )?);
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
@@ -2301,6 +2303,7 @@ pub async fn start_budget_server(
     pool: Arc<dyn DbPoolTrait>,
     oauth2: &Oauth2,
     billing: &Billing,
+    quota_tiers: &QuotaTiers,
     redis: &Option<Redis>,
     usage_service: &Option<UsageServiceClient>,
 ) -> Result<()> {
@@ -2373,6 +2376,7 @@ pub async fn start_budget_server(
         pool.clone(),
         oauth2,
         billing,
+        quota_tiers,
     )?);
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));

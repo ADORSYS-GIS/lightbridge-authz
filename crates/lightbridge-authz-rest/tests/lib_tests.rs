@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use lightbridge_authz_core::config::{
-    ApiServer, BasicAuth, Billing, BillingPlan, Oauth2, Oauth2Type, OpaServer, Redis, Tls,
+    ApiServer, BasicAuth, Billing, BillingPlan, Oauth2, Oauth2Type, OpaServer, QuotaTiers, Redis,
+    Tls,
 };
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use sqlx::postgres::PgPoolOptions;
@@ -31,6 +32,14 @@ fn sample_billing() -> Billing {
             limits: None,
         }],
     }
+}
+
+/// Empty catalogue -- none of these tests exercise quota-tier validation itself (that lives in
+/// `crates/lightbridge-authz-rest/src/handlers/mod.rs`'s own tests), so the deliberate
+/// accept-anything default (see `QuotaTiers`'s doc comment) is exactly what every server-startup
+/// test here wants: unrelated to what's under test either way.
+fn sample_quota_tiers() -> QuotaTiers {
+    QuotaTiers::default()
 }
 
 fn bad_tls() -> Tls {
@@ -78,6 +87,7 @@ async fn start_api_server_fails_fast_when_tls_certs_are_missing() {
         lazy_pool(),
         &external_oauth2(),
         &sample_billing(),
+        &sample_quota_tiers(),
         &sample_redis(),
         &None,
     )
@@ -152,6 +162,7 @@ async fn start_api_server_rejects_self_signed_oauth2_without_signing_block() {
         lazy_pool(),
         &oauth2,
         &sample_billing(),
+        &sample_quota_tiers(),
         &sample_redis(),
         &None,
     )
@@ -183,6 +194,7 @@ async fn start_api_server_warns_when_dev_cors_is_enabled() {
         lazy_pool(),
         &external_oauth2(),
         &sample_billing(),
+        &sample_quota_tiers(),
         &sample_redis(),
         &None,
     )
@@ -313,6 +325,7 @@ mod db {
             db_pool,
             &self_signed_oauth2(),
             &sample_billing(),
+            &sample_quota_tiers(),
             &sample_redis(),
             &None,
         )
@@ -349,6 +362,7 @@ mod db {
             db_pool,
             &external_oauth2_with_issuance(),
             &sample_billing(),
+            &sample_quota_tiers(),
             &None,
             &None,
         )
@@ -377,6 +391,7 @@ mod db {
             db_pool,
             &external_oauth2_with_issuance(),
             &sample_billing(),
+            &sample_quota_tiers(),
             &unreachable_redis(),
             &None,
         )
@@ -407,6 +422,7 @@ mod db {
             db_pool,
             &external_oauth2_with_issuance(),
             &sample_billing(),
+            &sample_quota_tiers(),
             &None,
             &None,
         )
@@ -427,6 +443,7 @@ mod db {
             db_pool,
             &external_oauth2_with_issuance(),
             &sample_billing(),
+            &sample_quota_tiers(),
             &unreachable_redis(),
             &None,
         )

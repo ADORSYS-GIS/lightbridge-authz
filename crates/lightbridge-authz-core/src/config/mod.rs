@@ -1427,4 +1427,47 @@ otel:
         assert_eq!(usage_service.timeout_ms, 5_000);
         assert_eq!(usage_service.ca_bundle_path, None);
     }
+
+    // #177: `QuotaTiers::is_allowed` is the enforcement primitive the write paths call. These
+    // cover its four cases directly; `crates/lightbridge-authz-rest/src/handlers/mod.rs` carries
+    // the corresponding "is it actually wired into a write path" tests.
+    fn configured_tiers() -> QuotaTiers {
+        QuotaTiers {
+            tiers: vec![
+                QuotaTier {
+                    id: "bronze".to_string(),
+                    name: "Bronze".to_string(),
+                },
+                QuotaTier {
+                    id: "gold".to_string(),
+                    name: "Gold".to_string(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn quota_tiers_is_allowed_none_is_always_allowed() {
+        assert!(configured_tiers().is_allowed(None));
+        assert!(QuotaTiers::default().is_allowed(None));
+    }
+
+    #[test]
+    fn quota_tiers_is_allowed_empty_catalogue_accepts_anything() {
+        let empty = QuotaTiers::default();
+        assert!(empty.is_allowed(Some("anything")));
+        assert!(empty.is_allowed(Some("medim")));
+    }
+
+    #[test]
+    fn quota_tiers_is_allowed_accepts_a_configured_id() {
+        assert!(configured_tiers().is_allowed(Some("bronze")));
+        assert!(configured_tiers().is_allowed(Some("gold")));
+    }
+
+    #[test]
+    fn quota_tiers_is_allowed_rejects_an_unconfigured_id() {
+        assert!(!configured_tiers().is_allowed(Some("medim")));
+        assert!(!configured_tiers().is_allowed(Some("")));
+    }
 }

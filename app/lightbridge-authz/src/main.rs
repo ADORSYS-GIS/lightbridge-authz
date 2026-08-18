@@ -76,6 +76,7 @@ async fn main() -> Result<()> {
                     pool_clone,
                     &config_clone.oauth2,
                     &config_clone.billing,
+                    &config_clone.quota_tiers,
                     &config_clone.redis,
                     &config_clone.usage_service,
                 )
@@ -113,6 +114,7 @@ async fn main() -> Result<()> {
                 pool,
                 &config.oauth2,
                 &config.billing,
+                &config.quota_tiers,
                 &config.redis,
                 &config.usage_service,
             )
@@ -164,6 +166,7 @@ async fn main() -> Result<()> {
                 pool,
                 &config.oauth2,
                 &config.billing,
+                &config.quota_tiers,
                 &config.redis,
                 &config.usage_service,
             )
