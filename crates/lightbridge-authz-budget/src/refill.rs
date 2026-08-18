@@ -67,6 +67,23 @@ pub struct RefillRequest {
     pub as_of: DateTime<Utc>,
 }
 
+/// One rung on the ADR-0008 ladder, paired with the dollar amount (in micros) it represents. Part
+/// of [`RefillStatus::ladder`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LadderRung {
+    pub tier: BudgetTier,
+    pub amount_micros: i64,
+}
+
+/// The result of [`RefillService::refill_status`] -- see that method's doc comment for what this
+/// does and does not guarantee.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefillStatus {
+    pub current_tier: BudgetTier,
+    pub next_tier: Option<BudgetTier>,
+    pub ladder: Vec<LadderRung>,
+}
+
 /// Orchestrates one refill request end to end: idempotency short-circuit, tier resolution, policy
 /// evaluation, and (when approved) the grant write -- all recorded on the
 /// `budget_augmentation_requests` ledger via [`AugmentationRepo`]. See the module doc for the
@@ -110,6 +127,37 @@ impl RefillService {
         self.augmentation_repo
             .list_by_budget_account(budget_account_id, before, limit)
             .await
+    }
+
+    /// Read-only companion to [`Self::request_refill`]: where an account currently sits on the
+    /// ADR-0008 ladder for `period`, and what the next refill would grant *if* a submitted
+    /// request is later approved. Deliberately does not call the policy engine and makes no claim
+    /// about the outcome of an actual submission -- see [`Self::request_refill`]'s own doc comment
+    /// for the evaluation, capping, and denial paths this status intentionally does not preview.
+    /// `next_tier` is `None` exactly when [`Self::request_refill`] would deny with
+    /// `"already_at_top_rung"` (already on [`BudgetTier::B1000`]).
+    ///
+    /// This exists so a UI can show "you are here, this is next" instead of asking the caller to
+    /// choose an amount -- ADR-0008's ladder stays the server's decision space; this is visibility
+    /// into it, not a selector (see converse-frontends#148 for the prior attempt at a
+    /// caller-chosen tier and why it was rejected).
+    pub async fn refill_status(
+        &self,
+        budget_account_id: &str,
+        period: &Period,
+    ) -> Result<RefillStatus, BudgetError> {
+        let current_tier = self.current_tier(budget_account_id, period).await?;
+        Ok(RefillStatus {
+            current_tier,
+            next_tier: current_tier.next(),
+            ladder: BudgetTier::ALL
+                .iter()
+                .map(|&tier| LadderRung {
+                    tier,
+                    amount_micros: tier.amount().get(),
+                })
+                .collect(),
+        })
     }
 
     /// Resolves the tier an account is currently on for `period`, from the most recent

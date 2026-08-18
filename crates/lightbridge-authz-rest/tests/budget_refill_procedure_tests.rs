@@ -250,6 +250,34 @@ fn refill_args(
     }
 }
 
+async fn get_ladder(
+    procedures: &Procedures,
+    db: &schema::Cratestack,
+    ctx: &CoolContext,
+    args: schema::procedures::get_my_budget_refill_ladder::Args,
+) -> Result<schema::procedures::get_my_budget_refill_ladder::Output, CoolError> {
+    let call_args = args.clone();
+    schema::procedures::get_my_budget_refill_ladder::invoke_with_db(
+        db,
+        &args,
+        ctx,
+        |authorized| async move {
+            procedures
+                .get_my_budget_refill_ladder(db, ctx, call_args, authorized)
+                .await
+        },
+    )
+    .await
+}
+
+fn ladder_args() -> schema::procedures::get_my_budget_refill_ladder::Args {
+    schema::procedures::get_my_budget_refill_ladder::Args {
+        args: schema::GetMyBudgetRefillLadderInput {
+            period: PERIOD.to_string(),
+        },
+    }
+}
+
 fn list_pending_args(
     budget_account_id: Option<&str>,
 ) -> schema::procedures::list_pending_augmentation_requests::Args {
@@ -719,5 +747,93 @@ async fn list_my_augmentation_requests_does_not_leak_another_callers_requests(po
         bystander_history.entries.is_empty(),
         "a caller with no requests of their own must never see another account's: {:?}",
         bystander_history.entries
+    );
+}
+
+/// The read-only ladder-visibility companion (see `refill.rs`'s `RefillService::refill_status`
+/// doc comment): a fresh account with no grants this period sees `currentTier: "b-15"`,
+/// `nextTier: "b-30"`, and the full seven-rung ladder -- and this preview must agree with what a
+/// real `requestBudgetRefill` call would actually request, proven here by calling both against
+/// the same account.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_my_budget_refill_ladder_matches_what_a_real_refill_would_request(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let (procedures, ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let db = lazy_cratestack_db();
+
+    let status = get_ladder(&procedures, &db, &ctx, ladder_args())
+        .await
+        .expect("a fresh account's ladder status must succeed");
+
+    assert_eq!(status.budgetAccountId, account_id);
+    assert_eq!(status.period, PERIOD);
+    assert_eq!(status.currentTier, "b-15");
+    assert_eq!(status.currentTierAmountMicros, "15000000");
+    assert_eq!(status.nextTier.as_deref(), Some("b-30"));
+    assert_eq!(status.nextTierAmountMicros.as_deref(), Some("30000000"));
+    assert_eq!(status.ladder.len(), 7, "the full static ADR-0008 ladder");
+    assert_eq!(status.ladder[0].tier, "b-15");
+    assert_eq!(status.ladder[0].amountMicros, "15000000");
+    assert_eq!(status.ladder[6].tier, "b-1000");
+    assert_eq!(status.ladder[6].amountMicros, "1000000000");
+
+    let refill = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
+        .await
+        .expect("the actual refill this preview described must succeed the same way");
+    assert_eq!(
+        refill.requestedTier, "b-30",
+        "the preview's nextTier must match what request_refill actually requests, not drift from it"
+    );
+}
+
+/// Once an account is already on the top rung, the ladder preview must say so up front
+/// (`nextTier: null`) rather than only revealing it after a failed submission.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_my_budget_refill_ladder_has_no_next_tier_at_the_top_rung(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let (procedures, ctx, budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let db = lazy_cratestack_db();
+
+    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B1000).await;
+
+    let status = get_ladder(&procedures, &db, &ctx, ladder_args())
+        .await
+        .expect("status at the top rung must still succeed");
+
+    assert_eq!(status.currentTier, "b-1000");
+    assert_eq!(status.nextTier, None);
+    assert_eq!(status.nextTierAmountMicros, None);
+}
+
+/// The self-scoping guarantee `getMyBudgetRefillLadder`'s schema doc comment claims: the caller
+/// always sees THEIR OWN ladder position, derived from the authenticated subject, never another
+/// account's -- there is no target field on the input to even attempt otherwise.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_my_budget_refill_ladder_is_scoped_to_the_caller_not_another_account(pool: PgPool) {
+    let owner_id = cuid2();
+    let bystander_id = cuid2();
+    insert_account(&pool, &owner_id).await;
+    insert_account(&pool, &bystander_id).await;
+    let (procedures, owner_ctx, budget_repo) = procedures_and_ctx(pool, &owner_id).await;
+    let bystander_ctx = ctx_for(&bystander_id);
+    let db = lazy_cratestack_db();
+
+    seed_self_service_grant(&budget_repo, &owner_id, BudgetTier::B250).await;
+
+    let owner_status = get_ladder(&procedures, &db, &owner_ctx, ladder_args())
+        .await
+        .expect("owner's own status must succeed");
+    assert_eq!(owner_status.budgetAccountId, owner_id);
+    assert_eq!(owner_status.currentTier, "b-250");
+
+    let bystander_status = get_ladder(&procedures, &db, &bystander_ctx, ladder_args())
+        .await
+        .expect("bystander's own (fresh) status must succeed");
+    assert_eq!(bystander_status.budgetAccountId, bystander_id);
+    assert_eq!(
+        bystander_status.currentTier, "b-15",
+        "a caller must never see another account's tier progress"
     );
 }

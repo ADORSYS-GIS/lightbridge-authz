@@ -443,3 +443,155 @@ async fn manual_review_decision_records_reason_codes_and_matched_rule_ids_from_t
         Some("test-manual-review-policy".to_string())
     );
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn refill_status_for_a_fresh_account_starts_at_b15_with_b30_next(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    let service = refill_service(
+        &pool,
+        Arc::new(PanicIfCalledPolicyEngine),
+        known_zero_spend_reader(),
+    );
+
+    let status = service
+        .refill_status(&account_id, &Period::parse(PERIOD).expect("valid period"))
+        .await
+        .expect("a fresh account's status must succeed");
+
+    assert_eq!(
+        status.current_tier,
+        BudgetTier::B15,
+        "no grants yet this period -> the same B15 default request_refill itself falls back to"
+    );
+    assert_eq!(status.next_tier, Some(BudgetTier::B30));
+    assert_eq!(
+        status.ladder.len(),
+        7,
+        "the full static ADR-0008 ladder, not just current/next"
+    );
+    assert_eq!(status.ladder[0].tier, BudgetTier::B15);
+    assert_eq!(status.ladder[0].amount_micros, 15_000_000);
+    assert_eq!(status.ladder[6].tier, BudgetTier::B1000);
+    assert_eq!(status.ladder[6].amount_micros, 1_000_000_000);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn refill_status_resolves_current_tier_from_the_latest_tier_grant(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
+    let budget_repo = BudgetRepo::new(Arc::clone(&db_pool));
+    budget_repo
+        .grant(seed_grant_request(
+            &account_id,
+            GrantSource::SelfService,
+            BudgetTier::B30.amount().get(),
+        ))
+        .await
+        .expect("seed grant must succeed");
+
+    let service = RefillService::new(
+        Arc::new(budget_repo),
+        Arc::new(AugmentationRepo::new(Arc::clone(&db_pool))),
+        Arc::new(PanicIfCalledPolicyEngine),
+        known_zero_spend_reader(),
+    );
+
+    let status = service
+        .refill_status(&account_id, &Period::parse(PERIOD).expect("valid period"))
+        .await
+        .expect("status must succeed");
+
+    assert_eq!(
+        status.current_tier,
+        BudgetTier::B30,
+        "must read back the latest tier grant (B30), not always default to B15"
+    );
+    assert_eq!(status.next_tier, Some(BudgetTier::B60));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn refill_status_at_top_rung_has_no_next_tier(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
+    let budget_repo = BudgetRepo::new(Arc::clone(&db_pool));
+    budget_repo
+        .grant(seed_grant_request(
+            &account_id,
+            GrantSource::Admin,
+            BudgetTier::B1000.amount().get(),
+        ))
+        .await
+        .expect("seeding the top-rung grant must succeed");
+
+    let service = RefillService::new(
+        Arc::new(budget_repo),
+        Arc::new(AugmentationRepo::new(Arc::clone(&db_pool))),
+        Arc::new(PanicIfCalledPolicyEngine),
+        known_zero_spend_reader(),
+    );
+
+    let status = service
+        .refill_status(&account_id, &Period::parse(PERIOD).expect("valid period"))
+        .await
+        .expect("status must succeed even at the top rung");
+
+    assert_eq!(status.current_tier, BudgetTier::B1000);
+    assert_eq!(
+        status.next_tier, None,
+        "top rung has nothing further, mirroring request_refill's already_at_top_rung case"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn refill_status_never_calls_the_policy_engine(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    // PanicIfCalledPolicyEngine::evaluate panics if invoked -- reaching a returned status at all
+    // (rather than a panic) is the proof this read never touches policy evaluation.
+    let service = refill_service(
+        &pool,
+        Arc::new(PanicIfCalledPolicyEngine),
+        known_zero_spend_reader(),
+    );
+
+    let status = service
+        .refill_status(&account_id, &Period::parse(PERIOD).expect("valid period"))
+        .await
+        .expect("status must succeed without ever calling the policy engine");
+
+    assert_eq!(status.current_tier, BudgetTier::B15);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn refill_status_next_tier_agrees_with_what_request_refill_would_actually_request(
+    pool: PgPool,
+) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    let service = refill_service(&pool, default_policy_engine(), known_zero_spend_reader());
+    let period = Period::parse(PERIOD).expect("valid period");
+
+    let status_before = service
+        .refill_status(&account_id, &period)
+        .await
+        .expect("status before any refill must succeed");
+
+    let request_result = service
+        .request_refill(base_request(&account_id, None))
+        .await
+        .expect("refill must succeed");
+
+    assert_eq!(
+        status_before.next_tier,
+        Some(request_result.requested_tier),
+        "the ladder preview must never promise a rung that the real request path disagrees with"
+    );
+}

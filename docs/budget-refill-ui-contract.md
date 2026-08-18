@@ -6,7 +6,7 @@ this repo's PRs cannot produce the screenshot evidence #191's own Verification s
 that story for the full picture. This doc orients a frontend engineer on the RPC shapes and the
 behaviors that need explicit copy, without duplicating the schema.
 
-**⚠️ Breaking change: these five RPCs, and every other `budget:*`-gated procedure, moved off
+**⚠️ Breaking change: these six RPCs, and every other `budget:*`-gated procedure, moved off
 `authz-api` onto a separate `authz-budget` service, mounted under a fixed `/budget` path prefix
 (`POST /budget/rpc/{op_id}` instead of `POST /rpc/{op_id}`) — see
 [`docs/architecture/budget.md`](./architecture/budget.md#service-boundary-authz-budget-hard-cutover).
@@ -17,13 +17,14 @@ see the tracking issue filed in `ADORSYS-GIS/converse-frontends` for the exact U
 
 Source of truth: `crates/lightbridge-authz-api/schema/authz.cstack` (search for
 `AugmentationRequest`, `AugmentationRequestPage`, `requestBudgetRefill`,
-`listPendingAugmentationRequests`, `approveAugmentationRequest`, `rejectAugmentationRequest`,
-`listMyAugmentationRequests`) is the authoritative field list. This doc explains what those fields
-*mean*; if it and the schema ever disagree, the schema wins.
+`getMyBudgetRefillLadder`, `MyBudgetRefillLadder`, `listPendingAugmentationRequests`,
+`approveAugmentationRequest`, `rejectAugmentationRequest`, `listMyAugmentationRequests`) is the
+authoritative field list. This doc explains what those fields *mean*; if it and the schema ever
+disagree, the schema wins.
 
-## The five RPCs
+## The six RPCs
 
-All five require a bearer token (OIDC user session token). None accept an "act on behalf of"
+All six require a bearer token (OIDC user session token). None accept an "act on behalf of"
 parameter — the reviewing/requesting identity is always the authenticated caller.
 
 ### `requestBudgetRefill` — self-service ask for more budget
@@ -53,6 +54,54 @@ Requires the caller to hold `budget:self-refill`. A caller who lacks it gets a `
 not normally let a user reach this action if their role doesn't carry it, but should still handle a
 `403` gracefully (generic "you don't have permission" messaging) rather than assuming it can't
 happen.
+
+### `getMyBudgetRefillLadder` — where the caller sits on the ladder (read), before submitting
+
+```
+procedure getMyBudgetRefillLadder(args: {
+  period: string        // "YYYY-MM", the calendar month to preview
+}): MyBudgetRefillLadder
+```
+
+```
+type MyBudgetRefillLadder {
+  budgetAccountId: string
+  period: string
+  currentTier: string              // e.g. "b-15"
+  currentTierAmountMicros: string  // micro-USD decimal string, same encoding as everywhere else
+  nextTier?: string                // null exactly when already on "b-1000" (the top rung)
+  nextTierAmountMicros?: string    // null under the same condition as nextTier
+  ladder: { tier: string, amountMicros: string }[]   // all 7 rungs, ascending, so a UI never
+                                                       // hand-maintains its own copy of the ladder
+}
+```
+
+**Added specifically so a UI can show a ladder-visibility panel — "you are here, this is what a
+refill would grant" — before the caller ever clicks refill**, without inventing a caller-chosen
+tier anywhere (see `converse-frontends#148`'s "blocking correction": a tier picker was found not
+buildable against `requestBudgetRefill`'s actual contract, because the server decides the tier,
+not the caller). This procedure closes that gap with visibility, not choice — `requestBudgetRefill`
+above is completely unaffected and still takes no tier/amount input of any kind.
+
+No target field — always the caller's own budget account, the same self-scoping guarantee
+`getMyBudgetBalance`/`listMyBudgetGrants` already give (`crates/lightbridge-authz-rest/src/lib.rs`'s
+`get_my_budget_refill_ladder` derives `budgetAccountId` from the authenticated subject, never a
+caller-supplied field). Requires `budget:self-refill` — the SAME permission `requestBudgetRefill`
+requires, not the broader `budget:read-own` the balance/grant-history reads use, since this exists
+to serve one screen alongside that mutation rather than general budget visibility.
+
+**Deliberately does not preview a policy decision.** It calls no policy engine and returns no
+reason codes or cap prediction — `nextTier`/`nextTierAmountMicros` describe what `request_refill`
+would *ask for* (`current_tier.next()`), not what it is guaranteed to *grant*. Policy can still
+route an actual submission to `pending_review`, cap it, or (much less commonly) deny it — see
+`requestBudgetRefill`'s response and the Status values table below for what a real submission can
+come back as. **UI copy must not imply this preview is a guarantee of the outcome.**
+
+**⚠️ Also does not describe live enforcement.** A successful refill changes the ledger; whether an
+account's ladder position affects anything a request gateway actually enforces is a separate,
+currently-open gap — see "Today, a refill has no gateway effect at all" below. A UI showing this
+ladder should disclose that gap, not just the ladder position, or a caller who refills and sees no
+change in what they can actually do may reasonably conclude the product is broken.
 
 ### `listPendingAugmentationRequests` — the admin review queue (read)
 
