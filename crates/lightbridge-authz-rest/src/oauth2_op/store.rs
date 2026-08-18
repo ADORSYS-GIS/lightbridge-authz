@@ -55,12 +55,15 @@ use chrono::{DateTime, Duration, Utc};
 use lightbridge_authz_api_key::entities::exchange_refresh_token_row::NewExchangeRefreshToken;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::BearerTokenServiceTrait;
+use lightbridge_authz_budget::repo::BudgetRepo;
+use lightbridge_authz_budget::{BudgetTier, Period};
 use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::config::Oauth2TokenExchange;
 use lightbridge_authz_core::crypto::hash_api_key;
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::dto::ResourceStatus;
 use lightbridge_authz_core::error::Error;
+use serde_json::Value;
 
 use crate::signing::{KeyOwner, access_token_extra, id_token_extra, identity_for};
 
@@ -83,6 +86,7 @@ pub struct TokenExchangeOpStore {
     devices: NoDeviceCodeStore,
     assertions: RedisClientAssertionStore,
     repo: Arc<StoreRepo>,
+    budget_repo: Arc<BudgetRepo>,
     bearer: Arc<dyn BearerTokenServiceTrait>,
     cfg: Oauth2TokenExchange,
 }
@@ -92,6 +96,7 @@ impl TokenExchangeOpStore {
         clients: ConfigClientStore,
         assertions: RedisClientAssertionStore,
         repo: Arc<StoreRepo>,
+        budget_repo: Arc<BudgetRepo>,
         bearer: Arc<dyn BearerTokenServiceTrait>,
         cfg: Oauth2TokenExchange,
     ) -> Self {
@@ -102,6 +107,7 @@ impl TokenExchangeOpStore {
             devices: NoDeviceCodeStore,
             assertions,
             repo,
+            budget_repo,
             bearer,
             cfg,
         }
@@ -142,6 +148,45 @@ impl TokenExchangeOpStore {
         expires_at: DateTime<Utc>,
     ) -> Result<bool, OpError> {
         self.assertions.record_jti(jti, expires_at).await
+    }
+
+    /// Resolves the `budget_tier` claim to stamp on a minted access token (ADR-0014,
+    /// superseding ADR-0008's Keycloak-attribute delivery mechanism -- the tier ladder and
+    /// reset-not-topup semantics from ADR-0008 are unchanged, only *how the tier reaches the
+    /// gateway* changed). Called from both [`Self::handle_token_exchange`] and
+    /// [`Self::handle_refresh_token`], since ADR-0011 already re-mints both symmetrically through
+    /// the same signing calls.
+    ///
+    /// **Fail-closed, unconditionally.** [`BudgetRepo::current_tier`] already defaults to
+    /// [`BudgetTier::B15`] (the lowest rung) for "no grant yet this period" and "grant amount
+    /// doesn't match a known rung" -- both handled inside that method. What it does NOT swallow
+    /// is a genuine storage failure (`Err(BudgetError::StorageFailed)`, e.g. the budget ledger's
+    /// database being unreachable): that propagates as an `Err` because a caller that wants to
+    /// tell "new account" apart from "ledger down" (an operator alert, say) still can. THIS
+    /// caller does not want that distinction -- a budget-ledger outage is orthogonal to whether a
+    /// login/refresh should succeed, and per the budget-tier-rekey-cutover runbook, "an account
+    /// with no claim lands on no matching rule, which is the difference between base budget and
+    /// unlimited". So any `Err` here -- for any reason -- is caught and downgraded to `B15` too,
+    /// logged, and the token mint proceeds. The claim is never omitted and the exchange/refresh
+    /// grant never fails because of this lookup.
+    async fn resolve_budget_tier(&self, budget_account_id: &str, now: DateTime<Utc>) -> BudgetTier {
+        let period = Period::current(now);
+        match self
+            .budget_repo
+            .current_tier(budget_account_id, &period)
+            .await
+        {
+            Ok(tier) => tier,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    account_id = %budget_account_id,
+                    "budget tier resolution failed; falling back to the lowest rung rather than \
+                     omitting the claim or failing the token exchange"
+                );
+                BudgetTier::B15
+            }
+        }
     }
 
     /// The RFC 8693 token-exchange grant (ADR-0011, Decisions 1, 5, 7). `project_id` is this
@@ -288,13 +333,18 @@ impl TokenExchangeOpStore {
         let expires_in_secs = self.cfg.access_ttl_seconds.max(0) as u64;
         let scope_str = scope_to_string(&granted_scopes);
 
-        let access_extra = access_token_extra(
+        let budget_tier = self.resolve_budget_tier(&context.account_id, now).await;
+        let mut access_extra = access_token_extra(
             &owner,
             &session_id,
             &context.project_id,
             &context.account_id,
             allowed_models,
             Some(&client_id),
+        );
+        access_extra.insert(
+            "budget_tier".to_string(),
+            Value::String(budget_tier.label().to_string()),
         );
         let access_token = tokens
             .issue_user_token_with_extra(
@@ -527,13 +577,18 @@ impl TokenExchangeOpStore {
         let expires_in_secs = self.cfg.access_ttl_seconds.max(0) as u64;
         let scope_str = old_row.scope.clone();
 
-        let access_extra = access_token_extra(
+        let budget_tier = self.resolve_budget_tier(&context.account_id, now).await;
+        let mut access_extra = access_token_extra(
             &owner,
             &session_id,
             &context.project_id,
             &context.account_id,
             allowed_models,
             Some(&client_id),
+        );
+        access_extra.insert(
+            "budget_tier".to_string(),
+            Value::String(budget_tier.label().to_string()),
         );
         let access_token = tokens
             .issue_user_token_with_extra(

@@ -555,6 +555,7 @@ fn discovery_document(
         "api_key_id",
         "project_id",
         "account_id",
+        "budget_tier",
         "email",
         "email_verified",
         "allowed_models",

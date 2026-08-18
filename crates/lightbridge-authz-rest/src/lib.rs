@@ -2022,9 +2022,15 @@ const CLIENT_ASSERTION_JTI_KEY_PREFIX: &str = "authz-api:client-assertion-jti:";
 /// ADR-0011 phase 2: builds the config-defined `ClientStore` (Decision 5) and the Redis-backed
 /// `ClientAssertionStore` (Decision 6) that together let `oauth2_op::store::TokenExchangeOpStore`
 /// implement `authkestra_op::store::OpStore`.
+///
+/// `budget_repo` (ADR-0014) is a new dependency edge, not a new outbound service call: it reads
+/// `budget_grants`/`budget_balances` off the SAME Postgres `pool` every other repository on this
+/// server already uses (see the call site's own `budget_repo` construction), so this stays an
+/// intra-database read, never a network hop to the separate `authz-budget` microservice.
 fn build_token_exchange_state(
     oauth2: &Oauth2,
     repo: Arc<StoreRepo>,
+    budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
     bearer: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait>,
     redis_url: &str,
     redis_ca_bundle_path: Option<&str>,
@@ -2071,6 +2077,7 @@ fn build_token_exchange_state(
         client_store,
         assertions,
         repo,
+        budget_repo,
         bearer,
         cfg.clone(),
     ));
@@ -2394,6 +2401,12 @@ pub async fn start_idp_server(
     })?;
 
     let readiness_pool = pool.clone();
+    // ADR-0014: the budget ledger is read here (not called over the network) because
+    // `authz-idp`/`authz-budget` share the same Postgres -- see `build_token_exchange_state`'s
+    // own doc comment.
+    let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
+        pool.clone(),
+    ));
     let signing_repo = Arc::new(StoreRepo::new(pool));
     signing::bootstrap_signing_key(&signing_repo, signing).await?;
 
@@ -2419,6 +2432,7 @@ pub async fn start_idp_server(
     let token_exchange_state = build_token_exchange_state(
         oauth2,
         signing_repo.clone(),
+        budget_repo,
         bearer_service,
         &redis.url,
         redis.ca_bundle_path.as_deref(),
@@ -2745,6 +2759,19 @@ mod tests {
         Arc::new(StoreRepo::new(pool))
     }
 
+    /// Same lazy/dead-pool trick as [`lazy_signing_repo`], for the config-validation tests below
+    /// -- none of them reach a real `current_tier` query, only `build_token_exchange_state`'s own
+    /// synchronous validation branches, so a live budget ledger is never needed here.
+    fn lazy_budget_repo() -> Arc<lightbridge_authz_budget::repo::BudgetRepo> {
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(250))
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
+            .expect("lazy pool should be constructible");
+        let pool: Arc<dyn DbPoolTrait> =
+            Arc::new(lightbridge_authz_core::db::DbPool::from_pool(pool));
+        Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(pool))
+    }
+
     fn noop_bearer() -> Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> {
         Arc::new(NoopBearer)
     }
@@ -2826,6 +2853,7 @@ mod tests {
         let result = build_token_exchange_state(
             &oauth2,
             lazy_signing_repo(),
+            lazy_budget_repo(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2841,6 +2869,7 @@ mod tests {
         let Err(err) = build_token_exchange_state(
             &oauth2,
             lazy_signing_repo(),
+            lazy_budget_repo(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2857,6 +2886,7 @@ mod tests {
         let Err(err) = build_token_exchange_state(
             &oauth2,
             lazy_signing_repo(),
+            lazy_budget_repo(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2876,6 +2906,7 @@ mod tests {
         let Err(err) = build_token_exchange_state(
             &oauth2,
             lazy_signing_repo(),
+            lazy_budget_repo(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2895,6 +2926,7 @@ mod tests {
         let Err(err) = build_token_exchange_state(
             &oauth2,
             lazy_signing_repo(),
+            lazy_budget_repo(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2916,6 +2948,7 @@ mod tests {
         let Err(err) = build_token_exchange_state(
             &oauth2,
             lazy_signing_repo(),
+            lazy_budget_repo(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2938,6 +2971,7 @@ mod tests {
         let Err(err) = build_token_exchange_state(
             &oauth2,
             lazy_signing_repo(),
+            lazy_budget_repo(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2959,6 +2993,7 @@ mod tests {
         let result = build_token_exchange_state(
             &oauth2,
             lazy_signing_repo(),
+            lazy_budget_repo(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,

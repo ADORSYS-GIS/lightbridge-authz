@@ -26,6 +26,7 @@ use sqlx::PgPool;
 use crate::error::BudgetError;
 use crate::period::Period;
 use crate::source::GrantSource;
+use crate::tier::BudgetTier;
 
 #[derive(Debug, Clone)]
 pub struct BudgetRepo {
@@ -124,6 +125,18 @@ const EFFECTIVE_BALANCE_SQL: &str = "SELECT COALESCE(SUM(amount_micros), 0)::big
      WHERE budget_account_id = $1 AND period = $2 \
        AND (expires_at IS NULL OR expires_at > $3) \
        AND revoked_at IS NULL";
+
+/// The grant whose most recent `amount_micros` for `(budget_account_id, period)` represents "the
+/// tier this account is currently on" -- shared by [`crate::refill::RefillService`] (deciding the
+/// next rung to request) and, since ADR-0014, the token-exchange minting path (deciding what to
+/// stamp on a JWT). Deliberately excludes `correction`/`refund`: neither represents a tier an
+/// account is on -- a `correction` can shift the raw ledger total in a way that no longer matches
+/// any known rung, and a `refund` is a compensating adjustment, not a statement about the
+/// account's current tier.
+const LATEST_TIER_GRANT_AMOUNT_SQL: &str = "SELECT amount_micros FROM budget_grants \
+     WHERE budget_account_id = $1 AND period = $2 \
+       AND source IN ('base','self_service','automatic','admin','manual_approval','promotion') \
+     ORDER BY created_at DESC LIMIT 1";
 
 const GET_BALANCE_SQL: &str = "SELECT \
      budget_account_id, period, base_total_micros, self_service_total_micros, \
@@ -487,6 +500,60 @@ impl BudgetRepo {
             .map_err(storage_failed)?;
 
         Ok(total)
+    }
+
+    /// Resolves the tier an account is currently on for `period`, from the most recent
+    /// tier-representing grant (see [`LATEST_TIER_GRANT_AMOUNT_SQL`]'s doc comment for exactly
+    /// which sources count). Moved here from [`crate::refill::RefillService`] (ADR-0014) so a
+    /// caller that only needs a tier lookup -- notably the OIDC token-exchange/refresh minting
+    /// path in `lightbridge-authz-rest`, which has no reason to construct a full
+    /// `RefillService` (policy engine, spend reader, augmentation repo) just to read a tier --
+    /// can depend on this crate's lightest-weight read primitive instead.
+    ///
+    /// Falls back to [`BudgetTier::B15`] (the lowest rung) in two cases, and both are deliberate,
+    /// defensive fallbacks rather than a trusted derivation:
+    ///
+    /// - No qualifying grant exists yet this period (a genuinely new account/period).
+    /// - A qualifying grant exists, but its `amount_micros` doesn't match any known rung (e.g. a
+    ///   `correction` shifted the raw ledger total in a way that makes the *most recent
+    ///   tier-grant* no longer reflect current reality -- or just data this service doesn't
+    ///   expect in practice).
+    ///
+    /// **This does NOT cover a genuine storage failure** (DB unreachable, timeout, etc.) -- that
+    /// still surfaces as `Err(BudgetError::StorageFailed)`, same as every other read on this
+    /// type. A caller that must never omit a downstream claim on such a failure (the token-mint
+    /// path -- see the budget-tier-rekey-cutover runbook's "an account with no claim lands on no
+    /// matching rule, which is the difference between base budget and unlimited") is responsible
+    /// for catching that `Err` itself and choosing its own fail-closed default; this method does
+    /// not silently swallow a storage error into `B15` on its own, since a caller that actually
+    /// wants to distinguish "new account" from "ledger unavailable" (e.g. for an operator alert)
+    /// still can.
+    ///
+    /// **Known simplification, not solved here (ADR-0008):** "the billing plan determines the
+    /// starting rung" has no `billing_plan` -> `BudgetTier` mapping anywhere in this codebase
+    /// yet, so every account with no qualifying grant history this period defaults to `B15`
+    /// regardless of plan. Safe (never grants/claims more than the cheapest plan would justify)
+    /// but not the intended long-run behavior for e.g. an enterprise-plan account.
+    pub async fn current_tier(
+        &self,
+        budget_account_id: &str,
+        period: &Period,
+    ) -> Result<BudgetTier, BudgetError> {
+        let period_str = period.to_string();
+
+        let row: Option<(i64,)> = sqlx::query_as(LATEST_TIER_GRANT_AMOUNT_SQL)
+            .bind(budget_account_id)
+            .bind(&period_str)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(storage_failed)?;
+
+        Ok(match row {
+            Some((amount_micros,)) => {
+                BudgetTier::from_amount_micros(amount_micros).unwrap_or(BudgetTier::B15)
+            }
+            None => BudgetTier::B15,
+        })
     }
 
     /// A plain, single-row read of the stored `budget_balances` projection for `(budget_account_id,

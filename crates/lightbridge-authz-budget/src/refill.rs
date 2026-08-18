@@ -14,13 +14,15 @@
 //! ## The starting-tier gap (ADR-0008, flagged, not solved here)
 //!
 //! ADR-0008 says "the billing plan determines the starting rung". That `billing_plan` ->
-//! `BudgetTier` mapping does not exist anywhere in this codebase yet. [`RefillService`] defaults
-//! every account with no qualifying grant history this period to [`BudgetTier::B15`], the lowest
-//! rung. That default is *safe* (it never grants more than the cheapest plan would justify) but it
-//! is NOT the real, intended behavior for e.g. an enterprise-plan account that should start at
-//! `B1000` -- such an account would have to refill repeatedly, one rung at a time, to reach the
-//! tier it should have started at. This is a deliberate, flagged simplification for follow-up, not
-//! something this PR is claiming is fully solved.
+//! `BudgetTier` mapping does not exist anywhere in this codebase yet. [`BudgetRepo::current_tier`]
+//! (which [`RefillService`] resolves through, and which ADR-0014's token-mint claim also now
+//! reads) defaults every account with no qualifying grant history this period to
+//! [`BudgetTier::B15`], the lowest rung. That default is *safe* (it never grants -- or claims --
+//! more than the cheapest plan would justify) but it is NOT the real, intended behavior for e.g.
+//! an enterprise-plan account that should start at `B1000` -- such an account would have to
+//! refill repeatedly, one rung at a time, to reach the tier it should have started at. This is a
+//! deliberate, flagged simplification for follow-up, not something this PR is claiming is fully
+//! solved.
 
 use std::sync::Arc;
 
@@ -38,20 +40,6 @@ use crate::repo::{BudgetRepo, GrantRequest};
 use crate::source::GrantSource;
 use crate::spend::SpendReader;
 use crate::tier::BudgetTier;
-
-/// The grants whose most recent `amount_micros` for `(budget_account_id, period)` represents "the
-/// tier this account is currently on". Deliberately excludes `correction`/`refund`: neither
-/// represents a tier an account is on -- a `correction` can shift the raw ledger total in a way
-/// that no longer matches any known rung, and a `refund` is a compensating adjustment, not a
-/// statement about the account's current tier.
-const LATEST_TIER_GRANT_AMOUNT_SQL: &str = "SELECT amount_micros FROM budget_grants \
-     WHERE budget_account_id = $1 AND period = $2 \
-       AND source IN ('base','self_service','automatic','admin','manual_approval','promotion') \
-     ORDER BY created_at DESC LIMIT 1";
-
-fn storage_failed(err: sqlx::Error) -> BudgetError {
-    BudgetError::StorageFailed(err.to_string())
-}
 
 /// One refill request. Deliberately caller-supplied `as_of`, not read from the clock internally --
 /// the same discipline the rest of this crate already applies (`Period` is clock-free;
@@ -201,27 +189,21 @@ impl RefillService {
     /// or deleting this transitional path early (breaks the live frontend, see ADR-0015 and the
     /// `MyBudgetRefillLadder`/`RequestBudgetRefillInput` doc comments in `authz.cstack`). The
     /// real, policy-sourced floor (`fail_closed_floor_micros`) is what every new/current caller
-    /// actually observes, since it is not read through this method at all.
+    /// actually observes, since it is not read through this method at all -- including ADR-0014's
+    /// own token-mint fail-closed fallback, which reads
+    /// [`PolicyEngine::fail_closed_floor_micros`] directly rather than going through this
+    /// transitional, `BudgetTier`-shaped path. (ADR-0014 moved this query onto [`BudgetRepo`]
+    /// itself, as [`BudgetRepo::current_tier`], so both this transitional caller and the
+    /// token-exchange minting path could share it without constructing a full `RefillService` --
+    /// see that method's doc comment for the exact fallback semantics.)
     async fn current_tier(
         &self,
         budget_account_id: &str,
         period: &Period,
     ) -> Result<BudgetTier, BudgetError> {
-        let period_str = period.to_string();
-
-        let row: Option<(i64,)> = sqlx::query_as(LATEST_TIER_GRANT_AMOUNT_SQL)
-            .bind(budget_account_id)
-            .bind(&period_str)
-            .fetch_optional(self.budget_repo.pool())
+        self.budget_repo
+            .current_tier(budget_account_id, period)
             .await
-            .map_err(storage_failed)?;
-
-        Ok(match row {
-            Some((amount_micros,)) => {
-                BudgetTier::from_amount_micros(amount_micros).unwrap_or(BudgetTier::B15)
-            }
-            None => BudgetTier::B15,
-        })
     }
 
     /// Handles one refill request end to end. Returns the resulting [`AugmentationRequest`] in

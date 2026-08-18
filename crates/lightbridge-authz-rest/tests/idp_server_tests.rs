@@ -177,6 +177,12 @@ fn offline_token_exchange_state(
             .expect("lazy redis connection manager always builds");
     let bearer: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(UnreachableBearer);
+    // Built off the SAME (lazy, never-dialed) pool `repo` already wraps -- `StoreRepo.pool` is
+    // public precisely so callers like this can share one pool across repos without a second
+    // connection config. Keeps this helper "fully offline" per its own doc comment above.
+    let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
+        repo.pool.clone(),
+    ));
     let op_config = authkestra_op::config::OpConfig {
         issuer: oauth2.signing.as_ref().unwrap().issuer.clone(),
         scopes_supported: cfg.allowed_scopes.clone(),
@@ -195,6 +201,7 @@ fn offline_token_exchange_state(
         client_store,
         assertions,
         repo,
+        budget_repo,
         bearer,
         cfg,
     ));
