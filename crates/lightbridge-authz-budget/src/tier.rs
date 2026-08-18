@@ -21,6 +21,21 @@ pub enum BudgetTier {
 }
 
 impl BudgetTier {
+    /// Every rung, ascending, in declaration order. The single source of truth for "the whole
+    /// ladder" -- [`crate::refill::RefillService::refill_status`] returns this (paired with each
+    /// rung's amount) so a caller can render "where am I, what's next" without the frontend
+    /// hand-maintaining its own copy of the ladder. Kept as a `const` rather than a `Vec`-building
+    /// function since the ladder itself is a compile-time constant, not configuration.
+    pub const ALL: [BudgetTier; 7] = [
+        BudgetTier::B15,
+        BudgetTier::B30,
+        BudgetTier::B60,
+        BudgetTier::B120,
+        BudgetTier::B250,
+        BudgetTier::B500,
+        BudgetTier::B1000,
+    ];
+
     pub fn amount(&self) -> AmountMicros {
         let micros = match self {
             BudgetTier::B15 => 15_000_000,
@@ -104,15 +119,7 @@ impl FromStr for BudgetTier {
 mod tests {
     use super::*;
 
-    const LADDER: [BudgetTier; 7] = [
-        BudgetTier::B15,
-        BudgetTier::B30,
-        BudgetTier::B60,
-        BudgetTier::B120,
-        BudgetTier::B250,
-        BudgetTier::B500,
-        BudgetTier::B1000,
-    ];
+    const LADDER: [BudgetTier; 7] = BudgetTier::ALL;
 
     #[test]
     fn ladder_is_strictly_ascending() {

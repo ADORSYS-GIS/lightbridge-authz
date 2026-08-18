@@ -227,7 +227,7 @@ per-frame RBAC" above describes for the permission check.
 | `budget:policy-activate` | `procedure.activateBudgetPolicy`                | — (no MCP tool yet)                 |
 | `budget:policy-read`     | `procedure.getBudgetPolicyStatus`               | — (no MCP tool yet)                 |
 | `budget:policy-simulate` | `procedure.simulateBudgetPolicy`                | — (no MCP tool yet)                 |
-| `budget:self-refill`     | `procedure.requestBudgetRefill`                 | — (no MCP tool yet)                 |
+| `budget:self-refill`     | `procedure.requestBudgetRefill`, `procedure.getMyBudgetRefillLadder` | — (no MCP tool yet)   |
 | `budget:review`          | `procedure.listPendingAugmentationRequests`, `procedure.approveAugmentationRequest`, `procedure.rejectAugmentationRequest` | — (no MCP tool yet) |
 | `budget:read-own`        | `procedure.getMyBudgetBalance`, `procedure.listMyBudgetGrants`, `procedure.listMyAugmentationRequests` | — (no MCP tool yet) |
 | `budget:read`            | `procedure.getBudgetBalance`                    | — (no MCP tool yet)                 |
@@ -291,6 +291,14 @@ what's serving), `budget:policy-read` (coarser gate, only reads it), and `budget
 for `budgetAccountId`/`period`, and the service decides — immediately (auto-grant, possibly
 capped), or by queuing the request for a human (`pending_review`) — without anyone hand-editing
 policy config. Gated at `budget:self-refill`.
+
+`procedure.getMyBudgetRefillLadder` is the read-only companion over
+`RefillService::refill_status`, gated at the same `budget:self-refill` permission: it returns where
+the caller currently sits on the ADR-0008 ladder for `period`, the next rung (`null` at the top
+rung), and the full static ladder — visibility only, no policy evaluation, no reason codes. It
+exists so a UI can show the ladder instead of offering a tier picker; ADR-0008's ladder stays the
+server's decision space (`current_tier.next()` inside `request_refill`), never a caller-supplied
+choice — see converse-frontends#148 for the prior attempt at a picker and why it was rejected.
 
 `procedure.listPendingAugmentationRequests` / `procedure.approveAugmentationRequest` /
 `procedure.rejectAugmentationRequest` are the admin review queue over

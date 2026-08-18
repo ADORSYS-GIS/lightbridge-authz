@@ -186,6 +186,12 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         // gated separately from reviewing one -- a caller who can ask for more budget should not
         // thereby be able to approve/reject requests (including their own), and vice versa.
         "procedure.requestBudgetRefill" => BudgetSelfRefill,
+        // Read-only companion to `requestBudgetRefill`: the ladder-position preview a caller sees
+        // before submitting. Gated at the same `budget:self-refill` permission (not the broader
+        // `budget:read-own` `getMyBudgetBalance`/`listMyBudgetGrants` share) -- same
+        // "read-only companion gated at the mutation's own permission" precedent as
+        // `listBillingPlans` above, not a new, looser permission for a one-screen read.
+        "procedure.getMyBudgetRefillLadder" => BudgetSelfRefill,
         "procedure.listPendingAugmentationRequests" => BudgetReview,
         "procedure.approveAugmentationRequest" => BudgetReview,
         "procedure.rejectAugmentationRequest" => BudgetReview,
@@ -387,6 +393,10 @@ mod tests {
                 Permission::BudgetSelfRefill,
             ),
             (
+                "procedure.getMyBudgetRefillLadder",
+                Permission::BudgetSelfRefill,
+            ),
+            (
                 "procedure.listPendingAugmentationRequests",
                 Permission::BudgetReview,
             ),
@@ -493,22 +503,23 @@ mod tests {
         assert_eq!(extract_bearer(&headers), None);
     }
 
-    /// The exact 15 op-ids moved off `authz-api` onto `authz-budget` (derived from the
+    /// The exact 16 op-ids moved off `authz-api` onto `authz-budget` (derived from the
     /// `budget:*`-permission entries in `required_permission` above — this is the same list the
     /// PR description enumerates as "derived from the code", not from memory). If a future PR
-    /// adds a 16th `budget:*` op-id and forgets to add it here, `all_and_only_the_budget_gated_op_ids_are_in_budget_scope`
+    /// adds a 17th `budget:*` op-id and forgets to add it here, `all_and_only_the_budget_gated_op_ids_are_in_budget_scope`
     /// below still passes for it automatically (since it re-derives from `required_permission`
     /// instead of this literal), but this list existing at all is what lets a reviewer diff "the
     /// procedures that moved" without re-deriving them by hand.
     ///
-    /// `procedure.listMyAugmentationRequests` (#295) is the 15th entry, added alongside the
-    /// original 14 -- it is a `budget:read-own` op-id like `getMyBudgetBalance`/
-    /// `listMyBudgetGrants` above it, so it was always going to land in this scope.
-    const BUDGET_OP_IDS: [&str; 15] = [
+    /// `procedure.getMyBudgetRefillLadder` is the 16th entry, added alongside the original 15 --
+    /// it is a `budget:self-refill` op-id like `requestBudgetRefill` right above it (the ladder
+    /// preview it serves), so it was always going to land in this scope.
+    const BUDGET_OP_IDS: [&str; 16] = [
         "procedure.activateBudgetPolicy",
         "procedure.getBudgetPolicyStatus",
         "procedure.simulateBudgetPolicy",
         "procedure.requestBudgetRefill",
+        "procedure.getMyBudgetRefillLadder",
         "procedure.listPendingAugmentationRequests",
         "procedure.approveAugmentationRequest",
         "procedure.rejectAugmentationRequest",
@@ -523,7 +534,7 @@ mod tests {
     ];
 
     #[test]
-    fn is_budget_op_id_recognizes_exactly_the_fifteen_moved_procedures() {
+    fn is_budget_op_id_recognizes_exactly_the_sixteen_moved_procedures() {
         for op_id in BUDGET_OP_IDS {
             assert!(is_budget_op_id(op_id), "{op_id} must be a budget op-id");
         }

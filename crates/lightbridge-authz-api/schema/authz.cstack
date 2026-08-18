@@ -685,6 +685,51 @@ type RequestBudgetRefillInput {
 mutation procedure requestBudgetRefill(args: RequestBudgetRefillInput): AugmentationRequest
   @allow(auth() != null)
 
+// Read-only companion to `requestBudgetRefill`: where the caller currently sits on ADR-0008's
+// ladder for `period`, and what the next refill would grant *if* a submitted request is later
+// approved. Unlike `AugmentationRequest.requestedTier` (only known after submitting), this can be
+// shown before the caller ever clicks refill. Deliberately visibility only -- no reason codes, no
+// cap/deny prediction; `requestBudgetRefill` alone decides what actually happens (see
+// `RefillService::refill_status`'s own doc comment). `nextTier`/`nextTierAmountMicros` are `null`
+// exactly when the caller is already on the top rung (`b-1000`).
+//
+// `ladder` is the full, static ADR-0008 rung list (`BudgetTier::ALL`) so the frontend never
+// hand-maintains its own copy of it as a selector's option list -- see
+// `packages/hooks/src/budget-tiers.ts` on the converse-frontends side for the existing
+// display-only mirror this is meant to backstop, not replace.
+//
+// Built for the tier-visibility screen: converse-frontends#148 already established a tier picker
+// cannot be built because the caller doesn't choose the tier (`RefillService::request_refill`
+// always resolves `current_tier.next()` itself) -- this procedure exists so the UI can show the
+// ladder instead of pretending to offer a choice.
+type BudgetLadderRung {
+  tier String
+  amountMicros String
+}
+
+type MyBudgetRefillLadder {
+  budgetAccountId String
+  period String
+  currentTier String
+  currentTierAmountMicros String
+  nextTier String?
+  nextTierAmountMicros String?
+  ladder BudgetLadderRung[]
+}
+
+type GetMyBudgetRefillLadderInput {
+  period String
+}
+
+// Gated at the SAME `budget:self-refill` permission as `requestBudgetRefill` itself, not the
+// broader `budget:read-own` `getMyBudgetBalance`/`listMyBudgetGrants` share -- this exists to serve
+// the one screen that also calls `requestBudgetRefill`, mirroring `listBillingPlans`'s "read-only
+// companion gated at the mutation's own permission" precedent
+// (`crates/lightbridge-authz-rest/src/rpc_authorize.rs`'s doc comment on that entry) rather than
+// inventing a new, looser permission for a one-screen read.
+procedure getMyBudgetRefillLadder(args: GetMyBudgetRefillLadderInput): MyBudgetRefillLadder
+  @allow(auth() != null)
+
 // The admin review queue's read path (#191, PR 3.3's `ReviewService::list_pending`; pagination
 // added by #296). `budgetAccountId: String?` mirrors `list_pending`'s own `Option<&str>` scoping
 // precisely: omitted/`null` lists the whole cross-account queue (a global admin view), `Some`

@@ -34,7 +34,7 @@ pub use error::BudgetError;
 pub use facts::Facts;
 pub use period::Period;
 pub use policy_store::PolicyStore;
-pub use refill::{RefillRequest, RefillService};
+pub use refill::{LadderRung, RefillRequest, RefillService, RefillStatus};
 pub use review::ReviewService;
 pub use rule_data::{
     Condition, Field, Operator, Rule, RuleDataEngine, RuleSet, default_rule_set_json,
