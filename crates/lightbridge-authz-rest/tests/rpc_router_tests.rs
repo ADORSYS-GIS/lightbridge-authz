@@ -6,12 +6,18 @@
 
 //! Hermetic tests for the assembled authz-api RPC router (`build_api_router`), re-porting the
 //! route-shape coverage the deleted `router_tests.rs`/`controllers_tests.rs` had (health probes,
-//! dev-CORS, the well-known / token-exchange merges) onto the cratestack RPC surface, plus the
-//! **fail-closed half** of the RBAC gate (`docs/rbac.md`, `rpc_authorize.rs`).
+//! dev-CORS) onto the cratestack RPC surface, plus the **fail-closed half** of the RBAC gate
+//! (`docs/rbac.md`, `rpc_authorize.rs`).
+//!
+//! `build_api_router` no longer mounts OIDC discovery/JWKS or native token-exchange at all — that
+//! surface moved exclusively to `authz-idp` (`build_idp_router`) once the `auth.ai.camer.digital`
+//! ingress was repointed there (see `build_api_router`'s own doc comment). This file's
+//! `well_known_and_token_exchange_paths_are_never_served_by_api_router` proves the fail-closed
+//! response those paths now get here.
 //!
 //! Everything here is offline: the cratestack CRUD client / idempotency store / rate-limit store are
 //! lazily connected to an unreachable address and never queried, because every request either
-//!   * hits a non-RPC route (`/healthz*`, `/.well-known/*`, `/oauth2/token`, CORS preflight),
+//!   * hits a non-RPC route (`/healthz*`, CORS preflight, or an unmapped path like `/.well-known/*`),
 //!   * is rejected by the outermost `rpc_authorize` gate (403/401) **before** dispatch, idempotency,
 //!     or rate-limiting run, or
 //!   * is a `POST /rpc/batch` call the gate *does* let through (it only requires a valid token, not a
@@ -29,22 +35,15 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use common::{
-    MapBearer, Wire, admin_perms, as_json, external_oauth2, rpc_call, token_info, viewer_perms,
-};
+use common::{MapBearer, Wire, admin_perms, as_json, rpc_call, token_info, viewer_perms};
 use cratestack::SqlxIdempotencyStore;
 use cratestack::ratelimit::RateLimitStore;
 use lightbridge_authz_api::schema;
-use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::BearerTokenServiceTrait;
-use lightbridge_authz_core::config::{
-    Billing, JwtSigning, Oauth2, Oauth2TokenExchange, Oauth2Type,
-};
+use lightbridge_authz_core::config::Billing;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
 use lightbridge_authz_rest::ratelimit_redis::build_redis_rate_limit_store;
-use lightbridge_authz_rest::signing::ApiKeyJwtSigner;
-use lightbridge_authz_rest::token_exchange::TokenExchangeState;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
@@ -60,10 +59,6 @@ fn lazy_core_pool() -> Arc<dyn DbPoolTrait> {
         .connect_lazy(DEAD_PG)
         .expect("lazy core pool");
     Arc::new(DbPool::from_pool(pool))
-}
-
-fn lazy_store_repo() -> Arc<StoreRepo> {
-    Arc::new(StoreRepo::new(lazy_core_pool()))
 }
 
 fn lazy_cratestack_db() -> schema::Cratestack {
@@ -135,87 +130,17 @@ fn lazy_refill_and_review_services(
     (refill_service, review_service, budget_repo)
 }
 
-fn signing_cfg() -> JwtSigning {
-    JwtSigning {
-        issuer: "https://authz.example.test".to_string(),
-        audience: None,
-        ttl_seconds: 7_776_000,
-        max_key_age_days: 30,
-    }
-}
-
-fn self_signed_oauth2() -> Oauth2 {
-    let mut oauth2 = external_oauth2();
-    oauth2.oauth2_type = Oauth2Type::SelfSigned;
-    oauth2.signing = Some(signing_cfg());
-    oauth2
-}
-
-fn exchange_cfg() -> Oauth2TokenExchange {
-    Oauth2TokenExchange {
-        enabled: true,
-        access_ttl_seconds: 900,
-        refresh_ttl_seconds: 2_592_000,
-        allowed_scopes: vec!["openid".to_string()],
-        refresh_absolute_ttl_seconds: 7_776_000,
-    }
-}
-
-/// Builds a `TokenExchangeState` for router-wiring tests that only need the route to be *merged*
-/// -- no real client list, no reachable Redis (the `ClientAssertionStore` connection is lazy; see
-/// `RedisClientAssertionStore::connect`'s own doc comment).
-fn token_exchange_state(bearer: Arc<dyn BearerTokenServiceTrait>) -> TokenExchangeState {
-    let signer = ApiKeyJwtSigner::from_config(&signing_cfg(), lazy_store_repo())
-        .expect("signer builds from config");
-    let client_store =
-        lightbridge_authz_rest::oauth2_op::client_store::ConfigClientStore::from_config(&[]);
-    let assertions =
-        lightbridge_authz_rest::oauth2_op::client_assertion_store::RedisClientAssertionStore::connect(
-            "redis://127.0.0.1:1",
-            "test:",
-        )
-        .expect("lazy connection manager always builds");
-    let op_store = Arc::new(
-        lightbridge_authz_rest::oauth2_op::store::TokenExchangeOpStore::new(
-            client_store,
-            assertions,
-            lazy_store_repo(),
-            bearer,
-            exchange_cfg(),
-        ),
-    );
-    let op_config = authkestra_op::config::OpConfig {
-        issuer: signing_cfg().issuer,
-        scopes_supported: exchange_cfg().allowed_scopes,
-        response_types_supported: vec!["token".to_string()],
-        grant_types_supported: vec![
-            "urn:ietf:params:oauth:grant-type:token-exchange".to_string(),
-            "refresh_token".to_string(),
-        ],
-        id_token_signing_alg: "RS256".to_string(),
-        authorization_code_ttl_secs: 0,
-        access_token_ttl_secs: 900,
-        device_code_ttl_secs: 0,
-        token_exchange_enabled: true,
-    };
-    TokenExchangeState::new(signer, op_config, op_store)
-}
-
-/// Assemble the full API router with a caller-supplied bearer and (optional) token-exchange state,
-/// everything else lazily wired to unreachable backends.
-fn build_router(
-    bearer: Arc<dyn BearerTokenServiceTrait>,
-    oauth2: &Oauth2,
-    token_exchange: Option<TokenExchangeState>,
-    dev_cors: bool,
-) -> Router {
+/// Assemble the full API router with a caller-supplied bearer, everything else lazily wired to
+/// unreachable backends. `build_api_router` no longer takes `oauth2`/`signing_repo`/
+/// `token_exchange` params at all — it stopped mounting OIDC discovery/JWKS and token-exchange
+/// once that surface moved exclusively to `authz-idp` (see its doc comment).
+fn build_router(bearer: Arc<dyn BearerTokenServiceTrait>, dev_cors: bool) -> Router {
     let core = lazy_core_pool();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()));
     let policy_store = lazy_policy_store(core.clone());
     let (refill_service, review_service, budget_repo) =
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
-        oauth2,
         bearer,
         issuer,
         policy_store,
@@ -224,8 +149,6 @@ fn build_router(
         budget_repo,
         lazy_cratestack_db(),
         core,
-        lazy_store_repo(),
-        token_exchange,
         lazy_idempotency(),
         lazy_rate_limit(),
         dev_cors,
@@ -245,7 +168,6 @@ fn build_router_with_billing(bearer: Arc<dyn BearerTokenServiceTrait>, billing: 
     let (refill_service, review_service, budget_repo) =
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
-        &external_oauth2(),
         bearer,
         issuer,
         policy_store,
@@ -254,8 +176,6 @@ fn build_router_with_billing(bearer: Arc<dyn BearerTokenServiceTrait>, billing: 
         budget_repo,
         lazy_cratestack_db(),
         core,
-        lazy_store_repo(),
-        None,
         lazy_idempotency(),
         lazy_rate_limit(),
         false,
@@ -267,7 +187,6 @@ fn build_router_with_billing(bearer: Arc<dyn BearerTokenServiceTrait>, billing: 
 /// configurable-mount test.
 fn build_router_at(
     bearer: Arc<dyn BearerTokenServiceTrait>,
-    oauth2: &Oauth2,
     rpc_base_path: Option<&str>,
 ) -> Router {
     let core = lazy_core_pool();
@@ -276,7 +195,6 @@ fn build_router_at(
     let (refill_service, review_service, budget_repo) =
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
-        oauth2,
         bearer,
         issuer,
         policy_store,
@@ -285,8 +203,6 @@ fn build_router_at(
         budget_repo,
         lazy_cratestack_db(),
         core,
-        lazy_store_repo(),
-        None,
         lazy_idempotency(),
         lazy_rate_limit(),
         false,
@@ -319,14 +235,14 @@ async fn get(router: Router, uri: &str) -> StatusCode {
 #[tokio::test]
 async fn health_probes_report_ok() {
     for uri in ["/", "/healthz", "/healthz/startup"] {
-        let router = build_router(admin_bearer(), &external_oauth2(), None, false);
+        let router = build_router(admin_bearer(), false);
         assert_eq!(get(router, uri).await, StatusCode::OK, "probe {uri}");
     }
 }
 
 #[tokio::test]
 async fn dev_cors_preflight_is_answered_with_permissive_headers() {
-    let router = build_router(admin_bearer(), &external_oauth2(), None, true);
+    let router = build_router(admin_bearer(), true);
     let response = router
         .oneshot(
             Request::builder()
@@ -352,7 +268,7 @@ async fn dev_cors_preflight_is_answered_with_permissive_headers() {
 
 #[tokio::test]
 async fn dev_cors_adds_allow_origin_header_to_normal_responses() {
-    let router = build_router(admin_bearer(), &external_oauth2(), None, true);
+    let router = build_router(admin_bearer(), true);
     let response = router
         .oneshot(
             Request::builder()
@@ -374,7 +290,7 @@ async fn dev_cors_adds_allow_origin_header_to_normal_responses() {
 
 #[tokio::test]
 async fn no_dev_cors_means_no_allow_origin_header() {
-    let router = build_router(admin_bearer(), &external_oauth2(), None, false);
+    let router = build_router(admin_bearer(), false);
     let response = router
         .oneshot(
             Request::builder()
@@ -393,34 +309,35 @@ async fn no_dev_cors_means_no_allow_origin_header() {
     );
 }
 
+/// `build_api_router` no longer mounts `well_known_router`/`token_exchange_router` at all — that
+/// surface moved exclusively to `authz-idp` once the `auth.ai.camer.digital` ingress was
+/// repointed there (see `build_api_router`'s doc comment in `lib.rs`). Replaces
+/// `well_known_discovery_is_merged_only_for_self_signed_oauth2` and the two
+/// `token_exchange_route_*` tests, whose premise (that either route is ever reachable here under
+/// some config) is now false unconditionally, not just for `external` oauth2. None of these paths
+/// are a public route on this router anymore, so each falls through to the RPC router's fallback,
+/// which the outermost `rpc_authorize` gate fail-closes to `403` for an unmapped op-id — no
+/// bearer token required, since `op_id_from_path` extracts `""` for any path with no `/rpc/`
+/// segment and the fail-closed set denies that unconditionally (see `rpc_authorize`'s doc
+/// comment). Never the `200`/merged-4xx these paths used to return when self-signed/token-exchange
+/// config was present.
 #[tokio::test]
-async fn well_known_discovery_is_merged_only_for_self_signed_oauth2() {
-    // self-signed → well-known router merged, discovery served (static, no DB).
-    let router = build_router(admin_bearer(), &self_signed_oauth2(), None, false);
-    assert_eq!(
-        get(router, "/.well-known/openid-configuration").await,
-        StatusCode::OK,
-        "self-signed oauth2 must publish OIDC discovery"
-    );
-
-    // external → not merged. The path is not a public route, so it falls through to the RPC
-    // router's fallback, which the outermost `rpc_authorize` gate wraps — an unknown op-id is
-    // fail-closed to 403 (never 200, i.e. the discovery document is decidedly not served).
-    let router = build_router(admin_bearer(), &external_oauth2(), None, false);
+async fn well_known_and_token_exchange_paths_are_never_served_by_api_router() {
+    let router = build_router(admin_bearer(), false);
     assert_eq!(
         get(router, "/.well-known/openid-configuration").await,
         StatusCode::FORBIDDEN,
-        "external oauth2 must not publish the self-signed discovery document"
+        "authz-api must never serve OIDC discovery"
     );
-}
 
-#[tokio::test]
-async fn token_exchange_route_is_merged_when_configured() {
-    let te = token_exchange_state(admin_bearer());
-    let router = build_router(admin_bearer(), &self_signed_oauth2(), Some(te), false);
+    let router = build_router(admin_bearer(), false);
+    assert_eq!(
+        get(router, "/.well-known/jwks.json").await,
+        StatusCode::FORBIDDEN,
+        "authz-api must never serve JWKS"
+    );
 
-    // The route is merged: a POST reaches the handler (Form extraction fails on an empty body →
-    // 4xx), which is decisively *not* the 404 an unmerged route would give.
+    let router = build_router(admin_bearer(), false);
     let status = router
         .oneshot(
             Request::builder()
@@ -432,33 +349,29 @@ async fn token_exchange_route_is_merged_when_configured() {
         .await
         .unwrap()
         .status();
-    // Merged → the request reaches the token handler (Form extraction fails on the empty body →
-    // a 4xx that is neither the 404 of an absent route nor the 403 the gate gives unmatched paths).
-    assert_ne!(status, StatusCode::NOT_FOUND, "route should be merged");
-    assert_ne!(
+    assert_eq!(
         status,
         StatusCode::FORBIDDEN,
-        "merged route reaches the handler, not the gate fallback (got {status})"
+        "authz-api must never mount /oauth2/token"
     );
-}
 
-#[tokio::test]
-async fn token_exchange_route_absent_when_not_configured() {
-    let router = build_router(admin_bearer(), &external_oauth2(), None, false);
+    let router = build_router(admin_bearer(), false);
     let status = router
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/oauth2/token")
+                .uri("/oauth2/revoke")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap()
         .status();
-    // Not merged → swallowed by the RPC fallback + `rpc_authorize` gate → fail-closed 403 (the
-    // merged case above instead reaches the handler and returns a non-403 4xx).
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "authz-api must never mount /oauth2/revoke"
+    );
 }
 
 /// The security-critical fail-closed half of the RBAC gate: a read-only viewer is rejected on every
@@ -484,7 +397,7 @@ async fn rbac_gate_denies_viewer_on_every_mutating_op() {
         "procedure.revokeApiKey",
         "procedure.rotateApiKey",
     ] {
-        let router = build_router(admin_and_viewer_bearer(), &external_oauth2(), None, false);
+        let router = build_router(admin_and_viewer_bearer(), false);
         let (status, _) = rpc_call(router, op, Wire::Cbor, &json!({}), Some("viewer")).await;
         assert_eq!(
             status,
@@ -507,7 +420,7 @@ async fn rbac_gate_denies_unmapped_and_locked_ops_even_for_admin() {
         "procedure.unknown",
         "",
     ] {
-        let router = build_router(admin_bearer(), &external_oauth2(), None, false);
+        let router = build_router(admin_bearer(), false);
         let (status, _) = rpc_call(router, op, Wire::Cbor, &json!({}), Some("admin")).await;
         assert_eq!(
             status,
@@ -529,7 +442,7 @@ async fn rbac_gate_denies_unmapped_and_locked_ops_even_for_admin() {
 #[tokio::test]
 async fn rbac_gate_on_the_batch_endpoint_requires_a_valid_token_then_forwards() {
     async fn batch_request(token: Option<&str>) -> StatusCode {
-        let router = build_router(admin_bearer(), &external_oauth2(), None, false);
+        let router = build_router(admin_bearer(), false);
         let mut builder = Request::builder()
             .method("POST")
             .uri("/rpc/batch")
@@ -581,7 +494,7 @@ async fn rpc_surface_honours_configured_base_path() {
     };
 
     // Mapped op at the configured prefix: op-id resolves, then 401 for the missing bearer.
-    let router = build_router_at(admin_bearer(), &external_oauth2(), Some("/api"));
+    let router = build_router_at(admin_bearer(), Some("/api"));
     let resolved = router
         .oneshot(req("/api/rpc/model.Account.list"))
         .await
@@ -593,7 +506,7 @@ async fn rpc_surface_honours_configured_base_path() {
     );
 
     // The surface no longer answers at the root when a base path is configured.
-    let router = build_router_at(admin_bearer(), &external_oauth2(), Some("/api"));
+    let router = build_router_at(admin_bearer(), Some("/api"));
     let moved = router
         .oneshot(req("/rpc/model.Account.list"))
         .await
@@ -605,7 +518,7 @@ async fn rpc_surface_honours_configured_base_path() {
     );
 
     // Default (no base path) keeps serving at the root.
-    let router = build_router_at(admin_bearer(), &external_oauth2(), None);
+    let router = build_router_at(admin_bearer(), None);
     let default_root = router
         .oneshot(req("/rpc/model.Account.list"))
         .await
@@ -620,11 +533,11 @@ async fn rpc_surface_honours_configured_base_path() {
 /// A mapped op with no bearer → 401 (missing token); with an unknown/invalid token → 401.
 #[tokio::test]
 async fn rbac_gate_requires_a_valid_token_on_mapped_ops() {
-    let router = build_router(admin_bearer(), &external_oauth2(), None, false);
+    let router = build_router(admin_bearer(), false);
     let (status, _) = rpc_call(router, "model.Account.list", Wire::Cbor, &json!({}), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "missing token → 401");
 
-    let router = build_router(admin_bearer(), &external_oauth2(), None, false);
+    let router = build_router(admin_bearer(), false);
     let (status, _) = rpc_call(
         router,
         "model.Account.list",
@@ -641,7 +554,7 @@ async fn rbac_gate_requires_a_valid_token_on_mapped_ops() {
 /// `apikey:create`) must be refused exactly like on `createApiKey` itself.
 #[tokio::test]
 async fn list_billing_plans_denied_for_caller_without_apikey_create() {
-    let router = build_router(admin_and_viewer_bearer(), &external_oauth2(), None, false);
+    let router = build_router(admin_and_viewer_bearer(), false);
     let (status, _) = rpc_call(
         router,
         "procedure.listBillingPlans",
@@ -732,7 +645,7 @@ async fn budget_gated_op_ids_are_unreachable_on_authz_api_regardless_of_permissi
         "procedure.createBudgetPolicyRevision",
     ];
     for op in op_ids {
-        let router = build_router(admin_bearer(), &external_oauth2(), None, false);
+        let router = build_router(admin_bearer(), false);
         let (status, body) = rpc_call(router, op, Wire::Cbor, &json!({}), Some("admin")).await;
         assert_eq!(
             status,
@@ -777,7 +690,7 @@ async fn viewer_and_editor_roles_are_granted_account_create_by_shipped_config() 
             "caller",
             token_info(&format!("{role}-subject"), perms_from_shipped_config(role)),
         ));
-        let router = build_router(bearer, &external_oauth2(), None, false);
+        let router = build_router(bearer, false);
         let (status, body) = rpc_call(
             router,
             "procedure.createAccount",

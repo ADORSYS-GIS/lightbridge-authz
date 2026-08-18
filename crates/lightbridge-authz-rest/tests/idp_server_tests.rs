@@ -4,11 +4,13 @@
 // for shipping code.
 #![allow(clippy::unwrap_used)]
 
-//! ADR-0012 Phase 1: `authz-idp` carries `/oauth2/token`, `/oauth2/revoke`, and `.well-known/*`
-//! off `authz-api` onto a new, dedicated `idp` subcommand/server. This file proves the four things
-//! that phase's safety depends on:
-//! 1. `build_idp_router` serves discovery + JWKS byte-identical to `build_api_router` (the
-//!    routing-cutover safety property ADR-0012 names explicitly).
+//! ADR-0012: `authz-idp` carries `/oauth2/token`, `/oauth2/revoke`, and `.well-known/*` on a
+//! dedicated `idp` subcommand/server. The `auth.ai.camer.digital` ingress now routes directly to
+//! `authz-idp`, and `authz-api`'s own copy of this surface has been removed (see
+//! `build_api_router`'s doc comment in `lib.rs`) -- `authz-idp` is the sole owner. This file
+//! proves what that now depends on:
+//! 1. `build_idp_router` serves discovery + JWKS with real content, and `build_api_router` no
+//!    longer serves either at all (`api_router_no_longer_serves_well_known_idp_still_does`).
 //! 2. `build_idp_router` serves `/oauth2/token` and `/oauth2/revoke`.
 //! 3. Its probes behave like every other server's, DB-unavailable readiness failure included.
 //! 4. The signing-key ownership decision (`authz-idp` bootstraps, like `authz-api`/
@@ -443,14 +445,18 @@ mod db {
         );
     }
 
-    /// The routing-cutover safety property ADR-0012 names explicitly: `authz-api` and
-    /// `authz-idp` must resolve `.well-known/openid-configuration` and `.well-known/jwks.json`
-    /// to byte-identical bodies for as long as both serve them (Phase 1's transitional
-    /// duplication). Both routers here are built from the same `oauth2`/`signing_repo`/database,
-    /// which is the real-world condition the cutover depends on -- see `well_known_mount_params`
-    /// and `build_idp_router`'s doc comment in `lib.rs`.
+    /// Replaces `idp_and_api_routers_serve_byte_identical_discovery_and_jwks`, whose premise --
+    /// that `authz-api` and `authz-idp` serve byte-identical discovery/JWKS -- is now deliberately
+    /// false: `authz-api`'s own `well_known_router`/`token_exchange_router` merges were removed
+    /// once the `auth.ai.camer.digital` ingress was repointed at `authz-idp` (see
+    /// `build_api_router`'s doc comment in `lib.rs`). This proves the intended split instead:
+    /// `authz-idp` still serves both paths with real content, and `authz-api`'s RPC router treats
+    /// them as an unmapped op-id and fail-closes to `403` with no token required --
+    /// `op_id_from_path` extracts `""` for any path with no `/rpc/` segment, which
+    /// `rpc_authorize`'s fail-closed set denies unconditionally regardless of authentication (see
+    /// that module's doc comment) -- never the `200` the two routers used to agree on.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn idp_and_api_routers_serve_byte_identical_discovery_and_jwks(pool: PgPool) {
+    async fn api_router_no_longer_serves_well_known_idp_still_does(pool: PgPool) {
         use cratestack::SqlxIdempotencyStore;
         use lightbridge_authz_api::schema;
         use lightbridge_authz_rest::handlers::AuthzStoreImpl;
@@ -468,16 +474,12 @@ mod db {
 
         // authz-idp's router: thin, no cratestack/idempotency/rate-limit scaffolding needed.
         let idp_state = offline_token_exchange_state(&oauth2, signing_repo.clone());
-        let idp_router = build_idp_router(
-            &oauth2,
-            signing_repo.clone(),
-            Some(idp_state),
-            db_pool.clone(),
-        );
+        let idp_router = build_idp_router(&oauth2, signing_repo, Some(idp_state), db_pool.clone());
 
-        // authz-api's router: the cratestack CRUD client / idempotency store / rate-limit store
-        // are lazily-connected to an unreachable address and never touched by `.well-known/*` --
-        // mirrors `tests/lib_tests.rs`'s `readiness_route_reports_ok_with_a_reachable_database`.
+        // authz-api's router: no oauth2/signing_repo/token_exchange params anymore (it mounts
+        // neither well-known nor token-exchange), so the cratestack CRUD client / idempotency
+        // store / rate-limit store just need to construct -- they're never touched, since both
+        // paths this test drives are rejected by the `rpc_authorize` gate before dispatch.
         let lazy_cratestack_pool = cratestack::sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(std::time::Duration::from_millis(250))
             .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
@@ -514,9 +516,7 @@ mod db {
             budget_repo.clone(),
             augmentation_repo,
         ));
-        let api_state = offline_token_exchange_state(&oauth2, signing_repo.clone());
         let api_router = build_api_router(
-            &oauth2,
             bearer,
             issuer,
             policy_store,
@@ -525,8 +525,6 @@ mod db {
             budget_repo,
             cratestack_db,
             db_pool,
-            signing_repo,
-            Some(api_state),
             idempotency_store,
             rate_limit_store,
             false,
@@ -542,24 +540,30 @@ mod db {
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
+            assert_eq!(
+                idp_response.status(),
+                StatusCode::OK,
+                "authz-idp must still serve {path}"
+            );
+            let idp_body = to_bytes(idp_response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                !idp_body.is_empty(),
+                "authz-idp's {path} response must carry real content"
+            );
+
             let api_response = api_router
                 .clone()
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
-            assert_eq!(idp_response.status(), StatusCode::OK, "{path}");
-            assert_eq!(api_response.status(), StatusCode::OK, "{path}");
-
-            let idp_body = to_bytes(idp_response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let api_body = to_bytes(api_response.into_body(), usize::MAX)
-                .await
-                .unwrap();
             assert_eq!(
-                idp_body, api_body,
-                "{path} must be byte-identical between authz-idp and authz-api during the \
-                 Phase 1 transitional duplication"
+                api_response.status(),
+                StatusCode::FORBIDDEN,
+                "authz-api must no longer serve {path} -- expected the RPC gate's fail-closed \
+                 unmapped-op-id response (403), got {}",
+                api_response.status()
             );
         }
     }

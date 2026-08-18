@@ -460,7 +460,6 @@ mod db {
         let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
         let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(NoopBearer);
         let issuer = Arc::new(AuthzStoreImpl::with_pool(db_pool.clone()));
-        let signing_repo = Arc::new(StoreRepo::new(db_pool.clone()));
         // The migration this test's `sqlx::test` runs seeds an active `budget-refill` revision,
         // so a real `load_active_from_db` (not the offline `from_engine` helper) works here.
         let policy_store = Arc::new(
@@ -493,7 +492,6 @@ mod db {
             augmentation_repo,
         ));
         let router = lightbridge_authz_rest::build_api_router(
-            &external_oauth2(),
             bearer,
             issuer,
             policy_store,
@@ -502,8 +500,6 @@ mod db {
             budget_repo,
             lazy_cratestack_db(),
             db_pool.clone(),
-            signing_repo,
-            None,
             lazy_idempotency_store(),
             lazy_rate_limit_store(),
             false,
