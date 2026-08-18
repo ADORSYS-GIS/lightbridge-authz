@@ -123,7 +123,7 @@ httpmock = "0.8"
 # fixture key is a guaranteed CI secret-scan failure. Same crate/version httpmock already vendors
 # internally for its own "https" feature (unused here), so this doesn't add a new supply-chain
 # surface to research.
-rcgen = { version = "0.13", features = ["pem"] }
+rcgen = { version = "0.14", features = ["pem"] }
 # Dev-only, alongside rcgen above: computes ATS-compliant (<=825 day) leaf-certificate validity
 # windows relative to "now" so the generated test certs never go stale. Already resolved as
 # rcgen's own transitive dependency; declared directly only so the test can call
