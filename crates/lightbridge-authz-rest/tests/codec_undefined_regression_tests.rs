@@ -14,7 +14,7 @@
 //! hit this because `JSON.stringify` drops `undefined`-valued keys entirely, which is why the bug
 //! only reproduced in prod.
 
-use cratestack_core::CoolCodec;
+use cratestack_core::CratestackCodec;
 use lightbridge_authz_api::schema::inputs::CreateProjectInput;
 use lightbridge_authz_rest::codec::LenientCborCodec;
 

@@ -33,7 +33,7 @@
 
 use std::sync::Arc;
 
-use cratestack::{CoolContext, CoolError, Value};
+use cratestack::{CratestackContext, CratestackError, Value};
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api::schema::procedures::ProcedureRegistry;
 use lightbridge_authz_budget::PolicyStore;
@@ -76,15 +76,15 @@ async fn insert_account(pool: &PgPool, account_id: &str) {
         .expect("inserting a test account must succeed");
 }
 
-fn ctx_for(subject: &str) -> CoolContext {
-    CoolContext::authenticated([("id".to_owned(), Value::String(subject.to_owned()))])
+fn ctx_for(subject: &str) -> CratestackContext {
+    CratestackContext::authenticated([("id".to_owned(), Value::String(subject.to_owned()))])
 }
 
 /// Like [`ctx_for`], but stamped with [`auth_provider::CALLER_KIND_CONTEXT_KEY`] as
 /// [`lightbridge_authz_rest::auth_provider::CratestackAuthProvider::authenticate`] would for a
 /// token carrying `lightbridge_authz_bearer::API_KEY_CALLER_KIND` -- i.e. an `oauth2.type: self`
 /// self-signed API-key JWT (#191/#216).
-fn ctx_for_api_key_caller(subject: &str) -> CoolContext {
+fn ctx_for_api_key_caller(subject: &str) -> CratestackContext {
     let mut ctx = ctx_for(subject);
     ctx.extensions.insert(
         auth_provider::CALLER_KIND_CONTEXT_KEY.to_owned(),
@@ -95,14 +95,14 @@ fn ctx_for_api_key_caller(subject: &str) -> CoolContext {
 
 /// Builds a real `Procedures` instance against `pool` (a genuinely migrated, seeded database),
 /// mirroring `budget_policy_procedure_tests.rs::procedures_and_ctx` but also wiring the new
-/// `refill_service`/`review_service` fields this PR adds. Returns the `Procedures`, a `CoolContext`
+/// `refill_service`/`review_service` fields this PR adds. Returns the `Procedures`, a `CratestackContext`
 /// sealed to `subject`, and the raw `BudgetRepo` handle so tests can pre-seed grants directly
 /// (mirroring `lightbridge-authz-budget`'s own `refill_service_tests.rs` pattern for exercising
 /// the "allowance exhausted" branch).
 async fn procedures_and_ctx(
     pool: PgPool,
     subject: &str,
-) -> (Procedures, CoolContext, Arc<BudgetRepo>) {
+) -> (Procedures, CratestackContext, Arc<BudgetRepo>) {
     let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
     let issuer = Arc::new(AuthzStoreImpl::with_pool(db_pool.clone()));
     let policy_store = Arc::new(
@@ -138,9 +138,9 @@ async fn procedures_and_ctx(
 async fn request_refill(
     procedures: &Procedures,
     db: &schema::Cratestack,
-    ctx: &CoolContext,
+    ctx: &CratestackContext,
     args: schema::procedures::request_budget_refill::Args,
-) -> Result<schema::procedures::request_budget_refill::Output, CoolError> {
+) -> Result<schema::procedures::request_budget_refill::Output, CratestackError> {
     let call_args = args.clone();
     schema::procedures::request_budget_refill::invoke_with_db(
         db,
@@ -158,9 +158,9 @@ async fn request_refill(
 async fn list_pending(
     procedures: &Procedures,
     db: &schema::Cratestack,
-    ctx: &CoolContext,
+    ctx: &CratestackContext,
     args: schema::procedures::list_pending_augmentation_requests::Args,
-) -> Result<schema::procedures::list_pending_augmentation_requests::Output, CoolError> {
+) -> Result<schema::procedures::list_pending_augmentation_requests::Output, CratestackError> {
     let call_args = args.clone();
     schema::procedures::list_pending_augmentation_requests::invoke_with_db(
         db,
@@ -178,9 +178,9 @@ async fn list_pending(
 async fn list_my(
     procedures: &Procedures,
     db: &schema::Cratestack,
-    ctx: &CoolContext,
+    ctx: &CratestackContext,
     args: schema::procedures::list_my_augmentation_requests::Args,
-) -> Result<schema::procedures::list_my_augmentation_requests::Output, CoolError> {
+) -> Result<schema::procedures::list_my_augmentation_requests::Output, CratestackError> {
     let call_args = args.clone();
     schema::procedures::list_my_augmentation_requests::invoke_with_db(
         db,
@@ -198,9 +198,9 @@ async fn list_my(
 async fn approve(
     procedures: &Procedures,
     db: &schema::Cratestack,
-    ctx: &CoolContext,
+    ctx: &CratestackContext,
     args: schema::procedures::approve_augmentation_request::Args,
-) -> Result<schema::procedures::approve_augmentation_request::Output, CoolError> {
+) -> Result<schema::procedures::approve_augmentation_request::Output, CratestackError> {
     let call_args = args.clone();
     schema::procedures::approve_augmentation_request::invoke_with_db(
         db,
@@ -218,9 +218,9 @@ async fn approve(
 async fn reject(
     procedures: &Procedures,
     db: &schema::Cratestack,
-    ctx: &CoolContext,
+    ctx: &CratestackContext,
     args: schema::procedures::reject_augmentation_request::Args,
-) -> Result<schema::procedures::reject_augmentation_request::Output, CoolError> {
+) -> Result<schema::procedures::reject_augmentation_request::Output, CratestackError> {
     let call_args = args.clone();
     schema::procedures::reject_augmentation_request::invoke_with_db(
         db,
@@ -396,7 +396,7 @@ async fn request_refill_refuses_api_key_derived_caller(pool: PgPool) {
         .expect_err("an API-key-derived caller must be refused, not served");
 
     assert!(
-        matches!(err, CoolError::Forbidden(_)),
+        matches!(err, CratestackError::Forbidden(_)),
         "expected Forbidden, got {err:?}"
     );
 }

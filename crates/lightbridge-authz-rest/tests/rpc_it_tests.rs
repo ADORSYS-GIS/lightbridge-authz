@@ -40,7 +40,7 @@ use common::{MapBearer, Wire, admin_perms, as_json, rpc_call, token_info, viewer
 use cratestack::SqlxIdempotencyStore;
 use cratestack::{DEFAULT_BODY_LIMIT_BYTES, Json, Value as CValue, ratelimit::RateLimitStore};
 use cratestack_codec_cbor::CborCodec;
-use cratestack_core::CoolCodec;
+use cratestack_core::CratestackCodec;
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::BearerTokenServiceTrait;

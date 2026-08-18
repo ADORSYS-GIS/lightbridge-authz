@@ -10,13 +10,13 @@
 //! [`crate::rpc_authorize`] (this is what gives `/rpc/batch` real per-frame RBAC: `rpc_authorize`
 //! can't evaluate a single op-id for a whole batch, but this provider is invoked once per frame with
 //! that frame's own op-id, so the check happens here instead), and on success projects the validated
-//! subject into a [`CoolContext`] so the schema's `@@allow`/`@@deny` policies — all of which reference
+//! subject into a [`CratestackContext`] so the schema's `@@allow`/`@@deny` policies — all of which reference
 //! `auth().id` against `auth Principal { id String }` — resolve to the caller's subject.
 
 use std::sync::Arc;
 
 use cratestack::axum::http;
-use cratestack::{AuthProvider, CoolContext, CoolError, RequestContext, Value};
+use cratestack::{AuthProvider, CratestackContext, CratestackError, RequestContext, Value};
 use lightbridge_authz_bearer::BearerTokenServiceTrait;
 
 use crate::rpc_authorize::{RpcScope, op_id_from_path, required_permission};
@@ -69,12 +69,12 @@ fn extract_bearer(headers: &http::HeaderMap) -> Option<String> {
 }
 
 impl AuthProvider for CratestackAuthProvider {
-    type Error = CoolError;
+    type Error = CratestackError;
 
     fn authenticate(
         &self,
         request: &RequestContext<'_>,
-    ) -> impl core::future::Future<Output = Result<CoolContext, Self::Error>> + Send {
+    ) -> impl core::future::Future<Output = Result<CratestackContext, Self::Error>> + Send {
         let bearer = self.bearer.clone();
         let scope = self.scope;
         let token = extract_bearer(request.headers);
@@ -89,25 +89,33 @@ impl AuthProvider for CratestackAuthProvider {
             // bearer token, mirroring `rpc_authorize`'s own scope check for unary calls. For a
             // batch frame this is the ONLY place that check happens at all.
             if !scope.permits(&op_id) {
-                return Err(CoolError::NotFound(format!("unknown RPC op `{op_id}`")));
+                return Err(CratestackError::NotFound(format!(
+                    "unknown RPC op `{op_id}`"
+                )));
             }
             // Unmapped op-id → 403 unconditionally, mirroring `rpc_authorize`'s fail-closed set
             // (unknown ops, `model.ProjectMember.*`, `model.ApiKey.create`, ...).
             let Some(required) = required_permission(&op_id) else {
-                return Err(CoolError::Forbidden("operation not permitted".to_owned()));
+                return Err(CratestackError::Forbidden(
+                    "operation not permitted".to_owned(),
+                ));
             };
             // No bearer at all → 401, matching the prior middleware's fail-closed posture (rather
             // than an anonymous context, which would surface as a policy-driven empty read).
             let Some(token) = token else {
-                return Err(CoolError::Unauthorized("missing bearer token".to_owned()));
+                return Err(CratestackError::Unauthorized(
+                    "missing bearer token".to_owned(),
+                ));
             };
             match bearer.validate_bearer_token(&token).await {
                 Ok(info) if info.active => {
                     if !info.has_permission(required) {
-                        return Err(CoolError::Forbidden("insufficient permissions".to_owned()));
+                        return Err(CratestackError::Forbidden(
+                            "insufficient permissions".to_owned(),
+                        ));
                     }
                     // Project the validated subject as `auth().id`.
-                    let mut ctx = CoolContext::authenticated([(
+                    let mut ctx = CratestackContext::authenticated([(
                         "id".to_owned(),
                         Value::String(info.sub.clone()),
                     )]);
@@ -131,7 +139,9 @@ impl AuthProvider for CratestackAuthProvider {
                 }
                 // Invalid/inactive token or validation error → uniform 401, never leaking which step
                 // failed (matching the bearer service's existing security posture).
-                Ok(_) | Err(_) => Err(CoolError::Unauthorized("invalid bearer token".to_owned())),
+                Ok(_) | Err(_) => Err(CratestackError::Unauthorized(
+                    "invalid bearer token".to_owned(),
+                )),
             }
         }
     }
