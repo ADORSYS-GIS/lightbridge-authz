@@ -72,6 +72,7 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use sqlx::{Postgres, Transaction};
 
 use crate::augmentation::{AugmentationRepo, AugmentationRequest, AugmentationStatus};
@@ -104,12 +105,18 @@ impl ReviewService {
     /// [`AugmentationRepo::list_pending_review`] -- this exists on `ReviewService` (rather than
     /// callers reaching into `AugmentationRepo` directly) so the review queue has exactly one
     /// place a caller depends on for both reads and writes.
+    ///
+    /// Paginated by `created_at` (#296) -- see [`AugmentationRepo::list_pending_review`]'s own
+    /// doc comment for the ASC/`after` cursor semantics this preserves from before pagination
+    /// existed.
     pub async fn list_pending(
         &self,
         budget_account_id: Option<&str>,
+        after: Option<DateTime<Utc>>,
+        limit: i64,
     ) -> Result<Vec<AugmentationRequest>, BudgetError> {
         self.augmentation_repo
-            .list_pending_review(budget_account_id)
+            .list_pending_review(budget_account_id, after, limit)
             .await
     }
 

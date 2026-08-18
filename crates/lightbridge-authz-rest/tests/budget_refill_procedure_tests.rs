@@ -175,6 +175,26 @@ async fn list_pending(
     .await
 }
 
+async fn list_my(
+    procedures: &Procedures,
+    db: &schema::Cratestack,
+    ctx: &CoolContext,
+    args: schema::procedures::list_my_augmentation_requests::Args,
+) -> Result<schema::procedures::list_my_augmentation_requests::Output, CoolError> {
+    let call_args = args.clone();
+    schema::procedures::list_my_augmentation_requests::invoke_with_db(
+        db,
+        &args,
+        ctx,
+        |authorized| async move {
+            procedures
+                .list_my_augmentation_requests(db, ctx, call_args, authorized)
+                .await
+        },
+    )
+    .await
+}
+
 async fn approve(
     procedures: &Procedures,
     db: &schema::Cratestack,
@@ -233,10 +253,29 @@ fn refill_args(
 fn list_pending_args(
     budget_account_id: Option<&str>,
 ) -> schema::procedures::list_pending_augmentation_requests::Args {
+    list_pending_args_paged(budget_account_id, None, None)
+}
+
+fn list_pending_args_paged(
+    budget_account_id: Option<&str>,
+    after: Option<chrono::DateTime<chrono::Utc>>,
+    limit: Option<i64>,
+) -> schema::procedures::list_pending_augmentation_requests::Args {
     schema::procedures::list_pending_augmentation_requests::Args {
         args: schema::ListPendingAugmentationRequestsInput {
             budgetAccountId: budget_account_id.map(str::to_string),
+            after,
+            limit,
         },
+    }
+}
+
+fn list_my_args(
+    before: Option<chrono::DateTime<chrono::Utc>>,
+    limit: Option<i64>,
+) -> schema::procedures::list_my_augmentation_requests::Args {
+    schema::procedures::list_my_augmentation_requests::Args {
+        args: schema::ListMyAugmentationRequestsInput { before, limit },
     }
 }
 
@@ -399,15 +438,19 @@ async fn list_pending_returns_queued_requests(pool: PgPool) {
         .await
         .expect("listing the review queue must succeed");
 
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].id, queued.id);
-    assert_eq!(pending[0].status, "pending_review");
+    assert_eq!(pending.entries.len(), 1);
+    assert_eq!(pending.entries[0].id, queued.id);
+    assert_eq!(pending.entries[0].status, "pending_review");
+    assert!(
+        pending.nextCursor.is_none(),
+        "a short (single-entry) page must report no further cursor"
+    );
 
     let pending_global = list_pending(&procedures, &db, &ctx, list_pending_args(None))
         .await
         .expect("listing the whole queue must succeed");
     assert!(
-        pending_global.iter().any(|r| r.id == queued.id),
+        pending_global.entries.iter().any(|r| r.id == queued.id),
         "the global (unscoped) queue must include this account's pending request too"
     );
 }
@@ -477,7 +520,7 @@ async fn reject_without_a_reason_is_rejected_at_the_schema_or_procedure_layer(po
         .await
         .expect("listing the review queue must succeed");
     assert!(
-        still_pending.iter().any(|r| r.id == queued.id),
+        still_pending.entries.iter().any(|r| r.id == queued.id),
         "a rejected-at-validation reject call must not have changed the row's status"
     );
 }
@@ -516,4 +559,165 @@ async fn reject_with_a_reason_succeeds_and_records_it(pool: PgPool) {
     );
     assert_eq!(rejected.rejectionReason.as_deref(), Some(reason));
     assert_eq!(rejected.reviewedBy.as_deref(), Some(reviewer_id.as_str()));
+}
+
+/// #296: `listPendingAugmentationRequests` pages oldest-first with a `created_at`-based `after`
+/// cursor, and continues forward without repeating or skipping rows across pages -- the
+/// procedure-layer proof on top of `augmentation_repo_tests.rs`'s own repo-level coverage of the
+/// same behavior.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_pending_augmentation_requests_paginates_oldest_first(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let (procedures, ctx, budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let db = lazy_cratestack_db();
+
+    // Exhaust the auto-approve allowance once, then every further call queues -- three distinct
+    // pending rows for one account, oldest to newest in call order.
+    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
+    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
+
+    let mut queued_ids = Vec::new();
+    for _ in 0..3 {
+        let queued = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
+            .await
+            .expect("an exhausted-allowance refill must still queue, not error");
+        assert_eq!(queued.status, "pending_review");
+        queued_ids.push(queued.id);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let page1 = list_pending(
+        &procedures,
+        &db,
+        &ctx,
+        list_pending_args_paged(Some(&account_id), None, Some(2)),
+    )
+    .await
+    .expect("first page must succeed");
+    assert_eq!(
+        page1
+            .entries
+            .iter()
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>(),
+        queued_ids[0..2],
+        "the first page must be the two oldest pending requests, oldest first"
+    );
+    let cursor = page1
+        .nextCursor
+        .expect("a full page must carry a nextCursor -- there is a third, newer request");
+
+    let page2 = list_pending(
+        &procedures,
+        &db,
+        &ctx,
+        list_pending_args_paged(Some(&account_id), Some(cursor), Some(2)),
+    )
+    .await
+    .expect("second page must succeed");
+    assert_eq!(
+        page2
+            .entries
+            .iter()
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>(),
+        vec![queued_ids[2].clone()],
+        "the second page must return exactly the one remaining, newest request"
+    );
+    assert!(
+        page2.nextCursor.is_none(),
+        "a short page must report no further cursor"
+    );
+}
+
+/// #295: `listMyAugmentationRequests` returns the caller's own history across every status --
+/// not just `pending_review` -- newest-first.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_my_augmentation_requests_returns_own_history_across_statuses_newest_first(
+    pool: PgPool,
+) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let (procedures, ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let db = lazy_cratestack_db();
+
+    // The seeded default policy auto-approves the first two self-service refills per period, then
+    // queues the third -- so three plain calls (no pre-seeded grants) produce two distinct
+    // statuses without any direct repo access.
+    let mut submitted = Vec::new();
+    for _ in 0..3 {
+        let created = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
+            .await
+            .expect("request must succeed (auto-approved or queued, never erroring)");
+        submitted.push(created);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(submitted[0].status, "auto_approved");
+    assert_eq!(submitted[1].status, "auto_approved");
+    assert_eq!(
+        submitted[2].status, "pending_review",
+        "the third refill this period must exhaust the auto-approve allowance"
+    );
+
+    let history = list_my(&procedures, &db, &ctx, list_my_args(None, None))
+        .await
+        .expect("listing own history must succeed");
+
+    assert_eq!(
+        history.entries.len(),
+        3,
+        "every request must be returned regardless of status: {:?}",
+        history.entries
+    );
+    assert_eq!(
+        history
+            .entries
+            .iter()
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            submitted[2].id.clone(),
+            submitted[1].id.clone(),
+            submitted[0].id.clone(),
+        ],
+        "must be newest-first"
+    );
+    assert_eq!(history.entries[0].status, "pending_review");
+    assert_eq!(history.entries[1].status, "auto_approved");
+}
+
+/// The IDOR guard #295 explicitly calls for: `listMyAugmentationRequests` takes no target
+/// account/subject field at all, so a second caller with their own (empty) history must never see
+/// the first caller's requests -- proven here, not merely asserted from the schema shape.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_my_augmentation_requests_does_not_leak_another_callers_requests(pool: PgPool) {
+    let owner_id = cuid2();
+    let bystander_id = cuid2();
+    insert_account(&pool, &owner_id).await;
+    insert_account(&pool, &bystander_id).await;
+    let (procedures, owner_ctx, _budget_repo) = procedures_and_ctx(pool, &owner_id).await;
+    let bystander_ctx = ctx_for(&bystander_id);
+    let db = lazy_cratestack_db();
+
+    let created = request_refill(&procedures, &db, &owner_ctx, refill_args(&owner_id, None))
+        .await
+        .expect("owner's own refill request must succeed");
+
+    let owner_history = list_my(&procedures, &db, &owner_ctx, list_my_args(None, None))
+        .await
+        .expect("owner listing their own history must succeed");
+    assert!(
+        owner_history.entries.iter().any(|r| r.id == created.id),
+        "the owner must see their own request"
+    );
+
+    let bystander_history = list_my(&procedures, &db, &bystander_ctx, list_my_args(None, None))
+        .await
+        .expect("bystander listing their own (empty) history must succeed");
+    assert!(
+        bystander_history.entries.is_empty(),
+        "a caller with no requests of their own must never see another account's: {:?}",
+        bystander_history.entries
+    );
 }

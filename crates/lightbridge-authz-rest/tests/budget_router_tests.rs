@@ -202,6 +202,7 @@ async fn every_budget_op_id_is_reachable_past_the_gate_for_an_admin() {
         "procedure.rejectAugmentationRequest",
         "procedure.getMyBudgetBalance",
         "procedure.listMyBudgetGrants",
+        "procedure.listMyAugmentationRequests",
         "procedure.getBudgetBalance",
         "procedure.listBudgetGrants",
         "procedure.grantBudget",
@@ -354,18 +355,24 @@ async fn editor_role_can_self_refill_but_not_review() {
 
 #[test]
 fn budget_read_own_input_types_have_no_target_field() {
-    use lightbridge_authz_api::schema::{GetMyBudgetBalanceInput, ListMyBudgetGrantsInput};
+    use lightbridge_authz_api::schema::{
+        GetMyBudgetBalanceInput, ListMyAugmentationRequestsInput, ListMyBudgetGrantsInput,
+    };
 
-    // Every field these two input types carry -- if this ever grows a `budgetAccountId` or
-    // `accountId` field, this test's field list goes stale and must be updated, which is exactly
-    // the point: it forces a reviewer to notice the input type gained a way to target another
-    // account, at which point `budget:read-own`'s "cannot be aimed at another account" guarantee
-    // stops being structural and starts depending on procedure-body discipline instead.
+    // Every field these three input types carry -- if any of them ever grows a `budgetAccountId`
+    // or `accountId` field, this test's field list goes stale and must be updated, which is
+    // exactly the point: it forces a reviewer to notice the input type gained a way to target
+    // another account, at which point `budget:read-own`'s "cannot be aimed at another account"
+    // guarantee stops being structural and starts depending on procedure-body discipline instead.
     let _ = GetMyBudgetBalanceInput {
         period: "2026-08".to_string(),
     };
     let _ = ListMyBudgetGrantsInput {
         period: None,
+        before: None,
+        limit: None,
+    };
+    let _ = ListMyAugmentationRequestsInput {
         before: None,
         limit: None,
     };
@@ -407,6 +414,7 @@ async fn budget_read_own_permission_reaches_dispatch_for_the_callers_own_data() 
     for op in [
         "procedure.getMyBudgetBalance",
         "procedure.listMyBudgetGrants",
+        "procedure.listMyAugmentationRequests",
     ] {
         let router = build_router(bearer.clone());
         let (status, body) = rpc_call(router, op, &json!({}), Some("self-only")).await;

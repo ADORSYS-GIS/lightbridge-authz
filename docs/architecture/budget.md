@@ -23,7 +23,7 @@ microservice — same binary (`lightbridge-authz`), a `budget` subcommand, own a
 (`config::BudgetServer`), own container in `compose.yaml`. **Hard cutover, not the transitional
 duplication `authz-idp` still carries**: `authz-api` no longer serves any budget op-id at all, on
 either the unary `/rpc/{op_id}` path or a `/rpc/batch` frame — see
-[`services.md`](./services.md#authz-budget) for the full route table and the exact 14 procedures
+[`services.md`](./services.md#authz-budget) for the full route table and the exact 15 procedures
 that moved.
 
 **Why one `Procedures` impl, not a second schema/crate.** cratestack's `include_server_schema!`
@@ -220,7 +220,7 @@ present to the `lightbridge-ss` frontend.
   `PolicyEngine` implementation that exists; the trait boundary is designed to accept a second one
   without changing callers, but no work toward it has begun.
 
-**RPC surface, as of `origin/main` at the time this document was written:** all 14 procedures below
+**RPC surface, as of `origin/main` at the time this document was written:** all 15 procedures below
 are reachable on `authz-budget` (`POST /budget/rpc/{op_id}`) and refused (404) on `authz-api` —
 see "Service boundary" above.
 
@@ -229,10 +229,13 @@ see "Service boundary" above.
   `createBudgetPolicyRevision` (`budget:policy-write`).
 - Self-service refill + admin review: `requestBudgetRefill` (`budget:self-refill`),
   `listPendingAugmentationRequests` / `approveAugmentationRequest` / `rejectAugmentationRequest`
-  (all `budget:review`).
-- Direct balance/ledger reads: `getMyBudgetBalance` / `listMyBudgetGrants` (`budget:read-own` —
-  no target field, structurally scoped to the caller's own account), `getBudgetBalance`
-  (`budget:read`) / `listBudgetGrants` (`budget:audit-read`) (both admin, arbitrary-target).
+  (all `budget:review`; `listPendingAugmentationRequests` paginated by `createdAt`, oldest-first,
+  cursored via `after` — #296).
+- Direct balance/ledger/history reads: `getMyBudgetBalance` / `listMyBudgetGrants` /
+  `listMyAugmentationRequests` (`budget:read-own` — no target field, structurally scoped to the
+  caller's own account; `listMyAugmentationRequests` returns the caller's own request history in
+  ANY status, newest-first, cursored via `before` — #295), `getBudgetBalance` (`budget:read`) /
+  `listBudgetGrants` (`budget:audit-read`) (both admin, arbitrary-target).
 - Direct admin grant/revoke: `grantBudget` (`budget:grant`), `revokeBudgetGrant`
   (`budget:revoke`).
 

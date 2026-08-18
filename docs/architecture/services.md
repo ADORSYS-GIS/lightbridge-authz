@@ -70,14 +70,14 @@ Router assembly: `build_budget_router` in `crates/lightbridge-authz-rest/src/lib
 
 Reachable procedures (all hand-written — ADR-0010 — declared in
 `crates/lightbridge-authz-api/schema/authz.cstack`, implemented on the same `Procedures` type
-`authz-api` uses; `RpcScope::Budget` is what actually restricts this server to only these 14):
+`authz-api` uses; `RpcScope::Budget` is what actually restricts this server to only these 15):
 
 - Policy lifecycle: `activateBudgetPolicy`, `getBudgetPolicyStatus`, `simulateBudgetPolicy`,
   `createBudgetPolicyRevision`.
 - Self-service refill + admin review: `requestBudgetRefill`, `listPendingAugmentationRequests`,
   `approveAugmentationRequest`, `rejectAugmentationRequest`.
-- Direct balance/ledger reads: `getMyBudgetBalance`, `listMyBudgetGrants`, `getBudgetBalance`,
-  `listBudgetGrants`.
+- Direct balance/ledger/history reads: `getMyBudgetBalance`, `listMyBudgetGrants`,
+  `listMyAugmentationRequests`, `getBudgetBalance`, `listBudgetGrants`.
 - Direct admin grant/revoke: `grantBudget`, `revokeBudgetGrant`.
 
 Every procedure keeps its exact `docs/rbac.md`-mandated permission unchanged by the move — the

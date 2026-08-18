@@ -218,7 +218,7 @@ async fn seed_budget_account(pool: &sqlx::PgPool, id: &str) {
 // Reachability: every moved procedure is dispatchable at its new path (`/budget/rpc/{op_id}`).
 // ---------------------------------------------------------------------------------------------
 
-/// Every one of the 14 moved procedures reaches real dispatch on `authz-budget` for an admin
+/// Every one of the 15 moved procedures reaches real dispatch on `authz-budget` for an admin
 /// bearer — proven by asserting the response is never `401`/`403`/`404` (some legitimately return
 /// a different error, e.g. `revokeBudgetGrant` on a nonexistent `grantId`, which is a business
 /// error, not an authorization/routing one).
@@ -228,7 +228,7 @@ async fn every_moved_procedure_is_reachable_on_authz_budget() {
     let ctx = setup(admin_bearer(&subject), None).await;
     seed_budget_account(&ctx.verify, &subject).await;
 
-    let cases: [(&str, Value); 14] = [
+    let cases: [(&str, Value); 15] = [
         (
             "procedure.activateBudgetPolicy",
             json!({ "policySetId": "budget-refill", "revisionId": "budget-refill-v1" }),
@@ -266,6 +266,7 @@ async fn every_moved_procedure_is_reachable_on_authz_budget() {
             json!({ "period": "2026-08" }),
         ),
         ("procedure.listMyBudgetGrants", json!({})),
+        ("procedure.listMyAugmentationRequests", json!({})),
         (
             "procedure.getBudgetBalance",
             json!({ "budgetAccountId": subject, "period": "2026-08" }),
@@ -808,7 +809,7 @@ async fn create_budget_policy_revision_does_not_activate_it() {
 }
 
 /// A caller holding none of the six wired-up budget permissions is refused 403 on every one of
-/// the seven procedures they gate -- proves the RBAC gate is actually wired for each on
+/// the eight procedures they gate -- proves the RBAC gate is actually wired for each on
 /// `authz-budget`, not merely present in `rpc_authorize`'s map.
 #[tokio::test]
 async fn each_budget_permission_is_actually_enforced() {
@@ -819,12 +820,13 @@ async fn each_budget_permission_is_actually_enforced() {
     let r = &ctx.router;
     seed_budget_account(&ctx.verify, &subject).await;
 
-    let cases: [(&str, Value); 7] = [
+    let cases: [(&str, Value); 8] = [
         (
             "procedure.getMyBudgetBalance",
             json!({ "period": "2026-08" }),
         ),
         ("procedure.listMyBudgetGrants", json!({})),
+        ("procedure.listMyAugmentationRequests", json!({})),
         (
             "procedure.getBudgetBalance",
             json!({ "budgetAccountId": subject, "period": "2026-08" }),
