@@ -33,7 +33,9 @@ use rpc_authorize::{RpcAuthorizeState, RpcScope};
 
 use cratestack::idempotency::IdempotencyLayer;
 use cratestack::ratelimit::{RateLimitConfig, RateLimitLayer, RateLimitStore};
-use cratestack::{CoolContext, CoolError, DEFAULT_BODY_LIMIT_BYTES, SqlxIdempotencyStore, Value};
+use cratestack::{
+    CratestackContext, CratestackError, DEFAULT_BODY_LIMIT_BYTES, SqlxIdempotencyStore, Value,
+};
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait};
@@ -138,39 +140,39 @@ impl OpaRepoTrait for StoreRepo {
     }
 }
 
-/// Maps a core repository `Error` (reused hand-written sqlx) into cratestack's `CoolError` so an RPC
+/// Maps a core repository `Error` (reused hand-written sqlx) into cratestack's `CratestackError` so an RPC
 /// procedure failure surfaces with the right HTTP status through the RPC error envelope.
-fn to_cool_error(err: Error) -> CoolError {
+fn to_cratestack_error(err: Error) -> CratestackError {
     match err {
-        Error::NotFound => CoolError::NotFound("not found".to_owned()),
-        Error::Forbidden(m) => CoolError::Forbidden(m),
-        Error::Conflict(m) => CoolError::Conflict(m),
-        Error::BadRequest(m) => CoolError::BadRequest(m),
-        other => CoolError::Internal(other.to_string()),
+        Error::NotFound => CratestackError::NotFound("not found".to_owned()),
+        Error::Forbidden(m) => CratestackError::Forbidden(m),
+        Error::Conflict(m) => CratestackError::Conflict(m),
+        Error::BadRequest(m) => CratestackError::BadRequest(m),
+        other => CratestackError::Internal(other.to_string()),
     }
 }
 
-/// Maps a [`lightbridge_authz_budget::BudgetError`] into cratestack's `CoolError`, mirroring
-/// [`to_cool_error`] above for the (unrelated) core `Error` type. Exhaustive match, no wildcard
+/// Maps a [`lightbridge_authz_budget::BudgetError`] into cratestack's `CratestackError`, mirroring
+/// [`to_cratestack_error`] above for the (unrelated) core `Error` type. Exhaustive match, no wildcard
 /// arm, so a new `BudgetError` variant fails this crate's build until it is triaged here rather
 /// than silently falling into some default status.
-fn budget_error_to_cool_error(err: lightbridge_authz_budget::BudgetError) -> CoolError {
+fn budget_error_to_cratestack_error(err: lightbridge_authz_budget::BudgetError) -> CratestackError {
     use lightbridge_authz_budget::BudgetError;
     match err {
-        BudgetError::InvalidRuleData(m) => CoolError::BadRequest(m),
+        BudgetError::InvalidRuleData(m) => CratestackError::BadRequest(m),
         BudgetError::InvalidAmount(_)
         | BudgetError::InvalidPeriod(_)
         | BudgetError::UnknownSource(_)
         | BudgetError::UnknownTier(_)
         | BudgetError::UnknownStatus(_)
         | BudgetError::InvalidReviewOutcome(_)
-        | BudgetError::MissingRejectionReason => CoolError::BadRequest(err.to_string()),
+        | BudgetError::MissingRejectionReason => CratestackError::BadRequest(err.to_string()),
         BudgetError::AlreadyGranted | BudgetError::AlreadyReviewed(_) => {
-            CoolError::Conflict(err.to_string())
+            CratestackError::Conflict(err.to_string())
         }
-        BudgetError::PolicyDenied(_) => CoolError::Forbidden(err.to_string()),
-        BudgetError::NotFound(m) => CoolError::NotFound(m),
-        BudgetError::StorageFailed(m) => CoolError::Internal(m),
+        BudgetError::PolicyDenied(_) => CratestackError::Forbidden(err.to_string()),
+        BudgetError::NotFound(m) => CratestackError::NotFound(m),
+        BudgetError::StorageFailed(m) => CratestackError::Internal(m),
     }
 }
 
@@ -351,7 +353,7 @@ fn resolve_budget_grants_page_size(limit: Option<i64>) -> i64 {
 }
 
 /// The validated caller's subject, projected as `auth().id` by [`CratestackAuthProvider`].
-fn subject_from_ctx(ctx: &CoolContext) -> Option<String> {
+fn subject_from_ctx(ctx: &CratestackContext) -> Option<String> {
     match ctx.auth_field("id") {
         Some(Value::String(s)) => Some(s.clone()),
         _ => None,
@@ -360,7 +362,7 @@ fn subject_from_ctx(ctx: &CoolContext) -> Option<String> {
 
 /// The caller's raw access token, stashed into the context by [`CratestackAuthProvider`] so the
 /// rotate procedure's downstream secret issuance can reuse it (email profile / token exchange).
-fn access_token_from_ctx(ctx: &CoolContext) -> Option<String> {
+fn access_token_from_ctx(ctx: &CratestackContext) -> Option<String> {
     match ctx.extensions.get(ACCESS_TOKEN_CONTEXT_KEY) {
         Some(Value::String(s)) => Some(s.clone()),
         _ => None,
@@ -370,7 +372,7 @@ fn access_token_from_ctx(ctx: &CoolContext) -> Option<String> {
 /// The caller-kind signal stashed into the context by [`CratestackAuthProvider`], when the
 /// validated token carried [`lightbridge_authz_bearer::CALLER_KIND_CLAIM`]. `None` means the claim
 /// was absent, which must be treated as "unknown" -- see that constant's docs.
-fn caller_kind_from_ctx(ctx: &CoolContext) -> Option<String> {
+fn caller_kind_from_ctx(ctx: &CratestackContext) -> Option<String> {
     match ctx.extensions.get(CALLER_KIND_CONTEXT_KEY) {
         Some(Value::String(s)) => Some(s.clone()),
         _ => None,
@@ -567,22 +569,22 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn create_account(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::create_account::Args,
         _authorized: schema::procedures::create_account::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::create_account::Output, CoolError>,
+        Output = std::result::Result<schema::procedures::create_account::Output, CratestackError>,
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
         let default_quota = args.args.defaultQuota;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let account = issuer
                 .create_account(&subject, CreateAccount { default_quota })
                 .await
-                .map_err(to_cool_error)?;
+                .map_err(to_cratestack_error)?;
             Ok(to_schema_account(account))
         }
     }
@@ -590,19 +592,19 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn rotate_api_key(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::rotate_api_key::Args,
         _authorized: schema::procedures::rotate_api_key::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::rotate_api_key::Output, CoolError>,
+        Output = std::result::Result<schema::procedures::rotate_api_key::Output, CratestackError>,
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
         let access_token = access_token_from_ctx(ctx);
         let key_id = args.args.keyId;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let secret = issuer
                 .rotate_api_key(
                     &subject,
@@ -615,7 +617,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                     },
                 )
                 .await
-                .map_err(to_cool_error)?;
+                .map_err(to_cratestack_error)?;
             Ok(to_schema_api_key_secret(secret))
         }
     }
@@ -623,19 +625,19 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn create_api_key(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::create_api_key::Args,
         _authorized: schema::procedures::create_api_key::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::create_api_key::Output, CoolError>,
+        Output = std::result::Result<schema::procedures::create_api_key::Output, CratestackError>,
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
         let access_token = access_token_from_ctx(ctx);
         let input = args.args;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let secret = issuer
                 .create_api_key(
                     &subject,
@@ -648,7 +650,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                     },
                 )
                 .await
-                .map_err(to_cool_error)?;
+                .map_err(to_cratestack_error)?;
             Ok(to_schema_api_key_secret(secret))
         }
     }
@@ -659,17 +661,20 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn list_billing_plans(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         _args: schema::procedures::list_billing_plans::Args,
         _authorized: schema::procedures::list_billing_plans::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::list_billing_plans::Output, CoolError>,
+        Output = std::result::Result<
+            schema::procedures::list_billing_plans::Output,
+            CratestackError,
+        >,
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
         async move {
-            let _subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             Ok(to_schema_billing_plans(issuer.billing_plans()))
         }
     }
@@ -677,22 +682,22 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn disable_account(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::disable_account::Args,
         _authorized: schema::procedures::disable_account::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::disable_account::Output, CoolError>,
+        Output = std::result::Result<schema::procedures::disable_account::Output, CratestackError>,
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
         let account_id = args.args.accountId;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let account = issuer
                 .disable_account(&subject, &account_id)
                 .await
-                .map_err(to_cool_error)?;
+                .map_err(to_cratestack_error)?;
             Ok(to_schema_account(account))
         }
     }
@@ -700,22 +705,22 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn enable_account(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::enable_account::Args,
         _authorized: schema::procedures::enable_account::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::enable_account::Output, CoolError>,
+        Output = std::result::Result<schema::procedures::enable_account::Output, CratestackError>,
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
         let account_id = args.args.accountId;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let account = issuer
                 .enable_account(&subject, &account_id)
                 .await
-                .map_err(to_cool_error)?;
+                .map_err(to_cratestack_error)?;
             Ok(to_schema_account(account))
         }
     }
@@ -723,22 +728,22 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn disable_project(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::disable_project::Args,
         _authorized: schema::procedures::disable_project::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::disable_project::Output, CoolError>,
+        Output = std::result::Result<schema::procedures::disable_project::Output, CratestackError>,
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
         let project_id = args.args.projectId;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let project = issuer
                 .disable_project(&subject, &project_id)
                 .await
-                .map_err(to_cool_error)?;
+                .map_err(to_cratestack_error)?;
             Ok(to_schema_project(project))
         }
     }
@@ -746,22 +751,22 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn enable_project(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::enable_project::Args,
         _authorized: schema::procedures::enable_project::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::enable_project::Output, CoolError>,
+        Output = std::result::Result<schema::procedures::enable_project::Output, CratestackError>,
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
         let project_id = args.args.projectId;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let project = issuer
                 .enable_project(&subject, &project_id)
                 .await
-                .map_err(to_cool_error)?;
+                .map_err(to_cratestack_error)?;
             Ok(to_schema_project(project))
         }
     }
@@ -769,22 +774,25 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn set_default_project(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::set_default_project::Args,
         _authorized: schema::procedures::set_default_project::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::set_default_project::Output, CoolError>,
+        Output = std::result::Result<
+            schema::procedures::set_default_project::Output,
+            CratestackError,
+        >,
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
         let project_id = args.args.projectId;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let project = issuer
                 .set_default_project(&subject, &project_id)
                 .await
-                .map_err(to_cool_error)?;
+                .map_err(to_cratestack_error)?;
             Ok(to_schema_project(project))
         }
     }
@@ -792,22 +800,22 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn revoke_api_key(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::revoke_api_key::Args,
         _authorized: schema::procedures::revoke_api_key::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::revoke_api_key::Output, CoolError>,
+        Output = std::result::Result<schema::procedures::revoke_api_key::Output, CratestackError>,
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
         let key_id = args.args.keyId;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let key = issuer
                 .revoke_api_key(&subject, &key_id)
                 .await
-                .map_err(to_cool_error)?;
+                .map_err(to_cratestack_error)?;
             Ok(to_schema_api_key(key))
         }
     }
@@ -815,62 +823,13 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn add_project_member(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::add_project_member::Args,
         _authorized: schema::procedures::add_project_member::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::add_project_member::Output, CoolError>,
-    > + Send {
-        let issuer = self.issuer.clone();
-        let subject = subject_from_ctx(ctx);
-        let project_id = args.args.projectId;
-        let target_account_id = args.args.accountId;
-        let role = args.args.role;
-        async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
-            let project = issuer
-                .add_project_member(&subject, &project_id, &target_account_id, role.as_deref())
-                .await
-                .map_err(to_cool_error)?;
-            Ok(to_schema_project(project))
-        }
-    }
-
-    fn remove_project_member(
-        &self,
-        _db: &schema::Cratestack,
-        ctx: &CoolContext,
-        args: schema::procedures::remove_project_member::Args,
-        _authorized: schema::procedures::remove_project_member::Authorized,
-    ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::remove_project_member::Output, CoolError>,
-    > + Send {
-        let issuer = self.issuer.clone();
-        let subject = subject_from_ctx(ctx);
-        let project_id = args.args.projectId;
-        let target_account_id = args.args.accountId;
-        async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
-            let project = issuer
-                .remove_project_member(&subject, &project_id, &target_account_id)
-                .await
-                .map_err(to_cool_error)?;
-            Ok(to_schema_project(project))
-        }
-    }
-
-    fn set_project_member_role(
-        &self,
-        _db: &schema::Cratestack,
-        ctx: &CoolContext,
-        args: schema::procedures::set_project_member_role::Args,
-        _authorized: schema::procedures::set_project_member_role::Authorized,
-    ) -> impl core::future::Future<
         Output = std::result::Result<
-            schema::procedures::set_project_member_role::Output,
-            CoolError,
+            schema::procedures::add_project_member::Output,
+            CratestackError,
         >,
     > + Send {
         let issuer = self.issuer.clone();
@@ -879,12 +838,67 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         let target_account_id = args.args.accountId;
         let role = args.args.role;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            let project = issuer
+                .add_project_member(&subject, &project_id, &target_account_id, role.as_deref())
+                .await
+                .map_err(to_cratestack_error)?;
+            Ok(to_schema_project(project))
+        }
+    }
+
+    fn remove_project_member(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::remove_project_member::Args,
+        _authorized: schema::procedures::remove_project_member::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::remove_project_member::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let project_id = args.args.projectId;
+        let target_account_id = args.args.accountId;
+        async move {
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            let project = issuer
+                .remove_project_member(&subject, &project_id, &target_account_id)
+                .await
+                .map_err(to_cratestack_error)?;
+            Ok(to_schema_project(project))
+        }
+    }
+
+    fn set_project_member_role(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::set_project_member_role::Args,
+        _authorized: schema::procedures::set_project_member_role::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::set_project_member_role::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let project_id = args.args.projectId;
+        let target_account_id = args.args.accountId;
+        let role = args.args.role;
+        async move {
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let project = issuer
                 .set_project_member_role(&subject, &project_id, &target_account_id, &role)
                 .await
-                .map_err(to_cool_error)?;
+                .map_err(to_cratestack_error)?;
             Ok(to_schema_project(project))
         }
     }
@@ -892,13 +906,13 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn set_project_member_quota_tier(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::set_project_member_quota_tier::Args,
         _authorized: schema::procedures::set_project_member_quota_tier::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<
             schema::procedures::set_project_member_quota_tier::Output,
-            CoolError,
+            CratestackError,
         >,
     > + Send {
         let issuer = self.issuer.clone();
@@ -907,8 +921,8 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         let target_account_id = args.args.accountId;
         let quota_tier = args.args.quotaTier;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let project = issuer
                 .set_project_member_quota_tier(
                     &subject,
@@ -917,7 +931,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                     quota_tier.as_deref(),
                 )
                 .await
-                .map_err(to_cool_error)?;
+                .map_err(to_cratestack_error)?;
             Ok(to_schema_project(project))
         }
     }
@@ -928,22 +942,25 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn list_project_roster(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::list_project_roster::Args,
         _authorized: schema::procedures::list_project_roster::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::list_project_roster::Output, CoolError>,
+        Output = std::result::Result<
+            schema::procedures::list_project_roster::Output,
+            CratestackError,
+        >,
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
         let project_id = args.args.projectId;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let members = issuer
                 .list_project_roster(&subject, &project_id)
                 .await
-                .map_err(to_cool_error)?;
+                .map_err(to_cratestack_error)?;
             Ok(members.into_iter().map(to_schema_project_member).collect())
         }
     }
@@ -951,25 +968,25 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn delete_account_permanently(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::delete_account_permanently::Args,
         _authorized: schema::procedures::delete_account_permanently::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<
             schema::procedures::delete_account_permanently::Output,
-            CoolError,
+            CratestackError,
         >,
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
         let account_id = args.args.accountId;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let account = issuer
                 .delete_account(&subject, &account_id)
                 .await
-                .map_err(to_cool_error)?;
+                .map_err(to_cratestack_error)?;
             Ok(to_schema_account(account))
         }
     }
@@ -989,11 +1006,14 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn activate_budget_policy(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::activate_budget_policy::Args,
         _authorized: schema::procedures::activate_budget_policy::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::activate_budget_policy::Output, CoolError>,
+        Output = std::result::Result<
+            schema::procedures::activate_budget_policy::Output,
+            CratestackError,
+        >,
     > + Send {
         let policy_store = self.policy_store.clone();
         let subject = subject_from_ctx(ctx);
@@ -1001,11 +1021,11 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         let rule_data_json = args.args.ruleDataJson;
         let revision_id = args.args.revisionId;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
 
             if policy_set_id != BUDGET_POLICY_SET_ID {
-                return Err(CoolError::BadRequest(format!(
+                return Err(CratestackError::BadRequest(format!(
                     "unknown policySetId '{policy_set_id}' -- only '{BUDGET_POLICY_SET_ID}' \
                      exists today"
                 )));
@@ -1015,19 +1035,19 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 (Some(json), None) => policy_store
                     .activate(&json, Some(&subject))
                     .await
-                    .map_err(budget_error_to_cool_error)?,
+                    .map_err(budget_error_to_cratestack_error)?,
                 (None, Some(revision_id)) => policy_store
                     .activate_by_revision_id(&revision_id)
                     .await
-                    .map_err(budget_error_to_cool_error)?,
+                    .map_err(budget_error_to_cratestack_error)?,
                 (Some(_), Some(_)) => {
-                    return Err(CoolError::BadRequest(
+                    return Err(CratestackError::BadRequest(
                         "exactly one of ruleDataJson or revisionId must be provided, not both"
                             .to_owned(),
                     ));
                 }
                 (None, None) => {
-                    return Err(CoolError::BadRequest(
+                    return Err(CratestackError::BadRequest(
                         "exactly one of ruleDataJson or revisionId must be provided".to_owned(),
                     ));
                 }
@@ -1047,24 +1067,24 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn get_budget_policy_status(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::get_budget_policy_status::Args,
         _authorized: schema::procedures::get_budget_policy_status::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<
             schema::procedures::get_budget_policy_status::Output,
-            CoolError,
+            CratestackError,
         >,
     > + Send {
         let policy_store = self.policy_store.clone();
         let subject = subject_from_ctx(ctx);
         let policy_set_id = args.args.policySetId;
         async move {
-            let _subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
 
             if policy_set_id != BUDGET_POLICY_SET_ID {
-                return Err(CoolError::BadRequest(format!(
+                return Err(CratestackError::BadRequest(format!(
                     "unknown policySetId '{policy_set_id}' -- only '{BUDGET_POLICY_SET_ID}' \
                      exists today"
                 )));
@@ -1090,28 +1110,31 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn simulate_budget_policy(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::simulate_budget_policy::Args,
         _authorized: schema::procedures::simulate_budget_policy::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::simulate_budget_policy::Output, CoolError>,
+        Output = std::result::Result<
+            schema::procedures::simulate_budget_policy::Output,
+            CratestackError,
+        >,
     > + Send {
         let subject = subject_from_ctx(ctx);
         let rule_data_json = args.args.ruleDataJson;
         let scenario_json = args.args.scenarioJson;
         let requested_amount_str = args.args.requestedAmountMicros;
         async move {
-            let _subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
 
             let requested_amount_micros: i64 = requested_amount_str.trim().parse().map_err(|_| {
-                CoolError::BadRequest(format!(
+                CratestackError::BadRequest(format!(
                     "requestedAmountMicros must be a valid integer, got '{requested_amount_str}'"
                 ))
             })?;
 
             let facts: lightbridge_authz_budget::Facts = serde_json::from_str(&scenario_json)
-                .map_err(|e| CoolError::BadRequest(format!("invalid scenarioJson: {e}")))?;
+                .map_err(|e| CratestackError::BadRequest(format!("invalid scenarioJson: {e}")))?;
 
             // A short-lived engine, constructed and discarded within this one call -- never
             // wired into `self.policy_store`, never persisted, never touches
@@ -1120,7 +1143,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 &rule_data_json,
                 BUDGET_POLICY_EVALUATION_BUDGET,
             )
-            .map_err(budget_error_to_cool_error)?;
+            .map_err(budget_error_to_cratestack_error)?;
 
             let decision = lightbridge_authz_budget::PolicyEngine::evaluate(
                 &engine,
@@ -1128,7 +1151,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 requested_amount_micros,
             )
             .await
-            .map_err(budget_error_to_cool_error)?;
+            .map_err(budget_error_to_cratestack_error)?;
 
             Ok(to_schema_decision(decision))
         }
@@ -1164,27 +1187,30 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn request_budget_refill(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::request_budget_refill::Args,
         _authorized: schema::procedures::request_budget_refill::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::request_budget_refill::Output, CoolError>,
+        Output = std::result::Result<
+            schema::procedures::request_budget_refill::Output,
+            CratestackError,
+        >,
     > + Send {
         let refill_service = self.refill_service.clone();
         let subject = subject_from_ctx(ctx);
         let caller_kind = caller_kind_from_ctx(ctx);
         let input = args.args;
         async move {
-            let _subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             if caller_kind.as_deref() == Some(lightbridge_authz_bearer::API_KEY_CALLER_KIND) {
-                return Err(CoolError::Forbidden(
+                return Err(CratestackError::Forbidden(
                     "self-service budget refills are for OIDC human callers only".to_owned(),
                 ));
             }
 
             let period = lightbridge_authz_budget::Period::parse(&input.period)
-                .map_err(budget_error_to_cool_error)?;
+                .map_err(budget_error_to_cratestack_error)?;
 
             let request = lightbridge_authz_budget::RefillRequest {
                 budget_account_id: input.budgetAccountId,
@@ -1198,7 +1224,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
             let created = refill_service
                 .request_refill(request)
                 .await
-                .map_err(budget_error_to_cool_error)?;
+                .map_err(budget_error_to_cratestack_error)?;
 
             Ok(to_schema_augmentation_request(created))
         }
@@ -1216,27 +1242,27 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn list_pending_augmentation_requests(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::list_pending_augmentation_requests::Args,
         _authorized: schema::procedures::list_pending_augmentation_requests::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<
             schema::procedures::list_pending_augmentation_requests::Output,
-            CoolError,
+            CratestackError,
         >,
     > + Send {
         let review_service = self.review_service.clone();
         let subject = subject_from_ctx(ctx);
         let input = args.args;
         async move {
-            let _subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
 
             let page_size = resolve_augmentation_requests_page_size(input.limit);
             let requests = review_service
                 .list_pending(input.budgetAccountId.as_deref(), input.after, page_size)
                 .await
-                .map_err(budget_error_to_cool_error)?;
+                .map_err(budget_error_to_cratestack_error)?;
 
             Ok(to_schema_augmentation_request_page(requests, page_size))
         }
@@ -1256,27 +1282,27 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn list_my_augmentation_requests(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::list_my_augmentation_requests::Args,
         _authorized: schema::procedures::list_my_augmentation_requests::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<
             schema::procedures::list_my_augmentation_requests::Output,
-            CoolError,
+            CratestackError,
         >,
     > + Send {
         let refill_service = self.refill_service.clone();
         let subject = subject_from_ctx(ctx);
         let input = args.args;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
 
             let page_size = resolve_augmentation_requests_page_size(input.limit);
             let requests = refill_service
                 .list_own_history(&subject, input.before, page_size)
                 .await
-                .map_err(budget_error_to_cool_error)?;
+                .map_err(budget_error_to_cratestack_error)?;
 
             Ok(to_schema_augmentation_request_page(requests, page_size))
         }
@@ -1289,26 +1315,26 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn approve_augmentation_request(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::approve_augmentation_request::Args,
         _authorized: schema::procedures::approve_augmentation_request::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<
             schema::procedures::approve_augmentation_request::Output,
-            CoolError,
+            CratestackError,
         >,
     > + Send {
         let review_service = self.review_service.clone();
         let subject = subject_from_ctx(ctx);
         let request_id = args.args.requestId;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
 
             let reviewed = review_service
                 .approve(&request_id, &subject)
                 .await
-                .map_err(budget_error_to_cool_error)?;
+                .map_err(budget_error_to_cratestack_error)?;
 
             Ok(to_schema_augmentation_request(reviewed))
         }
@@ -1322,13 +1348,13 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn reject_augmentation_request(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::reject_augmentation_request::Args,
         _authorized: schema::procedures::reject_augmentation_request::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<
             schema::procedures::reject_augmentation_request::Output,
-            CoolError,
+            CratestackError,
         >,
     > + Send {
         let review_service = self.review_service.clone();
@@ -1336,13 +1362,13 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         let request_id = args.args.requestId;
         let reason = args.args.reason;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
 
             let reviewed = review_service
                 .reject(&request_id, &subject, &reason)
                 .await
-                .map_err(budget_error_to_cool_error)?;
+                .map_err(budget_error_to_cratestack_error)?;
 
             Ok(to_schema_augmentation_request(reviewed))
         }
@@ -1359,21 +1385,24 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn revoke_own_sessions(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         _args: schema::procedures::revoke_own_sessions::Args,
         _authorized: schema::procedures::revoke_own_sessions::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::revoke_own_sessions::Output, CoolError>,
+        Output = std::result::Result<
+            schema::procedures::revoke_own_sessions::Output,
+            CratestackError,
+        >,
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let revoked_count = issuer
                 .revoke_sessions(&subject)
                 .await
-                .map_err(to_cool_error)?;
+                .map_err(to_cratestack_error)?;
             Ok(to_schema_session_revocation_result(revoked_count))
         }
     }
@@ -1389,25 +1418,25 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn revoke_subject_sessions(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::revoke_subject_sessions::Args,
         _authorized: schema::procedures::revoke_subject_sessions::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<
             schema::procedures::revoke_subject_sessions::Output,
-            CoolError,
+            CratestackError,
         >,
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
         let target_account_id = args.args.accountId;
         async move {
-            let _subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let revoked_count = issuer
                 .revoke_sessions(&target_account_id)
                 .await
-                .map_err(to_cool_error)?;
+                .map_err(to_cratestack_error)?;
             Ok(to_schema_session_revocation_result(revoked_count))
         }
     }
@@ -1420,25 +1449,28 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn get_my_budget_balance(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::get_my_budget_balance::Args,
         _authorized: schema::procedures::get_my_budget_balance::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::get_my_budget_balance::Output, CoolError>,
+        Output = std::result::Result<
+            schema::procedures::get_my_budget_balance::Output,
+            CratestackError,
+        >,
     > + Send {
         let budget_repo = self.budget_repo.clone();
         let subject = subject_from_ctx(ctx);
         let period_str = args.args.period;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let period = lightbridge_authz_budget::Period::parse(&period_str)
-                .map_err(budget_error_to_cool_error)?;
+                .map_err(budget_error_to_cratestack_error)?;
 
             let snapshot = budget_repo
                 .get_balance(&subject, &period)
                 .await
-                .map_err(budget_error_to_cool_error)?
+                .map_err(budget_error_to_cratestack_error)?
                 .unwrap_or_else(|| {
                     lightbridge_authz_budget::repo::BalanceSnapshot::zero(&subject, &period)
                 });
@@ -1452,26 +1484,29 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn get_budget_balance(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::get_budget_balance::Args,
         _authorized: schema::procedures::get_budget_balance::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::get_budget_balance::Output, CoolError>,
+        Output = std::result::Result<
+            schema::procedures::get_budget_balance::Output,
+            CratestackError,
+        >,
     > + Send {
         let budget_repo = self.budget_repo.clone();
         let subject = subject_from_ctx(ctx);
         let budget_account_id = args.args.budgetAccountId;
         let period_str = args.args.period;
         async move {
-            let _subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let period = lightbridge_authz_budget::Period::parse(&period_str)
-                .map_err(budget_error_to_cool_error)?;
+                .map_err(budget_error_to_cratestack_error)?;
 
             let snapshot = budget_repo
                 .get_balance(&budget_account_id, &period)
                 .await
-                .map_err(budget_error_to_cool_error)?
+                .map_err(budget_error_to_cratestack_error)?
                 .unwrap_or_else(|| {
                     lightbridge_authz_budget::repo::BalanceSnapshot::zero(
                         &budget_account_id,
@@ -1489,18 +1524,21 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn list_my_budget_grants(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::list_my_budget_grants::Args,
         _authorized: schema::procedures::list_my_budget_grants::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::list_my_budget_grants::Output, CoolError>,
+        Output = std::result::Result<
+            schema::procedures::list_my_budget_grants::Output,
+            CratestackError,
+        >,
     > + Send {
         let budget_repo = self.budget_repo.clone();
         let subject = subject_from_ctx(ctx);
         let input = args.args;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let page = list_budget_grants_page(
                 &budget_repo,
                 &subject,
@@ -1518,18 +1556,21 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn list_budget_grants(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::list_budget_grants::Args,
         _authorized: schema::procedures::list_budget_grants::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::list_budget_grants::Output, CoolError>,
+        Output = std::result::Result<
+            schema::procedures::list_budget_grants::Output,
+            CratestackError,
+        >,
     > + Send {
         let budget_repo = self.budget_repo.clone();
         let subject = subject_from_ctx(ctx);
         let input = args.args;
         async move {
-            let _subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let page = list_budget_grants_page(
                 &budget_repo,
                 &input.budgetAccountId,
@@ -1548,23 +1589,23 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn grant_budget(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::grant_budget::Args,
         _authorized: schema::procedures::grant_budget::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::grant_budget::Output, CoolError>,
+        Output = std::result::Result<schema::procedures::grant_budget::Output, CratestackError>,
     > + Send {
         let budget_repo = self.budget_repo.clone();
         let subject = subject_from_ctx(ctx);
         let input = args.args;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
 
             let period = lightbridge_authz_budget::Period::parse(&input.period)
-                .map_err(budget_error_to_cool_error)?;
+                .map_err(budget_error_to_cratestack_error)?;
             let amount_micros: i64 = input.amountMicros.trim().parse().map_err(|_| {
-                CoolError::BadRequest(format!(
+                CratestackError::BadRequest(format!(
                     "amountMicros must be a valid integer, got '{}'",
                     input.amountMicros
                 ))
@@ -1587,7 +1628,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                     expires_at: None,
                 })
                 .await
-                .map_err(budget_error_to_cool_error)?;
+                .map_err(budget_error_to_cratestack_error)?;
 
             Ok(to_schema_budget_grant_entry(grant))
         }
@@ -1601,24 +1642,27 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn revoke_budget_grant(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::revoke_budget_grant::Args,
         _authorized: schema::procedures::revoke_budget_grant::Authorized,
     ) -> impl core::future::Future<
-        Output = std::result::Result<schema::procedures::revoke_budget_grant::Output, CoolError>,
+        Output = std::result::Result<
+            schema::procedures::revoke_budget_grant::Output,
+            CratestackError,
+        >,
     > + Send {
         let budget_repo = self.budget_repo.clone();
         let subject = subject_from_ctx(ctx);
         let grant_id = args.args.grantId;
         let reason = args.args.reason;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
 
             let original = budget_repo
                 .get_grant_by_id(&grant_id)
                 .await
-                .map_err(budget_error_to_cool_error)?;
+                .map_err(budget_error_to_cratestack_error)?;
 
             let correction = budget_repo
                 .grant(lightbridge_authz_budget::repo::GrantRequest {
@@ -1637,7 +1681,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                     expires_at: None,
                 })
                 .await
-                .map_err(budget_error_to_cool_error)?;
+                .map_err(budget_error_to_cratestack_error)?;
 
             Ok(to_schema_budget_grant_entry(correction))
         }
@@ -1650,13 +1694,13 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     fn create_budget_policy_revision(
         &self,
         _db: &schema::Cratestack,
-        ctx: &CoolContext,
+        ctx: &CratestackContext,
         args: schema::procedures::create_budget_policy_revision::Args,
         _authorized: schema::procedures::create_budget_policy_revision::Authorized,
     ) -> impl core::future::Future<
         Output = std::result::Result<
             schema::procedures::create_budget_policy_revision::Output,
-            CoolError,
+            CratestackError,
         >,
     > + Send {
         let policy_store = self.policy_store.clone();
@@ -1664,11 +1708,11 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         let policy_set_id = args.args.policySetId;
         let rule_data_json = args.args.ruleDataJson;
         async move {
-            let subject =
-                subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
 
             if policy_set_id != BUDGET_POLICY_SET_ID {
-                return Err(CoolError::BadRequest(format!(
+                return Err(CratestackError::BadRequest(format!(
                     "unknown policySetId '{policy_set_id}' -- only '{BUDGET_POLICY_SET_ID}' \
                      exists today"
                 )));
@@ -1677,7 +1721,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
             let new_revision = policy_store
                 .create_revision(&rule_data_json, Some(&subject))
                 .await
-                .map_err(budget_error_to_cool_error)?;
+                .map_err(budget_error_to_cratestack_error)?;
 
             Ok(schema::procedures::create_budget_policy_revision::Output {
                 policySetId: policy_set_id,
@@ -1698,18 +1742,18 @@ async fn list_budget_grants_page(
     period_str: Option<String>,
     before: Option<chrono::DateTime<chrono::Utc>>,
     limit: Option<i64>,
-) -> std::result::Result<schema::BudgetGrantPage, CoolError> {
+) -> std::result::Result<schema::BudgetGrantPage, CratestackError> {
     let period = period_str
         .as_deref()
         .map(lightbridge_authz_budget::Period::parse)
         .transpose()
-        .map_err(budget_error_to_cool_error)?;
+        .map_err(budget_error_to_cratestack_error)?;
     let page_size = resolve_budget_grants_page_size(limit);
 
     let grants = budget_repo
         .list_grants(budget_account_id, period.as_ref(), before, page_size)
         .await
-        .map_err(budget_error_to_cool_error)?;
+        .map_err(budget_error_to_cratestack_error)?;
 
     let next_cursor = if grants.len() == usize::try_from(page_size).unwrap_or(usize::MAX) {
         grants.last().map(|g| g.created_at)
@@ -1806,8 +1850,8 @@ pub fn build_api_router(
     // "tested path != shipped path" gap that produced two prod-only bugs invisible to a green CI).
     // `LenientCborCodec`, not the raw `cratestack_codec_cbor::CborCodec` — see `codec.rs` for why
     // (CBOR clients that encode JS `undefined` as wire-level `undefined` instead of omitting the
-    // key, e.g. `cborg`). A single `CoolCodec` implementor satisfies `rpc_router`'s transport bound
-    // directly via cratestack-axum's blanket `impl<C: CoolCodec> HttpTransport for C` — no
+    // key, e.g. `cborg`). A single `CratestackCodec` implementor satisfies `rpc_router`'s transport bound
+    // directly via cratestack-axum's blanket `impl<C: CratestackCodec> HttpTransport for C` — no
     // `CodecSet` wrapper needed once there is only one codec to serve.
     // The coarse RBAC gate (docs/rbac.md) that cratestack's membership `@@allow` policies do not
     // express. Applied as the OUTERMOST layer so an unauthorized caller is rejected with 403 before

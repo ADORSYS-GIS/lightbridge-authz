@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use cratestack::{CoolContext, CoolError, Value};
+use cratestack::{CratestackContext, CratestackError, Value};
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api::schema::procedures::ProcedureRegistry;
 use lightbridge_authz_budget::PolicyStore;
@@ -107,11 +107,11 @@ fn lazy_cratestack_db() -> schema::Cratestack {
 }
 
 /// Builds a real `Procedures` instance against `pool` (a genuinely migrated, seeded database),
-/// with a bearer subject sealed into the `CoolContext` the way `CratestackAuthProvider` would for
+/// with a bearer subject sealed into the `CratestackContext` the way `CratestackAuthProvider` would for
 /// a real authenticated request. `simulate_budget_policy` itself never touches `PolicyStore`, but
 /// `Procedures::new` still requires one to construct -- same reasoning as
 /// `budget_policy_procedure_tests.rs`.
-async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, CoolContext) {
+async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, CratestackContext) {
     let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
     let issuer = Arc::new(AuthzStoreImpl::with_pool(db_pool.clone()));
     let policy_store = Arc::new(
@@ -143,7 +143,8 @@ async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, CoolCon
         review_service,
         budget_repo,
     );
-    let ctx = CoolContext::authenticated([("id".to_owned(), Value::String(subject.to_owned()))]);
+    let ctx =
+        CratestackContext::authenticated([("id".to_owned(), Value::String(subject.to_owned()))]);
     (procedures, ctx)
 }
 
@@ -155,9 +156,9 @@ async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, CoolCon
 async fn simulate(
     procedures: &Procedures,
     db: &schema::Cratestack,
-    ctx: &CoolContext,
+    ctx: &CratestackContext,
     args: schema::procedures::simulate_budget_policy::Args,
-) -> Result<schema::procedures::simulate_budget_policy::Output, CoolError> {
+) -> Result<schema::procedures::simulate_budget_policy::Output, CratestackError> {
     let call_args = args.clone();
     schema::procedures::simulate_budget_policy::invoke_with_db(
         db,
@@ -177,9 +178,9 @@ async fn simulate(
 async fn get_status(
     procedures: &Procedures,
     db: &schema::Cratestack,
-    ctx: &CoolContext,
+    ctx: &CratestackContext,
     args: schema::procedures::get_budget_policy_status::Args,
-) -> Result<schema::procedures::get_budget_policy_status::Output, CoolError> {
+) -> Result<schema::procedures::get_budget_policy_status::Output, CratestackError> {
     let call_args = args.clone();
     schema::procedures::get_budget_policy_status::invoke_with_db(
         db,
@@ -363,7 +364,7 @@ async fn malformed_scenario_json_is_rejected(pool: PgPool) {
     .await;
 
     match result {
-        Err(cratestack::CoolError::BadRequest(_)) => {}
+        Err(cratestack::CratestackError::BadRequest(_)) => {}
         other => panic!("malformed scenarioJson must be rejected as BadRequest, got: {other:?}"),
     }
 
@@ -389,7 +390,7 @@ async fn malformed_rule_data_is_rejected(pool: PgPool) {
     .await;
 
     match result {
-        Err(cratestack::CoolError::BadRequest(_)) => {}
+        Err(cratestack::CratestackError::BadRequest(_)) => {}
         other => panic!("malformed ruleDataJson must be rejected as BadRequest, got: {other:?}"),
     }
 

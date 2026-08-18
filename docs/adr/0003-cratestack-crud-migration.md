@@ -84,7 +84,7 @@ canonical `/rpc/<op_id>`. The gate's op-id extraction (`rpc_authorize::op_id_fro
 `crates/lightbridge-authz-api/src/store.rs` (`AuthzStore` trait) and its single implementation
 (`StoreRepo`'s CRUD methods) existed to abstract persistence behind a trait boundary. `cratestack-pg`
 is usable directly as the CRUD ORM/runtime — controllers and procedure handlers call the generated
-model delegates (`cool.account().create(...)`, `cool.project().find_many()...run(ctx)`, etc.)
+model delegates (`cratestack.account().create(...)`, `cratestack.project().find_many()...run(ctx)`, etc.)
 directly. The `AuthzStore` trait's CRUD methods and its single impl are deleted rather than kept as a
 wrapper around the generated client; there was only ever one implementation, so the trait indirection
 had no polymorphism to justify keeping. `StoreRepo` survives only for the non-CRUD methods listed in
@@ -106,7 +106,7 @@ generated `list` route (REST and RPC alike) wraps its response in
 `Page<T> { items, totalCount, pageInfo: { limit, offset, hasNextPage, hasPreviousPage } }` instead of
 a bare array, and the handler runs a second count-only query per call for `totalCount`. This only
 affects HTTP-facing consumers (the RPC surface, and the generated Rust/TS *client*) — the raw
-server-side query builder (`cool.account().find_many()...run(ctx)`, what `lib.rs`'s procedures and
+server-side query builder (`cratestack.account().find_many()...run(ctx)`, what `lib.rs`'s procedures and
 `mcp.rs` call directly) is unaffected and still returns a plain `Vec<T>`; confirmed by the workspace
 compiling unchanged after `@@paged` was added, and matching the codegen split found in
 `cratestack-macros/src/axum/model/handlers_list.rs` / `prep/list_logging.rs` (paging is applied by the
@@ -190,7 +190,7 @@ never for an authorization or validation decision.
 `authz-api`'s existing bearer-token/JWKS validation (`crates/lightbridge-authz-bearer`) is wrapped in
 a `CratestackAuthProvider` implementing cratestack's `AuthProvider` trait, rather than reimplemented.
 `authenticate()` extracts and validates the bearer token exactly as today, then projects the resulting
-subject/role claims into `CoolContext` so `@@allow`/`@@deny` policy expressions can reference
+subject/role claims into `CratestackContext` so `@@allow`/`@@deny` policy expressions can reference
 `auth().id` / `auth().role` (or the `lightbridge_api_roles` claim shape already in use, see
 `docs/rbac.md`). This is glue code around existing validation, not new authentication logic.
 

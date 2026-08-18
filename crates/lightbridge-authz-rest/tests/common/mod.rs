@@ -16,7 +16,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use cratestack_codec_cbor::CborCodec;
 use cratestack_codec_json::JsonCodec;
-use cratestack_core::CoolCodec;
+use cratestack_core::CratestackCodec;
 use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
 use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::authz::{Permission, PermissionSet};

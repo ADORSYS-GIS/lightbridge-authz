@@ -8,7 +8,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use cratestack::{CoolContext, CoolError, Value as CratestackValue};
+use cratestack::{CratestackContext, CratestackError, Value as CratestackValue};
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait, TokenInfo};
@@ -262,35 +262,37 @@ fn to_tool_error(error: Error) -> ErrorData {
     }
 }
 
-/// Map a cratestack `CoolError` (returned by the generated CRUD client) onto an MCP `ErrorData`,
+/// Map a cratestack `CratestackError` (returned by the generated CRUD client) onto an MCP `ErrorData`,
 /// mirroring [`to_tool_error`]'s status mapping for the hand-written `Error`. Internal/database
 /// variants collapse to a generic internal error so operator detail never leaks to the client.
-fn cool_error_to_tool_error(error: CoolError) -> ErrorData {
+fn cratestack_error_to_tool_error(error: CratestackError) -> ErrorData {
     match error {
-        CoolError::NotFound(_) => ErrorData::resource_not_found("not found", None),
-        CoolError::Forbidden(msg) | CoolError::Unauthorized(msg) => {
+        CratestackError::NotFound(_) => ErrorData::resource_not_found("not found", None),
+        CratestackError::Forbidden(msg) | CratestackError::Unauthorized(msg) => {
             ErrorData::invalid_request(msg, None)
         }
-        CoolError::Conflict(msg)
-        | CoolError::PreconditionFailed(msg)
-        | CoolError::BadRequest(msg)
-        | CoolError::Validation(msg)
-        | CoolError::NotAcceptable(msg)
-        | CoolError::UnsupportedMediaType(msg) => ErrorData::invalid_params(msg, None),
+        CratestackError::Conflict(msg)
+        | CratestackError::PreconditionFailed(msg)
+        | CratestackError::BadRequest(msg)
+        | CratestackError::Validation(msg)
+        | CratestackError::NotAcceptable(msg)
+        | CratestackError::UnsupportedMediaType(msg) => ErrorData::invalid_params(msg, None),
         other => ErrorData::internal_error(other.to_string(), None),
     }
 }
 
-/// Build a cratestack [`CoolContext`] for the authenticated MCP caller, mirroring
+/// Build a cratestack [`CratestackContext`] for the authenticated MCP caller, mirroring
 /// `lightbridge_authz_rest::auth_provider::CratestackAuthProvider::authenticate`: the validated
 /// subject is projected as `auth().id` (what the schema's `@@allow` membership predicates resolve
 /// against) and the raw access token + roles are stashed as context extensions, so a CRUD tool
 /// invoking the generated client is scoped to exactly the caller's tenants — the same second-gate
 /// policy path the RPC surface applies. The extension keys are the public constants exported by
 /// that module, so the two surfaces stay in lockstep.
-fn cool_context_from_token_info(info: &TokenInfo) -> CoolContext {
-    let mut ctx =
-        CoolContext::authenticated([("id".to_owned(), CratestackValue::String(info.sub.clone()))]);
+fn cratestack_context_from_token_info(info: &TokenInfo) -> CratestackContext {
+    let mut ctx = CratestackContext::authenticated([(
+        "id".to_owned(),
+        CratestackValue::String(info.sub.clone()),
+    )]);
     ctx.extensions.insert(
         ACCESS_TOKEN_CONTEXT_KEY.to_owned(),
         CratestackValue::String(info.access_token.clone()),
@@ -824,7 +826,7 @@ impl LightbridgeMcpHandler {
         let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
         let bound = self
             .cratestack_db
-            .bind_context(cool_context_from_token_info(&token_info));
+            .bind_context(cratestack_context_from_token_info(&token_info));
         let accounts = bound
             .account()
             .find_many()
@@ -832,7 +834,7 @@ impl LightbridgeMcpHandler {
             .offset(offset as i64)
             .run()
             .await
-            .map_err(cool_error_to_tool_error)?;
+            .map_err(cratestack_error_to_tool_error)?;
 
         to_json_value(accounts)
     }
@@ -849,13 +851,13 @@ impl LightbridgeMcpHandler {
         let token_info = token_info_from_request_context(&context)?;
         let bound = self
             .cratestack_db
-            .bind_context(cool_context_from_token_info(&token_info));
+            .bind_context(cratestack_context_from_token_info(&token_info));
         let account = bound
             .account()
             .find_unique(params.account_id)
             .run()
             .await
-            .map_err(cool_error_to_tool_error)?;
+            .map_err(cratestack_error_to_tool_error)?;
 
         to_json_value(require_found(account)?)
     }
@@ -872,7 +874,7 @@ impl LightbridgeMcpHandler {
         let token_info = token_info_from_request_context(&context)?;
         let bound = self
             .cratestack_db
-            .bind_context(cool_context_from_token_info(&token_info));
+            .bind_context(cratestack_context_from_token_info(&token_info));
         let mut input = schema::inputs::UpdateAccountInput::default();
         if let Some(default_quota) = params.default_quota {
             input.defaultQuota = Some(default_quota);
@@ -883,7 +885,7 @@ impl LightbridgeMcpHandler {
             .set(input)
             .run()
             .await
-            .map_err(cool_error_to_tool_error)?;
+            .map_err(cratestack_error_to_tool_error)?;
 
         to_json_value(account)
     }
@@ -1071,7 +1073,7 @@ impl LightbridgeMcpHandler {
         let token_info = token_info_from_request_context(&context)?;
         let bound = self
             .cratestack_db
-            .bind_context(cool_context_from_token_info(&token_info));
+            .bind_context(cratestack_context_from_token_info(&token_info));
         let default_limits = params
             .default_limits
             .map(DefaultLimits::from)
@@ -1095,7 +1097,7 @@ impl LightbridgeMcpHandler {
             .create(input)
             .run()
             .await
-            .map_err(cool_error_to_tool_error)?;
+            .map_err(cratestack_error_to_tool_error)?;
 
         to_json_value(project)
     }
@@ -1113,7 +1115,7 @@ impl LightbridgeMcpHandler {
         let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
         let bound = self
             .cratestack_db
-            .bind_context(cool_context_from_token_info(&token_info));
+            .bind_context(cratestack_context_from_token_info(&token_info));
         let projects = bound
             .project()
             .find_many()
@@ -1122,7 +1124,7 @@ impl LightbridgeMcpHandler {
             .offset(offset as i64)
             .run()
             .await
-            .map_err(cool_error_to_tool_error)?;
+            .map_err(cratestack_error_to_tool_error)?;
 
         to_json_value(projects)
     }
@@ -1139,13 +1141,13 @@ impl LightbridgeMcpHandler {
         let token_info = token_info_from_request_context(&context)?;
         let bound = self
             .cratestack_db
-            .bind_context(cool_context_from_token_info(&token_info));
+            .bind_context(cratestack_context_from_token_info(&token_info));
         let project = bound
             .project()
             .find_unique(params.project_id)
             .run()
             .await
-            .map_err(cool_error_to_tool_error)?;
+            .map_err(cratestack_error_to_tool_error)?;
 
         to_json_value(require_found(project)?)
     }
@@ -1162,7 +1164,7 @@ impl LightbridgeMcpHandler {
         let token_info = token_info_from_request_context(&context)?;
         let bound = self
             .cratestack_db
-            .bind_context(cool_context_from_token_info(&token_info));
+            .bind_context(cratestack_context_from_token_info(&token_info));
         let mut input = schema::inputs::UpdateProjectInput::default();
         if let Some(name) = params.name {
             input.name = Some(name);
@@ -1184,7 +1186,7 @@ impl LightbridgeMcpHandler {
             .set(input)
             .run()
             .await
-            .map_err(cool_error_to_tool_error)?;
+            .map_err(cratestack_error_to_tool_error)?;
 
         to_json_value(project)
     }
@@ -1201,13 +1203,13 @@ impl LightbridgeMcpHandler {
         let token_info = token_info_from_request_context(&context)?;
         let bound = self
             .cratestack_db
-            .bind_context(cool_context_from_token_info(&token_info));
+            .bind_context(cratestack_context_from_token_info(&token_info));
         let project = bound
             .project()
             .delete(params.project_id)
             .run()
             .await
-            .map_err(cool_error_to_tool_error)?;
+            .map_err(cratestack_error_to_tool_error)?;
 
         to_json_value(project)
     }
@@ -1312,7 +1314,7 @@ impl LightbridgeMcpHandler {
         let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
         let bound = self
             .cratestack_db
-            .bind_context(cool_context_from_token_info(&token_info));
+            .bind_context(cratestack_context_from_token_info(&token_info));
         let api_keys = bound
             .api_key()
             .find_many()
@@ -1321,7 +1323,7 @@ impl LightbridgeMcpHandler {
             .offset(offset as i64)
             .run()
             .await
-            .map_err(cool_error_to_tool_error)?;
+            .map_err(cratestack_error_to_tool_error)?;
 
         to_json_value(api_keys)
     }
@@ -1338,13 +1340,13 @@ impl LightbridgeMcpHandler {
         let token_info = token_info_from_request_context(&context)?;
         let bound = self
             .cratestack_db
-            .bind_context(cool_context_from_token_info(&token_info));
+            .bind_context(cratestack_context_from_token_info(&token_info));
         let api_key = bound
             .api_key()
             .find_unique(params.key_id)
             .run()
             .await
-            .map_err(cool_error_to_tool_error)?;
+            .map_err(cratestack_error_to_tool_error)?;
 
         to_json_value(require_found(api_key)?)
     }
@@ -1362,7 +1364,7 @@ impl LightbridgeMcpHandler {
         let expires_at = parse_optional_datetime(params.expires_at, "expires_at")?;
         let bound = self
             .cratestack_db
-            .bind_context(cool_context_from_token_info(&token_info));
+            .bind_context(cratestack_context_from_token_info(&token_info));
         let mut input = schema::inputs::UpdateApiKeyInput::default();
         if let Some(name) = params.name {
             input.name = Some(name);
@@ -1376,7 +1378,7 @@ impl LightbridgeMcpHandler {
             .set(input)
             .run()
             .await
-            .map_err(cool_error_to_tool_error)?;
+            .map_err(cratestack_error_to_tool_error)?;
 
         to_json_value(api_key)
     }
@@ -1393,13 +1395,13 @@ impl LightbridgeMcpHandler {
         let token_info = token_info_from_request_context(&context)?;
         let bound = self
             .cratestack_db
-            .bind_context(cool_context_from_token_info(&token_info));
+            .bind_context(cratestack_context_from_token_info(&token_info));
         let api_key = bound
             .api_key()
             .delete(params.key_id)
             .run()
             .await
-            .map_err(cool_error_to_tool_error)?;
+            .map_err(cratestack_error_to_tool_error)?;
 
         to_json_value(api_key)
     }

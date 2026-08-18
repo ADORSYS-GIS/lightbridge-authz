@@ -15,7 +15,7 @@
 //! rather than a byte-level find/replace, so a `0xf7` byte occurring inside a text/byte string's
 //! payload is never mistaken for the `undefined` type marker.
 
-use cratestack_core::{CoolCodec, CoolError};
+use cratestack_core::{CratestackCodec, CratestackError};
 use minicbor::data::Token;
 use minicbor::encode::Encode;
 use serde::{Deserialize, Serialize};
@@ -23,22 +23,22 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default)]
 pub struct LenientCborCodec(cratestack_codec_cbor::CborCodec);
 
-impl CoolCodec for LenientCborCodec {
+impl CratestackCodec for LenientCborCodec {
     const CONTENT_TYPE: &'static str =
-        <cratestack_codec_cbor::CborCodec as CoolCodec>::CONTENT_TYPE;
+        <cratestack_codec_cbor::CborCodec as CratestackCodec>::CONTENT_TYPE;
 
-    fn encode<T: Serialize + ?Sized>(&self, value: &T) -> Result<Vec<u8>, CoolError> {
+    fn encode<T: Serialize + ?Sized>(&self, value: &T) -> Result<Vec<u8>, CratestackError> {
         self.0.encode(value)
     }
 
-    fn decode<T: for<'de> Deserialize<'de>>(&self, bytes: &[u8]) -> Result<T, CoolError> {
+    fn decode<T: for<'de> Deserialize<'de>>(&self, bytes: &[u8]) -> Result<T, CratestackError> {
         self.0.decode(&normalize_undefined_to_null(bytes)?)
     }
 }
 
 /// Re-encodes `bytes` with every `undefined` token replaced by `null`. Cheap no-op (returns the
 /// input unchanged, no tokenize/re-encode pass) when no `0xf7` byte is present at all.
-fn normalize_undefined_to_null(bytes: &[u8]) -> Result<Vec<u8>, CoolError> {
+fn normalize_undefined_to_null(bytes: &[u8]) -> Result<Vec<u8>, CratestackError> {
     if !bytes.contains(&0xf7) {
         return Ok(bytes.to_vec());
     }
@@ -46,16 +46,17 @@ fn normalize_undefined_to_null(bytes: &[u8]) -> Result<Vec<u8>, CoolError> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut encoder = minicbor::Encoder::new(&mut out);
     for token in minicbor::decode::Tokenizer::new(bytes) {
-        let token = token
-            .map_err(|error| CoolError::Codec(format!("failed to decode CBOR body: {error}")))?;
+        let token = token.map_err(|error| {
+            CratestackError::Codec(format!("failed to decode CBOR body: {error}"))
+        })?;
         let token = if matches!(token, Token::Undefined) {
             Token::Null
         } else {
             token
         };
-        token
-            .encode(&mut encoder, &mut ())
-            .map_err(|error| CoolError::Codec(format!("failed to re-encode CBOR body: {error}")))?;
+        token.encode(&mut encoder, &mut ()).map_err(|error| {
+            CratestackError::Codec(format!("failed to re-encode CBOR body: {error}"))
+        })?;
     }
     Ok(out)
 }

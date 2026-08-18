@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use cratestack::{CoolContext, CoolError, Value};
+use cratestack::{CratestackContext, CratestackError, Value};
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api::schema::procedures::ProcedureRegistry;
 use lightbridge_authz_budget::PolicyStore;
@@ -87,9 +87,9 @@ fn lazy_cratestack_db() -> schema::Cratestack {
 }
 
 /// Builds a real `Procedures` instance against `pool` (a genuinely migrated, seeded database --
-/// see the module doc), with a bearer subject sealed into the `CoolContext` the way
+/// see the module doc), with a bearer subject sealed into the `CratestackContext` the way
 /// `CratestackAuthProvider` would for a real authenticated request.
-async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, CoolContext) {
+async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, CratestackContext) {
     let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
     let issuer = Arc::new(AuthzStoreImpl::with_pool(db_pool.clone()));
     let policy_store = Arc::new(
@@ -122,7 +122,8 @@ async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, CoolCon
         review_service,
         budget_repo,
     );
-    let ctx = CoolContext::authenticated([("id".to_owned(), Value::String(subject.to_owned()))]);
+    let ctx =
+        CratestackContext::authenticated([("id".to_owned(), Value::String(subject.to_owned()))]);
     (procedures, ctx)
 }
 
@@ -134,9 +135,9 @@ async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, CoolCon
 async fn activate(
     procedures: &Procedures,
     db: &schema::Cratestack,
-    ctx: &CoolContext,
+    ctx: &CratestackContext,
     args: schema::procedures::activate_budget_policy::Args,
-) -> Result<schema::procedures::activate_budget_policy::Output, CoolError> {
+) -> Result<schema::procedures::activate_budget_policy::Output, CratestackError> {
     let call_args = args.clone();
     schema::procedures::activate_budget_policy::invoke_with_db(
         db,
@@ -155,9 +156,9 @@ async fn activate(
 async fn get_status(
     procedures: &Procedures,
     db: &schema::Cratestack,
-    ctx: &CoolContext,
+    ctx: &CratestackContext,
     args: schema::procedures::get_budget_policy_status::Args,
-) -> Result<schema::procedures::get_budget_policy_status::Output, CoolError> {
+) -> Result<schema::procedures::get_budget_policy_status::Output, CratestackError> {
     let call_args = args.clone();
     schema::procedures::get_budget_policy_status::invoke_with_db(
         db,

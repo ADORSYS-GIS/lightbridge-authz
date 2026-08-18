@@ -80,7 +80,7 @@ test that exercises the RPC surface now exercises the one and only format the ro
 
 No `CodecSet` wrapper is needed to satisfy `rpc_router`'s transport bound with a single codec —
 `cratestack-axum` (0.7.16, this workspace's pin) provides a blanket
-`impl<C: CoolCodec> HttpTransport for C`, so any single `CoolCodec` implementor — here,
+`impl<C: CratestackCodec> HttpTransport for C`, so any single `CratestackCodec` implementor — here,
 `LenientCborCodec` — already satisfies the bound directly. `LenientCborCodec` itself is unchanged:
 it still exists specifically to normalize the `undefined`-vs-`null` drift (Context, bug 1) on top of
 the raw `cratestack_codec_cbor::CborCodec`. `cratestack-codec-json` is dropped from
@@ -89,7 +89,7 @@ the raw `cratestack_codec_cbor::CborCodec`. `cratestack-codec-json` is dropped f
 suite expects the router to *reject* (Decision 4).
 
 A request with any other `Content-Type` — including `application/json` — now gets
-`415 Unsupported Media Type` before reaching dispatch (`cratestack_core::CoolError::UnsupportedMediaType`
+`415 Unsupported Media Type` before reaching dispatch (`cratestack_core::CratestackError::UnsupportedMediaType`
 → `StatusCode::UNSUPPORTED_MEDIA_TYPE`), the same as it always would have for, say,
 `application/xml`. A request asking for a non-CBOR `Accept` gets `406 Not Acceptable` instead, and
 is checked *first* — `cratestack-axum`'s header validation validates `Accept` before
