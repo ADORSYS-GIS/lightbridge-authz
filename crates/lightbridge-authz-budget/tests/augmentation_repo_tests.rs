@@ -398,7 +398,7 @@ async fn list_pending_review_returns_only_pending_requests_oldest_first(pool: Pg
         .expect("must move to denied directly, never pending_review");
 
     let pending = repo
-        .list_pending_review(None)
+        .list_pending_review(None, None, 200)
         .await
         .expect("listing the queue must succeed");
 
@@ -437,7 +437,7 @@ async fn list_pending_review_scopes_to_one_account_when_given_an_id(pool: PgPool
         .expect("must move to pending_review");
 
     let scoped = repo
-        .list_pending_review(Some(&account_a))
+        .list_pending_review(Some(&account_a), None, 200)
         .await
         .expect("scoped listing must succeed");
 
@@ -491,4 +491,66 @@ async fn find_by_idempotency_key_returns_the_matching_request(pool: PgPool) {
 
     assert_eq!(found.id, created.id);
     assert_eq!(found.idempotency_key, Some(idempotency_key));
+}
+
+/// #296: `list_pending_review` pages oldest-first (unchanged order) with a `created_at`-based
+/// `after` cursor, and pages forward without repeating or skipping rows -- the exact bug a test
+/// that never calls it a second time would miss, mirroring
+/// `budget_repo_query_tests.rs::list_grants_pages_newest_first_by_created_at`'s own reasoning for
+/// its DESC counterpart.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_pending_review_pages_oldest_first_by_created_at(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    let repo = AugmentationRepo::new(Arc::new(DbPool::from_pool(pool)));
+
+    let mut inserted_ids = Vec::new();
+    for i in 0..5 {
+        let created = repo
+            .create(base_new_request(&account_id, 1_000_000 * (i + 1)))
+            .await
+            .expect("create must succeed");
+        repo.record_decision(&created.id, pending_review_decision())
+            .await
+            .expect("must move to pending_review");
+        inserted_ids.push(created.id);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Oldest-first means insertion order IS the expected page order (unlike the DESC ledger
+    // query, no reversal needed here).
+    let oldest_to_newest = inserted_ids;
+
+    let page1 = repo
+        .list_pending_review(None, None, 2)
+        .await
+        .expect("first page must succeed");
+    assert_eq!(page1.len(), 2, "page size must be respected");
+    assert_eq!(
+        page1.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+        oldest_to_newest[0..2],
+        "the first page must be the two oldest pending requests, oldest first"
+    );
+
+    let cursor = page1[1].created_at;
+    let page2 = repo
+        .list_pending_review(None, Some(cursor), 2)
+        .await
+        .expect("second page must succeed");
+    assert_eq!(
+        page2.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+        oldest_to_newest[2..4],
+        "the second page must continue strictly after the cursor, not repeat or skip rows"
+    );
+
+    let cursor2 = page2[1].created_at;
+    let page3 = repo
+        .list_pending_review(None, Some(cursor2), 2)
+        .await
+        .expect("third page must succeed");
+    assert_eq!(
+        page3.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+        oldest_to_newest[4..5],
+        "the final page must return exactly the one remaining, newest request"
+    );
 }

@@ -313,7 +313,7 @@ async fn list_pending_excludes_resolved_requests(pool: PgPool) {
         .expect("resolving the first request must succeed");
 
     let pending = service
-        .list_pending(None)
+        .list_pending(None, None, 200)
         .await
         .expect("listing the queue must succeed");
     let pending_ids: Vec<&str> = pending.iter().map(|r| r.id.as_str()).collect();

@@ -302,13 +302,29 @@ const REQUEST_SELECT_BY_ID_SQL: &str = "SELECT id, budget_account_id, account_id
      idempotency_key, reviewed_by, rejection_reason, created_at, reviewed_at \
      FROM budget_augmentation_requests WHERE id = $1";
 
+// `after: $2::timestamptz` makes the cursor exclusive on the low side (`created_at > $2`) --
+// the correct direction for this query's ASC/oldest-first order (#296): paging forward through an
+// ascending walk means "give me the ones after what I've already seen", the mirror image of
+// `crate::repo::LIST_GRANTS_SQL`'s `created_at < $before` for its DESC walk. `ORDER BY created_at
+// ASC` itself is unchanged from before pagination existed -- deliberately: #296's own acceptance
+// criteria require the no-cursor-supplied case to keep matching today's "from the start"
+// behavior. Ordered by `created_at` ONLY, per ADR-0039 (ids are opaque CUID2 strings with no
+// defined ordering).
 const REQUEST_LIST_PENDING_REVIEW_SQL: &str = "SELECT id, budget_account_id, account_id, \
      project_id, period, requested_tier, requested_amount_micros, status, policy_effect, \
      policy_reason_codes, matched_rule_ids, policy_revision, approved_amount_micros, grant_id, \
      idempotency_key, reviewed_by, rejection_reason, created_at, reviewed_at \
      FROM budget_augmentation_requests \
      WHERE status = 'pending_review' AND ($1::text IS NULL OR budget_account_id = $1) \
-     ORDER BY created_at ASC";
+       AND ($2::timestamptz IS NULL OR created_at > $2) \
+     ORDER BY created_at ASC \
+     LIMIT $3";
+
+/// Upper bound on [`AugmentationRepo::list_pending_review`]'s page size, independent of whatever
+/// the RPC procedure layer additionally defaults/clamps to -- mirrors [`crate::repo::BudgetRepo`]'s
+/// own `MAX_LIST_GRANTS_LIMIT`. This repo method must never be made to scan an unbounded page
+/// regardless of what a caller (procedure or test) asks for.
+const MAX_LIST_REQUESTS_LIMIT: i64 = 200;
 
 #[derive(Debug, sqlx::FromRow)]
 struct AugmentationRequestRow {
@@ -570,12 +586,25 @@ impl AugmentationRepo {
     /// The review queue's read path: every `pending_review` request, oldest-first (a queue, not
     /// a stack). `budget_account_id: None` lists across every account (an admin's global queue);
     /// `Some(id)` scopes to one account.
+    ///
+    /// Paginated by `created_at` ONLY (#296, ADR-0039 -- never by id). `after`, when supplied,
+    /// returns rows strictly newer than it (continuing an ascending walk forward); `limit` is
+    /// clamped to `[1, MAX_LIST_REQUESTS_LIMIT]` here, the same defensive clamp
+    /// [`crate::repo::BudgetRepo::list_grants`] applies for its own page size. `None` for `after`
+    /// (the default, no-cursor call) reproduces exactly the pre-#296 "whole queue from the
+    /// start" behavior, just bounded to one page.
     pub async fn list_pending_review(
         &self,
         budget_account_id: Option<&str>,
+        after: Option<DateTime<Utc>>,
+        limit: i64,
     ) -> Result<Vec<AugmentationRequest>, BudgetError> {
+        let clamped_limit = limit.clamp(1, MAX_LIST_REQUESTS_LIMIT);
+
         let rows: Vec<AugmentationRequestRow> = sqlx::query_as(REQUEST_LIST_PENDING_REVIEW_SQL)
             .bind(budget_account_id)
+            .bind(after)
+            .bind(clamped_limit)
             .fetch_all(self.pool())
             .await
             .map_err(storage_failed)?;

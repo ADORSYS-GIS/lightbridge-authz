@@ -238,6 +238,47 @@ fn to_schema_augmentation_request(
     }
 }
 
+/// Default/max page size for `listPendingAugmentationRequests` (#296). Mirrors
+/// [`DEFAULT_BUDGET_GRANTS_PAGE_SIZE`]/[`MAX_BUDGET_GRANTS_PAGE_SIZE`] exactly -- same reasoning:
+/// this procedure layer's own default when a caller omits `limit`, and its own tighter ceiling
+/// when a caller supplies one, independent of whatever `AugmentationRepo` additionally clamps
+/// to.
+const DEFAULT_AUGMENTATION_REQUESTS_PAGE_SIZE: i64 = 20;
+const MAX_AUGMENTATION_REQUESTS_PAGE_SIZE: i64 = 50;
+
+/// Resolves a caller-supplied, optional `limit` into a page size clamped to
+/// `[1, MAX_AUGMENTATION_REQUESTS_PAGE_SIZE]`, defaulting to
+/// [`DEFAULT_AUGMENTATION_REQUESTS_PAGE_SIZE`] when omitted.
+fn resolve_augmentation_requests_page_size(limit: Option<i64>) -> i64 {
+    match limit {
+        Some(requested) => requested.clamp(1, MAX_AUGMENTATION_REQUESTS_PAGE_SIZE),
+        None => DEFAULT_AUGMENTATION_REQUESTS_PAGE_SIZE,
+    }
+}
+
+/// Maps one page of domain [`lightbridge_authz_budget::AugmentationRequest`] rows into the
+/// schema's `AugmentationRequestPage` (#296), mirroring `list_budget_grants_page`'s own
+/// `nextCursor` rule: the last entry's `createdAt` when the page came back exactly `page_size`
+/// long (there may be more), `None` when it came back short (nothing further).
+fn to_schema_augmentation_request_page(
+    requests: Vec<lightbridge_authz_budget::AugmentationRequest>,
+    page_size: i64,
+) -> schema::AugmentationRequestPage {
+    let next_cursor = if requests.len() == usize::try_from(page_size).unwrap_or(usize::MAX) {
+        requests.last().map(|r| r.created_at)
+    } else {
+        None
+    };
+
+    schema::AugmentationRequestPage {
+        entries: requests
+            .into_iter()
+            .map(to_schema_augmentation_request)
+            .collect(),
+        nextCursor: next_cursor,
+    }
+}
+
 /// Maps a domain [`lightbridge_authz_budget::repo::BalanceSnapshot`] into the schema's wire
 /// `BudgetBalance` shape (see `authz.cstack`'s `type BudgetBalance` doc comment for the
 /// string-vs-`Int` field reasoning).
@@ -1157,10 +1198,15 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         }
     }
 
-    /// The admin review queue's read path (#191, PR 3.4), delegating to
-    /// [`lightbridge_authz_budget::ReviewService::list_pending`]. `budgetAccountId: None` lists
-    /// the whole cross-account queue; `Some` scopes to one account -- see that method's own doc
-    /// comment.
+    /// The admin review queue's read path (#191, PR 3.4; pagination added by #296), delegating
+    /// to [`lightbridge_authz_budget::ReviewService::list_pending`]. `budgetAccountId: None`
+    /// lists the whole cross-account queue; `Some` scopes to one account -- see that method's own
+    /// doc comment.
+    ///
+    /// Paginated by `createdAt`, oldest-first, cursored via `after` -- see
+    /// `authz.cstack`'s `ListPendingAugmentationRequestsInput` doc comment for why this queue
+    /// keeps its pre-existing ASC order and uses `after` rather than `listMyBudgetGrants`'s
+    /// `before`.
     fn list_pending_augmentation_requests(
         &self,
         _db: &schema::Cratestack,
@@ -1175,20 +1221,18 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     > + Send {
         let review_service = self.review_service.clone();
         let subject = subject_from_ctx(ctx);
-        let budget_account_id = args.args.budgetAccountId;
+        let input = args.args;
         async move {
             let _subject =
                 subject.ok_or_else(|| CoolError::Unauthorized("missing subject".to_owned()))?;
 
+            let page_size = resolve_augmentation_requests_page_size(input.limit);
             let requests = review_service
-                .list_pending(budget_account_id.as_deref())
+                .list_pending(input.budgetAccountId.as_deref(), input.after, page_size)
                 .await
                 .map_err(budget_error_to_cool_error)?;
 
-            Ok(requests
-                .into_iter()
-                .map(to_schema_augmentation_request)
-                .collect())
+            Ok(to_schema_augmentation_request_page(requests, page_size))
         }
     }
 

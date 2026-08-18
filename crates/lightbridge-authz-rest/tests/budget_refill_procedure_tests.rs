@@ -233,9 +233,19 @@ fn refill_args(
 fn list_pending_args(
     budget_account_id: Option<&str>,
 ) -> schema::procedures::list_pending_augmentation_requests::Args {
+    list_pending_args_paged(budget_account_id, None, None)
+}
+
+fn list_pending_args_paged(
+    budget_account_id: Option<&str>,
+    after: Option<chrono::DateTime<chrono::Utc>>,
+    limit: Option<i64>,
+) -> schema::procedures::list_pending_augmentation_requests::Args {
     schema::procedures::list_pending_augmentation_requests::Args {
         args: schema::ListPendingAugmentationRequestsInput {
             budgetAccountId: budget_account_id.map(str::to_string),
+            after,
+            limit,
         },
     }
 }
@@ -399,15 +409,19 @@ async fn list_pending_returns_queued_requests(pool: PgPool) {
         .await
         .expect("listing the review queue must succeed");
 
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].id, queued.id);
-    assert_eq!(pending[0].status, "pending_review");
+    assert_eq!(pending.entries.len(), 1);
+    assert_eq!(pending.entries[0].id, queued.id);
+    assert_eq!(pending.entries[0].status, "pending_review");
+    assert!(
+        pending.nextCursor.is_none(),
+        "a short (single-entry) page must report no further cursor"
+    );
 
     let pending_global = list_pending(&procedures, &db, &ctx, list_pending_args(None))
         .await
         .expect("listing the whole queue must succeed");
     assert!(
-        pending_global.iter().any(|r| r.id == queued.id),
+        pending_global.entries.iter().any(|r| r.id == queued.id),
         "the global (unscoped) queue must include this account's pending request too"
     );
 }
@@ -477,7 +491,7 @@ async fn reject_without_a_reason_is_rejected_at_the_schema_or_procedure_layer(po
         .await
         .expect("listing the review queue must succeed");
     assert!(
-        still_pending.iter().any(|r| r.id == queued.id),
+        still_pending.entries.iter().any(|r| r.id == queued.id),
         "a rejected-at-validation reject call must not have changed the row's status"
     );
 }
@@ -516,4 +530,74 @@ async fn reject_with_a_reason_succeeds_and_records_it(pool: PgPool) {
     );
     assert_eq!(rejected.rejectionReason.as_deref(), Some(reason));
     assert_eq!(rejected.reviewedBy.as_deref(), Some(reviewer_id.as_str()));
+}
+
+/// #296: `listPendingAugmentationRequests` pages oldest-first with a `created_at`-based `after`
+/// cursor, and continues forward without repeating or skipping rows across pages -- the
+/// procedure-layer proof on top of `augmentation_repo_tests.rs`'s own repo-level coverage of the
+/// same behavior.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_pending_augmentation_requests_paginates_oldest_first(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let (procedures, ctx, budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let db = lazy_cratestack_db();
+
+    // Exhaust the auto-approve allowance once, then every further call queues -- three distinct
+    // pending rows for one account, oldest to newest in call order.
+    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
+    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
+
+    let mut queued_ids = Vec::new();
+    for _ in 0..3 {
+        let queued = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
+            .await
+            .expect("an exhausted-allowance refill must still queue, not error");
+        assert_eq!(queued.status, "pending_review");
+        queued_ids.push(queued.id);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let page1 = list_pending(
+        &procedures,
+        &db,
+        &ctx,
+        list_pending_args_paged(Some(&account_id), None, Some(2)),
+    )
+    .await
+    .expect("first page must succeed");
+    assert_eq!(
+        page1
+            .entries
+            .iter()
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>(),
+        queued_ids[0..2],
+        "the first page must be the two oldest pending requests, oldest first"
+    );
+    let cursor = page1
+        .nextCursor
+        .expect("a full page must carry a nextCursor -- there is a third, newer request");
+
+    let page2 = list_pending(
+        &procedures,
+        &db,
+        &ctx,
+        list_pending_args_paged(Some(&account_id), Some(cursor), Some(2)),
+    )
+    .await
+    .expect("second page must succeed");
+    assert_eq!(
+        page2
+            .entries
+            .iter()
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>(),
+        vec![queued_ids[2].clone()],
+        "the second page must return exactly the one remaining, newest request"
+    );
+    assert!(
+        page2.nextCursor.is_none(),
+        "a short page must report no further cursor"
+    );
 }

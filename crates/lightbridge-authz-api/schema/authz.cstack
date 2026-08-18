@@ -643,6 +643,18 @@ type AugmentationRequest {
   reviewedAt DateTime?
 }
 
+// One page of `AugmentationRequest` rows (#296/#295) -- the same `{ entries, nextCursor }` shape
+// `BudgetGrantPage` already established, reused verbatim rather than inventing a second
+// page-shape convention for the same "cursor by createdAt, never by id" contract (ADR-0039).
+// Shared by both `listPendingAugmentationRequests` and `listMyAugmentationRequests` below even
+// though the two order their pages in opposite directions (see each procedure's own doc comment
+// for why) -- `nextCursor` means the same thing either way: "pass this back to continue the same
+// walk", `null` when the page came back short of a full page (nothing further to page to).
+type AugmentationRequestPage {
+  entries AugmentationRequest[]
+  nextCursor DateTime?
+}
+
 // Self-service refill (#191's own reason this epic exists): a user asks for more budget for
 // `budgetAccountId`/`period`, and `RefillService::request_refill` decides -- immediately (auto
 // grant), or by queuing for a human (`pending_review`) -- without anyone hand-editing config.
@@ -673,18 +685,33 @@ type RequestBudgetRefillInput {
 mutation procedure requestBudgetRefill(args: RequestBudgetRefillInput): AugmentationRequest
   @allow(auth() != null)
 
-// The admin review queue's read path (#191, PR 3.3's `ReviewService::list_pending`). `budgetAccountId:
-// String?` mirrors `list_pending`'s own `Option<&str>` scoping precisely: omitted/`null` lists the
-// whole cross-account queue (a global admin view), `Some` scopes to one account's pending requests.
-// Gated at `budget:review` (`Permission::BudgetReview`), same permission as the two mutations
-// below -- reading the queue and acting on it are both "the reviewer capability" here, unlike the
-// budget-policy pair above where read and write are deliberately split into two permissions;
-// there is no separate "read the review queue" capability in RFC-0001's sketch to split it into.
+// The admin review queue's read path (#191, PR 3.3's `ReviewService::list_pending`; pagination
+// added by #296). `budgetAccountId: String?` mirrors `list_pending`'s own `Option<&str>` scoping
+// precisely: omitted/`null` lists the whole cross-account queue (a global admin view), `Some`
+// scopes to one account's pending requests. Gated at `budget:review` (`Permission::BudgetReview`),
+// same permission as the two mutations below -- reading the queue and acting on it are both "the
+// reviewer capability" here, unlike the budget-policy pair above where read and write are
+// deliberately split into two permissions; there is no separate "read the review queue"
+// capability in RFC-0001's sketch to split it into.
+//
+// #296: paginated by `createdAt`, never by id (ADR-0039), the same house rule
+// `listMyBudgetGrants`/`listBudgetGrants` already follow. This queue is deliberately kept
+// **oldest-first** (`ORDER BY created_at ASC` in `AugmentationRepo::list_pending_review` -- a
+// queue, not a stack: the request that has waited longest surfaces first) -- #296's own
+// acceptance criteria require "no cursor supplied" to keep matching that existing "from the
+// start" behavior, so this is not a place to also flip the ordering. Because the walk is
+// oldest-first, the cursor field is named `after` rather than `listMyBudgetGrants`'s `before` --
+// pass `nextCursor` back as `after` to continue toward newer requests, the correct direction for
+// an ascending walk. This is a deliberate, documented divergence from `listMyBudgetGrants`'s
+// `before`/DESC convention, not an oversight: mirroring that field name here while keeping ASC
+// ordering would silently invert what the field means without any signal in the schema itself.
 type ListPendingAugmentationRequestsInput {
   budgetAccountId String?
+  after DateTime?
+  limit Int?
 }
 
-procedure listPendingAugmentationRequests(args: ListPendingAugmentationRequestsInput): AugmentationRequest[]
+procedure listPendingAugmentationRequests(args: ListPendingAugmentationRequestsInput): AugmentationRequestPage
   @allow(auth() != null)
 
 // Approves a `pending_review` request: grants the requested amount and records the outcome
