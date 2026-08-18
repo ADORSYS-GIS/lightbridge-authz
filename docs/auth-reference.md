@@ -1,9 +1,10 @@
 # Auth/token reference dictionary
 
-A lookup layer over the auth/token surface of `authz-api`, `authz-opa`, `lightbridge-mcp`, and
-`lightbridge-authz-usage`. Ctrl-F a config key, a claim, a discovery field, or a permission string
-and get a `file:line` citation, not prose. This does **not** replace `docs/rbac.md` (the RBAC
-model in full) or the ADRs (the *why*) — it points at them instead of restating them.
+A lookup layer over the auth/token surface of `authz-api`, `authz-idp`, `authz-opa`,
+`lightbridge-mcp`, and `lightbridge-authz-usage`. Ctrl-F a config key, a claim, a discovery field,
+or a permission string and get a `file:line` citation, not prose. This does **not** replace
+`docs/rbac.md` (the RBAC model in full) or the ADRs (the *why*) — it points at them instead of
+restating them.
 
 Verified against commit `9f095e0` on `origin/main` (2026-08-15). Every row below was checked
 against the code at that commit; anything that could not be confirmed by reading source or a
@@ -94,9 +95,13 @@ Verified by `config/mod.rs:646-701`.
 
 ## 2. Discovery document fields → derivation
 
-Covers `authz-api`'s own `GET /.well-known/openid-configuration`, built by `discovery_document`
+Covers `GET /.well-known/openid-configuration`, built by `discovery_document`
 in `crates/lightbridge-authz-rest/src/signing.rs:438-529` and served via `well_known_router`
-(`signing.rs:542-592`).
+(`signing.rs:542-592`). **Now served exclusively by `authz-idp`** — `authz-api` mounted this same
+`well_known_router` call during the ADR-0012 Phase 1 transitional-duplication window, but that copy
+was removed once the public `auth.ai.camer.digital` ingress was repointed directly at `authz-idp`;
+`authz-api` no longer serves `/.well-known/*` at all (see `docs/architecture/services.md`). The
+derivation mechanics below are unchanged, only the serving service's name is.
 
 > **Gating note:** the `token_endpoint` omission logic was fixed in PR #301
 > (`fix(oauth2): drop token_endpoint from OIDC discovery when token-exchange is disabled`,
@@ -107,8 +112,9 @@ in `crates/lightbridge-authz-rest/src/signing.rs:438-529` and served via `well_k
 > that function is intentionally dense and updated whenever the gating logic moves.
 
 **Whether the document exists at all**: only mounted when `oauth2.type: self` **and**
-`oauth2.signing` is set (`lib.rs:1178-1187`). Under `type: external`, `authz-api` serves no
-`/.well-known/openid-configuration` and no `/.well-known/jwks.json`.
+`oauth2.signing` is set (`lib.rs:1178-1187`). Under `type: external`, `authz-idp` serves no
+`/.well-known/openid-configuration` and no `/.well-known/jwks.json` (`authz-api` never serves
+either regardless of `oauth2.type`, since it no longer mounts this router at all).
 
 **Whether `enabled` (the exchange-specific fields) is true**: `token_exchange_scopes.is_some()`,
 which is `oauth2.token_exchange.as_ref().filter(|t| t.enabled)` (`lib.rs:1169-1173`) — true only
@@ -135,7 +141,7 @@ when the block is present *and* `enabled: true`.
 server (`app/lightbridge-authz/src/mcp.rs:1612-1627`, handler at `mcp.rs:515-538`) are **not**
 `signing::discovery_document` — they synthesize a document from `oauth2.issuer_url` /
 `authorization_endpoint` / `token_endpoint` / `jwks_url`, i.e. they describe the **upstream IdP's**
-real endpoints (for MCP OAuth dynamic-client-registration flows), not `authz-api`'s own
+real endpoints (for MCP OAuth dynamic-client-registration flows), not `authz-idp`'s own
 token-exchange capabilities. Do not conflate the two when debugging a "wrong discovery document"
 report — check which server served it first.
 
@@ -288,16 +294,17 @@ catalogue + RBAC compilation), `app/lightbridge-authz/src/mcp.rs:378-403` (MCP t
 | Server | Route | Auth | Purpose |
 |---|---|---|---|
 | `authz-api` | `GET /`, `GET /healthz`, `GET /healthz/startup`, `GET /healthz/ready` | none | liveness/startup/readiness probes |
-| `authz-api` | `GET /.well-known/openid-configuration`, `GET /.well-known/jwks.json` | none | OIDC discovery + JWKS; only mounted under `oauth2.type: self` with `signing` set (see §2) |
-| `authz-api` | `POST /oauth2/token` | client auth (public `client_id` or `private_key_jwt`), no bearer | RFC 8693 token-exchange + refresh grant; only mounted when `oauth2.token_exchange.enabled` |
-| `authz-api` | `POST /oauth2/revoke` | client auth, same as `/oauth2/token` (public `client_id` or `private_key_jwt`), no bearer | RFC 7009 token revocation for `exchange_refresh_tokens` rows; mounted alongside `/oauth2/token` by the same `token_exchange_router` (`crates/lightbridge-authz-rest/src/token_exchange.rs`). **Not advertised in discovery** — see §2's `revocation_endpoint` row. §2.2: an unknown/already-revoked/out-of-scope token is `200`, never an error; only client-authentication failure is |
-| `authz-api` | `POST /rpc/{op_id}`, `POST /rpc/batch` | Bearer JWT + RBAC (`rpc_authorize` outer gate, `CratestackAuthProvider` inner gate, then cratestack `@@allow` membership policy) | Generated CRUD + hand-written budget-domain procedures; base path configurable via `server.api.rpc_base_path` |
+| `authz-api` | `POST /rpc/{op_id}`, `POST /rpc/batch` | Bearer JWT + RBAC (`rpc_authorize` outer gate, `CratestackAuthProvider` inner gate, then cratestack `@@allow` membership policy) | Generated CRUD + hand-written budget-domain procedures; base path configurable via `server.api.rpc_base_path`. `authz-api` no longer serves `/.well-known/*` or `/oauth2/{token,revoke}` — see `authz-idp` below (a request to either path here falls through to this fallback and fail-closes to `403`) |
+| `authz-idp` | `GET /`, `GET /healthz`, `GET /healthz/startup`, `GET /healthz/ready` | none | liveness/startup/readiness probes |
+| `authz-idp` | `GET /.well-known/openid-configuration`, `GET /.well-known/jwks.json` | none | OIDC discovery + JWKS; only mounted under `oauth2.type: self` with `signing` set (see §2). The sole owner of this surface (ADR-0012) — moved off `authz-api` as a hard cutover |
+| `authz-idp` | `POST /oauth2/token` | client auth (public `client_id` or `private_key_jwt`), no bearer | RFC 8693 token-exchange + refresh grant; only mounted when `oauth2.token_exchange.enabled` |
+| `authz-idp` | `POST /oauth2/revoke` | client auth, same as `/oauth2/token` (public `client_id` or `private_key_jwt`), no bearer | RFC 7009 token revocation for `exchange_refresh_tokens` rows; mounted alongside `/oauth2/token` by the same `token_exchange_router` (`crates/lightbridge-authz-rest/src/token_exchange.rs`). **Not advertised in discovery** — see §2's `revocation_endpoint` row. §2.2: an unknown/already-revoked/out-of-scope token is `200`, never an error; only client-authentication failure is |
 | `authz-opa` | `GET /`, `GET /healthz`, `GET /healthz/startup`, `GET /healthz/ready` | none | probes |
 | `authz-opa` | `GET /v1/opa/docs`, `GET /v1/opa/openapi.json` | none | Swagger UI (`lib.rs:1525`) |
 | `authz-opa` | `POST /v1/authorino/validate/introspect` | **Basic auth** | RFC 7662-shaped API-key introspection; response includes `role`/`quota_tier`/`project_quota` (`routers/mod.rs:14-22`, `introspect.rs`) |
 | `authz-opa` | `POST /idp/v1/resolve-context` | **Basic auth** | `{subject, project_id} → {account_id, project_id}`; uniform 404 for unknown project or non-member (`routers/mod.rs:20`, `handlers/idp.rs`) |
 | `lightbridge-mcp` | `GET /`, `GET /healthz`, `GET /healthz/startup`, `GET /healthz/ready` | none | probes |
-| `lightbridge-mcp` | `GET /.well-known/oauth-authorization-server`, `GET /.well-known/openid-configuration`, `POST /oauth/register` | none | proxy/synthesized discovery pointing at the **upstream IdP's** real endpoints — a different document from `authz-api`'s own (see §2) |
+| `lightbridge-mcp` | `GET /.well-known/oauth-authorization-server`, `GET /.well-known/openid-configuration`, `POST /oauth/register` | none | proxy/synthesized discovery pointing at the **upstream IdP's** real endpoints — a different document from `authz-idp`'s own (see §2) |
 | `lightbridge-mcp` | `/mcp` (streamable HTTP) | Bearer JWT (`bearer_auth`) + per-tool permission check (`call_tool`, `mcp.rs:378-403`) | MCP tool surface mirroring the RPC/CRUD + validation operations |
 | `lightbridge-authz-usage` | `GET /`, `GET /healthz`, `GET /healthz/startup`, `GET /healthz/ready` | none | probes |
 | `lightbridge-authz-usage` | `GET /usage/v1/usage/docs` | none | Swagger UI |
@@ -348,10 +355,11 @@ use `/v1/authorino/validate/introspect`. All three should be updated to match th
 - **`oauth2.token_exchange.enabled: true` under `oauth2.type: external` fails server startup**,
   not a runtime 4xx — `Error::Server("oauth2.token_exchange is enabled but requires oauth2.type:
   self")` at `crates/lightbridge-authz-rest/src/lib.rs:1278-1282`.
-- **Two unrelated `.well-known` discovery documents exist across the two servers** — `authz-api`'s
-  own (`signing::discovery_document`) describes its native token-exchange capabilities;
-  `lightbridge-mcp`'s (`oauth_authorization_server_metadata_handler`) proxies/synthesizes a
-  document describing the **upstream IdP's** endpoints. See §2.
+- **Two unrelated `.well-known` discovery documents exist across the fleet** — `authz-idp`'s own
+  (`signing::discovery_document`; moved off `authz-api` as a hard cutover, ADR-0012) describes its
+  native token-exchange capabilities; `lightbridge-mcp`'s
+  (`oauth_authorization_server_metadata_handler`) proxies/synthesizes a document describing the
+  **upstream IdP's** endpoints. See §2.
 
 ## See also
 

@@ -1658,13 +1658,12 @@ where
 }
 
 /// Derives the two `well_known_router` mount parameters (`token_exchange_scopes`,
-/// `private_key_jwt_supported`) from `oauth2`. Shared by `build_api_router` and
-/// `build_idp_router` so the discovery document each serves is computed from the exact same
-/// inputs and can never diverge — this is what makes
-/// `idp_and_api_routers_serve_byte_identical_discovery_and_jwks`
-/// (`tests/idp_server_tests.rs`) hold, and what the ADR-0012 Phase 1 routing cutover depends on:
-/// `authz-api` and `authz-idp` must resolve `https://auth.ai.camer.digital/.well-known/*`
-/// identically for as long as both serve it.
+/// `private_key_jwt_supported`) from `oauth2`. Used by `build_idp_router` — `authz-idp` is now the
+/// only server that mounts `well_known_router` at all; `authz-api` stopped serving OIDC
+/// discovery/JWKS once the `auth.ai.camer.digital` ingress was repointed at `authz-idp` (see
+/// `build_api_router`'s doc comment). Kept as its own function rather than inlined into
+/// `build_idp_router` so a future second self-signed-JWKS server can reuse it the same way
+/// `build_api_router` used to.
 fn well_known_mount_params(oauth2: &Oauth2) -> (Option<Vec<String>>, bool) {
     let token_exchange_scopes = oauth2
         .token_exchange
@@ -1678,18 +1677,23 @@ fn well_known_mount_params(oauth2: &Oauth2) -> (Option<Vec<String>>, bool) {
     (token_exchange_scopes, private_key_jwt_supported)
 }
 
-/// Assembles the API server router: public probes, OIDC discovery/JWKS (when signing is enabled),
-/// native token-exchange, and the generated cratestack RPC CRUD surface (`POST /rpc/{op_id}`,
-/// `POST /rpc/batch`) wrapped in idempotency + rate-limit middleware. Separated from
-/// `start_api_server` so the composition can be built without binding a TLS socket. `dev_cors`
-/// (driven by `AUTHZ_DEV_CORS`) layers a wide-open CORS policy over the whole router — never enable
-/// it in production. `cratestack_db` and `idempotency_store` are built on cratestack's own sqlx pool
-/// (see `start_api_server`); the RPC surface replaces the old REST `/api/v1` CRUD mount entirely
-/// (ADR-0003, "RPC transport, not REST"), and its OpenAPI/Swagger UI is intentionally gone
-/// (ADR-0003, "Loss of Swagger UI").
+/// Assembles the API server router: public probes plus the generated cratestack RPC CRUD surface
+/// (`POST /rpc/{op_id}`, `POST /rpc/batch`) wrapped in idempotency + rate-limit middleware.
+/// Separated from `start_api_server` so the composition can be built without binding a TLS socket.
+/// `dev_cors` (driven by `AUTHZ_DEV_CORS`) layers a wide-open CORS policy over the whole router —
+/// never enable it in production. `cratestack_db` and `idempotency_store` are built on cratestack's
+/// own sqlx pool (see `start_api_server`); the RPC surface replaces the old REST `/api/v1` CRUD
+/// mount entirely (ADR-0003, "RPC transport, not REST"), and its OpenAPI/Swagger UI is
+/// intentionally gone (ADR-0003, "Loss of Swagger UI").
+///
+/// **No longer serves OIDC discovery/JWKS or native token-exchange.** Those routes moved
+/// exclusively to `authz-idp` (`build_idp_router`) once the `auth.ai.camer.digital` ingress was
+/// repointed there — see that function's doc comment. A request to `/.well-known/*` or
+/// `/oauth2/{token,revoke}` here now falls through to the RPC router's own fallback, which
+/// `rpc_authorize` fail-closes to `403` for an unmatched path (this router never served a literal
+/// axum `404` for any path, mounted or not).
 #[allow(clippy::too_many_arguments)]
 pub fn build_api_router(
-    oauth2: &Oauth2,
     bearer: Arc<dyn BearerTokenServiceTrait>,
     issuer: Arc<AuthzStoreImpl>,
     policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
@@ -1698,30 +1702,12 @@ pub fn build_api_router(
     budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
     cratestack_db: schema::Cratestack,
     readiness_pool: Arc<dyn DbPoolTrait>,
-    signing_repo: Arc<StoreRepo>,
-    token_exchange: Option<token_exchange::TokenExchangeState>,
     idempotency_store: Arc<SqlxIdempotencyStore>,
     rate_limit_store: Arc<dyn RateLimitStore>,
     dev_cors: bool,
     rpc_base_path: Option<&str>,
 ) -> Router {
-    let mut public = probe_router(readiness_pool);
-
-    let (token_exchange_scopes, private_key_jwt_supported) = well_known_mount_params(oauth2);
-    if oauth2.is_self_signed()
-        && let Some(signing) = oauth2.signing.as_ref()
-    {
-        public = public.merge(signing::well_known_router(
-            &signing.issuer,
-            signing_repo,
-            token_exchange_scopes,
-            private_key_jwt_supported,
-        ));
-    }
-
-    if let Some(te_state) = token_exchange {
-        public = public.merge(token_exchange::token_exchange_router(te_state));
-    }
+    let public = probe_router(readiness_pool);
 
     // Generated RPC CRUD surface. Codec: CBOR is the ONLY wire format this router serves — no JSON
     // fallback (ADR-0013, "CBOR is the only transport codec", reversing ADR-0003's "CBOR in
@@ -1971,11 +1957,15 @@ pub async fn start_api_server(
     ));
 
     let readiness_pool = pool.clone();
-    let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
+    // Bootstraps (or observes) the active self-signed-JWT signing key so `AuthzStoreImpl`'s own
+    // `ApiKeyJwtSigner` (constructed just below, via `with_pool_and_oauth2`) can mint API-key JWTs
+    // immediately -- unrelated to OIDC discovery/JWKS, which `authz-api` no longer serves at all
+    // (that surface lives exclusively on `authz-idp` now; see `build_api_router`'s doc comment).
     if oauth2.is_self_signed() {
         let signing = oauth2.signing.as_ref().ok_or_else(|| {
             Error::Server("oauth2.type is 'self' but oauth2.signing is missing".to_string())
         })?;
+        let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
         signing::bootstrap_signing_key(&signing_repo, signing).await?;
     }
     // Secret-issuance + membership operations reused by the RPC procedures (hand-written sqlx on the
@@ -1988,23 +1978,12 @@ pub async fn start_api_server(
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
 
-    // Redis is required unconditionally for authz-api rate limiting (see the rate-limit-store
-    // construction further below), so it is already a hard startup dependency; pulling the
-    // required-ness check up here just lets token-exchange's `ClientAssertionStore` (ADR-0011,
-    // Decision 6) share the same `redis.url` instead of re-deriving it.
+    // Redis is required unconditionally for authz-api rate limiting.
     let redis = redis.as_ref().ok_or_else(|| {
         Error::Server(
             "redis config is required for authz-api rate limiting (set `redis.url`)".to_string(),
         )
     })?;
-
-    let token_exchange_state = build_token_exchange_state(
-        oauth2,
-        signing_repo.clone(),
-        bearer_service.clone(),
-        &redis.url,
-    )?;
-    let token_exchange_enabled = token_exchange_state.is_some();
 
     // cratestack runs on its own sqlx major (0.8, vs this workspace's 0.9), so its CRUD client and
     // Postgres-backed idempotency store need a separate pool built with cratestack's sqlx. Both talk
@@ -2035,12 +2014,10 @@ pub async fn start_api_server(
     // The URL comes from the already-loaded `Config.redis.url` (YAML `redis: url:`, itself
     // populated from `REDIS_URL` via env interpolation — see `config/default.yaml`), not a
     // separately-read raw env var, mirroring how every other config value reaches this function.
-    // `redis` itself was already required further up, ahead of `build_token_exchange_state`.
     let rate_limit_store = build_redis_rate_limit_store(&redis.url, "authz-api")?;
 
     let dev_cors = dev_cors_enabled();
     let app = build_api_router(
-        oauth2,
         bearer_service,
         issuer,
         policy_store,
@@ -2049,8 +2026,6 @@ pub async fn start_api_server(
         budget_repo,
         cratestack_db,
         readiness_pool,
-        signing_repo,
-        token_exchange_state,
         idempotency_store,
         rate_limit_store,
         dev_cors,
@@ -2069,7 +2044,6 @@ pub async fn start_api_server(
         oauth2_type = ?oauth2.oauth2_type,
         signing_enabled,
         issuance_enabled,
-        token_exchange_enabled,
         "starting api server"
     );
 
@@ -2112,16 +2086,17 @@ pub async fn start_opa_server(
     serve_tls("OPA", &opa.address, opa.port, &opa.tls, app).await
 }
 
-/// Assembles the `authz-idp` server router (ADR-0012 Phase 1): public probes plus the exact same
-/// OIDC discovery/JWKS/token-exchange surface `build_api_router` mounts, built from the same
-/// `well_known_mount_params` helper so the two can never compute different discovery documents.
-/// Separated from `start_idp_server` for testability, mirroring `build_api_router`/
-/// `build_opa_router`.
+/// Assembles the `authz-idp` server router (ADR-0012): public probes plus the OIDC
+/// discovery/JWKS/token-exchange surface, the only place this codebase still mounts it (see
+/// "The only server that serves this surface" below). Separated from `start_idp_server` for
+/// testability, mirroring `build_api_router`/`build_opa_router`.
 ///
-/// **Transitional duplication, not a permanent parallel path.** `authz-api` keeps serving this
-/// exact surface too, unchanged, until the `auth.ai.camer.digital` ingress is repointed at
-/// `authz-idp` — a separate, later PR (see `start_idp_server`'s doc comment for the full routing
-/// risk this defers against).
+/// **The only server that serves this surface.** ADR-0012 Phase 1 ran `authz-idp` alongside
+/// `authz-api`'s own (now-removed) `well_known_router`/`token_exchange_router` merges as a
+/// transitional duplication while the `auth.ai.camer.digital` ingress still routed
+/// `/.well-known`, `/oauth2/token`, and `/oauth2/revoke` to `authz-api`. That ingress has since
+/// been repointed at `authz-idp` and `authz-api`'s copy of this surface removed (see
+/// `build_api_router`'s doc comment) — `authz-idp` is now the sole owner.
 pub fn build_idp_router(
     oauth2: &Oauth2,
     signing_repo: Arc<StoreRepo>,
@@ -2149,23 +2124,20 @@ pub fn build_idp_router(
     router
 }
 
-/// Starts `authz-idp` (ADR-0012 Phase 1): the OIDC broker service carrying `/oauth2/token`,
-/// `/oauth2/revoke`, and `.well-known/*` off `authz-api`. Deliberately thin next to
-/// `start_api_server` — no RPC CRUD surface, no budget domain, no idempotency/rate-limit layers —
-/// because `well_known_router`/`token_exchange_router` need none of that; every route this server
-/// mounts is public (see [`config::IdpServer`]'s doc comment).
+/// Starts `authz-idp` (ADR-0012): the OIDC broker service carrying `/oauth2/token`,
+/// `/oauth2/revoke`, and `.well-known/*`. Deliberately thin next to `start_api_server` — no RPC
+/// CRUD surface, no budget domain, no idempotency/rate-limit layers — because
+/// `well_known_router`/`token_exchange_router` need none of that; every route this server mounts
+/// is public (see [`config::IdpServer`]'s doc comment).
 ///
-/// **Transitional duplication, not a permanent parallel path.** `authz-api` keeps serving this
-/// exact surface too (`build_api_router`'s own calls to `well_known_router`/
-/// `token_exchange_router`) until the `auth.ai.camer.digital` ingress is repointed at
-/// `authz-idp` — that repointing is a separate, later PR. `https://auth.ai.camer.digital` is a
-/// live, trusted issuer in `security-policies.yaml` today (every in-circulation API-key JWT
-/// carries it as `iss`), so discovery/JWKS must never stop resolving there, even transiently,
-/// during the cutover (ADR-0012, "Routing risk"). Both routers are built from the same
-/// `well_known_mount_params` helper and read the exact same `signing_keys` rows, which is what
-/// makes running both side by side safe — see
-/// `idp_and_api_routers_serve_byte_identical_discovery_and_jwks`
-/// (`tests/idp_server_tests.rs`), the test this cutover's safety depends on.
+/// **The sole owner of this surface, not a duplicate.** ADR-0012 Phase 1 ran this alongside
+/// `authz-api`'s own copy of the same routes while `auth.ai.camer.digital` still routed here via
+/// `authz-api`. The ingress has since been repointed at `authz-idp` directly and `authz-api`'s
+/// copy removed (`build_api_router` no longer mounts `well_known_router`/`token_exchange_router`
+/// at all — see its doc comment), so `authz-idp` resolving `https://auth.ai.camer.digital` — a
+/// live, trusted issuer in `security-policies.yaml` (every in-circulation API-key JWT carries it
+/// as `iss`) — is now load-bearing on its own, not backed by a same-surface fallback on
+/// `authz-api`.
 ///
 /// ## Signing-key ownership decision (ADR-0012, "signing-key bootstrap")
 ///
@@ -2239,9 +2211,10 @@ const BUDGET_RPC_BASE_PATH: &str = "/budget";
 
 /// Assembles the `authz-budget` server router: public probes plus the exact `budget:*`-gated RPC
 /// procedures `build_api_router` used to serve, now mounted under [`BUDGET_RPC_BASE_PATH`] and
-/// reachable ONLY here — a hard cutover, not the transitional duplication `build_idp_router` still
-/// carries for `authz-idp` (see that function's own doc comment for the contrast). Both the outer
-/// `rpc_authorize` gate and the per-op `CratestackAuthProvider` are constructed with
+/// reachable ONLY here — a hard cutover, same shape as `authz-api`'s own OIDC surface removal
+/// (`build_api_router`'s doc comment): the old location stops serving the moved routes entirely,
+/// no transitional dual-serving window. Both the outer `rpc_authorize` gate and the per-op
+/// `CratestackAuthProvider` are constructed with
 /// `RpcScope::Budget`, so every non-budget op-id — the whole CRUD surface included — 404s here,
 /// exactly as every budget op-id now 404s on `build_api_router` (`RpcScope::Crud`). Separated from
 /// `start_budget_server` for testability, mirroring `build_api_router`/`build_idp_router`.

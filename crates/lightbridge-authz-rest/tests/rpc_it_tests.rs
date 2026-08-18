@@ -36,9 +36,7 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
-use common::{
-    MapBearer, Wire, admin_perms, as_json, external_oauth2, rpc_call, token_info, viewer_perms,
-};
+use common::{MapBearer, Wire, admin_perms, as_json, rpc_call, token_info, viewer_perms};
 use cratestack::SqlxIdempotencyStore;
 use cratestack::{DEFAULT_BODY_LIMIT_BYTES, Json, Value as CValue, ratelimit::RateLimitStore};
 use cratestack_codec_cbor::CborCodec;
@@ -148,7 +146,6 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
     let cpool = cratestack_pool().await;
     let cdb = schema::Cratestack::builder(cpool.clone()).build();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()).with_billing(billing()));
-    let signing_repo = Arc::new(StoreRepo::new(core.clone()));
     let idempotency = Arc::new(SqlxIdempotencyStore::new(cpool.clone()));
     IDEMPOTENCY_SCHEMA_READY
         .get_or_init(|| async {
@@ -201,7 +198,6 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
     ));
 
     let router = lightbridge_authz_rest::build_api_router(
-        &external_oauth2(),
         bearer,
         issuer.clone(),
         policy_store.clone(),
@@ -210,8 +206,6 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
         budget_repo.clone(),
         cdb,
         core.clone(),
-        signing_repo,
-        None,
         idempotency,
         rate_limit,
         false,
@@ -2130,7 +2124,8 @@ async fn set_default_project_rejects_a_project_the_caller_is_not_a_member_of() {
 // Refresh-token session revocation RPC (`revokeOwnSessions` / `revokeSubjectSessions`).
 // `exchange_refresh_tokens` carries no foreign keys to accounts/projects, so these tests seed rows
 // directly against `ctx.verify` rather than driving a real token-exchange grant (this file's
-// router is built with `token_exchange: None`, see `setup`'s `external_oauth2()`).
+// router is `build_api_router`, which no longer mounts token-exchange at all -- see that
+// function's doc comment).
 // ---------------------------------------------------------------------------------------------
 
 /// Inserts one active `exchange_refresh_tokens` row for `subject` and returns its `id`, so a test

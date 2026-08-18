@@ -8,25 +8,30 @@ writing, the code wins — see "Corrections to prior docs" at the end.
 
 ## `authz-api`
 
-**Responsibility:** account/project/API-key CRUD, native OAuth2/OIDC token issuance (self-signed
-JWT mode), RFC 8693 token exchange, and RFC 7009 revocation. The budget domain's RPC procedures
-moved off this service onto `authz-budget` (hard cutover, not a transitional duplication) — see
-below.
+**Responsibility:** account/project/API-key CRUD. Two other surfaces that used to live here have
+each moved off as a hard cutover, not a transitional duplication: the budget domain's RPC
+procedures onto `authz-budget` (see below), and OIDC discovery/JWKS + RFC 8693 token exchange +
+RFC 7009 revocation onto `authz-idp` (see its section below) — the public `auth.ai.camer.digital`
+ingress now routes directly to `authz-idp`, and `build_api_router` no longer mounts
+`signing::well_known_router`/`token_exchange::token_exchange_router` at all.
 **Owns:** the `authz` Postgres database (all tables), plus Redis (mandatory — `start_api_server`
 refuses to start without `redis.url` configured; see AGENTS.md's "Redis is a mandatory dependency"
-house rule) for rate limiting and `private_key_jwt` replay tracking.
+house rule) for rate limiting. `authz-api` still bootstraps/reads the shared `signing_keys` table
+(`signing::bootstrap_signing_key`) — unrelated to the OIDC surface it no longer serves; that key
+backs the self-signed JWTs `AuthzStoreImpl` mints when issuing/rotating an API key.
 
 Router assembly: `build_api_router` in `crates/lightbridge-authz-rest/src/lib.rs`.
 
 | Route | Method | Protection | Notes |
 | --- | --- | --- | --- |
 | `/`, `/healthz`, `/healthz/startup`, `/healthz/ready` | GET | none | `/healthz/ready` checks DB reachability. |
-| `/.well-known/openid-configuration` | GET | none | Only mounted when `oauth2.type: self` (`signing::well_known_router`). |
-| `/.well-known/jwks.json` | GET | none | Same gate as above. |
-| `/oauth2/token` | POST | none (credential is the presented token) | RFC 8693 token exchange + `refresh_token` grant. Only mounted when `token_exchange.enabled`. `project_id` is an optional form param — the caller's default project resolves when omitted. |
-| `/oauth2/revoke` | POST | none (credential is the presented token) | RFC 7009. Live and functional the moment the router is merged, but absent from `/.well-known/openid-configuration` — `authkestra-op`'s `OidcDiscovery` has no `revocation_endpoint` field yet (upstream issue filed, see `signing.rs`). |
 | `/rpc/{op_id}` | POST | Bearer JWT, then `rpc_authorize` RBAC gate (`RpcScope::Crud`), then cratestack's own per-model `@@allow` | The generated CRUD surface (accounts, projects, api-keys, project members) plus the hand-written procedures below. Any `budget:*`-gated op-id 404s here — moved to `authz-budget`. |
 | `/rpc/batch` | POST | same as above, per-frame | Batched RPC calls; each frame is authorized individually (#165), including the out-of-scope check — a batch frame aimed at a budget op-id 404s too (`CratestackAuthProvider::authenticate`, not merely the outer gate). |
+
+A request to `/.well-known/*` or `/oauth2/{token,revoke}` here is not a public route and falls
+through to the RPC router's own fallback, which `rpc_authorize` fail-closes to `403` for an
+unmapped op-id — no bearer token required (see `authz-idp` below for where these routes actually
+live now).
 
 Hand-written procedures reachable only via `/rpc/{op_id}` (not cratestack-generated —
 `crates/lightbridge-authz-api/schema/authz.cstack` declares them, `Procedures` in
@@ -46,7 +51,7 @@ secondary in production, JSON-only in dev/CI (`AGENTS.md`, `server.api.codec`).
 
 **Responsibility:** the budget domain's RPC procedures — policy lifecycle, self-service refill,
 the admin review queue, and direct balance/ledger reads/writes — carried off `authz-api` as a hard
-cutover (not a transitional duplication like `authz-idp` below). See
+cutover, the same shape `authz-idp` below now also is. See
 [`budget.md`](./budget.md) for the full domain writeup and
 [`../rbac.md`](../rbac.md) for the permission mapping.
 **Owns:** nothing of its own — reads/writes the same `authz` Postgres database as `authz-api`
@@ -84,11 +89,10 @@ comment for why this is not a real dependency on the CRUD domain.
 
 ## `authz-idp`
 
-**Responsibility:** OIDC broker server (ADR-0012 Phase 1) — carries the discovery/JWKS/token-
-exchange surface off `authz-api`, so a public OIDC issuer can eventually live on its own
-deployable instead of `authz-api`'s CRUD/RPC surface. Requires `oauth2.type: self`; refuses to
-start otherwise (`start_idp_server` rejects the external-issuance path outright — this server only
-ever serves the self-signed-JWT surface).
+**Responsibility:** OIDC broker server (ADR-0012) — the sole owner of the discovery/JWKS/token-
+exchange surface, carried off `authz-api` as a hard cutover (see `authz-api` above). Requires
+`oauth2.type: self`; refuses to start otherwise (`start_idp_server` rejects the external-issuance
+path outright — this server only ever serves the self-signed-JWT surface).
 **Owns:** nothing of its own — reads/writes the same `signing_keys` table as `authz-api` and
 `lightbridge-mcp` via `StoreRepo`, and is a third concurrent bootstrapper against it
 (`signing::bootstrap_signing_key`); plus Redis, mandatory unconditionally (not only when
@@ -97,23 +101,24 @@ ever serves the self-signed-JWT surface).
 exchange is enabled; when it is enabled, that same Redis instance also backs the `private_key_jwt`
 client-assertion replay-protection store (ADR-0011, Decision 6).
 
-**Transitional duplication, not a permanent parallel path — unlike `authz-budget` above, this is
-not a hard cutover.** `authz-api` keeps serving this exact surface too, byte-identical
-(`idp_and_api_routers_serve_byte_identical_discovery_and_jwks`,
-`crates/lightbridge-authz-rest/tests/idp_server_tests.rs`), until the public issuer
-(`auth.ai.camer.digital`, a live, trusted `iss` in every in-circulation API-key JWT) is repointed
-at `authz-idp` — a separate, later PR (ADR-0012, "Routing risk"). Both routers are built from the
-same `well_known_mount_params` helper, which is what makes running both side by side safe.
+**The sole owner of this surface, not a duplicate.** ADR-0012 Phase 1 ran this router alongside
+`authz-api`'s own (now-removed) copy of the same routes while the public issuer
+(`auth.ai.camer.digital`, a live, trusted `iss` in every in-circulation API-key JWT) still routed
+through `authz-api`. That ingress has since been repointed directly at `authz-idp`, and
+`authz-api`'s copy of `well_known_router`/`token_exchange_router` was removed in the same change
+(`crates/lightbridge-authz-rest/tests/idp_server_tests.rs`'s
+`api_router_no_longer_serves_well_known_idp_still_does` proves the split). `authz-idp` resolving
+`auth.ai.camer.digital` is now load-bearing on its own, no same-surface fallback on `authz-api`.
 
 Router assembly: `build_idp_router`/`start_idp_server` in `crates/lightbridge-authz-rest/src/lib.rs`.
 
 | Route | Method | Protection | Notes |
 | --- | --- | --- | --- |
 | `/`, `/healthz`, `/healthz/startup`, `/healthz/ready` | GET | none | Same probe wiring as every other server (`probe_router`), `/healthz/ready` checks DB reachability. |
-| `/.well-known/openid-configuration` | GET | none | Only mounted when `oauth2.type: self` — same `signing::well_known_router` call `authz-api` makes, same `signing_keys` rows. |
+| `/.well-known/openid-configuration` | GET | none | Only mounted when `oauth2.type: self` (`signing::well_known_router`), reading the same `signing_keys` rows `authz-api` bootstraps/reads for its own (unrelated) API-key JWT signer. |
 | `/.well-known/jwks.json` | GET | none | Same gate as above. |
-| `/oauth2/token` | POST | none (credential is the presented token/assertion) | RFC 8693 token exchange + `refresh_token` grant. Only mounted when `oauth2.token_exchange.enabled` — but `redis.url` is required for this server to start at all regardless of that flag (`start_idp_server` errors at startup otherwise). `project_id` is an optional form param, as on `authz-api`. |
-| `/oauth2/revoke` | POST | none (credential is the presented token) | RFC 7009. Same caveat as `authz-api`'s copy: absent from `/.well-known/openid-configuration` pending an upstream `authkestra-op` `OidcDiscovery` field. |
+| `/oauth2/token` | POST | none (credential is the presented token/assertion) | RFC 8693 token exchange + `refresh_token` grant. Only mounted when `oauth2.token_exchange.enabled` — but `redis.url` is required for this server to start at all regardless of that flag (`start_idp_server` errors at startup otherwise). `project_id` is an optional form param. |
+| `/oauth2/revoke` | POST | none (credential is the presented token) | RFC 7009. Absent from `/.well-known/openid-configuration` pending an upstream `authkestra-op` `OidcDiscovery` field. |
 
 Deliberately thin next to `authz-api`: no RPC CRUD surface, no budget domain, no idempotency/rate-
 limit layers — `well_known_router`/`token_exchange_router` need none of that, and every route this
