@@ -32,26 +32,31 @@
 //! upstream type instead of duplicating it.
 //!
 //! `RedisRateLimitStore::open`/`from_client`/`bucket_key` are cratestack-redis's own
-//! public constructors; [`build_redis_rate_limit_store`] below only adapts the error
-//! type to this crate's `lightbridge_authz_core::Result` and returns the
-//! `Arc<dyn RateLimitStore>` shape `RateLimitLayer::new` expects.
+//! public constructors; [`build_redis_rate_limit_store`] below builds the client through
+//! [`crate::redis_tls::build_redis_client`] (lightbridge-authz#363 -- TLS/CA-aware, shared
+//! with `oauth2_op::client_assertion_store`) and hands it to `from_client`, rather than
+//! `open`'s plain-URL path, so a `rediss://` `redis.url` works here too.
 
 use std::sync::Arc;
 
 use cratestack_axum::ratelimit::RateLimitStore;
-use lightbridge_authz_core::error::{Error, Result};
+use lightbridge_authz_core::error::Result;
 
 pub use cratestack_redis::RedisRateLimitStore;
 
-/// Builds a Redis-backed [`RateLimitStore`] from a `redis://` connection URL and a key
-/// prefix used to namespace rate-limit buckets in the shared Redis instance (see
+use crate::redis_tls::build_redis_client;
+
+/// Builds a Redis-backed [`RateLimitStore`] from a `redis://`/`rediss://` connection URL, an
+/// optional CA bundle path (see [`crate::redis_tls::build_redis_client`]), and a key prefix
+/// used to namespace rate-limit buckets in the shared Redis instance (see
 /// `RedisRateLimitStore::bucket_key`). Suitable for direct use with
 /// `cratestack_axum::ratelimit::RateLimitLayer::new`.
 pub fn build_redis_rate_limit_store(
     redis_url: &str,
+    ca_bundle_path: Option<&str>,
     key_prefix: impl Into<String>,
 ) -> Result<Arc<dyn RateLimitStore>> {
-    let store = RedisRateLimitStore::open(redis_url, key_prefix)
-        .map_err(|err| Error::Server(format!("failed to open redis rate limit store: {err}")))?;
+    let client = build_redis_client(redis_url, ca_bundle_path)?;
+    let store = RedisRateLimitStore::from_client(client, key_prefix);
     Ok(Arc::new(store))
 }

@@ -22,6 +22,8 @@ use lightbridge_authz_core::error::{Error, Result};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 
+use crate::redis_tls::build_redis_client;
+
 /// Lower bound on the `PX` we hand Redis. `record_jti` is only ever called with an `expires_at`
 /// that `client_assertion::verify_client_assertion` already checked is in the future (assertions
 /// with an expired `exp` are refused before replay tracking runs at all), but clamping here keeps
@@ -47,10 +49,16 @@ impl RedisClientAssertionStore {
     /// how this service already treats Redis for rate limiting. The fail-closed property this
     /// module exists for is about `record_jti`'s *return value* when Redis genuinely is
     /// unreachable at request time, not about startup ordering.
-    pub fn connect(redis_url: &str, key_prefix: impl Into<String>) -> Result<Self> {
-        let client = redis::Client::open(redis_url).map_err(|e| {
-            Error::Server(format!("invalid redis url for client-assertion store: {e}"))
-        })?;
+    ///
+    /// `ca_bundle_path` (lightbridge-authz#363) is only consulted when `redis_url` is
+    /// `rediss://` -- see [`crate::redis_tls::build_redis_client`] for the full TLS/CA
+    /// contract this shares with `ratelimit_redis::build_redis_rate_limit_store`.
+    pub fn connect(
+        redis_url: &str,
+        ca_bundle_path: Option<&str>,
+        key_prefix: impl Into<String>,
+    ) -> Result<Self> {
+        let client = build_redis_client(redis_url, ca_bundle_path)?;
         let manager = client
             .get_connection_manager_lazy(redis::aio::ConnectionManagerConfig::default())
             .map_err(|e| {
@@ -106,7 +114,7 @@ mod tests {
     /// endpoint (Redis-down => confidential-client auth refused, not admitted).
     #[tokio::test]
     async fn record_jti_refuses_rather_than_admits_when_redis_is_unreachable() {
-        let store = RedisClientAssertionStore::connect("redis://127.0.0.1:1/", "test:")
+        let store = RedisClientAssertionStore::connect("redis://127.0.0.1:1/", None, "test:")
             .expect("connection manager construction is lazy and always succeeds");
         let result = store
             .record_jti("some-jti", Utc::now() + chrono::Duration::seconds(60))

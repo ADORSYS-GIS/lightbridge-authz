@@ -173,7 +173,7 @@ fn offline_token_exchange_state(
         .expect("valid signing config");
     let client_store = ConfigClientStore::from_config(&oauth2.clients);
     let assertions =
-        RedisClientAssertionStore::connect("redis://127.0.0.1:1", "test:idp-server-tests:")
+        RedisClientAssertionStore::connect("redis://127.0.0.1:1", None, "test:idp-server-tests:")
             .expect("lazy redis connection manager always builds");
     let bearer: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(UnreachableBearer);
@@ -330,6 +330,7 @@ mod db {
     fn unreachable_redis_cfg() -> Option<Redis> {
         Some(Redis {
             url: "redis://127.0.0.1:1".to_string(),
+            ca_bundle_path: None,
         })
     }
 
@@ -486,8 +487,9 @@ mod db {
             .expect("lazy cratestack pool should be constructible");
         let cratestack_db = schema::Cratestack::builder(lazy_cratestack_pool.clone()).build();
         let idempotency_store = Arc::new(SqlxIdempotencyStore::new(lazy_cratestack_pool));
-        let rate_limit_store = build_redis_rate_limit_store("redis://127.0.0.1:1", "idp-test")
-            .expect("well-formed redis url constructs a store without connecting");
+        let rate_limit_store =
+            build_redis_rate_limit_store("redis://127.0.0.1:1", None, "idp-test")
+                .expect("well-formed redis url constructs a store without connecting");
         let bearer: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
             Arc::new(UnreachableBearer);
         let issuer = Arc::new(AuthzStoreImpl::with_pool(db_pool.clone()));

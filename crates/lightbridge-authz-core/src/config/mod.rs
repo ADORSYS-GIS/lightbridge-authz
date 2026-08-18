@@ -513,10 +513,24 @@ fn default_usage_service_timeout_ms() -> u64 {
 
 /// Redis connection settings. `url` is a standard `redis://[:password@]host:port[/db]`
 /// connection string, e.g. `redis://redis:6379` in Compose or `redis://localhost:6379`
-/// for non-container local runs (see `config/default.yaml`, `.docker/authz/container.yaml`).
+/// for non-container local runs (see `config/default.yaml`, `.docker/authz/container.yaml`),
+/// or `rediss://[:password@]host:port[/db]` for TLS (lightbridge-authz#363) — real
+/// deployments talk to the cluster's TLS-only `redis-ha`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Redis {
     pub url: String,
+    /// PEM file trusted as the sole root when `url` uses `rediss://`. `redis-ha`'s TLS
+    /// listener presents a certificate signed by the cluster's internal self-signed CA
+    /// (the same `ClusterIssuer/self-signed-ca` root as `usage_service.ca_bundle_path` and
+    /// the `authz-tls` Secret's `ca.crt` already mounted at `/etc/lightbridge/tls/ca.crt`),
+    /// which is never in the OS/public trust store, so this is required whenever `url` is
+    /// `rediss://` — see `redis_tls::build_redis_client`. `redis-ha` requires no client
+    /// certificate (`tls-auth-clients no`), so unlike `usage_service` there is no
+    /// `client_cert_path`/`client_key_path` pair here. Ignored for plain `redis://` URLs
+    /// (local Compose). An unreadable or unparseable path, like every other CA-bundle
+    /// config in this codebase, is a hard startup failure, never a silent fallback.
+    #[serde(default)]
+    pub ca_bundle_path: Option<String>,
 }
 
 /// Credential-issuance mode. REQUIRED and has no default — the operator must state it explicitly,
@@ -1190,6 +1204,96 @@ otel:
         assert!(!usage_service.insecure_skip_verify);
         assert_eq!(
             usage_service.ca_bundle_path.as_deref(),
+            Some("/etc/lightbridge/tls/ca.crt")
+        );
+    }
+
+    /// lightbridge-authz#363: a `redis:` block with no `ca_bundle_path` (local Compose's plain
+    /// `redis://`) must still parse -- the field is optional, defaulting to `None`, not a
+    /// required key that would break every existing `redis: { url: ... }` deployment config.
+    #[test]
+    fn config_with_redis_url_only_parses_ca_bundle_path_as_none() {
+        let yaml = "\
+server:
+  api:
+    address: \"0.0.0.0\"
+    port: 3000
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+  opa:
+    address: \"0.0.0.0\"
+    port: 3001
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+    basic_auth:
+      username: \"u\"
+      password: \"p\"
+logging:
+  level: \"info\"
+database:
+  url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz\"
+redis:
+  url: \"redis://localhost:6379\"
+oauth2:
+  type: self
+  jwks_url: \"http://localhost/jwks\"
+otel:
+  enabled: true
+  otlp_endpoint: \"http://localhost:4317\"
+  service_name: \"svc\"
+";
+        let cfg: Config = from_str(yaml).expect("config with a plain redis.url must load");
+        let redis = cfg.redis.expect("redis must be set");
+        assert_eq!(redis.url, "redis://localhost:6379");
+        assert_eq!(redis.ca_bundle_path, None);
+    }
+
+    /// lightbridge-authz#363: a `rediss://` deployment sets `redis.ca_bundle_path` alongside
+    /// `redis.url` -- the shape `redis_tls::build_redis_client` expects.
+    #[test]
+    fn config_with_redis_ca_bundle_path_parses_it() {
+        let yaml = "\
+server:
+  api:
+    address: \"0.0.0.0\"
+    port: 3000
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+  opa:
+    address: \"0.0.0.0\"
+    port: 3001
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+    basic_auth:
+      username: \"u\"
+      password: \"p\"
+logging:
+  level: \"info\"
+database:
+  url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz\"
+redis:
+  url: \"rediss://:pw@redis-ha-haproxy.redis-system.svc.cluster.local:6379\"
+  ca_bundle_path: \"/etc/lightbridge/tls/ca.crt\"
+oauth2:
+  type: self
+  jwks_url: \"http://localhost/jwks\"
+otel:
+  enabled: true
+  otlp_endpoint: \"http://localhost:4317\"
+  service_name: \"svc\"
+";
+        let cfg: Config = from_str(yaml).expect("config with redis.ca_bundle_path must load");
+        let redis = cfg.redis.expect("redis must be set");
+        assert_eq!(
+            redis.url,
+            "rediss://:pw@redis-ha-haproxy.redis-system.svc.cluster.local:6379"
+        );
+        assert_eq!(
+            redis.ca_bundle_path.as_deref(),
             Some("/etc/lightbridge/tls/ca.crt")
         );
     }

@@ -306,8 +306,9 @@ fn state_with_cfg(
 ) -> TokenExchangeState {
     let signer = ApiKeyJwtSigner::from_config(&signing_cfg(), repo.clone()).unwrap();
     let client_store = ConfigClientStore::from_config(&clients);
-    let assertions = RedisClientAssertionStore::connect(redis_url, "test:token-exchange-jti:")
-        .expect("lazy connection manager always builds");
+    let assertions =
+        RedisClientAssertionStore::connect(redis_url, None, "test:token-exchange-jti:")
+            .expect("lazy connection manager always builds");
     let op_config = authkestra_op::config::OpConfig {
         issuer: ISSUER.to_string(),
         scopes_supported: cfg.allowed_scopes.clone(),

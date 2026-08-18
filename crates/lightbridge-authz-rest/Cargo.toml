@@ -65,6 +65,14 @@ tracing-subscriber.workspace = true
 # Dev-only: tests use this to prove a JSON-Content-Type request is now rejected (415) and to keep
 # `common::Wire::Json` as that negative-path probe. Never a production dependency post-ADR-0013.
 cratestack-codec-json.workspace = true
+# Dev-only (lightbridge-authz#363): `redis_tls_tests.rs` generates throwaway CA/leaf keypairs
+# (rcgen, same pattern as lightbridge-authz-budget's usage_service_ca_bundle_tests.rs) and serves
+# them over a raw rustls TLS TCP acceptor (tokio-rustls) to prove
+# `redis_tls::build_redis_client` actually verifies the server certificate, not just plumbs the
+# config through.
+rcgen.workspace = true
+time.workspace = true
+tokio-rustls.workspace = true
 
 [features]
 load-tests = []

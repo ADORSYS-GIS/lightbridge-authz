@@ -18,6 +18,7 @@ pub mod middleware;
 pub mod models;
 pub mod oauth2_op;
 pub mod ratelimit_redis;
+pub mod redis_tls;
 pub mod routers;
 pub mod rpc_authorize;
 pub mod signing;
@@ -1802,6 +1803,7 @@ fn build_token_exchange_state(
     repo: Arc<StoreRepo>,
     bearer: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait>,
     redis_url: &str,
+    redis_ca_bundle_path: Option<&str>,
 ) -> Result<Option<token_exchange::TokenExchangeState>> {
     let Some(cfg) = oauth2.token_exchange.as_ref().filter(|t| t.enabled) else {
         return Ok(None);
@@ -1838,6 +1840,7 @@ fn build_token_exchange_state(
     let client_store = oauth2_op::client_store::ConfigClientStore::from_config(&oauth2.clients);
     let assertions = oauth2_op::client_assertion_store::RedisClientAssertionStore::connect(
         redis_url,
+        redis_ca_bundle_path,
         CLIENT_ASSERTION_JTI_KEY_PREFIX,
     )?;
     let op_store = Arc::new(oauth2_op::store::TokenExchangeOpStore::new(
@@ -2014,7 +2017,8 @@ pub async fn start_api_server(
     // The URL comes from the already-loaded `Config.redis.url` (YAML `redis: url:`, itself
     // populated from `REDIS_URL` via env interpolation — see `config/default.yaml`), not a
     // separately-read raw env var, mirroring how every other config value reaches this function.
-    let rate_limit_store = build_redis_rate_limit_store(&redis.url, "authz-api")?;
+    let rate_limit_store =
+        build_redis_rate_limit_store(&redis.url, redis.ca_bundle_path.as_deref(), "authz-api")?;
 
     let dev_cors = dev_cors_enabled();
     let app = build_api_router(
@@ -2186,8 +2190,13 @@ pub async fn start_idp_server(
         )
     })?;
 
-    let token_exchange_state =
-        build_token_exchange_state(oauth2, signing_repo.clone(), bearer_service, &redis.url)?;
+    let token_exchange_state = build_token_exchange_state(
+        oauth2,
+        signing_repo.clone(),
+        bearer_service,
+        &redis.url,
+        redis.ca_bundle_path.as_deref(),
+    )?;
     let token_exchange_enabled = token_exchange_state.is_some();
 
     let app = build_idp_router(oauth2, signing_repo, token_exchange_state, readiness_pool);
@@ -2399,7 +2408,8 @@ pub async fn start_budget_server(
 
     // Own key prefix ("authz-budget", not "authz-api") so the two services' token buckets never
     // share state, even though they may point at the same Redis instance.
-    let rate_limit_store = build_redis_rate_limit_store(&redis.url, "authz-budget")?;
+    let rate_limit_store =
+        build_redis_rate_limit_store(&redis.url, redis.ca_bundle_path.as_deref(), "authz-budget")?;
 
     let dev_cors = dev_cors_enabled();
     let app = build_budget_router(
@@ -2590,6 +2600,7 @@ mod tests {
             lazy_signing_repo(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
+            None,
         )
         .unwrap();
         assert!(result.is_none());
@@ -2604,6 +2615,7 @@ mod tests {
             lazy_signing_repo(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
+            None,
         ) else {
             panic!("expected an error for external oauth2 with token_exchange enabled");
         };
@@ -2619,6 +2631,7 @@ mod tests {
             lazy_signing_repo(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
+            None,
         ) else {
             panic!("expected an error for a missing signing block");
         };
@@ -2637,6 +2650,7 @@ mod tests {
             lazy_signing_repo(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
+            None,
         ) else {
             panic!("expected an error for a non-positive ttl");
         };
@@ -2655,6 +2669,7 @@ mod tests {
             lazy_signing_repo(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
+            None,
         ) else {
             panic!("expected an error for a zero refresh_absolute_ttl_seconds");
         };
@@ -2675,6 +2690,7 @@ mod tests {
             lazy_signing_repo(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
+            None,
         ) else {
             panic!("expected an error for a negative refresh_absolute_ttl_seconds");
         };
@@ -2696,6 +2712,7 @@ mod tests {
             lazy_signing_repo(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
+            None,
         ) else {
             panic!(
                 "expected an error when refresh_absolute_ttl_seconds does not exceed refresh_ttl_seconds"
@@ -2716,6 +2733,7 @@ mod tests {
             lazy_signing_repo(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
+            None,
         )
         .unwrap();
         assert!(result.is_some());

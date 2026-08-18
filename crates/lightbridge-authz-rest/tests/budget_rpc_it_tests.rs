@@ -134,7 +134,7 @@ async fn setup(
     // comment: every test authenticates with a fixed literal bearer token, so a shared prefix
     // would put every concurrently-running test's calls into the same token bucket.
     let rate_limit: Arc<dyn RateLimitStore> =
-        build_redis_rate_limit_store(&redis_url(), format!("authz-budget-it-{}", cuid2()))
+        build_redis_rate_limit_store(&redis_url(), None, format!("authz-budget-it-{}", cuid2()))
             .expect("redis rate-limit store");
 
     let policy_store = Arc::new(

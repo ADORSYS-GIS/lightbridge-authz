@@ -74,7 +74,7 @@ fn lazy_idempotency() -> Arc<SqlxIdempotencyStore> {
 }
 
 fn lazy_rate_limit() -> Arc<dyn RateLimitStore> {
-    build_redis_rate_limit_store(DEAD_REDIS, "authz-budget-test").expect("rate limit store")
+    build_redis_rate_limit_store(DEAD_REDIS, None, "authz-budget-test").expect("rate limit store")
 }
 
 fn lazy_policy_store(core: Arc<dyn DbPoolTrait>) -> Arc<lightbridge_authz_budget::PolicyStore> {

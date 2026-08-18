@@ -215,7 +215,19 @@ cratestack-codec-json = "0.7.16"
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
 # feature). See that module for why.
 minicbor = { version = "2.2", features = ["std", "half"] }
-redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
+# lightbridge-authz#363: `tokio-rustls-comp` is a superset of the previous `tokio-comp` (it
+# enables `tls-rustls` + `tokio-comp` together — see docs.rs/crate/redis/1.5.0/features), so
+# `rediss://` URLs now build a rustls-backed TLS connection via `redis::Client::build_with_tls`
+# (see `crates/lightbridge-authz-rest/src/redis_tls.rs`) while plain `redis://` (local Compose)
+# is untouched. Deliberately NOT `tls-rustls-webpki-roots` (trusts public roots, wrong for the
+# cluster's internal self-signed CA) and NOT `tls-rustls-insecure` (skips verification — the
+# ticket explicitly forbids trading a working TLS tunnel for an unverified one).
+redis = { version = "1", features = ["tokio-rustls-comp", "connection-manager"] }
+# Dev-only: `redis_tls_tests.rs` spins up a raw rustls TLS TCP acceptor (no HTTP framing) to
+# prove `redis_tls::build_redis_client` actually verifies the server certificate against the
+# configured CA, not just plumbs the config through. `^0.26` matches what `tokio-rustls-comp`
+# above already pulls in transitively, so this adds no new major version to the tree.
+tokio-rustls = "0.26"
 
 # Debug/test builds ship line tables instead of full DWARF.
 #
