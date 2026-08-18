@@ -200,16 +200,16 @@ mimalloc = "0"
 # check: it also prints single-version `cratestack-*` crates as leaves of other, unrelated
 # already-duplicated packages (e.g. `bytes`, `windows_x86_64_msvc`), so it is not zero even on a
 # fully consistent tree; don't use it as the pass/fail gate for this failure mode.
-cratestack-core = "0.7.16"
-cratestack-axum = "0.7.16"
-cratestack-redis = "0.7.16"
+cratestack-core = "0.8.0"
+cratestack-axum = "0.8.0"
+cratestack-redis = "0.8.0"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
 # `include_server_schema!` macro emits `::cratestack::*` paths (see cratestack-pg lib docs). The
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
 # it to build the RPC router (ADR-0003).
 cratestack = { package = "cratestack-pg", version = "0.7.16" }
-cratestack-codec-cbor = "0.7.16"
-cratestack-codec-json = "0.7.16"
+cratestack-codec-cbor = "0.8.0"
+cratestack-codec-json = "0.8.0"
 # Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
