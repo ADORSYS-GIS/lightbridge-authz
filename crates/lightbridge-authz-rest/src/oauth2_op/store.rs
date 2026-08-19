@@ -986,3 +986,44 @@ impl OpStore for RequestScopedOpStore<'_> {
             .await
     }
 }
+
+#[cfg(test)]
+mod budget_tier_wire_label_tests {
+    use super::budget_tier_wire_label;
+    use lightbridge_authz_budget::tier::BudgetTier;
+
+    /// The ADR-0015-shipped fail-closed floor ($6, `6_000_000` micros) -- the whole reason
+    /// `budget_tier_wire_label` exists: `BudgetTier` has no variant below `B15`'s $15, so a
+    /// caller that stamped `BudgetTier::B15.label()` here regardless of the configured floor
+    /// would misrepresent a $6 outage fallback as the $15 rung, silently granting more than the
+    /// policy actually authorizes on the one path (a budget-ledger outage) meant to be the most
+    /// conservative. This is the exact fail-open shape ADR-0015 Decision 6 exists to prevent.
+    #[test]
+    fn the_adr_0015_fail_closed_floor_gets_its_own_honest_label_not_the_nearest_legacy_rung() {
+        assert_eq!(budget_tier_wire_label(6_000_000), "b-6");
+        assert_ne!(
+            budget_tier_wire_label(6_000_000),
+            BudgetTier::B15.label(),
+            "a $6 floor must never be represented as the $15 rung"
+        );
+    }
+
+    /// Every legacy `BudgetTier` rung round-trips through its exact, pre-ADR-0015 label --
+    /// stamping the claim for an account that resolved through the real ledger (not the
+    /// fail-closed fallback) must not change shape for any account already on a known rung.
+    #[test]
+    fn every_legacy_rung_keeps_its_exact_pre_adr_0015_label() {
+        for tier in BudgetTier::ALL {
+            assert_eq!(budget_tier_wire_label(tier.amount().get()), tier.label());
+        }
+    }
+
+    /// An amount that matches neither a legacy rung nor a whole number of dollars still produces
+    /// a label (truncating division) rather than panicking -- no different in kind from the
+    /// legacy enum, which likewise had no representation for a non-whole-dollar amount. Documents
+    /// the behavior rather than asserting it is ideal.
+    #[test]
+    fn a_non_whole_dollar_amount_truncates_rather_than_panics() {
+        assert_eq!(budget_tier_wire_label(6_500_000), "b-6");
+    }
+}
