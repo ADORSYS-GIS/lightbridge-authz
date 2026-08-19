@@ -2711,3 +2711,162 @@ async fn batch_create_api_key_with_real_cborg_null_expires_at_bytes() {
     );
     assert!(frame["output"]["apiKey"]["expiresAt"].is_null());
 }
+
+/// The response-side half of the same bug -- and the one with the much larger blast radius.
+/// `rpc_batch_dispatch`'s `response_to_frame` decodes each inner dispatch's SUCCESS body into a
+/// generic `serde_json::Value` (`RpcResponseFrame.output: Option<serde_json::Value>`) before
+/// folding it into the batch's response array, which then goes through the exact same
+/// `LenientCborCodec::encode` this module's doc comment describes. So this bug corrupts not just
+/// a batched *request*'s `null` fields, but *every* `null` anywhere in *every* batched response --
+/// independent of which procedure/model was called, and independent of the field's original Rust
+/// type, since by the time `response_to_frame` sees it, `None` has already been fully erased into
+/// the generic `serde_json::Value::Null`.
+///
+/// This is the resolution to converse-frontends#180's `oauth2Url` mystery: that investigation
+/// proved (independently, exhaustively) that prod's `authz-api` can only ever send `null` for
+/// `oauth2Url`, yet the deployed bundle demonstrably crashed on a *present, non-string* value.
+/// `null` -> `[]` through this exact mechanism resolves the contradiction -- `[]` is present,
+/// non-nullish, and has no `.trim` method, so neither the `?.` in the caller nor a naive falsy
+/// check would have caught it.
+///
+/// The request built here carries no `null` anywhere (`expiresAt` is a real, present date) --
+/// deliberately isolating the RESPONSE-side encode from the already-covered REQUEST-side bug
+/// (`batch_create_api_key_with_real_cborg_null_expires_at_bytes` above). The response naturally
+/// carries several `None` fields on a freshly created key (`oauth2Url`, `lastUsedAt`, `lastIp`,
+/// `revokedAt`, `deletedAt`) -- this asserts on `oauth2Url` specifically since that's the field
+/// converse-frontends#180 was stuck on, but confirmed by hand (see this PR's description) that
+/// all five decoded as CBOR's empty array before the fix and as real `null` after it.
+#[tokio::test]
+async fn batch_response_null_fields_encode_as_cbor_null_not_empty_array() {
+    let subject = format!("owner-batch-resp-null-{}", cuid2());
+    let ctx = setup(admin_bearer(&subject)).await;
+
+    let billing_id = format!("tenant-batch-resp-null-{}", cuid2());
+    let account_id = create_account(&ctx.router, "admin", &billing_id).await;
+    let project_id = create_project(&ctx.router, "admin", &account_id, "p-batch-resp-null").await;
+
+    let mut raw = Vec::new();
+    let mut e = minicbor::Encoder::new(&mut raw);
+    e.array(1).unwrap();
+    e.map(3).unwrap();
+    e.str("id").unwrap();
+    e.u32(0).unwrap();
+    e.str("op").unwrap();
+    e.str("procedure.createApiKey").unwrap();
+    e.str("input").unwrap();
+    e.map(1).unwrap();
+    e.str("args").unwrap();
+    e.map(4).unwrap();
+    e.str("name").unwrap();
+    e.str("Miaou").unwrap();
+    e.str("billingPlan").unwrap();
+    e.str("free").unwrap();
+    e.str("expiresAt").unwrap();
+    e.str("2027-01-01T00:00:00Z").unwrap();
+    e.str("projectId").unwrap();
+    e.str(&project_id).unwrap();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/rpc/batch")
+        .header("content-type", "application/cbor")
+        .header("accept", "application/cbor")
+        .header("authorization", "Bearer admin")
+        .body(Body::from(raw))
+        .unwrap();
+    let response = ctx.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+    // Assert on the raw wire byte directly, not just the decoded value: a lenient decoder could
+    // in principle paper over a `[]` and hand back `Null` (this codec's own decoder does exactly
+    // that normalization for `undefined`), which would hide a real wire-level corruption behind a
+    // clean-looking assertion.
+    let key = b"ioauth2Url";
+    let pos = bytes
+        .windows(key.len())
+        .position(|w| w == key)
+        .expect("oauth2Url key present in raw response bytes");
+    assert_eq!(
+        bytes[pos + key.len()],
+        0xf6,
+        "oauth2Url's wire value must be CBOR null (0xf6), not CBOR's empty array (0x80)"
+    );
+
+    let frames: Vec<Value> = Wire::Cbor.decode(&bytes);
+    let output = &frames[0]["output"];
+    {
+        let field = "oauth2Url";
+        assert!(
+            output[field].is_null(),
+            "{field} must decode as JSON null: {output}"
+        );
+    }
+    for field in ["lastUsedAt", "lastIp", "revokedAt", "deletedAt"] {
+        assert!(
+            output["apiKey"][field].is_null(),
+            "apiKey.{field} must decode as JSON null: {}",
+            output["apiKey"]
+        );
+    }
+}
+
+/// Same mechanism, a non-string `Option<T>` field: `Project.allowedModels: Option<Vec<String>>`.
+/// Confirms the corruption is type-independent (any `None` collapses to the same
+/// `serde_json::Value::Null` before `response_to_frame` ever sees it, regardless of what Rust type
+/// originally held it) rather than something specific to `Option<String>`.
+///
+/// Deliberately does NOT assert this breaks anything user-visible -- for this one field the
+/// corruption was harmless by convention (`AGENTS.md`: `NULL`/`[]` both mean "all models allowed"
+/// for `allowed_models`), which is exactly why it went unnoticed while `oauth2Url`/`defaultQuota`
+/// did not: this field happened to have a semantics where `null` and `[]` coincide, not because
+/// the encode bug spared it.
+#[tokio::test]
+async fn batch_response_null_allowed_models_encodes_as_cbor_null_not_empty_array() {
+    let subject = format!("owner-batch-resp-null-am-{}", cuid2());
+    let ctx = setup(admin_bearer(&subject)).await;
+
+    let billing_id = format!("tenant-batch-resp-null-am-{}", cuid2());
+    let account_id = create_account(&ctx.router, "admin", &billing_id).await;
+    let project_id =
+        create_project(&ctx.router, "admin", &account_id, "p-batch-resp-null-am").await;
+
+    let mut raw = Vec::new();
+    let mut e = minicbor::Encoder::new(&mut raw);
+    e.array(1).unwrap();
+    e.map(3).unwrap();
+    e.str("id").unwrap();
+    e.u32(0).unwrap();
+    e.str("op").unwrap();
+    e.str("model.Project.get").unwrap();
+    e.str("input").unwrap();
+    e.map(1).unwrap();
+    e.str("id").unwrap();
+    e.str(&project_id).unwrap();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/rpc/batch")
+        .header("content-type", "application/cbor")
+        .header("accept", "application/cbor")
+        .header("authorization", "Bearer admin")
+        .body(Body::from(raw))
+        .unwrap();
+    let response = ctx.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+    let key = b"mallowedModels";
+    let pos = bytes
+        .windows(key.len())
+        .position(|w| w == key)
+        .expect("allowedModels key present in raw response bytes");
+    assert_eq!(
+        bytes[pos + key.len()],
+        0xf6,
+        "allowedModels' wire value must be CBOR null (0xf6), not CBOR's empty array (0x80)"
+    );
+
+    let frames: Vec<Value> = Wire::Cbor.decode(&bytes);
+    assert!(frames[0]["output"]["allowedModels"].is_null());
+}
