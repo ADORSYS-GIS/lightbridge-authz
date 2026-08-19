@@ -90,13 +90,34 @@ pub struct Rule {
 }
 
 /// A full, versioned rule-data policy: an ordered list of [`Rule`]s plus the fallback applied
-/// when none match.
+/// when none match, plus (ADR-0015) the three admin-configured amounts that used to live in the
+/// compile-time `BudgetTier` enum. Deliberately three separate fields, not one -- see ADR-0015
+/// Decisions 5/6 for why "the account's starting budget" and "the fail-closed floor for an
+/// outage/unresolvable amount" must never share a value, even though they often will in
+/// practice: conflating them once already meant a lookup failure and a brand-new signup were
+/// indistinguishable, silently.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuleSet {
     pub policy_revision: String,
     pub rules: Vec<Rule>,
     pub default_effect: Effect,
     pub default_reason_code: String,
+    /// The self-service refill amounts a caller may request, strictly ascending, e.g.
+    /// `[6_000_000, 15_000_000, 30_000_000]` for $6/$15/$30. Deliberately a discrete set, not a
+    /// `min`/`max` range a caller could pick any value inside of -- see ADR-0015 Decision 2.
+    /// `requestBudgetRefill` rejects any `requested_amount_micros` not a member of this set
+    /// (`BudgetError::AmountNotOffered`) before ever evaluating policy.
+    pub allowed_amounts_micros: Vec<i64>,
+    /// What an account with no qualifying grant history yet this period starts with (ADR-0015
+    /// Decision 5). NOT derived from `allowed_amounts_micros`'s minimum -- a plan may start
+    /// callers above or below the lowest self-service step.
+    pub starting_amount_micros: i64,
+    /// The fail-closed fallback used only when a tier/amount lookup fails outright or resolves
+    /// to data matching nothing known (ADR-0015 Decision 6) -- never used for "brand new
+    /// account," which is `starting_amount_micros` instead. Enforced by [`validate`] to never
+    /// exceed `starting_amount_micros`: an outage must never grant more than a legitimate new
+    /// signup would get.
+    pub fail_closed_floor_micros: i64,
 }
 
 /// ADR-0008's actual policy verbatim: two unaided rungs per period, `manual_review` beyond that.
@@ -121,7 +142,10 @@ pub fn default_rule_set_json() -> &'static str {
     }
   ],
   "default_effect": "manual_review",
-  "default_reason_code": "unaided_allowance_exhausted"
+  "default_reason_code": "unaided_allowance_exhausted",
+  "allowed_amounts_micros": [6000000, 15000000, 30000000],
+  "starting_amount_micros": 15000000,
+  "fail_closed_floor_micros": 6000000
 }"#
 }
 
@@ -156,6 +180,54 @@ fn validate(rule_set: &RuleSet) -> Result<(), BudgetError> {
                 rule.id
             )));
         }
+    }
+
+    if rule_set.allowed_amounts_micros.is_empty() {
+        return Err(BudgetError::InvalidRuleData(
+            "allowed_amounts_micros must not be empty".to_string(),
+        ));
+    }
+    let mut seen_amounts: HashSet<i64> = HashSet::new();
+    let mut previous_amount: Option<i64> = None;
+    for &amount in &rule_set.allowed_amounts_micros {
+        if amount <= 0 {
+            return Err(BudgetError::InvalidRuleData(format!(
+                "allowed_amounts_micros entries must be positive, got {amount}"
+            )));
+        }
+        if !seen_amounts.insert(amount) {
+            return Err(BudgetError::InvalidRuleData(format!(
+                "duplicate entry in allowed_amounts_micros: {amount}"
+            )));
+        }
+        if let Some(previous) = previous_amount
+            && amount <= previous
+        {
+            return Err(BudgetError::InvalidRuleData(
+                "allowed_amounts_micros must be strictly ascending".to_string(),
+            ));
+        }
+        previous_amount = Some(amount);
+    }
+
+    if rule_set.starting_amount_micros <= 0 {
+        return Err(BudgetError::InvalidRuleData(format!(
+            "starting_amount_micros must be positive, got {}",
+            rule_set.starting_amount_micros
+        )));
+    }
+    if rule_set.fail_closed_floor_micros <= 0 {
+        return Err(BudgetError::InvalidRuleData(format!(
+            "fail_closed_floor_micros must be positive, got {}",
+            rule_set.fail_closed_floor_micros
+        )));
+    }
+    if rule_set.fail_closed_floor_micros > rule_set.starting_amount_micros {
+        return Err(BudgetError::InvalidRuleData(format!(
+            "fail_closed_floor_micros ({}) must not exceed starting_amount_micros ({}): an \
+             outage must never grant more than a legitimate new signup would get",
+            rule_set.fail_closed_floor_micros, rule_set.starting_amount_micros
+        )));
     }
 
     Ok(())
@@ -481,6 +553,28 @@ impl PolicyEngine for RuleDataEngine {
             rule_set.policy_revision.clone(),
         ))
     }
+
+    fn allowed_amounts_micros(&self) -> Vec<i64> {
+        self.active
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .allowed_amounts_micros
+            .clone()
+    }
+
+    fn starting_amount_micros(&self) -> i64 {
+        self.active
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .starting_amount_micros
+    }
+
+    fn fail_closed_floor_micros(&self) -> i64 {
+        self.active
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fail_closed_floor_micros
+    }
 }
 
 #[cfg(test)]
@@ -567,7 +661,10 @@ mod tests {
             }
           ],
           "default_effect": "manual_review",
-          "default_reason_code": "unaided_allowance_exhausted"
+          "default_reason_code": "unaided_allowance_exhausted",
+          "allowed_amounts_micros": [6000000, 15000000, 30000000],
+          "starting_amount_micros": 15000000,
+          "fail_closed_floor_micros": 6000000
         }"#;
 
         engine.load(replacement).expect("valid rule set loads");
@@ -600,7 +697,10 @@ mod tests {
             }
           ],
           "default_effect": "manual_review",
-          "default_reason_code": "default_reason"
+          "default_reason_code": "default_reason",
+          "allowed_amounts_micros": [6000000, 15000000, 30000000],
+          "starting_amount_micros": 15000000,
+          "fail_closed_floor_micros": 6000000
         }"#;
         let engine = RuleDataEngine::new(rule_data, 1).expect("valid rule set");
 
@@ -626,7 +726,10 @@ mod tests {
             }
           ],
           "default_effect": "manual_review",
-          "default_reason_code": "default_reason"
+          "default_reason_code": "default_reason",
+          "allowed_amounts_micros": [6000000, 15000000, 30000000],
+          "starting_amount_micros": 15000000,
+          "fail_closed_floor_micros": 6000000
         }"#;
         let engine = RuleDataEngine::new(rule_data, 1_000).expect("valid rule set");
 
@@ -655,7 +758,10 @@ mod tests {
             }
           ],
           "default_effect": "manual_review",
-          "default_reason_code": "default_reason"
+          "default_reason_code": "default_reason",
+          "allowed_amounts_micros": [6000000, 15000000, 30000000],
+          "starting_amount_micros": 15000000,
+          "fail_closed_floor_micros": 6000000
         }"#;
         let engine = RuleDataEngine::new(rule_data, 1_000).expect("valid rule set");
 
@@ -688,7 +794,10 @@ mod tests {
             }
           ],
           "default_effect": "manual_review",
-          "default_reason_code": "default_reason"
+          "default_reason_code": "default_reason",
+          "allowed_amounts_micros": [6000000, 15000000, 30000000],
+          "starting_amount_micros": 15000000,
+          "fail_closed_floor_micros": 6000000
         }"#;
         let engine = RuleDataEngine::new(rule_data, 1_000).expect("valid rule set");
 
@@ -739,5 +848,153 @@ mod tests {
 
         let result = RuleDataEngine::new(rule_data, 1_000);
         assert!(matches!(result, Err(BudgetError::InvalidRuleData(_))));
+    }
+
+    /// ADR-0015: `default_rule_set_json()` must itself be valid -- if this test fails, the
+    /// production seed migration (kept byte-for-byte in sync by convention, not by the compiler)
+    /// is very likely invalid too.
+    #[test]
+    fn default_rule_set_json_is_valid() {
+        validate_rule_data(default_rule_set_json()).expect("the shipped default must validate");
+    }
+
+    fn rule_set_with(fields_json: &str) -> String {
+        format!(
+            r#"{{
+          "policy_revision": "budget-policy-vtest",
+          "rules": [],
+          "default_effect": "manual_review",
+          "default_reason_code": "default_reason",
+          {fields_json}
+        }}"#
+        )
+    }
+
+    #[test]
+    fn empty_allowed_amounts_micros_rejected() {
+        let rule_data = rule_set_with(
+            r#""allowed_amounts_micros": [], "starting_amount_micros": 15000000, "fail_closed_floor_micros": 6000000"#,
+        );
+        let result = validate_rule_data(&rule_data);
+        assert!(
+            matches!(&result, Err(BudgetError::InvalidRuleData(m)) if m.contains("allowed_amounts_micros must not be empty")),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn non_ascending_allowed_amounts_micros_rejected() {
+        let rule_data = rule_set_with(
+            r#""allowed_amounts_micros": [15000000, 6000000, 30000000], "starting_amount_micros": 15000000, "fail_closed_floor_micros": 6000000"#,
+        );
+        let result = validate_rule_data(&rule_data);
+        assert!(
+            matches!(&result, Err(BudgetError::InvalidRuleData(m)) if m.contains("strictly ascending")),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_allowed_amounts_micros_rejected() {
+        let rule_data = rule_set_with(
+            r#""allowed_amounts_micros": [6000000, 6000000, 30000000], "starting_amount_micros": 15000000, "fail_closed_floor_micros": 6000000"#,
+        );
+        let result = validate_rule_data(&rule_data);
+        assert!(
+            matches!(&result, Err(BudgetError::InvalidRuleData(m)) if m.contains("duplicate entry")),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn non_positive_allowed_amount_rejected() {
+        let rule_data = rule_set_with(
+            r#""allowed_amounts_micros": [0, 15000000, 30000000], "starting_amount_micros": 15000000, "fail_closed_floor_micros": 6000000"#,
+        );
+        let result = validate_rule_data(&rule_data);
+        assert!(
+            matches!(&result, Err(BudgetError::InvalidRuleData(m)) if m.contains("must be positive")),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn non_positive_starting_amount_rejected() {
+        let rule_data = rule_set_with(
+            r#""allowed_amounts_micros": [6000000], "starting_amount_micros": 0, "fail_closed_floor_micros": 0"#,
+        );
+        let result = validate_rule_data(&rule_data);
+        assert!(
+            matches!(&result, Err(BudgetError::InvalidRuleData(m)) if m.contains("starting_amount_micros must be positive")),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn non_positive_fail_closed_floor_rejected() {
+        let rule_data = rule_set_with(
+            r#""allowed_amounts_micros": [6000000], "starting_amount_micros": 6000000, "fail_closed_floor_micros": -1"#,
+        );
+        let result = validate_rule_data(&rule_data);
+        assert!(
+            matches!(&result, Err(BudgetError::InvalidRuleData(m)) if m.contains("fail_closed_floor_micros must be positive")),
+            "got {result:?}"
+        );
+    }
+
+    /// The cross-field invariant that matters most: an outage must never grant more than a
+    /// legitimate new signup would get. Proved by construction: the failing case has the floor
+    /// strictly above the starting amount; flip the two back to floor <= starting and the same
+    /// rule set validates (see the next test), which is what proves this test is actually
+    /// checking the ordering and not just "any mismatch."
+    #[test]
+    fn fail_closed_floor_exceeding_starting_amount_rejected() {
+        let rule_data = rule_set_with(
+            r#""allowed_amounts_micros": [6000000], "starting_amount_micros": 6000000, "fail_closed_floor_micros": 15000000"#,
+        );
+        let result = validate_rule_data(&rule_data);
+        assert!(
+            matches!(&result, Err(BudgetError::InvalidRuleData(m)) if m.contains("must not exceed starting_amount_micros")),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn fail_closed_floor_equal_to_starting_amount_is_allowed() {
+        let rule_data = rule_set_with(
+            r#""allowed_amounts_micros": [6000000], "starting_amount_micros": 6000000, "fail_closed_floor_micros": 6000000"#,
+        );
+        validate_rule_data(&rule_data).expect("floor == starting amount must be allowed");
+    }
+
+    #[test]
+    fn engine_exposes_allowed_starting_and_floor_amounts_from_the_active_rule_set() {
+        let engine =
+            RuleDataEngine::new(default_rule_set_json(), 1_000).expect("valid default rule set");
+        assert_eq!(
+            engine.allowed_amounts_micros(),
+            vec![6_000_000, 15_000_000, 30_000_000]
+        );
+        assert_eq!(engine.starting_amount_micros(), 15_000_000);
+        assert_eq!(engine.fail_closed_floor_micros(), 6_000_000);
+    }
+
+    /// Proves the three ADR-0015 accessors read the *currently active* rule set, not a value
+    /// cached at construction time -- a real risk given `active` is swapped under a lock by
+    /// `load()`. Break this by making the accessors read a value captured in `RuleDataEngine::new`
+    /// instead of re-reading `self.active` and this test fails because the post-`load()` values
+    /// would still be the pre-`load()` ones.
+    #[test]
+    fn engine_accessors_reflect_a_hot_swapped_rule_set() {
+        let engine =
+            RuleDataEngine::new(default_rule_set_json(), 1_000).expect("valid default rule set");
+        let replacement = rule_set_with(
+            r#""allowed_amounts_micros": [9000000, 45000000], "starting_amount_micros": 9000000, "fail_closed_floor_micros": 9000000"#,
+        );
+        engine.load(&replacement).expect("valid replacement loads");
+
+        assert_eq!(engine.allowed_amounts_micros(), vec![9_000_000, 45_000_000]);
+        assert_eq!(engine.starting_amount_micros(), 9_000_000);
+        assert_eq!(engine.fail_closed_floor_micros(), 9_000_000);
     }
 }

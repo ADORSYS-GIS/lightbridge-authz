@@ -46,6 +46,13 @@ pub enum BudgetError {
         "augmentation request '{0}' is not pending review (already reviewed, or does not exist)"
     )]
     AlreadyReviewed(String),
+    /// ADR-0015: `requestBudgetRefill` rejects any `requested_amount_micros` that is not a
+    /// member of the active policy's `allowed_amounts_micros`. Distinct from `InvalidAmount`
+    /// (which is about sign/positivity) and `PolicyDenied` (a policy-evaluation outcome for an
+    /// otherwise-legitimate amount) -- this is a structural rejection before policy is ever
+    /// consulted.
+    #[error("{0} is not a currently offered refill amount (micro-USD)")]
+    AmountNotOffered(i64),
 }
 
 pub type Result<T> = std::result::Result<T, BudgetError>;
@@ -108,6 +115,10 @@ mod tests {
         assert_eq!(
             BudgetError::AlreadyReviewed("req-1".to_string()).to_string(),
             "augmentation request 'req-1' is not pending review (already reviewed, or does not exist)"
+        );
+        assert_eq!(
+            BudgetError::AmountNotOffered(17_000_000).to_string(),
+            "17000000 is not a currently offered refill amount (micro-USD)"
         );
     }
 }

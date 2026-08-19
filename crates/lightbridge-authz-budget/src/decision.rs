@@ -69,6 +69,24 @@ pub trait PolicyEngine: Send + Sync + std::fmt::Debug {
         facts: &Facts,
         requested_amount_micros: i64,
     ) -> Result<Decision, BudgetError>;
+
+    /// The self-service refill amounts currently offered (ADR-0015 Decision 2): a strictly
+    /// ascending, discrete set, not a `min`/`max` range. Synchronous and infallible by
+    /// construction -- an engine only ever holds an already-validated active policy, the same
+    /// invariant [`Self::evaluate`] relies on.
+    fn allowed_amounts_micros(&self) -> Vec<i64>;
+
+    /// What an account with no qualifying grant history yet this period starts with (ADR-0015
+    /// Decision 5). Distinct from [`Self::fail_closed_floor_micros`] -- see that method's doc
+    /// comment for why the two must never be conflated.
+    fn starting_amount_micros(&self) -> i64;
+
+    /// The fail-closed fallback for an outage or an unresolvable/unrecognized amount (ADR-0015
+    /// Decision 6) -- never used for "brand new account, no history yet," which is
+    /// [`Self::starting_amount_micros`] instead. The active policy document enforces this is
+    /// never greater than `starting_amount_micros` (see `rule_data::validate`), so an outage can
+    /// never grant more than a legitimate new signup would get.
+    fn fail_closed_floor_micros(&self) -> i64;
 }
 
 #[cfg(test)]

@@ -34,7 +34,9 @@ use lightbridge_authz_rest::handlers::AuthzStoreImpl;
 use sqlx::PgPool;
 
 const SEEDED_POLICY_SET_ID: &str = "budget-refill";
-const SEEDED_POLICY_REVISION: &str = "budget-policy-v1";
+// ADR-0015: the seeded-active revision as of migration 20260819000001 -- see the identical
+// comment in `lightbridge-authz-budget`'s own `policy_store_tests.rs`.
+const SEEDED_POLICY_REVISION: &str = "budget-policy-v2-adr0015";
 const EVALUATION_BUDGET: usize = 10_000;
 
 /// A proposed policy that genuinely differs from the seeded active one
@@ -54,7 +56,10 @@ fn proposed_rule_data_json(policy_revision: &str) -> String {
             }}
           ],
           "default_effect": "manual_review",
-          "default_reason_code": "unaided_allowance_exhausted"
+          "default_reason_code": "unaided_allowance_exhausted",
+          "allowed_amounts_micros": [6000000, 15000000, 30000000],
+          "starting_amount_micros": 15000000,
+          "fail_closed_floor_micros": 6000000
         }}"#
     )
 }
@@ -78,7 +83,10 @@ const MALFORMED_RULE_DATA: &str = r#"{
     }
   ],
   "default_effect": "manual_review",
-  "default_reason_code": "default_reason"
+  "default_reason_code": "default_reason",
+  "allowed_amounts_micros": [6000000, 15000000, 30000000],
+  "starting_amount_micros": 15000000,
+  "fail_closed_floor_micros": 6000000
 }"#;
 
 /// A scenario (`Facts`, see `crates/lightbridge-authz-budget/src/facts.rs`) with

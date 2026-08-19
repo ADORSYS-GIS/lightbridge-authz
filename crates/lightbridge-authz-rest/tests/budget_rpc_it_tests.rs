@@ -228,10 +228,19 @@ async fn every_moved_procedure_is_reachable_on_authz_budget() {
     let ctx = setup(admin_bearer(&subject), None).await;
     seed_budget_account(&ctx.verify, &subject).await;
 
+    // ADR-0015: reactivating BY DESIGN as a reachability probe -- but this file's tests all
+    // share one persistent database via `core_pool()` (no per-test `sqlx::test` isolation), so
+    // reactivating a revision here is a real, visible side effect for every test that runs
+    // after this one in the same process. It must be a revision that stays valid under the
+    // CURRENT `RuleSet` schema (`allowed_amounts_micros`/`starting_amount_micros`/
+    // `fail_closed_floor_micros` all required) -- the original `20260804000001` seed row
+    // (`budget-refill-v1`) predates ADR-0015 and no longer parses, so pointing this probe at it
+    // would silently break `PolicyStore::load_active_from_db` for every subsequent test in this
+    // binary that calls `setup()`. Use the ADR-0015 seed instead.
     let cases: [(&str, Value); 15] = [
         (
             "procedure.activateBudgetPolicy",
-            json!({ "policySetId": "budget-refill", "revisionId": "budget-refill-v1" }),
+            json!({ "policySetId": "budget-refill", "revisionId": "budget-refill-v2-adr0015" }),
         ),
         (
             "procedure.getBudgetPolicyStatus",
@@ -769,7 +778,10 @@ async fn create_budget_policy_revision_does_not_activate_it() {
             }}
           ],
           "default_effect": "manual_review",
-          "default_reason_code": "no"
+          "default_reason_code": "no",
+          "allowed_amounts_micros": [6000000, 15000000, 30000000],
+          "starting_amount_micros": 15000000,
+          "fail_closed_floor_micros": 6000000
         }}"#,
         cuid2()
     );
@@ -932,7 +944,10 @@ async fn spend_unavailable_routes_self_service_refill_to_manual_review_never_aut
         }}
       ],
       "default_effect": "deny",
-      "default_reason_code": "over_spend_cap"
+      "default_reason_code": "over_spend_cap",
+      "allowed_amounts_micros": [6000000, 15000000, 30000000],
+      "starting_amount_micros": 15000000,
+      "fail_closed_floor_micros": 6000000
     }}"#,
         cuid2()
     );

@@ -46,6 +46,10 @@ fn base_request(account_id: &str, idempotency_key: Option<String>) -> RefillRequ
         period: Period::parse(PERIOD).expect("valid period"),
         idempotency_key,
         as_of: Utc::now(),
+        // Deliberately `None` -- these tests exercise the pre-ADR-0015, `current_tier.next()`
+        // wire shape (still the live behavior for a caller that omits the field). ADR-0015's
+        // amount-based path has its own dedicated tests below.
+        requested_amount_micros: None,
     }
 }
 
@@ -113,6 +117,14 @@ fn known_zero_spend_reader() -> Arc<dyn SpendReader> {
 #[derive(Debug)]
 struct PanicIfCalledPolicyEngine;
 
+/// Shared ADR-0015 defaults for every mock `PolicyEngine` in this file -- $6/$15/$30 offered,
+/// $15 starting, $6 fail-closed floor. Kept as one function so the mocks agree with each other
+/// and with `default_rule_set_json()`'s real values, rather than each mock hand-rolling its own
+/// (possibly drifting) numbers.
+fn default_allowed_amounts_micros() -> Vec<i64> {
+    vec![6_000_000, 15_000_000, 30_000_000]
+}
+
 #[lightbridge_authz_core::async_trait]
 impl PolicyEngine for PanicIfCalledPolicyEngine {
     async fn evaluate(
@@ -123,6 +135,18 @@ impl PolicyEngine for PanicIfCalledPolicyEngine {
         panic!(
             "PolicyEngine::evaluate must not be called when the account is already at the top rung"
         );
+    }
+
+    fn allowed_amounts_micros(&self) -> Vec<i64> {
+        default_allowed_amounts_micros()
+    }
+
+    fn starting_amount_micros(&self) -> i64 {
+        15_000_000
+    }
+
+    fn fail_closed_floor_micros(&self) -> i64 {
+        6_000_000
     }
 }
 
@@ -139,6 +163,18 @@ impl PolicyEngine for AlwaysErrPolicyEngine {
         Err(BudgetError::StorageFailed(
             "simulated policy engine outage".to_string(),
         ))
+    }
+
+    fn allowed_amounts_micros(&self) -> Vec<i64> {
+        default_allowed_amounts_micros()
+    }
+
+    fn starting_amount_micros(&self) -> i64 {
+        15_000_000
+    }
+
+    fn fail_closed_floor_micros(&self) -> i64 {
+        6_000_000
     }
 }
 
@@ -178,6 +214,18 @@ impl PolicyEngine for CountingAutoApprovePolicyEngine {
             policy_revision: "counting-test-revision".to_string(),
             obligations: Obligations::default(),
         })
+    }
+
+    fn allowed_amounts_micros(&self) -> Vec<i64> {
+        default_allowed_amounts_micros()
+    }
+
+    fn starting_amount_micros(&self) -> i64 {
+        15_000_000
+    }
+
+    fn fail_closed_floor_micros(&self) -> i64 {
+        6_000_000
     }
 }
 
@@ -414,7 +462,10 @@ async fn manual_review_decision_records_reason_codes_and_matched_rule_ids_from_t
         }
       ],
       "default_effect": "deny",
-      "default_reason_code": "unreachable_default"
+      "default_reason_code": "unreachable_default",
+      "allowed_amounts_micros": [6000000, 15000000, 30000000],
+      "starting_amount_micros": 15000000,
+      "fail_closed_floor_micros": 6000000
     }"#;
     let engine: Arc<dyn PolicyEngine> =
         Arc::new(RuleDataEngine::new(rule_data, 1_000).expect("valid rule set"));

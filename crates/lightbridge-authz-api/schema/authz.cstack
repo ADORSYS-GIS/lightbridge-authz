@@ -674,12 +674,21 @@ type AugmentationRequestPage {
 // already-plumbed-through signal on this RPC surface today that distinguishes an OIDC-human
 // caller from an internal/API-key-derived one (see `Procedures::request_budget_refill`'s own doc
 // comment, and this PR's description, for exactly what was checked and why).
+//
+// `requestedAmountMicros` (ADR-0015): the caller-chosen amount, checked against the active
+// policy's offered set (`MyBudgetRefillLadder.allowedAmountsMicros`) before evaluation.
+// Deliberately optional and additive, NOT a replacement for the pre-ADR-0015 shape: omitting it
+// preserves exactly today's behavior (`current_tier.next()`), so a live client that has not yet
+// redeployed to send it keeps working unchanged against this same backend deploy. Tracked for
+// removal (making it required, dropping the derivation) once every caller sends it -- same
+// follow-up as `MyBudgetRefillLadder.ladder` below.
 type RequestBudgetRefillInput {
   budgetAccountId String
   accountId String
   projectId String?
   period String
   idempotencyKey String?
+  requestedAmountMicros String?
 }
 
 mutation procedure requestBudgetRefill(args: RequestBudgetRefillInput): AugmentationRequest
@@ -693,15 +702,15 @@ mutation procedure requestBudgetRefill(args: RequestBudgetRefillInput): Augmenta
 // `RefillService::refill_status`'s own doc comment). `nextTier`/`nextTierAmountMicros` are `null`
 // exactly when the caller is already on the top rung (`b-1000`).
 //
-// `ladder` is the full, static ADR-0008 rung list (`BudgetTier::ALL`) so the frontend never
-// hand-maintains its own copy of it as a selector's option list -- see
-// `packages/hooks/src/budget-tiers.ts` on the converse-frontends side for the existing
-// display-only mirror this is meant to backstop, not replace.
-//
-// Built for the tier-visibility screen: converse-frontends#148 already established a tier picker
-// cannot be built because the caller doesn't choose the tier (`RefillService::request_refill`
-// always resolves `current_tier.next()` itself) -- this procedure exists so the UI can show the
-// ladder instead of pretending to offer a choice.
+// ⚠️ ADR-0015 superseded the "caller chooses nothing" model this type was originally built
+// under (see the removed paragraph this comment used to carry, and ADR-0015 itself for the full
+// reversal and why converse-frontends#148's original objection no longer applies -- policy still
+// gates every requested amount). `currentTier`/`currentTierAmountMicros`/`nextTier`/
+// `nextTierAmountMicros`/`ladder` are kept BYTE-FOR-BYTE as before ADR-0015 -- converse-
+// frontends#185 is live in production reading exactly this shape, and deploying a backend that
+// dropped or changed these fields would break it immediately. Do not remove or reshape them
+// until a converse-frontends PR has switched to `allowedAmountsMicros` and deployed; then remove
+// in a follow-up (tracked alongside `RequestBudgetRefillInput.requestedAmountMicros` above).
 type BudgetLadderRung {
   tier String
   amountMicros String
@@ -715,6 +724,11 @@ type MyBudgetRefillLadder {
   nextTier String?
   nextTierAmountMicros String?
   ladder BudgetLadderRung[]
+  // ADR-0015: the self-service refill amounts currently offered by the active policy, strictly
+  // ascending micro-USD strings (e.g. `["6000000", "15000000", "30000000"]` for $6/$15/$30).
+  // This is the source of truth going forward for what `requestBudgetRefill.requestedAmountMicros`
+  // may legally be -- `ladder` above is a frozen pre-ADR-0015 snapshot, not this.
+  allowedAmountsMicros String[]
 }
 
 type GetMyBudgetRefillLadderInput {

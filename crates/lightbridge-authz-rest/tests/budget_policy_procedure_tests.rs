@@ -29,8 +29,10 @@ use lightbridge_authz_rest::handlers::AuthzStoreImpl;
 use sqlx::PgPool;
 
 const SEEDED_POLICY_SET_ID: &str = "budget-refill";
-const SEEDED_POLICY_REVISION: &str = "budget-policy-v1";
-const SEEDED_REVISION_ID: &str = "budget-refill-v1";
+// ADR-0015: the seeded-active revision as of migration 20260819000001 -- see the identical
+// comment in `lightbridge-authz-budget`'s own `policy_store_tests.rs`.
+const SEEDED_POLICY_REVISION: &str = "budget-policy-v2-adr0015";
+const SEEDED_REVISION_ID: &str = "budget-refill-v2-adr0015";
 const EVALUATION_BUDGET: usize = 10_000;
 
 /// Syntactically valid JSON, but invalid rule data (a duplicate rule id) -- exercises the real
@@ -53,7 +55,10 @@ const MALFORMED_RULE_DATA: &str = r#"{
     }
   ],
   "default_effect": "manual_review",
-  "default_reason_code": "default_reason"
+  "default_reason_code": "default_reason",
+  "allowed_amounts_micros": [6000000, 15000000, 30000000],
+  "starting_amount_micros": 15000000,
+  "fail_closed_floor_micros": 6000000
 }"#;
 
 fn valid_replacement_rule_data(policy_revision: &str) -> String {
@@ -69,7 +74,10 @@ fn valid_replacement_rule_data(policy_revision: &str) -> String {
             }}
           ],
           "default_effect": "manual_review",
-          "default_reason_code": "unaided_allowance_exhausted"
+          "default_reason_code": "unaided_allowance_exhausted",
+          "allowed_amounts_micros": [6000000, 15000000, 30000000],
+          "starting_amount_micros": 15000000,
+          "fail_closed_floor_micros": 6000000
         }}"#
     )
 }

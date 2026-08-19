@@ -166,7 +166,8 @@ fn budget_error_to_cratestack_error(err: lightbridge_authz_budget::BudgetError) 
         | BudgetError::UnknownTier(_)
         | BudgetError::UnknownStatus(_)
         | BudgetError::InvalidReviewOutcome(_)
-        | BudgetError::MissingRejectionReason => CratestackError::BadRequest(err.to_string()),
+        | BudgetError::MissingRejectionReason
+        | BudgetError::AmountNotOffered(_) => CratestackError::BadRequest(err.to_string()),
         BudgetError::AlreadyGranted | BudgetError::AlreadyReviewed(_) => {
             CratestackError::Conflict(err.to_string())
         }
@@ -333,6 +334,11 @@ fn to_schema_my_budget_refill_ladder(
                 tier: rung.tier.to_string(),
                 amountMicros: rung.amount_micros.to_string(),
             })
+            .collect(),
+        allowedAmountsMicros: status
+            .allowed_amounts_micros
+            .into_iter()
+            .map(|amount| amount.to_string())
             .collect(),
     }
 }
@@ -1240,6 +1246,20 @@ impl schema::procedures::ProcedureRegistry for Procedures {
             let period = lightbridge_authz_budget::Period::parse(&input.period)
                 .map_err(budget_error_to_cratestack_error)?;
 
+            // ADR-0015: optional and additive -- `None` when the caller omits the field
+            // preserves the pre-ADR-0015 wire shape exactly (`RefillRequest::
+            // requested_amount_micros`'s own doc comment covers why).
+            let requested_amount_micros = input
+                .requestedAmountMicros
+                .map(|raw| {
+                    raw.trim().parse::<i64>().map_err(|_| {
+                        CratestackError::BadRequest(format!(
+                            "requestedAmountMicros must be a valid integer, got '{raw}'"
+                        ))
+                    })
+                })
+                .transpose()?;
+
             let request = lightbridge_authz_budget::RefillRequest {
                 budget_account_id: input.budgetAccountId,
                 account_id: input.accountId,
@@ -1247,6 +1267,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 period,
                 idempotency_key: input.idempotencyKey,
                 as_of: chrono::Utc::now(),
+                requested_amount_micros,
             };
 
             let created = refill_service
