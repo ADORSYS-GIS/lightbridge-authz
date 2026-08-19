@@ -23,6 +23,11 @@ controllers:
       surge: 1
     podDisruptionBudget:
       maxUnavailable: 1
+    # Second (later) sync-wave than `migrate` below -- see the matching comment in
+    # charts/lightbridge-authz/values.yaml (docs/adr/0016-migrate-job-sync-wave-not-hook.md) for
+    # the full incident/reasoning this mirrors.
+    annotations:
+      "argocd.argoproj.io/sync-wave": "2"
     containers:
       authz:
         image:
@@ -82,16 +87,23 @@ controllers:
 
   migrate:
     type: job
+    # NOT a Helm hook -- see charts/lightbridge-authz/values.yaml's matching `migrate` block
+    # (docs/adr/0016-migrate-job-sync-wave-not-hook.md) for the full incident/reasoning this
+    # mirrors: the old `post-install,post-upgrade` hook is a PostSync hook that only fires once
+    # every non-hook resource (including `main` above) is already Healthy, which deadlocks
+    # permanently the moment a migration is itself a precondition for the new pods to pass their
+    # readiness probe. `argocd.argoproj.io/sync-wave: "1"` runs this Job in an earlier wave than
+    # `main`'s wave "2" instead, unconditionally.
+    suffix: '{{ printf "%s:%s" .Values.global.authz_usage.image.repository .Values.global.authz_usage.image.version | sha256sum | trunc 10 }}'
     job:
       backoffLimit: 3
-      # Backstop against ArgoCD's helm.sh/hook-delete-policy cleanup silently not firing -- see the
-      # matching comment in charts/lightbridge-authz/values.yaml for the incident this guards
-      # against (a stuck migrate Job silently blocked every future deploy's migration from running).
-      ttlSecondsAfterFinished: 300
+      # 7-day retention for post-incident inspection, on the native Kubernetes Job-controller GC
+      # path -- see the matching comment in charts/lightbridge-authz/values.yaml for why this is
+      # no longer "clean up before the next deploy's static name collides" (the `suffix` above
+      # means each distinct image gets its own Job name, so there is nothing left to collide).
+      ttlSecondsAfterFinished: 604800
     annotations:
-      "helm.sh/hook": post-install,post-upgrade
-      "helm.sh/hook-weight": "-5"
-      "helm.sh/hook-delete-policy": hook-succeeded
+      "argocd.argoproj.io/sync-wave": "1"
     containers:
       authz:
         image:
