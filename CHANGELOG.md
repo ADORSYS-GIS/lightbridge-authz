@@ -1,5 +1,26 @@
 # Changelog
 
+## [3.7.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.6.1...v3.7.0) (2026-08-19)
+
+
+### Features
+
+* **budget:** ADR-0015 -- refill amounts become admin-configured policy ranges ([#386](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/386)) ([b7a09d7](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/b7a09d72f0d7b3975ee7a56005e979148d6b7e38))
+* **budget:** paginate listPendingAugmentationRequests + add listMyAugmentationRequests ([#296](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/296), [#295](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/295)) ([#376](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/376)) ([3b3f447](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/3b3f44752c383462af8357155694488373e828c9))
+* **budget:** read-only getMyBudgetRefillLadder for tier visibility ([#380](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/380)) ([9800cac](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/9800cac2c526d99b181355523beeac6b81db6441))
+* **budget:** stamp budget_tier claim at token-mint time (ADR-0014, [#196](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/196)) ([#381](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/381)) ([3e62041](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/3e62041dd390bc9a7212e57b8c596ab4500047da))
+* **rest:** add read-only listModelCatalog RPC procedure ([#392](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/392)) ([fc2bbb2](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/fc2bbb23b57f6c8aba62a157e31c7a0bcb93fc3e))
+* **rest:** enable native redis TLS (tls-rustls) for rediss:// ([#363](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/363)) ([#374](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/374)) ([a700e90](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/a700e90da1b9efad15c6a52e3149380830ec64f2))
+
+
+### Bug Fixes
+
+* **authz:** enforce QuotaTiers catalogue on createAccount and setProjectMemberQuotaTier ([#177](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/177)) ([#375](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/375)) ([e0a6310](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/e0a6310f45cec8e52076ead4f3851bcd92d27c54))
+* **charts:** replace migrate Job's Helm hook with an ArgoCD sync-wave ([#394](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/394)) ([45a4493](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/45a449305799e4809020e2053bb498aacdaa3214))
+* **rest:** correct CoolContext/CoolError typo in getMyBudgetRefillLadder ([#382](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/382)) ([fad91a3](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/fad91a33dace9530b36fdb9fc6aab67d41d130b1))
+* **rest:** stop /rpc/batch mis-encoding every null as CBOR empty array ([#391](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/391)) ([c066ddd](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/c066ddd0ac36de86a465b12512460fad2764a555))
+* **tests:** port TLS test helpers to rcgen 0.14's Issuer-based signed_by ([#378](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/378)) ([4a5db94](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/4a5db94b083f5dc812850209f5b2d183ec9e7ea9))
+
 ## [3.6.1](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.6.0...v3.6.1) (2026-08-18)
 
 
