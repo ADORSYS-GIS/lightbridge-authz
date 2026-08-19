@@ -2826,6 +2826,7 @@ dependencies = [
  "lightbridge-authz-budget",
  "lightbridge-authz-core",
  "minicbor",
+ "minicbor-serde",
  "rand_core 0.6.4",
  "rcgen",
  "redis",

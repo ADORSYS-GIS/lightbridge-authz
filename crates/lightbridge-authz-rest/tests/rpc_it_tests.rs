@@ -2528,25 +2528,21 @@ async fn budget_gated_op_ids_are_unreachable_on_authz_api_even_for_an_admin() {
     }
 }
 
-/// Regression test for a production bug report: creating a non-expiring API key (the "No expiry"
-/// option added in converse-frontends#182) failed with the generic `invalid_argument` /
-/// "invalid request payload" error. The report captured the request as CBOR `map(4)` with
-/// `expiresAt` as CBOR `null` (0xf6) -- distinct from the `createProject` incident above, which
-/// was CBOR `undefined` (0xf7). This frame is built to be byte-for-byte what the real frontend's
-/// `cborg` encoder produces for `{ args: { name, expiresAt: null, projectId, billingPlan } }`
-/// (verified against a real `cborg.encode(stripUndefined(...))` run, matching
-/// `converse-frontends/packages/authz-rpc/src/codec.ts`): a real CBOR `null`, definite-length
-/// maps, definite-length text strings.
+/// Covers the *direct* `/rpc/procedure.createApiKey` half of the production bug report (creating
+/// a non-expiring API key -- the "No expiry" option added in converse-frontends#182 -- failed
+/// with the generic `invalid_argument` / "invalid request payload" error). This frame is built to
+/// be byte-for-byte what `cborg` produces for `{ args: { name, expiresAt: null, projectId,
+/// billingPlan } }` (verified against a real `cborg.encode(stripUndefined(...))` run, matching
+/// `converse-frontends/packages/authz-rpc/src/codec.ts`).
 ///
-/// This does NOT reproduce against current `main`: `codec::tests::
-/// explicit_null_expires_at_decodes_as_none_for_create_api_key_input` already proves the codec
-/// layer accepts it in isolation, and this proves the same all the way through the real router
-/// (RBAC gate, idempotency/rate-limit layers, cratestack dispatch) against a live DB -- the
-/// request succeeds and the created key has `expiresAt: null`. Kept as a permanent regression
-/// test rather than deleted: it pins down exactly the byte shape the production report described,
-/// so if a future codec/schema change reintroduces a decode failure for an explicit `null` on an
-/// `Option<DateTime<Utc>>` field, this fails immediately instead of waiting for the next prod
-/// incident.
+/// This direct-call shape was never actually broken -- see `codec.rs`'s module doc comment and
+/// `batch_create_api_key_with_real_cborg_null_expires_at_bytes` below for where the real bug was
+/// (an encode-side mis-mapping of `serde_json::Value::Null`, reachable only through
+/// `POST /rpc/batch`, which every real `createApiKey` call in `converse-frontends` actually takes
+/// -- `apps/self-service/src/app/_layout.tsx` wires `createBatchLink()` into every unary authz RPC
+/// call). Kept as a permanent regression test anyway: it pins down that the direct-call path
+/// stays safe too, so a future codec/schema change reintroducing a decode failure for an explicit
+/// `null` on an `Option<DateTime<Utc>>` field is caught immediately either way.
 #[tokio::test]
 async fn create_api_key_with_real_cborg_null_expires_at_bytes() {
     let subject = format!("owner-cborg-null-expiry-{}", cuid2());
@@ -2586,8 +2582,8 @@ async fn create_api_key_with_real_cborg_null_expires_at_bytes() {
 /// `packages/authz-rpc/generated/src/client.ts`'s `update()` -> `{ id, patch }` wire shape),
 /// exercising the PATCH double-Option path (`UpdateApiKeyInput.expiresAt` wraps as
 /// `Option<Option<DateTime>>` server-side per `field_definition`'s `wrap_for_patch`) rather than
-/// `createApiKey`'s plain `Option<DateTime>`. Also does not reproduce the production failure --
-/// kept for the same reason as its companion above.
+/// `createApiKey`'s plain `Option<DateTime>`. Same story as its companion above: this direct-call
+/// shape was always safe; kept as permanent coverage regardless.
 #[tokio::test]
 async fn update_api_key_clears_expiry_with_real_cborg_null_bytes() {
     let subject = format!("owner-cborg-null-patch-{}", cuid2());
@@ -2619,4 +2615,99 @@ async fn update_api_key_clears_expiry_with_real_cborg_null_bytes() {
     );
     let decoded = Wire::Cbor.decode::<Value>(&body);
     assert!(decoded["expiresAt"].is_null());
+}
+
+/// The actual reproduction of the production bug report, found only after the two direct-call
+/// tests above passed and testing the real captured request/response bytes (not a reconstruction)
+/// through the real batch envelope was the only thing left to try.
+///
+/// `converse-frontends` wires `createBatchLink()` (`@cratestack/link-batch`) into every unary
+/// authz RPC call (`apps/self-service/src/app/_layout.tsx`) -- it is a *terminal* link: it never
+/// calls `next` for a `kind: "unary"` request, it always queues the call and sends it later as its
+/// own `POST /rpc/batch` request (`dispatchPartition` in `@cratestack/link-batch`'s `dispatch.js`,
+/// building `{ id, op: request.opId, input: request.input }` per queued call). So `createApiKey`
+/// never actually reaches `/rpc/procedure.createApiKey` directly in this app -- every real call
+/// takes this path.
+///
+/// Root cause, confirmed with a standalone minimal reproduction outside this whole stack
+/// (`serde_json::json!(null)` through `minicbor_serde::to_vec` alone) before touching this test:
+/// `cratestack-axum`'s generated `rpc_batch_dispatch` decodes each frame's `input` into
+/// `cratestack_core::rpc::RpcRequest.input: serde_json::Value` (an intentionally opaque carrier --
+/// the dispatcher doesn't know the target procedure's concrete input type until it looks up `op`),
+/// then re-encodes *that* `serde_json::Value` back to bytes (`encode_rpc_value`) before
+/// redispatching through the normal per-op decode path. `serde_json::Value::Null`'s `Serialize`
+/// impl calls `serializer.serialize_unit()`, not `serialize_none()`; `minicbor-serde`'s own
+/// `serialize_unit()` encodes Rust's `()` as CBOR's empty-array marker (`0x80`) by default, not
+/// `null` (`0xf6`) -- confirmed directly against `cratestack-codec-cbor`'s own source and test
+/// comments (see `codec.rs`'s module doc comment for the full citation). So `expiresAt: null`
+/// survives the *first* decode (into the opaque `serde_json::Value`) fine, gets corrupted into an
+/// empty array on the *re-encode*, and then fails the *second* decode (into the concrete
+/// `CreateApiKeyInput.expiresAt: Option<chrono::DateTime<Utc>>`) with exactly the generic
+/// `invalid_argument` / "invalid request payload" the production report described -- a CBOR empty
+/// array has no mapping onto `Option<DateTime<Utc>>` any more than it did onto a plain `DateTime`.
+///
+/// Fixed in `LenientCborCodec::encode` (`codec.rs`) by constructing a `minicbor_serde::Serializer`
+/// with `serialize_unit_as_null(true)` instead of delegating to
+/// `cratestack_codec_cbor::CborCodec::encode`'s hardcoded default. This test is the end-to-end
+/// proof: byte-for-byte what the frontend's `createBatchLink()` + `cborg` actually produce for a
+/// batched `createApiKey` call with `expiresAt: null`, sent straight at `POST /rpc/batch`.
+#[tokio::test]
+async fn batch_create_api_key_with_real_cborg_null_expires_at_bytes() {
+    let subject = format!("owner-batch-null-expiry-{}", cuid2());
+    let ctx = setup(admin_bearer(&subject)).await;
+
+    let billing_id = format!("tenant-batch-null-expiry-{}", cuid2());
+    let account_id = create_account(&ctx.router, "admin", &billing_id).await;
+    let project_id = create_project(&ctx.router, "admin", &account_id, "p-batch-null-expiry").await;
+
+    // `[{ id: 0, op: "procedure.createApiKey", input: { args: { name, billingPlan, expiresAt:
+    // null, projectId } } }]` -- the exact frame `dispatchPartition` builds for a single queued
+    // `createApiKey` call. `project_id` substituted below since the real one is generated per
+    // test run; every other byte matches a real `cborg.encode(stripUndefined(...))` run verbatim.
+    let mut raw = Vec::new();
+    let mut e = minicbor::Encoder::new(&mut raw);
+    e.array(1).unwrap();
+    e.map(3).unwrap();
+    e.str("id").unwrap();
+    e.u32(0).unwrap();
+    e.str("op").unwrap();
+    e.str("procedure.createApiKey").unwrap();
+    e.str("input").unwrap();
+    e.map(1).unwrap();
+    e.str("args").unwrap();
+    e.map(4).unwrap();
+    e.str("name").unwrap();
+    e.str("Miaou").unwrap();
+    e.str("billingPlan").unwrap();
+    e.str("free").unwrap();
+    e.str("expiresAt").unwrap();
+    e.null().unwrap();
+    e.str("projectId").unwrap();
+    e.str(&project_id).unwrap();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/rpc/batch")
+        .header("content-type", "application/cbor")
+        .header("accept", "application/cbor")
+        .header("authorization", "Bearer admin")
+        .body(Body::from(raw))
+        .unwrap();
+    let response = ctx.router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        status.is_success(),
+        "batch envelope must be 200 even if a frame fails: {status} {}",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    let frames: Vec<Value> = Wire::Cbor.decode(&bytes);
+    assert_eq!(frames.len(), 1);
+    let frame = &frames[0];
+    assert!(
+        frame.get("error").is_none(),
+        "createApiKey batch frame with null expiresAt must succeed, not error: {frame}"
+    );
+    assert!(frame["output"]["apiKey"]["expiresAt"].is_null());
 }

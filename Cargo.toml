@@ -259,6 +259,18 @@ cratestack-codec-json = "=0.8.0"
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
 # feature). See that module for why.
 minicbor = { version = "2.2", features = ["std", "half"] }
+# Direct dep (also pulled in transitively via cratestack-codec-cbor) so `LenientCborCodec::encode`
+# can construct its own `minicbor_serde::Serializer` with `serialize_unit_as_null(true)` instead of
+# going through `cratestack_codec_cbor::CborCodec::encode`'s hardcoded `minicbor_serde::to_vec`
+# (which leaves that flag at its default `false`). See `codec.rs` for the full mechanism this
+# works around: `serde_json::Value::Null`'s `Serialize` impl calls `serializer.serialize_unit()`,
+# not `serialize_none()`, and minicbor-serde's own `serialize_unit()` encodes `()` as CBOR's empty
+# array (`0x80`) rather than null (`0xf6`) unless this flag is set — confirmed directly against
+# `cratestack-codec-cbor`'s own source and test comments, which document this exact pitfall for
+# `serde_json::Value::Null` but only guard the model-projection decode path, not the
+# `/rpc/batch` handler's `RpcRequest.input: serde_json::Value` re-encode step (cratestack-axum's
+# `rpc_batch_dispatch`/`encode_rpc_value`).
+minicbor-serde = "0.6"
 # lightbridge-authz#363: `tokio-rustls-comp` is a superset of the previous `tokio-comp` (it
 # enables `tls-rustls` + `tokio-comp` together — see docs.rs/crate/redis/1.5.0/features), so
 # `rediss://` URLs now build a rustls-backed TLS connection via `redis::Client::build_with_tls`
