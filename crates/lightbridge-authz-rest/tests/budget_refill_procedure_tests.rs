@@ -19,7 +19,9 @@
 //! `UnavailableSpendReader` (no HTTP calls, no network of any kind) stands in, which is also what
 //! a real deployment falls back to when `Config.usage_service` is not configured -- see that
 //! type's own doc comment in `lightbridge-authz-budget`. The seeded default policy
-//! (`budget-policy-v1`, migrated by `migrations/20260804000001_budget_policy_sets_and_revisions.sql`)
+//! (`budget-policy-v2-adr0015`, migrated by
+//! `migrations/20260819000001_budget_policy_adr0015_amounts.sql`, superseding
+//! `20260804000001`'s original `budget-policy-v1`)
 //! only reads `self_service_grant_count`, never `spend_this_period`/`spend_last_period`, so
 //! `Spend::Unavailable` never actually changes any outcome in this file -- it is simply the
 //! correct, honest choice of reader for a test that seeds no usage data.
@@ -239,6 +241,19 @@ fn refill_args(
     budget_account_id: &str,
     idempotency_key: Option<String>,
 ) -> schema::procedures::request_budget_refill::Args {
+    refill_args_with_amount(budget_account_id, idempotency_key, None)
+}
+
+/// ADR-0015: the amount-based wire shape. `requested_amount_micros: None` (used by every
+/// pre-existing test in this file via [`refill_args`]) exercises the pre-ADR-0015
+/// `current_tier.next()` derivation; `Some(amount)` exercises the new path, which validates
+/// `amount` against the active policy's `allowed_amounts_micros` before ever calling the policy
+/// engine.
+fn refill_args_with_amount(
+    budget_account_id: &str,
+    idempotency_key: Option<String>,
+    requested_amount_micros: Option<&str>,
+) -> schema::procedures::request_budget_refill::Args {
     schema::procedures::request_budget_refill::Args {
         args: schema::RequestBudgetRefillInput {
             budgetAccountId: budget_account_id.to_string(),
@@ -246,6 +261,7 @@ fn refill_args(
             projectId: None,
             period: PERIOD.to_string(),
             idempotencyKey: idempotency_key,
+            requestedAmountMicros: requested_amount_micros.map(str::to_string),
         },
     }
 }
@@ -403,6 +419,59 @@ async fn request_refill_exhausting_allowance_returns_pending_review(pool: PgPool
     assert_eq!(
         output.requestedTier, "b-60",
         "resolves from the latest tier grant (B30) -> next is B60"
+    );
+}
+
+/// ADR-0015: the caller names the amount directly, checked against the active policy's
+/// `allowed_amounts_micros` ($6/$15/$30 in the ADR-0015 seed migration) rather than derived via
+/// `current_tier.next()`. `$6` is the new floor -- unreachable through the pre-ADR-0015
+/// `refill_args(None)` path at all, since `current_tier.next()` starting from a fresh account's
+/// implicit `B15` can only ever request `B30` next. This is the test that actually exercises the
+/// new floor being requestable.
+#[sqlx::test(migrations = "../../migrations")]
+async fn request_refill_with_a_named_amount_in_the_offered_set_auto_approves(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let (procedures, ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let db = lazy_cratestack_db();
+
+    let output = request_refill(
+        &procedures,
+        &db,
+        &ctx,
+        refill_args_with_amount(&account_id, None, Some("6000000")),
+    )
+    .await
+    .expect("an amount in the offered set must succeed");
+
+    assert_eq!(output.status, "auto_approved");
+    assert_eq!(output.approvedAmountMicros.as_deref(), Some("6000000"));
+}
+
+/// ADR-0015's structural rejection: an amount that is not a member of the active policy's
+/// `allowed_amounts_micros` must be refused before an `AugmentationRequest` row is ever created
+/// or the policy engine is ever consulted -- distinct from a policy `Deny`/`ManualReview`
+/// decision, which only exists for amounts that were legitimately offered.
+#[sqlx::test(migrations = "../../migrations")]
+async fn request_refill_with_an_amount_not_offered_is_rejected(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let (procedures, ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let db = lazy_cratestack_db();
+
+    // $17 is not one of the seeded $6/$15/$30 offered amounts.
+    let result = request_refill(
+        &procedures,
+        &db,
+        &ctx,
+        refill_args_with_amount(&account_id, None, Some("17000000")),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(CratestackError::BadRequest(_))),
+        "an amount outside the offered set must be a BadRequest, not silently accepted or a \
+         different error kind: {result:?}"
     );
 }
 
@@ -784,6 +853,33 @@ async fn get_my_budget_refill_ladder_matches_what_a_real_refill_would_request(po
     assert_eq!(
         refill.requestedTier, "b-30",
         "the preview's nextTier must match what request_refill actually requests, not drift from it"
+    );
+}
+
+/// ADR-0015: `allowedAmountsMicros` must be present ALONGSIDE the untouched pre-ADR-0015 fields,
+/// not instead of them -- proves the additive contract the coordinator required: converse-
+/// frontends#185 is live in production reading `currentTier`/`ladder`/etc., so a backend deploy
+/// that dropped or reshaped those fields would break it the instant it shipped. This test would
+/// catch that regression by construction: it asserts both halves of the response in one place.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_my_budget_refill_ladder_is_additive_both_legacy_and_new_fields_present(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let (procedures, ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let db = lazy_cratestack_db();
+
+    let status = get_ladder(&procedures, &db, &ctx, ladder_args())
+        .await
+        .expect("a fresh account's ladder status must succeed");
+
+    // Pre-ADR-0015, unchanged -- the live frontend's existing contract.
+    assert_eq!(status.currentTier, "b-15");
+    assert_eq!(status.ladder.len(), 7);
+
+    // ADR-0015, new -- what `allowed_amounts_micros` for `requestBudgetRefill` looks like.
+    assert_eq!(
+        status.allowedAmountsMicros,
+        vec!["6000000", "15000000", "30000000"]
     );
 }
 

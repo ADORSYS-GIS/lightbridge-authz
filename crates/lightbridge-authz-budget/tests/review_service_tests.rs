@@ -157,6 +157,7 @@ async fn seed_pending_review_via_refill_service(pool: &PgPool, account_id: &str)
             period: Period::parse(PERIOD).expect("valid period"),
             idempotency_key: None,
             as_of: chrono::Utc::now(),
+            requested_amount_micros: None,
         })
         .await
         .expect("the exhausted-allowance refill must succeed, queued for review");

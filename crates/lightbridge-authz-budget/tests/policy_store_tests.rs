@@ -11,8 +11,12 @@ use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use sqlx::PgPool;
 
 const SEEDED_POLICY_SET_ID: &str = "budget-refill";
-const SEEDED_POLICY_REVISION: &str = "budget-policy-v1";
-const SEEDED_REVISION_ID: &str = "budget-refill-v1";
+// ADR-0015: the seeded-active revision as of migration 20260819000001, which supersedes
+// 20260804000001's original `budget-policy-v1`/`budget-refill-v1` seed (still present as an
+// inactive row -- migrations are immutable, so the ADR-0015 migration inserts and activates a
+// second revision rather than editing the first).
+const SEEDED_POLICY_REVISION: &str = "budget-policy-v2-adr0015";
+const SEEDED_REVISION_ID: &str = "budget-refill-v2-adr0015";
 const EVALUATION_BUDGET: usize = 1_000;
 
 /// Deliberately valid JSON *syntax* (so a JSONB column would happily store it) but invalid rule
@@ -38,7 +42,10 @@ const MALFORMED_RULE_DATA: &str = r#"{
     }
   ],
   "default_effect": "manual_review",
-  "default_reason_code": "default_reason"
+  "default_reason_code": "default_reason",
+  "allowed_amounts_micros": [6000000, 15000000, 30000000],
+  "starting_amount_micros": 15000000,
+  "fail_closed_floor_micros": 6000000
 }"#;
 
 fn facts_with_grant_count(self_service_grant_count: i32) -> Facts {
@@ -63,7 +70,10 @@ fn valid_replacement_rule_data(policy_revision: &str, threshold: i64) -> String 
             }}
           ],
           "default_effect": "manual_review",
-          "default_reason_code": "unaided_allowance_exhausted"
+          "default_reason_code": "unaided_allowance_exhausted",
+          "allowed_amounts_micros": [6000000, 15000000, 30000000],
+          "starting_amount_micros": 15000000,
+          "fail_closed_floor_micros": 6000000
         }}"#
     )
 }

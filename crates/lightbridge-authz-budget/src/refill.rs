@@ -65,6 +65,13 @@ pub struct RefillRequest {
     pub period: Period,
     pub idempotency_key: Option<String>,
     pub as_of: DateTime<Utc>,
+    /// ADR-0015: the caller-chosen amount, validated against the active policy's
+    /// `allowed_amounts_micros` before evaluation. `None` is the pre-ADR-0015 wire shape --
+    /// preserved deliberately so a live caller that has not yet been redeployed to send this
+    /// field keeps getting exactly today's behavior (`current_tier.next()`), rather than the
+    /// backend deploy breaking it out from under it. Transitional: tracked for removal once
+    /// every caller sends `Some`, in the same follow-up as [`RefillStatus::ladder`].
+    pub requested_amount_micros: Option<i64>,
 }
 
 /// One rung on the ADR-0008 ladder, paired with the dollar amount (in micros) it represents. Part
@@ -79,9 +86,17 @@ pub struct LadderRung {
 /// does and does not guarantee.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RefillStatus {
+    /// ADR-0008-era fields, kept byte-for-byte as today. Transitional -- `converse-frontends`
+    /// still reads them in production (#185); do not remove until a frontend PR has switched to
+    /// `allowed_amounts_micros` and deployed. Tracked for removal in the same follow-up issue as
+    /// [`RefillRequest::requested_amount_micros`]'s optionality.
     pub current_tier: BudgetTier,
     pub next_tier: Option<BudgetTier>,
     pub ladder: Vec<LadderRung>,
+    /// ADR-0015: the self-service refill amounts currently offered by the active policy,
+    /// strictly ascending. This is the source of truth going forward; `ladder` above is a
+    /// frozen, pre-ADR-0015 snapshot shape kept only for the live frontend's current contract.
+    pub allowed_amounts_micros: Vec<i64>,
 }
 
 /// Orchestrates one refill request end to end: idempotency short-circuit, tier resolution, policy
@@ -157,6 +172,7 @@ impl RefillService {
                     amount_micros: tier.amount().get(),
                 })
                 .collect(),
+            allowed_amounts_micros: self.policy_engine.allowed_amounts_micros(),
         })
     }
 
@@ -173,6 +189,19 @@ impl RefillService {
     ///   `correction` shifted the raw ledger total in a way that makes the *most recent
     ///   tier-grant* no longer reflect current reality -- or just data this service doesn't
     ///   expect in practice).
+    ///
+    /// ⚠️ ADR-0015: this method, and the `BudgetTier` enum it returns, are now used **only** by
+    /// the transitional [`RefillStatus`] fields (`current_tier`/`next_tier`/`ladder`) and the
+    /// transitional `requested_amount_micros: None` branch of [`Self::request_refill`] -- both
+    /// scheduled for removal once the frontend switches to `allowed_amounts_micros`. The
+    /// `BudgetTier` enum has no representation for amounts introduced by policy after ADR-0015
+    /// (e.g. a $6 floor below `B15`), so this fallback deliberately still resolves to `B15`
+    /// exactly as before ADR-0015 rather than to the policy-configured floor -- fixing that would
+    /// require either extending this enum (rejected; ADR-0015 moved amounts out of it on purpose)
+    /// or deleting this transitional path early (breaks the live frontend, see ADR-0015 and the
+    /// `MyBudgetRefillLadder`/`RequestBudgetRefillInput` doc comments in `authz.cstack`). The
+    /// real, policy-sourced floor (`fail_closed_floor_micros`) is what every new/current caller
+    /// actually observes, since it is not read through this method at all.
     async fn current_tier(
         &self,
         budget_account_id: &str,
@@ -230,13 +259,35 @@ impl RefillService {
             return Ok(existing);
         }
 
-        let current_tier = self
-            .current_tier(&request.budget_account_id, &request.period)
-            .await?;
-
-        let Some(requested_tier) = current_tier.next() else {
-            return self.deny_already_at_top_rung(&request, current_tier).await;
-        };
+        // ADR-0015: `Some` is the current, policy-driven path -- the caller names an amount and
+        // it is checked against the active policy's offered set. `None` is the pre-ADR-0015 wire
+        // shape, preserved so a live caller that has not yet redeployed to send this field keeps
+        // getting exactly today's behavior. See `RefillRequest::requested_amount_micros`'s own
+        // doc comment for why this branch exists and when it may be removed.
+        let (requested_tier, requested_amount_micros): (BudgetTier, i64) =
+            match request.requested_amount_micros {
+                Some(amount) => {
+                    let allowed = self.policy_engine.allowed_amounts_micros();
+                    if !allowed.contains(&amount) {
+                        return Err(BudgetError::AmountNotOffered(amount));
+                    }
+                    // Best-effort display label only -- see `Self::current_tier`'s doc comment on
+                    // why an amount outside the legacy `BudgetTier` enum (e.g. the $6 floor) has
+                    // no exact label and falls back to `B15` here. `requested_amount_micros`
+                    // below is the authoritative value; this label is not.
+                    let label = BudgetTier::from_amount_micros(amount).unwrap_or(BudgetTier::B15);
+                    (label, amount)
+                }
+                None => {
+                    let current_tier = self
+                        .current_tier(&request.budget_account_id, &request.period)
+                        .await?;
+                    let Some(next_tier) = current_tier.next() else {
+                        return self.deny_already_at_top_rung(&request, current_tier).await;
+                    };
+                    (next_tier, next_tier.amount().get())
+                }
+            };
 
         let created = self
             .augmentation_repo
@@ -246,7 +297,7 @@ impl RefillService {
                 project_id: request.project_id.clone(),
                 period: request.period.clone(),
                 requested_tier,
-                requested_amount_micros: requested_tier.amount().get(),
+                requested_amount_micros,
                 idempotency_key: request.idempotency_key.clone(),
             })
             .await?;
@@ -255,7 +306,7 @@ impl RefillService {
 
         let decision = match self
             .policy_engine
-            .evaluate(&facts, requested_tier.amount().get())
+            .evaluate(&facts, requested_amount_micros)
             .await
         {
             Ok(decision) => decision,
