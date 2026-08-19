@@ -39,6 +39,20 @@ controllers:
     # schema-documented key). `maxUnavailable: 1` matches that existing prod convention.
     podDisruptionBudget:
       maxUnavailable: 1
+    # Second (later) sync-wave than `migrate` below (ADR: docs/adr/0016-migrate-job-sync-wave-not-hook.md).
+    # ArgoCD applies wave N and waits for it to be Healthy before starting wave N+1, so the new
+    # image's pods are never even created until the `migrate` Job of the SAME sync has completed
+    # successfully. If migrate fails (Degraded, backoffLimit exhausted), the sync stops here --
+    # this Deployment is never touched, so the currently-running (already-migrated) pods keep
+    # serving. That is the fail-closed guarantee this deliberately replaces the old
+    # `post-install,post-upgrade` Helm hook with: a PostSync hook only runs once every
+    # non-hook resource -- including this Deployment -- is already Healthy, which is exactly
+    # backwards when a migration is a startup precondition, and is what produced the prod
+    # deadlock this ADR fixes (the new image can never pass its readiness probe without the
+    # migration, so the Deployment can never go Healthy, so the PostSync hook that would run the
+    # migration never fires).
+    annotations:
+      "argocd.argoproj.io/sync-wave": "2"
     containers:
       authz:
         image:
@@ -114,20 +128,47 @@ controllers:
 
   migrate:
     type: job
+    # NOT a Helm hook (see docs/adr/0016-migrate-job-sync-wave-not-hook.md for the full incident
+    # and reasoning). This used to be a `post-install,post-upgrade` hook, which ArgoCD runs as a
+    # PostSync hook -- fired only after every non-hook resource in the sync (including the `main`
+    # Deployment above) is already Healthy. ADR-0015 made a rule-data field required at startup,
+    # so the new pods can never pass their readiness probe without this migration having already
+    # run -- meaning the Deployment can never go Healthy, so the PostSync hook that would run the
+    # migration never fires. Confirmed live in prod 2026-08-19: `argocd app resources` showed zero
+    # Job objects anywhere in the tree (managed or orphaned) and the sync operation's own
+    # `syncResult.resources` never listed a `batch/Job` entry at all -- the Job was never created,
+    # not created-then-deleted. `argocd.argoproj.io/sync-wave: "1"` below replaces the hook: an
+    # ordinary, ArgoCD-tracked resource that runs and must go Healthy (Job Complete) in an earlier
+    # wave than `main`'s wave "2", regardless of whether `main`'s pods are, or will ever be, ready.
+    #
+    # `suffix` (rendered via the same generic bjw-s/common `tpl` pass already used for this
+    # chart's image repository/tag strings) ties this Job's own name to the image actually being
+    # deployed. Kubernetes Jobs are otherwise immutable -- PR #150's incident was a STATIC-named
+    # hook Job that got stuck and then silently no-op'd against every later deploy's attempt to
+    # re-apply the same name with a different spec. A per-image name sidesteps that permanently:
+    # a new image tag renders a new Job name (guaranteed to run), while re-syncing the SAME image
+    # (e.g. a values-only change) re-renders the SAME name with an identical spec, which is a
+    # true no-op, not a collision. Rejected alternatives: (1) a values-wide checksum suffix --
+    # would mint a pointless new migrate Job on every unrelated values change (e.g. an Ingress
+    # annotation), which the image tag alone does not; (2) `argocd.argoproj.io/sync-options:
+    # Replace=true` on a static name -- forces `kubectl replace` on literally every sync/reconcile
+    # (including ArgoCD's periodic no-op resyncs and every `selfHeal` pass), so the Job would be
+    # deleted and recreated every few minutes even when nothing changed, defeating the
+    # "inspectable" half of this same ADR; (3) `generateName` -- ArgoCD tracks/diffs managed
+    # resources by exact name, so a random per-apply suffix cannot be reconciled against the
+    # desired manifest and is a documented ArgoCD anti-pattern.
+    suffix: '{{ printf "%s:%s" .Values.global.authz.image.repository .Values.global.authz.image.version | sha256sum | trunc 10 }}'
     job:
       backoffLimit: 3
-      # Backstop against ArgoCD's helm.sh/hook-delete-policy cleanup silently not firing (observed
-      # in prod: a completed migrate Job from 2026-07-23 was never deleted, and since this Job's
-      # name is static -- not revision-hashed, a bjw-s/common `job` controller limitation -- every
-      # subsequent deploy's hook-creation step then no-ops against the stale, already-existing,
-      # immutable Job object instead of running a fresh migration. `ttlSecondsAfterFinished` is a
-      # native Kubernetes Job-controller GC mechanism, independent of ArgoCD's hook-finalizer path,
-      # so cleanup no longer depends on that one mechanism working correctly.
-      ttlSecondsAfterFinished: 300
+      # Bounded retention, not the old hook-delete-policy's job of "clean up so the next deploy's
+      # static name doesn't collide" -- that concern no longer exists (see `suffix` above). This
+      # is purely "how long does a completed migration stay inspectable" now: 7 days is enough to
+      # diagnose an incident like this one after the fact (`kubectl describe job`, `kubectl logs`)
+      # without Jobs accumulating forever, and runs on the native Kubernetes Job-controller GC
+      # path, independent of ArgoCD's hook-finalizer / prune machinery entirely.
+      ttlSecondsAfterFinished: 604800
     annotations:
-      "helm.sh/hook": post-install,post-upgrade
-      "helm.sh/hook-weight": "-5"
-      "helm.sh/hook-delete-policy": hook-succeeded
+      "argocd.argoproj.io/sync-wave": "1"
     containers:
       authz:
         image:
