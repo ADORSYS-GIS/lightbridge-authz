@@ -60,6 +60,15 @@ pub struct Config {
     /// real tier catalogue (see `QuotaTiers::is_allowed`).
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub quota_tiers: QuotaTiers,
+    /// The operator-configured AI-model catalogue backing `listModelCatalog`, a read-only display
+    /// aid for a `Project.allowedModels` editor (e.g. a checkbox picker in the self-service UI) --
+    /// see that procedure's schema doc comment. Same env-driven loading shape as `billing` above,
+    /// but like `quota_tiers` (unlike `billing`) an empty/absent catalogue is the supported default:
+    /// there is nothing here to validate a write against (`allowedModels` stays unvalidated free-form
+    /// at write time), so a deployment that has not configured a catalogue yet simply serves an empty
+    /// list rather than failing to start.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub models: ModelCatalog,
 }
 
 /// The operator-configured catalogue of billing plans. Populated from env — either a single
@@ -320,6 +329,95 @@ where
     }
 
     deserializer.deserialize_any(TiersVisitor)
+}
+
+/// The operator-configured catalogue of AI models a `Project.allowedModels` editor may offer.
+/// Populated from env — either a single `MODEL_CATALOG` JSON-array env var (e.g.
+/// `models: "${MODEL_CATALOG}"`) or an inline YAML/JSON sequence of model objects — the same
+/// shape and env-driven loading as `Billing`/`QuotaTiers` above. Unlike `Billing`, an empty/absent
+/// catalogue is the supported default (see the `Config::models` field doc comment): this is a
+/// read-only display aid, not something a write path validates against, so there is nothing here
+/// that needs to fail startup when unset.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ModelCatalog {
+    #[serde(default, deserialize_with = "deserialize_model_list")]
+    pub models: Vec<ModelCatalogEntry>,
+}
+
+/// A single catalogue entry. `id` is the model id a caller would place in
+/// `Project.allowedModels`; `name` is the human-facing label for a UI checkbox list.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+pub struct ModelCatalogEntry {
+    pub id: String,
+    pub name: String,
+}
+
+impl ModelCatalog {
+    /// The configured model ids, mainly useful for tests/diagnostics -- `listModelCatalog` itself
+    /// returns the full entries, not just ids.
+    pub fn model_ids(&self) -> Vec<&str> {
+        self.models.iter().map(|m| m.id.as_str()).collect()
+    }
+}
+
+/// Accepts a JSON-array string (the single-env-var case, e.g. `${MODEL_CATALOG}`), an inline
+/// YAML/JSON sequence of model objects, or null/blank. A null value or a blank/unset env var yields
+/// an empty catalogue rather than a parse error -- mirrors `deserialize_plan_list`/
+/// `deserialize_tier_list` above.
+fn deserialize_model_list<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<ModelCatalogEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ModelsVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ModelsVisitor {
+        type Value = Vec<ModelCatalogEntry>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a JSON-array string, a sequence of model catalogue entries, or null")
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Ok(Vec::new());
+            }
+            serde_json::from_str(trimmed).map_err(E::custom)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut models = Vec::new();
+            while let Some(model) = seq.next_element::<ModelCatalogEntry>()? {
+                models.push(model);
+            }
+            Ok(models)
+        }
+    }
+
+    deserializer.deserialize_any(ModelsVisitor)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -984,6 +1082,48 @@ mod tests {
         let ok: Billing =
             from_str("plans:\n  - id: free\n    name: Free\n  - id: pro\n    name: Pro\n").unwrap();
         assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn model_catalog_parse_from_json_env_string() {
+        let json = r#"[{"id":"dev-model-a","name":"Dev Model A"},{"id":"dev-model-b","name":"Dev Model B"}]"#;
+        let catalog: ModelCatalog = from_str(&format!("models: '{json}'\n")).unwrap();
+        assert_eq!(catalog.model_ids(), vec!["dev-model-a", "dev-model-b"]);
+        assert_eq!(catalog.models[0].name, "Dev Model A");
+        assert_eq!(catalog.models[1].name, "Dev Model B");
+    }
+
+    #[test]
+    fn model_catalog_parse_from_inline_sequence() {
+        let yaml = "models:\n  - id: dev-model-a\n    name: Dev Model A\n  - id: dev-model-b\n    name: Dev Model B\n";
+        let catalog: ModelCatalog = from_str(yaml).unwrap();
+        assert_eq!(catalog.model_ids(), vec!["dev-model-a", "dev-model-b"]);
+    }
+
+    #[test]
+    fn model_catalog_empty_when_unset() {
+        let catalog: ModelCatalog = from_str("{}\n").unwrap();
+        assert!(catalog.models.is_empty());
+
+        let blank: ModelCatalog = from_str("models: \"\"\n").unwrap();
+        assert!(blank.models.is_empty());
+    }
+
+    #[test]
+    fn model_catalog_null_is_tolerated_as_empty() {
+        let via_models_null: ModelCatalog = from_str("models: null\n").unwrap();
+        assert!(via_models_null.models.is_empty());
+
+        let via_models_bare: ModelCatalog = from_str("models:\n").unwrap();
+        assert!(via_models_bare.models.is_empty());
+
+        #[derive(Deserialize)]
+        struct Wrap {
+            #[serde(default, deserialize_with = "deserialize_null_default")]
+            models: ModelCatalog,
+        }
+        let via_wrapper_null: Wrap = from_str("models:\n").unwrap();
+        assert!(via_wrapper_null.models.models.is_empty());
     }
 
     #[test]

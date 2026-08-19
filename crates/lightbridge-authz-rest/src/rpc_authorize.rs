@@ -155,6 +155,11 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         // Gated at the same `apikey:create` permission (not a new, looser one) -- see the schema
         // doc comment on `listBillingPlans` for why.
         "procedure.listBillingPlans" => ApiKeyCreate,
+        // Read-only companion to `model.Project.update`, not to `createApiKey`/`listBillingPlans`
+        // above: the catalogue a `Project.allowedModels` editor renders. Gated at `project:update`
+        // (the same permission `updateProject` needs to actually write `allowedModels`), not a new,
+        // looser permission -- see the schema doc comment on `listModelCatalog` for why.
+        "procedure.listModelCatalog" => ProjectUpdate,
         "model.ApiKey.list" => ApiKeyRead,
         "model.ApiKey.get" => ApiKeyRead,
         "model.ApiKey.update" => ApiKeyUpdate,
@@ -368,6 +373,7 @@ mod tests {
             ),
             ("procedure.createApiKey", Permission::ApiKeyCreate),
             ("procedure.listBillingPlans", Permission::ApiKeyCreate),
+            ("procedure.listModelCatalog", Permission::ProjectUpdate),
             ("model.ApiKey.list", Permission::ApiKeyRead),
             ("model.ApiKey.get", Permission::ApiKeyRead),
             ("model.ApiKey.update", Permission::ApiKeyUpdate),
@@ -587,6 +593,7 @@ mod tests {
                 "procedure.setProjectMemberQuotaTier",
                 "procedure.createApiKey",
                 "procedure.listBillingPlans",
+                "procedure.listModelCatalog",
                 "model.ApiKey.list",
                 "model.ApiKey.get",
                 "model.ApiKey.update",

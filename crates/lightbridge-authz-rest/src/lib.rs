@@ -3,8 +3,8 @@ use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
     RotateApiKey, async_trait,
     config::{
-        ApiServer, BasicAuth, Billing, BudgetServer, IdpServer, Oauth2, OauthClientType, OpaServer,
-        QuotaTiers, Redis, UsageServiceClient,
+        ApiServer, BasicAuth, Billing, BudgetServer, IdpServer, ModelCatalog, Oauth2,
+        OauthClientType, OpaServer, QuotaTiers, Redis, UsageServiceClient,
     },
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
@@ -538,6 +538,20 @@ fn to_schema_billing_plans(billing: &Billing) -> Vec<schema::BillingPlanInfo> {
         .collect()
 }
 
+/// Maps the operator-configured `config::ModelCatalog` catalogue onto the wire
+/// `ModelCatalogEntry[]` shape `listModelCatalog` returns. No numeric fields, so unlike
+/// `to_schema_billing_plans` above there is no widening to account for.
+fn to_schema_model_catalog(models: &ModelCatalog) -> Vec<schema::ModelCatalogEntry> {
+    models
+        .models
+        .iter()
+        .map(|entry| schema::ModelCatalogEntry {
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+        })
+        .collect()
+}
+
 fn to_schema_session_revocation_result(revoked_count: u64) -> schema::SessionRevocationResult {
     // `revokedCount` is a schema `Int` (Rust `i64`, see `authz.cstack`'s `Int` mapping note on
     // `SimulateBudgetPolicyInput`) -- `rows_affected()` is `u64`, so this is a lossy cast only in
@@ -710,6 +724,31 @@ impl schema::procedures::ProcedureRegistry for Procedures {
             let _subject = subject
                 .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             Ok(to_schema_billing_plans(issuer.billing_plans()))
+        }
+    }
+
+    /// Read-only: the operator-configured AI-model catalogue a `Project.allowedModels` editor
+    /// renders (see that procedure's doc comment in `authz.cstack`). No DB access --
+    /// `AuthzStoreImpl::model_catalog` returns the in-memory `ModelCatalog` config loaded at
+    /// startup. Mirrors `list_billing_plans` above.
+    fn list_model_catalog(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        _args: schema::procedures::list_model_catalog::Args,
+        _authorized: schema::procedures::list_model_catalog::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::list_model_catalog::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        async move {
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            Ok(to_schema_model_catalog(issuer.model_catalog()))
         }
     }
 
@@ -2093,12 +2132,20 @@ fn build_token_exchange_state(
     )))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "startup wiring for authz-api -- each parameter is a distinct, independently-loaded \
+              config section (billing/quota_tiers/models catalogues, redis, usage_service); \
+              bundling them into a struct would just move the same count into a constructor call \
+              at the one caller (main.rs) without reducing anything"
+)]
 pub async fn start_api_server(
     api: &ApiServer,
     pool: Arc<dyn DbPoolTrait>,
     oauth2: &Oauth2,
     billing: &Billing,
     quota_tiers: &QuotaTiers,
+    models: &ModelCatalog,
     redis: &Option<Redis>,
     usage_service: &Option<UsageServiceClient>,
 ) -> Result<()> {
@@ -2203,6 +2250,7 @@ pub async fn start_api_server(
         oauth2,
         billing,
         quota_tiers,
+        models,
     )?);
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
@@ -2522,12 +2570,18 @@ pub fn build_budget_router(
 /// key bootstrap (this server only ever validates bearer tokens via `oauth2.jwks_url`, never
 /// issues or rotates one — `rotateApiKey`/`createApiKey` are CRUD op-ids, refused here by
 /// `RpcScope::Budget` before they could reach `AuthzStoreImpl`'s signer).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "startup wiring for authz-budget, mirroring start_api_server's identical rationale \
+              -- each parameter is a distinct, independently-loaded config section"
+)]
 pub async fn start_budget_server(
     budget: &BudgetServer,
     pool: Arc<dyn DbPoolTrait>,
     oauth2: &Oauth2,
     billing: &Billing,
     quota_tiers: &QuotaTiers,
+    models: &ModelCatalog,
     redis: &Option<Redis>,
     usage_service: &Option<UsageServiceClient>,
 ) -> Result<()> {
@@ -2601,6 +2655,7 @@ pub async fn start_budget_server(
         oauth2,
         billing,
         quota_tiers,
+        models,
     )?);
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
