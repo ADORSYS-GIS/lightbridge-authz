@@ -111,24 +111,42 @@ behavior inherited unchanged from `RefillService`'s prior private implementation
 swallow a genuine storage failure (`BudgetError::StorageFailed`) into that default; the error still
 propagates, so a caller that wants to distinguish "new account" from "ledger unavailable" (an
 operator alert, say) still can (`current_tier_propagates_a_genuine_storage_failure`,
-`crates/lightbridge-authz-budget/tests/budget_repo_query_tests.rs`).
+`crates/lightbridge-authz-budget/tests/budget_repo_query_tests.rs`). This B15 default is left
+exactly as it was: ADR-0015 (`docs/adr/0015-refill-amounts-are-admin-configured-policy-ranges.md`)
+distinguishes "brand-new account, no grant yet" (its Decision 5, `starting_amount_micros`) from
+the genuine fail-closed floor below, and `current_tier`'s "no grant yet" default is the former, not
+the latter -- see `BudgetRepo::current_tier`'s own doc comment for the full reasoning on why it
+stays untouched here.
 
-`TokenExchangeOpStore::resolve_budget_tier` is the layer that closes that gap for the token-mint
-path specifically: any `Err` from `current_tier` -- for any reason, including a genuine database
-outage -- is caught, logged, and downgraded to `BudgetTier::B15`. The claim is **never** omitted
-and the token exchange/refresh **never** fails because of this lookup. This is deliberate and
-matches the exact requirement `docs/runbooks/budget-tier-rekey-cutover.md` (§"Before you deploy")
-already states for the eventual gateway cutover: *"An account with no claim must land on a sane
-rung, not on no matching rule -- that is the difference between 'starts at their base budget' and
-'is unlimited'."* Proven, not just asserted: with `budget_repo` pointed at an unreachable pool
-(the same `connect_lazy`-to-`127.0.0.1:1` pattern this test suite already uses elsewhere for
-"database down" scenarios), both `budget_tier_claim_survives_a_budget_ledger_outage_on_exchange`
-and `budget_tier_claim_survives_a_budget_ledger_outage_on_refresh` assert the exchange/refresh
-still returns `200 OK` with `budget_tier: "b-15"` on the decoded access token
-(`crates/lightbridge-authz-rest/tests/token_exchange_tests.rs`). The fallback's B15 constant was
-deliberately mutated to `B1000` (the most permissive rung -- a simulated fail-*open* bug) to watch
-both tests fail for exactly that reason before being restored; see the PR for the failure
-transcript.
+`TokenExchangeOpStore::resolve_budget_tier` is the layer that closes the *genuine outage* gap for
+the token-mint path specifically: any `Err` from `current_tier` -- for any reason, including a
+genuine database outage -- is caught, logged, and downgraded to
+`PolicyEngine::fail_closed_floor_micros()` (ADR-0015 Decision 6), read live off a `PolicyEngine`
+`authz-idp` now loads via its own `PolicyStore`, off the SAME `budget_policy_sets`/
+`budget_policy_revisions` tables `authz-api`/`authz-budget` already read -- not a hard-coded
+`BudgetTier::B15` (this ADR originally shipped with that hard-coded constant, before ADR-0015 gave
+the floor a policy-configurable home; see that ADR's "Neutral / follow-ups" for the cross-reference
+and this PR's own follow-up commit for the rewiring). The claim is **never** omitted and the token
+exchange/refresh **never** fails because of this lookup. This is deliberate and matches the exact
+requirement `docs/runbooks/budget-tier-rekey-cutover.md` (§"Before you deploy") already states for
+the eventual gateway cutover: *"An account with no claim must land on a sane rung, not on no
+matching rule -- that is the difference between 'starts at their base budget' and 'is unlimited'."*
+Proven, not just asserted: with `budget_repo` pointed at an unreachable pool (the same
+`connect_lazy`-to-`127.0.0.1:1` pattern this test suite already uses elsewhere for "database down"
+scenarios) and a `PolicyEngine` double configured with a deliberately distinctive $9 floor, both
+`budget_tier_claim_survives_a_budget_ledger_outage_on_exchange` and
+`budget_tier_claim_survives_a_budget_ledger_outage_on_refresh` assert the exchange/refresh still
+returns `200 OK` with `budget_tier: "b-9"` on the decoded access token
+(`crates/lightbridge-authz-rest/tests/token_exchange_tests.rs`). The fallback was deliberately
+hard-coded to `"b-1000"` (the most permissive legacy rung -- a simulated fail-*open* bug that
+ignores the configured floor entirely) to watch both tests fail for exactly that reason before
+being restored.
+
+The floor amount has no guarantee of matching a compile-time `BudgetTier` rung at all (the
+ADR-0015-shipped default is $6, below `B15`'s $15), so the wire label for both the success and
+fallback paths is produced by `budget_tier_wire_label` -- the `"b-<dollars>"` convention ADR-0015
+kept as a display-only format, generalized to any amount rather than assuming one of the seven
+legacy rungs.
 
 ### 4. Propagation latency is bounded by the access-token TTL, not undefined
 
