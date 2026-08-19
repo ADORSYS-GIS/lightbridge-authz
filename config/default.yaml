@@ -232,3 +232,18 @@ billing:
     - id: enterprise
       name: Enterprise
 
+# The operator-configured AI-model catalogue backing `listModelCatalog`, a read-only display aid
+# for a `Project.allowedModels` checkbox picker (see that procedure's schema doc comment). Unlike
+# `billing` above, an empty/absent catalogue is a supported default -- there is no write-path
+# validation against it. The two entries below are obviously-fake, local-dev-only placeholders,
+# not real production model ids -- an operator supplies the real catalogue for their deployment.
+#
+# `models` also accepts a single JSON-array string for fully env-driven setups, e.g.
+#   models: { models: "${MODEL_CATALOG}" }  with MODEL_CATALOG='[{"id":"dev-model-a","name":"Dev Model A"}]'
+models:
+  models:
+    - id: dev-model-a
+      name: Dev Model A (local dev only)
+    - id: dev-model-b
+      name: Dev Model B (local dev only)
+

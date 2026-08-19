@@ -14,7 +14,7 @@ use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait, TokenInfo};
 use lightbridge_authz_core::{
     Config, CreateAccount, CreateApiKey, DefaultLimits, Error, Permission, Result, RotateApiKey,
-    config::{ApiServer, BasicAuth, Billing, Oauth2, QuotaTiers},
+    config::{ApiServer, BasicAuth, Billing, ModelCatalog, Oauth2, QuotaTiers},
     cuid::cuid2,
     db::{DbPoolTrait, is_database_ready},
     server::serve_tls,
@@ -1660,6 +1660,7 @@ pub async fn start_mcp_server(
     basic_auth: &BasicAuth,
     billing: &Billing,
     quota_tiers: &QuotaTiers,
+    models: &ModelCatalog,
     pool: Arc<dyn DbPoolTrait>,
 ) -> Result<()> {
     billing.validate()?;
@@ -1680,6 +1681,7 @@ pub async fn start_mcp_server(
         oauth2,
         billing,
         quota_tiers,
+        models,
     )?);
     let opa_repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
     let bearer_service: Arc<dyn BearerTokenServiceTrait> =
@@ -1737,6 +1739,7 @@ pub async fn start_mcp_server_from_config(config: &Config) -> Result<()> {
         &config.server.opa.basic_auth,
         &config.billing,
         &config.quota_tiers,
+        &config.models,
         pool,
     )
     .await

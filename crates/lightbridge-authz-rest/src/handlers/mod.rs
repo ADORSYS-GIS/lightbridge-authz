@@ -8,7 +8,7 @@ use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
 use getrandom::fill;
 use lightbridge_authz_api_key::repo::StoreRepo;
-use lightbridge_authz_core::config::{Billing, Oauth2, Oauth2Issuance, QuotaTiers};
+use lightbridge_authz_core::config::{Billing, ModelCatalog, Oauth2, Oauth2Issuance, QuotaTiers};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey, Project,
@@ -32,6 +32,10 @@ pub struct AuthzStoreImpl {
     /// catalogue, and accepts everything (including `None`) when the catalogue is empty/absent
     /// (see that type's own doc comment for why that default is deliberate, unlike `Billing`'s).
     quota_tiers: Arc<QuotaTiers>,
+    /// Operator-configured AI-model catalogue backing `listModelCatalog` -- a read-only display
+    /// aid, not a value validated anywhere (see that type's own doc comment). Threaded through the
+    /// same way as `billing`/`quota_tiers` above.
+    models: Arc<ModelCatalog>,
 }
 
 impl std::fmt::Debug for AuthzStoreImpl {
@@ -49,6 +53,7 @@ impl AuthzStoreImpl {
             jwt_signer: None,
             billing: Arc::new(Billing::default()),
             quota_tiers: Arc::new(QuotaTiers::default()),
+            models: Arc::new(ModelCatalog::default()),
         }
     }
 
@@ -67,11 +72,19 @@ impl AuthzStoreImpl {
         self
     }
 
+    /// Override the configured model catalogue. Primarily for tests that drive `list_model_catalog`
+    /// without going through the full config-loading path -- mirrors `with_billing` above.
+    pub fn with_model_catalog(mut self, models: ModelCatalog) -> Self {
+        self.models = Arc::new(models);
+        self
+    }
+
     pub fn with_pool_and_oauth2(
         pool: Arc<dyn DbPoolTrait>,
         oauth2: &Oauth2,
         billing: &Billing,
         quota_tiers: &QuotaTiers,
+        models: &ModelCatalog,
     ) -> Result<Self> {
         use lightbridge_authz_core::config::Oauth2Type;
         let repo = Arc::new(StoreRepo::new(pool));
@@ -91,6 +104,7 @@ impl AuthzStoreImpl {
             jwt_signer,
             billing: Arc::new(billing.clone()),
             quota_tiers: Arc::new(quota_tiers.clone()),
+            models: Arc::new(models.clone()),
         })
     }
 
@@ -436,6 +450,13 @@ impl AuthzStoreImpl {
         &self.billing
     }
 
+    /// The operator-configured AI-model catalogue backing `listModelCatalog` -- a plain accessor,
+    /// no DB round-trip, since the catalogue is config (`ModelCatalog`), not a table. Mirrors
+    /// `billing_plans` above.
+    pub fn model_catalog(&self) -> &ModelCatalog {
+        &self.models
+    }
+
     /// Suspend an account (`status = 'suspended'`). Backs `disableAccount`. Thin wrapper over
     /// `StoreRepo::set_account_status` (membership enforced in SQL).
     pub async fn disable_account(&self, subject: &str, account_id: &str) -> Result<Account> {
@@ -679,7 +700,9 @@ mod tests {
     };
     use chrono::{Duration, Utc};
     use httpmock::{Method::POST, MockServer};
-    use lightbridge_authz_core::config::{Billing, Oauth2, Oauth2Issuance, Oauth2Type, QuotaTiers};
+    use lightbridge_authz_core::config::{
+        Billing, ModelCatalog, Oauth2, Oauth2Issuance, Oauth2Type, QuotaTiers,
+    };
     use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
@@ -720,6 +743,7 @@ mod tests {
             &base_oauth2(Oauth2Type::SelfSigned),
             &Billing::default(),
             &QuotaTiers::default(),
+            &ModelCatalog::default(),
         )
         .unwrap_err();
         assert!(format!("{err}").contains("oauth2.signing is missing"));
@@ -732,6 +756,7 @@ mod tests {
             &base_oauth2(Oauth2Type::External),
             &Billing::default(),
             &QuotaTiers::default(),
+            &ModelCatalog::default(),
         )
         .unwrap_err();
         assert!(format!("{err}").contains("oauth2.issuance is missing"));
@@ -924,6 +949,34 @@ mod tests {
         let store = AuthzStoreImpl::with_pool(lazy_pool()).with_billing(configured.clone());
 
         assert_eq!(store.billing_plans().plans, configured.plans);
+    }
+
+    // Backs `listModelCatalog`: proves `model_catalog()` hands back the exact catalogue the store
+    // was constructed with (same entries, in order) rather than e.g. a default-constructed
+    // `ModelCatalog` or a stale clone from before `with_model_catalog` -- this would fail if
+    // `model_catalog()` returned `&ModelCatalog::default()` or otherwise didn't thread through the
+    // field `with_model_catalog` sets. Mirrors `billing_plans_returns_the_configured_catalogue_verbatim`
+    // above.
+    #[tokio::test]
+    async fn model_catalog_returns_the_configured_catalogue_verbatim() {
+        use lightbridge_authz_core::config::ModelCatalogEntry;
+
+        let configured = ModelCatalog {
+            models: vec![
+                ModelCatalogEntry {
+                    id: "dev-model-a".to_string(),
+                    name: "Dev Model A".to_string(),
+                },
+                ModelCatalogEntry {
+                    id: "dev-model-b".to_string(),
+                    name: "Dev Model B".to_string(),
+                },
+            ],
+        };
+
+        let store = AuthzStoreImpl::with_pool(lazy_pool()).with_model_catalog(configured.clone());
+
+        assert_eq!(store.model_catalog().models, configured.models);
     }
 
     #[test]

@@ -40,7 +40,7 @@ use cratestack::SqlxIdempotencyStore;
 use cratestack::ratelimit::RateLimitStore;
 use lightbridge_authz_api::schema;
 use lightbridge_authz_bearer::BearerTokenServiceTrait;
-use lightbridge_authz_core::config::Billing;
+use lightbridge_authz_core::config::{Billing, ModelCatalog};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
 use lightbridge_authz_rest::ratelimit_redis::build_redis_rate_limit_store;
@@ -164,6 +164,33 @@ fn build_router(bearer: Arc<dyn BearerTokenServiceTrait>, dev_cors: bool) -> Rou
 fn build_router_with_billing(bearer: Arc<dyn BearerTokenServiceTrait>, billing: Billing) -> Router {
     let core = lazy_core_pool();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()).with_billing(billing));
+    let policy_store = lazy_policy_store(core.clone());
+    let (refill_service, review_service, budget_repo) =
+        lazy_refill_and_review_services(core.clone(), &policy_store);
+    lightbridge_authz_rest::build_api_router(
+        bearer,
+        issuer,
+        policy_store,
+        refill_service,
+        review_service,
+        budget_repo,
+        lazy_cratestack_db(),
+        core,
+        lazy_idempotency(),
+        lazy_rate_limit(),
+        false,
+        None,
+    )
+}
+
+/// Like [`build_router`], but with a caller-supplied [`ModelCatalog`] instead of the default
+/// (empty) one -- for exercising `listModelCatalog`, mirroring `build_router_with_billing` above.
+fn build_router_with_models(
+    bearer: Arc<dyn BearerTokenServiceTrait>,
+    models: ModelCatalog,
+) -> Router {
+    let core = lazy_core_pool();
+    let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()).with_model_catalog(models));
     let policy_store = lazy_policy_store(core.clone());
     let (refill_service, review_service, budget_repo) =
         lazy_refill_and_review_services(core.clone(), &policy_store);
@@ -614,6 +641,69 @@ async fn list_billing_plans_returns_the_configured_catalogue_over_rpc() {
             {"id": "enterprise", "name": "Enterprise", "limits": null},
         ]),
         "listBillingPlans must echo the router's configured catalogue verbatim"
+    );
+}
+
+/// `listModelCatalog` is gated at `project:update` (not `apikey:create` like `listBillingPlans`
+/// above -- see the schema doc comment on `listModelCatalog` for why it reuses `updateProject`'s
+/// permission instead) -- a viewer (`account:read`/`project:read`/`apikey:read` only, no
+/// `project:update`) must be refused.
+#[tokio::test]
+async fn list_model_catalog_denied_for_caller_without_project_update() {
+    let router = build_router(admin_and_viewer_bearer(), false);
+    let (status, _) = rpc_call(
+        router,
+        "procedure.listModelCatalog",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        Some("viewer"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "viewer must be denied listModelCatalog by the RBAC gate"
+    );
+}
+
+/// End-to-end proof that `listModelCatalog` reaches dispatch and answers from the router's actual
+/// configured `ModelCatalog` -- not a placeholder, not `ModelCatalog::default()` (which is empty
+/// and would make this assert an empty array instead). No DB access happens (this file's stores
+/// are all lazily wired to unreachable Postgres/Redis, see the module docs), because
+/// `AuthzStoreImpl::model_catalog` is a plain in-memory accessor. Mirrors
+/// `list_billing_plans_returns_the_configured_catalogue_over_rpc` above.
+#[tokio::test]
+async fn list_model_catalog_returns_the_configured_catalogue_over_rpc() {
+    let models = ModelCatalog {
+        models: vec![
+            lightbridge_authz_core::config::ModelCatalogEntry {
+                id: "dev-model-a".to_string(),
+                name: "Dev Model A".to_string(),
+            },
+            lightbridge_authz_core::config::ModelCatalogEntry {
+                id: "dev-model-b".to_string(),
+                name: "Dev Model B".to_string(),
+            },
+        ],
+    };
+    let router = build_router_with_models(admin_bearer(), models);
+    let (status, body) = rpc_call(
+        router,
+        "procedure.listModelCatalog",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "admin must reach dispatch");
+    let entries = as_json(Wire::Cbor, &body);
+    assert_eq!(
+        entries,
+        json!([
+            {"id": "dev-model-a", "name": "Dev Model A"},
+            {"id": "dev-model-b", "name": "Dev Model B"},
+        ]),
+        "listModelCatalog must echo the router's configured catalogue verbatim"
     );
 }
 

@@ -350,6 +350,28 @@ type ListBillingPlansInput {
 procedure listBillingPlans(args: ListBillingPlansInput): BillingPlanInfo[]
   @allow(auth() != null)
 
+// The operator-configured AI-model catalogue (`config.models`, `ModelCatalog` in
+// `lightbridge-authz-core`), read-only. Lets a `Project.allowedModels` editor (e.g. a checkbox
+// picker in the self-service UI) render real model ids instead of hardcoding a list client-side --
+// the RBAC permission map and the pre-#283 `allowed_models` encoding bug are both examples of
+// exactly the kind of silent drift a hardcoded frontend mirror produces. Gated at the same
+// `project:update` permission `updateProject` uses for editing `allowedModels` itself (see
+// `rpc_authorize.rs`) -- a caller who cannot edit a project's allowlist has no use for the
+// catalogue either. NOT a validation source: `Project.allowedModels` stays an unvalidated
+// free-form list at write time (see that field's own doc comment) -- this procedure is a read-only
+// display aid, not a server-side allowlist gate; making `updateProject` validate against this
+// catalogue would be a separate, larger change.
+type ModelCatalogEntry {
+  id String
+  name String
+}
+
+type ListModelCatalogInput {
+}
+
+procedure listModelCatalog(args: ListModelCatalogInput): ModelCatalogEntry[]
+  @allow(auth() != null)
+
 type RevokeApiKeyInput {
   keyId String
 }
