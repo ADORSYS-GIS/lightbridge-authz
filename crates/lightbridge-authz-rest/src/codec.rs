@@ -156,4 +156,46 @@ mod tests {
             "byte string payload must round-trip byte-for-byte"
         );
     }
+
+    /// Regression coverage for a production bug report (creating a non-expiring API key failed
+    /// with the generic `invalid_argument` / "invalid request payload" error) diagnosed as
+    /// plausibly the same CBOR `null`-vs-`undefined` asymmetry as the `createProject` incident
+    /// above -- the create-key screen's "No expiry" option sends `expiresAt: null` explicitly
+    /// (`converse-frontends/apps/self-service/src/screens/api-key-create-screen.tsx`), and the
+    /// field is `expiresAt DateTime?` (`crates/lightbridge-authz-api/schema/authz.cstack`), i.e.
+    /// `Option<chrono::DateTime<Utc>>` on the wire.
+    ///
+    /// This does NOT reproduce against the real generated type: byte-for-byte reconstruction of
+    /// what `cborg` (the frontend's encoder) actually emits for an explicit `null` -- CBOR simple
+    /// value `null` (0xf6), same as `null_field_still_decodes_as_none` above -- decodes cleanly
+    /// into `None` here, and end-to-end through the real router in
+    /// `rpc_it_tests.rs::create_api_key_with_real_cborg_null_expires_at_bytes` /
+    /// `update_api_key_clears_expiry_with_real_cborg_null_bytes`. `Option<T>: Deserialize` defers
+    /// the "is this null" decision to the format (`deserialize_option`), never to `T`, so
+    /// `chrono::DateTime<Utc>` behaves identically to `Vec<String>` here -- there is no
+    /// DateTime-specific decode path to diverge. This test locks that in so a future codec/schema
+    /// change can't silently reintroduce the failure the production report describes.
+    #[test]
+    fn explicit_null_expires_at_decodes_as_none_for_create_api_key_input() {
+        use lightbridge_authz_api::schema::types::CreateApiKeyInput;
+
+        let mut bytes = Vec::new();
+        let mut e = minicbor::Encoder::new(&mut bytes);
+        e.map(4).unwrap();
+        e.str("name").unwrap();
+        e.str("Miaou").unwrap();
+        e.str("expiresAt").unwrap();
+        e.null().unwrap();
+        e.str("projectId").unwrap();
+        e.str("zezxvt21irmoi0kzm22el7gu").unwrap();
+        e.str("billingPlan").unwrap();
+        e.str("free").unwrap();
+
+        let codec = LenientCborCodec::default();
+        let decoded: CreateApiKeyInput = codec
+            .decode(&bytes)
+            .expect("explicit null expiresAt must decode to None, not fail");
+        assert_eq!(decoded.expiresAt, None);
+        assert_eq!(decoded.name, "Miaou");
+    }
 }

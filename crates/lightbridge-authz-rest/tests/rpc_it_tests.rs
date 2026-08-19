@@ -2527,3 +2527,96 @@ async fn budget_gated_op_ids_are_unreachable_on_authz_api_even_for_an_admin() {
         );
     }
 }
+
+/// Regression test for a production bug report: creating a non-expiring API key (the "No expiry"
+/// option added in converse-frontends#182) failed with the generic `invalid_argument` /
+/// "invalid request payload" error. The report captured the request as CBOR `map(4)` with
+/// `expiresAt` as CBOR `null` (0xf6) -- distinct from the `createProject` incident above, which
+/// was CBOR `undefined` (0xf7). This frame is built to be byte-for-byte what the real frontend's
+/// `cborg` encoder produces for `{ args: { name, expiresAt: null, projectId, billingPlan } }`
+/// (verified against a real `cborg.encode(stripUndefined(...))` run, matching
+/// `converse-frontends/packages/authz-rpc/src/codec.ts`): a real CBOR `null`, definite-length
+/// maps, definite-length text strings.
+///
+/// This does NOT reproduce against current `main`: `codec::tests::
+/// explicit_null_expires_at_decodes_as_none_for_create_api_key_input` already proves the codec
+/// layer accepts it in isolation, and this proves the same all the way through the real router
+/// (RBAC gate, idempotency/rate-limit layers, cratestack dispatch) against a live DB -- the
+/// request succeeds and the created key has `expiresAt: null`. Kept as a permanent regression
+/// test rather than deleted: it pins down exactly the byte shape the production report described,
+/// so if a future codec/schema change reintroduces a decode failure for an explicit `null` on an
+/// `Option<DateTime<Utc>>` field, this fails immediately instead of waiting for the next prod
+/// incident.
+#[tokio::test]
+async fn create_api_key_with_real_cborg_null_expires_at_bytes() {
+    let subject = format!("owner-cborg-null-expiry-{}", cuid2());
+    let ctx = setup(admin_bearer(&subject)).await;
+    let r = &ctx.router;
+
+    let billing_id = format!("tenant-cborg-null-expiry-{}", cuid2());
+    let account_id = create_account(r, "admin", &billing_id).await;
+    let project_id = create_project(r, "admin", &account_id, "p-cborg-null-expiry").await;
+
+    let mut raw = Vec::new();
+    let mut e = minicbor::Encoder::new(&mut raw);
+    e.map(1).unwrap();
+    e.str("args").unwrap();
+    e.map(4).unwrap();
+    e.str("name").unwrap();
+    e.str("Miaou").unwrap();
+    e.str("expiresAt").unwrap();
+    e.null().unwrap();
+    e.str("projectId").unwrap();
+    e.str(&project_id).unwrap();
+    e.str("billingPlan").unwrap();
+    e.str("free").unwrap();
+
+    let (status, body) = rpc_call_raw(r, "procedure.createApiKey", Wire::Cbor, raw, "admin").await;
+    assert!(
+        status.is_success(),
+        "createApiKey with real cborg-shaped null expiresAt bytes: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let decoded = Wire::Cbor.decode::<Value>(&body);
+    assert!(decoded["apiKey"]["expiresAt"].is_null());
+}
+
+/// Companion to `create_api_key_with_real_cborg_null_expires_at_bytes` for the settings/edit
+/// screen's clear-expiry path (`useUpdateApiKey` -> `apiKeys.update(id, { name, expiresAt })`,
+/// `packages/authz-rpc/generated/src/client.ts`'s `update()` -> `{ id, patch }` wire shape),
+/// exercising the PATCH double-Option path (`UpdateApiKeyInput.expiresAt` wraps as
+/// `Option<Option<DateTime>>` server-side per `field_definition`'s `wrap_for_patch`) rather than
+/// `createApiKey`'s plain `Option<DateTime>`. Also does not reproduce the production failure --
+/// kept for the same reason as its companion above.
+#[tokio::test]
+async fn update_api_key_clears_expiry_with_real_cborg_null_bytes() {
+    let subject = format!("owner-cborg-null-patch-{}", cuid2());
+    let ctx = setup(admin_bearer(&subject)).await;
+    let r = &ctx.router;
+
+    let billing_id = format!("tenant-cborg-null-patch-{}", cuid2());
+    let account_id = create_account(r, "admin", &billing_id).await;
+    let project_id = create_project(r, "admin", &account_id, "p-cborg-null-patch").await;
+    let (key_id, _secret) = create_api_key(r, "admin", &project_id, "k-cborg-null-patch").await;
+
+    let mut raw = Vec::new();
+    let mut e = minicbor::Encoder::new(&mut raw);
+    e.map(2).unwrap();
+    e.str("id").unwrap();
+    e.str(&key_id).unwrap();
+    e.str("patch").unwrap();
+    e.map(2).unwrap();
+    e.str("name").unwrap();
+    e.str("k-cborg-null-patch-renamed").unwrap();
+    e.str("expiresAt").unwrap();
+    e.null().unwrap();
+
+    let (status, body) = rpc_call_raw(r, "model.ApiKey.update", Wire::Cbor, raw, "admin").await;
+    assert!(
+        status.is_success(),
+        "ApiKey update clearing expiresAt via real cborg-shaped null bytes: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let decoded = Wire::Cbor.decode::<Value>(&body);
+    assert!(decoded["expiresAt"].is_null());
+}
