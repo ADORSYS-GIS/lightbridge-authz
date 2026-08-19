@@ -206,3 +206,15 @@ billing:
     # No `limits` block ⇒ unlimited on every dimension (the edge treats absent limits as no cap).
     - id: enterprise
       name: Enterprise
+
+# The operator-configured AI-model catalogue backing `listModelCatalog`, a read-only display aid
+# for a `Project.allowedModels` checkbox picker. Unlike `billing` above, an empty/absent catalogue
+# is a supported default. The two entries below are obviously-fake, local/compose-dev-only
+# placeholders, not real production model ids. `models` also accepts a single JSON-array string
+# via "${MODEL_CATALOG}", mirroring `billing.plans`.
+models:
+  models:
+    - id: dev-model-a
+      name: Dev Model A (local dev only)
+    - id: dev-model-b
+      name: Dev Model B (local dev only)

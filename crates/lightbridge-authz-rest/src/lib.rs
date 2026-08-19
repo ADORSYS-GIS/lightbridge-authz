@@ -3,8 +3,8 @@ use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
     RotateApiKey, async_trait,
     config::{
-        ApiServer, BasicAuth, Billing, BudgetServer, IdpServer, Oauth2, OauthClientType, OpaServer,
-        QuotaTiers, Redis, UsageServiceClient,
+        ApiServer, BasicAuth, Billing, BudgetServer, IdpServer, ModelCatalog, Oauth2,
+        OauthClientType, OpaServer, QuotaTiers, Redis, UsageServiceClient,
     },
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
@@ -538,6 +538,20 @@ fn to_schema_billing_plans(billing: &Billing) -> Vec<schema::BillingPlanInfo> {
         .collect()
 }
 
+/// Maps the operator-configured `config::ModelCatalog` catalogue onto the wire
+/// `ModelCatalogEntry[]` shape `listModelCatalog` returns. No numeric fields, so unlike
+/// `to_schema_billing_plans` above there is no widening to account for.
+fn to_schema_model_catalog(models: &ModelCatalog) -> Vec<schema::ModelCatalogEntry> {
+    models
+        .models
+        .iter()
+        .map(|entry| schema::ModelCatalogEntry {
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+        })
+        .collect()
+}
+
 fn to_schema_session_revocation_result(revoked_count: u64) -> schema::SessionRevocationResult {
     // `revokedCount` is a schema `Int` (Rust `i64`, see `authz.cstack`'s `Int` mapping note on
     // `SimulateBudgetPolicyInput`) -- `rows_affected()` is `u64`, so this is a lossy cast only in
@@ -710,6 +724,31 @@ impl schema::procedures::ProcedureRegistry for Procedures {
             let _subject = subject
                 .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             Ok(to_schema_billing_plans(issuer.billing_plans()))
+        }
+    }
+
+    /// Read-only: the operator-configured AI-model catalogue a `Project.allowedModels` editor
+    /// renders (see that procedure's doc comment in `authz.cstack`). No DB access --
+    /// `AuthzStoreImpl::model_catalog` returns the in-memory `ModelCatalog` config loaded at
+    /// startup. Mirrors `list_billing_plans` above.
+    fn list_model_catalog(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        _args: schema::procedures::list_model_catalog::Args,
+        _authorized: schema::procedures::list_model_catalog::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::list_model_catalog::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        async move {
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            Ok(to_schema_model_catalog(issuer.model_catalog()))
         }
     }
 
@@ -2022,9 +2061,21 @@ const CLIENT_ASSERTION_JTI_KEY_PREFIX: &str = "authz-api:client-assertion-jti:";
 /// ADR-0011 phase 2: builds the config-defined `ClientStore` (Decision 5) and the Redis-backed
 /// `ClientAssertionStore` (Decision 6) that together let `oauth2_op::store::TokenExchangeOpStore`
 /// implement `authkestra_op::store::OpStore`.
+///
+/// `budget_repo` (ADR-0014) is a new dependency edge, not a new outbound service call: it reads
+/// `budget_grants`/`budget_balances` off the SAME Postgres `pool` every other repository on this
+/// server already uses (see the call site's own `budget_repo` construction), so this stays an
+/// intra-database read, never a network hop to the separate `authz-budget` microservice.
+///
+/// `policy_engine` (ADR-0015 Decision 6) is the same kind of edge: the call site loads its own
+/// `PolicyStore` off the shared `budget_policy_sets`/`budget_policy_revisions` tables, so
+/// `TokenExchangeOpStore::resolve_budget_tier`'s fail-closed fallback reads the live, admin-
+/// configured `fail_closed_floor_micros` instead of a hard-coded rung.
 fn build_token_exchange_state(
     oauth2: &Oauth2,
     repo: Arc<StoreRepo>,
+    budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+    policy_engine: Arc<dyn lightbridge_authz_budget::PolicyEngine>,
     bearer: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait>,
     redis_url: &str,
     redis_ca_bundle_path: Option<&str>,
@@ -2071,6 +2122,8 @@ fn build_token_exchange_state(
         client_store,
         assertions,
         repo,
+        budget_repo,
+        policy_engine,
         bearer,
         cfg.clone(),
     ));
@@ -2093,12 +2146,20 @@ fn build_token_exchange_state(
     )))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "startup wiring for authz-api -- each parameter is a distinct, independently-loaded \
+              config section (billing/quota_tiers/models catalogues, redis, usage_service); \
+              bundling them into a struct would just move the same count into a constructor call \
+              at the one caller (main.rs) without reducing anything"
+)]
 pub async fn start_api_server(
     api: &ApiServer,
     pool: Arc<dyn DbPoolTrait>,
     oauth2: &Oauth2,
     billing: &Billing,
     quota_tiers: &QuotaTiers,
+    models: &ModelCatalog,
     redis: &Option<Redis>,
     usage_service: &Option<UsageServiceClient>,
 ) -> Result<()> {
@@ -2203,6 +2264,7 @@ pub async fn start_api_server(
         oauth2,
         billing,
         quota_tiers,
+        models,
     )?);
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
@@ -2394,6 +2456,27 @@ pub async fn start_idp_server(
     })?;
 
     let readiness_pool = pool.clone();
+    // ADR-0014: the budget ledger is read here (not called over the network) because
+    // `authz-idp`/`authz-budget` share the same Postgres -- see `build_token_exchange_state`'s
+    // own doc comment.
+    let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
+        pool.clone(),
+    ));
+    // ADR-0015 Decision 6: `TokenExchangeOpStore::resolve_budget_tier`'s fail-closed fallback
+    // needs a live `PolicyEngine`, exactly like `start_api_server`'s/`start_budget_server`'s
+    // identical load -- loading whatever is genuinely active in the DB right now, off the SAME
+    // shared Postgres `budget_policy_sets`/`budget_policy_revisions` tables, so `authz-idp` never
+    // drifts from what `activateBudgetPolicy` most recently activated.
+    let policy_store = Arc::new(
+        lightbridge_authz_budget::PolicyStore::load_active_from_db(
+            pool.clone(),
+            BUDGET_POLICY_SET_ID,
+            BUDGET_POLICY_EVALUATION_BUDGET,
+        )
+        .await
+        .map_err(|e| Error::Server(format!("failed to load active budget policy: {e}")))?,
+    );
+    let policy_engine: Arc<dyn lightbridge_authz_budget::PolicyEngine> = policy_store.engine();
     let signing_repo = Arc::new(StoreRepo::new(pool));
     signing::bootstrap_signing_key(&signing_repo, signing).await?;
 
@@ -2419,6 +2502,8 @@ pub async fn start_idp_server(
     let token_exchange_state = build_token_exchange_state(
         oauth2,
         signing_repo.clone(),
+        budget_repo,
+        policy_engine,
         bearer_service,
         &redis.url,
         redis.ca_bundle_path.as_deref(),
@@ -2522,12 +2607,18 @@ pub fn build_budget_router(
 /// key bootstrap (this server only ever validates bearer tokens via `oauth2.jwks_url`, never
 /// issues or rotates one — `rotateApiKey`/`createApiKey` are CRUD op-ids, refused here by
 /// `RpcScope::Budget` before they could reach `AuthzStoreImpl`'s signer).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "startup wiring for authz-budget, mirroring start_api_server's identical rationale \
+              -- each parameter is a distinct, independently-loaded config section"
+)]
 pub async fn start_budget_server(
     budget: &BudgetServer,
     pool: Arc<dyn DbPoolTrait>,
     oauth2: &Oauth2,
     billing: &Billing,
     quota_tiers: &QuotaTiers,
+    models: &ModelCatalog,
     redis: &Option<Redis>,
     usage_service: &Option<UsageServiceClient>,
 ) -> Result<()> {
@@ -2601,6 +2692,7 @@ pub async fn start_budget_server(
         oauth2,
         billing,
         quota_tiers,
+        models,
     )?);
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
@@ -2745,8 +2837,58 @@ mod tests {
         Arc::new(StoreRepo::new(pool))
     }
 
+    /// Same lazy/dead-pool trick as [`lazy_signing_repo`], for the config-validation tests below
+    /// -- none of them reach a real `current_tier` query, only `build_token_exchange_state`'s own
+    /// synchronous validation branches, so a live budget ledger is never needed here.
+    fn lazy_budget_repo() -> Arc<lightbridge_authz_budget::repo::BudgetRepo> {
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(250))
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
+            .expect("lazy pool should be constructible");
+        let pool: Arc<dyn DbPoolTrait> =
+            Arc::new(lightbridge_authz_core::db::DbPool::from_pool(pool));
+        Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(pool))
+    }
+
     fn noop_bearer() -> Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> {
         Arc::new(NoopBearer)
+    }
+
+    /// A `PolicyEngine` double that panics if `evaluate` is ever called.
+    /// `build_token_exchange_state` only needs a `PolicyEngine` to satisfy
+    /// `TokenExchangeOpStore::new`'s constructor (ADR-0015 Decision 6); none of the
+    /// config-validation tests below ever mint a token, so `resolve_budget_tier` -- the only
+    /// caller of any `PolicyEngine` method reachable from this store -- is never exercised here
+    /// either.
+    #[derive(Debug)]
+    struct UnusedPolicyEngine;
+
+    #[async_trait]
+    impl lightbridge_authz_budget::PolicyEngine for UnusedPolicyEngine {
+        async fn evaluate(
+            &self,
+            _facts: &lightbridge_authz_budget::Facts,
+            _requested_amount_micros: i64,
+        ) -> Result<lightbridge_authz_budget::Decision, lightbridge_authz_budget::BudgetError>
+        {
+            unreachable!("build_token_exchange_state never calls the policy engine")
+        }
+
+        fn allowed_amounts_micros(&self) -> Vec<i64> {
+            vec![6_000_000, 15_000_000, 30_000_000]
+        }
+
+        fn starting_amount_micros(&self) -> i64 {
+            15_000_000
+        }
+
+        fn fail_closed_floor_micros(&self) -> i64 {
+            6_000_000
+        }
+    }
+
+    fn lazy_policy_engine() -> Arc<dyn lightbridge_authz_budget::PolicyEngine> {
+        Arc::new(UnusedPolicyEngine)
     }
 
     #[test]
@@ -2826,6 +2968,8 @@ mod tests {
         let result = build_token_exchange_state(
             &oauth2,
             lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2841,6 +2985,8 @@ mod tests {
         let Err(err) = build_token_exchange_state(
             &oauth2,
             lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2857,6 +3003,8 @@ mod tests {
         let Err(err) = build_token_exchange_state(
             &oauth2,
             lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2876,6 +3024,8 @@ mod tests {
         let Err(err) = build_token_exchange_state(
             &oauth2,
             lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2895,6 +3045,8 @@ mod tests {
         let Err(err) = build_token_exchange_state(
             &oauth2,
             lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2916,6 +3068,8 @@ mod tests {
         let Err(err) = build_token_exchange_state(
             &oauth2,
             lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2938,6 +3092,8 @@ mod tests {
         let Err(err) = build_token_exchange_state(
             &oauth2,
             lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2959,6 +3115,8 @@ mod tests {
         let result = build_token_exchange_state(
             &oauth2,
             lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,

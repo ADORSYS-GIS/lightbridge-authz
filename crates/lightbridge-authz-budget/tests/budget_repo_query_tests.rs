@@ -6,6 +6,7 @@ use lightbridge_authz_budget::error::BudgetError;
 use lightbridge_authz_budget::period::Period;
 use lightbridge_authz_budget::repo::{BudgetRepo, GrantRequest};
 use lightbridge_authz_budget::source::GrantSource;
+use lightbridge_authz_budget::tier::BudgetTier;
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::DbPool;
 use sqlx::PgPool;
@@ -224,4 +225,150 @@ async fn list_grants_does_not_leak_another_accounts_entries(pool: PgPool) {
 
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].budget_account_id, account_id);
+}
+
+/// ADR-0014 (the token-mint budget-tier claim) reuses this exact resolver, so its fallback
+/// behavior on a brand-new account/period must be `B15`, the lowest rung -- never an error,
+/// never a permissive default.
+#[sqlx::test(migrations = "../../migrations")]
+async fn current_tier_defaults_to_b15_with_no_grant(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    let repo = BudgetRepo::new(Arc::new(DbPool::from_pool(pool)));
+    let period = Period::parse(PERIOD).expect("valid period");
+
+    let tier = repo
+        .current_tier(&account_id, &period)
+        .await
+        .expect("current_tier must succeed even with zero grants");
+
+    assert_eq!(tier, BudgetTier::B15);
+}
+
+/// The primary correctness case: a real grant on the ledger must be the tier reported back,
+/// proving `current_tier` genuinely reads the ledger rather than always returning its `B15`
+/// default.
+#[sqlx::test(migrations = "../../migrations")]
+async fn current_tier_resolves_the_most_recent_qualifying_grant(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    let repo = BudgetRepo::new(Arc::new(DbPool::from_pool(pool)));
+    repo.grant(base_request(
+        &account_id,
+        PERIOD,
+        GrantSource::SelfService,
+        BudgetTier::B120.amount().get(),
+    ))
+    .await
+    .expect("grant must succeed");
+
+    let period = Period::parse(PERIOD).expect("valid period");
+    let tier = repo
+        .current_tier(&account_id, &period)
+        .await
+        .expect("current_tier must succeed");
+
+    assert_eq!(tier, BudgetTier::B120);
+}
+
+/// `correction`/`refund` grants must NOT be read as "the tier this account is on" -- see
+/// [`GrantSource`]'s own doc comment on `current_tier` for why. A correction here deliberately
+/// carries an amount that doesn't even match a known rung, so if it were wrongly counted this
+/// test would fail via the "unrecognized amount" fallback rather than silently passing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn current_tier_ignores_correction_and_refund_sources(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    let repo = BudgetRepo::new(Arc::new(DbPool::from_pool(pool)));
+    repo.grant(base_request(
+        &account_id,
+        PERIOD,
+        GrantSource::SelfService,
+        BudgetTier::B60.amount().get(),
+    ))
+    .await
+    .expect("base grant must succeed");
+    repo.grant(base_request(
+        &account_id,
+        PERIOD,
+        GrantSource::Correction,
+        1_234_567,
+    ))
+    .await
+    .expect("correction grant must succeed");
+    repo.grant(base_request(
+        &account_id,
+        PERIOD,
+        GrantSource::Refund,
+        500_000,
+    ))
+    .await
+    .expect("refund grant must succeed");
+
+    let period = Period::parse(PERIOD).expect("valid period");
+    let tier = repo
+        .current_tier(&account_id, &period)
+        .await
+        .expect("current_tier must succeed");
+
+    assert_eq!(
+        tier,
+        BudgetTier::B60,
+        "the correction/refund rows landed after the tier grant but must not be read as the \
+         account's current tier"
+    );
+}
+
+/// A qualifying grant whose `amount_micros` doesn't match any known rung (data this service
+/// doesn't expect in practice, e.g. a hand-edited or historically-imported row) must fall back to
+/// `B15` rather than propagating a lookup failure or silently rounding to the nearest rung.
+#[sqlx::test(migrations = "../../migrations")]
+async fn current_tier_falls_back_to_b15_on_unrecognized_amount(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    let repo = BudgetRepo::new(Arc::new(DbPool::from_pool(pool)));
+    repo.grant(base_request(
+        &account_id,
+        PERIOD,
+        GrantSource::Admin,
+        42_000_000,
+    ))
+    .await
+    .expect("grant must succeed");
+
+    let period = Period::parse(PERIOD).expect("valid period");
+    let tier = repo
+        .current_tier(&account_id, &period)
+        .await
+        .expect("current_tier must succeed even on an unrecognized amount");
+
+    assert_eq!(tier, BudgetTier::B15);
+}
+
+/// A genuine storage failure is NOT swallowed into `B15` inside `BudgetRepo::current_tier`
+/// itself -- see that method's doc comment for why (a caller that wants to distinguish "new
+/// account" from "ledger unavailable" still can). The token-mint path
+/// (`TokenExchangeOpStore::resolve_budget_tier`, `lightbridge-authz-rest`) is the layer that
+/// downgrades this `Err` to `B15`; this test pins that `current_tier` itself still surfaces the
+/// error rather than pre-emptively hiding it.
+#[tokio::test]
+async fn current_tier_propagates_a_genuine_storage_failure() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(250))
+        .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
+        .expect("lazy pool should be constructible");
+    let repo = BudgetRepo::new(Arc::new(DbPool::from_pool(pool)));
+    let period = Period::parse(PERIOD).expect("valid period");
+
+    let result = repo.current_tier("unreachable-account", &period).await;
+
+    assert!(
+        matches!(result, Err(BudgetError::StorageFailed(_))),
+        "an unreachable database must surface as a typed StorageFailed error, not a silent \
+         default: {result:?}"
+    );
 }
