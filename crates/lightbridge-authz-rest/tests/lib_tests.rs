@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use lightbridge_authz_core::config::{
-    ApiServer, BasicAuth, Billing, BillingPlan, Oauth2, Oauth2Type, OpaServer, QuotaTiers, Redis,
-    Tls,
+    ApiServer, BasicAuth, Billing, BillingPlan, ModelCatalog, Oauth2, Oauth2Type, OpaServer,
+    QuotaTiers, Redis, Tls,
 };
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use sqlx::postgres::PgPoolOptions;
@@ -40,6 +40,14 @@ fn sample_billing() -> Billing {
 /// test here wants: unrelated to what's under test either way.
 fn sample_quota_tiers() -> QuotaTiers {
     QuotaTiers::default()
+}
+
+/// Empty catalogue -- none of these tests exercise `listModelCatalog` itself (that lives in
+/// `rpc_router_tests.rs`), so the deliberate accept-anything empty default (see `ModelCatalog`'s
+/// doc comment) is exactly what every server-startup test here wants -- mirrors
+/// `sample_quota_tiers` above.
+fn sample_models() -> ModelCatalog {
+    ModelCatalog::default()
 }
 
 fn bad_tls() -> Tls {
@@ -88,6 +96,7 @@ async fn start_api_server_fails_fast_when_tls_certs_are_missing() {
         &external_oauth2(),
         &sample_billing(),
         &sample_quota_tiers(),
+        &sample_models(),
         &sample_redis(),
         &None,
     )
@@ -163,6 +172,7 @@ async fn start_api_server_rejects_self_signed_oauth2_without_signing_block() {
         &oauth2,
         &sample_billing(),
         &sample_quota_tiers(),
+        &sample_models(),
         &sample_redis(),
         &None,
     )
@@ -195,6 +205,7 @@ async fn start_api_server_warns_when_dev_cors_is_enabled() {
         &external_oauth2(),
         &sample_billing(),
         &sample_quota_tiers(),
+        &sample_models(),
         &sample_redis(),
         &None,
     )
@@ -326,6 +337,7 @@ mod db {
             &self_signed_oauth2(),
             &sample_billing(),
             &sample_quota_tiers(),
+            &sample_models(),
             &sample_redis(),
             &None,
         )
@@ -363,6 +375,7 @@ mod db {
             &external_oauth2_with_issuance(),
             &sample_billing(),
             &sample_quota_tiers(),
+            &sample_models(),
             &None,
             &None,
         )
@@ -392,6 +405,7 @@ mod db {
             &external_oauth2_with_issuance(),
             &sample_billing(),
             &sample_quota_tiers(),
+            &sample_models(),
             &unreachable_redis(),
             &None,
         )
@@ -423,6 +437,7 @@ mod db {
             &external_oauth2_with_issuance(),
             &sample_billing(),
             &sample_quota_tiers(),
+            &sample_models(),
             &None,
             &None,
         )
@@ -444,6 +459,7 @@ mod db {
             &external_oauth2_with_issuance(),
             &sample_billing(),
             &sample_quota_tiers(),
+            &sample_models(),
             &unreachable_redis(),
             &None,
         )
