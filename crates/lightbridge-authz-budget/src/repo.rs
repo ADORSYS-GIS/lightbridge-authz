@@ -534,6 +534,21 @@ impl BudgetRepo {
     /// yet, so every account with no qualifying grant history this period defaults to `B15`
     /// regardless of plan. Safe (never grants/claims more than the cheapest plan would justify)
     /// but not the intended long-run behavior for e.g. an enterprise-plan account.
+    ///
+    /// **ADR-0015 note, so the two `B15` defaults above are never mistaken for the fail-closed
+    /// floor:** neither is [`crate::decision::PolicyEngine::fail_closed_floor_micros`] (ADR-0015
+    /// Decision 6) -- that is a distinct concept (an outage/unresolvable-data fallback) from
+    /// "brand-new account, no grant yet" (Decision 5's `starting_amount_micros`, coincidentally
+    /// $15 too under the shipped default policy, but not derived from it here) or "a grant exists
+    /// but the amount predates/postdates the compile-time ladder." This method has no
+    /// `PolicyEngine` to read either live value from, and is used today only by the transitional,
+    /// `BudgetTier`-shaped [`crate::refill::RefillStatus`] fields the live frontend still reads
+    /// (see [`crate::refill::RefillService::current_tier`]'s own doc comment) -- so both defaults
+    /// deliberately stay `B15` rather than being wired to either policy field. The token-mint
+    /// path that DOES need the real fail-closed floor
+    /// (`TokenExchangeOpStore::resolve_budget_tier` in `lightbridge-authz-rest`) reads
+    /// `fail_closed_floor_micros()` directly on its OWN `Err` branch below, never through this
+    /// method's internal `B15` defaults.
     pub async fn current_tier(
         &self,
         budget_account_id: &str,

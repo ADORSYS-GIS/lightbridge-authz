@@ -23,6 +23,9 @@ use axum::http::{Request, StatusCode, header};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
+use lightbridge_authz_budget::decision::{Decision, PolicyEngine};
+use lightbridge_authz_budget::error::BudgetError;
+use lightbridge_authz_budget::facts::Facts;
 use lightbridge_authz_budget::period::Period;
 use lightbridge_authz_budget::repo::{BudgetRepo, GrantRequest};
 use lightbridge_authz_budget::source::GrantSource;
@@ -302,7 +305,9 @@ async fn seed_member_project(repo: &StoreRepo) {
 /// tests that need a non-default `refresh_absolute_ttl_seconds` (the absolute-cap tests) call this
 /// directly. Uses a REAL budget repo built off `repo`'s own pool -- see
 /// [`state_with_cfg_and_budget_repo`] for tests that need an independently-controlled (e.g. dead)
-/// budget-ledger pool while the rest of the stack (`repo`) stays real.
+/// budget-ledger pool while the rest of the stack (`repo`) stays real. `policy_engine` is the
+/// ADR-0015 default fixed double ([`default_policy_engine`]) -- tests exercising the fail-closed
+/// floor itself call [`state_with_cfg_and_budget_repo`] directly with their own.
 fn state_with_cfg(
     repo: Arc<StoreRepo>,
     bearer: Arc<dyn BearerTokenServiceTrait>,
@@ -313,16 +318,26 @@ fn state_with_cfg(
     let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
         repo.pool.clone(),
     ));
-    state_with_cfg_and_budget_repo(repo, budget_repo, bearer, clients, redis_url, cfg)
+    state_with_cfg_and_budget_repo(
+        repo,
+        budget_repo,
+        default_policy_engine(),
+        bearer,
+        clients,
+        redis_url,
+        cfg,
+    )
 }
 
-/// Same as [`state_with_cfg`], but with `budget_repo` supplied explicitly rather than derived
-/// from `repo`'s own pool -- the ADR-0014 fail-closed tests use this to point the budget ledger
-/// at an unreachable pool while `repo` (subject/context resolution) stays a real, reachable
-/// Postgres.
+/// Same as [`state_with_cfg`], but with `budget_repo`/`policy_engine` supplied explicitly rather
+/// than derived/defaulted -- the ADR-0014/ADR-0015 fail-closed tests use this to point the budget
+/// ledger at an unreachable pool (and, separately, to control exactly what
+/// `fail_closed_floor_micros()` resolves to) while `repo` (subject/context resolution) stays a
+/// real, reachable Postgres.
 fn state_with_cfg_and_budget_repo(
     repo: Arc<StoreRepo>,
     budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+    policy_engine: Arc<dyn PolicyEngine>,
     bearer: Arc<dyn BearerTokenServiceTrait>,
     clients: Vec<OauthClient>,
     redis_url: &str,
@@ -349,6 +364,7 @@ fn state_with_cfg_and_budget_repo(
         assertions,
         repo,
         budget_repo,
+        policy_engine,
         bearer,
         cfg,
     ));
@@ -2577,7 +2593,59 @@ async fn replaying_an_explicitly_revoked_token_does_not_trigger_the_reuse_cascad
 // resolved live from the budget ledger -- superseding ADR-0008's "write a Keycloak attribute"
 // delivery mechanism. The fail-closed test below is the one that matters most: a budget-ledger
 // outage must never omit the claim and must never fail the token exchange/refresh itself.
+//
+// ADR-0015 Decision 6 moved WHAT that fail-closed fallback resolves to off the compile-time
+// `BudgetTier::B15` constant and onto the active policy document's `fail_closed_floor_micros`
+// (shipped default: $6, below `B15`'s $15) -- see `FixedPolicyEngine`/`default_policy_engine`
+// below and `TokenExchangeOpStore::resolve_budget_tier`'s own doc comment.
 // ============================================================================================
+
+/// A `PolicyEngine` double whose `fail_closed_floor_micros()` is caller-controlled, so the
+/// fail-closed tests below can assert the exact claim value the exchange/refresh path stamps
+/// without depending on whatever the real, DB-seeded active policy happens to contain right now.
+/// `evaluate` panics if called -- `resolve_budget_tier` never calls it, and neither does any test
+/// in this file that constructs this double.
+#[derive(Debug)]
+struct FixedPolicyEngine {
+    allowed_amounts_micros: Vec<i64>,
+    starting_amount_micros: i64,
+    fail_closed_floor_micros: i64,
+}
+
+#[async_trait]
+impl PolicyEngine for FixedPolicyEngine {
+    async fn evaluate(
+        &self,
+        _facts: &Facts,
+        _requested_amount_micros: i64,
+    ) -> Result<Decision, BudgetError> {
+        unreachable!("resolve_budget_tier never calls PolicyEngine::evaluate")
+    }
+
+    fn allowed_amounts_micros(&self) -> Vec<i64> {
+        self.allowed_amounts_micros.clone()
+    }
+
+    fn starting_amount_micros(&self) -> i64 {
+        self.starting_amount_micros
+    }
+
+    fn fail_closed_floor_micros(&self) -> i64 {
+        self.fail_closed_floor_micros
+    }
+}
+
+/// The ADR-0015 shipped defaults ($6/$15/$30 offered, $15 starting, $6 fail-closed floor --
+/// matching `rule_data::default_rule_set_json` and the `20260819000001_...` migration), used by
+/// every test in this file that does NOT specifically exercise the fail-closed floor value
+/// itself.
+fn default_policy_engine() -> Arc<dyn PolicyEngine> {
+    Arc::new(FixedPolicyEngine {
+        allowed_amounts_micros: vec![6_000_000, 15_000_000, 30_000_000],
+        starting_amount_micros: 15_000_000,
+        fail_closed_floor_micros: 6_000_000,
+    })
+}
 
 const BUDGET_UNREACHABLE_URL: &str = "postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz";
 
@@ -2756,10 +2824,16 @@ async fn refresh_re_resolves_the_budget_tier_live_rather_than_copying_the_old_cl
 
 /// **The fail-closed test that matters most.** With the budget ledger unreachable, the
 /// token-exchange grant must still succeed and the `budget_tier` claim must still be stamped --
-/// at the lowest rung, never omitted, never turning into a failed exchange. Proven by first
-/// showing the SAME setup succeeds with a real budget ledger reachable (so a later regression
-/// that broke the exchange for an unrelated reason wouldn't be mistaken for this fail-closed path
-/// specifically), then swapping only the budget repo for a dead one and re-asserting.
+/// at the policy-configured fail-closed floor (ADR-0015 Decision 6), never omitted, never
+/// turning into a failed exchange. Proven by first showing the SAME setup succeeds with a real
+/// budget ledger reachable (so a later regression that broke the exchange for an unrelated
+/// reason wouldn't be mistaken for this fail-closed path specifically), then swapping only the
+/// budget repo for a dead one and re-asserting.
+///
+/// Deliberately uses a floor ($9, `9_000_000`) that matches neither a legacy `BudgetTier` rung
+/// nor the ADR-0015-shipped $6 default -- if this assertion ever passed against a hard-coded
+/// `B15`/$6 fallback instead of genuinely reading `PolicyEngine::fail_closed_floor_micros()` off
+/// the engine this test supplies, it would fail loudly rather than accidentally match.
 #[sqlx::test(migrations = "../../migrations")]
 async fn budget_tier_claim_survives_a_budget_ledger_outage_on_exchange(pool: PgPool) {
     let repo = repo(pool);
@@ -2769,6 +2843,11 @@ async fn budget_tier_claim_survives_a_budget_ledger_outage_on_exchange(pool: PgP
     let state = state_with_cfg_and_budget_repo(
         repo.clone(),
         lazy_budget_repo(),
+        Arc::new(FixedPolicyEngine {
+            allowed_amounts_micros: vec![9_000_000],
+            starting_amount_micros: 15_000_000,
+            fail_closed_floor_micros: 9_000_000,
+        }),
         Arc::new(MockBearer::new(true, vec![PUBLIC_CLIENT_ID.to_string()])),
         vec![public_client(PUBLIC_CLIENT_ID)],
         &redis_url(),
@@ -2796,9 +2875,9 @@ async fn budget_tier_claim_survives_a_budget_ledger_outage_on_exchange(pool: PgP
     )
     .await;
     assert_eq!(
-        claims["budget_tier"], "b-15",
-        "an unreachable budget ledger must fall back to the lowest rung, never omit the claim: \
-         {claims:?}"
+        claims["budget_tier"], "b-9",
+        "an unreachable budget ledger must fall back to the policy-configured fail-closed floor \
+         (b-9), never a hard-coded rung, and never omit the claim: {claims:?}"
     );
 }
 
@@ -2806,6 +2885,8 @@ async fn budget_tier_claim_survives_a_budget_ledger_outage_on_exchange(pool: PgP
 /// same signing calls, so this pins that the fallback applies there too, not only on the initial
 /// exchange. The refresh token itself is minted with a REAL budget repo (proving the account had
 /// a resolvable tier once); only the ledger backing the *refresh* call is swapped to unreachable.
+/// Uses the same deliberately-distinctive $9 floor as
+/// [`budget_tier_claim_survives_a_budget_ledger_outage_on_exchange`], for the same reason.
 #[sqlx::test(migrations = "../../migrations")]
 async fn budget_tier_claim_survives_a_budget_ledger_outage_on_refresh(pool: PgPool) {
     let repo = repo(pool);
@@ -2834,6 +2915,11 @@ async fn budget_tier_claim_survives_a_budget_ledger_outage_on_refresh(pool: PgPo
     let state = state_with_cfg_and_budget_repo(
         repo.clone(),
         lazy_budget_repo(),
+        Arc::new(FixedPolicyEngine {
+            allowed_amounts_micros: vec![9_000_000],
+            starting_amount_micros: 15_000_000,
+            fail_closed_floor_micros: 9_000_000,
+        }),
         Arc::new(MockBearer::new(true, vec![PUBLIC_CLIENT_ID.to_string()])),
         vec![public_client(PUBLIC_CLIENT_ID)],
         &redis_url(),
@@ -2859,8 +2945,9 @@ async fn budget_tier_claim_survives_a_budget_ledger_outage_on_refresh(pool: PgPo
     )
     .await;
     assert_eq!(
-        claims["budget_tier"], "b-15",
-        "refresh must also fall back to the lowest rung on a ledger outage, not surface the \
-         previously-known real tier (b-250) or omit the claim: {claims:?}"
+        claims["budget_tier"], "b-9",
+        "refresh must also fall back to the policy-configured fail-closed floor (b-9) on a \
+         ledger outage, not surface the previously-known real tier (b-250), not a hard-coded \
+         rung, and never omit the claim: {claims:?}"
     );
 }

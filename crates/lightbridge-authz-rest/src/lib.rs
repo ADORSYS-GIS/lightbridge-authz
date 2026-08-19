@@ -2027,10 +2027,16 @@ const CLIENT_ASSERTION_JTI_KEY_PREFIX: &str = "authz-api:client-assertion-jti:";
 /// `budget_grants`/`budget_balances` off the SAME Postgres `pool` every other repository on this
 /// server already uses (see the call site's own `budget_repo` construction), so this stays an
 /// intra-database read, never a network hop to the separate `authz-budget` microservice.
+///
+/// `policy_engine` (ADR-0015 Decision 6) is the same kind of edge: the call site loads its own
+/// `PolicyStore` off the shared `budget_policy_sets`/`budget_policy_revisions` tables, so
+/// `TokenExchangeOpStore::resolve_budget_tier`'s fail-closed fallback reads the live, admin-
+/// configured `fail_closed_floor_micros` instead of a hard-coded rung.
 fn build_token_exchange_state(
     oauth2: &Oauth2,
     repo: Arc<StoreRepo>,
     budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+    policy_engine: Arc<dyn lightbridge_authz_budget::PolicyEngine>,
     bearer: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait>,
     redis_url: &str,
     redis_ca_bundle_path: Option<&str>,
@@ -2078,6 +2084,7 @@ fn build_token_exchange_state(
         assertions,
         repo,
         budget_repo,
+        policy_engine,
         bearer,
         cfg.clone(),
     ));
@@ -2407,6 +2414,21 @@ pub async fn start_idp_server(
     let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
         pool.clone(),
     ));
+    // ADR-0015 Decision 6: `TokenExchangeOpStore::resolve_budget_tier`'s fail-closed fallback
+    // needs a live `PolicyEngine`, exactly like `start_api_server`'s/`start_budget_server`'s
+    // identical load -- loading whatever is genuinely active in the DB right now, off the SAME
+    // shared Postgres `budget_policy_sets`/`budget_policy_revisions` tables, so `authz-idp` never
+    // drifts from what `activateBudgetPolicy` most recently activated.
+    let policy_store = Arc::new(
+        lightbridge_authz_budget::PolicyStore::load_active_from_db(
+            pool.clone(),
+            BUDGET_POLICY_SET_ID,
+            BUDGET_POLICY_EVALUATION_BUDGET,
+        )
+        .await
+        .map_err(|e| Error::Server(format!("failed to load active budget policy: {e}")))?,
+    );
+    let policy_engine: Arc<dyn lightbridge_authz_budget::PolicyEngine> = policy_store.engine();
     let signing_repo = Arc::new(StoreRepo::new(pool));
     signing::bootstrap_signing_key(&signing_repo, signing).await?;
 
@@ -2433,6 +2455,7 @@ pub async fn start_idp_server(
         oauth2,
         signing_repo.clone(),
         budget_repo,
+        policy_engine,
         bearer_service,
         &redis.url,
         redis.ca_bundle_path.as_deref(),
@@ -2776,6 +2799,43 @@ mod tests {
         Arc::new(NoopBearer)
     }
 
+    /// A `PolicyEngine` double that panics if `evaluate` is ever called.
+    /// `build_token_exchange_state` only needs a `PolicyEngine` to satisfy
+    /// `TokenExchangeOpStore::new`'s constructor (ADR-0015 Decision 6); none of the
+    /// config-validation tests below ever mint a token, so `resolve_budget_tier` -- the only
+    /// caller of any `PolicyEngine` method reachable from this store -- is never exercised here
+    /// either.
+    #[derive(Debug)]
+    struct UnusedPolicyEngine;
+
+    #[async_trait]
+    impl lightbridge_authz_budget::PolicyEngine for UnusedPolicyEngine {
+        async fn evaluate(
+            &self,
+            _facts: &lightbridge_authz_budget::Facts,
+            _requested_amount_micros: i64,
+        ) -> Result<lightbridge_authz_budget::Decision, lightbridge_authz_budget::BudgetError>
+        {
+            unreachable!("build_token_exchange_state never calls the policy engine")
+        }
+
+        fn allowed_amounts_micros(&self) -> Vec<i64> {
+            vec![6_000_000, 15_000_000, 30_000_000]
+        }
+
+        fn starting_amount_micros(&self) -> i64 {
+            15_000_000
+        }
+
+        fn fail_closed_floor_micros(&self) -> i64 {
+            6_000_000
+        }
+    }
+
+    fn lazy_policy_engine() -> Arc<dyn lightbridge_authz_budget::PolicyEngine> {
+        Arc::new(UnusedPolicyEngine)
+    }
+
     #[test]
     fn normalize_rpc_base_path_handles_unset_and_root() {
         // Unset / empty / bare-slash all mean "root mount" (caller uses `merge`).
@@ -2854,6 +2914,7 @@ mod tests {
             &oauth2,
             lazy_signing_repo(),
             lazy_budget_repo(),
+            lazy_policy_engine(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2870,6 +2931,7 @@ mod tests {
             &oauth2,
             lazy_signing_repo(),
             lazy_budget_repo(),
+            lazy_policy_engine(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2887,6 +2949,7 @@ mod tests {
             &oauth2,
             lazy_signing_repo(),
             lazy_budget_repo(),
+            lazy_policy_engine(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2907,6 +2970,7 @@ mod tests {
             &oauth2,
             lazy_signing_repo(),
             lazy_budget_repo(),
+            lazy_policy_engine(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2927,6 +2991,7 @@ mod tests {
             &oauth2,
             lazy_signing_repo(),
             lazy_budget_repo(),
+            lazy_policy_engine(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2949,6 +3014,7 @@ mod tests {
             &oauth2,
             lazy_signing_repo(),
             lazy_budget_repo(),
+            lazy_policy_engine(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2972,6 +3038,7 @@ mod tests {
             &oauth2,
             lazy_signing_repo(),
             lazy_budget_repo(),
+            lazy_policy_engine(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
@@ -2994,6 +3061,7 @@ mod tests {
             &oauth2,
             lazy_signing_repo(),
             lazy_budget_repo(),
+            lazy_policy_engine(),
             noop_bearer(),
             UNREACHABLE_REDIS_URL,
             None,
