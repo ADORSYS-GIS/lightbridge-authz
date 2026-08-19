@@ -55,12 +55,15 @@ use chrono::{DateTime, Duration, Utc};
 use lightbridge_authz_api_key::entities::exchange_refresh_token_row::NewExchangeRefreshToken;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::BearerTokenServiceTrait;
+use lightbridge_authz_budget::repo::BudgetRepo;
+use lightbridge_authz_budget::{BudgetTier, Period, PolicyEngine};
 use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::config::Oauth2TokenExchange;
 use lightbridge_authz_core::crypto::hash_api_key;
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::dto::ResourceStatus;
 use lightbridge_authz_core::error::Error;
+use serde_json::Value;
 
 use crate::signing::{KeyOwner, access_token_extra, id_token_extra, identity_for};
 
@@ -73,6 +76,32 @@ use super::{
     decode_email, generate_refresh_secret, grant_scopes, oauth_err, scope_to_string,
 };
 
+/// The `budget_tier` claim's wire label for an arbitrary amount, in micros. ADR-0008's ladder
+/// used `"b-<dollars>"` (`"b-15"`, `"b-30"`, ...) for its seven compile-time rungs; ADR-0015
+/// moved the amounts that can appear here (notably the fail-closed floor, which now defaults to
+/// $6 -- below `B15`) out of that compile-time enum and onto a policy document a revision can
+/// change without a deploy. Per ADR-0015's own "Neutral / follow-ups": "the wire labels the old
+/// enum used ... may still be a reasonable *display* convention for whatever amounts a policy
+/// happens to configure, but they are no longer a source of truth for which amounts are valid."
+/// This function is that convention, generalized to any amount: prefer the exact legacy label
+/// when `amount_micros` happens to match a known rung (byte-for-byte unchanged claim shape for
+/// every account on today's $15/$30/.../$1000 ladder), otherwise synthesize `"b-<dollars>"`
+/// directly from the amount so a policy-configured floor (or any other new amount) gets an
+/// honest label instead of being misrepresented as the nearest legacy rung.
+///
+/// Assumes whole-dollar amounts (integer micros divisible by `1_000_000`), matching every
+/// `allowed_amounts_micros`/`starting_amount_micros`/`fail_closed_floor_micros` value this
+/// codebase ships today (`rule_data::default_rule_set_json`, the ADR-0015 migration). A
+/// non-whole-dollar amount still produces a label (truncating division), just not one that
+/// round-trips back through [`BudgetTier::from_amount_micros`] -- no different in kind from the
+/// legacy enum, which likewise had no representation for a non-whole-dollar amount.
+fn budget_tier_wire_label(amount_micros: i64) -> String {
+    match BudgetTier::from_amount_micros(amount_micros) {
+        Some(tier) => tier.label().to_string(),
+        None => format!("b-{}", amount_micros / 1_000_000),
+    }
+}
+
 /// Everything the native token-exchange endpoint needs, minus the one per-request field
 /// (`project_id`) `handle_token`'s dispatch has no room to carry -- see `RequestScopedOpStore`.
 /// One instance is built once at server startup and shared (`Arc`) across every request.
@@ -83,6 +112,13 @@ pub struct TokenExchangeOpStore {
     devices: NoDeviceCodeStore,
     assertions: RedisClientAssertionStore,
     repo: Arc<StoreRepo>,
+    budget_repo: Arc<BudgetRepo>,
+    /// ADR-0015 Decision 6's fail-closed floor, read live (see [`Self::resolve_budget_tier`]) --
+    /// the SAME hot-swappable engine `authz-api`/`authz-budget` already hold via
+    /// `policy_store.engine()`, not a private copy. `authz-idp` (this store's only production
+    /// constructor, `start_idp_server`) loads its own `PolicyStore` off the shared Postgres
+    /// `budget_policy_sets`/`budget_policy_revisions` tables for exactly this reason.
+    policy_engine: Arc<dyn PolicyEngine>,
     bearer: Arc<dyn BearerTokenServiceTrait>,
     cfg: Oauth2TokenExchange,
 }
@@ -92,6 +128,8 @@ impl TokenExchangeOpStore {
         clients: ConfigClientStore,
         assertions: RedisClientAssertionStore,
         repo: Arc<StoreRepo>,
+        budget_repo: Arc<BudgetRepo>,
+        policy_engine: Arc<dyn PolicyEngine>,
         bearer: Arc<dyn BearerTokenServiceTrait>,
         cfg: Oauth2TokenExchange,
     ) -> Self {
@@ -102,6 +140,8 @@ impl TokenExchangeOpStore {
             devices: NoDeviceCodeStore,
             assertions,
             repo,
+            budget_repo,
+            policy_engine,
             bearer,
             cfg,
         }
@@ -142,6 +182,62 @@ impl TokenExchangeOpStore {
         expires_at: DateTime<Utc>,
     ) -> Result<bool, OpError> {
         self.assertions.record_jti(jti, expires_at).await
+    }
+
+    /// Resolves the `budget_tier` claim to stamp on a minted access token (ADR-0014,
+    /// superseding ADR-0008's Keycloak-attribute delivery mechanism -- the tier ladder and
+    /// reset-not-topup semantics from ADR-0008 are unchanged, only *how the tier reaches the
+    /// gateway* changed). Called from both [`Self::handle_token_exchange`] and
+    /// [`Self::handle_refresh_token`], since ADR-0011 already re-mints both symmetrically through
+    /// the same signing calls.
+    ///
+    /// **Fail-closed, unconditionally, at the policy-configured floor -- not a hard-coded
+    /// rung (ADR-0015 Decision 6).** [`BudgetRepo::current_tier`] handles the ADR-0008 "no grant
+    /// yet this period" / "grant amount doesn't match a known rung" cases internally by
+    /// defaulting to [`BudgetTier::B15`] -- that is the *starting-amount* case (a brand-new
+    /// account), a distinct concept from the fail-closed floor this method is about, and it is
+    /// deliberately left alone here: see `BudgetRepo::current_tier`'s own doc comment for why
+    /// that default stays a flagged, pre-existing simplification rather than being wired to
+    /// [`PolicyEngine::starting_amount_micros`] in this change.
+    ///
+    /// What `BudgetRepo::current_tier` does NOT swallow is a genuine storage failure
+    /// (`Err(BudgetError::StorageFailed)`, e.g. the budget ledger's database being unreachable):
+    /// that propagates as an `Err`, because a caller that wants to tell "new account" apart from
+    /// "ledger down" (an operator alert, say) still can. THIS caller does not want that
+    /// distinction -- a budget-ledger outage is orthogonal to whether a login/refresh should
+    /// succeed, and per the budget-tier-rekey-cutover runbook, "an account with no claim lands on
+    /// no matching rule, which is the difference between base budget and unlimited". So any `Err`
+    /// here -- for any reason -- is caught, logged, and downgraded to
+    /// [`PolicyEngine::fail_closed_floor_micros`] (read live off the same hot-swappable engine
+    /// `authz-api`/`authz-budget` use, never a private snapshot), and the token mint proceeds.
+    /// The claim is never omitted and the exchange/refresh grant never fails because of this
+    /// lookup.
+    ///
+    /// Returns the wire label to stamp directly (not a [`BudgetTier`]): the floor amount a policy
+    /// revision configures has no guarantee of matching any compile-time rung (the shipped
+    /// default is $6, below `B15`'s $15), so [`budget_tier_wire_label`] is used for both the
+    /// success and fallback paths to produce a consistent `"b-<dollars>"` label either way.
+    async fn resolve_budget_tier(&self, budget_account_id: &str, now: DateTime<Utc>) -> String {
+        let period = Period::current(now);
+        match self
+            .budget_repo
+            .current_tier(budget_account_id, &period)
+            .await
+        {
+            Ok(tier) => tier.label().to_string(),
+            Err(err) => {
+                let floor_micros = self.policy_engine.fail_closed_floor_micros();
+                tracing::error!(
+                    error = %err,
+                    account_id = %budget_account_id,
+                    fail_closed_floor_micros = floor_micros,
+                    "budget tier resolution failed; falling back to the policy-configured \
+                     fail-closed floor rather than omitting the claim or failing the token \
+                     exchange"
+                );
+                budget_tier_wire_label(floor_micros)
+            }
+        }
     }
 
     /// The RFC 8693 token-exchange grant (ADR-0011, Decisions 1, 5, 7). `project_id` is this
@@ -288,7 +384,8 @@ impl TokenExchangeOpStore {
         let expires_in_secs = self.cfg.access_ttl_seconds.max(0) as u64;
         let scope_str = scope_to_string(&granted_scopes);
 
-        let access_extra = access_token_extra(
+        let budget_tier = self.resolve_budget_tier(&context.account_id, now).await;
+        let mut access_extra = access_token_extra(
             &owner,
             &session_id,
             &context.project_id,
@@ -296,6 +393,7 @@ impl TokenExchangeOpStore {
             allowed_models,
             Some(&client_id),
         );
+        access_extra.insert("budget_tier".to_string(), Value::String(budget_tier));
         let access_token = tokens
             .issue_user_token_with_extra(
                 identity_for(&owner),
@@ -527,7 +625,8 @@ impl TokenExchangeOpStore {
         let expires_in_secs = self.cfg.access_ttl_seconds.max(0) as u64;
         let scope_str = old_row.scope.clone();
 
-        let access_extra = access_token_extra(
+        let budget_tier = self.resolve_budget_tier(&context.account_id, now).await;
+        let mut access_extra = access_token_extra(
             &owner,
             &session_id,
             &context.project_id,
@@ -535,6 +634,7 @@ impl TokenExchangeOpStore {
             allowed_models,
             Some(&client_id),
         );
+        access_extra.insert("budget_tier".to_string(), Value::String(budget_tier));
         let access_token = tokens
             .issue_user_token_with_extra(
                 identity_for(&owner),
@@ -884,5 +984,46 @@ impl OpStore for RequestScopedOpStore<'_> {
         self.inner
             .handle_refresh_token(req, client_id, client, tokens)
             .await
+    }
+}
+
+#[cfg(test)]
+mod budget_tier_wire_label_tests {
+    use super::budget_tier_wire_label;
+    use lightbridge_authz_budget::tier::BudgetTier;
+
+    /// The ADR-0015-shipped fail-closed floor ($6, `6_000_000` micros) -- the whole reason
+    /// `budget_tier_wire_label` exists: `BudgetTier` has no variant below `B15`'s $15, so a
+    /// caller that stamped `BudgetTier::B15.label()` here regardless of the configured floor
+    /// would misrepresent a $6 outage fallback as the $15 rung, silently granting more than the
+    /// policy actually authorizes on the one path (a budget-ledger outage) meant to be the most
+    /// conservative. This is the exact fail-open shape ADR-0015 Decision 6 exists to prevent.
+    #[test]
+    fn the_adr_0015_fail_closed_floor_gets_its_own_honest_label_not_the_nearest_legacy_rung() {
+        assert_eq!(budget_tier_wire_label(6_000_000), "b-6");
+        assert_ne!(
+            budget_tier_wire_label(6_000_000),
+            BudgetTier::B15.label(),
+            "a $6 floor must never be represented as the $15 rung"
+        );
+    }
+
+    /// Every legacy `BudgetTier` rung round-trips through its exact, pre-ADR-0015 label --
+    /// stamping the claim for an account that resolved through the real ledger (not the
+    /// fail-closed fallback) must not change shape for any account already on a known rung.
+    #[test]
+    fn every_legacy_rung_keeps_its_exact_pre_adr_0015_label() {
+        for tier in BudgetTier::ALL {
+            assert_eq!(budget_tier_wire_label(tier.amount().get()), tier.label());
+        }
+    }
+
+    /// An amount that matches neither a legacy rung nor a whole number of dollars still produces
+    /// a label (truncating division) rather than panicking -- no different in kind from the
+    /// legacy enum, which likewise had no representation for a non-whole-dollar amount. Documents
+    /// the behavior rather than asserting it is ideal.
+    #[test]
+    fn a_non_whole_dollar_amount_truncates_rather_than_panics() {
+        assert_eq!(budget_tier_wire_label(6_500_000), "b-6");
     }
 }

@@ -149,6 +149,37 @@ impl lightbridge_authz_bearer::BearerTokenServiceTrait for UnreachableBearer {
     }
 }
 
+/// ADR-0015 Decision 6: `TokenExchangeOpStore::new` now requires a `PolicyEngine` for
+/// `resolve_budget_tier`'s fail-closed fallback. Neither test in this file mints a token (both
+/// exercise `/oauth2/revoke`'s pre-store request validation, or router wiring only), so this
+/// double panics if actually consulted -- same "fully offline, unreachable if ever called"
+/// contract as [`UnreachableBearer`] above.
+#[derive(Debug)]
+struct UnreachablePolicyEngine;
+
+#[async_trait]
+impl lightbridge_authz_budget::PolicyEngine for UnreachablePolicyEngine {
+    async fn evaluate(
+        &self,
+        _facts: &lightbridge_authz_budget::Facts,
+        _requested_amount_micros: i64,
+    ) -> Result<lightbridge_authz_budget::Decision, lightbridge_authz_budget::BudgetError> {
+        unreachable!("neither test below reaches a refill policy evaluation")
+    }
+
+    fn allowed_amounts_micros(&self) -> Vec<i64> {
+        unreachable!("neither test below reaches a refill ladder read")
+    }
+
+    fn starting_amount_micros(&self) -> i64 {
+        unreachable!("neither test below reaches a starting-amount read")
+    }
+
+    fn fail_closed_floor_micros(&self) -> i64 {
+        unreachable!("neither test below reaches resolve_budget_tier's fail-closed fallback")
+    }
+}
+
 /// Builds a fully offline `TokenExchangeState`: `ApiKeyJwtSigner::from_config` and
 /// `RedisClientAssertionStore::connect` are both lazy (never dial out at construction time -- see
 /// `signing::ApiKeyJwtSigner`'s and `RedisClientAssertionStore::connect`'s own doc comments), so
@@ -177,6 +208,12 @@ fn offline_token_exchange_state(
             .expect("lazy redis connection manager always builds");
     let bearer: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(UnreachableBearer);
+    // Built off the SAME (lazy, never-dialed) pool `repo` already wraps -- `StoreRepo.pool` is
+    // public precisely so callers like this can share one pool across repos without a second
+    // connection config. Keeps this helper "fully offline" per its own doc comment above.
+    let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
+        repo.pool.clone(),
+    ));
     let op_config = authkestra_op::config::OpConfig {
         issuer: oauth2.signing.as_ref().unwrap().issuer.clone(),
         scopes_supported: cfg.allowed_scopes.clone(),
@@ -191,10 +228,14 @@ fn offline_token_exchange_state(
         device_code_ttl_secs: 0,
         token_exchange_enabled: cfg.enabled,
     };
+    let policy_engine: Arc<dyn lightbridge_authz_budget::PolicyEngine> =
+        Arc::new(UnreachablePolicyEngine);
     let op_store = Arc::new(TokenExchangeOpStore::new(
         client_store,
         assertions,
         repo,
+        budget_repo,
+        policy_engine,
         bearer,
         cfg,
     ));
