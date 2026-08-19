@@ -8,12 +8,25 @@
 
 use std::fmt;
 
+use chrono::{DateTime, Datelike, Utc};
+
 use crate::error::BudgetError;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Period(String);
 
 impl Period {
+    /// The calendar period containing `now` (ADR-0014: budget-tier claim resolution at
+    /// token-mint time needs "the current period" the same way `requestBudgetRefill` needs a
+    /// caller-supplied one). Still honours this module's clock-free discipline in spirit -- the
+    /// clock read (`Utc::now()`) happens at the call site, this function only converts an
+    /// already-read instant. Infallible: `DateTime<Utc>::month()` is always `1..=12` by
+    /// construction, so `from_ymd` can never reject it.
+    pub fn current(now: DateTime<Utc>) -> Period {
+        Self::from_ymd(now.year() as u32, now.month() as u8)
+            .expect("chrono DateTime::month() is always in 1..=12")
+    }
+
     pub fn parse(s: &str) -> Result<Self, BudgetError> {
         let invalid = || BudgetError::InvalidPeriod(s.to_string());
 
@@ -157,6 +170,28 @@ mod tests {
         assert_eq!(
             period.previous(),
             Period::parse("2025-12").expect("valid period must parse")
+        );
+    }
+
+    #[test]
+    fn current_reads_year_and_month_off_the_supplied_instant() {
+        let now = DateTime::parse_from_rfc3339("2026-08-18T12:00:00Z")
+            .expect("valid rfc3339")
+            .with_timezone(&Utc);
+        assert_eq!(
+            Period::current(now),
+            Period::parse("2026-08").expect("valid period must parse")
+        );
+    }
+
+    #[test]
+    fn current_handles_december() {
+        let now = DateTime::parse_from_rfc3339("2026-12-31T23:59:59Z")
+            .expect("valid rfc3339")
+            .with_timezone(&Utc);
+        assert_eq!(
+            Period::current(now),
+            Period::parse("2026-12").expect("valid period must parse")
         );
     }
 }
