@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use lightbridge_authz_core::config::{
-    ApiServer, BasicAuth, Billing, BillingPlan, ModelCatalog, Oauth2, Oauth2Type, OpaServer,
-    QuotaTiers, Redis, Tls,
+    ApiKeyExpiry, ApiServer, BasicAuth, Billing, BillingPlan, ModelCatalog, Oauth2, Oauth2Type,
+    OpaServer, QuotaTiers, Redis, Tls,
 };
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use sqlx::postgres::PgPoolOptions;
@@ -48,6 +48,14 @@ fn sample_quota_tiers() -> QuotaTiers {
 /// `sample_quota_tiers` above.
 fn sample_models() -> ModelCatalog {
     ModelCatalog::default()
+}
+
+/// The built-in default (90 days) -- none of these tests exercise `expires_at` validation itself
+/// (that lives in `crates/lightbridge-authz-rest/src/handlers/mod.rs`'s own tests and
+/// `api_key_expiry_tests.rs`), so the real default is exactly what every server-startup test here
+/// wants -- mirrors `sample_quota_tiers`/`sample_models` above.
+fn sample_api_key_expiry() -> ApiKeyExpiry {
+    ApiKeyExpiry::default()
 }
 
 fn bad_tls() -> Tls {
@@ -97,6 +105,7 @@ async fn start_api_server_fails_fast_when_tls_certs_are_missing() {
         &sample_billing(),
         &sample_quota_tiers(),
         &sample_models(),
+        &sample_api_key_expiry(),
         &sample_redis(),
         &None,
     )
@@ -173,6 +182,7 @@ async fn start_api_server_rejects_self_signed_oauth2_without_signing_block() {
         &sample_billing(),
         &sample_quota_tiers(),
         &sample_models(),
+        &sample_api_key_expiry(),
         &sample_redis(),
         &None,
     )
@@ -206,6 +216,7 @@ async fn start_api_server_warns_when_dev_cors_is_enabled() {
         &sample_billing(),
         &sample_quota_tiers(),
         &sample_models(),
+        &sample_api_key_expiry(),
         &sample_redis(),
         &None,
     )
@@ -338,6 +349,7 @@ mod db {
             &sample_billing(),
             &sample_quota_tiers(),
             &sample_models(),
+            &sample_api_key_expiry(),
             &sample_redis(),
             &None,
         )
@@ -376,6 +388,7 @@ mod db {
             &sample_billing(),
             &sample_quota_tiers(),
             &sample_models(),
+            &sample_api_key_expiry(),
             &None,
             &None,
         )
@@ -406,6 +419,7 @@ mod db {
             &sample_billing(),
             &sample_quota_tiers(),
             &sample_models(),
+            &sample_api_key_expiry(),
             &unreachable_redis(),
             &None,
         )
@@ -438,6 +452,7 @@ mod db {
             &sample_billing(),
             &sample_quota_tiers(),
             &sample_models(),
+            &sample_api_key_expiry(),
             &None,
             &None,
         )
@@ -460,6 +475,7 @@ mod db {
             &sample_billing(),
             &sample_quota_tiers(),
             &sample_models(),
+            &sample_api_key_expiry(),
             &unreachable_redis(),
             &None,
         )
@@ -599,7 +615,9 @@ mod db {
                 &project.id,
                 CreateApiKey {
                     name: "opa-trait-key".to_string(),
-                    expires_at: None,
+                    // `expires_at` is mandatory as of lightbridge-authz#395 --
+                    // `AuthzStoreImpl::create_api_key` now rejects `None` outright.
+                    expires_at: Some(chrono::Utc::now() + chrono::Duration::days(30)),
                     billing_plan: "free".to_string(),
                 },
             )

@@ -13,6 +13,14 @@ fn build_repo(pool: PgPool) -> StoreRepo {
     StoreRepo::new(Arc::new(DbPool::from_pool(pool)))
 }
 
+/// `api_keys.expires_at` is `NOT NULL` (lightbridge-authz#395), so every `seed_key` call in this
+/// file needs a real value -- this stands in for the pre-#395 "no expiry" baseline case: a plain
+/// active key, far enough out that it never interferes with the suspension/status assertions these
+/// tests actually check.
+fn far_future() -> Option<chrono::DateTime<Utc>> {
+    Some(Utc::now() + chrono::Duration::days(30))
+}
+
 /// Seed an account -> project -> API key (with the given expiry) and return their ids plus the
 /// key hash.
 async fn seed_key(
@@ -80,7 +88,7 @@ async fn effective_status(repo: &StoreRepo, key_hash: &str) -> String {
 async fn suspending_account_invalidates_its_keys(pool: PgPool) {
     let repo = build_repo(pool);
     let subject = "user-1";
-    let (account_id, _project_id, key_hash) = seed_key(&repo, subject, None).await;
+    let (account_id, _project_id, key_hash) = seed_key(&repo, subject, far_future()).await;
 
     assert_eq!(effective_status(&repo, &key_hash).await, "active");
 
@@ -102,7 +110,7 @@ async fn suspending_account_invalidates_its_keys(pool: PgPool) {
 async fn suspending_project_invalidates_its_keys(pool: PgPool) {
     let repo = build_repo(pool);
     let subject = "user-1";
-    let (_account_id, project_id, key_hash) = seed_key(&repo, subject, None).await;
+    let (_account_id, project_id, key_hash) = seed_key(&repo, subject, far_future()).await;
 
     assert_eq!(effective_status(&repo, &key_hash).await, "active");
 
@@ -128,7 +136,7 @@ async fn expired_key_reports_key_expired(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn set_account_status_requires_membership(pool: PgPool) {
     let repo = build_repo(pool);
-    let (account_id, _project_id, _key_hash) = seed_key(&repo, "owner", None).await;
+    let (account_id, _project_id, _key_hash) = seed_key(&repo, "owner", far_future()).await;
 
     let err = repo
         .set_account_status("intruder", &account_id, ResourceStatus::Suspended)

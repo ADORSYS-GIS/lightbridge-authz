@@ -69,6 +69,17 @@ pub struct Config {
     /// list rather than failing to start.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub models: ModelCatalog,
+    /// Operator-configured ceiling on how far in the future `createApiKey`/`rotateApiKey` may set
+    /// `expires_at` (lightbridge-authz#395: every API key must carry an expiry, no more nullable
+    /// "never expires" keys). Unlike `quota_tiers`/`models` above, an absent/null block is NOT an
+    /// escape hatch to "unlimited" -- `ApiKeyExpiry::default()` resolves it to a real 90-day
+    /// ceiling instead, because a missing config value here is "unknown", and unknown must route
+    /// to the strictest reading, never the most permissive one (see that type's own doc comment).
+    /// A value that fails to parse (e.g. a non-numeric `max_lifetime_days`) fails config load
+    /// entirely rather than silently falling back to anything -- also fail-closed, for the same
+    /// reason.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub api_key_expiry: ApiKeyExpiry,
 }
 
 /// The operator-configured catalogue of billing plans. Populated from env — either a single
@@ -418,6 +429,53 @@ where
     }
 
     deserializer.deserialize_any(ModelsVisitor)
+}
+
+/// Operator-configured ceiling on `api_keys.expires_at` (lightbridge-authz#395). Every
+/// `createApiKey`/`rotateApiKey` write is validated against this: `expiresAt` must be present, in
+/// the future, and no further out than `now + max_lifetime_days`
+/// (`AuthzStoreImpl::validate_expires_at`, `crates/lightbridge-authz-rest/src/handlers/mod.rs`).
+///
+/// Deliberately the opposite default posture from `QuotaTiers`/`ModelCatalog` above: those two
+/// treat an empty/absent catalogue as "accept anything" because they gate optional, informational
+/// fields. This gates a mandatory credential-lifetime ceiling, so absent must resolve to a real,
+/// conservative number (90 days) instead -- never to "no ceiling". `Default` and serde's
+/// `#[serde(default)]` both route through the same `default_api_key_max_lifetime_days` constant so
+/// "field omitted from YAML" and "struct built directly in Rust with `..Default::default()`" can
+/// never disagree.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ApiKeyExpiry {
+    #[serde(default = "default_api_key_max_lifetime_days")]
+    pub max_lifetime_days: u32,
+}
+
+impl Default for ApiKeyExpiry {
+    fn default() -> Self {
+        Self {
+            max_lifetime_days: default_api_key_max_lifetime_days(),
+        }
+    }
+}
+
+fn default_api_key_max_lifetime_days() -> u32 {
+    90
+}
+
+impl ApiKeyExpiry {
+    /// Fails startup loudly on a nonsensical ceiling, mirroring `Billing::validate`'s and
+    /// `ApiKeyJwtSigner::from_config`'s own startup guards (`oauth2.signing.ttl_seconds must be
+    /// positive`) -- a misconfigured ceiling must never silently become "no ceiling" (zero days
+    /// would make every `createApiKey` call fail instead, which is the fail-closed direction, but
+    /// still worth rejecting loudly at startup rather than discovering it via a wall of runtime
+    /// 400s).
+    pub fn validate(&self) -> Result<()> {
+        if self.max_lifetime_days == 0 {
+            return Err(Error::Server(
+                "api_key_expiry.max_lifetime_days must be greater than 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1124,6 +1182,49 @@ mod tests {
         }
         let via_wrapper_null: Wrap = from_str("models:\n").unwrap();
         assert!(via_wrapper_null.models.models.is_empty());
+    }
+
+    // lightbridge-authz#395: unlike `QuotaTiers`/`ModelCatalog` above, `ApiKeyExpiry` must default
+    // to a real, conservative ceiling (90 days) rather than "accept anything" when the config
+    // block is entirely absent -- mirrors the null-tolerance tests above but asserts the opposite
+    // failure-mode requirement (default is restrictive, not permissive).
+    #[test]
+    fn api_key_expiry_defaults_to_ninety_days_when_unset() {
+        let cfg: ApiKeyExpiry = from_str("{}\n").unwrap();
+        assert_eq!(cfg.max_lifetime_days, 90);
+        assert_eq!(ApiKeyExpiry::default().max_lifetime_days, 90);
+    }
+
+    #[test]
+    fn api_key_expiry_null_is_tolerated_as_the_default_not_unlimited() {
+        #[derive(Deserialize)]
+        struct Wrap {
+            #[serde(default, deserialize_with = "deserialize_null_default")]
+            api_key_expiry: ApiKeyExpiry,
+        }
+        let via_wrapper_null: Wrap = from_str("api_key_expiry:\n").unwrap();
+        assert_eq!(via_wrapper_null.api_key_expiry.max_lifetime_days, 90);
+    }
+
+    #[test]
+    fn api_key_expiry_parses_a_configured_ceiling() {
+        let cfg: ApiKeyExpiry = from_str("max_lifetime_days: 30\n").unwrap();
+        assert_eq!(cfg.max_lifetime_days, 30);
+    }
+
+    #[test]
+    fn api_key_expiry_validate_rejects_zero() {
+        let err = ApiKeyExpiry {
+            max_lifetime_days: 0,
+        }
+        .validate()
+        .unwrap_err();
+        assert!(format!("{err}").contains("must be greater than 0"));
+    }
+
+    #[test]
+    fn api_key_expiry_validate_accepts_the_default() {
+        assert!(ApiKeyExpiry::default().validate().is_ok());
     }
 
     #[test]

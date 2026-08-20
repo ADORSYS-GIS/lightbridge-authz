@@ -218,3 +218,9 @@ models:
       name: Dev Model A (local dev only)
     - id: dev-model-b
       name: Dev Model B (local dev only)
+
+# Ceiling on how far in the future createApiKey/rotateApiKey may set expires_at
+# (lightbridge-authz#395). Commented out deliberately: absent means the built-in 90-day default,
+# not "unlimited" -- see config/default.yaml's identical block for the full rationale.
+# api_key_expiry:
+#   max_lifetime_days: 90

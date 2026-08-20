@@ -247,3 +247,12 @@ models:
     - id: dev-model-b
       name: Dev Model B (local dev only)
 
+# Ceiling on how far in the future createApiKey/rotateApiKey may set expires_at
+# (lightbridge-authz#395: every API key must carry an expiry, no more nullable "never expires"
+# keys). Commented out here deliberately: the default (90 days) already applies when this block is
+# absent -- unlike `billing`/`quota_tiers`/`models` above, an absent block does NOT mean "accept
+# anything", it means "use the conservative built-in ceiling" (see `ApiKeyExpiry`'s own doc
+# comment in lightbridge-authz-core). Uncomment only to override the default.
+# api_key_expiry:
+#   max_lifetime_days: 90
+

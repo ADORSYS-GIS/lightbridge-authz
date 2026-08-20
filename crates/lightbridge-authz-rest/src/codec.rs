@@ -30,10 +30,12 @@
 //! serde_json::Value` (an intentionally opaque carrier -- it doesn't know the target procedure's
 //! concrete input type yet), then re-encodes *that* `serde_json::Value` back to bytes
 //! (`encode_rpc_value`) before redispatching through the normal per-op decode path. A `null`
-//! anywhere inside that value -- e.g. `CreateApiKeyInput.expiresAt: null` for "no expiry" -- comes
-//! out the other side of that round trip as CBOR's empty array, which then fails to decode into
-//! the concrete `Option<chrono::DateTime<Utc>>` field, producing the same generic `invalid_argument`
-//! / "invalid request payload" error. This reproduces only through `/rpc/batch`
+//! anywhere inside that value -- e.g. (historically -- see lightbridge-authz#395, which made
+//! `expiresAt` required and closed off "no expiry" entirely) `CreateApiKeyInput.expiresAt: null`
+//! for "no expiry" -- comes out the other side of that round trip as CBOR's empty array, which
+//! then fails to decode into the target field, producing the same generic `invalid_argument` /
+//! "invalid request payload" error a `null` gets rejected with today, just for a different reason
+//! (required-field enforcement, not this codec bug). This reproduces only through `/rpc/batch`
 //! (`converse-frontends` wires `createBatchLink()` into every unary authz RPC call --
 //! `apps/self-service/src/app/_layout.tsx` -- so every `createApiKey` call actually takes this
 //! path in production) and never through a direct `/rpc/procedure.createApiKey` call, which is why
@@ -195,23 +197,23 @@ mod tests {
         );
     }
 
-    /// A *direct* decode of an explicit `null` `expiresAt` for `createApiKey` was never actually
-    /// broken -- this test is kept as coverage for that half of the production bug report
-    /// (creating a non-expiring API key failed with the generic `invalid_argument` / "invalid
-    /// request payload" error), proving `Option<T>: Deserialize` defers the "is this null"
-    /// decision to the format, never to `T`, so `chrono::DateTime<Utc>` behaves identically to
-    /// `Vec<String>` (`null_field_still_decodes_as_none` above) on decode.
+    /// Historical note: a *direct* decode of an explicit `null` `expiresAt` for `createApiKey` was
+    /// never actually broken by the `undefined`/empty-array bug this module fixes -- that bug was
+    /// on *encode*, one hop further downstream, and only reachable through `POST /rpc/batch` (see
+    /// this module's doc comment and
+    /// `rpc_it_tests.rs::batch_create_api_key_rejects_real_cborg_null_expires_at_bytes` for the
+    /// full mechanism). This test used to prove exactly that: a direct decode of `expiresAt: null`
+    /// succeeded, landing as `None`.
     ///
-    /// The real bug was on *encode*, one hop further downstream, and only reachable through
-    /// `POST /rpc/batch` -- see this module's doc comment and
-    /// `rpc_it_tests.rs::batch_create_api_key_with_real_cborg_null_expires_at_bytes` for the full
-    /// mechanism and the end-to-end reproduction. A byte-faithful *direct* `/rpc/procedure.
-    /// createApiKey` call, which is what this test and `rpc_it_tests.rs::
-    /// create_api_key_with_real_cborg_null_expires_at_bytes` exercise, was always safe -- testing
-    /// only the unary endpoint is exactly what let the batch-path bug hide during the first pass
-    /// at this investigation.
+    /// Since lightbridge-authz#395 made `expiresAt` a *required* (non-nullable) field on
+    /// `CreateApiKeyInput` -- every API key must carry an expiry now, no more "no expiry" -- the
+    /// correct outcome for the identical bytes flipped: `Option<T>: Deserialize` no longer applies
+    /// (the field is a plain `chrono::DateTime<Utc>`, not `Option<..>`), so a `null` value must now
+    /// fail to decode. Kept as a permanent regression test with the assertion flipped, for the same
+    /// "a future change quietly reopening the hole" reason `rpc_it_tests.rs`'s companion tests were
+    /// flipped rather than deleted.
     #[test]
-    fn explicit_null_expires_at_decodes_as_none_for_create_api_key_input() {
+    fn explicit_null_expires_at_fails_to_decode_for_create_api_key_input() {
         use lightbridge_authz_api::schema::types::CreateApiKeyInput;
 
         let mut bytes = Vec::new();
@@ -227,11 +229,12 @@ mod tests {
         e.str("free").unwrap();
 
         let codec = LenientCborCodec::default();
-        let decoded: CreateApiKeyInput = codec
-            .decode(&bytes)
-            .expect("explicit null expiresAt must decode to None, not fail");
-        assert_eq!(decoded.expiresAt, None);
-        assert_eq!(decoded.name, "Miaou");
+        let result: Result<CreateApiKeyInput, _> = codec.decode(&bytes);
+        assert!(
+            result.is_err(),
+            "a null expiresAt must fail to decode now that the field is required \
+             (lightbridge-authz#395), got: {result:?}"
+        );
     }
 
     /// The actual root cause, in isolation: `serde_json::Value::Null` must encode as CBOR `null`

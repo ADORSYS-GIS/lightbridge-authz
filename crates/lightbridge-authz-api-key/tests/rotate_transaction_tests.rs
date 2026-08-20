@@ -44,6 +44,10 @@ async fn rotate_rolls_back_on_create_failure(pool: PgPool) {
         .await
         .unwrap();
 
+    // `api_keys.expires_at` is `NOT NULL` (lightbridge-authz#395) -- a real, far-future value
+    // stands in for the pre-#395 "no expiry" fixture in both rows below.
+    let far_future = Utc::now() + chrono::Duration::days(30);
+
     let initial_row = NewApiKeyRow {
         id: cuid2(),
         project_id: project.id.clone(),
@@ -51,7 +55,7 @@ async fn rotate_rolls_back_on_create_failure(pool: PgPool) {
         key_prefix: "lbk_init".to_string(),
         key_hash: "hash_init".to_string(),
         created_at: Utc::now(),
-        expires_at: None,
+        expires_at: Some(far_future),
         status: ApiKeyStatus::Active.to_string(),
         last_used_at: None,
         last_ip: None,
@@ -68,7 +72,7 @@ async fn rotate_rolls_back_on_create_failure(pool: PgPool) {
         key_prefix: "lbk_new".to_string(),
         key_hash: "hash_new".to_string(),
         created_at: Utc::now(),
-        expires_at: None,
+        expires_at: Some(far_future),
         status: ApiKeyStatus::Active.to_string(),
         last_used_at: None,
         last_ip: None,
