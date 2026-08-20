@@ -33,6 +33,8 @@
 //! is nothing for a direct-call test here to usefully assert about permission denial.
 #![cfg(feature = "it-tests")]
 
+mod common;
+
 use std::sync::Arc;
 
 use cratestack::{CratestackContext, CratestackError, Value};
@@ -51,7 +53,9 @@ use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::Procedures;
 use lightbridge_authz_rest::auth_provider;
+use lightbridge_authz_rest::auth_provider::build_context;
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
+use lightbridge_authz_rest::rpc_authorize::RpcScope;
 use sqlx::PgPool;
 
 const SEEDED_POLICY_SET_ID: &str = "budget-refill";
@@ -78,8 +82,17 @@ async fn insert_account(pool: &PgPool, account_id: &str) {
         .expect("inserting a test account must succeed");
 }
 
+// Issue #383 follow-up: a bare `authenticated([("id", ...)])` context satisfied the schema's old
+// `@allow(auth() != null)` but silently fails the `auth().rpcScope`/`auth().perm*` clauses #383
+// added to every mapped op-id (including these four budget procedures) -- this file's own module
+// doc already says permission DENIAL is not what's under test here, so this grants the full
+// permission set via the SAME shared helper `CratestackAuthProvider`/MCP use (`build_context`),
+// scoped `RpcScope::Budget`, rather than hand-rolling a second, out-of-sync context shape.
 fn ctx_for(subject: &str) -> CratestackContext {
-    CratestackContext::authenticated([("id".to_owned(), Value::String(subject.to_owned()))])
+    build_context(
+        &common::token_info(subject, common::admin_perms()),
+        RpcScope::Budget,
+    )
 }
 
 /// Like [`ctx_for`], but stamped with [`auth_provider::CALLER_KIND_CONTEXT_KEY`] as

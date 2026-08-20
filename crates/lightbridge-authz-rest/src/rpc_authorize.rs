@@ -99,6 +99,19 @@ impl RpcScope {
             RpcScope::Budget => is_budget,
         }
     }
+
+    /// The `auth().rpcScope` wire value `CratestackAuthProvider` bakes into every batch-envelope
+    /// context (see `auth_provider.rs`) and every `@allow`/`@@allow` clause in `authz.cstack`
+    /// checks against (see `schema_policy_sync_tests.rs`). Envelope-invariant by construction: which
+    /// binary is running is a deployment fact, the same for every frame in one `/rpc/batch` call,
+    /// so caching it once per envelope (unlike a per-frame *permission* requirement) is correct,
+    /// not a compromise.
+    pub(crate) const fn wire_str(self) -> &'static str {
+        match self {
+            RpcScope::Crud => "crud",
+            RpcScope::Budget => "budget",
+        }
+    }
 }
 
 /// Whether `op_id` requires a `budget:*` permission — the single predicate [`RpcScope::permits`]
@@ -238,6 +251,125 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
     })
 }
 
+/// Every op-id `required_permission` maps to a `Some`, paired with the expected permission —
+/// the single enumeration both `every_mapped_op_id_maps_to_the_documented_permission` (below) and
+/// `schema_policy_sync`'s codegen/drift-check walk, so there is exactly one hand-maintained list
+/// of "every mapped op-id" in this crate, not two that could silently diverge. Order matches
+/// `required_permission`'s own declaration order. `model.AccountSummary.{list,get}` are included
+/// even though that view has no live RPC dispatch arm today (see `authz.cstack`'s own doc comment
+/// on it) — its `@@allow` clause still exists and still deserves the same generated gate, forward-
+/// looking/defensive exactly as the view entry itself already is.
+pub const MAPPED_OP_ID_PERMISSIONS: &[(&str, Permission)] = &[
+    ("procedure.createAccount", Permission::AccountCreate),
+    ("model.Account.list", Permission::AccountRead),
+    ("model.Account.get", Permission::AccountRead),
+    ("model.Account.update", Permission::AccountUpdate),
+    (
+        "procedure.updateAccountDefaultQuota",
+        Permission::AccountUpdate,
+    ),
+    ("procedure.disableAccount", Permission::AccountDisable),
+    ("procedure.enableAccount", Permission::AccountDisable),
+    (
+        "procedure.deleteAccountPermanently",
+        Permission::AccountDelete,
+    ),
+    ("model.Project.create", Permission::ProjectCreate),
+    ("model.Project.list", Permission::ProjectRead),
+    ("model.Project.get", Permission::ProjectRead),
+    ("model.Project.update", Permission::ProjectUpdate),
+    ("model.Project.delete", Permission::ProjectDelete),
+    ("procedure.disableProject", Permission::ProjectDisable),
+    ("procedure.enableProject", Permission::ProjectDisable),
+    ("procedure.setDefaultProject", Permission::ProjectUpdate),
+    ("procedure.setProjectQuota", Permission::ProjectUpdate),
+    ("procedure.addProjectMember", Permission::ProjectMember),
+    ("procedure.removeProjectMember", Permission::ProjectMember),
+    ("procedure.listProjectRoster", Permission::ProjectMember),
+    ("procedure.setProjectMemberRole", Permission::ProjectMember),
+    (
+        "procedure.setProjectMemberQuotaTier",
+        Permission::ProjectMember,
+    ),
+    ("procedure.createApiKey", Permission::ApiKeyCreate),
+    ("procedure.listBillingPlans", Permission::ApiKeyCreate),
+    ("procedure.listModelCatalog", Permission::ProjectUpdate),
+    ("model.ApiKey.list", Permission::ApiKeyRead),
+    ("model.ApiKey.get", Permission::ApiKeyRead),
+    ("model.ApiKey.update", Permission::ApiKeyUpdate),
+    ("model.ApiKey.delete", Permission::ApiKeyDelete),
+    ("procedure.revokeApiKey", Permission::ApiKeyRevoke),
+    ("procedure.rotateApiKey", Permission::ApiKeyRotate),
+    ("model.AccountSummary.list", Permission::AccountRead),
+    ("model.AccountSummary.get", Permission::AccountRead),
+    (
+        "procedure.activateBudgetPolicy",
+        Permission::BudgetPolicyActivate,
+    ),
+    (
+        "procedure.getBudgetPolicyStatus",
+        Permission::BudgetPolicyRead,
+    ),
+    (
+        "procedure.simulateBudgetPolicy",
+        Permission::BudgetPolicySimulate,
+    ),
+    (
+        "procedure.requestBudgetRefill",
+        Permission::BudgetSelfRefill,
+    ),
+    (
+        "procedure.getMyBudgetRefillLadder",
+        Permission::BudgetSelfRefill,
+    ),
+    (
+        "procedure.listPendingAugmentationRequests",
+        Permission::BudgetReview,
+    ),
+    (
+        "procedure.approveAugmentationRequest",
+        Permission::BudgetReview,
+    ),
+    (
+        "procedure.rejectAugmentationRequest",
+        Permission::BudgetReview,
+    ),
+    ("procedure.revokeOwnSessions", Permission::SessionRevokeOwn),
+    ("procedure.revokeSubjectSessions", Permission::SessionRevoke),
+    ("procedure.getMyBudgetBalance", Permission::BudgetReadOwn),
+    ("procedure.listMyBudgetGrants", Permission::BudgetReadOwn),
+    (
+        "procedure.listMyAugmentationRequests",
+        Permission::BudgetReadOwn,
+    ),
+    ("procedure.getBudgetBalance", Permission::BudgetRead),
+    ("procedure.listBudgetGrants", Permission::BudgetAuditRead),
+    ("procedure.grantBudget", Permission::BudgetGrant),
+    ("procedure.revokeBudgetGrant", Permission::BudgetRevoke),
+    (
+        "procedure.createBudgetPolicyRevision",
+        Permission::BudgetPolicyWrite,
+    ),
+];
+
+/// The `auth().<field>` name `CratestackAuthProvider` bakes each [`Permission`]'s boolean grant
+/// into, and every generated `@allow`/`@@allow` clause in `authz.cstack` reads. Mechanically
+/// derived from [`Permission::as_str`]'s canonical `resource:action` string (splitting further on
+/// `-` for hyphenated actions like `read-own`) rather than a second hand-typed list of 31 names —
+/// same single-source-of-truth reasoning as [`MAPPED_OP_ID_PERMISSIONS`] above. E.g.
+/// `"account:create"` -> `"permAccountCreate"`, `"budget:read-own"` -> `"permBudgetReadOwn"`.
+pub fn permission_field_name(permission: Permission) -> String {
+    let mut out = String::from("perm");
+    for part in permission.as_str().split([':', '-']) {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out
+}
+
 /// Extract a bearer token from the `Authorization` header, tolerating `Bearer`/`bearer` casing and
 /// surrounding whitespace. Mirrors `auth_provider::extract_bearer` (kept local so this module does
 /// not depend on that one's internals).
@@ -275,7 +407,9 @@ pub(crate) fn op_id_from_path(path: &str) -> &str {
 
 /// The op-id `op_id_from_path` extracts from `POST /rpc/batch` — handled specially in
 /// [`rpc_authorize`] rather than through the [`required_permission`] map (see module docs).
-const BATCH_OP_ID: &str = "batch";
+/// `pub(crate)` so `auth_provider.rs`'s batch special case (see its module docs) can match on the
+/// same constant rather than a second hand-typed `"batch"` literal.
+pub(crate) const BATCH_OP_ID: &str = "batch";
 
 /// State for [`rpc_authorize`]: the bearer service plus which half of the RPC surface (see
 /// [`RpcScope`]) this particular router instance serves. Bundled into one `Clone` struct rather
@@ -353,105 +487,41 @@ mod tests {
 
     #[test]
     fn every_mapped_op_id_maps_to_the_documented_permission() {
-        let cases = [
-            ("procedure.createAccount", Permission::AccountCreate),
-            ("model.Account.list", Permission::AccountRead),
-            ("model.Account.get", Permission::AccountRead),
-            ("model.Account.update", Permission::AccountUpdate),
-            (
-                "procedure.updateAccountDefaultQuota",
-                Permission::AccountUpdate,
-            ),
-            ("procedure.disableAccount", Permission::AccountDisable),
-            ("procedure.enableAccount", Permission::AccountDisable),
-            (
-                "procedure.deleteAccountPermanently",
-                Permission::AccountDelete,
-            ),
-            ("model.Project.create", Permission::ProjectCreate),
-            ("model.Project.list", Permission::ProjectRead),
-            ("model.Project.get", Permission::ProjectRead),
-            ("model.Project.update", Permission::ProjectUpdate),
-            ("model.Project.delete", Permission::ProjectDelete),
-            ("procedure.disableProject", Permission::ProjectDisable),
-            ("procedure.enableProject", Permission::ProjectDisable),
-            ("procedure.setDefaultProject", Permission::ProjectUpdate),
-            ("procedure.setProjectQuota", Permission::ProjectUpdate),
-            ("procedure.addProjectMember", Permission::ProjectMember),
-            ("procedure.removeProjectMember", Permission::ProjectMember),
-            ("procedure.listProjectRoster", Permission::ProjectMember),
-            ("procedure.setProjectMemberRole", Permission::ProjectMember),
-            (
-                "procedure.setProjectMemberQuotaTier",
-                Permission::ProjectMember,
-            ),
-            ("procedure.createApiKey", Permission::ApiKeyCreate),
-            ("procedure.listBillingPlans", Permission::ApiKeyCreate),
-            ("procedure.listModelCatalog", Permission::ProjectUpdate),
-            ("model.ApiKey.list", Permission::ApiKeyRead),
-            ("model.ApiKey.get", Permission::ApiKeyRead),
-            ("model.ApiKey.update", Permission::ApiKeyUpdate),
-            ("model.ApiKey.delete", Permission::ApiKeyDelete),
-            ("procedure.revokeApiKey", Permission::ApiKeyRevoke),
-            ("procedure.rotateApiKey", Permission::ApiKeyRotate),
-            ("model.AccountSummary.list", Permission::AccountRead),
-            ("model.AccountSummary.get", Permission::AccountRead),
-            (
-                "procedure.activateBudgetPolicy",
-                Permission::BudgetPolicyActivate,
-            ),
-            (
-                "procedure.getBudgetPolicyStatus",
-                Permission::BudgetPolicyRead,
-            ),
-            (
-                "procedure.simulateBudgetPolicy",
-                Permission::BudgetPolicySimulate,
-            ),
-            (
-                "procedure.requestBudgetRefill",
-                Permission::BudgetSelfRefill,
-            ),
-            (
-                "procedure.getMyBudgetRefillLadder",
-                Permission::BudgetSelfRefill,
-            ),
-            (
-                "procedure.listPendingAugmentationRequests",
-                Permission::BudgetReview,
-            ),
-            (
-                "procedure.approveAugmentationRequest",
-                Permission::BudgetReview,
-            ),
-            (
-                "procedure.rejectAugmentationRequest",
-                Permission::BudgetReview,
-            ),
-            ("procedure.revokeOwnSessions", Permission::SessionRevokeOwn),
-            ("procedure.revokeSubjectSessions", Permission::SessionRevoke),
-            ("procedure.getMyBudgetBalance", Permission::BudgetReadOwn),
-            ("procedure.listMyBudgetGrants", Permission::BudgetReadOwn),
-            (
-                "procedure.listMyAugmentationRequests",
-                Permission::BudgetReadOwn,
-            ),
-            ("procedure.getBudgetBalance", Permission::BudgetRead),
-            ("procedure.listBudgetGrants", Permission::BudgetAuditRead),
-            ("procedure.grantBudget", Permission::BudgetGrant),
-            ("procedure.revokeBudgetGrant", Permission::BudgetRevoke),
-            (
-                "procedure.createBudgetPolicyRevision",
-                Permission::BudgetPolicyWrite,
-            ),
-        ];
-        for (op_id, expected) in cases {
+        for (op_id, expected) in MAPPED_OP_ID_PERMISSIONS.iter().copied() {
             assert_eq!(
                 required_permission(op_id),
                 Some(expected),
                 "op-id {op_id} should require {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn permission_field_name_is_mechanically_derived_and_unique() {
+        let cases = [
+            (Permission::AccountCreate, "permAccountCreate"),
+            (Permission::BudgetReadOwn, "permBudgetReadOwn"),
+            (Permission::BudgetPolicyActivate, "permBudgetPolicyActivate"),
+            (Permission::SessionRevokeOwn, "permSessionRevokeOwn"),
+            (Permission::ApiKeyRotate, "permApikeyRotate"),
+        ];
+        for (permission, expected) in cases {
+            assert_eq!(permission_field_name(permission), expected);
+        }
+
+        let mut names: Vec<String> = Permission::ALL
+            .into_iter()
+            .map(permission_field_name)
+            .collect();
+        let before = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            before,
+            "permission_field_name must be injective over Permission::ALL — a collision here \
+             would silently merge two distinct permissions onto one auth field"
+        );
     }
 
     #[test]

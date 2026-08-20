@@ -21,10 +21,10 @@ use lightbridge_authz_core::{
 };
 use lightbridge_authz_rest::{
     OpaRepoTrait, OpaState,
-    auth_provider::{ACCESS_TOKEN_CONTEXT_KEY, ROLES_CONTEXT_KEY},
     handlers::{AuthzStoreImpl, opa::validate_api_key_context},
     middleware::bearer_auth,
     models::authorino::AuthorinoMetadata,
+    rpc_authorize::RpcScope,
 };
 use reqwest::Client;
 use rmcp::{
@@ -294,35 +294,30 @@ fn cratestack_error_to_tool_error(error: CratestackError) -> ErrorData {
     }
 }
 
-/// Build a cratestack [`CratestackContext`] for the authenticated MCP caller, mirroring
-/// `lightbridge_authz_rest::auth_provider::CratestackAuthProvider::authenticate`: the validated
-/// subject is projected as `auth().id` (what the schema's `@@allow` membership predicates resolve
-/// against) and the raw access token + roles are stashed as context extensions, so a CRUD tool
-/// invoking the generated client is scoped to exactly the caller's tenants — the same second-gate
-/// policy path the RPC surface applies. The extension keys are the public constants exported by
-/// that module, so the two surfaces stay in lockstep.
+/// Build a cratestack [`CratestackContext`] for the authenticated MCP caller by delegating to
+/// [`lightbridge_authz_rest::auth_provider::build_context`] — the SAME function
+/// `CratestackAuthProvider::authenticate` uses for the RPC surface, not a second, independently
+/// maintained copy of "how a context gets its permission fields".
+///
+/// This is load-bearing, not stylistic (issue #383 follow-up): both MCP and the RPC surface hand
+/// their built context to the SAME generated cratestack client, which evaluates the SAME
+/// `authz.cstack` `@allow`/`@@allow` clauses regardless of which surface reached it. Before this
+/// was unified, MCP's own copy set only `auth().id`, which satisfied the schema's old
+/// `@allow(auth() != null)` clauses but silently failed every clause #383 added (`auth().rpcScope`,
+/// `auth().perm<Permission>`) — found by CI's `integration-test` (`it-servers`) failing the very
+/// first MCP tool call after that PR merged, not by any local test, because nothing exercised this
+/// second entry point at all. `RpcScope::Crud` because the MCP surface only ever exposes the CRUD
+/// tool set (accounts/projects/api-keys) — confirmed against `app/lightbridge-authz/src/bin/
+/// lightbridge-mcp.rs` (a dedicated binary, entirely separate from `authz-budget`'s `command:
+/// budget` subcommand on the main `lightbridge-authz` binary) and `compose.yaml`'s `authz-mcp`
+/// service (own image/port, no budget-scoped env or command, same `DATABASE_URL` as `authz-api`)
+/// — `mcp.rs` has no `RpcScope`/budget-procedure concept anywhere in it.
+///
+/// See `cratestack_context_from_token_info_matches_the_shared_helper` below for the regression
+/// test pinning this delegation — it fails immediately if a future edit reintroduces a
+/// hand-rolled, out-of-sync copy here.
 fn cratestack_context_from_token_info(info: &TokenInfo) -> CratestackContext {
-    let mut ctx = CratestackContext::authenticated([(
-        "id".to_owned(),
-        CratestackValue::String(info.sub.clone()),
-    )]);
-    ctx.extensions.insert(
-        ACCESS_TOKEN_CONTEXT_KEY.to_owned(),
-        CratestackValue::String(info.access_token.clone()),
-    );
-    if !info.roles.is_empty() {
-        ctx.extensions.insert(
-            ROLES_CONTEXT_KEY.to_owned(),
-            CratestackValue::List(
-                info.roles
-                    .iter()
-                    .cloned()
-                    .map(CratestackValue::String)
-                    .collect(),
-            ),
-        );
-    }
-    ctx
+    lightbridge_authz_rest::auth_provider::build_context(info, RpcScope::Crud)
 }
 
 /// A `find_unique` that returned `None` (row absent, or hidden by the membership read policy) is a
@@ -2056,6 +2051,70 @@ mod tests {
 
     fn full_access_token_info() -> TokenInfo {
         token_info_with_permissions(Permission::ALL.into_iter().collect())
+    }
+
+    /// Issue #383 follow-up regression: MCP's `cratestack_context_from_token_info` must build the
+    /// context by delegating to the SAME `lightbridge_authz_rest::auth_provider::build_context`
+    /// the RPC surface uses (`RpcScope::Crud` — MCP only ever exposes the CRUD tool set, see that
+    /// function's own doc comment for what was confirmed and where). This is the test that fails
+    /// immediately if a future edit reintroduces a hand-rolled, independently-drifting copy here
+    /// instead of updating (or continuing to call) the shared helper — exactly the failure mode
+    /// that shipped once already: MCP's pre-fix copy set only `auth().id`, satisfied the schema's
+    /// OLD `@allow(auth() != null)` clauses, and silently failed every #383-added
+    /// `auth().rpcScope`/`auth().perm<Permission>` clause with no local test catching it (found by
+    /// CI's `integration-test` failing the first live MCP tool call instead).
+    ///
+    /// Covers both a full-access and a zero-permission token so the comparison can't pass merely
+    /// because both sides happen to agree on an all-`true` or all-`false` context.
+    #[test]
+    fn cratestack_context_from_token_info_matches_the_shared_helper() {
+        for info in [
+            full_access_token_info(),
+            token_info_with_permissions(lightbridge_authz_core::authz::PermissionSet::new()),
+        ] {
+            let mcp_ctx = cratestack_context_from_token_info(&info);
+            let shared_ctx =
+                lightbridge_authz_rest::auth_provider::build_context(&info, RpcScope::Crud);
+            assert_eq!(
+                mcp_ctx, shared_ctx,
+                "MCP's context-builder has drifted from the shared helper for subject {:?} — it \
+                 must delegate to lightbridge_authz_rest::auth_provider::build_context, not \
+                 maintain its own copy of the permission-field population logic",
+                info.sub,
+            );
+        }
+    }
+
+    /// Companion to the delegation test above: independently pins down the actual field SHAPE a
+    /// real `authz.cstack` `@allow`/`@@allow` clause reads — `auth().rpcScope == "crud"` and
+    /// `auth().perm<Permission>` reflecting the caller's real, computed grant — so a change that
+    /// broke both `build_context` AND this MCP delegation identically (which the equality test
+    /// above alone would not catch) still fails here.
+    #[test]
+    fn cratestack_context_from_token_info_carries_the_real_permission_set_and_crud_scope() {
+        let viewer_perms: lightbridge_authz_core::authz::PermissionSet =
+            [lightbridge_authz_core::authz::Permission::AccountRead]
+                .into_iter()
+                .collect();
+        let ctx = cratestack_context_from_token_info(&token_info_with_permissions(viewer_perms));
+
+        assert_eq!(
+            ctx.auth_field("rpcScope"),
+            Some(&cratestack::Value::String("crud".to_owned())),
+            "MCP must scope its context to RpcScope::Crud (it never dispatches budget:* op-ids)"
+        );
+        assert_eq!(
+            ctx.auth_field("permAccountRead"),
+            Some(&cratestack::Value::Bool(true)),
+            "a permission the caller actually holds must read back true"
+        );
+        assert_eq!(
+            ctx.auth_field("permAccountCreate"),
+            Some(&cratestack::Value::Bool(false)),
+            "a permission the caller does NOT hold must read back false, never absent (absent \
+             would make the schema's auth().permAccountCreate == true comparison fail closed for \
+             the wrong reason — this pins it explicitly false instead)"
+        );
     }
 
     fn lazy_pool() -> Arc<dyn DbPoolTrait> {
