@@ -60,6 +60,24 @@ pub struct Config {
     /// real tier catalogue (see `QuotaTiers::is_allowed`).
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub quota_tiers: QuotaTiers,
+    /// HTTP client config for calling the `ai-models-info` service's `/v1/models/info` endpoint --
+    /// the LIVE source `listModelCatalog` reads from when configured (issue #393). That service
+    /// (deployed by the sibling `ai-helm`/`ai-helm-values` repos, chart `charts/ai-models-info`)
+    /// already renders an OpenRouter-shape JSON catalog from the SAME `models.yaml` data the
+    /// `aii-models` ArgoCD ApplicationSet deploys real gateway routes from, already filtered by
+    /// that chart's own `ai-models-info.catalog` Helm helper to exactly the subset a
+    /// `Project.allowedModels` picker needs (enabled, non-`embedding`/`reranker` kind, not
+    /// `disableExternal`) -- so `listModelCatalog` can consume `data[].id`/`data[].name` verbatim,
+    /// with no additional filtering reimplemented here. This replaces the prior design of a second,
+    /// hand-maintained `models:` catalogue duplicating that same data with no connection to it (see
+    /// `Config::models`'s doc comment below, now demoted to a local/dev fallback). Confirmed live in
+    /// prod: `models-info` is a plain-HTTP (no TLS) ClusterIP `Service` in the same `converse`
+    /// namespace `authz-api` runs in, so this client carries no TLS options, unlike
+    /// `UsageServiceClient` above. Optional -- when unset (e.g. local Compose, which has no
+    /// `ai-models-info` deployment), `listModelCatalog` falls back to the static `models` catalogue
+    /// below rather than failing to start or failing the RPC call.
+    #[serde(default)]
+    pub model_catalog_service: Option<ModelCatalogServiceClient>,
     /// The operator-configured AI-model catalogue backing `listModelCatalog`, a read-only display
     /// aid for a `Project.allowedModels` editor (e.g. a checkbox picker in the self-service UI) --
     /// see that procedure's schema doc comment. Same env-driven loading shape as `billing` above,
@@ -67,6 +85,14 @@ pub struct Config {
     /// there is nothing here to validate a write against (`allowedModels` stays unvalidated free-form
     /// at write time), so a deployment that has not configured a catalogue yet simply serves an empty
     /// list rather than failing to start.
+    ///
+    /// **Local/dev fallback only as of #393.** `listModelCatalog` now prefers a live fetch against
+    /// `model_catalog_service` above when that is configured (the real prod/staging path); this
+    /// field is what it falls back to when that is unset OR the live fetch fails for any reason
+    /// (unreachable, timeout, non-2xx, unparseable body) -- see `to_schema_model_catalog`/
+    /// `list_model_catalog` in `crates/lightbridge-authz-rest/src/lib.rs`. There is no
+    /// `ai-models-info` deployment in local Compose, so `config/default.yaml`/
+    /// `.docker/authz/container.yaml` keep populating this field with static entries unchanged.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub models: ModelCatalog,
 }
@@ -607,6 +633,34 @@ pub struct UsageServiceClient {
 
 fn default_usage_service_timeout_ms() -> u64 {
     5_000
+}
+
+/// HTTP client config for `lightbridge-authz-rest`'s live `listModelCatalog` fetch against the
+/// `ai-models-info` service's `/v1/models/info` endpoint. See `Config::model_catalog_service`'s
+/// doc comment for the full rationale (issue #393) and why this replaced a second, hand-maintained
+/// model catalogue. Deliberately plain HTTP, unlike [`UsageServiceClient`] above: `ai-models-info`'s
+/// nginx serves plain HTTP on port 80 in every environment this has been verified against (a
+/// live `kubectl --context hetzner-prod -n converse get svc` showed `models-info` as a ClusterIP
+/// on port 80, with no `NetworkPolicy` on either pod restricting egress) -- there is no TLS
+/// posture to configure here, so no `insecure_skip_verify`/`ca_bundle_path`/client-cert fields.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelCatalogServiceClient {
+    /// Base URL of the `ai-models-info` service, e.g.
+    /// `http://models-info.converse.svc.cluster.local`. A trailing slash is stripped if present;
+    /// the client appends `/v1/models/info` itself.
+    pub base_url: String,
+    /// Per-request timeout in milliseconds. Defaults to 2000 (2s) -- shorter than
+    /// `UsageServiceClient`'s 5s default because this backs a read-only display aid
+    /// (`listModelCatalog`) that degrades to a static fallback catalogue on any failure (see
+    /// `Config::models`'s doc comment), so there is no reason to let a slow/unreachable dependency
+    /// hold the RPC call open as long as a budget-affecting call like the usage-service spend
+    /// query does.
+    #[serde(default = "default_model_catalog_service_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_model_catalog_service_timeout_ms() -> u64 {
+    2_000
 }
 
 /// Redis connection settings. `url` is a standard `redis://[:password@]host:port[/db]`
@@ -1301,6 +1355,129 @@ otel:
         assert!(usage_service.insecure_skip_verify);
         assert_eq!(usage_service.timeout_ms, 2500);
         assert_eq!(usage_service.ca_bundle_path, None);
+    }
+
+    #[test]
+    fn config_with_model_catalog_service_parses_it() {
+        let yaml = "\
+server:
+  api:
+    address: \"0.0.0.0\"
+    port: 3000
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+  opa:
+    address: \"0.0.0.0\"
+    port: 3001
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+    basic_auth:
+      username: \"u\"
+      password: \"p\"
+logging:
+  level: \"info\"
+database:
+  url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz\"
+model_catalog_service:
+  base_url: \"http://models-info.converse.svc.cluster.local\"
+  timeout_ms: 1500
+oauth2:
+  type: self
+  jwks_url: \"http://localhost/jwks\"
+otel:
+  enabled: true
+  otlp_endpoint: \"http://localhost:4317\"
+  service_name: \"svc\"
+";
+        let cfg: Config =
+            from_str(yaml).expect("config with model_catalog_service must load");
+        let model_catalog_service = cfg
+            .model_catalog_service
+            .expect("model_catalog_service must be set");
+        assert_eq!(
+            model_catalog_service.base_url,
+            "http://models-info.converse.svc.cluster.local"
+        );
+        assert_eq!(model_catalog_service.timeout_ms, 1500);
+    }
+
+    #[test]
+    fn config_with_model_catalog_service_defaults_timeout_when_omitted() {
+        let yaml = "\
+server:
+  api:
+    address: \"0.0.0.0\"
+    port: 3000
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+  opa:
+    address: \"0.0.0.0\"
+    port: 3001
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+    basic_auth:
+      username: \"u\"
+      password: \"p\"
+logging:
+  level: \"info\"
+database:
+  url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz\"
+model_catalog_service:
+  base_url: \"http://models-info.converse.svc.cluster.local\"
+oauth2:
+  type: self
+  jwks_url: \"http://localhost/jwks\"
+otel:
+  enabled: true
+  otlp_endpoint: \"http://localhost:4317\"
+  service_name: \"svc\"
+";
+        let cfg: Config = from_str(yaml)
+            .expect("config with model_catalog_service omitting timeout_ms must load");
+        let model_catalog_service = cfg
+            .model_catalog_service
+            .expect("model_catalog_service must be set");
+        assert_eq!(model_catalog_service.timeout_ms, 2_000);
+    }
+
+    #[test]
+    fn config_without_model_catalog_service_still_loads() {
+        let yaml = "\
+server:
+  api:
+    address: \"0.0.0.0\"
+    port: 3000
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+  opa:
+    address: \"0.0.0.0\"
+    port: 3001
+    tls:
+      cert_path: \"a.crt\"
+      key_path: \"a.key\"
+    basic_auth:
+      username: \"u\"
+      password: \"p\"
+logging:
+  level: \"info\"
+database:
+  url: \"postgres://postgres:postgres@localhost:5432/lightbridge_authz\"
+oauth2:
+  type: self
+  jwks_url: \"http://localhost/jwks\"
+otel:
+  enabled: true
+  otlp_endpoint: \"http://localhost:4317\"
+  service_name: \"svc\"
+";
+        let cfg: Config =
+            from_str(yaml).expect("config omitting model_catalog_service must load");
+        assert!(cfg.model_catalog_service.is_none());
     }
 
     #[test]
