@@ -389,9 +389,9 @@ dependencies = [
 
 [[package]]
 name = "authkestra-resource"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c879a0809e6496f95d926d2b7307ff923f0a3a754fbc68ea18b3c094963a486"
+checksum = "ebdc8a1942e6a660babb03b852557b44e1afcc6999b43d6d2feb07905033a617"
 dependencies = [
  "async-trait",
  "authkestra-engine",
@@ -6069,7 +6069,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
