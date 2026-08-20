@@ -112,6 +112,18 @@ pub struct TokenExchangeOpStore {
     devices: NoDeviceCodeStore,
     assertions: RedisClientAssertionStore,
     repo: Arc<StoreRepo>,
+    /// The `project_members` handle [`Self::resolve_quota_tier`] (ADR-0017) reads from.
+    /// Production (`start_idp_server`) always constructs this as a clone of the same `repo`
+    /// pointed at the same Postgres pool -- there is no operational separation, only a
+    /// deliberately independent injection seam, mirroring exactly why `budget_repo` below is its
+    /// own field rather than a method on `repo` (ADR-0014 Decision 2): it lets a test hold `repo`
+    /// reachable (so `resolve_context` succeeds) while pointing `quota_repo` at an unreachable
+    /// pool, proving [`Self::resolve_quota_tier`]'s own fail-closed branch fires on its own
+    /// dependency failing, not merely as a side effect of `resolve_context` failing first --
+    /// `crates/lightbridge-authz-rest/tests/token_exchange_tests.rs`'s
+    /// `quota_tier_lookup_failure_refuses_the_exchange_even_though_context_resolution_succeeds`
+    /// and its refresh-grant mirror are exactly that proof.
+    quota_repo: Arc<StoreRepo>,
     budget_repo: Arc<BudgetRepo>,
     /// ADR-0015 Decision 6's fail-closed floor, read live (see [`Self::resolve_budget_tier`]) --
     /// the SAME hot-swappable engine `authz-api`/`authz-budget` already hold via
@@ -124,10 +136,12 @@ pub struct TokenExchangeOpStore {
 }
 
 impl TokenExchangeOpStore {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         clients: ConfigClientStore,
         assertions: RedisClientAssertionStore,
         repo: Arc<StoreRepo>,
+        quota_repo: Arc<StoreRepo>,
         budget_repo: Arc<BudgetRepo>,
         policy_engine: Arc<dyn PolicyEngine>,
         bearer: Arc<dyn BearerTokenServiceTrait>,
@@ -140,6 +154,7 @@ impl TokenExchangeOpStore {
             devices: NoDeviceCodeStore,
             assertions,
             repo,
+            quota_repo,
             budget_repo,
             policy_engine,
             bearer,
@@ -238,6 +253,51 @@ impl TokenExchangeOpStore {
                 budget_tier_wire_label(floor_micros)
             }
         }
+    }
+
+    /// Resolves the `quota_tier` claim to stamp on a minted access token (ADR-0017, superseding
+    /// ADR-0011 Decision 7's "role/quota data stays out of both JWTs" specifically for
+    /// `quota_tier` -- see that ADR for the full rationale and why the general principle otherwise
+    /// still stands).
+    ///
+    /// **Deliberately NOT the same fail-closed shape as [`Self::resolve_budget_tier`].** That
+    /// method downgrades any lookup failure to a policy-configured floor because `budget_tier` has
+    /// one: a well-ordered ladder with a defined "most conservative" rung. `quota_tier` has no such
+    /// ladder -- it is an operator-defined, unordered catalogue (`QuotaTiers`) with no floor to
+    /// fall back to, and per `StoreRepo::project_member_quota_tier`'s own doc comment, `Ok(None)`
+    /// is ALREADY the resolved-and-legitimate "no per-member ceiling" answer (mirroring the
+    /// `api_key_validation` view's NULL semantics for the API-key plane). Reusing that same shape
+    /// for "the lookup failed" would make a database outage indistinguishable on the wire from
+    /// "this account genuinely has no per-member ceiling" -- silently trading an availability
+    /// failure for a quota bypass, exactly the failure mode this repository's review guidance
+    /// treats as the highest-yield question to ask of any code on this boundary.
+    ///
+    /// So this method refuses instead: any `Err` from the lookup is surfaced as `server_error` and
+    /// the token exchange/refresh fails outright -- no token is minted, and therefore no
+    /// `quota_tier` value (real, absent, or sentinel) ever reaches the wire for that request. This
+    /// is not a new failure philosophy invented here -- it is the exact one `resolve_context`'s own
+    /// `Err(_) => oauth_err("server_error", ...)` branches already apply to account/project
+    /// resolution failures a few lines above every call site of this method; this only extends the
+    /// same rule to the per-member tier lookup instead of quietly exempting it.
+    async fn resolve_quota_tier(
+        &self,
+        project_id: &str,
+        subject: &str,
+    ) -> Result<Option<String>, TokenErrorResponse> {
+        self.quota_repo
+            .project_member_quota_tier(project_id, subject)
+            .await
+            .map_err(|err| {
+                tracing::error!(
+                    error = %err,
+                    project_id = %project_id,
+                    subject = %subject,
+                    "quota tier resolution failed; refusing to mint rather than omitting the \
+                     claim, which would be indistinguishable from a legitimate 'no per-member \
+                     ceiling' account"
+                );
+                oauth_err("server_error", "quota tier resolution failed")
+            })
     }
 
     /// The RFC 8693 token-exchange grant (ADR-0011, Decisions 1, 5, 7). `project_id` is this
@@ -385,6 +445,9 @@ impl TokenExchangeOpStore {
         let scope_str = scope_to_string(&granted_scopes);
 
         let budget_tier = self.resolve_budget_tier(&context.account_id, now).await;
+        let quota_tier = self
+            .resolve_quota_tier(&context.project_id, &subject)
+            .await?;
         let mut access_extra = access_token_extra(
             &owner,
             &session_id,
@@ -394,6 +457,9 @@ impl TokenExchangeOpStore {
             Some(&client_id),
         );
         access_extra.insert("budget_tier".to_string(), Value::String(budget_tier));
+        if let Some(quota_tier) = quota_tier {
+            access_extra.insert("quota_tier".to_string(), Value::String(quota_tier));
+        }
         let access_token = tokens
             .issue_user_token_with_extra(
                 identity_for(&owner),
@@ -626,6 +692,9 @@ impl TokenExchangeOpStore {
         let scope_str = old_row.scope.clone();
 
         let budget_tier = self.resolve_budget_tier(&context.account_id, now).await;
+        let quota_tier = self
+            .resolve_quota_tier(&context.project_id, &old_row.subject)
+            .await?;
         let mut access_extra = access_token_extra(
             &owner,
             &session_id,
@@ -635,6 +704,9 @@ impl TokenExchangeOpStore {
             Some(&client_id),
         );
         access_extra.insert("budget_tier".to_string(), Value::String(budget_tier));
+        if let Some(quota_tier) = quota_tier {
+            access_extra.insert("quota_tier".to_string(), Value::String(quota_tier));
+        }
         let access_token = tokens
             .issue_user_token_with_extra(
                 identity_for(&owner),

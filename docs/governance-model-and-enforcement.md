@@ -278,8 +278,16 @@ Authorino. At ~100 keys that is ~27 DB ops/sec against a store measured at 600�
 Paying it buys a property claims cannot: **a quota or roster change takes effect within 30 seconds**,
 rather than waiting for the key to be rotated. Claims freeze at mint time.
 
-That is why `project_quota`, `role` and `quota_tier` ride on the introspection response, while
+That is why `project_quota` and `role` ride on the introspection response only, while
 `allowed_models` is *also* in the JWT (it is stamped at mint time and used for the header path).
+
+`quota_tier` used to sit in that same "introspection only" bucket, but as of ADR-0017 the
+API-key plane still reads it from introspection (unchanged — this section's reasoning applies to
+it in full there) while the human/OIDC plane now *also* gets it as a token-exchange-time claim,
+resolved live from `project_members` on every exchange and refresh rather than copied forward —
+see §4.7 and ADR-0017 for why `quota_tier` specifically could take the claims-based carve-out that
+`project_quota`/`role` deliberately do not (there is no equivalent live, per-request path for the
+human plane the way introspection provides for API keys).
 
 ### Absence-safety, and why every header falls back to `""`
 
@@ -423,6 +431,18 @@ allowlist predicate **skips entirely** — its first escape hatch is "no `api_ke
 
 So: **the model allowlist is not enforced on the human plane.** See §5.
 
+**As of ADR-0017**, `x-quota-tier` on this plane is no longer unconditionally `""` either. The
+native RFC 8693 exchange (`TokenExchangeOpStore`, `crates/lightbridge-authz-rest/src/oauth2_op/store.rs`)
+that mints Claire's access token also resolves her `project_members.quota_tier` on *Atlas* at
+exchange/refresh time and stamps it as a `quota_tier` claim when present. If she holds no roster
+row on *Atlas* (e.g. she owns it, or is a member with no tier set), the claim is omitted — the same
+"no per-member ceiling" answer the `Exact`-selector rule already treats an empty header as, per §5.
+If the lookup itself fails (the database is unreachable), the exchange/refresh is refused outright
+rather than minting a token with the claim silently omitted — an unresolvable tier must never look,
+on the wire, like a resolved "no ceiling" answer. See ADR-0017 for the full contract; §5's "tier and
+envelope rules are not configured" still applies unchanged — nothing at the gateway reads this claim
+yet.
+
 ### 4.8 Introspection is unavailable
 
 The allowlist predicate's first two clauses (`!has(...)`) are true → the request is **allowed**, and
@@ -517,7 +537,7 @@ gateway.
 | Plan burst + budget | Keycloak group attribute / key's `billing_plan` | `x-billing-plan` | yes |
 | Model allowlist | `projects.allowed_models` | introspection → CEL predicate | API keys only |
 | Pooled project ceiling | `projects.project_quota` | introspection → `x-project-quota` | header yes, **rule not configured** |
-| Per-member ceiling | `project_members.quota_tier` | introspection → `x-quota-tier` | header yes, **rule not configured** |
+| Per-member ceiling | `project_members.quota_tier` | introspection (API keys) or a token-exchange-time claim (human/OIDC, ADR-0017) → `x-quota-tier` | header yes, **rule not configured** |
 | Key validity cascade | `api_key_validation.effective_status` | introspection `active` | yes |
 | Monthly budget window | `unit: Month` in the BTP | RLS counter key | yes, **calendar month (`YYYY-MM`, UTC), not a 30-day epoch bucket** |
 | Account's own default-project tier | `accounts.default_quota` | *not currently stamped* | no |

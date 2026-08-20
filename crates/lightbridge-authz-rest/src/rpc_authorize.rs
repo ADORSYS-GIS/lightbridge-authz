@@ -116,6 +116,10 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         "model.Account.list" => AccountRead,
         "model.Account.get" => AccountRead,
         "model.Account.update" => AccountUpdate,
+        // #379: `Account.defaultQuota` is now `@readonly` on the generic verb above, so
+        // `updateAccountDefaultQuota` is its replacement write path -- same coarse permission,
+        // matching the acceptance criteria's "existing permission granularity" requirement.
+        "procedure.updateAccountDefaultQuota" => AccountUpdate,
         // model.Account.delete is intentionally absent (falls through to `_ => None`, denied): the
         // schema carries no `@@allow("delete", ...)` on Account, so the cratestack policy layer
         // already fail-closes this op-id -- omitted here too, same defense-in-depth pattern as
@@ -134,6 +138,11 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         "procedure.disableProject" => ProjectDisable,
         "procedure.enableProject" => ProjectDisable,
         "procedure.setDefaultProject" => ProjectUpdate,
+        // #379: `Project.projectQuota` is now `@readonly` on BOTH generic verbs above, so
+        // `setProjectQuota` is its replacement write path -- same coarse permission as
+        // `model.Project.update`, matching the acceptance criteria's "existing permission
+        // granularity" requirement.
+        "procedure.setProjectQuota" => ProjectUpdate,
         // Roster management (ADR-0006). These replace the removed account-member procedures, and
         // the capability moved with them: `project:member`, not `account:member`. Note this is only
         // the coarse gate — the lead check ("the member row matching my subject must ALSO have
@@ -349,6 +358,10 @@ mod tests {
             ("model.Account.list", Permission::AccountRead),
             ("model.Account.get", Permission::AccountRead),
             ("model.Account.update", Permission::AccountUpdate),
+            (
+                "procedure.updateAccountDefaultQuota",
+                Permission::AccountUpdate,
+            ),
             ("procedure.disableAccount", Permission::AccountDisable),
             ("procedure.enableAccount", Permission::AccountDisable),
             (
@@ -363,6 +376,7 @@ mod tests {
             ("procedure.disableProject", Permission::ProjectDisable),
             ("procedure.enableProject", Permission::ProjectDisable),
             ("procedure.setDefaultProject", Permission::ProjectUpdate),
+            ("procedure.setProjectQuota", Permission::ProjectUpdate),
             ("procedure.addProjectMember", Permission::ProjectMember),
             ("procedure.removeProjectMember", Permission::ProjectMember),
             ("procedure.listProjectRoster", Permission::ProjectMember),
@@ -575,6 +589,7 @@ mod tests {
                 "model.Account.list",
                 "model.Account.get",
                 "model.Account.update",
+                "procedure.updateAccountDefaultQuota",
                 "procedure.disableAccount",
                 "procedure.enableAccount",
                 "procedure.deleteAccountPermanently",
@@ -586,6 +601,7 @@ mod tests {
                 "procedure.disableProject",
                 "procedure.enableProject",
                 "procedure.setDefaultProject",
+                "procedure.setProjectQuota",
                 "procedure.addProjectMember",
                 "procedure.removeProjectMember",
                 "procedure.listProjectRoster",

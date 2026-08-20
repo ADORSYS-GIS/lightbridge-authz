@@ -637,6 +637,33 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         }
     }
 
+    fn update_account_default_quota(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::update_account_default_quota::Args,
+        _authorized: schema::procedures::update_account_default_quota::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::update_account_default_quota::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let account_id = args.args.accountId;
+        let default_quota = args.args.defaultQuota;
+        async move {
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            let account = issuer
+                .update_account_default_quota(&subject, &account_id, default_quota.as_deref())
+                .await
+                .map_err(to_cratestack_error)?;
+            Ok(to_schema_account(account))
+        }
+    }
+
     fn rotate_api_key(
         &self,
         _db: &schema::Cratestack,
@@ -864,6 +891,33 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let project = issuer
                 .set_default_project(&subject, &project_id)
+                .await
+                .map_err(to_cratestack_error)?;
+            Ok(to_schema_project(project))
+        }
+    }
+
+    fn set_project_quota(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::set_project_quota::Args,
+        _authorized: schema::procedures::set_project_quota::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::set_project_quota::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let project_id = args.args.projectId;
+        let project_quota = args.args.projectQuota;
+        async move {
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            let project = issuer
+                .set_project_quota(&subject, &project_id, project_quota.as_deref())
                 .await
                 .map_err(to_cratestack_error)?;
             Ok(to_schema_project(project))
@@ -2071,6 +2125,12 @@ const CLIENT_ASSERTION_JTI_KEY_PREFIX: &str = "authz-api:client-assertion-jti:";
 /// `PolicyStore` off the shared `budget_policy_sets`/`budget_policy_revisions` tables, so
 /// `TokenExchangeOpStore::resolve_budget_tier`'s fail-closed fallback reads the live, admin-
 /// configured `fail_closed_floor_micros` instead of a hard-coded rung.
+///
+/// `TokenExchangeOpStore::new` also takes `repo` a second time as its own `quota_repo` parameter
+/// (ADR-0017): production always passes the same `Arc<StoreRepo>` clone for both, since
+/// `project_members` lives on this exact pool with no operational separation from tenant-context
+/// resolution -- the duplicate parameter exists purely as an independent test-injection seam, see
+/// `TokenExchangeOpStore`'s own `quota_repo` field doc comment for why.
 fn build_token_exchange_state(
     oauth2: &Oauth2,
     repo: Arc<StoreRepo>,
@@ -2121,6 +2181,7 @@ fn build_token_exchange_state(
     let op_store = Arc::new(oauth2_op::store::TokenExchangeOpStore::new(
         client_store,
         assertions,
+        repo.clone(),
         repo,
         budget_repo,
         policy_engine,

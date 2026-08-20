@@ -233,6 +233,7 @@ fn offline_token_exchange_state(
     let op_store = Arc::new(TokenExchangeOpStore::new(
         client_store,
         assertions,
+        repo.clone(),
         repo,
         budget_repo,
         policy_engine,

@@ -676,6 +676,41 @@ impl StoreRepo {
         })
     }
 
+    /// Resolves the acting `subject`'s per-member `quota_tier` on `project_id` (ADR-0017), the
+    /// human/OIDC-plane mirror of the API-key plane's `owner_quota_tier`
+    /// (`api_key_validation` view, `migrations/20260731000001_api_keys_owner_account.sql`).
+    /// Deliberately keyed on `subject` (the acting person), not the project's owning account --
+    /// same reasoning as that view's `pm.account_id = k.owner_account_id` join: a lead acting on a
+    /// project someone else owns is governed by their OWN roster row, not the owner's.
+    ///
+    /// `Ok(None)` covers two states the caller must NOT distinguish, matching the view's own
+    /// documented NULL semantics verbatim: no `project_members` row at all (the common case for a
+    /// project's owning account, which normally holds none), or a row whose `quota_tier` column is
+    /// NULL. Both mean "no per-member ceiling, the caller is bounded by the pooled
+    /// `projects.project_quota` alone" -- a resolved, legitimate answer, not a failure.
+    ///
+    /// `Err` means the lookup itself could not be completed (e.g. the database is unreachable) --
+    /// distinct in kind from `Ok(None)`, and callers MUST NOT collapse the two: a database outage
+    /// must never be represented on the wire the same way as "no per-member ceiling", or an
+    /// availability failure becomes a quota bypass. See `TokenExchangeOpStore::resolve_quota_tier`
+    /// for how the token-exchange/refresh call sites act on that distinction (refuse the mint
+    /// rather than omit the claim).
+    #[instrument(skip(self, subject))]
+    pub async fn project_member_quota_tier(
+        &self,
+        project_id: &str,
+        subject: &str,
+    ) -> Result<Option<String>> {
+        let quota_tier: Option<Option<String>> = sqlx::query_scalar(
+            r#"SELECT quota_tier FROM project_members WHERE project_id = $1 AND account_id = $2"#,
+        )
+        .bind(project_id)
+        .bind(subject)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(quota_tier.flatten())
+    }
+
     pub async fn create_exchange_refresh_token(
         &self,
         input: NewExchangeRefreshToken,
@@ -1332,6 +1367,95 @@ impl StoreRepo {
             "#,
         )
         .bind(status.to_string())
+        .bind(Utc::now())
+        .bind(project_id)
+        .bind(subject)
+        .fetch_optional(self.pool())
+        .await?;
+        let row = row.ok_or(Error::NotFound)?;
+        Ok(Self::to_project(row))
+    }
+
+    /// Updates `Account.defaultQuota` (#379, completing #177/#375). Backs
+    /// `updateAccountDefaultQuota` -- the sole write path left now that `Account.defaultQuota` is
+    /// `@readonly` on the generic `model.Account.update` verb. Same authorization shape as
+    /// `set_account_status`: since ADR-0006 there is no owner/role concept left, so "the caller is
+    /// this account" (`id = account_id = subject`) is the entire check, enforced in the `WHERE`
+    /// clause -- a mismatched `account_id`/`subject` pair or an unknown account is `NotFound`. The
+    /// tier value itself is NOT validated against the operator-configured quota-tier catalogue
+    /// here -- same layering as `create_account`/`set_project_member_quota_tier`: that check
+    /// happens in `AuthzStoreImpl::update_account_default_quota`, before this method is ever
+    /// called, so an empty/absent catalogue transparently accepts any value with no special casing
+    /// needed here.
+    #[instrument(skip(self))]
+    pub async fn update_account_default_quota(
+        &self,
+        subject: &str,
+        account_id: &str,
+        default_quota: Option<&str>,
+    ) -> Result<Account> {
+        let row: Option<AccountRow> = sqlx::query_as(
+            r#"
+            UPDATE accounts
+            SET default_quota = $1, updated_at = $2
+            WHERE id = $3 AND id = $4
+            RETURNING id, default_quota, status, created_at, updated_at
+            "#,
+        )
+        .bind(default_quota)
+        .bind(Utc::now())
+        .bind(account_id)
+        .bind(subject)
+        .fetch_optional(self.pool())
+        .await?;
+        let row = row.ok_or(Error::NotFound)?;
+        Ok(Self::to_account(row))
+    }
+
+    /// Sets `Project.projectQuota` (#379, completing #177/#375). Backs `setProjectQuota` -- the
+    /// sole write path left now that `Project.projectQuota` is `@readonly` on both generic
+    /// `model.Project.create`/`.update` verbs. Project-scoped rule, same as `set_project_status`:
+    /// the project's account owner or ANY `project_members` row authorizes this (not lead-gated,
+    /// matching `model.Project.update`'s own dropped `@@allow` policy exactly rather than the
+    /// lead-only roster procedures' narrower rule); a non-authorized subject or unknown project is
+    /// `NotFound`. The tier value itself is NOT validated against the operator-configured
+    /// quota-tier catalogue here -- same layering as `set_project_member_quota_tier`: that check
+    /// happens in `AuthzStoreImpl::set_project_quota`, before this method is ever called.
+    #[instrument(skip(self))]
+    pub async fn set_project_quota(
+        &self,
+        subject: &str,
+        project_id: &str,
+        project_quota: Option<&str>,
+    ) -> Result<Project> {
+        let row: Option<ProjectRow> = sqlx::query_as(
+            r#"
+            UPDATE projects
+            SET project_quota = $1, updated_at = $2
+            WHERE projects.id = $3
+              AND (
+                projects.account_id = $4
+                OR EXISTS (
+                  SELECT 1 FROM project_members pm
+                  WHERE pm.project_id = projects.id AND pm.account_id = $4
+                )
+              )
+            RETURNING
+              projects.id,
+              projects.account_id,
+              projects.name,
+              projects.allowed_models,
+              projects.default_limits,
+              projects.billing_plan,
+              projects.billing_identity,
+              projects.project_quota,
+              projects.status,
+              projects.is_default,
+              projects.created_at,
+              projects.updated_at
+            "#,
+        )
+        .bind(project_quota)
         .bind(Utc::now())
         .bind(project_id)
         .bind(subject)
