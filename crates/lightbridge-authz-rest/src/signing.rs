@@ -556,6 +556,7 @@ fn discovery_document(
         "project_id",
         "account_id",
         "budget_tier",
+        "quota_tier",
         "email",
         "email_verified",
         "allowed_models",
