@@ -137,12 +137,28 @@ fn extract_bearer(headers: &http::HeaderMap) -> Option<String> {
 /// envelope), and one `auth().perm<Permission>` boolean per [`Permission::ALL`] variant, each set
 /// from the caller's OWN, REAL [`TokenInfo::has_permission`] verdict — never a blanket `true`, and
 /// never anything narrower than the caller's actual grants. This is the single most
-/// security-sensitive function in this file: every `authz.cstack` `@allow`/`@@allow` clause's
+/// security-sensitive function in this crate: every `authz.cstack` `@allow`/`@@allow` clause's
 /// permission gate is only as fail-closed as the values populated here. Looping over
 /// [`Permission::ALL`] rather than 31 hand-written field insertions is deliberate — a variant
 /// added to `Permission` later is picked up automatically, with no separate list to remember to
 /// update here.
-fn build_context(info: &TokenInfo, scope: RpcScope) -> CratestackContext {
+///
+/// `pub` and called from TWO independent entry points, deliberately kept as ONE function rather
+/// than two copies of "how a context gets its permission fields": [`CratestackAuthProvider`]
+/// above (the HTTP RPC surface, `authz-api`/`authz-budget`), and
+/// `lightbridge-authz::mcp::cratestack_context_from_token_info` (the MCP surface, `authz-mcp`,
+/// `app/lightbridge-authz/src/mcp.rs`). Both build a [`CratestackContext`] from a validated
+/// [`TokenInfo`] to hand to the SAME generated cratestack client, which evaluates the SAME
+/// `authz.cstack` `@allow`/`@@allow` clauses regardless of which surface reached it — a schema
+/// clause added for the RPC surface (like every clause `authz.cstack`'s `auth Principal` doc
+/// comment on issue #383 describes) applies to MCP too, whether or not MCP's own context-builder
+/// was updated to populate the new fields. Before this was unified, MCP's copy set only `id`,
+/// which satisfied the old `@allow(auth() != null)` but silently failed every #383-added clause —
+/// found in CI (`integration-test`, `it-servers`), not locally. A drift between two independent
+/// copies of this logic is an authorization bug, not a cosmetic one, so there is exactly one
+/// version now; see `mcp.rs`'s own `cratestack_context_from_token_info_matches_the_shared_helper` test for
+/// the regression coverage pinning "every context-construction path sets the full field set."
+pub fn build_context(info: &TokenInfo, scope: RpcScope) -> CratestackContext {
     let mut fields: Vec<(String, Value)> = Vec::with_capacity(Permission::ALL.len() + 2);
     fields.push(("id".to_owned(), Value::String(info.sub.clone())));
     fields.push((
