@@ -4,31 +4,27 @@
 // for shipping code.
 #![allow(clippy::unwrap_used)]
 
-//! Live-database coverage for #177: `QuotaTiers::is_allowed` wired into
-//! `AuthzStoreImpl::create_account` (`Account.defaultQuota`) and
-//! `AuthzStoreImpl::set_project_member_quota_tier` (`ProjectMember.quotaTier`) -- the two write
-//! paths that are hand-written procedures and therefore have somewhere to put the check. Gated
-//! behind `it-tests` / `just it-tests` (needs a migrated Postgres via `DATABASE_URL`), same as
+//! Live-database coverage for #177/#375/#379: `QuotaTiers::is_allowed` wired into all 5 real write
+//! paths for `Account.defaultQuota` / `Project.projectQuota` / `ProjectMember.quotaTier`:
+//! `AuthzStoreImpl::create_account` (`Account.defaultQuota`, #375),
+//! `AuthzStoreImpl::update_account_default_quota` (`Account.defaultQuota`, #379),
+//! `AuthzStoreImpl::set_project_member_quota_tier` (`ProjectMember.quotaTier`, #375), and
+//! `AuthzStoreImpl::set_project_quota` (`Project.projectQuota`, #379). Gated behind `it-tests` /
+//! `just it-tests` (needs a migrated Postgres via `DATABASE_URL`), same as
 //! `crates/lightbridge-authz-api-key/tests/project_membership_tests.rs`, whose seeding helpers
 //! this mirrors.
 //!
-//! Deliberately does NOT cover `Project.projectQuota`. In production that field is reachable only
-//! through the generic cratestack `model.Project.create`/`model.Project.update` RPC verbs (see
-//! `crates/lightbridge-authz-rest/src/rpc_authorize.rs`'s `model.Project.create`/`.update` ->
-//! `ProjectCreate`/`ProjectUpdate` permission mapping -- both live, both reachable, neither backed
-//! by a hand-written procedure). Confirmed by inspecting cratestack 0.7.16's own source
-//! (`cratestack-macros`/`cratestack-core`): the generated `validate()` on create/update input
-//! structs is assembled purely from static `@length`/`@range`/`@regex`/`@email`/`@uri`/`@iso4217`
-//! field attributes (`crates/cratestack-macros/src/validators.rs`), which cannot express a
-//! runtime-configured (env-driven `QUOTA_TIERS`) catalogue; `AuditSink::record` only fires *after*
-//! the write's transaction has already committed (`crates/cratestack-core/src/audit.rs`'s own doc
-//! comment), so it cannot reject anything either. Also confirmed:
-//! `StoreRepo::create_project` (`crates/lightbridge-authz-api-key/src/repo.rs`) -- the only
-//! hand-written path that accepts a `project_quota` -- has zero production callers; every real
-//! `Project.create` goes through the generic verb. Closing that gap needs a schema change
-//! (`@readonly` + a dedicated procedure, mirroring how `Account.status`/`Project.status` are
-//! already `@readonly` and procedure-only) that is out of scope for this PR -- see the PR
-//! description for the full finding.
+//! #375 originally shipped only the first and third of the four methods above: `Account.defaultQuota`
+//! via the generic `model.Account.update` verb and `Project.projectQuota` via the generic
+//! `model.Project.create`/`model.Project.update` verbs had no extension point for a
+//! runtime-configured catalogue check (cratestack 0.8.0's generated `validate()` on create/update
+//! input structs is assembled purely from static `@length`/`@range`/`@regex`/`@email`/`@uri`/
+//! `@iso4217` field attributes -- confirmed against this workspace's actual pin, not the stale
+//! "0.5.1" AGENTS.md previously carried; `AuditSink::record` only fires *after* the write's
+//! transaction has already committed, so it cannot reject anything either). #379 closes that gap by
+//! marking both fields `@readonly` on the generic verbs (`crates/lightbridge-authz-api/schema/
+//! authz.cstack`) and adding `updateAccountDefaultQuota`/`setProjectQuota` as the sole remaining
+//! write paths -- this file now covers all four hand-written-procedure paths symmetrically.
 #![cfg(feature = "it-tests")]
 
 use lightbridge_authz_api_key::repo::StoreRepo;
@@ -149,6 +145,114 @@ async fn create_account_accepts_anything_when_catalogue_is_empty(pool: PgPool) {
         )
         .await
         .expect("an empty/absent catalogue must accept any value (same default as Billing's is-empty-vs-absent semantics for quota tiers, see QuotaTiers' own doc comment)");
+
+    assert_eq!(account.default_quota.as_deref(), Some("anything-goes"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// updateAccountDefaultQuota / Account.defaultQuota (#379 -- the generic model.Account.update
+// verb's replacement now that the field is `@readonly` there)
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_account_default_quota_accepts_a_configured_tier(pool: PgPool) {
+    let core = core_pool(pool);
+    let store = AuthzStoreImpl::with_pool(core.clone()).with_quota_tiers(configured_tiers());
+    let subject = format!("subj-{}", cuid2());
+    StoreRepo::new(core)
+        .create_account(
+            &subject,
+            CreateAccount {
+                default_quota: None,
+            },
+        )
+        .await
+        .expect("seed account creation");
+
+    let account = store
+        .update_account_default_quota(&subject, &subject, Some("gold"))
+        .await
+        .expect("a configured tier must be accepted");
+
+    assert_eq!(account.default_quota.as_deref(), Some("gold"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_account_default_quota_rejects_an_unconfigured_tier(pool: PgPool) {
+    let core = core_pool(pool);
+    let store = AuthzStoreImpl::with_pool(core.clone()).with_quota_tiers(configured_tiers());
+    let subject = format!("subj-{}", cuid2());
+    let repo = StoreRepo::new(core.clone());
+    repo.create_account(
+        &subject,
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .expect("seed account creation");
+
+    let err = store
+        .update_account_default_quota(&subject, &subject, Some("medim"))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, Error::BadRequest(ref m) if m.contains("unknown defaultQuota") && m.contains("medim")),
+        "got: {err}"
+    );
+    // The rejected update must never have reached the DB -- still NULL from seeding.
+    let account = repo
+        .get_account_by_id(&subject)
+        .await
+        .expect("lookup should succeed")
+        .expect("account must exist");
+    assert_eq!(account.default_quota, None);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_account_default_quota_accepts_none_to_clear(pool: PgPool) {
+    let core = core_pool(pool);
+    let store = AuthzStoreImpl::with_pool(core.clone()).with_quota_tiers(configured_tiers());
+    let subject = format!("subj-{}", cuid2());
+    StoreRepo::new(core)
+        .create_account(
+            &subject,
+            CreateAccount {
+                default_quota: Some("gold".to_string()),
+            },
+        )
+        .await
+        .expect("seed account creation");
+
+    let account = store
+        .update_account_default_quota(&subject, &subject, None)
+        .await
+        .expect("None must always be accepted, even against a non-empty catalogue");
+
+    assert_eq!(account.default_quota, None);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_account_default_quota_accepts_anything_when_catalogue_is_empty(pool: PgPool) {
+    let core = core_pool(pool);
+    // No `.with_quota_tiers(...)` -- exercises the default empty catalogue.
+    let store = AuthzStoreImpl::with_pool(core.clone());
+    let subject = format!("subj-{}", cuid2());
+    StoreRepo::new(core)
+        .create_account(
+            &subject,
+            CreateAccount {
+                default_quota: None,
+            },
+        )
+        .await
+        .expect("seed account creation");
+
+    let account = store
+        .update_account_default_quota(&subject, &subject, Some("anything-goes"))
+        .await
+        .expect("an empty/absent catalogue must accept any value");
 
     assert_eq!(account.default_quota.as_deref(), Some("anything-goes"));
 }
@@ -308,4 +412,120 @@ async fn set_project_member_quota_tier_accepts_anything_when_catalogue_is_empty(
         roster_quota_tier(core, &project_id, &target_subject).await,
         Some("anything-goes".to_string())
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// setProjectQuota / Project.projectQuota (#379 -- the generic model.Project.create/.update verbs'
+// replacement now that the field is `@readonly` on both)
+// ---------------------------------------------------------------------------------------------
+
+/// Seeds an owner account with a fresh (roster-less) project -- `set_project_quota`'s
+/// authorization is "account owner or any roster member", same as `model.Project.update`'s own
+/// dropped `@@allow` policy, so an owner alone (no roster) already suffices to authorize it.
+async fn seed_owner_and_project(core: Arc<dyn DbPoolTrait>) -> (String, String) {
+    let repo = StoreRepo::new(core);
+    let owner_subject = format!("owner-{}", cuid2());
+
+    let owner_account = repo
+        .create_account(
+            &owner_subject,
+            CreateAccount {
+                default_quota: None,
+            },
+        )
+        .await
+        .expect("owner account creation");
+
+    let project = repo
+        .create_project(
+            &owner_subject,
+            &owner_account.id,
+            CreateProject {
+                name: "proj".to_string(),
+                allowed_models: None,
+                default_limits: None,
+                billing_plan: "free".to_string(),
+                billing_identity: format!("bill-{}", cuid2()),
+                project_quota: None,
+            },
+            cuid2(),
+        )
+        .await
+        .expect("project creation");
+
+    (owner_subject, project.id)
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_project_quota_accepts_a_configured_tier(pool: PgPool) {
+    let core = core_pool(pool);
+    let (owner_subject, project_id) = seed_owner_and_project(core.clone()).await;
+    let store = AuthzStoreImpl::with_pool(core.clone()).with_quota_tiers(configured_tiers());
+
+    let project = store
+        .set_project_quota(&owner_subject, &project_id, Some("bronze"))
+        .await
+        .expect("a configured tier must be accepted");
+
+    assert_eq!(project.project_quota.as_deref(), Some("bronze"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_project_quota_rejects_an_unconfigured_tier(pool: PgPool) {
+    let core = core_pool(pool);
+    let (owner_subject, project_id) = seed_owner_and_project(core.clone()).await;
+    let store = AuthzStoreImpl::with_pool(core.clone()).with_quota_tiers(configured_tiers());
+
+    let err = store
+        .set_project_quota(&owner_subject, &project_id, Some("medim"))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, Error::BadRequest(ref m) if m.contains("unknown projectQuota") && m.contains("medim")),
+        "got: {err}"
+    );
+    // The rejected write must never have reached the DB -- still NULL from seeding.
+    let repo = StoreRepo::new(core);
+    let project = repo
+        .get_project_by_id(&project_id)
+        .await
+        .expect("lookup should succeed")
+        .expect("project must exist");
+    assert_eq!(project.project_quota, None);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_project_quota_accepts_none_to_clear(pool: PgPool) {
+    let core = core_pool(pool);
+    let (owner_subject, project_id) = seed_owner_and_project(core.clone()).await;
+    let store = AuthzStoreImpl::with_pool(core.clone()).with_quota_tiers(configured_tiers());
+
+    // First set a real tier, then clear it with `None` -- proving `None` both passes validation
+    // and still reaches the repo's clearing behavior end to end.
+    store
+        .set_project_quota(&owner_subject, &project_id, Some("gold"))
+        .await
+        .expect("setup: configured tier must be accepted");
+    let project = store
+        .set_project_quota(&owner_subject, &project_id, None)
+        .await
+        .expect("None must always be accepted, even against a non-empty catalogue");
+
+    assert_eq!(project.project_quota, None);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_project_quota_accepts_anything_when_catalogue_is_empty(pool: PgPool) {
+    let core = core_pool(pool);
+    let (owner_subject, project_id) = seed_owner_and_project(core.clone()).await;
+    // No `.with_quota_tiers(...)` -- exercises the default empty catalogue.
+    let store = AuthzStoreImpl::with_pool(core.clone());
+
+    let project = store
+        .set_project_quota(&owner_subject, &project_id, Some("anything-goes"))
+        .await
+        .expect("an empty/absent catalogue must accept any value");
+
+    assert_eq!(project.project_quota.as_deref(), Some("anything-goes"));
 }

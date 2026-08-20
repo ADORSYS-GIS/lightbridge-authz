@@ -208,12 +208,12 @@ per-frame RBAC" above describes for the permission check.
 | ----------------- | ---------------------------------------------------- | ----------------------------------- |
 | `account:create`  | `procedure.createAccount`                            | `create-account`                    |
 | `account:read`    | `model.Account.list`, `model.Account.get`, `model.AccountSummary.list`, `model.AccountSummary.get` | `list-accounts`, `get-account` |
-| `account:update`  | `model.Account.update`                               | `update-account`                    |
+| `account:update`  | `model.Account.update`, `procedure.updateAccountDefaultQuota` | `update-account`          |
 | `account:delete`  | `procedure.deleteAccountPermanently`                 | `delete-account`                    |
 | `account:disable` | `procedure.disableAccount`, `procedure.enableAccount`| `disable-account`, `enable-account` |
 | `project:create`  | `model.Project.create`                               | `create-project`                    |
 | `project:read`    | `model.Project.list`, `model.Project.get`            | `list-projects`, `get-project`      |
-| `project:update`  | `model.Project.update`, `procedure.setDefaultProject`, `procedure.listModelCatalog` | `update-project`, `set-default-project` |
+| `project:update`  | `model.Project.update`, `procedure.setDefaultProject`, `procedure.listModelCatalog`, `procedure.setProjectQuota` | `update-project`, `set-default-project`, `set-project-quota` |
 | `project:delete`  | `model.Project.delete`                               | `delete-project`                    |
 | `project:disable` | `procedure.disableProject`, `procedure.enableProject`| `disable-project`, `enable-project` |
 | `project:member`  | `procedure.listProjectRoster`, `procedure.addProjectMember`, `procedure.removeProjectMember`, `procedure.setProjectMemberRole`, `procedure.setProjectMemberQuotaTier` | `list-project-roster`, `add-project-member`, `remove-project-member`, `set-project-member-role`, `set-project-member-quota-tier` |

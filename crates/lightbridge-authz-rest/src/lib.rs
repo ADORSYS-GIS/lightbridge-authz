@@ -637,6 +637,33 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         }
     }
 
+    fn update_account_default_quota(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::update_account_default_quota::Args,
+        _authorized: schema::procedures::update_account_default_quota::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::update_account_default_quota::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let account_id = args.args.accountId;
+        let default_quota = args.args.defaultQuota;
+        async move {
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            let account = issuer
+                .update_account_default_quota(&subject, &account_id, default_quota.as_deref())
+                .await
+                .map_err(to_cratestack_error)?;
+            Ok(to_schema_account(account))
+        }
+    }
+
     fn rotate_api_key(
         &self,
         _db: &schema::Cratestack,
@@ -864,6 +891,33 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let project = issuer
                 .set_default_project(&subject, &project_id)
+                .await
+                .map_err(to_cratestack_error)?;
+            Ok(to_schema_project(project))
+        }
+    }
+
+    fn set_project_quota(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::set_project_quota::Args,
+        _authorized: schema::procedures::set_project_quota::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::set_project_quota::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let project_id = args.args.projectId;
+        let project_quota = args.args.projectQuota;
+        async move {
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            let project = issuer
+                .set_project_quota(&subject, &project_id, project_quota.as_deref())
                 .await
                 .map_err(to_cratestack_error)?;
             Ok(to_schema_project(project))

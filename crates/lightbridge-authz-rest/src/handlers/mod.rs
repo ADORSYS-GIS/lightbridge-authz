@@ -385,6 +385,38 @@ impl AuthzStoreImpl {
         Ok(account)
     }
 
+    /// Updates `Account.defaultQuota` post-creation. Backs `updateAccountDefaultQuota` (#379,
+    /// completing #177/#375): `Account.defaultQuota` is now `@readonly` on the generic
+    /// `model.Account.update` verb (which has no hook for a runtime-configured catalogue check),
+    /// so this procedure is the only write path left. Same catalogue check, same pattern/error
+    /// shape, as `create_account`'s `default_quota` check above -- see that method's doc comment
+    /// for the full contract (`None` always passes, an empty/absent catalogue accepts any value).
+    pub async fn update_account_default_quota(
+        &self,
+        subject: &str,
+        account_id: &str,
+        default_quota: Option<&str>,
+    ) -> Result<Account> {
+        if !self.quota_tiers.is_allowed(default_quota) {
+            return Err(Error::BadRequest(format!(
+                "unknown defaultQuota '{}': must be one of the configured tiers [{}]",
+                default_quota.unwrap_or_default(),
+                self.quota_tiers.tier_ids().join(", ")
+            )));
+        }
+        let account = self
+            .repo
+            .update_account_default_quota(subject, account_id, default_quota)
+            .await?;
+        tracing::info!(
+            operation = "update_account_default_quota",
+            subject = %subject,
+            account_id = %account.id,
+            "account defaultQuota updated"
+        );
+        Ok(account)
+    }
+
     /// Create an API key: validate the requested `billing_plan` against the operator-configured
     /// catalogue (before any DB write), issue a fresh secret (generation/hashing unchanged from
     /// before the migration), and insert the row via hand-written sqlx. Backs the `createApiKey`
@@ -504,6 +536,31 @@ impl AuthzStoreImpl {
     /// in SQL).
     pub async fn set_default_project(&self, subject: &str, project_id: &str) -> Result<Project> {
         self.repo.set_default_project(subject, project_id).await
+    }
+
+    /// Sets `Project.projectQuota` post-creation. Backs `setProjectQuota` (#379, completing
+    /// #177/#375): `Project.projectQuota` is now `@readonly` on both generic
+    /// `model.Project.create`/`.update` verbs (neither has a hook for a runtime-configured
+    /// catalogue check), so this procedure is the only write path left. `project_quota` is
+    /// validated against the operator-configured catalogue here, before the ownership-gated SQL
+    /// write (`StoreRepo::set_project_quota`) -- same pattern/error shape as `create_account`'s
+    /// `default_quota` check and `set_project_member_quota_tier`'s `quota_tier` check above.
+    pub async fn set_project_quota(
+        &self,
+        subject: &str,
+        project_id: &str,
+        project_quota: Option<&str>,
+    ) -> Result<Project> {
+        if !self.quota_tiers.is_allowed(project_quota) {
+            return Err(Error::BadRequest(format!(
+                "unknown projectQuota '{}': must be one of the configured tiers [{}]",
+                project_quota.unwrap_or_default(),
+                self.quota_tiers.tier_ids().join(", ")
+            )));
+        }
+        self.repo
+            .set_project_quota(subject, project_id, project_quota)
+            .await
     }
 
     /// Revoke an API key (business-state transition to `revoked`). Backs `revokeApiKey`.
@@ -909,6 +966,107 @@ mod tests {
 
         let err = store
             .set_project_member_quota_tier("subject", "proj", "target", None)
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(err, lightbridge_authz_core::error::Error::BadRequest(_)),
+            "None must not be rejected by the catalogue check, got: {err}"
+        );
+    }
+
+    // #379 (completing #177/#375): `defaultQuota` validation on `updateAccountDefaultQuota`, same
+    // shape/reasoning as the two `create_account` tests above -- the only difference is this write
+    // path used to be the generic, entirely-unvalidated `model.Account.update` verb before #379
+    // marked `Account.defaultQuota` `@readonly` and moved the write behind this procedure.
+    #[tokio::test]
+    async fn update_account_default_quota_rejects_default_quota_not_in_configured_set() {
+        use lightbridge_authz_core::config::QuotaTier;
+
+        let store = AuthzStoreImpl::with_pool(lazy_pool()).with_quota_tiers(QuotaTiers {
+            tiers: vec![QuotaTier {
+                id: "gold".to_string(),
+                name: "Gold".to_string(),
+            }],
+        });
+
+        for tier in ["medim", ""] {
+            let err = store
+                .update_account_default_quota("subject", "subject", Some(tier))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, lightbridge_authz_core::error::Error::BadRequest(ref m) if m.contains("unknown defaultQuota")),
+                "tier {tier:?} should be rejected before any DB access, got: {err}"
+            );
+        }
+    }
+
+    /// Mirrors `create_account_allows_missing_default_quota_against_a_configured_catalogue`:
+    /// `None` must pass the catalogue check and reach the (dead) DB connection, never `BadRequest`.
+    #[tokio::test]
+    async fn update_account_default_quota_allows_missing_default_quota_against_a_configured_catalogue()
+     {
+        use lightbridge_authz_core::config::QuotaTier;
+
+        let store = AuthzStoreImpl::with_pool(lazy_pool()).with_quota_tiers(QuotaTiers {
+            tiers: vec![QuotaTier {
+                id: "gold".to_string(),
+                name: "Gold".to_string(),
+            }],
+        });
+
+        let err = store
+            .update_account_default_quota("subject", "subject", None)
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(err, lightbridge_authz_core::error::Error::BadRequest(_)),
+            "a missing default_quota must not be rejected by the catalogue check, got: {err}"
+        );
+    }
+
+    // #379 (completing #177/#375): `projectQuota` validation on `setProjectQuota`, same
+    // shape/reasoning as above -- this write path used to be the generic, entirely-unvalidated
+    // `model.Project.create`/`model.Project.update` verbs before #379 marked `Project.projectQuota`
+    // `@readonly` and moved the write behind this procedure.
+    #[tokio::test]
+    async fn set_project_quota_rejects_project_quota_not_in_configured_set() {
+        use lightbridge_authz_core::config::QuotaTier;
+
+        let store = AuthzStoreImpl::with_pool(lazy_pool()).with_quota_tiers(QuotaTiers {
+            tiers: vec![QuotaTier {
+                id: "gold".to_string(),
+                name: "Gold".to_string(),
+            }],
+        });
+
+        for tier in ["medim", ""] {
+            let err = store
+                .set_project_quota("subject", "proj", Some(tier))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, lightbridge_authz_core::error::Error::BadRequest(ref m) if m.contains("unknown projectQuota")),
+                "tier {tier:?} should be rejected before any DB access, got: {err}"
+            );
+        }
+    }
+
+    /// Mirrors `set_project_member_quota_tier_allows_none_against_a_configured_catalogue`: `None`
+    /// must pass the catalogue check and reach the (dead) DB connection, never `BadRequest`.
+    #[tokio::test]
+    async fn set_project_quota_allows_none_against_a_configured_catalogue() {
+        use lightbridge_authz_core::config::QuotaTier;
+
+        let store = AuthzStoreImpl::with_pool(lazy_pool()).with_quota_tiers(QuotaTiers {
+            tiers: vec![QuotaTier {
+                id: "gold".to_string(),
+                name: "Gold".to_string(),
+            }],
+        });
+
+        let err = store
+            .set_project_quota("subject", "proj", None)
             .await
             .unwrap_err();
         assert!(
