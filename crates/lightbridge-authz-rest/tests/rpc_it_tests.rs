@@ -1764,6 +1764,160 @@ async fn batch_rpc_frames_enforce_permission_per_frame() {
     );
 }
 
+/// Issue #383's fail-closed obligation, stated explicitly: the `"batch"` special case in
+/// `CratestackAuthProvider::authenticate` (see that module's doc comment) is the single most
+/// dangerous line in the fix, because it is the one place that authenticates-and-attaches a
+/// context instead of denying outright. It must attach the caller's REAL, computed permission set
+/// -- never a blanket-permissive one -- so a caller holding a valid, active token but genuinely
+/// ZERO permissions must have EVERY bundled frame refused, not silently let through because the
+/// envelope-level check only required "some valid caller". This is the negative-space complement
+/// to `batch_rpc_frames_enforce_permission_per_frame` above (which proves a MIXED-permission
+/// caller gets a MIXED result) -- this test proves a ZERO-permission caller gets an ALL-denied
+/// result, which a bug that granted broad access on successful envelope authentication (the
+/// "naive fix" #383's own Risks section warns against) would NOT catch, since a mixed-result test
+/// alone can pass even if the envelope-level context is wrongly permissive for every op the
+/// caller genuinely lacks.
+///
+/// Scoped to `procedure.*` and `model.*` write verbs (`create`/`update`/`delete`) deliberately --
+/// NOT `model.*` `list`/`get`. Those two verb families are enforced through genuinely different
+/// cratestack mechanisms: a write verb's policy denial is an explicit `CratestackError::Forbidden`
+/// (`cratestack-sqlx/src/query/support/create.rs`'s `evaluate_create_policy_expr`; `update.rs`'s
+/// existence-probe-then-`Forbidden`), matching `authorize_procedure`'s all-or-nothing behavior for
+/// procedures. A `list`/`get` verb's `@@allow("read", ...)` is compiled into the SQL `WHERE`
+/// clause itself (`cratestack-sqlx/src/render/policy.rs`) -- a caller whose permission field is
+/// `false` simply matches zero rows, the same as any other caller-scoping predicate (e.g. "only
+/// rows this account owns"). That is a pre-existing, upstream cratestack property of read
+/// policies, not something this fix changed or could change without a much larger rewrite (there
+/// is no schema-level way to make a `@@allow("read", ...)` clause reject instead of filter) -- see
+/// `batch_rpc_read_verbs_filter_to_empty_not_an_error_for_a_caller_lacking_read_permission` below
+/// for the read-verb half of this same fail-closed obligation, and `auth_provider.rs`'s module doc
+/// for where this is recorded as the second accepted, documented behavior difference (alongside
+/// the 403-vs-404 scope one).
+#[tokio::test]
+async fn batch_rpc_frames_all_deny_for_a_caller_with_zero_permissions() {
+    let subject = format!("zero-perm-batch-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with(
+        "zero",
+        token_info(
+            &subject,
+            lightbridge_authz_core::authz::PermissionSet::new(),
+        ),
+    ));
+    let ctx = setup(bearer).await;
+
+    let batch = json!([
+        { "id": 1, "op": "procedure.listBillingPlans", "input": { "args": {} } },
+        { "id": 2, "op": "model.Project.create", "input": { "accountId": subject, "name": "x", "billingIdentity": format!("tenant-{subject}"), "defaultLimits": {}, "billingPlan": "free" } },
+        { "id": 3, "op": "procedure.createAccount", "input": { "args": {} } }
+    ]);
+
+    let response = ctx
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/rpc/batch")
+                .header("content-type", Wire::Cbor.content_type())
+                .header("accept", Wire::Cbor.content_type())
+                .header("authorization", "Bearer zero")
+                .body(Body::from(Wire::Cbor.encode(&batch)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the envelope itself is 200 -- the caller IS validly authenticated, just permission-less; \
+         per-frame denial happens deeper, in schema policy"
+    );
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let frames: Vec<Value> = Wire::Cbor.decode(&bytes);
+    assert_eq!(frames.len(), 3);
+    for frame in &frames {
+        let error = frame.get("error").unwrap_or_else(|| {
+            panic!("zero-permission caller's frame must be refused, not succeed: {frame}")
+        });
+        assert_eq!(
+            error["code"], "permission_denied",
+            "every frame must be denied with permission_denied for a zero-permission caller: {frame}"
+        );
+    }
+}
+
+/// The read-verb half of the fail-closed obligation the test above documents: a caller lacking
+/// `account:read` must never see another account's row (or, here, their OWN not-yet-visible
+/// permission state) through `model.Account.list`/`.get` inside a batch call. Per that test's own
+/// doc comment, cratestack compiles `@@allow("read", ...)` into the SQL `WHERE` clause rather than
+/// a hard pre-check, so the OBSERVABLE shape is "zero rows" / "not found", not `permission_denied`
+/// -- verified here so that shape is pinned down explicitly rather than assumed. The
+/// security-relevant assertion is the same either way: no row this caller cannot read is ever
+/// returned. Unary calls never exercise this path at all (the outer `rpc_authorize` gate already
+/// rejects a `model.Account.list` call from a caller lacking `account:read` with a clean `403`
+/// before cratestack's dispatch/query layer ever runs) -- this divergence is therefore scoped to
+/// `POST /rpc/batch` specifically, same as the 403-vs-404 scope trade-off.
+#[tokio::test]
+async fn batch_rpc_read_verbs_filter_to_empty_not_an_error_for_a_caller_lacking_read_permission() {
+    let owner = format!("owner-readfilter-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("owner", token_info(&owner, admin_perms()))
+            .with(
+                "zero",
+                token_info(&owner, lightbridge_authz_core::authz::PermissionSet::new()),
+            ),
+    );
+    let ctx = setup(bearer).await;
+    let account_id = create_account(&ctx.router, "owner", "unused").await;
+    assert_eq!(account_id, owner, "account id is the subject per ADR-0006");
+
+    // Same subject as the account owner, but the `"zero"` token carries no permissions at all --
+    // `model.Account.get`/`.list` for their OWN account must not return it.
+    let batch = json!([
+        { "id": 1, "op": "model.Account.get", "input": { "id": account_id } },
+        { "id": 2, "op": "model.Account.list", "input": {} }
+    ]);
+    let response = ctx
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/rpc/batch")
+                .header("content-type", Wire::Cbor.content_type())
+                .header("accept", Wire::Cbor.content_type())
+                .header("authorization", "Bearer zero")
+                .body(Body::from(Wire::Cbor.encode(&batch)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "batch envelope is 200");
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let frames: Vec<Value> = Wire::Cbor.decode(&bytes);
+    assert_eq!(frames.len(), 2);
+
+    let get_frame = frames.iter().find(|f| f["id"] == 1).expect("frame 1");
+    assert!(
+        get_frame.get("output").is_none() || get_frame["output"].is_null(),
+        "get must not return the caller's own account row when they lack account:read: {get_frame}"
+    );
+
+    let list_frame = frames.iter().find(|f| f["id"] == 2).expect("frame 2");
+    if let Some(output) = list_frame.get("output") {
+        let items = output["items"]
+            .as_array()
+            .expect("list output has an items array");
+        assert!(
+            items.is_empty(),
+            "list must not return the caller's own account row when they lack account:read: \
+             {list_frame}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Section 3: createAccount seeds the creator's membership, enabling a subsequent project create;
 // a non-member is refused.

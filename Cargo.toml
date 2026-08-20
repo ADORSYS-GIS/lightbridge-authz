@@ -213,7 +213,9 @@ mimalloc = "0"
 # been the one left behind — if this recurs on the next bump, that is strong enough signal to stop
 # trusting Dependabot with this line at all and script a post-PR CI check that fails when it drifts
 # from its five siblings, rather than relying on a human noticing during review.
-# DO NOT widen any line below off `=0.8.0` (not even to a caret `"0.8.0"`) without first re-running
+# (Historical, superseded by the RESOLVED note above: this pin block used to say DO NOT widen off
+# `=0.8.0` at all. That constraint is what #383 existed to lift — the pin is now `=0.8.4`.) Still
+# true regardless of target version: never widen any line below without first re-running
 # `just it-tests` and specifically watching `batch_rpc_frames_enforce_permission_per_frame` /
 # `batch_rpc_frames_succeed_and_fail_independently` /
 # `budget_gated_op_ids_are_unreachable_on_authz_api_even_for_an_admin` in
@@ -244,16 +246,56 @@ mimalloc = "0"
 # critical surgery, not a version bump, and deliberately out of scope for the 0.7.16->0.8.0 dependency
 # upgrade this pin block's history otherwise documents. See the tracking issue filed alongside this
 # exact pin for the reconciliation work itself.
-cratestack-core = "=0.8.0"
-cratestack-axum = "=0.8.0"
-cratestack-redis = "=0.8.0"
+#
+# RESOLVED (#383, 2026-08-20): the family is unpinned to `=0.8.4` — confirmed against cratestack's
+# own `origin/main` to be the newest published release; the ~10 unreleased commits past it (up to
+# and including a breaking `remove protobuf/gRPC support entirely`, #655) carry no workspace version
+# bump (`Cargo.toml` `version` is still `0.8.4` at that tip) and are therefore not resolvable from
+# crates.io at all, not merely "not yet needed" — nothing to re-check here until cratestack cuts an
+# actual next release.
+#
+# The fix does NOT touch `AuthProvider`/`CachedAuthProvider` at all — that seam is structurally
+# unusable for this: `CachedAuthProvider` (`cratestack-core::context`) is a sealed, non-generic
+# wrapper that unconditionally discards the `RequestContext` it's asked to authenticate and returns
+# one pre-computed context, so `CratestackAuthProvider::authenticate` is invoked exactly ONCE per
+# `/rpc/batch` envelope now (`request.path` always the literal `/rpc/batch`), never once per frame —
+# confirmed by tracing `crates/cratestack-macros/src/include/server/rpc_module/batch.rs`.
+#
+# Instead, the coarse per-op-id RBAC gate moved from that (now-broken-for-batch) auth hook into
+# `crates/lightbridge-authz-api/schema/authz.cstack`'s `@allow`/`@@allow` policy clauses — cratestack's
+# OWN per-frame extension point, proven still correct post-0.8.4 by tracing `invoke_with_db` ->
+# `authorize_with_db` -> `::cratestack::authorize_procedure` inside `#dispatch_ident`
+# (`crates/cratestack-macros/src/procedure/instrument.rs`), which batch dispatch re-enters once per
+# frame exactly like a unary call, untouched by the `CachedAuthProvider` change (that only touches
+# `AuthProvider::authenticate`, a separate call site) — and by cratestack's own upstream test
+# `rpc_batch_error_frames_carry_lowercase_grpc_codes`
+# (`crates/cratestack-pg/tests/include_schema.rs`), which the 0.8.4 release itself reports green and
+# which proves a policy-driven per-frame denial produces THAT FRAME's own error, not a wholesale
+# envelope failure. `CratestackAuthProvider::authenticate` now populates every `Permission::ALL`
+# variant's real, computed grant as an `auth().perm<Permission>` boolean (plus `auth().rpcScope`,
+# restoring the `RpcScope` authz-api/authz-budget cutover) once per envelope for batch — same as it
+# always did per request for unary — and each op-id's schema clause reads back the ONE boolean it
+# needs, per frame. Generated, not hand-transcribed, from `rpc_authorize::MAPPED_OP_ID_PERMISSIONS`
+# by `crates/lightbridge-authz-rest/tests/schema_policy_sync_tests.rs`, which also stays as a
+# permanent CI drift-check (`cargo test -p lightbridge-authz-rest --test schema_policy_sync_tests`)
+# so a future op-id/permission change can't silently desync the schema from the Rust-side map again.
+# Full mechanism, the options considered (including two rejected: a `/rpc/batch` reimplementation
+# downstream, and an upstream cratestack opt-in per-frame-auth flag), and the two accepted, batch-
+# path-only behavior differences -- (1) an out-of-scope op-id is `403` not `404` (unary unaffected,
+# still `404`) and (2) `model.*` `list`/`get` verbs filter to empty/not-found rather than
+# `permission_denied` for a caller lacking read permission, an upstream cratestack row-filter-vs-
+# hard-gate property this fix did not create -- are recorded in `auth_provider.rs`'s own module doc
+# (search "Two accepted, documented behavior differences") and in the PR that resolved this issue.
+cratestack-core = "=0.8.4"
+cratestack-axum = "=0.8.4"
+cratestack-redis = "=0.8.4"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
 # `include_server_schema!` macro emits `::cratestack::*` paths (see cratestack-pg lib docs). The
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
 # it to build the RPC router (ADR-0003).
-cratestack = { package = "cratestack-pg", version = "=0.8.0" }
-cratestack-codec-cbor = "=0.8.0"
-cratestack-codec-json = "=0.8.0"
+cratestack = { package = "cratestack-pg", version = "=0.8.4" }
+cratestack-codec-cbor = "=0.8.4"
+cratestack-codec-json = "=0.8.4"
 # Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"

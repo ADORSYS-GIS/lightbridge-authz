@@ -21,8 +21,96 @@ datasource db {
   url = env("DATABASE_URL")
 }
 
+// `rpcScope` + the 31 `perm*` booleans below are issue #383's fix, not part of the original
+// ADR-0003 migration. Background: cratestack 0.8.4 rewrote `POST /rpc/batch` to authenticate the
+// envelope exactly once (`CachedAuthProvider`), so `CratestackAuthProvider::authenticate` --
+// previously the sole per-frame RBAC enforcement point -- can no longer see an individual batch
+// frame's op-id at all. What cratestack's OWN per-frame policy evaluation (`authorize_procedure`
+// for procedures, the model read-policy equivalent for `model.*` verbs -- both invoked from inside
+// `#dispatch_ident`, re-entered once per batch frame exactly like a unary call, completely
+// unaffected by the auth-caching change; see `crates/cratestack-macros/src/procedure/instrument.rs`)
+// CAN still see is which permission a given op-id requires, because that's a schema-compile-time
+// constant, not something read off the per-request path. So the coarse RBAC gate moves here:
+// `CratestackAuthProvider` bakes the caller's REAL, already-computed `TokenInfo::has_permission`
+// verdict for every permission (plus which server -- authz-api vs authz-budget -- is asking, via
+// `rpcScope`) into one auth context, once, at authenticate() time (envelope-once for batch, same as
+// ever for unary), and every mapped op-id's `@allow`/`@@allow` clause below reads the ONE boolean
+// it needs back out, per frame. See `crates/lightbridge-authz-rest/src/auth_provider.rs` (where
+// these fields are populated) and `crates/lightbridge-authz-rest/tests/schema_policy_sync_tests.rs`
+// (the generator/drift-check this block and every amended clause below were produced by, driven
+// from `rpc_authorize::MAPPED_OP_ID_PERMISSIONS` -- NOT hand-transcribed, to keep 43 op-ids' worth
+// of clauses from silently drifting out of sync with the Rust-side permission map). Every original
+// expression is parenthesized before the appended `&& auth().rpcScope == ... && auth().perm... ==
+// true` clause -- without the parens, `a || b && c` parses as `a || (b && c)` (`&&` binds tighter
+// than `||`), which would silently exempt the FIRST disjunct of every `||`-based ownership check
+// below (the account-owner branch on `Project`/`ApiKey`) from the permission gate entirely. Caught
+// by hand-reviewing this generator's own first draft output before it was committed, not by the
+// drift-check test alone (which only proves the file matches what the generator computes, not that
+// the generator computes something semantically correct) -- see the PR description.
+//
+// Field names are mechanically derived from `Permission::as_str()` by
+// `rpc_authorize::permission_field_name` (e.g. `"budget:read-own"` -> `permBudgetReadOwn`); this
+// block is a literal transcription of `Permission::ALL` in that same declaration order, printed by
+// that function, not typed by hand permission-by-permission.
+//
+// KNOWN, ACCEPTED BEHAVIOR CHANGE (batch path only -- unary is byte-for-byte unchanged, still a
+// clean 404): a caller hitting a budget op-id on `authz-api` inside a `/rpc/batch` envelope now
+// gets that frame's `403 permission_denied` instead of `404 not_found`. `RpcScope` is a deployment
+// fact (which binary is running), not a caller fact, so it genuinely IS safe to bake into the one
+// envelope-cached context -- unlike a per-frame *permission requirement*, which varies by op-id and
+// is correctly handled by each clause below instead. But cratestack's `authorize_procedure` can
+// only ever return `Forbidden` on denial, never `NotFound` -- there is no schema-policy mechanism
+// to reject before dispatch reaches policy evaluation, because `CratestackAuthProvider` is invoked
+// once for the whole envelope and structurally cannot see individual frames to 404 them ahead of
+// time. The refusal itself is unaffected (still fail-closed, still unreachable for a caller lacking
+// the scope regardless of how many permissions they otherwise hold -- see
+// `budget_gated_op_ids_are_unreachable_on_authz_api_even_for_an_admin`), and the only observable
+// consequence is that a `403` on a `/rpc/batch` frame confirms the op-id EXISTS in the schema where
+// a `404` previously did not -- negligible here, since every op-id in this schema is already public
+// (there is no secret op-id whose mere existence this schema keeps hidden), but worth being
+// explicit about rather than leaving unremarked.
+//
+// SECOND KNOWN, ACCEPTED BEHAVIOR DIFFERENCE (also batch-path-only): `model.*` `list`/`get` verbs'
+// `@@allow("read", ...)` below compiles into the SQL `WHERE` clause itself, not a hard pre-check
+// (cratestack-sqlx's `render/policy.rs`) -- a caller lacking read permission simply matches zero
+// rows (empty list / not-found), never `403 permission_denied`, unlike `create`/`update`/`delete`
+// verbs and every `procedure.*`, which DO hard-gate. Pre-existing upstream cratestack property this
+// fix did not create; see `auth_provider.rs`'s module doc ("Two accepted, documented behavior
+// differences") for the full explanation and the two tests that pin down both halves.
 auth Principal {
   id String
+  rpcScope String
+  permAccountCreate Boolean
+  permAccountRead Boolean
+  permAccountUpdate Boolean
+  permAccountDelete Boolean
+  permAccountDisable Boolean
+  permProjectCreate Boolean
+  permProjectRead Boolean
+  permProjectUpdate Boolean
+  permProjectDelete Boolean
+  permProjectDisable Boolean
+  permProjectMember Boolean
+  permApikeyCreate Boolean
+  permApikeyRead Boolean
+  permApikeyUpdate Boolean
+  permApikeyDelete Boolean
+  permApikeyRevoke Boolean
+  permApikeyRotate Boolean
+  permApikeyValidate Boolean
+  permBudgetRead Boolean
+  permBudgetReadOwn Boolean
+  permBudgetSelfRefill Boolean
+  permBudgetReview Boolean
+  permBudgetGrant Boolean
+  permBudgetRevoke Boolean
+  permBudgetAuditRead Boolean
+  permBudgetPolicyRead Boolean
+  permBudgetPolicyWrite Boolean
+  permBudgetPolicySimulate Boolean
+  permBudgetPolicyActivate Boolean
+  permSessionRevokeOwn Boolean
+  permSessionRevoke Boolean
 }
 
 mixin AuditFields {
@@ -86,8 +174,8 @@ model Account {
   // in the ADR-0006 follow-up procedure pass, not this schema/migration pass).
   @@audit
   @@paged
-  @@allow("read", id == auth().id)
-  @@allow("update", id == auth().id)
+  @@allow("read", (id == auth().id) && auth().rpcScope == "crud" && auth().permAccountRead == true)
+  @@allow("update", (id == auth().id) && auth().rpcScope == "crud" && auth().permAccountUpdate == true)
 }
 
 model Project {
@@ -143,10 +231,10 @@ model Project {
 
   @@audit
   @@paged
-  @@allow("create", account.id == auth().id)
-  @@allow("read", account.id == auth().id || members.some.accountId == auth().id)
-  @@allow("update", account.id == auth().id || members.some.accountId == auth().id)
-  @@allow("delete", isDefault != true && account.id == auth().id)
+  @@allow("create", (account.id == auth().id) && auth().rpcScope == "crud" && auth().permProjectCreate == true)
+  @@allow("read", (account.id == auth().id || members.some.accountId == auth().id) && auth().rpcScope == "crud" && auth().permProjectRead == true)
+  @@allow("update", (account.id == auth().id || members.some.accountId == auth().id) && auth().rpcScope == "crud" && auth().permProjectUpdate == true)
+  @@allow("delete", (isDefault != true && account.id == auth().id) && auth().rpcScope == "crud" && auth().permProjectDelete == true)
   // Lead-only mutations are NOT expressible as `@@allow` -- same class of problem ADR-0005 hit
   // with account roles: "the member row matching my subject must ALSO have role=lead" is a
   // compound condition on one related row, and cratestack's relation-quantifier policy can't
@@ -199,9 +287,9 @@ model ApiKey {
   @@soft_delete
   @@audit
   @@paged
-  @@allow("read", project.account.id == auth().id || project.members.some.accountId == auth().id)
-  @@allow("update", project.account.id == auth().id || project.members.some.accountId == auth().id)
-  @@allow("delete", project.account.id == auth().id || project.members.some.accountId == auth().id)
+  @@allow("read", (project.account.id == auth().id || project.members.some.accountId == auth().id) && auth().rpcScope == "crud" && auth().permApikeyRead == true)
+  @@allow("update", (project.account.id == auth().id || project.members.some.accountId == auth().id) && auth().rpcScope == "crud" && auth().permApikeyUpdate == true)
+  @@allow("delete", (project.account.id == auth().id || project.members.some.accountId == auth().id) && auth().rpcScope == "crud" && auth().permApikeyDelete == true)
 }
 
 // Relation target ONLY. The real `project_members` table (owned by
@@ -271,7 +359,7 @@ view AccountSummary from Account, Project, ApiKey {
   activeApiKeyCount Int
 
   @@server_sql("SELECT a.id, COUNT(DISTINCT p.id)::int AS project_count, COUNT(DISTINCT k.id)::int AS api_key_count, COUNT(DISTINCT k.id) FILTER (WHERE k.status = 'active' AND k.deleted_at IS NULL)::int AS active_api_key_count FROM accounts a LEFT JOIN projects p ON p.account_id = a.id LEFT JOIN api_keys k ON k.project_id = p.id GROUP BY a.id")
-  @@allow("read", auth() != null)
+  @@allow("read", (auth() != null) && auth().rpcScope == "crud" && auth().permAccountRead == true)
   @@materialized
 }
 
@@ -296,7 +384,7 @@ type ApiKeySecret {
 }
 
 mutation procedure rotateApiKey(args: RotateApiKeyInput): ApiKeySecret
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permApikeyRotate == true)
 
 // Server-side account creation (ADR-0003 follow-up; re-scoped by ADR-0006). Replaces the
 // now-denied generic `model.Account.create` verb -- kept as a procedure not because of any
@@ -315,7 +403,7 @@ type CreateAccountInput {
 }
 
 mutation procedure createAccount(args: CreateAccountInput): Account
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permAccountCreate == true)
 
 // Updates `Account.defaultQuota` post-creation (#379, completing #177/#375):
 // `Account.defaultQuota` is `@readonly` above, so the generic `model.Account.update` verb can no
@@ -363,7 +451,7 @@ type CreateApiKeyInput {
 }
 
 mutation procedure createApiKey(args: CreateApiKeyInput): ApiKeySecret
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permApikeyCreate == true)
 
 // The operator-configured billing-plan catalogue (`config.billing.plans`, `Billing` in
 // `lightbridge-authz-core`), read-only. Added so a caller building a `createApiKey` UI can build a
@@ -394,7 +482,7 @@ type ListBillingPlansInput {
 }
 
 procedure listBillingPlans(args: ListBillingPlansInput): BillingPlanInfo[]
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permApikeyCreate == true)
 
 // The operator-configured AI-model catalogue (`config.models`, `ModelCatalog` in
 // `lightbridge-authz-core`), read-only. Lets a `Project.allowedModels` editor (e.g. a checkbox
@@ -416,14 +504,14 @@ type ListModelCatalogInput {
 }
 
 procedure listModelCatalog(args: ListModelCatalogInput): ModelCatalogEntry[]
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permProjectUpdate == true)
 
 type RevokeApiKeyInput {
   keyId String
 }
 
 mutation procedure revokeApiKey(args: RevokeApiKeyInput): ApiKey
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permApikeyRevoke == true)
 
 // Project roster mutations (ADR-0006 follow-up to ADR-0003 item 4; replaces the retired
 // `addAccountMember`/`removeAccountMember`/`setAccountMemberRole` trio now that membership lives
@@ -447,7 +535,7 @@ type AddProjectMemberInput {
 }
 
 mutation procedure addProjectMember(args: AddProjectMemberInput): Project
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permProjectMember == true)
 
 type RemoveProjectMemberInput {
   projectId String
@@ -455,7 +543,7 @@ type RemoveProjectMemberInput {
 }
 
 mutation procedure removeProjectMember(args: RemoveProjectMemberInput): Project
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permProjectMember == true)
 
 type SetProjectMemberRoleInput {
   projectId String
@@ -464,7 +552,7 @@ type SetProjectMemberRoleInput {
 }
 
 mutation procedure setProjectMemberRole(args: SetProjectMemberRoleInput): Project
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permProjectMember == true)
 
 // Governance tier for this specific member's usage on this specific project (see
 // `ProjectMember.quotaTier` above). Validated against the operator-configured tier catalog at
@@ -476,7 +564,7 @@ type SetProjectMemberQuotaTierInput {
 }
 
 mutation procedure setProjectMemberQuotaTier(args: SetProjectMemberQuotaTierInput): Project
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permProjectMember == true)
 
 // The roster's READ path, and the only one there is. The four mutations above all return
 // `Project`, so without this the roster could be changed but never listed.
@@ -500,7 +588,7 @@ type ListProjectRosterInput {
 }
 
 procedure listProjectRoster(args: ListProjectRosterInput): ProjectMember[]
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permProjectMember == true)
 
 // Replaces the now-denied generic `model.Account.delete` verb (see the `Account` model's
 // `@@allow` comments). Per ADR-0006 there is no more owner/role concept to gate this with -- one
@@ -513,7 +601,7 @@ type DeleteAccountPermanentlyInput {
 }
 
 mutation procedure deleteAccountPermanently(args: DeleteAccountPermanentlyInput): Account
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permAccountDelete == true)
 
 // Account / project suspension (data-plane authorization; see docs/rbac.md). Disabling sets
 // `status = 'suspended'`, which the `api_key_validation` view cascades so every key beneath a
@@ -530,20 +618,20 @@ type AccountStatusInput {
 }
 
 mutation procedure disableAccount(args: AccountStatusInput): Account
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permAccountDisable == true)
 
 mutation procedure enableAccount(args: AccountStatusInput): Account
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permAccountDisable == true)
 
 type ProjectStatusInput {
   projectId String
 }
 
 mutation procedure disableProject(args: ProjectStatusInput): Project
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permProjectDisable == true)
 
 mutation procedure enableProject(args: ProjectStatusInput): Project
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permProjectDisable == true)
 
 // Reassign the default project (escape hatch for the "default can never be hard-deleted" policy
 // above -- without this, the first project an account ever gets is permanently undeletable).
@@ -559,7 +647,7 @@ type SetDefaultProjectInput {
 }
 
 mutation procedure setDefaultProject(args: SetDefaultProjectInput): Project
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permProjectUpdate == true)
 
 // Sets `Project.projectQuota` post-creation (#379, completing #177/#375): `Project.projectQuota`
 // is `@readonly` above, so neither the generic `model.Project.create` nor `model.Project.update`
@@ -607,7 +695,7 @@ type ActivateBudgetPolicyInput {
 }
 
 mutation procedure activateBudgetPolicy(args: ActivateBudgetPolicyInput): BudgetPolicyStatus
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetPolicyActivate == true)
 
 // Reports the revision genuinely serving `evaluate()` calls right now -- not the one someone most
 // recently tried to activate, which may have been rejected and left the previous one in force
@@ -620,7 +708,7 @@ type GetBudgetPolicyStatusInput {
 }
 
 procedure getBudgetPolicyStatus(args: GetBudgetPolicyStatusInput): BudgetPolicyStatus
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetPolicyRead == true)
 
 // Obligations a Decision attaches beyond auto/deny (ADR-0007's decision contract). Mirrors
 // `lightbridge_authz_budget::decision::Obligations` field-for-field: the one obligation kind
@@ -679,7 +767,7 @@ type SimulateBudgetPolicyInput {
 // here at all -- simulation never reads or writes any stored policy set, so there is nothing to
 // scope it to).
 procedure simulateBudgetPolicy(args: SimulateBudgetPolicyInput): Decision
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetPolicySimulate == true)
 
 // Self-service refill and the admin review queue (#191, PR 3.4) -- the RPC surface over
 // `lightbridge_authz_budget::refill::RefillService`/`review::ReviewService`. Mirrors
@@ -781,7 +869,7 @@ type RequestBudgetRefillInput {
 }
 
 mutation procedure requestBudgetRefill(args: RequestBudgetRefillInput): AugmentationRequest
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetSelfRefill == true)
 
 // Read-only companion to `requestBudgetRefill`: where the caller currently sits on ADR-0008's
 // ladder for `period`, and what the next refill would grant *if* a submitted request is later
@@ -831,7 +919,7 @@ type GetMyBudgetRefillLadderInput {
 // (`crates/lightbridge-authz-rest/src/rpc_authorize.rs`'s doc comment on that entry) rather than
 // inventing a new, looser permission for a one-screen read.
 procedure getMyBudgetRefillLadder(args: GetMyBudgetRefillLadderInput): MyBudgetRefillLadder
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetSelfRefill == true)
 
 // The admin review queue's read path (#191, PR 3.3's `ReviewService::list_pending`; pagination
 // added by #296). `budgetAccountId: String?` mirrors `list_pending`'s own `Option<&str>` scoping
@@ -860,7 +948,7 @@ type ListPendingAugmentationRequestsInput {
 }
 
 procedure listPendingAugmentationRequests(args: ListPendingAugmentationRequestsInput): AugmentationRequestPage
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetReview == true)
 
 // A caller's own `AugmentationRequest` history (#295's remaining half -- `getMyBudgetBalance`/
 // `listMyBudgetGrants` shipped the balance/ledger half in PR #325). Returns every request the
@@ -886,7 +974,7 @@ type ListMyAugmentationRequestsInput {
 }
 
 procedure listMyAugmentationRequests(args: ListMyAugmentationRequestsInput): AugmentationRequestPage
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetReadOwn == true)
 
 // Approves a `pending_review` request: grants the requested amount and records the outcome
 // (`ReviewService::approve`). Concurrency-safe against a racing `approve`/`reject` on the same
@@ -897,7 +985,7 @@ type ApproveAugmentationRequestInput {
 }
 
 mutation procedure approveAugmentationRequest(args: ApproveAugmentationRequestInput): AugmentationRequest
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetReview == true)
 
 // Rejects a `pending_review` request: no grant, just the review outcome plus a mandatory reason
 // (`ReviewService::reject`). `reason` is a non-optional schema field -- the mandatory-reason rule
@@ -912,7 +1000,7 @@ type RejectAugmentationRequestInput {
 }
 
 mutation procedure rejectAugmentationRequest(args: RejectAugmentationRequestInput): AugmentationRequest
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetReview == true)
 
 // Refresh-token session revocation. There was previously no way to kill a live session short of a
 // manual SQL UPDATE against `exchange_refresh_tokens` in prod -- these two procedures are the
@@ -940,7 +1028,7 @@ type RevokeOwnSessionsInput {
 }
 
 mutation procedure revokeOwnSessions(args: RevokeOwnSessionsInput): SessionRevocationResult
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permSessionRevokeOwn == true)
 
 // The offboarding kill switch: an operator revokes every active session for `accountId` (which is
 // that subject's JWT `sub`, per ADR-0006 -- `accounts.id` holds it verbatim). Gated at
@@ -951,7 +1039,7 @@ type RevokeSubjectSessionsInput {
 }
 
 mutation procedure revokeSubjectSessions(args: RevokeSubjectSessionsInput): SessionRevocationResult
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permSessionRevoke == true)
 
 // Direct budget-balance/ledger reads (docs/rbac.md "Budget permissions (remaining five reserved,
 // not yet gating any operation)" -- this section wires up the reads). `budget_balances` is
@@ -1011,7 +1099,7 @@ type GetMyBudgetBalanceInput {
 // answer from a caller's point of view even though the repository layer distinguishes them.
 // Gated at `budget:read-own` (`Permission::BudgetReadOwn`).
 procedure getMyBudgetBalance(args: GetMyBudgetBalanceInput): BudgetBalance
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetReadOwn == true)
 
 type GetBudgetBalanceInput {
   budgetAccountId String
@@ -1022,7 +1110,7 @@ type GetBudgetBalanceInput {
 // caller's own. Gated at `budget:read` (`Permission::BudgetRead`) -- the highest-value permission
 // this PR wires up, since `budget_balances` was previously unreadable by anyone, admin included.
 procedure getBudgetBalance(args: GetBudgetBalanceInput): BudgetBalance
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetRead == true)
 
 // One page of the `budget_grants` append-only ledger (ADR-0009). `nextCursor` is the `createdAt`
 // of the last entry on this page -- pass it back as `before` on the next call to page further
@@ -1071,7 +1159,7 @@ type ListMyBudgetGrantsInput {
 // slice). `period: null` lists across every period for this account; `limit` is clamped server-side
 // (`BudgetRepo::list_grants`) regardless of what is requested.
 procedure listMyBudgetGrants(args: ListMyBudgetGrantsInput): BudgetGrantPage
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetReadOwn == true)
 
 type ListBudgetGrantsInput {
   budgetAccountId String
@@ -1084,7 +1172,7 @@ type ListBudgetGrantsInput {
 // `budget:audit-read` (`Permission::BudgetAuditRead`) -- this is what makes the append-only ledger
 // actually readable by anyone, not just written.
 procedure listBudgetGrants(args: ListBudgetGrantsInput): BudgetGrantPage
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetAuditRead == true)
 
 // A direct admin grant, bypassing self-service policy evaluation entirely (`budget:grant`,
 // `Permission::BudgetGrant`) -- e.g. a support-driven top-up. Delegates to the exact same
@@ -1105,7 +1193,7 @@ type GrantBudgetInput {
 }
 
 mutation procedure grantBudget(args: GrantBudgetInput): BudgetGrantEntry
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetGrant == true)
 
 // The compensating-correction counterpart to `grantBudget` (`budget:revoke`,
 // `Permission::BudgetRevoke`). Per ADR-0009, an already-committed `budget_grants` row can never be
@@ -1124,7 +1212,7 @@ type RevokeBudgetGrantInput {
 }
 
 mutation procedure revokeBudgetGrant(args: RevokeBudgetGrantInput): BudgetGrantEntry
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetRevoke == true)
 
 // Authors a new budget-policy revision WITHOUT activating it (`budget:policy-write`,
 // `Permission::BudgetPolicyWrite`) -- deliberately kept separate from `activateBudgetPolicy`
@@ -1148,4 +1236,4 @@ type BudgetPolicyRevisionRef {
 }
 
 mutation procedure createBudgetPolicyRevision(args: CreateBudgetPolicyRevisionInput): BudgetPolicyRevisionRef
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetPolicyWrite == true)

@@ -1,25 +1,88 @@
 //! `AuthProvider` bridging the existing bearer/JWKS validation into cratestack's RPC router
 //! (ADR-0003, "AuthProvider bridges the existing JWT/JWKS validation").
 //!
-//! The RPC router calls [`CratestackAuthProvider::authenticate`] once per op — for a unary
-//! `POST /rpc/<op_id>` call that's once per request; for `POST /rpc/batch` it's once *per frame*,
-//! each time with that frame's own canonical `/rpc/<op_id>` path (see `docs/adr/0003-*`, "RPC
-//! transport"). It reuses the unchanged [`BearerTokenServiceTrait`] validation (JWKS fetch/cache,
-//! RS256 verification, audience matching — see `lightbridge-authz-bearer`, migrated to
-//! `authkestra-resource` in ADR-0004), enforces the same coarse role -> permission gate as
-//! [`crate::rpc_authorize`] (this is what gives `/rpc/batch` real per-frame RBAC: `rpc_authorize`
-//! can't evaluate a single op-id for a whole batch, but this provider is invoked once per frame with
-//! that frame's own op-id, so the check happens here instead), and on success projects the validated
-//! subject into a [`CratestackContext`] so the schema's `@@allow`/`@@deny` policies — all of which reference
-//! `auth().id` against `auth Principal { id String }` — resolve to the caller's subject.
+//! ## Batch vs unary (issue #383)
+//!
+//! Before cratestack 0.8.4, the RPC router called [`CratestackAuthProvider::authenticate`] once
+//! per op — for a unary `POST /rpc/<op_id>` call that's once per request; for `POST /rpc/batch` it
+//! was once *per frame*, each time with that frame's own canonical `/rpc/<op_id>` path, which is
+//! what let this provider be the sole per-frame RBAC enforcement point. cratestack 0.8.4 rewrote
+//! `POST /rpc/batch` to authenticate the real envelope — method, path (always the literal
+//! `/rpc/batch`), raw body — exactly ONCE via a new `CachedAuthProvider`, then reuses that one
+//! resulting [`CratestackContext`] for every frame's dispatch. This provider's `authenticate` is
+//! therefore invoked once per *unary* request still, but for a batch call it is invoked once for
+//! the *whole envelope*, never once per frame — `request.path` for that one call is always the
+//! literal `/rpc/batch`, never an individual frame's `/rpc/<op_id>`.
+//!
+//! The per-frame RBAC decision this provider used to make here (`required_permission(op_id)` +
+//! `TokenInfo::has_permission`) has moved to `authz.cstack`'s `@allow`/`@@allow` clauses instead —
+//! see that schema file's own doc comment on `auth Principal`, and
+//! `crates/lightbridge-authz-rest/tests/schema_policy_sync_tests.rs` for how those clauses are
+//! generated (not hand-transcribed) from [`crate::rpc_authorize::MAPPED_OP_ID_PERMISSIONS`]. Those
+//! clauses are evaluated by cratestack's OWN per-frame policy machinery
+//! (`authorize_procedure`/the model read-policy equivalent, invoked from inside `#dispatch_ident`
+//! — unaffected by the `CachedAuthProvider` change, since that only touches
+//! `AuthProvider::authenticate`, a separate call site), reading back the exact permission booleans
+//! `authenticate` bakes into the context here. This is what restores real per-frame mixed
+//! pass/fail semantics for `/rpc/batch` without any upstream cratestack change: `authenticate`
+//! still only runs once per envelope, but it now hands every frame's dispatch the caller's FULL,
+//! REAL computed permission set (every [`lightbridge_authz_core::Permission`], via
+//! [`build_context`]) rather than a single, already-narrowed-to-one-op-id verdict — and it is
+//! cratestack's per-frame policy evaluation, not this function, that narrows it back down per
+//! frame.
+//!
+//! For a UNARY call, `build_context` populates the exact same fields, but the pre-existing
+//! `required_permission`/`scope.permits`/`has_permission` checks below still run FIRST and are
+//! completely unchanged — the schema clauses are a second, now-redundant-for-unary but harmless
+//! check on that path (unary was never broken by 0.8.4 in the first place: `request.path` for a
+//! unary call was always its own canonical path, both before and after 0.8.4).
+//!
+//! ## Two accepted, documented behavior differences (batch path only — unary is unaffected)
+//!
+//! 1. **Out-of-scope op-id: `403` instead of `404`.** `RpcScope` (which server — `authz-api` vs
+//!    `authz-budget`) is baked into every batch-envelope context as `auth().rpcScope`, and every
+//!    mapped op-id's schema clause checks it. Since `CratestackAuthProvider` is invoked once for
+//!    the whole envelope and structurally cannot see individual frames ahead of dispatch, there is
+//!    no point to reject a frame before policy evaluation runs — and cratestack's
+//!    `authorize_procedure` can only ever return `Forbidden` on denial, never `NotFound`. So a
+//!    batch frame aimed at a budget op-id on `authz-api` now gets `403 permission_denied` where a
+//!    unary call to the same op-id still gets a clean `404` (that check is untouched — see the
+//!    unary branch below). The refusal itself is unaffected and still fail-closed — an admin
+//!    holding every permission is still refused purely on `rpcScope`, proven by
+//!    `budget_gated_op_ids_are_unreachable_on_authz_api_even_for_an_admin` — the only observable
+//!    consequence is that `403` confirms the op-id EXISTS in the schema where `404` previously did
+//!    not, which is negligible here since every op-id in `authz.cstack` is already public.
+//! 2. **`model.*` `list`/`get` verbs filter to empty/not-found, not `permission_denied`.**
+//!    `@@allow("read", ...)` compiles into the SQL `WHERE` clause itself
+//!    (`cratestack-sqlx/src/render/policy.rs`), not a hard pre-check — a caller whose read
+//!    permission field is `false` simply matches zero rows, indistinguishable from any other
+//!    caller-scoping predicate. `create`/`update`/`delete` verbs, by contrast, DO hard-gate
+//!    (`cratestack-sqlx/src/query/support/create.rs`'s `evaluate_create_policy_expr`,
+//!    `update.rs`'s existence-probe-then-`Forbidden`), matching `authorize_procedure`'s
+//!    all-or-nothing behavior for procedures — see
+//!    `batch_rpc_frames_all_deny_for_a_caller_with_zero_permissions` (write verbs + procedures,
+//!    `permission_denied`) vs
+//!    `batch_rpc_read_verbs_filter_to_empty_not_an_error_for_a_caller_lacking_read_permission`
+//!    (read verbs, empty/not-found) in `rpc_it_tests.rs` for both halves verified directly. This
+//!    is a pre-existing, upstream cratestack property of read policies this fix did not create and
+//!    cannot change without a much larger rewrite (there is no schema-level way to make a
+//!    `@@allow("read", ...)` clause reject instead of filter). The security-relevant property
+//!    holds regardless: no row a caller cannot read is ever returned, in batch or unary.
+//!
+//! It reuses the unchanged [`BearerTokenServiceTrait`] validation (JWKS fetch/cache, RS256
+//! verification, audience matching — see `lightbridge-authz-bearer`, migrated to
+//! `authkestra-resource` in ADR-0004).
 
 use std::sync::Arc;
 
 use cratestack::axum::http;
 use cratestack::{AuthProvider, CratestackContext, CratestackError, RequestContext, Value};
-use lightbridge_authz_bearer::BearerTokenServiceTrait;
+use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
+use lightbridge_authz_core::Permission;
 
-use crate::rpc_authorize::{RpcScope, op_id_from_path, required_permission};
+use crate::rpc_authorize::{
+    BATCH_OP_ID, RpcScope, op_id_from_path, permission_field_name, required_permission,
+};
 
 /// Context key under which the validated caller's raw access token is stashed, so procedures that
 /// still need it (e.g. `rotateApiKey`'s downstream secret issuance / token exchange) can read it
@@ -41,9 +104,10 @@ pub const CALLER_KIND_CONTEXT_KEY: &str = "caller_kind";
 pub struct CratestackAuthProvider {
     bearer: Arc<dyn BearerTokenServiceTrait>,
     /// Which half of the RPC surface this provider's router serves (see [`RpcScope`]). Checked
-    /// first, ahead of even the bearer/permission checks below — this is the sole place that
-    /// closes the `POST /rpc/batch` gap `rpc_authorize`'s own out-of-scope check cannot reach
-    /// (that check only sees the outer `/rpc/batch` request, never an individual frame's op-id).
+    /// first, ahead of even the bearer/permission checks below, for a unary call — the sole place
+    /// that closed the `POST /rpc/batch` gap pre-#383. Now ALSO baked into every batch-envelope
+    /// context's `rpcScope` auth field (see [`build_context`]), which is what lets `authz.cstack`
+    /// close that same gap per frame today.
     scope: RpcScope,
 }
 
@@ -68,6 +132,49 @@ fn extract_bearer(headers: &http::HeaderMap) -> Option<String> {
     }
 }
 
+/// Builds the full [`CratestackContext`] for a validated caller: `auth().id` (the subject),
+/// `auth().rpcScope` (this server instance's [`RpcScope`], the same for every frame of one
+/// envelope), and one `auth().perm<Permission>` boolean per [`Permission::ALL`] variant, each set
+/// from the caller's OWN, REAL [`TokenInfo::has_permission`] verdict — never a blanket `true`, and
+/// never anything narrower than the caller's actual grants. This is the single most
+/// security-sensitive function in this file: every `authz.cstack` `@allow`/`@@allow` clause's
+/// permission gate is only as fail-closed as the values populated here. Looping over
+/// [`Permission::ALL`] rather than 31 hand-written field insertions is deliberate — a variant
+/// added to `Permission` later is picked up automatically, with no separate list to remember to
+/// update here.
+fn build_context(info: &TokenInfo, scope: RpcScope) -> CratestackContext {
+    let mut fields: Vec<(String, Value)> = Vec::with_capacity(Permission::ALL.len() + 2);
+    fields.push(("id".to_owned(), Value::String(info.sub.clone())));
+    fields.push((
+        "rpcScope".to_owned(),
+        Value::String(scope.wire_str().to_owned()),
+    ));
+    for permission in Permission::ALL {
+        fields.push((
+            permission_field_name(permission),
+            Value::Bool(info.has_permission(permission)),
+        ));
+    }
+    let mut ctx = CratestackContext::authenticated(fields);
+    ctx.extensions.insert(
+        ACCESS_TOKEN_CONTEXT_KEY.to_owned(),
+        Value::String(info.access_token.clone()),
+    );
+    if !info.roles.is_empty() {
+        ctx.extensions.insert(
+            ROLES_CONTEXT_KEY.to_owned(),
+            Value::List(info.roles.iter().cloned().map(Value::String).collect()),
+        );
+    }
+    if let Some(caller_kind) = &info.caller_kind {
+        ctx.extensions.insert(
+            CALLER_KIND_CONTEXT_KEY.to_owned(),
+            Value::String(caller_kind.clone()),
+        );
+    }
+    ctx
+}
+
 impl AuthProvider for CratestackAuthProvider {
     type Error = CratestackError;
 
@@ -78,16 +185,43 @@ impl AuthProvider for CratestackAuthProvider {
         let bearer = self.bearer.clone();
         let scope = self.scope;
         let token = extract_bearer(request.headers);
-        // `request.path` is the canonical `/rpc/<op_id>` for whichever op is being dispatched right
-        // now — for a unary call that's the request's own path (already checked once by
-        // `rpc_authorize`, so this is a harmless second check); for a `POST /rpc/batch` frame it's
-        // that frame's own op-id, which `rpc_authorize` structurally cannot see. This is the sole
-        // permission enforcement point for batch frames.
+        // `request.path` is `/rpc/batch` (literal, envelope-level — see module docs) when this
+        // call is authenticating a whole `POST /rpc/batch` request, or the canonical `/rpc/<op_id>`
+        // for a unary call.
         let op_id = op_id_from_path(request.path).to_owned();
         async move {
+            if op_id == BATCH_OP_ID {
+                // The envelope-level call (see module docs): per-op-id scope/permission can no
+                // longer be checked here at all (there is no single op-id for a batch), so — same
+                // as `rpc_authorize`'s own batch special case — this only requires SOME valid,
+                // active caller, and hands back their FULL real permission set for cratestack's
+                // per-frame schema policies to narrow down per frame. This is the single most
+                // dangerous branch in this file: it must never attach a blanket-permissive
+                // context — `build_context` is the same function the fully-checked unary path
+                // below uses, populated from the SAME real `TokenInfo`, so a caller with zero
+                // permissions gets a context where every `perm*` field is `false`, and every
+                // frame's `@allow` clause denies them exactly as it would for a unary call.
+                let Some(token) = token else {
+                    return Err(CratestackError::Unauthorized(
+                        "missing bearer token".to_owned(),
+                    ));
+                };
+                return match bearer.validate_bearer_token(&token).await {
+                    Ok(info) if info.active => Ok(build_context(&info, scope)),
+                    Ok(_) | Err(_) => Err(CratestackError::Unauthorized(
+                        "invalid bearer token".to_owned(),
+                    )),
+                };
+            }
+
+            // Unary path — byte-for-byte unchanged from pre-#383: `request.path` here was always
+            // this request's own canonical path, so nothing about the 0.8.4 batch-auth rewrite
+            // affects it. Kept as real, independent enforcement (not merely redundant with the
+            // new schema clauses) rather than relying solely on the schema, so a unary call's
+            // scope/permission refusal keeps its own well-tested 404/403 shape unconditionally.
+            //
             // Out-of-scope op-id (moved to the other service) → 404, before even looking at the
-            // bearer token, mirroring `rpc_authorize`'s own scope check for unary calls. For a
-            // batch frame this is the ONLY place that check happens at all.
+            // bearer token, mirroring `rpc_authorize`'s own scope check.
             if !scope.permits(&op_id) {
                 return Err(CratestackError::NotFound(format!(
                     "unknown RPC op `{op_id}`"
@@ -114,28 +248,7 @@ impl AuthProvider for CratestackAuthProvider {
                             "insufficient permissions".to_owned(),
                         ));
                     }
-                    // Project the validated subject as `auth().id`.
-                    let mut ctx = CratestackContext::authenticated([(
-                        "id".to_owned(),
-                        Value::String(info.sub.clone()),
-                    )]);
-                    ctx.extensions.insert(
-                        ACCESS_TOKEN_CONTEXT_KEY.to_owned(),
-                        Value::String(info.access_token.clone()),
-                    );
-                    if !info.roles.is_empty() {
-                        ctx.extensions.insert(
-                            ROLES_CONTEXT_KEY.to_owned(),
-                            Value::List(info.roles.iter().cloned().map(Value::String).collect()),
-                        );
-                    }
-                    if let Some(caller_kind) = info.caller_kind {
-                        ctx.extensions.insert(
-                            CALLER_KIND_CONTEXT_KEY.to_owned(),
-                            Value::String(caller_kind),
-                        );
-                    }
-                    Ok(ctx)
+                    Ok(build_context(&info, scope))
                 }
                 // Invalid/inactive token or validation error → uniform 401, never leaking which step
                 // failed (matching the bearer service's existing security posture).
