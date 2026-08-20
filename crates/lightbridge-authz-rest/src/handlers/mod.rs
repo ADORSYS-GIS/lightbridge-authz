@@ -8,7 +8,9 @@ use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
 use getrandom::fill;
 use lightbridge_authz_api_key::repo::StoreRepo;
-use lightbridge_authz_core::config::{Billing, ModelCatalog, Oauth2, Oauth2Issuance, QuotaTiers};
+use lightbridge_authz_core::config::{
+    ApiKeyExpiry, Billing, ModelCatalog, Oauth2, Oauth2Issuance, QuotaTiers,
+};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey, Project,
@@ -36,6 +38,11 @@ pub struct AuthzStoreImpl {
     /// aid, not a value validated anywhere (see that type's own doc comment). Threaded through the
     /// same way as `billing`/`quota_tiers` above.
     models: Arc<ModelCatalog>,
+    /// Operator-configured ceiling `create_api_key`/`rotate_api_key` validate `expires_at`
+    /// against (lightbridge-authz#395). Threaded through the same way as `billing`/`quota_tiers`/
+    /// `models` above, but unlike those, absent config still resolves to a real value (90 days),
+    /// never to "no ceiling" -- see `ApiKeyExpiry`'s own doc comment.
+    api_key_expiry: Arc<ApiKeyExpiry>,
 }
 
 impl std::fmt::Debug for AuthzStoreImpl {
@@ -54,6 +61,7 @@ impl AuthzStoreImpl {
             billing: Arc::new(Billing::default()),
             quota_tiers: Arc::new(QuotaTiers::default()),
             models: Arc::new(ModelCatalog::default()),
+            api_key_expiry: Arc::new(ApiKeyExpiry::default()),
         }
     }
 
@@ -79,12 +87,21 @@ impl AuthzStoreImpl {
         self
     }
 
+    /// Override the configured api-key expiry ceiling. Primarily for tests that drive
+    /// `create_api_key`/`rotate_api_key` without going through the full config-loading path --
+    /// mirrors `with_billing` above.
+    pub fn with_api_key_expiry(mut self, api_key_expiry: ApiKeyExpiry) -> Self {
+        self.api_key_expiry = Arc::new(api_key_expiry);
+        self
+    }
+
     pub fn with_pool_and_oauth2(
         pool: Arc<dyn DbPoolTrait>,
         oauth2: &Oauth2,
         billing: &Billing,
         quota_tiers: &QuotaTiers,
         models: &ModelCatalog,
+        api_key_expiry: &ApiKeyExpiry,
     ) -> Result<Self> {
         use lightbridge_authz_core::config::Oauth2Type;
         let repo = Arc::new(StoreRepo::new(pool));
@@ -105,6 +122,7 @@ impl AuthzStoreImpl {
             billing: Arc::new(billing.clone()),
             quota_tiers: Arc::new(quota_tiers.clone()),
             models: Arc::new(models.clone()),
+            api_key_expiry: Arc::new(api_key_expiry.clone()),
         })
     }
 
@@ -350,6 +368,46 @@ fn resolve_issued_expires_at(
     }
 }
 
+/// The single gate every `api_keys.expires_at` write funnels through (lightbridge-authz#395: "all
+/// api-keys created from our system MUST have an expiry date... max 90 days"). Called by
+/// `create_api_key` and `rotate_api_key` before any DB write or external issuance call, so a
+/// rejection never touches the database. Fail-closed on every axis, never a silent default or
+/// clamp:
+///   - missing `expires_at` -> rejected (no more nullable "never expires" keys)
+///   - `expires_at` at or before `now` -> rejected (a dead-on-arrival key is as good as none)
+///   - `expires_at` beyond `now + max_lifetime.max_lifetime_days` -> rejected
+///
+/// This is deliberately independent of `signing::capped_expiry`, which *clamps* (never rejects)
+/// the JWT `exp` claim to `oauth2.signing.ttl_seconds` under `oauth2.type: self` only -- a
+/// cryptographic-freshness concern for the bearer token itself. This function is the
+/// mode-independent governance gate on the DB row's `expires_at`, and runs for every issuance mode
+/// (self-signed, external token-exchange, and the plain opaque-secret fallback alike).
+fn validate_expires_at(
+    expires_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    max_lifetime: &ApiKeyExpiry,
+) -> Result<DateTime<Utc>> {
+    let expires_at = expires_at.ok_or_else(|| {
+        Error::BadRequest(
+            "expiresAt is required: api keys may not be created or rotated without an expiry"
+                .to_string(),
+        )
+    })?;
+    if expires_at <= now {
+        return Err(Error::BadRequest(
+            "expiresAt must be in the future".to_string(),
+        ));
+    }
+    let max_allowed = now + Duration::days(i64::from(max_lifetime.max_lifetime_days));
+    if expires_at > max_allowed {
+        return Err(Error::BadRequest(format!(
+            "expiresAt exceeds the configured maximum api key lifetime of {} day(s)",
+            max_lifetime.max_lifetime_days
+        )));
+    }
+    Ok(expires_at)
+}
+
 /// The four write operations the RPC procedures delegate to (ADR-0003 item 4). Everything else the
 /// old `AuthzStore` trait exposed (account/project/api-key list/read/create/update/delete) now runs
 /// through the generated cratestack CRUD client, so only these survive — as inherent methods, no
@@ -386,11 +444,12 @@ impl AuthzStoreImpl {
     }
 
     /// Create an API key: validate the requested `billing_plan` against the operator-configured
-    /// catalogue (before any DB write), issue a fresh secret (generation/hashing unchanged from
-    /// before the migration), and insert the row via hand-written sqlx. Backs the `createApiKey`
-    /// procedure. Since ADR-0006 this path is **lead-gated** in SQL: the caller must own the
-    /// project's account or hold `role = 'lead'` on it, because a key is live spending power with
-    /// no per-request human in the loop.
+    /// catalogue and `expires_at` against the operator-configured `ApiKeyExpiry` ceiling (both
+    /// before any DB write), issue a fresh secret (generation/hashing unchanged from before the
+    /// migration), and insert the row via hand-written sqlx. Backs the `createApiKey` procedure.
+    /// Since ADR-0006 this path is **lead-gated** in SQL: the caller must own the project's
+    /// account or hold `role = 'lead'` on it, because a key is live spending power with no
+    /// per-request human in the loop.
     pub async fn create_api_key(
         &self,
         subject: &str,
@@ -405,14 +464,22 @@ impl AuthzStoreImpl {
                 self.billing.plan_ids().join(", ")
             )));
         }
+        let now = Utc::now();
+        let requested_expires_at =
+            validate_expires_at(input.expires_at, now, &self.api_key_expiry)?;
         let id = cuid2();
         let issued = self
-            .issue_api_key_secret(subject, bearer_token, project_id, &id, input.expires_at)
+            .issue_api_key_secret(
+                subject,
+                bearer_token,
+                project_id,
+                &id,
+                Some(requested_expires_at),
+            )
             .await?;
         let key_hash = hash_api_key(&issued.secret);
         let key_prefix = Self::key_prefix(&issued.secret);
-        let now = Utc::now();
-        let expires_at = resolve_issued_expires_at(input.expires_at, issued.expires_at);
+        let expires_at = resolve_issued_expires_at(Some(requested_expires_at), issued.expires_at);
         let row = lightbridge_authz_api_key::entities::new_api_key_row::NewApiKeyRow {
             id,
             project_id: project_id.to_string(),
@@ -616,7 +683,12 @@ impl AuthzStoreImpl {
 
     /// Rotate an API key: issue a fresh secret (generation/hashing unchanged from before the
     /// migration) and, in one hand-written transaction (`StoreRepo::rotate_api_key_transaction`,
-    /// NOT `run_in_tx`), revoke the old key and insert its successor. Backs `rotateApiKey`.
+    /// NOT `run_in_tx`), revoke the old key and insert its successor. Backs `rotateApiKey`. The
+    /// successor's `expires_at` -- normally the preserved existing value, since
+    /// `RotateApiKeyInput` carries no `expiresAt` of its own -- is re-validated against the
+    /// operator-configured `ApiKeyExpiry` ceiling the same way `create_api_key` validates it
+    /// (lightbridge-authz#395): a pre-existing key whose expiry now exceeds a newly-lowered
+    /// ceiling fails to rotate rather than silently carrying the stale value forward.
     pub async fn rotate_api_key(
         &self,
         subject: &str,
@@ -646,18 +718,20 @@ impl AuthzStoreImpl {
         let new_id = cuid2();
         let requested_expires_at =
             resolve_rotated_expires_at(input.expires_at, existing.expires_at);
+        let requested_expires_at =
+            validate_expires_at(requested_expires_at, now, &self.api_key_expiry)?;
         let issued = self
             .issue_api_key_secret(
                 subject,
                 bearer_token,
                 existing.project_id.as_str(),
                 &new_id,
-                requested_expires_at,
+                Some(requested_expires_at),
             )
             .await?;
         let key_hash = hash_api_key(&issued.secret);
         let key_prefix = Self::key_prefix(&issued.secret);
-        let expires_at = resolve_issued_expires_at(requested_expires_at, issued.expires_at);
+        let expires_at = resolve_issued_expires_at(Some(requested_expires_at), issued.expires_at);
         let row = lightbridge_authz_api_key::entities::new_api_key_row::NewApiKeyRow {
             id: new_id,
             project_id: existing.project_id,
@@ -701,7 +775,7 @@ mod tests {
     use chrono::{Duration, Utc};
     use httpmock::{Method::POST, MockServer};
     use lightbridge_authz_core::config::{
-        Billing, ModelCatalog, Oauth2, Oauth2Issuance, Oauth2Type, QuotaTiers,
+        ApiKeyExpiry, Billing, ModelCatalog, Oauth2, Oauth2Issuance, Oauth2Type, QuotaTiers,
     };
     use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
     use serde_json::json;
@@ -744,6 +818,7 @@ mod tests {
             &Billing::default(),
             &QuotaTiers::default(),
             &ModelCatalog::default(),
+            &ApiKeyExpiry::default(),
         )
         .unwrap_err();
         assert!(format!("{err}").contains("oauth2.signing is missing"));
@@ -757,6 +832,7 @@ mod tests {
             &Billing::default(),
             &QuotaTiers::default(),
             &ModelCatalog::default(),
+            &ApiKeyExpiry::default(),
         )
         .unwrap_err();
         assert!(format!("{err}").contains("oauth2.issuance is missing"));

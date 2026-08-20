@@ -25,7 +25,9 @@ fn build_new_api_key_row(project_id: &str, name: &str, key_hash: &str) -> NewApi
         key_prefix: "lbk_test".to_string(),
         key_hash: key_hash.to_string(),
         created_at: Utc::now(),
-        expires_at: None,
+        // `api_keys.expires_at` is `NOT NULL` (lightbridge-authz#395) -- a real, far-future value
+        // here stands in for the pre-#395 "no expiry" fixture.
+        expires_at: Some(Utc::now() + chrono::Duration::days(30)),
         status: ApiKeyStatus::Active.to_string(),
         last_used_at: None,
         last_ip: None,

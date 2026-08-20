@@ -3,7 +3,7 @@ use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
     RotateApiKey, async_trait,
     config::{
-        ApiServer, BasicAuth, Billing, BudgetServer, IdpServer, ModelCatalog, Oauth2,
+        ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetServer, IdpServer, ModelCatalog, Oauth2,
         OauthClientType, OpaServer, QuotaTiers, Redis, UsageServiceClient,
     },
     db::{DbPoolTrait, is_database_ready},
@@ -693,7 +693,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                     &input.projectId,
                     CreateApiKey {
                         name: input.name,
-                        expires_at: input.expiresAt,
+                        expires_at: Some(input.expiresAt),
                         billing_plan: input.billingPlan,
                     },
                 )
@@ -2160,10 +2160,12 @@ pub async fn start_api_server(
     billing: &Billing,
     quota_tiers: &QuotaTiers,
     models: &ModelCatalog,
+    api_key_expiry: &ApiKeyExpiry,
     redis: &Option<Redis>,
     usage_service: &Option<UsageServiceClient>,
 ) -> Result<()> {
     billing.validate()?;
+    api_key_expiry.validate()?;
     oauth2.rbac.validate()?;
 
     // ADR-0007: load whatever is genuinely active in the DB right now, so a fresh startup always
@@ -2265,6 +2267,7 @@ pub async fn start_api_server(
         billing,
         quota_tiers,
         models,
+        api_key_expiry,
     )?);
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
@@ -2619,10 +2622,12 @@ pub async fn start_budget_server(
     billing: &Billing,
     quota_tiers: &QuotaTiers,
     models: &ModelCatalog,
+    api_key_expiry: &ApiKeyExpiry,
     redis: &Option<Redis>,
     usage_service: &Option<UsageServiceClient>,
 ) -> Result<()> {
     billing.validate()?;
+    api_key_expiry.validate()?;
     oauth2.rbac.validate()?;
 
     // ADR-0007: load whatever is genuinely active in the DB right now, so a fresh startup always
@@ -2693,6 +2698,7 @@ pub async fn start_budget_server(
         billing,
         quota_tiers,
         models,
+        api_key_expiry,
     )?);
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));

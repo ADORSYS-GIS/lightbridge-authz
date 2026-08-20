@@ -440,11 +440,15 @@ enforcement; see "Batch RPC: per-frame RBAC" above.
 
 > **Field-level immutability on `ApiKey` update.** The coarse `apikey:update` gate allows
 > `model.ApiKey.update`, but the schema additionally marks the key's server-managed columns
-> (`status`, `keyHash`, `billingPlan`, `keyPrefix`, `projectId`, `revokedAt`, timestamps) as
-> `@readonly` / `@server_only`, so they are dropped from the generated `UpdateApiKeyInput`. The
-> update surface is therefore `{ name, expiresAt }` only — a caller with `apikey:update` cannot flip
-> a key's `status`, overwrite its `keyHash`, or change its `billingPlan`; those transitions are
-> reachable exclusively through `apikey:rotate` / `apikey:revoke` / `apikey:create`.
+> (`status`, `keyHash`, `billingPlan`, `keyPrefix`, `projectId`, `revokedAt`, `expiresAt`,
+> timestamps) as `@readonly` / `@server_only`, so they are dropped from the generated
+> `UpdateApiKeyInput`. The update surface is therefore `{ name }` only — a caller with
+> `apikey:update` cannot flip a key's `status`, overwrite its `keyHash`, change its `billingPlan`,
+> or touch its `expiresAt`; those transitions are reachable exclusively through `apikey:rotate` /
+> `apikey:revoke` / `apikey:create`. `expiresAt` joined this list in lightbridge-authz#395: every
+> API key must now carry an expiry (no more nullable "never expires"), and before this change
+> `model.ApiKey.update` was a live, unvalidated bypass for it — a caller could set `expiresAt` to
+> anything, including explicit `null`, with no cap and no procedure in the path.
 
 The OPA validation endpoints (introspection / `/idp/v1/resolve-context`) are protected by Basic
 auth, not JWT, so they are outside RBAC; the equivalent MCP validation tools (which run behind JWT)
