@@ -350,14 +350,29 @@ type ListBillingPlansInput {
 procedure listBillingPlans(args: ListBillingPlansInput): BillingPlanInfo[]
   @allow(auth() != null)
 
-// The operator-configured AI-model catalogue (`config.models`, `ModelCatalog` in
-// `lightbridge-authz-core`), read-only. Lets a `Project.allowedModels` editor (e.g. a checkbox
-// picker in the self-service UI) render real model ids instead of hardcoding a list client-side --
-// the RBAC permission map and the pre-#283 `allowed_models` encoding bug are both examples of
-// exactly the kind of silent drift a hardcoded frontend mirror produces. Gated at the same
-// `project:update` permission `updateProject` uses for editing `allowedModels` itself (see
-// `rpc_authorize.rs`) -- a caller who cannot edit a project's allowlist has no use for the
-// catalogue either. NOT a validation source: `Project.allowedModels` stays an unvalidated
+// The AI-model catalogue a `Project.allowedModels` editor (e.g. a checkbox picker in the
+// self-service UI) renders, read-only. Originally (PR #392) backed entirely by the
+// operator-configured `config.models` (`ModelCatalog` in `lightbridge-authz-core`) -- a SECOND,
+// hand-maintained copy of model data that already existed, in far richer form, in the sibling
+// `ai-helm-values` repo's `models.yaml`, with no connection between the two. That was exactly the
+// kind of silent drift the RBAC permission map and the pre-#283 `allowed_models` encoding bug had
+// already shown this codebase (see issue #393).
+//
+// Since #393, the live source is `ai-models-info` -- a service the sibling `ai-helm`/
+// `ai-helm-values` repos already deploy from that SAME `models.yaml`, already filtered (by that
+// chart's own Helm helper) to exactly the enabled, non-embedding/reranker, externally-visible
+// subset this picker needs. When `config.model_catalog_service` is set, this procedure fetches
+// that service's `/v1/models/info` live and returns it verbatim (see
+// `model_catalog::ModelCatalogClient` and `Config::model_catalog_service`'s doc comments in
+// `lightbridge-authz-rest`/`lightbridge-authz-core`). `config.models` is now consulted only as a
+// fallback -- used when `model_catalog_service` is unset (e.g. local Compose, which has no
+// `ai-models-info` deployment) or when the live fetch fails for any reason (unreachable, timeout,
+// non-2xx, unparseable body); a fetch failure degrades to the fallback rather than failing this
+// RPC call, since this is a read-only display aid, not a security-critical path.
+//
+// Gated at the same `project:update` permission `updateProject` uses for editing `allowedModels`
+// itself (see `rpc_authorize.rs`) -- a caller who cannot edit a project's allowlist has no use for
+// the catalogue either. NOT a validation source: `Project.allowedModels` stays an unvalidated
 // free-form list at write time (see that field's own doc comment) -- this procedure is a read-only
 // display aid, not a server-side allowlist gate; making `updateProject` validate against this
 // catalogue would be a separate, larger change.
