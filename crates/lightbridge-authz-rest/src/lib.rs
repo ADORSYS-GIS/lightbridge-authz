@@ -2300,9 +2300,9 @@ pub async fn start_api_server(
     // comment. `None` when unconfigured (e.g. local Compose), in which case the procedure falls
     // back to the static `models` catalogue already loaded into `issuer` above.
     let model_catalog_client = match model_catalog_service {
-        Some(model_catalog_service) => Some(Arc::new(ModelCatalogClient::new(
-            model_catalog_service,
-        )?)),
+        Some(model_catalog_service) => {
+            Some(Arc::new(ModelCatalogClient::new(model_catalog_service)?))
+        }
         None => None,
     };
 

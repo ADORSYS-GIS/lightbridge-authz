@@ -1391,8 +1391,7 @@ otel:
   otlp_endpoint: \"http://localhost:4317\"
   service_name: \"svc\"
 ";
-        let cfg: Config =
-            from_str(yaml).expect("config with model_catalog_service must load");
+        let cfg: Config = from_str(yaml).expect("config with model_catalog_service must load");
         let model_catalog_service = cfg
             .model_catalog_service
             .expect("model_catalog_service must be set");
@@ -1475,8 +1474,7 @@ otel:
   otlp_endpoint: \"http://localhost:4317\"
   service_name: \"svc\"
 ";
-        let cfg: Config =
-            from_str(yaml).expect("config omitting model_catalog_service must load");
+        let cfg: Config = from_str(yaml).expect("config omitting model_catalog_service must load");
         assert!(cfg.model_catalog_service.is_none());
     }
 

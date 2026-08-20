@@ -63,7 +63,9 @@ impl ModelCatalogClient {
             .timeout(std::time::Duration::from_millis(config.timeout_ms))
             .build()
             .map_err(|err| {
-                Error::Server(format!("failed to build model-catalog-service HTTP client: {err}"))
+                Error::Server(format!(
+                    "failed to build model-catalog-service HTTP client: {err}"
+                ))
             })?;
         let base_url = config.base_url.trim_end_matches('/');
         Ok(Self {
