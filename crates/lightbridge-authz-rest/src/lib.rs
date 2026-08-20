@@ -3,8 +3,9 @@ use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
     RotateApiKey, async_trait,
     config::{
-        ApiServer, BasicAuth, Billing, BudgetServer, IdpServer, ModelCatalog, Oauth2,
-        OauthClientType, OpaServer, QuotaTiers, Redis, UsageServiceClient,
+        ApiServer, BasicAuth, Billing, BudgetServer, IdpServer, ModelCatalog,
+        ModelCatalogServiceClient, Oauth2, OauthClientType, OpaServer, QuotaTiers, Redis,
+        UsageServiceClient,
     },
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
@@ -15,6 +16,7 @@ pub mod auth_provider;
 pub mod codec;
 pub mod handlers;
 pub mod middleware;
+pub mod model_catalog;
 pub mod models;
 pub mod oauth2_op;
 pub mod ratelimit_redis;
@@ -27,6 +29,7 @@ pub mod token_exchange;
 use auth_provider::{ACCESS_TOKEN_CONTEXT_KEY, CALLER_KIND_CONTEXT_KEY, CratestackAuthProvider};
 use codec::LenientCborCodec;
 use handlers::AuthzStoreImpl;
+use model_catalog::ModelCatalogClient;
 use ratelimit_redis::build_redis_rate_limit_store;
 use routers::opa_router;
 use rpc_authorize::{RpcAuthorizeState, RpcScope};
@@ -593,6 +596,13 @@ pub struct Procedures {
     /// independent handle against the SAME underlying database (constructed once at server
     /// startup, see `start_api_server`).
     budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+    /// Live `ai-models-info` fetch client for `list_model_catalog` (issue #393) -- `Some` when
+    /// `Config.model_catalog_service` is configured, `None` otherwise (e.g. local Compose, or
+    /// this same `Procedures` type reused by `build_budget_router`, where `listModelCatalog` is
+    /// unreachable regardless since it is not a `budget:*` op-id -- see that function's own doc
+    /// comment). See `model_catalog::ModelCatalogClient`'s doc comment for the full fetch/fallback
+    /// contract.
+    model_catalog_client: Option<Arc<ModelCatalogClient>>,
 }
 
 impl Procedures {
@@ -602,6 +612,7 @@ impl Procedures {
         refill_service: Arc<lightbridge_authz_budget::RefillService>,
         review_service: Arc<lightbridge_authz_budget::ReviewService>,
         budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+        model_catalog_client: Option<Arc<ModelCatalogClient>>,
     ) -> Self {
         Self {
             issuer,
@@ -609,6 +620,7 @@ impl Procedures {
             refill_service,
             review_service,
             budget_repo,
+            model_catalog_client,
         }
     }
 }
@@ -727,10 +739,16 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         }
     }
 
-    /// Read-only: the operator-configured AI-model catalogue a `Project.allowedModels` editor
-    /// renders (see that procedure's doc comment in `authz.cstack`). No DB access --
-    /// `AuthzStoreImpl::model_catalog` returns the in-memory `ModelCatalog` config loaded at
-    /// startup. Mirrors `list_billing_plans` above.
+    /// Read-only: the AI-model catalogue a `Project.allowedModels` editor renders (see that
+    /// procedure's doc comment in `authz.cstack`). Since #393, prefers a live fetch against the
+    /// `ai-models-info` service (`Config.model_catalog_service`, when configured) so this list
+    /// stays the single source of truth `ai-helm`/`ai-helm-values` already maintain rather than a
+    /// second, hand-maintained copy that can drift -- see `model_catalog::ModelCatalogClient`'s
+    /// doc comment. Falls back to the static `AuthzStoreImpl::model_catalog` (the in-memory
+    /// `ModelCatalog` config loaded at startup) when `model_catalog_client` is `None` (unset, e.g.
+    /// local Compose) or the live fetch fails for any reason -- a catalogue-fetch failure never
+    /// fails this RPC call, since it is a read-only display aid, not a security gate. Mirrors
+    /// `list_billing_plans` above except for this fetch/fallback step.
     fn list_model_catalog(
         &self,
         _db: &schema::Cratestack,
@@ -745,9 +763,15 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     > + Send {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
+        let model_catalog_client = self.model_catalog_client.clone();
         async move {
             let _subject = subject
                 .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            if let Some(client) = model_catalog_client
+                && let Some(entries) = client.fetch().await
+            {
+                return Ok(entries);
+            }
             Ok(to_schema_model_catalog(issuer.model_catalog()))
         }
     }
@@ -1964,6 +1988,7 @@ pub fn build_api_router(
     refill_service: Arc<lightbridge_authz_budget::RefillService>,
     review_service: Arc<lightbridge_authz_budget::ReviewService>,
     budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+    model_catalog_client: Option<Arc<ModelCatalogClient>>,
     cratestack_db: schema::Cratestack,
     readiness_pool: Arc<dyn DbPoolTrait>,
     idempotency_store: Arc<SqlxIdempotencyStore>,
@@ -1996,6 +2021,7 @@ pub fn build_api_router(
             refill_service,
             review_service,
             budget_repo,
+            model_catalog_client,
         ),
         LenientCborCodec::default(),
         CratestackAuthProvider::new(bearer.clone(), RpcScope::Crud),
@@ -2149,9 +2175,9 @@ fn build_token_exchange_state(
 #[expect(
     clippy::too_many_arguments,
     reason = "startup wiring for authz-api -- each parameter is a distinct, independently-loaded \
-              config section (billing/quota_tiers/models catalogues, redis, usage_service); \
-              bundling them into a struct would just move the same count into a constructor call \
-              at the one caller (main.rs) without reducing anything"
+              config section (billing/quota_tiers/models catalogues, redis, usage_service, \
+              model_catalog_service); bundling them into a struct would just move the same count \
+              into a constructor call at the one caller (main.rs) without reducing anything"
 )]
 pub async fn start_api_server(
     api: &ApiServer,
@@ -2162,6 +2188,7 @@ pub async fn start_api_server(
     models: &ModelCatalog,
     redis: &Option<Redis>,
     usage_service: &Option<UsageServiceClient>,
+    model_catalog_service: &Option<ModelCatalogServiceClient>,
 ) -> Result<()> {
     billing.validate()?;
     oauth2.rbac.validate()?;
@@ -2269,6 +2296,16 @@ pub async fn start_api_server(
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
 
+    // `listModelCatalog`'s live source (issue #393) -- see `Config::model_catalog_service`'s doc
+    // comment. `None` when unconfigured (e.g. local Compose), in which case the procedure falls
+    // back to the static `models` catalogue already loaded into `issuer` above.
+    let model_catalog_client = match model_catalog_service {
+        Some(model_catalog_service) => Some(Arc::new(ModelCatalogClient::new(
+            model_catalog_service,
+        )?)),
+        None => None,
+    };
+
     // Redis is required unconditionally for authz-api rate limiting.
     let redis = redis.as_ref().ok_or_else(|| {
         Error::Server(
@@ -2316,6 +2353,7 @@ pub async fn start_api_server(
         refill_service,
         review_service,
         budget_repo,
+        model_catalog_client,
         cratestack_db,
         readiness_pool,
         idempotency_store,
@@ -2571,6 +2609,11 @@ pub fn build_budget_router(
             refill_service,
             review_service,
             budget_repo,
+            // `listModelCatalog` is not a `budget:*` op-id, so `RpcScope::Budget` above refuses it
+            // before dispatch ever reaches `Procedures` -- same "type-level obligation, not a
+            // real dependency" reasoning as `issuer` in this function's own doc comment. `None`
+            // here is correct and permanent for this server, not a TODO.
+            None,
         ),
         LenientCborCodec::default(),
         CratestackAuthProvider::new(bearer.clone(), RpcScope::Budget),

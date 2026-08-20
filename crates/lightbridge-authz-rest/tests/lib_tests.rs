@@ -99,6 +99,7 @@ async fn start_api_server_fails_fast_when_tls_certs_are_missing() {
         &sample_models(),
         &sample_redis(),
         &None,
+        &None,
     )
     .await;
     assert!(
@@ -175,6 +176,7 @@ async fn start_api_server_rejects_self_signed_oauth2_without_signing_block() {
         &sample_models(),
         &sample_redis(),
         &None,
+        &None,
     )
     .await;
     assert!(
@@ -207,6 +209,7 @@ async fn start_api_server_warns_when_dev_cors_is_enabled() {
         &sample_quota_tiers(),
         &sample_models(),
         &sample_redis(),
+        &None,
         &None,
     )
     .await;
@@ -340,6 +343,7 @@ mod db {
             &sample_models(),
             &sample_redis(),
             &None,
+            &None,
         )
         .await;
         assert!(
@@ -378,6 +382,7 @@ mod db {
             &sample_models(),
             &None,
             &None,
+            &None,
         )
         .await
         .expect_err("authz-api must refuse to start with no redis config");
@@ -407,6 +412,7 @@ mod db {
             &sample_quota_tiers(),
             &sample_models(),
             &unreachable_redis(),
+            &None,
             &None,
         )
         .await;
@@ -533,6 +539,7 @@ mod db {
             refill_service,
             review_service,
             budget_repo,
+            None,
             lazy_cratestack_db(),
             db_pool.clone(),
             lazy_idempotency_store(),

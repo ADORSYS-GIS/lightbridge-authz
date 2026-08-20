@@ -80,6 +80,7 @@ async fn main() -> Result<()> {
                     &config_clone.models,
                     &config_clone.redis,
                     &config_clone.usage_service,
+                    &config_clone.model_catalog_service,
                 )
                 .await
                 {
@@ -119,6 +120,7 @@ async fn main() -> Result<()> {
                 &config.models,
                 &config.redis,
                 &config.usage_service,
+                &config.model_catalog_service,
             )
             .await?;
             Ok(())
