@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import base64
+import datetime
 import json
 import os
 import ssl
@@ -27,6 +28,18 @@ INSECURE_TLS = ssl.create_default_context()
 INSECURE_TLS.check_hostname = False
 INSECURE_TLS.verify_mode = ssl.CERT_NONE
 
+
+
+def _it_expires_at() -> str:
+    """RFC3339 expiry 30 days out.
+
+    `createApiKey` requires `expiresAt` and rejects anything past the configured
+    ceiling (default 90 days) or in the past, so this must be computed at run time
+    rather than hardcoded -- a literal date would silently start failing once it
+    drifted into the past.
+    """
+    when = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def log(msg: str) -> None:
     print(f"[it-authorino] {msg}", flush=True)
@@ -217,7 +230,7 @@ def main() -> int:
         status, key_payload = request_rpc(
             "POST",
             f"{API_URL}/rpc/procedure.createApiKey",
-            {"args": {"projectId": project_id, "name": "it-key", "billingPlan": "free"}},
+            {"args": {"projectId": project_id, "name": "it-key", "billingPlan": "free", "expiresAt": _it_expires_at()}},
             headers=authz_headers,
             insecure_tls=True,
         )

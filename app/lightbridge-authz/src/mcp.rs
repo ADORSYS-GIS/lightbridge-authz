@@ -14,7 +14,7 @@ use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait, TokenInfo};
 use lightbridge_authz_core::{
     Config, CreateAccount, CreateApiKey, DefaultLimits, Error, Permission, Result, RotateApiKey,
-    config::{ApiServer, BasicAuth, Billing, ModelCatalog, Oauth2, QuotaTiers},
+    config::{ApiKeyExpiry, ApiServer, BasicAuth, Billing, ModelCatalog, Oauth2, QuotaTiers},
     cuid::cuid2,
     db::{DbPoolTrait, is_database_ready},
     server::serve_tls,
@@ -250,6 +250,19 @@ fn parse_optional_datetime(
                 })
         })
         .transpose()
+}
+
+/// `create-api-key`'s `expires_at` counterpart to `parse_optional_datetime` above --
+/// non-`Option`, since lightbridge-authz#395 made an expiry mandatory on every created key.
+fn parse_required_datetime(
+    value: String,
+    field_name: &str,
+) -> std::result::Result<DateTime<Utc>, ErrorData> {
+    DateTime::parse_from_rfc3339(&value)
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .map_err(|_| {
+            ErrorData::invalid_params(format!("invalid RFC3339 datetime for `{field_name}`"), None)
+        })
 }
 
 fn to_tool_error(error: Error) -> ErrorData {
@@ -739,8 +752,10 @@ struct UpdateProjectParams {
 struct CreateApiKeyParams {
     project_id: String,
     name: String,
-    #[serde(default)]
-    expires_at: Option<String>,
+    /// Required (RFC3339), lightbridge-authz#395: every api key must carry an expiry, no more
+    /// than `api_key_expiry.max_lifetime_days` (default 90) days out. Server-validated
+    /// regardless -- see `AuthzStoreImpl::validate_expires_at`.
+    expires_at: String,
     billing_plan: String,
 }
 
@@ -758,13 +773,17 @@ struct ApiKeyByIdParams {
     key_id: String,
 }
 
+// No `expires_at` here (lightbridge-authz#395): the generic `model.ApiKey.update` verb this tool
+// wraps had its `expiresAt` field removed at the schema level (`@readonly` on `ApiKey.expiresAt`
+// in `authz.cstack`) because it was a live, unvalidated bypass -- a caller could set any expiry,
+// including explicit `null`, with no cap and no procedure in the path. Changing a key's expiry now
+// goes exclusively through `rotate-api-key` (which validates it) or minting a new key via
+// `create-api-key`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct UpdateApiKeyParams {
     key_id: String,
     #[serde(default)]
     name: Option<String>,
-    #[serde(default)]
-    expires_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1306,7 +1325,7 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "create-api-key",
-        description = "Create an API key (RPC procedure.createApiKey; the server generates + hashes the secret and validates the billing plan)"
+        description = "Create an API key (RPC procedure.createApiKey; the server generates + hashes the secret, and validates the billing plan and expires_at -- required, RFC3339, at most ~90 days out by default)"
     )]
     async fn create_api_key_tool(
         &self,
@@ -1314,7 +1333,7 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<CreateApiKeyParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
-        let expires_at = parse_optional_datetime(params.expires_at, "expires_at")?;
+        let expires_at = parse_required_datetime(params.expires_at, "expires_at")?;
 
         let api_key_secret = self
             .issuer
@@ -1324,7 +1343,7 @@ impl LightbridgeMcpHandler {
                 &params.project_id,
                 CreateApiKey {
                     name: params.name,
-                    expires_at,
+                    expires_at: Some(expires_at),
                     billing_plan: params.billing_plan,
                 },
             )
@@ -1386,7 +1405,7 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "update-api-key",
-        description = "Update an API key's name/expires_at (RPC model.ApiKey.update)"
+        description = "Update an API key's name (RPC model.ApiKey.update); expires_at can only be changed via rotate-api-key or by creating a new key (lightbridge-authz#395)"
     )]
     async fn update_api_key_tool(
         &self,
@@ -1394,16 +1413,12 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<UpdateApiKeyParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
-        let expires_at = parse_optional_datetime(params.expires_at, "expires_at")?;
         let bound = self
             .cratestack_db
             .bind_context(cratestack_context_from_token_info(&token_info));
         let mut input = schema::inputs::UpdateApiKeyInput::default();
         if let Some(name) = params.name {
             input.name = Some(name);
-        }
-        if let Some(expires_at) = expires_at {
-            input.expiresAt = Some(Some(expires_at));
         }
         let api_key = bound
             .api_key()
@@ -1687,6 +1702,12 @@ fn build_mcp_router(
     public.merge(protected)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "startup wiring for lightbridge-mcp, mirroring lightbridge-authz-rest's \
+              start_api_server/start_budget_server rationale -- each parameter is a distinct, \
+              independently-loaded config section"
+)]
 pub async fn start_mcp_server(
     api: &ApiServer,
     oauth2: &Oauth2,
@@ -1694,9 +1715,11 @@ pub async fn start_mcp_server(
     billing: &Billing,
     quota_tiers: &QuotaTiers,
     models: &ModelCatalog,
+    api_key_expiry: &ApiKeyExpiry,
     pool: Arc<dyn DbPoolTrait>,
 ) -> Result<()> {
     billing.validate()?;
+    api_key_expiry.validate()?;
     oauth2.rbac.validate()?;
     let readiness_pool = pool.clone();
     if oauth2.is_self_signed() {
@@ -1715,6 +1738,7 @@ pub async fn start_mcp_server(
         billing,
         quota_tiers,
         models,
+        api_key_expiry,
     )?);
     let opa_repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
     let bearer_service: Arc<dyn BearerTokenServiceTrait> =
@@ -1773,6 +1797,7 @@ pub async fn start_mcp_server_from_config(config: &Config) -> Result<()> {
         &config.billing,
         &config.quota_tiers,
         &config.models,
+        &config.api_key_expiry,
         pool,
     )
     .await
@@ -2203,13 +2228,15 @@ mod tests {
             ("set-default-project", json!({ "project_id": "proj_1" })),
             (
                 "create-api-key",
-                json!({ "project_id": "proj_1", "name": "key", "expires_at": "2030-01-01T00:00:00Z", "billing_plan": "free" }),
+                json!({ "project_id": "proj_1", "name": "key", "expires_at": near_future_expiry(), "billing_plan": "free" }),
             ),
             ("list-api-keys", json!({ "project_id": "proj_1" })),
             ("get-api-key", json!({ "key_id": "key_1" })),
+            // No `expires_at` here (lightbridge-authz#395): `UpdateApiKeyParams` no longer
+            // carries the field at all, so this exercises the tool's real, current shape.
             (
                 "update-api-key",
-                json!({ "key_id": "key_1", "name": "key2", "expires_at": "2030-01-01T00:00:00Z" }),
+                json!({ "key_id": "key_1", "name": "key2" }),
             ),
             ("revoke-api-key", json!({ "key_id": "key_1" })),
             (
@@ -2235,6 +2262,14 @@ mod tests {
             username: "u".to_string(),
             password: "p".to_string(),
         }
+    }
+
+    /// A `create-api-key`/`rotate-api-key` test payload's `expires_at`: comfortably inside the
+    /// default 90-day `ApiKeyExpiry` ceiling (lightbridge-authz#395) and always in the future,
+    /// unlike a hardcoded calendar date which would eventually violate one rule or the other as
+    /// time passes.
+    fn near_future_expiry() -> String {
+        (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339()
     }
 
     fn sample_billing() -> Billing {

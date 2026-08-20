@@ -521,7 +521,9 @@ mod db {
     // `Billing`/`BillingPlan` are imported HERE, not at file scope: they are used only by this
     // `it-tests`-gated module, so a file-level import reads as unused on a build without the
     // feature (which is what `cargo fix` acted on) while being required with it.
-    use lightbridge_authz_core::config::{Billing, BillingPlan, ModelCatalog, Oauth2, QuotaTiers};
+    use lightbridge_authz_core::config::{
+        ApiKeyExpiry, Billing, BillingPlan, ModelCatalog, Oauth2, QuotaTiers,
+    };
     use lightbridge_authz_core::cuid::cuid2;
     use lightbridge_authz_core::{CreateAccount, CreateApiKey, CreateProject};
     use lightbridge_authz_rest::handlers::AuthzStoreImpl;
@@ -971,6 +973,7 @@ mod db {
             },
             &QuotaTiers::default(),
             &ModelCatalog::default(),
+            &ApiKeyExpiry::default(),
         )
         .unwrap();
         let subject = "owner-sign";
@@ -1015,7 +1018,12 @@ mod db {
                 &project.id,
                 CreateApiKey {
                     name: "k".to_string(),
-                    expires_at: None,
+                    // `expires_at` is mandatory as of lightbridge-authz#395 --
+                    // `AuthzStoreImpl::create_api_key` now rejects `None` outright. The signer's
+                    // own `ttl_seconds` cap (asserted elsewhere in this file) still applies on
+                    // top via `resolve_issued_expires_at`'s `min`, so this value is deliberately
+                    // far enough out to never become the binding constraint here.
+                    expires_at: Some(Utc::now() + Duration::days(30)),
                     billing_plan: "free".to_string(),
                 },
             )

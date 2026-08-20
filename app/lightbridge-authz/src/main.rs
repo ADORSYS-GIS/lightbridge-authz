@@ -78,6 +78,7 @@ async fn main() -> Result<()> {
                     &config_clone.billing,
                     &config_clone.quota_tiers,
                     &config_clone.models,
+                    &config_clone.api_key_expiry,
                     &config_clone.redis,
                     &config_clone.usage_service,
                 )
@@ -117,6 +118,7 @@ async fn main() -> Result<()> {
                 &config.billing,
                 &config.quota_tiers,
                 &config.models,
+                &config.api_key_expiry,
                 &config.redis,
                 &config.usage_service,
             )
@@ -170,6 +172,7 @@ async fn main() -> Result<()> {
                 &config.billing,
                 &config.quota_tiers,
                 &config.models,
+                &config.api_key_expiry,
                 &config.redis,
                 &config.usage_service,
             )

@@ -314,7 +314,16 @@ async fn create_project(router: &Router, token: &str, account_id: &str, name: &s
         .to_string()
 }
 
-/// Create an api-key over RPC and return (key_id, secret), asserting 200.
+/// A `createApiKey`/`rotateApiKey` test payload's `expiresAt`: comfortably inside the default
+/// 90-day `ApiKeyExpiry` ceiling (lightbridge-authz#395) `setup()`'s `AuthzStoreImpl` uses, and
+/// always in the future -- unlike a hardcoded calendar literal, which would eventually violate one
+/// rule or the other as real time passes.
+fn near_future_expiry() -> String {
+    (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339()
+}
+
+/// Create an api-key over RPC and return (key_id, secret), asserting 200. `expiresAt` is required
+/// as of lightbridge-authz#395, so every caller of this helper gets a real, compliant one.
 async fn create_api_key(
     router: &Router,
     token: &str,
@@ -325,7 +334,7 @@ async fn create_api_key(
         router.clone(),
         "procedure.createApiKey",
         Wire::Cbor,
-        &json!({ "args": { "projectId": project_id, "name": name, "billingPlan": "free" } }),
+        &json!({ "args": { "projectId": project_id, "name": name, "billingPlan": "free", "expiresAt": near_future_expiry() } }),
         Some(token),
     )
     .await;
@@ -1173,7 +1182,7 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
         ("model.Project.delete", json!({ "id": project_id })),
         (
             "procedure.createApiKey",
-            json!({ "args": { "projectId": project_id, "name": "k", "billingPlan": "free" } }),
+            json!({ "args": { "projectId": project_id, "name": "k", "billingPlan": "free", "expiresAt": near_future_expiry() } }),
         ),
         (
             "procedure.disableAccount",
@@ -2542,23 +2551,19 @@ async fn budget_gated_op_ids_are_unreachable_on_authz_api_even_for_an_admin() {
     }
 }
 
-/// Covers the *direct* `/rpc/procedure.createApiKey` half of the production bug report (creating
-/// a non-expiring API key -- the "No expiry" option added in converse-frontends#182 -- failed
-/// with the generic `invalid_argument` / "invalid request payload" error). This frame is built to
-/// be byte-for-byte what `cborg` produces for `{ args: { name, expiresAt: null, projectId,
-/// billingPlan } }` (verified against a real `cborg.encode(stripUndefined(...))` run, matching
-/// `converse-frontends/packages/authz-rpc/src/codec.ts`).
-///
-/// This direct-call shape was never actually broken -- see `codec.rs`'s module doc comment and
-/// `batch_create_api_key_with_real_cborg_null_expires_at_bytes` below for where the real bug was
-/// (an encode-side mis-mapping of `serde_json::Value::Null`, reachable only through
-/// `POST /rpc/batch`, which every real `createApiKey` call in `converse-frontends` actually takes
-/// -- `apps/self-service/src/app/_layout.tsx` wires `createBatchLink()` into every unary authz RPC
-/// call). Kept as a permanent regression test anyway: it pins down that the direct-call path
-/// stays safe too, so a future codec/schema change reintroducing a decode failure for an explicit
-/// `null` on an `Option<DateTime<Utc>>` field is caught immediately either way.
+/// Regression coverage for lightbridge-authz#395's `createApiKey` half. Before that hard cutover,
+/// this test proved the *direct* `/rpc/procedure.createApiKey` half of an older production bug
+/// (creating a non-expiring API key -- the "No expiry" option added in converse-frontends#182 --
+/// failed with a generic `invalid_argument` error even though it should have succeeded): a frame
+/// byte-for-byte what `cborg` produces for `{ args: { name, expiresAt: null, projectId,
+/// billingPlan } }` used to decode fine into `Option<DateTime<Utc>>::None` and create a
+/// non-expiring key. Since #395, `expiresAt` is required (non-nullable) on `CreateApiKeyInput`, so
+/// the *same* bytes must now be rejected -- there is no more "no expiry" to create. Kept as a
+/// permanent regression test with the assertion flipped: a future schema/codec change that made
+/// `null` decode successfully again into a required field would silently reopen the "no expiry"
+/// hole this whole rule exists to close.
 #[tokio::test]
-async fn create_api_key_with_real_cborg_null_expires_at_bytes() {
+async fn create_api_key_rejects_real_cborg_null_expires_at_bytes() {
     let subject = format!("owner-cborg-null-expiry-{}", cuid2());
     let ctx = setup(admin_bearer(&subject)).await;
     let r = &ctx.router;
@@ -2583,23 +2588,26 @@ async fn create_api_key_with_real_cborg_null_expires_at_bytes() {
 
     let (status, body) = rpc_call_raw(r, "procedure.createApiKey", Wire::Cbor, raw, "admin").await;
     assert!(
-        status.is_success(),
-        "createApiKey with real cborg-shaped null expiresAt bytes: {status} {}",
+        !status.is_success(),
+        "createApiKey with a null expiresAt must be rejected now that it is required \
+         (lightbridge-authz#395): {status} {}",
         String::from_utf8_lossy(&body)
     );
-    let decoded = Wire::Cbor.decode::<Value>(&body);
-    assert!(decoded["apiKey"]["expiresAt"].is_null());
 }
 
-/// Companion to `create_api_key_with_real_cborg_null_expires_at_bytes` for the settings/edit
-/// screen's clear-expiry path (`useUpdateApiKey` -> `apiKeys.update(id, { name, expiresAt })`,
-/// `packages/authz-rpc/generated/src/client.ts`'s `update()` -> `{ id, patch }` wire shape),
-/// exercising the PATCH double-Option path (`UpdateApiKeyInput.expiresAt` wraps as
-/// `Option<Option<DateTime>>` server-side per `field_definition`'s `wrap_for_patch`) rather than
-/// `createApiKey`'s plain `Option<DateTime>`. Same story as its companion above: this direct-call
-/// shape was always safe; kept as permanent coverage regardless.
+/// Companion to `create_api_key_rejects_real_cborg_null_expires_at_bytes` for the settings/edit
+/// screen's old clear-expiry path (`useUpdateApiKey` -> `apiKeys.update(id, { name, expiresAt })`).
+/// Before lightbridge-authz#395 this proved the PATCH double-Option path
+/// (`UpdateApiKeyInput.expiresAt` wraps as `Option<Option<DateTime>>` per `field_definition`'s
+/// `wrap_for_patch`) correctly cleared an api key's expiry via real cborg-shaped null bytes. That
+/// was itself the security bypass #395 closes: `expiresAt` no longer exists on the generated
+/// `UpdateApiKeyInput` at all (`@readonly` in `authz.cstack`), so this now proves the opposite --
+/// the exact same bytes can no longer clear (or touch) the key's expiry, whether the schema
+/// silently drops the now-unrecognized field (success, only `name` changes) or rejects the call
+/// outright. Either response is acceptable; what must never happen again is the key ending up with
+/// a cleared `expiresAt`.
 #[tokio::test]
-async fn update_api_key_clears_expiry_with_real_cborg_null_bytes() {
+async fn update_api_key_cannot_clear_expiry_with_real_cborg_null_bytes() {
     let subject = format!("owner-cborg-null-patch-{}", cuid2());
     let ctx = setup(admin_bearer(&subject)).await;
     let r = &ctx.router;
@@ -2608,6 +2616,25 @@ async fn update_api_key_clears_expiry_with_real_cborg_null_bytes() {
     let account_id = create_account(r, "admin", &billing_id).await;
     let project_id = create_project(r, "admin", &account_id, "p-cborg-null-patch").await;
     let (key_id, _secret) = create_api_key(r, "admin", &project_id, "k-cborg-null-patch").await;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.ApiKey.get",
+        Wire::Cbor,
+        &json!({ "id": key_id }),
+        Some("admin"),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "get-api-key before update: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let original_expires_at = json_body(&body)["expiresAt"].clone();
+    assert!(
+        !original_expires_at.is_null(),
+        "fixture key must have a real expiry to make this test meaningful"
+    );
 
     let mut raw = Vec::new();
     let mut e = minicbor::Encoder::new(&mut raw);
@@ -2622,13 +2649,31 @@ async fn update_api_key_clears_expiry_with_real_cborg_null_bytes() {
     e.null().unwrap();
 
     let (status, body) = rpc_call_raw(r, "model.ApiKey.update", Wire::Cbor, raw, "admin").await;
+    if status.is_success() {
+        let decoded = Wire::Cbor.decode::<Value>(&body);
+        assert_eq!(
+            decoded["expiresAt"], original_expires_at,
+            "model.ApiKey.update must not be able to change expiresAt at all, let alone clear \
+             it: {decoded}"
+        );
+    }
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.ApiKey.get",
+        Wire::Cbor,
+        &json!({ "id": key_id }),
+        Some("admin"),
+    )
+    .await;
+    assert!(status.is_success());
+    let after = json_body(&body);
     assert!(
-        status.is_success(),
-        "ApiKey update clearing expiresAt via real cborg-shaped null bytes: {status} {}",
-        String::from_utf8_lossy(&body)
+        !after["expiresAt"].is_null(),
+        "the bypass this test used to demonstrate must stay closed -- expiresAt is still set \
+         after the update attempt: {after}"
     );
-    let decoded = Wire::Cbor.decode::<Value>(&body);
-    assert!(decoded["expiresAt"].is_null());
+    assert_eq!(after["expiresAt"], original_expires_at);
 }
 
 /// The actual reproduction of the production bug report, found only after the two direct-call
@@ -2662,11 +2707,18 @@ async fn update_api_key_clears_expiry_with_real_cborg_null_bytes() {
 ///
 /// Fixed in `LenientCborCodec::encode` (`codec.rs`) by constructing a `minicbor_serde::Serializer`
 /// with `serialize_unit_as_null(true)` instead of delegating to
-/// `cratestack_codec_cbor::CborCodec::encode`'s hardcoded default. This test is the end-to-end
-/// proof: byte-for-byte what the frontend's `createBatchLink()` + `cborg` actually produce for a
-/// batched `createApiKey` call with `expiresAt: null`, sent straight at `POST /rpc/batch`.
+/// `cratestack_codec_cbor::CborCodec::encode`'s hardcoded default. This test was the end-to-end
+/// proof, byte-for-byte, that the frontend's `createBatchLink()` + `cborg` output for a batched
+/// `createApiKey` call with `expiresAt: null` decoded correctly and *succeeded*.
+///
+/// Since lightbridge-authz#395 made `expiresAt` required (non-nullable) on `CreateApiKeyInput`,
+/// the correct outcome for these exact bytes flipped: `null` now decodes cleanly (the codec fix
+/// above still holds) but is then rejected by the required-field check, so the batch frame must
+/// carry an error instead of a created key. Kept as a permanent regression test with the
+/// assertion flipped, for the same reason its direct-call sibling above was flipped rather than
+/// deleted.
 #[tokio::test]
-async fn batch_create_api_key_with_real_cborg_null_expires_at_bytes() {
+async fn batch_create_api_key_rejects_real_cborg_null_expires_at_bytes() {
     let subject = format!("owner-batch-null-expiry-{}", cuid2());
     let ctx = setup(admin_bearer(&subject)).await;
 
@@ -2720,10 +2772,10 @@ async fn batch_create_api_key_with_real_cborg_null_expires_at_bytes() {
     assert_eq!(frames.len(), 1);
     let frame = &frames[0];
     assert!(
-        frame.get("error").is_none(),
-        "createApiKey batch frame with null expiresAt must succeed, not error: {frame}"
+        frame.get("error").is_some(),
+        "createApiKey batch frame with a null expiresAt must carry an error now that it is \
+         required (lightbridge-authz#395), not create a key: {frame}"
     );
-    assert!(frame["output"]["apiKey"]["expiresAt"].is_null());
 }
 
 /// The response-side half of the same bug -- and the one with the much larger blast radius.
@@ -2743,9 +2795,11 @@ async fn batch_create_api_key_with_real_cborg_null_expires_at_bytes() {
 /// non-nullish, and has no `.trim` method, so neither the `?.` in the caller nor a naive falsy
 /// check would have caught it.
 ///
-/// The request built here carries no `null` anywhere (`expiresAt` is a real, present date) --
-/// deliberately isolating the RESPONSE-side encode from the already-covered REQUEST-side bug
-/// (`batch_create_api_key_with_real_cborg_null_expires_at_bytes` above). The response naturally
+/// The request built here carries no `null` anywhere (`expiresAt` is a real, present date --
+/// computed relative to `now`, not hardcoded, so it stays within the `ApiKeyExpiry` ceiling
+/// lightbridge-authz#395 added regardless of when this test runs) -- deliberately isolating the
+/// RESPONSE-side encode from the already-covered REQUEST-side bug
+/// (`batch_create_api_key_rejects_real_cborg_null_expires_at_bytes` above). The response naturally
 /// carries several `None` fields on a freshly created key (`oauth2Url`, `lastUsedAt`, `lastIp`,
 /// `revokedAt`, `deletedAt`) -- this asserts on `oauth2Url` specifically since that's the field
 /// converse-frontends#180 was stuck on, but confirmed by hand (see this PR's description) that
@@ -2776,7 +2830,7 @@ async fn batch_response_null_fields_encode_as_cbor_null_not_empty_array() {
     e.str("billingPlan").unwrap();
     e.str("free").unwrap();
     e.str("expiresAt").unwrap();
-    e.str("2027-01-01T00:00:00Z").unwrap();
+    e.str(&near_future_expiry()).unwrap();
     e.str("projectId").unwrap();
     e.str(&project_id).unwrap();
 
