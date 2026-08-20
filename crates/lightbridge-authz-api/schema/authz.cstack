@@ -423,7 +423,7 @@ type UpdateAccountDefaultQuotaInput {
 }
 
 mutation procedure updateAccountDefaultQuota(args: UpdateAccountDefaultQuotaInput): Account
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permAccountUpdate == true)
 
 // Server-side API-key creation (ADR-0003 follow-up). Replaces the now-denied generic
 // `model.ApiKey.create` verb: the server generates the secret, hashes it, derives the
@@ -668,7 +668,7 @@ type SetProjectQuotaInput {
 }
 
 mutation procedure setProjectQuota(args: SetProjectQuotaInput): Project
-  @allow(auth() != null)
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permProjectUpdate == true)
 
 // Budget policy lifecycle (ADR-0007; storage in `lightbridge-authz-budget`'s `PolicyStore`).
 // `activePolicyRevision` is the revision genuinely serving `evaluate()` calls right now -- not
