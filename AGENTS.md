@@ -808,8 +808,12 @@ hand-written SQL and direct `sqlx` dependencies.
     (`rotate_exchange_refresh_token` in `crates/lightbridge-authz-api-key/src/repo.rs`).
   - `lightbridge-authz-usage`: dynamic `QueryBuilder` aggregates against the Timescale-backed
     `usage_events` table (`query_usage` in `crates/lightbridge-authz-usage/src/repo.rs`).
-- This repo runs cratestack (`cratestack-pg`) 0.5.1; ADR-0038's capability findings were verified
-  against 0.7.8. Re-verify any capability claim against 0.5.1 here before relying on it.
+- This repo runs cratestack (`cratestack-pg`) `=0.8.0` (pinned exactly in the root `Cargo.toml`,
+  which also documents why the pin cannot float past it -- see that file's `cratestack-core =
+  "=0.8.0"` block); ADR-0038's capability findings were verified against 0.7.8. Re-verify any
+  capability claim against `0.8.0` here before relying on it -- "0.5.1" was stale as of #379
+  (2026-08-20), which also corrected #375's own PR description, which had already found the pin
+  was 0.7.16 at authoring time and out of date by the time #379 landed.
 
 ## Troubleshooting and Gotchas
 

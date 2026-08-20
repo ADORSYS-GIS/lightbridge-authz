@@ -392,7 +392,7 @@ fn required_tool_permission(tool: &str) -> Option<Permission> {
         | "set-project-member-quota-tier" => Permission::ProjectMember,
         "create-project" => Permission::ProjectCreate,
         "list-projects" | "get-project" => Permission::ProjectRead,
-        "update-project" => Permission::ProjectUpdate,
+        "update-project" | "set-project-quota" => Permission::ProjectUpdate,
         "delete-project" => Permission::ProjectDelete,
         "disable-project" | "enable-project" => Permission::ProjectDisable,
         "set-default-project" => Permission::ProjectUpdate,
@@ -639,11 +639,12 @@ struct AccountByIdParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct UpdateAccountParams {
     account_id: String,
-    /// Nested like `UpdateProjectParams::allowed_models`: absent leaves the tier untouched, an
-    /// explicit `null` clears it. `defaultQuota` is nullable in the schema, so the generated patch
-    /// field is `Option<Option<String>>`.
+    /// A tier drawn from the operator-configured catalogue, or omitted/`null` to clear it. Unlike
+    /// before #379, this always writes (no PATCH "leave untouched" state) -- `updateAccountDefaultQuota`
+    /// is a dedicated single-field procedure, not the generic `model.Account.update` verb, mirroring
+    /// `SetProjectMemberQuotaTierParams::quota_tier` below.
     #[serde(default)]
-    default_quota: Option<Option<String>>,
+    default_quota: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -696,7 +697,13 @@ struct CreateProjectParams {
     /// Who is paying for this project. Moved here from `Account` by ADR-0006 so one account can
     /// bill several projects to different parties; unique across all projects.
     billing_identity: String,
-    /// The pooled, tier-catalogue-validated ceiling shared by everyone on the project.
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetProjectQuotaParams {
+    project_id: String,
+    /// The pooled, tier-catalogue-validated ceiling shared by everyone on the project, drawn from
+    /// the operator-configured catalogue, or omitted/`null` to clear it.
     #[serde(default)]
     project_quota: Option<String>,
 }
@@ -864,28 +871,28 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "update-account",
-        description = "Update an account's default quota tier (RPC model.Account.update)"
+        description = "Update an account's default quota tier (RPC procedure.updateAccountDefaultQuota); tier validated against the configured catalogue"
     )]
     async fn update_account_tool(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<UpdateAccountParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let token_info = token_info_from_request_context(&context)?;
-        let bound = self
-            .cratestack_db
-            .bind_context(cratestack_context_from_token_info(&token_info));
-        let mut input = schema::inputs::UpdateAccountInput::default();
-        if let Some(default_quota) = params.default_quota {
-            input.defaultQuota = Some(default_quota);
-        }
-        let account = bound
-            .account()
-            .update(params.account_id)
-            .set(input)
-            .run()
+        // Repointed from the generic `model.Account.update` client call (#379): `defaultQuota` is
+        // now `@readonly` on that verb's generated input (it has no hook for the runtime-configured
+        // quota-tier catalogue check), so this now calls the `updateAccountDefaultQuota` procedure
+        // instead, same as the RPC surface -- mirrors how `delete-account` was already repointed
+        // from `model.Account.delete` to `deleteAccountPermanently`.
+        let subject = subject_from_request_context(&context)?;
+        let account = self
+            .issuer
+            .update_account_default_quota(
+                &subject,
+                &params.account_id,
+                params.default_quota.as_deref(),
+            )
             .await
-            .map_err(cratestack_error_to_tool_error)?;
+            .map_err(to_tool_error)?;
 
         to_json_value(account)
     }
@@ -1062,8 +1069,31 @@ impl LightbridgeMcpHandler {
     }
 
     #[tool(
+        name = "set-project-quota",
+        description = "Set a project's pooled spending ceiling (RPC procedure.setProjectQuota); owner or any roster member, tier validated against the configured catalogue"
+    )]
+    async fn set_project_quota_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SetProjectQuotaParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let project = self
+            .issuer
+            .set_project_quota(
+                &subject,
+                &params.project_id,
+                params.project_quota.as_deref(),
+            )
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(project)
+    }
+
+    #[tool(
         name = "create-project",
-        description = "Create a project (RPC model.Project.create)"
+        description = "Create a project (RPC model.Project.create); projectQuota is set afterward via set-project-quota"
     )]
     async fn create_project_tool(
         &self,
@@ -1080,6 +1110,10 @@ impl LightbridgeMcpHandler {
             .unwrap_or_default();
         let default_limits_json =
             serde_json::to_value(default_limits).unwrap_or_else(|_| json!({}));
+        // `projectQuota` is `@readonly` on this generated input since #379 (no hook for the
+        // runtime-configured quota-tier catalogue check on the generic verb) -- a brand-new project
+        // always starts with `projectQuota = NULL` (always valid), settable afterward via the
+        // `set-project-quota` tool below.
         let input = schema::inputs::CreateProjectInput {
             id: cuid2(),
             accountId: params.account_id,
@@ -1090,7 +1124,6 @@ impl LightbridgeMcpHandler {
             defaultLimits: cratestack_json(default_limits_json),
             billingPlan: params.billing_plan,
             billingIdentity: params.billing_identity,
-            projectQuota: params.project_quota,
         };
         let project = bound
             .project()
@@ -2155,6 +2188,10 @@ mod tests {
                 "create-project",
                 json!({ "account_id": "acct_1", "name": "proj", "billing_plan": "free", "billing_identity": "acme" }),
             ),
+            (
+                "set-project-quota",
+                json!({ "project_id": "proj_1", "project_quota": "small" }),
+            ),
             ("list-projects", json!({ "account_id": "acct_1" })),
             ("get-project", json!({ "project_id": "proj_1" })),
             (
@@ -2380,6 +2417,7 @@ mod tests {
             "set-default-project",
             "set-project-member-quota-tier",
             "set-project-member-role",
+            "set-project-quota",
             "update-account",
             "update-api-key",
             "update-project",

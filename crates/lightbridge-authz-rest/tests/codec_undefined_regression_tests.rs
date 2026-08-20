@@ -26,8 +26,8 @@ fn frontend_frame_with_undefined_allowed_models() -> Vec<u8> {
     let mut e = minicbor::Encoder::new(&mut out);
     // Seven fields, not six: ADR-0006 moved `billingIdentity` from `Account` onto `Project` and it
     // is non-optional there, so the real frontend now sends it on every create (added in
-    // `buildCreateProjectInput` alongside the optional `projectQuota`, which stays omitted here —
-    // it is nullable, so its absence is not what this regression is about).
+    // `buildCreateProjectInput`). `projectQuota` is `@readonly` since #379 and no longer exists on
+    // `CreateProjectInput` at all -- unrelated to this regression either way.
     e.map(7).unwrap();
     e.str("id").unwrap();
     e.str("abc123def456").unwrap();

@@ -288,7 +288,6 @@ fn project_input(
         defaultLimits: Json(CValue::Map(std::collections::BTreeMap::new())),
         billingPlan: "free".to_string(),
         billingIdentity: format!("bill-{}", cuid2()),
-        projectQuota: None,
     }
 }
 
@@ -389,17 +388,21 @@ async fn crud_lifecycle_for_all_resources() {
     );
     assert!(accounts["totalCount"].as_i64().unwrap() >= 1);
 
-    let new_billing = format!("tenant2-{}", cuid2());
+    // `Account.defaultQuota` is `@readonly` on the generic verb since #379 -- updated via the
+    // dedicated `updateAccountDefaultQuota` procedure instead (`model.Account.update` still exists
+    // for whatever fields remain generically writable; there are none left on `Account` today, see
+    // that procedure's own doc comment).
+    let new_quota = format!("tenant2-{}", cuid2());
     let (status, body) = rpc_call(
         r.clone(),
-        "model.Account.update",
+        "procedure.updateAccountDefaultQuota",
         Wire::Cbor,
-        &json!({ "id": account_id, "patch": { "defaultQuota": new_billing } }),
+        &json!({ "args": { "accountId": account_id, "defaultQuota": new_quota } }),
         Some("admin"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json_body(&body)["defaultQuota"], new_billing);
+    assert_eq!(json_body(&body)["defaultQuota"], new_quota);
 
     // Project: create → get → list → update.
     let project_id = create_project(r, "admin", &account_id, "proj").await;
@@ -1185,16 +1188,27 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
         );
     }
 
-    // Admin succeeds on a representative mutating op the viewer was denied.
-    let (status, _) = rpc_call(
+    // Admin succeeds on a representative mutating op the viewer was denied. Uses
+    // `procedure.updateAccountDefaultQuota`, not `model.Account.update` (the op the loop above
+    // exercises for the *viewer-denied* half): since #379 marked `Account.defaultQuota`
+    // `@readonly`, `model.Account.update`'s generated input has zero settable fields left, so
+    // every call to it -- including an authorized admin's -- now 422s with cratestack's own
+    // "update input must contain at least one changed column" before ever reaching the RBAC
+    // question this assertion is about. The procedure is the real write path post-#379.
+    let (status, body) = rpc_call(
         r.clone(),
-        "model.Account.update",
+        "procedure.updateAccountDefaultQuota",
         Wire::Cbor,
-        &json!({ "id": account_id, "patch": { "defaultQuota": format!("t-{}", cuid2()) } }),
+        &json!({ "args": { "accountId": account_id, "defaultQuota": format!("t-{}", cuid2()) } }),
         Some("admin"),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "admin update must succeed");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "admin update must succeed: {}",
+        String::from_utf8_lossy(&body)
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
