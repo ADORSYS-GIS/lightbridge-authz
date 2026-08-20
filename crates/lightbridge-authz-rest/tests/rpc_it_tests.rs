@@ -1807,7 +1807,7 @@ async fn batch_rpc_frames_all_deny_for_a_caller_with_zero_permissions() {
 
     let batch = json!([
         { "id": 1, "op": "procedure.listBillingPlans", "input": { "args": {} } },
-        { "id": 2, "op": "model.Project.create", "input": { "accountId": subject, "name": "x", "billingIdentity": format!("tenant-{subject}"), "defaultLimits": {}, "billingPlan": "free" } },
+        { "id": 2, "op": "model.Project.create", "input": { "id": cuid2(), "accountId": subject, "name": "x", "defaultLimits": {}, "billingPlan": "free", "status": "active" } },
         { "id": 3, "op": "procedure.createAccount", "input": { "args": {} } }
     ]);
 
