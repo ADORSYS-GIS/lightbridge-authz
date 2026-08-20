@@ -2125,6 +2125,12 @@ const CLIENT_ASSERTION_JTI_KEY_PREFIX: &str = "authz-api:client-assertion-jti:";
 /// `PolicyStore` off the shared `budget_policy_sets`/`budget_policy_revisions` tables, so
 /// `TokenExchangeOpStore::resolve_budget_tier`'s fail-closed fallback reads the live, admin-
 /// configured `fail_closed_floor_micros` instead of a hard-coded rung.
+///
+/// `TokenExchangeOpStore::new` also takes `repo` a second time as its own `quota_repo` parameter
+/// (ADR-0017): production always passes the same `Arc<StoreRepo>` clone for both, since
+/// `project_members` lives on this exact pool with no operational separation from tenant-context
+/// resolution -- the duplicate parameter exists purely as an independent test-injection seam, see
+/// `TokenExchangeOpStore`'s own `quota_repo` field doc comment for why.
 fn build_token_exchange_state(
     oauth2: &Oauth2,
     repo: Arc<StoreRepo>,
@@ -2175,6 +2181,7 @@ fn build_token_exchange_state(
     let op_store = Arc::new(oauth2_op::store::TokenExchangeOpStore::new(
         client_store,
         assertions,
+        repo.clone(),
         repo,
         budget_repo,
         policy_engine,

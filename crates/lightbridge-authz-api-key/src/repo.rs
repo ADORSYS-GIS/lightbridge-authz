@@ -676,6 +676,41 @@ impl StoreRepo {
         })
     }
 
+    /// Resolves the acting `subject`'s per-member `quota_tier` on `project_id` (ADR-0017), the
+    /// human/OIDC-plane mirror of the API-key plane's `owner_quota_tier`
+    /// (`api_key_validation` view, `migrations/20260731000001_api_keys_owner_account.sql`).
+    /// Deliberately keyed on `subject` (the acting person), not the project's owning account --
+    /// same reasoning as that view's `pm.account_id = k.owner_account_id` join: a lead acting on a
+    /// project someone else owns is governed by their OWN roster row, not the owner's.
+    ///
+    /// `Ok(None)` covers two states the caller must NOT distinguish, matching the view's own
+    /// documented NULL semantics verbatim: no `project_members` row at all (the common case for a
+    /// project's owning account, which normally holds none), or a row whose `quota_tier` column is
+    /// NULL. Both mean "no per-member ceiling, the caller is bounded by the pooled
+    /// `projects.project_quota` alone" -- a resolved, legitimate answer, not a failure.
+    ///
+    /// `Err` means the lookup itself could not be completed (e.g. the database is unreachable) --
+    /// distinct in kind from `Ok(None)`, and callers MUST NOT collapse the two: a database outage
+    /// must never be represented on the wire the same way as "no per-member ceiling", or an
+    /// availability failure becomes a quota bypass. See `TokenExchangeOpStore::resolve_quota_tier`
+    /// for how the token-exchange/refresh call sites act on that distinction (refuse the mint
+    /// rather than omit the claim).
+    #[instrument(skip(self, subject))]
+    pub async fn project_member_quota_tier(
+        &self,
+        project_id: &str,
+        subject: &str,
+    ) -> Result<Option<String>> {
+        let quota_tier: Option<Option<String>> = sqlx::query_scalar(
+            r#"SELECT quota_tier FROM project_members WHERE project_id = $1 AND account_id = $2"#,
+        )
+        .bind(project_id)
+        .bind(subject)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(quota_tier.flatten())
+    }
+
     pub async fn create_exchange_refresh_token(
         &self,
         input: NewExchangeRefreshToken,
