@@ -1805,9 +1805,11 @@ async fn batch_rpc_frames_all_deny_for_a_caller_with_zero_permissions() {
     ));
     let ctx = setup(bearer).await;
 
+    let create_project_input = serde_json::to_value(project_input(&cuid2(), &subject, "x", None))
+        .expect("CreateProjectInput serializes");
     let batch = json!([
         { "id": 1, "op": "procedure.listBillingPlans", "input": { "args": {} } },
-        { "id": 2, "op": "model.Project.create", "input": { "id": cuid2(), "accountId": subject, "name": "x", "defaultLimits": {}, "billingPlan": "free", "status": "active" } },
+        { "id": 2, "op": "model.Project.create", "input": create_project_input },
         { "id": 3, "op": "procedure.createAccount", "input": { "args": {} } }
     ]);
 
