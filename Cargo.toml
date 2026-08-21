@@ -312,6 +312,28 @@ minicbor = { version = "2.2", features = ["std", "half"] }
 # `serde_json::Value::Null` but only guard the model-projection decode path, not the
 # `/rpc/batch` handler's `RpcRequest.input: serde_json::Value` re-encode step (cratestack-axum's
 # `rpc_batch_dispatch`/`encode_rpc_value`).
+# ⚠️ MUST STAY ON 0.6.x. Rejected the 0.7.1 bump (#405) 2026-08-21, and this comment exists so
+# the next Dependabot attempt is answered here rather than re-investigated.
+#
+# `cratestack-codec-cbor = "=0.8.4"` hard-constrains its own `minicbor-serde` requirement to
+# `^0.6.2`. Moving THIS requirement to 0.7 therefore does not upgrade anything -- it makes Cargo
+# resolve TWO coexisting `minicbor-serde` versions (0.6.2 for cratestack's own `CborCodec`, 0.7.1
+# for our `LenientCborCodec`), both encoding CBOR on the same request path. Dependabot's own
+# lockfile diff shows it: entries become version-disambiguated (`"minicbor-serde 0.6.2"` vs
+# `"minicbor-serde 0.7.1"`), which Cargo only writes when multiple versions coexist.
+#
+# That is the `jsonwebtoken`-double-major failure shape (see the authkestra block above), aimed at
+# the one seam we can least afford it: `LenientCborCodec` exists precisely BECAUSE cratestack's
+# encoder and ours disagreed about how to encode `null` -- `serde_json::Value::Null` serializes via
+# `serialize_unit()`, which minicbor-serde encodes as CBOR's empty array `0x80` unless
+# `serialize_unit_as_null(true)` is set (see `codec.rs`). That mismatch shipped to production as a
+# white-screen crash (`TypeError: x.trim is not a function`) and took real time to diagnose.
+#
+# And the bump buys nothing: 0.6.2 and 0.7.1 have byte-for-byte identical `Serializer`,
+# `serialize_unit_as_null`, and `serialize_unit` bodies (diffed both vendored `src/ser.rs`); 0.7
+# only adds i128/u128 support and a tag-container mechanism, neither of which touches unit/null
+# handling. Revisit only when `cratestack-codec-cbor` itself moves to `^0.7`, and then bump both
+# together -- never this one alone.
 minicbor-serde = "0.6"
 # lightbridge-authz#363: `tokio-rustls-comp` is a superset of the previous `tokio-comp` (it
 # enables `tls-rustls` + `tokio-comp` together — see docs.rs/crate/redis/1.5.0/features), so
