@@ -5,8 +5,8 @@ use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_core::error::{Error, Result};
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeyStatus, ApiKeyValidation, CreateAccount, CreateProject, DefaultLimits,
-    Project, ProjectMember, ResolvedContext, ResourceStatus, UpdateAccount, UpdateApiKey,
-    UpdateProject,
+    ModelPolicy, Project, ProjectMember, ResolvedContext, ResourceStatus, UpdateAccount,
+    UpdateApiKey, UpdateProject,
 };
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -190,6 +190,7 @@ impl StoreRepo {
             project_quota: row.project_quota,
             status: ResourceStatus::from(row.status),
             is_default: row.is_default,
+            model_policy: ModelPolicy::from(row.model_policy),
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -580,7 +581,8 @@ impl StoreRepo {
             SELECT $3, account_auth.account_id, $4, $5, $6, $7, $8, $9, $10, $11
             FROM account_auth
             RETURNING id, account_id, name, allowed_models, default_limits, billing_plan,
-              billing_identity, project_quota, status, is_default, created_at, updated_at
+              billing_identity, project_quota, status, is_default, model_policy, created_at,
+              updated_at
             "#,
         )
         .bind(account_id)
@@ -936,6 +938,7 @@ impl StoreRepo {
               projects.project_quota,
               projects.status,
               projects.is_default,
+              projects.model_policy,
               projects.created_at,
               projects.updated_at
             FROM projects
@@ -976,6 +979,7 @@ impl StoreRepo {
               projects.project_quota,
               projects.status,
               projects.is_default,
+              projects.model_policy,
               projects.created_at,
               projects.updated_at
             FROM projects
@@ -1011,6 +1015,7 @@ impl StoreRepo {
               project_quota,
               status,
               is_default,
+              model_policy,
               created_at,
               updated_at
             FROM projects
@@ -1076,6 +1081,7 @@ impl StoreRepo {
               projects.project_quota,
               projects.status,
               projects.is_default,
+              projects.model_policy,
               projects.created_at,
               projects.updated_at
             "#,
@@ -1362,6 +1368,7 @@ impl StoreRepo {
               projects.project_quota,
               projects.status,
               projects.is_default,
+              projects.model_policy,
               projects.created_at,
               projects.updated_at
             "#,
@@ -1451,6 +1458,7 @@ impl StoreRepo {
               projects.project_quota,
               projects.status,
               projects.is_default,
+              projects.model_policy,
               projects.created_at,
               projects.updated_at
             "#,
@@ -1503,6 +1511,7 @@ impl StoreRepo {
               projects.project_quota,
               projects.status,
               projects.is_default,
+              projects.model_policy,
               projects.created_at,
               projects.updated_at
             "#,
@@ -1569,7 +1578,8 @@ impl StoreRepo {
             UPDATE projects SET is_default = true, updated_at = $1
             WHERE id = $2
             RETURNING id, account_id, name, allowed_models, default_limits, billing_plan,
-              billing_identity, project_quota, status, is_default, created_at, updated_at
+              billing_identity, project_quota, status, is_default, model_policy, created_at,
+              updated_at
             "#,
         )
         .bind(Utc::now())

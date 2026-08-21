@@ -356,12 +356,19 @@ Tables (see `migrations/`):
   `default_quota` (the governance tier for work in the account's own default project).
 - `projects` (belongs to `accounts`): includes `billing_identity` (unique — "who is paying" moved
   here from `accounts`, so one person can bill projects to different parties), `project_quota` (the
-  pooled ceiling), and `is_default` (the auto-provisioned, roster-less project; server-computed by a
-  `BEFORE INSERT` trigger, undeletable).
+  pooled ceiling), `is_default` (the auto-provisioned, roster-less project; server-computed by a
+  `BEFORE INSERT` trigger, undeletable), `allowed_models` (list of permitted models — `NULL` or
+  `[]` (empty list) are interpreted as "all models allowed" when `model_policy = allow_all`, and
+  mean "nothing" when `model_policy = allowlist`; ignored entirely under `deny_all`), and
+  `model_policy` (ADR-0018): `allow_all` (default — the sole pre-existing behavior, and what every
+  row backfills to on migration), `allowlist` (only `allowed_models` entries), or `deny_all`
+  (nothing). Not yet settable through the RPC surface (`@readonly` in `authz.cstack` — see that
+  field's own comment for why); returned by introspection and stamped as an access-token claim
+  (`crates/lightbridge-authz-rest/src/oauth2_op/store.rs`) alongside `allowed_models`.
 - `project_members` (`{project_id, account_id, role: lead|member, quota_tier}`): the project roster.
   Default projects have none by construction. Replaces `account_memberships`, which was dropped
   entirely — there is no account-level membership of any kind.
-- `api_keys` (belongs to `projects`): includes `allowed_models`.
+- `api_keys` (belongs to `projects`).
 
 API keys are stored as:
 
@@ -369,7 +376,6 @@ API keys are stored as:
 - `key_prefix`: derived from the secret for identification/useful listing.
 - `status`: `active` or `revoked`.
 - `expires_at`: optional expiration.
-- `allowed_models`: list of permitted models. `NULL` or `[]` (empty list) are interpreted as "all models allowed".
 - usage telemetry: `last_used_at`, `last_ip`.
 - `owner_account_id`: the member the key belongs to, set from the acting subject on create/rotate.
   Distinct from the project's owning account -- a lead who is not the owner may mint keys. This is

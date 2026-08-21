@@ -195,7 +195,7 @@ model Project {
   // hook for a runtime-configured catalogue check, so both were leaving this settable but
   // unvalidated -- a typo here was harmless under today's allow-all-only world (it just never
   // matched), but becomes a silent lockout once `model_policy = allowlist` (ADR-0018 Ticket 1)
-  // ships. `@readonly` drops it from BOTH generated inputs; `setProjectAllowedModels` below is now
+  // ships. `@readonly` marks it non-settable through the generic verbs (see CORRECTION below); `setProjectAllowedModels` below is now
   // the only write path (post-creation only -- a brand-new project starts with `allowedModels =
   // NULL`, settable afterward, same "starts NULL, set later" shape as `projectQuota`). Existing
   // rows are NOT backfilled/re-validated by this change -- a project that already carries a
@@ -203,6 +203,40 @@ model Project {
   // fresh write is checked). See that procedure's own doc comment for the catalogue-validation
   // contract.
   allowedModels Json? @readonly
+  //
+  // ⚠️ CORRECTION (verified empirically at cratestack 0.8.4 via converse-frontends#194): `@readonly`
+  // does NOT remove the field from the generated `CreateProjectInput`/`UpdateProjectInput`. The
+  // field stays in the generated input type and is silently IGNORED server-side. A caller can
+  // still send it and gets a no-op, not an error -- which is exactly why the frontend picker had
+  // to be moved to the dedicated procedure rather than relying on a compile error to catch the old
+  // call site. Do not assume `@readonly` makes a field unsendable; it makes it uneffective.
+  // ADR-0018: three-value access-control policy governing which models this project's keys may
+  // reach -- "allow_all" (default; today's only behavior, and what every pre-existing row
+  // backfills to -- see the migration), "allowlist" (only `allowedModels` entries; an empty list
+  // now genuinely means "nothing", unlike today's NULL/[] == "everything" collapse), "deny_all"
+  // (nothing, `allowedModels` ignored entirely). Plain `String`, not a schema-level enum -- this
+  // schema has no enum construct (see `Decision.effect`/`AugmentationRequest.status`'s own
+  // comments for the same choice), and CLAUDE.md's "ids and enums in this schema are plain
+  // strings" convention applies here too. The Rust-side representation is
+  // `lightbridge_authz_core::dto::ModelPolicy`, parsed FAIL-CLOSED from this raw column
+  // (`ModelPolicy::from(String)`): an unrecognized value maps to `DenyAll`, the strictest state,
+  // never silently to `AllowAll` -- see that type's own doc comment and tests.
+  //
+  // `@readonly` (deliberate, not an oversight -- ADR-0018's own Risk section flags this
+  // explicitly): unlike `projectQuota`/`defaultQuota` above, `modelPolicy`'s own three values need
+  // no runtime-configured *catalogue* check (it is a closed, compile-time-known set) -- so
+  // `@readonly` here is not about that pattern. It exists because ADR-0018 Decision 5 states
+  // `allowlist` mode is not safely selectable until `allowedModels` gets catalogue validation
+  // (tracked separately, #415, landing before this field goes live) -- a caller flipping a
+  // project to `allowlist` today would have zero server-side guard against a typo'd model id
+  // silently locking the project out. Marking this `@readonly` makes it non-settable through the generated
+  // `CreateProjectInput` and `UpdateProjectInput` (matching `projectQuota`/`isDefault`/`status`'s
+  // own precedent immediately above/below), so no write path exists anywhere yet -- not even an
+  // unvalidated one. A dedicated `setProjectModelPolicy`-style procedure (mirroring
+  // `setProjectQuota`'s shape) is left as follow-up work once #415 ships, not built here: this
+  // ticket's own acceptance criteria only requires the value to be *readable* (introspection,
+  // token-exchange claim), never to be *settable* through this surface.
+  modelPolicy String @readonly
   defaultLimits Json
   billingPlan String
   // MOVED here from `Account` per ADR-0006: one project, one billing identity ("who's

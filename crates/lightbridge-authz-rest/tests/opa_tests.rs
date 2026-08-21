@@ -3,7 +3,8 @@ use axum::body::to_bytes;
 use axum::http::StatusCode;
 use chrono::{Duration, Utc};
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeyStatus, ApiKeyValidation, Project, ResourceStatus, async_trait,
+    Account, ApiKey, ApiKeyStatus, ApiKeyValidation, ModelPolicy, Project, ResourceStatus,
+    async_trait,
     config::{BasicAuth, Billing, BillingLimits, BillingPlan},
     error::Result,
 };
@@ -148,6 +149,7 @@ fn mk_project() -> Project {
         project_quota: None,
         status: ResourceStatus::Active,
         is_default: false,
+        model_policy: ModelPolicy::AllowAll,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -235,6 +237,10 @@ async fn introspect_returns_active_with_context_and_records_usage() {
     assert_eq!(
         payload["allowed_models"],
         serde_json::json!(["gpt-4.1-mini"])
+    );
+    assert_eq!(
+        payload["model_policy"], "allow_all",
+        "the default policy must be reflected on the wire as the default project's model_policy"
     );
     assert_eq!(payload["exp"], expires_at.timestamp());
 
@@ -406,4 +412,57 @@ async fn introspect_returns_empty_allowed_models_when_empty() {
     assert_eq!(payload["active"], true);
     assert!(payload["allowed_models"].is_array());
     assert_eq!(payload["allowed_models"].as_array().unwrap().len(), 0);
+}
+
+/// ADR-0018 acceptance criterion: each of the three `model_policy` values round-trips through
+/// introspection unchanged.
+#[tokio::test]
+async fn introspect_round_trips_each_model_policy_value() {
+    for (policy, wire_value) in [
+        (ModelPolicy::AllowAll, "allow_all"),
+        (ModelPolicy::Allowlist, "allowlist"),
+        (ModelPolicy::DenyAll, "deny_all"),
+    ] {
+        let mut project = mk_project();
+        project.model_policy = policy;
+        let state = mk_state(MockOpaRepo {
+            api_key: Some(mk_api_key(ApiKeyStatus::Active, None)),
+            project: Some(project),
+            account: Some(mk_account()),
+            usage_calls: Arc::new(Mutex::new(vec![])),
+        });
+
+        let (status, payload) = introspect(state, "lbk_secret_valid").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            payload["model_policy"], wire_value,
+            "model_policy {policy:?} must round-trip as {wire_value:?}"
+        );
+    }
+}
+
+/// House rule: an unparseable/unknown stored `model_policy` value must be refused (routed to the
+/// strict `deny_all` branch), never silently defaulted to the permissive `allow_all`. This proves
+/// the fail-closed behavior end-to-end through the introspection response, not only at the
+/// `ModelPolicy::from` unit-test level (`lightbridge-authz-core/src/dto.rs`).
+#[tokio::test]
+async fn introspect_fails_closed_to_deny_all_for_an_unknown_stored_model_policy_value() {
+    let mut project = mk_project();
+    project.model_policy =
+        ModelPolicy::from("some-future-value-this-build-does-not-know".to_string());
+    let state = mk_state(MockOpaRepo {
+        api_key: Some(mk_api_key(ApiKeyStatus::Active, None)),
+        project: Some(project),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+    });
+
+    let (status, payload) = introspect(state, "lbk_secret_valid").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["model_policy"], "deny_all",
+        "an unrecognized stored value must resolve to the strict deny_all branch, never allow_all"
+    );
 }
