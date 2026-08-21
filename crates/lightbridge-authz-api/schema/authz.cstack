@@ -893,58 +893,40 @@ type AugmentationRequestPage {
 // comment, and this PR's description, for exactly what was checked and why).
 //
 // `requestedAmountMicros` (ADR-0015): the caller-chosen amount, checked against the active
-// policy's offered set (`MyBudgetRefillLadder.allowedAmountsMicros`) before evaluation.
-// Deliberately optional and additive, NOT a replacement for the pre-ADR-0015 shape: omitting it
-// preserves exactly today's behavior (`current_tier.next()`), so a live client that has not yet
-// redeployed to send it keeps working unchanged against this same backend deploy. Tracked for
-// removal (making it required, dropping the derivation) once every caller sends it -- same
-// follow-up as `MyBudgetRefillLadder.ladder` below.
+// policy's offered set (`MyBudgetRefillLadder.allowedAmountsMicros`) before evaluation. Required
+// -- the pre-ADR-0015 optional/additive shape (an omitted field deriving `current_tier.next()`)
+// was a deliberately temporary bridge for `converse-frontends#185` while it still read the legacy
+// ladder fields below; #387 removed both once that frontend switched to `allowedAmountsMicros`
+// and deployed (see `docs/adr/0015-refill-amounts-are-admin-configured-policy-ranges.md`).
 type RequestBudgetRefillInput {
   budgetAccountId String
   accountId String
   projectId String?
   period String
   idempotencyKey String?
-  requestedAmountMicros String?
+  requestedAmountMicros String
 }
 
 mutation procedure requestBudgetRefill(args: RequestBudgetRefillInput): AugmentationRequest
   @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetSelfRefill == true)
 
-// Read-only companion to `requestBudgetRefill`: where the caller currently sits on ADR-0008's
-// ladder for `period`, and what the next refill would grant *if* a submitted request is later
-// approved. Unlike `AugmentationRequest.requestedTier` (only known after submitting), this can be
-// shown before the caller ever clicks refill. Deliberately visibility only -- no reason codes, no
-// cap/deny prediction; `requestBudgetRefill` alone decides what actually happens (see
-// `RefillService::refill_status`'s own doc comment). `nextTier`/`nextTierAmountMicros` are `null`
-// exactly when the caller is already on the top rung (`b-1000`).
+// Read-only companion to `requestBudgetRefill`: the self-service refill amounts currently offered
+// by the active policy for `period`, so a UI can render an amount picker without hand-maintaining
+// its own copy of the offered set. Calls no policy engine and predicts no outcome --
+// `requestBudgetRefill` alone decides what an actual submission produces (see
+// `RefillService::refill_status`'s own doc comment).
 //
-// ⚠️ ADR-0015 superseded the "caller chooses nothing" model this type was originally built
-// under (see the removed paragraph this comment used to carry, and ADR-0015 itself for the full
-// reversal and why converse-frontends#148's original objection no longer applies -- policy still
-// gates every requested amount). `currentTier`/`currentTierAmountMicros`/`nextTier`/
-// `nextTierAmountMicros`/`ladder` are kept BYTE-FOR-BYTE as before ADR-0015 -- converse-
-// frontends#185 is live in production reading exactly this shape, and deploying a backend that
-// dropped or changed these fields would break it immediately. Do not remove or reshape them
-// until a converse-frontends PR has switched to `allowedAmountsMicros` and deployed; then remove
-// in a follow-up (tracked alongside `RequestBudgetRefillInput.requestedAmountMicros` above).
-type BudgetLadderRung {
-  tier String
-  amountMicros String
-}
-
+// #387 removed the pre-ADR-0015 `currentTier`/`currentTierAmountMicros`/`nextTier`/
+// `nextTierAmountMicros`/`ladder` fields and the `BudgetLadderRung` type this response used to
+// also carry: ADR-0015 moved the offered amounts off the compile-time `BudgetTier` ladder onto
+// this admin-configured, flat policy set, which has no "current rung"/"next rung" concept left to
+// display. Those fields were kept byte-for-byte additive alongside `allowedAmountsMicros` only
+// because `converse-frontends#185` was live in production reading them at the moment ADR-0015
+// landed (PR #386); #387 deleted them once that frontend switched to `allowedAmountsMicros` and
+// deployed -- see `docs/adr/0015-refill-amounts-are-admin-configured-policy-ranges.md`.
 type MyBudgetRefillLadder {
   budgetAccountId String
   period String
-  currentTier String
-  currentTierAmountMicros String
-  nextTier String?
-  nextTierAmountMicros String?
-  ladder BudgetLadderRung[]
-  // ADR-0015: the self-service refill amounts currently offered by the active policy, strictly
-  // ascending micro-USD strings (e.g. `["6000000", "15000000", "30000000"]` for $6/$15/$30).
-  // This is the source of truth going forward for what `requestBudgetRefill.requestedAmountMicros`
-  // may legally be -- `ladder` above is a frozen pre-ADR-0015 snapshot, not this.
   allowedAmountsMicros String[]
 }
 

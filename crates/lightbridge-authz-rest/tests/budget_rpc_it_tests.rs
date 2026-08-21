@@ -973,7 +973,8 @@ async fn spend_unavailable_routes_self_service_refill_to_manual_review_never_aut
         &json!({ "args": {
             "budgetAccountId": subject,
             "accountId": subject,
-            "period": "2026-08"
+            "period": "2026-08",
+            "requestedAmountMicros": "15000000"
         } }),
         Some("caller"),
     )

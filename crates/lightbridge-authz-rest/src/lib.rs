@@ -313,7 +313,7 @@ fn to_schema_budget_balance(
 /// Maps a domain [`lightbridge_authz_budget::RefillStatus`] into the schema's wire
 /// `MyBudgetRefillLadder` shape (see `authz.cstack`'s `type MyBudgetRefillLadder` doc comment).
 /// `budget_account_id`/`period` are threaded through from the call site rather than carried on
-/// `RefillStatus` itself -- the domain type only needs to answer "which tier, what ladder", not
+/// `RefillStatus` itself -- the domain type only needs to answer "what amounts are offered", not
 /// echo back the request that produced it.
 fn to_schema_my_budget_refill_ladder(
     budget_account_id: String,
@@ -323,18 +323,6 @@ fn to_schema_my_budget_refill_ladder(
     schema::MyBudgetRefillLadder {
         budgetAccountId: budget_account_id,
         period,
-        currentTier: status.current_tier.to_string(),
-        currentTierAmountMicros: status.current_tier.amount().get().to_string(),
-        nextTier: status.next_tier.map(|tier| tier.to_string()),
-        nextTierAmountMicros: status.next_tier.map(|tier| tier.amount().get().to_string()),
-        ladder: status
-            .ladder
-            .into_iter()
-            .map(|rung| schema::BudgetLadderRung {
-                tier: rung.tier.to_string(),
-                amountMicros: rung.amount_micros.to_string(),
-            })
-            .collect(),
         allowedAmountsMicros: status
             .allowed_amounts_micros
             .into_iter()
@@ -1339,19 +1327,14 @@ impl schema::procedures::ProcedureRegistry for Procedures {
             let period = lightbridge_authz_budget::Period::parse(&input.period)
                 .map_err(budget_error_to_cratestack_error)?;
 
-            // ADR-0015: optional and additive -- `None` when the caller omits the field
-            // preserves the pre-ADR-0015 wire shape exactly (`RefillRequest::
-            // requested_amount_micros`'s own doc comment covers why).
-            let requested_amount_micros = input
-                .requestedAmountMicros
-                .map(|raw| {
-                    raw.trim().parse::<i64>().map_err(|_| {
-                        CratestackError::BadRequest(format!(
-                            "requestedAmountMicros must be a valid integer, got '{raw}'"
-                        ))
-                    })
-                })
-                .transpose()?;
+            // ADR-0015: required -- checked against the active policy's offered set
+            // (`allowed_amounts_micros`) inside `RefillService::request_refill` itself.
+            let requested_amount_raw = input.requestedAmountMicros.trim();
+            let requested_amount_micros: i64 = requested_amount_raw.parse().map_err(|_| {
+                CratestackError::BadRequest(format!(
+                    "requestedAmountMicros must be a valid integer, got '{requested_amount_raw}'"
+                ))
+            })?;
 
             let request = lightbridge_authz_budget::RefillRequest {
                 budget_account_id: input.budgetAccountId,
@@ -1372,15 +1355,15 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         }
     }
 
-    /// Read-only companion to [`Self::request_budget_refill`]: where the caller currently sits on
-    /// the ADR-0008 ladder for `period`, and what the next refill would grant if approved --
-    /// delegating to [`lightbridge_authz_budget::RefillService::refill_status`], which calls no
-    /// policy engine and mutates nothing. `budgetAccountId` is derived from the authenticated
-    /// subject exactly like [`Self::get_my_budget_balance`] (never a caller-supplied field, the
-    /// same structural self-scoping guarantee), which is why `GetMyBudgetRefillLadderInput` has no
-    /// target field either. No caller-kind refusal here -- unlike the mutation above, this is a
-    /// pure read with no OIDC-human-only business rule of its own; the shared
-    /// `budget:self-refill` RBAC gate is the entire authorization story for this op-id.
+    /// Read-only companion to [`Self::request_budget_refill`]: the self-service refill amounts
+    /// currently offered by the active policy for `period` -- delegating to
+    /// [`lightbridge_authz_budget::RefillService::refill_status`], which calls no policy engine
+    /// and mutates nothing. `budgetAccountId` is derived from the authenticated subject exactly
+    /// like [`Self::get_my_budget_balance`] (never a caller-supplied field, the same structural
+    /// self-scoping guarantee), which is why `GetMyBudgetRefillLadderInput` has no target field
+    /// either. No caller-kind refusal here -- unlike the mutation above, this is a pure read with
+    /// no OIDC-human-only business rule of its own; the shared `budget:self-refill` RBAC gate is
+    /// the entire authorization story for this op-id.
     fn get_my_budget_refill_ladder(
         &self,
         _db: &schema::Cratestack,
@@ -1399,11 +1382,11 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         async move {
             let subject = subject
                 .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
-            let period = lightbridge_authz_budget::Period::parse(&period_str)
+            lightbridge_authz_budget::Period::parse(&period_str)
                 .map_err(budget_error_to_cratestack_error)?;
 
             let status = refill_service
-                .refill_status(&subject, &period)
+                .refill_status()
                 .await
                 .map_err(budget_error_to_cratestack_error)?;
 
