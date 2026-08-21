@@ -166,6 +166,11 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         // `model.Project.update`, matching the acceptance criteria's "existing permission
         // granularity" requirement.
         "procedure.setProjectQuota" => ProjectUpdate,
+        // #415 (ADR-0018 Decision 5): `Project.allowedModels` is now `@readonly` on BOTH generic
+        // verbs above too, for the same reason `projectQuota` is -- `setProjectAllowedModels` is
+        // its replacement write path, same coarse permission as `model.Project.update`, matching
+        // `setProjectQuota`'s own precedent immediately above.
+        "procedure.setProjectAllowedModels" => ProjectUpdate,
         // Roster management (ADR-0006). These replace the removed account-member procedures, and
         // the capability moved with them: `project:member`, not `account:member`. Note this is only
         // the coarse gate — the lead check ("the member row matching my subject must ALSO have
@@ -292,6 +297,10 @@ pub const MAPPED_OP_ID_PERMISSIONS: &[(&str, Permission)] = &[
     ("procedure.enableProject", Permission::ProjectDisable),
     ("procedure.setDefaultProject", Permission::ProjectUpdate),
     ("procedure.setProjectQuota", Permission::ProjectUpdate),
+    (
+        "procedure.setProjectAllowedModels",
+        Permission::ProjectUpdate,
+    ),
     ("procedure.addProjectMember", Permission::ProjectMember),
     ("procedure.removeProjectMember", Permission::ProjectMember),
     ("procedure.listProjectRoster", Permission::ProjectMember),
@@ -681,6 +690,7 @@ mod tests {
                 "procedure.enableProject",
                 "procedure.setDefaultProject",
                 "procedure.setProjectQuota",
+                "procedure.setProjectAllowedModels",
                 "procedure.addProjectMember",
                 "procedure.removeProjectMember",
                 "procedure.listProjectRoster",

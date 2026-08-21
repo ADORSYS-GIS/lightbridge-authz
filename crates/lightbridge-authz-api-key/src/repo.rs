@@ -1465,6 +1465,58 @@ impl StoreRepo {
         Ok(Self::to_project(row))
     }
 
+    /// Project-scoped rule, identical to `set_project_quota` immediately above (owner or any
+    /// roster member; a non-authorized subject or unknown project is `NotFound`). Backs
+    /// `AuthzStoreImpl::set_project_allowed_models` (#415, ADR-0018 Decision 5). The catalogue
+    /// check itself does NOT happen here -- same layering as `set_project_quota`: it happens in
+    /// `AuthzStoreImpl::set_project_allowed_models`, before this method is ever called. `None` maps
+    /// to SQL `NULL` (via `Self::vec_to_json`, the same mapping `create_project`/`update_project`
+    /// already use) -- see that helper's own doc comment for why NULL, not jsonb `null`.
+    #[instrument(skip(self))]
+    pub async fn set_project_allowed_models(
+        &self,
+        subject: &str,
+        project_id: &str,
+        allowed_models: Option<Vec<String>>,
+    ) -> Result<Project> {
+        let allowed_models_json = Self::vec_to_json(&allowed_models);
+        let row: Option<ProjectRow> = sqlx::query_as(
+            r#"
+            UPDATE projects
+            SET allowed_models = $1, updated_at = $2
+            WHERE projects.id = $3
+              AND (
+                projects.account_id = $4
+                OR EXISTS (
+                  SELECT 1 FROM project_members pm
+                  WHERE pm.project_id = projects.id AND pm.account_id = $4
+                )
+              )
+            RETURNING
+              projects.id,
+              projects.account_id,
+              projects.name,
+              projects.allowed_models,
+              projects.default_limits,
+              projects.billing_plan,
+              projects.billing_identity,
+              projects.project_quota,
+              projects.status,
+              projects.is_default,
+              projects.created_at,
+              projects.updated_at
+            "#,
+        )
+        .bind(allowed_models_json)
+        .bind(Utc::now())
+        .bind(project_id)
+        .bind(subject)
+        .fetch_optional(self.pool())
+        .await?;
+        let row = row.ok_or(Error::NotFound)?;
+        Ok(Self::to_project(row))
+    }
+
     /// Promote `project_id` to be its account's new default project, atomically demoting whichever
     /// project is currently default for that account. Relies on `projects_account_id_default_uidx`
     /// (a partial unique index on `(account_id) WHERE is_default`) to guarantee the invariant even

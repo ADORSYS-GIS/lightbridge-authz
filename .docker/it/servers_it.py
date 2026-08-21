@@ -52,6 +52,7 @@ EXPECTED_MCP_TOOLS = {
     "enable-project",
     "set-default-project",
     "set-project-quota",
+    "set-project-allowed-models",
     "create-api-key",
     "list-api-keys",
     "get-api-key",
