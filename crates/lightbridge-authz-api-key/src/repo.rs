@@ -1511,6 +1511,7 @@ impl StoreRepo {
               projects.project_quota,
               projects.status,
               projects.is_default,
+              projects.model_policy,
               projects.created_at,
               projects.updated_at
             "#,
