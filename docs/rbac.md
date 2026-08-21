@@ -380,12 +380,15 @@ capped), or by queuing the request for a human (`pending_review`) — without an
 policy config. Gated at `budget:self-refill`.
 
 `procedure.getMyBudgetRefillLadder` is the read-only companion over
-`RefillService::refill_status`, gated at the same `budget:self-refill` permission: it returns where
-the caller currently sits on the ADR-0008 ladder for `period`, the next rung (`null` at the top
-rung), and the full static ladder — visibility only, no policy evaluation, no reason codes. It
-exists so a UI can show the ladder instead of offering a tier picker; ADR-0008's ladder stays the
-server's decision space (`current_tier.next()` inside `request_refill`), never a caller-supplied
-choice — see converse-frontends#148 for the prior attempt at a picker and why it was rejected.
+`RefillService::refill_status`, gated at the same `budget:self-refill` permission: it returns the
+self-service refill amounts (`allowedAmountsMicros`) currently offered by the active policy —
+visibility only, no policy evaluation, no reason codes. It exists so a UI can render an amount
+picker without hand-maintaining its own copy of the offered set; `requestBudgetRefill`'s
+`requestedAmountMicros` is checked against this same offered set (ADR-0015) — see
+converse-frontends#148 for the prior, pre-ADR-0015 attempt at a tier picker and why it was rejected
+at the time. #387 removed the pre-ADR-0015 `currentTier`/`nextTier`/`ladder` fields this response
+used to also carry, once the frontend that read them switched to `allowedAmountsMicros` and
+deployed.
 
 `procedure.listPendingAugmentationRequests` / `procedure.approveAugmentationRequest` /
 `procedure.rejectAugmentationRequest` are the admin review queue over

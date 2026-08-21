@@ -34,8 +34,10 @@ mutation requestBudgetRefill(args: {
   budgetAccountId: string
   accountId: string
   projectId?: string
-  period: string        // "YYYY-MM", the calendar month being refilled
+  period: string                 // "YYYY-MM", the calendar month being refilled
   idempotencyKey?: string
+  requestedAmountMicros: string  // required; must be a member of getMyBudgetRefillLadder's
+                                  // allowedAmountsMicros for this same period
 }): AugmentationRequest
 ```
 
@@ -44,6 +46,11 @@ mutation requestBudgetRefill(args: {
   signed-in user's account id for both.
 - `period`: the calendar month the refill applies to, e.g. `"2026-08"`. Almost always "the current
   month" from the UI's perspective.
+- `requestedAmountMicros`: the caller-chosen amount, as a micro-USD decimal string (ADR-0015). Must
+  be one of the values `getMyBudgetRefillLadder` returns in `allowedAmountsMicros`; an amount
+  outside that set is refused with a `BadRequest` before an `AugmentationRequest` row is ever
+  created or the policy engine is ever consulted. **Required** — call `getMyBudgetRefillLadder`
+  first to populate the picker this value comes from.
 - `idempotencyKey`: **generate and send one on every submit.** The client, not the server, owns
   idempotency keys here — a double-click or a retried request with the same key returns the
   original outcome instead of being evaluated twice. Use a fresh UUID/cuid per logical user action
@@ -55,7 +62,7 @@ not normally let a user reach this action if their role doesn't carry it, but sh
 `403` gracefully (generic "you don't have permission" messaging) rather than assuming it can't
 happen.
 
-### `getMyBudgetRefillLadder` — where the caller sits on the ladder (read), before submitting
+### `getMyBudgetRefillLadder` — the amounts currently on offer (read), before submitting
 
 ```
 procedure getMyBudgetRefillLadder(args: {
@@ -67,21 +74,15 @@ procedure getMyBudgetRefillLadder(args: {
 type MyBudgetRefillLadder {
   budgetAccountId: string
   period: string
-  currentTier: string              // e.g. "b-15"
-  currentTierAmountMicros: string  // micro-USD decimal string, same encoding as everywhere else
-  nextTier?: string                // null exactly when already on "b-1000" (the top rung)
-  nextTierAmountMicros?: string    // null under the same condition as nextTier
-  ladder: { tier: string, amountMicros: string }[]   // all 7 rungs, ascending, so a UI never
-                                                       // hand-maintains its own copy of the ladder
+  allowedAmountsMicros: string[]   // strictly ascending micro-USD decimal strings, e.g.
+                                    // ["6000000", "15000000", "30000000"] for $6/$15/$30
 }
 ```
 
-**Added specifically so a UI can show a ladder-visibility panel — "you are here, this is what a
-refill would grant" — before the caller ever clicks refill**, without inventing a caller-chosen
-tier anywhere (see `converse-frontends#148`'s "blocking correction": a tier picker was found not
-buildable against `requestBudgetRefill`'s actual contract, because the server decides the tier,
-not the caller). This procedure closes that gap with visibility, not choice — `requestBudgetRefill`
-above is completely unaffected and still takes no tier/amount input of any kind.
+**Exists so a UI can render an amount picker without hand-maintaining its own copy of the offered
+set.** `allowedAmountsMicros` is the exact set `requestBudgetRefill.requestedAmountMicros` will be
+checked against for this `period` — pass one of these values back, unmodified, as the mutation's
+`requestedAmountMicros`.
 
 No target field — always the caller's own budget account, the same self-scoping guarantee
 `getMyBudgetBalance`/`listMyBudgetGrants` already give (`crates/lightbridge-authz-rest/src/lib.rs`'s
@@ -91,17 +92,24 @@ requires, not the broader `budget:read-own` the balance/grant-history reads use,
 to serve one screen alongside that mutation rather than general budget visibility.
 
 **Deliberately does not preview a policy decision.** It calls no policy engine and returns no
-reason codes or cap prediction — `nextTier`/`nextTierAmountMicros` describe what `request_refill`
-would *ask for* (`current_tier.next()`), not what it is guaranteed to *grant*. Policy can still
-route an actual submission to `pending_review`, cap it, or (much less commonly) deny it — see
+reason codes or cap prediction — `allowedAmountsMicros` describes what `request_refill` will
+*accept as a candidate amount*, not what it is guaranteed to *grant*. Policy can still route an
+actual submission to `pending_review`, cap it, or (much less commonly) deny it — see
 `requestBudgetRefill`'s response and the Status values table below for what a real submission can
 come back as. **UI copy must not imply this preview is a guarantee of the outcome.**
 
-**⚠️ Also does not describe live enforcement.** A successful refill changes the ledger; whether an
-account's ladder position affects anything a request gateway actually enforces is a separate,
-currently-open gap — see "Today, a refill has no gateway effect at all" below. A UI showing this
-ladder should disclose that gap, not just the ladder position, or a caller who refills and sees no
-change in what they can actually do may reasonably conclude the product is broken.
+**⚠️ Also does not describe live enforcement.** A successful refill changes the ledger; whether
+that changes anything a request gateway actually enforces is a separate, currently-open gap — see
+"Today, a refill has no gateway effect at all" below. A UI showing this picker should disclose that
+gap, not just the offered amounts, or a caller who refills and sees no change in what they can
+actually do may reasonably conclude the product is broken.
+
+**Historical note:** before #387, this response also carried `currentTier`/`currentTierAmountMicros`/
+`nextTier`/`nextTierAmountMicros`/`ladder` — a snapshot of the pre-ADR-0015 `BudgetTier` ladder,
+kept additive alongside `allowedAmountsMicros` only while a frontend consumer still read them.
+Those fields, and the tier-progression concept behind them ("you are here, this is next"), no
+longer exist: ADR-0015's amounts are a flat, admin-configured set with no rung ordering, so there
+is nothing left to preview a "next" position for.
 
 ### `listPendingAugmentationRequests` — the admin review queue (read)
 
@@ -177,10 +185,10 @@ The fields a UI actually needs to render, in plain terms (the schema has the exh
 | Field | Meaning for the UI |
 | --- | --- |
 | `status` | See "Status values" below — drives which screen/message to show. |
-| `requestedTier` | The rung being requested, e.g. `"b-30"`. Not usually shown raw to a user — pair with your own tier→dollar-amount display copy if you have one. |
+| `requestedTier` | A best-effort `BudgetTier` label for the requested amount, e.g. `"b-30"` — falls back to `"b-15"` for an amount (e.g. ADR-0015's $6 floor) the enum has no exact variant for. Not usually shown raw to a user; `requestedAmountMicros` is the authoritative value, this is a display convenience only. |
 | `requestedAmountMicros` | The dollar amount as a decimal string in **micro-USD** (divide by 1,000,000 for dollars). String, not a number — see "Why amounts are strings" below. |
 | `approvedAmountMicros` | Set only once a grant happened (`auto_approved` / `partially_approved` / `approved`); same micro-USD string encoding. `null` otherwise. |
-| `policyReasonCodes` | Machine-readable reason codes (e.g. `"within_unaided_allowance"`, `"unaided_allowance_exhausted"`, `"already_at_top_rung"`). Useful for debugging/support tooling; not designed to be shown to an end user verbatim — write your own copy per code, or fall back to a generic message for codes you don't have copy for yet. |
+| `policyReasonCodes` | Machine-readable reason codes (e.g. `"within_unaided_allowance"`, `"unaided_allowance_exhausted"`, `"policy_engine_unavailable"`). Useful for debugging/support tooling; not designed to be shown to an end user verbatim — write your own copy per code, or fall back to a generic message for codes you don't have copy for yet. An amount outside `allowedAmountsMicros` never reaches this field at all — it is refused as a request-level `BadRequest` before any `AugmentationRequest` row exists. |
 | `rejectionReason` | Present only when `status == "denied"` **and a human rejected it** (as opposed to a policy denial — see below). Always show this verbatim when present; see "Rejection reasons" below. |
 | `grantId` | Present when a grant was actually issued. Not usually shown directly, but its presence/absence is a reliable way to tell "did this produce money" apart from `status` alone if you want a belt-and-suspenders check. |
 | `createdAt` / `reviewedAt` | Timestamps for queue/history views. |
@@ -202,7 +210,7 @@ for anything that gets sent back to an API.
 | `auto_approved` | Granted immediately, in full. | "You've been granted $X." Pair with the token-refresh-delay note below. |
 | `partially_approved` | Granted, but capped below the requested tier by policy. | Same as `auto_approved`, but the granted amount (`approvedAmountMicros`) may be less than what was requested (`requestedAmountMicros`) — show the actual granted amount, not the requested one. |
 | `pending_review` | Queued for a human. Not denied, not granted yet. | "Your request is under review" — explicitly NOT "denied" and NOT "granted". Avoid implying a timeline the system doesn't promise (see #191: "admins will action the queue promptly enough... if not, that's a policy problem, not an engineering one" — don't paper over a slow queue with a UI promise). |
-| `denied` | Refused — either by policy (e.g. already at the top rung) or by a human reviewer. | If `rejectionReason` is present, show it verbatim (a human rejected it). If not, this was a policy-level refusal (e.g. `policyReasonCodes` contains `"already_at_top_rung"`) — show a clear, specific message from your own reason-code copy table, not a generic "denied". |
+| `denied` | Refused — either by policy or by a human reviewer. | If `rejectionReason` is present, show it verbatim (a human rejected it). If not, this was a policy-level refusal — show a clear, specific message from your own reason-code copy table (`policyReasonCodes`), not a generic "denied". |
 | `approved` | A queued request was approved by a reviewer and granted. | Same messaging as `auto_approved`/`partially_approved` — from the end user's perspective these all mean "you got more budget," just via different paths. |
 | `created` / `evaluating` | Transient states the RPC surface should never actually return to a caller (every procedure here only returns after evaluation/review has completed) — if you see one, treat it as unexpected and log it, don't build a screen for it. |
 | `cancelled` / `expired` / `applied` | Not produced by `requestBudgetRefill`/`approveAugmentationRequest`/`rejectAugmentationRequest` (the only RPCs that write a status) — reserved for later phases (queue expiry, the Phase 6a/6b gateway-apply step). `listMyAugmentationRequests` would surface one if it ever existed, but none can today. No UI needed yet. |

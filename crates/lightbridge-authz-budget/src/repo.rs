@@ -541,14 +541,13 @@ impl BudgetRepo {
     /// "brand-new account, no grant yet" (Decision 5's `starting_amount_micros`, coincidentally
     /// $15 too under the shipped default policy, but not derived from it here) or "a grant exists
     /// but the amount predates/postdates the compile-time ladder." This method has no
-    /// `PolicyEngine` to read either live value from, and is used today only by the transitional,
-    /// `BudgetTier`-shaped [`crate::refill::RefillStatus`] fields the live frontend still reads
-    /// (see [`crate::refill::RefillService::current_tier`]'s own doc comment) -- so both defaults
-    /// deliberately stay `B15` rather than being wired to either policy field. The token-mint
-    /// path that DOES need the real fail-closed floor
-    /// (`TokenExchangeOpStore::resolve_budget_tier` in `lightbridge-authz-rest`) reads
-    /// `fail_closed_floor_micros()` directly on its OWN `Err` branch below, never through this
-    /// method's internal `B15` defaults.
+    /// `PolicyEngine` to read either live value from, and after #387 removed the transitional,
+    /// `BudgetTier`-shaped `RefillStatus` fields a live frontend used to read, its only remaining
+    /// caller is the token-mint/refresh path below -- so both defaults deliberately stay `B15`
+    /// rather than being wired to either policy field. The token-mint path that DOES need the real
+    /// fail-closed floor (`TokenExchangeOpStore::resolve_budget_tier` in `lightbridge-authz-rest`)
+    /// reads `fail_closed_floor_micros()` directly on its OWN `Err` branch below, never through
+    /// this method's internal `B15` defaults.
     pub async fn current_tier(
         &self,
         budget_account_id: &str,

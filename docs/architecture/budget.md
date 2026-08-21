@@ -107,10 +107,9 @@ Notes the diagram can't carry:
 flowchart TD
     Req["RefillService::request_refill"] --> Idem{"idempotency_key\nalready seen?"}
     Idem -- yes --> Existing["return existing request\n(no re-evaluation)"]
-    Idem -- no --> Tier["resolve current tier\n(latest tier-granting grant this period,\nfallback B15)"]
-    Tier --> NextTier{"tier.next()\nexists?"}
-    NextTier -- no, already B1000 --> DenyTop["denied: already_at_top_rung\n(policy engine never called)"]
-    NextTier -- yes --> Create["create budget_augmentation_requests row\n(status = created)"]
+    Idem -- no --> Offered{"requested_amount_micros\nin allowed_amounts_micros?\n(ADR-0015, active policy)"}
+    Offered -- no --> DenyAmount["Err: AmountNotOffered\n(policy engine never called)"]
+    Offered -- yes --> Create["create budget_augmentation_requests row\n(status = created)"]
     Create --> Facts["gather Facts:\neffective_balance_micros (BudgetRepo)\nself_service_grant_count (budget_balances)\nspend_this_period, spend_last_period (SpendReader)"]
     Facts --> Engine["PolicyEngine::evaluate(Facts, requested_amount)"]
     Engine -- Err --> EngineDown["pending_review:\npolicy_engine_unavailable"]
@@ -120,6 +119,11 @@ flowchart TD
     Effect -- ManualReview --> Recorded2["record_decision:\npending_review"]
     Effect -- Deny / NoAction --> Recorded3["record_decision:\ndenied"]
 ```
+
+#387 removed the pre-ADR-0015 tier-progression branch this flowchart used to show
+(`RefillService::current_tier`, `tier.next()`, `already_at_top_rung`): every refill now names an
+amount directly, validated against the active policy's `allowed_amounts_micros` before a request
+row is ever created.
 
 `Facts` is gathered fresh for every request (`RefillService::load_facts`) — nothing is cached
 across calls. `spend_this_period`/`spend_last_period` come from a `SpendReader`, which reads
@@ -159,24 +163,23 @@ of five `*_total_micros` columns (`base`/`migration` → `base_total_micros`,
 `correction` adjusts only `effective_budget_micros` directly, never a named bucket, since crediting
 it to one would misattribute the adjustment to whatever it's compensating for.
 
-## The discrete tier ladder (ADR-0008)
+## The discrete tier ladder (ADR-0008) and its ADR-0015 supersession
 
-Refills move an account up one fixed rung at a time, not by an arbitrary requested amount:
+`BudgetTier` (`B15`/`B30`/`B60`/`B120`/`B250`/`B500`/`B1000`) started as the ladder a refill moved
+an account up one fixed rung at a time. ADR-0015 moved the *offered amounts* off this compile-time
+ladder onto an admin-configured, flat policy set (`allowed_amounts_micros`) instead — a refill now
+names any amount from that set directly (checked in `RefillService::request_refill`), not
+necessarily the next rung up, and there is no "top rung" concept left to deny against. #387
+completed that migration by deleting the last code that resolved a "current tier" from grant
+history to derive an amount (`RefillService::current_tier`, `tier.next()`), and the
+`RefillStatus`/`MyBudgetRefillLadder` fields that exposed it.
 
-`B15` ($15) → `B30` → `B60` → `B120` → `B250` → `B500` → `B1000` ($1,000)
-
-`BudgetTier::next()` returns `None` at `B1000` — the top rung has nothing above it, and
-`request_refill` denies with `already_at_top_rung` without ever calling the policy engine in that
-case. A refill request always asks for exactly `current_tier.next()`'s amount; there is no
-"request $200" free-form path.
-
-**Reset-not-add semantics**: refilling moves an account to the next rung's absolute amount, it
-does not add the rung's amount on top of whatever is left. `RefillService::current_tier` resolves
-"the tier this account is currently on" from the most recent *tier-representing* grant this period
-(sources `base`/`self_service`/`automatic`/`admin`/`manual_approval`/`promotion` — deliberately
-excluding `correction`/`refund`, neither of which represents a tier), falling back to `B15` if no
-such grant exists yet, or if the most recent one doesn't match any known rung amount exactly (a
-defensive fallback, not an expected case).
+`BudgetTier` itself is not removed: `BudgetTier::from_amount_micros` still supplies a best-effort
+display label (`requestedTier` on `AugmentationRequest`) for whichever amount was actually
+requested, falling back to `B15` for an amount the enum has no exact variant for (e.g. ADR-0015's
+$6 floor) — a labeling convenience only, never a source of truth for what amount is grantable.
+[`BudgetRepo::current_tier`] is also still live, but only as the ADR-0014 token-mint claim's own
+tier lookup, independent of the refill path.
 
 ## What is actually live versus merely implemented
 
@@ -206,12 +209,12 @@ present to the `lightbridge-ss` frontend.
   a different policy revision is activated.
 - **Billing-plan → starting-tier mapping (ADR-0008) is unimplemented.** ADR-0008 says the billing
   plan determines the starting rung; that mapping does not exist anywhere in this codebase.
-  `RefillService::current_tier` defaults every account with no qualifying grant history this
-  period to `BudgetTier::B15`, the lowest rung, regardless of plan — flagged explicitly in
-  `refill.rs`'s own module doc comment as "a deliberate, flagged simplification for follow-up, not
-  something this PR is claiming is fully solved." An enterprise-plan account starts at the same
-  rung as a free-plan one and has to refill repeatedly, one rung at a time, to reach where it
-  should have started.
+  `BudgetRepo::current_tier` (the ADR-0014 token-mint claim's tier lookup) defaults every account
+  with no qualifying grant history this period to `BudgetTier::B15`, the lowest rung, regardless of
+  plan — flagged explicitly in `refill.rs`'s own module doc comment as "a deliberate, flagged
+  simplification for follow-up, not something this PR is claiming is fully solved." An
+  enterprise-plan account starts at the same rung as a free-plan one and has to refill repeatedly,
+  one rung at a time, to reach where it should have started.
 - **Policy administration has no UI.** `activateBudgetPolicy`, `getBudgetPolicyStatus`, and
   `simulateBudgetPolicy` exist as permission-gated RPC procedures
   (`crates/lightbridge-authz-api/schema/authz.cstack`) and are exercised by tests, but nothing in
