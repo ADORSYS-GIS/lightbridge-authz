@@ -2937,9 +2937,12 @@ async fn update_api_key_cannot_clear_expiry_with_real_cborg_null_bytes() {
 /// `invalid_argument` / "invalid request payload" the production report described -- a CBOR empty
 /// array has no mapping onto `Option<DateTime<Utc>>` any more than it did onto a plain `DateTime`.
 ///
-/// Fixed in `LenientCborCodec::encode` (`codec.rs`) by constructing a `minicbor_serde::Serializer`
-/// with `serialize_unit_as_null(true)` instead of delegating to
-/// `cratestack_codec_cbor::CborCodec::encode`'s hardcoded default. This test was the end-to-end
+/// Originally fixed in `LenientCborCodec::encode` (`codec.rs`) by constructing a
+/// `minicbor_serde::Serializer` with `serialize_unit_as_null(true)` instead of delegating to
+/// `cratestack_codec_cbor::CborCodec::encode`'s hardcoded default. As of cratestack 0.8.6
+/// (cratestack/cratestack#675, closing #657) the raw `CborCodec::encode` does this itself, so
+/// `LenientCborCodec::encode` now just delegates straight through -- see `codec.rs`'s module doc
+/// comment for the full mechanism and the upstream commit link. This test was the end-to-end
 /// proof, byte-for-byte, that the frontend's `createBatchLink()` + `cborg` output for a batched
 /// `createApiKey` call with `expiresAt: null` decoded correctly and *succeeded*.
 ///

@@ -308,55 +308,57 @@ mimalloc = "0"
 # `permission_denied` for a caller lacking read permission, an upstream cratestack row-filter-vs-
 # hard-gate property this fix did not create -- are recorded in `auth_provider.rs`'s own module doc
 # (search "Two accepted, documented behavior differences") and in the PR that resolved this issue.
-cratestack-core = "=0.8.4"
-cratestack-axum = "=0.8.4"
-cratestack-redis = "=0.8.4"
+#
+# BUMPED (2026-08-21, cratestack 0.8.4 -> 0.8.6): 0.8.5 was never independently published to
+# crates.io (its workspace-version bump landed as part of the 0.8.6 tag, per cratestack's own
+# release notes -- `crates.io/api/v1/crates/cratestack-pg` lists no 0.8.5), so this is a single
+# jump, not two. Verified no-op for this repo: 0.8.5 dropped protobuf/gRPC entirely (its own
+# breaking-change ADR 0017) -- this workspace has no `transport grpc`, `@pb(`, or dependency on
+# `cratestack-grpc`/`cratestack-proto`, confirmed by grep, so nothing here was reachable by that
+# removal. 0.8.6 also adds If-Match/ETag on generated update/delete and "omit untouched
+# update-input fields from the wire" (cratestack/cratestack#673) -- neither is used by any
+# hand-written call site in this repo today, so both are inert here, not exercised.
+#
+# The bump's actual payload for this repo: cratestack commit 2c0f4676 (PR
+# https://github.com/cratestack/cratestack/pull/675, cratestack/cratestack#657) makes
+# `cratestack_codec_cbor::CborCodec::encode` itself enable
+# `minicbor_serde::Serializer::serialize_unit_as_null`, which is verbatim the same fix
+# `crates/lightbridge-authz-rest/src/codec.rs`'s `LenientCborCodec::encode` override was hand-
+# rolling locally (confirmed by reading upstream's actual 0.8.6 `cratestack-codec-cbor` source,
+# not just its changelog prose -- `minicbor_serde::Serializer::new` + `serialize_unit_as_null(true)`
+# + the identical `serde_json::Value::Null` root-cause comment). That override is REMOVED --
+# `LenientCborCodec::encode` now delegates straight to the wrapped `CborCodec::encode`. The
+# DECODE-side half of `LenientCborCodec` (wire-level `undefined` -> `null` normalization, `cborg`'s
+# encoding of a JS `undefined` property) is untouched by 0.8.6 -- upstream `CborCodec::decode` is
+# still a bare `minicbor_serde::from_slice`, no `undefined` handling -- so `LenientCborCodec` stays,
+# narrowed to decode-only. `codec.rs`'s own module doc comment carries the full mechanism and the
+# byte-level (`0xf6` vs `0x80`) regression tests that pin this down independent of who implements
+# the encode fix. Also checked and confirmed orthogonal: cratestack#676 (0.8.6, required-enum-field
+# literal comparisons in read policies) only extends the SAME SQL-predicate-compilation mechanism
+# lightbridge-authz#401 is about to a new field type -- it does not add a pre-dispatch permission
+# gate, so it changes nothing about #401's "filter, not refuse" read-policy question.
+cratestack-core = "=0.8.6"
+cratestack-axum = "=0.8.6"
+cratestack-redis = "=0.8.6"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
 # `include_server_schema!` macro emits `::cratestack::*` paths (see cratestack-pg lib docs). The
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
 # it to build the RPC router (ADR-0003).
-cratestack = { package = "cratestack-pg", version = "=0.8.4" }
-cratestack-codec-cbor = "=0.8.4"
-cratestack-codec-json = "=0.8.4"
+cratestack = { package = "cratestack-pg", version = "=0.8.6" }
+cratestack-codec-cbor = "=0.8.6"
+cratestack-codec-json = "=0.8.6"
 # Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
 # feature). See that module for why.
 minicbor = { version = "2.2", features = ["std", "half"] }
-# Direct dep (also pulled in transitively via cratestack-codec-cbor) so `LenientCborCodec::encode`
-# can construct its own `minicbor_serde::Serializer` with `serialize_unit_as_null(true)` instead of
-# going through `cratestack_codec_cbor::CborCodec::encode`'s hardcoded `minicbor_serde::to_vec`
-# (which leaves that flag at its default `false`). See `codec.rs` for the full mechanism this
-# works around: `serde_json::Value::Null`'s `Serialize` impl calls `serializer.serialize_unit()`,
-# not `serialize_none()`, and minicbor-serde's own `serialize_unit()` encodes `()` as CBOR's empty
-# array (`0x80`) rather than null (`0xf6`) unless this flag is set — confirmed directly against
-# `cratestack-codec-cbor`'s own source and test comments, which document this exact pitfall for
-# `serde_json::Value::Null` but only guard the model-projection decode path, not the
-# `/rpc/batch` handler's `RpcRequest.input: serde_json::Value` re-encode step (cratestack-axum's
-# `rpc_batch_dispatch`/`encode_rpc_value`).
-# ⚠️ MUST STAY ON 0.6.x. Rejected the 0.7.1 bump (#405) 2026-08-21, and this comment exists so
-# the next Dependabot attempt is answered here rather than re-investigated.
-#
-# `cratestack-codec-cbor = "=0.8.4"` hard-constrains its own `minicbor-serde` requirement to
-# `^0.6.2`. Moving THIS requirement to 0.7 therefore does not upgrade anything -- it makes Cargo
-# resolve TWO coexisting `minicbor-serde` versions (0.6.2 for cratestack's own `CborCodec`, 0.7.1
-# for our `LenientCborCodec`), both encoding CBOR on the same request path. Dependabot's own
-# lockfile diff shows it: entries become version-disambiguated (`"minicbor-serde 0.6.2"` vs
-# `"minicbor-serde 0.7.1"`), which Cargo only writes when multiple versions coexist.
-#
-# That is the `jsonwebtoken`-double-major failure shape (see the authkestra block above), aimed at
-# the one seam we can least afford it: `LenientCborCodec` exists precisely BECAUSE cratestack's
-# encoder and ours disagreed about how to encode `null` -- `serde_json::Value::Null` serializes via
-# `serialize_unit()`, which minicbor-serde encodes as CBOR's empty array `0x80` unless
-# `serialize_unit_as_null(true)` is set (see `codec.rs`). That mismatch shipped to production as a
-# white-screen crash (`TypeError: x.trim is not a function`) and took real time to diagnose.
-#
-# And the bump buys nothing: 0.6.2 and 0.7.1 have byte-for-byte identical `Serializer`,
-# `serialize_unit_as_null`, and `serialize_unit` bodies (diffed both vendored `src/ser.rs`); 0.7
-# only adds i128/u128 support and a tag-container mechanism, neither of which touches unit/null
-# handling. Revisit only when `cratestack-codec-cbor` itself moves to `^0.7`, and then bump both
-# together -- never this one alone.
-minicbor-serde = "0.6"
+# No direct `minicbor-serde` dependency here (2026-08-21 cratestack 0.8.6 bump removed it, see the
+# cratestack pin block's "BUMPED" note above). It still exists in the dependency graph -- pulled in
+# transitively via `cratestack-codec-cbor` -- but nothing in this workspace names it directly any
+# more now that `LenientCborCodec::encode` was deleted (upstream's own `CborCodec::encode` does the
+# `serialize_unit_as_null(true)` fix itself as of 0.8.6). The `#405`-rejection comment that used to
+# live on a direct `minicbor-serde = "0.6"` line here is gone with the dependency it explained --
+# that pin no longer exists to have an opinion about.
 # lightbridge-authz#363: `tokio-rustls-comp` is a superset of the previous `tokio-comp` (it
 # enables `tls-rustls` + `tokio-comp` together — see docs.rs/crate/redis/1.5.0/features), so
 # `rediss://` URLs now build a rustls-backed TLS connection via `redis::Client::build_with_tls`
