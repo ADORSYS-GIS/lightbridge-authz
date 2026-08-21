@@ -92,9 +92,31 @@ jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
 # so all three lines below MUST move together on any future bump, exactly like the cratestack
 # lockstep block further down — a partial bump within this trio reproduces the exact failure mode
 # the old git-pin comment (see git history) documented for jsonwebtoken majors.
-authkestra-resource = "0.5.0"
-authkestra-op = "0.5.0"
-authkestra-engine = "0.5.0"
+#
+# DRIFT OCCURRED (2026-08-21, #404/#406): Dependabot opened one PR per crate — #406
+# (`authkestra-resource` 0.5.0 -> 0.5.1) and #404 (`authkestra-op` 0.5.0 -> 0.5.1) — same as the
+# cratestack family's recurring failure mode documented in the block below. #406 merged first,
+# touching only `Cargo.lock` (the caret range `"0.5.0"` already permitted 0.5.1, so there was
+# nothing for it to change in this manifest); `authkestra-engine` incidentally floated to 0.5.1 in
+# the same lockfile resolution even though nothing bumped it directly, because the resolver picks
+# the newest version satisfying the shared caret range for every crate, not just the one Dependabot
+# targeted. That left `authkestra-op` alone at 0.5.0 in `Cargo.lock` until #404 merged separately —
+# exactly the "two of three moved, one didn't" shape, caught only because `jsonwebtoken` happened to
+# stay at a single 11.0.0 entry throughout (re-verify with the grep two paragraphs up any time this
+# recurs; it is what actually would have failed the build).
+#
+# Per the cratestack block's own "FOURTH OCCURRENCE" finding below: a caret requirement string is
+# not durable against this, because Dependabot's scheduled `cargo update` can silently move a
+# `Cargo.lock` entry within an already-permitted range without ever touching `Cargo.toml` — there is
+# no diff to notice in review. Applying that same fix here: every line below is now an exact `=`
+# pin, so a future single-crate Dependabot bump either edits the requirement string itself (a visible,
+# reviewable `Cargo.toml` diff) or fails to resolve — it cannot land as a silent lockfile-only float
+# again. This repo has no downstream consumers of its own `Cargo.toml` (it produces binaries, not a
+# published library), so exact-pinning carries none of the "raises the floor for consumers" cost an
+# exact pin would have in a published crate.
+authkestra-resource = "=0.5.1"
+authkestra-op = "=0.5.1"
+authkestra-engine = "=0.5.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "tracing", "net", "time"] }
 thiserror = "2"
 anyhow = "1"
