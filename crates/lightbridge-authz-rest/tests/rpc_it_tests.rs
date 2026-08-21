@@ -398,9 +398,8 @@ async fn crud_lifecycle_for_all_resources() {
     assert!(accounts["totalCount"].as_i64().unwrap() >= 1);
 
     // `Account.defaultQuota` is `@readonly` on the generic verb since #379 -- updated via the
-    // dedicated `updateAccountDefaultQuota` procedure instead (`model.Account.update` still exists
-    // for whatever fields remain generically writable; there are none left on `Account` today, see
-    // that procedure's own doc comment).
+    // dedicated `updateAccountDefaultQuota` procedure instead. `model.Account.update` itself was
+    // removed entirely by #398, since #379 had left it with zero generically-writable fields.
     let new_quota = format!("tenant2-{}", cuid2());
     let (status, body) = rpc_call(
         r.clone(),
@@ -1165,11 +1164,10 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
 
     // Viewer is blocked by the coarse RBAC gate (403) on every mutating op — even though membership
     // would otherwise permit it. This is the privilege-escalation regression under test.
+    // `model.Account.update` is deliberately absent from this loop: since #398 it is unmapped
+    // (denied unconditionally, see below), not merely permission-gated, so a viewer 403 on it
+    // would prove nothing about *this* regression specifically.
     for (op, input) in [
-        (
-            "model.Account.update",
-            json!({ "id": account_id, "patch": { "defaultQuota": "x" } }),
-        ),
         ("model.Account.delete", json!({ "id": account_id })),
         (
             "model.Project.create",
@@ -1197,13 +1195,30 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
         );
     }
 
-    // Admin succeeds on a representative mutating op the viewer was denied. Uses
-    // `procedure.updateAccountDefaultQuota`, not `model.Account.update` (the op the loop above
-    // exercises for the *viewer-denied* half): since #379 marked `Account.defaultQuota`
-    // `@readonly`, `model.Account.update`'s generated input has zero settable fields left, so
-    // every call to it -- including an authorized admin's -- now 422s with cratestack's own
-    // "update input must contain at least one changed column" before ever reaching the RBAC
-    // question this assertion is about. The procedure is the real write path post-#379.
+    // `model.Account.update` (#398, completing #379): #379 marked `Account.defaultQuota`, the
+    // verb's only settable field, `@readonly`, leaving it with zero writable fields, so it 422ed
+    // unconditionally for every caller -- a live endpoint that could only ever fail. #398 removed
+    // the schema's `@@allow("update")` and its `rpc_authorize.rs` permission mapping, so it is now
+    // unreachable at both layers. Proven here against the real DB-backed dispatch pipeline, with a
+    // fully-privileged admin, specifically to rule out the old 422: if this ever regressed back to
+    // a mapped-but-empty verb, this assertion would catch the reappearing 422, not just a 403.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Account.update",
+        Wire::Cbor,
+        &json!({ "id": account_id, "patch": { "defaultQuota": "x" } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "model.Account.update must be unreachable (403), not the old unconditional 422: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Admin succeeds on a representative mutating op the viewer was denied.
+    // `procedure.updateAccountDefaultQuota` is the real write path post-#379/#398.
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.updateAccountDefaultQuota",
@@ -1927,6 +1942,68 @@ async fn batch_rpc_read_verbs_filter_to_empty_not_an_error_for_a_caller_lacking_
              {list_frame}"
         );
     }
+}
+
+/// The unary counterpart to the batch test above (#401) -- pins the OTHER half of the asymmetry
+/// that test's own doc comment claims but does not itself exercise: a UNARY `model.Account.get`/
+/// `.list` call from a caller lacking `account:read` never reaches cratestack's dispatch/query
+/// layer at all. Both `rpc_authorize` (the outer Axum middleware) and
+/// `CratestackAuthProvider::authenticate`'s unary branch (`auth_provider.rs`) hard-gate on the
+/// *coarse* `op_id` -> permission map from `rpc_authorize::required_permission` BEFORE dispatch, so
+/// the caller gets a clean `403`, never the SQL-filtered empty/not-found shape
+/// `batch_rpc_read_verbs_filter_to_empty_not_an_error_for_a_caller_lacking_read_permission` proves
+/// for the batch path. Together the two tests pin the full, decided contract #401 asked for: read
+/// verbs hard-refuse on the unary surface and filter only inside `/rpc/batch`, where cratestack's
+/// per-frame `CachedAuthProvider` change (0.8.4) leaves no pre-dispatch hook to hard-gate a read
+/// verb -- see `docs/rbac.md`'s "Read verbs filter, they do not refuse" section for the decision
+/// this documents and why routing these three models' reads through hand-written procedures (the
+/// only structural fix) was rejected as disproportionate to a diagnosability-only risk.
+#[tokio::test]
+async fn unary_read_verb_hard_refuses_a_caller_lacking_read_permission() {
+    let owner = format!("owner-unary-readfilter-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("owner", token_info(&owner, admin_perms()))
+            .with(
+                "zero",
+                token_info(&owner, lightbridge_authz_core::authz::PermissionSet::new()),
+            ),
+    );
+    let ctx = setup(bearer).await;
+    let account_id = create_account(&ctx.router, "owner", "unused").await;
+    assert_eq!(account_id, owner, "account id is the subject per ADR-0006");
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "model.Account.get",
+        Wire::Cbor,
+        &json!({ "id": account_id }),
+        Some("zero"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "unary get for a caller lacking account:read must hard-refuse before dispatch, not \
+         filter to not-found: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "model.Account.list",
+        Wire::Cbor,
+        &json!({}),
+        Some("zero"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "unary list for a caller lacking account:read must hard-refuse before dispatch, not \
+         filter to empty: {}",
+        String::from_utf8_lossy(&body)
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

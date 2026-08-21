@@ -148,13 +148,11 @@ model Account {
   // the only write path after creation, matching the `status` pattern immediately below.
   //
   // Confirmed consequence, not just a theoretical one: `defaultQuota` was `Account`'s only
-  // generically-settable field (`status` was already `@readonly`), so `model.Account.update` now
-  // has ZERO settable fields left -- cratestack rejects every call to it, even from an otherwise
-  // fully-authorized caller, with 422 "update input must contain at least one changed column"
-  // (`crates/lightbridge-authz-rest/tests/rpc_it_tests.rs::rbac_gate_admin_succeeds_and_member_
-  // viewer_reads_but_cannot_write` exercises this directly). The verb is left mapped rather than
-  // denied -- removing it outright is an explicit maintainer decision per #379's own scope, not an
-  // assumption to bake in here -- but callers should treat it as permanently non-functional today.
+  // generically-settable field (`status` was already `@readonly`), so #379 left `model.Account.
+  // update` with ZERO settable fields -- every call, even from an otherwise fully-authorized
+  // caller, 422ed with "update input must contain at least one changed column". #398 removed the
+  // verb outright rather than leaving a live endpoint that could only ever fail -- see the NOTE
+  // above `@@audit` below for the removal itself.
   defaultQuota String? @readonly
   // Server-managed lifecycle state: set only by the disable/enable procedures and the
   // DB `DEFAULT 'active'` (migrations/20260714000001). `@readonly` drops it from the
@@ -172,10 +170,18 @@ model Account {
   // per ADR-0006 there is no more membership/role concept to gate it with -- one account is one
   // person, so its hand-written SQL check becomes simply "the caller is this account" (updated
   // in the ADR-0006 follow-up procedure pass, not this schema/migration pass).
+  //
+  // NOTE: no `@@allow("update", ...)` either (#398, completing #379). #379 marked `defaultQuota`
+  // (the only field the generic verb could still write) `@readonly`, so `model.Account.update`
+  // had zero settable fields left and 422ed unconditionally, for every caller, regardless of
+  // permission -- a live, discoverable RPC verb that could only ever fail. Removed outright
+  // rather than kept registered "just in case": account default-quota updates go exclusively
+  // through `procedure.updateAccountDefaultQuota`, below. `model.Account.update` is also denied
+  // unconditionally at the RBAC layer (crates/lightbridge-authz-rest/src/rpc_authorize.rs), same
+  // pattern as `model.ApiKey.create`'s NOTE on the `ApiKey` model further down this file.
   @@audit
   @@paged
   @@allow("read", (id == auth().id) && auth().rpcScope == "crud" && auth().permAccountRead == true)
-  @@allow("update", (id == auth().id) && auth().rpcScope == "crud" && auth().permAccountUpdate == true)
 }
 
 model Project {
@@ -438,17 +444,16 @@ mutation procedure createAccount(args: CreateAccountInput): Account
   @allow((auth() != null) && auth().rpcScope == "crud" && auth().permAccountCreate == true)
 
 // Updates `Account.defaultQuota` post-creation (#379, completing #177/#375):
-// `Account.defaultQuota` is `@readonly` above, so the generic `model.Account.update` verb can no
-// longer set it -- this procedure is the only write path left. Shaped like `disableAccount`/
+// `Account.defaultQuota` is `@readonly` above, and `model.Account.update` itself was removed
+// entirely by #398 (it had zero settable fields left after that `@readonly`, so it 422ed
+// unconditionally) -- this procedure is the sole write path. Shaped like `disableAccount`/
 // `enableAccount` immediately below, not like `createAccount`: it carries an explicit `accountId`
-// argument even though the schema's own `@@allow("update", id == auth().id)` on `Account` (dropped
-// from the generic verb's own policy the same way it always applied) means only a self-update ever
-// succeeds -- `id = accountId AND id = auth().id` is enforced in the hand-written SQL `WHERE`
-// clause, same as those two procedures' `StoreRepo::set_account_status`. Implemented as
-// hand-written sqlx in the ProcedureRegistry impl (`AuthzStoreImpl::update_account_default_quota`
-// -> `StoreRepo::update_account_default_quota`), validating `defaultQuota` against the
-// operator-configured catalog at write time (config, not DB) before the DB write, same
-// pattern/error shape as `createAccount`'s own check.
+// argument even though only a self-update ever succeeds -- `id = accountId AND id = auth().id` is
+// enforced in the hand-written SQL `WHERE` clause, same as those two procedures'
+// `StoreRepo::set_account_status`. Implemented as hand-written sqlx in the ProcedureRegistry impl
+// (`AuthzStoreImpl::update_account_default_quota` -> `StoreRepo::update_account_default_quota`),
+// validating `defaultQuota` against the operator-configured catalog at write time (config, not
+// DB) before the DB write, same pattern/error shape as `createAccount`'s own check.
 type UpdateAccountDefaultQuotaInput {
   accountId String
   defaultQuota String?

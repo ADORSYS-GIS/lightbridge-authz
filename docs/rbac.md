@@ -31,9 +31,12 @@ Enforcement is centralized, so the handlers/tools themselves contain no authoriz
   "Batch RPC: per-frame RBAC" below.
 - **CratestackAuthProvider** (`crates/lightbridge-authz-rest/src/auth_provider.rs`) enforces the
   *same* `op_id` → permission map a second time, from inside cratestack's own dispatch. Redundant for
-  a unary call (already checked by `rpc_authorize` above), but this is what actually authorizes a
-  `POST /rpc/batch` request: cratestack calls this provider once per frame, each time with that
-  frame's own canonical `/rpc/<op_id>` path, so every frame in a batch is authorized independently.
+  a unary call (already checked by `rpc_authorize` above — `request.path` is that call's own
+  canonical path both before and after cratestack 0.8.4). For `POST /rpc/batch`, cratestack 0.8.4
+  changed this: the provider is now invoked exactly **once per envelope**, not once per frame (a new
+  `CachedAuthProvider` caches the one resulting context and reuses it for every frame's dispatch), so
+  it can no longer see an individual frame's op-id to authorize it here at all. See "Batch RPC:
+  per-frame RBAC" below for where per-frame enforcement actually happens post-0.8.4.
 - **MCP** — `call_tool` maps the tool name to the required permission and checks it before
   dispatching. It likewise fails closed (an unmapped tool name is rejected).
 
@@ -65,22 +68,44 @@ auth, outside RBAC) — is unchanged, and the MCP enforcement above is unaffecte
 `POST /rpc/batch` bundles multiple ops in one JSON array of frames (`{id, op, input}`), each
 carrying its own `op` (op-id). `rpc_authorize` is a URL-derived, whole-HTTP-request gate — it has no
 visibility into the frames inside the body, so it cannot check a single permission for the batch call
-the way it does for `POST /rpc/{op_id}`. Instead:
+the way it does for `POST /rpc/{op_id}`, and neither can `CratestackAuthProvider::authenticate`
+(cratestack 0.8.4 authenticates a batch envelope exactly once, before it is even split into frames —
+see the bullet above). Since #383/#400, per-frame enforcement instead moves into the schema itself:
 
 1. **`rpc_authorize`** requires only that the caller present *some* valid, active bearer token, then
    forwards the request — a wholly unauthenticated batch call still gets a clean top-level `401`
    rather than a `200` envelope full of per-frame `unauthenticated` errors.
-2. **`CratestackAuthProvider::authenticate`** does the actual permission check, once per frame:
-   cratestack's batch dispatch calls it once for every frame, each time with that frame's own
-   canonical `/rpc/<op_id>` path, and it looks that op-id up in the *same* map `rpc_authorize` uses
-   for unary calls. A frame whose op the caller lacks permission for fails independently with
-   `{"error": {"code": "permission_denied", ...}}` in its own slot — the rest of the batch, and the
-   overall `200`, are unaffected.
+2. **`CratestackAuthProvider::authenticate`** builds ONE `CratestackContext` for the whole envelope,
+   carrying the caller's `id`, which server (`authz-api` vs `authz-budget`) is asking (`rpcScope`),
+   and one boolean field per `Permission` (`permAccountRead`, `permProjectCreate`, …) — the caller's
+   real, already-computed `TokenInfo::has_permission` verdicts, never a blanket `true`
+   (`build_context` in `auth_provider.rs`).
+3. **cratestack's own per-frame policy evaluation** — re-entered once per batch frame from inside
+   `#dispatch_ident`, unaffected by the envelope-level auth caching — reads that ONE context back out
+   per frame via `@allow`/`@@allow` clauses in `crates/lightbridge-authz-api/schema/authz.cstack`.
+   Those clauses are **generated**, not hand-transcribed, from the exact `op_id` → `Permission` map
+   `rpc_authorize::MAPPED_OP_ID_PERMISSIONS` defines (see
+   `crates/lightbridge-authz-rest/tests/schema_policy_sync_tests.rs`, which fails CI on drift) — so a
+   batch frame is authorized against the *same* permission every unary call to that op-id would need.
+
+For `create`/`update`/`delete` verbs and every `procedure.*`, this schema-level check is a genuine
+hard gate — cratestack's create/update SQL executors evaluate the policy expression as an
+application-level pre-check and return `Forbidden` on denial, and `authorize_procedure` does the
+same for procedures — so a frame whose op the caller lacks permission for fails independently with
+`{"error": {"code": "permission_denied", ...}}` in its own slot, exactly like a unary call would.
+
+**`model.*` `list`/`get` verbs are the one exception — see "Read verbs filter, they do not refuse"
+below.** `@@allow("read", …)` compiles into the SQL `WHERE` clause itself
+(`cratestack-sqlx/src/render/policy.rs`), not an application-level pre-check, so there is nothing for
+that boolean permission field to short-circuit against before the query runs. A batch frame calling
+`model.Account.list`/`.get` (or the `Project`/`ApiKey` equivalents) for a caller lacking the read
+permission does not fail at all — it returns `200` with an empty list / a `null` get, the SAME shape
+as a caller who holds the permission but owns none of the matching rows.
 
 One token authorizes every frame in a batch (there's one `Authorization` header per HTTP request, not
 per frame) — so a batch mixing a permitted read and a forbidden write for the *same* caller returns
 `200` with the read's `output` in one frame and a `permission_denied` `error` in the other. Membership
-(`@@allow`) is still the second gate per frame, exactly as for unary calls.
+(`@@allow`) is still the second gate per frame for both shapes, exactly as for unary calls.
 
 The `op_id` → permission and tool → permission maps are the single sources of truth and must stay in
 sync with the tables below. The claim is read at request time; the role→permission map is compiled
@@ -200,15 +225,20 @@ listed here is denied unconditionally (fail closed).**
 The permission each op-id requires is unchanged by that move; only the host and path prefix
 differ. A third gate, `RpcScope` (`rpc_authorize.rs`), sits ahead of the RBAC/membership pair
 described above and enforces this split: `authz-api` 404s every `budget:*` op-id before the RBAC
-gate even runs, and `authz-budget` 404s everything else the same way — including per-frame inside
-a `/rpc/batch` call, via the same `CratestackAuthProvider::authenticate` mechanism "Batch RPC:
-per-frame RBAC" above describes for the permission check.
+gate even runs, and `authz-budget` 404s everything else the same way, for a **unary** call. Inside
+`POST /rpc/batch` the scope check moves with everything else described in "Read verbs filter, they
+do not refuse" above: `rpcScope` is baked into the one envelope-level context as `auth().rpcScope`,
+and every mapped op-id's generated schema clause checks it, so an out-of-scope batch frame still
+gets refused — but as `403 permission_denied` (cratestack's policy layer can only ever return
+`Forbidden` on denial, never `NotFound`), not the clean `404` a unary call to the same op-id gets.
+That 403-vs-404 divergence is a separate, deliberate accepted trade-off recorded in PR #400 — out of
+scope for #401.
 
 | Permission        | RPC `op_id`                                          | MCP tool                            |
 | ----------------- | ---------------------------------------------------- | ----------------------------------- |
 | `account:create`  | `procedure.createAccount`                            | `create-account`                    |
 | `account:read`    | `model.Account.list`, `model.Account.get`, `model.AccountSummary.list`, `model.AccountSummary.get` | `list-accounts`, `get-account` |
-| `account:update`  | `model.Account.update`, `procedure.updateAccountDefaultQuota` | `update-account`          |
+| `account:update`  | `procedure.updateAccountDefaultQuota` | `update-account`          |
 | `account:delete`  | `procedure.deleteAccountPermanently`                 | `delete-account`                    |
 | `account:disable` | `procedure.disableAccount`, `procedure.enableAccount`| `disable-account`, `enable-account` |
 | `project:create`  | `model.Project.create`                               | `create-project`                    |
@@ -239,6 +269,63 @@ per-frame RBAC" above describes for the permission check.
 | `session:revoke`         | `procedure.revokeSubjectSessions`                    | — (no MCP tool yet)                 |
 
 `read` covers both the list and get operations for a resource.
+
+### Read verbs filter, they do not refuse (`POST /rpc/batch` only) — #401
+
+**Contract:** an empty `model.Account.list`/`model.Project.list`/`model.ApiKey.list` result, or a
+`null`/not-found `model.Account.get`/`model.Project.get`/`model.ApiKey.get`, is not proof the
+underlying data is empty. It can equally mean the caller lacks the corresponding `*:read`
+permission entirely. Operators and the frontend must not treat "list came back empty" as "there is
+nothing to show" without also checking the caller's granted permissions — this is deliberately
+indistinguishable from ordinary per-tenant scoping (a member seeing zero rows because they belong
+to no matching account/project), the same way `/idp/v1/resolve-context` deliberately returns a
+uniform `404` for "not a member" and "doesn't exist."
+
+This is **not a data-leak** — the filtering is fail-closed, and an unauthorized caller never sees a
+row it should not — but it is a **diagnosability gap**: a misconfigured read permission looks
+exactly like an empty table, so it can go unnoticed indefinitely (the same silent-inertness class as
+the `allowed_models` allowlist that was inert for months, #282/#283).
+
+**Where this applies, precisely — it is narrower than "read verbs":**
+
+- **Unary `POST /rpc/{op_id}`** calls to `model.*.list`/`.get` hard-refuse a caller lacking the
+  permission with a clean `403`, exactly like a write verb — `rpc_authorize` and
+  `CratestackAuthProvider::authenticate`'s unary branch both check the coarse `op_id` → permission
+  map (this page's own table above) *before* cratestack's dispatch/query layer ever runs. Proven by
+  `unary_read_verb_hard_refuses_a_caller_lacking_read_permission` in `rpc_it_tests.rs`.
+- **`POST /rpc/batch`** frames are where the filtering contract actually bites. Since cratestack
+  0.8.4 (#383/#400 — see "Batch RPC: per-frame RBAC" above), `CratestackAuthProvider::authenticate`
+  runs once per envelope, not once per frame, so there is no pre-dispatch point left that could see
+  an individual frame's op-id and hard-refuse it before cratestack's own per-frame policy evaluation
+  runs. For `create`/`update`/`delete` verbs and every `procedure.*`, that per-frame policy
+  evaluation is still a hard gate (cratestack's create/update SQL executors and
+  `authorize_procedure` both evaluate the policy as an application-level pre-check and return
+  `Forbidden`). For `model.*` `list`/`get` verbs it is not: `@@allow("read", …)` compiles directly
+  into the query's SQL `WHERE` clause (`cratestack-sqlx/src/render/policy.rs`), so a caller whose
+  read-permission field is `false` simply matches zero rows — indistinguishable, at the SQL level,
+  from a legitimate per-tenant scoping predicate. Proven by
+  `batch_rpc_read_verbs_filter_to_empty_not_an_error_for_a_caller_lacking_read_permission` in
+  `rpc_it_tests.rs`.
+
+**Decision (issue #401): keep the semantic, documented here, rather than build a pre-dispatch gate
+for batch reads.** The alternative would need one of two things, both investigated and rejected as
+disproportionate to a diagnosability-only risk:
+
+1. An upstream cratestack change adding an application-level pre-check hook for `list`/`get`
+   dispatch, mirroring the one `create.rs`/`update.rs` already has (`evaluate_create_policy_expr` /
+   the existence-probe-then-`Forbidden` pattern) — not something this repo controls, and cratestack's
+   own `render/policy.rs` module doc states plainly that read policies compile to SQL, by design.
+2. Routing `Account`/`Project`/`ApiKey` reads through hand-written procedures instead of cratestack's
+   generated `model.*.list`/`.get` verbs, so they could hard-gate exactly like `authorize_procedure`
+   does — the same structural move #379 made for the three write paths cratestack's policy layer
+   could not fully cover. Unlike #379's write paths, this would mean abandoning the
+   ADR-0003 cratestack-CRUD-migration for the read side of exactly the three generic models it was
+   built for, to close a gap that produces an empty result, not a policy bypass — a much larger
+   rewrite than the risk (diagnosability, not disclosure) justifies.
+
+If cratestack ever adds a pre-dispatch hook for read policies, revisit option 1 — the two tests named
+above will start failing the moment the underlying compiled-to-SQL behavior changes, since both
+assert the *current* shape (empty/not-found) rather than merely "the caller sees no data."
 
 ### Refresh-token session revocation
 
@@ -433,6 +520,12 @@ wildcard, exactly as already advised for the existing resources.
 - `model.Account.delete` — the generic delete verb carries no `@@allow` at all and is denied here
   too. Account deletion is `procedure.deleteAccountPermanently` only, whose SQL check is simply "the
   caller is this account".
+- `model.Account.update` (#398, completing #379) — #379 marked `Account.defaultQuota`, the verb's
+  only settable field, `@readonly`, leaving it with zero writable fields; every call 422ed
+  unconditionally, for every caller, regardless of permission — a live endpoint that could only
+  ever fail. The schema's `@@allow("update")` was removed alongside this, so the op-id is now
+  fail-closed at both layers, same as `model.ApiKey.create` above. Account default-quota updates
+  go exclusively through `procedure.updateAccountDefaultQuota`.
 - `model.ProjectMember.*` — that model is policy-locked to read-only with no generated mutation
   verbs; roster changes go through the `addProjectMember` / `removeProjectMember` /
   `setProjectMemberRole` / `setProjectMemberQuotaTier` procedures, which enforce the lead check in
