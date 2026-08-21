@@ -988,7 +988,7 @@ dependencies = [
  "cratestack-core",
  "futures-util",
  "minicbor",
- "minicbor-serde",
+ "minicbor-serde 0.6.2",
  "reqwest 0.13.4",
  "rustls",
  "serde",
@@ -1006,7 +1006,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b02ec9031a314b745007fb409c4e7d52541b3485a9a3cd3ba089a84bf1e5d0f3"
 dependencies = [
  "cratestack-core",
- "minicbor-serde",
+ "minicbor-serde 0.6.2",
  "serde",
 ]
 
@@ -2826,7 +2826,7 @@ dependencies = [
  "lightbridge-authz-budget",
  "lightbridge-authz-core",
  "minicbor",
- "minicbor-serde",
+ "minicbor-serde 0.7.1",
  "rand_core 0.6.4",
  "rcgen",
  "redis",
@@ -3014,6 +3014,16 @@ name = "minicbor-serde"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "80047f75e28e3b38f6ab2ec3c2c7669f6b411fa6f8424e1a90a3fd784b19a3f4"
+dependencies = [
+ "minicbor",
+ "serde",
+]
+
+[[package]]
+name = "minicbor-serde"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7abdec9761edcb452764c68564ae4b77ec62f6c1a361aa68f5de15fd788c679"
 dependencies = [
  "minicbor",
  "serde",
@@ -6069,7 +6079,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

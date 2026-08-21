@@ -312,7 +312,7 @@ minicbor = { version = "2.2", features = ["std", "half"] }
 # `serde_json::Value::Null` but only guard the model-projection decode path, not the
 # `/rpc/batch` handler's `RpcRequest.input: serde_json::Value` re-encode step (cratestack-axum's
 # `rpc_batch_dispatch`/`encode_rpc_value`).
-minicbor-serde = "0.6"
+minicbor-serde = "0.7"
 # lightbridge-authz#363: `tokio-rustls-comp` is a superset of the previous `tokio-comp` (it
 # enables `tls-rustls` + `tokio-comp` together — see docs.rs/crate/redis/1.5.0/features), so
 # `rediss://` URLs now build a rustls-backed TLS connection via `redis::Client::build_with_tls`
