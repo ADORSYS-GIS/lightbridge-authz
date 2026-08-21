@@ -7,66 +7,62 @@
 //! Regression test for the CBOR `undefined`-vs-`null` bug that broke project creation in
 //! production (see `lightbridge_authz_rest::codec`). The TS client's cborg-based CBOR encoder
 //! (`converse-frontends/packages/authz-rpc/src/codec.ts`) encodes a JS `undefined` property
-//! value as the CBOR `undefined` simple value rather than omitting the key -- the create-project
-//! screen never collects `allowedModels`, so every `createProject` RPC call on the CBOR path
-//! (`authz-api`'s production default) sent `{ ..., allowedModels: undefined, ... }` and 400'd with
-//! the generic `invalid_argument` / "invalid request payload" error. JSON dev/CI traffic never
-//! hit this because `JSON.stringify` drops `undefined`-valued keys entirely, which is why the bug
-//! only reproduced in prod.
+//! value as the CBOR `undefined` simple value rather than omitting the key -- the original
+//! production incident was the create-project screen never collecting `allowedModels`, so every
+//! `createProject` RPC call on the CBOR path (`authz-api`'s production default) sent
+//! `{ ..., allowedModels: undefined, ... }` and 400'd with the generic `invalid_argument` /
+//! "invalid request payload" error. JSON dev/CI traffic never hit this because
+//! `JSON.stringify` drops `undefined`-valued keys entirely, which is why the bug only reproduced
+//! in prod.
+//!
+//! **Retargeted by #415 (ADR-0018 Decision 5):** `Project.allowedModels` is now `@readonly` on
+//! `model.Project.create`/`.update` (no runtime-catalogue-check hook on the generic verbs, same
+//! reason `Project.projectQuota` already was since #379/#397), so `CreateProjectInput` no longer
+//! carries the field at all -- the original reproduction is structurally closed. Its only write
+//! path is now `procedure.setProjectAllowedModels`, whose `allowedModels` argument is exactly the
+//! same shape (`Json?`) a model-picker clearing its selection could still send as `undefined`, so
+//! this test moved there rather than being deleted -- the underlying `LenientCborCodec` behavior
+//! it proves is still load-bearing for that new endpoint.
 
 use cratestack_core::CratestackCodec;
-use lightbridge_authz_api::schema::inputs::CreateProjectInput;
+use lightbridge_authz_api::schema::procedures::set_project_allowed_models;
 use lightbridge_authz_rest::codec::LenientCborCodec;
 
-/// Builds the exact wire frame `cborg` produces for a `createProject` call whose
-/// `allowedModels` field is `undefined` -- i.e. what the real frontend sends today
-/// (`packages/hooks/src/projects.ts::buildCreateProjectInput`/`tagProjectJsonFields`).
-fn frontend_frame_with_undefined_allowed_models() -> Vec<u8> {
+/// Builds the wire frame a `cborg`-encoding client sends for `setProjectAllowedModels` when
+/// `allowedModels` is `undefined` (e.g. a picker with nothing selected) -- the same shape
+/// `frontend_frame_with_undefined_allowed_models` used to build for `createProject` before #415.
+fn frame_with_undefined_allowed_models() -> Vec<u8> {
     let mut out = Vec::new();
     let mut e = minicbor::Encoder::new(&mut out);
-    // Seven fields, not six: ADR-0006 moved `billingIdentity` from `Account` onto `Project` and it
-    // is non-optional there, so the real frontend now sends it on every create (added in
-    // `buildCreateProjectInput`). `projectQuota` is `@readonly` since #379 and no longer exists on
-    // `CreateProjectInput` at all -- unrelated to this regression either way.
-    e.map(7).unwrap();
-    e.str("id").unwrap();
+    e.map(1).unwrap();
+    e.str("args").unwrap();
+    e.map(2).unwrap();
+    e.str("projectId").unwrap();
     e.str("abc123def456").unwrap();
-    e.str("accountId").unwrap();
-    e.str("go17t93z1vbd99yl5toj7eu5").unwrap();
-    e.str("name").unwrap();
-    e.str("demo").unwrap();
     e.str("allowedModels").unwrap();
     e.undefined().unwrap();
-    e.str("defaultLimits").unwrap();
-    e.map(1).unwrap();
-    e.str("Map").unwrap();
-    e.map(0).unwrap();
-    e.str("billingPlan").unwrap();
-    e.str("free").unwrap();
-    e.str("billingIdentity").unwrap();
-    e.str("acme-corp").unwrap();
     out
 }
 
 #[test]
 fn lenient_cbor_codec_accepts_undefined_allowed_models() {
     let codec = LenientCborCodec::default();
-    let bytes = frontend_frame_with_undefined_allowed_models();
+    let bytes = frame_with_undefined_allowed_models();
 
-    let decoded: CreateProjectInput = codec
+    let decoded: set_project_allowed_models::Args = codec
         .decode(&bytes)
         .expect("LenientCborCodec must accept the real frontend wire frame");
 
-    assert_eq!(decoded.name, "demo");
-    assert!(decoded.allowedModels.is_none());
+    assert_eq!(decoded.args.projectId, "abc123def456");
+    assert!(decoded.args.allowedModels.is_none());
 }
 
 #[test]
 fn raw_cratestack_cbor_codec_still_rejects_undefined_documenting_why_the_wrapper_exists() {
     let codec = cratestack_codec_cbor::CborCodec;
-    let bytes = frontend_frame_with_undefined_allowed_models();
+    let bytes = frame_with_undefined_allowed_models();
 
-    let decoded: Result<CreateProjectInput, _> = codec.decode(&bytes);
+    let decoded: Result<set_project_allowed_models::Args, _> = codec.decode(&bytes);
 
     assert!(
         decoded.is_err(),

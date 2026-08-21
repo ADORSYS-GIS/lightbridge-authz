@@ -6,8 +6,10 @@
 //! encodes a JS `undefined` property value as CBOR `undefined` rather than omitting the key --
 //! unlike `JSON.stringify`, which drops `undefined`-valued keys entirely. `minicbor-serde` treats
 //! `undefined` as a distinct CBOR type from `null` and has no mapping for it into `Option<T>`, so
-//! an RPC input with an `undefined`-valued optional field (e.g. `CreateProjectInput.allowedModels`
-//! when the caller supplies `{ allowedModels: undefined, ... }`) fails to decode with the generic
+//! an RPC input with an `undefined`-valued optional field (originally reproduced on
+//! `CreateProjectInput.allowedModels` when the caller supplied `{ allowedModels: undefined, ... }`
+//! -- since #415/ADR-0018 that field moved to `SetProjectAllowedModelsInput.allowedModels`, same
+//! shape, see `codec_undefined_regression_tests.rs`) fails to decode with the generic
 //! `invalid_argument` / "invalid request payload" error. This reproduces on the CBOR path only --
 //! `authz-api`'s production default -- never on the JSON path used in dev/CI, which is why it
 //! surfaced only in prod.
