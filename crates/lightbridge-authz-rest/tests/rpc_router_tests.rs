@@ -406,7 +406,6 @@ async fn well_known_and_token_exchange_paths_are_never_served_by_api_router() {
 #[tokio::test]
 async fn rbac_gate_denies_viewer_on_every_mutating_op() {
     for op in [
-        "model.Account.update",
         "model.Account.delete",
         "procedure.createAccount",
         "procedure.disableAccount",
@@ -440,6 +439,12 @@ async fn rbac_gate_denies_viewer_on_every_mutating_op() {
 async fn rbac_gate_denies_unmapped_and_locked_ops_even_for_admin() {
     for op in [
         "model.Account.create",
+        // #398: #379 left `Account.defaultQuota` (the verb's only settable field) `@readonly`,
+        // so `model.Account.update` had zero writable fields left and 422ed unconditionally for
+        // every caller. The schema's `@@allow("update")` and this op-id's permission mapping were
+        // both removed rather than leaving a verb that could only ever fail — the assertion below
+        // proves it now denies with 403, not the old 422.
+        "model.Account.update",
         "model.ApiKey.create",
         "model.ProjectMember.list",
         "model.ProjectMember.create",

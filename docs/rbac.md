@@ -238,7 +238,7 @@ scope for #401.
 | ----------------- | ---------------------------------------------------- | ----------------------------------- |
 | `account:create`  | `procedure.createAccount`                            | `create-account`                    |
 | `account:read`    | `model.Account.list`, `model.Account.get`, `model.AccountSummary.list`, `model.AccountSummary.get` | `list-accounts`, `get-account` |
-| `account:update`  | `model.Account.update`, `procedure.updateAccountDefaultQuota` | `update-account`          |
+| `account:update`  | `procedure.updateAccountDefaultQuota` | `update-account`          |
 | `account:delete`  | `procedure.deleteAccountPermanently`                 | `delete-account`                    |
 | `account:disable` | `procedure.disableAccount`, `procedure.enableAccount`| `disable-account`, `enable-account` |
 | `project:create`  | `model.Project.create`                               | `create-project`                    |
@@ -517,6 +517,12 @@ wildcard, exactly as already advised for the existing resources.
 - `model.Account.delete` — the generic delete verb carries no `@@allow` at all and is denied here
   too. Account deletion is `procedure.deleteAccountPermanently` only, whose SQL check is simply "the
   caller is this account".
+- `model.Account.update` (#398, completing #379) — #379 marked `Account.defaultQuota`, the verb's
+  only settable field, `@readonly`, leaving it with zero writable fields; every call 422ed
+  unconditionally, for every caller, regardless of permission — a live endpoint that could only
+  ever fail. The schema's `@@allow("update")` was removed alongside this, so the op-id is now
+  fail-closed at both layers, same as `model.ApiKey.create` above. Account default-quota updates
+  go exclusively through `procedure.updateAccountDefaultQuota`.
 - `model.ProjectMember.*` — that model is policy-locked to read-only with no generated mutation
   verbs; roster changes go through the `addProjectMember` / `removeProjectMember` /
   `setProjectMemberRole` / `setProjectMemberQuotaTier` procedures, which enforce the lead check in

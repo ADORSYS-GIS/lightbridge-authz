@@ -54,6 +54,12 @@ use serde_json::json;
 ///   fail-closed at the policy layer; denying it here as well guarantees a clean `403` even if the
 ///   schema-level removal alone did not produce one. API-key creation goes through
 ///   `procedure.createApiKey`.
+/// - `model.Account.update` (#398) — #379 marked `Account.defaultQuota`, the verb's only
+///   settable field, `@readonly`, leaving it with zero writable fields; every call 422ed
+///   unconditionally regardless of permission, a live endpoint that could only ever fail. The
+///   schema removed its `@@allow("update")` alongside this, so both layers now fail-closed the
+///   same way `model.ApiKey.create` above does. Account default-quota updates go exclusively
+///   through `procedure.updateAccountDefaultQuota`.
 /// - `model.ProjectMember.*` — that model is policy-locked to read-only and has no generated
 ///   mutation verbs; denied here too for defense in depth. Roster changes go through
 ///   `procedure.addProjectMember` / `procedure.removeProjectMember` / `procedure.setProjectMemberRole`
@@ -128,10 +134,14 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         "procedure.createAccount" => AccountCreate,
         "model.Account.list" => AccountRead,
         "model.Account.get" => AccountRead,
-        "model.Account.update" => AccountUpdate,
-        // #379: `Account.defaultQuota` is now `@readonly` on the generic verb above, so
-        // `updateAccountDefaultQuota` is its replacement write path -- same coarse permission,
-        // matching the acceptance criteria's "existing permission granularity" requirement.
+        // model.Account.update is intentionally absent (#398, completing #379): #379 marked
+        // `Account.defaultQuota` -- the verb's only settable field -- `@readonly`, leaving the
+        // generic verb with zero writable fields, so every call to it 422ed unconditionally for
+        // every caller regardless of permission. The schema's `@@allow("update", ...)` clause was
+        // removed alongside this (`crates/lightbridge-authz-api/schema/authz.cstack`), so the
+        // op-id is unreachable at both layers, same as `model.ApiKey.create` below.
+        // `updateAccountDefaultQuota` is the sole write path -- same coarse permission, matching
+        // the acceptance criteria's "existing permission granularity" requirement.
         "procedure.updateAccountDefaultQuota" => AccountUpdate,
         // model.Account.delete is intentionally absent (falls through to `_ => None`, denied): the
         // schema carries no `@@allow("delete", ...)` on Account, so the cratestack policy layer
@@ -263,7 +273,6 @@ pub const MAPPED_OP_ID_PERMISSIONS: &[(&str, Permission)] = &[
     ("procedure.createAccount", Permission::AccountCreate),
     ("model.Account.list", Permission::AccountRead),
     ("model.Account.get", Permission::AccountRead),
-    ("model.Account.update", Permission::AccountUpdate),
     (
         "procedure.updateAccountDefaultQuota",
         Permission::AccountUpdate,
@@ -528,6 +537,7 @@ mod tests {
     fn unmapped_and_sensitive_op_ids_are_fail_closed() {
         for op_id in [
             "model.Account.create",
+            "model.Account.update",
             "model.Account.delete",
             "model.ApiKey.create",
             "model.ProjectMember.list",
@@ -658,7 +668,6 @@ mod tests {
                 "procedure.createAccount",
                 "model.Account.list",
                 "model.Account.get",
-                "model.Account.update",
                 "procedure.updateAccountDefaultQuota",
                 "procedure.disableAccount",
                 "procedure.enableAccount",

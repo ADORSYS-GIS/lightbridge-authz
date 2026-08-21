@@ -398,9 +398,8 @@ async fn crud_lifecycle_for_all_resources() {
     assert!(accounts["totalCount"].as_i64().unwrap() >= 1);
 
     // `Account.defaultQuota` is `@readonly` on the generic verb since #379 -- updated via the
-    // dedicated `updateAccountDefaultQuota` procedure instead (`model.Account.update` still exists
-    // for whatever fields remain generically writable; there are none left on `Account` today, see
-    // that procedure's own doc comment).
+    // dedicated `updateAccountDefaultQuota` procedure instead. `model.Account.update` itself was
+    // removed entirely by #398, since #379 had left it with zero generically-writable fields.
     let new_quota = format!("tenant2-{}", cuid2());
     let (status, body) = rpc_call(
         r.clone(),
@@ -1165,11 +1164,10 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
 
     // Viewer is blocked by the coarse RBAC gate (403) on every mutating op — even though membership
     // would otherwise permit it. This is the privilege-escalation regression under test.
+    // `model.Account.update` is deliberately absent from this loop: since #398 it is unmapped
+    // (denied unconditionally, see below), not merely permission-gated, so a viewer 403 on it
+    // would prove nothing about *this* regression specifically.
     for (op, input) in [
-        (
-            "model.Account.update",
-            json!({ "id": account_id, "patch": { "defaultQuota": "x" } }),
-        ),
         ("model.Account.delete", json!({ "id": account_id })),
         (
             "model.Project.create",
@@ -1197,13 +1195,30 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
         );
     }
 
-    // Admin succeeds on a representative mutating op the viewer was denied. Uses
-    // `procedure.updateAccountDefaultQuota`, not `model.Account.update` (the op the loop above
-    // exercises for the *viewer-denied* half): since #379 marked `Account.defaultQuota`
-    // `@readonly`, `model.Account.update`'s generated input has zero settable fields left, so
-    // every call to it -- including an authorized admin's -- now 422s with cratestack's own
-    // "update input must contain at least one changed column" before ever reaching the RBAC
-    // question this assertion is about. The procedure is the real write path post-#379.
+    // `model.Account.update` (#398, completing #379): #379 marked `Account.defaultQuota`, the
+    // verb's only settable field, `@readonly`, leaving it with zero writable fields, so it 422ed
+    // unconditionally for every caller -- a live endpoint that could only ever fail. #398 removed
+    // the schema's `@@allow("update")` and its `rpc_authorize.rs` permission mapping, so it is now
+    // unreachable at both layers. Proven here against the real DB-backed dispatch pipeline, with a
+    // fully-privileged admin, specifically to rule out the old 422: if this ever regressed back to
+    // a mapped-but-empty verb, this assertion would catch the reappearing 422, not just a 403.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Account.update",
+        Wire::Cbor,
+        &json!({ "id": account_id, "patch": { "defaultQuota": "x" } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "model.Account.update must be unreachable (403), not the old unconditional 422: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Admin succeeds on a representative mutating op the viewer was denied.
+    // `procedure.updateAccountDefaultQuota` is the real write path post-#379/#398.
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.updateAccountDefaultQuota",
