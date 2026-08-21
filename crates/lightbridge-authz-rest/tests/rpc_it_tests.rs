@@ -1944,6 +1944,68 @@ async fn batch_rpc_read_verbs_filter_to_empty_not_an_error_for_a_caller_lacking_
     }
 }
 
+/// The unary counterpart to the batch test above (#401) -- pins the OTHER half of the asymmetry
+/// that test's own doc comment claims but does not itself exercise: a UNARY `model.Account.get`/
+/// `.list` call from a caller lacking `account:read` never reaches cratestack's dispatch/query
+/// layer at all. Both `rpc_authorize` (the outer Axum middleware) and
+/// `CratestackAuthProvider::authenticate`'s unary branch (`auth_provider.rs`) hard-gate on the
+/// *coarse* `op_id` -> permission map from `rpc_authorize::required_permission` BEFORE dispatch, so
+/// the caller gets a clean `403`, never the SQL-filtered empty/not-found shape
+/// `batch_rpc_read_verbs_filter_to_empty_not_an_error_for_a_caller_lacking_read_permission` proves
+/// for the batch path. Together the two tests pin the full, decided contract #401 asked for: read
+/// verbs hard-refuse on the unary surface and filter only inside `/rpc/batch`, where cratestack's
+/// per-frame `CachedAuthProvider` change (0.8.4) leaves no pre-dispatch hook to hard-gate a read
+/// verb -- see `docs/rbac.md`'s "Read verbs filter, they do not refuse" section for the decision
+/// this documents and why routing these three models' reads through hand-written procedures (the
+/// only structural fix) was rejected as disproportionate to a diagnosability-only risk.
+#[tokio::test]
+async fn unary_read_verb_hard_refuses_a_caller_lacking_read_permission() {
+    let owner = format!("owner-unary-readfilter-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("owner", token_info(&owner, admin_perms()))
+            .with(
+                "zero",
+                token_info(&owner, lightbridge_authz_core::authz::PermissionSet::new()),
+            ),
+    );
+    let ctx = setup(bearer).await;
+    let account_id = create_account(&ctx.router, "owner", "unused").await;
+    assert_eq!(account_id, owner, "account id is the subject per ADR-0006");
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "model.Account.get",
+        Wire::Cbor,
+        &json!({ "id": account_id }),
+        Some("zero"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "unary get for a caller lacking account:read must hard-refuse before dispatch, not \
+         filter to not-found: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "model.Account.list",
+        Wire::Cbor,
+        &json!({}),
+        Some("zero"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "unary list for a caller lacking account:read must hard-refuse before dispatch, not \
+         filter to empty: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Section 3: createAccount seeds the creator's membership, enabling a subsequent project create;
 // a non-member is refused.

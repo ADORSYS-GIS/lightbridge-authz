@@ -92,9 +92,31 @@ jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
 # so all three lines below MUST move together on any future bump, exactly like the cratestack
 # lockstep block further down — a partial bump within this trio reproduces the exact failure mode
 # the old git-pin comment (see git history) documented for jsonwebtoken majors.
-authkestra-resource = "0.5.0"
-authkestra-op = "0.5.0"
-authkestra-engine = "0.5.0"
+#
+# DRIFT OCCURRED (2026-08-21, #404/#406): Dependabot opened one PR per crate — #406
+# (`authkestra-resource` 0.5.0 -> 0.5.1) and #404 (`authkestra-op` 0.5.0 -> 0.5.1) — same as the
+# cratestack family's recurring failure mode documented in the block below. #406 merged first,
+# touching only `Cargo.lock` (the caret range `"0.5.0"` already permitted 0.5.1, so there was
+# nothing for it to change in this manifest); `authkestra-engine` incidentally floated to 0.5.1 in
+# the same lockfile resolution even though nothing bumped it directly, because the resolver picks
+# the newest version satisfying the shared caret range for every crate, not just the one Dependabot
+# targeted. That left `authkestra-op` alone at 0.5.0 in `Cargo.lock` until #404 merged separately —
+# exactly the "two of three moved, one didn't" shape, caught only because `jsonwebtoken` happened to
+# stay at a single 11.0.0 entry throughout (re-verify with the grep two paragraphs up any time this
+# recurs; it is what actually would have failed the build).
+#
+# Per the cratestack block's own "FOURTH OCCURRENCE" finding below: a caret requirement string is
+# not durable against this, because Dependabot's scheduled `cargo update` can silently move a
+# `Cargo.lock` entry within an already-permitted range without ever touching `Cargo.toml` — there is
+# no diff to notice in review. Applying that same fix here: every line below is now an exact `=`
+# pin, so a future single-crate Dependabot bump either edits the requirement string itself (a visible,
+# reviewable `Cargo.toml` diff) or fails to resolve — it cannot land as a silent lockfile-only float
+# again. This repo has no downstream consumers of its own `Cargo.toml` (it produces binaries, not a
+# published library), so exact-pinning carries none of the "raises the floor for consumers" cost an
+# exact pin would have in a published crate.
+authkestra-resource = "=0.5.1"
+authkestra-op = "=0.5.1"
+authkestra-engine = "=0.5.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "tracing", "net", "time"] }
 thiserror = "2"
 anyhow = "1"
@@ -312,6 +334,28 @@ minicbor = { version = "2.2", features = ["std", "half"] }
 # `serde_json::Value::Null` but only guard the model-projection decode path, not the
 # `/rpc/batch` handler's `RpcRequest.input: serde_json::Value` re-encode step (cratestack-axum's
 # `rpc_batch_dispatch`/`encode_rpc_value`).
+# ⚠️ MUST STAY ON 0.6.x. Rejected the 0.7.1 bump (#405) 2026-08-21, and this comment exists so
+# the next Dependabot attempt is answered here rather than re-investigated.
+#
+# `cratestack-codec-cbor = "=0.8.4"` hard-constrains its own `minicbor-serde` requirement to
+# `^0.6.2`. Moving THIS requirement to 0.7 therefore does not upgrade anything -- it makes Cargo
+# resolve TWO coexisting `minicbor-serde` versions (0.6.2 for cratestack's own `CborCodec`, 0.7.1
+# for our `LenientCborCodec`), both encoding CBOR on the same request path. Dependabot's own
+# lockfile diff shows it: entries become version-disambiguated (`"minicbor-serde 0.6.2"` vs
+# `"minicbor-serde 0.7.1"`), which Cargo only writes when multiple versions coexist.
+#
+# That is the `jsonwebtoken`-double-major failure shape (see the authkestra block above), aimed at
+# the one seam we can least afford it: `LenientCborCodec` exists precisely BECAUSE cratestack's
+# encoder and ours disagreed about how to encode `null` -- `serde_json::Value::Null` serializes via
+# `serialize_unit()`, which minicbor-serde encodes as CBOR's empty array `0x80` unless
+# `serialize_unit_as_null(true)` is set (see `codec.rs`). That mismatch shipped to production as a
+# white-screen crash (`TypeError: x.trim is not a function`) and took real time to diagnose.
+#
+# And the bump buys nothing: 0.6.2 and 0.7.1 have byte-for-byte identical `Serializer`,
+# `serialize_unit_as_null`, and `serialize_unit` bodies (diffed both vendored `src/ser.rs`); 0.7
+# only adds i128/u128 support and a tag-container mechanism, neither of which touches unit/null
+# handling. Revisit only when `cratestack-codec-cbor` itself moves to `^0.7`, and then bump both
+# together -- never this one alone.
 minicbor-serde = "0.6"
 # lightbridge-authz#363: `tokio-rustls-comp` is a superset of the previous `tokio-comp` (it
 # enables `tls-rustls` + `tokio-comp` together — see docs.rs/crate/redis/1.5.0/features), so
