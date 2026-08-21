@@ -3104,6 +3104,206 @@ async fn refresh_re_resolves_the_quota_tier_live_rather_than_copying_the_old_cla
     );
 }
 
+/// ADR-0018: `model_policy` has no dedicated write path yet (the schema field is `@readonly` --
+/// see `authz.cstack`'s own comment on `Project.modelPolicy`), so this test sets it directly
+/// against the real Postgres row rather than through `StoreRepo`, purely as test fixture setup --
+/// exactly the kind of direct-SQL test plumbing this file already uses for scenarios no
+/// application write path covers yet.
+async fn set_project_model_policy(repo: &StoreRepo, project_id: &str, policy: &str) {
+    sqlx::query("UPDATE projects SET model_policy = $1 WHERE id = $2")
+        .bind(policy)
+        .bind(project_id)
+        .execute(repo.pool.pool())
+        .await
+        .expect("direct model_policy update should succeed");
+}
+
+/// ADR-0018 acceptance criterion: a token-exchange call stamps `model_policy` on the minted access
+/// token, reflecting the project's current value at mint time -- default `allow_all` here (the
+/// value `seed()` leaves every project at, matching the migration's own backfill default).
+#[sqlx::test(migrations = "../../migrations")]
+async fn token_exchange_stamps_the_projects_model_policy_allow_all_by_default(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let claims = decode_access_token_claims(
+        &repo,
+        body["access_token"].as_str().unwrap(),
+        PUBLIC_CLIENT_ID,
+    )
+    .await;
+    assert_eq!(claims["model_policy"], "allow_all", "claims: {claims:?}");
+}
+
+/// Each of the three `model_policy` values round-trips onto the minted access-token claim,
+/// mirroring `introspect_round_trips_each_model_policy_value` on the human/OIDC plane.
+#[sqlx::test(migrations = "../../migrations")]
+async fn token_exchange_stamps_each_model_policy_value(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    for wire_value in ["allow_all", "allowlist", "deny_all"] {
+        set_project_model_policy(&repo, PROJECT_ID, wire_value).await;
+
+        let (status, body) = post_token(
+            state(repo.clone(), true),
+            &format!(
+                "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let claims = decode_access_token_claims(
+            &repo,
+            body["access_token"].as_str().unwrap(),
+            PUBLIC_CLIENT_ID,
+        )
+        .await;
+        assert_eq!(
+            claims["model_policy"], wire_value,
+            "stored value {wire_value:?} must round-trip onto the claim: {claims:?}"
+        );
+    }
+}
+
+/// The refresh grant re-mints through the SAME project lookup the exchange grant uses (verified
+/// here, not just trusted from the doc comment) -- mirrors
+/// `refresh_re_resolves_the_budget_tier_live_rather_than_copying_the_old_claim`/
+/// `refresh_re_resolves_the_quota_tier_live_rather_than_copying_the_old_claim` exactly, on the
+/// `model_policy` axis: an operator flipping the policy AFTER the original exchange must be
+/// visible on the NEXT refresh, proving refresh re-resolves live rather than copying the value
+/// forward from the token it is replacing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn refresh_re_resolves_the_model_policy_live_rather_than_copying_the_old_claim(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x\
+             &project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let claims = decode_access_token_claims(
+        &repo,
+        body["access_token"].as_str().unwrap(),
+        PUBLIC_CLIENT_ID,
+    )
+    .await;
+    assert_eq!(
+        claims["model_policy"], "allow_all",
+        "initial exchange claims: {claims:?}"
+    );
+    let refresh_token = body["refresh_token"].as_str().unwrap().to_string();
+
+    // The project is flipped to deny_all between the exchange and the refresh -- the claim must
+    // catch up on the next refresh (bounded by access-token TTL / refresh timing), not require a
+    // fresh login.
+    set_project_model_policy(&repo, PROJECT_ID, "deny_all").await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={refresh_token}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let claims = decode_access_token_claims(
+        &repo,
+        body["access_token"].as_str().unwrap(),
+        PUBLIC_CLIENT_ID,
+    )
+    .await;
+    assert_eq!(
+        claims["model_policy"], "deny_all",
+        "refresh must re-resolve model_policy live, not copy the prior token's claim forward: \
+         {claims:?}"
+    );
+}
+
+/// ADR-0018 acceptance criterion: "the migration backfills every existing row to `allow_all` and
+/// is verified against a pre-migration fixture, not just a fresh schema." Mirrors
+/// `migration_backfill_gives_existing_rows_a_chain_and_a_backdated_cap`'s own `run_to`/`run`
+/// pattern: apply every migration up to (but not including)
+/// `20260821000001_projects_model_policy.sql`, insert a project row the way the pre-ADR-0018
+/// schema shaped it (no `model_policy` column exists yet), THEN apply the remaining migrations
+/// and assert the pre-existing row now reads `model_policy = 'allow_all'` -- the exact value that
+/// reproduces its current "all models allowed" behavior, with no application code involved.
+#[sqlx::test(migrations = false)]
+async fn migration_backfills_a_pre_existing_project_row_to_allow_all(pool: PgPool) {
+    let migrator = sqlx::migrate::Migrator::new(std::path::Path::new("../../migrations"))
+        .await
+        .expect("migrator loads from the workspace migrations directory");
+    // The migration immediately preceding ADR-0018's own -- everything up to and including
+    // `api_keys_require_expiry`, but no `projects.model_policy` column yet.
+    migrator
+        .run_to(20260820000001, &pool)
+        .await
+        .expect("pre-ADR-0018 migrations apply");
+
+    sqlx::query(
+        r#"
+        INSERT INTO accounts (id, created_at, updated_at)
+        VALUES ($1, now(), now())
+        "#,
+    )
+    .bind(SUBJECT)
+    .execute(&pool)
+    .await
+    .expect("pre-existing account inserts under the pre-ADR-0018 schema");
+
+    let project_id = cuid2();
+    sqlx::query(
+        r#"
+        INSERT INTO projects
+          (id, account_id, name, allowed_models, default_limits, billing_plan, billing_identity,
+           created_at, updated_at)
+        VALUES ($1, $2, 'pre-existing-project', NULL, '{}'::jsonb, 'free', $3, now(), now())
+        "#,
+    )
+    .bind(&project_id)
+    .bind(SUBJECT)
+    .bind(format!("bill-{}", cuid2()))
+    .execute(&pool)
+    .await
+    .expect("pre-existing project row inserts under the pre-ADR-0018 schema (no model_policy column yet)");
+
+    migrator
+        .run(&pool)
+        .await
+        .expect("the ADR-0018 migration applies on top of an existing project row");
+
+    let model_policy: String =
+        sqlx::query_scalar("SELECT model_policy FROM projects WHERE id = $1")
+            .bind(&project_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the row survives the migration and gained the new column");
+
+    assert_eq!(
+        model_policy, "allow_all",
+        "a pre-existing row must backfill to allow_all -- the value that reproduces its current \
+         NULL-allowed_models 'all models allowed' behavior exactly"
+    );
+}
+
 /// **Outcome 3, the fail-closed test that matters most.** `repo` (subject/context resolution)
 /// stays a REAL, reachable Postgres -- `resolve_context` succeeds -- while `quota_repo` (the
 /// `project_members` lookup `resolve_quota_tier` reads) is pointed at an unreachable pool

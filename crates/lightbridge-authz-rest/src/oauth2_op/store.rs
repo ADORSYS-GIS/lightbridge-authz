@@ -61,7 +61,7 @@ use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::config::Oauth2TokenExchange;
 use lightbridge_authz_core::crypto::hash_api_key;
 use lightbridge_authz_core::cuid::cuid2;
-use lightbridge_authz_core::dto::ResourceStatus;
+use lightbridge_authz_core::dto::{ModelPolicy, ResourceStatus};
 use lightbridge_authz_core::error::Error;
 use serde_json::Value;
 
@@ -300,6 +300,51 @@ impl TokenExchangeOpStore {
             })
     }
 
+    /// Resolves `allowed_models` and `model_policy` (ADR-0018) from the SAME project row for the
+    /// token-exchange grant -- one query for both, generalizing the ADR's "same call, same row, no
+    /// new query" shape (stated there for introspection) to this call site too. Not used by
+    /// [`Self::handle_refresh_token`], which already loads `project` earlier for its own
+    /// re-validation and reads both fields directly off that value instead of calling this again.
+    ///
+    /// `allowed_models` keeps its pre-existing behavior, UNCHANGED by this method: any lookup
+    /// failure (not found, or a genuine error) resolves to `None`, same as before this ADR existed
+    /// -- not a decision this ticket revisits.
+    ///
+    /// `model_policy` is different, and deliberately NOT given that same fail-open shape: unlike
+    /// `allowed_models`'s `None` (a legitimate "no restriction" answer), there is no reading of "the
+    /// lookup failed" that safely maps to a permissive `model_policy`. So any lookup failure here
+    /// fails CLOSED to [`ModelPolicy::DenyAll`] (logged as an error) -- the claim is still always
+    /// minted, never omitted, and the exchange itself is never refused because of this lookup,
+    /// mirroring [`Self::resolve_budget_tier`]'s "downgrade to the safest value, don't fail the
+    /// mint" shape rather than [`Self::resolve_quota_tier`]'s "refuse the exchange" shape, because
+    /// -- like `budget_tier` and unlike `quota_tier` -- `model_policy` always has a well-defined
+    /// most-conservative value to fall back to.
+    async fn resolve_project_model_access(
+        &self,
+        project_id: &str,
+    ) -> (Option<Vec<String>>, ModelPolicy) {
+        match self.repo.get_project_by_id(project_id).await {
+            Ok(Some(project)) => (project.allowed_models, project.model_policy),
+            Ok(None) => {
+                tracing::error!(
+                    project_id = %project_id,
+                    "project not found while resolving model_policy claim; failing closed to \
+                     deny_all rather than defaulting to allow_all"
+                );
+                (None, ModelPolicy::DenyAll)
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    project_id = %project_id,
+                    "project lookup failed while resolving model_policy claim; failing closed to \
+                     deny_all rather than defaulting to allow_all"
+                );
+                (None, ModelPolicy::DenyAll)
+            }
+        }
+    }
+
     /// The RFC 8693 token-exchange grant (ADR-0011, Decisions 1, 5, 7). `project_id` is this
     /// crate's own extension to the request, threaded in by `RequestScopedOpStore` since it is
     /// not a field `authkestra_op::handlers::token::TokenRequest` has room for. Optional: a
@@ -422,10 +467,8 @@ impl TokenExchangeOpStore {
             }
         };
 
-        let allowed_models = match self.repo.get_project_by_id(&context.project_id).await {
-            Ok(Some(project)) => project.allowed_models,
-            _ => None,
-        };
+        let (allowed_models, model_policy) =
+            self.resolve_project_model_access(&context.project_id).await;
 
         let granted_scopes = grant_scopes(&req.scope, &self.cfg.allowed_scopes, &client.scopes);
         let offline = granted_scopes.iter().any(|s| s == OFFLINE_ACCESS_SCOPE);
@@ -460,6 +503,10 @@ impl TokenExchangeOpStore {
         if let Some(quota_tier) = quota_tier {
             access_extra.insert("quota_tier".to_string(), Value::String(quota_tier));
         }
+        access_extra.insert(
+            "model_policy".to_string(),
+            Value::String(model_policy.to_string()),
+        );
         let access_token = tokens
             .issue_user_token_with_extra(
                 identity_for(&owner),
@@ -680,6 +727,7 @@ impl TokenExchangeOpStore {
             email_verified: old_row.email_verified,
         };
         let allowed_models = project.allowed_models;
+        let model_policy = project.model_policy;
         let openid = old_row
             .scope
             .as_deref()
@@ -707,6 +755,10 @@ impl TokenExchangeOpStore {
         if let Some(quota_tier) = quota_tier {
             access_extra.insert("quota_tier".to_string(), Value::String(quota_tier));
         }
+        access_extra.insert(
+            "model_policy".to_string(),
+            Value::String(model_policy.to_string()),
+        );
         let access_token = tokens
             .issue_user_token_with_extra(
                 identity_for(&owner),

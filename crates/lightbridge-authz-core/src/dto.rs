@@ -81,9 +81,110 @@ pub struct UpdateAccount {
     pub default_quota: Option<String>,
 }
 
+/// ADR-0018's three-value access-control policy for which models a project's keys may reach.
+/// `AllowAll` is the default -- today's only behavior, and what every pre-existing row backfills
+/// to (`migrations/20260821000001_projects_model_policy.sql`). `Allowlist` consults
+/// `Project.allowed_models` (an empty list now genuinely means "nothing", unlike the NULL/[] ==
+/// "everything" collapse `allowed_models` has on its own). `DenyAll` allows nothing, ignoring
+/// `allowed_models` entirely.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPolicy {
+    #[default]
+    AllowAll,
+    Allowlist,
+    DenyAll,
+}
+
+const MODEL_POLICY_ALLOW_ALL: &str = "allow_all";
+const MODEL_POLICY_ALLOWLIST: &str = "allowlist";
+const MODEL_POLICY_DENY_ALL: &str = "deny_all";
+
+impl Display for ModelPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let r = match self {
+            ModelPolicy::AllowAll => MODEL_POLICY_ALLOW_ALL,
+            ModelPolicy::Allowlist => MODEL_POLICY_ALLOWLIST,
+            ModelPolicy::DenyAll => MODEL_POLICY_DENY_ALL,
+        };
+        write!(f, "{}", r)
+    }
+}
+
+impl From<String> for ModelPolicy {
+    /// Fails CLOSED, not open: only the exact `allow_all`/`allowlist` strings map to their
+    /// permissive/conditional variants. Anything else -- an unrecognized value, a future variant
+    /// this build does not know about yet, corrupted data -- maps to `DenyAll`, the strictest
+    /// state. This is the opposite direction from `ResourceStatus::from`'s fail-safe default
+    /// (which also fails to the restrictive branch, `Suspended`) but for the same reason: an
+    /// unparseable/unknown `model_policy` value must never silently become the *permissive*
+    /// `AllowAll`, or corrupted/unexpected DB state would widen access instead of narrowing it.
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            MODEL_POLICY_ALLOW_ALL => ModelPolicy::AllowAll,
+            MODEL_POLICY_ALLOWLIST => ModelPolicy::Allowlist,
+            _ => ModelPolicy::DenyAll,
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_policy_tests {
+    use super::ModelPolicy;
+
+    #[test]
+    fn from_string_round_trips_known_values() {
+        assert_eq!(
+            ModelPolicy::from("allow_all".to_string()),
+            ModelPolicy::AllowAll
+        );
+        assert_eq!(
+            ModelPolicy::from("allowlist".to_string()),
+            ModelPolicy::Allowlist
+        );
+        assert_eq!(
+            ModelPolicy::from("deny_all".to_string()),
+            ModelPolicy::DenyAll
+        );
+    }
+
+    #[test]
+    fn from_string_fails_closed_on_unknown_values() {
+        assert_eq!(ModelPolicy::from("bogus".to_string()), ModelPolicy::DenyAll);
+        assert_eq!(ModelPolicy::from(String::new()), ModelPolicy::DenyAll);
+        assert_eq!(
+            ModelPolicy::from("ALLOW_ALL".to_string()),
+            ModelPolicy::DenyAll,
+            "must not case-fold into the permissive variant"
+        );
+        assert_eq!(
+            ModelPolicy::from("allow-all".to_string()),
+            ModelPolicy::DenyAll,
+            "a near-miss spelling must not silently become allow_all"
+        );
+    }
+
+    #[test]
+    fn default_is_allow_all() {
+        assert_eq!(ModelPolicy::default(), ModelPolicy::AllowAll);
+    }
+
+    #[test]
+    fn display_matches_the_wire_strings_from_from_round_trips_back() {
+        for policy in [
+            ModelPolicy::AllowAll,
+            ModelPolicy::Allowlist,
+            ModelPolicy::DenyAll,
+        ] {
+            assert_eq!(ModelPolicy::from(policy.to_string()), policy);
+        }
+    }
+}
+
 /// Per ADR-0006, `Project` gains `billing_identity` (moved from `Account` -- one project, one
 /// billing identity, so a single account can bill several projects to different parties) and
 /// `project_quota` (the pooled, tier-catalog-validated ceiling shared by everyone on the project).
+/// Per ADR-0018, `Project` also gains `model_policy` -- see `ModelPolicy`'s own doc comment.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Project {
     pub id: String,
@@ -101,6 +202,8 @@ pub struct Project {
     pub status: ResourceStatus,
     #[serde(default)]
     pub is_default: bool,
+    #[serde(default)]
+    pub model_policy: ModelPolicy,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

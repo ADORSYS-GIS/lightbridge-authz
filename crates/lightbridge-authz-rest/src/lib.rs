@@ -473,6 +473,7 @@ fn to_schema_project(p: Project) -> schema::Project {
         projectQuota: p.project_quota,
         status: p.status.to_string(),
         isDefault: p.is_default,
+        modelPolicy: p.model_policy.to_string(),
     }
 }
 

@@ -1959,6 +1959,7 @@ mod tests {
             project_quota: None,
             status: lightbridge_authz_core::ResourceStatus::Active,
             is_default: false,
+            model_policy: lightbridge_authz_core::ModelPolicy::AllowAll,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

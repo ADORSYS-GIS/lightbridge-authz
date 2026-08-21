@@ -557,6 +557,7 @@ fn discovery_document(
         "account_id",
         "budget_tier",
         "quota_tier",
+        "model_policy",
         "email",
         "email_verified",
         "allowed_models",

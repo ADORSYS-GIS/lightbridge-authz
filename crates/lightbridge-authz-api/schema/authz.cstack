@@ -191,6 +191,33 @@ model Project {
   accountId String
   name String
   allowedModels Json?
+  // ADR-0018: three-value access-control policy governing which models this project's keys may
+  // reach -- "allow_all" (default; today's only behavior, and what every pre-existing row
+  // backfills to -- see the migration), "allowlist" (only `allowedModels` entries; an empty list
+  // now genuinely means "nothing", unlike today's NULL/[] == "everything" collapse), "deny_all"
+  // (nothing, `allowedModels` ignored entirely). Plain `String`, not a schema-level enum -- this
+  // schema has no enum construct (see `Decision.effect`/`AugmentationRequest.status`'s own
+  // comments for the same choice), and CLAUDE.md's "ids and enums in this schema are plain
+  // strings" convention applies here too. The Rust-side representation is
+  // `lightbridge_authz_core::dto::ModelPolicy`, parsed FAIL-CLOSED from this raw column
+  // (`ModelPolicy::from(String)`): an unrecognized value maps to `DenyAll`, the strictest state,
+  // never silently to `AllowAll` -- see that type's own doc comment and tests.
+  //
+  // `@readonly` (deliberate, not an oversight -- ADR-0018's own Risk section flags this
+  // explicitly): unlike `projectQuota`/`defaultQuota` above, `modelPolicy`'s own three values need
+  // no runtime-configured *catalogue* check (it is a closed, compile-time-known set) -- so
+  // `@readonly` here is not about that pattern. It exists because ADR-0018 Decision 5 states
+  // `allowlist` mode is not safely selectable until `allowedModels` gets catalogue validation
+  // (tracked separately, #415, landing before this field goes live) -- a caller flipping a
+  // project to `allowlist` today would have zero server-side guard against a typo'd model id
+  // silently locking the project out. Marking this `@readonly` drops it from BOTH the generated
+  // `CreateProjectInput` and `UpdateProjectInput` (matching `projectQuota`/`isDefault`/`status`'s
+  // own precedent immediately above/below), so no write path exists anywhere yet -- not even an
+  // unvalidated one. A dedicated `setProjectModelPolicy`-style procedure (mirroring
+  // `setProjectQuota`'s shape) is left as follow-up work once #415 ships, not built here: this
+  // ticket's own acceptance criteria only requires the value to be *readable* (introspection,
+  // token-exchange claim), never to be *settable* through this surface.
+  modelPolicy String @readonly
   defaultLimits Json
   billingPlan String
   // MOVED here from `Account` per ADR-0006: one project, one billing identity ("who's
