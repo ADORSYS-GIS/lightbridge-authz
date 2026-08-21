@@ -400,7 +400,9 @@ fn required_tool_permission(tool: &str) -> Option<Permission> {
         | "set-project-member-quota-tier" => Permission::ProjectMember,
         "create-project" => Permission::ProjectCreate,
         "list-projects" | "get-project" => Permission::ProjectRead,
-        "update-project" | "set-project-quota" => Permission::ProjectUpdate,
+        "update-project" | "set-project-quota" | "set-project-allowed-models" => {
+            Permission::ProjectUpdate
+        }
         "delete-project" => Permission::ProjectDelete,
         "disable-project" | "enable-project" => Permission::ProjectDisable,
         "set-default-project" => Permission::ProjectUpdate,
@@ -698,8 +700,6 @@ struct CreateProjectParams {
     account_id: String,
     name: String,
     #[serde(default)]
-    allowed_models: Option<Vec<String>>,
-    #[serde(default)]
     default_limits: Option<DefaultLimitsInput>,
     billing_plan: String,
     /// Who is paying for this project. Moved here from `Account` by ADR-0006 so one account can
@@ -714,6 +714,16 @@ struct SetProjectQuotaParams {
     /// the operator-configured catalogue, or omitted/`null` to clear it.
     #[serde(default)]
     project_quota: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetProjectAllowedModelsParams {
+    project_id: String,
+    /// Model ids drawn from the operator-configured catalogue (`list-model-catalog`), or omitted/
+    /// `null` for "all models allowed". Rejected (#415, ADR-0018 Decision 5) if any entry is
+    /// absent from a non-empty catalogue.
+    #[serde(default)]
+    allowed_models: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -735,8 +745,6 @@ struct UpdateProjectParams {
     project_id: String,
     #[serde(default)]
     name: Option<String>,
-    #[serde(default)]
-    allowed_models: Option<Option<Vec<String>>>,
     #[serde(default)]
     default_limits: Option<DefaultLimitsInput>,
     #[serde(default)]
@@ -1106,8 +1114,27 @@ impl LightbridgeMcpHandler {
     }
 
     #[tool(
+        name = "set-project-allowed-models",
+        description = "Set a project's AI-model allowlist (RPC procedure.setProjectAllowedModels); owner or any roster member, every entry validated against the operator-configured model catalogue (#415, ADR-0018 Decision 5)"
+    )]
+    async fn set_project_allowed_models_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SetProjectAllowedModelsParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let project = self
+            .issuer
+            .set_project_allowed_models(&subject, &params.project_id, params.allowed_models)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(project)
+    }
+
+    #[tool(
         name = "create-project",
-        description = "Create a project (RPC model.Project.create); projectQuota is set afterward via set-project-quota"
+        description = "Create a project (RPC model.Project.create); allowedModels is set afterward via set-project-allowed-models, projectQuota via set-project-quota"
     )]
     async fn create_project_tool(
         &self,
@@ -1124,17 +1151,15 @@ impl LightbridgeMcpHandler {
             .unwrap_or_default();
         let default_limits_json =
             serde_json::to_value(default_limits).unwrap_or_else(|_| json!({}));
-        // `projectQuota` is `@readonly` on this generated input since #379 (no hook for the
-        // runtime-configured quota-tier catalogue check on the generic verb) -- a brand-new project
-        // always starts with `projectQuota = NULL` (always valid), settable afterward via the
-        // `set-project-quota` tool below.
+        // `projectQuota`/`allowedModels` are both `@readonly` on this generated input (#379 and
+        // #415 respectively -- neither has a hook for a runtime-configured catalogue check on the
+        // generic verb) -- a brand-new project always starts with `projectQuota = NULL`/
+        // `allowedModels = NULL` (both always valid), settable afterward via the
+        // `set-project-quota`/`set-project-allowed-models` tools below.
         let input = schema::inputs::CreateProjectInput {
             id: cuid2(),
             accountId: params.account_id,
             name: params.name,
-            allowedModels: params
-                .allowed_models
-                .map(|models| cratestack_json(json!(models))),
             defaultLimits: cratestack_json(default_limits_json),
             billingPlan: params.billing_plan,
             billingIdentity: params.billing_identity,
@@ -1201,7 +1226,7 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "update-project",
-        description = "Update a project (RPC model.Project.update)"
+        description = "Update a project (RPC model.Project.update); allowedModels is set via set-project-allowed-models, not this tool (#415, ADR-0018 Decision 5)"
     )]
     async fn update_project_tool(
         &self,
@@ -1218,9 +1243,6 @@ impl LightbridgeMcpHandler {
         }
         if let Some(billing_plan) = params.billing_plan {
             input.billingPlan = Some(billing_plan);
-        }
-        if let Some(allowed_models) = params.allowed_models {
-            input.allowedModels = Some(allowed_models.map(|models| cratestack_json(json!(models))));
         }
         if let Some(default_limits) = params.default_limits {
             let value = serde_json::to_value(DefaultLimits::from(default_limits))
@@ -2277,6 +2299,10 @@ mod tests {
                 "set-project-quota",
                 json!({ "project_id": "proj_1", "project_quota": "small" }),
             ),
+            (
+                "set-project-allowed-models",
+                json!({ "project_id": "proj_1", "allowed_models": ["gpt-4.1-mini"] }),
+            ),
             ("list-projects", json!({ "account_id": "acct_1" })),
             ("get-project", json!({ "project_id": "proj_1" })),
             (
@@ -2510,6 +2536,7 @@ mod tests {
             "revoke-api-key",
             "rotate-api-key",
             "set-default-project",
+            "set-project-allowed-models",
             "set-project-member-quota-tier",
             "set-project-member-role",
             "set-project-quota",

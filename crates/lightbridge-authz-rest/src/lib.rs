@@ -453,6 +453,64 @@ fn json_to_cratestack_value(value: serde_json::Value) -> Value {
     }
 }
 
+/// The inverse of `json_to_cratestack_value` above: lowers cratestack's own `Value` enum back into
+/// the `serde_json::Value` shape the core repo speaks. Needed by `set_project_allowed_models`
+/// (#415) to read a `Json?` procedure argument (`Option<cratestack::Json<Value>>`) back into
+/// `Option<Vec<String>>` before handing it to `AuthzStoreImpl`.
+fn cratestack_value_to_json(value: Value) -> serde_json::Value {
+    match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(b) => serde_json::Value::Bool(b),
+        Value::Int(i) => serde_json::Value::Number(i.into()),
+        Value::Float(f) => serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::String(s) => serde_json::Value::String(s),
+        Value::List(items) => {
+            serde_json::Value::Array(items.into_iter().map(cratestack_value_to_json).collect())
+        }
+        Value::Map(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, cratestack_value_to_json(v)))
+                .collect(),
+        ),
+        // `Bytes` has no `serde_json::Value` counterpart and no forward `json_to_cratestack_value`
+        // arm ever produces it (the core repo never stores binary blobs in `Json` columns) -- not
+        // reachable from `Project.allowedModels`'s own DB round-trip, so `Null` here just means
+        // "not a shape this converter's only caller understands", same tolerance
+        // `allowed_models_from_json_arg` already applies to any other unexpected whole-argument
+        // shape.
+        Value::Bytes(_) => serde_json::Value::Null,
+    }
+}
+
+/// Reads a `Project.allowedModels`-shaped `Json?` procedure argument
+/// (`Option<cratestack::Json<Value>>`) into the core domain's `Option<Vec<String>>`: an absent
+/// argument or an explicit `null` both mean "leave/set to all models allowed" (`None`); a JSON
+/// array is read element-by-element, silently dropping any non-string entry (mirrors
+/// `StoreRepo::json_to_vec`'s existing tolerance for the same shape read back from the DB); any
+/// other JSON shape (a bare string/number/object) is not a valid `allowedModels` value and is
+/// treated the same as `null` rather than panicking -- the catalogue check downstream only ever
+/// rejects known-bad *entries*, so a malformed whole-argument shape fails the same permissive way
+/// `Project.allowedModels`'s own DB decode already does for legacy rows (see that field's schema
+/// doc comment).
+fn allowed_models_from_json_arg(value: Option<cratestack::Json<Value>>) -> Option<Vec<String>> {
+    let json = cratestack_value_to_json(value?.0);
+    match json {
+        serde_json::Value::Null => None,
+        serde_json::Value::Array(items) => Some(
+            items
+                .into_iter()
+                .filter_map(|item| match item {
+                    serde_json::Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 fn to_schema_project(p: Project) -> schema::Project {
     let allowed_models = p
         .allowed_models
@@ -907,6 +965,33 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let project = issuer
                 .set_project_quota(&subject, &project_id, project_quota.as_deref())
+                .await
+                .map_err(to_cratestack_error)?;
+            Ok(to_schema_project(project))
+        }
+    }
+
+    fn set_project_allowed_models(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::set_project_allowed_models::Args,
+        _authorized: schema::procedures::set_project_allowed_models::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::set_project_allowed_models::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let project_id = args.args.projectId;
+        let allowed_models = allowed_models_from_json_arg(args.args.allowedModels);
+        async move {
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            let project = issuer
+                .set_project_allowed_models(&subject, &project_id, allowed_models)
                 .await
                 .map_err(to_cratestack_error)?;
             Ok(to_schema_project(project))

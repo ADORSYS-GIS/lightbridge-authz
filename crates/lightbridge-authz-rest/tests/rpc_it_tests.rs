@@ -263,28 +263,18 @@ async fn create_account(router: &Router, token: &str, _unused: &str) -> String {
         .to_string()
 }
 
-/// Build a typed `CreateProjectInput`. The `Json` columns (`defaultLimits`, `allowedModels`) carry
-/// cratestack's own `Value` enum, which serializes *externally tagged* (`{}` → `{"Map":{}}`), so a
-/// hand-built `serde_json` body would be rejected as an invalid payload — encoding the generated
-/// input type is the only correct wire shape for both JSON and CBOR.
-fn project_input(
-    id: &str,
-    account_id: &str,
-    name: &str,
-    allowed_models: Option<Vec<&str>>,
-) -> schema::inputs::CreateProjectInput {
+/// Build a typed `CreateProjectInput`. `defaultLimits` carries cratestack's own `Value` enum,
+/// which serializes *externally tagged* (`{}` → `{"Map":{}}`), so a hand-built `serde_json` body
+/// would be rejected as an invalid payload — encoding the generated input type is the only correct
+/// wire shape for both JSON and CBOR. `allowedModels` is NOT a field here (#415, ADR-0018 Decision
+/// 5): it is `@readonly` on the generic verb now, so a fresh project always starts with
+/// `allowedModels = NULL` — see `set_project_allowed_models_over_cbor` below for setting it
+/// afterward via `procedure.setProjectAllowedModels`.
+fn project_input(id: &str, account_id: &str, name: &str) -> schema::inputs::CreateProjectInput {
     schema::inputs::CreateProjectInput {
         id: id.to_string(),
         accountId: account_id.to_string(),
         name: name.to_string(),
-        allowedModels: allowed_models.map(|models| {
-            Json(CValue::List(
-                models
-                    .into_iter()
-                    .map(|m| CValue::String(m.to_string()))
-                    .collect(),
-            ))
-        }),
         defaultLimits: Json(CValue::Map(std::collections::BTreeMap::new())),
         billingPlan: "free".to_string(),
         billingIdentity: format!("bill-{}", cuid2()),
@@ -294,7 +284,7 @@ fn project_input(
 /// Create a project over RPC and return its id, asserting 200.
 async fn create_project(router: &Router, token: &str, account_id: &str, name: &str) -> String {
     let project_id = cuid2();
-    let input = project_input(&project_id, account_id, name, None);
+    let input = project_input(&project_id, account_id, name);
     let (status, body) = rpc_call(
         router.clone(),
         "model.Project.create",
@@ -914,14 +904,13 @@ async fn crud_lifecycle_over_cbor() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(Wire::Cbor.decode::<Value>(&body)["id"], account_id);
 
-    // A project create+get over CBOR too (allowedModels carried as a real list).
+    // A project create+get over CBOR too. `allowedModels` is `@readonly` on the generic verb since
+    // #415 (ADR-0018 Decision 5), so it starts NULL and is set afterward via
+    // `procedure.setProjectAllowedModels` -- see that call below (carried as a real list, not
+    // `None`, to exercise the same `Json` tagged-value encoding this comment used to describe on
+    // create).
     let project_id = cuid2();
-    let input = project_input(
-        &project_id,
-        &account_id,
-        "p-cbor",
-        Some(vec!["gpt-4.1-mini"]),
-    );
+    let input = project_input(&project_id, &account_id, "p-cbor");
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.create",
@@ -937,6 +926,24 @@ async fn crud_lifecycle_over_cbor() {
     );
     assert_eq!(Wire::Cbor.decode::<Value>(&body)["id"], project_id);
 
+    let allowed_models_value = serde_json::to_value(Json(CValue::List(vec![CValue::String(
+        "gpt-4.1-mini".to_string(),
+    )])))
+    .expect("Json<Value> serializes");
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.setProjectAllowedModels",
+        Wire::Cbor,
+        &json!({ "args": { "projectId": project_id, "allowedModels": allowed_models_value } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "cbor setProjectAllowedModels: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.get",
@@ -946,7 +953,9 @@ async fn crud_lifecycle_over_cbor() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(Wire::Cbor.decode::<Value>(&body)["name"], "p-cbor");
+    let decoded = Wire::Cbor.decode::<Value>(&body);
+    assert_eq!(decoded["name"], "p-cbor");
+    assert_eq!(decoded["allowedModels"], json!(["gpt-4.1-mini"]));
 
     // Account deletion is owner-only and no longer the generic `model.Account.delete` verb
     // (ADR-0005) -- the account's creator ("admin", the token subject used throughout this test)
@@ -971,36 +980,23 @@ async fn crud_lifecycle_over_cbor() {
 /// field as CBOR `null` (0xf6) — Rust has no way to emit CBOR's distinct `undefined` (0xf7). The
 /// regression below needs the literal `undefined` wire byte the frontend's `cborg` encoder
 /// actually sends for a JS `undefined` property value, so this builds the raw frame by hand
-/// instead of going through the typed `CreateProjectInput`.
-fn raw_cbor_create_project_with_undefined_allowed_models(
-    id: &str,
-    account_id: &str,
-    name: &str,
-) -> Vec<u8> {
+/// instead of going through the typed `SetProjectAllowedModelsInput`.
+///
+/// Targets `procedure.setProjectAllowedModels`, not `model.Project.create` (the original #341
+/// production incident this regression documents): #415 (ADR-0018 Decision 5) made `allowedModels`
+/// `@readonly` on the generic create/update verbs, moving its only write path onto this procedure
+/// -- a picker that clears its selection is exactly the shape that would send `allowedModels:
+/// undefined` again, so this keeps covering the real risk rather than a structurally-closed one.
+fn raw_cbor_set_project_allowed_models_with_undefined(project_id: &str) -> Vec<u8> {
     let mut out = Vec::new();
     let mut e = minicbor::Encoder::new(&mut out);
-    // Seven fields, not six: ADR-0006 moved `billingIdentity` from `Account` onto `Project` and
-    // it is non-optional there (matches `codec_undefined_regression_tests.rs`'s
-    // `frontend_frame_with_undefined_allowed_models`, the real frontend's own wire shape) -- an
-    // omitted `billingIdentity` fails decode with the same generic "invalid request payload" this
-    // test is trying to prove is fixed for `allowedModels`, masking the real regression.
-    e.map(7).unwrap();
-    e.str("id").unwrap();
-    e.str(id).unwrap();
-    e.str("accountId").unwrap();
-    e.str(account_id).unwrap();
-    e.str("name").unwrap();
-    e.str(name).unwrap();
+    e.map(1).unwrap();
+    e.str("args").unwrap();
+    e.map(2).unwrap();
+    e.str("projectId").unwrap();
+    e.str(project_id).unwrap();
     e.str("allowedModels").unwrap();
     e.undefined().unwrap();
-    e.str("defaultLimits").unwrap();
-    e.map(1).unwrap();
-    e.str("Map").unwrap();
-    e.map(0).unwrap();
-    e.str("billingPlan").unwrap();
-    e.str("free").unwrap();
-    e.str("billingIdentity").unwrap();
-    e.str(&format!("bill-{}", cuid2())).unwrap();
     out
 }
 
@@ -1034,33 +1030,36 @@ async fn rpc_call_raw(
 }
 
 #[tokio::test]
-async fn cbor_project_create_accepts_the_frontends_undefined_allowed_models() {
+async fn cbor_set_project_allowed_models_accepts_undefined_allowed_models() {
     // Regression test for the prod-only "invalid_argument" / "invalid request payload" bug: the
     // TS client's `cborg` CBOR encoder (`converse-frontends/packages/authz-rpc/src/codec.ts`)
     // encodes a JS `undefined` property value as the CBOR `undefined` simple value instead of
-    // omitting the key. The create-project screen never collects `allowedModels`, so every real
-    // `createProject` call on the CBOR path (`authz-api`'s production default) sent exactly this
-    // frame and 400'd — `crud_lifecycle_over_cbor` above sidesteps it entirely (its comment notes
-    // "allowedModels carried as a real list", never `None`). `codec_undefined_regression_tests.rs`
-    // covers `LenientCborCodec` in isolation; this exercises the same frame through the real
-    // router + a live DB.
+    // omitting the key. Originally reproduced on `model.Project.create`'s `allowedModels` (the
+    // create-project screen never collected it); #415 (ADR-0018 Decision 5) moved that field's
+    // only write path onto `procedure.setProjectAllowedModels`, so this test moved with it -- see
+    // `raw_cbor_set_project_allowed_models_with_undefined`'s own doc comment.
+    // `codec_undefined_regression_tests.rs` covers `LenientCborCodec` in isolation; this exercises
+    // the same frame through the real router + a live DB.
     let subject = format!("owner-cbor-undefined-{}", cuid2());
     let ctx = setup(admin_bearer(&subject)).await;
     let r = &ctx.router;
 
     let billing_id = format!("tenant-cbor-undefined-{}", cuid2());
     let account_id = create_account(r, "admin", &billing_id).await;
+    let project_id = create_project(r, "admin", &account_id, "p-cbor-undefined").await;
 
-    let project_id = cuid2();
-    let raw = raw_cbor_create_project_with_undefined_allowed_models(
-        &project_id,
-        &account_id,
-        "p-cbor-undefined",
-    );
-    let (status, body) = rpc_call_raw(r, "model.Project.create", Wire::Cbor, raw, "admin").await;
+    let raw = raw_cbor_set_project_allowed_models_with_undefined(&project_id);
+    let (status, body) = rpc_call_raw(
+        r,
+        "procedure.setProjectAllowedModels",
+        Wire::Cbor,
+        raw,
+        "admin",
+    )
+    .await;
     assert!(
         status.is_success(),
-        "cbor project create with undefined allowedModels: {status} {}",
+        "cbor setProjectAllowedModels with undefined allowedModels: {status} {}",
         String::from_utf8_lossy(&body)
     );
     let decoded = Wire::Cbor.decode::<Value>(&body);
@@ -1829,7 +1828,7 @@ async fn batch_rpc_frames_all_deny_for_a_caller_with_zero_permissions() {
     ));
     let ctx = setup(bearer).await;
 
-    let create_project_input = serde_json::to_value(project_input(&cuid2(), &subject, "x", None))
+    let create_project_input = serde_json::to_value(project_input(&cuid2(), &subject, "x"))
         .expect("CreateProjectInput serializes");
     let batch = json!([
         { "id": 1, "op": "procedure.listBillingPlans", "input": { "args": {} } },
@@ -2030,7 +2029,7 @@ async fn create_account_seeds_membership_enabling_project_create() {
 
     // A stranger (holds every RBAC permission, so passes the coarse gate, but is NOT a member of
     // this account) is refused by the membership policy — a non-member cannot create under it.
-    let stranger_input = project_input(&cuid2(), &account_id, "nope", None);
+    let stranger_input = project_input(&cuid2(), &account_id, "nope");
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.create",

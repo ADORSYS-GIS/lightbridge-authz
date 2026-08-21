@@ -630,6 +630,37 @@ impl AuthzStoreImpl {
             .await
     }
 
+    /// Sets `Project.allowedModels` post-creation/update. Backs `setProjectAllowedModels` (#415,
+    /// ADR-0018 Decision 5): `Project.allowedModels` is now `@readonly` on both generic
+    /// `model.Project.create`/`.update` verbs (same "no runtime-catalogue-check hook" gap #379
+    /// closed for `projectQuota`), so this procedure is the only write path left. Every entry in
+    /// `allowed_models` is validated against the operator-configured AI-model catalogue here,
+    /// before the ownership-gated SQL write (`StoreRepo::set_project_allowed_models`) -- same
+    /// pattern/error shape as `set_project_quota`'s `project_quota` check above, except the
+    /// catalogue check here names every invalid entry (`ModelCatalog::invalid_ids`) rather than
+    /// accept/reject a single scalar. `None` always passes (unchanged "all models allowed"
+    /// meaning); an empty/absent catalogue accepts anything (see `ModelCatalog::invalid_ids`'s own
+    /// doc comment).
+    pub async fn set_project_allowed_models(
+        &self,
+        subject: &str,
+        project_id: &str,
+        allowed_models: Option<Vec<String>>,
+    ) -> Result<Project> {
+        let invalid = self.models.invalid_ids(allowed_models.as_deref());
+        if !invalid.is_empty() {
+            return Err(Error::BadRequest(format!(
+                "unknown allowedModels entr{} [{}]: must each be one of the configured models [{}]",
+                if invalid.len() == 1 { "y" } else { "ies" },
+                invalid.join(", "),
+                self.models.model_ids().join(", ")
+            )));
+        }
+        self.repo
+            .set_project_allowed_models(subject, project_id, allowed_models)
+            .await
+    }
+
     /// Revoke an API key (business-state transition to `revoked`). Backs `revokeApiKey`.
     pub async fn revoke_api_key(&self, subject: &str, key_id: &str) -> Result<ApiKey> {
         let api_key = self
@@ -1148,6 +1179,75 @@ mod tests {
         assert!(
             !matches!(err, lightbridge_authz_core::error::Error::BadRequest(_)),
             "None must not be rejected by the catalogue check, got: {err}"
+        );
+    }
+
+    // #415 (ADR-0018 Decision 5): `allowedModels` validation on `setProjectAllowedModels`, same
+    // shape/reasoning as `setProjectQuota` above -- this write path used to be the generic,
+    // entirely-unvalidated `model.Project.create`/`model.Project.update` verbs before #415 marked
+    // `Project.allowedModels` `@readonly` and moved the write behind this procedure.
+    #[tokio::test]
+    async fn set_project_allowed_models_rejects_models_not_in_configured_set() {
+        use lightbridge_authz_core::config::ModelCatalogEntry;
+
+        let store = AuthzStoreImpl::with_pool(lazy_pool()).with_model_catalog(ModelCatalog {
+            models: vec![ModelCatalogEntry {
+                id: "gpt-4.1-mini".to_string(),
+                name: "GPT-4.1 Mini".to_string(),
+            }],
+        });
+
+        let err = store
+            .set_project_allowed_models(
+                "subject",
+                "proj",
+                Some(vec!["gpt-4.1-mini".to_string(), "gtp-4.1-typo".to_string()]),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, lightbridge_authz_core::error::Error::BadRequest(ref m) if m.contains("unknown allowedModels") && m.contains("gtp-4.1-typo")),
+            "an entry absent from the catalogue should be rejected by name before any DB access, got: {err}"
+        );
+    }
+
+    /// Mirrors `set_project_quota_allows_none_against_a_configured_catalogue`: `None` must pass the
+    /// catalogue check and reach the (dead) DB connection, never `BadRequest`.
+    #[tokio::test]
+    async fn set_project_allowed_models_allows_none_against_a_configured_catalogue() {
+        use lightbridge_authz_core::config::ModelCatalogEntry;
+
+        let store = AuthzStoreImpl::with_pool(lazy_pool()).with_model_catalog(ModelCatalog {
+            models: vec![ModelCatalogEntry {
+                id: "gpt-4.1-mini".to_string(),
+                name: "GPT-4.1 Mini".to_string(),
+            }],
+        });
+
+        let err = store
+            .set_project_allowed_models("subject", "proj", None)
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(err, lightbridge_authz_core::error::Error::BadRequest(_)),
+            "None must not be rejected by the catalogue check, got: {err}"
+        );
+    }
+
+    /// #415: proves the "empty/absent catalogue accepts anything" default is real, not merely
+    /// documented -- an entry that matches nothing configured must still pass when `models` is
+    /// never set (`AuthzStoreImpl::with_pool` defaults to `ModelCatalog::default()`).
+    #[tokio::test]
+    async fn set_project_allowed_models_accepts_anything_when_catalogue_is_empty() {
+        let store = AuthzStoreImpl::with_pool(lazy_pool());
+
+        let err = store
+            .set_project_allowed_models("subject", "proj", Some(vec!["anything-goes".to_string()]))
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(err, lightbridge_authz_core::error::Error::BadRequest(_)),
+            "an empty/absent catalogue must accept any value, got: {err}"
         );
     }
 

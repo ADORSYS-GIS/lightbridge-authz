@@ -60,13 +60,14 @@ pub struct Config {
     /// real tier catalogue (see `QuotaTiers::is_allowed`).
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub quota_tiers: QuotaTiers,
-    /// The operator-configured AI-model catalogue backing `listModelCatalog`, a read-only display
-    /// aid for a `Project.allowedModels` editor (e.g. a checkbox picker in the self-service UI) --
-    /// see that procedure's schema doc comment. Same env-driven loading shape as `billing` above,
-    /// but like `quota_tiers` (unlike `billing`) an empty/absent catalogue is the supported default:
-    /// there is nothing here to validate a write against (`allowedModels` stays unvalidated free-form
-    /// at write time), so a deployment that has not configured a catalogue yet simply serves an empty
-    /// list rather than failing to start.
+    /// The operator-configured AI-model catalogue backing `listModelCatalog` (a read-only display
+    /// aid for a `Project.allowedModels` editor) **and**, since #415 (ADR-0018 Decision 5), the
+    /// validation source `setProjectAllowedModels` checks every `allowedModels` entry against
+    /// before writing. Same env-driven loading shape as `billing` above, and like `quota_tiers`
+    /// (unlike `billing`) an empty/absent catalogue is the supported default: a deployment that has
+    /// not configured a catalogue yet accepts any `allowedModels` value uncritically (see
+    /// `ModelCatalog::invalid_ids`), same "no behavior change until populated" contract
+    /// `quota_tiers` already established, rather than failing to start.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub models: ModelCatalog,
     /// Operator-configured ceiling on how far in the future `createApiKey`/`rotateApiKey` may set
@@ -342,13 +343,15 @@ where
     deserializer.deserialize_any(TiersVisitor)
 }
 
-/// The operator-configured catalogue of AI models a `Project.allowedModels` editor may offer.
-/// Populated from env — either a single `MODEL_CATALOG` JSON-array env var (e.g.
-/// `models: "${MODEL_CATALOG}"`) or an inline YAML/JSON sequence of model objects — the same
-/// shape and env-driven loading as `Billing`/`QuotaTiers` above. Unlike `Billing`, an empty/absent
-/// catalogue is the supported default (see the `Config::models` field doc comment): this is a
-/// read-only display aid, not something a write path validates against, so there is nothing here
-/// that needs to fail startup when unset.
+/// The operator-configured catalogue of AI models a `Project.allowedModels` editor may offer, and
+/// -- since #415 (ADR-0018 Decision 5) -- the catalogue `setProjectAllowedModels` validates every
+/// `allowedModels` entry against before writing. Populated from env — either a single
+/// `MODEL_CATALOG` JSON-array env var (e.g. `models: "${MODEL_CATALOG}"`) or an inline YAML/JSON
+/// sequence of model objects — the same shape and env-driven loading as `Billing`/`QuotaTiers`
+/// above. Unlike `Billing`, an empty/absent catalogue is the supported default (see the
+/// `Config::models` field doc comment and `invalid_ids` below): nothing here needs to fail startup
+/// when unset, and until an operator populates a real catalogue every `allowedModels` value is
+/// accepted uncritically, same as `QuotaTiers::is_allowed`'s contract for an empty tier list.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ModelCatalog {
     #[serde(default, deserialize_with = "deserialize_model_list")]
@@ -368,6 +371,35 @@ impl ModelCatalog {
     /// returns the full entries, not just ids.
     pub fn model_ids(&self) -> Vec<&str> {
         self.models.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    /// Validates `models` (a `Project.allowedModels` write, e.g. from `setProjectAllowedModels`)
+    /// against this catalogue, returning the entries (deduplicated, in the caller's order) that are
+    /// not configured. An empty return means the write is allowed.
+    ///
+    /// `None` (the field left unset -- "all models allowed", unrelated to catalogue membership) is
+    /// always allowed, matching `QuotaTiers::is_allowed`'s `None`-always-passes contract. An
+    /// empty/absent catalogue accepts anything, including `Some(vec![...])` with entries that would
+    /// otherwise be unrecognized -- the deliberate "no behavior change until populated" default (see
+    /// this type's own doc comment), same as `QuotaTiers::is_allowed` for an empty tier list. This is
+    /// the one asymmetry with `Billing::is_allowed`/`QuotaTiers::is_allowed`, which each validate a
+    /// single scalar: `allowedModels` is a list, so a single invalid entry among otherwise-valid ones
+    /// must still be named, not just accepted-or-rejected as a whole -- see the returned `Vec` above.
+    pub fn invalid_ids<'a>(&self, models: Option<&'a [String]>) -> Vec<&'a str> {
+        let Some(models) = models else {
+            return Vec::new();
+        };
+        if self.models.is_empty() {
+            return Vec::new();
+        }
+        let mut invalid: Vec<&str> = Vec::new();
+        for id in models {
+            let known = self.models.iter().any(|m| m.id == *id);
+            if !known && !invalid.contains(&id.as_str()) {
+                invalid.push(id.as_str());
+            }
+        }
+        invalid
     }
 }
 
@@ -1182,6 +1214,68 @@ mod tests {
         }
         let via_wrapper_null: Wrap = from_str("models:\n").unwrap();
         assert!(via_wrapper_null.models.models.is_empty());
+    }
+
+    // #415 (ADR-0018 Decision 5): `ModelCatalog::invalid_ids` is the validation `setProjectAllowedModels`
+    // gates on. Mirrors `QuotaTiers::is_allowed`'s own test shape (configured/rejected/`None`/empty)
+    // one section up, adjusted for "a list, not a scalar, so name the offending entries".
+    fn configured_catalog() -> ModelCatalog {
+        ModelCatalog {
+            models: vec![
+                ModelCatalogEntry {
+                    id: "gpt-4.1-mini".to_string(),
+                    name: "GPT-4.1 Mini".to_string(),
+                },
+                ModelCatalogEntry {
+                    id: "claude-3.7".to_string(),
+                    name: "Claude 3.7".to_string(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn model_catalog_invalid_ids_accepts_configured_entries() {
+        let catalog = configured_catalog();
+        let models = vec!["gpt-4.1-mini".to_string(), "claude-3.7".to_string()];
+        assert!(catalog.invalid_ids(Some(&models)).is_empty());
+    }
+
+    #[test]
+    fn model_catalog_invalid_ids_names_unconfigured_entries() {
+        let catalog = configured_catalog();
+        let models = vec![
+            "gpt-4.1-mini".to_string(),
+            "gtp-4.1-typo".to_string(),
+            "also-unknown".to_string(),
+        ];
+        assert_eq!(
+            catalog.invalid_ids(Some(&models)),
+            vec!["gtp-4.1-typo", "also-unknown"]
+        );
+    }
+
+    #[test]
+    fn model_catalog_invalid_ids_deduplicates_the_same_bad_entry() {
+        let catalog = configured_catalog();
+        let models = vec!["typo".to_string(), "typo".to_string()];
+        assert_eq!(catalog.invalid_ids(Some(&models)), vec!["typo"]);
+    }
+
+    #[test]
+    fn model_catalog_invalid_ids_allows_none() {
+        let catalog = configured_catalog();
+        assert!(catalog.invalid_ids(None).is_empty());
+    }
+
+    #[test]
+    fn model_catalog_invalid_ids_accepts_anything_when_catalogue_is_empty() {
+        let catalog = ModelCatalog::default();
+        let models = vec!["anything-goes".to_string()];
+        assert!(
+            catalog.invalid_ids(Some(&models)).is_empty(),
+            "an empty/absent catalogue must accept any value, same default as QuotaTiers::is_allowed"
+        );
     }
 
     // lightbridge-authz#395: unlike `QuotaTiers`/`ModelCatalog` above, `ApiKeyExpiry` must default

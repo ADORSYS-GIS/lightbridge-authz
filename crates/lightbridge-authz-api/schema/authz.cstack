@@ -190,7 +190,26 @@ model Project {
   id String @id
   accountId String
   name String
-  allowedModels Json?
+  // `@readonly` (#415, ADR-0018 Decision 5, following the #379/#397 `projectQuota` precedent
+  // immediately below): neither generic `model.Project.create` nor `model.Project.update` has a
+  // hook for a runtime-configured catalogue check, so both were leaving this settable but
+  // unvalidated -- a typo here was harmless under today's allow-all-only world (it just never
+  // matched), but becomes a silent lockout once `model_policy = allowlist` (ADR-0018 Ticket 1)
+  // ships. `@readonly` marks it non-settable through the generic verbs (see CORRECTION below); `setProjectAllowedModels` below is now
+  // the only write path (post-creation only -- a brand-new project starts with `allowedModels =
+  // NULL`, settable afterward, same "starts NULL, set later" shape as `projectQuota`). Existing
+  // rows are NOT backfilled/re-validated by this change -- a project that already carries a
+  // stale/renamed id from before this validation existed keeps it (reads are unaffected; only a
+  // fresh write is checked). See that procedure's own doc comment for the catalogue-validation
+  // contract.
+  allowedModels Json? @readonly
+  //
+  // ⚠️ CORRECTION (verified empirically at cratestack 0.8.4 via converse-frontends#194): `@readonly`
+  // does NOT remove the field from the generated `CreateProjectInput`/`UpdateProjectInput`. The
+  // field stays in the generated input type and is silently IGNORED server-side. A caller can
+  // still send it and gets a no-op, not an error -- which is exactly why the frontend picker had
+  // to be moved to the dedicated procedure rather than relying on a compile error to catch the old
+  // call site. Do not assume `@readonly` makes a field unsendable; it makes it uneffective.
   // ADR-0018: three-value access-control policy governing which models this project's keys may
   // reach -- "allow_all" (default; today's only behavior, and what every pre-existing row
   // backfills to -- see the migration), "allowlist" (only `allowedModels` entries; an empty list
@@ -210,7 +229,7 @@ model Project {
   // `allowlist` mode is not safely selectable until `allowedModels` gets catalogue validation
   // (tracked separately, #415, landing before this field goes live) -- a caller flipping a
   // project to `allowlist` today would have zero server-side guard against a typo'd model id
-  // silently locking the project out. Marking this `@readonly` drops it from BOTH the generated
+  // silently locking the project out. Marking this `@readonly` makes it non-settable through the generated
   // `CreateProjectInput` and `UpdateProjectInput` (matching `projectQuota`/`isDefault`/`status`'s
   // own precedent immediately above/below), so no write path exists anywhere yet -- not even an
   // unvalidated one. A dedicated `setProjectModelPolicy`-style procedure (mirroring
@@ -277,7 +296,9 @@ model Project {
   // `removeProjectMember`, `setProjectMemberRole`, `setProjectMemberQuotaTier`), ADR-0005's
   // pattern re-targeted at project leadership; `createApiKey` below is lead-gated the same way.
   // Allowlist edits (`allowedModels`) are not yet lead-gated by a dedicated procedure -- still
-  // tracked as follow-up, see ADR-0006.
+  // tracked as follow-up, see ADR-0006. (`setProjectAllowedModels` below matches
+  // `model.Project.update`'s own owner-or-any-member policy, same as `setProjectQuota` -- not
+  // lead-gated either, consistent with that follow-up still being open.)
 }
 
 // Field-level immutability closes the gap the coarse RBAC gate cannot express on
@@ -561,12 +582,13 @@ procedure listBillingPlans(args: ListBillingPlansInput): BillingPlanInfo[]
 // picker in the self-service UI) render real model ids instead of hardcoding a list client-side --
 // the RBAC permission map and the pre-#283 `allowed_models` encoding bug are both examples of
 // exactly the kind of silent drift a hardcoded frontend mirror produces. Gated at the same
-// `project:update` permission `updateProject` uses for editing `allowedModels` itself (see
-// `rpc_authorize.rs`) -- a caller who cannot edit a project's allowlist has no use for the
-// catalogue either. NOT a validation source: `Project.allowedModels` stays an unvalidated
-// free-form list at write time (see that field's own doc comment) -- this procedure is a read-only
-// display aid, not a server-side allowlist gate; making `updateProject` validate against this
-// catalogue would be a separate, larger change.
+// `project:update` permission `setProjectAllowedModels` uses for editing `allowedModels` itself
+// (see `rpc_authorize.rs`) -- a caller who cannot edit a project's allowlist has no use for the
+// catalogue either. Since #415 (ADR-0018 Decision 5) this IS also the validation source:
+// `setProjectAllowedModels` (below) rejects any `allowedModels` entry absent from this same
+// catalogue before writing -- this procedure and that validation read the exact same
+// `ModelCatalog`, so there is no drift between what a picker offers and what the write path
+// accepts.
 type ModelCatalogEntry {
   id String
   name String
@@ -740,6 +762,31 @@ type SetProjectQuotaInput {
 }
 
 mutation procedure setProjectQuota(args: SetProjectQuotaInput): Project
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permProjectUpdate == true)
+
+// Sets `Project.allowedModels` post-creation/update (#415, ADR-0018 Decision 5): `allowedModels`
+// is `@readonly` above for the same reason `projectQuota` is (#379/#397 precedent) -- neither
+// generic verb has a hook for a runtime-configured catalogue check -- so this procedure is the
+// only write path left. A brand-new project therefore always starts with `allowedModels = NULL`
+// ("all models allowed", unchanged meaning); this is where it gets set/narrowed afterward.
+// Authorization mirrors `setProjectQuota` exactly (owner-or-any-member, hand-written SQL,
+// `@allow(auth() != null)` here only asserts an authenticated caller -- the coarse `project:update`
+// capability is enforced by the RBAC layer). Validates every entry in `allowedModels` against the
+// operator-configured `config.models` catalogue (`ModelCatalog::invalid_ids`,
+// `lightbridge-authz-core`) before the DB write: `None` always passes (unchanged "all models"
+// meaning); a non-empty catalogue rejects the request naming every entry not present in it; an
+// empty/absent catalogue accepts anything uncritically -- same "no behavior change until an
+// operator populates a real catalogue" contract `QuotaTiers::is_allowed` already established for
+// `projectQuota`/`defaultQuota`/`quotaTier`, deliberately, so this ships with zero observable
+// effect until `config.models` is actually configured. Pre-existing rows written before this
+// validation existed are NOT re-validated or backfilled -- only a fresh write through this
+// procedure is checked (see the field's own doc comment above).
+type SetProjectAllowedModelsInput {
+  projectId String
+  allowedModels Json?
+}
+
+mutation procedure setProjectAllowedModels(args: SetProjectAllowedModelsInput): Project
   @allow((auth() != null) && auth().rpcScope == "crud" && auth().permProjectUpdate == true)
 
 // Budget policy lifecycle (ADR-0007; storage in `lightbridge-authz-budget`'s `PolicyStore`).
