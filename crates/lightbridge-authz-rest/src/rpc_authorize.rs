@@ -171,6 +171,11 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         // its replacement write path, same coarse permission as `model.Project.update`, matching
         // `setProjectQuota`'s own precedent immediately above.
         "procedure.setProjectAllowedModels" => ProjectUpdate,
+        // ADR-0018 Decision 5 follow-up (unblocked by #415): `Project.modelPolicy` is now
+        // `@readonly` on both generic verbs above too, for the same reason -- `setProjectModelPolicy`
+        // is its replacement write path, same coarse permission as `model.Project.update`, matching
+        // `setProjectQuota`/`setProjectAllowedModels`'s own precedent immediately above.
+        "procedure.setProjectModelPolicy" => ProjectUpdate,
         // Roster management (ADR-0006). These replace the removed account-member procedures, and
         // the capability moved with them: `project:member`, not `account:member`. Note this is only
         // the coarse gate — the lead check ("the member row matching my subject must ALSO have
@@ -301,6 +306,7 @@ pub const MAPPED_OP_ID_PERMISSIONS: &[(&str, Permission)] = &[
         "procedure.setProjectAllowedModels",
         Permission::ProjectUpdate,
     ),
+    ("procedure.setProjectModelPolicy", Permission::ProjectUpdate),
     ("procedure.addProjectMember", Permission::ProjectMember),
     ("procedure.removeProjectMember", Permission::ProjectMember),
     ("procedure.listProjectRoster", Permission::ProjectMember),
@@ -691,6 +697,7 @@ mod tests {
                 "procedure.setDefaultProject",
                 "procedure.setProjectQuota",
                 "procedure.setProjectAllowedModels",
+                "procedure.setProjectModelPolicy",
                 "procedure.addProjectMember",
                 "procedure.removeProjectMember",
                 "procedure.listProjectRoster",

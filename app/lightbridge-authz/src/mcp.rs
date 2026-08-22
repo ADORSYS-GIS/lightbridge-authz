@@ -410,9 +410,10 @@ fn required_tool_permission(tool: &str) -> Option<Permission> {
         | "set-project-member-quota-tier" => Permission::ProjectMember,
         "create-project" => Permission::ProjectCreate,
         "list-projects" | "get-project" => Permission::ProjectRead,
-        "update-project" | "set-project-quota" | "set-project-allowed-models" => {
-            Permission::ProjectUpdate
-        }
+        "update-project"
+        | "set-project-quota"
+        | "set-project-allowed-models"
+        | "set-project-model-policy" => Permission::ProjectUpdate,
         "delete-project" => Permission::ProjectDelete,
         "disable-project" | "enable-project" => Permission::ProjectDisable,
         "set-default-project" => Permission::ProjectUpdate,
@@ -734,6 +735,18 @@ struct SetProjectAllowedModelsParams {
     /// absent from a non-empty catalogue.
     #[serde(default)]
     allowed_models: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetProjectModelPolicyParams {
+    project_id: String,
+    /// One of `"allow_all"` (every model, present and future -- the default), `"allowlist"`
+    /// (only `allowed_models` entries), or `"deny_all"` (no models). Any other value is refused
+    /// (ADR-0018 Decision 5 follow-up). Switching to `"allowlist"` while the project's current
+    /// `allowed_models` is empty/absent is refused -- populate it via `set-project-allowed-models`
+    /// first. `allowed_models` itself is never touched by this tool; it is preserved across a
+    /// policy change in either direction.
+    model_policy: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1136,6 +1149,25 @@ impl LightbridgeMcpHandler {
         let project = self
             .issuer
             .set_project_allowed_models(&subject, &params.project_id, params.allowed_models)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(project)
+    }
+
+    #[tool(
+        name = "set-project-model-policy",
+        description = "Set a project's model access policy to allow_all/allowlist/deny_all (RPC procedure.setProjectModelPolicy); owner or any roster member. Refuses switching to allowlist while allowedModels is empty; never touches allowedModels itself (ADR-0018 Decision 5 follow-up)"
+    )]
+    async fn set_project_model_policy_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SetProjectModelPolicyParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context)?;
+        let project = self
+            .issuer
+            .set_project_model_policy(&subject, &params.project_id, &params.model_policy)
             .await
             .map_err(to_tool_error)?;
 
@@ -2365,6 +2397,10 @@ mod tests {
                 "set-project-allowed-models",
                 json!({ "project_id": "proj_1", "allowed_models": ["gpt-4.1-mini"] }),
             ),
+            (
+                "set-project-model-policy",
+                json!({ "project_id": "proj_1", "model_policy": "deny_all" }),
+            ),
             ("list-projects", json!({ "account_id": "acct_1" })),
             ("get-project", json!({ "project_id": "proj_1" })),
             (
@@ -2601,6 +2637,7 @@ mod tests {
             "set-project-allowed-models",
             "set-project-member-quota-tier",
             "set-project-member-role",
+            "set-project-model-policy",
             "set-project-quota",
             "update-account",
             "update-api-key",

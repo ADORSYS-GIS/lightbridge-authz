@@ -14,7 +14,7 @@ use lightbridge_authz_core::config::{
 };
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey, Project,
+    Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey, ModelPolicy, Project,
     ProjectMember, ResourceStatus, RotateApiKey, hash_api_key,
 };
 use lightbridge_authz_core::{
@@ -659,6 +659,44 @@ impl AuthzStoreImpl {
         }
         self.repo
             .set_project_allowed_models(subject, project_id, allowed_models)
+            .await
+    }
+
+    /// Sets `Project.modelPolicy` (ADR-0018 Decision 5 follow-up). Backs `setProjectModelPolicy`:
+    /// `Project.modelPolicy` is `@readonly` on both generic `model.Project.create`/`.update` verbs
+    /// (it needed a precondition -- `allowedModels` catalogue validation, #415 -- before a write
+    /// path could safely exist at all; see that field's own schema doc comment), so this procedure
+    /// is the only write path.
+    ///
+    /// `model_policy` is validated to be one of the three canonical wire values here
+    /// (`ModelPolicy::parse_strict`), fail-closed: an unrecognized value is refused outright with
+    /// `BadRequest`, never silently coerced to a default -- the opposite of `ModelPolicy::from`'s
+    /// read-path coercion to `DenyAll`, which exists only because a DB read has no caller left to
+    /// return an error to (see that type's own doc comment). The other business rule this
+    /// procedure enforces -- refusing a transition to `allowlist` while `allowedModels` is empty,
+    /// because that would silently deny every model rather than the caller's evident intent -- is
+    /// NOT checked here: it needs the row's current `allowed_models` read under lock, so it lives
+    /// in `StoreRepo::set_project_model_policy`'s single transaction instead (see that method's
+    /// own doc comment for the full reasoning, including why this is a refusal rather than a
+    /// warning or a silent allow).
+    ///
+    /// `allowedModels` itself is never touched by this procedure -- switching to `allow_all` (or
+    /// back to `allowlist`) preserves whatever list was already there, so toggling `allow_all` off
+    /// and back on restores the previous selection instead of forcing the caller to re-enter it.
+    /// The list is simply inert while `model_policy` is not `allowlist` (ADR-0018 Decision 2).
+    pub async fn set_project_model_policy(
+        &self,
+        subject: &str,
+        project_id: &str,
+        model_policy: &str,
+    ) -> Result<Project> {
+        let parsed = ModelPolicy::parse_strict(model_policy).ok_or_else(|| {
+            Error::BadRequest(format!(
+                "unknown modelPolicy '{model_policy}': must be one of allow_all, allowlist, deny_all"
+            ))
+        })?;
+        self.repo
+            .set_project_model_policy(subject, project_id, &parsed.to_string())
             .await
     }
 

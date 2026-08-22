@@ -1536,6 +1536,111 @@ impl StoreRepo {
         Ok(Self::to_project(row))
     }
 
+    /// Sets `Project.modelPolicy` (ADR-0018 Decision 5 follow-up, #415's own tracked next step).
+    /// Backs `AuthzStoreImpl::set_project_model_policy` -- `model_policy` is validated to be one of
+    /// the three canonical wire strings there (`ModelPolicy::parse_strict`) before this method is
+    /// ever called, so `model_policy` here is trusted input, same layering as `set_project_quota`/
+    /// `set_project_allowed_models` above.
+    ///
+    /// Runs in a transaction, unlike the two setters immediately above, because this method also
+    /// enforces a business rule this repo's owner decided is a refusal, not a warning or a
+    /// silent allow (see the schema doc comment on `setProjectModelPolicy` for the full
+    /// reasoning): switching to `allowlist` while `allowed_models` is empty/absent would silently
+    /// deny every model -- a lockout by configuration, the same class of footgun ADR-0018 Decision
+    /// 5 already closed for a typo'd model id. That check needs to read the row's *current*
+    /// `allowed_models` under lock (`FOR UPDATE`) so a concurrent `set_project_allowed_models` call
+    /// racing this one cannot slip an empty list past the guard between the check and the write --
+    /// same transactional-invariant shape as `set_default_project` below, just guarding a business
+    /// rule instead of the "at most one default project" structural invariant.
+    #[instrument(skip(self))]
+    pub async fn set_project_model_policy(
+        &self,
+        subject: &str,
+        project_id: &str,
+        model_policy: &str,
+    ) -> Result<Project> {
+        let mut tx: Transaction<'_, Postgres> = self.pool().begin().await?;
+
+        let current: Option<ProjectRow> = sqlx::query_as(
+            r#"
+            SELECT
+              projects.id,
+              projects.account_id,
+              projects.name,
+              projects.allowed_models,
+              projects.default_limits,
+              projects.billing_plan,
+              projects.billing_identity,
+              projects.project_quota,
+              projects.status,
+              projects.is_default,
+              projects.model_policy,
+              projects.created_at,
+              projects.updated_at
+            FROM projects
+            WHERE projects.id = $1
+              AND (
+                projects.account_id = $2
+                OR EXISTS (
+                  SELECT 1 FROM project_members pm
+                  WHERE pm.project_id = projects.id AND pm.account_id = $2
+                )
+              )
+            FOR UPDATE
+            "#,
+        )
+        .bind(project_id)
+        .bind(subject)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let current = current.ok_or(Error::NotFound)?;
+        let current = Self::to_project(current);
+
+        if model_policy == "allowlist"
+            && current
+                .allowed_models
+                .as_deref()
+                .is_none_or(<[String]>::is_empty)
+        {
+            return Err(Error::BadRequest(
+                "cannot set modelPolicy to 'allowlist' while allowedModels is empty -- this would \
+                 silently deny every model; populate allowedModels via setProjectAllowedModels \
+                 first, or use 'deny_all' if blocking every model is actually intended"
+                    .to_string(),
+            ));
+        }
+
+        let row: ProjectRow = sqlx::query_as(
+            r#"
+            UPDATE projects
+            SET model_policy = $1, updated_at = $2
+            WHERE id = $3
+            RETURNING
+              id,
+              account_id,
+              name,
+              allowed_models,
+              default_limits,
+              billing_plan,
+              billing_identity,
+              project_quota,
+              status,
+              is_default,
+              model_policy,
+              created_at,
+              updated_at
+            "#,
+        )
+        .bind(model_policy)
+        .bind(Utc::now())
+        .bind(project_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(Self::to_project(row))
+    }
+
     /// Promote `project_id` to be its account's new default project, atomically demoting whichever
     /// project is currently default for that account. Relies on `projects_account_id_default_uidx`
     /// (a partial unique index on `(account_id) WHERE is_default`) to guarantee the invariant even

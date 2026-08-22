@@ -1185,6 +1185,10 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
             "procedure.disableAccount",
             json!({ "args": { "accountId": account_id } }),
         ),
+        (
+            "procedure.setProjectModelPolicy",
+            json!({ "args": { "projectId": project_id, "modelPolicy": "deny_all" } }),
+        ),
     ] {
         let (status, _) = rpc_call(r.clone(), op, Wire::Cbor, &input, Some("viewer")).await;
         assert_eq!(
@@ -1230,6 +1234,22 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
         status,
         StatusCode::OK,
         "admin update must succeed: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Admin also succeeds on `setProjectModelPolicy`, the op the viewer was 403'd on above.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.setProjectModelPolicy",
+        Wire::Cbor,
+        &json!({ "args": { "projectId": project_id, "modelPolicy": "deny_all" } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "admin setProjectModelPolicy must succeed: {}",
         String::from_utf8_lossy(&body)
     );
 }

@@ -128,6 +128,29 @@ impl From<String> for ModelPolicy {
     }
 }
 
+impl ModelPolicy {
+    /// Strictly parses `s` as one of the three canonical wire values, refusing (returning `None`
+    /// for) anything else -- the opposite failure mode from `From<String>` above. `From<String>`
+    /// exists to read back already-persisted DB state, where there is no caller left to hand an
+    /// error to, so it deliberately coerces an unrecognized value to the strictest `DenyAll`
+    /// rather than panicking. A *write* has a caller, and the house rule for this procedure
+    /// (`setProjectModelPolicy`, ADR-0018 Decision 5 follow-up) is fail-closed in the other
+    /// direction: an unrecognized value on the wire must be refused outright, never silently
+    /// coerced into a value the caller did not ask for -- `DenyAll` would silently narrow, and
+    /// `AllowAll` would (per `From<String>`'s own doc comment) silently widen access. Used by
+    /// `AuthzStoreImpl::set_project_model_policy`
+    /// (`crates/lightbridge-authz-rest/src/handlers/mod.rs`) to validate `setProjectModelPolicy`'s
+    /// wire input before any DB write.
+    pub fn parse_strict(s: &str) -> Option<Self> {
+        match s {
+            MODEL_POLICY_ALLOW_ALL => Some(ModelPolicy::AllowAll),
+            MODEL_POLICY_ALLOWLIST => Some(ModelPolicy::Allowlist),
+            MODEL_POLICY_DENY_ALL => Some(ModelPolicy::DenyAll),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod model_policy_tests {
     use super::ModelPolicy;
@@ -178,6 +201,38 @@ mod model_policy_tests {
         ] {
             assert_eq!(ModelPolicy::from(policy.to_string()), policy);
         }
+    }
+
+    #[test]
+    fn parse_strict_accepts_known_values() {
+        assert_eq!(
+            ModelPolicy::parse_strict("allow_all"),
+            Some(ModelPolicy::AllowAll)
+        );
+        assert_eq!(
+            ModelPolicy::parse_strict("allowlist"),
+            Some(ModelPolicy::Allowlist)
+        );
+        assert_eq!(
+            ModelPolicy::parse_strict("deny_all"),
+            Some(ModelPolicy::DenyAll)
+        );
+    }
+
+    #[test]
+    fn parse_strict_refuses_unknown_values_instead_of_coercing() {
+        assert_eq!(ModelPolicy::parse_strict("bogus"), None);
+        assert_eq!(ModelPolicy::parse_strict(""), None);
+        assert_eq!(
+            ModelPolicy::parse_strict("ALLOW_ALL"),
+            None,
+            "must not case-fold into a valid variant"
+        );
+        assert_eq!(
+            ModelPolicy::parse_strict("allow-all"),
+            None,
+            "a near-miss spelling must not silently become allow_all"
+        );
     }
 }
 
