@@ -1250,6 +1250,7 @@ fn opa_state(core: Arc<dyn DbPoolTrait>) -> Arc<OpaState> {
             password: "secret".to_string(),
         },
         billing: Arc::new(billing()),
+        api_key_audience: None,
     })
 }
 

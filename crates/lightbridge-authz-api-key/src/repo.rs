@@ -110,7 +110,17 @@ impl StoreRepo {
     /// the project's account owner -- callers that need to treat the owner as implicitly authorized
     /// (every lead-gated procedure does) go through `authorize_project_lead` instead, which layers
     /// that check on top of this one.
-    async fn project_member_role(&self, project_id: &str, subject: &str) -> Result<Option<String>> {
+    ///
+    /// `pub`: also read by `authz-opa`'s introspection handler (`OpaRepoTrait::project_member_role`)
+    /// to resolve the `role` claim for a native RFC 8693 exchange session at introspection time,
+    /// the human/OIDC-plane mirror of `project_member_quota_tier` below (ADR-0017's same
+    /// reasoning applies here).
+    #[instrument(skip(self, subject))]
+    pub async fn project_member_role(
+        &self,
+        project_id: &str,
+        subject: &str,
+    ) -> Result<Option<String>> {
         let role: Option<String> = sqlx::query_scalar(
             r#"SELECT role FROM project_members WHERE project_id = $1 AND account_id = $2"#,
         )
@@ -1772,33 +1782,18 @@ impl StoreRepo {
         Ok(Self::to_api_key(row))
     }
 
-    /// Project-scoped rule (not lead-gated, unlike `create_api_key`).
-    #[instrument(skip(self))]
-    pub async fn delete_api_key(&self, subject: &str, key_id: &str) -> Result<()> {
-        let result = sqlx::query(
-            r#"
-            DELETE FROM api_keys
-            USING projects
-            WHERE api_keys.project_id = projects.id
-              AND api_keys.id = $1
-              AND (
-                projects.account_id = $2
-                OR EXISTS (
-                  SELECT 1 FROM project_members pm
-                  WHERE pm.project_id = projects.id AND pm.account_id = $2
-                )
-              )
-            "#,
-        )
-        .bind(key_id)
-        .bind(subject)
-        .execute(self.pool())
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(Error::NotFound);
-        }
-        Ok(())
-    }
+    // `delete_api_key` (a hand-written hard `DELETE FROM api_keys`) was removed here (PR #429
+    // follow-up): it had no production caller -- `delete-api-key`'s MCP tool and the RPC
+    // `model.ApiKey.delete` verb both go through cratestack's generated soft-delete
+    // (`deleted_at`), per `migrations/20260721000001_cratestack_soft_delete_audit_defaults.sql`
+    // -- and its semantics were actively unsafe alongside self-issued-token introspection
+    // (`handlers::exchange_token`): a hard delete leaves NO `api_keys` row behind, and
+    // `verify_self_issued_token`'s `azp` check is what keeps a hard-deleted key's
+    // still-cryptographically-valid JWT from being reinterpreted as an active exchange session,
+    // not the row's mere absence (see that function's doc comment). A dead method whose only
+    // effect, if ever wired up again, is to reopen a revocation bypass is worse than no method;
+    // do not reintroduce a hand-written hard delete for `api_keys` without re-reading that
+    // function's doc comment first.
 
     #[instrument(skip(self, key_hash))]
     pub async fn find_api_key_by_hash(&self, key_hash: &str) -> Result<Option<ApiKey>> {
