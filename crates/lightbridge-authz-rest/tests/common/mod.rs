@@ -72,9 +72,12 @@ pub fn token_info(subject: &str, perms: PermissionSet) -> TokenInfo {
 }
 
 /// Like [`token_info`], but stamped with [`lightbridge_authz_bearer::API_KEY_CALLER_KIND`], as an
-/// `oauth2.type: self` self-signed API-key JWT would be (see `ApiKeyClaims` in
-/// `lightbridge-authz-rest::signing`). Used to exercise the caller-kind refusal in
-/// `requestBudgetRefill` (#191/#216).
+/// `oauth2.type: self` self-signed API-key JWT -- and, per #419, every human-plane RFC 8693
+/// exchange token too -- would be (see `access_token_extra` in `lightbridge-authz-rest::signing`).
+/// `requestBudgetRefill` no longer refuses a caller for carrying this signal (#191/#216's gate
+/// was deleted by #419: it fired on humans, and was never load-bearing for service accounts to
+/// begin with -- see that PR's description). Kept for tests that want to prove a specific caller
+/// is served or refused independent of this signal.
 pub fn api_key_token_info(subject: &str, perms: PermissionSet) -> TokenInfo {
     TokenInfo {
         caller_kind: Some(lightbridge_authz_bearer::API_KEY_CALLER_KIND.to_owned()),

@@ -426,10 +426,30 @@ the project as a whole.
 ### 4.7 A human on the Keycloak plane
 
 Claire signs in through opencode and exchanges for project *Atlas*. `x-project-id` and
-`x-account-id` come from **claims**, not introspection (there is no `api_key_id`). The model
-allowlist predicate **skips entirely** — its first escape hatch is "no `api_key_id`".
+`x-account-id` come from **claims**, not introspection.
 
-So: **the model allowlist is not enforced on the human plane.** See §5.
+> **Correction (#419): the exchanged access token does carry an `api_key_id` claim.**
+> `TokenExchangeOpStore::handle_token_exchange`/`handle_refresh_token`
+> (`crates/lightbridge-authz-rest/src/oauth2_op/store.rs:494-497`, `:746-749`) call
+> `signing::access_token_extra` with a freshly generated `session_id` (a CUID2, `let session_id =
+> cuid2()` at `:486`/`:738`) as its `api_key_id` argument, and that function stamps it into the
+> token unconditionally (`crates/lightbridge-authz-rest/src/signing.rs`). So Claire's own token
+> carries `api_key_id: <session_id>` — not the absence this section used to claim, just a value
+> that is a session id, never a row in `api_keys`. Whether Authorino's own plane-routing predicate
+> (external to this repo — see §3's `F7 -->|"has api_key_id?"| PLANE` branch) keys off this exact
+> JWT claim, and if so what that does to a human caller, is **not verified here** — a separate,
+> in-flight investigation is tracing a related gateway-side incident to this same code, so treat
+> that as open pending its findings rather than assuming either outcome.
+
+The model allowlist predicate **skips entirely** — its first escape hatch is "no `api_key_id`" —
+but per the correction above, that escape hatch's premise ("a human's token carries no
+`api_key_id`") no longer holds for a token from the native RFC 8693 exchange. Whether the predicate
+still skips for Claire today, and why, is part of the same open investigation.
+
+So: **the model allowlist is not enforced on the human plane** (verified for the human plane as
+the legacy `lightbridge-keycloak-spi` + protocol-mapper exchange produces it — §2 — which stamps no
+`api_key_id` at all; not independently re-verified here for the native RFC 8693 exchange given the
+correction above). See §5.
 
 **As of ADR-0017**, `x-quota-tier` on this plane is no longer unconditionally `""` either. The
 native RFC 8693 exchange (`TokenExchangeOpStore`, `crates/lightbridge-authz-rest/src/oauth2_op/store.rs`)
@@ -492,7 +512,10 @@ the (unattractive) options are in §3. Worth knowing before anyone reconciles a 
 
 Walkthrough 4.7. The predicate is gated on `api_key_id`, and the Keycloak plane has no allowlist
 source — `resolve-context` returns account/project context, not `allowed_models`. A human can reach
-any model their plan allows, regardless of the project they are working in.
+any model their plan allows, regardless of the project they are working in. **See 4.7's #419
+correction**: this was verified for the legacy `lightbridge-keycloak-spi` exchange, which stamps no
+`api_key_id` at all; the native RFC 8693 exchange's token does carry one (a session id, not a real
+key), and whether that changes anything here is an open, separately-tracked question.
 
 ### Removing a member does not revoke their keys
 

@@ -98,7 +98,11 @@ fn ctx_for(subject: &str) -> CratestackContext {
 /// Like [`ctx_for`], but stamped with [`auth_provider::CALLER_KIND_CONTEXT_KEY`] as
 /// [`lightbridge_authz_rest::auth_provider::CratestackAuthProvider::authenticate`] would for a
 /// token carrying `lightbridge_authz_bearer::API_KEY_CALLER_KIND` -- i.e. an `oauth2.type: self`
-/// self-signed API-key JWT (#191/#216).
+/// self-signed API-key JWT, or (per #419) the RFC 8693-exchanged token every human dashboard
+/// caller presents too, since `signing.rs`'s `access_token_extra` stamps this claim
+/// unconditionally regardless of caller. Kept after #419 deleted `request_budget_refill`'s own
+/// `caller_kind` gate specifically to prove the claim is now irrelevant to that procedure's
+/// outcome -- see `request_refill_accepts_api_key_shaped_caller_holding_the_permission` below.
 fn ctx_for_api_key_caller(subject: &str) -> CratestackContext {
     let mut ctx = ctx_for(subject);
     ctx.extensions.insert(
@@ -489,38 +493,43 @@ async fn request_refill_with_an_amount_not_offered_is_rejected(pool: PgPool) {
     );
 }
 
-/// #191/#216: an `oauth2.type: self` self-signed API-key JWT carries
-/// `lightbridge_authz_bearer::API_KEY_CALLER_KIND`, which `CratestackAuthProvider` projects into
-/// the context as `auth_provider::CALLER_KIND_CONTEXT_KEY` -- `request_budget_refill` must refuse
-/// it before ever reaching `RefillService`, regardless of whether the request would otherwise have
-/// been auto-approved.
+/// #419: before this fix, an `oauth2.type: self` self-signed API-key JWT's
+/// `lightbridge_authz_bearer::API_KEY_CALLER_KIND` claim -- projected into the context as
+/// `auth_provider::CALLER_KIND_CONTEXT_KEY` -- caused `request_budget_refill` to refuse the
+/// caller outright, *even though the same signal is stamped on every human-plane RFC 8693
+/// exchange token too* (see `token_exchange_tests.rs`'s
+/// `request_refill_accepts_a_real_human_plane_token_that_still_carries_the_stale_api_key_signal`
+/// for the real-signer proof). Authorization is `budget:self-refill` alone now: a caller stamped
+/// with this signal, who holds the permission, must be served exactly like any other caller.
 #[sqlx::test(migrations = "../../migrations")]
-async fn request_refill_refuses_api_key_derived_caller(pool: PgPool) {
+async fn request_refill_accepts_api_key_shaped_caller_holding_the_permission(pool: PgPool) {
     let account_id = cuid2();
     insert_account(&pool, &account_id).await;
     let (procedures, _human_ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
     let ctx = ctx_for_api_key_caller(&account_id);
     let db = lazy_cratestack_db();
 
-    let err = request_refill(
+    let output = request_refill(
         &procedures,
         &db,
         &ctx,
         refill_args(&account_id, None, "15000000"),
     )
     .await
-    .expect_err("an API-key-derived caller must be refused, not served");
-
-    assert!(
-        matches!(err, CratestackError::Forbidden(_)),
-        "expected Forbidden, got {err:?}"
+    .expect(
+        "a caller stamped with the API-key caller-kind signal, holding budget:self-refill, must \
+         be served -- the permission is the only gate now",
     );
+
+    assert_eq!(output.status, "auto_approved");
 }
 
-/// Regression guard for the refusal added above: a caller whose token carries no caller-kind
-/// signal at all (the ordinary case for a human OIDC login, and for every caller before this
-/// PR) must still be served normally -- absence of the claim must never be treated as "is an
-/// API key" (see `TokenInfo::caller_kind`'s doc comment).
+/// Regression guard: a caller whose token carries no caller-kind signal at all (the ordinary case
+/// for most callers) must still be served normally -- absence of the claim must never be treated
+/// as "is an API key" (see `TokenInfo::caller_kind`'s doc comment). Since #419 this is no longer
+/// distinguishing behavior (every caller is served the same way regardless of the signal -- see
+/// the test above), but it remains a useful pin on `TokenInfo::caller_kind`'s absence-is-unknown
+/// contract.
 #[sqlx::test(migrations = "../../migrations")]
 async fn request_refill_still_serves_caller_with_no_caller_kind_signal(pool: PgPool) {
     let account_id = cuid2();
