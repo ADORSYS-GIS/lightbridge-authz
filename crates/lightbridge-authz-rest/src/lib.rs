@@ -1032,6 +1032,33 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         }
     }
 
+    fn set_project_model_policy(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::set_project_model_policy::Args,
+        _authorized: schema::procedures::set_project_model_policy::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::set_project_model_policy::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let project_id = args.args.projectId;
+        let model_policy = args.args.modelPolicy;
+        async move {
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            let project = issuer
+                .set_project_model_policy(&subject, &project_id, &model_policy)
+                .await
+                .map_err(to_cratestack_error)?;
+            Ok(to_schema_project(project))
+        }
+    }
+
     fn revoke_api_key(
         &self,
         _db: &schema::Cratestack,

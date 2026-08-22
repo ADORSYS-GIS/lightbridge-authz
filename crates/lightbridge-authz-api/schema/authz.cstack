@@ -226,16 +226,14 @@ model Project {
   // explicitly): unlike `projectQuota`/`defaultQuota` above, `modelPolicy`'s own three values need
   // no runtime-configured *catalogue* check (it is a closed, compile-time-known set) -- so
   // `@readonly` here is not about that pattern. It exists because ADR-0018 Decision 5 states
-  // `allowlist` mode is not safely selectable until `allowedModels` gets catalogue validation
-  // (tracked separately, #415, landing before this field goes live) -- a caller flipping a
-  // project to `allowlist` today would have zero server-side guard against a typo'd model id
-  // silently locking the project out. Marking this `@readonly` makes it non-settable through the generated
-  // `CreateProjectInput` and `UpdateProjectInput` (matching `projectQuota`/`isDefault`/`status`'s
-  // own precedent immediately above/below), so no write path exists anywhere yet -- not even an
-  // unvalidated one. A dedicated `setProjectModelPolicy`-style procedure (mirroring
-  // `setProjectQuota`'s shape) is left as follow-up work once #415 ships, not built here: this
-  // ticket's own acceptance criteria only requires the value to be *readable* (introspection,
-  // token-exchange claim), never to be *settable* through this surface.
+  // `allowlist` mode is not safely selectable until `allowedModels` gets catalogue validation --
+  // that precondition shipped in #415, and `setProjectModelPolicy` below is now the dedicated
+  // write path this field's own Decision 5 anticipated (mirroring `setProjectQuota`'s shape, same
+  // "no hook for the write on the generic verb" reasoning as `projectQuota`/`allowedModels`
+  // above). `@readonly` stays here regardless -- it was never about the generic verbs someday
+  // gaining a hook for this field's own validation (a closed 3-value set needs none); it is about
+  // there being exactly one write path, same as `projectQuota`/`allowedModels`/`isDefault`/
+  // `status` immediately above/below.
   modelPolicy String @readonly
   defaultLimits Json
   billingPlan String
@@ -787,6 +785,56 @@ type SetProjectAllowedModelsInput {
 }
 
 mutation procedure setProjectAllowedModels(args: SetProjectAllowedModelsInput): Project
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permProjectUpdate == true)
+
+// Sets `Project.modelPolicy` (ADR-0018 Decision 5's own tracked follow-up, now unblocked: #415
+// shipped the `allowedModels` catalogue validation that precondition named). `Project.modelPolicy`
+// is `@readonly` above for the same "no hook on the generic verb" reason `projectQuota`/
+// `allowedModels` are -- this procedure is the only write path. Authorization mirrors
+// `setProjectQuota`/`setProjectAllowedModels` exactly (owner-or-any-member, hand-written SQL,
+// `@allow(auth() != null)` here only asserts an authenticated caller -- the coarse `project:update`
+// capability is enforced by the RBAC layer, same permission `setProjectAllowedModels` uses).
+//
+// `modelPolicy` is validated to be exactly one of `"allow_all"`/`"allowlist"`/`"deny_all"` before
+// the DB write (`ModelPolicy::parse_strict`, `lightbridge-authz-core`): an unrecognized value is
+// refused with a `BadRequest`, never silently coerced -- deliberately the OPPOSITE failure mode
+// from `ModelPolicy::from`'s read-path fail-closed-to-`DenyAll` coercion (that coercion exists
+// only because a DB read has no caller to hand an error back to; a write does, so it must refuse
+// instead of guessing what the caller meant).
+//
+// Decision (own reasoning recorded here, not only in the PR, per this repo's convention -- see
+// this field's own `@readonly` comment above for the precedent): switching to `allowlist` while
+// `allowedModels` is empty/absent is REFUSED, not allowed and not merely warned about. This is a
+// deliberate choice among three real options (refuse / warn / allow), argued through: `deny_all`
+// already exists as the named, unambiguous way to block every model, so refusing this transition
+// loses no expressiveness -- a caller who genuinely wants "nothing" has a clearly-labeled state
+// for it. What an `allowlist`-with-empty-list transition usually signals instead is an accident:
+// a UI that lets an operator flip the policy toggle before populating the picker, or a caller who
+// does not realize the project's list is currently empty -- exactly the "lockout by
+// configuration, not by typo" failure mode ADR-0018 Decision 5's own Context section names as the
+// reason catalogue validation had to land before ANY write path here could exist. Refusing gives
+// the caller (the frontend) a clean, actionable `BadRequest` to react to instead of a project that
+// silently stops serving every model with no error anywhere. The wire contract a caller must
+// honour: this procedure fails with `BadRequest` when `modelPolicy == "allowlist"` and the
+// project's CURRENT `allowedModels` (not the request body -- this procedure does not accept
+// `allowedModels` at all, see below) is `null` or `[]`; the caller must call
+// `setProjectAllowedModels` with a non-empty list FIRST, then this procedure, when driving a
+// "turn restriction on" flow from empty state.
+//
+// This procedure does NOT accept `allowedModels` -- it writes only the `modelPolicy` column, so
+// `allowedModels` is always PRESERVED across a policy change in either direction. This is a
+// deliberate choice, not an oversight: switching to `allow_all` does not clear the project's
+// existing allowlist, so toggling back to `allowlist` later (the "disable restriction, then
+// re-enable it" flow the repo owner's own request for THIS procedure is itself an example of, just
+// the opposite direction) restores the previous selection instead of forcing the caller to
+// re-enter it from scratch. The list is simply inert while `modelPolicy` is not `allowlist`
+// (ADR-0018 Decision 2), so preserving it has no observable effect until the caller switches back.
+type SetProjectModelPolicyInput {
+  projectId String
+  modelPolicy String
+}
+
+mutation procedure setProjectModelPolicy(args: SetProjectModelPolicyInput): Project
   @allow((auth() != null) && auth().rpcScope == "crud" && auth().permProjectUpdate == true)
 
 // Budget policy lifecycle (ADR-0007; storage in `lightbridge-authz-budget`'s `PolicyStore`).
