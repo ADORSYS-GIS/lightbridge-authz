@@ -34,12 +34,22 @@ struct ExchangeClaims {
     /// tenant-scoped at all, distinct from any other self-issued token shape this service's keys
     /// might sign.
     project_id: Option<String>,
-    /// A freshly-minted session CUID2 on an exchange-derived token (`access_token_extra` receives
-    /// `session_id` in the parameter this struct field shares a name with), NEVER a real
-    /// `api_keys.id` -- see this module's doc comment on why a token reaching this function can
-    /// only be exchange-derived in the first place. Surfaced on the introspection response as
-    /// `sub` (the "subject of the credential"), not as `api_key_id` (there is no `api_keys` row).
+    /// A freshly-minted session CUID2 on an exchange-derived token, or a real `api_keys.id` on a
+    /// self-signed API-key JWT (`access_token_extra`'s `api_key_id` parameter serves both mint
+    /// paths -- see `crate::signing::access_token_extra`). Which one this claim actually holds is
+    /// NOT decidable from the claim alone; [`azp`](Self::azp) is what disambiguates. Surfaced on
+    /// the introspection response as `sub` (the "subject of the credential") once the `azp` gate
+    /// below has confirmed this is genuinely an exchange session.
     api_key_id: Option<String>,
+    /// The authorized-party claim `crate::signing::access_token_extra` stamps from its `azp`
+    /// parameter: the FIXED `oauth2.signing.audience` value on a self-signed API-key JWT
+    /// (`ApiKeyJwtSigner::sign` passes `self.audience.as_deref()`), or the requesting OAuth2
+    /// client's `client_id` (which varies per client and is never registered under the API-key
+    /// audience -- see `verify_self_issued_token`'s doc comment) on a token-exchange access/
+    /// refresh token. This is the ONLY field that reliably tells the two mint paths apart once a
+    /// token has reached this function; see that function's `azp` gate for why it must be checked
+    /// before this token is ever treated as an exchange session.
+    azp: Option<String>,
 }
 
 /// Verifies `token` was signed by one of THIS service's own signing keys (`signing_keys`, the
@@ -57,18 +67,42 @@ struct ExchangeClaims {
 /// Postgres, per AGENTS.md) is consulted -- no outbound HTTP call to `authz-idp`'s own
 /// `/.well-known/jwks.json`, so this has no runtime dependency on that service being reachable.
 ///
-/// **Why a token reaching this function can only be exchange-derived, never a real (even revoked)
-/// API key.** Every self-signed API-key JWT is hashed and inserted into `api_keys.key_hash` at
-/// the moment it is minted (`handlers::mod::AuthzStoreImpl::issue_api_key_secret` ->
-/// `hash_api_key(&issued.secret)`), and that row is never deleted, only status-flipped on
-/// revocation. So `find_api_key_validation_by_hash(hash_api_key(token))` finding NO row for this
-/// exact token string is proof this token was never minted by `ApiKeyJwtSigner::sign` -- it can
-/// only be a forged token (rejected below: an attacker without our private key cannot produce a
-/// signature `DecodingKey::from_jwk` accepts) or a genuine RFC 8693 exchange/refresh access token.
-/// This function's caller (`resolve_exchange_token_context`, via `introspect_api_key`) MUST only
-/// be reached after that hash lookup has already returned `None` -- see `introspect_api_key`'s own
-/// doc comment for why the hash check always runs first and unconditionally short-circuits when a
-/// row exists, active or not.
+/// **Why a token reaching this function is NOT proven to be exchange-derived by hash-lookup-miss
+/// alone -- the `azp` gate below is load-bearing, not defense-in-depth.** An earlier version of
+/// this doc comment claimed a hash-lookup miss was "structural proof" this token was never a real
+/// API key, reasoning that every self-signed API-key JWT is hashed into `api_keys.key_hash` at
+/// mint time and "that row is never deleted, only status-flipped." That second half was false:
+/// `StoreRepo::delete_api_key` was a genuine hard `DELETE FROM api_keys` with no production caller
+/// (`delete-api-key`'s MCP tool and the RPC `model.ApiKey.delete` verb both go through
+/// cratestack's generated SOFT delete instead) -- but nothing stopped a future caller from wiring
+/// it up, and had one, a hard-deleted key's still-cryptographically-valid JWT would have hash-miss
+/// its way straight into this function and come back `active: true`. That method has been removed
+/// (see its former doc comment / removal note in `crates/lightbridge-authz-api-key/src/repo.rs`)
+/// specifically because it made that bypass reachable, but this function does not rely on "nothing
+/// hard-deletes an `api_keys` row" being true anymore -- it refuses independently, below, any
+/// token shaped like a self-signed API-key JWT regardless of whether a matching row exists.
+///
+/// The actual, structural discriminant is `ExchangeClaims::azp`
+/// (`crate::signing::access_token_extra`): a self-signed API-key JWT's `azp` is always the FIXED
+/// `oauth2.signing.audience` value (`ApiKeyJwtSigner::sign` passes `self.audience.as_deref()`); a
+/// token-exchange access/refresh token's `azp` is always the requesting OAuth2 client's
+/// `client_id` instead, which varies per client and is never registered under the API-key
+/// audience by deployment convention (`Oauth2TokenExchange::clients`; the same convention
+/// `ai-helm-values`' `lightbridge-key-active`/`lightbridgeintrospect` AuthConfig steps already
+/// rely on -- PRs #290/#291/#288 there). So: if `claims.azp` matches
+/// `OpaState::api_key_audience` (or is ABSENT -- an absent `azp` must NOT be read as "therefore
+/// not an API key"; a self-signed JWT minted under an unconfigured `oauth2.signing.audience` also
+/// carries no `azp` claim at all, since `access_token_extra` only inserts it `if let Some(azp) =
+/// azp`), this function refuses the token outright, before any project/membership resolution runs
+/// -- regardless of whether `api_keys` currently holds a matching row. A forged token is separately
+/// rejected by signature verification: an attacker without this service's private key cannot
+/// produce a signature `DecodingKey::from_jwk` accepts.
+///
+/// This function's caller (`resolve_exchange_token_context`, via `introspect_api_key`) is still
+/// only reached after `find_api_key_validation_by_hash` has already returned `None` for the
+/// presented bearer's hash -- see `introspect_api_key`'s own doc comment. That check remains the
+/// FIRST line of defense for the common case (a still-present, hash-matched row); the `azp` gate
+/// here is what keeps the guarantee holding even when it is not.
 #[instrument(skip(state, token))]
 async fn verify_self_issued_token(
     state: &Arc<OpaState>,
@@ -104,12 +138,35 @@ async fn verify_self_issued_token(
     validation.algorithms = vec![Algorithm::RS256];
     validation.validate_aud = false;
 
-    match decode::<ExchangeClaims>(token, &decoding_key, &validation) {
-        Ok(data) => Ok(Some(data.claims)),
+    let claims = match decode::<ExchangeClaims>(token, &decoding_key, &validation) {
+        Ok(data) => data.claims,
         Err(err) => {
             tracing::debug!(error = %err, "self-issued token signature/claims verification failed");
-            Ok(None)
+            return Ok(None);
         }
+    };
+
+    if is_api_key_shaped(&claims, state.api_key_audience.as_deref()) {
+        tracing::info!(
+            active = false,
+            reason = "api_key_shaped_azp",
+            "self-issued token carries an API-key-shaped azp (or none at all); refusing to treat \
+             it as an exchange session regardless of whether an api_keys row still exists"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(claims))
+}
+
+/// The `azp` discriminant `verify_self_issued_token` refuses on. Fail-closed on an absent `azp`
+/// (treated as "could be an API key", never as "therefore not one") -- see that function's doc
+/// comment for the full reasoning and why this must not be weakened to "only refuse an exact
+/// match."
+fn is_api_key_shaped(claims: &ExchangeClaims, configured_api_key_audience: Option<&str>) -> bool {
+    match claims.azp.as_deref() {
+        None => true,
+        Some(azp) => Some(azp) == configured_api_key_audience,
     }
 }
 

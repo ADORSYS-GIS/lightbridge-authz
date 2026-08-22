@@ -74,6 +74,13 @@ pub struct OpaState {
     /// Configured billing-plan catalogue, used to resolve a key's plan id into its display name
     /// and limits at introspection time.
     pub billing: Arc<Billing>,
+    /// `oauth2.signing.audience` -- the FIXED `azp` value a self-signed API-key JWT always
+    /// carries (`ApiKeyJwtSigner::sign`). `handlers::exchange_token::verify_self_issued_token`
+    /// uses this to refuse any self-issued token shaped like an API-key JWT before ever treating
+    /// it as an exchange session, independent of whether an `api_keys` row still exists for it --
+    /// see that function's doc comment. `None` when `oauth2.type` is `external` (no self-signing
+    /// at all) or when `oauth2.signing.audience` is left unconfigured under `type: self`.
+    pub api_key_audience: Option<String>,
 }
 
 #[async_trait]
@@ -2527,13 +2534,19 @@ pub async fn start_opa_server(
     opa: &OpaServer,
     pool: Arc<dyn DbPoolTrait>,
     billing: &Billing,
+    oauth2: &Oauth2,
 ) -> Result<()> {
     let readiness_pool = pool.clone();
     let repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
+    let api_key_audience = oauth2
+        .signing
+        .as_ref()
+        .and_then(|signing| signing.audience.clone());
     let state = Arc::new(OpaState {
         repo,
         basic_auth: opa.basic_auth.clone(),
         billing: Arc::new(billing.clone()),
+        api_key_audience,
     });
 
     let app = build_opa_router(state, readiness_pool);

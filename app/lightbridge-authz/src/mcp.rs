@@ -130,18 +130,28 @@ impl std::fmt::Debug for LightbridgeMcpHandler {
 }
 
 impl LightbridgeMcpHandler {
+    /// `api_key_audience` (`oauth2.signing.audience`) is threaded onto the `OpaState` this
+    /// handler builds purely for construction-site consistency with `authz-opa`'s own
+    /// `start_opa_server` -- MCP's own tools only ever call
+    /// `handlers::opa::validate_api_key_context` (the API-key hash path), never
+    /// `handlers::exchange_token::verify_self_issued_token`, so this value is currently inert
+    /// here. Kept correct anyway rather than hardcoding `None`, so a future MCP tool that does
+    /// reach the exchange-token path inherits the same `azp` gate by construction instead of
+    /// silently getting a `None` that would fail closed on every `azp`-bearing token.
     pub fn new(
         cratestack_db: schema::Cratestack,
         issuer: Arc<AuthzStoreImpl>,
         opa_repo: Arc<dyn OpaRepoTrait>,
         basic_auth: BasicAuth,
         billing: &Billing,
+        api_key_audience: Option<String>,
     ) -> Self {
         let billing = Arc::new(billing.clone());
         let opa_state = Arc::new(OpaState {
             repo: opa_repo,
             basic_auth,
             billing: billing.clone(),
+            api_key_audience,
         });
 
         Self {
@@ -1650,7 +1660,18 @@ fn build_mcp_router(
         bearer: bearer_service,
     });
 
-    let handler = LightbridgeMcpHandler::new(cratestack_db, issuer, opa_repo, basic_auth, billing);
+    let api_key_audience = oauth2
+        .signing
+        .as_ref()
+        .and_then(|signing| signing.audience.clone());
+    let handler = LightbridgeMcpHandler::new(
+        cratestack_db,
+        issuer,
+        opa_repo,
+        basic_auth,
+        billing,
+        api_key_audience,
+    );
     let oauth_proxy_state = Arc::new(OauthProxyState {
         client: Client::new(),
         endpoints: resolve_oauth2_endpoints(oauth2),
@@ -2224,6 +2245,7 @@ mod tests {
             sample_repo(),
             basic_auth(),
             &sample_billing(),
+            None,
         )
     }
 
@@ -2628,6 +2650,7 @@ mod tests {
             sample_repo(),
             basic_auth(),
             &Billing::default(),
+            None,
         );
         let tools = handler.advertised_tools();
         let create = tools
@@ -2823,6 +2846,7 @@ mod tests {
             repo: Arc::new(NotFoundOpaRepo),
             basic_auth: basic_auth(),
             billing: Arc::new(sample_billing()),
+            api_key_audience: None,
         });
 
         let result = run_validate_api_key(
@@ -2846,6 +2870,7 @@ mod tests {
             repo: Arc::new(NotFoundOpaRepo),
             basic_auth: basic_auth(),
             billing: Arc::new(sample_billing()),
+            api_key_audience: None,
         });
 
         let result = run_validate_authorino(

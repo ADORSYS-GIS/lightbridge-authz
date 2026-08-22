@@ -219,6 +219,7 @@ fn mk_state(repo: MockOpaRepo) -> Arc<OpaState> {
                 }),
             }],
         }),
+        api_key_audience: Some(TEST_API_KEY_AUDIENCE.to_string()),
     })
 }
 
@@ -571,6 +572,16 @@ fn mk_signing_key() -> TestSigningKey {
     }
 }
 
+/// `oauth2.signing.audience` as configured on `mk_state`'s `OpaState::api_key_audience` --
+/// mirrors production's `"lightbridge-api-key"` (`ai-helm-values`, `lightbridge-app.yaml`'s
+/// `signing:` block). A token whose `azp` equals this is refused by
+/// `handlers::exchange_token::verify_self_issued_token` regardless of `api_keys` row state.
+const TEST_API_KEY_AUDIENCE: &str = "lightbridge-api-key";
+/// A representative token-exchange client id -- varies per client, never registered under
+/// `TEST_API_KEY_AUDIENCE` (see `verify_self_issued_token`'s doc comment for why that convention
+/// is what makes `azp` a reliable discriminant).
+const TEST_EXCHANGE_CLIENT_ID: &str = "governance-auth-cli";
+
 #[derive(Serialize)]
 struct ExchangeTokenClaims {
     sub: String,
@@ -581,6 +592,8 @@ struct ExchangeTokenClaims {
     project_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     api_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    azp: Option<String>,
 }
 
 fn sign_exchange_token(key: &TestSigningKey, claims: &ExchangeTokenClaims) -> String {
@@ -609,6 +622,7 @@ async fn introspect_resolves_active_exchange_session_with_live_project_authoriza
             account_id: Some("acct_1".to_string()),
             project_id: Some("proj_1".to_string()),
             api_key_id: Some("session_abc123".to_string()),
+            azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
         },
     );
     let state = mk_state(MockOpaRepo {
@@ -663,6 +677,7 @@ async fn introspect_returns_inactive_for_an_expired_exchange_token() {
             account_id: Some("acct_1".to_string()),
             project_id: Some("proj_1".to_string()),
             api_key_id: Some("session_abc123".to_string()),
+            azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
         },
     );
     let state = mk_state(MockOpaRepo {
@@ -694,6 +709,7 @@ async fn introspect_returns_inactive_for_a_token_signed_by_an_unknown_key() {
             account_id: Some("acct_1".to_string()),
             project_id: Some("proj_1".to_string()),
             api_key_id: Some("session_abc123".to_string()),
+            azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
         },
     );
     let state = mk_state(MockOpaRepo {
@@ -729,6 +745,7 @@ async fn introspect_returns_inactive_for_a_self_issued_token_with_no_project_cla
             account_id: None,
             project_id: None,
             api_key_id: None,
+            azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
         },
     );
     let state = mk_state(MockOpaRepo {
@@ -759,6 +776,7 @@ async fn introspect_returns_inactive_when_exchange_subject_is_no_longer_a_member
             account_id: Some("acct_1".to_string()),
             project_id: Some("proj_1".to_string()),
             api_key_id: Some("session_abc123".to_string()),
+            azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
         },
     );
     let state = mk_state(MockOpaRepo {
@@ -791,6 +809,7 @@ async fn introspect_returns_inactive_when_exchange_project_is_suspended() {
             account_id: Some("acct_1".to_string()),
             project_id: Some("proj_1".to_string()),
             api_key_id: Some("session_abc123".to_string()),
+            azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
         },
     );
     let mut project = mk_project();
@@ -823,6 +842,7 @@ async fn introspect_returns_inactive_when_exchange_account_is_suspended() {
             account_id: Some("acct_1".to_string()),
             project_id: Some("proj_1".to_string()),
             api_key_id: Some("session_abc123".to_string()),
+            azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
         },
     );
     let mut account = mk_account();
@@ -864,8 +884,9 @@ async fn a_revoked_api_key_jwt_is_never_reinterpreted_as_an_active_exchange_sess
             account_id: Some("acct_1".to_string()),
             project_id: Some("proj_1".to_string()),
             // Shaped like a real self-signed API-key JWT: `api_key_id` names the actual
-            // (now-revoked) key row, not a session id.
+            // (now-revoked) key row, not a session id, and `azp` is the fixed API-key audience.
             api_key_id: Some("key_1".to_string()),
+            azp: Some(TEST_API_KEY_AUDIENCE.to_string()),
         },
     );
     let state = mk_state(MockOpaRepo {
@@ -890,4 +911,84 @@ async fn a_revoked_api_key_jwt_is_never_reinterpreted_as_an_active_exchange_sess
         "no exchange-path authorization data must leak through for a revoked key"
     );
     assert!(payload.get("quota_tier").is_none());
+}
+
+/// **The `azp`-gate regression -- proves the guarantee holds even with NO `api_keys` row at
+/// all**, the exact shape a hard-deleted key would present (unlike the test above, which proves
+/// the row-existence check wins when a row IS present). `StoreRepo::delete_api_key` -- a
+/// hand-written hard `DELETE FROM api_keys` that would have produced precisely this scenario --
+/// has been removed because of this, but this test does not rely on that removal either: it
+/// proves `verify_self_issued_token` independently refuses any token whose `azp` matches the
+/// configured API-key audience, regardless of what the `api_keys` table currently contains.
+#[tokio::test]
+async fn a_token_carrying_the_api_key_audience_as_azp_is_refused_even_with_no_api_keys_row() {
+    let key = mk_signing_key();
+    let token = sign_exchange_token(
+        &key,
+        &ExchangeTokenClaims {
+            sub: "human-subject-1".to_string(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp() as usize,
+            account_id: Some("acct_1".to_string()),
+            project_id: Some("proj_1".to_string()),
+            api_key_id: Some("key_1".to_string()),
+            azp: Some(TEST_API_KEY_AUDIENCE.to_string()),
+        },
+    );
+    let state = mk_state(MockOpaRepo {
+        // No api_keys row at all -- the hard-delete scenario. Every other precondition the
+        // exchange path needs IS satisfied, to prove the azp gate alone is what refuses this.
+        api_key: None,
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: vec![key.public_jwk.clone()],
+        member_context: Some(mk_member_context()),
+        member_role: Some("lead".to_string()),
+        member_quota_tier: Some("t-m".to_string()),
+    });
+
+    let (status, payload) = introspect(state, &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], false);
+    assert!(
+        payload.get("role").is_none(),
+        "no exchange-path authorization data must leak through for an API-key-shaped azp"
+    );
+}
+
+/// The fail-closed half of the `azp` gate: a token with NO `azp` claim at all must also be
+/// refused, not treated as "obviously not an API key." A self-signed API-key JWT minted under an
+/// unconfigured `oauth2.signing.audience` carries no `azp` claim either (`access_token_extra`
+/// only inserts it `if let Some(azp) = azp`), so an absent `azp` is genuinely ambiguous and must
+/// resolve to the more conservative reading.
+#[tokio::test]
+async fn a_token_with_no_azp_claim_at_all_is_refused() {
+    let key = mk_signing_key();
+    let token = sign_exchange_token(
+        &key,
+        &ExchangeTokenClaims {
+            sub: "human-subject-1".to_string(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp() as usize,
+            account_id: Some("acct_1".to_string()),
+            project_id: Some("proj_1".to_string()),
+            api_key_id: Some("session_abc123".to_string()),
+            azp: None,
+        },
+    );
+    let state = mk_state(MockOpaRepo {
+        api_key: None,
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: vec![key.public_jwk.clone()],
+        member_context: Some(mk_member_context()),
+        member_role: None,
+        member_quota_tier: None,
+    });
+
+    let (status, payload) = introspect(state, &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], false);
 }

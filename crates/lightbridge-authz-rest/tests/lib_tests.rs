@@ -127,8 +127,13 @@ async fn start_opa_server_fails_fast_when_tls_certs_are_missing() {
             password: "change-me".to_string(),
         },
     };
-    let result =
-        lightbridge_authz_rest::start_opa_server(&opa, lazy_pool(), &sample_billing()).await;
+    let result = lightbridge_authz_rest::start_opa_server(
+        &opa,
+        lazy_pool(),
+        &sample_billing(),
+        &external_oauth2(),
+    )
+    .await;
     assert!(
         result.is_err(),
         "missing TLS cert paths must surface as an error"
@@ -152,8 +157,13 @@ async fn start_opa_server_starts_fine_with_no_redis_configured() {
             password: "change-me".to_string(),
         },
     };
-    let result =
-        lightbridge_authz_rest::start_opa_server(&opa, lazy_pool(), &sample_billing()).await;
+    let result = lightbridge_authz_rest::start_opa_server(
+        &opa,
+        lazy_pool(),
+        &sample_billing(),
+        &external_oauth2(),
+    )
+    .await;
     let err = result.expect_err("missing TLS cert paths must surface as an error");
     assert!(
         !format!("{err}").to_lowercase().contains("redis"),
