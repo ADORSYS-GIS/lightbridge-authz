@@ -20,15 +20,23 @@ use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
+use cratestack::CratestackContext;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use lightbridge_authz_api::schema;
+use lightbridge_authz_api::schema::procedures::ProcedureRegistry;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
+use lightbridge_authz_budget::PolicyStore;
+use lightbridge_authz_budget::augmentation::AugmentationRepo;
 use lightbridge_authz_budget::decision::{Decision, PolicyEngine};
 use lightbridge_authz_budget::error::BudgetError;
 use lightbridge_authz_budget::facts::Facts;
 use lightbridge_authz_budget::period::Period;
+use lightbridge_authz_budget::refill::RefillService;
 use lightbridge_authz_budget::repo::{BudgetRepo, GrantRequest};
+use lightbridge_authz_budget::review::ReviewService;
 use lightbridge_authz_budget::source::GrantSource;
+use lightbridge_authz_budget::spend::UnavailableSpendReader;
 use lightbridge_authz_budget::tier::BudgetTier;
 use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::config::{
@@ -36,10 +44,16 @@ use lightbridge_authz_core::config::{
 };
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
-use lightbridge_authz_core::{CreateAccount, CreateProject, ResourceStatus, hash_api_key};
+use lightbridge_authz_core::{
+    CreateAccount, CreateProject, Permission, ResourceStatus, hash_api_key,
+};
+use lightbridge_authz_rest::Procedures;
+use lightbridge_authz_rest::auth_provider::build_context;
+use lightbridge_authz_rest::handlers::AuthzStoreImpl;
 use lightbridge_authz_rest::oauth2_op::client_assertion_store::RedisClientAssertionStore;
 use lightbridge_authz_rest::oauth2_op::client_store::ConfigClientStore;
 use lightbridge_authz_rest::oauth2_op::store::TokenExchangeOpStore;
+use lightbridge_authz_rest::rpc_authorize::RpcScope;
 use lightbridge_authz_rest::signing::{ApiKeyJwtSigner, bootstrap_signing_key, generate_rs256_key};
 use lightbridge_authz_rest::token_exchange::{TokenExchangeState, token_exchange_router};
 use serde::Deserialize;
@@ -879,6 +893,176 @@ async fn tenant_claims_on_access_token_role_and_quota_absent_from_both(pool: PgP
             "id_token must never carry {tenant_claim}: {id_claims}"
         );
     }
+}
+
+// ============================================================================================
+// #419: `request_budget_refill` used to refuse any caller whose token carried
+// `lightbridge_caller_kind: api_key` (#191/#216). `access_token_extra` -- shared by
+// `ApiKeyJwtSigner::sign` AND this file's own `handle_token_exchange`/`handle_refresh_token`
+// grants -- stamps that claim unconditionally, so it fired on humans too. The tests that shipped
+// alongside the original gate never caught this because they built a `CratestackContext` by hand
+// rather than minting a token through this real signing path (see #419's own investigation). The
+// test below mints one for real, decodes it for real, and proves both halves: the stale signal is
+// present, and it no longer changes the outcome.
+// ============================================================================================
+
+/// A `schema::Cratestack` lazily wired to an unreachable address -- `Procedures::request_budget_refill`
+/// takes `_db: &schema::Cratestack` but never uses it (it delegates entirely to `RefillService`),
+/// matching the identical pattern in `budget_refill_procedure_tests.rs::lazy_cratestack_db`.
+fn lazy_cratestack_db() -> schema::Cratestack {
+    let pool = cratestack::sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(250))
+        .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
+        .expect("lazy cratestack pool should be constructible");
+    schema::Cratestack::builder(pool).build()
+}
+
+/// #419's own required regression: mints a genuine human-plane access token through
+/// `TokenExchangeOpStore::handle_token_exchange` (the real RFC 8693 exchange
+/// `oauth2_op/store.rs` handler backing `POST /oauth2/token`, driven here through the real
+/// `token_exchange_router` over HTTP, not called directly) rather than constructing a
+/// `CratestackContext` by hand, then feeds that same real token's decoded claims into
+/// `request_budget_refill`.
+///
+/// Two things are asserted:
+/// 1. `lightbridge_caller_kind` on the REAL token really is `"api_key"` -- the empirical premise
+///    #419 is built on, never previously asserted against a human-plane mint anywhere in this
+///    suite (only against `ApiKeyJwtSigner`-minted API-key JWTs, in `signing_tests.rs`).
+/// 2. `request_budget_refill`, built from a `CratestackContext` whose `id`/caller-kind extension
+///    come from that real token's own decoded claims (not hand-typed), still accepts the call.
+///
+/// One field is *not* sourced from the real token: `permissions`. This exchanged access token
+/// carries no RBAC roles claim at all -- `access_token_extra` never stamps one, on either the
+/// exchange or the API-key-signing path -- so there is no real claim to decode `budget:self-refill`
+/// out of here. Granting it explicitly is the one deliberate departure from "fully real" in this
+/// test; it is orthogonal to the bug #419 fixes (a caller_kind check, not a permission-mapping
+/// one) and is the same `Permission` set every other direct-`Procedures`-call test in this crate
+/// already grants by hand (see `budget_refill_procedure_tests.rs`'s own `ctx_for`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn request_refill_accepts_a_real_human_plane_token_that_still_carries_the_stale_api_key_signal(
+    pool: PgPool,
+) {
+    let repo = repo(pool.clone());
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "token exchange must succeed: {body}"
+    );
+    let access_token = body["access_token"]
+        .as_str()
+        .expect("a successful exchange returns an access_token")
+        .to_string();
+
+    let access_claims = decode_access_token_claims(&repo, &access_token, PUBLIC_CLIENT_ID).await;
+    let real_sub = access_claims["sub"]
+        .as_str()
+        .expect("access token carries sub")
+        .to_string();
+    let real_caller_kind = access_claims
+        .get("lightbridge_caller_kind")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    assert_eq!(
+        real_caller_kind.as_deref(),
+        Some(lightbridge_authz_bearer::API_KEY_CALLER_KIND),
+        "premise check: a REAL human-plane RFC 8693 exchange token must carry the same \
+         `lightbridge_caller_kind: api_key` signal an API-key JWT does -- {access_claims}"
+    );
+
+    let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+    let issuer = Arc::new(AuthzStoreImpl::with_pool(db_pool.clone()));
+    let policy_store = Arc::new(
+        PolicyStore::load_active_from_db(db_pool.clone(), "budget-refill", 10_000)
+            .await
+            .expect("migrations seed an active budget-refill revision"),
+    );
+    let budget_repo = Arc::new(BudgetRepo::new(db_pool.clone()));
+    let augmentation_repo = Arc::new(AugmentationRepo::new(db_pool));
+    let refill_service = Arc::new(RefillService::new(
+        budget_repo.clone(),
+        augmentation_repo.clone(),
+        policy_store.engine(),
+        Arc::new(UnavailableSpendReader),
+    ));
+    let review_service = Arc::new(ReviewService::new(budget_repo.clone(), augmentation_repo));
+    let procedures = Procedures::new(
+        issuer,
+        policy_store,
+        refill_service,
+        review_service,
+        budget_repo,
+    );
+
+    // Every field below traces to the real token decoded above, except `permissions` -- see this
+    // test's own doc comment for why that one field is granted directly.
+    let token_info = TokenInfo {
+        active: true,
+        sub: real_sub.clone(),
+        exp: 0,
+        aud: vec![],
+        roles: vec![],
+        permissions: [Permission::BudgetSelfRefill].into_iter().collect(),
+        caller_kind: real_caller_kind,
+        access_token: access_token.clone(),
+    };
+    let ctx: CratestackContext = build_context(&token_info, RpcScope::Budget);
+    let cratestack_db = lazy_cratestack_db();
+
+    let args = schema::procedures::request_budget_refill::Args {
+        args: schema::RequestBudgetRefillInput {
+            budgetAccountId: real_sub.clone(),
+            accountId: real_sub,
+            projectId: None,
+            period: "2026-08".to_string(),
+            idempotencyKey: None,
+            requestedAmountMicros: "15000000".to_string(),
+        },
+    };
+    let output = call_request_budget_refill(&procedures, &cratestack_db, &ctx, args)
+        .await
+        .expect(
+            "a human-plane caller holding budget:self-refill must be accepted, regardless of the \
+             stale api_key caller-kind signal on their real token",
+        );
+
+    assert_eq!(output.status, "auto_approved");
+}
+
+/// Mirrors `budget_refill_procedure_tests.rs`'s own `request_refill` helper: cratestack#512's
+/// `ProcedureRegistry` methods require an `Authorized` witness only `authorize_with_db`/
+/// `invoke_with_db` can produce, so this runs that (trivial, `@allow(auth() != null)`) check
+/// before invoking the hand-written procedure body, exactly like the generated RPC dispatch
+/// handler does for a real request. Taking `db`/`ctx` by reference (rather than closing over
+/// owned locals) is what lets the `async move` closure below capture them as `Copy` references
+/// instead of trying to move the caller's only copies into it.
+async fn call_request_budget_refill(
+    procedures: &Procedures,
+    db: &schema::Cratestack,
+    ctx: &CratestackContext,
+    args: schema::procedures::request_budget_refill::Args,
+) -> Result<schema::procedures::request_budget_refill::Output, cratestack::CratestackError> {
+    let call_args = args.clone();
+    schema::procedures::request_budget_refill::invoke_with_db(
+        db,
+        &args,
+        ctx,
+        |authorized| async move {
+            procedures
+                .request_budget_refill(db, ctx, call_args, authorized)
+                .await
+        },
+    )
+    .await
 }
 
 // ============================================================================================
