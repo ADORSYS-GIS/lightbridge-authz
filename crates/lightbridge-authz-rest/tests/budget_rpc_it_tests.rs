@@ -821,8 +821,16 @@ async fn create_budget_policy_revision_does_not_activate_it() {
 }
 
 /// A caller holding none of the six wired-up budget permissions is refused 403 on every one of
-/// the eight procedures they gate -- proves the RBAC gate is actually wired for each on
+/// the nine procedures they gate -- proves the RBAC gate is actually wired for each on
 /// `authz-budget`, not merely present in `rpc_authorize`'s map.
+///
+/// `procedure.requestBudgetRefill` (#419): before this fix, this op-id was ALSO refused for a
+/// different, wrong reason for any caller carrying `lightbridge_caller_kind: api_key` --
+/// including humans, since every access token this service mints carries that claim
+/// unconditionally. That check is gone; `budget:self-refill` is the only remaining gate, and this
+/// case proves it is still an *effective* one -- a caller lacking it is refused regardless of
+/// caller-kind, through the real HTTP RPC surface (`rpc_authorize` + `CratestackAuthProvider` +
+/// cratestack's own schema `@allow` clause), not merely by a direct `Procedures` call.
 #[tokio::test]
 async fn each_budget_permission_is_actually_enforced() {
     let subject = format!("budget-noperm-{}", cuid2());
@@ -832,7 +840,7 @@ async fn each_budget_permission_is_actually_enforced() {
     let r = &ctx.router;
     seed_budget_account(&ctx.verify, &subject).await;
 
-    let cases: [(&str, Value); 8] = [
+    let cases: [(&str, Value); 9] = [
         (
             "procedure.getMyBudgetBalance",
             json!({ "period": "2026-08" }),
@@ -863,6 +871,15 @@ async fn each_budget_permission_is_actually_enforced() {
         (
             "procedure.createBudgetPolicyRevision",
             json!({ "policySetId": "budget-refill", "ruleDataJson": "{}" }),
+        ),
+        (
+            "procedure.requestBudgetRefill",
+            json!({
+                "budgetAccountId": subject,
+                "accountId": subject,
+                "period": "2026-08",
+                "requestedAmountMicros": "15000000"
+            }),
         ),
     ];
 
