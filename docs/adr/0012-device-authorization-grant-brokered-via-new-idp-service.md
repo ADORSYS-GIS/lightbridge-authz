@@ -1,5 +1,13 @@
 # ADR-0012: authz brokers the OAuth 2.0 Device Authorization Grant (RFC 8628) to Keycloak, from a new microservice that takes over the OIDC surface
 
+> **Superseded in part by ADR-0019** (`docs/adr/0019-authz-idp-brokers-authorization-code-alongside-device-grant.md`,
+> 2026-08-22): Decision 3's `AuthorizationCodeStore` half ("remains a permanent no-op stub") and
+> Decision 4 in full (`redirect_uris` deliberately empty) no longer hold — `/authorize` and a real
+> `redirect_uris` registry are now in scope, to serve browser clients the device grant was never
+> meant to cover. Decision 3's `DeviceCodeStore` half and every other decision below are
+> unaffected. See ADR-0019 for the full argument, including why the `redirect_uris` trade this ADR
+> avoided is now accepted deliberately, not by accident.
+
 - Status: Accepted
 - Date: 2026-08-16
 - Decision owners: @stephane-segning
