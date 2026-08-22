@@ -110,7 +110,17 @@ impl StoreRepo {
     /// the project's account owner -- callers that need to treat the owner as implicitly authorized
     /// (every lead-gated procedure does) go through `authorize_project_lead` instead, which layers
     /// that check on top of this one.
-    async fn project_member_role(&self, project_id: &str, subject: &str) -> Result<Option<String>> {
+    ///
+    /// `pub`: also read by `authz-opa`'s introspection handler (`OpaRepoTrait::project_member_role`)
+    /// to resolve the `role` claim for a native RFC 8693 exchange session at introspection time,
+    /// the human/OIDC-plane mirror of `project_member_quota_tier` below (ADR-0017's same
+    /// reasoning applies here).
+    #[instrument(skip(self, subject))]
+    pub async fn project_member_role(
+        &self,
+        project_id: &str,
+        subject: &str,
+    ) -> Result<Option<String>> {
         let role: Option<String> = sqlx::query_scalar(
             r#"SELECT role FROM project_members WHERE project_id = $1 AND account_id = $2"#,
         )

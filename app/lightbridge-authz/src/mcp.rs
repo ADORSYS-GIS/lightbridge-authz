@@ -1949,6 +1949,26 @@ mod tests {
             }
             Ok(None)
         }
+
+        async fn project_member_quota_tier(
+            &self,
+            _project_id: &str,
+            _subject: &str,
+        ) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn project_member_role(
+            &self,
+            _project_id: &str,
+            _subject: &str,
+        ) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn list_verification_jwks(&self) -> Result<Vec<serde_json::Value>> {
+            Ok(Vec::new())
+        }
     }
 
     fn fixture_api_key() -> ApiKey {
@@ -2043,6 +2063,26 @@ mod tests {
 
         async fn get_account_by_id(&self, _account_id: &str) -> Result<Option<Account>> {
             Ok(None)
+        }
+
+        async fn project_member_quota_tier(
+            &self,
+            _project_id: &str,
+            _subject: &str,
+        ) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn project_member_role(
+            &self,
+            _project_id: &str,
+            _subject: &str,
+        ) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn list_verification_jwks(&self) -> Result<Vec<serde_json::Value>> {
+            Ok(Vec::new())
         }
     }
 

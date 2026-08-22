@@ -1,3 +1,4 @@
+pub mod exchange_token;
 pub mod idp;
 pub mod introspect;
 pub mod opa;

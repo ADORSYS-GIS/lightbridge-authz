@@ -96,6 +96,27 @@ pub trait OpaRepoTrait: Send + Sync {
         subject: &str,
         project_id: &str,
     ) -> Result<lightbridge_authz_core::ResolvedContext>;
+    /// `subject`'s per-member `quota_tier` on `project_id` (ADR-0017), or `None` for "no
+    /// per-member ceiling" -- see `StoreRepo::project_member_quota_tier`'s doc comment for the
+    /// full `Ok(None)` vs `Err` distinction. Used by introspection to resolve the `quota_tier`
+    /// field for a native RFC 8693 exchange session the same way `owner_quota_tier` already does
+    /// for the API-key plane.
+    async fn project_member_quota_tier(
+        &self,
+        project_id: &str,
+        subject: &str,
+    ) -> Result<Option<String>>;
+    /// `subject`'s roster `role` on `project_id`, or `None` if they hold no `project_members` row.
+    /// Used by introspection to resolve the `role` field for a native RFC 8693 exchange session,
+    /// the human/OIDC-plane mirror of `owner_role` on the API-key plane.
+    async fn project_member_role(&self, project_id: &str, subject: &str) -> Result<Option<String>>;
+    /// Every signing key (active + retired-but-not-yet-expired) this service has minted, as raw
+    /// JWK JSON -- the same rows `signing::well_known_router`'s `/.well-known/jwks.json` handler
+    /// serves. Introspection uses this to verify a presented token was signed by one of THIS
+    /// service's own keys (a *different* trust root than `oauth2.jwks_url`, the external IdP)
+    /// before trusting any tenant claim on it -- see
+    /// `handlers::exchange_token::verify_self_issued_token`.
+    async fn list_verification_jwks(&self) -> Result<Vec<serde_json::Value>>;
 }
 
 #[async_trait]
@@ -137,6 +158,22 @@ impl OpaRepoTrait for StoreRepo {
         project_id: &str,
     ) -> Result<lightbridge_authz_core::ResolvedContext> {
         StoreRepo::resolve_context(self, subject, project_id).await
+    }
+
+    async fn project_member_quota_tier(
+        &self,
+        project_id: &str,
+        subject: &str,
+    ) -> Result<Option<String>> {
+        StoreRepo::project_member_quota_tier(self, project_id, subject).await
+    }
+
+    async fn project_member_role(&self, project_id: &str, subject: &str) -> Result<Option<String>> {
+        StoreRepo::project_member_role(self, project_id, subject).await
+    }
+
+    async fn list_verification_jwks(&self) -> Result<Vec<serde_json::Value>> {
+        StoreRepo::list_verification_jwks(self).await
     }
 }
 

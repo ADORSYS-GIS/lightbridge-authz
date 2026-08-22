@@ -2,15 +2,18 @@ use axum::Form;
 use axum::body::to_bytes;
 use axum::http::StatusCode;
 use chrono::{Duration, Utc};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeyStatus, ApiKeyValidation, ModelPolicy, Project, ResourceStatus,
-    async_trait,
+    Account, ApiKey, ApiKeyStatus, ApiKeyValidation, ModelPolicy, Project, ResolvedContext,
+    ResourceStatus, async_trait,
     config::{BasicAuth, Billing, BillingLimits, BillingPlan},
-    error::Result,
+    error::{Error, Result},
 };
 use lightbridge_authz_rest::OpaState;
 use lightbridge_authz_rest::handlers::introspect::introspect_api_key;
 use lightbridge_authz_rest::models::IntrospectRequest;
+use lightbridge_authz_rest::signing::generate_rs256_key;
+use serde::Serialize;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
@@ -22,6 +25,18 @@ struct MockOpaRepo {
     project: Option<Project>,
     account: Option<Account>,
     usage_calls: UsageCalls,
+    /// Raw JWK JSON this mock's `list_verification_jwks` serves -- what
+    /// `handlers::exchange_token::verify_self_issued_token` checks a presented token's signature
+    /// against. Empty by default (every API-key-focused test above needs none of this).
+    verification_jwks: Vec<Value>,
+    /// What `resolve_context` resolves to for the exchange-token tests below. `None` means "not a
+    /// member" (`Err(Error::NotFound)`, mirroring the real `StoreRepo::resolve_context`'s own
+    /// uniform-404 contract), `Some` means the subject currently resolves to this tenant context.
+    member_context: Option<ResolvedContext>,
+    /// `project_member_role`/`project_member_quota_tier` mock answers for the exchange-token
+    /// tests below.
+    member_role: Option<String>,
+    member_quota_tier: Option<String>,
 }
 
 #[async_trait]
@@ -115,7 +130,27 @@ impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
         _subject: &str,
         _project_id: &str,
     ) -> Result<lightbridge_authz_core::ResolvedContext> {
-        Err(lightbridge_authz_core::error::Error::NotFound)
+        self.member_context.clone().ok_or(Error::NotFound)
+    }
+
+    async fn project_member_role(
+        &self,
+        _project_id: &str,
+        _subject: &str,
+    ) -> Result<Option<String>> {
+        Ok(self.member_role.clone())
+    }
+
+    async fn project_member_quota_tier(
+        &self,
+        _project_id: &str,
+        _subject: &str,
+    ) -> Result<Option<String>> {
+        Ok(self.member_quota_tier.clone())
+    }
+
+    async fn list_verification_jwks(&self) -> Result<Vec<Value>> {
+        Ok(self.verification_jwks.clone())
     }
 }
 
@@ -214,6 +249,10 @@ async fn introspect_returns_active_with_context_and_records_usage() {
         project: Some(mk_project()),
         account: Some(mk_account()),
         usage_calls: usage_calls.clone(),
+        verification_jwks: Vec::new(),
+        member_context: None,
+        member_role: None,
+        member_quota_tier: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -265,6 +304,10 @@ async fn introspect_omits_name_and_limits_for_plan_absent_from_catalogue() {
         project: Some(mk_project()),
         account: Some(mk_account()),
         usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: Vec::new(),
+        member_context: None,
+        member_role: None,
+        member_quota_tier: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -292,6 +335,10 @@ async fn introspect_returns_inactive_when_revoked() {
         project: Some(mk_project()),
         account: Some(mk_account()),
         usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: Vec::new(),
+        member_context: None,
+        member_role: None,
+        member_quota_tier: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_revoked").await;
@@ -309,6 +356,10 @@ async fn introspect_returns_inactive_when_missing() {
         project: Some(mk_project()),
         account: Some(mk_account()),
         usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: Vec::new(),
+        member_context: None,
+        member_role: None,
+        member_quota_tier: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_missing").await;
@@ -327,6 +378,10 @@ async fn introspect_returns_inactive_when_expired() {
         project: Some(mk_project()),
         account: Some(mk_account()),
         usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: Vec::new(),
+        member_context: None,
+        member_role: None,
+        member_quota_tier: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_expired").await;
@@ -344,6 +399,10 @@ async fn introspect_returns_inactive_when_account_suspended() {
         project: Some(mk_project()),
         account: Some(account),
         usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: Vec::new(),
+        member_context: None,
+        member_role: None,
+        member_quota_tier: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_suspended_account").await;
@@ -362,6 +421,10 @@ async fn introspect_returns_inactive_when_project_suspended() {
         project: Some(project),
         account: Some(mk_account()),
         usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: Vec::new(),
+        member_context: None,
+        member_role: None,
+        member_quota_tier: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_suspended_project").await;
@@ -379,6 +442,10 @@ async fn introspect_omits_allowed_models_when_null() {
         project: Some(project),
         account: Some(mk_account()),
         usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: Vec::new(),
+        member_context: None,
+        member_role: None,
+        member_quota_tier: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -404,6 +471,10 @@ async fn introspect_returns_empty_allowed_models_when_empty() {
         project: Some(project),
         account: Some(mk_account()),
         usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: Vec::new(),
+        member_context: None,
+        member_role: None,
+        member_quota_tier: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -430,6 +501,10 @@ async fn introspect_round_trips_each_model_policy_value() {
             project: Some(project),
             account: Some(mk_account()),
             usage_calls: Arc::new(Mutex::new(vec![])),
+            verification_jwks: Vec::new(),
+            member_context: None,
+            member_role: None,
+            member_quota_tier: None,
         });
 
         let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -456,6 +531,10 @@ async fn introspect_fails_closed_to_deny_all_for_an_unknown_stored_model_policy_
         project: Some(project),
         account: Some(mk_account()),
         usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: Vec::new(),
+        member_context: None,
+        member_role: None,
+        member_quota_tier: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -465,4 +544,350 @@ async fn introspect_fails_closed_to_deny_all_for_an_unknown_stored_model_policy_
         payload["model_policy"], "deny_all",
         "an unrecognized stored value must resolve to the strict deny_all branch, never allow_all"
     );
+}
+
+// ── Exchange-token (RFC 8693) introspection ─────────────────────────────────────────────────
+//
+// A native token-exchange access token (`TokenExchangeOpStore`, `oauth2_op/store.rs`) is never
+// hashed into `api_keys` -- it carries a session CUID2 in the same `api_key_id` claim slot a real
+// self-signed API-key JWT uses, but there is no `api_keys` row behind it. These tests exercise
+// `handlers::introspect::introspect_api_key`'s second dispatch branch
+// (`handlers::exchange_token::resolve_exchange_token_context`), which verifies the token against
+// THIS service's own signing keys and re-resolves current project authorization live, rather than
+// trusting any claim on the token itself for authorization data.
+
+struct TestSigningKey {
+    kid: String,
+    private_key_pem: String,
+    public_jwk: Value,
+}
+
+fn mk_signing_key() -> TestSigningKey {
+    let generated = generate_rs256_key().expect("rsa key generation should succeed");
+    TestSigningKey {
+        kid: generated.kid,
+        private_key_pem: generated.private_key_pem,
+        public_jwk: generated.public_jwk,
+    }
+}
+
+#[derive(Serialize)]
+struct ExchangeTokenClaims {
+    sub: String,
+    exp: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key_id: Option<String>,
+}
+
+fn sign_exchange_token(key: &TestSigningKey, claims: &ExchangeTokenClaims) -> String {
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(key.kid.clone());
+    let encoding_key = EncodingKey::from_rsa_pem(key.private_key_pem.as_bytes())
+        .expect("generated PEM should parse as an RSA encoding key");
+    encode(&header, claims, &encoding_key).expect("signing a well-formed claim set should succeed")
+}
+
+fn mk_member_context() -> ResolvedContext {
+    ResolvedContext {
+        account_id: "acct_1".to_string(),
+        project_id: "proj_1".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn introspect_resolves_active_exchange_session_with_live_project_authorization_data() {
+    let key = mk_signing_key();
+    let token = sign_exchange_token(
+        &key,
+        &ExchangeTokenClaims {
+            sub: "human-subject-1".to_string(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp() as usize,
+            account_id: Some("acct_1".to_string()),
+            project_id: Some("proj_1".to_string()),
+            api_key_id: Some("session_abc123".to_string()),
+        },
+    );
+    let state = mk_state(MockOpaRepo {
+        api_key: None,
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: vec![key.public_jwk.clone()],
+        member_context: Some(mk_member_context()),
+        member_role: Some("lead".to_string()),
+        member_quota_tier: Some("t-m".to_string()),
+    });
+
+    let (status, payload) = introspect(state, &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], true);
+    assert_eq!(payload["account_id"], "acct_1");
+    assert_eq!(payload["project_id"], "proj_1");
+    assert_eq!(
+        payload["sub"], "session_abc123",
+        "sub should be the token's own session id, not the human subject or a real api_key_id"
+    );
+    assert!(
+        payload.get("api_key_id").is_none(),
+        "there is no api_keys row behind an exchange session"
+    );
+    assert!(payload.get("api_key_status").is_none());
+    assert!(
+        payload.get("exp").is_none(),
+        "no persisted expiry to report for an exchange session"
+    );
+    assert_eq!(payload["billing_plan"], "free");
+    assert_eq!(payload["billing_plan_name"], "Free");
+    assert_eq!(
+        payload["allowed_models"],
+        serde_json::json!(["gpt-4.1-mini"])
+    );
+    assert_eq!(payload["model_policy"], "allow_all");
+    assert_eq!(payload["role"], "lead");
+    assert_eq!(payload["quota_tier"], "t-m");
+}
+
+#[tokio::test]
+async fn introspect_returns_inactive_for_an_expired_exchange_token() {
+    let key = mk_signing_key();
+    let token = sign_exchange_token(
+        &key,
+        &ExchangeTokenClaims {
+            sub: "human-subject-1".to_string(),
+            exp: (Utc::now() - Duration::minutes(5)).timestamp() as usize,
+            account_id: Some("acct_1".to_string()),
+            project_id: Some("proj_1".to_string()),
+            api_key_id: Some("session_abc123".to_string()),
+        },
+    );
+    let state = mk_state(MockOpaRepo {
+        api_key: None,
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: vec![key.public_jwk.clone()],
+        member_context: Some(mk_member_context()),
+        member_role: None,
+        member_quota_tier: None,
+    });
+
+    let (status, payload) = introspect(state, &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], false);
+}
+
+#[tokio::test]
+async fn introspect_returns_inactive_for_a_token_signed_by_an_unknown_key() {
+    let signing_key = mk_signing_key();
+    let unrelated_key = mk_signing_key();
+    let token = sign_exchange_token(
+        &signing_key,
+        &ExchangeTokenClaims {
+            sub: "human-subject-1".to_string(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp() as usize,
+            account_id: Some("acct_1".to_string()),
+            project_id: Some("proj_1".to_string()),
+            api_key_id: Some("session_abc123".to_string()),
+        },
+    );
+    let state = mk_state(MockOpaRepo {
+        api_key: None,
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+        // The verifier only trusts `unrelated_key` -- proves signature/kid mismatch fails closed,
+        // not merely "some key exists somewhere".
+        verification_jwks: vec![unrelated_key.public_jwk.clone()],
+        member_context: Some(mk_member_context()),
+        member_role: None,
+        member_quota_tier: None,
+    });
+
+    let (status, payload) = introspect(state, &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], false);
+}
+
+#[tokio::test]
+async fn introspect_returns_inactive_for_a_self_issued_token_with_no_project_claim() {
+    // Mirrors an id_token's claim shape (`signing::id_token_extra`): no `project_id`/`account_id`
+    // at all. A validly-signed-by-us token with no tenant claim must still fail closed rather than
+    // being treated as an exchange session with an empty project.
+    let key = mk_signing_key();
+    let token = sign_exchange_token(
+        &key,
+        &ExchangeTokenClaims {
+            sub: "human-subject-1".to_string(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp() as usize,
+            account_id: None,
+            project_id: None,
+            api_key_id: None,
+        },
+    );
+    let state = mk_state(MockOpaRepo {
+        api_key: None,
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: vec![key.public_jwk.clone()],
+        member_context: Some(mk_member_context()),
+        member_role: None,
+        member_quota_tier: None,
+    });
+
+    let (status, payload) = introspect(state, &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], false);
+}
+
+#[tokio::test]
+async fn introspect_returns_inactive_when_exchange_subject_is_no_longer_a_member() {
+    let key = mk_signing_key();
+    let token = sign_exchange_token(
+        &key,
+        &ExchangeTokenClaims {
+            sub: "human-subject-1".to_string(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp() as usize,
+            account_id: Some("acct_1".to_string()),
+            project_id: Some("proj_1".to_string()),
+            api_key_id: Some("session_abc123".to_string()),
+        },
+    );
+    let state = mk_state(MockOpaRepo {
+        api_key: None,
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: vec![key.public_jwk.clone()],
+        // No member_context configured -- resolve_context refuses (Error::NotFound), exactly the
+        // live-membership re-check firing for a subject removed from the roster since mint time.
+        member_context: None,
+        member_role: None,
+        member_quota_tier: None,
+    });
+
+    let (status, payload) = introspect(state, &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], false);
+}
+
+#[tokio::test]
+async fn introspect_returns_inactive_when_exchange_project_is_suspended() {
+    let key = mk_signing_key();
+    let token = sign_exchange_token(
+        &key,
+        &ExchangeTokenClaims {
+            sub: "human-subject-1".to_string(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp() as usize,
+            account_id: Some("acct_1".to_string()),
+            project_id: Some("proj_1".to_string()),
+            api_key_id: Some("session_abc123".to_string()),
+        },
+    );
+    let mut project = mk_project();
+    project.status = ResourceStatus::Suspended;
+    let state = mk_state(MockOpaRepo {
+        api_key: None,
+        project: Some(project),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: vec![key.public_jwk.clone()],
+        member_context: Some(mk_member_context()),
+        member_role: None,
+        member_quota_tier: None,
+    });
+
+    let (status, payload) = introspect(state, &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], false);
+}
+
+#[tokio::test]
+async fn introspect_returns_inactive_when_exchange_account_is_suspended() {
+    let key = mk_signing_key();
+    let token = sign_exchange_token(
+        &key,
+        &ExchangeTokenClaims {
+            sub: "human-subject-1".to_string(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp() as usize,
+            account_id: Some("acct_1".to_string()),
+            project_id: Some("proj_1".to_string()),
+            api_key_id: Some("session_abc123".to_string()),
+        },
+    );
+    let mut account = mk_account();
+    account.status = ResourceStatus::Suspended;
+    let state = mk_state(MockOpaRepo {
+        api_key: None,
+        project: Some(mk_project()),
+        account: Some(account),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: vec![key.public_jwk.clone()],
+        member_context: Some(mk_member_context()),
+        member_role: None,
+        member_quota_tier: None,
+    });
+
+    let (status, payload) = introspect(state, &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], false);
+}
+
+/// **The critical revocation-integrity regression.** A revoked (or expired) self-signed API-key
+/// JWT is still a perfectly valid signature under this service's own keys -- revocation only
+/// flips `api_keys.status`, it cannot un-sign an already-issued JWT. If introspection ever fell
+/// through to exchange-token verification after an `api_keys` row lookup came back inactive, a
+/// revoked key's own still-good signature would resurrect it as an "active" exchange session,
+/// silently defeating revocation. This proves the dispatch never does that: an `api_keys` row
+/// existing (here, in the `Revoked` state) short-circuits straight to `{"active": false}`, even
+/// though every precondition the exchange path would need (valid signature, a resolvable member
+/// context) is deliberately ALSO satisfied here.
+#[tokio::test]
+async fn a_revoked_api_key_jwt_is_never_reinterpreted_as_an_active_exchange_session() {
+    let key = mk_signing_key();
+    let token = sign_exchange_token(
+        &key,
+        &ExchangeTokenClaims {
+            sub: "human-subject-1".to_string(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp() as usize,
+            account_id: Some("acct_1".to_string()),
+            project_id: Some("proj_1".to_string()),
+            // Shaped like a real self-signed API-key JWT: `api_key_id` names the actual
+            // (now-revoked) key row, not a session id.
+            api_key_id: Some("key_1".to_string()),
+        },
+    );
+    let state = mk_state(MockOpaRepo {
+        api_key: Some(mk_api_key(ApiKeyStatus::Revoked, None)),
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+        // Everything the exchange path would need to succeed IS present, to prove it is never
+        // reached, not merely that it happens to fail too.
+        verification_jwks: vec![key.public_jwk.clone()],
+        member_context: Some(mk_member_context()),
+        member_role: Some("lead".to_string()),
+        member_quota_tier: Some("t-m".to_string()),
+    });
+
+    let (status, payload) = introspect(state, &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], false);
+    assert!(
+        payload.get("role").is_none(),
+        "no exchange-path authorization data must leak through for a revoked key"
+    );
+    assert!(payload.get("quota_tier").is_none());
 }
