@@ -2022,6 +2022,13 @@ mod tests {
         async fn list_verification_jwks(&self) -> Result<Vec<serde_json::Value>> {
             Ok(Vec::new())
         }
+
+        async fn find_session_status(
+            &self,
+            _session_id: &str,
+        ) -> Result<Option<lightbridge_authz_rest::SessionStatusRow>> {
+            Ok(None)
+        }
     }
 
     fn fixture_api_key() -> ApiKey {
@@ -2136,6 +2143,13 @@ mod tests {
 
         async fn list_verification_jwks(&self) -> Result<Vec<serde_json::Value>> {
             Ok(Vec::new())
+        }
+
+        async fn find_session_status(
+            &self,
+            _session_id: &str,
+        ) -> Result<Option<lightbridge_authz_rest::SessionStatusRow>> {
+            Ok(None)
         }
     }
 

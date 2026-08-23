@@ -10,6 +10,7 @@ use lightbridge_authz_core::{
     error::{Error, Result},
 };
 use lightbridge_authz_rest::OpaState;
+use lightbridge_authz_rest::SessionStatusRow;
 use lightbridge_authz_rest::handlers::introspect::introspect_api_key;
 use lightbridge_authz_rest::models::IntrospectRequest;
 use lightbridge_authz_rest::signing::generate_rs256_key;
@@ -18,6 +19,22 @@ use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
 type UsageCalls = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+/// Controls what `MockOpaRepo::find_session_status` answers for ADR-0020/#437's session-status
+/// check in `resolve_exchange_token_context`. `Active` is the default so every pre-existing
+/// exchange-token test above (none of which cares about session revocation) keeps passing
+/// unchanged; the session-specific tests near the bottom of this file override it explicitly.
+#[derive(Debug, Clone, Default)]
+enum MockSessionStatus {
+    #[default]
+    Active,
+    Revoked,
+    Expired,
+    NotFound,
+    /// The fail-closed case (#437's hard requirement): the lookup itself errors, and
+    /// `resolve_exchange_token_context` must propagate `Err`, never `Ok(None)`/`Ok(Some(..))`.
+    LookupErrors,
+}
 
 #[derive(Debug)]
 struct MockOpaRepo {
@@ -37,6 +54,9 @@ struct MockOpaRepo {
     /// tests below.
     member_role: Option<String>,
     member_quota_tier: Option<String>,
+    /// ADR-0020/#437: what `find_session_status` answers for the `sid` the presented exchange
+    /// token carries. See [`MockSessionStatus`].
+    session_status: MockSessionStatus,
 }
 
 #[async_trait]
@@ -152,6 +172,27 @@ impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
     async fn list_verification_jwks(&self) -> Result<Vec<Value>> {
         Ok(self.verification_jwks.clone())
     }
+
+    async fn find_session_status(&self, _session_id: &str) -> Result<Option<SessionStatusRow>> {
+        match self.session_status {
+            MockSessionStatus::Active => Ok(Some(SessionStatusRow {
+                status: "active".to_string(),
+                expires_at: Utc::now() + Duration::hours(1),
+            })),
+            MockSessionStatus::Revoked => Ok(Some(SessionStatusRow {
+                status: "revoked".to_string(),
+                expires_at: Utc::now() + Duration::hours(1),
+            })),
+            MockSessionStatus::Expired => Ok(Some(SessionStatusRow {
+                status: "active".to_string(),
+                expires_at: Utc::now() - Duration::hours(1),
+            })),
+            MockSessionStatus::NotFound => Ok(None),
+            MockSessionStatus::LookupErrors => {
+                Err(Error::Server("session store unreachable".to_string()))
+            }
+        }
+    }
 }
 
 fn mk_api_key(status: ApiKeyStatus, expires_at: Option<chrono::DateTime<Utc>>) -> ApiKey {
@@ -254,6 +295,7 @@ async fn introspect_returns_active_with_context_and_records_usage() {
         member_context: None,
         member_role: None,
         member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -309,6 +351,7 @@ async fn introspect_omits_name_and_limits_for_plan_absent_from_catalogue() {
         member_context: None,
         member_role: None,
         member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -340,6 +383,7 @@ async fn introspect_returns_inactive_when_revoked() {
         member_context: None,
         member_role: None,
         member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_revoked").await;
@@ -361,6 +405,7 @@ async fn introspect_returns_inactive_when_missing() {
         member_context: None,
         member_role: None,
         member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_missing").await;
@@ -383,6 +428,7 @@ async fn introspect_returns_inactive_when_expired() {
         member_context: None,
         member_role: None,
         member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_expired").await;
@@ -404,6 +450,7 @@ async fn introspect_returns_inactive_when_account_suspended() {
         member_context: None,
         member_role: None,
         member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_suspended_account").await;
@@ -426,6 +473,7 @@ async fn introspect_returns_inactive_when_project_suspended() {
         member_context: None,
         member_role: None,
         member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_suspended_project").await;
@@ -447,6 +495,7 @@ async fn introspect_omits_allowed_models_when_null() {
         member_context: None,
         member_role: None,
         member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -476,6 +525,7 @@ async fn introspect_returns_empty_allowed_models_when_empty() {
         member_context: None,
         member_role: None,
         member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -506,6 +556,7 @@ async fn introspect_round_trips_each_model_policy_value() {
             member_context: None,
             member_role: None,
             member_quota_tier: None,
+            session_status: MockSessionStatus::Active,
         });
 
         let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -536,6 +587,7 @@ async fn introspect_fails_closed_to_deny_all_for_an_unknown_stored_model_policy_
         member_context: None,
         member_role: None,
         member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -592,6 +644,13 @@ struct ExchangeTokenClaims {
     project_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     api_key_id: Option<String>,
+    /// ADR-0020 Decision 2: `sid` now carries the same real, persisted session id as
+    /// `api_key_id` for a token-exchange-minted access token (rather than an independent,
+    /// unpersisted `cuid2()` mint) -- see `crate::signing::access_token_extra`. Modelled here as
+    /// its own optional claim (not aliased to `api_key_id`) so tests can exercise "no `sid`
+    /// claim at all" (a pre-ADR-0020 token) independently of `api_key_id`'s own presence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     azp: Option<String>,
 }
@@ -622,6 +681,7 @@ async fn introspect_resolves_active_exchange_session_with_live_project_authoriza
             account_id: Some("acct_1".to_string()),
             project_id: Some("proj_1".to_string()),
             api_key_id: Some("session_abc123".to_string()),
+            sid: Some("session_abc123".to_string()),
             azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
         },
     );
@@ -634,6 +694,7 @@ async fn introspect_resolves_active_exchange_session_with_live_project_authoriza
         member_context: Some(mk_member_context()),
         member_role: Some("lead".to_string()),
         member_quota_tier: Some("t-m".to_string()),
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -677,6 +738,7 @@ async fn introspect_returns_inactive_for_an_expired_exchange_token() {
             account_id: Some("acct_1".to_string()),
             project_id: Some("proj_1".to_string()),
             api_key_id: Some("session_abc123".to_string()),
+            sid: Some("session_abc123".to_string()),
             azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
         },
     );
@@ -689,6 +751,7 @@ async fn introspect_returns_inactive_for_an_expired_exchange_token() {
         member_context: Some(mk_member_context()),
         member_role: None,
         member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -709,6 +772,7 @@ async fn introspect_returns_inactive_for_a_token_signed_by_an_unknown_key() {
             account_id: Some("acct_1".to_string()),
             project_id: Some("proj_1".to_string()),
             api_key_id: Some("session_abc123".to_string()),
+            sid: Some("session_abc123".to_string()),
             azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
         },
     );
@@ -723,6 +787,7 @@ async fn introspect_returns_inactive_for_a_token_signed_by_an_unknown_key() {
         member_context: Some(mk_member_context()),
         member_role: None,
         member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -745,6 +810,7 @@ async fn introspect_returns_inactive_for_a_self_issued_token_with_no_project_cla
             account_id: None,
             project_id: None,
             api_key_id: None,
+            sid: None,
             azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
         },
     );
@@ -757,6 +823,7 @@ async fn introspect_returns_inactive_for_a_self_issued_token_with_no_project_cla
         member_context: Some(mk_member_context()),
         member_role: None,
         member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -776,6 +843,7 @@ async fn introspect_returns_inactive_when_exchange_subject_is_no_longer_a_member
             account_id: Some("acct_1".to_string()),
             project_id: Some("proj_1".to_string()),
             api_key_id: Some("session_abc123".to_string()),
+            sid: Some("session_abc123".to_string()),
             azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
         },
     );
@@ -790,6 +858,7 @@ async fn introspect_returns_inactive_when_exchange_subject_is_no_longer_a_member
         member_context: None,
         member_role: None,
         member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -809,6 +878,7 @@ async fn introspect_returns_inactive_when_exchange_project_is_suspended() {
             account_id: Some("acct_1".to_string()),
             project_id: Some("proj_1".to_string()),
             api_key_id: Some("session_abc123".to_string()),
+            sid: Some("session_abc123".to_string()),
             azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
         },
     );
@@ -823,6 +893,7 @@ async fn introspect_returns_inactive_when_exchange_project_is_suspended() {
         member_context: Some(mk_member_context()),
         member_role: None,
         member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -842,6 +913,7 @@ async fn introspect_returns_inactive_when_exchange_account_is_suspended() {
             account_id: Some("acct_1".to_string()),
             project_id: Some("proj_1".to_string()),
             api_key_id: Some("session_abc123".to_string()),
+            sid: Some("session_abc123".to_string()),
             azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
         },
     );
@@ -856,6 +928,7 @@ async fn introspect_returns_inactive_when_exchange_account_is_suspended() {
         member_context: Some(mk_member_context()),
         member_role: None,
         member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -886,6 +959,7 @@ async fn a_revoked_api_key_jwt_is_never_reinterpreted_as_an_active_exchange_sess
             // Shaped like a real self-signed API-key JWT: `api_key_id` names the actual
             // (now-revoked) key row, not a session id, and `azp` is the fixed API-key audience.
             api_key_id: Some("key_1".to_string()),
+            sid: Some("key_1".to_string()),
             azp: Some(TEST_API_KEY_AUDIENCE.to_string()),
         },
     );
@@ -900,6 +974,7 @@ async fn a_revoked_api_key_jwt_is_never_reinterpreted_as_an_active_exchange_sess
         member_context: Some(mk_member_context()),
         member_role: Some("lead".to_string()),
         member_quota_tier: Some("t-m".to_string()),
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -931,6 +1006,7 @@ async fn a_token_carrying_the_api_key_audience_as_azp_is_refused_even_with_no_ap
             account_id: Some("acct_1".to_string()),
             project_id: Some("proj_1".to_string()),
             api_key_id: Some("key_1".to_string()),
+            sid: Some("key_1".to_string()),
             azp: Some(TEST_API_KEY_AUDIENCE.to_string()),
         },
     );
@@ -945,6 +1021,7 @@ async fn a_token_carrying_the_api_key_audience_as_azp_is_refused_even_with_no_ap
         member_context: Some(mk_member_context()),
         member_role: Some("lead".to_string()),
         member_quota_tier: Some("t-m".to_string()),
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -973,6 +1050,7 @@ async fn a_token_with_no_azp_claim_at_all_is_refused() {
             account_id: Some("acct_1".to_string()),
             project_id: Some("proj_1".to_string()),
             api_key_id: Some("session_abc123".to_string()),
+            sid: Some("session_abc123".to_string()),
             azp: None,
         },
     );
@@ -985,10 +1063,226 @@ async fn a_token_with_no_azp_claim_at_all_is_refused() {
         member_context: Some(mk_member_context()),
         member_role: None,
         member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
     });
 
     let (status, payload) = introspect(state, &token).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["active"], false);
+}
+
+// ============================================================================================
+// ADR-0020 Decision 4 / #437: `resolve_exchange_token_context` gains a session-status lookup
+// keyed on `claims.sid`, joining the existing checks above. Three outcomes, exercised below:
+// session found+active (already covered by every test above, all of which default to
+// `MockSessionStatus::Active`), session found but not active/expired/not-found (`active: false`,
+// same as every other fail-to-inactive branch), and the session lookup itself erroring (`Err`,
+// never `Ok(None)`/`Ok(Some(..))` -- the one hard, fail-closed requirement of this whole ADR).
+// ============================================================================================
+
+#[tokio::test]
+async fn introspect_returns_inactive_when_session_is_revoked() {
+    let key = mk_signing_key();
+    let token = sign_exchange_token(
+        &key,
+        &ExchangeTokenClaims {
+            sub: "human-subject-1".to_string(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp() as usize,
+            account_id: Some("acct_1".to_string()),
+            project_id: Some("proj_1".to_string()),
+            api_key_id: Some("session_abc123".to_string()),
+            sid: Some("session_abc123".to_string()),
+            azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
+        },
+    );
+    let state = mk_state(MockOpaRepo {
+        api_key: None,
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: vec![key.public_jwk.clone()],
+        member_context: Some(mk_member_context()),
+        member_role: Some("lead".to_string()),
+        member_quota_tier: Some("t-m".to_string()),
+        session_status: MockSessionStatus::Revoked,
+    });
+
+    let (status, payload) = introspect(state, &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["active"], false,
+        "a revoked session must resolve inactive, even though every other check would pass"
+    );
+}
+
+#[tokio::test]
+async fn introspect_returns_inactive_when_session_is_expired() {
+    let key = mk_signing_key();
+    let token = sign_exchange_token(
+        &key,
+        &ExchangeTokenClaims {
+            sub: "human-subject-1".to_string(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp() as usize,
+            account_id: Some("acct_1".to_string()),
+            project_id: Some("proj_1".to_string()),
+            api_key_id: Some("session_abc123".to_string()),
+            sid: Some("session_abc123".to_string()),
+            azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
+        },
+    );
+    let state = mk_state(MockOpaRepo {
+        api_key: None,
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: vec![key.public_jwk.clone()],
+        member_context: Some(mk_member_context()),
+        member_role: Some("lead".to_string()),
+        member_quota_tier: Some("t-m".to_string()),
+        session_status: MockSessionStatus::Expired,
+    });
+
+    let (status, payload) = introspect(state, &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], false);
+}
+
+#[tokio::test]
+async fn introspect_returns_inactive_when_session_row_not_found() {
+    let key = mk_signing_key();
+    let token = sign_exchange_token(
+        &key,
+        &ExchangeTokenClaims {
+            sub: "human-subject-1".to_string(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp() as usize,
+            account_id: Some("acct_1".to_string()),
+            project_id: Some("proj_1".to_string()),
+            api_key_id: Some("session_abc123".to_string()),
+            sid: Some("session_abc123".to_string()),
+            azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
+        },
+    );
+    let state = mk_state(MockOpaRepo {
+        api_key: None,
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: vec![key.public_jwk.clone()],
+        member_context: Some(mk_member_context()),
+        member_role: Some("lead".to_string()),
+        member_quota_tier: Some("t-m".to_string()),
+        session_status: MockSessionStatus::NotFound,
+    });
+
+    let (status, payload) = introspect(state, &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["active"], false,
+        "an unrecognized sid (e.g. a pre-ADR-0020 token) must resolve inactive, not error"
+    );
+}
+
+#[tokio::test]
+async fn introspect_returns_inactive_when_no_sid_claim_at_all() {
+    let key = mk_signing_key();
+    let token = sign_exchange_token(
+        &key,
+        &ExchangeTokenClaims {
+            sub: "human-subject-1".to_string(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp() as usize,
+            account_id: Some("acct_1".to_string()),
+            project_id: Some("proj_1".to_string()),
+            api_key_id: Some("session_abc123".to_string()),
+            sid: None,
+            azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
+        },
+    );
+    let state = mk_state(MockOpaRepo {
+        api_key: None,
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: vec![key.public_jwk.clone()],
+        member_context: Some(mk_member_context()),
+        member_role: Some("lead".to_string()),
+        member_quota_tier: Some("t-m".to_string()),
+        // Deliberately Active -- proves the ABSENCE of a `sid` claim alone is what resolves this
+        // inactive, not the session lookup (which would never even be called).
+        session_status: MockSessionStatus::Active,
+    });
+
+    let (status, payload) = introspect(state, &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], false);
+}
+
+/// **The fail-closed regression test #437 requires as a hard, non-optional gate.** A session-store
+/// lookup error must propagate as `Err`, never collapse into `Ok(None)` (which the HTTP layer
+/// would render as an indistinguishable, safe-looking `{"active": false}`) and never `Ok(Some(..))`
+/// (`active: true`). Calls `resolve_exchange_token_context` directly (not through
+/// `introspect_api_key`, which would `?`-propagate the same `Err` up through
+/// `axum::response::Result`'s `IntoResponse` machinery into a 500 -- asserting `Err` here is the
+/// more precise, one-hop check of the actual contract this ADR adds).
+#[tokio::test]
+async fn resolve_exchange_token_context_errors_when_session_lookup_fails_never_active_true() {
+    let key = mk_signing_key();
+    let token = sign_exchange_token(
+        &key,
+        &ExchangeTokenClaims {
+            sub: "human-subject-1".to_string(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp() as usize,
+            account_id: Some("acct_1".to_string()),
+            project_id: Some("proj_1".to_string()),
+            api_key_id: Some("session_abc123".to_string()),
+            sid: Some("session_abc123".to_string()),
+            azp: Some(TEST_EXCHANGE_CLIENT_ID.to_string()),
+        },
+    );
+    let state = mk_state(MockOpaRepo {
+        api_key: None,
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: vec![key.public_jwk.clone()],
+        // Every other precondition is satisfied (a real member context, an active project/
+        // account) so this test proves the session-lookup error ALONE is what refuses the call --
+        // not some other, unrelated failure hiding behind it.
+        member_context: Some(mk_member_context()),
+        member_role: Some("lead".to_string()),
+        member_quota_tier: Some("t-m".to_string()),
+        session_status: MockSessionStatus::LookupErrors,
+    });
+
+    let result = lightbridge_authz_rest::handlers::exchange_token::resolve_exchange_token_context(
+        &state, &token,
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a session-store lookup error must propagate as Err, never Ok(None)/Ok(Some(..)): {result:?}"
+    );
+
+    // Also assert the HTTP-layer consequence: the same error, reached through the real
+    // introspection entrypoint, must surface as a hard failure (never a 200 with any `active`
+    // value) -- proving the fail-closed branch takes the exact same existing error route every
+    // other `Err` case in this function already uses (a bare `?`), not a new, invented response
+    // shape.
+    let http_result = introspect_api_key(
+        axum::extract::State(state),
+        Form(IntrospectRequest {
+            token: token.clone(),
+            token_type_hint: Some("access_token".to_string()),
+        }),
+    )
+    .await;
+    assert!(
+        http_result.is_err(),
+        "the HTTP introspection entrypoint must also refuse, not silently resolve `active: false`"
+    );
 }

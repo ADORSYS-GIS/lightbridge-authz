@@ -2511,38 +2511,83 @@ async fn api_key_ownership_boundary_refuses_a_non_member_stranger() {
 // function's doc comment).
 // ---------------------------------------------------------------------------------------------
 
-/// Inserts one active `exchange_refresh_tokens` row for `subject` and returns its `id`, so a test
-/// can assert on which specific rows a revocation touched.
+/// Inserts one active `sessions` row (`kind = 'token'`) for `subject`, plus one active
+/// `exchange_refresh_tokens` row chained under it (`session_id` set), and returns the SESSION's
+/// `id` -- so a test can assert on which specific sessions a revocation touched, and (via
+/// [`refresh_token_status_for_session`]) that the cascade reaches the chained refresh token too.
 async fn seed_active_session(pool: &sqlx::PgPool, subject: &str) -> String {
+    seed_session_with_refresh_token(pool, subject, "token").await
+}
+
+/// Inserts one active `sessions` row of the given `kind` (`"token"` or `"browser"`) for `subject`.
+/// `kind = "browser"` rows get no `exchange_refresh_tokens` row chained under them (ADR-0021
+/// Decision 3: a browser session is never presented as a bearer token, so it structurally cannot
+/// have a refresh-token chain) and no `client_id` (`sessions_kind_client_id_check`).
+async fn seed_session(pool: &sqlx::PgPool, subject: &str, kind: &str) -> String {
     let id = cuid2();
-    // `chain_id`/`chain_expires_at` (migration `20260815000001_exchange_refresh_tokens_add_chain`)
-    // are `NOT NULL` with no default -- mirrors that migration's own backfill convention for a
-    // pre-existing row: a single-member chain (`chain_id = id`) with a cap far enough out that
-    // none of these tests' assertions ever race it.
+    let client_id: Option<String> = (kind == "token").then(|| "test-client".to_string());
     sqlx::query(
         r#"
-        INSERT INTO exchange_refresh_tokens
-          (id, subject, account_id, project_id, client_id, token_hash, status, chain_id, chain_expires_at, created_at, expires_at)
-        VALUES ($1, $2, $2, $3, 'test-client', $4, 'active', $1, now() + interval '90 days', now(), now() + interval '30 days')
+        INSERT INTO sessions (id, account_id, project_id, client_id, kind, status, expires_at)
+        VALUES ($1, $2, $3, $4, $5, 'active', now() + interval '1 hour')
         "#,
     )
     .bind(&id)
     .bind(subject)
     .bind(cuid2())
-    .bind(cuid2())
+    .bind(client_id)
+    .bind(kind)
     .execute(pool)
     .await
-    .expect("seed active session");
+    .expect("seed session row");
     id
 }
 
-/// The `status` of the `exchange_refresh_tokens` row with `id`.
+/// [`seed_session`] plus one active `exchange_refresh_tokens` row chained under it via
+/// `session_id` -- only meaningful for `kind = "token"` (a browser session has no refresh-token
+/// chain, see [`seed_session`]'s doc comment). Returns the session's `id`.
+async fn seed_session_with_refresh_token(pool: &sqlx::PgPool, subject: &str, kind: &str) -> String {
+    let session_id = seed_session(pool, subject, kind).await;
+    // `chain_id`/`chain_expires_at` (migration `20260815000001_exchange_refresh_tokens_add_chain`)
+    // are `NOT NULL` with no default -- a single-member chain (`chain_id` = the refresh token's
+    // own fresh id) with a cap far enough out that none of these tests' assertions ever race it.
+    let refresh_id = cuid2();
+    sqlx::query(
+        r#"
+        INSERT INTO exchange_refresh_tokens
+          (id, subject, account_id, project_id, client_id, token_hash, status, chain_id, chain_expires_at, session_id, created_at, expires_at)
+        VALUES ($1, $2, $2, $3, 'test-client', $4, 'active', $1, now() + interval '90 days', $5, now(), now() + interval '30 days')
+        "#,
+    )
+    .bind(&refresh_id)
+    .bind(subject)
+    .bind(cuid2())
+    .bind(cuid2())
+    .bind(&session_id)
+    .execute(pool)
+    .await
+    .expect("seed active refresh token chained under the session");
+    session_id
+}
+
+/// The `status` of the `sessions` row with `id`.
 async fn session_status(pool: &sqlx::PgPool, id: &str) -> String {
-    sqlx::query_scalar("SELECT status FROM exchange_refresh_tokens WHERE id = $1")
+    sqlx::query_scalar("SELECT status FROM sessions WHERE id = $1")
         .bind(id)
         .fetch_one(pool)
         .await
         .expect("session row exists")
+}
+
+/// The `status` of the `exchange_refresh_tokens` row chained under `session_id` (ADR-0020
+/// Decision 9's cascade requirement: bulk-revoking a session must also revoke the refresh token
+/// rows chained under it, not leave a live one behind).
+async fn refresh_token_status_for_session(pool: &sqlx::PgPool, session_id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM exchange_refresh_tokens WHERE session_id = $1")
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .expect("chained refresh token row exists")
 }
 
 /// Test 6 (task list): the self-service procedure revokes only the caller's own sessions, and
@@ -2602,6 +2647,14 @@ async fn revoke_own_sessions_revokes_only_the_callers_sessions() {
         session_status(&ctx.verify, &bystander_session).await,
         "active",
         "a bystander's session must never be touched by another subject's self-service call"
+    );
+    // ADR-0020 Decision 9's cascade requirement: bulk-revoking a session must also revoke the
+    // exchange_refresh_tokens row chained under it, not leave a live refresh token behind for a
+    // session that was just killed. Self-service parity with the admin path (task 6e).
+    assert_eq!(
+        refresh_token_status_for_session(&ctx.verify, &caller_session_a).await,
+        "revoked",
+        "revokeOwnSessions must cascade to the refresh token chained under the caller's session"
     );
 }
 
@@ -2732,6 +2785,98 @@ async fn revoke_subject_sessions_reports_zero_when_nothing_is_active() {
     );
     let parsed = as_json(Wire::Cbor, &body);
     assert_eq!(parsed["revokedCount"], 0);
+}
+
+/// #441's own required regression test: `revokeSubjectSessions`'s underlying query must cover
+/// BOTH `kind`s, proven by seeding a `kind = 'browser'` row directly (no RP-leg caller exists yet
+/// to create one for real -- ADR-0021 Follow-up 6/#441's own scope note; this is fine and expected
+/// per that ticket's own acceptance criteria) alongside a normal `kind = 'token'` one, and
+/// asserting the bulk cascade reaches BOTH in the same call -- not just asserted by code review,
+/// per ADR-0021 Decision 3's own explicit "must be proven, not assumed" requirement.
+#[tokio::test]
+async fn revoke_subject_sessions_reaches_a_browser_kind_session_too() {
+    let admin_subject = format!("session-admin-kind-{}", cuid2());
+    let target = format!("kind-mixed-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let token_session = seed_session(&ctx.verify, &target, "token").await;
+    let browser_session = seed_session(&ctx.verify, &target, "browser").await;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.revokeSubjectSessions",
+        Wire::Cbor,
+        &json!({ "args": { "accountId": target } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let parsed = as_json(Wire::Cbor, &body);
+    assert_eq!(
+        parsed["revokedCount"], 2,
+        "must revoke both sessions, of either kind, in one call: {parsed}"
+    );
+
+    assert_eq!(session_status(&ctx.verify, &token_session).await, "revoked");
+    assert_eq!(
+        session_status(&ctx.verify, &browser_session).await,
+        "revoked",
+        "a kind='browser' row must be reached by the same bulk cascade as a kind='token' one -- \
+         a kind-blind-in-the-wrong-direction bug here would leave this row silently active"
+    );
+}
+
+/// #441's cross-subject isolation criterion: revoking one subject's sessions must not touch a
+/// different subject's rows, of EITHER kind. Seeds both kinds for both a target and a bystander,
+/// revokes only the target, and asserts the bystander's rows (both kinds) are untouched.
+#[tokio::test]
+async fn revoke_subject_sessions_does_not_touch_a_different_subjects_sessions_of_either_kind() {
+    let admin_subject = format!("session-admin-cross-{}", cuid2());
+    let target = format!("cross-target-{}", cuid2());
+    let bystander = format!("cross-bystander-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let target_token = seed_session(&ctx.verify, &target, "token").await;
+    let target_browser = seed_session(&ctx.verify, &target, "browser").await;
+    let bystander_token = seed_session(&ctx.verify, &bystander, "token").await;
+    let bystander_browser = seed_session(&ctx.verify, &bystander, "browser").await;
+
+    let (status, _) = rpc_call(
+        r.clone(),
+        "procedure.revokeSubjectSessions",
+        Wire::Cbor,
+        &json!({ "args": { "accountId": target } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(session_status(&ctx.verify, &target_token).await, "revoked");
+    assert_eq!(
+        session_status(&ctx.verify, &target_browser).await,
+        "revoked"
+    );
+    assert_eq!(
+        session_status(&ctx.verify, &bystander_token).await,
+        "active",
+        "a bystander's token-kind session must never be touched by another subject's revoke call"
+    );
+    assert_eq!(
+        session_status(&ctx.verify, &bystander_browser).await,
+        "active",
+        "a bystander's browser-kind session must never be touched by another subject's revoke call"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

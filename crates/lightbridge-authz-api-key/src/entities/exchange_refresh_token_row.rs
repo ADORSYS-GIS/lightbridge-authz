@@ -35,6 +35,12 @@ pub struct ExchangeRefreshTokenRow {
     /// inherited unchanged by every rotation since -- independent of, and typically longer-lived
     /// than, this individual row's own `expires_at`.
     pub chain_expires_at: DateTime<Utc>,
+    /// ADR-0020: the `sessions` row this refresh token is chained under -- minted once at the
+    /// initial exchange grant and inherited unchanged across every rotation, the same "born once,
+    /// inherited across rotation" shape `chain_id` already has (Decision 1 explicitly subsumes
+    /// `chain_id`'s role into this column going forward; `chain_id`/`chain_expires_at` are kept,
+    /// unchanged, for one release per that Decision's own deferral).
+    pub session_id: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
@@ -54,6 +60,8 @@ pub struct NewExchangeRefreshToken {
     pub auth_time: Option<i64>,
     pub chain_id: String,
     pub chain_expires_at: DateTime<Utc>,
+    /// See [`ExchangeRefreshTokenRow::session_id`]'s doc comment.
+    pub session_id: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }

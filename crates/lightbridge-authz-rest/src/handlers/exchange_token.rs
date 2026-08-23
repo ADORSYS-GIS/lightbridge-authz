@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use chrono::Utc;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::Jwk};
 use lightbridge_authz_core::{
     Project, ResourceStatus,
@@ -50,6 +51,13 @@ struct ExchangeClaims {
     /// token has reached this function; see that function's `azp` gate for why it must be checked
     /// before this token is ever treated as an exchange session.
     azp: Option<String>,
+    /// ADR-0020 Decision 2 / #437: the `sessions` row this token is bound to -- on a
+    /// token-exchange-minted token this carries the SAME value as [`api_key_id`](Self::api_key_id)
+    /// (see `crate::signing::access_token_extra`'s doc comment for why the two claims are not yet
+    /// fully separated). Absent on a pre-ADR-0020 token or an `id_token` (`id_token_extra` never
+    /// sets it) -- treated as "no session to check", never as "therefore active" (see
+    /// [`resolve_exchange_token_context`]).
+    sid: Option<String>,
 }
 
 /// Verifies `token` was signed by one of THIS service's own signing keys (`signing_keys`, the
@@ -175,10 +183,14 @@ fn is_api_key_shaped(claims: &ExchangeClaims, configured_api_key_audience: Optio
 /// [`crate::models::IntrospectResponse`] for it. `project` doubles as the source of
 /// `allowed_models`/`model_policy`/`project_quota`/`billing_plan` -- the same fields
 /// `ValidatedApiKeyContext` reads off a project row on the API-key plane.
+#[derive(Debug)]
 pub struct ExchangeTokenContext {
     /// The session id this token was minted with (`access_token_extra`'s `api_key_id` claim) --
     /// there is no `api_keys` row, so this is surfaced as the introspection response's `sub`
-    /// (this credential's own identifier), never as `api_key_id`.
+    /// (this credential's own identifier), never as `api_key_id`. Deliberately still reads
+    /// `claims.api_key_id`, not `claims.sid`, even though the two now carry the same value
+    /// (ADR-0020 Decision 2, #437's scoped-down interpretation) -- kept as the smaller diff; the
+    /// two claims fully diverging is #421's own future scope, not this PR's.
     pub session_id: Option<String>,
     pub account_id: String,
     pub project: Project,
@@ -220,6 +232,51 @@ pub async fn resolve_exchange_token_context(
         );
         return Ok(None);
     };
+
+    // ADR-0020 Decision 4 / #437: consult the session this token's `sid` claim names, and fail
+    // closed on any lookup error -- never `Ok(None)`, never `Ok(Some(..))`, only `Err`. See this
+    // function's own "never widen `active`" doc comment and `OpaRepoTrait::find_session_status`'s.
+    let Some(sid) = claims.sid.filter(|s| !s.trim().is_empty()) else {
+        tracing::info!(
+            active = false,
+            reason = "no_sid_claim",
+            "exchange token introspection resolved inactive"
+        );
+        return Ok(None);
+    };
+    match state.repo.find_session_status(&sid).await {
+        Ok(Some(session)) if session.status == "active" && session.expires_at > Utc::now() => {
+            // Proceed to the existing membership/project/account checks below, unchanged.
+        }
+        Ok(Some(session)) => {
+            let reason = if session.status != "active" {
+                "session_revoked"
+            } else {
+                "session_expired"
+            };
+            tracing::info!(
+                active = false,
+                reason = reason,
+                sid = %sid,
+                "exchange token introspection resolved inactive"
+            );
+            return Ok(None);
+        }
+        Ok(None) => {
+            tracing::info!(
+                active = false,
+                reason = "session_not_found",
+                sid = %sid,
+                "exchange token introspection resolved inactive"
+            );
+            return Ok(None);
+        }
+        // Fail closed: the lookup itself errored (DB unreachable, etc). This must propagate, not
+        // collapse into `Ok(None)` -- an unreachable session store is "unknown," and the
+        // strictest available branch for an already-erroring request is to fail the introspection
+        // call outright, never to synthesize `active: true`.
+        Err(err) => return Err(err),
+    }
 
     let context = match state.repo.resolve_context(&claims.sub, &project_id).await {
         Ok(context) => context,
