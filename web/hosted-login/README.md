@@ -1,10 +1,13 @@
 # authz-idp hosted login page
 
-Vite + React + TypeScript static build, served same-origin by `authz-idp` (ADR-0021 Decisions
-1 and 10 -- `docs/adr/0021-browser-sso-hosted-login-page-and-session-cookie.md`). This project
-builds to static assets; `authz-idp`'s Rust router serves them via `tower-http`'s `fs` feature
-(`crates/lightbridge-authz-rest/src/static_assets.rs`), never a separate origin -- see that ADR's
-Decision 1 for why same-origin is load-bearing for the `__Host-` session cookie.
+Vite + React + TypeScript static build, served same-origin by `authz-idp` under the `/ui` path
+prefix (ADR-0021 Decisions 1 and 10 --
+`docs/adr/0021-browser-sso-hosted-login-page-and-session-cookie.md`). This project builds to
+static assets with Vite `base: "/ui/"`; `authz-idp`'s Rust router serves them via `tower-http`'s
+`fs` feature, nested at `/ui`, never at the server root and never a separate origin
+(`crates/lightbridge-authz-rest/src/static_assets.rs`) -- see that ADR's Decision 1 for why
+same-origin is load-bearing for the `__Host-` session cookie, and Decision 10 for why `/ui`
+specifically (`GET /` stays `authz-idp`'s own API-welcome-JSON route; the two never collide).
 
 ## Stack
 
@@ -56,8 +59,10 @@ npm run dev      # local dev server (not served by authz-idp; SW registration is
                   # service worker against a real production build)
 npm run build    # tsc -b && vite build && scripts/verify-service-worker-scope.mjs --
                   # production build -> dist/ (content-hashed assets/*.js, assets/*.css,
-                  # sw.js), then asserts the built service worker only precaches assets/** and
-                  # never intercepts navigation (ADR-0021 Decision 10's SW scoping property)
+                  # sw.js), every asset/HTML reference and the service worker's own
+                  # registration prefixed with /ui/ (vite.config.ts's base: "/ui/"), then
+                  # asserts the built service worker only precaches assets/** and never
+                  # intercepts navigation (ADR-0021 Decision 10's SW scoping property)
 npm run check    # biome check . (format + lint + import order, read-only)
 npm run lint     # biome lint . only
 npm run format   # biome format --write .

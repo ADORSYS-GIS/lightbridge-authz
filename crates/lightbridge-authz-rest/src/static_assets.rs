@@ -1,26 +1,39 @@
 //! ADR-0021 (`docs/adr/0021-browser-sso-hosted-login-page-and-session-cookie.md`) Decisions 1 +
-//! 10: serves the hosted-login Vite React static build (`web/hosted-login/`) as `authz-idp`'s
-//! lowest-priority fallback, with Decision 10's content-hash-aware caching and strict CSP.
+//! 10: serves the hosted-login Vite React static build (`web/hosted-login/`, built with Vite
+//! `base: "/ui/"`) under `authz-idp`'s `/ui` path prefix, with Decision 10's content-hash-aware
+//! caching and strict CSP.
 //!
 //! **Scaffold only (#442).** This module makes the built assets reachable; it does not implement
 //! any part of the login flow itself -- the RP leg to Keycloak (#424), `GET /authorize` (#425),
 //! or session/cookie issuance (#441, #443) all land as separate, later changes. Nothing in this
 //! module reads or writes a cookie, calls Keycloak, or knows what a session is.
 //!
-//! **Mount order and namespace reservation preserve protocol safety.**
-//! [`static_assets_fallback`] must be mounted via `.fallback_service(..)` on
-//! `build_idp_router`'s router after every protocol route has already been merged in. Axum tries
-//! the route table before the fallback, and this fallback independently refuses its reserved
-//! OAuth/OIDC namespaces so an unknown future protocol path cannot become a successful SPA page.
+//! **Path-scoping is the whole safety property, not mount order.** [`static_assets_fallback`] is
+//! mounted via `.nest_service("/ui", ..)` on `build_idp_router`'s router (see that function's doc
+//! comment), not as a root-level `.fallback_service(..)`. Nesting under `/ui` means this service
+//! only ever receives a request whose original path already started with `/ui` -- it cannot be
+//! reached by, and cannot shadow, any protocol route (`.well-known/*`, `/oauth2/*`, `/authorize`,
+//! the probe router, all of which live outside `/ui`), regardless of merge order. Within its own
+//! `/ui` subtree this router still behaves like an SPA catch-all: any path under `/ui` that does
+//! not match a real static file falls back to `index.html` (client-side routing), exactly as
+//! before -- only the outer scope changed.
+//!
+//! **This supersedes #462's `RESERVED_PROTOCOL_ROOTS` denylist, which is removed here.** That
+//! list existed only because this service was mounted at the router root, where an unknown
+//! protocol path could otherwise fall through and render as a successful SPA page; it had to be
+//! kept in step by hand every time a new protocol route was accepted. Nesting removes the
+//! condition it defended against: a protocol path never reaches this service at all. Keeping it
+//! would also be actively wrong here -- `nest_service` strips the `/ui` prefix, so a legitimate
+//! client-side route such as `/ui/authorize` would arrive as `/authorize` and be refused. A
+//! structural guarantee replaces an enumerated one; there is no dormant second mechanism.
 
 use std::path::Path;
 
 use axum::Router;
 use axum::extract::Request;
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, header};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
-use percent_encoding::percent_decode_str;
+use axum::response::Response;
 use tower_http::services::{ServeDir, ServeFile};
 
 /// Vite's default production output directory for content-hashed JS/CSS
@@ -48,28 +61,19 @@ const NO_CACHE_CONTROL: &str = "no-cache";
 /// byte-identical copy of its own.
 pub(crate) const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; frame-ancestors 'none'";
 
-/// Root-level protocol endpoints already named by accepted ADRs or the current roadmap, plus the
-/// two discovery/token namespaces (`.well-known`, `oauth2`). Keep device verification out of this
-/// list: its `/device/verify` spelling remains hosted UI, not the machine-facing
-/// device-authorization endpoint. Matched case-insensitively against the percent-decoded request
-/// path -- see [`is_reserved_protocol_namespace`].
-const RESERVED_PROTOCOL_ROOTS: &[&str] = &[
-    "/authorize",
-    "/userinfo",
-    "/device_authorization",
-    "/idp/callback",
-    "/.well-known",
-    "/oauth2",
-];
-
-/// Builds the static-asset fallback service for `build_idp_router`.
+/// Builds the static-asset service `build_idp_router` mounts under `/ui` (`.nest_service("/ui",
+/// ..)`).
 ///
 /// `static_dir` is the Vite build's `dist/` output (an `index.html` plus a content-hashed
-/// `assets/` directory). Serves a matching file when one exists; otherwise serves `index.html`
-/// with a `200` for client-side routing. OAuth/OIDC protocol namespaces are reserved before that
-/// fallback, so an unknown endpoint can never appear to be a successful hosted page. Every static
-/// response -- asset, real `index.html`, or the SPA-fallback `index.html` -- carries Decision 10's
-/// cache headers and CSP.
+/// `assets/` directory built with Vite `base: "/ui/"`). This function's own paths (`/`,
+/// `/assets/...`) are relative to wherever it is mounted -- `axum::Router::nest_service` strips
+/// the `/ui` prefix before a request reaches here, so `GET /ui` and `GET /ui/` both arrive as `/`
+/// and `GET /ui/assets/<file>` arrives as `/assets/<file>`, exactly like the caller mounted this
+/// router at the origin. Serves a matching file when one exists; otherwise serves `index.html`
+/// with a `200` (client-side routing) -- **never a bare `404`**, which would otherwise let a
+/// client distinguish "unknown static path under `/ui`" from "protocol route that doesn't exist"
+/// by response shape. Every response -- asset, real `index.html`, or the SPA-fallback
+/// `index.html` -- carries Decision 10's cache headers and CSP.
 pub fn static_assets_fallback(static_dir: impl AsRef<Path>) -> Router {
     let static_dir = static_dir.as_ref();
     let index_html = static_dir.join("index.html");
@@ -85,9 +89,6 @@ pub fn static_assets_fallback(static_dir: impl AsRef<Path>) -> Router {
 /// `index.html`) has already been resolved -- this never changes *which* file is served, only the
 /// headers on the response.
 async fn apply_static_asset_headers(req: Request, next: Next) -> Response {
-    if is_reserved_protocol_namespace(req.uri().path()) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
     let is_hashed_asset = req.uri().path().starts_with(HASHED_ASSET_PREFIX);
     let mut response = next.run(req).await;
 
@@ -106,20 +107,4 @@ async fn apply_static_asset_headers(req: Request, next: Next) -> Response {
     );
 
     response
-}
-
-/// Percent-decodes and lowercases `path` before comparing it against
-/// [`RESERVED_PROTOCOL_ROOTS`], so a disguised request (`/oauth2%2Ftoken`, `/OAuth2/token`)
-/// cannot slip past the raw, case-sensitive `http::Uri::path()` string and fall through to the
-/// SPA fallback as if it were an ordinary unrecognized path.
-fn is_reserved_protocol_namespace(path: &str) -> bool {
-    let decoded = percent_decode_str(path)
-        .decode_utf8_lossy()
-        .to_ascii_lowercase();
-    RESERVED_PROTOCOL_ROOTS.iter().any(|root| {
-        decoded == *root
-            || decoded
-                .strip_prefix(root)
-                .is_some_and(|suffix| suffix.starts_with('/'))
-    })
 }

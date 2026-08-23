@@ -2795,15 +2795,23 @@ pub async fn start_opa_server(
 /// been repointed at `authz-idp` and `authz-api`'s copy of this surface removed (see
 /// `build_api_router`'s doc comment) — `authz-idp` is now the sole owner.
 ///
-/// ## Static asset fallback (ADR-0021 Decisions 1 + 10, #442)
+/// ## Static asset serving under `/ui` (ADR-0021 Decisions 1 + 10, #442, and the follow-up that
+/// moved this from a root-level fallback to a path-scoped mount)
 ///
-/// `static_dir` is mounted last, via `.fallback_service(..)`, after every protocol route above
-/// has already been merged in — `.well-known/*`, `/oauth2/*`, and the probe router. A
-/// `Router`'s fallback is always axum's lowest-priority match regardless of call order (the route
-/// table is tried first; the fallback only runs when nothing there matched), so this ordering is
-/// not what makes protocol routes win — it is documentation of that fact, kept in the same order
-/// the ADR describes it. See `static_assets::static_assets_fallback`'s own doc comment for the
-/// caching/CSP posture applied to everything served from `static_dir`.
+/// `static_dir` is mounted at `/ui`, via `.nest_service("/ui", ..)`, not as a root-level
+/// `.fallback_service(..)`. Mounting it as a root fallback made `GET /` split-brained in
+/// production: a real route always wins over a fallback, so `GET /` kept answering this server's
+/// own API-welcome-JSON `root_handler` (from `probe_router`, merged above) while `GET /index.html`
+/// or `GET /login` served the SPA — same build, two different personalities depending on the
+/// exact path. Scoping the static build under `/ui` removes the ambiguity outright: `GET /` is
+/// unconditionally the API route, `GET /ui`, `GET /ui/`, and every `GET /ui/<anything>` are
+/// unconditionally the SPA (client-side routing falls back to `index.html`), and a path outside
+/// `/ui` that matches no protocol route is a normal `404` — the SPA is no longer a catch-all for
+/// the whole server. This also makes the safety property strictly path-scoping rather than
+/// mount-order: static assets and protocol routes now occupy disjoint path spaces, so they cannot
+/// collide regardless of merge order, whereas the old fallback-based mount was safe only because
+/// a real route always beats a fallback. See `static_assets::static_assets_fallback`'s own doc
+/// comment for the caching/CSP posture applied to everything served from `static_dir`.
 ///
 /// ## `relying_party` is pre-validated, not (re)constructed here
 ///
@@ -2866,7 +2874,7 @@ pub fn build_idp_router(
         router = router.merge(rp_router);
     }
 
-    router.fallback_service(static_assets::static_assets_fallback(static_dir))
+    router.nest_service("/ui", static_assets::static_assets_fallback(static_dir))
 }
 
 /// Starts `authz-idp` (ADR-0012): the OIDC broker service carrying `/oauth2/token`,

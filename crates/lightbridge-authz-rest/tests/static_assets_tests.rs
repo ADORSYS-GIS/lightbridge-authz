@@ -4,8 +4,15 @@
 #![allow(clippy::unwrap_used)]
 
 //! ADR-0021 Decisions 1 + 10 (#442): `static_assets::static_assets_fallback` serves the hosted
-//! login page's Vite build with content-hash-aware caching and a strict CSP. This file proves,
-//! against a real (temp-directory) build output rather than a mocked service:
+//! login page's Vite build with content-hash-aware caching and a strict CSP. This file exercises
+//! the service in isolation, at its own root -- exactly the paths it sees once
+//! `build_idp_router` nests it under `/ui` and `axum::Router::nest_service` strips that prefix
+//! (`GET /ui/assets/x.js` arrives here as `/assets/x.js`, `GET /ui`/`GET /ui/` both arrive as
+//! `/`). The `/ui`-prefixed mounting itself -- bare `/ui`, `/ui/`, `GET /` staying the API route,
+//! and a non-`/ui` path 404ing -- is `idp_server_tests.rs`'s job
+//! (`ui_bare_and_trailing_slash_both_serve_index_html` and friends), since that behavior only
+//! exists once this service is actually mounted on `build_idp_router`. Proves, against a real
+//! (temp-directory) build output rather than a mocked service:
 //! 1. A hashed asset under `assets/` gets the immutable long-cache header.
 //! 2. `index.html` -- both the real file and the SPA-fallback response for an unrecognized path
 //!    -- gets `no-cache`, and the fallback case is a `200`, never a bare `404`.

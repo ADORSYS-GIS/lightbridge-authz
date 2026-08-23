@@ -524,7 +524,18 @@ login.
   30s introspection cache sitting in front of this particular check. Any user-facing "sign out"
   copy must say so, not promise instant effect.
 
-### 10. Static asset serving: `tower-http`'s file-serving layer, mounted as the lowest-priority fallback, with asset-hash-aware caching and a strict CSP
+### 10. Static asset serving: `tower-http`'s file-serving layer, mounted under `/ui`, with asset-hash-aware caching and a strict CSP
+
+> **Update (2026-08-23, follow-up to #442):** the original text of this Decision mounted the
+> static build as the idp router's root-level `.fallback_service(..)` — safe only because a real
+> route always beats a fallback, never because the two could not otherwise collide. In production
+> that produced a split personality: `GET /` returned the API-welcome-JSON `root_handler` every
+> server in this workspace shares (a real route wins), while `GET /index.html`/`GET /login` served
+> the SPA. The fix, decided by the repo owner: build the frontend with Vite `base: "/ui/"` and
+> serve it exclusively under an `/ui` path prefix, never at the router root. `GET /` stays
+> API-only, unconditionally. The bullets below describe the corrected shape; the safety property
+> is now **path-scoping**, not **mount-order** — static assets and protocol routes occupy disjoint
+> path spaces, so they cannot collide at all, regardless of merge order.
 
 `tower-http` is already a direct dependency but pinned with only the `cors` feature
 (`Cargo.toml:155`) — no static-file-serving feature is enabled anywhere in this workspace today.
@@ -533,12 +544,15 @@ to the implementation ticket (Follow-up 7):
 
 - **Layer**: `tower-http`'s `fs` feature (`ServeDir`/`ServeFile`), the same crate family already in
   the dependency graph for CORS — no new crate, only a feature-flag addition. Mounted into
-  `build_idp_router` (`crates/lightbridge-authz-rest/src/lib.rs:2590-2615`) as a `.fallback(...)`,
-  after every protocol route (`.well-known/*`, `/oauth2/*`, `/authorize`, the RP-leg callback, the
-  probe router) — so a path collision between a future static asset and a protocol route always
-  resolves in the protocol route's favor, never the reverse. `well_known_router` and
-  `token_exchange_router` already merge into this same `Router` (`lib.rs:2602,2611`); the static
-  fallback is the last merge, not the first.
+  `build_idp_router` (`crates/lightbridge-authz-rest/src/lib.rs`) via `.nest_service("/ui", ..)`,
+  scoped entirely under the `/ui` path prefix rather than mounted as a root-level fallback. Every
+  protocol route (`.well-known/*`, `/oauth2/*`, `/authorize`, the RP-leg callback, the probe
+  router, including `GET /`) lives outside `/ui` and the static build can only ever answer a
+  request that already starts with `/ui` — the two path spaces are disjoint by construction, so a
+  future protocol route and a future static asset can never collide no matter what order they are
+  merged in. `GET /ui` and `GET /ui/` both serve `index.html`; `GET /ui/<anything-else>` falls
+  back to `index.html` too (client-side routing); a path outside `/ui` that matches no protocol
+  route gets a normal `404`, not the SPA.
 - **Caching**: Vite's default production build emits content-hashed filenames for JS/CSS
   (`assets/index-<hash>.js`), so those files are safe to cache as `Cache-Control:
   public, max-age=31536000, immutable` — a hash change is a different URL, not a cache-invalidation
