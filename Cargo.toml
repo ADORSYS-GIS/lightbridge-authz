@@ -364,16 +364,40 @@ mimalloc = "0"
 # literal comparisons in read policies) only extends the SAME SQL-predicate-compilation mechanism
 # lightbridge-authz#401 is about to a new field type -- it does not add a pre-dispatch permission
 # gate, so it changes nothing about #401's "filter, not refuse" read-policy question.
-cratestack-core = "=0.8.6"
-cratestack-axum = "=0.8.6"
-cratestack-redis = "=0.8.6"
+# BUMPED (2026-08-23, cratestack 0.8.6 -> 0.8.10): 0.8.8 was never independently published to
+# crates.io for any of the six packages here (confirmed via `crates.io/api/v1/crates/<pkg>/versions`
+# for all of `cratestack-core`/`-axum`/`-redis`/`-pg`/`-codec-cbor`/`-codec-json` -- each jumps
+# 0.8.7 -> 0.8.9 with no 0.8.8 row), so this is a single jump, not two -- the same shape as the
+# 0.8.4 -> 0.8.6 gap above. Per cratestack's own CHANGELOG.md: 0.8.9's release step re-versioned
+# three Dart packages (`cratestack_cbor`/`cratestack_annotations`/`cratestack_builder`) that pub.dev
+# rejected for a tag/pubspec mismatch *after* crates.io and npm had already published, so 0.8.9
+# absorbed what would otherwise have been 0.8.8's crates.io content; 0.8.10 fixed the underlying
+# bump-tooling bug (`just bump`'s dart-pubspec rewrite matched against the *old* workspace version,
+# so it silently skipped any package that had already diverged) and brought those Dart packages back
+# in line. None of this touches the Rust crates this workspace depends on.
+#
+# The only Rust-facing change across 0.8.7-0.8.10 (0.8.9/0.8.10 are entirely internal to
+# cratestack's own release/changelog tooling -- no `cratestack-core`/`-axum`/`-redis`/`-pg`/
+# `-codec-cbor`/`-codec-json` change at all): 0.8.7 makes field-level `@allow`/`@deny` (a bare `@`
+# attached directly to a field inside `model`/`view`/`mixin`/`type`/`auth`) a parse-time error
+# instead of a silently-unenforced no-op (cratestack#679 -- it previously parsed, reported
+# `schema OK`, and was read by nothing). Breaking only for a schema that used that exact field-
+# position form; procedure-level `@allow`/`@deny` and model/view-level `@@allow`/`@@deny` -- the only
+# forms this schema uses -- are untouched. Checked before bumping:
+# `grep -nE '^\s*[A-Za-z_][A-Za-z0-9_]*\s+[A-Za-z_].*@(allow|deny)\('
+# crates/lightbridge-authz-api/schema/authz.cstack` returns zero matches, so this is a no-op here.
+# (0.8.7 also ships `cratestack_cbor` platform artifacts for the Dart package and a changelog-seed
+# fix -- both internal to cratestack's own tooling, not reachable from this repo.)
+cratestack-core = "=0.8.10"
+cratestack-axum = "=0.8.10"
+cratestack-redis = "=0.8.10"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
 # `include_server_schema!` macro emits `::cratestack::*` paths (see cratestack-pg lib docs). The
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
 # it to build the RPC router (ADR-0003).
-cratestack = { package = "cratestack-pg", version = "=0.8.6" }
-cratestack-codec-cbor = "=0.8.6"
-cratestack-codec-json = "=0.8.6"
+cratestack = { package = "cratestack-pg", version = "=0.8.10" }
+cratestack-codec-cbor = "=0.8.10"
+cratestack-codec-json = "=0.8.10"
 # Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
