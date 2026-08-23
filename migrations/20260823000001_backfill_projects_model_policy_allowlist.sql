@@ -21,28 +21,35 @@
 -- make a re-run non-idempotent in spirit even though the WHERE clause already excludes them by
 -- construction).
 --
--- Stale catalogue ids inside some projects' `allowed_models` (e.g. the owner's own project
--- carries `qwen3p7-plus`/`qwen3-5-9b-local`, no longer in the model catalogue) are left exactly
--- as-is. Under `allowlist` a stale id is simply a non-matching entry -- harmless. #417's catalogue
--- validation only guards fresh writes (`setProjectAllowedModels`), not pre-existing rows, and
--- cleaning them up is converse-frontends#195 (merged), not this migration's job.
+-- Stale catalogue ids inside some projects' `allowed_models` (ids that no longer appear in the
+-- current model catalogue) are left exactly as-is. Under `allowlist` a stale id is simply a
+-- non-matching entry -- harmless. #417's catalogue validation only guards fresh writes
+-- (`setProjectAllowedModels`), not pre-existing rows, and cleaning up any such rows is
+-- https://github.com/ADORSYS-GIS/converse-frontends/pull/195 (merged), not this migration's job.
 --
--- The stored encoding of `allowed_models` was verified against THIS database, not assumed, before
--- writing the WHERE clause below -- this repo has already shipped a bug from exactly that
--- assumption once (#282/#283, cratestack's tagged-`Value` era). Confirmed live:
+-- The stored encoding of `allowed_models` was verified, not assumed, before writing the WHERE
+-- clause below -- this repo has already shipped a bug from exactly that assumption once
+-- (#282/#283, cratestack's tagged-`Value` era). Verified two ways:
 --   * `StoreRepo::vec_to_json`/`json_to_vec` (crates/lightbridge-authz-api-key/src/repo.rs) map
 --     `Some(vec)` to a PLAIN jsonb array via `serde_json::json!(v)` (untagged since
 --     `20260814000001_untag_legacy_cratestack_value_json` ran) and `None` to SQL NULL, never the
 --     jsonb `null` literal.
 --   * `SELECT jsonb_typeof(allowed_models), model_policy, count(*) FROM projects GROUP BY 1,2`
---     against this database's live data shows FOUR shapes today, all `model_policy = 'allow_all'`
---     except the 3 `deny_all` rows: 651 SQL NULL, 72 plain `array` (36 of length 1, 36 of length 2
---     -- confirmed no length-0 arrays currently exist, but the WHERE clause still guards for one),
---     and -- notably -- 36 rows holding the jsonb `null` LITERAL, not SQL NULL. That third shape is
---     not hypothetical: it is live, current data (recent `created_at` timestamps), despite
---     `20260723000001_normalize_allowed_models_json_null` having already run against this same
---     database. Both SQL NULL and jsonb `null` mean "no restriction" per `json_to_vec` (`v.is_null()
---     => None`), so both must be excluded here.
+--     run against the local development Postgres container (`lightbridge-authz-postgresql-1`,
+--     NOT a production database -- no production access was available or used while authoring
+--     this migration) showed, at that point in time, three of the four shapes this predicate has
+--     to handle, all under `model_policy = 'allow_all'` except a handful of `deny_all` rows: SQL
+--     NULL, a plain jsonb `array` of length > 0, and -- notably -- rows holding the jsonb `null`
+--     LITERAL, not SQL NULL (a length-0 array was not observed at that point, but the WHERE
+--     clause still guards for one, since nothing in the write path rules it out). The jsonb-null
+--     shape is not hypothetical: it was present with recent `created_at` timestamps despite
+--     `20260723000001_normalize_allowed_models_json_null` having already run against that same
+--     local database. The exact row counts observed are not reproduced here -- they were a
+--     point-in-time sample of a local dev instance already stale within the hour, not an
+--     invariant about any deployment this migration will actually run against. What matters is
+--     the shape, not the count: SQL NULL and jsonb `null` both mean "no restriction" per
+--     `json_to_vec` (`v.is_null() => None`), so both must be excluded here, and neither can be
+--     assumed absent.
 --
 -- The "guard `jsonb_array_length` behind `jsonb_typeof(...) = 'array'` using plain `AND`" version
 -- of this predicate was actually tried first and FAILED the prove-fail-first migration test below
