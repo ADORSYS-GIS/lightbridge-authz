@@ -70,7 +70,8 @@ use crate::signing::{KeyOwner, access_token_extra, id_token_extra, identity_for}
 
 use super::client_assertion_store::RedisClientAssertionStore;
 use super::client_store::ConfigClientStore;
-use super::noop_stores::{NoAuthorizationCodeStore, NoDeviceCodeStore};
+use super::device_store::DbDeviceCodeStore;
+use super::noop_stores::NoAuthorizationCodeStore;
 use super::refresh_store::DbRefreshTokenStore;
 use super::{
     ACCESS_TOKEN_TYPE, OFFLINE_ACCESS_SCOPE, OPENID_SCOPE, decode_auth_time_and_nonce,
@@ -110,7 +111,14 @@ pub struct TokenExchangeOpStore {
     clients: ConfigClientStore,
     codes: NoAuthorizationCodeStore,
     refresh: DbRefreshTokenStore,
-    devices: NoDeviceCodeStore,
+    /// #423: real, CAS-consuming storage over `device_authorizations` (ADR-0012 Decision 7),
+    /// replacing the permanent `NoDeviceCodeStore` stub ADR-0011 Decision 3 originally installed.
+    /// Still practically unreachable in production today -- `oauth2_op::client_store` never maps
+    /// any client to the `device_code` grant type, so `handle_token`'s device-code arm rejects
+    /// before ever consulting this field -- but no longer errors/no-ops unconditionally in case
+    /// that invariant is ever lifted by a later ticket (the `/device_authorization` endpoint and
+    /// verification page, both out of scope here).
+    devices: DbDeviceCodeStore,
     assertions: RedisClientAssertionStore,
     repo: Arc<StoreRepo>,
     /// The `project_members` handle [`Self::resolve_quota_tier`] (ADR-0017) reads from.
@@ -152,7 +160,7 @@ impl TokenExchangeOpStore {
             clients,
             codes: NoAuthorizationCodeStore,
             refresh: DbRefreshTokenStore::new(repo.clone()),
-            devices: NoDeviceCodeStore,
+            devices: DbDeviceCodeStore::new(repo.clone()),
             assertions,
             repo,
             quota_repo,

@@ -816,6 +816,11 @@ hand-written SQL and direct `sqlx` dependencies.
     `crates/lightbridge-authz-api/schema/authz.cstack`).
   - `exchange_refresh_tokens`: CAS rotation via `SELECT ... FOR UPDATE`
     (`rotate_exchange_refresh_token` in `crates/lightbridge-authz-api-key/src/repo.rs`).
+  - `device_authorizations`: CAS rotation via `SELECT ... FOR UPDATE`, mirroring
+    `rotate_exchange_refresh_token`'s single-use-consume pattern -- a device code must be
+    atomically claimed exactly once across concurrent poll requests (ADR-0012 Decision 7, #423;
+    `consume_device_authorization`/`approve_device_authorization`/`deny_device_authorization` in
+    `crates/lightbridge-authz-api-key/src/repo.rs`).
   - `lightbridge-authz-usage`: dynamic `QueryBuilder` aggregates against the Timescale-backed
     `usage_events` table (`query_usage` in `crates/lightbridge-authz-usage/src/repo.rs`).
 - This repo runs cratestack (`cratestack-pg`) `=0.8.0` (pinned exactly in the root `Cargo.toml`,
