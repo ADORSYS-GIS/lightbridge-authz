@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 
+use axum::Form;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use cratestack::CratestackContext;
@@ -40,16 +41,20 @@ use lightbridge_authz_budget::spend::UnavailableSpendReader;
 use lightbridge_authz_budget::tier::BudgetTier;
 use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::config::{
-    JwtSigning, Oauth2TokenExchange, OauthClient, OauthClientType,
+    BasicAuth, Billing, BillingPlan, JwtSigning, Oauth2TokenExchange, OauthClient, OauthClientType,
 };
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_core::{
     CreateAccount, CreateProject, Permission, ResourceStatus, hash_api_key,
 };
+use lightbridge_authz_rest::OpaRepoTrait;
+use lightbridge_authz_rest::OpaState;
 use lightbridge_authz_rest::Procedures;
 use lightbridge_authz_rest::auth_provider::build_context;
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
+use lightbridge_authz_rest::handlers::introspect::introspect_api_key;
+use lightbridge_authz_rest::models::IntrospectRequest;
 use lightbridge_authz_rest::oauth2_op::client_assertion_store::RedisClientAssertionStore;
 use lightbridge_authz_rest::oauth2_op::client_store::ConfigClientStore;
 use lightbridge_authz_rest::oauth2_op::store::TokenExchangeOpStore;
@@ -425,6 +430,45 @@ fn state(repo: Arc<StoreRepo>, active: bool) -> TokenExchangeState {
         vec![public_client(PUBLIC_CLIENT_ID)],
         &redis_url(),
     )
+}
+
+/// Wraps a real, Postgres-backed `StoreRepo` as `OpaState` -- the introspection-plane counterpart
+/// to [`state`] (the token-exchange-plane state). `api_key_audience: None` since none of these
+/// tests mint a self-signed API-key JWT, only token-exchange access tokens.
+fn opa_state(repo: Arc<StoreRepo>) -> Arc<OpaState> {
+    Arc::new(OpaState {
+        repo: repo as Arc<dyn OpaRepoTrait>,
+        basic_auth: BasicAuth {
+            username: "authorino".to_string(),
+            password: "change-me".to_string(),
+        },
+        billing: Arc::new(Billing {
+            plans: vec![BillingPlan {
+                id: "free".to_string(),
+                name: "Free".to_string(),
+                limits: None,
+            }],
+        }),
+        api_key_audience: None,
+    })
+}
+
+/// Calls the real `/v1/authorino/validate/introspect` handler function directly against `state`,
+/// returning the decoded status/body -- the introspection-plane counterpart to [`post_token`].
+async fn introspect(state: Arc<OpaState>, token: &str) -> (StatusCode, Value) {
+    let response = introspect_api_key(
+        axum::extract::State(state),
+        Form(IntrospectRequest {
+            token: token.to_string(),
+            token_type_hint: Some("access_token".to_string()),
+        }),
+    )
+    .await
+    .expect("introspection handler should return a response, not error, for these tests");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    (status, json)
 }
 
 async fn post_token(state: TokenExchangeState, body: &str) -> (StatusCode, Value) {
@@ -2365,6 +2409,229 @@ async fn migration_backfill_gives_existing_rows_a_chain_and_a_backdated_cap(pool
         drift < 5,
         "chain_expires_at must be backdated from the row's own created_at ({old_created_at}), \
          not from migration time: got {chain_expires_at}, expected ~{expected}"
+    );
+}
+
+/// #440's own migration-verification requirement: given pre-existing `exchange_refresh_tokens`
+/// chains (already carrying `chain_id`/`chain_expires_at` from the earlier hardening migration),
+/// when `20260823000002_sessions.sql` runs, then (a) every row ends up with a non-null
+/// `session_id`, (b) rows sharing a `chain_id` end up sharing a `session_id` (= that `chain_id`,
+/// per the id-reuse backfill), (c) a chain with its live member still active backfills to a
+/// `sessions` row with `status = 'active'`, and (d) a chain whose only member is `revoked`
+/// backfills to `status = 'revoked'`. Runs migrations up to the migration immediately preceding
+/// the sessions one, seeds two chains by hand (mirroring `rpc_it_tests.rs`'s `seed_active_session`
+/// shape), then applies the rest -- same `sqlx::test(migrations = false)` + `Migrator::run_to`
+/// pattern `migration_backfill_gives_existing_rows_a_chain_and_a_backdated_cap` above uses, for
+/// the same reason: this has to inspect state that no longer exists once the migration under test
+/// has already run.
+#[sqlx::test(migrations = false)]
+async fn sessions_migration_backfills_session_id_and_status_from_existing_chains(pool: PgPool) {
+    let migrator = sqlx::migrate::Migrator::new(std::path::Path::new("../../migrations"))
+        .await
+        .expect("migrator loads from the workspace migrations directory");
+    // The migration immediately preceding `20260823000002_sessions.sql` -- chain_id/
+    // chain_expires_at/client_id all already exist, sessions/session_id do not yet.
+    migrator
+        .run_to(20260823000001, &pool)
+        .await
+        .expect("pre-sessions migrations apply");
+
+    let now = chrono::Utc::now();
+    let insert_row = |id: String,
+                      chain_id: String,
+                      status: &'static str,
+                      created_at: chrono::DateTime<chrono::Utc>| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                r#"
+                INSERT INTO exchange_refresh_tokens
+                  (id, subject, account_id, project_id, client_id, token_hash, scope, status, chain_id, chain_expires_at, created_at, expires_at)
+                VALUES ($1, $2, $2, $3, $4, $5, NULL, $6, $7, $8, $9, $9)
+                "#,
+            )
+            .bind(&id)
+            .bind(SUBJECT)
+            .bind(PROJECT_ID)
+            .bind(PUBLIC_CLIENT_ID)
+            .bind(format!("hash-{id}"))
+            .bind(status)
+            .bind(&chain_id)
+            .bind(now + chrono::Duration::days(90))
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("legacy-shaped row inserts under the pre-sessions schema");
+        }
+    };
+
+    // Chain A: two rows (an already-rotated one, and its live successor) -- a chain with its live
+    // member still active must backfill to `sessions.status = 'active'`.
+    let chain_a = cuid2();
+    insert_row(
+        cuid2(),
+        chain_a.clone(),
+        "rotated",
+        now - chrono::Duration::minutes(10),
+    )
+    .await;
+    let chain_a_active_row = cuid2();
+    insert_row(
+        chain_a_active_row.clone(),
+        chain_a.clone(),
+        "active",
+        now - chrono::Duration::minutes(5),
+    )
+    .await;
+
+    // Chain B: a single, fully-revoked row -- must backfill to `sessions.status = 'revoked'`.
+    let chain_b = cuid2();
+    let chain_b_row = cuid2();
+    insert_row(chain_b_row.clone(), chain_b.clone(), "revoked", now).await;
+
+    migrator
+        .run(&pool)
+        .await
+        .expect("the sessions migration applies on top of existing chains");
+
+    let session_id_a: String =
+        sqlx::query_scalar("SELECT session_id FROM exchange_refresh_tokens WHERE id = $1")
+            .bind(&chain_a_active_row)
+            .fetch_one(&pool)
+            .await
+            .expect("row survives the migration");
+    assert_eq!(
+        session_id_a, chain_a,
+        "session_id must be the chain's own id (id-reuse backfill)"
+    );
+
+    let session_id_b: String =
+        sqlx::query_scalar("SELECT session_id FROM exchange_refresh_tokens WHERE id = $1")
+            .bind(&chain_b_row)
+            .fetch_one(&pool)
+            .await
+            .expect("row survives the migration");
+    assert_eq!(session_id_b, chain_b);
+
+    let (status_a, expires_at_a): (String, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as("SELECT status, expires_at FROM sessions WHERE id = $1")
+            .bind(&chain_a)
+            .fetch_one(&pool)
+            .await
+            .expect("chain A's session row exists");
+    assert_eq!(
+        status_a, "active",
+        "a chain with its live member still active must backfill to an active session"
+    );
+    let expected_expires_a = now + chrono::Duration::days(90);
+    assert!(
+        (expires_at_a - expected_expires_a).num_seconds().abs() < 5,
+        "session.expires_at must be backfilled from chain_expires_at: got {expires_at_a}, \
+         expected ~{expected_expires_a}"
+    );
+
+    let status_b: String = sqlx::query_scalar("SELECT status FROM sessions WHERE id = $1")
+        .bind(&chain_b)
+        .fetch_one(&pool)
+        .await
+        .expect("chain B's session row exists");
+    assert_eq!(
+        status_b, "revoked",
+        "a chain whose only member is revoked must backfill to a revoked session"
+    );
+}
+
+// ============================================================================================
+// #437's core fix: `revokeSubjectSessions`/`revokeOwnSessions` must actually stop an
+// already-minted access token from introspecting active. Mints a real token-exchange access
+// token, introspects it (active), revokes the subject's sessions, introspects the SAME token
+// again (must now be inactive). This is the exact "prove the test catches the bug" cycle
+// AGENTS.md requires: run against the pre-#437 code (no session-status check wired into
+// `resolve_exchange_token_context`) and confirm it fails for the predicted reason (second
+// introspect still `active: true`), then apply the fix and confirm it passes.
+// ============================================================================================
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoking_a_subjects_sessions_makes_a_live_access_token_introspect_inactive(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let access_token = body["access_token"].as_str().unwrap().to_string();
+
+    let state = opa_state(repo.clone());
+
+    let (status, payload) = introspect(state.clone(), &access_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["active"], true,
+        "a freshly minted token must introspect active: {payload}"
+    );
+
+    let revoked = repo
+        .revoke_sessions_and_cascade(ACCOUNT_ID)
+        .await
+        .expect("revoke should succeed");
+    assert_eq!(
+        revoked, 1,
+        "exactly the one session just minted for this grant must be revoked"
+    );
+
+    let (status, payload) = introspect(state, &access_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["active"], false,
+        "the SAME access token, presented again after its session was revoked, must now \
+         introspect inactive -- this is #437's core fix: {payload}"
+    );
+}
+
+/// Self-service parity (task 6e): `revokeOwnSessions`'s effect is the same repo call
+/// (`AuthzStoreImpl::revoke_sessions`) regardless of which procedure dispatches into it -- this
+/// test drives the same assertion through the account id a self-service caller's own `auth().id`
+/// would supply, proving the caller's own live token goes inactive too, not only the admin path.
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoking_own_sessions_makes_the_callers_own_live_access_token_introspect_inactive(
+    pool: PgPool,
+) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let access_token = body["access_token"].as_str().unwrap().to_string();
+
+    let opa = opa_state(repo.clone());
+    let (status, payload) = introspect(opa.clone(), &access_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active"], true, "{payload}");
+
+    // Self-service revoke targets `auth().id` -- for this seed, that's ACCOUNT_ID (== SUBJECT,
+    // ADR-0006), the exact same value `revokeOwnSessions` would receive from the caller's own JWT.
+    repo.revoke_sessions_and_cascade(ACCOUNT_ID)
+        .await
+        .expect("self-service revoke should succeed");
+
+    let (status, payload) = introspect(opa, &access_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["active"], false,
+        "the caller's own cached access token must go inactive after revokeOwnSessions: {payload}"
     );
 }
 

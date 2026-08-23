@@ -124,6 +124,25 @@ pub trait OpaRepoTrait: Send + Sync {
     /// before trusting any tenant claim on it -- see
     /// `handlers::exchange_token::verify_self_issued_token`.
     async fn list_verification_jwks(&self) -> Result<Vec<serde_json::Value>>;
+    /// ADR-0020 Decision 4 / #437: the current `status`/`expires_at` of the `sessions` row named
+    /// by a token-exchange access token's `sid` claim -- `Ok(None)` when no such row exists (a
+    /// pre-ADR-0020 token, or an unrecognized `sid`), `Err` when the lookup itself fails (DB
+    /// unreachable). See `handlers::exchange_token::resolve_exchange_token_context`'s own doc
+    /// comment for why the `Err` case must never be read as "session is fine" -- it is the one
+    /// fail-closed branch this whole ADR exists to add.
+    async fn find_session_status(&self, session_id: &str) -> Result<Option<SessionStatusRow>>;
+}
+
+/// The two session-row fields introspection needs to decide `active`/`revoked`/`expired`
+/// (ADR-0020 Decision 6) -- deliberately narrower than the full `sessions` row (no `account_id`/
+/// `project_id`/`client_id`/`kind`/etc, none of which `resolve_exchange_token_context` needs).
+#[derive(Debug, Clone)]
+pub struct SessionStatusRow {
+    /// `"active"` / `"revoked"` -- plain `String`, parsed fail-closed on the read side (an
+    /// unrecognized value is never treated as `"active"`), matching this schema's established
+    /// convention for closed-set string columns (`Project.modelPolicy`, `AugmentationRequest.status`).
+    pub status: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[async_trait]
@@ -181,6 +200,17 @@ impl OpaRepoTrait for StoreRepo {
 
     async fn list_verification_jwks(&self) -> Result<Vec<serde_json::Value>> {
         StoreRepo::list_verification_jwks(self).await
+    }
+
+    async fn find_session_status(&self, session_id: &str) -> Result<Option<SessionStatusRow>> {
+        StoreRepo::find_session_status(self, session_id)
+            .await
+            .map(|opt| {
+                opt.map(|row| SessionStatusRow {
+                    status: row.status,
+                    expires_at: row.expires_at,
+                })
+            })
     }
 }
 

@@ -215,6 +215,22 @@ pub(crate) fn identity_for(owner: &KeyOwner) -> Identity {
 /// values each supplies. See [`ApiKeyJwtSigner::sign`]'s doc comment for the full claim-by-claim
 /// provenance; this is that same set, factored out so it is defined exactly once.
 ///
+/// **`sid` (ADR-0020 Decision 2, #437's scoped-down interpretation):** the caller now supplies
+/// `sid` explicitly rather than this function minting one inline. For a token-exchange access
+/// token (`oauth2_op::store`), `sid` and `api_key_id` are the SAME real, persisted `sessions.id`
+/// (see `oauth2_op::store::TokenExchangeOpStore::handle_token_exchange`/`handle_refresh_token`) --
+/// a deliberate, documented narrowing of ADR-0020 Decision 2's full scope: that Decision's own
+/// text anticipates `sid`/`api_key_id` eventually being fully separated (tracked by #421,
+/// deliberately NOT done in this PR), but Authorino's `"lightbridgeintrospect"` metadata step is
+/// gated on `auth.identity.api_key_id != ""` (ADR-0020 Context point 6) -- emptying or
+/// repurposing `api_key_id` here would silently stop the gateway from ever calling introspection
+/// at all for these tokens, a regression far worse than what this PR fixes. Both claims carrying
+/// the same value already fixes the practical symptom #421 describes (a token-exchange session id
+/// changing identity on every refresh), even though it does not rename/separate the claims the
+/// way #421's full scope eventually will. For the plain self-signed API-key JWT path
+/// (`ApiKeyJwtSigner::sign`), `sid` stays an independent, freshly-minted `cuid2()` per call --
+/// completely unchanged behavior, since this PR does not touch API-key-JWT session semantics.
+///
 /// Stamps `extra["jti"]` with this repo's own `lgbr:`-prefixed CUID2 (ADR-0039: every id this
 /// service mints is a CUID2). `TokenManager` (authkestra-engine 0.5.0, PR #215) removes a
 /// string-valued `extra["jti"]` and uses it verbatim as the token's `jti` claim instead of
@@ -223,6 +239,7 @@ pub(crate) fn identity_for(owner: &KeyOwner) -> Identity {
 /// key, producing an undecodable duplicate-key JWT.
 pub(crate) fn access_token_extra(
     owner: &KeyOwner,
+    sid: &str,
     api_key_id: &str,
     project_id: &str,
     account_id: &str,
@@ -242,7 +259,7 @@ pub(crate) fn access_token_extra(
         "lightbridge_caller_kind".to_string(),
         Value::String(lightbridge_authz_bearer::API_KEY_CALLER_KIND.to_string()),
     );
-    extra.insert("sid".to_string(), Value::String(cuid2()));
+    extra.insert("sid".to_string(), Value::String(sid.to_string()));
     extra.insert(
         "api_key_id".to_string(),
         Value::String(api_key_id.to_string()),
@@ -396,8 +413,12 @@ impl ApiKeyJwtSigner {
         // single-`now`-for-everything implementation.
         let expires_in_secs = (expires_at - now).num_seconds().max(0) as u64;
 
+        // Unchanged behavior: this path has no `sessions` table concept, so `sid` stays an
+        // independent, freshly-minted `cuid2()` per call -- see `access_token_extra`'s doc
+        // comment.
         let extra = access_token_extra(
             owner,
+            &cuid2(),
             api_key_id,
             project_id,
             account_id,

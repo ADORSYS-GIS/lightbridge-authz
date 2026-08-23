@@ -370,6 +370,47 @@ model ApiKey {
   @@allow("delete", (project.account.id == auth().id || project.members.some.accountId == auth().id) && auth().rpcScope == "crud" && auth().permApikeyDelete == true)
 }
 
+// ADR-0020 Decision 9: `sessions` is a normal cratestack-modelled table (unlike
+// `exchange_refresh_tokens`/`project_members`/`signing_keys`, this repo's three documented
+// ADR-0038 exceptions) -- a plain single-column `id` PK, no cross-replica coordination need, no
+// CAS-rotation race to guard against. Real schema (columns, the `sessions_kind_client_id_check`
+// constraint, the backfill from `exchange_refresh_tokens.chain_id`) lives in the hand-written
+// migration `migrations/20260823000002_sessions.sql`, per this schema's own ADR-0003 convention
+// (source-only, does not drive DDL).
+//
+// Deliberately NO `@@allow` clause on this model in THIS PR. #440/#441's own scope is schema +
+// migration only, explicitly "no behavior change" -- `session:read-own`/`session:read` (the
+// permissions a read policy would need to gate on) do not exist yet; they are ADR-0020 Follow-up
+// 4 (RPC procedures + RBAC), a separate, not-yet-filed ticket. Adding a policy clause that
+// references a nonexistent permission field would not compile; adding one gated on an existing,
+// unrelated permission would be an undocumented, scope-creeping capability grant. The absence of
+// any `@@allow` here already fail-closes every generic `model.Session.*` verb by construction
+// (see `ApiKey`'s own `@@allow`-less `create` verb, immediately above, for the same idiom) --
+// `rpc_authorize.rs`'s `required_permission` map needs no new entry: an op-id it does not list is
+// denied unconditionally (its own module doc comment), and `model.Session.*` is not listed.
+//
+// No `account Account @relation`/`project Project @relation` here either, mirroring
+// `ProjectMember`'s own deliberate omission below (see that model's comment): this repo already
+// hit a real, measured cratestack codegen blowup (~51GB RAM, 36 minutes, CI-killed) from a second
+// relation path between two already-connected models. `Account`/`Project` are already connected
+// via `Account.projects`; adding `Session.account`/`Session.project` on top would create the same
+// second-path problem `ProjectMember.account`'s removal fixed. Nothing needs the relation today:
+// this model has no `@@allow` to write one, the repository layer is hand-written SQL against the
+// plain scalar columns, and the generated client is not consuming it either.
+model Session {
+  @use(AuditFields)
+
+  id String @id
+  accountId String
+  projectId String
+  clientId String?
+  kind String
+  status String
+  lastUsedAt DateTime?
+  expiresAt DateTime
+  userAgent String?
+}
+
 // Relation target ONLY. The real `project_members` table (owned by
 // migrations/<date>_create_project_members.sql) has a composite primary key
 // (project_id, account_id) and no `id` column -- same shape as the removed

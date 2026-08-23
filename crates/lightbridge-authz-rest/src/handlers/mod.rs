@@ -587,16 +587,16 @@ impl AuthzStoreImpl {
             .await
     }
 
-    /// Revokes every active refresh-token session for `subject`, returning how many were
-    /// revoked. Backs both `revokeOwnSessions` (`subject` is the caller's own, from
-    /// `auth().id`) and `revokeSubjectSessions` (`subject` is an operator-supplied target) --
-    /// the operation is identical either way; only which `subject` reaches this method differs,
-    /// and that choice is made entirely by the two procedures' own RBAC gates
-    /// (`session:revoke-own` vs `session:revoke`, `docs/rbac.md`), not by anything in this method.
+    /// Revokes every active session (of either `kind`, ADR-0021 Decision 3) for `subject`,
+    /// cascading to every `exchange_refresh_tokens` row chained under one of them (ADR-0020
+    /// Decision 9), and returns how many SESSIONS were revoked. Backs both `revokeOwnSessions`
+    /// (`subject` is the caller's own, from `auth().id`) and `revokeSubjectSessions` (`subject`
+    /// is an operator-supplied target) -- the operation is identical either way; only which
+    /// `subject` reaches this method differs, and that choice is made entirely by the two
+    /// procedures' own RBAC gates (`session:revoke-own` vs `session:revoke`, `docs/rbac.md`), not
+    /// by anything in this method.
     pub async fn revoke_sessions(&self, subject: &str) -> Result<u64> {
-        self.repo
-            .revoke_active_exchange_refresh_tokens_for_subject(subject)
-            .await
+        self.repo.revoke_sessions_and_cascade(subject).await
     }
 
     /// Promote `project_id` to be its account's new default project. Backs `setDefaultProject`.

@@ -53,6 +53,7 @@ use authkestra_op::refresh::{RefreshToken, RefreshTokenStore};
 use authkestra_op::store::OpStore;
 use chrono::{DateTime, Duration, Utc};
 use lightbridge_authz_api_key::entities::exchange_refresh_token_row::NewExchangeRefreshToken;
+use lightbridge_authz_api_key::entities::session_row::NewSession;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::BearerTokenServiceTrait;
 use lightbridge_authz_budget::repo::BudgetRepo;
@@ -483,16 +484,46 @@ impl TokenExchangeOpStore {
         };
 
         let now = Utc::now();
-        let session_id = cuid2();
         let expires_in_secs = self.cfg.access_ttl_seconds.max(0) as u64;
         let scope_str = scope_to_string(&granted_scopes);
+
+        // ADR-0020 Decision 1: a session row is created exactly once, at the initial
+        // handle_token_exchange grant -- unconditionally, whether or not offline_access was
+        // requested, since even an access-token-only grant needs a revocable identity.
+        // `expires_at` mirrors the refresh chain's own absolute cap (`chain_expires_at`, set
+        // below) when this grant has one, so the two agree; for an access-token-only grant there
+        // is no chain, so the session's own cap is just the access token's own TTL.
+        let session_expires_at = if offline {
+            now + Duration::seconds(self.cfg.refresh_absolute_ttl_seconds.max(0))
+        } else {
+            now + Duration::seconds(expires_in_secs as i64)
+        };
+        let session = match self
+            .repo
+            .create_session(NewSession {
+                id: cuid2(),
+                account_id: context.account_id.clone(),
+                project_id: context.project_id.clone(),
+                client_id: Some(client_id.clone()),
+                kind: "token".to_string(),
+                expires_at: session_expires_at,
+            })
+            .await
+        {
+            Ok(session) => session,
+            Err(_) => return Err(oauth_err("server_error", "session persistence failed")),
+        };
+        let session_id = session.id;
 
         let budget_tier = self.resolve_budget_tier(&context.account_id, now).await;
         let quota_tier = self
             .resolve_quota_tier(&context.project_id, &subject)
             .await?;
+        // ADR-0020 Decision 2 (#437's scoped-down interpretation, see `access_token_extra`'s doc
+        // comment): `sid` and `api_key_id` carry the SAME real, persisted session id.
         let mut access_extra = access_token_extra(
             &owner,
+            &session_id,
             &session_id,
             &context.project_id,
             &context.account_id,
@@ -548,6 +579,7 @@ impl TokenExchangeOpStore {
                 auth_time,
                 &chain_id,
                 chain_expires_at,
+                &session_id,
             );
             let rt = RefreshToken {
                 token: plaintext.clone(),
@@ -735,7 +767,12 @@ impl TokenExchangeOpStore {
             .split_whitespace()
             .any(|s| s == OPENID_SCOPE);
 
-        let session_id = cuid2();
+        // ADR-0020 Decision 1 (the bug this ticket fixes): reuse the session already bound to the
+        // refresh token being redeemed, instead of minting a new one on every refresh -- a fresh
+        // `cuid2()` here would silently discard session continuity on every single rotation,
+        // exactly the correction ADR-0020 calls out (`chain_id` one column over already gets this
+        // right). No new `sessions` row is inserted for a refresh.
+        let session_id = old_row.session_id.clone();
         let expires_in_secs = self.cfg.access_ttl_seconds.max(0) as u64;
         let scope_str = old_row.scope.clone();
 
@@ -743,8 +780,11 @@ impl TokenExchangeOpStore {
         let quota_tier = self
             .resolve_quota_tier(&context.project_id, &old_row.subject)
             .await?;
+        // ADR-0020 Decision 2 (#437's scoped-down interpretation, see `access_token_extra`'s doc
+        // comment): `sid` and `api_key_id` carry the SAME real, persisted (reused) session id.
         let mut access_extra = access_token_extra(
             &owner,
+            &session_id,
             &session_id,
             &context.project_id,
             &context.account_id,
@@ -801,6 +841,9 @@ impl TokenExchangeOpStore {
             // chain, not a new one born on every rotation.
             chain_id: old_row.chain_id.clone(),
             chain_expires_at: old_row.chain_expires_at,
+            // Inherited unchanged too (ADR-0020 Decision 1) -- same "born once, inherited across
+            // rotation" shape as chain_id immediately above.
+            session_id: session_id.clone(),
             created_at: now,
             expires_at: now + Duration::seconds(self.cfg.refresh_ttl_seconds),
         };
@@ -889,6 +932,7 @@ fn refresh_identity(
     auth_time: Option<i64>,
     chain_id: &str,
     chain_expires_at: DateTime<Utc>,
+    session_id: &str,
 ) -> Identity {
     let mut attributes = std::collections::HashMap::new();
     attributes.insert("account_id".to_string(), account_id.to_string());
@@ -904,6 +948,7 @@ fn refresh_identity(
         "chain_expires_at".to_string(),
         chain_expires_at.to_rfc3339(),
     );
+    attributes.insert("session_id".to_string(), session_id.to_string());
     Identity {
         provider_id: "keycloak".to_string(),
         external_id: owner.subject.clone(),

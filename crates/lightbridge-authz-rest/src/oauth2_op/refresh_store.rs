@@ -55,6 +55,10 @@ const ATTR_AUTH_TIME: &str = "auth_time";
 /// these attributes through correctly for any other `RefreshTokenStore` caller.
 const ATTR_CHAIN_ID: &str = "chain_id";
 const ATTR_CHAIN_EXPIRES_AT: &str = "chain_expires_at";
+/// ADR-0020: round-trips `exchange_refresh_tokens.session_id` (the `sessions` row this refresh
+/// token is chained under -- see that entity's own doc comment) through `Identity.attributes`,
+/// same convention as `chain_id`/`chain_expires_at` above.
+const ATTR_SESSION_ID: &str = "session_id";
 
 pub struct DbRefreshTokenStore {
     repo: Arc<StoreRepo>,
@@ -81,6 +85,7 @@ fn row_to_refresh_token(row: ExchangeRefreshTokenRow) -> RefreshToken {
         ATTR_CHAIN_EXPIRES_AT.to_string(),
         row.chain_expires_at.to_rfc3339(),
     );
+    attributes.insert(ATTR_SESSION_ID.to_string(), row.session_id);
     RefreshToken {
         // See this module's doc comment: the plaintext was never stored, so this is the hash --
         // never read back as a real secret by anything in this codebase.
@@ -141,6 +146,16 @@ impl RefreshTokenStore for DbRefreshTokenStore {
             .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
             .map(|dt| dt.with_timezone(&Utc))
             .ok_or(OpError::Storage)?;
+        // Fail closed, same reasoning as chain_id/chain_expires_at above: every caller of
+        // `store_token` in this codebase (`TokenExchangeOpStore::handle_token_exchange`) always
+        // sets this, so a missing value means a caller bug, and persisting a session-less row
+        // would violate the `session_id` FK/NOT NULL constraint anyway.
+        let session_id = token
+            .identity
+            .attributes
+            .get(ATTR_SESSION_ID)
+            .cloned()
+            .ok_or(OpError::Storage)?;
         let new = NewExchangeRefreshToken {
             id: cuid2(),
             subject: token.identity.external_id,
@@ -158,6 +173,7 @@ impl RefreshTokenStore for DbRefreshTokenStore {
             auth_time,
             chain_id,
             chain_expires_at,
+            session_id,
             created_at: Utc::now(),
             expires_at: token.expires_at,
         };
