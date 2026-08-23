@@ -844,6 +844,8 @@ hand-written SQL and direct `sqlx` dependencies.
 - Authorino endpoint usage + integration test: `docs/authorino-usage.md`
 - Usage ingest/query API: `docs/usage-api.md`
 - RBAC (JWT claim → permission mapping): `docs/rbac.md`
+- API key approaching-expiry visibility (`listMyExpiringApiKeys`, window/threshold rationale, why
+  there is no cross-tenant admin surface): `docs/api-key-expiry-visibility.md`
 - Governance data model + how quotas/allowlists are actually enforced at the gateway (accounts,
   projects, roster, keys; introspection, Authorino claim extraction, BackendTrafficPolicy rule
   families; worked scenarios and the gaps that remain): `docs/governance-model-and-enforcement.md`

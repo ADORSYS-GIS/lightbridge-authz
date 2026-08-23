@@ -208,6 +208,12 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         "model.ApiKey.delete" => ApiKeyDelete,
         "procedure.revokeApiKey" => ApiKeyRevoke,
         "procedure.rotateApiKey" => ApiKeyRotate,
+        // Self-scoped cross-project "expiring soon" aggregate (lightbridge-authz#436). Gated at
+        // the SAME `apikey:read` permission as `model.ApiKey.list`/`get` -- not a new, looser one
+        // -- since it returns strictly a filtered subset of what that permission already lets a
+        // caller read one project at a time. See the schema doc comment on
+        // `listMyExpiringApiKeys` for why this has no cross-tenant admin twin.
+        "procedure.listMyExpiringApiKeys" => ApiKeyRead,
 
         // AccountSummary is the read-only dashboard aggregate this migration adds. It is gated at
         // `account:read` (same coarse capability as reading accounts). NB: in cratestack-pg 0.4.9 a
@@ -324,6 +330,7 @@ pub const MAPPED_OP_ID_PERMISSIONS: &[(&str, Permission)] = &[
     ("model.ApiKey.delete", Permission::ApiKeyDelete),
     ("procedure.revokeApiKey", Permission::ApiKeyRevoke),
     ("procedure.rotateApiKey", Permission::ApiKeyRotate),
+    ("procedure.listMyExpiringApiKeys", Permission::ApiKeyRead),
     ("model.AccountSummary.list", Permission::AccountRead),
     ("model.AccountSummary.get", Permission::AccountRead),
     (
