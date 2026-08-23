@@ -7,7 +7,11 @@
 //! - [`client_assertion_store`]: Redis-backed `ClientAssertionStore` (Decision 6) -- fail-closed
 //!   `private_key_jwt` replay tracking.
 //! - [`refresh_store`]: `RefreshTokenStore` over `exchange_refresh_tokens`.
-//! - [`noop_stores`]: permanent `AuthorizationCodeStore`/`DeviceCodeStore` stubs (Decision 3).
+//! - [`device_store`]: `DeviceCodeStore` over `device_authorizations` (ADR-0012 Decision 7, #423)
+//!   -- real, CAS-consuming storage, replacing the permanent `NoDeviceCodeStore` stub ADR-0011
+//!   Decision 3 originally installed for both OP-side traits.
+//! - [`noop_stores`]: the one trait that IS still a permanent no-op --
+//!   `AuthorizationCodeStore` (ADR-0012 Decision 3 reaffirms this half, unchanged).
 //! - [`store`]: `TokenExchangeOpStore`, the `OpStore` implementation tying all of the above
 //!   together, with hand-rolled `handle_token_exchange`/`handle_refresh_token` overrides (the
 //!   upstream defaults are `pub(crate)` to `authkestra-op` and never stamp `extra` claims -- see
@@ -15,6 +19,7 @@
 
 pub mod client_assertion_store;
 pub mod client_store;
+pub mod device_store;
 pub mod noop_stores;
 pub mod refresh_store;
 pub mod store;
