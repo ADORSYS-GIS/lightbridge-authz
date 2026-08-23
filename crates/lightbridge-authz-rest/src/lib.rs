@@ -21,6 +21,7 @@ pub mod ratelimit_redis;
 pub mod redis_tls;
 pub mod routers;
 pub mod rpc_authorize;
+pub mod session_cookie;
 pub mod signing;
 pub mod token_exchange;
 
