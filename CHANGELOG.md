@@ -1,5 +1,35 @@
 # Changelog
 
+## [3.8.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.7.0...v3.8.0) (2026-08-23)
+
+
+### Features
+
+* **authz:** add model_policy enum on projects (ADR-0018) ([#418](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/418)) ([d23db66](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/d23db664220b65c2e64e66253855c9483421e12e))
+* **authz:** add setProjectModelPolicy write path (ADR-0018 Decision 5) ([#431](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/431)) ([23c3c20](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/23c3c20ef089a57eb15ad3b234ec89f364aa645f))
+* **opa:** resolve exchange-token authorization live via introspection ([#429](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/429)) ([2fb068e](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/2fb068e5d767bb1d71ff4ee7a0a2afe3d4dd68a8))
+
+
+### Bug Fixes
+
+* **api-key:** require and bound expiresAt on every write path ([#402](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/402)) ([aa8f418](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/aa8f418e13c5fd922c44755cc72eb180a982d735))
+* **authz:** backfill model_policy=allowlist for allow_all projects with a real allowed_models list ([#432](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/432)) ([edac511](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/edac511418e70f8d811dfb21390d245005a46ae1))
+* **authz:** enforce quota-tier catalogue on the 3 generic cratestack write paths ([#379](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/379)) ([#397](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/397)) ([8e45eec](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/8e45eec440c767e4b12442fb7c3c755cf3e6dd78))
+* **authz:** validate Project.allowedModels against the model catalogue at write time ([#415](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/415)) ([#417](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/417)) ([4d01ed3](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/4d01ed378d7a61b56b85812011b6bd215d403397))
+* **budget:** delete the caller_kind gate on requestBudgetRefill ([#419](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/419)) ([#428](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/428)) ([7f671d3](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/7f671d3fb8afea5709d9c854bd5569fb271af7ae))
+* **budget:** drop transitional MyBudgetRefillLadder legacy fields ([#387](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/387)) ([#412](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/412)) ([47c89ff](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/47c89ff1ff083c403700a56efe04099fb7549518))
+* **idp:** stamp quota_tier claim on human-plane token exchange (ADR-0017) ([#396](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/396)) ([b090733](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/b09073341d75e980a2a0f484e8c465df6225ef5a))
+* **rbac:** remove model.Account.update RPC verb, 422 on every call ([#398](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/398)) ([#409](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/409)) ([d36a85f](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/d36a85f19b1d1ceb9293ec339544adefc7033616))
+
+
+### Documentation
+
+* **adr:** add ADR-0018 for the model_policy enum on projects ([#413](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/413)) ([9d7104a](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/9d7104ada26cb8372ff49355a12791a9316e75fa))
+* **adr:** add ADR-0019 for authz-idp authorization-code + device grant ([#337](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/337)) ([#422](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/422)) ([cfd4c97](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/cfd4c97f21326ec806d24f37644fdb908217cbb7))
+* **adr:** propose first-class, revocable sessions (ADR-0020) ([#435](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/435)) ([a55a010](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/a55a010b0e4fcf05309e8732fc75388d3a71b872))
+* **rbac:** record model.* read-verb filter-not-refuse as a decided contract ([#401](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/401)) ([#410](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/410)) ([92caca8](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/92caca81941ae48ec10fafa0debbd53bf3664f38))
+* **test-protocol:** replace pre-cratestack /api/v1 examples with the RPC/CBOR surface ([#433](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/433)) ([47025f3](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/47025f301ecc8372d822dae15cff37968df5cfb7))
+
 ## [3.7.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.6.1...v3.7.0) (2026-08-19)
 
 
