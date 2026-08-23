@@ -13,6 +13,13 @@ WORKDIR /app
 COPY dist/lightbridge-authz /usr/local/bin/lightbridge-authz
 COPY dist/lightbridge-authz-healthcheck /usr/local/bin/lightbridge-authz-healthcheck
 
+# Hosted login page static build (ADR-0021 Decisions 1 + 10, #442) -- staged into dist/static by
+# the build-frontend composite action (see .github/actions/build-release), same tarball as the
+# prebuilt binaries above. authz-idp serves this from `server.idp.static_dir`, which
+# .docker/authz/container.yaml points at this exact path. Harmless on the other runtime stages
+# below, which never mount the static fallback.
+COPY dist/static /app/static
+
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=1s --retries=3 \

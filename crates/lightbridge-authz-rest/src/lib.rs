@@ -21,7 +21,9 @@ pub mod ratelimit_redis;
 pub mod redis_tls;
 pub mod routers;
 pub mod rpc_authorize;
+pub mod session_cookie;
 pub mod signing;
+pub mod static_assets;
 pub mod token_exchange;
 
 use auth_provider::{ACCESS_TOKEN_CONTEXT_KEY, CratestackAuthProvider};
@@ -2617,11 +2619,22 @@ pub async fn start_opa_server(
 /// `/.well-known`, `/oauth2/token`, and `/oauth2/revoke` to `authz-api`. That ingress has since
 /// been repointed at `authz-idp` and `authz-api`'s copy of this surface removed (see
 /// `build_api_router`'s doc comment) — `authz-idp` is now the sole owner.
+///
+/// ## Static asset fallback (ADR-0021 Decisions 1 + 10, #442)
+///
+/// `static_dir` is mounted last, via `.fallback_service(..)`, after every protocol route above
+/// has already been merged in — `.well-known/*`, `/oauth2/*`, and the probe router. A
+/// `Router`'s fallback is always axum's lowest-priority match regardless of call order (the route
+/// table is tried first; the fallback only runs when nothing there matched), so this ordering is
+/// not what makes protocol routes win — it is documentation of that fact, kept in the same order
+/// the ADR describes it. See `static_assets::static_assets_fallback`'s own doc comment for the
+/// caching/CSP posture applied to everything served from `static_dir`.
 pub fn build_idp_router(
     oauth2: &Oauth2,
     signing_repo: Arc<StoreRepo>,
     token_exchange: Option<token_exchange::TokenExchangeState>,
     readiness_pool: Arc<dyn DbPoolTrait>,
+    static_dir: impl AsRef<std::path::Path>,
 ) -> Router {
     let mut router = probe_router(readiness_pool);
 
@@ -2641,7 +2654,7 @@ pub fn build_idp_router(
         router = router.merge(token_exchange::token_exchange_router(te_state));
     }
 
-    router
+    router.fallback_service(static_assets::static_assets_fallback(static_dir))
 }
 
 /// Starts `authz-idp` (ADR-0012): the OIDC broker service carrying `/oauth2/token`,
@@ -2738,7 +2751,13 @@ pub async fn start_idp_server(
     )?;
     let token_exchange_enabled = token_exchange_state.is_some();
 
-    let app = build_idp_router(oauth2, signing_repo, token_exchange_state, readiness_pool);
+    let app = build_idp_router(
+        oauth2,
+        signing_repo,
+        token_exchange_state,
+        readiness_pool,
+        &idp.static_dir,
+    );
 
     tracing::info!(
         server = "authz-idp",

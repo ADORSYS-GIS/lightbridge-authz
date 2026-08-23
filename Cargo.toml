@@ -130,6 +130,33 @@ opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 prost = "0.14"
 axum = { version = "0.8", features = ["macros", "tracing"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
+# ADR-0021 Decision 4 / #443: the `__Host-` browser-session cookie. `0.12` is the axum-extra line
+# whose own manifest pins `axum = "0.8.9"` (verified: `axum-extra-0.12.6`'s registry Cargo.toml,
+# `[dependencies.axum] version = "0.8.9"`), matching the `axum` pin above -- `axum-extra` 0.10.x
+# targets axum 0.7 and will not resolve here.
+#
+# Verified against the exact `cookie-0.18.2` source this pulls in (axum-extra re-exports
+# `cookie::{Cookie, Expiration, SameSite}` verbatim) rather than trusting the crate description,
+# per this repo's capability-verification house rule (same standard as the `jsonwebtoken` 10.x
+# pin below and ADR-0021 Decision 5's `authkestra-oidc` trace):
+#   - `Cookie::build()` exposes typed builder methods for every Decision-4 attribute:
+#     `.secure(bool)`, `.http_only(bool)`, `.same_site(SameSite)`, `.path(&str)`,
+#     `.max_age(time::Duration)`, `.expires(Expiration)` (cookie-0.18.2/src/builder.rs:88-183).
+#   - `Cookie`'s `Display` impl renders `HttpOnly`, `SameSite=`, `Secure`, `Path=`, `Domain=`
+#     (only if set), `Max-Age=`, `Expires=` as real `Set-Cookie` attribute tokens, omitting
+#     `Domain` entirely when unset (cookie-0.18.2/src/lib.rs:1198-1236) -- confirmed by this
+#     ticket's own unit tests asserting the exact rendered header string.
+#   - The crate ships a dedicated `__Host-`/`__Secure-` prefix module (`cookie::prefix::Host`,
+#     cookie-0.18.2/src/prefix.rs) that *forcibly conforms* a cookie added through a
+#     `CookieJar::prefixed_mut(Host)` jar (forces `Secure`, `Path=/`, strips `Domain`) -- but this
+#     enforcement lives on the low-level `cookie::CookieJar`, which axum-extra's own `CookieJar`
+#     extractor wrapper does NOT re-expose (`extract::cookie::CookieJar` has no `prefixed`/
+#     `prefixed_mut`, axum-extra-0.12.6/src/extract/cookie/mod.rs:89-206). The plain
+#     `Cookie::build()` path this workspace uses does **not** guard against setting `Domain`
+#     alongside a `__Host-`-prefixed name -- confirmed by
+#     `lightbridge-authz-rest::session_cookie`'s own negative test. The calling code must never
+#     call `.domain(...)` on this cookie; it deliberately never does.
+axum-extra = { version = "0.12", features = ["cookie"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
@@ -152,7 +179,7 @@ rcgen = { version = "0.14", features = ["pem"] }
 # `OffsetDateTime::now_utc()` itself.
 time = { version = "0.3", features = ["std"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.7", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors", "fs"] }
 rsa = { version = "0.9", features = ["pem", "std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.13", features = ["json", "form"] }

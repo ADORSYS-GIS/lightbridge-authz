@@ -580,6 +580,35 @@ pub struct IdpServer {
     pub address: String,
     pub port: u16,
     pub tls: Tls,
+    /// ADR-0021 Decisions 1 + 10 (#442): filesystem path to the hosted login page's Vite
+    /// production build (`web/hosted-login/dist` — an `index.html` plus a content-hashed
+    /// `assets/` directory), mounted as `build_idp_router`'s lowest-priority fallback. This
+    /// server always mounts the fallback unconditionally (AGENTS.md's "no dormant flags"
+    /// convention) -- an operator who has not built the frontend yet gets a working server whose
+    /// static fallback 404s until the assets exist, not a server with the feature silently
+    /// switched off.
+    ///
+    /// Defaults to [`default_idp_static_dir`] (`/app/static`) when the key is omitted from
+    /// config -- **not optional in behavior, but optional in config**. This distinction is
+    /// load-bearing: prod's `authz-idp` config is a wholesale override living in a separate repo
+    /// (`ai-helm-values`) that this PR cannot touch, and prod tracks `main` HEAD directly via
+    /// argocd-image-updater with no release-tag gate. A hard-required field here would mean the
+    /// very next promotion after this merges ships a binary that refuses to deserialize prod's
+    /// (not-yet-updated) config and crash-loops `authz-idp` -- taking out `/oauth2/token`,
+    /// `/oauth2/revoke`, discovery, and (once Authorino's JWKS cache expires) every API-key JWT
+    /// validation at the gateway. `/app/static` is a safe default for every containerised
+    /// deployment because it is exactly where `Dockerfile`/`Dockerfile.dist` already copy
+    /// `dist/static` on the `runtime` image -- zero config change required anywhere.
+    /// `config/default.yaml`/`.docker/authz/container.yaml` still set this key explicitly (this
+    /// default exists for configs this repo does not own, not to make the local ones lazy).
+    #[serde(default = "default_idp_static_dir")]
+    pub static_dir: String,
+}
+
+/// See [`IdpServer::static_dir`]'s doc comment for why this default exists and why `/app/static`
+/// is the right value.
+fn default_idp_static_dir() -> String {
+    "/app/static".to_owned()
 }
 
 /// `authz-budget`'s server block. Shaped like [`IdpServer`] (address/port/TLS, no `basic_auth`):

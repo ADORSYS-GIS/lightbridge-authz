@@ -1,0 +1,9 @@
+# Kept minimal on purpose: the Rust builder stage in Dockerfile bind-mounts only the paths it
+# needs (Cargo.toml/Cargo.lock, app/, crates/, migrations/, migrations-usage/), so `target/` never
+# needed excluding here for that stage. web/hosted-login/node_modules is the first thing in this
+# repo that actually needs it -- without this file, `docker build .` ships a developer's local
+# `npm install` output (and any local `target/`) into the build context on every build.
+target
+node_modules
+web/*/dist
+.git
