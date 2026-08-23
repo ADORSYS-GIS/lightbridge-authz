@@ -59,7 +59,9 @@ use lightbridge_authz_rest::oauth2_op::client_assertion_store::RedisClientAssert
 use lightbridge_authz_rest::oauth2_op::client_store::ConfigClientStore;
 use lightbridge_authz_rest::oauth2_op::store::TokenExchangeOpStore;
 use lightbridge_authz_rest::rpc_authorize::RpcScope;
-use lightbridge_authz_rest::signing::{ApiKeyJwtSigner, bootstrap_signing_key, generate_rs256_key};
+use lightbridge_authz_rest::signing::{
+    ApiKeyJwtSigner, KeyOwner, bootstrap_signing_key, generate_rs256_key,
+};
 use lightbridge_authz_rest::token_exchange::{TokenExchangeState, token_exchange_router};
 use serde::Deserialize;
 use serde_json::Value;
@@ -817,6 +819,119 @@ async fn aud_is_the_requesting_client_id_and_varies_between_clients(pool: PgPool
     assert_eq!(claims_b["aud"], client_b);
 
     assert_ne!(claims_a["aud"], claims_b["aud"]);
+}
+
+// ============================================================================================
+// #421: `access_token_extra` (`crate::signing`) is shared by `ApiKeyJwtSigner::sign` (real
+// self-signed API-key JWTs) and `TokenExchangeOpStore::handle_token_exchange`/
+// `handle_refresh_token` (native RFC 8693 human-plane exchange tokens). Both paths stamp
+// identical `api_key_id`/`sid`/`lightbridge_caller_kind` shapes -- ADR-0020 Decision 2 / #437's
+// own scoped-down interpretation deliberately keeps it that way for now, because
+// `ai-helm-values`' Authorino `when` gates trigger introspection on `api_key_id != ""`, and
+// emptying/renaming that claim on the exchange path without a coordinated, VERIFIED-DEPLOYED
+// gateway change would silently stop introspection from ever running for these tokens -- a
+// regression worse than the claim-reuse itself (see `access_token_extra`'s own doc comment).
+// This repo's own consumers of "is this really an API key" (`handlers/opa.rs`'s
+// `verify_self_issued_token`, and every `ai-helm-values` `when` gate that reads `azp`) do NOT
+// use `api_key_id`/`sid`/`lightbridge_caller_kind` to draw that line -- they use `azp`. This test
+// pins that as the real, load-bearing discriminant: mints one real API-key JWT and one real
+// exchange access token through their actual production signing paths, and proves `azp` reliably
+// tells them apart even though every other tenant-ish claim is identical in shape.
+// ============================================================================================
+
+/// The one claim that actually, reliably distinguishes a real self-signed API-key JWT from a
+/// native-exchange human-plane token today: `azp`. A self-signed API-key JWT's `azp` is always
+/// the FIXED `oauth2.signing.audience` config value (`ApiKeyJwtSigner::sign` passes
+/// `self.audience.as_deref()`); an exchange token's `azp` is always the requesting OAuth2
+/// client's `client_id`, which by deployment convention (`Oauth2TokenExchange::clients`) is never
+/// registered under the API-key audience. `api_key_id`/`sid`/`lightbridge_caller_kind` are, by
+/// contrast, proven here to be identical in shape on both -- the still-open half of #421's scope,
+/// tracked and NOT closed by this test (see this section's own doc comment for why).
+#[sqlx::test(migrations = "../../migrations")]
+async fn azp_reliably_distinguishes_a_real_api_key_jwt_from_a_real_exchange_session_token(
+    pool: PgPool,
+) {
+    const API_KEY_AUDIENCE: &str = "lightbridge-api-key";
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    // Real self-signed API-key JWT, minted through the actual `ApiKeyJwtSigner::sign` production
+    // path -- not a hand-built claim set.
+    let api_key_signing_cfg = JwtSigning {
+        issuer: ISSUER.to_string(),
+        audience: Some(API_KEY_AUDIENCE.to_string()),
+        ttl_seconds: 3600,
+        max_key_age_days: 30,
+    };
+    let signer = ApiKeyJwtSigner::from_config(&api_key_signing_cfg, repo.clone()).unwrap();
+    let owner = KeyOwner {
+        subject: SUBJECT.to_string(),
+        email: None,
+        email_verified: None,
+    };
+    let signed = signer
+        .sign(
+            &owner,
+            "key_1",
+            PROJECT_ID,
+            ACCOUNT_ID,
+            None,
+            chrono::Utc::now(),
+            None,
+        )
+        .await
+        .unwrap();
+    let api_key_claims = decode_access_token_claims(&repo, &signed.token, API_KEY_AUDIENCE).await;
+
+    // Real human-plane exchange access token, minted through the actual RFC 8693
+    // `TokenExchangeOpStore::handle_token_exchange` production path, driven over the real HTTP
+    // `token_exchange_router` -- not a hand-built claim set either.
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let exchange_claims = decode_access_token_claims(
+        &repo,
+        body["access_token"].as_str().unwrap(),
+        PUBLIC_CLIENT_ID,
+    )
+    .await;
+
+    // The load-bearing discriminant: `azp` never collides between the two mint paths, by
+    // deployment convention (`PUBLIC_CLIENT_ID` is never registered as the API-key audience).
+    assert_eq!(api_key_claims["azp"], API_KEY_AUDIENCE);
+    assert_eq!(exchange_claims["azp"], PUBLIC_CLIENT_ID);
+    assert_ne!(
+        api_key_claims["azp"], exchange_claims["azp"],
+        "azp must reliably tell a real API-key JWT apart from a real exchange token: \
+         api_key={api_key_claims}, exchange={exchange_claims}"
+    );
+
+    // The still-open half of #421: every other tenant-shaped claim is identical, by design, for
+    // now (ADR-0020 Decision 2 / #437's scoped-down interpretation) -- documented here, not
+    // silently assumed, so a future full claim-separation (#421's remaining scope) has a test to
+    // update rather than a surprise to discover.
+    assert!(
+        !api_key_claims["api_key_id"].as_str().unwrap().is_empty(),
+        "api_key_id must be present on the API-key path: {api_key_claims}"
+    );
+    assert!(
+        !exchange_claims["api_key_id"].as_str().unwrap().is_empty(),
+        "api_key_id is still stamped (with a session id, not a real api_keys.id) on the exchange \
+         path -- #421's known, deliberate, not-yet-closed scope: {exchange_claims}"
+    );
+    assert_eq!(
+        api_key_claims["lightbridge_caller_kind"], exchange_claims["lightbridge_caller_kind"],
+        "lightbridge_caller_kind is still conflated between the two mint paths -- #421's known, \
+         deliberate, not-yet-closed scope (harmless today because #419 deleted the one procedure \
+         that read it for a security decision): api_key={api_key_claims}, \
+         exchange={exchange_claims}"
+    );
 }
 
 /// Real Keycloak-issued subject tokens carry a multi-valued `aud` (one entry per
