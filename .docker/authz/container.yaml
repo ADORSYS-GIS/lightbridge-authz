@@ -47,7 +47,14 @@ server:
 logging:
   level: "info"
 database:
-  url: "postgres://postgres:postgres@postgresql:5432/lightbridge_authz"
+  # Same silent-misconfiguration bug class as config/default.yaml's database.url (lightbridge-
+  # authz#PR447), extended here for consistency. Behavior-preserving today: authz-api/authz-
+  # budget/authz-mcp already export DATABASE_URL in compose.yaml at this exact connection string
+  # (for cratestack's own `env("DATABASE_URL")` datasource, a separate connection from this
+  # core DbPool -- see the comment on that env var in compose.yaml), so interpolation resolves to
+  # the identical value; authz-migrate sets no DATABASE_URL at all, so it takes the fallback below,
+  # unchanged from before.
+  url: "${DATABASE_URL:-postgres://postgres:postgres@postgresql:5432/lightbridge_authz}"
   pool_size: 10
 # Mandatory for authz-api, authz-idp, and authz-budget -- each refuses to start without it (see
 # AGENTS.md's "Redis is a mandatory dependency" house rule). Used for Redis-backed rate limiting

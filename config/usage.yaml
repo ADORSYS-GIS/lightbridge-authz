@@ -22,7 +22,16 @@ server:
 logging:
   level: "info"
 database:
-  url: "postgres://postgres:postgres@localhost:5432/lightbridge_authz_usage"
+  # Same silent-misconfiguration bug class as config/default.yaml's database.url (lightbridge-
+  # authz#PR447): a bare literal here means `cargo run -p lightbridge-authz-usage -- migrate
+  # --config-path config/usage.yaml` would silently ignore an exported env var and connect to
+  # localhost regardless. Deliberately named USAGE_DATABASE_URL, not DATABASE_URL -- this repo's
+  # main authz stack already treats a plain `DATABASE_URL` export as its own convention (see
+  # AGENTS.md's it-tests instructions and this config's sibling config/default.yaml); reusing that
+  # same name here would silently repoint the *usage* migrate/service at the *authz* database
+  # whenever both are exported in the same shell, which is exactly the class of bug this fix
+  # removes, not one to reintroduce under a different name.
+  url: "${USAGE_DATABASE_URL:-postgres://postgres:postgres@localhost:5432/lightbridge_authz_usage}"
   pool_size: 10
 otel:
   enabled: true

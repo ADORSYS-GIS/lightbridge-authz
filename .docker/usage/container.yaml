@@ -24,7 +24,12 @@ server:
 logging:
   level: "info"
 database:
-  url: "postgres://postgres:postgres@timescaledb:5432/lightbridge_authz_usage"
+  # Same silent-misconfiguration bug class as config/default.yaml's database.url (lightbridge-
+  # authz#PR447), extended here for consistency. USAGE_DATABASE_URL (not DATABASE_URL) -- see the
+  # identical note in config/usage.yaml for why reusing DATABASE_URL would risk silently repointing
+  # this service at the main authz database instead. Behavior-preserving today: no compose service
+  # sets USAGE_DATABASE_URL, so this always resolves to the fallback below, unchanged from before.
+  url: "${USAGE_DATABASE_URL:-postgres://postgres:postgres@timescaledb:5432/lightbridge_authz_usage}"
   pool_size: 10
 otel:
   enabled: true
