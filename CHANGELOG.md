@@ -1,5 +1,28 @@
 # Changelog
 
+## [3.9.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.8.0...v3.9.0) (2026-08-23)
+
+
+### Features
+
+* **api-key:** add listMyExpiringApiKeys visibility surface ([#436](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/436)) ([#451](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/451)) ([f061b41](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/f061b411922fc99a14ecb926f71481648eea8ad8))
+* **idp:** real, CAS-consuming DeviceCodeStore replacing NoDeviceCodeStore ([#423](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/423)) ([#452](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/452)) ([a9ba5cc](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/a9ba5cc066bb0606338f96e481353785f8bd7599))
+* **rest:** add axum-extra cookie crate + __Host- session cookie helper ([#443](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/443)) ([#445](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/445)) ([66630d6](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/66630d6dd70fe079f4710830707ea04e80e82b78))
+* **sessions:** first-class revocable sessions table + fail-closed introspection ([#440](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/440), [#441](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/441), [#437](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/437)) ([#447](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/447)) ([ecd0e39](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/ecd0e392bd56c31a06b67ebc63d04101208a4c2a))
+
+
+### Bug Fixes
+
+* **ci:** stage dist/static before the integration-test compose build ([#455](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/455)) ([f37e0f4](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/f37e0f4a00c620f4638227c6cc98b5c1876c6c9d))
+* **config:** stop database.url from silently ignoring DATABASE_URL ([#450](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/450)) ([a000aa2](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/a000aa26a9b859613f4c56ef7abf769ea9f52616))
+* **docs:** correct ADR-0021 Decision 5's nonce defect to fail-closed, not fail-open ([#448](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/448)) ([b8fcf33](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/b8fcf33b154b410ca3bb9799564ed374139270af))
+
+
+### Documentation
+
+* **adr:** ADR-0021 -- browser SSO at authz-idp via a hosted login page + session cookie ([#438](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/438)) ([b2a1f54](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/b2a1f54776bd57622926e426cab08e041c2db123))
+* **adr:** ADR-0022 -- conversational usage analytics via function-calling over the closed usage query schema ([#453](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/453)) ([5539c29](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/5539c29b869ce2b51b0be35a2e1911e2c2ebabd9))
+
 ## [3.8.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.7.0...v3.8.0) (2026-08-23)
 
 
