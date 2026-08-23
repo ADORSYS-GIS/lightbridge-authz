@@ -340,6 +340,37 @@ async fn create_api_key(
     )
 }
 
+/// Like [`create_api_key`], but with a caller-supplied `expires_at` instead of the fixed
+/// `near_future_expiry()` -- used by the `listMyExpiringApiKeys` boundary tests
+/// (lightbridge-authz#436) to seed keys at precise offsets from "now", exactly at, just inside,
+/// and just outside the expiry window under test.
+async fn create_api_key_with_expiry(
+    router: &Router,
+    token: &str,
+    project_id: &str,
+    name: &str,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> (String, String) {
+    let (status, body) = rpc_call(
+        router.clone(),
+        "procedure.createApiKey",
+        Wire::Cbor,
+        &json!({ "args": { "projectId": project_id, "name": name, "billingPlan": "free", "expiresAt": expires_at.to_rfc3339() } }),
+        Some(token),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "createApiKey: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = json_body(&body);
+    (
+        v["apiKey"]["id"].as_str().expect("key id").to_string(),
+        v["secret"].as_str().expect("secret").to_string(),
+    )
+}
+
 // ---------------------------------------------------------------------------------------------
 // Section 2: full CRUD lifecycle over the RPC router (CBOR — the only wire format post-ADR-0013).
 // ---------------------------------------------------------------------------------------------
@@ -2500,6 +2531,347 @@ async fn api_key_ownership_boundary_refuses_a_non_member_stranger() {
         json_body(&body)["name"],
         "k-boundary",
         "stranger's update must not have applied"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// `procedure.listMyExpiringApiKeys` (lightbridge-authz#436) -- the self-scoped, cross-project
+// "expiring soon" aggregate. Two concerns:
+//   1. the boundary predicate (`status = active AND expiresAt > now AND expiresAt <= cutoff`) --
+//      already-expired excluded, comfortably-outside-the-window excluded, comfortably-inside
+//      included, and the two window edges tested with enough slack to absorb real HTTP/DB
+//      round-trip latency (see `boundary_slack` below for why exact single-second precision
+//      against the window edge is not attempted here);
+//   2. cross-tenant isolation -- this procedure calls the generated `db.api_key()` delegate
+//      precisely so it inherits `ApiKey`'s own compiled `@@allow("read", ...)` policy rather than
+//      a second, hand-written ownership join (see the schema doc comment on
+//      `listMyExpiringApiKeys`), so this test also stands as a regression test for that policy
+//      actually firing when invoked this way, not just when invoked via `model.ApiKey.list`.
+// ---------------------------------------------------------------------------------------------
+
+/// A little slack around a window boundary so "just inside"/"just outside" seeding survives the
+/// real network+DB round trip between this test computing its own reference clock and the
+/// procedure computing its own `Utc::now()` server-side moments later -- chasing literal
+/// single-second precision against a live HTTP call would make this test flaky, not more
+/// rigorous. The comparison operators themselves (`>`/`<=`) are cratestack's own, already
+/// covered by its own test suite; what this test verifies is that THIS procedure wires the right
+/// fields/operators/window to them.
+const BOUNDARY_SLACK_SECONDS: i64 = 5;
+
+async fn call_list_my_expiring_api_keys(
+    router: &Router,
+    token: &str,
+    within_days: i64,
+) -> (StatusCode, Vec<u8>) {
+    rpc_call(
+        router.clone(),
+        "procedure.listMyExpiringApiKeys",
+        Wire::Cbor,
+        &json!({ "args": { "withinDays": within_days } }),
+        Some(token),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn list_my_expiring_api_keys_applies_the_window_boundary_and_excludes_already_expired() {
+    let owner = format!("owner-expiring-boundary-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("owner", token_info(&owner, admin_perms())));
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let account_id =
+        create_account(r, "owner", &format!("tenant-expiring-boundary-{}", cuid2())).await;
+    let project_id = create_project(r, "owner", &account_id, "proj-expiring-boundary").await;
+
+    let now = chrono::Utc::now();
+    let within_days = 7;
+    let cutoff = now + chrono::Duration::days(within_days);
+
+    // Comfortably inside the 7-day window.
+    let (comfortably_inside_id, _) = create_api_key_with_expiry(
+        r,
+        "owner",
+        &project_id,
+        "k-comfortably-inside",
+        now + chrono::Duration::days(1),
+    )
+    .await;
+    // Just inside the window edge (within slack of the cutoff, but before it).
+    let (just_inside_id, _) = create_api_key_with_expiry(
+        r,
+        "owner",
+        &project_id,
+        "k-just-inside",
+        cutoff - chrono::Duration::seconds(BOUNDARY_SLACK_SECONDS),
+    )
+    .await;
+    // Just outside the window edge (within slack of the cutoff, but after it).
+    let (just_outside_id, _) = create_api_key_with_expiry(
+        r,
+        "owner",
+        &project_id,
+        "k-just-outside",
+        cutoff + chrono::Duration::seconds(BOUNDARY_SLACK_SECONDS),
+    )
+    .await;
+    // Comfortably outside the window (30 days out, well beyond the 7-day ask).
+    let (comfortably_outside_id, _) = create_api_key_with_expiry(
+        r,
+        "owner",
+        &project_id,
+        "k-comfortably-outside",
+        now + chrono::Duration::days(30),
+    )
+    .await;
+    // Already expired: created with a valid future expiry (write-time validation requires it),
+    // then pushed into the past directly via the verify pool -- `createApiKey` itself refuses a
+    // past `expiresAt` (lightbridge-authz#395's `validate_expires_at`), so this is the only way
+    // to get an expired row seeded through the real create path rather than hand-inserting one.
+    let (expired_id, _) = create_api_key_with_expiry(
+        r,
+        "owner",
+        &project_id,
+        "k-already-expired",
+        now + chrono::Duration::days(1),
+    )
+    .await;
+    sqlx::query("UPDATE api_keys SET expires_at = $1 WHERE id = $2")
+        .bind(now - chrono::Duration::days(1))
+        .bind(&expired_id)
+        .execute(&ctx.verify)
+        .await
+        .expect("push key into the past");
+
+    let (status, body) = call_list_my_expiring_api_keys(r, "owner", within_days).await;
+    assert!(
+        status.is_success(),
+        "listMyExpiringApiKeys: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let returned_ids: std::collections::HashSet<String> = json_body(&body)
+        .as_array()
+        .expect("array response")
+        .iter()
+        .map(|k| k["id"].as_str().expect("id").to_string())
+        .collect();
+
+    assert!(
+        returned_ids.contains(&comfortably_inside_id),
+        "a key expiring well inside the window must be returned"
+    );
+    assert!(
+        returned_ids.contains(&just_inside_id),
+        "a key expiring just inside the window edge must be returned"
+    );
+    assert!(
+        !returned_ids.contains(&just_outside_id),
+        "a key expiring just outside the window edge must NOT be returned"
+    );
+    assert!(
+        !returned_ids.contains(&comfortably_outside_id),
+        "a key expiring well outside the window must NOT be returned"
+    );
+    assert!(
+        !returned_ids.contains(&expired_id),
+        "an already-expired key must NOT be returned -- that is a separate, existing concern \
+         from \"about to expire\""
+    );
+}
+
+#[tokio::test]
+async fn list_my_expiring_api_keys_does_not_leak_another_tenants_keys() {
+    let owner = format!("owner-expiring-tenant-{}", cuid2());
+    let stranger = format!("stranger-expiring-tenant-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("owner", token_info(&owner, admin_perms()))
+            .with("stranger", token_info(&stranger, admin_perms())),
+    );
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let owner_account =
+        create_account(r, "owner", &format!("tenant-expiring-owner-{}", cuid2())).await;
+    let owner_project = create_project(r, "owner", &owner_account, "proj-expiring-owner").await;
+    let now = chrono::Utc::now();
+    let (owner_key_id, _) = create_api_key_with_expiry(
+        r,
+        "owner",
+        &owner_project,
+        "k-owner-expiring",
+        now + chrono::Duration::days(1),
+    )
+    .await;
+
+    let stranger_account = create_account(
+        r,
+        "stranger",
+        &format!("tenant-expiring-stranger-{}", cuid2()),
+    )
+    .await;
+    let stranger_project =
+        create_project(r, "stranger", &stranger_account, "proj-expiring-stranger").await;
+    let (stranger_key_id, _) = create_api_key_with_expiry(
+        r,
+        "stranger",
+        &stranger_project,
+        "k-stranger-expiring",
+        now + chrono::Duration::days(1),
+    )
+    .await;
+
+    let (status, body) = call_list_my_expiring_api_keys(r, "owner", 7).await;
+    assert!(
+        status.is_success(),
+        "{status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let owner_view: std::collections::HashSet<String> = json_body(&body)
+        .as_array()
+        .expect("array response")
+        .iter()
+        .map(|k| k["id"].as_str().expect("id").to_string())
+        .collect();
+    assert!(
+        owner_view.contains(&owner_key_id),
+        "owner must see their own expiring key"
+    );
+    assert!(
+        !owner_view.contains(&stranger_key_id),
+        "owner must NOT see the stranger's expiring key"
+    );
+
+    let (status, body) = call_list_my_expiring_api_keys(r, "stranger", 7).await;
+    assert!(
+        status.is_success(),
+        "{status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let stranger_view: std::collections::HashSet<String> = json_body(&body)
+        .as_array()
+        .expect("array response")
+        .iter()
+        .map(|k| k["id"].as_str().expect("id").to_string())
+        .collect();
+    assert!(
+        stranger_view.contains(&stranger_key_id),
+        "stranger must see their own expiring key"
+    );
+    assert!(
+        !stranger_view.contains(&owner_key_id),
+        "stranger must NOT see the owner's expiring key"
+    );
+}
+
+#[tokio::test]
+async fn list_my_expiring_api_keys_aggregates_across_every_project_the_caller_can_see() {
+    // The whole point of this procedure (lightbridge-authz#436): the self-service UI's
+    // `listApiKeys` is scoped to one project at a time, so nobody aggregates across projects
+    // without opening each one. This proves a single call surfaces expiring keys from BOTH an
+    // owned project AND a project the caller is merely a MEMBER of (not the owning account) --
+    // the exact ownership disjunction `ApiKey`'s `@@allow("read", ...)` compiles
+    // (`project.account.id == auth().id || project.members.some.accountId == auth().id`).
+    let owner = format!("owner-expiring-aggregate-{}", cuid2());
+    let member = format!("member-expiring-aggregate-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("owner", token_info(&owner, admin_perms()))
+            .with("member", token_info(&member, admin_perms())),
+    );
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let owner_account = create_account(
+        r,
+        "owner",
+        &format!("tenant-expiring-aggregate-owner-{}", cuid2()),
+    )
+    .await;
+    let _member_account = create_account(
+        r,
+        "member",
+        &format!("tenant-expiring-aggregate-member-{}", cuid2()),
+    )
+    .await;
+
+    let project_a = create_project(r, "owner", &owner_account, "proj-expiring-aggregate-a").await;
+    let project_b = create_project(r, "owner", &owner_account, "proj-expiring-aggregate-b").await;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.addProjectMember",
+        Wire::Cbor,
+        &json!({ "args": { "projectId": project_b, "accountId": member, "role": "member" } }),
+        Some("owner"),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "addProjectMember: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let now = chrono::Utc::now();
+    let (key_a_id, _) = create_api_key_with_expiry(
+        r,
+        "owner",
+        &project_a,
+        "k-project-a-expiring",
+        now + chrono::Duration::days(1),
+    )
+    .await;
+    let (key_b_id, _) = create_api_key_with_expiry(
+        r,
+        "owner",
+        &project_b,
+        "k-project-b-expiring",
+        now + chrono::Duration::days(1),
+    )
+    .await;
+
+    // The member calls it as themselves -- they hold no account-owner relationship to either
+    // project, only a `project_members` row on project B.
+    let (status, body) = call_list_my_expiring_api_keys(r, "member", 7).await;
+    assert!(
+        status.is_success(),
+        "{status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let member_view: std::collections::HashSet<String> = json_body(&body)
+        .as_array()
+        .expect("array response")
+        .iter()
+        .map(|k| k["id"].as_str().expect("id").to_string())
+        .collect();
+    assert!(
+        member_view.contains(&key_b_id),
+        "a project member must see that project's expiring keys"
+    );
+    assert!(
+        !member_view.contains(&key_a_id),
+        "a project member must NOT see another project's expiring keys just because its owner \
+         happens to also own the project they ARE a member of"
+    );
+
+    // The owner calls it as themselves -- one call, both projects' expiring keys.
+    let (status, body) = call_list_my_expiring_api_keys(r, "owner", 7).await;
+    assert!(
+        status.is_success(),
+        "{status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let owner_view: std::collections::HashSet<String> = json_body(&body)
+        .as_array()
+        .expect("array response")
+        .iter()
+        .map(|k| k["id"].as_str().expect("id").to_string())
+        .collect();
+    assert!(
+        owner_view.contains(&key_a_id) && owner_view.contains(&key_b_id),
+        "the owner's single call must aggregate expiring keys across BOTH of their projects, \
+         not just whichever one a UI happens to have open"
     );
 }
 

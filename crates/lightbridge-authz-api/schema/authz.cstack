@@ -646,6 +646,53 @@ type RevokeApiKeyInput {
 mutation procedure revokeApiKey(args: RevokeApiKeyInput): ApiKey
   @allow((auth() != null) && auth().rpcScope == "crud" && auth().permApikeyRevoke == true)
 
+// lightbridge-authz#436: every key now has a mandatory, capped expiry (#402/#395), but until this
+// procedure there was no way to learn a key was *approaching* that expiry short of opening the
+// self-service UI's per-project list view -- which does nothing for a machine credential (a CI
+// key, a service integration) whose owner never opens it. `withinDays` frames "soon" the same way
+// `apps/self-service/src/lib/api-key-expiry.ts`'s `EXPIRING_SOON_WINDOW_DAYS` already does in
+// converse-frontends (14 days) -- reused as this procedure's default so the two surfaces agree
+// rather than silently diverging; see `docs/api-key-expiry-visibility.md` for the full threshold
+// rationale. Clamped server-side to `[1, 90]` when supplied (90 mirrors the operator-configured
+// `ApiKeyExpiry` ceiling's documented default -- a window wider than the max possible key lifetime
+// cannot surface anything a plain `model.ApiKey.list` call could not already return), the same
+// "clamp, don't reject" convention `listMyBudgetGrants`'s `limit` already uses for a read-side
+// convenience parameter (docs/rbac.md, "Direct budget-balance/ledger reads"), not the fail-closed
+// "reject, never clamp" rule `validate_expires_at` uses for the write-time expiry gate -- these are
+// different kinds of parameter and deliberately follow different precedents.
+type ListMyExpiringApiKeysInput {
+  withinDays Int?
+}
+
+// Deliberately SELF-scoped only -- no cross-tenant admin twin (contrast
+// `listMyBudgetGrants`/`listBudgetGrants`'s self/admin split). Reuses the EXISTING `apikey:read`
+// permission rather than a new one: this returns strictly a filtered, cross-project aggregate of
+// rows a caller holding `apikey:read` could already read one project at a time via
+// `model.ApiKey.list`, so gating it any tighter would add friction with no matching security
+// benefit, and gating it any looser would be a real widening. Implemented against the generated
+// cratestack client (`db.api_key().find_many()`, ADR-0038), NOT a hand-written repo method: calling
+// through the generated delegate means this procedure's tenant isolation is enforced by the exact
+// same compiled `@@allow("read", ...)` clause below -- `push_scoped_conditions` in cratestack-pg's
+// `query/support/conditions.rs` folds that policy into the WHERE clause on every `find_many` call,
+// with no bypass available from a hand-written procedure body -- rather than a second,
+// independently-written ownership join that could drift from the model's own policy over time.
+//
+// A true cross-tenant "every account's expiring keys" admin surface was considered (the ticket's
+// "an operator ... can poll" framing) and deliberately dropped: cratestack's generated model client
+// has no escape hatch that skips `@@allow` -- every `FindMany::run` call folds the model's read
+// policy into the query unconditionally -- so building one would require either weakening
+// `ApiKey`'s shared tenant-isolation clause (which also protects `model.ApiKey.list`/`get` for
+// every other caller) or new hand-written SQL bypassing cratestack entirely, which ADR-0038
+// forbids for a model that is not one of that ADR's three documented exceptions
+// (`signing_keys`/`project_members`/`exchange_refresh_tokens`). Either path is a materially
+// bigger, separate security decision than this ticket's "add a visibility surface" scope -- left
+// for a follow-up that can weigh it deliberately rather than as a side effect here. The self-scoped
+// surface above still closes real ground: an account owner or any project member/lead (not just
+// whoever happens to have the self-service UI open for that one project) can now poll one endpoint
+// across every project they can already see, machine-credential projects included.
+procedure listMyExpiringApiKeys(args: ListMyExpiringApiKeysInput): ApiKey[]
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permApikeyRead == true)
+
 // Project roster mutations (ADR-0006 follow-up to ADR-0003 item 4; replaces the retired
 // `addAccountMember`/`removeAccountMember`/`setAccountMemberRole` trio now that membership lives
 // on `Project`, not `Account`). Hand-written sqlx in the ProcedureRegistry impl (not generated

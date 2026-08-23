@@ -450,6 +450,34 @@ fn resolve_budget_grants_page_size(limit: Option<i64>) -> i64 {
     }
 }
 
+/// `listMyExpiringApiKeys`'s default "soon" window when a caller omits `withinDays`
+/// (lightbridge-authz#436). Matches `apps/self-service/src/lib/api-key-expiry.ts`'s
+/// `EXPIRING_SOON_WINDOW_DAYS` in converse-frontends so the two surfaces agree on what "soon"
+/// means rather than silently diverging -- see `docs/api-key-expiry-visibility.md`.
+const DEFAULT_EXPIRING_SOON_WINDOW_DAYS: i64 = 14;
+/// Ceiling a caller-supplied `withinDays` clamps to. Mirrors the documented default of the
+/// operator-configured `ApiKeyExpiry` ceiling (`api_key_expiry`,
+/// `lightbridge_authz_core::config::ApiKeyExpiry::max_lifetime_days`) -- a window wider than the
+/// maximum possible key lifetime cannot surface anything a plain `model.ApiKey.list` call could
+/// not already return, so there is no security reason to allow (or need to reject) more.
+const MAX_EXPIRING_SOON_WINDOW_DAYS: i64 = 90;
+/// Hard cap on rows `listMyExpiringApiKeys` returns (soonest-expiring first). Comfortably above
+/// the estate-wide count of keys expiring within 30 days at the time of lightbridge-authz#436's
+/// own investigation (11) -- this bounds the query rather than expecting that count to hold
+/// forever.
+const MAX_EXPIRING_API_KEYS_RESULTS: i64 = 500;
+
+/// Resolves a caller-supplied, optional `withinDays` into a window clamped to
+/// `[1, MAX_EXPIRING_SOON_WINDOW_DAYS]`, defaulting to [`DEFAULT_EXPIRING_SOON_WINDOW_DAYS`] when
+/// omitted -- the same "clamp, don't reject" convention [`resolve_budget_grants_page_size`] above
+/// already uses for a read-side convenience parameter, not the fail-closed "reject, never clamp"
+/// rule `validate_expires_at` (`handlers/mod.rs`) uses for the write-time expiry gate.
+fn clamp_expiring_soon_window_days(requested: Option<i64>) -> i64 {
+    requested
+        .unwrap_or(DEFAULT_EXPIRING_SOON_WINDOW_DAYS)
+        .clamp(1, MAX_EXPIRING_SOON_WINDOW_DAYS)
+}
+
 /// The validated caller's subject, projected as `auth().id` by [`CratestackAuthProvider`].
 fn subject_from_ctx(ctx: &CratestackContext) -> Option<String> {
     match ctx.auth_field("id") {
@@ -1111,6 +1139,52 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 .await
                 .map_err(to_cratestack_error)?;
             Ok(to_schema_api_key(key))
+        }
+    }
+
+    /// Self-scoped, cross-project "expiring soon" aggregate (lightbridge-authz#436). Unlike every
+    /// other procedure in this impl, this one DOES use `db` -- see the schema doc comment on
+    /// `listMyExpiringApiKeys` for why: calling the generated `db.api_key()` delegate means this
+    /// procedure's tenant isolation is enforced by the exact same compiled `@@allow("read", ...)`
+    /// clause `model.ApiKey.list`/`get` already go through (`push_scoped_conditions` in
+    /// cratestack-pg folds it into the query unconditionally, with no bypass), rather than a
+    /// second, hand-written ownership join that could drift from the model's own policy.
+    /// Soft-deleted rows are excluded the same way (the model's `@@soft_delete` filter, also
+    /// applied unconditionally by the generated delegate) -- no explicit `deletedAt` check needed
+    /// here.
+    fn list_my_expiring_api_keys(
+        &self,
+        db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::list_my_expiring_api_keys::Args,
+        _authorized: schema::procedures::list_my_expiring_api_keys::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::list_my_expiring_api_keys::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let within_days = args.args.withinDays;
+        async move {
+            let within_days = clamp_expiring_soon_window_days(within_days);
+            let now = chrono::Utc::now();
+            let cutoff = now + chrono::Duration::days(within_days);
+            // Three separate `.where_(...)` calls, not one `.and()`-chained expression:
+            // `FindMany`/`ScopedFindMany` combine every entry in its `filters: Vec<FilterExpr>`
+            // with `AND` when building the query (`push_filter_query`,
+            // cratestack-sqlx/src/query/support/filter.rs), so this is equivalent to (and simpler
+            // than) chaining `.and()` on the `Filter` values `eq`/`gt`/`lte` return.
+            let keys = db
+                .api_key()
+                .find_many()
+                .where_(schema::api_key::status().eq("active".to_string()))
+                .where_(schema::api_key::expiresAt().gt(now))
+                .where_(schema::api_key::expiresAt().lte(cutoff))
+                .order_by(schema::api_key::expiresAt().asc())
+                .limit(MAX_EXPIRING_API_KEYS_RESULTS)
+                .run(ctx)
+                .await?;
+            Ok(keys)
         }
     }
 
@@ -3469,5 +3543,49 @@ mod tests {
             readiness_handler(pool).await,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // `clamp_expiring_soon_window_days` (lightbridge-authz#436, `listMyExpiringApiKeys`'s
+    // `withinDays` resolution) -- boundary cases only; the query's own "which keys actually come
+    // back" boundary (exactly-at-threshold expiry timestamps, already-expired exclusion,
+    // cross-tenant isolation) is covered by the live-database `rpc_it_tests.rs` suite, which can
+    // exercise the real generated `db.api_key()` policy-scoped query this function's result feeds
+    // into -- this unit test only proves the pure clamp arithmetic in isolation.
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn expiring_soon_window_defaults_to_fourteen_days_when_omitted() {
+        assert_eq!(
+            clamp_expiring_soon_window_days(None),
+            DEFAULT_EXPIRING_SOON_WINDOW_DAYS
+        );
+        assert_eq!(DEFAULT_EXPIRING_SOON_WINDOW_DAYS, 14);
+    }
+
+    #[test]
+    fn expiring_soon_window_passes_through_an_in_range_value_unchanged() {
+        assert_eq!(clamp_expiring_soon_window_days(Some(1)), 1);
+        assert_eq!(clamp_expiring_soon_window_days(Some(7)), 7);
+        assert_eq!(clamp_expiring_soon_window_days(Some(90)), 90);
+    }
+
+    #[test]
+    fn expiring_soon_window_clamps_a_non_positive_request_up_to_one() {
+        assert_eq!(clamp_expiring_soon_window_days(Some(0)), 1);
+        assert_eq!(clamp_expiring_soon_window_days(Some(-30)), 1);
+    }
+
+    #[test]
+    fn expiring_soon_window_clamps_an_oversized_request_down_to_the_ceiling() {
+        assert_eq!(
+            clamp_expiring_soon_window_days(Some(91)),
+            MAX_EXPIRING_SOON_WINDOW_DAYS
+        );
+        assert_eq!(
+            clamp_expiring_soon_window_days(Some(36_500)),
+            MAX_EXPIRING_SOON_WINDOW_DAYS
+        );
+        assert_eq!(MAX_EXPIRING_SOON_WINDOW_DAYS, 90);
     }
 }

@@ -248,7 +248,7 @@ scope for #401.
 | `project:disable` | `procedure.disableProject`, `procedure.enableProject`| `disable-project`, `enable-project` |
 | `project:member`  | `procedure.listProjectRoster`, `procedure.addProjectMember`, `procedure.removeProjectMember`, `procedure.setProjectMemberRole`, `procedure.setProjectMemberQuotaTier` | `list-project-roster`, `add-project-member`, `remove-project-member`, `set-project-member-role`, `set-project-member-quota-tier` |
 | `apikey:create`   | `procedure.createApiKey`, `procedure.listBillingPlans` | `create-api-key`                  |
-| `apikey:read`     | `model.ApiKey.list`, `model.ApiKey.get`              | `list-api-keys`, `get-api-key`      |
+| `apikey:read`     | `model.ApiKey.list`, `model.ApiKey.get`, `procedure.listMyExpiringApiKeys` | `list-api-keys`, `get-api-key` |
 | `apikey:update`   | `model.ApiKey.update`                                | `update-api-key`                    |
 | `apikey:delete`   | `model.ApiKey.delete`                                | `delete-api-key`                    |
 | `apikey:revoke`   | `procedure.revokeApiKey`                             | `revoke-api-key`                    |
@@ -547,6 +547,13 @@ enforcement; see "Batch RPC: per-frame RBAC" above.
 > API key must now carry an expiry (no more nullable "never expires"), and before this change
 > `model.ApiKey.update` was a live, unvalidated bypass for it — a caller could set `expiresAt` to
 > anything, including explicit `null`, with no cap and no procedure in the path.
+
+> **Approaching-expiry visibility (lightbridge-authz#436).** `procedure.listMyExpiringApiKeys`
+> (`apikey:read`, same permission as the two read verbs above) returns the caller's own active,
+> not-yet-expired keys landing inside a configurable "soon" window, aggregated across every
+> project the caller can already see — not one project at a time the way the self-service UI's
+> list view is. See `docs/api-key-expiry-visibility.md` for the window/threshold and why it has no
+> cross-tenant admin counterpart.
 
 The OPA validation endpoints (introspection / `/idp/v1/resolve-context`) are protected by Basic
 auth, not JWT, so they are outside RBAC; the equivalent MCP validation tools (which run behind JWT)
