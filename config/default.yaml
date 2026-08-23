@@ -49,7 +49,14 @@ server:
 logging:
   level: "info"
 database:
-  url: "postgres://postgres:postgres@localhost:5432/lightbridge_authz"
+  # Honors DATABASE_URL when set (and non-empty), falling back to the checked-in local default
+  # otherwise -- see AGENTS.md's "Environment Variable Interpolation" (`:-` also falls back on
+  # set-but-empty, unlike `-`). Before this, this key was a bare literal, so `cargo run -p
+  # lightbridge-authz -- migrate --config-path config/default.yaml` silently ignored an exported
+  # DATABASE_URL and always connected to localhost:5432 -- the dangerous part being that it
+  # connected *successfully* to the wrong database rather than erroring, so the migration looked
+  # like it ran when it actually ran somewhere else (found via PR #447 / #440-#441-#437).
+  url: "${DATABASE_URL:-postgres://postgres:postgres@localhost:5432/lightbridge_authz}"
   pool_size: 10
 # Mandatory for authz-api, authz-idp, and authz-budget -- each refuses to start without it (see
 # AGENTS.md's "Redis is a mandatory dependency" house rule). Used for Redis-backed rate limiting

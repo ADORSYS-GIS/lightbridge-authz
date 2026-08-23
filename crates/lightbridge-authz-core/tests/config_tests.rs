@@ -165,3 +165,60 @@ fn load_from_path_defaults_idp_static_dir_when_the_config_predates_the_field() {
 
     let _ = fs::remove_file(&path);
 }
+
+/// Regression test for the silent-misconfiguration bug found while pointing the migrate binary at
+/// an isolated Postgres container during #440/#441/#437 (PR #447): `config/default.yaml`'s
+/// `database.url` used to be a bare literal, so `cargo run -p lightbridge-authz -- migrate
+/// --config-path config/default.yaml` silently ignored an exported `DATABASE_URL` and connected to
+/// localhost regardless -- dangerously, it connected *successfully* to the wrong database rather
+/// than erroring, so the migration looked like it ran when it actually ran somewhere else.
+///
+/// This loads the real checked-in `config/default.yaml` (not a synthetic fixture) through the same
+/// `load_from_path` pipeline `main.rs` uses, so reverting that file's `database.url` back to a bare
+/// literal makes this test fail for the exact right reason.
+///
+/// Env-var isolation: `DATABASE_URL` is process-global, so this single test drives both the
+/// "set" and "unset" cases sequentially (rather than as two separate `#[test]` functions that
+/// could race against each other under the default parallel test runner) and restores whatever
+/// value was present beforehand before returning, including on the unset branch.
+#[test]
+fn checked_in_default_config_honors_database_url_env_override() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/default.yaml");
+    assert!(
+        path.exists(),
+        "expected the checked-in config/default.yaml at {path:?}"
+    );
+
+    let prior_database_url = std::env::var("DATABASE_URL").ok();
+
+    unsafe {
+        std::env::set_var(
+            "DATABASE_URL",
+            "postgres://custom:custom@example.invalid:5555/custom_db",
+        );
+    }
+    let config: Config =
+        load_from_path(&path).expect("config/default.yaml should load with DATABASE_URL set");
+    assert_eq!(
+        config.database.url, "postgres://custom:custom@example.invalid:5555/custom_db",
+        "config/default.yaml's database.url must honor DATABASE_URL when set -- a hardcoded \
+         value here silently ignores the env var and connects to the wrong database instead of \
+         erroring (see PR #447)"
+    );
+
+    unsafe {
+        std::env::remove_var("DATABASE_URL");
+    }
+    let config: Config =
+        load_from_path(&path).expect("config/default.yaml should load with DATABASE_URL unset");
+    assert_eq!(
+        config.database.url, "postgres://postgres:postgres@localhost:5432/lightbridge_authz",
+        "config/default.yaml's database.url must still fall back to the checked-in local default \
+         when DATABASE_URL is unset"
+    );
+
+    match prior_database_url {
+        Some(value) => unsafe { std::env::set_var("DATABASE_URL", value) },
+        None => unsafe { std::env::remove_var("DATABASE_URL") },
+    }
+}
