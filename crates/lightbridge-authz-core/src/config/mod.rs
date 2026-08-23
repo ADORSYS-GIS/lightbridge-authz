@@ -580,6 +580,16 @@ pub struct IdpServer {
     pub address: String,
     pub port: u16,
     pub tls: Tls,
+    /// ADR-0021 Decisions 1 + 10 (#442): filesystem path to the hosted login page's Vite
+    /// production build (`web/hosted-login/dist` — an `index.html` plus a content-hashed
+    /// `assets/` directory), mounted as `build_idp_router`'s lowest-priority fallback. Points at
+    /// `/app/static` in the container image (`Dockerfile`/`Dockerfile.dist` bake the build there)
+    /// and at the repo-relative `web/hosted-login/dist` for local `cargo run`. Required, not
+    /// optional: this server always mounts the fallback (AGENTS.md's "no dormant flags"
+    /// convention) — an operator who has not built the frontend yet gets a working server whose
+    /// static fallback 404s until the assets exist, not a server with the feature silently
+    /// switched off.
+    pub static_dir: String,
 }
 
 /// `authz-budget`'s server block. Shaped like [`IdpServer`] (address/port/TLS, no `basic_auth`):

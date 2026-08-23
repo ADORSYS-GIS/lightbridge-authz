@@ -1,4 +1,19 @@
 # Multi-stage build for optimized production image
+
+# ADR-0021 Decisions 1 + 10 (#442): builds the hosted login page's static assets so `authz-idp`
+# can serve them same-origin. Only `runtime` (the image `authz-idp` actually runs from -- see
+# compose.yaml, which shares one `lightbridge-authz` image across api/opa/idp/budget) consumes
+# this stage's output; the other runtime stages below don't need it.
+FROM node:22-alpine as frontend
+
+WORKDIR /app/web/hosted-login
+
+COPY web/hosted-login/package.json web/hosted-login/package-lock.json ./
+RUN npm ci
+
+COPY web/hosted-login/ ./
+RUN npm run build
+
 FROM rust:1-alpine as builder
 
 ARG TARGETARCH
@@ -67,6 +82,11 @@ WORKDIR /app
 # Copy binary from builder stage
 COPY --from=builder /app/lightbridge-authz /usr/local/bin/lightbridge-authz
 COPY --from=builder /app/lightbridge-authz-healthcheck /usr/local/bin/lightbridge-authz-healthcheck
+
+# Hosted login page static build (ADR-0021 Decisions 1 + 10, #442) -- authz-idp serves this from
+# `server.idp.static_dir` (config/default.yaml / .docker/authz/container.yaml default to this
+# path). Harmless on api/opa/budget, which never mount the static fallback at all.
+COPY --from=frontend /app/web/hosted-login/dist /app/static
 
 # Expose port
 EXPOSE 3000

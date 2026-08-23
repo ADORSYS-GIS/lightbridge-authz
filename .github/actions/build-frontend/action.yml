@@ -1,0 +1,45 @@
+name: Build Frontend
+description: >
+  Install dependencies and run a production Vite build of the hosted login page
+  (web/hosted-login, ADR-0021 Decisions 1 + 10, #442), assert it produced content-hashed output,
+  and stage it into dist/static for the container build.
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "22"
+        cache: npm
+        cache-dependency-path: web/hosted-login/package-lock.json
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: web/hosted-login
+      run: npm ci
+
+    - name: Build
+      shell: bash
+      working-directory: web/hosted-login
+      run: npm run build
+
+    # Decision 10's caching posture only makes sense if Vite is actually emitting
+    # content-hashed filenames -- assert it here rather than discovering a regression at
+    # `static_assets_tests.rs` runtime or, worse, in production.
+    - name: Assert content-hashed output
+      shell: bash
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        hashed=(web/hosted-login/dist/assets/*-*.js)
+        if [ ${#hashed[@]} -eq 0 ]; then
+          echo "expected at least one content-hashed JS asset under web/hosted-login/dist/assets/, found none" >&2
+          exit 1
+        fi
+        test -f web/hosted-login/dist/index.html
+
+    - name: Stage into dist/static for the container build
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p dist/static
+        cp -r web/hosted-login/dist/. dist/static/

@@ -37,6 +37,12 @@ fn lazy_pool() -> Arc<dyn DbPoolTrait> {
     Arc::new(DbPool::from_pool(pool))
 }
 
+/// A nonexistent directory is fine here: none of the tests in this file exercise the static
+/// fallback's actual file-serving behavior (that's `static_assets_tests.rs`'s job) -- they only
+/// assert that existing protocol routes still resolve with the fallback mounted, per ADR-0021's
+/// mount-order requirement (#442).
+const TEST_STATIC_DIR: &str = "/nonexistent/idp-server-tests/static";
+
 fn bad_tls() -> Tls {
     Tls {
         cert_path: "/nonexistent/idp-server-tests/cert.pem".to_string(),
@@ -87,7 +93,13 @@ fn self_signed_oauth2() -> Oauth2 {
 async fn build_idp_router_probes_behave_like_the_other_servers_including_db_unavailable() {
     let pool = lazy_pool();
     let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
-    let router = build_idp_router(&self_signed_oauth2(), signing_repo, None, pool);
+    let router = build_idp_router(
+        &self_signed_oauth2(),
+        signing_repo,
+        None,
+        pool,
+        TEST_STATIC_DIR,
+    );
 
     for path in ["/", "/healthz", "/healthz/startup"] {
         let response = router
@@ -123,7 +135,13 @@ async fn build_idp_router_probes_behave_like_the_other_servers_including_db_unav
 async fn build_idp_router_omits_well_known_when_oauth2_is_external() {
     let pool = lazy_pool();
     let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
-    let router = build_idp_router(&external_oauth2(), signing_repo, None, pool);
+    let router = build_idp_router(
+        &external_oauth2(),
+        signing_repo,
+        None,
+        pool,
+        TEST_STATIC_DIR,
+    );
 
     let response = router
         .oneshot(
@@ -264,7 +282,7 @@ async fn build_idp_router_serves_oauth2_revoke_without_touching_the_database() {
     let oauth2 = token_exchange_oauth2();
     let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
     let state = offline_token_exchange_state(&oauth2, signing_repo.clone());
-    let router = build_idp_router(&oauth2, signing_repo, Some(state), pool);
+    let router = build_idp_router(&oauth2, signing_repo, Some(state), pool, TEST_STATIC_DIR);
 
     let response = router
         .oneshot(
@@ -297,7 +315,7 @@ async fn build_idp_router_serves_oauth2_token_route() {
     let oauth2 = token_exchange_oauth2();
     let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
     let state = offline_token_exchange_state(&oauth2, signing_repo.clone());
-    let router = build_idp_router(&oauth2, signing_repo, Some(state), pool);
+    let router = build_idp_router(&oauth2, signing_repo, Some(state), pool, TEST_STATIC_DIR);
 
     let response = router
         .oneshot(
@@ -327,6 +345,7 @@ async fn start_idp_server_rejects_external_oauth2() {
         address: "127.0.0.1".to_string(),
         port: 0,
         tls: bad_tls(),
+        static_dir: TEST_STATIC_DIR.to_string(),
     };
     let result = start_idp_server(&idp, lazy_pool(), &external_oauth2(), &None).await;
     let err = result.expect_err("authz-idp must reject oauth2.type: external");
@@ -344,6 +363,7 @@ async fn start_idp_server_rejects_self_signed_oauth2_without_signing_block() {
         address: "127.0.0.1".to_string(),
         port: 0,
         tls: bad_tls(),
+        static_dir: TEST_STATIC_DIR.to_string(),
     };
     let result = start_idp_server(&idp, lazy_pool(), &oauth2, &None).await;
     assert!(
@@ -400,6 +420,7 @@ mod db {
             address: "127.0.0.1".to_string(),
             port: 0,
             tls: bad_tls(),
+            static_dir: TEST_STATIC_DIR.to_string(),
         };
         let result = start_idp_server(
             &idp,
@@ -429,6 +450,7 @@ mod db {
             address: "127.0.0.1".to_string(),
             port: 0,
             tls: bad_tls(),
+            static_dir: TEST_STATIC_DIR.to_string(),
         };
         let err = start_idp_server(&idp, db_pool, &token_exchange_oauth2(), &None)
             .await
@@ -448,6 +470,7 @@ mod db {
             address: "127.0.0.1".to_string(),
             port: 0,
             tls: bad_tls(),
+            static_dir: TEST_STATIC_DIR.to_string(),
         };
         let err = start_idp_server(&idp, db_pool, &self_signed_oauth2(), &None)
             .await
@@ -472,6 +495,7 @@ mod db {
             address: "127.0.0.1".to_string(),
             port: 0,
             tls: bad_tls(),
+            static_dir: TEST_STATIC_DIR.to_string(),
         };
         let result = start_idp_server(
             &idp,
@@ -517,7 +541,13 @@ mod db {
 
         // authz-idp's router: thin, no cratestack/idempotency/rate-limit scaffolding needed.
         let idp_state = offline_token_exchange_state(&oauth2, signing_repo.clone());
-        let idp_router = build_idp_router(&oauth2, signing_repo, Some(idp_state), db_pool.clone());
+        let idp_router = build_idp_router(
+            &oauth2,
+            signing_repo,
+            Some(idp_state),
+            db_pool.clone(),
+            TEST_STATIC_DIR,
+        );
 
         // authz-api's router: no oauth2/signing_repo/token_exchange params anymore (it mounts
         // neither well-known nor token-exchange), so the cratestack CRUD client / idempotency
@@ -610,5 +640,143 @@ mod db {
                 api_response.status()
             );
         }
+    }
+
+    /// ADR-0021's highest-risk property (#442, "Risks" table in issue #442): mounting the static
+    /// fallback must never shadow an existing protocol route. Needs the DB-backed setup (a real
+    /// bootstrapped signing key) so `/.well-known/jwks.json` actually succeeds -- offline it
+    /// 500s for its own unrelated reason (no key to serialize), which would make a coarse
+    /// status-code assertion here meaningless. Builds the idp router with a REAL, on-disk static
+    /// build directory (not `TEST_STATIC_DIR`'s nonexistent path, so the fallback is actually
+    /// capable of answering every request) and proves both directions: every existing protocol
+    /// route still resolves to its own handler with real content, and only a genuinely unmatched
+    /// path reaches the static fallback (getting `index.html` back with a `200`, never a bare
+    /// `404`).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn static_fallback_never_shadows_an_existing_protocol_route(pool: PgPool) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let static_dir =
+            std::env::temp_dir().join(format!("lightbridge-authz-idp-server-tests-static-{nanos}"));
+        std::fs::create_dir_all(&static_dir).unwrap();
+        std::fs::write(
+            static_dir.join("index.html"),
+            b"<!doctype html><title>hosted-login placeholder</title>",
+        )
+        .unwrap();
+
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
+        let oauth2 = token_exchange_oauth2();
+        let signing_repo = repo(pool);
+        lightbridge_authz_rest::signing::bootstrap_signing_key(
+            &signing_repo,
+            oauth2.signing.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let idp_state = offline_token_exchange_state(&oauth2, signing_repo.clone());
+        let router = build_idp_router(&oauth2, signing_repo, Some(idp_state), db_pool, &static_dir);
+
+        // A bare status-code check is not enough to prove non-shadowing: the SPA fallback also
+        // answers every unmatched path with a 200. Each protocol route below is asserted against
+        // its own real, non-placeholder body too, so a router bug that accidentally routes one of
+        // these through the static fallback fails on content, not just status.
+        for path in [
+            "/.well-known/openid-configuration",
+            "/.well-known/jwks.json",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "GET {path} must still resolve to its protocol handler, not the static \
+                 fallback, with a real static_dir mounted"
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_else(|e| {
+                panic!(
+                    "GET {path} must return real JSON discovery/JWKS content, not the static \
+                     fallback's HTML placeholder: {e}, got {body:?}"
+                )
+            });
+        }
+
+        for path in ["/healthz", "/healthz/startup"] {
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "GET {path} must still resolve to its protocol handler, not the static \
+                 fallback, with a real static_dir mounted"
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert!(
+                body.is_empty(),
+                "GET {path} must return the probe handler's empty body, not the static \
+                 fallback's HTML placeholder: got {body:?}"
+            );
+        }
+
+        for (path, expected) in [
+            ("/oauth2/token", StatusCode::UNPROCESSABLE_ENTITY),
+            ("/oauth2/revoke", StatusCode::BAD_REQUEST),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from(""))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                expected,
+                "POST {path} must still be dispatched to its own handler (a malformed-request \
+                 status), not fall through to the static fallback (which would answer 200)"
+            );
+        }
+
+        let fallback_response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/some/spa/route/that/is/not/a/protocol/route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fallback_response.status(),
+            StatusCode::OK,
+            "a genuinely unmatched path must reach the static fallback and get index.html back, \
+             never a bare 404"
+        );
+        let body = to_bytes(fallback_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[..],
+            b"<!doctype html><title>hosted-login placeholder</title>"
+        );
+
+        let _ = std::fs::remove_dir_all(&static_dir);
     }
 }

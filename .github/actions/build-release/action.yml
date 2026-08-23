@@ -6,6 +6,11 @@ runs:
     - uses: ./.github/actions/rust-setup
     - uses: ./.github/actions/build-binaries
 
+    # ADR-0021 Decisions 1 + 10 (#442): stages the hosted login page's static build into
+    # dist/static, alongside the binaries above, so it rides the same dist-binaries.tar.gz into
+    # container-build and Dockerfile.dist's runtime stage.
+    - uses: ./.github/actions/build-frontend
+
     - name: Package tarballs
       shell: bash
       run: |
