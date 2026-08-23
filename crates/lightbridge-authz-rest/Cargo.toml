@@ -21,6 +21,10 @@ tracing.workspace = true
 chrono.workspace = true
 base64.workspace = true
 axum-server.workspace = true
+# ADR-0021 Decision 4 / #443: builds and reads the `__Host-` browser-session cookie
+# (`session_cookie` module). See the root `Cargo.toml` comment on this dependency for the
+# version/capability verification evidence.
+axum-extra.workspace = true
 getrandom.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
@@ -51,6 +55,11 @@ redis.workspace = true
 cratestack = { workspace = true }
 cratestack-codec-cbor.workspace = true
 minicbor.workspace = true
+# `session_cookie`'s `Max-Age`/`Expires` attributes (ADR-0021 Decision 4) are typed
+# `time::Duration`/`time::OffsetDateTime` per the `cookie` crate's own builder API. Previously
+# dev-only in this crate (see the `[dev-dependencies]` comment below); now also a real production
+# dependency.
+time.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
@@ -69,9 +78,9 @@ cratestack-codec-json.workspace = true
 # (rcgen, same pattern as lightbridge-authz-budget's usage_service_ca_bundle_tests.rs) and serves
 # them over a raw rustls TLS TCP acceptor (tokio-rustls) to prove
 # `redis_tls::build_redis_client` actually verifies the server certificate, not just plumbs the
-# config through.
+# config through. `time` itself moved to `[dependencies]` above (#443) -- dev code still gets it
+# transitively, no need to list it twice.
 rcgen.workspace = true
-time.workspace = true
 tokio-rustls.workspace = true
 
 [features]
