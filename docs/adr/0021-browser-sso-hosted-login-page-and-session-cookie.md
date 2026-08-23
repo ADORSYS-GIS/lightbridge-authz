@@ -344,10 +344,22 @@ ways:
 
 There is no builder or setter on `OidcProvider` that allows overriding this `Validation` — using it
 safely would require forking the crate, not configuring it. A second, independent defect compounds
-this: `authkestra-engine`'s `OAuth2Flow` composition re-checks the OIDC `nonce` by reading it back
-out of `identity.attributes["nonce"]`, a field `OidcProvider` never populates — so nonce validation
-(Decision 7's second CSRF-relevant control) silently does not happen even where the documented
-composition pattern is followed exactly as intended.
+this — but in the fail-**closed**, not fail-open, direction, corrected here after re-tracing the
+real published source: `OidcProvider::exchange_code_for_identity` *does* correctly validate the
+nonce it receives as a parameter against `claims.nonce` from the verified ID token
+(`authkestra-oidc` 0.5.1 `src/provider.rs:277-282`); the defect is that when it then builds the
+returned `Identity`, it inserts only `"picture"` into `attributes` (`src/provider.rs:287`) —
+`"nonce"` is never written there. `authkestra-engine`'s `OAuth2Flow::finalize_login` performs a
+*second*, redundant nonce check by reading `identity.attributes.get("nonce")` back out
+(`authkestra-engine` 0.5.1 `src/flow/oauth2.rs:192-197`), which is therefore always `None`,
+while `OAuth2Flow::initiate_login` generates a nonce unconditionally for every flow with no
+opt-out (`src/flow/oauth2.rs:128`), so the value on the other side of that comparison is always
+`Some(...)`. `Some(...) != None` is always true, so the composition returns
+`Err("Nonce mismatch")` on *every* login through it — nonce validation (Decision 7's second
+CSRF-relevant control) is redundant and totally broken here, blocking all logins through this
+composition, not a silent no-op that would let a forged or replayed nonce through undetected. The
+distinction matters for a security ADR specifically: describing a fail-closed defect as fail-open
+points a future reader in exactly the wrong direction.
 
 **What hand-writing costs, concretely: nothing new in the dependency graph.** Every primitive an RP
 leg needs is already a direct workspace dependency at the same `=0.5.1` pin, just not yet composed
