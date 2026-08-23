@@ -2397,6 +2397,113 @@ async fn set_default_project_rejects_a_project_the_caller_is_not_a_member_of() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// `ApiKey`'s ownership disjunction (`authz.cstack` `@@allow("read"|"update"|"delete", ...)`):
+//   (project.account.id == auth().id || project.members.some.accountId == auth().id)
+//   && auth().rpcScope == "crud" && auth().permApikey<Verb> == true
+//
+// Every other `model.ApiKey.*` call site in this file uses `"admin"`, the same subject that
+// created the key -- so the ownership half of the disjunction has never been exercised failing.
+// `rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write` above proves only the
+// coarse RBAC-gate half (a legitimate *member*, refused by permission). This proves the
+// complementary half: a caller who holds every permission (passes the gate) but is neither the
+// project's owning account nor a project member must still be refused. Restores the coverage
+// `StoreRepo::delete_api_key`'s test used to carry before it was removed as dead/unsafe code
+// (PR #429 follow-up) -- see the comment in
+// `crates/lightbridge-authz-api-key/tests/access_control_scenarios_tests.rs` this test backs.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn api_key_ownership_boundary_refuses_a_non_member_stranger() {
+    let owner = format!("owner-apikey-boundary-{}", cuid2());
+    let stranger = format!("stranger-apikey-boundary-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("owner", token_info(&owner, admin_perms()))
+            .with("stranger", token_info(&stranger, admin_perms())),
+    );
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let account_id =
+        create_account(r, "owner", &format!("tenant-apikey-boundary-{}", cuid2())).await;
+    let project_id = create_project(r, "owner", &account_id, "proj-apikey-boundary").await;
+    let (key_id, _secret) = create_api_key(r, "owner", &project_id, "k-boundary").await;
+
+    // Stranger holds every RBAC permission (`admin_perms()`), so the coarse gate passes; only the
+    // model policy's ownership disjunction stands between them and someone else's key. Observed
+    // (not assumed) via a temporary prove-fail-first run: a filtered read comes back 404 (the
+    // policy's uniform not-found), while update/delete come back 403 -- the two verb families are
+    // NOT interchangeable here, so each gets its own exact assertion rather than a shared loose
+    // one.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.ApiKey.get",
+        Wire::Cbor,
+        &json!({ "id": key_id }),
+        Some("stranger"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a non-member must be refused reading someone else's api key: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.ApiKey.update",
+        Wire::Cbor,
+        &json!({ "id": key_id, "patch": { "name": "hijacked" } }),
+        Some("stranger"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a non-member must be refused updating someone else's api key: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.ApiKey.delete",
+        Wire::Cbor,
+        &json!({ "id": key_id }),
+        Some("stranger"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a non-member must be refused deleting someone else's api key: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // The key must still be intact for its rightful owner -- proves the stranger's attempts had
+    // no effect, not merely that they returned an error status.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.ApiKey.get",
+        Wire::Cbor,
+        &json!({ "id": key_id }),
+        Some("owner"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "owner get after stranger's refused attempts: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        json_body(&body)["name"],
+        "k-boundary",
+        "stranger's update must not have applied"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // Refresh-token session revocation RPC (`revokeOwnSessions` / `revokeSubjectSessions`).
 // `exchange_refresh_tokens` carries no foreign keys to accounts/projects, so these tests seed rows
 // directly against `ctx.verify` rather than driving a real token-exchange grant (this file's

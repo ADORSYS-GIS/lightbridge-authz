@@ -369,8 +369,11 @@ async fn access_control_allows_project_members_and_rejects_non_members(pool: PgP
 
     // `StoreRepo::delete_api_key` (a hand-written hard delete) was removed as dead/unsafe code
     // (PR #429 follow-up) -- the only production api-key delete path is cratestack's generated
-    // soft-delete, exercised elsewhere. `api_key` is left active here; `delete_project` below
-    // cascade-deletes it (`api_keys.project_id ... ON DELETE CASCADE`,
+    // soft-delete. The ownership half of the `ApiKey` policy's read/update/delete disjunction
+    // (`project.account.id == auth().id || project.members.some.accountId == auth().id`) is
+    // covered by `api_key_ownership_boundary_refuses_a_non_member_stranger` in
+    // `crates/lightbridge-authz-rest/tests/rpc_it_tests.rs`. `api_key` is left active here;
+    // `delete_project` below cascade-deletes it (`api_keys.project_id ... ON DELETE CASCADE`,
     // `migrations/20260203000001_init_authz.sql`), so this test still proves the project/account
     // deletion authorization it was already covering.
 
