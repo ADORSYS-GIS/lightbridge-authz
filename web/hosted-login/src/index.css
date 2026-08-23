@@ -1,20 +1,7 @@
-/* Minimal reset. No visual direction has been decided for this surface yet -- see
-   src/App.tsx's own comment. Keep this file boring until a design lands. */
-
-:root {
-  color-scheme: light dark;
-  font-family:
-    system-ui,
-    -apple-system,
-    "Segoe UI",
-    sans-serif;
-}
-
-* {
-  box-sizing: border-box;
-}
-
-body {
-  margin: 0;
-  min-height: 100vh;
-}
+/* Tailwind CSS v4 (CSS-first config) + daisyUI as plumbing only -- no theme, palette, or
+   visual direction has been chosen for this surface. daisyUI ships with its own
+   default light/dark themes (prefers-color-scheme driven) and nothing here overrides
+   them; picking an actual look is a design decision this scaffold deliberately defers
+   (see src/App.tsx's own comment). */
+@import "tailwindcss";
+@plugin "daisyui";
