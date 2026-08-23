@@ -33,6 +33,9 @@ server:
     tls:
       cert_path: "./config/tls/idp.crt"
       key_path: "./config/tls/idp.key"
+    # ADR-0021 Decisions 1 + 10 (#442): the hosted login page's Vite production build
+    # (`npm run build` inside web/hosted-login), served as authz-idp's lowest-priority fallback.
+    static_dir: "./web/hosted-login/dist"
   # authz-budget: the budget-domain microservice carrying every budget:*-gated RPC procedure off
   # authz-api (hard cutover, not a transitional duplication like idp above -- see
   # docs/architecture/budget.md). Its RPC surface is mounted under a fixed /budget prefix

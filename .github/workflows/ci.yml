@@ -43,6 +43,16 @@ jobs:
         uses: actions/checkout@v7
       - uses: ./.github/actions/code-checks
 
+  # ADR-0021 Decisions 1 + 10 (#442): the hosted login page (web/hosted-login) is a separate npm
+  # project, not part of the Rust workspace -- proves `vite build` succeeds and produces
+  # content-hashed output on every push/PR, independent of the Rust `code-checks`/`test` jobs.
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+      - uses: ./.github/actions/build-frontend
+
   test:
     needs: code-checks
     runs-on: ubuntu-latest
