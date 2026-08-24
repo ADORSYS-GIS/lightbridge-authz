@@ -326,15 +326,17 @@ fn offline_token_exchange_state(
     let op_config = authkestra_op::config::OpConfig {
         issuer: oauth2.signing.as_ref().unwrap().issuer.clone(),
         scopes_supported: cfg.allowed_scopes.clone(),
-        response_types_supported: vec!["token".to_string()],
+        response_types_supported: vec!["code".to_string()],
         grant_types_supported: vec![
             "urn:ietf:params:oauth:grant-type:token-exchange".to_string(),
             "refresh_token".to_string(),
+            "authorization_code".to_string(),
+            "urn:ietf:params:oauth:grant-type:device_code".to_string(),
         ],
         id_token_signing_alg: "RS256".to_string(),
-        authorization_code_ttl_secs: 0,
+        authorization_code_ttl_secs: cfg.authorization_code_ttl_seconds,
         access_token_ttl_secs: cfg.access_ttl_seconds.max(0) as u64,
-        device_code_ttl_secs: 0,
+        device_code_ttl_secs: cfg.device_code_ttl_seconds as u64,
         token_exchange_enabled: cfg.enabled,
     };
     let policy_engine: Arc<dyn lightbridge_authz_budget::PolicyEngine> =
@@ -455,6 +457,31 @@ async fn path_issuer_metadata_advertises_root_jwks_and_token_paths() {
         metadata["revocation_endpoint"],
         "https://authz.example.test/oauth2/revoke"
     );
+    assert_eq!(
+        metadata["device_authorization_endpoint"],
+        "https://authz.example.test/oauth2/device_authorization",
+        "the device endpoint is mounted with the token router and must be advertised at its real root route"
+    );
+    assert_eq!(
+        metadata["grant_types_supported"],
+        serde_json::json!([
+            "urn:ietf:params:oauth:grant-type:token-exchange",
+            "refresh_token",
+            "urn:ietf:params:oauth:grant-type:device_code"
+        ]),
+        "without a relying-party router, authorization-code metadata must stay absent even though device routes are live"
+    );
+    for field in [
+        "authorization_endpoint",
+        "response_types_supported",
+        "response_modes_supported",
+        "code_challenge_methods_supported",
+    ] {
+        assert!(
+            metadata.get(field).is_none(),
+            "{field} must not be inferred from an unmounted browser route: {metadata}"
+        );
+    }
     for field in [
         "token_endpoint_auth_methods_supported",
         "token_endpoint_auth_signing_alg_values_supported",

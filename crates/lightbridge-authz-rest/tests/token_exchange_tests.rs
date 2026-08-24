@@ -455,11 +455,12 @@ fn state_with_cfg_and_budget_repo(
             TOKEN_EXCHANGE_GRANT.to_string(),
             "refresh_token".to_string(),
             "authorization_code".to_string(),
+            "urn:ietf:params:oauth:grant-type:device_code".to_string(),
         ],
         id_token_signing_alg: "RS256".to_string(),
         authorization_code_ttl_secs: cfg.authorization_code_ttl_seconds,
         access_token_ttl_secs: 900,
-        device_code_ttl_secs: 0,
+        device_code_ttl_secs,
         token_exchange_enabled: true,
     };
     let op_store = Arc::new(TokenExchangeOpStore::new(

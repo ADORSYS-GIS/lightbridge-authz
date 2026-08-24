@@ -2211,22 +2211,23 @@ where
         )
 }
 
-/// Derives the two `well_known_router` mount parameters (`token_exchange_scopes`,
-/// `client_authentication`) from `oauth2`. Used by `build_idp_router` — `authz-idp` is now the
+/// Derives the token-surface `well_known_router` parameters from the successfully assembled
+/// state, rather than configuration intent. Used by `build_idp_router` — `authz-idp` is now the
 /// only server that mounts `well_known_router` at all; `authz-api` stopped serving OIDC
 /// discovery/JWKS once the `auth.ai.camer.digital` ingress was repointed at `authz-idp` (see
-/// `build_api_router`'s doc comment). Kept as its own function rather than inlined into
-/// `build_idp_router` so a future second self-signed-JWKS server can reuse it the same way
-/// `build_api_router` used to.
+/// `build_api_router`'s doc comment). A configured client cannot make discovery advertise a
+/// token endpoint that this router did not mount.
 fn well_known_mount_params(
     oauth2: &Oauth2,
+    token_exchange: Option<&token_exchange::TokenExchangeState>,
 ) -> (Option<Vec<String>>, signing::ClientAuthenticationMetadata) {
-    let token_exchange_scopes = oauth2
-        .token_exchange
-        .as_ref()
-        .filter(|t| t.enabled)
-        .map(|t| t.allowed_scopes.clone());
-    let client_authentication = signing::ClientAuthenticationMetadata::from_oauth2(oauth2);
+    let token_exchange_scopes =
+        token_exchange.map(|state| state.op_config().scopes_supported.clone());
+    let client_authentication = if token_exchange.is_some() {
+        signing::ClientAuthenticationMetadata::from_oauth2(oauth2)
+    } else {
+        signing::ClientAuthenticationMetadata::default()
+    };
     (token_exchange_scopes, client_authentication)
 }
 
@@ -2823,7 +2824,20 @@ pub fn build_idp_router(
     };
     let rp_router = rp.as_ref().map(|rp| relying_party::router(rp.clone()));
 
-    let (token_exchange_scopes, client_authentication) = well_known_mount_params(oauth2);
+    let (token_exchange_scopes, client_authentication) =
+        well_known_mount_params(oauth2, token_exchange.as_ref());
+    let discovery_capabilities = token_exchange
+        .as_ref()
+        .map(|_| {
+            let capabilities =
+                signing::DiscoveryCapabilities::token_surface().with_device_authorization();
+            if rp.is_some() {
+                capabilities.with_authorization_code()
+            } else {
+                capabilities
+            }
+        })
+        .unwrap_or_default();
     if oauth2.is_self_signed()
         && let Some(signing) = oauth2.signing.as_ref()
     {
@@ -2832,6 +2846,7 @@ pub fn build_idp_router(
             signing_repo,
             token_exchange_scopes,
             client_authentication,
+            discovery_capabilities,
         ));
     }
 
