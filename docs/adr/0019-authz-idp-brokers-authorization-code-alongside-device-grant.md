@@ -36,24 +36,24 @@ https://auth.ai.camer.digital/.well-known/openid-configuration
   token_endpoint:                /oauth2/token   ← live
 ```
 
-`AGENTS.md`'s service list already documents `authz-idp` as exposing discovery, JWKS,
-`/oauth2/token`, and `/oauth2/revoke`, with every route public because the presented
-token/assertion is itself the credential — and as transitional, since `authz-api` still serves the
-identical surface until the public issuer is repointed. Issue #337 (opened against ADR-0012) still
-frames Phase 1 as future work ("stand up a new binary under `app/`... move `/oauth2/token`...").
-That framing is stale: the service exists, is routed, and is live. **This ADR re-scopes from the
-current state, not from #337's original plan** — its epic breakdown is superseded by this ADR's own
-ticket list (see the linked issues in "Related").
+`AGENTS.md`'s service list documents `authz-idp` as exposing discovery, JWKS, `/oauth2/token`, and
+`/oauth2/revoke`, with every route public because the presented token/assertion is itself the
+credential. The public issuer has since been cut over to this service and `authz-api` no longer
+serves the identical surface. Issue #337 (opened against ADR-0012) still frames Phase 1 as future
+work ("stand up a new binary under `app/`... move `/oauth2/token`..."). That framing is stale: the
+service exists, is routed, and is live. **This ADR re-scopes from the current state, not from
+#337's original plan** — its epic breakdown is superseded by this ADR's own ticket list (see the
+linked issues in "Related").
 
-**The device grant is stubbed, not implemented**, despite ADR-0012 Accepted status:
-`crates/lightbridge-authz-rest/src/oauth2_op/noop_stores.rs` has no-op `store_device_code`/
-`get_device_code`/`get_by_user_code`/`update_device_code`/`consume_device_code` on
-`NoDeviceCodeStore`; `discovery_document` (`signing.rs`) hardcodes `device_code_ttl_secs: 0`; and
-`oauth2_op/client_store.rs:76` already maps
-`urn:ietf:params:oauth:grant-type:device_code → GrantType::DeviceCode` with nothing behind it yet.
-authkestra-op (workspace-pinned `=0.5.1`, lockstep with the rest of the `authkestra-*` family)
-supplies the device-flow handlers and store trait — this remains wiring plus a verification page,
-not a protocol implementation, exactly as ADR-0012's own "Key Assumptions" already stated.
+**The device grant is not implemented as a reachable protocol surface**, despite ADR-0012 Accepted
+status. #423 has since replaced the device no-op with the persisted
+`oauth2_op::device_store::DbDeviceCodeStore`, but `discovery_document` (`signing.rs`) still
+hardcodes `device_code_ttl_secs: 0`, no device-authorization/verification endpoint is mounted,
+and the token router does not dispatch a device grant. `oauth2_op/client_store.rs` maps
+`urn:ietf:params:oauth:grant-type:device_code → GrantType::DeviceCode`, but that registration
+mapping is not a client-facing flow. `authkestra-op` (workspace-pinned `=0.5.1`, lockstep with the
+rest of the `authkestra-*` family) supplies the handlers and store trait; remaining work is route
+wiring plus the Keycloak-backed verification page, not a completed protocol implementation.
 
 ### ADR-0012's two decisions this ADR directly contradicts, quoted verbatim
 

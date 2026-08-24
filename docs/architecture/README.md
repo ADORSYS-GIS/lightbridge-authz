@@ -75,17 +75,16 @@ Notes grounded in code, not intent:
   against the same Keycloak JWKS, reads/writes the same `authz` Postgres database, has its own
   Redis-backed rate limiting, and calls `lightbridge-authz-usage`'s spend-query endpoint over HTTP
   the same way `authz-api` used to before the move.
-- **`authz-idp` carries the OIDC discovery/JWKS/token-exchange surface off `authz-api`, but as a
-  transitional duplication, not a cutover** (ADR-0012 Phase 1; see
-  [`services.md`](./services.md#authz-idp)) — `authz-api` keeps serving the byte-identical surface
-  until the public issuer is repointed at `authz-idp` in a later PR. Every route it mounts is
-  public (the presented token/assertion is itself the credential); it validates the `subject_token`
-  presented during an RFC 8693 exchange against Keycloak's JWKS the same way `authz-api` does.
-- **Redis is `authz-api`/`authz-budget`/`authz-idp`-only** today: RPC rate-limiting, the idempotency
-  store, and the `private_key_jwt` replay-tracking store for token exchange
-  (`crates/lightbridge-authz-rest/src/lib.rs`) — `authz-idp` only reaches Redis when
-  `oauth2.token_exchange.enabled`. `authz-opa`, `lightbridge-mcp`, and `lightbridge-authz-usage`
-  have no Redis dependency.
+- **`authz-idp` is the sole owner of the OIDC discovery/JWKS/token-exchange surface.** The public
+  issuer has been cut over to it and `authz-api` no longer mounts the same routes (see
+  [`services.md`](./services.md#authz-idp)). Every route it mounts is public because the presented
+  token/assertion is itself the credential; it validates an RFC 8693 `subject_token` against
+  Keycloak's JWKS. The accepted browser/device roadmap is not yet a deployed grant surface; see
+  [`../oauth-oidc-standards-roadmap.md`](../oauth-oidc-standards-roadmap.md).
+- **Redis is `authz-api`/`authz-budget`/`authz-idp`-only** today: `authz-idp` requires it at
+  startup even if token exchange is disabled; when exchange is enabled it backs the
+  `private_key_jwt` replay-tracking store (`crates/lightbridge-authz-rest/src/lib.rs`).
+  `authz-opa`, `lightbridge-mcp`, and `lightbridge-authz-usage` have no Redis dependency.
 - **`lightbridge-authz-usage` splits ingest and query auth (#347)** — `/v1/otel/{traces,metrics,logs}`
   stays unprotected (its caller is an AI Envoy/OpenTelemetry exporter outside this repo's deploy
   surface); `/usage/v1/usage/query` and `/usage/v1/spend/query` moved to a separate listener that
@@ -121,7 +120,7 @@ flowchart TB
     C1 -->|"Bearer JWT"| MCP
     C2 -->|"Basic auth"| OPA
     C3 -->|"unprotected"| Usage
-    C4 -->|"transitional: same surface authz-api still serves"| Idp
+    C4 -->|"public discovery/JWKS + RFC 8693 exchange"| Idp
 
     API --> AuthzDB
     OPA --> AuthzDB
@@ -152,6 +151,7 @@ in-container ports shown above.
 | [`data-model.md`](./data-model.md) | Entity relationships, the account/project/membership model, identifier format (CUID2). |
 | [`budget.md`](./budget.md) | The budget domain: ledger, policy engine, self-service refill/review — distinct from the Envoy-side rate limiting `governance-model-and-enforcement.md` describes. |
 | [`auth-flows.md`](./auth-flows.md) | Credential lifecycle, introspection, `resolve-context`, native RFC 8693 token exchange (including today's refresh-token hardening and RFC 7009 revocation), MCP auth. |
+| [`../oauth-oidc-standards-roadmap.md`](../oauth-oidc-standards-roadmap.md) | Implemented OAuth/OIDC surface, standards gaps, and the ordered Authorization Code + PKCE, device-flow, lifecycle, and hardening roadmap. |
 | [`../rbac.md`](../rbac.md) | JWT claim → permission mapping; which permission gates which operation. |
 | [`../governance-model-and-enforcement.md`](../governance-model-and-enforcement.md) | The Envoy/Authorino data plane: how a request actually gets rate-limited or refused at the gateway. |
 | [`../auth-reference.md`](../auth-reference.md) | Field-by-field dictionary for JWT claims, config keys, and RPC/HTTP shapes. |
