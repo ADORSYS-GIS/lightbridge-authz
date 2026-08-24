@@ -114,9 +114,51 @@ jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
 # again. This repo has no downstream consumers of its own `Cargo.toml` (it produces binaries, not a
 # published library), so exact-pinning carries none of the "raises the floor for consumers" cost an
 # exact pin would have in a published crate.
-authkestra-resource = "=0.5.3"
-authkestra-op = "=0.5.3"
-authkestra-engine = "=0.5.3"
+# BUMPED (2026-08-24, authkestra 0.5.1 -> 0.5.4): all three move together per the lockstep rule
+# above -- upstream still shares one `version.workspace = true`, and 0.5.2/0.5.3/0.5.4 each
+# re-released every crate in the workspace (the `authkestra-v0.5.x` release notes list all of
+# `-engine`/`-providers`/`-resource`/`-op`/`-axum`/`-oidc`/`-actix` as "updated local packages"),
+# so a partial bump here reproduces exactly the #404/#406 drift documented above.
+#
+# What actually changed for THIS repo across 0.5.2..0.5.4, from upstream's per-crate changelogs:
+#
+# - 0.5.3, `authkestra-op` PR #226 -- `OidcDiscovery` gains a `revocation_endpoint` field.
+#   This resolves <https://github.com/marcjazz/authkestra/issues/220>, which THIS repo filed.
+#   `crates/lightbridge-authz-rest/src/signing.rs` currently carries an explicit
+#   "`revocation_endpoint` is absent, on purpose, not an oversight -- it cannot be added here"
+#   callout justified solely by the field not existing. That justification dies with this bump:
+#   `POST /oauth2/revoke` (RFC 7009) is real, mounted and live, and RFC 8414 §2 says the document
+#   should carry it. Wiring it in is deliberately NOT done here -- PRs #460 and #467 are both
+#   rewriting `signing.rs`'s discovery construction right now, and doing it in this bump would
+#   conflict with them for no benefit. Whichever of those lands last owns the wiring; until then
+#   the `signing.rs` comment is stale and says so only by pointing at an issue now closed.
+#
+# - 0.5.3, `authkestra-op` PR #230 -- requested `audience` is now validated against the client's
+#   `allowed_audiences` in the client_credentials grant. No effect here: this workspace registers
+#   no client for `client_credentials` (the only references are `client_store.rs`'s exhaustive
+#   `GrantType` match arm and a `token_exchange_tests.rs` case that asserts an UNREGISTERED
+#   grant is rejected with `unauthorized_client` -- both unaffected by tighter validation inside
+#   a grant nothing reaches). `app/lightbridge-authz/src/mcp.rs`'s hand-built metadata advertises
+#   the grant but is a separate JSON document that never touches authkestra.
+#
+# - 0.5.4, `authkestra-op`/`-resource` PR #231 -- RFC 8705 certificate-bound access tokens for
+#   client_credentials. Additive, same grant, same reasoning: unreachable from here.
+#
+# - 0.5.3 `authkestra-engine` PR #229 (private_key_jwt on ClientCredentialsFlow) and 0.5.4
+#   `authkestra-oidc` PR #228 (ID-token `Validation` derived from discovery) -- the former is
+#   again client_credentials-only; the latter is in `authkestra-oidc`, which this workspace
+#   deliberately does not depend on (ADR-0021 Decision 5 uses `authkestra-resource`'s
+#   `JwksCache`/`validate_jwt_generic` for the RP leg instead).
+#
+# - 0.5.2, `authkestra-op` PR #211 -- `RedisClientAssertionStore`. This repo already constructs
+#   its own `RedisClientAssertionStore`; verify at review time that the constructor signature is
+#   unchanged (it compiled clean on `cargo check --workspace`, which is the actual proof).
+#
+# Exact `=` pins retained deliberately -- see the drift paragraphs above; a caret range here is
+# not durable against a lockfile-only Dependabot float.
+authkestra-resource = "=0.5.4"
+authkestra-op = "=0.5.4"
+authkestra-engine = "=0.5.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "tracing", "net", "time"] }
 thiserror = "2"
 anyhow = "1"
@@ -180,6 +222,10 @@ rcgen = { version = "0.14", features = ["pem"] }
 time = { version = "0.3", features = ["std"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "fs"] }
+# Already resolved transitively at 2.3.2 via axum itself; declared directly so
+# `static_assets.rs` can percent-decode the request path for its reserved-namespace comparison
+# without hand-rolling a `%XX` decoder.
+percent-encoding = "2.3"
 rsa = { version = "0.9", features = ["pem", "std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.13", features = ["json", "form"] }

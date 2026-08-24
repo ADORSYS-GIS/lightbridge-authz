@@ -23,14 +23,14 @@ use authkestra_op::handlers::token::{
 };
 use axum::{
     Form, Json, Router,
-    extract::State,
-    http::{HeaderMap, StatusCode, header},
+    extract::{Request, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::post,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::oauth2_op::ACCESS_TOKEN_TYPE;
 use crate::oauth2_op::store::{RequestScopedOpStore, TokenExchangeOpStore};
 use crate::signing::ApiKeyJwtSigner;
 
@@ -77,7 +77,10 @@ where
     S: Clone + Send + Sync + 'static,
 {
     Router::new()
-        .route("/oauth2/token", post(token_endpoint))
+        .route(
+            "/oauth2/token",
+            post(token_endpoint).layer(middleware::from_fn(apply_token_response_headers)),
+        )
         .route("/oauth2/revoke", post(revoke_endpoint))
         .with_state(state)
 }
@@ -132,16 +135,15 @@ impl From<RawTokenRequest> for AkTokenRequest {
     }
 }
 
-/// RFC 8693 §2.2.1 response, plus `issued_token_type` (REQUIRED there, but absent from
-/// `authkestra_op::handlers::token::TokenResponse` -- zero hits for the field in that crate).
-/// Always `access_token`: this endpoint never returns any other primary token type on the wire (an
-/// `id_token` rides alongside it in the same response, never as `access_token` itself).
+/// Token response. RFC 8693 §2.2.1 requires `issued_token_type` for token exchange, while other
+/// grants must not claim to be token-exchange responses.
 #[derive(Serialize)]
 struct TokenResponseBody {
     access_token: String,
     token_type: String,
     expires_in: u64,
-    issued_token_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issued_token_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     refresh_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -190,13 +192,24 @@ fn success_response(resp: AkTokenResponse) -> Response {
             access_token: resp.access_token,
             token_type: resp.token_type,
             expires_in: resp.expires_in,
-            issued_token_type: ACCESS_TOKEN_TYPE,
+            issued_token_type: resp.issued_token_type,
             refresh_token: resp.refresh_token,
             scope: resp.scope,
             id_token: resp.id_token,
         }),
     )
         .into_response()
+}
+
+/// RFC 6749 §5.1 and §5.2 require both directives on every token-endpoint response containing
+/// credentials or their error details. Applying them as route middleware also covers extractor
+/// rejections before [`token_endpoint`] runs.
+async fn apply_token_response_headers(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response
 }
 
 fn error_response(err: &AkTokenErrorResponse) -> Response {
@@ -221,11 +234,13 @@ fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
 
 /// `TokenErrorResponse` carries no HTTP status (`authkestra_op::handlers::token`'s own type
 /// docs it as opaque to transport), so this is the one place that decides it, from the `error`
-/// string alone. `invalid_client`/`invalid_token` (subject_token, presented like a bearer
-/// credential) map to 401; `access_denied` (non-member project, an authorization outcome, not an
-/// authentication one) maps to 403; `server_error` maps to 500; everything else RFC 6749 §5.2
-/// defines (`invalid_request`, `invalid_grant`, `invalid_scope`, `unsupported_grant_type`,
-/// `unauthorized_client`, `invalid_target`) maps to 400.
+/// string alone. `invalid_client`/`invalid_token` map to 401 (client-authentication failures);
+/// `access_denied` (non-member project, an authorization outcome, not an authentication one)
+/// maps to 403; `server_error` maps to 500; everything else RFC 6749 §5.2 defines
+/// (`invalid_request` -- including subject_token validation failures, which use this
+/// token-endpoint convention rather than RFC 6750's resource-server `invalid_token` -- plus
+/// `invalid_grant`, `invalid_scope`, `unsupported_grant_type`, `unauthorized_client`,
+/// `invalid_target`) maps to 400.
 fn status_for_oauth_error(error: &str) -> StatusCode {
     match error {
         "invalid_client" | "invalid_token" => StatusCode::UNAUTHORIZED,

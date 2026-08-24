@@ -101,20 +101,21 @@ Verified by `config/mod.rs:646-701`.
 ## 2. Discovery document fields → derivation
 
 Covers `GET /.well-known/openid-configuration`, built by `discovery_document`
-in `crates/lightbridge-authz-rest/src/signing.rs:438-529` and served via `well_known_router`
-(`signing.rs:542-592`). **Now served exclusively by `authz-idp`** — `authz-api` mounted this same
+in `crates/lightbridge-authz-rest/src/signing.rs:576-628` and served via `well_known_router`
+(`signing.rs:666-736`). **Now served exclusively by `authz-idp`** — `authz-api` mounted this same
 `well_known_router` call during the ADR-0012 Phase 1 transitional-duplication window, but that copy
 was removed once the public `auth.ai.camer.digital` ingress was repointed directly at `authz-idp`;
-`authz-api` no longer serves `/.well-known/*` at all (see `docs/architecture/services.md`). The
-derivation mechanics below are unchanged, only the serving service's name is.
+`authz-api` no longer serves `/.well-known/*` at all (see `docs/architecture/services.md`).
 
 > **Gating note:** the `token_endpoint` omission logic was fixed in PR #301
 > (`fix(oauth2): drop token_endpoint from OIDC discovery when token-exchange is disabled`,
 > commit `3f00ca6`, merged 2026-08-15) — before that fix, a disabled token-exchange still
-> advertised a live-looking `token_endpoint` URL next to empty `grant_types_supported`. This
-> document was checked against `1c2fc6e` (one commit after that fix). Re-check the current state
-> of `discovery_document` before trusting this section if it looks stale — the doc comment on
-> that function is intentionally dense and updated whenever the gating logic moves.
+> advertised a live-looking `token_endpoint` URL next to empty `grant_types_supported`. The
+> derivation mechanics below were rewritten for the model-replacement PR (`OidcDiscovery` →
+> the explicit `DiscoveryDocument`/`ClientAuthenticationMetadata` structs) and re-checked against
+> that PR's final state. Re-check the current state of `discovery_document` before trusting this
+> section if it looks stale — the doc comment directly above that function is intentionally dense
+> and updated whenever the gating logic moves.
 
 **Whether the document exists at all**: only mounted when `oauth2.type: self` **and**
 `oauth2.signing` is set (`lib.rs:1178-1187`). Under `type: external`, `authz-idp` serves no
@@ -125,21 +126,29 @@ either regardless of `oauth2.type`, since it no longer mounts this router at all
 which is `oauth2.token_exchange.as_ref().filter(|t| t.enabled)` (`lib.rs:1169-1173`) — true only
 when the block is present *and* `enabled: true`.
 
+As of this PR, the document is no longer built from `authkestra_op::handlers::discovery::OidcDiscovery`.
+It is a small, explicit `DiscoveryDocument` struct owned by this crate (`signing.rs:551-574`), built by
+`discovery_document` (`signing.rs:576-628`) from two inputs: `token_exchange_scopes: Option<&[String]>`
+(`None` when the block is absent or `enabled: false`; `Some(allowed_scopes)` otherwise) and a
+`ClientAuthenticationMetadata` describing what the registered `oauth2.clients` can actually do
+(`ClientAuthenticationMetadata::from_oauth2`, `signing.rs:51-82`). Every `Vec`/`Option` field on
+`DiscoveryDocument` carries `#[serde(skip_serializing_if = ...)]`, so "empty" and "absent from the JSON"
+are the same thing here — RFC 8414's "omit, don't emit an empty array" discipline applied uniformly.
+
 | Field | Derivation | Gated by |
 |---|---|---|
 | `issuer` | `oauth2.signing.issuer` verbatim | mount condition above |
-| `jwks_uri` | `{issuer}/.well-known/jwks.json` (`signing.rs:476`) | always present when doc exists |
-| `token_endpoint` | `{issuer}/oauth2/token` | **removed from the JSON entirely** when `enabled` is false (`signing.rs:524-526`) — not a null/empty string, the key is absent |
-| `authorization_endpoint` | n/a | **always removed** (`signing.rs:406,523`) — this service never serves `/authorize` (no authorization_code flow, ADR-0011) |
-| `userinfo_endpoint` | n/a | always `null` (`signing.rs:478`) — no userinfo endpoint served |
-| `response_modes_supported` | n/a | always `[]` regardless of `enabled` (`signing.rs:486`) — no redirect flow ever applies |
-| `token_endpoint_auth_methods_supported` | `["none"]`, or `["none","private_key_jwt"]` | second form iff `oauth2.clients` contains at least one `type: confidential` entry (`private_key_jwt_supported`, computed at `lib.rs:1174-1177`) |
-| `grant_types_supported` | `[]` when disabled; `[token-exchange URN, refresh_token URN]` when enabled | `enabled` |
-| `response_types_supported` | **always `[]`** — literal `Vec::new()` in `op_config` (`signing.rs:466`), never touched afterward on either side of `enabled` | **never gated by `enabled` — always empty.** This service has no `/authorize` endpoint (no authorization_code/implicit flow, ADR-0011), so no response type is ever advertised. This field previously *was* wired to `enabled` in production and briefly advertised `["token","id_token","id_token token"]` the moment token-exchange was turned on, even though nothing about token-exchange stands up an authorization endpoint; pinned by regression test `discovery_never_advertises_response_types_or_modes` in `signing_tests.rs` |
-| `scopes_supported` | `[]` when disabled; `oauth2.token_exchange.allowed_scopes` verbatim when enabled | `enabled` |
-| `id_token_signing_alg_values_supported` | hardcoded `["RS256"]` — `ALGORITHM` const (`signing.rs:30`) fed into `op_config.id_token_signing_alg` (`signing.rs:468`), wrapped into a single-element array by `OidcDiscovery::from_config` (`authkestra_op` 0.5.0) | always |
-| `claims_supported` | hardcoded static list: `iss, sub, aud, exp, iat, nbf, jti, typ, azp, lightbridge_caller_kind, sid, scope, api_key_id, project_id, account_id, email, email_verified, allowed_models, identity, nonce, auth_time, at_hash` (`signing.rs:492-518`) | always, regardless of `enabled` — lists claims that *can* appear, not ones guaranteed on every token |
-| `revocation_endpoint` | **Not emitted — the field does not exist on `OidcDiscovery`.** `POST /oauth2/revoke` (RFC 7009) is real and mounted (see §6), but `authkestra_op::handlers::discovery::OidcDiscovery` (0.5.0) has no field to carry it; RFC 8414 §2 lists it as standard metadata this document should otherwise have. Filed upstream: `marcjazz/authkestra#220`. See the doc comment directly above `discovery_document` in `signing.rs` | n/a — structurally absent, not gated by any config |
+| `jwks_uri` | `{issuer origin}/.well-known/jwks.json` (`signing.rs:616`) | always present when doc exists |
+| `token_endpoint` | `{issuer origin}/oauth2/token` | **omitted entirely** (not null, the key is absent) when `enabled` is false (`signing.rs:581,617`) |
+| `revocation_endpoint` | `{issuer origin}/oauth2/revoke` (RFC 7009, mounted — see §6) | same gate as `token_endpoint` (`signing.rs:618`). **This field now exists and is emitted** — the old `OidcDiscovery`-based model had no field to carry it at all; that gap is closed, not just documented |
+| `scopes_supported` | `oauth2.token_exchange.allowed_scopes` verbatim, else omitted | `enabled` (`signing.rs:582-584,619`) |
+| `grant_types_supported` | `[token-exchange URN, refresh_token URN]`, else omitted | `enabled` (`signing.rs:585-590,620`) |
+| `token_endpoint_auth_methods_supported` | from `ClientAuthenticationMetadata`: `"none"` iff at least one `type: public` client is registered, `"private_key_jwt"` iff at least one `type: confidential` client's registered JWKS yields a usable signing algorithm (`signing.rs:73-79`) — this replaces the old single `private_key_jwt_supported` boolean with the actual method list | `enabled` — forced empty/omitted regardless of the client registry when token-exchange is disabled (`signing.rs:593-597,621`) |
+| `token_endpoint_auth_signing_alg_values_supported` | per-JWK algorithms collected across every confidential client's registered JWKS via `client_assertion_algorithms` (`signing.rs:101-115`): RSA keys advertise `RS256/RS384/RS512/PS256/PS384/PS512`; EC keys advertise `ES256`/`ES384` for curves P-256/P-384 only (other curves yield none); OKP keys advertise `EdDSA` only for curve `Ed25519` (any other OKP curve, e.g. X25519, yields none) — deduped via `HashSet` (`signing.rs:56-72`) | same as above (`signing.rs:598-602,622`) |
+| `revocation_endpoint_auth_methods_supported` / `revocation_endpoint_auth_signing_alg_values_supported` | **mirror the token-endpoint auth fields exactly** — the same `ClientAuthenticationMetadata` values are reused for both endpoints (`signing.rs:623-624`), since the same registered clients authenticate against either one | `enabled` |
+| `subject_types_supported` | `["public"]`, else omitted | `enabled` **and** `openid` present in `oauth2.token_exchange.allowed_scopes` (`oidc_tokens_supported`, `signing.rs:591,603-607,625`) |
+| `id_token_signing_alg_values_supported` | `[ALGORITHM]` = `["RS256"]` (`ALGORITHM` const, `signing.rs:31`), else omitted | same gate as `subject_types_supported` (`signing.rs:608-612,626`) |
+| `authorization_endpoint`, `userinfo_endpoint`, `response_types_supported`, `response_modes_supported`, `claims_supported` | **structurally removed.** `DiscoveryDocument` carries no field for any of these — the old `OidcDiscovery`-based model always emitted (or force-nulled/emptied) them; this explicit struct never serializes them regardless of config | n/a — unconditionally absent, not gated by any config |
 
 **A second, unrelated discovery surface exists on `lightbridge-mcp`.** `GET
 /.well-known/oauth-authorization-server` and `GET /.well-known/openid-configuration` on the MCP

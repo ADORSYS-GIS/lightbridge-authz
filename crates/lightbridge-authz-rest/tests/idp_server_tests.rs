@@ -155,6 +155,79 @@ async fn build_idp_router_omits_well_known_when_oauth2_is_external() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+/// Protocol namespaces belong to the authorization server even when a particular endpoint is not
+/// mounted. The hosted SPA must therefore not make a typo such as `/oauth2/future-grant` appear
+/// to be a successful browser page.
+#[tokio::test]
+async fn static_fallback_refuses_unknown_protocol_namespace_paths() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let static_dir =
+        std::env::temp_dir().join(format!("lightbridge-authz-idp-protocol-namespace-{nanos}"));
+    std::fs::create_dir_all(&static_dir).unwrap();
+    std::fs::write(static_dir.join("index.html"), b"hosted-login-placeholder").unwrap();
+
+    let pool = lazy_pool();
+    let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
+    let router = build_idp_router(&external_oauth2(), signing_repo, None, pool, &static_dir);
+
+    for path in [
+        "/.well-known/future-document",
+        "/oauth2/future-grant",
+        "/authorize",
+        "/authorize/future-handler",
+        "/userinfo",
+        "/device_authorization",
+        "/idp/callback",
+        // Percent-encoded `/`: `http::Uri::path()` never decodes it, so a naive raw-string
+        // `strip_prefix("/authorize")`/`starts_with(".../")` check sees a suffix that starts
+        // with `%2F`, not `/`, and lets the request fall through to the SPA fallback as if it
+        // were an unreserved path.
+        "/authorize%2Ffuture-handler",
+        "/oauth2%2Ftoken",
+        "/.well-known%2Fjwks.json",
+        // Mixed case: a byte-exact comparison against the lowercase reserved roots also lets
+        // these fall through to the SPA fallback.
+        "/OAuth2/token",
+        "/AUTHORIZE",
+    ] {
+        let response = router
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{path} must not fall through to index.html"
+        );
+    }
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/device/verify")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"hosted-login-placeholder"
+    );
+
+    std::fs::remove_dir_all(static_dir).unwrap();
+}
+
 struct UnreachableBearer;
 
 #[async_trait]
@@ -303,6 +376,92 @@ async fn build_idp_router_serves_oauth2_revoke_without_touching_the_database() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["error"], "invalid_request");
+}
+
+#[tokio::test]
+async fn path_issuer_metadata_advertises_root_jwks_and_token_paths() {
+    let pool = lazy_pool();
+    let mut oauth2 = token_exchange_oauth2();
+    oauth2.signing.as_mut().unwrap().issuer = "https://authz.example.test/issuer/acme".to_string();
+    let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
+    let state = offline_token_exchange_state(&oauth2, signing_repo.clone());
+    let router = build_idp_router(&oauth2, signing_repo, Some(state), pool, TEST_STATIC_DIR);
+
+    let metadata = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/issuer/acme/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(metadata.status(), StatusCode::OK);
+    let body = to_bytes(metadata.into_body(), usize::MAX).await.unwrap();
+    let metadata: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        metadata["jwks_uri"],
+        "https://authz.example.test/.well-known/jwks.json"
+    );
+    assert_eq!(
+        metadata["token_endpoint"],
+        "https://authz.example.test/oauth2/token"
+    );
+    assert_eq!(
+        metadata["revocation_endpoint"],
+        "https://authz.example.test/oauth2/revoke"
+    );
+    for field in [
+        "token_endpoint_auth_methods_supported",
+        "token_endpoint_auth_signing_alg_values_supported",
+        "revocation_endpoint_auth_methods_supported",
+        "revocation_endpoint_auth_signing_alg_values_supported",
+    ] {
+        assert!(
+            metadata.get(field).is_none(),
+            "an empty client registry must not advertise {field}: {metadata}"
+        );
+    }
+
+    let jwks = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/jwks.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(jwks.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let token = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth2/token")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(""))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(token.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let revoke = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth2/revoke")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(""))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), StatusCode::BAD_REQUEST);
 }
 
 /// `/oauth2/token`'s `Form<RawTokenRequest>` extractor requires `grant_type` -- an empty body
