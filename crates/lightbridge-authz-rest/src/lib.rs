@@ -2433,6 +2433,7 @@ fn build_token_exchange_state(
                 .to_string(),
         ));
     }
+    validate_authorization_code_clients(&oauth2.clients)?;
     let signer = signing::ApiKeyJwtSigner::from_config(signing, repo.clone())?;
 
     let client_store = oauth2_op::client_store::ConfigClientStore::from_config(&oauth2.clients);
@@ -2493,24 +2494,47 @@ fn token_endpoint_cors_origins(clients: &[OauthClient]) -> Result<Vec<String>> {
                     .any(|grant| grant == "authorization_code")
         })
         .flat_map(|client| client.redirect_uris.iter())
-        .map(|redirect_uri| {
-            let url = reqwest::Url::parse(redirect_uri).map_err(|_| {
-                Error::Server("authorization-code redirect_uri must be an absolute URL".to_string())
-            })?;
-            if !matches!(url.scheme(), "https" | "http")
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || url.host_str().is_none_or(|host| host.contains('*'))
-            {
-                return Err(Error::Server(
-                    "authorization-code redirect_uri must have an HTTP(S) origin without credentials"
-                        .to_string(),
-                ));
-            }
-            Ok(url.origin().ascii_serialization())
-        })
+        .map(|redirect_uri| redirect_origin(redirect_uri))
         .collect::<Result<std::collections::BTreeSet<_>>>()
         .map(|origins| origins.into_iter().collect())
+}
+
+fn validate_authorization_code_clients(clients: &[OauthClient]) -> Result<()> {
+    for client in clients {
+        for redirect_uri in &client.redirect_uris {
+            redirect_origin(redirect_uri)?;
+        }
+        if client.client_type == OauthClientType::Public
+            && client
+                .grant_types
+                .iter()
+                .any(|grant| grant == "authorization_code")
+            && (!client.require_pkce || client.redirect_uris.is_empty())
+        {
+            return Err(Error::Server(
+                "public authorization_code clients require PKCE and at least one redirect_uri"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn redirect_origin(redirect_uri: &str) -> Result<String> {
+    let url = reqwest::Url::parse(redirect_uri).map_err(|_| {
+        Error::Server("authorization-code redirect_uri must be an absolute URL".to_string())
+    })?;
+    if !matches!(url.scheme(), "https" | "http")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none_or(|host| host.contains('*'))
+    {
+        return Err(Error::Server(
+            "authorization-code redirect_uri must have an HTTP(S) origin without credentials"
+                .to_string(),
+        ));
+    }
+    Ok(url.origin().ascii_serialization())
 }
 
 #[expect(

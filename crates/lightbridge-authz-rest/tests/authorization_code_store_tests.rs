@@ -1,4 +1,7 @@
-#![allow(clippy::unwrap_used)]
+#![expect(
+    clippy::unwrap_used,
+    reason = "test setup and assertions intentionally unwrap expected database results"
+)]
 
 use std::sync::Arc;
 

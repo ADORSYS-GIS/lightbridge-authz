@@ -756,6 +756,11 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
     )
     .await
     .unwrap();
+    let default_project_id = repo
+        .find_default_project_id("keycloak-subject")
+        .await
+        .unwrap()
+        .unwrap();
     repo.create_account(
         "other-subject",
         CreateAccount {
@@ -790,7 +795,7 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
     );
     let (location, cookie) = rp
         .begin_browser(BrowserLoginTarget {
-            project_id: "browser-project".to_string(),
+            project_id: None,
             resume_path: "/browser".to_string(),
         })
         .await
@@ -851,17 +856,11 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(
-        row,
-        (
-            "keycloak-subject".to_string(),
-            "browser-project".to_string()
-        )
-    );
+    assert_eq!(row, ("keycloak-subject".to_string(), default_project_id));
 
     let (location, cookie) = rp
         .begin_browser(BrowserLoginTarget {
-            project_id: "other-browser-project".to_string(),
+            project_id: Some("other-browser-project".to_string()),
             resume_path: "/browser".to_string(),
         })
         .await

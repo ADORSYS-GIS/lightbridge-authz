@@ -42,7 +42,7 @@ struct BrowserAuthorizeRequest {
     code_challenge: Option<String>,
     code_challenge_method: Option<String>,
     nonce: Option<String>,
-    project_id: String,
+    project_id: Option<String>,
 }
 
 impl From<BrowserAuthorizeRequest> for AuthorizeRequest {
