@@ -1,5 +1,19 @@
 # Changelog
 
+## [3.10.1](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.10.0...v3.10.1) (2026-08-24)
+
+
+### Bug Fixes
+
+* **idp:** gate oauth2.relying_party requirement on the RP-leg actually mounting ([#473](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/473)) ([468084a](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/468084a0aea43cdf9ddd50044e3da7e51402c9c1))
+* **oauth2:** close four browser-SSO/authorization-code/token-exchange identity gaps ([#472](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/472)) ([f2f8894](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/f2f88943fb1b57288ad17d38a77e3c95e1eb296b))
+* **oauth2:** require PKCE for all authorization_code clients, not only Public ([#471](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/471)) ([06cd7b9](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/06cd7b9374d0dddc1b4d8eb04e657e7832c1c46d))
+
+
+### Continuous Integration
+
+* run every it-tests file in lightbridge-authz-rest, not a stale allowlist ([#474](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/474)) ([a1a5b0a](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/a1a5b0ab5fc8d21700a98c7391e436212dffb540))
+
 ## [3.10.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.9.0...v3.10.0) (2026-08-24)
 
 
