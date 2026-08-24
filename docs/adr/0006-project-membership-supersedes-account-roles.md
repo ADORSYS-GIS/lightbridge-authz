@@ -313,3 +313,13 @@ composite-key gap closes soon. Rejected for this pass — the gap is still open 
 status ADR-0005 found it in), and blocking this schema change on an upstream fix with no committed
 timeline isn't worth it when the workaround is already proven safe by `AccountMembership`'s own
 history.
+
+## Related
+
+- **ADR-0024 amends this ADR's "a person's defining identity in the system is their `accountId`.
+  One account = one person" sentence.** Federation (a person authenticating through more than one
+  Keycloak issuer) makes that sentence untrue in general — `accounts.id` is a JWT `sub`, unique
+  only *within* an issuer. ADR-0024 introduces `users.id` as the actual defining identity ("one
+  account = one federated identity; a person may hold several") while leaving every other part of
+  this ADR — `accounts.id` being the stored subject, no account-level membership, the whole
+  project-membership/billing/quota apparatus below — unamended.

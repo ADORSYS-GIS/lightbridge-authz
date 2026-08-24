@@ -16,6 +16,14 @@ was dropped entirely in the ADR-0006 migration batch
 `migrations/20260727000005_drop_account_memberships.sql`). See
 [ADR-0006](../adr/0006-project-membership-supersedes-account-roles.md) for the full rationale.
 
+**Amended by [ADR-0024](../adr/0024-we-own-our-users-accounts-are-federated-identities.md):**
+`accounts.id` is still the caller's stored `sub`, unchanged, but it is no longer *the* defining
+identity — a `sub` is only unique within one issuer, so the same real person authenticating
+through two issuers would otherwise collide or fork silently. The defining identity is now
+`users.id`; an account is a **federated identity** ("one account = one federated identity; a
+person may hold several"). Every table/paragraph below this note is otherwise exactly as ADR-0006
+left it — see the "Users and federated identities" section further down for what's new.
+
 Once identity collapses to "one account = one person, keyed by their own subject", membership as a
 concept moves entirely to the **project** level (`project_members`), and everything that used to
 be an account-level property that could legitimately vary per *billing relationship*
@@ -26,6 +34,9 @@ different parties (e.g. a consultant with three client projects, each invoiced s
 
 ```mermaid
 erDiagram
+    USERS ||--o{ ACCOUNTS : "owns (user_id), ADR-0024"
+    USERS ||--o{ FEDERATED_IDENTITIES : "holds (user_id)"
+    ACCOUNTS |o--o{ FEDERATED_IDENTITIES : "adopted by AT MOST ONE (account_id)"
     ACCOUNTS ||--o{ PROJECTS : "owns (account_id)"
     ACCOUNTS ||--o{ PROJECT_MEMBERS : "is a member via (account_id)"
     PROJECTS ||--o{ PROJECT_MEMBERS : "has roster (project_id)"
@@ -33,8 +44,30 @@ erDiagram
     ACCOUNTS ||--o{ API_KEYS : "owns (owner_account_id)"
     ACCOUNTS ||--o{ EXCHANGE_REFRESH_TOKENS : "sessions for (account_id)"
 
+    USERS {
+        text id PK "cuid2, or the backfilled subject verbatim"
+        text status "active"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    FEDERATED_IDENTITIES {
+        text id PK
+        text user_id FK
+        text issuer "UK with subject"
+        text subject "UK with issuer"
+        text account_id FK "nullable; adopted, AT MOST ONE identity per account"
+        text token_envelope "sealed AES-256-GCM, ADR-0024"
+        timestamptz token_sealed_at
+        timestamptz access_expires_at
+        timestamptz refresh_expires_at
+        text scope
+        timestamptz last_authenticated_at
+    }
+
     ACCOUNTS {
         text id PK "the caller's JWT sub, ADR-0006"
+        text user_id FK "the owning federated identity's user, ADR-0024"
         text default_quota "governance tier for the default project"
         text status "active or suspended"
         timestamptz created_at
@@ -143,6 +176,29 @@ Notes that don't survive a schema dump:
 - **`signing_keys`** rotates under `pg_advisory_xact_lock` for cross-replica-safe JWT key rotation
   (`ensure_active_signing_key` in `crates/lightbridge-authz-api-key/src/repo.rs`); at most one row
   may hold `status = 'active'` at a time, enforced by a partial unique index.
+
+### Users and federated identities (ADR-0024)
+
+- **`accounts.user_id`** is `NOT NULL`, populated by a `BEFORE INSERT` trigger
+  (`accounts_set_user`, `migrations/20260825000001_users_and_federated_identities.sql`) that mints
+  a `users` row on the fly for any insert that doesn't already supply one — so
+  `StoreRepo::create_account` and every raw-SQL `INSERT INTO accounts (id)` fixture across the
+  workspace needed zero changes. Every pre-existing account was backfilled the same way its trigger
+  handles new ones: `users.id := accounts.id` (an id-reuse of the already-stored subject, not a new
+  mint — see the CUID2 section below).
+- **`federated_identities`** is keyed by `(issuer, subject)` — `UNIQUE (issuer, subject)` is the
+  federation key itself. `account_id` is nullable and **adopted at most once**: a partial unique
+  index (`WHERE account_id IS NOT NULL`) means the first issuer to present a subject matching a
+  pre-existing `accounts.id` adopts that account; any subsequent issuer presenting the *same*
+  subject value is refused outright (`23505` → `Error::Conflict`), never silently merged onto
+  someone else's projects/budget. `ON DELETE SET NULL` on `account_id`: deleting a tenant's account
+  must not delete the person who logged in as that tenant.
+- **`federated_identities.token_envelope`** holds the sealed Keycloak token set (refresh token + a
+  non-access-token claims snapshot — never the access token, never the raw ID token JWT) —
+  AES-256-GCM via `lightbridge_authz_core::crypto::{seal,open}`, under a key wholly separate from
+  the one protecting the short-lived RP state cookie. See ADR-0024 for the full envelope format and
+  rotation posture (an unopenable envelope is treated as "no stored token", never deleted).
+  **Deliberately absent from `authz.cstack`** — see the ADR-0038 table below.
 
 ## Budget domain schema
 
@@ -286,6 +342,12 @@ as issued, whatever shape it has. The same applies to any OIDC claim this servic
 forwards (`jti`, `sub`, `aud`, `iss` from an external token): read, never rewritten, never
 regenerated into CUID2 form.
 
+**ADR-0024 extends this, it doesn't bend it.** `users.id` for a backfilled/trigger-provisioned
+account is the account's own id verbatim — an id-reuse of an already-stored subject, which is
+"storing", not "minting", so it needs no exception of its own. A `users.id` or
+`federated_identities.id` minted fresh (a brand-new person with no pre-existing account) goes
+through the same one chokepoint, `cuid2()`, as everything else in this section.
+
 ### ADR-0038 / cratestack
 
 [ADR-0038](https://github.com/ADORSYS-GIS/webank-context/blob/master/decisions/0038-cratestack-is-the-only-database-api.md)
@@ -301,6 +363,7 @@ scratch:
 | `signing_keys` | Rotated under `pg_advisory_xact_lock` for cross-replica-safe JWT key rotation — a coordination primitive cratestack's generated CRUD has no way to express. |
 | `project_members` | Composite primary key `(project_id, account_id)`; cratestack's schema only models it as a relation target with a synthetic `id`, explicitly barred from the migration generator. |
 | `exchange_refresh_tokens` | Refresh-token rotation is a compare-and-swap (`SELECT ... FOR UPDATE`), not a plain CRUD write. |
+| `federated_identities` (ADR-0024) | Carries a sealed credential (`token_envelope`); must be structurally unreachable from any generated read path, same class as `signing_keys` — modelling it, even `@@allow`-less, would still leave it reachable as a relation target. |
 | `lightbridge-authz-usage`'s `usage_events` queries | Dynamic `QueryBuilder`-assembled aggregates against the Timescale-backed table, driven by caller-selected dimensions/filters. |
 
 This repo runs `cratestack-pg` 0.5.1; ADR-0038's own capability findings were verified against

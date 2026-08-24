@@ -411,6 +411,41 @@ model Session {
   userAgent String?
 }
 
+// ADR-0024: `users` is a normal cratestack-modelled table -- same shape of justification as
+// `Session` immediately above (plain single-column `id` PK, no CAS-rotation race, no
+// cross-replica coordination need). Real schema (the `status` default, the `accounts_set_user`
+// trigger, the backfill) lives in the hand-written migration
+// `migrations/20260825000001_users_and_federated_identities.sql`, per this schema's own
+// ADR-0003 convention (source-only, does not drive DDL).
+//
+// Deliberately NO `@@allow` clause on this model, mirroring `Session`'s own precedent immediately
+// above: there is no RPC surface for users yet (no read/create/update/delete permission exists to
+// gate on), so the absence of any `@@allow` already fail-closes every generic `model.User.*` verb
+// by construction -- `rpc_authorize.rs`'s `required_permission` map needs no new entry, since an
+// op-id it does not list is denied unconditionally.
+//
+// `federated_identities` -- the sibling table this same migration creates, carrying the sealed
+// Keycloak token envelope -- is deliberately ABSENT from this schema entirely, not merely
+// `@@allow`-less: same class of exception as `signing_keys`/`exchange_refresh_tokens`/
+// `device_authorizations`/`authorization_codes` (see this file's and AGENTS.md's "Persistence"
+// section) -- a credential-bearing table must be unreachable from any generated read path, not
+// just unreachable via the coarse-RBAC gate a present-but-unallowed model would still have.
+//
+// No relations on this model (no `federatedIdentities FederatedIdentity[]`, and `Account` does
+// NOT gain a `user User @relation(...)` field either): this repo already hit a real, measured
+// cratestack codegen blowup (~51GB RAM, 36 minutes, CI-killed) from a second relation path
+// between two already-connected models -- see `ProjectMember.account`'s own removal and
+// `Session`'s comment above for the same precedent. Nothing needs the relation today: this model
+// has no `@@allow` to write one, and `accounts.user_id` is read/written exclusively through
+// hand-written SQL (the migration's trigger, `StoreRepo::upsert_federated_identity`), never
+// through the generated client.
+model User {
+  @use(AuditFields)
+
+  id String @id
+  status String @readonly
+}
+
 // Relation target ONLY. The real `project_members` table (owned by
 // migrations/<date>_create_project_members.sql) has a composite primary key
 // (project_id, account_id) and no `id` column -- same shape as the removed

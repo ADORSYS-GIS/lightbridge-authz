@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_core::error::{Error, Result};
 use lightbridge_authz_core::{
@@ -20,6 +21,7 @@ use crate::entities::device_authorization_row::{DeviceAuthorizationRow, NewDevic
 use crate::entities::exchange_refresh_token_row::{
     ExchangeRefreshTokenRow, NewExchangeRefreshToken,
 };
+use crate::entities::federated_identity_row::{FederatedIdentityRow, UpsertFederatedIdentity};
 use crate::entities::new_account_row::NewAccountRow;
 use crate::entities::new_api_key_row::NewApiKeyRow;
 use crate::entities::new_project_row::NewProjectRow;
@@ -1049,6 +1051,150 @@ impl StoreRepo {
         .bind(input.expires_at)
         .bind(input.subject)
         .fetch_one(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// ADR-0024: seals-and-persists a login's Keycloak token set for `(input.issuer,
+    /// input.subject)`, inside one transaction (pattern: `rotate_api_key_transaction` above).
+    /// `SELECT ... FOR UPDATE` first, so a second call for the same `(issuer, subject)` racing
+    /// concurrently serializes onto the UPDATE branch rather than double-inserting.
+    ///
+    /// On this identity's FIRST login ever (no existing row), it either adopts a grandfathered
+    /// `accounts` row whose id equals the subject (a pre-ADR-0024 account, ADR-0006's "id is the
+    /// stored sub" property) or mints a brand-new `users` row when no such account exists. Never
+    /// rewrites `issuer`/`subject`/`user_id` on an update -- those are the federation key and its
+    /// owner, fixed at creation.
+    ///
+    /// `federated_identities_issuer_subject_uidx`/`federated_identities_account_uidx` (the owning
+    /// migration, `20260825000001_users_and_federated_identities.sql`) make a concurrent insert
+    /// racing on either index surface as `Error::Conflict` here, mirroring `create_account`'s own
+    /// 23505 idiom above -- in particular, a second issuer presenting a subject that already
+    /// adopted an account is REFUSED, never silently merged onto that account.
+    #[instrument(skip(self, input))]
+    pub async fn upsert_federated_identity(
+        &self,
+        input: UpsertFederatedIdentity,
+    ) -> Result<FederatedIdentityRow> {
+        let mut tx = self.pool().begin().await?;
+
+        let existing: Option<(String,)> = sqlx::query_as(
+            r#"
+            SELECT id
+            FROM federated_identities
+            WHERE issuer = $1 AND subject = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(&input.issuer)
+        .bind(&input.subject)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let row: FederatedIdentityRow = if let Some((id,)) = existing {
+            sqlx::query_as(
+                r#"
+                UPDATE federated_identities
+                SET token_envelope = $1,
+                    token_sealed_at = $2,
+                    access_expires_at = $3,
+                    refresh_expires_at = $4,
+                    scope = $5,
+                    last_authenticated_at = now(),
+                    updated_at = now()
+                WHERE id = $6
+                RETURNING id, user_id, issuer, subject, account_id, token_envelope,
+                          token_sealed_at, access_expires_at, refresh_expires_at, scope,
+                          last_authenticated_at, created_at, updated_at
+                "#,
+            )
+            .bind(&input.token_envelope)
+            .bind(input.token_sealed_at)
+            .bind(input.access_expires_at)
+            .bind(input.refresh_expires_at)
+            .bind(&input.scope)
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await?
+        } else {
+            let account_user_id: Option<(String,)> =
+                sqlx::query_as("SELECT user_id FROM accounts WHERE id = $1")
+                    .bind(&input.subject)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let (user_id, account_id) = match account_user_id {
+                Some((user_id,)) => (user_id, Some(input.subject.clone())),
+                None => {
+                    let new_user_id = cuid2();
+                    sqlx::query("INSERT INTO users (id) VALUES ($1)")
+                        .bind(&new_user_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    (new_user_id, None)
+                }
+            };
+            sqlx::query_as(
+                r#"
+                INSERT INTO federated_identities
+                  (id, user_id, issuer, subject, account_id, token_envelope, token_sealed_at,
+                   access_expires_at, refresh_expires_at, scope)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                RETURNING id, user_id, issuer, subject, account_id, token_envelope,
+                          token_sealed_at, access_expires_at, refresh_expires_at, scope,
+                          last_authenticated_at, created_at, updated_at
+                "#,
+            )
+            .bind(cuid2())
+            .bind(&user_id)
+            .bind(&input.issuer)
+            .bind(&input.subject)
+            .bind(&account_id)
+            .bind(&input.token_envelope)
+            .bind(input.token_sealed_at)
+            .bind(input.access_expires_at)
+            .bind(input.refresh_expires_at)
+            .bind(&input.scope)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                if let sqlx::Error::Database(db_err) = &e
+                    && db_err.code().as_deref() == Some("23505")
+                {
+                    return Error::Conflict(format!(
+                        "federated identity already exists or account already adopted for \
+                         subject '{}'",
+                        input.subject
+                    ));
+                }
+                Error::from(e)
+            })?
+        };
+
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    /// Read-side counterpart to [`Self::upsert_federated_identity`]. Not yet wired to any RPC
+    /// surface -- ADR-0024's Follow-ups list "refreshing stored tokens" as a later consumer; this
+    /// exists now so that consumer does not also need a new repo method.
+    #[instrument(skip(self, subject))]
+    pub async fn find_federated_identity(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<FederatedIdentityRow>> {
+        let row = sqlx::query_as(
+            r#"
+            SELECT id, user_id, issuer, subject, account_id, token_envelope, token_sealed_at,
+                   access_expires_at, refresh_expires_at, scope, last_authenticated_at,
+                   created_at, updated_at
+            FROM federated_identities
+            WHERE issuer = $1 AND subject = $2
+            "#,
+        )
+        .bind(issuer)
+        .bind(subject)
+        .fetch_optional(self.pool())
         .await?;
         Ok(row)
     }

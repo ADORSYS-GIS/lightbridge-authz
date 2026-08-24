@@ -2787,16 +2787,19 @@ dependencies = [
 name = "lightbridge-authz-core"
 version = "0.8.1"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "async-trait",
  "axum",
  "axum-server",
+ "base64 0.23.1",
  "chrono",
  "cuid",
  "hex",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "rand_core 0.6.4",
  "rcgen",
  "regex",
  "reqwest 0.13.4",

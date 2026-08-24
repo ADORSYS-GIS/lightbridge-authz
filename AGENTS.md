@@ -355,8 +355,19 @@ Primary local stack is in `compose.yaml`:
 
 Tables (see `migrations/`):
 
-- `accounts`: **`id` is the caller's JWT `sub`** — one account is one person (ADR-0006). Carries
-  `default_quota` (the governance tier for work in the account's own default project).
+- `accounts`: **`id` is the caller's JWT `sub`** (ADR-0006; amended by ADR-0024 — see `users`
+  below). Carries `default_quota` (the governance tier for work in the account's own default
+  project) and `user_id` (`NOT NULL`, `BEFORE INSERT`-trigger-provisioned — see `users`).
+- `users` (ADR-0024): the actual defining identity — "one account = one federated identity; a
+  person may hold several." `id` is a CUID2 for a newly-minted user, or the backfilled/adopted
+  account's own id verbatim (an id-reuse, not a new mint — ADR-0039 bans minting, not storing).
+- `federated_identities` (ADR-0024; deliberately absent from `authz.cstack` — see "Persistence"
+  below): keyed by `(issuer, subject)`, the login federation key. Carries the sealed Keycloak
+  token set (`token_envelope`, AES-256-GCM, `lightbridge_authz_core::crypto`) — refresh token plus
+  a non-access-token ID-token claims snapshot, never the access token. `account_id` is nullable and
+  adopted by AT MOST ONE federated identity ever (a partial unique index enforces this): a second
+  issuer presenting a subject that already adopted an account is refused (`Error::Conflict`), never
+  silently merged.
 - `projects` (belongs to `accounts`): includes `billing_identity` (unique — "who is paying" moved
   here from `accounts`, so one person can bill projects to different parties), `project_quota` (the
   pooled ceiling), `is_default` (the auto-provisioned, roster-less project; server-computed by a
@@ -553,6 +564,10 @@ Key config fields:
 - `oauth2.relying_party`, `oauth2.token_exchange` (with `enabled: true` and `openid` in
   `allowed_scopes`): both mandatory for `authz-idp` (ADR-0023) — see "The authz-idp surface is
   mandatory" below.
+- `oauth2.relying_party.token_encryption_key` (ADR-0024): mandatory, base64url-encoded 32 bytes,
+  MUST differ from `oauth2.relying_party.state_encryption_key` — `KeycloakRelyingParty::new`
+  refuses to start otherwise. Seals the Keycloak token set at rest; rotating it makes every
+  previously-sealed row permanently unopenable (treated as "no stored token", never deleted).
 
 ### CBOR is the only transport codec for the RPC/CRUD surface (ADR-0013)
 
@@ -791,6 +806,10 @@ Traces capture the full lifecycle of a validation request, including database lo
 - Keep secrets out of logs and persisted storage:
   - only store `key_hash` in DB
   - return plaintext `secret` only on create/rotate responses
+  - the Keycloak refresh token is sealed AES-256-GCM at rest (`federated_identities.token_envelope`,
+    ADR-0024) under `oauth2.relying_party.token_encryption_key`; the access token is never stored
+    at all, and every struct carrying a credential-bearing field (`TokenResponse`,
+    `KeycloakTokenSet`) gets a hand-written, redacting `Debug` impl — never `#[derive(Debug)]`
 - Treat validation endpoints as security-sensitive:
   - do constant-time comparisons where relevant (currently Basic auth is direct string compare; acceptable for local/dev but may be upgraded)
   - avoid leaking details in error responses (validation returns generic `unauthorized`)
