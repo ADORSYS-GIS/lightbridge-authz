@@ -19,14 +19,32 @@ impl DbPool {
     }
 
     pub async fn new(database: &Database) -> Result<Self> {
+        Self::new_with_retry(
+            database,
+            30,
+            Duration::from_millis(250),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await
+    }
+
+    /// Connect with explicit retry bounds so tests can exercise the failure path
+    /// without paying the production backoff (30 attempts, up to 5s each) or the
+    /// 30s `acquire_timeout` against an unreachable host.
+    pub async fn new_with_retry(
+        database: &Database,
+        max_attempts: u32,
+        base_backoff: Duration,
+        max_backoff: Duration,
+        acquire_timeout: Duration,
+    ) -> Result<Self> {
         let max_size = database.pool_size.unwrap_or(10);
         let options = PgPoolOptions::new()
             .max_connections(max_size)
             .min_connections(5)
-            .acquire_timeout(Duration::from_secs(30));
+            .acquire_timeout(acquire_timeout);
 
-        let max_attempts: u32 = 30;
-        let max_backoff = Duration::from_secs(5);
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
@@ -46,8 +64,7 @@ impl DbPool {
                     return Err(err.into());
                 }
                 Err(err) => {
-                    let backoff = Duration::from_millis(250u64.saturating_mul(attempt as u64))
-                        .min(max_backoff);
+                    let backoff = base_backoff.saturating_mul(attempt).min(max_backoff);
                     tracing::warn!(
                         attempt,
                         error = %err,
