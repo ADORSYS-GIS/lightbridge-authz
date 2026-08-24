@@ -229,6 +229,41 @@ configMaps:
           # For local development with multiple audiences:
           #   audience: ["lightbridge-api-key", "lightbridge-token-issuer"]
           audience: []
+          # REQUIRED for the `idp` alias only (ADR-0023: authz-idp is a full IdP — both this block
+          # and `token_exchange` below are mandatory, `start_idp_server` refuses to start without
+          # them). `authz-api`/`authz-opa`/`authz-budget` never read this block; it is harmless
+          # dead config for their subcommands, kept in the same shared config.yaml because all
+          # four aliases mount it identically (see this subchart's persistence.config). Real
+          # deployments MUST override every value here from their own values repo (issuer,
+          # callback_url, and above all state_encryption_key) — these are local-dev-shaped
+          # placeholders, not production values, mirroring config/default.yaml's own precedent for
+          # this exact block.
+          relying_party:
+            issuer: "http://keycloak:9100/realms/dev"
+            client_id: "authz-idp-rp"
+            callback_url: "https://authz-idp:3000/idp/callback"
+            # Development-only fixed key. Production MUST override with a unique base64url-encoded
+            # 32-byte key (config/default.yaml's KEYCLOAK_RP_STATE_ENCRYPTION_KEY precedent).
+            state_encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            timeout_ms: 5000
+            browser_session_ttl_seconds: 28800
+          # REQUIRED for the `idp` alias (ADR-0023) — see the comment on `relying_party` above.
+          # `enabled: true` and `openid` present in `allowed_scopes` are both hard startup
+          # requirements for authz-idp specifically.
+          token_exchange:
+            enabled: true
+            access_ttl_seconds: 900
+            authorization_code_ttl_seconds: 300
+            refresh_ttl_seconds: 2592000
+            refresh_absolute_ttl_seconds: 7776000
+            allowed_scopes:
+              - openid
+              - profile
+              - email
+              - offline_access
+            device_code_ttl_seconds: 600
+            device_poll_interval_seconds: 5
+            device_verification_uri: "https://authz-idp:3000/device/verify"
         server:
           api:
             address: 0.0.0.0
