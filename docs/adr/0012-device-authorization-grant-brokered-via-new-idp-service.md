@@ -408,6 +408,9 @@ alongside `signing_keys`, `project_members`, and `exchange_refresh_tokens`, in t
 
 ## Related
 
+- Amended by ADR-0023 (`docs/adr/0023-the-authz-idp-surface-is-mandatory-not-composable.md`):
+  `oauth2.relying_party` and `oauth2.token_exchange` are no longer optional for `authz-idp` — every
+  flow route this ADR and ADR-0019 describe is mounted unconditionally.
 - ADR-0006 (project membership supersedes account roles) — establishes `accounts.id` as the
   caller's JWT `sub`, which Decision 5 depends on.
 - ADR-0011 (authz issues a derived OIDC token object via token-exchange) — the token-exchange grant

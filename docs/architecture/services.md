@@ -89,17 +89,27 @@ comment for why this is not a real dependency on the CRUD domain.
 
 ## `authz-idp`
 
-**Responsibility:** OIDC broker server (ADR-0012) — the sole owner of the discovery/JWKS/token-
-exchange surface, carried off `authz-api` as a hard cutover (see `authz-api` above). Requires
-`oauth2.type: self`; refuses to start otherwise (`start_idp_server` rejects the external-issuance
-path outright — this server only ever serves the self-signed-JWT surface).
+**Responsibility:** OIDC broker server (ADR-0012, ADR-0019, ADR-0023) — the sole owner of the
+discovery/JWKS/token-exchange/browser-SSO surface, carried off `authz-api` as a hard cutover (see
+`authz-api` above). Requires `oauth2.type: self`; refuses to start otherwise (`start_idp_server`
+rejects the external-issuance path outright — this server only ever serves the self-signed-JWT
+surface). **It is a full IdP (ADR-0023): every route below is mounted unconditionally, on every
+deployment — there is no reduced-surface configuration.**
 **Owns:** nothing of its own — reads/writes the same `signing_keys` table as `authz-api` and
 `lightbridge-mcp` via `StoreRepo`, and is a third concurrent bootstrapper against it
-(`signing::bootstrap_signing_key`); plus Redis, mandatory unconditionally (not only when
-`oauth2.token_exchange.enabled`) — see AGENTS.md's "Redis is a mandatory dependency" house rule.
-`start_idp_server` refuses to start with no `redis.url` configured, regardless of whether token
-exchange is enabled; when it is enabled, that same Redis instance also backs the `private_key_jwt`
-client-assertion replay-protection store (ADR-0011, Decision 6).
+(`signing::bootstrap_signing_key`). Three dependencies are hard startup requirements, checked in
+this order (①→⑤, `start_idp_server`):
+
+1. `oauth2.type: self` + `oauth2.signing` present.
+2. `redis.url` present (mandatory unconditionally — see AGENTS.md's "Redis is a mandatory
+   dependency" house rule; presence-only, no startup-time `PING`). Backs the Keycloak RP-leg's
+   `user_code` rate limiting and, when token exchange runs, the `private_key_jwt` client-assertion
+   replay-protection store (ADR-0011, Decision 6).
+3. `oauth2.relying_party` present and valid (ADR-0023) — `KeycloakRelyingParty::new` validates its
+   shape offline (timeout, TTL, base64url 32-byte state key, exact callback URL/path); never dials
+   Keycloak at startup.
+4. `oauth2.token_exchange` present, `enabled: true`, and `openid` ∈ `allowed_scopes` (ADR-0023,
+   OIDC Discovery 1.0 §3).
 
 **The sole owner of this surface, not a duplicate.** ADR-0012 Phase 1 ran this router alongside
 `authz-api`'s own (now-removed) copy of the same routes while the public issuer
@@ -111,24 +121,31 @@ through `authz-api`. That ingress has since been repointed directly at `authz-id
 `auth.ai.camer.digital` is now load-bearing on its own, no same-surface fallback on `authz-api`.
 
 Router assembly: `build_idp_router`/`start_idp_server` in `crates/lightbridge-authz-rest/src/lib.rs`.
-The implemented surface below is intentionally narrower than the accepted ADR-0019/ADR-0021
-browser roadmap: `/authorize`, Authorization Code + PKCE, Keycloak browser-session brokering, and
-the device endpoints are not mounted yet. See
+Unlike the prior revision of this doc, the surface below is no longer narrower than the accepted
+ADR-0019/ADR-0021 browser roadmap: `/authorize` (Authorization Code + PKCE), the Keycloak
+browser-session brokering routes, and the device-authorization endpoints are all implemented and,
+since ADR-0023, always mounted. See
 [`docs/oauth-oidc-standards-roadmap.md`](../oauth-oidc-standards-roadmap.md) for the canonical
-implementation status and conformance sequence.
+conformance-sequence status of each grant.
 
 | Route | Method | Protection | Notes |
 | --- | --- | --- | --- |
 | `/`, `/healthz`, `/healthz/startup`, `/healthz/ready` | GET | none | Same probe wiring as every other server (`probe_router`), `/healthz/ready` checks DB reachability. |
-| `/.well-known/openid-configuration` | GET | none | Only mounted when `oauth2.type: self` (`signing::well_known_router`), reading the same `signing_keys` rows `authz-api` bootstraps/reads for its own (unrelated) API-key JWT signer. |
-| `/.well-known/jwks.json` | GET | none | Same gate as above. |
-| `/oauth2/token` | POST | none (credential is the presented token/assertion) | RFC 8693 token exchange + `refresh_token` grant. Only mounted when `oauth2.token_exchange.enabled` — but `redis.url` is required for this server to start at all regardless of that flag (`start_idp_server` errors at startup otherwise). `project_id` is an optional form param. |
-| `/oauth2/revoke` | POST | none (credential is the presented token) | RFC 7009. Absent from `/.well-known/openid-configuration` pending an upstream `authkestra-op` `OidcDiscovery` field. |
+| `/.well-known/openid-configuration`, `/.well-known/oauth-authorization-server` | GET | none | `signing::well_known_router`, unconditional. `DiscoveryCapabilities::full_idp()` (ADR-0023): `grant_types_supported` always advertises token-exchange, `refresh_token`, `device_code`, and `authorization_code`; `authorization_endpoint`, `response_types_supported: ["code"]`, `response_modes_supported: ["query"]`, and `code_challenge_methods_supported: ["S256"]` are always present (#471). |
+| `/.well-known/jwks.json` | GET | none | Same router, reads the shared `signing_keys` table. |
+| `/authorize` | GET | none (redirects to Keycloak login) | ADR-0019 Authorization Code + PKCE. Mandatory PKCE for every client type (#471), exact-match `redirect_uris` only. |
+| `/device/verify`, `/device/verify/continue` | GET, POST | none (rate-limited by caller IP, not authenticated) | The hosted device-pairing page (ADR-0012 Decision 2/ADR-0021). |
+| `/idp/callback` | GET | none | The fixed Keycloak OAuth2 redirect target both `/authorize` and `/device/verify` route through. |
+| `/oauth2/token` | POST | none (credential is the presented token/assertion) | RFC 8693 token exchange + `authorization_code` + `refresh_token` + RFC 8628 device-code grants, all unconditional (ADR-0023). `project_id` is an optional form param. |
+| `/oauth2/device_authorization` | POST | none | RFC 8628 device-authorization endpoint, unconditional. |
+| `/oauth2/revoke` | POST | none (credential is the presented token) | RFC 7009. |
+| `/ui/*` | GET | none | The hosted-login SPA build, path-scoped under `/ui` (ADR-0021 Decision 10 follow-up) — never a whole-server catch-all; a path outside `/ui` matching no protocol route above is a plain `404`. |
 
 Deliberately thin next to `authz-api`: no RPC CRUD surface, no budget domain, no idempotency/rate-
-limit layers — `well_known_router`/`token_exchange_router` need none of that, and every route this
-server mounts is public by design (`config::IdpServer`'s doc comment; no `basic_auth` block, unlike
-`OpaServer`).
+limit tower layers on the protocol routes — every route this server mounts is public by design
+(`config::IdpServer`'s doc comment; no `basic_auth` block, unlike `OpaServer`). The one exception is
+the Keycloak RP-leg's `user_code` lookups, which consult the same Redis-backed rate-limit store
+`authz-api`/`authz-budget` use for their tower layer, just called directly rather than layered.
 
 ## `authz-opa`
 

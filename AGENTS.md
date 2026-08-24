@@ -7,10 +7,13 @@ This repository provides API key management plus usage analytics:
   self-service refill, the admin review queue, and direct balance/ledger reads/writes) — carried
   off `authz-api` as a hard cutover (ADR-0010, #351).
 - `authz-opa`: Basic-auth protected validation API intended to be called by Authorino (or similar external auth components). It validates API keys and returns rich context plus dynamic metadata.
-- `authz-idp`: OIDC broker server (ADR-0012 Phase 1) exposing `.well-known/openid-configuration`,
-  `.well-known/jwks.json`, `/oauth2/token`, and `/oauth2/revoke` — every route is public, the
-  presented token/assertion is itself the credential. Transitional: `authz-api` keeps serving the
-  identical surface until the public issuer is repointed at `authz-idp` in a later PR.
+- `authz-idp`: OIDC broker server (ADR-0012, ADR-0019, ADR-0023) exposing
+  `.well-known/openid-configuration`, `.well-known/jwks.json`, `/oauth2/token`, `/oauth2/revoke`,
+  `/oauth2/device_authorization`, `/authorize`, `/device/verify`, and `/idp/callback` — every route
+  is public, the presented token/assertion (or completed Keycloak login) is itself the credential.
+  It is a full IdP: `oauth2.relying_party` and an enabled `oauth2.token_exchange` are both
+  MANDATORY, and every route above is mounted unconditionally — see "The authz-idp surface is
+  mandatory" below.
 - `lightbridge-mcp`: OAuth2/JWT-protected MCP server exposing the authz surface as MCP tools over streamable HTTP (`/mcp`).
 - `lightbridge-authz-usage`: unprotected OTLP/HTTP ingest API (`/v1/otel/traces`, `/v1/otel/metrics`) plus a single usage query API (`/usage/v1/usage/query`) backed by Timescale/Postgres.
 
@@ -547,6 +550,9 @@ Key config fields:
 - `database.url`: Postgres connection string
 - `oauth2.jwks_url`: JWKS endpoint (Keycloak in local compose)
 - `redis.url`: mandatory for `authz-api`, `authz-idp`, `authz-budget` — see below.
+- `oauth2.relying_party`, `oauth2.token_exchange` (with `enabled: true` and `openid` in
+  `allowed_scopes`): both mandatory for `authz-idp` (ADR-0023) — see "The authz-idp surface is
+  mandatory" below.
 
 ### CBOR is the only transport codec for the RPC/CRUD surface (ADR-0013)
 
@@ -597,6 +603,40 @@ Redis."* Concretely:
   with `redis` entirely absent from their YAML. Enforcement lives per-component inside
   `start_api_server`/`start_idp_server`/`start_budget_server`
   (`crates/lightbridge-authz-rest/src/lib.rs`), not on the shared config struct.
+
+### The authz-idp surface is mandatory — every route, every deployment (ADR-0023)
+
+**House rule, from the repo owner:** *"Let's not make something from the IdP optional anymore.
+It's a full IDP now."* The same shape as the Redis rule above, applied to `authz-idp`'s two other
+dependencies:
+
+- `oauth2.relying_party` and `oauth2.token_exchange` **refuse to start** `authz-idp` when either is
+  absent, or when `token_exchange.enabled` is `false`, or when `token_exchange.allowed_scopes`
+  omits `openid` — loudly, at startup, never a silent degradation. `Config.oauth2.relying_party`/
+  `Config.oauth2.token_exchange` stay `Option` at the type level (`authz-api`/`authz-opa`/
+  `authz-budget`/`lightbridge-mcp` load the same `Oauth2` type and never set either), but
+  enforcement is unconditional inside `start_idp_server`
+  (`crates/lightbridge-authz-rest/src/lib.rs`), not a config-driven mount decision.
+- **There is no neutralisation escape hatch and no mount-conditional gate.** `build_idp_router`
+  takes `relying_party`/`token_exchange` as owned, non-`Option` parameters — `/authorize`,
+  `/device/verify`, `/idp/callback`, `/oauth2/token`, `/oauth2/revoke`, and
+  `/oauth2/device_authorization` are all mounted unconditionally, and discovery
+  (`DiscoveryCapabilities::full_idp()`) always advertises all of them.
+- **Enforcement for `relying_party` is presence PLUS the existing offline validation** — unlike the
+  Redis rule's presence-only posture. `KeycloakRelyingParty::new` is fully synchronous and offline
+  (validates shape: timeout, TTL, base64url 32-byte state key, exact callback URL/path — never
+  dials Keycloak), so validating it at startup costs no ordering dependency on a live third party.
+  This deliberately does **not** fetch Keycloak discovery at startup — that would be the same
+  mistake the Redis rule's "presence-only, not a `PING`" reasoning warns against, aimed at an
+  external IdP instead of an in-cluster Redis.
+- **Do not reintroduce PR #473's mount-conditional gate.** #473 (`468084a`) made `relying_party`
+  optional again after #463 (`9e0ef4d`) made it (wrongly, unconditionally) required — but #473's fix
+  left a live defect: discovery advertised `device_code` (gated only on `token_exchange`) while
+  `/device/verify` 404'd, because the RP-leg silently wasn't mounted. "Optional" and "half-broken"
+  were the same state for that field. ADR-0023 closes this for good; see that ADR for the full
+  chain and the regression test
+  (`build_idp_router_mounts_authorize_device_verify_and_callback_unconditionally`,
+  `crates/lightbridge-authz-rest/tests/idp_server_tests.rs`) that would have caught it.
 
 ### Environment Variable Interpolation
 

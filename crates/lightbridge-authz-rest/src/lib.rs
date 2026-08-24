@@ -3,8 +3,9 @@ use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
     RotateApiKey, async_trait,
     config::{
-        ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetServer, IdpServer, ModelCatalog, Oauth2,
-        OauthClient, OauthClientType, OpaServer, QuotaTiers, Redis, UsageServiceClient,
+        ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetServer, IdpServer, JwtSigning,
+        ModelCatalog, Oauth2, OauthClient, OauthClientType, OpaServer, QuotaTiers, Redis,
+        UsageServiceClient,
     },
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
@@ -2215,20 +2216,18 @@ where
 /// state, rather than configuration intent. Used by `build_idp_router` — `authz-idp` is now the
 /// only server that mounts `well_known_router` at all; `authz-api` stopped serving OIDC
 /// discovery/JWKS once the `auth.ai.camer.digital` ingress was repointed at `authz-idp` (see
-/// `build_api_router`'s doc comment). A configured client cannot make discovery advertise a
-/// token endpoint that this router did not mount.
+/// `build_api_router`'s doc comment). `token_exchange` is unconditionally assembled by
+/// `start_idp_server` (ADR-0023: `oauth2.token_exchange` is mandatory for `authz-idp`, no longer
+/// optional), so this always reports the real scope/client-authentication metadata — there is no
+/// "token exchange absent" case left to fall back from.
 fn well_known_mount_params(
     oauth2: &Oauth2,
-    token_exchange: Option<&token_exchange::TokenExchangeState>,
+    token_exchange: &token_exchange::TokenExchangeState,
 ) -> (Option<Vec<String>>, signing::ClientAuthenticationMetadata) {
-    let token_exchange_scopes =
-        token_exchange.map(|state| state.op_config().scopes_supported.clone());
-    let client_authentication = if token_exchange.is_some() {
-        signing::ClientAuthenticationMetadata::from_oauth2(oauth2)
-    } else {
-        signing::ClientAuthenticationMetadata::default()
-    };
-    (token_exchange_scopes, client_authentication)
+    (
+        Some(token_exchange.op_config().scopes_supported.clone()),
+        signing::ClientAuthenticationMetadata::from_oauth2(oauth2),
+    )
 }
 
 /// Assembles the API server router: public probes plus the generated cratestack RPC CRUD surface
@@ -2346,7 +2345,11 @@ const CLIENT_ASSERTION_JTI_KEY_PREFIX: &str = "authz-api:client-assertion-jti:";
 
 /// Builds the native token-exchange state. Enabled only when `token_exchange.enabled` is set, and
 /// it REQUIRES `oauth2.type: self` (the exchanged access token is a self-signed JWT). Returns
-/// `Ok(None)` when the feature is off; errors on invalid config so startup fails fast.
+/// `Ok(None)` when the feature is off; errors on invalid config so startup fails fast. This
+/// function's `Result<Option<...>>` contract is unchanged by ADR-0023, and its own unit tests
+/// still exercise the `None`/disabled path directly -- but its sole production caller,
+/// `start_idp_server`, now treats a `None` result as fatal (`oauth2.token_exchange` is mandatory
+/// for authz-idp), so `build_token_exchange_state` itself has exactly ONE production caller.
 ///
 /// ADR-0011 phase 2: builds the config-defined `ClientStore` (Decision 5) and the Redis-backed
 /// `ClientAssertionStore` (Decision 6) that together let `oauth2_op::store::TokenExchangeOpStore`
@@ -2813,73 +2816,59 @@ pub async fn start_opa_server(
 /// a real route always beats a fallback. See `static_assets::static_assets_fallback`'s own doc
 /// comment for the caching/CSP posture applied to everything served from `static_dir`.
 ///
-/// ## `relying_party` is pre-validated, not (re)constructed here
+/// ## Every parameter here is a pre-validated product of `start_idp_server`'s checks
 ///
-/// `relying_party` is `None` when the deployment never configured `oauth2.relying_party` (the
-/// RP-leg -- the hosted device-verification page and `/authorize` browser SSO -- simply isn't
-/// mounted, matching that field's optionality in `config::Oauth2`), or `Some` with an already
-/// live `KeycloakRelyingParty` when it did. `start_idp_server` is the one call site that performs
-/// that construction (and surfaces a bad `oauth2.relying_party` block as a hard startup failure);
-/// this function only decides what to mount from the result. Test call sites that want the RP-leg
-/// mounted must construct their own `KeycloakRelyingParty` the same way.
+/// ADR-0023 reverses PR #473 (468084a) on purpose: `oauth2.relying_party` and
+/// `oauth2.token_exchange` are no longer optional inputs this function branches on -- they are
+/// mandatory for `authz-idp`, enforced once, up front, in `start_idp_server`, exactly the same
+/// shape as the "Redis is a mandatory dependency" house rule in `AGENTS.md`. By the time this
+/// function runs, `signing`, `token_exchange`, and `relying_party` are all known-good: `signing`
+/// and `relying_party` come from `start_idp_server`'s own construction (`KeycloakRelyingParty::new`
+/// validates its config offline -- no Keycloak discovery fetch at startup, the same
+/// presence-PLUS-offline-validation posture, not presence-only, that AGENTS.md documents for this
+/// exact field), and `token_exchange` is the `Some` arm of `build_token_exchange_state`'s result
+/// (`start_idp_server` now treats `None` as fatal). So every flow route below -- well-known/JWKS,
+/// `/authorize`, `/oauth2/token` + `/oauth2/revoke` + `/oauth2/device_authorization`,
+/// `/device/verify`, `/idp/callback` -- is mounted unconditionally, and `DiscoveryCapabilities::
+/// full_idp()` describes that unconditionally too. #473's OTHER half is kept and strengthened
+/// here: `relying_party` was already threaded through as a pre-validated `Arc` instead of being
+/// rebuilt inside this function; only the `Option` wrapper (and the mount-conditional branching it
+/// enabled) is removed.
 pub fn build_idp_router(
     oauth2: &Oauth2,
+    signing: &JwtSigning,
     signing_repo: Arc<StoreRepo>,
-    token_exchange: Option<token_exchange::TokenExchangeState>,
+    token_exchange: token_exchange::TokenExchangeState,
     readiness_pool: Arc<dyn DbPoolTrait>,
     static_dir: impl AsRef<std::path::Path>,
-    relying_party: Option<Arc<relying_party::KeycloakRelyingParty>>,
+    relying_party: Arc<relying_party::KeycloakRelyingParty>,
 ) -> Router {
     let mut router = probe_router(readiness_pool);
-    let rp = relying_party;
-    let rp_router = rp.as_ref().map(|rp| relying_party::router(Arc::clone(rp)));
-
     let (token_exchange_scopes, client_authentication) =
-        well_known_mount_params(oauth2, token_exchange.as_ref());
-    let discovery_capabilities = token_exchange
-        .as_ref()
-        .map(|_| {
-            let capabilities =
-                signing::DiscoveryCapabilities::token_surface().with_device_authorization();
-            if rp.is_some() {
-                capabilities.with_authorization_code()
-            } else {
-                capabilities
-            }
-        })
-        .unwrap_or_default();
-    if oauth2.is_self_signed()
-        && let Some(signing) = oauth2.signing.as_ref()
-    {
-        router = router.merge(signing::well_known_router(
-            &signing.issuer,
-            signing_repo,
-            token_exchange_scopes,
-            client_authentication,
-            discovery_capabilities,
-        ));
-    }
-
-    if let Some(te_state) = token_exchange {
-        if let Some(rp) = rp.as_ref() {
-            router = router.merge(authorize::router(authorize::AuthorizeState::new(
-                rp.clone(),
-                te_state.clone(),
-            )));
-        }
-        router = router.merge(token_exchange::token_exchange_router(te_state));
-    }
-
-    if let Some(rp_router) = rp_router {
-        router = router.merge(rp_router);
-    }
-
+        well_known_mount_params(oauth2, &token_exchange);
+    router = router.merge(signing::well_known_router(
+        &signing.issuer,
+        signing_repo,
+        token_exchange_scopes,
+        client_authentication,
+        signing::DiscoveryCapabilities::full_idp(),
+    ));
+    router = router.merge(authorize::router(authorize::AuthorizeState::new(
+        Arc::clone(&relying_party),
+        token_exchange.clone(),
+    )));
+    router = router.merge(token_exchange::token_exchange_router(token_exchange));
+    router = router.merge(relying_party::router(relying_party));
     router.nest_service("/ui", static_assets::static_assets_fallback(static_dir))
 }
 
-/// Starts `authz-idp` (ADR-0012): the OIDC broker service carrying `/oauth2/token`,
-/// `/oauth2/revoke`, and `.well-known/*`. Deliberately thin next to `start_api_server` — no RPC
-/// CRUD surface, no budget domain, no per-route idempotency/rate-limit tower layers — because
+/// Starts `authz-idp` (ADR-0012, ADR-0023): the OIDC broker service carrying `/oauth2/token`,
+/// `/oauth2/revoke`, `/oauth2/device_authorization`, `.well-known/*`, `/authorize`,
+/// `/device/verify`, and `/idp/callback`. Since ADR-0023 the full surface is unconditional — every
+/// authz-idp deployment must supply `oauth2.relying_party` and an enabled
+/// `oauth2.token_exchange`, or this function refuses to start. Deliberately thin next to
+/// `start_api_server` — no RPC CRUD surface, no budget domain, no per-route
+/// idempotency/rate-limit tower layers — because
 /// `well_known_router`/`token_exchange_router` need none of that; every route this server mounts
 /// is public (see [`config::IdpServer`]'s doc comment). The one exception: the Keycloak RP-leg's
 /// public, unauthenticated `user_code` lookups (`relying_party::verify_submit`/`verify_continue`)
@@ -2940,29 +2929,44 @@ pub async fn start_idp_server(
     let device_verify_rate_limit_store =
         build_redis_rate_limit_store(&redis.url, redis.ca_bundle_path.as_deref(), "authz-idp")?;
 
-    // `oauth2.relying_party` is only required when this deployment actually mounts the Keycloak
-    // RP-leg (the hosted device-verification page and the `/authorize` browser SSO flow) --
-    // mirroring `build_idp_router`'s own gate, `if let (Some(rp_config), Some(_)) =
-    // (&oauth2.relying_party, &oauth2.signing)`. `signing` is already guaranteed `Some` above, so
-    // that condition collapses to "relying_party is configured": there is no separate
-    // enable/disable flag for the RP-leg in `Oauth2` (`config::Oauth2::relying_party`'s own doc
-    // comment) -- presence of the block IS what opts a deployment into it. A deployment that never
-    // configures `relying_party` never mounts those routes and must not be blocked from starting
-    // because of it (regression: PR #463 made this unconditionally required, breaking every
-    // deployment that only wants the token-exchange/discovery surface). When it IS configured,
-    // validation stays exactly as strict as before -- a bad `relying_party` block (e.g. a
-    // malformed `state_encryption_key`) is still a hard startup failure, never a silent skip.
-    // Constructed once here (not re-derived inside `build_idp_router`) and threaded through as an
-    // already-validated `Arc`, so there is exactly one `KeycloakRelyingParty::new` call site.
-    let rp = match oauth2.relying_party.clone() {
-        Some(rp_config) => Some(Arc::new(relying_party::KeycloakRelyingParty::new(
-            rp_config,
-            oauth2.jwks_url.clone(),
-            Arc::new(StoreRepo::new(pool.clone())),
-            device_verify_rate_limit_store.clone(),
-        )?)),
-        None => None,
-    };
+    // `oauth2.relying_party` is now MANDATORY for authz-idp -- the same house-rule shape as the
+    // "Redis is a mandatory dependency" rule above: `Config.oauth2.relying_party` stays an
+    // `Option` at the type level (other components -- authz-api/authz-opa/authz-budget/
+    // lightbridge-mcp -- load the same `Config` type and never set this block at all), but
+    // enforcement is unconditional here, inside `start_idp_server`, not a config-driven mount
+    // decision. This is a DELIBERATE REVERSAL of PR #473 (468084a), which made `relying_party`
+    // optional to fix PR #463 (9e0ef4d)'s over-eager unconditional requirement. #463 was reverted
+    // for the wrong reason, not a wrong one: the repo owner's own words, verbatim: "Let's not make
+    // something from the IdP optional anymore. It's a full IDP now." Do not reintroduce #473's
+    // mount-conditional gate -- the defect it left behind was live in production: discovery
+    // advertised `device_code` (the device-authorization routes are gated on `token_exchange`,
+    // not on `relying_party`) while `/device/verify` 404'd, because the RP-leg silently wasn't
+    // mounted. "Optional" and "half-broken" were the same state for this field. Unlike the Redis
+    // rule, enforcement here is presence PLUS the existing offline validation, not presence-only:
+    // `KeycloakRelyingParty::new` is fully synchronous and offline (it validates the config
+    // shape, e.g. `state_encryption_key`, it does not dial Keycloak), so validating it at startup
+    // costs no startup-ordering dependency on a third party -- this deliberately does NOT fetch
+    // Keycloak discovery at startup, which would be the same mistake the Redis rule's own
+    // "presence-only, not a PING" reasoning warns against, aimed at an external IdP instead of an
+    // in-cluster Redis. Constructed once here (not re-derived inside `build_idp_router`) and
+    // threaded through as an already-validated `Arc`, so there is exactly one
+    // `KeycloakRelyingParty::new` call site -- #473's OTHER half (pre-validated `Arc` threading,
+    // not config re-derivation inside `build_idp_router`) is kept and strengthened, not reversed.
+    let rp_config = oauth2.relying_party.clone().ok_or_else(|| {
+        Error::Server(
+            "oauth2.relying_party is required for authz-idp -- it is a full IdP: /authorize, \
+             /device/verify and /idp/callback are always mounted and discovery always advertises \
+             authorization_endpoint. Set the oauth2.relying_party block (issuer, client_id, \
+             callback_url, state_encryption_key)."
+                .to_string(),
+        )
+    })?;
+    let relying_party = Arc::new(relying_party::KeycloakRelyingParty::new(
+        rp_config,
+        oauth2.jwks_url.clone(),
+        Arc::new(StoreRepo::new(pool.clone())),
+        device_verify_rate_limit_store,
+    )?);
 
     let readiness_pool = pool.clone();
     // ADR-0014: the budget ledger is read here (not called over the network) because
@@ -2992,6 +2996,14 @@ pub async fn start_idp_server(
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
 
+    // `oauth2.token_exchange` is now MANDATORY for authz-idp, the same reversal as
+    // `relying_party` above: without it there is no `/oauth2/token`, no
+    // `/oauth2/device_authorization`, and the `authorization_code` grant `authorize::router`
+    // mounts unconditionally cannot issue a redeemable token (`build_token_exchange_state`'s sole
+    // production caller is this function -- see its own doc comment). `build_token_exchange_state`
+    // keeps its `Result<Option<...>>` contract (its unit tests still exercise the `None`/disabled
+    // path directly), so the "disabled is fatal for authz-idp" decision lives here, at the one
+    // production call site, not inside that function.
     let token_exchange_state = build_token_exchange_state(
         oauth2,
         signing_repo.clone(),
@@ -3000,23 +3012,51 @@ pub async fn start_idp_server(
         bearer_service,
         &redis.url,
         redis.ca_bundle_path.as_deref(),
-    )?;
-    let token_exchange_enabled = token_exchange_state.is_some();
+    )?
+    .ok_or_else(|| {
+        Error::Server(
+            "oauth2.token_exchange is required and must be enabled for authz-idp (set \
+             oauth2.token_exchange.enabled: true) -- /oauth2/token, /oauth2/revoke and \
+             /oauth2/device_authorization are always mounted, and the authorization_code grant \
+             cannot issue a redeemable token without them"
+                .to_string(),
+        )
+    })?;
+
+    // OIDC Discovery 1.0 §3: an OpenID Provider's `scopes_supported` MUST include `openid` --
+    // absent it, this is a bare OAuth2 authorization server, not the OIDC provider the mounted
+    // `/authorize` browser-SSO flow and discovery document both advertise being. Checked here
+    // (Q2), not inside `build_token_exchange_state`, for the same reason the `None` check above
+    // lives here: this is an authz-idp-specific requirement, not a general token-exchange
+    // constraint on every caller of that function.
+    if !token_exchange_state
+        .op_config()
+        .scopes_supported
+        .iter()
+        .any(|scope| scope == "openid")
+    {
+        return Err(Error::Server(
+            "oauth2.token_exchange.allowed_scopes must include \"openid\" for authz-idp -- it is \
+             an OpenID Provider, and OIDC Discovery 1.0 §3 requires scopes_supported to advertise \
+             openid"
+                .to_string(),
+        ));
+    }
 
     let app = build_idp_router(
         oauth2,
+        signing,
         signing_repo,
         token_exchange_state,
         readiness_pool,
         &idp.static_dir,
-        rp,
+        relying_party,
     );
 
     tracing::info!(
         server = "authz-idp",
         address = %idp.address,
         port = idp.port,
-        token_exchange_enabled,
         "starting idp server"
     );
 
@@ -3470,6 +3510,9 @@ mod tests {
         }
     }
 
+    // This function's own `Result<Option<...>>` contract is unchanged by ADR-0023 -- only its
+    // sole production caller, `start_idp_server`, now treats this `None` result as fatal (see
+    // `build_token_exchange_state`'s doc comment).
     #[tokio::test]
     async fn build_token_exchange_state_is_none_when_disabled() {
         let oauth2 = base_oauth2(Oauth2Type::SelfSigned);

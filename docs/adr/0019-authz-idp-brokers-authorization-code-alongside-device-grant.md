@@ -321,6 +321,9 @@ implementation lands (tracked by the linked epic, not this ADR).
 
 ## Related
 
+- Amended by ADR-0023 (`docs/adr/0023-the-authz-idp-surface-is-mandatory-not-composable.md`):
+  `oauth2.relying_party` and `oauth2.token_exchange` are no longer optional for `authz-idp` — the
+  `/authorize` flow this ADR adds is mounted unconditionally, not gated on either config block.
 - Supersedes (partially): ADR-0012 (`docs/adr/0012-device-authorization-grant-brokered-via-new-idp-service.md`)
   Decision 3's `AuthorizationCodeStore` half, and Decision 4 in full. Every other ADR-0012 decision,
   including the device-grant half of Decision 3, is unaffected — see Decision 1 above.

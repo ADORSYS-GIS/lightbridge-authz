@@ -51,6 +51,10 @@ pub struct ClientAuthenticationMetadata {
 /// Discovery is a statement about the router assembled for this process, not about every grant a
 /// configured client could theoretically request. Keeping these route facts separate from the
 /// client registry prevents a configuration-only change from advertising an unmounted endpoint.
+/// authz-idp's production call site always passes [`DiscoveryCapabilities::full_idp`] -- it is a
+/// full IdP, so every flow route `build_idp_router` mounts is unconditional, and its discovery
+/// document describes all of them unconditionally too. The other named constructors remain because
+/// `well_known_router` stays generic over callers that mount less.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DiscoveryCapabilities {
     token_endpoint: bool,
@@ -78,6 +82,19 @@ impl DiscoveryCapabilities {
     pub const fn with_authorization_code(mut self) -> Self {
         self.authorization_endpoint = true;
         self
+    }
+
+    /// Every flow route build_idp_router mounts. authz-idp is a full IdP: the token,
+    /// revocation, device-authorization and browser /authorize routes are all mounted
+    /// unconditionally, so its discovery document describes all of them unconditionally too.
+    /// Kept as a named constructor rather than deleting DiscoveryCapabilities outright: this
+    /// type is what keeps the document a statement about the assembled route table instead of
+    /// about configuration intent (see the struct's own doc comment), and well_known_router
+    /// remains generic over callers that mount less.
+    pub const fn full_idp() -> Self {
+        Self::token_surface()
+            .with_device_authorization()
+            .with_authorization_code()
     }
 }
 
