@@ -383,14 +383,11 @@ impl TokenExchangeOpStore {
         if req.actor_token.is_some() || req.actor_token_type.is_some() {
             return Err(oauth_err("invalid_request", "actor_token is not supported"));
         }
-        if let Some(token_type) = req.subject_token_type.as_deref() {
-            let token_type = token_type.trim();
-            if !token_type.is_empty() && token_type != ACCESS_TOKEN_TYPE {
-                return Err(oauth_err(
-                    "invalid_request",
-                    "subject_token_type must be urn:ietf:params:oauth:token-type:access_token",
-                ));
-            }
+        if req.subject_token_type.as_deref() != Some(ACCESS_TOKEN_TYPE) {
+            return Err(oauth_err(
+                "invalid_request",
+                "subject_token_type must be urn:ietf:params:oauth:token-type:access_token",
+            ));
         }
         let requested_token_type = req
             .requested_token_type
@@ -414,13 +411,10 @@ impl TokenExchangeOpStore {
         let token_info = match self.bearer.validate_bearer_token(subject_token).await {
             Ok(info) if info.active => info,
             Ok(_) => {
-                return Err(oauth_err("invalid_token", "subject_token is not active"));
+                return Err(oauth_err("invalid_request", "subject_token is invalid"));
             }
             Err(_) => {
-                return Err(oauth_err(
-                    "invalid_token",
-                    "subject_token validation failed",
-                ));
+                return Err(oauth_err("invalid_request", "subject_token is invalid"));
             }
         };
         let subject = token_info.sub.clone();

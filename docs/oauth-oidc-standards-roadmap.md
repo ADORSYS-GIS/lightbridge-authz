@@ -96,24 +96,25 @@ These are concrete, independently testable defects in the current live token bou
 them first prevents the later authorization-code/device work from inheriting an incorrect HTTP
 contract.
 
-- **Token response cache controls:** successful token responses and token error responses lack
-  `Cache-Control: no-store` and `Pragma: no-cache`. RFC 6749 requires both for a response that
-  contains tokens, credentials, or other sensitive information. Apply them at the shared token
-  response/error builder, including the browser/device grant paths.
-- **RFC 8693 required parameter and errors:** `subject_token_type` is optional in
+- **Token response cache controls — resolved:** successful token responses and token error
+  responses now carry `Cache-Control: no-store` and `Pragma: no-cache`, applied at the token-route
+  boundary so extractor errors and future browser/device grants receive the same treatment.
+- **RFC 8693 required parameter and errors — resolved:** `subject_token_type` is required in
   [`handle_token_exchange`](../crates/lightbridge-authz-rest/src/oauth2_op/store.rs) and an empty
-  value is accepted. RFC 8693 makes it REQUIRED. Require exactly the supported access-token type.
-  An invalid or unacceptable subject token must use RFC 8693's `invalid_request` error shape,
-  rather than the current endpoint-specific `invalid_token`/401 response. Preserve RFC 6749's
-  client-authentication rules separately (including `WWW-Authenticate` where required).
-- **`issued_token_type` is unconditional:** the HTTP wrapper adds it to every successful token
-  response. It is REQUIRED for RFC 8693 token exchange, but a refresh/code/device response should
-  follow that grant's response profile instead of claiming it is an exchange response. Emit it
-  conditionally and test each grant.
-- **Browser token-endpoint CORS:** only discovery/JWKS has CORS today. A browser SPA cannot safely
-  redeem a code cross-origin at the token endpoint without an explicit, allowlisted CORS policy
-  (including preflight, exact allowed origins/methods/headers, and `Vary: Origin`). Do not use a
-  permissive credentialed policy.
+  value is rejected. RFC 8693 makes it REQUIRED, and this server accepts exactly the supported
+  access-token type. An invalid or unacceptable subject token now uses RFC 8693's
+  `invalid_request`/400 shape, separately from RFC 6749 client-authentication failures.
+- **`issued_token_type` — resolved:** the HTTP wrapper emits it only for successful RFC 8693 token
+  exchange. Refresh and future code/device responses follow their own grant response profile.
+- **Browser token-endpoint CORS — deferred to #425:** only discovery/JWKS has CORS today. The
+  current configuration has neither a browser-origin allowlist nor usable registered
+  `redirect_uris`; every `OauthClient` is still a token-exchange client and its registration maps
+  to an empty redirect list. An issuer URL is not a safe substitute for an SPA origin, and a
+  permissive or inferred token-endpoint policy would preempt the exact-match redirect registry in
+  #425. When #425 introduces validated browser-client redirect URIs, it must also provide an
+  explicit origin allowlist (scheme, host, and port), then mount token CORS with exact allowed
+  origins/methods/headers, preflight handling, and `Vary: Origin`; until then the endpoint emits no
+  browser CORS permission.
 - **SPA fallback leaks into the protocol namespace:** the current catch-all static fallback can
   answer an unknown `/oauth2/*`, `/.well-known/*`, or future protocol path with `index.html` and
   `200`. Reserve protocol namespaces before the SPA fallback and return a normal `404` or the

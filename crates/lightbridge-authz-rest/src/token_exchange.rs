@@ -23,8 +23,9 @@ use authkestra_op::handlers::token::{
 };
 use axum::{
     Form, Json, Router,
-    extract::State,
-    http::{HeaderMap, StatusCode, header},
+    extract::{Request, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -77,7 +78,10 @@ where
     S: Clone + Send + Sync + 'static,
 {
     Router::new()
-        .route("/oauth2/token", post(token_endpoint))
+        .route(
+            "/oauth2/token",
+            post(token_endpoint).layer(middleware::from_fn(apply_token_response_headers)),
+        )
         .route("/oauth2/revoke", post(revoke_endpoint))
         .with_state(state)
 }
@@ -132,16 +136,15 @@ impl From<RawTokenRequest> for AkTokenRequest {
     }
 }
 
-/// RFC 8693 §2.2.1 response, plus `issued_token_type` (REQUIRED there, but absent from
-/// `authkestra_op::handlers::token::TokenResponse` -- zero hits for the field in that crate).
-/// Always `access_token`: this endpoint never returns any other primary token type on the wire (an
-/// `id_token` rides alongside it in the same response, never as `access_token` itself).
+/// Token response. RFC 8693 §2.2.1 requires `issued_token_type` for token exchange, while other
+/// grants must not claim to be token-exchange responses.
 #[derive(Serialize)]
 struct TokenResponseBody {
     access_token: String,
     token_type: String,
     expires_in: u64,
-    issued_token_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issued_token_type: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     refresh_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -160,6 +163,7 @@ async fn token_endpoint(
         .and_then(|v| v.to_str().ok());
     let project_id = raw.project_id.clone();
     let req: AkTokenRequest = raw.into();
+    let grant_type = req.grant_type.clone();
 
     let tokens = match state.signer.token_manager().await {
         Ok(tokens) => tokens,
@@ -178,25 +182,36 @@ async fn token_endpoint(
     };
 
     match handle_token(req, auth_header, &state.op_config, &scoped, &tokens).await {
-        Ok(resp) => success_response(resp),
+        Ok(resp) => success_response(&grant_type, resp),
         Err(err) => error_response(&err),
     }
 }
 
-fn success_response(resp: AkTokenResponse) -> Response {
+fn success_response(grant_type: &str, resp: AkTokenResponse) -> Response {
     (
         StatusCode::OK,
         Json(TokenResponseBody {
             access_token: resp.access_token,
             token_type: resp.token_type,
             expires_in: resp.expires_in,
-            issued_token_type: ACCESS_TOKEN_TYPE,
+            issued_token_type: (grant_type == TOKEN_EXCHANGE_GRANT).then_some(ACCESS_TOKEN_TYPE),
             refresh_token: resp.refresh_token,
             scope: resp.scope,
             id_token: resp.id_token,
         }),
     )
         .into_response()
+}
+
+/// RFC 6749 §5.1 and §5.2 require both directives on every token-endpoint response containing
+/// credentials or their error details. Applying them as route middleware also covers extractor
+/// rejections before [`token_endpoint`] runs.
+async fn apply_token_response_headers(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response
 }
 
 fn error_response(err: &AkTokenErrorResponse) -> Response {
