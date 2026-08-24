@@ -19,6 +19,7 @@ pub mod models;
 pub mod oauth2_op;
 pub mod ratelimit_redis;
 pub mod redis_tls;
+pub mod relying_party;
 pub mod routers;
 pub mod rpc_authorize;
 pub mod session_cookie;
@@ -2710,6 +2711,17 @@ pub fn build_idp_router(
     static_dir: impl AsRef<std::path::Path>,
 ) -> Router {
     let mut router = probe_router(readiness_pool);
+    let rp_router = if let (Some(rp_config), Some(_)) = (&oauth2.relying_party, &oauth2.signing) {
+        let rp = relying_party::KeycloakRelyingParty::new(
+            rp_config.clone(),
+            oauth2.jwks_url.clone(),
+            signing_repo.clone(),
+        )
+        .expect("authz-idp startup validates oauth2.relying_party before router construction");
+        Some(relying_party::router(Arc::new(rp)))
+    } else {
+        None
+    };
 
     let (token_exchange_scopes, client_authentication) = well_known_mount_params(oauth2);
     if oauth2.is_self_signed()
@@ -2725,6 +2737,10 @@ pub fn build_idp_router(
 
     if let Some(te_state) = token_exchange {
         router = router.merge(token_exchange::token_exchange_router(te_state));
+    }
+
+    if let Some(rp_router) = rp_router {
+        router = router.merge(rp_router);
     }
 
     router.fallback_service(static_assets::static_assets_fallback(static_dir))
@@ -2768,6 +2784,17 @@ pub async fn start_idp_server(
     let signing = oauth2.signing.as_ref().ok_or_else(|| {
         Error::Server("oauth2.type is 'self' but oauth2.signing is missing".to_string())
     })?;
+    let rp_config = oauth2.relying_party.clone().ok_or_else(|| {
+        Error::Server(
+            "authz-idp requires oauth2.relying_party for its Keycloak browser login flow"
+                .to_string(),
+        )
+    })?;
+    relying_party::KeycloakRelyingParty::new(
+        rp_config,
+        oauth2.jwks_url.clone(),
+        Arc::new(StoreRepo::new(pool.clone())),
+    )?;
 
     let readiness_pool = pool.clone();
     // ADR-0014: the budget ledger is read here (not called over the network) because
@@ -3257,6 +3284,7 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
+            relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
         }

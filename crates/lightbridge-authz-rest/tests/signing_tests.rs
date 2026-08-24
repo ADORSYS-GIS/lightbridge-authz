@@ -1067,6 +1067,7 @@ mod db {
             audience: None,
             signing: Some(signing_cfg(3600)),
             token_exchange: None,
+            relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
         }

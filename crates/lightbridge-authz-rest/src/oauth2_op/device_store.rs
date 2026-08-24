@@ -159,6 +159,20 @@ impl DbDeviceCodeStore {
     pub fn new(repo: Arc<StoreRepo>) -> Self {
         Self { repo }
     }
+
+    /// Transitions exactly one live pending device authorization to approved. Unlike the upstream
+    /// trait's `update_device_code` method, this exposes the CAS result to the browser callback so
+    /// it never claims success when a concurrent consume, expiry, or deny won the race.
+    pub async fn approve_pending(&self, device_code: &str, subject: &str) -> Result<bool, OpError> {
+        self.repo
+            .approve_device_authorization(device_code, subject, Utc::now())
+            .await
+            .map(|row| row.is_some())
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to approve device authorization");
+                OpError::Storage
+            })
+    }
 }
 
 #[async_trait]

@@ -795,6 +795,12 @@ pub struct Oauth2 {
     /// service). Independent of `issuance`, which proxies exchange to an upstream IdP.
     #[serde(default)]
     pub token_exchange: Option<Oauth2TokenExchange>,
+    /// The outbound OIDC relying-party leg to Keycloak used by the hosted device-verification
+    /// page and, once `/authorize` lands, browser SSO. It is deliberately separate from
+    /// `issuance`: this is an interactive authorization-code client, not the service-account
+    /// token-exchange client used to issue API-key credentials.
+    #[serde(default)]
+    pub relying_party: Option<OidcRelyingParty>,
     /// Role-based access control: which JWT claim carries the caller's roles and how those roles
     /// map to permissions. When omitted, the built-in default mapping is used
     /// (`crate::authz::default_role_permissions`).
@@ -810,6 +816,38 @@ pub struct Oauth2 {
     /// `authkestra-op`).
     #[serde(default)]
     pub clients: Vec<OauthClient>,
+}
+
+/// Configuration for `authz-idp` acting as a Keycloak OIDC relying party (ADR-0012, ADR-0021).
+#[derive(Debug, Clone, Deserialize)]
+pub struct OidcRelyingParty {
+    /// Keycloak realm issuer, used for discovery and the mandatory ID-token issuer check.
+    pub issuer: String,
+    /// Registered Keycloak client ID. The ID-token audience must contain this exact value.
+    pub client_id: String,
+    /// The one fixed callback Keycloak is allowed to redirect to. This value is deployment
+    /// configuration, never derived from a request parameter or client registration.
+    pub callback_url: String,
+    /// Optional confidential-client credential. Public clients use PKCE with no secret.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Base64url-without-padding encoding of exactly 32 random bytes, used to encrypt the
+    /// short-lived RP state cookie.
+    pub state_encryption_key: String,
+    /// Bounded timeout for discovery and authorization-code redemption.
+    #[serde(default = "default_rp_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Fixed lifetime of a browser SSO session. Device pairing never creates this session.
+    #[serde(default = "default_browser_session_ttl_seconds")]
+    pub browser_session_ttl_seconds: i64,
+}
+
+fn default_rp_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_browser_session_ttl_seconds() -> i64 {
+    28_800
 }
 
 /// A registered OAuth2/OIDC client (ADR-0011, Decision 5). Mirrors

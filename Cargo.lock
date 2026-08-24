@@ -2822,6 +2822,7 @@ dependencies = [
  "anyhow",
  "authkestra-engine",
  "authkestra-op",
+ "authkestra-resource",
  "axum",
  "axum-extra",
  "axum-server",
