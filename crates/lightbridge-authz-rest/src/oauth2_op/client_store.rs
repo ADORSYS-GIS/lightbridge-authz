@@ -41,21 +41,20 @@ impl ClientStore for ConfigClientStore {
 }
 
 /// Maps our config shape onto `authkestra_op::client::ClientRegistration`'s 9 fields.
-/// `client_secret_hash` is always `None` and `redirect_uris` is always empty -- see
-/// `OauthClient`'s own doc comment (`lightbridge-authz-core::config`) for why both are permanent,
-/// not placeholders.
+/// `client_secret_hash` is always `None`; browser registration settings are sourced directly from
+/// the reviewed config.
 fn to_registration(client: &OauthClient) -> ClientRegistration {
     ClientRegistration {
         client_id: client.client_id.clone(),
         client_secret_hash: None,
-        redirect_uris: Vec::new(),
+        redirect_uris: client.redirect_uris.clone(),
         grant_types: client
             .grant_types
             .iter()
             .map(|g| parse_grant_type(g))
             .collect(),
         scopes: client.scopes.clone(),
-        require_pkce: false,
+        require_pkce: client.require_pkce,
         allowed_audiences: client.allowed_audiences.clone(),
         token_endpoint_auth_method: Some(match client.client_type {
             OauthClientType::Public => TokenEndpointAuthMethod::NoAuth,
@@ -91,6 +90,8 @@ mod tests {
             grant_types: vec!["urn:ietf:params:oauth:grant-type:token-exchange".to_string()],
             allowed_audiences: vec![client_id.to_string()],
             jwks: None,
+            redirect_uris: Vec::new(),
+            require_pkce: false,
         }
     }
 

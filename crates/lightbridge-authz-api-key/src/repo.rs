@@ -15,6 +15,7 @@ use tracing::instrument;
 use crate::entities::account_row::AccountRow;
 use crate::entities::api_key_row::{ApiKeyChangeset, ApiKeyRow};
 use crate::entities::api_key_validation_row::ApiKeyValidationRow;
+use crate::entities::authorization_code_row::{AuthorizationCodeRow, NewAuthorizationCode};
 use crate::entities::device_authorization_row::{DeviceAuthorizationRow, NewDeviceAuthorization};
 use crate::entities::exchange_refresh_token_row::{
     ExchangeRefreshTokenRow, NewExchangeRefreshToken,
@@ -24,7 +25,9 @@ use crate::entities::new_api_key_row::NewApiKeyRow;
 use crate::entities::new_project_row::NewProjectRow;
 use crate::entities::project_member_row::ProjectMemberRow;
 use crate::entities::project_row::{ProjectChangeset, ProjectRow};
-use crate::entities::session_row::{NewSession, SessionRow, SessionStatusRow};
+use crate::entities::session_row::{
+    BrowserSessionContextRow, NewSession, SessionRow, SessionStatusRow,
+};
 use crate::entities::signing_key_row::{NewSigningKey, SigningKeyRow};
 
 #[derive(Debug, Clone)]
@@ -39,6 +42,80 @@ impl StoreRepo {
 
     fn pool(&self) -> &PgPool {
         self.pool.pool()
+    }
+
+    pub async fn create_authorization_code(&self, input: NewAuthorizationCode) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO authorization_codes
+              (id, code_hash, client_id, redirect_uri, scope, code_challenge, code_challenge_method, nonce, identity, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            "#,
+        )
+        .bind(input.id)
+        .bind(input.code_hash)
+        .bind(input.client_id)
+        .bind(input.redirect_uri)
+        .bind(input.scope)
+        .bind(input.code_challenge)
+        .bind(input.code_challenge_method)
+        .bind(input.nonce)
+        .bind(input.identity)
+        .bind(input.expires_at)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn consume_authorization_code(
+        &self,
+        code_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<AuthorizationCodeRow>> {
+        let row = sqlx::query_as(
+            r#"
+            UPDATE authorization_codes
+            SET consumed_at = $2
+            WHERE code_hash = $1
+              AND consumed_at IS NULL
+              AND expires_at > $2
+            RETURNING id, code_hash, client_id, redirect_uri, scope, code_challenge,
+                      code_challenge_method, nonce, identity, created_at, expires_at, consumed_at
+            "#,
+        )
+        .bind(code_hash)
+        .bind(now)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn authorization_code_matches(
+        &self,
+        code_hash: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let matches = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM authorization_codes
+                WHERE code_hash = $1
+                  AND client_id = $2
+                  AND redirect_uri = $3
+                  AND consumed_at IS NULL
+                  AND expires_at > $4
+            )
+            "#,
+        )
+        .bind(code_hash)
+        .bind(client_id)
+        .bind(redirect_uri)
+        .bind(now)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(matches)
     }
 
     /// Map an optional model list to the value stored in `projects.allowed_models`. `None` maps to
@@ -939,6 +1016,28 @@ impl StoreRepo {
             "#,
         )
         .bind(session_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn find_active_browser_session(
+        &self,
+        session_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<BrowserSessionContextRow>> {
+        let row = sqlx::query_as(
+            r#"
+            SELECT account_id, project_id
+            FROM sessions
+            WHERE id = $1
+              AND kind = 'browser'
+              AND status = 'active'
+              AND expires_at > $2
+            "#,
+        )
+        .bind(session_id)
+        .bind(now)
         .fetch_optional(self.pool())
         .await?;
         Ok(row)
@@ -2131,15 +2230,16 @@ impl StoreRepo {
         let row: DeviceAuthorizationRow = sqlx::query_as(
             r#"
             INSERT INTO device_authorizations
-              (id, device_code, user_code, client_id, scope, status, interval_secs, expires_at)
-            VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
-            RETURNING id, device_code, user_code, client_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
+              (id, device_code, user_code, client_id, project_id, scope, status, interval_secs, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)
+            RETURNING id, device_code, user_code, client_id, project_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
             "#,
         )
         .bind(input.id)
         .bind(input.device_code)
         .bind(input.user_code)
         .bind(input.client_id)
+        .bind(input.project_id)
         .bind(input.scope)
         .bind(input.interval_secs)
         .bind(input.expires_at)
@@ -2175,7 +2275,7 @@ impl StoreRepo {
     ) -> Result<Option<DeviceAuthorizationRow>> {
         let row = sqlx::query_as(
             r#"
-            SELECT id, device_code, user_code, client_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
+            SELECT id, device_code, user_code, client_id, project_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
             FROM device_authorizations
             WHERE device_code = $1
               AND status <> 'consumed'
@@ -2184,6 +2284,26 @@ impl StoreRepo {
         )
         .bind(device_code)
         .bind(now)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// Reads a device authorization without treating expiry or consumption as absence. The token
+    /// endpoint uses this to return RFC 8628's distinct `expired_token` response while keeping all
+    /// other lookup paths enumeration-safe.
+    pub async fn find_device_authorization_by_device_code(
+        &self,
+        device_code: &str,
+    ) -> Result<Option<DeviceAuthorizationRow>> {
+        let row = sqlx::query_as(
+            r#"
+            SELECT id, device_code, user_code, client_id, project_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
+            FROM device_authorizations
+            WHERE device_code = $1
+            "#,
+        )
+        .bind(device_code)
         .fetch_optional(self.pool())
         .await?;
         Ok(row)
@@ -2201,7 +2321,7 @@ impl StoreRepo {
     ) -> Result<Option<DeviceAuthorizationRow>> {
         let row = sqlx::query_as(
             r#"
-            SELECT id, device_code, user_code, client_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
+            SELECT id, device_code, user_code, client_id, project_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
             FROM device_authorizations
             WHERE user_code = $1
               AND status <> 'consumed'
@@ -2236,7 +2356,7 @@ impl StoreRepo {
             WHERE device_code = $1
               AND status = 'pending'
               AND expires_at > $2
-            RETURNING id, device_code, user_code, client_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
+            RETURNING id, device_code, user_code, client_id, project_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
             "#,
         )
         .bind(device_code)
@@ -2268,7 +2388,7 @@ impl StoreRepo {
             WHERE device_code = $1
               AND status = 'pending'
               AND expires_at > $3
-            RETURNING id, device_code, user_code, client_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
+            RETURNING id, device_code, user_code, client_id, project_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
             "#,
         )
         .bind(device_code)
@@ -2295,7 +2415,7 @@ impl StoreRepo {
             WHERE device_code = $1
               AND status = 'pending'
               AND expires_at > $2
-            RETURNING id, device_code, user_code, client_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
+            RETURNING id, device_code, user_code, client_id, project_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
             "#,
         )
         .bind(device_code)
@@ -2339,7 +2459,7 @@ impl StoreRepo {
         let row: Option<DeviceAuthorizationRow> = sqlx::query_as(
             r#"
             WITH claimable AS (
-                SELECT id, device_code, user_code, client_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
+                SELECT id, device_code, user_code, client_id, project_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
                 FROM device_authorizations
                 WHERE device_code = $1
                   AND status IN ('approved', 'denied')
@@ -2350,7 +2470,7 @@ impl StoreRepo {
             SET status = 'consumed'
             FROM claimable
             WHERE d.id = claimable.id
-            RETURNING claimable.id, claimable.device_code, claimable.user_code, claimable.client_id, claimable.scope, claimable.status, claimable.subject, claimable.interval_secs, claimable.created_at, claimable.expires_at, claimable.last_polled_at
+            RETURNING claimable.id, claimable.device_code, claimable.user_code, claimable.client_id, claimable.project_id, claimable.scope, claimable.status, claimable.subject, claimable.interval_secs, claimable.created_at, claimable.expires_at, claimable.last_polled_at
             "#,
         )
         .bind(device_code)

@@ -196,6 +196,7 @@ impl DeviceCodeStore for DbDeviceCodeStore {
             device_code: session.device_code.clone(),
             user_code: session.user_code.clone(),
             client_id: session.client_id.clone(),
+            project_id: None,
             scope,
             interval_secs: DEFAULT_INTERVAL_SECS,
             expires_at: session.expires_at,
@@ -324,6 +325,7 @@ impl DeviceCodeStore for DbDeviceCodeStore {
 pub async fn create_pending_device_authorization(
     repo: &StoreRepo,
     client_id: &str,
+    project_id: Option<&str>,
     scope: &str,
     ttl: Duration,
     interval_secs: i32,
@@ -341,6 +343,7 @@ pub async fn create_pending_device_authorization(
             device_code: generate_device_code(),
             user_code: generate_user_code(),
             client_id: client_id.to_string(),
+            project_id: project_id.map(str::to_string),
             scope: scope_owned.clone(),
             interval_secs,
             expires_at,

@@ -53,3 +53,9 @@ pub struct SessionStatusRow {
     pub status: String,
     pub expires_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, FromRow)]
+pub struct BrowserSessionContextRow {
+    pub account_id: String,
+    pub project_id: String,
+}

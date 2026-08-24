@@ -153,12 +153,13 @@ oauth2:
     audience: "${JWT_SIGNING_AUDIENCE:-lightbridge-api-key}"
     ttl_seconds: ${JWT_SIGNING_TTL_SECONDS:-7776000}
     max_key_age_days: ${JWT_SIGNING_MAX_KEY_AGE_DAYS:-30}
-  # Native RFC 8693 token-exchange (POST /oauth2/token). Requires `signing`. Exchanges an upstream
-  # IdP access token (+ project_id) for a short-lived project-scoped self-signed JWT, plus a
-  # revocable refresh token when `offline_access` is requested. Independent of `issuance`.
+  # Native RFC 8693 token-exchange and RFC 8628 device grant. Requires `signing`. Token exchange
+  # exchanges an upstream IdP access token (+ project_id) for a short-lived project-scoped JWT;
+  # the device flow delegates approval to the Keycloak relying-party verification page.
   token_exchange:
-    enabled: ${TOKEN_EXCHANGE_ENABLED:-false}
+    enabled: ${TOKEN_EXCHANGE_ENABLED:-true}
     access_ttl_seconds: ${TOKEN_EXCHANGE_ACCESS_TTL_SECONDS:-900}
+    authorization_code_ttl_seconds: ${AUTHORIZATION_CODE_TTL_SECONDS:-300}
     refresh_ttl_seconds: ${TOKEN_EXCHANGE_REFRESH_TTL_SECONDS:-2592000}
     # Absolute cap on a refresh-token chain's lifetime, independent of the per-rotation TTL above
     # -- see Oauth2TokenExchange::refresh_absolute_ttl_seconds's doc comment for why this exists.
@@ -168,21 +169,32 @@ oauth2:
       - profile
       - email
       - offline_access
-  # Real, config-sourced OAuth2/OIDC clients permitted to use the token-exchange endpoint above
+    device_code_ttl_seconds: ${DEVICE_CODE_TTL_SECONDS:-600}
+    device_poll_interval_seconds: ${DEVICE_POLL_INTERVAL_SECONDS:-5}
+    device_verification_uri: "${DEVICE_VERIFICATION_URI:-https://localhost:13004/device/verify}"
+  # Real, config-sourced OAuth2/OIDC clients. Authorization-code clients must register exact
+  # redirect_uris and set require_pkce: true; S256 is the only accepted PKCE method. No concrete
+  # lightbridge-ss callback is configured in this repository, so it is intentionally not enabled.
   # (ADR-0011, Decision 5). Empty here by default -- with no clients registered, every exchange
   # fails client authentication (invalid_client), it is not left unprotected. Uncomment/adapt when
   # enabling token_exchange for a real client. `public` clients present no credential beyond
   # client_id; `confidential` clients authenticate via `private_key_jwt` only (ADR-0011, Decision
   # 6 -- never client_secret_basic/client_secret_post) and need their public key inline as `jwks`
   # (a JWK Set: `{"keys": [...]}`) -- there is deliberately no `jwks_uri`.
-  # clients:
-  #   - client_id: lightbridge-ss
-  #     type: public
+  clients:
+    - client_id: opencode-cli
+      type: public
+      scopes: [openid, offline_access]
+      grant_types:
+        - "urn:ietf:params:oauth:grant-type:device_code"
+        - refresh_token
   #     scopes: [openid, profile, email, offline_access]
   #     grant_types:
   #       - "urn:ietf:params:oauth:grant-type:token-exchange"
   #       - refresh_token
   #     allowed_audiences: [lightbridge-ss]
+  #     redirect_uris: ["https://dashboard.example.invalid/oauth/callback"]
+  #     require_pkce: true
   #   - client_id: lightbridge-mcp
   #     type: confidential
   #     scopes: [openid, profile, email, offline_access]

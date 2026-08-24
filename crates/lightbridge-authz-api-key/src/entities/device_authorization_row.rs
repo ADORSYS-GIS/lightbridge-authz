@@ -13,6 +13,7 @@ pub struct DeviceAuthorizationRow {
     pub device_code: String,
     pub user_code: String,
     pub client_id: String,
+    pub project_id: Option<String>,
     pub scope: Option<String>,
     pub status: String,
     /// The resolved Keycloak `sub`, set only once `status = 'approved'`. Never present on a
@@ -33,6 +34,7 @@ pub struct NewDeviceAuthorization {
     pub device_code: String,
     pub user_code: String,
     pub client_id: String,
+    pub project_id: Option<String>,
     pub scope: Option<String>,
     pub interval_secs: i32,
     pub expires_at: DateTime<Utc>,

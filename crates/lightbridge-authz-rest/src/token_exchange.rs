@@ -34,10 +34,11 @@ use serde::{Deserialize, Serialize};
 use crate::oauth2_op::store::{RequestScopedOpStore, TokenExchangeOpStore};
 use crate::signing::ApiKeyJwtSigner;
 
-/// Also referenced from `crate::signing::discovery_document` so the discovery document's
-/// `grant_types_supported` stays in lockstep with what this endpoint actually dispatches.
+/// The exchange and refresh values are also referenced from `crate::signing::discovery_document`.
+/// Device authorization remains deliberately undiscoverable until the dedicated discovery work.
 pub(crate) const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 pub(crate) const REFRESH_TOKEN_GRANT: &str = "refresh_token";
+pub(crate) const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 /// Everything the native token-exchange endpoint needs: the self-signed-JWT signer (used only to
 /// build the per-request `TokenManager` `handle_token` requires), the OP-level config discovery
@@ -47,6 +48,10 @@ pub struct TokenExchangeState {
     signer: ApiKeyJwtSigner,
     op_config: OpConfig,
     op_store: Arc<TokenExchangeOpStore>,
+    device_verification_uri: String,
+    device_code_ttl_secs: u64,
+    device_poll_interval_secs: u64,
+    cors_origins: Arc<Vec<String>>,
 }
 
 impl TokenExchangeState {
@@ -54,12 +59,36 @@ impl TokenExchangeState {
         signer: ApiKeyJwtSigner,
         op_config: OpConfig,
         op_store: Arc<TokenExchangeOpStore>,
+        device_verification_uri: String,
+        device_code_ttl_secs: u64,
+        device_poll_interval_secs: u64,
     ) -> Self {
         Self {
             signer,
             op_config,
             op_store,
+            device_verification_uri,
+            device_code_ttl_secs,
+            device_poll_interval_secs,
+            cors_origins: Arc::new(Vec::new()),
         }
+    }
+
+    pub fn with_cors_origins(mut self, cors_origins: Vec<String>) -> Self {
+        self.cors_origins = Arc::new(cors_origins);
+        self
+    }
+
+    pub(crate) fn op_config(&self) -> &OpConfig {
+        &self.op_config
+    }
+
+    pub(crate) fn op_store(&self) -> &TokenExchangeOpStore {
+        self.op_store.as_ref()
+    }
+
+    fn allows_cors_origin(&self, origin: &str) -> bool {
+        self.cors_origins.iter().any(|allowed| allowed == origin)
     }
 }
 
@@ -80,6 +109,11 @@ where
         .route(
             "/oauth2/token",
             post(token_endpoint).layer(middleware::from_fn(apply_token_response_headers)),
+        )
+        .route("/oauth2/token", axum::routing::options(token_preflight))
+        .route(
+            "/oauth2/device_authorization",
+            post(device_authorization_endpoint),
         )
         .route("/oauth2/revoke", post(revoke_endpoint))
         .with_state(state)
@@ -111,6 +145,26 @@ struct RawTokenRequest {
     project_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DeviceAuthorizationRequest {
+    client_id: Option<String>,
+    scope: Option<String>,
+    project_id: Option<String>,
+    client_secret: Option<String>,
+    client_assertion: Option<String>,
+    client_assertion_type: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DeviceAuthorizationResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    verification_uri_complete: String,
+    expires_in: u64,
+    interval: u64,
+}
+
 impl From<RawTokenRequest> for AkTokenRequest {
     fn from(raw: RawTokenRequest) -> Self {
         AkTokenRequest {
@@ -135,8 +189,8 @@ impl From<RawTokenRequest> for AkTokenRequest {
     }
 }
 
-/// Token response. RFC 8693 §2.2.1 requires `issued_token_type` for token exchange, while other
-/// grants must not claim to be token-exchange responses.
+/// Token response. `issued_token_type` is retained only when a grant, such as RFC 8693 token
+/// exchange, requires it; RFC 8628 responses must not advertise an exchange-token type.
 #[derive(Serialize)]
 struct TokenResponseBody {
     access_token: String,
@@ -157,12 +211,188 @@ async fn token_endpoint(
     headers: HeaderMap,
     Form(raw): Form<RawTokenRequest>,
 ) -> Response {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    if raw.grant_type == DEVICE_CODE_GRANT {
+        return cors_response(
+            device_token_endpoint(state.clone(), headers, raw).await,
+            origin.as_deref(),
+            &state,
+        );
+    }
     let auth_header = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     let project_id = raw.project_id.clone();
     let req: AkTokenRequest = raw.into();
 
+    let tokens = match state.signer.token_manager().await {
+        Ok(tokens) => tokens,
+        Err(_) => {
+            return cors_response(
+                oauth_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "signing key unavailable",
+                ),
+                origin.as_deref(),
+                &state,
+            );
+        }
+    };
+
+    let scoped = RequestScopedOpStore {
+        inner: state.op_store.as_ref(),
+        project_id,
+    };
+
+    let binding = if req.grant_type == "authorization_code" {
+        match (&req.code, &req.client_id, &req.redirect_uri) {
+            (Some(code), Some(client_id), Some(redirect_uri)) => state
+                .op_store
+                .authorization_code_matches_binding(code, client_id, redirect_uri)
+                .await
+                .map(Some),
+            _ => Ok(Some(false)),
+        }
+    } else {
+        Ok(None)
+    };
+    let response = match binding {
+        Ok(Some(false)) => oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "authorization code is invalid",
+        ),
+        Err(_) => oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "authorization-code storage unavailable",
+        ),
+        Ok(_) => match handle_token(req, auth_header, &state.op_config, &scoped, &tokens).await {
+            Ok(resp) => success_response(resp),
+            Err(err) => error_response(&err),
+        },
+    };
+    cors_response(response, origin.as_deref(), &state)
+}
+
+async fn device_authorization_endpoint(
+    State(state): State<TokenExchangeState>,
+    headers: HeaderMap,
+    Form(request): Form<DeviceAuthorizationRequest>,
+) -> Response {
+    if headers.contains_key(header::AUTHORIZATION)
+        || request
+            .client_secret
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        || request.client_assertion.is_some()
+        || request.client_assertion_type.is_some()
+    {
+        return oauth_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "device clients must not present a client credential",
+        );
+    }
+    let Some(client_id) = request
+        .client_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "client_id is required",
+        );
+    };
+    let session = match state
+        .op_store
+        .create_device_authorization(
+            client_id,
+            request.scope.as_deref(),
+            request.project_id.as_deref(),
+        )
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => return error_response(&error),
+    };
+    let mut complete = match reqwest::Url::parse(&state.device_verification_uri) {
+        Ok(url) => url,
+        Err(_) => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "device verification URI is invalid",
+            );
+        }
+    };
+    complete
+        .query_pairs_mut()
+        .append_pair("user_code", &session.user_code);
+    (
+        StatusCode::OK,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        Json(DeviceAuthorizationResponse {
+            device_code: session.device_code,
+            user_code: session.user_code,
+            verification_uri: state.device_verification_uri,
+            verification_uri_complete: complete.to_string(),
+            expires_in: state.device_code_ttl_secs,
+            interval: state.device_poll_interval_secs,
+        }),
+    )
+        .into_response()
+}
+
+async fn device_token_endpoint(
+    state: TokenExchangeState,
+    headers: HeaderMap,
+    request: RawTokenRequest,
+) -> Response {
+    if headers.contains_key(header::AUTHORIZATION)
+        || request
+            .client_secret
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        || request.client_assertion.is_some()
+        || request.client_assertion_type.is_some()
+    {
+        return oauth_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "device clients must not present a client credential",
+        );
+    }
+    let Some(client_id) = request
+        .client_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "client_id is required",
+        );
+    };
+    let Some(device_code) = request
+        .device_code
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "device_code is required",
+        );
+    };
     let tokens = match state.signer.token_manager().await {
         Ok(tokens) => tokens,
         Err(_) => {
@@ -173,21 +403,23 @@ async fn token_endpoint(
             );
         }
     };
-
-    let scoped = RequestScopedOpStore {
-        inner: state.op_store.as_ref(),
-        project_id,
-    };
-
-    match handle_token(req, auth_header, &state.op_config, &scoped, &tokens).await {
-        Ok(resp) => success_response(resp),
-        Err(err) => error_response(&err),
+    match state
+        .op_store
+        .poll_device_grant(client_id, device_code, &tokens)
+        .await
+    {
+        Ok(response) => success_response(response),
+        Err(error) => error_response(&error),
     }
 }
 
 fn success_response(resp: AkTokenResponse) -> Response {
     (
         StatusCode::OK,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
         Json(TokenResponseBody {
             access_token: resp.access_token,
             token_type: resp.token_type,
@@ -224,12 +456,49 @@ fn error_response(err: &AkTokenErrorResponse) -> Response {
 fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
     (
         status,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
         Json(serde_json::json!({
             "error": error,
             "error_description": description,
         })),
     )
         .into_response()
+}
+
+async fn token_preflight(State(state): State<TokenExchangeState>, headers: HeaderMap) -> Response {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok());
+    cors_response(StatusCode::NO_CONTENT.into_response(), origin, &state)
+}
+
+fn cors_response(
+    mut response: Response,
+    origin: Option<&str>,
+    state: &TokenExchangeState,
+) -> Response {
+    response
+        .headers_mut()
+        .append(header::VARY, HeaderValue::from_static("Origin"));
+    if let Some(origin) = origin.filter(|origin| state.allows_cors_origin(origin))
+        && let Ok(value) = HeaderValue::from_str(origin)
+    {
+        response
+            .headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("POST"),
+        );
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("content-type"),
+        );
+    }
+    response
 }
 
 /// `TokenErrorResponse` carries no HTTP status (`authkestra_op::handlers::token`'s own type

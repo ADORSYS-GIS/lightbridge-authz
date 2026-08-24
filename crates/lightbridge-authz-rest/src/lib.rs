@@ -4,7 +4,7 @@ use lightbridge_authz_core::{
     RotateApiKey, async_trait,
     config::{
         ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetServer, IdpServer, ModelCatalog, Oauth2,
-        OpaServer, QuotaTiers, Redis, UsageServiceClient,
+        OauthClient, OauthClientType, OpaServer, QuotaTiers, Redis, UsageServiceClient,
     },
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
@@ -12,6 +12,7 @@ use lightbridge_authz_core::{
 };
 
 pub mod auth_provider;
+pub mod authorize;
 pub mod codec;
 pub mod handlers;
 pub mod middleware;
@@ -2210,22 +2211,23 @@ where
         )
 }
 
-/// Derives the two `well_known_router` mount parameters (`token_exchange_scopes`,
-/// `client_authentication`) from `oauth2`. Used by `build_idp_router` — `authz-idp` is now the
+/// Derives the token-surface `well_known_router` parameters from the successfully assembled
+/// state, rather than configuration intent. Used by `build_idp_router` — `authz-idp` is now the
 /// only server that mounts `well_known_router` at all; `authz-api` stopped serving OIDC
 /// discovery/JWKS once the `auth.ai.camer.digital` ingress was repointed at `authz-idp` (see
-/// `build_api_router`'s doc comment). Kept as its own function rather than inlined into
-/// `build_idp_router` so a future second self-signed-JWKS server can reuse it the same way
-/// `build_api_router` used to.
+/// `build_api_router`'s doc comment). A configured client cannot make discovery advertise a
+/// token endpoint that this router did not mount.
 fn well_known_mount_params(
     oauth2: &Oauth2,
+    token_exchange: Option<&token_exchange::TokenExchangeState>,
 ) -> (Option<Vec<String>>, signing::ClientAuthenticationMetadata) {
-    let token_exchange_scopes = oauth2
-        .token_exchange
-        .as_ref()
-        .filter(|t| t.enabled)
-        .map(|t| t.allowed_scopes.clone());
-    let client_authentication = signing::ClientAuthenticationMetadata::from_oauth2(oauth2);
+    let token_exchange_scopes =
+        token_exchange.map(|state| state.op_config().scopes_supported.clone());
+    let client_authentication = if token_exchange.is_some() {
+        signing::ClientAuthenticationMetadata::from_oauth2(oauth2)
+    } else {
+        signing::ClientAuthenticationMetadata::default()
+    };
     (token_exchange_scopes, client_authentication)
 }
 
@@ -2385,9 +2387,13 @@ fn build_token_exchange_state(
     let signing = oauth2.signing.as_ref().ok_or_else(|| {
         Error::Server("oauth2.token_exchange requires oauth2.signing (type: self)".to_string())
     })?;
-    if cfg.access_ttl_seconds <= 0 || cfg.refresh_ttl_seconds <= 0 {
+    if cfg.access_ttl_seconds <= 0
+        || cfg.authorization_code_ttl_seconds <= 0
+        || cfg.refresh_ttl_seconds <= 0
+    {
         return Err(Error::Server(
-            "token_exchange access_ttl_seconds and refresh_ttl_seconds must be positive"
+            "token_exchange access_ttl_seconds, authorization_code_ttl_seconds, and \
+             refresh_ttl_seconds must be positive"
                 .to_string(),
         ));
     }
@@ -2404,6 +2410,31 @@ fn build_token_exchange_state(
                 .to_string(),
         ));
     }
+    if cfg.device_code_ttl_seconds <= 0 || cfg.device_poll_interval_seconds <= 0 {
+        return Err(Error::Server(
+            "token_exchange device_code_ttl_seconds and device_poll_interval_seconds must be positive"
+                .to_string(),
+        ));
+    }
+    let device_verification_uri =
+        reqwest::Url::parse(&cfg.device_verification_uri).map_err(|_| {
+            Error::Server(
+                "token_exchange device_verification_uri must be an absolute URL".to_string(),
+            )
+        })?;
+    if device_verification_uri.scheme() != "https"
+        || device_verification_uri.path() != "/device/verify"
+        || !device_verification_uri.username().is_empty()
+        || device_verification_uri.password().is_some()
+        || device_verification_uri.query().is_some()
+        || device_verification_uri.fragment().is_some()
+    {
+        return Err(Error::Server(
+            "token_exchange device_verification_uri must be a credential-free, query-free HTTPS /device/verify URL"
+                .to_string(),
+        ));
+    }
+    validate_authorization_code_clients(&oauth2.clients)?;
     let signer = signing::ApiKeyJwtSigner::from_config(signing, repo.clone())?;
 
     let client_store = oauth2_op::client_store::ConfigClientStore::from_config(&oauth2.clients);
@@ -2425,20 +2456,86 @@ fn build_token_exchange_state(
     let op_config = authkestra_op::config::OpConfig {
         issuer: signing.issuer.clone(),
         scopes_supported: cfg.allowed_scopes.clone(),
-        response_types_supported: vec!["token".to_string()],
+        response_types_supported: vec!["code".to_string()],
         grant_types_supported: vec![
+            "authorization_code".to_string(),
             token_exchange::TOKEN_EXCHANGE_GRANT.to_string(),
             token_exchange::REFRESH_TOKEN_GRANT.to_string(),
+            token_exchange::DEVICE_CODE_GRANT.to_string(),
         ],
         id_token_signing_alg: "RS256".to_string(),
-        authorization_code_ttl_secs: 0,
+        authorization_code_ttl_secs: cfg.authorization_code_ttl_seconds,
         access_token_ttl_secs: cfg.access_ttl_seconds.max(0) as u64,
-        device_code_ttl_secs: 0,
+        device_code_ttl_secs: cfg.device_code_ttl_seconds as u64,
         token_exchange_enabled: cfg.enabled,
     };
-    Ok(Some(token_exchange::TokenExchangeState::new(
-        signer, op_config, op_store,
-    )))
+    let cors_origins = token_endpoint_cors_origins(&oauth2.clients)?;
+    Ok(Some(
+        token_exchange::TokenExchangeState::new(
+            signer,
+            op_config,
+            op_store,
+            cfg.device_verification_uri.clone(),
+            cfg.device_code_ttl_seconds as u64,
+            cfg.device_poll_interval_seconds as u64,
+        )
+        .with_cors_origins(cors_origins),
+    ))
+}
+
+fn token_endpoint_cors_origins(clients: &[OauthClient]) -> Result<Vec<String>> {
+    clients
+        .iter()
+        .filter(|client| {
+            client.client_type == OauthClientType::Public
+                && client.require_pkce
+                && client
+                    .grant_types
+                    .iter()
+                    .any(|grant| grant == "authorization_code")
+        })
+        .flat_map(|client| client.redirect_uris.iter())
+        .map(|redirect_uri| redirect_origin(redirect_uri))
+        .collect::<Result<std::collections::BTreeSet<_>>>()
+        .map(|origins| origins.into_iter().collect())
+}
+
+fn validate_authorization_code_clients(clients: &[OauthClient]) -> Result<()> {
+    for client in clients {
+        for redirect_uri in &client.redirect_uris {
+            redirect_origin(redirect_uri)?;
+        }
+        if client.client_type == OauthClientType::Public
+            && client
+                .grant_types
+                .iter()
+                .any(|grant| grant == "authorization_code")
+            && (!client.require_pkce || client.redirect_uris.is_empty())
+        {
+            return Err(Error::Server(
+                "public authorization_code clients require PKCE and at least one redirect_uri"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn redirect_origin(redirect_uri: &str) -> Result<String> {
+    let url = reqwest::Url::parse(redirect_uri).map_err(|_| {
+        Error::Server("authorization-code redirect_uri must be an absolute URL".to_string())
+    })?;
+    if !matches!(url.scheme(), "https" | "http")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none_or(|host| host.contains('*'))
+    {
+        return Err(Error::Server(
+            "authorization-code redirect_uri must have an HTTP(S) origin without credentials"
+                .to_string(),
+        ));
+    }
+    Ok(url.origin().ascii_serialization())
 }
 
 #[expect(
@@ -2712,20 +2809,35 @@ pub fn build_idp_router(
     device_verify_rate_limit_store: Arc<dyn RateLimitStore>,
 ) -> Router {
     let mut router = probe_router(readiness_pool);
-    let rp_router = if let (Some(rp_config), Some(_)) = (&oauth2.relying_party, &oauth2.signing) {
-        let rp = relying_party::KeycloakRelyingParty::new(
-            rp_config.clone(),
-            oauth2.jwks_url.clone(),
-            signing_repo.clone(),
-            device_verify_rate_limit_store,
-        )
-        .expect("authz-idp startup validates oauth2.relying_party before router construction");
-        Some(relying_party::router(Arc::new(rp)))
+    let rp = if let (Some(rp_config), Some(_)) = (&oauth2.relying_party, &oauth2.signing) {
+        Some(Arc::new(
+            relying_party::KeycloakRelyingParty::new(
+                rp_config.clone(),
+                oauth2.jwks_url.clone(),
+                signing_repo.clone(),
+                device_verify_rate_limit_store,
+            )
+            .expect("authz-idp startup validates oauth2.relying_party before router construction"),
+        ))
     } else {
         None
     };
+    let rp_router = rp.as_ref().map(|rp| relying_party::router(rp.clone()));
 
-    let (token_exchange_scopes, client_authentication) = well_known_mount_params(oauth2);
+    let (token_exchange_scopes, client_authentication) =
+        well_known_mount_params(oauth2, token_exchange.as_ref());
+    let discovery_capabilities = token_exchange
+        .as_ref()
+        .map(|_| {
+            let capabilities =
+                signing::DiscoveryCapabilities::token_surface().with_device_authorization();
+            if rp.is_some() {
+                capabilities.with_authorization_code()
+            } else {
+                capabilities
+            }
+        })
+        .unwrap_or_default();
     if oauth2.is_self_signed()
         && let Some(signing) = oauth2.signing.as_ref()
     {
@@ -2734,10 +2846,17 @@ pub fn build_idp_router(
             signing_repo,
             token_exchange_scopes,
             client_authentication,
+            discovery_capabilities,
         ));
     }
 
     if let Some(te_state) = token_exchange {
+        if let Some(rp) = rp.as_ref() {
+            router = router.merge(authorize::router(authorize::AuthorizeState::new(
+                rp.clone(),
+                te_state.clone(),
+            )));
+        }
         router = router.merge(token_exchange::token_exchange_router(te_state));
     }
 
@@ -3312,9 +3431,13 @@ mod tests {
         Oauth2TokenExchange {
             enabled: true,
             access_ttl_seconds: 900,
+            authorization_code_ttl_seconds: 300,
             refresh_ttl_seconds: 2_592_000,
             allowed_scopes: vec!["openid".to_string()],
             refresh_absolute_ttl_seconds: 7_776_000,
+            device_code_ttl_seconds: 600,
+            device_poll_interval_seconds: 5,
+            device_verification_uri: "https://authz.example.test/device/verify".to_string(),
         }
     }
 
@@ -3398,6 +3521,29 @@ mod tests {
             panic!("expected an error for a non-positive ttl");
         };
         assert!(format!("{err}").contains("must be positive"));
+    }
+
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_unsafe_device_verification_uri() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        let mut cfg = exchange_cfg();
+        cfg.device_verification_uri =
+            "https://user:password@authz.example.test/device/verify?unexpected=1#fragment"
+                .to_string();
+        oauth2.token_exchange = Some(cfg);
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        ) else {
+            panic!("expected an error for an unsafe device verification URI");
+        };
+        assert!(format!("{err}").contains("credential-free"));
     }
 
     #[tokio::test]

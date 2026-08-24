@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use authkestra_engine::auth::state::Identity;
 use authkestra_engine::token::TokenManager;
-use authkestra_op::client::{ClientRegistration, ClientStore, GrantType};
+use authkestra_op::client::{ClientRegistration, ClientStore, GrantType, TokenEndpointAuthMethod};
 use authkestra_op::client_assertion::ClientAssertionStore;
 use authkestra_op::code::{AuthorizationCode, AuthorizationCodeStore};
 use authkestra_op::config::OpConfig;
@@ -68,10 +68,10 @@ use serde_json::Value;
 
 use crate::signing::{KeyOwner, access_token_extra, id_token_extra, identity_for};
 
+use super::authorization_code_store::DbAuthorizationCodeStore;
 use super::client_assertion_store::RedisClientAssertionStore;
 use super::client_store::ConfigClientStore;
-use super::device_store::DbDeviceCodeStore;
-use super::noop_stores::NoAuthorizationCodeStore;
+use super::device_store::{DbDeviceCodeStore, create_pending_device_authorization};
 use super::refresh_store::DbRefreshTokenStore;
 use super::{
     ACCESS_TOKEN_TYPE, OFFLINE_ACCESS_SCOPE, OPENID_SCOPE, decode_auth_time_and_nonce,
@@ -104,20 +104,26 @@ fn budget_tier_wire_label(amount_micros: i64) -> String {
     }
 }
 
+struct InitialRefreshToken<'a> {
+    owner: &'a KeyOwner,
+    account_id: &'a str,
+    project_id: &'a str,
+    client_id: &'a str,
+    scope: Option<&'a str>,
+    auth_time: Option<i64>,
+    session_id: &'a str,
+}
+
 /// Everything the native token-exchange endpoint needs, minus the one per-request field
 /// (`project_id`) `handle_token`'s dispatch has no room to carry -- see `RequestScopedOpStore`.
 /// One instance is built once at server startup and shared (`Arc`) across every request.
 pub struct TokenExchangeOpStore {
     clients: ConfigClientStore,
-    codes: NoAuthorizationCodeStore,
+    codes: DbAuthorizationCodeStore,
     refresh: DbRefreshTokenStore,
-    /// #423: real, CAS-consuming storage over `device_authorizations` (ADR-0012 Decision 7),
-    /// replacing the permanent `NoDeviceCodeStore` stub ADR-0011 Decision 3 originally installed.
-    /// Still practically unreachable in production today -- `oauth2_op::client_store` never maps
-    /// any client to the `device_code` grant type, so `handle_token`'s device-code arm rejects
-    /// before ever consulting this field -- but no longer errors/no-ops unconditionally in case
-    /// that invariant is ever lifted by a later ticket (the `/device_authorization` endpoint and
-    /// verification page, both out of scope here).
+    /// Real, CAS-consuming storage over `device_authorizations`. The native RFC 8628 endpoint
+    /// creates and redeems its rows directly so token issuance can preserve this service's
+    /// tenant-context and fail-closed claims contract.
     devices: DbDeviceCodeStore,
     assertions: RedisClientAssertionStore,
     repo: Arc<StoreRepo>,
@@ -158,7 +164,7 @@ impl TokenExchangeOpStore {
     ) -> Self {
         Self {
             clients,
-            codes: NoAuthorizationCodeStore,
+            codes: DbAuthorizationCodeStore::new(repo.clone()),
             refresh: DbRefreshTokenStore::new(repo.clone()),
             devices: DbDeviceCodeStore::new(repo.clone()),
             assertions,
@@ -175,6 +181,24 @@ impl TokenExchangeOpStore {
     /// (`signing::discovery_document`).
     pub fn has_confidential_client(&self) -> bool {
         self.clients.has_confidential_client()
+    }
+
+    pub async fn authorization_code_matches_binding(
+        &self,
+        code: &str,
+        client_id: &str,
+        redirect_uri: &str,
+    ) -> Result<bool, OpError> {
+        self.codes
+            .matches_binding(code, client_id, redirect_uri)
+            .await
+    }
+
+    pub(crate) async fn find_client_registration(
+        &self,
+        client_id: &str,
+    ) -> Result<Option<ClientRegistration>, OpError> {
+        self.clients.find_client(client_id).await
     }
 
     /// Revokes a single refresh token by its plaintext value, scoped to the presented
@@ -206,6 +230,339 @@ impl TokenExchangeOpStore {
         expires_at: DateTime<Utc>,
     ) -> Result<bool, OpError> {
         self.assertions.record_jti(jti, expires_at).await
+    }
+
+    pub async fn create_device_authorization(
+        &self,
+        client_id: &str,
+        scope: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<DeviceCodeSession, TokenErrorResponse> {
+        let client = self
+            .clients
+            .find_client(client_id)
+            .await
+            .map_err(|_| oauth_err("server_error", "client registry lookup failed"))?
+            .ok_or_else(|| oauth_err("invalid_client", "client authentication failed"))?;
+        if !client.allows_grant_type(&GrantType::DeviceCode) {
+            return Err(oauth_err(
+                "unauthorized_client",
+                "client is not authorized for the device grant",
+            ));
+        }
+        if client.token_endpoint_auth_method != Some(TokenEndpointAuthMethod::NoAuth) {
+            return Err(oauth_err(
+                "unauthorized_client",
+                "device authorization requires a public client",
+            ));
+        }
+        let requested = scope.unwrap_or_default();
+        let granted = grant_scopes(
+            &Some(requested.to_string()),
+            &self.cfg.allowed_scopes,
+            &client.scopes,
+        );
+        let requested_scopes: Vec<_> = requested.split_whitespace().collect();
+        if !requested_scopes.is_empty() && requested_scopes.len() != granted.len() {
+            return Err(oauth_err(
+                "invalid_scope",
+                "requested scope is not permitted",
+            ));
+        }
+        if granted.iter().any(|scope| scope == OFFLINE_ACCESS_SCOPE)
+            && !client.allows_grant_type(&GrantType::RefreshToken)
+        {
+            return Err(oauth_err(
+                "unauthorized_client",
+                "client is not authorized for refresh tokens",
+            ));
+        }
+        create_pending_device_authorization(
+            self.repo.as_ref(),
+            client_id,
+            project_id.filter(|id| !id.trim().is_empty()),
+            &scope_to_string(&granted).unwrap_or_default(),
+            Duration::seconds(self.cfg.device_code_ttl_seconds),
+            self.cfg.device_poll_interval_seconds,
+        )
+        .await
+        .map_err(|_| oauth_err("server_error", "device authorization persistence failed"))
+    }
+
+    /// Polls and, after approval, consumes an RFC 8628 device code before minting. This makes a
+    /// decision one-shot even if subsequent tenant resolution or signing fails: retrying a bearer
+    /// device code after partial issuance is less safe than requiring a fresh login.
+    pub async fn poll_device_grant(
+        &self,
+        client_id: &str,
+        device_code: &str,
+        tokens: &TokenManager,
+    ) -> Result<TokenResponse, TokenErrorResponse> {
+        let now = Utc::now();
+        let client = self
+            .clients
+            .find_client(client_id)
+            .await
+            .map_err(|_| oauth_err("server_error", "client registry lookup failed"))?
+            .ok_or_else(|| oauth_err("invalid_client", "client authentication failed"))?;
+        if !client.allows_grant_type(&GrantType::DeviceCode)
+            || client.token_endpoint_auth_method != Some(TokenEndpointAuthMethod::NoAuth)
+        {
+            return Err(oauth_err(
+                "unauthorized_client",
+                "client is not authorized for the device grant",
+            ));
+        }
+        let row = self
+            .repo
+            .find_device_authorization_by_device_code(device_code)
+            .await
+            .map_err(|_| oauth_err("server_error", "device authorization lookup failed"))?
+            .ok_or_else(|| oauth_err("invalid_grant", "device code is invalid"))?;
+        if row.client_id != client_id {
+            return Err(oauth_err(
+                "invalid_grant",
+                "device code was issued to another client",
+            ));
+        }
+        if now >= row.expires_at {
+            return Err(oauth_err("expired_token", "device code has expired"));
+        }
+        match row.status.as_str() {
+            "pending" => {
+                self.repo
+                    .touch_device_authorization_poll(device_code, now)
+                    .await
+                    .map_err(|_| {
+                        oauth_err("server_error", "device authorization polling failed")
+                    })?;
+                if let Some(last_polled_at) = row.last_polled_at
+                    && now < last_polled_at + Duration::seconds(i64::from(row.interval_secs))
+                {
+                    return Err(oauth_err(
+                        "slow_down",
+                        "device client is polling too quickly",
+                    ));
+                }
+                Err(oauth_err(
+                    "authorization_pending",
+                    "device authorization is still pending",
+                ))
+            }
+            "denied" | "approved" => {
+                let consumed = self
+                    .repo
+                    .consume_device_authorization(device_code, now)
+                    .await
+                    .map_err(|_| oauth_err("server_error", "device authorization consume failed"))?
+                    .ok_or_else(|| {
+                        oauth_err("invalid_grant", "device code is invalid or consumed")
+                    })?;
+                if consumed.status == "denied" {
+                    return Err(oauth_err(
+                        "access_denied",
+                        "device authorization was denied",
+                    ));
+                }
+                self.issue_device_tokens(
+                    consumed,
+                    client_id,
+                    client.allows_grant_type(&GrantType::RefreshToken),
+                    tokens,
+                    now,
+                )
+                .await
+            }
+            _ => Err(oauth_err(
+                "invalid_grant",
+                "device code is invalid or consumed",
+            )),
+        }
+    }
+
+    async fn issue_device_tokens(
+        &self,
+        row: lightbridge_authz_api_key::entities::device_authorization_row::DeviceAuthorizationRow,
+        client_id: &str,
+        client_allows_refresh: bool,
+        tokens: &TokenManager,
+        now: DateTime<Utc>,
+    ) -> Result<TokenResponse, TokenErrorResponse> {
+        let subject = row.subject.clone().ok_or_else(|| {
+            oauth_err(
+                "server_error",
+                "approved device authorization has no subject",
+            )
+        })?;
+        let project_id = match row.project_id.as_deref() {
+            Some(project_id) => project_id.to_string(),
+            None => self
+                .repo
+                .find_default_project_id(&subject)
+                .await
+                .map_err(|_| oauth_err("server_error", "context resolution failed"))?
+                .ok_or_else(|| oauth_err("access_denied", "subject has no default project"))?,
+        };
+        let context = match self.repo.resolve_context(&subject, &project_id).await {
+            Ok(context) => context,
+            Err(Error::NotFound) => {
+                return Err(oauth_err(
+                    "access_denied",
+                    "subject is not a member of the requested project",
+                ));
+            }
+            Err(_) => return Err(oauth_err("server_error", "context resolution failed")),
+        };
+        let project = match self.repo.get_project_by_id(&context.project_id).await {
+            Ok(Some(project)) if project.status == ResourceStatus::Active => project,
+            Ok(_) => return Err(oauth_err("access_denied", "project is inactive")),
+            Err(_) => return Err(oauth_err("server_error", "project lookup failed")),
+        };
+        match self.repo.get_account_by_id(&context.account_id).await {
+            Ok(Some(account)) if account.status == ResourceStatus::Active => {}
+            Ok(_) => return Err(oauth_err("access_denied", "account is inactive")),
+            Err(_) => return Err(oauth_err("server_error", "account lookup failed")),
+        }
+        let scope = row.scope.clone();
+        let offline = scope.as_deref().is_some_and(|scopes| {
+            scopes
+                .split_whitespace()
+                .any(|scope| scope == OFFLINE_ACCESS_SCOPE)
+        });
+        if offline && !client_allows_refresh {
+            return Err(oauth_err(
+                "unauthorized_client",
+                "client is not authorized for refresh tokens",
+            ));
+        }
+        let session_expires_at = if offline {
+            now + Duration::seconds(self.cfg.refresh_absolute_ttl_seconds.max(0))
+        } else {
+            now + Duration::seconds(self.cfg.access_ttl_seconds)
+        };
+        let session = self
+            .repo
+            .create_session(NewSession {
+                id: cuid2(),
+                account_id: context.account_id.clone(),
+                project_id: context.project_id.clone(),
+                client_id: Some(client_id.to_string()),
+                kind: "token".to_string(),
+                expires_at: session_expires_at,
+            })
+            .await
+            .map_err(|_| oauth_err("server_error", "session persistence failed"))?;
+        let owner = KeyOwner {
+            subject: subject.clone(),
+            email: None,
+            email_verified: None,
+        };
+        let expires_in = self.cfg.access_ttl_seconds as u64;
+        let budget_tier = self.resolve_budget_tier(&context.account_id, now).await;
+        let quota_tier = self
+            .resolve_quota_tier(&context.project_id, &subject)
+            .await?;
+        let mut extra = access_token_extra(
+            &owner,
+            &session.id,
+            &session.id,
+            &context.project_id,
+            &context.account_id,
+            project.allowed_models,
+            Some(client_id),
+        );
+        extra.insert("budget_tier".to_string(), Value::String(budget_tier));
+        if let Some(quota_tier) = quota_tier {
+            extra.insert("quota_tier".to_string(), Value::String(quota_tier));
+        }
+        extra.insert(
+            "model_policy".to_string(),
+            Value::String(project.model_policy.to_string()),
+        );
+        let access_token = tokens
+            .issue_user_token_with_extra(
+                identity_for(&owner),
+                expires_in,
+                scope.clone(),
+                Some(client_id.to_string()),
+                extra,
+            )
+            .map_err(|_| oauth_err("server_error", "access token signing failed"))?;
+        let id_token = scope
+            .as_deref()
+            .is_some_and(|scopes| scopes.split_whitespace().any(|scope| scope == OPENID_SCOPE))
+            .then(|| {
+                tokens
+                    .issue_id_token_with_extra(
+                        identity_for(&owner),
+                        client_id,
+                        None,
+                        expires_in,
+                        id_token_extra(&owner, &access_token, None, client_id),
+                    )
+                    .map_err(|_| oauth_err("server_error", "id token signing failed"))
+            })
+            .transpose()?;
+        let refresh_token = if offline {
+            Some(
+                self.create_initial_refresh_token(
+                    InitialRefreshToken {
+                        owner: &owner,
+                        account_id: &context.account_id,
+                        project_id: &context.project_id,
+                        client_id,
+                        scope: scope.as_deref(),
+                        auth_time: None,
+                        session_id: &session.id,
+                    },
+                    now,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        Ok(TokenResponse {
+            access_token,
+            token_type: "Bearer".to_string(),
+            expires_in,
+            id_token,
+            refresh_token,
+            scope,
+            issued_token_type: None,
+        })
+    }
+
+    async fn create_initial_refresh_token(
+        &self,
+        input: InitialRefreshToken<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<String, TokenErrorResponse> {
+        let plaintext = generate_refresh_secret();
+        let chain_id = cuid2();
+        let chain_expires_at =
+            now + Duration::seconds(self.cfg.refresh_absolute_ttl_seconds.max(0));
+        let identity = refresh_identity(
+            input.owner,
+            input.account_id,
+            input.project_id,
+            input.auth_time,
+            &chain_id,
+            chain_expires_at,
+            input.session_id,
+        );
+        let refresh = RefreshToken {
+            token: plaintext.clone(),
+            client_id: input.client_id.to_string(),
+            identity,
+            scope: input.scope.unwrap_or_default().to_string(),
+            expires_at: now + Duration::seconds(self.cfg.refresh_ttl_seconds),
+        };
+        self.refresh
+            .store_token(refresh)
+            .await
+            .map_err(|_| oauth_err("server_error", "refresh token persistence failed"))?;
+        Ok(plaintext)
     }
 
     /// Resolves the `budget_tier` claim to stamp on a minted access token (ADR-0014,
@@ -564,38 +921,21 @@ impl TokenExchangeOpStore {
         };
 
         let refresh_token = if offline {
-            let plaintext = generate_refresh_secret();
-            // A brand-new chain is born here (ADR: refresh-token absolute cap): every rotation of
-            // this token inherits `chain_id`/`chain_expires_at` unchanged from this point on --
-            // see `handle_refresh_token`.
-            let chain_id = cuid2();
-            let chain_expires_at =
-                now + Duration::seconds(self.cfg.refresh_absolute_ttl_seconds.max(0));
-            let identity = refresh_identity(
-                &owner,
-                &context.account_id,
-                &context.project_id,
-                auth_time,
-                &chain_id,
-                chain_expires_at,
-                &session_id,
-            );
-            let rt = RefreshToken {
-                token: plaintext.clone(),
-                client_id: client_id.clone(),
-                identity,
-                scope: scope_str.clone().unwrap_or_default(),
-                expires_at: now + Duration::seconds(self.cfg.refresh_ttl_seconds),
-            };
-            match self.refresh.store_token(rt).await {
-                Ok(()) => Some(plaintext),
-                Err(_) => {
-                    return Err(oauth_err(
-                        "server_error",
-                        "refresh token persistence failed",
-                    ));
-                }
-            }
+            Some(
+                self.create_initial_refresh_token(
+                    InitialRefreshToken {
+                        owner: &owner,
+                        account_id: &context.account_id,
+                        project_id: &context.project_id,
+                        client_id: &client_id,
+                        scope: scope_str.as_deref(),
+                        auth_time,
+                        session_id: &session_id,
+                    },
+                    now,
+                )
+                .await?,
+            )
         } else {
             None
         };

@@ -46,6 +46,41 @@ pub struct ClientAuthenticationMetadata {
     signing_algorithms: Vec<String>,
 }
 
+/// Protocol routes mounted alongside the discovery document.
+///
+/// Discovery is a statement about the router assembled for this process, not about every grant a
+/// configured client could theoretically request. Keeping these route facts separate from the
+/// client registry prevents a configuration-only change from advertising an unmounted endpoint.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DiscoveryCapabilities {
+    token_endpoint: bool,
+    device_authorization_endpoint: bool,
+    authorization_endpoint: bool,
+}
+
+impl DiscoveryCapabilities {
+    /// The token and revocation routes are mounted, with no browser-facing flow routes.
+    pub const fn token_surface() -> Self {
+        Self {
+            token_endpoint: true,
+            device_authorization_endpoint: false,
+            authorization_endpoint: false,
+        }
+    }
+
+    /// The RFC 8628 device-authorization route is mounted with the token surface.
+    pub const fn with_device_authorization(mut self) -> Self {
+        self.device_authorization_endpoint = true;
+        self
+    }
+
+    /// The browser-facing authorization-code route is mounted with the token surface.
+    pub const fn with_authorization_code(mut self) -> Self {
+        self.authorization_endpoint = true;
+        self
+    }
+}
+
 impl ClientAuthenticationMetadata {
     /// Derives supported client-authentication methods from the configured client registry.
     pub fn from_oauth2(oauth2: &Oauth2) -> Self {
@@ -540,8 +575,8 @@ fn to_jwks(raw: Vec<Value>) -> Vec<authkestra_engine::token::jwk::Jwk> {
 /// Authkestra's `OidcDiscovery` cannot represent RFC 8414's revocation metadata and serializes
 /// several unsupported endpoints and client-authentication defaults. This explicit, small model
 /// makes omission the default: a field appears only when this process mounts the corresponding
-/// route. In particular, `/authorize`, device authorization, UserInfo, introspection, and logout
-/// remain absent until their handlers exist.
+/// route. `/authorize` and device authorization are represented by independent route facts;
+/// UserInfo, introspection, and logout remain absent until their handlers exist.
 ///
 /// RFC 8414 requires zero-element arrays to be omitted from an authorization-server metadata
 /// response. The shared narrow document applies the same omission discipline to OIDC discovery:
@@ -555,10 +590,20 @@ struct DiscoveryDocument {
     token_endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     revocation_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_authorization_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorization_endpoint: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     scopes_supported: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     grant_types_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    response_types_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    response_modes_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    code_challenge_methods_supported: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     token_endpoint_auth_methods_supported: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -577,25 +622,40 @@ fn discovery_document(
     issuer: &str,
     token_exchange_scopes: Option<&[String]>,
     client_authentication: &ClientAuthenticationMetadata,
+    capabilities: DiscoveryCapabilities,
 ) -> DiscoveryDocument {
-    let enabled = token_exchange_scopes.is_some();
-    let scopes_supported = token_exchange_scopes
+    let token_endpoint_mounted = capabilities.token_endpoint && token_exchange_scopes.is_some();
+    let device_authorization_mounted =
+        token_endpoint_mounted && capabilities.device_authorization_endpoint;
+    let authorization_code_mounted = token_endpoint_mounted && capabilities.authorization_endpoint;
+    let scopes_supported = token_endpoint_mounted
+        .then_some(token_exchange_scopes)
+        .flatten()
         .map(<[String]>::to_vec)
         .unwrap_or_default();
-    let grant_types_supported = enabled.then(|| {
+    let mut grant_types_supported = if token_endpoint_mounted {
         vec![
             crate::token_exchange::TOKEN_EXCHANGE_GRANT.to_string(),
             crate::token_exchange::REFRESH_TOKEN_GRANT.to_string(),
         ]
-    });
-    let oidc_tokens_supported = enabled && scopes_supported.iter().any(|scope| scope == "openid");
+    } else {
+        Vec::new()
+    };
+    if device_authorization_mounted {
+        grant_types_supported.push(crate::token_exchange::DEVICE_CODE_GRANT.to_string());
+    }
+    if authorization_code_mounted {
+        grant_types_supported.push("authorization_code".to_string());
+    }
+    let oidc_tokens_supported =
+        token_endpoint_mounted && scopes_supported.iter().any(|scope| scope == "openid");
     let endpoint_base = issuer_origin(issuer);
-    let client_auth_methods = if enabled {
+    let client_auth_methods = if token_endpoint_mounted {
         client_authentication.methods.clone()
     } else {
         Vec::new()
     };
-    let client_auth_signing_algorithms = if enabled {
+    let client_auth_signing_algorithms = if token_endpoint_mounted {
         client_authentication.signing_algorithms.clone()
     } else {
         Vec::new()
@@ -614,10 +674,30 @@ fn discovery_document(
     DiscoveryDocument {
         issuer: issuer.to_string(),
         jwks_uri: format!("{endpoint_base}/.well-known/jwks.json"),
-        token_endpoint: enabled.then(|| format!("{endpoint_base}/oauth2/token")),
-        revocation_endpoint: enabled.then(|| format!("{endpoint_base}/oauth2/revoke")),
+        token_endpoint: token_endpoint_mounted.then(|| format!("{endpoint_base}/oauth2/token")),
+        revocation_endpoint: token_endpoint_mounted
+            .then(|| format!("{endpoint_base}/oauth2/revoke")),
+        device_authorization_endpoint: device_authorization_mounted
+            .then(|| format!("{endpoint_base}/oauth2/device_authorization")),
+        authorization_endpoint: authorization_code_mounted
+            .then(|| format!("{endpoint_base}/authorize")),
         scopes_supported,
-        grant_types_supported: grant_types_supported.unwrap_or_default(),
+        grant_types_supported,
+        response_types_supported: if authorization_code_mounted {
+            vec!["code".to_string()]
+        } else {
+            Vec::new()
+        },
+        response_modes_supported: if authorization_code_mounted {
+            vec!["query".to_string()]
+        } else {
+            Vec::new()
+        },
+        code_challenge_methods_supported: if authorization_code_mounted {
+            vec!["S256".to_string()]
+        } else {
+            Vec::new()
+        },
         token_endpoint_auth_methods_supported: client_auth_methods.clone(),
         token_endpoint_auth_signing_alg_values_supported: client_auth_signing_algorithms.clone(),
         revocation_endpoint_auth_methods_supported: client_auth_methods,
@@ -658,16 +738,16 @@ fn well_known_paths(issuer: &str) -> (String, String) {
 /// verifying until they expire. Stateless w.r.t. axum state, so it merges into any router. CORS
 /// is wide-open (any origin, GET) because these are public, non-secret discovery documents.
 ///
-/// `token_exchange_scopes` is `Some(allowed_scopes)` when the token-exchange grant is enabled
-/// (`oauth2.token_exchange.enabled`), `None` when it is off (including when the whole
-/// `oauth2.token_exchange` block is absent from config, which deserializes to `None` the same
-/// way). `discovery_document` drops `token_endpoint` from the disabled document entirely, matching
-/// the previous hand-built document -- see its doc comment for the full rationale.
+/// `token_exchange_scopes` is populated only when the token surface was successfully assembled;
+/// `capabilities` separately records which optional flow routes the enclosing router mounted.
+/// `discovery_document` drops every endpoint from the disabled document entirely, matching the
+/// actual route table rather than config intent alone.
 pub fn well_known_router<S>(
     issuer: &str,
     repo: Arc<StoreRepo>,
     token_exchange_scopes: Option<Vec<String>>,
     client_authentication: ClientAuthenticationMetadata,
+    capabilities: DiscoveryCapabilities,
 ) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -695,6 +775,7 @@ where
                             &issuer,
                             scopes.as_deref(),
                             &client_authentication,
+                            capabilities,
                         ))
                     }
                 }
@@ -715,6 +796,7 @@ where
                             &issuer,
                             scopes.as_deref(),
                             &client_authentication,
+                            capabilities,
                         ))
                     }
                 }

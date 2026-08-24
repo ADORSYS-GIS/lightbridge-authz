@@ -158,6 +158,7 @@ async fn get_by_user_code_is_case_insensitive(pool: PgPool) {
     let session = create_pending_device_authorization(
         &repo,
         "device-client",
+        None,
         "openid",
         Duration::minutes(10),
         5,
@@ -202,6 +203,7 @@ async fn get_by_user_code_rate_limited_throttles_after_the_configured_burst(pool
     let session = create_pending_device_authorization(
         &repo,
         "device-client",
+        None,
         "openid",
         Duration::minutes(10),
         5,
@@ -236,6 +238,7 @@ async fn get_by_user_code_rate_limited_buckets_are_per_caller(pool: PgPool) {
     let session = create_pending_device_authorization(
         &repo,
         "device-client",
+        None,
         "openid",
         Duration::minutes(10),
         5,
