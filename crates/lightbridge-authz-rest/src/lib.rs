@@ -2800,29 +2800,27 @@ pub async fn start_opa_server(
 /// not what makes protocol routes win — it is documentation of that fact, kept in the same order
 /// the ADR describes it. See `static_assets::static_assets_fallback`'s own doc comment for the
 /// caching/CSP posture applied to everything served from `static_dir`.
+///
+/// ## `relying_party` is pre-validated, not (re)constructed here
+///
+/// `relying_party` is `None` when the deployment never configured `oauth2.relying_party` (the
+/// RP-leg -- the hosted device-verification page and `/authorize` browser SSO -- simply isn't
+/// mounted, matching that field's optionality in `config::Oauth2`), or `Some` with an already
+/// live `KeycloakRelyingParty` when it did. `start_idp_server` is the one call site that performs
+/// that construction (and surfaces a bad `oauth2.relying_party` block as a hard startup failure);
+/// this function only decides what to mount from the result. Test call sites that want the RP-leg
+/// mounted must construct their own `KeycloakRelyingParty` the same way.
 pub fn build_idp_router(
     oauth2: &Oauth2,
     signing_repo: Arc<StoreRepo>,
     token_exchange: Option<token_exchange::TokenExchangeState>,
     readiness_pool: Arc<dyn DbPoolTrait>,
     static_dir: impl AsRef<std::path::Path>,
-    device_verify_rate_limit_store: Arc<dyn RateLimitStore>,
+    relying_party: Option<Arc<relying_party::KeycloakRelyingParty>>,
 ) -> Router {
     let mut router = probe_router(readiness_pool);
-    let rp = if let (Some(rp_config), Some(_)) = (&oauth2.relying_party, &oauth2.signing) {
-        Some(Arc::new(
-            relying_party::KeycloakRelyingParty::new(
-                rp_config.clone(),
-                oauth2.jwks_url.clone(),
-                signing_repo.clone(),
-                device_verify_rate_limit_store,
-            )
-            .expect("authz-idp startup validates oauth2.relying_party before router construction"),
-        ))
-    } else {
-        None
-    };
-    let rp_router = rp.as_ref().map(|rp| relying_party::router(rp.clone()));
+    let rp = relying_party;
+    let rp_router = rp.as_ref().map(|rp| relying_party::router(Arc::clone(rp)));
 
     let (token_exchange_scopes, client_authentication) =
         well_known_mount_params(oauth2, token_exchange.as_ref());
@@ -2909,12 +2907,6 @@ pub async fn start_idp_server(
     let signing = oauth2.signing.as_ref().ok_or_else(|| {
         Error::Server("oauth2.type is 'self' but oauth2.signing is missing".to_string())
     })?;
-    let rp_config = oauth2.relying_party.clone().ok_or_else(|| {
-        Error::Server(
-            "authz-idp requires oauth2.relying_party for its Keycloak browser login flow"
-                .to_string(),
-        )
-    })?;
 
     // Redis is required unconditionally for authz-idp -- every lightbridge-authz serving role
     // that isn't explicitly freed from it (authz-opa, lightbridge-mcp) needs Redis-backed caching,
@@ -2922,11 +2914,10 @@ pub async fn start_idp_server(
     // gate; it no longer is -- see AGENTS.md's "Redis is a mandatory dependency" house rule).
     // Mirrors start_api_server's/start_budget_server's identical unconditional check. Resolved
     // here (rather than just before `build_token_exchange_state`, its original spot) so the
-    // Redis-backed rate limit store built from it is available to BOTH `KeycloakRelyingParty::new`
-    // call sites below -- this early validation-only construction and `build_idp_router`'s real
-    // one. `build_token_exchange_state` itself still no-ops to `Ok(None)` when token_exchange is
-    // disabled (see its own doc comment), so this changes only whether a *missing* redis config is
-    // tolerated, never whether token exchange itself is attempted.
+    // Redis-backed rate limit store built from it is available to the `KeycloakRelyingParty::new`
+    // validation below. `build_token_exchange_state` itself still no-ops to `Ok(None)` when
+    // token_exchange is disabled (see its own doc comment), so this changes only whether a
+    // *missing* redis config is tolerated, never whether token exchange itself is attempted.
     let redis = redis.as_ref().ok_or_else(|| {
         Error::Server(
             "redis config is required for authz-idp (set `redis.url`) -- mandatory for every \
@@ -2937,12 +2928,29 @@ pub async fn start_idp_server(
     let device_verify_rate_limit_store =
         build_redis_rate_limit_store(&redis.url, redis.ca_bundle_path.as_deref(), "authz-idp")?;
 
-    relying_party::KeycloakRelyingParty::new(
-        rp_config,
-        oauth2.jwks_url.clone(),
-        Arc::new(StoreRepo::new(pool.clone())),
-        device_verify_rate_limit_store.clone(),
-    )?;
+    // `oauth2.relying_party` is only required when this deployment actually mounts the Keycloak
+    // RP-leg (the hosted device-verification page and the `/authorize` browser SSO flow) --
+    // mirroring `build_idp_router`'s own gate, `if let (Some(rp_config), Some(_)) =
+    // (&oauth2.relying_party, &oauth2.signing)`. `signing` is already guaranteed `Some` above, so
+    // that condition collapses to "relying_party is configured": there is no separate
+    // enable/disable flag for the RP-leg in `Oauth2` (`config::Oauth2::relying_party`'s own doc
+    // comment) -- presence of the block IS what opts a deployment into it. A deployment that never
+    // configures `relying_party` never mounts those routes and must not be blocked from starting
+    // because of it (regression: PR #463 made this unconditionally required, breaking every
+    // deployment that only wants the token-exchange/discovery surface). When it IS configured,
+    // validation stays exactly as strict as before -- a bad `relying_party` block (e.g. a
+    // malformed `state_encryption_key`) is still a hard startup failure, never a silent skip.
+    // Constructed once here (not re-derived inside `build_idp_router`) and threaded through as an
+    // already-validated `Arc`, so there is exactly one `KeycloakRelyingParty::new` call site.
+    let rp = match oauth2.relying_party.clone() {
+        Some(rp_config) => Some(Arc::new(relying_party::KeycloakRelyingParty::new(
+            rp_config,
+            oauth2.jwks_url.clone(),
+            Arc::new(StoreRepo::new(pool.clone())),
+            device_verify_rate_limit_store.clone(),
+        )?)),
+        None => None,
+    };
 
     let readiness_pool = pool.clone();
     // ADR-0014: the budget ledger is read here (not called over the network) because
@@ -2989,7 +2997,7 @@ pub async fn start_idp_server(
         token_exchange_state,
         readiness_pool,
         &idp.static_dir,
-        device_verify_rate_limit_store,
+        rp,
     );
 
     tracing::info!(

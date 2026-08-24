@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use cratestack_axum::ratelimit::{InMemoryRateLimitStore, RateLimitStore};
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::config::{IdpServer, JwtSigning, Oauth2, Oauth2Type, Tls};
@@ -29,12 +28,9 @@ use lightbridge_authz_rest::{build_idp_router, start_idp_server};
 use tower::ServiceExt;
 
 /// None of this file's `oauth2` fixtures configure `relying_party`, so `build_idp_router` never
-/// actually constructs a `KeycloakRelyingParty`/consults this store -- an in-memory stand-in is
-/// enough to satisfy the parameter without pulling in a live Redis dependency.
-fn test_rate_limit_store() -> Arc<dyn RateLimitStore> {
-    Arc::new(InMemoryRateLimitStore::new())
-}
-
+/// mounts a `KeycloakRelyingParty` -- every call site below passes `None` for that parameter.
+/// Tests that DO need the RP-leg mounted go through `start_idp_server` instead (`mod db` below),
+/// which is the one place that constructs a real `KeycloakRelyingParty` from config.
 fn lazy_pool() -> Arc<dyn DbPoolTrait> {
     let pool = sqlx::postgres::PgPoolOptions::new()
         // Bounded so a deliberately-dead pool fails fast: sqlx's default
@@ -108,7 +104,7 @@ async fn build_idp_router_probes_behave_like_the_other_servers_including_db_unav
         None,
         pool,
         TEST_STATIC_DIR,
-        test_rate_limit_store(),
+        None,
     );
 
     for path in ["/", "/healthz", "/healthz/startup"] {
@@ -151,7 +147,7 @@ async fn build_idp_router_omits_well_known_when_oauth2_is_external() {
         None,
         pool,
         TEST_STATIC_DIR,
-        test_rate_limit_store(),
+        None,
     );
 
     let response = router
@@ -190,7 +186,7 @@ async fn static_fallback_refuses_unknown_protocol_namespace_paths() {
         None,
         pool,
         &static_dir,
-        test_rate_limit_store(),
+        None,
     );
 
     for path in [
@@ -392,7 +388,7 @@ async fn build_idp_router_serves_oauth2_revoke_without_touching_the_database() {
         Some(state),
         pool,
         TEST_STATIC_DIR,
-        test_rate_limit_store(),
+        None,
     );
 
     let response = router
@@ -429,7 +425,7 @@ async fn path_issuer_metadata_advertises_root_jwks_and_token_paths() {
         Some(state),
         pool,
         TEST_STATIC_DIR,
-        test_rate_limit_store(),
+        None,
     );
 
     let metadata = router
@@ -550,7 +546,7 @@ async fn build_idp_router_serves_oauth2_token_route() {
         Some(state),
         pool,
         TEST_STATIC_DIR,
-        test_rate_limit_store(),
+        None,
     );
 
     let response = router
@@ -748,6 +744,91 @@ mod db {
         );
     }
 
+    /// An `oauth2.relying_party` block that fails `KeycloakRelyingParty::new`'s own validation
+    /// (here: a `state_encryption_key` that isn't 32 bytes once base64url-decoded).
+    fn invalid_relying_party_cfg() -> lightbridge_authz_core::config::OidcRelyingParty {
+        lightbridge_authz_core::config::OidcRelyingParty {
+            issuer: "https://keycloak.example.test/realms/dev".to_string(),
+            client_id: "authz-idp".to_string(),
+            callback_url: "https://authz.example.test/oauth2/callback".to_string(),
+            client_secret: None,
+            state_encryption_key: "not-32-bytes-of-key-material".to_string(),
+            timeout_ms: 5_000,
+            browser_session_ttl_seconds: 28_800,
+        }
+    }
+
+    /// Regression test for PR #463 (`9e0ef4d`): it made `oauth2.relying_party` an unconditional
+    /// requirement for every `authz-idp` deployment, even ones that never mount the Keycloak
+    /// RP-leg (the hosted device-verification page / `/authorize` browser SSO). That broke every
+    /// deployment relying only on the discovery/JWKS/token-exchange surface -- including this
+    /// file's own fixtures, none of which set `relying_party` -- with `Server Error: authz-idp
+    /// requires oauth2.relying_party for its Keycloak browser login flow` before ever reaching
+    /// signing-key bootstrap. `oauth2.relying_party` has no separate enable/disable flag
+    /// (`config::Oauth2::relying_party`'s doc comment): presence of the block is what opts a
+    /// deployment into the RP-leg (mirrors `build_idp_router`'s own
+    /// `if let (Some(rp_config), Some(_)) = (&oauth2.relying_party, &oauth2.signing)` gate, with
+    /// `oauth2.signing` already guaranteed `Some` by the check just above this one in
+    /// `start_idp_server`). A config that leaves it unset must not be rejected for that reason --
+    /// it should sail past this check and reach the same TLS-load failure the sibling
+    /// `start_idp_server_bootstraps_its_own_signing_key`/`_does_not_require_redis_to_be_reachable`
+    /// tests exercise.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_idp_server_does_not_require_relying_party_when_rp_leg_is_not_configured(
+        pool: PgPool,
+    ) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let mut oauth2 = self_signed_oauth2();
+        assert!(
+            oauth2.relying_party.is_none(),
+            "precondition: this fixture must not configure relying_party"
+        );
+        oauth2.relying_party = None;
+        let idp = IdpServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+            static_dir: TEST_STATIC_DIR.to_string(),
+        };
+        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg())
+            .await
+            .expect_err("missing TLS cert paths must still surface as an error");
+        let message = format!("{err}");
+        assert!(
+            !message.to_lowercase().contains("relying_party"),
+            "an authz-idp deployment that never configures oauth2.relying_party must not be \
+             rejected for lacking it -- it should fail later, on TLS load: got {message}"
+        );
+    }
+
+    /// The other half of the gating fix above: when `oauth2.relying_party` IS configured (opting
+    /// the deployment into the RP-leg), an invalid block must still be a hard startup failure --
+    /// the gating fix must not have turned this into a silent skip. Uses `unreachable_redis_cfg`
+    /// so the mandatory-redis check doesn't intercept this first, isolating the assertion to the
+    /// relying_party validation itself.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_idp_server_rejects_invalid_relying_party_when_configured(pool: PgPool) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let mut oauth2 = self_signed_oauth2();
+        oauth2.relying_party = Some(invalid_relying_party_cfg());
+        let idp = IdpServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+            static_dir: TEST_STATIC_DIR.to_string(),
+        };
+        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg())
+            .await
+            .expect_err(
+                "an invalid oauth2.relying_party block must still be a hard startup failure",
+            );
+        let message = format!("{err}");
+        assert!(
+            message.contains("state_encryption_key"),
+            "expected KeycloakRelyingParty::new's own validation error, got: {message}"
+        );
+    }
+
     /// Replaces `idp_and_api_routers_serve_byte_identical_discovery_and_jwks`, whose premise --
     /// that `authz-api` and `authz-idp` serve byte-identical discovery/JWKS -- is now deliberately
     /// false: `authz-api`'s own `well_known_router`/`token_exchange_router` merges were removed
@@ -783,7 +864,7 @@ mod db {
             Some(idp_state),
             db_pool.clone(),
             TEST_STATIC_DIR,
-            test_rate_limit_store(),
+            None,
         );
 
         // authz-api's router: no oauth2/signing_repo/token_exchange params anymore (it mounts
@@ -923,7 +1004,7 @@ mod db {
             Some(idp_state),
             db_pool,
             &static_dir,
-            test_rate_limit_store(),
+            None,
         );
 
         // A bare status-code check is not enough to prove non-shadowing: the SPA fallback also
