@@ -1,5 +1,19 @@
 # Changelog
 
+## [4.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.10.1...v4.0.0) (2026-08-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* **idp:** own our users — accounts become federated identities with sealed Keycloak tokens (ADR-0024) ([#482](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/482))
+* **idp:** authz-idp now refuses to start without a complete oauth2.relying_party block and an enabled oauth2.token_exchange block whose allowed_scopes includes "openid". There is no compatibility window and no opt-out flag -- every authz-idp deployment must supply both.
+
+### Features
+
+* **idp:** own our users — accounts become federated identities with sealed Keycloak tokens (ADR-0024) ([#482](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/482)) ([fbeb08b](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/fbeb08b6c252fdde31ec8b1dc37184047648a696))
+* **idp:** serve the hosted login SPA under /ui instead of the router root ([#476](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/476)) ([65d7936](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/65d7936c4009e3727527be5ccde20d5f4a713952))
+* **idp:** the authz-idp surface is mandatory — full IdP, spec-complete discovery ([#479](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/479)) ([18e57bb](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/18e57bbe431ab4917f3d685d676172d72d151d20))
+
 ## [3.10.1](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.10.0...v3.10.1) (2026-08-24)
 
 
