@@ -8,7 +8,8 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, deco
 use lightbridge_authz_core::config::JwtSigning;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::signing::{
-    ApiKeyJwtSigner, ClientAuthenticationMetadata, capped_expiry, generate_rs256_key,
+    ApiKeyJwtSigner, ClientAuthenticationMetadata, DiscoveryCapabilities, capped_expiry,
+    generate_rs256_key,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -115,6 +116,7 @@ async fn well_known_serves_cors_headers() {
         lazy_repo(),
         None,
         ClientAuthenticationMetadata::default(),
+        DiscoveryCapabilities::default(),
     )
     .oneshot(
         Request::builder()
@@ -148,6 +150,7 @@ async fn jwks_endpoint_returns_server_error_when_repo_is_unreachable() {
         lazy_repo(),
         None,
         ClientAuthenticationMetadata::default(),
+        DiscoveryCapabilities::default(),
     )
     .oneshot(
         Request::builder()
@@ -261,6 +264,7 @@ async fn discovery_advertises_exact_token_exchange_metadata_when_enabled() {
         lazy_repo(),
         Some(scopes),
         ClientAuthenticationMetadata::public_client(),
+        DiscoveryCapabilities::token_surface(),
     )
     .oneshot(
         Request::builder()
@@ -322,6 +326,9 @@ async fn oidc_and_oauth_metadata_use_their_distinct_issuer_path_rules() {
         lazy_repo(),
         Some(vec!["openid".to_string(), "offline_access".to_string()]),
         ClientAuthenticationMetadata::default(),
+        DiscoveryCapabilities::token_surface()
+            .with_device_authorization()
+            .with_authorization_code(),
     );
     let oidc = router
         .clone()
@@ -367,6 +374,15 @@ async fn oidc_and_oauth_metadata_use_their_distinct_issuer_path_rules() {
         oauth["revocation_endpoint"],
         "https://authz.example.test/oauth2/revoke"
     );
+    assert_eq!(
+        oauth["device_authorization_endpoint"],
+        "https://authz.example.test/oauth2/device_authorization",
+        "the issuer path selects the metadata path, not an unmounted protocol-route prefix"
+    );
+    assert_eq!(
+        oauth["authorization_endpoint"], "https://authz.example.test/authorize",
+        "the issuer path selects the metadata path, not an unmounted protocol-route prefix"
+    );
 
     let jwks = router
         .clone()
@@ -389,6 +405,7 @@ async fn oidc_and_oauth_metadata_use_their_distinct_issuer_path_rules() {
         lazy_repo(),
         Some(vec!["openid".to_string()]),
         ClientAuthenticationMetadata::default(),
+        DiscoveryCapabilities::token_surface(),
     )
     .oneshot(
         Request::builder()
@@ -436,6 +453,7 @@ async fn discovery_advertises_no_grants_when_exchange_disabled() {
         lazy_repo(),
         None,
         ClientAuthenticationMetadata::default(),
+        DiscoveryCapabilities::default(),
     )
     .oneshot(
         Request::builder()
@@ -502,6 +520,7 @@ async fn discovery_omits_token_endpoint_when_exchange_disabled() {
         lazy_repo(),
         None,
         ClientAuthenticationMetadata::default(),
+        DiscoveryCapabilities::default(),
     )
     .oneshot(
         Request::builder()
@@ -541,6 +560,7 @@ async fn discovery_advertises_private_key_jwt_only_when_a_confidential_client_is
         lazy_repo(),
         Some(vec!["openid".to_string()]),
         ClientAuthenticationMetadata::private_key_jwt(vec!["RS256".to_string()]),
+        DiscoveryCapabilities::token_surface(),
     )
     .oneshot(
         Request::builder()
@@ -570,21 +590,16 @@ async fn discovery_advertises_private_key_jwt_only_when_a_confidential_client_is
     );
 }
 
-/// This service never serves `/authorize` (ADR-0011, Context) regardless of whether
-/// `oauth2.token_exchange.enabled` is on: token-exchange is a direct token-endpoint grant
-/// (RFC 8693), not a redirect-based authorization flow. `response_types_supported` and
-/// `response_modes_supported` describe the authorization endpoint (OIDC Discovery 1.0 §3 --
-/// `response_types_supported` is REQUIRED to be present as a JSON array, but the spec's
-/// "MUST support code/id_token/id_token token" clause binds only "Dynamic OpenID Providers",
-/// meaning ones that also advertise a `registration_endpoint`; this deployment has none, so an
-/// empty array is spec-compliant, not merely tidy). So both must stay empty/absent on *both*
-/// sides of the token-exchange gate -- unlike `grant_types_supported`/`scopes_supported`/
-/// `token_endpoint`, which correctly describe the token-endpoint grant surface and are gated on
-/// it. Checked against both states in one test specifically because the enabled/disabled tests
-/// above each only prove one side; a gate wired to the wrong field (as `response_types_supported`
-/// was before this test was added -- it flipped to `["token", "id_token", "id_token token"]`
-/// purely because `oauth2.token_exchange.enabled` went from `false` to `true` in production) would
-/// still pass a test that only checks one state.
+/// Regression guard for the capability gates in ADR-0019 Decision 5 and #426. This test used to
+/// prove that `response_types_supported` and `response_modes_supported` remained absent because
+/// `/authorize` did not exist. That premise changed when the persisted authorization-code route
+/// shipped; its purpose did not. The document must now advertise `code` and `query` only when the
+/// router has mounted `/authorize`, never merely because token exchange, a client entry, or the
+/// device route exists. The device grant gets the same independent route gate.
+///
+/// Checking disabled, token-only, device-only, and authorization-code-only route combinations is
+/// deliberate. A prior production regression made response types appear when an unrelated
+/// token-exchange flag changed; a one-state test would let that coupling return.
 #[tokio::test]
 async fn discovery_never_advertises_response_types_or_modes() {
     use axum::body::{Body, to_bytes};
@@ -593,11 +608,52 @@ async fn discovery_never_advertises_response_types_or_modes() {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    for (label, scopes) in [
-        ("disabled", None),
+    for (label, scopes, capabilities, expected) in [
         (
-            "enabled",
+            "disabled",
+            None,
+            DiscoveryCapabilities::default(),
+            serde_json::json!({}),
+        ),
+        (
+            "token-only",
             Some(vec!["openid".to_string(), "offline_access".to_string()]),
+            DiscoveryCapabilities::token_surface(),
+            serde_json::json!({
+                "grant_types_supported": [
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                    "refresh_token"
+                ]
+            }),
+        ),
+        (
+            "device-only",
+            Some(vec!["openid".to_string(), "offline_access".to_string()]),
+            DiscoveryCapabilities::token_surface().with_device_authorization(),
+            serde_json::json!({
+                "device_authorization_endpoint": format!("{ISSUER}/oauth2/device_authorization"),
+                "grant_types_supported": [
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                    "refresh_token",
+                    "urn:ietf:params:oauth:grant-type:device_code"
+                ]
+            }),
+        ),
+        (
+            "authorization-code-only",
+            Some(vec!["openid".to_string(), "offline_access".to_string()]),
+            DiscoveryCapabilities::token_surface().with_authorization_code(),
+            serde_json::json!({
+                "authorization_endpoint": format!("{ISSUER}/authorize"),
+                "grant_types_supported": [
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                    "refresh_token",
+                    "authorization_code"
+                ],
+                "response_types_supported": ["code"],
+                "response_modes_supported": ["query"],
+                "code_challenge_methods_supported": ["S256"]
+            }),
         ),
     ] {
         let discovery = well_known_router::<()>(
@@ -605,6 +661,7 @@ async fn discovery_never_advertises_response_types_or_modes() {
             lazy_repo(),
             scopes,
             ClientAuthenticationMetadata::default(),
+            capabilities,
         )
         .oneshot(
             Request::builder()
@@ -618,18 +675,26 @@ async fn discovery_never_advertises_response_types_or_modes() {
         let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
         let payload: Value = serde_json::from_slice(&body).unwrap();
 
-        assert!(
-            payload.get("response_types_supported").is_none(),
-            "[{label}] response_types_supported must stay absent without /authorize: {payload}"
-        );
-        assert!(
-            payload.get("response_modes_supported").is_none(),
-            "[{label}] response_modes_supported must stay absent without /authorize: {payload}"
-        );
-        assert!(
-            payload.get("authorization_endpoint").is_none(),
-            "[{label}] authorization_endpoint must stay absent: {payload}"
-        );
+        for field in [
+            "authorization_endpoint",
+            "device_authorization_endpoint",
+            "grant_types_supported",
+            "response_types_supported",
+            "response_modes_supported",
+            "code_challenge_methods_supported",
+        ] {
+            match expected.get(field) {
+                Some(value) => assert_eq!(
+                    payload.get(field),
+                    Some(value),
+                    "[{label}] {field} must describe the mounted route: {payload}"
+                ),
+                None => assert!(
+                    payload.get(field).is_none(),
+                    "[{label}] {field} must stay absent when its route is not mounted: {payload}"
+                ),
+            }
+        }
     }
 }
 
@@ -1192,6 +1257,7 @@ mod db {
             repo.clone(),
             None,
             ClientAuthenticationMetadata::default(),
+            DiscoveryCapabilities::default(),
         )
         .oneshot(
             Request::builder()
@@ -1217,6 +1283,7 @@ mod db {
             repo,
             Some(scopes),
             ClientAuthenticationMetadata::default(),
+            DiscoveryCapabilities::token_surface(),
         )
         .oneshot(
             Request::builder()

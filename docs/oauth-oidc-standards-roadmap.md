@@ -31,8 +31,8 @@ configuration is enabled, it serves:
 
 | Surface | Current state |
 | --- | --- |
-| `GET /.well-known/openid-configuration`, `GET /.well-known/oauth-authorization-server`, `GET /.well-known/jwks.json` | Implemented for `oauth2.type: self` with signing configured. OIDC discovery and RFC 8414 authorization-server metadata advertise only the narrow, currently mounted token-exchange/refresh surface and its revocation endpoint. For an issuer with a path, OIDC discovery follows the issuer path (`/issuer/.well-known/openid-configuration`) while RFC 8414 inserts `.well-known` before it (`/.well-known/oauth-authorization-server/issuer`). |
-| `GET /authorize`, `POST /oauth2/token` | `/authorize` validates a reviewed static client registry, byte-exact redirect URI and S256 PKCE before either using a valid browser session or starting the Keycloak RP leg. Authorization codes are persisted, short-lived and CAS-consumed. `/oauth2/token` serves authorization-code, RFC 8693 token-exchange and refresh grants; its responses carry no-store cache controls and its browser CORS policy is derived from registered public authorization-code callbacks. Discovery intentionally continues to omit the authorization endpoint and authorization-code grant until the dedicated metadata ticket. |
+| `GET /.well-known/openid-configuration`, `GET /.well-known/oauth-authorization-server`, `GET /.well-known/jwks.json` | Implemented for `oauth2.type: self` with signing configured. OIDC discovery and RFC 8414 authorization-server metadata advertise the mounted token-exchange/refresh surface and revocation endpoint. When the matching routes are mounted, they independently add the RFC 8628 device-authorization endpoint/device grant and the authorization endpoint/`code` response type/`query` response mode/`S256` PKCE method/authorization-code grant. For an issuer with a path, OIDC discovery follows the issuer path (`/issuer/.well-known/openid-configuration`) while RFC 8414 inserts `.well-known` before it (`/.well-known/oauth-authorization-server/issuer`); protocol endpoints remain at their mounted root paths. |
+| `GET /authorize`, `POST /oauth2/token` | `/authorize` validates a reviewed static client registry, byte-exact redirect URI and S256 PKCE before either using a valid browser session or starting the Keycloak RP leg. Authorization codes are persisted, short-lived and CAS-consumed. `/oauth2/token` serves authorization-code, RFC 8628 device-code, RFC 8693 token-exchange, and refresh grants; its responses carry no-store cache controls and its browser CORS policy is derived from registered public authorization-code callbacks. |
 | `POST /oauth2/revoke` | Implemented for the persisted refresh-token/session chain under RFC 7009 and advertised as `revocation_endpoint` whenever the token surface is mounted. |
 | Device verification + Keycloak RP leg | `GET`/`POST /device/verify` and `GET /idp/callback` are mounted by [`relying_party.rs`](../crates/lightbridge-authz-rest/src/relying_party.rs). The page confirms the user code and requesting client before redirecting to Keycloak with PKCE, an encrypted, cookie-bound RP state, and nonce. The callback performs discovery, bounded code redemption, and RS256/`kid`/issuer/audience/required-`iat`/nonce validation (with `azp` bound to this client for multi-audience tokens) before its CAS approval of the persisted device row; failure leaves it pending. Browser sessions resolve the verified Keycloak subject and requested project through the store and are used by mounted `/authorize` for the SSO shortcut. |
 | Hosted static assets | A same-origin SPA fallback exists ([`static_assets.rs`](../crates/lightbridge-authz-rest/src/static_assets.rs)); it serves files only. It does not authenticate, set cookies, or implement `/authorize`. |
@@ -41,9 +41,9 @@ The existing exchange is useful for an already-authenticated, server-side caller
 authorization-code flow and must not be presented as one. Likewise, an accepted ADR is intent,
 not evidence that its routes or grant are live.
 
-## Required browser Authorization Code + PKCE work
+## Browser Authorization Code + PKCE implementation record
 
-The following is the must-have path for a standards-based browser client, using
+The following must-have path is implemented for a standards-based browser client, using
 [RFC 6749](https://www.rfc-editor.org/rfc/rfc6749),
 [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636), and OpenID Connect
 [Core](https://openid.net/specs/openid-connect-core-1_0.html):
@@ -72,19 +72,18 @@ The following is the must-have path for a standards-based browser client, using
 The browser client is a redirect/RP client; token exchange remains appropriate for the distinct
 server-to-server case that already holds a subject token. See ADR-0019 for that client split.
 
-## Device-flow work still required
+## Device-flow implementation record
 
-[RFC 8628](https://www.rfc-editor.org/rfc/rfc8628) support is not complete merely because the
-database store exists. The remaining public contract is:
+[RFC 8628](https://www.rfc-editor.org/rfc/rfc8628) support is complete beyond the database store:
 
-- a device-authorization endpoint that authenticates/validates the client, creates a pending
+- a device-authorization endpoint authenticates/validates the client, creates a pending
   device code, and returns `device_code`, `user_code`, `verification_uri`,
   `verification_uri_complete`, `expires_in`, and polling `interval`;
-- a browser verification route/page that accepts the user code, uses the shared Keycloak RP leg,
+- a browser verification route/page accepts the user code, uses the shared Keycloak RP leg,
   and atomically approves or denies the pending row for the verified subject;
-- token-endpoint dispatch for the device-code grant, including RFC 8628 `authorization_pending`,
+- token-endpoint dispatch for the device-code grant includes RFC 8628 `authorization_pending`,
   `slow_down`, expiry, denial, and one-time consumption behavior; and
-- discovery metadata that advertises `device_authorization_endpoint` and the device grant only
+- discovery metadata advertises `device_authorization_endpoint` and the device grant only
   once those endpoints are reachable.
 
 The exact endpoint spelling is an implementation choice retained by ADR-0012; clients must not
@@ -106,15 +105,10 @@ contract.
   `invalid_request`/400 shape, separately from RFC 6749 client-authentication failures.
 - **`issued_token_type` — resolved:** the HTTP wrapper emits it only for successful RFC 8693 token
   exchange. Refresh and future code/device responses follow their own grant response profile.
-- **Browser token-endpoint CORS — deferred to #425:** only discovery/JWKS has CORS today. The
-  current configuration has neither a browser-origin allowlist nor usable registered
-  `redirect_uris`; every `OauthClient` is still a token-exchange client and its registration maps
-  to an empty redirect list. An issuer URL is not a safe substitute for an SPA origin, and a
-  permissive or inferred token-endpoint policy would preempt the exact-match redirect registry in
-  #425. When #425 introduces validated browser-client redirect URIs, it must also provide an
-  explicit origin allowlist (scheme, host, and port), then mount token CORS with exact allowed
-  origins/methods/headers, preflight handling, and `Vary: Origin`; until then the endpoint emits no
-  browser CORS permission.
+- **Browser token-endpoint CORS — resolved:** the token endpoint derives an exact origin allowlist
+  (scheme, host, and port) from registered public authorization-code callbacks, mounts matching
+  methods/headers and preflight handling, and sets `Vary: Origin`. It does not infer an origin from
+  the issuer or allow a wildcard.
 - **SPA fallback protocol-namespace leak — resolved:** unknown `/oauth2/*` and
   `/.well-known/*` paths, plus allocated root protocol endpoints (`/authorize`, `/userinfo`,
   `/device_authorization`, and `/idp/callback`), are reserved ahead of the SPA fallback and return
@@ -123,16 +117,17 @@ contract.
 
 ## Discovery and authorization-server metadata gaps
 
-The current documents correctly omit authorization, device, UserInfo, introspection, and logout
-endpoints because none is implemented. When a new surface ships, update the metadata according to
+The current documents advertise authorization and device endpoints only when their routes are
+mounted. UserInfo, introspection, and logout remain absent. When a new surface ships, update the
+metadata according to
 [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) and
 [OpenID Connect Discovery](https://openid.net/specs/openid-connect-discovery-1_0.html), in lockstep
 with router tests:
 
-- advertise `authorization_endpoint`, `response_types_supported` (at least `code`),
+- keep `authorization_endpoint`, `response_types_supported` (at least `code`),
   `response_modes_supported`, `grant_types_supported`, and `code_challenge_methods_supported`
-  (`S256`) only when the matching routes are enabled;
-- advertise `device_authorization_endpoint` only with a working RFC 8628 endpoint;
+  (`S256`) tied to their matching mounted routes;
+- keep `device_authorization_endpoint` tied to a working RFC 8628 endpoint;
 - add the standard introspection, UserInfo, and logout metadata only with their corresponding
   endpoints; and
 - keep `issuer`, endpoint URLs, signing algorithms, client-auth methods, scopes, and CORS behavior
