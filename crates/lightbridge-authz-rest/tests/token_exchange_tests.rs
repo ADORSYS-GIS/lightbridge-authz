@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use axum::Form;
 use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use cratestack::CratestackContext;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use lightbridge_authz_api::schema;
@@ -474,6 +474,14 @@ async fn introspect(state: Arc<OpaState>, token: &str) -> (StatusCode, Value) {
 }
 
 async fn post_token(state: TokenExchangeState, body: &str) -> (StatusCode, Value) {
+    let (status, _, json) = post_token_response(state, body).await;
+    (status, json)
+}
+
+async fn post_token_response(
+    state: TokenExchangeState,
+    body: &str,
+) -> (StatusCode, HeaderMap, Value) {
     let response = token_exchange_router::<()>(state)
         .oneshot(
             Request::builder()
@@ -486,9 +494,10 @@ async fn post_token(state: TokenExchangeState, body: &str) -> (StatusCode, Value
         .await
         .unwrap();
     let status = response.status();
+    let headers = response.headers().clone();
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let json: Value = serde_json::from_slice(&bytes).unwrap();
-    (status, json)
+    (status, headers, json)
 }
 
 fn decoding_key(jwk: &Value) -> DecodingKey {
@@ -556,7 +565,7 @@ async fn public_client_with_no_credential_authenticates(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -573,7 +582,7 @@ async fn unknown_client_id_is_rejected(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id=never-registered&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id=never-registered&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -606,7 +615,7 @@ async fn confidential_client_with_valid_assertion_authenticates(pool: PgPool) {
         state,
         &format!(
             "grant_type={TOKEN_EXCHANGE_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}\
-             &client_assertion={assertion}&subject_token=x&project_id={PROJECT_ID}"
+             &client_assertion={assertion}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -631,7 +640,7 @@ async fn confidential_client_with_missing_assertion_is_refused(pool: PgPool) {
     let (status, body) = post_token(
         state,
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={CONFIDENTIAL_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={CONFIDENTIAL_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -666,7 +675,7 @@ async fn confidential_client_with_bad_assertion_is_refused(pool: PgPool) {
         state,
         &format!(
             "grant_type={TOKEN_EXCHANGE_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}\
-             &client_assertion={bad_assertion}&subject_token=x&project_id={PROJECT_ID}"
+             &client_assertion={bad_assertion}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -702,7 +711,7 @@ async fn replayed_client_assertion_jti_is_refused(pool: PgPool) {
     let state1 = state_with(repo.clone(), bearer1, vec![fixture.client.clone()], &redis);
     let body_str = format!(
         "grant_type={TOKEN_EXCHANGE_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}\
-         &client_assertion={assertion}&subject_token=x&project_id={PROJECT_ID}"
+         &client_assertion={assertion}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
     );
 
     let (status, body) = post_token(state1, &body_str).await;
@@ -755,7 +764,7 @@ async fn redis_unreachable_refuses_confidential_client_rather_than_admitting(poo
         state,
         &format!(
             "grant_type={TOKEN_EXCHANGE_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}\
-             &client_assertion={assertion}&subject_token=x&project_id={PROJECT_ID}"
+             &client_assertion={assertion}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -791,7 +800,7 @@ async fn aud_is_the_requesting_client_id_and_varies_between_clients(pool: PgPool
     let (status, body) = post_token(
         state_a,
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={client_a}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={client_a}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -809,7 +818,7 @@ async fn aud_is_the_requesting_client_id_and_varies_between_clients(pool: PgPool
     let (status, body) = post_token(
         state_b,
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={client_b}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={client_b}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -890,7 +899,7 @@ async fn azp_reliably_distinguishes_a_real_api_key_jwt_from_a_real_exchange_sess
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -962,7 +971,7 @@ async fn subject_token_aud_array_containing_client_id_among_others_is_accepted(p
     let (status, body) = post_token(
         state,
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -988,7 +997,7 @@ async fn subject_token_aud_not_naming_the_requesting_client_is_invalid_grant(poo
     let (status, body) = post_token(
         state,
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -1016,7 +1025,7 @@ async fn tenant_claims_on_access_token_role_and_quota_absent_from_both(pool: PgP
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=openid"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=openid"
         ),
     )
     .await;
@@ -1108,7 +1117,7 @@ async fn request_refill_accepts_a_real_human_plane_token_that_still_carries_the_
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -1247,7 +1256,7 @@ async fn refresh_token_issued_to_client_a_is_rejected_when_presented_by_client_b
     let (status, body) = post_token(
         state_a,
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={client_a}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={client_a}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
         ),
     )
     .await;
@@ -1286,7 +1295,7 @@ async fn both_public_and_confidential_clients_can_obtain_a_refresh_token(pool: P
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
         ),
     )
     .await;
@@ -1320,7 +1329,7 @@ async fn both_public_and_confidential_clients_can_obtain_a_refresh_token(pool: P
         state,
         &format!(
             "grant_type={TOKEN_EXCHANGE_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}\
-             &client_assertion={assertion}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+             &client_assertion={assertion}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
         ),
     )
     .await;
@@ -1348,7 +1357,7 @@ async fn exchange_mints_project_scoped_jwt_with_refresh(pool: PgPool) {
         state(repo.clone(), true),
         &format!(
             "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}\
-             &subject_token=upstream-kc-token&project_id={PROJECT_ID}&scope=openid+offline_access"
+             &subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=upstream-kc-token&project_id={PROJECT_ID}&scope=openid+offline_access"
         ),
     )
     .await;
@@ -1383,6 +1392,39 @@ async fn exchange_mints_project_scoped_jwt_with_refresh(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn token_endpoint_responses_are_never_stored(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, headers, body) = post_token_response(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}\
+             &subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token\
+             &subject_token=x&project_id={PROJECT_ID}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(headers.get(header::PRAGMA).unwrap(), "no-cache");
+
+    let (status, headers, body) = post_token_response(
+        state(repo, true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x\
+             &project_id={PROJECT_ID}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(headers.get(header::PRAGMA).unwrap(), "no-cache");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn exchange_without_offline_scope_has_no_refresh_token(pool: PgPool) {
     let repo = repo(pool);
     bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
@@ -1391,7 +1433,7 @@ async fn exchange_without_offline_scope_has_no_refresh_token(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=openid"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=openid"
         ),
     )
     .await;
@@ -1412,7 +1454,7 @@ async fn exchange_with_absent_scope_grants_no_refresh_token(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -1438,7 +1480,7 @@ async fn exchange_for_non_member_project_is_denied(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id=proj_does_not_exist"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id=proj_does_not_exist"
         ),
     )
     .await;
@@ -1448,7 +1490,7 @@ async fn exchange_for_non_member_project_is_denied(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn exchange_with_inactive_subject_token_is_unauthorized(pool: PgPool) {
+async fn exchange_with_inactive_subject_token_is_invalid_request(pool: PgPool) {
     let repo = repo(pool);
     bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
     seed(&repo).await;
@@ -1456,13 +1498,14 @@ async fn exchange_with_inactive_subject_token_is_unauthorized(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), false),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
 
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
-    assert_eq!(body["error"], "invalid_token");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(body["error_description"], "subject_token is invalid");
 }
 
 /// `seed()` gives `SUBJECT` a single project (`PROJECT_ID`), which the
@@ -1477,7 +1520,7 @@ async fn missing_project_id_resolves_caller_default_project(pool: PgPool) {
 
     let (status, body) = post_token(
         state(repo.clone(), true),
-        &format!("grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x"),
+        &format!("grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x"),
     )
     .await;
 
@@ -1516,7 +1559,7 @@ async fn missing_project_id_with_no_projects_is_denied(pool: PgPool) {
 
     let (status, body) = post_token(
         state(repo.clone(), true),
-        &format!("grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x"),
+        &format!("grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x"),
     )
     .await;
 
@@ -1533,7 +1576,7 @@ async fn refresh_rotates_and_rejects_replay(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
         ),
     )
     .await;
@@ -1548,6 +1591,10 @@ async fn refresh_rotates_and_rejects_replay(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body.get("issued_token_type").is_none(),
+        "refresh responses must not claim to be RFC 8693 token-exchange responses: {body}"
+    );
     let second_refresh = body["refresh_token"].as_str().unwrap().to_string();
     assert_ne!(first_refresh, second_refresh, "refresh token must rotate");
     let claims = verify_access_token(
@@ -1604,7 +1651,9 @@ async fn missing_subject_token_is_invalid_request(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}\
+             &subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token\
+             &project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -1612,6 +1661,29 @@ async fn missing_subject_token_is_invalid_request(pool: PgPool) {
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
     assert_eq!(body["error"], "invalid_request");
     assert_eq!(body["error_description"], "subject_token is required");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn missing_subject_token_type_is_invalid_request(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x\
+             &project_id={PROJECT_ID}"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(
+        body["error_description"],
+        "subject_token_type must be urn:ietf:params:oauth:token-type:access_token"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -1638,7 +1710,7 @@ async fn unsupported_subject_token_type_is_invalid_request(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn bearer_validation_error_is_unauthorized(pool: PgPool) {
+async fn bearer_validation_error_is_invalid_request(pool: PgPool) {
     let repo = repo(pool);
     bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
     seed(&repo).await;
@@ -1653,14 +1725,14 @@ async fn bearer_validation_error_is_unauthorized(pool: PgPool) {
     let (status, body) = post_token(
         state,
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
 
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
-    assert_eq!(body["error"], "invalid_token");
-    assert_eq!(body["error_description"], "subject_token validation failed");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(body["error_description"], "subject_token is invalid");
 }
 
 /// The axum boundary builds the request's single `TokenManager` (`state.signer.token_manager()`)
@@ -1682,7 +1754,7 @@ async fn totally_unreachable_repo_fails_the_exchange_grant_closed_as_server_erro
     let (status, body) = post_token(
         state,
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -1734,7 +1806,7 @@ async fn exchange_fails_when_no_signing_key_is_bootstrapped(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -1753,7 +1825,7 @@ async fn exchange_with_unrecognized_scope_omits_scope_from_response(pool: PgPool
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x\
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x\
              &project_id={PROJECT_ID}&scope=totally_unrecognized_scope"
         ),
     )
@@ -1782,7 +1854,7 @@ async fn exchange_snapshots_email_claims_from_subject_token(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token={subject_token}\
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token={subject_token}\
              &project_id={PROJECT_ID}"
         ),
     )
@@ -1808,7 +1880,7 @@ async fn exchange_tolerates_a_subject_token_with_an_unparsable_payload_segment(p
         state(repo.clone(), true),
         &format!(
             "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}\
-             &subject_token=h.not-valid-base64!!!.s&project_id={PROJECT_ID}"
+             &subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=h.not-valid-base64!!!.s&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -1837,7 +1909,7 @@ async fn exchange_tolerates_a_subject_token_with_a_non_json_payload_segment(pool
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token={subject_token}\
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token={subject_token}\
              &project_id={PROJECT_ID}"
         ),
     )
@@ -1867,7 +1939,7 @@ async fn exchange_issues_id_token_when_openid_granted(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=openid"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=openid"
         ),
     )
     .await;
@@ -1903,7 +1975,7 @@ async fn exchange_omits_id_token_when_openid_not_granted(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=profile"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=profile"
         ),
     )
     .await;
@@ -1929,7 +2001,7 @@ async fn exchange_id_token_propagates_auth_time_and_nonce_when_present(pool: PgP
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token={subject_token}\
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token={subject_token}\
              &project_id={PROJECT_ID}&scope=openid"
         ),
     )
@@ -1950,7 +2022,7 @@ async fn exchange_id_token_omits_auth_time_and_nonce_when_absent(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=openid"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=openid"
         ),
     )
     .await;
@@ -1991,7 +2063,7 @@ async fn refresh_reissues_id_token_and_preserves_email(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token={subject_token}\
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token={subject_token}\
              &project_id={PROJECT_ID}&scope=openid+offline_access"
         ),
     )
@@ -2057,7 +2129,7 @@ async fn refresh_succeeds_and_rotates_the_refresh_token(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
         ),
     )
     .await;
@@ -2117,7 +2189,7 @@ async fn refresh_after_absolute_cap_is_invalid_grant(pool: PgPool) {
             cfg.clone(),
         ),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
         ),
     )
     .await;
@@ -2163,7 +2235,7 @@ async fn chain_id_and_absolute_cap_survive_multiple_rotations(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
         ),
     )
     .await;
@@ -2221,7 +2293,7 @@ async fn refresh_after_member_removed_from_project_is_invalid_grant(pool: PgPool
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={MEMBER_PROJECT_ID}&scope=offline_access"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={MEMBER_PROJECT_ID}&scope=offline_access"
         ),
     )
     .await;
@@ -2261,7 +2333,7 @@ async fn refresh_after_project_deleted_is_invalid_grant_not_fail_open(pool: PgPo
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
         ),
     )
     .await;
@@ -2300,7 +2372,7 @@ async fn refresh_after_project_suspended_is_invalid_grant(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
         ),
     )
     .await;
@@ -2338,7 +2410,7 @@ async fn refresh_after_account_suspended_is_invalid_grant(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
         ),
     )
     .await;
@@ -2378,7 +2450,7 @@ async fn replaying_a_rotated_refresh_token_revokes_the_whole_chain(pool: PgPool)
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
         ),
     )
     .await;
@@ -2432,7 +2504,7 @@ async fn unknown_refresh_token_is_invalid_grant_without_cascading(pool: PgPool) 
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
         ),
     )
     .await;
@@ -2675,7 +2747,7 @@ async fn revoking_a_subjects_sessions_makes_a_live_access_token_introspect_inact
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -2724,7 +2796,7 @@ async fn revoking_own_sessions_makes_the_callers_own_live_access_token_introspec
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -2784,7 +2856,7 @@ async fn issue_refresh_token(state: TokenExchangeState, client_id: &str) -> Stri
     let (status, body) = post_token(
         state,
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={client_id}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={client_id}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
         ),
     )
     .await;
@@ -3027,7 +3099,7 @@ async fn revoke_confidential_client_with_valid_assertion_succeeds(pool: PgPool) 
         issue_state,
         &format!(
             "grant_type={TOKEN_EXCHANGE_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}\
-             &client_assertion={issue_assertion}&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+             &client_assertion={issue_assertion}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
         ),
     )
     .await;
@@ -3284,7 +3356,7 @@ async fn token_exchange_stamps_the_lowest_rung_when_the_account_has_no_grant_yet
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -3323,7 +3395,7 @@ async fn token_exchange_stamps_the_accounts_real_current_tier(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -3354,7 +3426,7 @@ async fn refresh_re_resolves_the_budget_tier_live_rather_than_copying_the_old_cl
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x\
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x\
              &project_id={PROJECT_ID}&scope=offline_access"
         ),
     )
@@ -3434,7 +3506,7 @@ async fn budget_tier_claim_survives_a_budget_ledger_outage_on_exchange(pool: PgP
     let (status, body) = post_token(
         state,
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -3481,7 +3553,7 @@ async fn budget_tier_claim_survives_a_budget_ledger_outage_on_refresh(pool: PgPo
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x\
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x\
              &project_id={PROJECT_ID}&scope=offline_access"
         ),
     )
@@ -3562,7 +3634,7 @@ async fn token_exchange_stamps_the_real_quota_tier_when_the_subject_has_one(pool
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={MEMBER_PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={MEMBER_PROJECT_ID}"
         ),
     )
     .await;
@@ -3591,7 +3663,7 @@ async fn token_exchange_omits_quota_tier_when_the_members_row_has_a_null_tier(po
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={MEMBER_PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={MEMBER_PROJECT_ID}"
         ),
     )
     .await;
@@ -3625,7 +3697,7 @@ async fn refresh_re_resolves_the_quota_tier_live_rather_than_copying_the_old_cla
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x\
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x\
              &project_id={MEMBER_PROJECT_ID}&scope=offline_access"
         ),
     )
@@ -3696,7 +3768,7 @@ async fn token_exchange_stamps_the_projects_model_policy_allow_all_by_default(po
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
         ),
     )
     .await;
@@ -3725,7 +3797,7 @@ async fn token_exchange_stamps_each_model_policy_value(pool: PgPool) {
         let (status, body) = post_token(
             state(repo.clone(), true),
             &format!(
-                "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={PROJECT_ID}"
+                "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
             ),
         )
         .await;
@@ -3760,7 +3832,7 @@ async fn refresh_re_resolves_the_model_policy_live_rather_than_copying_the_old_c
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x\
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x\
              &project_id={PROJECT_ID}&scope=offline_access"
         ),
     )
@@ -3906,7 +3978,7 @@ async fn quota_tier_lookup_failure_refuses_the_exchange_even_though_context_reso
     let (status, body) = post_token(
         state,
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x&project_id={MEMBER_PROJECT_ID}"
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={MEMBER_PROJECT_ID}"
         ),
     )
     .await;
@@ -3944,7 +4016,7 @@ async fn quota_tier_lookup_failure_refuses_the_refresh_even_though_context_resol
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x\
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x\
              &project_id={MEMBER_PROJECT_ID}&scope=offline_access"
         ),
     )
