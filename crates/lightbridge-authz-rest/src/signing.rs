@@ -53,7 +53,8 @@ impl ClientAuthenticationMetadata {
             .clients
             .iter()
             .any(|client| client.client_type == OauthClientType::Public);
-        let signing_algorithms = oauth2
+        let mut seen_algorithms = std::collections::HashSet::new();
+        let signing_algorithms: Vec<String> = oauth2
             .clients
             .iter()
             .filter(|client| client.client_type == OauthClientType::Confidential)
@@ -63,12 +64,8 @@ impl ClientAuthenticationMetadata {
             .filter_map(|jwk| parse_public_jwk(jwk).ok())
             .flat_map(|jwk| client_assertion_algorithms(&jwk.algorithm))
             .map(str::to_string)
-            .fold(Vec::new(), |mut algorithms, algorithm| {
-                if !algorithms.contains(&algorithm) {
-                    algorithms.push(algorithm);
-                }
-                algorithms
-            });
+            .filter(|algorithm| seen_algorithms.insert(algorithm.clone()))
+            .collect();
 
         let mut methods = Vec::new();
         if public_client_registered {
@@ -109,7 +106,10 @@ fn client_assertion_algorithms(algorithm: &AlgorithmParameters) -> Vec<&'static 
             EllipticCurve::P384 => vec!["ES384"],
             _ => Vec::new(),
         },
-        AlgorithmParameters::OctetKeyPair(_) => vec!["EdDSA"],
+        AlgorithmParameters::OctetKeyPair(params) => match params.curve {
+            EllipticCurve::Ed25519 => vec!["EdDSA"],
+            _ => Vec::new(),
+        },
         _ => Vec::new(),
     }
 }
@@ -672,42 +672,51 @@ pub fn well_known_router<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
-    let discovery_issuer = issuer.to_string();
-    let (openid_configuration_path, authorization_server_metadata_path) = well_known_paths(issuer);
-    let authorization_server_issuer = issuer.to_string();
-    let authorization_server_scopes = token_exchange_scopes.clone();
-    let authorization_server_client_authentication = client_authentication.clone();
+    let issuer: Arc<str> = Arc::from(issuer);
+    let (openid_configuration_path, authorization_server_metadata_path) = well_known_paths(&issuer);
+    let token_exchange_scopes = Arc::new(token_exchange_scopes);
+    let client_authentication = Arc::new(client_authentication);
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET]);
     Router::new()
         .route(
             &openid_configuration_path,
-            get(move || {
-                let issuer = discovery_issuer.clone();
-                let scopes = token_exchange_scopes.clone();
-                let client_authentication = client_authentication.clone();
-                async move {
-                    Json(discovery_document(
-                        &issuer,
-                        scopes.as_deref(),
-                        &client_authentication,
-                    ))
+            get({
+                let issuer = Arc::clone(&issuer);
+                let scopes = Arc::clone(&token_exchange_scopes);
+                let client_authentication = Arc::clone(&client_authentication);
+                move || {
+                    let issuer = Arc::clone(&issuer);
+                    let scopes = Arc::clone(&scopes);
+                    let client_authentication = Arc::clone(&client_authentication);
+                    async move {
+                        Json(discovery_document(
+                            &issuer,
+                            scopes.as_deref(),
+                            &client_authentication,
+                        ))
+                    }
                 }
             }),
         )
         .route(
             &authorization_server_metadata_path,
-            get(move || {
-                let issuer = authorization_server_issuer.clone();
-                let scopes = authorization_server_scopes.clone();
-                let client_authentication = authorization_server_client_authentication.clone();
-                async move {
-                    Json(discovery_document(
-                        &issuer,
-                        scopes.as_deref(),
-                        &client_authentication,
-                    ))
+            get({
+                let issuer = Arc::clone(&issuer);
+                let scopes = Arc::clone(&token_exchange_scopes);
+                let client_authentication = Arc::clone(&client_authentication);
+                move || {
+                    let issuer = Arc::clone(&issuer);
+                    let scopes = Arc::clone(&scopes);
+                    let client_authentication = Arc::clone(&client_authentication);
+                    async move {
+                        Json(discovery_document(
+                            &issuer,
+                            scopes.as_deref(),
+                            &client_authentication,
+                        ))
+                    }
                 }
             }),
         )
@@ -733,4 +742,48 @@ where
             }),
         )
         .layer(cors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::jwk::{OctetKeyPairParameters, OctetKeyPairType};
+
+    #[test]
+    fn client_assertion_algorithms_reports_eddsa_only_for_the_ed25519_okp_curve() {
+        let params = OctetKeyPairParameters {
+            key_type: OctetKeyPairType::OctetKeyPair,
+            curve: EllipticCurve::Ed25519,
+            x: String::new(),
+        };
+        assert_eq!(
+            client_assertion_algorithms(&AlgorithmParameters::OctetKeyPair(params)),
+            vec!["EdDSA"]
+        );
+    }
+
+    #[test]
+    fn client_assertion_algorithms_reports_no_algorithm_for_non_ed25519_okp_curves() {
+        // `jsonwebtoken`'s `OctetKeyPairParameters::curve` reuses the very same `EllipticCurve`
+        // enum as EC keys, so a non-Ed25519 curve value (a malformed key, or the real-world
+        // equivalent of an X25519 key-agreement JWK once that variant exists) can legitimately
+        // reach this arm. Before this fix, `AlgorithmParameters::OctetKeyPair(_) => vec!["EdDSA"]`
+        // matched unconditionally and reported every OKP key as EdDSA-capable regardless of curve.
+        for curve in [
+            EllipticCurve::P256,
+            EllipticCurve::P384,
+            EllipticCurve::P521,
+        ] {
+            let params = OctetKeyPairParameters {
+                key_type: OctetKeyPairType::OctetKeyPair,
+                curve: curve.clone(),
+                x: String::new(),
+            };
+            assert_eq!(
+                client_assertion_algorithms(&AlgorithmParameters::OctetKeyPair(params)),
+                Vec::<&'static str>::new(),
+                "non-Ed25519 OKP curve {curve:?} must not be reported as EdDSA-capable"
+            );
+        }
+    }
 }

@@ -416,10 +416,13 @@ async fn oidc_and_oauth_metadata_use_their_distinct_issuer_path_rules() {
 /// when `oauth2.type: self` + `oauth2.signing` are configured (see call site in `lib.rs`), which
 /// makes this service an OIDC *issuer* independent of whether the token-exchange grant is enabled
 /// -- `ApiKeyJwtSigner` mints self-signed API-key JWTs through that path regardless. So the
-/// issuer-identity fields (`issuer`, `jwks_uri`, `subject_types_supported`,
-/// `id_token_signing_alg_values_supported`) must stay populated even with token-exchange disabled;
-/// only the grant-surface fields (`grant_types_supported`, `scopes_supported`, `token_endpoint`)
-/// go empty/absent. Two independent gates, not one flag driving everything.
+/// issuer-identity fields that don't depend on OIDC ID tokens specifically (`issuer`, `jwks_uri`)
+/// stay populated even with token-exchange disabled; the OIDC-specific fields
+/// (`subject_types_supported`, `id_token_signing_alg_values_supported`) are gated on
+/// `oidc_tokens_supported` in `discovery_document` -- token-exchange enabled *and* `openid` present
+/// in the configured scopes -- and go empty/absent here alongside the rest of the grant-surface
+/// fields (`grant_types_supported`, `scopes_supported`, `token_endpoint`) precisely because this
+/// test disables token-exchange entirely. Two independent gates, not one flag driving everything.
 #[tokio::test]
 async fn discovery_advertises_no_grants_when_exchange_disabled() {
     use axum::body::{Body, to_bytes};
