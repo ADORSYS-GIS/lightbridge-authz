@@ -2286,6 +2286,10 @@ pub fn build_api_router(
             review_service,
             budget_repo,
         ),
+        // cratestack 0.8.11 (@computed) added this parameter to every generated router fn.
+        // `authz.cstack` declares no `@computed` field, so `()` (the generated
+        // `impl ComputedFieldResolver for ()`) is the correct, zero-behavior-change value here.
+        (),
         LenientCborCodec::default(),
         CratestackAuthProvider::new(bearer.clone(), RpcScope::Crud),
         // cratestack 0.7.12 (#413) made this request-body-size bound an explicit parameter instead
@@ -3112,6 +3116,10 @@ pub fn build_budget_router(
             review_service,
             budget_repo,
         ),
+        // cratestack 0.8.11 (@computed) added this parameter to every generated router fn.
+        // `authz.cstack` declares no `@computed` field, so `()` (the generated
+        // `impl ComputedFieldResolver for ()`) is the correct, zero-behavior-change value here.
+        (),
         LenientCborCodec::default(),
         CratestackAuthProvider::new(bearer.clone(), RpcScope::Budget),
         DEFAULT_BODY_LIMIT_BYTES,

@@ -440,16 +440,51 @@ mimalloc = "0"
 # crates/lightbridge-authz-api/schema/authz.cstack` returns zero matches, so this is a no-op here.
 # (0.8.7 also ships `cratestack_cbor` platform artifacts for the Dart package and a changelog-seed
 # fix -- both internal to cratestack's own tooling, not reachable from this repo.)
-cratestack-core = "=0.8.10"
-cratestack-axum = "=0.8.10"
-cratestack-redis = "=0.8.10"
+# BUMPED (2026-08-25, cratestack 0.8.10 -> 0.8.12): both intermediate releases published cleanly (no
+# 0.8.8-style gap) -- `crates.io/api/v1/crates/<pkg>/versions` lists 0.8.11 and 0.8.12 for all six
+# packages here.
+#
+# 0.8.11's real payload is `@computed` -- resolver-backed, response-time-derived fields on `type`/
+# `model` declarations, replacing the inert `@custom` attribute (cratestack's CHANGELOG.md, "@computed
+# -- resolver-backed response-time fields, replacing @custom"). Two BREAKING changes ship with it:
+# (1) a schema still using `@custom` now fails to parse -- checked before bumping:
+# `grep -n '@custom' crates/lightbridge-authz-api/schema/authz.cstack` returns zero matches, so this
+# is a no-op here; (2) the generated `router()`/`rpc_router()`/`model_router()`/`procedure_router()`
+# functions gain a new `resolvers` parameter (`router(db, registry, resolvers, codec, auth_provider,
+# body_limit_bytes)`), with `()` as the value for any schema with no computed fields (a generated
+# `impl ComputedFieldResolver for ()` covers that case). `authz.cstack` declares no `@computed` field
+# (checked: `grep -n '@computed' crates/lightbridge-authz-api/schema/authz.cstack` returns zero
+# matches), so this is NOT a no-op mechanically -- both `schema::axum::rpc_router(...)` call sites in
+# `crates/lightbridge-authz-rest/src/lib.rs` needed a `()` argument inserted (see that file's own
+# history for the exact diff) -- but it is a no-op behaviorally: no response shape, DDL, or dispatch
+# semantics change for a schema with zero computed fields. Verified by `cargo check --workspace` and
+# the RPC-batch/schema-policy-sync it-tests passing unchanged (see this commit's own message).
+#
+# The rest of 0.8.11 is CI/tooling/Flutter-glue only (TypeScript smoke-test hang fix, iOS log-capture
+# probe corrections, flutter_rust_bridge 2.12.0 -> 2.13.0, changelog-seed tooling) -- none of it
+# reachable from this repo, which has no Dart/Flutter/TypeScript client generation in its build.
+#
+# 0.8.12 (cratestack#729) is RPC `get` gaining REST's `fields`/`include`/`include_fields`/
+# `computedParams` selection parity, plus a typestate builder for `<Model>ComputedParams`. Confirmed
+# additive-only for this repo: every new `RpcGetInput`/`RpcListInput` field is `#[serde(default)]`, an
+# old `{"id": ...}` frame decodes unchanged (no RPC snapshot-version bump, per the PR's own wire-
+# compat claim), and the builder only exists for models with parameterized computed fields -- which,
+# per the 0.8.11 grep above, this schema has none of. No further `router()`/`rpc_router()` signature
+# change past what 0.8.11 already required. Checked specifically against this repo's sensitive seams
+# (per AGENTS.md): no touch to `@@allow`/`@allow` policy evaluation, `LenientCborCodec`/the
+# `undefined`-vs-`null` normalization, the migration generator, or `push_scoped_conditions` --
+# confirmed by grepping cratestack's own CHANGELOG.md for those terms across the 0.8.11-0.8.12 range
+# (zero matches) in addition to reading both features' full changelog prose.
+cratestack-core = "=0.8.12"
+cratestack-axum = "=0.8.12"
+cratestack-redis = "=0.8.12"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
 # `include_server_schema!` macro emits `::cratestack::*` paths (see cratestack-pg lib docs). The
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
 # it to build the RPC router (ADR-0003).
-cratestack = { package = "cratestack-pg", version = "=0.8.10" }
-cratestack-codec-cbor = "=0.8.10"
-cratestack-codec-json = "=0.8.10"
+cratestack = { package = "cratestack-pg", version = "=0.8.12" }
+cratestack-codec-cbor = "=0.8.12"
+cratestack-codec-json = "=0.8.12"
 # Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
