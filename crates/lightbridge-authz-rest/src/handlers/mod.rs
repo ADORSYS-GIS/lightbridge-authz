@@ -921,6 +921,7 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
+            relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
             issuance: None,
@@ -1427,6 +1428,7 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
+            relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
             issuance: Some(Oauth2Issuance {
@@ -1468,6 +1470,7 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
+            relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
             issuance: Some(Oauth2Issuance {
@@ -1496,6 +1499,7 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
+            relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
             issuance: None,

@@ -19,6 +19,7 @@ pub mod models;
 pub mod oauth2_op;
 pub mod ratelimit_redis;
 pub mod redis_tls;
+pub mod relying_party;
 pub mod routers;
 pub mod rpc_authorize;
 pub mod session_cookie;
@@ -2708,8 +2709,21 @@ pub fn build_idp_router(
     token_exchange: Option<token_exchange::TokenExchangeState>,
     readiness_pool: Arc<dyn DbPoolTrait>,
     static_dir: impl AsRef<std::path::Path>,
+    device_verify_rate_limit_store: Arc<dyn RateLimitStore>,
 ) -> Router {
     let mut router = probe_router(readiness_pool);
+    let rp_router = if let (Some(rp_config), Some(_)) = (&oauth2.relying_party, &oauth2.signing) {
+        let rp = relying_party::KeycloakRelyingParty::new(
+            rp_config.clone(),
+            oauth2.jwks_url.clone(),
+            signing_repo.clone(),
+            device_verify_rate_limit_store,
+        )
+        .expect("authz-idp startup validates oauth2.relying_party before router construction");
+        Some(relying_party::router(Arc::new(rp)))
+    } else {
+        None
+    };
 
     let (token_exchange_scopes, client_authentication) = well_known_mount_params(oauth2);
     if oauth2.is_self_signed()
@@ -2727,14 +2741,22 @@ pub fn build_idp_router(
         router = router.merge(token_exchange::token_exchange_router(te_state));
     }
 
+    if let Some(rp_router) = rp_router {
+        router = router.merge(rp_router);
+    }
+
     router.fallback_service(static_assets::static_assets_fallback(static_dir))
 }
 
 /// Starts `authz-idp` (ADR-0012): the OIDC broker service carrying `/oauth2/token`,
 /// `/oauth2/revoke`, and `.well-known/*`. Deliberately thin next to `start_api_server` — no RPC
-/// CRUD surface, no budget domain, no idempotency/rate-limit layers — because
+/// CRUD surface, no budget domain, no per-route idempotency/rate-limit tower layers — because
 /// `well_known_router`/`token_exchange_router` need none of that; every route this server mounts
-/// is public (see [`config::IdpServer`]'s doc comment).
+/// is public (see [`config::IdpServer`]'s doc comment). The one exception: the Keycloak RP-leg's
+/// public, unauthenticated `user_code` lookups (`relying_party::verify_submit`/`verify_continue`)
+/// go through the SAME Redis-backed [`RateLimitStore`] `start_api_server`/`start_budget_server`
+/// build for their tower `RateLimitLayer`, just consulted directly by
+/// `device_store::get_by_user_code_rate_limited` rather than via a layer.
 ///
 /// **The sole owner of this surface, not a duplicate.** ADR-0012 Phase 1 ran this alongside
 /// `authz-api`'s own copy of the same routes while `auth.ai.camer.digital` still routed here via
@@ -2768,6 +2790,40 @@ pub async fn start_idp_server(
     let signing = oauth2.signing.as_ref().ok_or_else(|| {
         Error::Server("oauth2.type is 'self' but oauth2.signing is missing".to_string())
     })?;
+    let rp_config = oauth2.relying_party.clone().ok_or_else(|| {
+        Error::Server(
+            "authz-idp requires oauth2.relying_party for its Keycloak browser login flow"
+                .to_string(),
+        )
+    })?;
+
+    // Redis is required unconditionally for authz-idp -- every lightbridge-authz serving role
+    // that isn't explicitly freed from it (authz-opa, lightbridge-mcp) needs Redis-backed caching,
+    // not only when `oauth2.token_exchange` happens to be enabled today (that used to be the only
+    // gate; it no longer is -- see AGENTS.md's "Redis is a mandatory dependency" house rule).
+    // Mirrors start_api_server's/start_budget_server's identical unconditional check. Resolved
+    // here (rather than just before `build_token_exchange_state`, its original spot) so the
+    // Redis-backed rate limit store built from it is available to BOTH `KeycloakRelyingParty::new`
+    // call sites below -- this early validation-only construction and `build_idp_router`'s real
+    // one. `build_token_exchange_state` itself still no-ops to `Ok(None)` when token_exchange is
+    // disabled (see its own doc comment), so this changes only whether a *missing* redis config is
+    // tolerated, never whether token exchange itself is attempted.
+    let redis = redis.as_ref().ok_or_else(|| {
+        Error::Server(
+            "redis config is required for authz-idp (set `redis.url`) -- mandatory for every \
+             authz-idp deployment, not only when oauth2.token_exchange is enabled"
+                .to_string(),
+        )
+    })?;
+    let device_verify_rate_limit_store =
+        build_redis_rate_limit_store(&redis.url, redis.ca_bundle_path.as_deref(), "authz-idp")?;
+
+    relying_party::KeycloakRelyingParty::new(
+        rp_config,
+        oauth2.jwks_url.clone(),
+        Arc::new(StoreRepo::new(pool.clone())),
+        device_verify_rate_limit_store.clone(),
+    )?;
 
     let readiness_pool = pool.clone();
     // ADR-0014: the budget ledger is read here (not called over the network) because
@@ -2797,22 +2853,6 @@ pub async fn start_idp_server(
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
 
-    // Redis is required unconditionally for authz-idp -- every lightbridge-authz serving role
-    // that isn't explicitly freed from it (authz-opa, lightbridge-mcp) needs Redis-backed caching,
-    // not only when `oauth2.token_exchange` happens to be enabled today (that used to be the only
-    // gate; it no longer is -- see AGENTS.md's "Redis is a mandatory dependency" house rule).
-    // Mirrors start_api_server's/start_budget_server's identical unconditional check.
-    // `build_token_exchange_state` itself still no-ops to `Ok(None)` when token_exchange is
-    // disabled (see its own doc comment), so this changes only whether a *missing* redis config
-    // is tolerated, never whether token exchange itself is attempted.
-    let redis = redis.as_ref().ok_or_else(|| {
-        Error::Server(
-            "redis config is required for authz-idp (set `redis.url`) -- mandatory for every \
-             authz-idp deployment, not only when oauth2.token_exchange is enabled"
-                .to_string(),
-        )
-    })?;
-
     let token_exchange_state = build_token_exchange_state(
         oauth2,
         signing_repo.clone(),
@@ -2830,6 +2870,7 @@ pub async fn start_idp_server(
         token_exchange_state,
         readiness_pool,
         &idp.static_dir,
+        device_verify_rate_limit_store,
     );
 
     tracing::info!(
@@ -3257,6 +3298,7 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
+            relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
         }

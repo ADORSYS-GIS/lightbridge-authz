@@ -49,7 +49,7 @@ pub async fn serve_plain_http(name: &str, address: &str, port: u16, app: Router)
         "Starting {name} server WITHOUT TLS on {addr} ({INSECURE_HTTP_ENV} is set — dev only)"
     );
     axum_server::bind(addr)
-        .serve(app.into_make_service())
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .map_err(|e| Error::Server(format!("Failed to start {name} server: {e}")))?;
 
@@ -73,7 +73,7 @@ pub async fn serve_tls(name: &str, address: &str, port: u16, tls: &Tls, app: Rou
 
     tracing::info!("Starting {name} server with TLS on {}", addr);
     axum_server::bind_rustls(addr, rustls_config)
-        .serve(app.into_make_service())
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .map_err(|e| Error::Server(format!("Failed to start {name} server: {e}")))?;
 

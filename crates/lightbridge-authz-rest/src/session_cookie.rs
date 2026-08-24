@@ -2,8 +2,10 @@
 //!
 //! Scope, deliberately narrow: this module only builds and reads the cookie envelope. It does
 //! not create, look up, or rotate the underlying `sessions` row (ADR-0021 Follow-up 6, a separate
-//! ticket) and it is not wired into any route yet -- the RP-leg callback (#441/#424) and
-//! `/authorize`'s cookie-lookup precondition (#425) are the callers, and they own that wiring.
+//! ticket). [`build_session_cookie`] is wired into the RP-leg callback (#441/#424, see
+//! `crate::relying_party::KeycloakRelyingParty::complete`'s `Completion::Browser` arm) --
+//! `/authorize`'s cookie-lookup precondition (#425) is a separate, still-unbuilt caller of
+//! [`read_session_cookie`].
 
 use axum::http::HeaderMap;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};

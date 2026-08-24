@@ -129,6 +129,16 @@ oauth2:
     client_secret: "${KEYCLOAK_TOKEN_CLIENT_SECRET:-lightbridge-token-issuer-secret}"
     subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
     requested_token_type: "urn:ietf:params:oauth:token-type:access_token"
+  # Outbound Keycloak OIDC RP used by /device/verify. This is deliberately distinct from
+  # `issuance`: it is an interactive PKCE client, not a token-exchange service account.
+  relying_party:
+    issuer: "http://localhost:9100/realms/dev"
+    client_id: "authz-idp-rp"
+    callback_url: "https://localhost:13004/idp/callback"
+    # Development-only fixed key. Production MUST set a unique base64url-encoded 32-byte key.
+    state_encryption_key: "${KEYCLOAK_RP_STATE_ENCRYPTION_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA}"
+    timeout_ms: ${KEYCLOAK_RP_TIMEOUT_MS:-5000}
+    browser_session_ttl_seconds: ${BROWSER_SESSION_TTL_SECONDS:-28800}
   # Self-signed API-key JWTs (enterprise: the credential must be a JWT). When enabled, issued
   # keys are RS256 JWTs signed by this service, carrying api_key_id/project_id/account_id/
   # allowed_models claims. The signing keypair is generated on first startup and stored in the
@@ -265,4 +275,3 @@ models:
 # comment in lightbridge-authz-core). Uncomment only to override the default.
 # api_key_expiry:
 #   max_lifetime_days: 90
-

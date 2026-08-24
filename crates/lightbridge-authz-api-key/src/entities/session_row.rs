@@ -30,12 +30,12 @@ pub struct SessionRow {
     pub user_agent: Option<String>,
 }
 
-/// Everything `StoreRepo::create_session` needs to insert a new `kind = 'token'` session row
+/// Everything `StoreRepo::create_session` needs to insert a new session row: `kind = "token"`
 /// (ADR-0020 Decision 1: created once, at the initial token-exchange grant, unconditionally --
-/// see `oauth2_op::store::TokenExchangeOpStore::handle_token_exchange`). Every call site this PR
-/// touches mints `kind = "token"`; nothing in this PR's scope creates a `kind = "browser"` row
-/// (that is ADR-0021 Follow-up 6/#441's RP-leg caller, not yet built) outside of tests exercising
-/// the bulk-revoke cascade.
+/// see `oauth2_op::store::TokenExchangeOpStore::handle_token_exchange`) or `kind = "browser"`
+/// (ADR-0021 Follow-up 6/#441 -- the Keycloak RP-leg callback in
+/// `lightbridge_authz_rest::relying_party::KeycloakRelyingParty::complete` mints these on a
+/// successful browser sign-in).
 #[derive(Debug, Clone)]
 pub struct NewSession {
     pub id: String,

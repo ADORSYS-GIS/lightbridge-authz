@@ -128,6 +128,15 @@ oauth2:
     requested_token_type: "urn:ietf:params:oauth:token-type:access_token"
     # Target audience for issued tokens - must match one of the valid audiences above
     # audience: "lightbridge-api-key"
+  # Local Compose's Keycloak RP client. The browser reaches authz-idp through localhost:13004;
+  # production must replace both callback_url and the state-encryption key.
+  relying_party:
+    issuer: "http://keycloak:9100/realms/dev"
+    client_id: "authz-idp-rp"
+    callback_url: "https://localhost:13004/idp/callback"
+    state_encryption_key: "${KEYCLOAK_RP_STATE_ENCRYPTION_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA}"
+    timeout_ms: ${KEYCLOAK_RP_TIMEOUT_MS:-5000}
+    browser_session_ttl_seconds: ${BROWSER_SESSION_TTL_SECONDS:-28800}
   # Used only when `type: self` — signing keypair generated on first startup and stored in the DB
   # (see docs/authorino-usage.md). Ignored under `type: external`.
   signing:

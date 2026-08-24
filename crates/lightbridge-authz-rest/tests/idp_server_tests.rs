@@ -20,12 +20,20 @@ use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use cratestack_axum::ratelimit::{InMemoryRateLimitStore, RateLimitStore};
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::config::{IdpServer, JwtSigning, Oauth2, Oauth2Type, Tls};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::{build_idp_router, start_idp_server};
 use tower::ServiceExt;
+
+/// None of this file's `oauth2` fixtures configure `relying_party`, so `build_idp_router` never
+/// actually constructs a `KeycloakRelyingParty`/consults this store -- an in-memory stand-in is
+/// enough to satisfy the parameter without pulling in a live Redis dependency.
+fn test_rate_limit_store() -> Arc<dyn RateLimitStore> {
+    Arc::new(InMemoryRateLimitStore::new())
+}
 
 fn lazy_pool() -> Arc<dyn DbPoolTrait> {
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -73,6 +81,7 @@ fn external_oauth2() -> Oauth2 {
         audience: None,
         signing: None,
         token_exchange: None,
+        relying_party: None,
         rbac: Default::default(),
         clients: Vec::new(),
     }
@@ -99,6 +108,7 @@ async fn build_idp_router_probes_behave_like_the_other_servers_including_db_unav
         None,
         pool,
         TEST_STATIC_DIR,
+        test_rate_limit_store(),
     );
 
     for path in ["/", "/healthz", "/healthz/startup"] {
@@ -141,6 +151,7 @@ async fn build_idp_router_omits_well_known_when_oauth2_is_external() {
         None,
         pool,
         TEST_STATIC_DIR,
+        test_rate_limit_store(),
     );
 
     let response = router
@@ -173,7 +184,14 @@ async fn static_fallback_refuses_unknown_protocol_namespace_paths() {
 
     let pool = lazy_pool();
     let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
-    let router = build_idp_router(&external_oauth2(), signing_repo, None, pool, &static_dir);
+    let router = build_idp_router(
+        &external_oauth2(),
+        signing_repo,
+        None,
+        pool,
+        &static_dir,
+        test_rate_limit_store(),
+    );
 
     for path in [
         "/.well-known/future-document",
@@ -355,7 +373,14 @@ async fn build_idp_router_serves_oauth2_revoke_without_touching_the_database() {
     let oauth2 = token_exchange_oauth2();
     let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
     let state = offline_token_exchange_state(&oauth2, signing_repo.clone());
-    let router = build_idp_router(&oauth2, signing_repo, Some(state), pool, TEST_STATIC_DIR);
+    let router = build_idp_router(
+        &oauth2,
+        signing_repo,
+        Some(state),
+        pool,
+        TEST_STATIC_DIR,
+        test_rate_limit_store(),
+    );
 
     let response = router
         .oneshot(
@@ -385,7 +410,14 @@ async fn path_issuer_metadata_advertises_root_jwks_and_token_paths() {
     oauth2.signing.as_mut().unwrap().issuer = "https://authz.example.test/issuer/acme".to_string();
     let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
     let state = offline_token_exchange_state(&oauth2, signing_repo.clone());
-    let router = build_idp_router(&oauth2, signing_repo, Some(state), pool, TEST_STATIC_DIR);
+    let router = build_idp_router(
+        &oauth2,
+        signing_repo,
+        Some(state),
+        pool,
+        TEST_STATIC_DIR,
+        test_rate_limit_store(),
+    );
 
     let metadata = router
         .clone()
@@ -474,7 +506,14 @@ async fn build_idp_router_serves_oauth2_token_route() {
     let oauth2 = token_exchange_oauth2();
     let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
     let state = offline_token_exchange_state(&oauth2, signing_repo.clone());
-    let router = build_idp_router(&oauth2, signing_repo, Some(state), pool, TEST_STATIC_DIR);
+    let router = build_idp_router(
+        &oauth2,
+        signing_repo,
+        Some(state),
+        pool,
+        TEST_STATIC_DIR,
+        test_rate_limit_store(),
+    );
 
     let response = router
         .oneshot(
@@ -706,6 +745,7 @@ mod db {
             Some(idp_state),
             db_pool.clone(),
             TEST_STATIC_DIR,
+            test_rate_limit_store(),
         );
 
         // authz-api's router: no oauth2/signing_repo/token_exchange params anymore (it mounts
@@ -839,7 +879,14 @@ mod db {
         .unwrap();
 
         let idp_state = offline_token_exchange_state(&oauth2, signing_repo.clone());
-        let router = build_idp_router(&oauth2, signing_repo, Some(idp_state), db_pool, &static_dir);
+        let router = build_idp_router(
+            &oauth2,
+            signing_repo,
+            Some(idp_state),
+            db_pool,
+            &static_dir,
+            test_rate_limit_store(),
+        );
 
         // A bare status-code check is not enough to prove non-shadowing: the SPA fallback also
         // answers every unmatched path with a 200. Each protocol route below is asserted against
