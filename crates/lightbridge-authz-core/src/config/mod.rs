@@ -980,6 +980,18 @@ pub struct Oauth2TokenExchange {
     /// session cannot outlive it indefinitely.
     #[serde(default = "default_exchange_refresh_absolute_ttl_seconds")]
     pub refresh_absolute_ttl_seconds: i64,
+    /// RFC 8628 device and user-code lifetime. Device authorization is mounted with the native
+    /// token endpoint, so this is an operational value rather than a separate feature flag.
+    #[serde(default = "default_device_code_ttl_seconds")]
+    pub device_code_ttl_seconds: i64,
+    /// Minimum RFC 8628 polling interval returned to a device client.
+    #[serde(default = "default_device_poll_interval_seconds")]
+    pub device_poll_interval_seconds: i32,
+    /// Public, absolute HTTPS verification page URL returned to device clients. Credentials,
+    /// query parameters, and fragments are rejected at startup so the user code is added only by
+    /// the device-authorization response.
+    #[serde(default = "default_device_verification_uri")]
+    pub device_verification_uri: String,
 }
 
 fn default_exchange_access_ttl_seconds() -> i64 {
@@ -992,6 +1004,18 @@ fn default_exchange_refresh_ttl_seconds() -> i64 {
 
 fn default_exchange_refresh_absolute_ttl_seconds() -> i64 {
     7_776_000
+}
+
+fn default_device_code_ttl_seconds() -> i64 {
+    600
+}
+
+fn default_device_poll_interval_seconds() -> i32 {
+    5
+}
+
+fn default_device_verification_uri() -> String {
+    "https://localhost:13004/device/verify".to_string()
 }
 
 fn default_exchange_allowed_scopes() -> Vec<String> {

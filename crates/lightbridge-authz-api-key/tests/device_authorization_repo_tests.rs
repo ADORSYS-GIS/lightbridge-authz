@@ -31,6 +31,7 @@ fn new_pending(device_code: &str, user_code: &str, ttl: Duration) -> NewDeviceAu
         device_code: device_code.to_string(),
         user_code: user_code.to_string(),
         client_id: "device-client".to_string(),
+        project_id: None,
         scope: Some("openid".to_string()),
         interval_secs: 5,
         expires_at: Utc::now() + ttl,
