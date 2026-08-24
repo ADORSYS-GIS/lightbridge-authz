@@ -219,6 +219,13 @@ delete`) for generated model CRUD and `procedure.<name>` for the hand-written pr
 This table is the source of truth for `rpc_authorize::required_permission`. **Any RPC `op_id` not
 listed here is denied unconditionally (fail closed).**
 
+**`users` (ADR-0024) has no RPC surface or permission in this pass** — the `User` model in
+`authz.cstack` carries no `@@allow` clause at all (same precedent as `Session`), so every generic
+`model.User.*` verb is denied unconditionally by the rule above; no new entry was needed here or
+in `rpc_authorize.rs`. `federated_identities` has no RPC surface either, and never will through the
+generated CRUD path — it is deliberately absent from `authz.cstack` entirely (see
+[`docs/architecture/data-model.md`](./architecture/data-model.md#users-and-federated-identities-adr-0024)).
+
 **Every `budget:*` row below is served at `POST /budget/rpc/{op_id}` on the separate
 `authz-budget` service, not `POST /rpc/{op_id}` on `authz-api`** (hard cutover — see
 [`docs/architecture/budget.md`](./architecture/budget.md#service-boundary-authz-budget-hard-cutover)).
