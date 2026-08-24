@@ -1,14 +1,17 @@
 #![allow(clippy::unwrap_used)]
 #![cfg(feature = "it-tests")]
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use authkestra_engine::auth::state::OAuth2State;
 use authkestra_op::device::{DeviceCodeSession, DeviceCodeStatus, DeviceCodeStore};
 use axum::body::{Body, to_bytes};
+use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode, header};
 use base64::Engine;
 use chrono::{Duration, Utc};
+use cratestack_axum::ratelimit::{InMemoryRateLimitStore, RateLimitStore};
 use httpmock::Method::{GET, POST};
 use httpmock::MockServer;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -30,6 +33,18 @@ const STATE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 fn repo(pool: PgPool) -> Arc<StoreRepo> {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
     Arc::new(StoreRepo::new(pool))
+}
+
+fn rate_limiter() -> Arc<dyn RateLimitStore> {
+    Arc::new(InMemoryRateLimitStore::new())
+}
+
+/// Fixed caller address injected into every request built below, standing in for the real
+/// `ConnectInfo<SocketAddr>` `axum-server` normally populates from the live TCP connection --
+/// `.oneshot()` bypasses that entirely, so tests insert it themselves via
+/// `http::request::Builder::extension`.
+fn test_addr() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 4242))
 }
 
 fn rp_config(server: &MockServer) -> OidcRelyingParty {
@@ -128,12 +143,17 @@ async fn begin_pairing(router: axum::Router) -> (axum::Router, String, String) {
                 .method("POST")
                 .uri("/device/verify")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .extension(ConnectInfo(test_addr()))
                 .body(Body::from("user_code=pair-1234"))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(confirmation.status(), StatusCode::OK);
+    // The CSRF-binding cookie `verify_submit` sets for this `user_code` -- `verify_continue`
+    // below requires it (proof this same caller was shown the confirmation page), so a real
+    // browser client forwards it exactly like this on the "Continue" form submission.
+    let confirm_cookie = rp_cookie(&confirmation);
     let confirmation_body = to_bytes(confirmation.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -149,6 +169,8 @@ async fn begin_pairing(router: axum::Router) -> (axum::Router, String, String) {
                 .method("POST")
                 .uri("/device/verify/continue")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::COOKIE, confirm_cookie)
+                .extension(ConnectInfo(test_addr()))
                 .body(Body::from("user_code=PAIR1234"))
                 .unwrap(),
         )
@@ -182,8 +204,10 @@ async fn verified_keycloak_callback_transitions_pending_device_code_to_approved(
     store.store_device_code(session()).await.unwrap();
     let mut config = rp_config(&keycloak);
     config.client_secret = Some("confidential-secret".to_string());
-    let rp =
-        Arc::new(KeycloakRelyingParty::new(config, keycloak.url("/jwks"), repo.clone()).unwrap());
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(config, keycloak.url("/jwks"), repo.clone(), rate_limiter())
+            .unwrap(),
+    );
     let router = router(rp);
     let (router, state, cookie) = begin_pairing(router).await;
     let decoded = OAuth2State::decrypt(
@@ -261,8 +285,13 @@ async fn keycloak_token_failure_leaves_device_code_pending(pool: PgPool) {
     let store = DbDeviceCodeStore::new(repo.clone());
     store.store_device_code(session()).await.unwrap();
     let rp = Arc::new(
-        KeycloakRelyingParty::new(rp_config(&keycloak), keycloak.url("/jwks"), repo.clone())
-            .unwrap(),
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.url("/jwks"),
+            repo.clone(),
+            rate_limiter(),
+        )
+        .unwrap(),
     );
     let (router, state, cookie) = begin_pairing(router(rp)).await;
     let response = router
@@ -286,8 +315,13 @@ async fn invalid_device_codes_have_one_uniform_response_and_frame_protection(poo
     let mut invalid_callback = rp_config(&keycloak);
     invalid_callback.callback_url = "https://authz.example.test/attacker-controlled".to_string();
     assert!(
-        KeycloakRelyingParty::new(invalid_callback, keycloak.url("/jwks"), repo(pool.clone()))
-            .is_err()
+        KeycloakRelyingParty::new(
+            invalid_callback,
+            keycloak.url("/jwks"),
+            repo(pool.clone()),
+            rate_limiter(),
+        )
+        .is_err()
     );
     let repo = repo(pool);
     let store = DbDeviceCodeStore::new(repo.clone());
@@ -316,7 +350,13 @@ async fn invalid_device_codes_have_one_uniform_response_and_frame_protection(poo
     );
 
     let rp = Arc::new(
-        KeycloakRelyingParty::new(rp_config(&keycloak), keycloak.url("/jwks"), repo).unwrap(),
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.url("/jwks"),
+            repo,
+            rate_limiter(),
+        )
+        .unwrap(),
     );
     let router = router(rp);
     let request = |code: &'static str| {
@@ -324,6 +364,7 @@ async fn invalid_device_codes_have_one_uniform_response_and_frame_protection(poo
             .method("POST")
             .uri("/device/verify")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .extension(ConnectInfo(test_addr()))
             .body(Body::from(format!("user_code={code}")))
             .unwrap()
     };
@@ -355,19 +396,170 @@ async fn invalid_device_codes_have_one_uniform_response_and_frame_protection(poo
     assert_eq!(unknown_body, consumed_body);
 }
 
+/// CSRF regression coverage for `POST /device/verify/continue`: without the mechanism this test
+/// pins down, an attacker starts their own device-code flow, then serves a page with a hidden
+/// auto-submitting form `POST`ing this route with the attacker's own `user_code`. A victim with
+/// an active Keycloak SSO session who merely visits that page would silently pair the attacker's
+/// device to the victim's identity -- the victim never sees the real confirmation screen.
+///
+/// (a) a same-site `POST` naming a real, live, pending `user_code` but carrying NO
+/// `__Host-authz_device_confirm` cookie must be refused, not approved -- this is exactly the
+/// shape of the cross-site auto-submitting form's request (the confirmation cookie itself is
+/// `SameSite=Strict`, so a genuinely cross-site request could never carry it even if the attacker
+/// somehow learned its value).
+/// (b) a confirmation cookie minted for a DIFFERENT `user_code` must not authorize this one.
+/// (c) the legitimate flow -- visit the confirmation page first, then submit with the cookie it
+/// set -- still succeeds; every `begin_pairing`-based test above already exercises this path end
+/// to end (each asserts `StatusCode::SEE_OTHER`), so it is not re-asserted standalone here.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_continue_requires_the_confirmation_cookie_from_verify_submit(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let repo = repo(pool);
+    let store = DbDeviceCodeStore::new(repo.clone());
+    store.store_device_code(session()).await.unwrap();
+    let mut other = session();
+    other.device_code = "other-device-code".to_string();
+    other.user_code = "OTHER1234".to_string();
+    store.store_device_code(other).await.unwrap();
+
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.url("/jwks"),
+            repo,
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+    let router = router(rp);
+
+    let continue_request = |cookie: Option<String>| {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/device/verify/continue")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .extension(ConnectInfo(test_addr()));
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        builder.body(Body::from("user_code=PAIR1234")).unwrap()
+    };
+
+    // (a) No confirmation cookie at all.
+    let no_cookie = router
+        .clone()
+        .oneshot(continue_request(None))
+        .await
+        .unwrap();
+    assert_eq!(
+        no_cookie.status(),
+        StatusCode::FORBIDDEN,
+        "a bare POST with no confirmation cookie must never pair a device"
+    );
+
+    // (b) A confirmation cookie minted for a *different* user_code (obtained by visiting the
+    // confirmation page for "OTHER1234") must not authorize approving "PAIR1234".
+    let other_confirmation = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/device/verify")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .extension(ConnectInfo(test_addr()))
+                .body(Body::from("user_code=OTHER1234"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(other_confirmation.status(), StatusCode::OK);
+    let mismatched_cookie = rp_cookie(&other_confirmation);
+    let mismatched = router
+        .clone()
+        .oneshot(continue_request(Some(mismatched_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(
+        mismatched.status(),
+        StatusCode::FORBIDDEN,
+        "a confirmation cookie bound to a different user_code must not authorize this one"
+    );
+
+    // Neither rejected attempt actually approved the device.
+    let still_pending = store.get_device_code("device-code").await.unwrap().unwrap();
+    assert!(matches!(still_pending.status, DeviceCodeStatus::Pending));
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn relying_party_rejects_non_positive_runtime_limits(pool: PgPool) {
     let keycloak = MockServer::start_async().await;
     let mut zero_timeout = rp_config(&keycloak);
     zero_timeout.timeout_ms = 0;
     assert!(
-        KeycloakRelyingParty::new(zero_timeout, keycloak.url("/jwks"), repo(pool.clone())).is_err()
+        KeycloakRelyingParty::new(
+            zero_timeout,
+            keycloak.url("/jwks"),
+            repo(pool.clone()),
+            rate_limiter(),
+        )
+        .is_err()
     );
 
     let mut zero_browser_ttl = rp_config(&keycloak);
     zero_browser_ttl.browser_session_ttl_seconds = 0;
     assert!(
-        KeycloakRelyingParty::new(zero_browser_ttl, keycloak.url("/jwks"), repo(pool)).is_err()
+        KeycloakRelyingParty::new(
+            zero_browser_ttl,
+            keycloak.url("/jwks"),
+            repo(pool),
+            rate_limiter(),
+        )
+        .is_err()
+    );
+}
+
+/// Open-redirect regression coverage for `begin_browser`'s `resume_path` guard. Blocking only a
+/// bare leading `//` is not enough on its own: WHATWG URL parsing (what every real browser
+/// implements) treats `\` identically to `/` when resolving a relative reference against an
+/// http(s) base, so `/\evil.com` and `/\/evil.com` both normalize to the same off-origin redirect
+/// as `//evil.com` even though a plain `starts_with("//")` check does not see them as such.
+#[sqlx::test(migrations = "../../migrations")]
+async fn begin_browser_rejects_backslash_open_redirect_variants(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let _discovery = keycloak
+        .mock_async(|when, then| {
+            when.method(GET).path("/.well-known/openid-configuration");
+            then.status(200).json_body(discovery_body(&keycloak));
+        })
+        .await;
+    let rp = KeycloakRelyingParty::new(
+        rp_config(&keycloak),
+        keycloak.url("/jwks"),
+        repo(pool),
+        rate_limiter(),
+    )
+    .unwrap();
+
+    for resume_path in ["/\\evil.com", "/\\/evil.com", "//evil.com"] {
+        assert!(
+            rp.begin_browser(BrowserLoginTarget {
+                project_id: "some-project".to_string(),
+                resume_path: resume_path.to_string(),
+            })
+            .await
+            .is_err(),
+            "resume_path {resume_path:?} must be rejected as an open-redirect bypass"
+        );
+    }
+
+    // Sanity check the guard is not simply rejecting every path: a real same-origin path passes.
+    assert!(
+        rp.begin_browser(BrowserLoginTarget {
+            project_id: "some-project".to_string(),
+            resume_path: "/browser".to_string(),
+        })
+        .await
+        .is_ok()
     );
 }
 
@@ -381,7 +573,13 @@ async fn callback_rejects_state_cookie_mismatch_before_contacting_keycloak(pool:
         })
         .await;
     let rp = Arc::new(
-        KeycloakRelyingParty::new(rp_config(&keycloak), keycloak.url("/jwks"), repo(pool)).unwrap(),
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.url("/jwks"),
+            repo(pool),
+            rate_limiter(),
+        )
+        .unwrap(),
     );
     let (location, cookie) = rp.begin_device("device-code".to_string()).await.unwrap();
     let state = reqwest::Url::parse(&location)
@@ -421,7 +619,13 @@ async fn invalid_id_token_profiles_fail_closed(pool: PgPool) {
         })
         .await;
     let rp = Arc::new(
-        KeycloakRelyingParty::new(rp_config(&keycloak), keycloak.url("/jwks"), repo(pool)).unwrap(),
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.url("/jwks"),
+            repo(pool),
+            rate_limiter(),
+        )
+        .unwrap(),
     );
     let now = Utc::now();
     let mut jwt_header = Header::new(Algorithm::RS256);
@@ -576,8 +780,13 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
     .await
     .unwrap();
     let rp = Arc::new(
-        KeycloakRelyingParty::new(rp_config(&keycloak), keycloak.url("/jwks"), repo.clone())
-            .unwrap(),
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.url("/jwks"),
+            repo.clone(),
+            rate_limiter(),
+        )
+        .unwrap(),
     );
     let (location, cookie) = rp
         .begin_browser(BrowserLoginTarget {

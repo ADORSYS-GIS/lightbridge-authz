@@ -83,11 +83,7 @@ pub fn generate_user_code() -> String {
 /// Generates the opaque, high-entropy device-verification code the CLI polls with. Never shown
 /// to a human, so no readability constraint applies (unlike [`generate_user_code`]).
 pub fn generate_device_code() -> String {
-    use base64::Engine;
-    use rand_core::{OsRng, RngCore};
-    let mut buf = [0u8; DEVICE_CODE_ENTROPY_BYTES];
-    OsRng.fill_bytes(&mut buf);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+    super::random_urlsafe(DEVICE_CODE_ENTROPY_BYTES)
 }
 
 /// Strips anything that is not an ASCII alphanumeric and upper-cases the rest -- the store's own

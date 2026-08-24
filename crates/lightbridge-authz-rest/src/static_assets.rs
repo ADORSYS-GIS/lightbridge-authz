@@ -42,7 +42,11 @@ const NO_CACHE_CONTROL: &str = "no-cache";
 /// since this page also sets an authentication cookie on success), no inline scripts (Vite's
 /// production build does not require any -- verified against a real `vite build` output, not
 /// dev-mode HMR injection).
-const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; frame-ancestors 'none'";
+///
+/// `pub(crate)` so `crate::relying_party` -- whose device-verification/callback pages share the
+/// exact same same-origin, unembeddable posture -- can reuse this constant instead of declaring a
+/// byte-identical copy of its own.
+pub(crate) const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; frame-ancestors 'none'";
 
 /// Root-level protocol endpoints already named by accepted ADRs or the current roadmap, plus the
 /// two discovery/token namespaces (`.well-known`, `oauth2`). Keep device verification out of this
