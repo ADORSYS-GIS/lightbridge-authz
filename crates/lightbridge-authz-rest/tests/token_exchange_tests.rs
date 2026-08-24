@@ -78,6 +78,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use cratestack_axum::ratelimit::InMemoryRateLimitStore;
 use tower::ServiceExt;
 
 const ISSUER: &str = "https://authz.example.test";
@@ -257,6 +258,7 @@ fn relying_party_with_issuer(repo: Arc<StoreRepo>, issuer: &str) -> Arc<Keycloak
             },
             format!("{issuer}/jwks"),
             repo,
+            Arc::new(InMemoryRateLimitStore::new()),
         )
         .unwrap(),
     )

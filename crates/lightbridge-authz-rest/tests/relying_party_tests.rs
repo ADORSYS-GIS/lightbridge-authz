@@ -543,7 +543,7 @@ async fn begin_browser_rejects_backslash_open_redirect_variants(pool: PgPool) {
     for resume_path in ["/\\evil.com", "/\\/evil.com", "//evil.com"] {
         assert!(
             rp.begin_browser(BrowserLoginTarget {
-                project_id: "some-project".to_string(),
+                project_id: Some("some-project".to_string()),
                 resume_path: resume_path.to_string(),
             })
             .await
@@ -555,7 +555,7 @@ async fn begin_browser_rejects_backslash_open_redirect_variants(pool: PgPool) {
     // Sanity check the guard is not simply rejecting every path: a real same-origin path passes.
     assert!(
         rp.begin_browser(BrowserLoginTarget {
-            project_id: "some-project".to_string(),
+            project_id: Some("some-project".to_string()),
             resume_path: "/browser".to_string(),
         })
         .await
