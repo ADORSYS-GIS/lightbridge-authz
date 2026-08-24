@@ -135,6 +135,11 @@ oauth2:
     client_id: "authz-idp-rp"
     callback_url: "https://localhost:13004/idp/callback"
     state_encryption_key: "${KEYCLOAK_RP_STATE_ENCRYPTION_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA}"
+    # ADR-0024: separate AES-256-GCM key sealing the Keycloak token set at rest on
+    # federated_identities.token_envelope. Development-only fixed key, deliberately different
+    # from state_encryption_key above (KeycloakRelyingParty::new refuses a config where the two
+    # are equal). Production must override with a unique base64url-encoded 32-byte key.
+    token_encryption_key: "${KEYCLOAK_RP_TOKEN_ENCRYPTION_KEY:-QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI}"
     timeout_ms: ${KEYCLOAK_RP_TIMEOUT_MS:-5000}
     browser_session_ttl_seconds: ${BROWSER_SESSION_TTL_SECONDS:-28800}
   # Used only when `type: self` — signing keypair generated on first startup and stored in the DB
