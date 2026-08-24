@@ -1695,6 +1695,9 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
             ctx.review_service.clone(),
             ctx.budget_repo.clone(),
         ),
+        // cratestack 0.8.11 (@computed) added this parameter; `()` is a no-op since
+        // `authz.cstack` declares no `@computed` field (see src/lib.rs's own call sites).
+        (),
         CborCodec,
         CratestackAuthProvider::new(admin_bearer(&subject), RpcScope::Crud),
         DEFAULT_BODY_LIMIT_BYTES,
