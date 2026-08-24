@@ -124,8 +124,55 @@ async fn authorize(
             .flatten(),
         None => None,
     };
-    if let Some(session) = session {
-        return issue_code(&state, request, session.account_id, session.project_id).await;
+    // A session row with no persisted `subject` predates
+    // `migrations/20260824000003_sessions_add_subject.sql` -- there is no real authenticated
+    // subject to recover for it, so this falls through to a fresh Keycloak login below rather
+    // than ever falling back to `session.account_id` for `external_id` (the identity-
+    // substitution bug that column exists to fix -- see `issue_code`'s doc comment).
+    if let Some(session) = session
+        && let Some(subject) = session.subject.clone()
+    {
+        return match project_id.as_deref() {
+            // The request names a DIFFERENT project than the one this session is pinned to: do
+            // NOT silently issue a code scoped to `session.project_id` (the pre-fix behavior --
+            // it ignored `project_id` entirely once a session existed). Re-resolve authorization
+            // for the REQUESTED project against the session's real subject, applying the same
+            // Active-status gate a fresh login would, and refuse outright -- rather than
+            // substituting the session's own project -- when the subject isn't authorized for it.
+            Some(requested) if requested != session.project_id => {
+                match state
+                    .rp
+                    .resolve_authorized_context(&subject, requested)
+                    .await
+                {
+                    Ok(context) => {
+                        issue_code(
+                            &state,
+                            request,
+                            subject,
+                            context.account_id,
+                            context.project_id,
+                        )
+                        .await
+                    }
+                    Err(_) => redirect_error(
+                        &request,
+                        "access_denied",
+                        "subject is not authorized for the requested project",
+                    ),
+                }
+            }
+            _ => {
+                issue_code(
+                    &state,
+                    request,
+                    subject,
+                    session.account_id,
+                    session.project_id,
+                )
+                .await
+            }
+        };
     }
 
     let Some(path_and_query) = original_uri.path_and_query() else {
@@ -148,18 +195,29 @@ async fn authorize(
     }
 }
 
+/// Mints the authorization code's underlying `Identity`. `external_id` (which ends up as the
+/// eventual access/id token's JWT `sub` claim) is `subject` -- the REAL authenticated IdP
+/// subject the browser session was minted for -- never `account_id`. `resolve_context`
+/// (`crates/lightbridge-authz-api-key/src/repo.rs`) always resolves `account_id` to the
+/// project's OWNING account, including when `subject` only holds a `project_members` roster row
+/// rather than ownership; substituting `account_id` for `external_id` here would attribute a
+/// non-owner member's actions to the owner's account instead of their own (the bug
+/// `sessions.subject`, added by `migrations/20260824000003_sessions_add_subject.sql`, exists to
+/// fix). `account_id` still rides along as its own `attributes["account_id"]` claim, matching
+/// every other grant (`identity_for`/`access_token_extra` in `crates/lightbridge-authz-rest/src/signing.rs`).
 async fn issue_code(
     state: &AuthorizeState,
     request: AuthorizeRequest,
+    subject: String,
     account_id: String,
     project_id: String,
 ) -> Response {
     let mut attributes = HashMap::new();
-    attributes.insert("account_id".to_string(), account_id.clone());
+    attributes.insert("account_id".to_string(), account_id);
     attributes.insert("project_id".to_string(), project_id);
     let identity = Identity {
         provider_id: "keycloak".to_string(),
-        external_id: account_id,
+        external_id: subject,
         email: None,
         username: None,
         attributes,

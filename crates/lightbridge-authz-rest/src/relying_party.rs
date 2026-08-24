@@ -232,6 +232,21 @@ impl KeycloakRelyingParty {
         self.repo.find_active_browser_session(session_id, now).await
     }
 
+    /// Resolves `{account_id, project_id}` for `subject` + `project_id`, gated by the
+    /// Active-status check `StoreRepo::resolve_context` itself deliberately does not apply (see
+    /// `StoreRepo::resolve_active_context`'s doc comment -- the single shared implementation every
+    /// grant/session path in this codebase now routes through). Used by `authorize.rs` when a
+    /// request's `project_id` differs from an already-established browser session's own project --
+    /// see that call site's doc comment for why silently issuing for the session's project instead
+    /// would be wrong.
+    pub async fn resolve_authorized_context(
+        &self,
+        subject: &str,
+        project_id: &str,
+    ) -> Result<lightbridge_authz_core::dto::ResolvedContext> {
+        self.repo.resolve_active_context(subject, project_id).await
+    }
+
     async fn begin(&self, flow: PendingFlow) -> Result<(String, Cookie<'static>)> {
         let metadata = self.discover().await?;
         let pkce = Pkce::new();
@@ -348,7 +363,10 @@ impl KeycloakRelyingParty {
                         .await?
                         .ok_or(Error::NotFound)?,
                 };
-                let context = self.repo.resolve_context(&claims.sub, &project_id).await?;
+                let context = self
+                    .repo
+                    .resolve_active_context(&claims.sub, &project_id)
+                    .await?;
                 let session = self
                     .repo
                     .create_session(NewSession {
@@ -358,6 +376,7 @@ impl KeycloakRelyingParty {
                         client_id: None,
                         kind: "browser".to_string(),
                         expires_at: Utc::now() + ChronoDuration::seconds(ttl),
+                        subject: Some(claims.sub),
                     })
                     .await?;
                 Ok(Completion::Browser {

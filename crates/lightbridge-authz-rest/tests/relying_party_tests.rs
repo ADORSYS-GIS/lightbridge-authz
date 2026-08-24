@@ -19,7 +19,7 @@ use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_core::{
     config::OidcRelyingParty,
-    dto::{CreateAccount, CreateProject},
+    dto::{CreateAccount, CreateProject, ResourceStatus},
 };
 use lightbridge_authz_rest::oauth2_op::device_store::DbDeviceCodeStore;
 use lightbridge_authz_rest::relying_party::{BrowserLoginTarget, KeycloakRelyingParty, router};
@@ -918,4 +918,412 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
             .await
             .unwrap();
     assert_eq!(browser_sessions, 1);
+}
+
+/// Code-review follow-up to #463/#466/#467 (Finding A): `resolve_context` only checks
+/// ownership/membership, never `status` -- before this fix, `KeycloakRelyingParty::complete`'s
+/// `PendingFlow::Browser` arm called it and then `create_session` with no Active-status gate at
+/// all, so a SUSPENDED account still got handed a live browser SSO session. Proof this test
+/// catches the regression: reverting the `resolve_active_context` status checks in
+/// `relying_party.rs` back to a bare `self.repo.resolve_context(...).await?` makes this test
+/// fail with `left: 0, right: 1` (a session row IS created) instead of passing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn suspended_account_is_refused_a_browser_session(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let _discovery = keycloak
+        .mock_async(|when, then| {
+            when.method(GET).path("/.well-known/openid-configuration");
+            then.status(200).json_body(discovery_body(&keycloak));
+        })
+        .await;
+    let key = generate_rs256_key().unwrap();
+    let _jwks = keycloak
+        .mock_async(|when, then| {
+            when.method(GET).path("/jwks");
+            then.status(200)
+                .json_body(serde_json::json!({ "keys": [key.public_jwk] }));
+        })
+        .await;
+    let repo = repo(pool.clone());
+    repo.create_account(
+        "suspended-subject",
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .unwrap();
+    repo.create_project(
+        "suspended-subject",
+        "suspended-subject",
+        CreateProject {
+            name: "suspended account project".to_string(),
+            allowed_models: None,
+            default_limits: None,
+            billing_plan: "free".to_string(),
+            billing_identity: "suspended-account-binding".to_string(),
+            project_quota: None,
+        },
+        "suspended-account-project".to_string(),
+    )
+    .await
+    .unwrap();
+    repo.set_account_status(
+        "suspended-subject",
+        "suspended-subject",
+        ResourceStatus::Suspended,
+    )
+    .await
+    .expect("suspend the account");
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.url("/jwks"),
+            repo.clone(),
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+    let (location, cookie) = rp
+        .begin_browser(BrowserLoginTarget {
+            project_id: None,
+            resume_path: "/browser".to_string(),
+        })
+        .await
+        .unwrap();
+    let state = reqwest::Url::parse(&location)
+        .unwrap()
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .unwrap();
+    let decoded = OAuth2State::decrypt(
+        &state,
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(STATE_KEY)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    )
+    .unwrap();
+    let mut jwt_header = Header::new(Algorithm::RS256);
+    jwt_header.kid = Some(key.kid);
+    let token = encode(
+        &jwt_header,
+        &IdToken {
+            sub: "suspended-subject",
+            iss: &keycloak.base_url(),
+            aud: "authz-idp-rp",
+            nonce: decoded.nonce.as_deref().unwrap(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp(),
+            iat: Utc::now().timestamp(),
+        },
+        &EncodingKey::from_rsa_pem(key.private_key_pem.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    let _token = keycloak
+        .mock_async(|when, then| {
+            when.method(POST).path("/token").body_includes("code=code");
+            then.status(200)
+                .json_body(serde_json::json!({ "id_token": token }));
+        })
+        .await;
+    let response = router(rp)
+        .oneshot(
+            Request::builder()
+                .uri(callback_uri(&state))
+                .header(header::COOKIE, cookie.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "a suspended account must not complete browser SSO"
+    );
+    let browser_sessions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE kind = 'browser'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        browser_sessions, 0,
+        "a suspended account must never get a live browser session"
+    );
+}
+
+/// Code-review follow-up to #463/#466/#467 (Finding A, project half): same gap as
+/// `suspended_account_is_refused_a_browser_session`, but for an INACTIVE project rather than a
+/// suspended account -- `resolve_context` resolves the project regardless of its own `status`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn inactive_project_is_refused_a_browser_session(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let _discovery = keycloak
+        .mock_async(|when, then| {
+            when.method(GET).path("/.well-known/openid-configuration");
+            then.status(200).json_body(discovery_body(&keycloak));
+        })
+        .await;
+    let key = generate_rs256_key().unwrap();
+    let _jwks = keycloak
+        .mock_async(|when, then| {
+            when.method(GET).path("/jwks");
+            then.status(200)
+                .json_body(serde_json::json!({ "keys": [key.public_jwk] }));
+        })
+        .await;
+    let repo = repo(pool.clone());
+    repo.create_account(
+        "inactive-project-subject",
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .unwrap();
+    repo.create_project(
+        "inactive-project-subject",
+        "inactive-project-subject",
+        CreateProject {
+            name: "inactive project".to_string(),
+            allowed_models: None,
+            default_limits: None,
+            billing_plan: "free".to_string(),
+            billing_identity: "inactive-project-binding".to_string(),
+            project_quota: None,
+        },
+        "inactive-project".to_string(),
+    )
+    .await
+    .unwrap();
+    repo.set_project_status(
+        "inactive-project-subject",
+        "inactive-project",
+        ResourceStatus::Suspended,
+    )
+    .await
+    .expect("suspend the project");
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.url("/jwks"),
+            repo.clone(),
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+    let (location, cookie) = rp
+        .begin_browser(BrowserLoginTarget {
+            project_id: Some("inactive-project".to_string()),
+            resume_path: "/browser".to_string(),
+        })
+        .await
+        .unwrap();
+    let state = reqwest::Url::parse(&location)
+        .unwrap()
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .unwrap();
+    let decoded = OAuth2State::decrypt(
+        &state,
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(STATE_KEY)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    )
+    .unwrap();
+    let mut jwt_header = Header::new(Algorithm::RS256);
+    jwt_header.kid = Some(key.kid);
+    let token = encode(
+        &jwt_header,
+        &IdToken {
+            sub: "inactive-project-subject",
+            iss: &keycloak.base_url(),
+            aud: "authz-idp-rp",
+            nonce: decoded.nonce.as_deref().unwrap(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp(),
+            iat: Utc::now().timestamp(),
+        },
+        &EncodingKey::from_rsa_pem(key.private_key_pem.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    let _token = keycloak
+        .mock_async(|when, then| {
+            when.method(POST).path("/token").body_includes("code=code");
+            then.status(200)
+                .json_body(serde_json::json!({ "id_token": token }));
+        })
+        .await;
+    let response = router(rp)
+        .oneshot(
+            Request::builder()
+                .uri(callback_uri(&state))
+                .header(header::COOKIE, cookie.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "an inactive project must not complete browser SSO"
+    );
+    let browser_sessions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE kind = 'browser'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        browser_sessions, 0,
+        "an inactive project must never get a live browser session"
+    );
+}
+
+/// Code-review follow-up to #463/#466/#467 (Finding B, groundwork): the browser session row must
+/// persist the REAL authenticated subject (`sessions.subject`), not just the resolved
+/// `account_id` -- which `resolve_context` sets to the project's OWNING account even when the
+/// caller only holds a `project_members` roster row. Proof this test catches the regression:
+/// before `migrations/20260824000003_sessions_add_subject.sql` and the `NewSession { subject:
+/// Some(claims.sub), .. }` change in `relying_party.rs`, `sessions` had no `subject` column at
+/// all, and `claims.sub` was discarded once `resolve_context` returned -- there would be no way
+/// to distinguish `member-subject` from `owner-subject` after this call.
+#[sqlx::test(migrations = "../../migrations")]
+async fn browser_session_persists_the_real_authenticated_member_subject(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let _discovery = keycloak
+        .mock_async(|when, then| {
+            when.method(GET).path("/.well-known/openid-configuration");
+            then.status(200).json_body(discovery_body(&keycloak));
+        })
+        .await;
+    let key = generate_rs256_key().unwrap();
+    let _jwks = keycloak
+        .mock_async(|when, then| {
+            when.method(GET).path("/jwks");
+            then.status(200)
+                .json_body(serde_json::json!({ "keys": [key.public_jwk] }));
+        })
+        .await;
+    let repo = repo(pool.clone());
+    repo.create_account(
+        "owner-subject",
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .unwrap();
+    repo.create_account(
+        "member-subject",
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .unwrap();
+    repo.create_project(
+        "owner-subject",
+        "owner-subject",
+        CreateProject {
+            name: "owner project".to_string(),
+            allowed_models: None,
+            default_limits: None,
+            billing_plan: "free".to_string(),
+            billing_identity: "member-binding".to_string(),
+            project_quota: None,
+        },
+        "member-scope-project".to_string(),
+    )
+    .await
+    .unwrap();
+    repo.add_project_member(
+        "owner-subject",
+        "member-scope-project",
+        "member-subject",
+        Some("member"),
+    )
+    .await
+    .expect("add member-subject as a roster member");
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.url("/jwks"),
+            repo.clone(),
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+    let (location, cookie) = rp
+        .begin_browser(BrowserLoginTarget {
+            project_id: Some("member-scope-project".to_string()),
+            resume_path: "/browser".to_string(),
+        })
+        .await
+        .unwrap();
+    let state = reqwest::Url::parse(&location)
+        .unwrap()
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .unwrap();
+    let decoded = OAuth2State::decrypt(
+        &state,
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(STATE_KEY)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    )
+    .unwrap();
+    let mut jwt_header = Header::new(Algorithm::RS256);
+    jwt_header.kid = Some(key.kid);
+    let token = encode(
+        &jwt_header,
+        &IdToken {
+            sub: "member-subject",
+            iss: &keycloak.base_url(),
+            aud: "authz-idp-rp",
+            nonce: decoded.nonce.as_deref().unwrap(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp(),
+            iat: Utc::now().timestamp(),
+        },
+        &EncodingKey::from_rsa_pem(key.private_key_pem.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    let _token = keycloak
+        .mock_async(|when, then| {
+            when.method(POST).path("/token").body_includes("code=code");
+            then.status(200)
+                .json_body(serde_json::json!({ "id_token": token }));
+        })
+        .await;
+    let response = router(rp)
+        .oneshot(
+            Request::builder()
+                .uri(callback_uri(&state))
+                .header(header::COOKIE, cookie.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let row: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT account_id, project_id, subject FROM sessions WHERE kind = 'browser'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row,
+        (
+            "owner-subject".to_string(),
+            "member-scope-project".to_string(),
+            Some("member-subject".to_string())
+        ),
+        "account_id resolves to the project OWNER, but subject must be the real authenticated \
+         member -- these must never collapse to the same value for a non-owner member"
+    );
 }

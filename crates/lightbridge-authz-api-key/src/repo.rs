@@ -767,6 +767,57 @@ impl StoreRepo {
         })
     }
 
+    /// Enforces the Active-status gate `resolve_context` itself deliberately does not apply (that
+    /// function only checks ownership/membership). Single source of truth for every grant/session
+    /// path that must refuse a suspended account or an inactive project rather than silently
+    /// admitting it: browser SSO (`KeycloakRelyingParty::complete`/`resolve_authorized_context`),
+    /// the device-code grant (`issue_device_tokens`), the refresh grant (`handle_refresh_token`),
+    /// and the RFC 8693 token-exchange grant (`handle_token_exchange`) all route through this (or
+    /// through [`Self::resolve_active_context`] below, which also resolves the context). Returns
+    /// the fetched [`Project`] because two of those four callers (`issue_device_tokens`,
+    /// `handle_refresh_token`) need `allowed_models`/`model_policy` off the SAME row right after
+    /// this check and would otherwise pay for a second, redundant query to get it.
+    ///
+    /// Fail-closed, unconditionally: a lookup ERROR refuses (`Error::Server`), never falls through
+    /// to permit. An inactive project or a suspended account refuses (`Error::Forbidden`). This is
+    /// the exact asymmetry that let `handle_token_exchange` silently admit a suspended account
+    /// through the RFC 8693 grant while `issue_device_tokens`/`handle_refresh_token` already
+    /// refused it -- callers translate the `Result` into their own OAuth error shape (some grants
+    /// use a specific `access_denied`, the refresh grant deliberately uses a uniform
+    /// `invalid_grant` for both "inactive" and "not authorized" so as not to reveal which applied),
+    /// but the underlying check must never drift between them again.
+    pub async fn require_active_project_and_account(
+        &self,
+        project_id: &str,
+        account_id: &str,
+    ) -> Result<Project> {
+        let project = match self.get_project_by_id(project_id).await {
+            Ok(Some(project)) if project.status == ResourceStatus::Active => project,
+            Ok(_) => return Err(Error::Forbidden("project is not active".to_string())),
+            Err(_) => return Err(Error::Server("project lookup failed".to_string())),
+        };
+        match self.get_account_by_id(account_id).await {
+            Ok(Some(account)) if account.status == ResourceStatus::Active => {}
+            Ok(_) => return Err(Error::Forbidden("account is suspended".to_string())),
+            Err(_) => return Err(Error::Server("account lookup failed".to_string())),
+        }
+        Ok(project)
+    }
+
+    /// `resolve_context` followed immediately by [`Self::require_active_project_and_account`], for
+    /// the callers (browser SSO's session creation and cross-project re-resolution) that only need
+    /// the resolved ids, not the fetched `Project` value itself.
+    pub async fn resolve_active_context(
+        &self,
+        subject: &str,
+        project_id: &str,
+    ) -> Result<ResolvedContext> {
+        let context = self.resolve_context(subject, project_id).await?;
+        self.require_active_project_and_account(&context.project_id, &context.account_id)
+            .await?;
+        Ok(context)
+    }
+
     /// Resolves the acting `subject`'s per-member `quota_tier` on `project_id` (ADR-0017), the
     /// human/OIDC-plane mirror of the API-key plane's `owner_quota_tier`
     /// (`api_key_validation` view, `migrations/20260731000001_api_keys_owner_account.sql`).
@@ -985,9 +1036,9 @@ impl StoreRepo {
         let row: SessionRow = sqlx::query_as(
             r#"
             INSERT INTO sessions
-              (id, account_id, project_id, client_id, kind, status, expires_at)
-            VALUES ($1, $2, $3, $4, $5, 'active', $6)
-            RETURNING id, account_id, project_id, client_id, kind, status, created_at, updated_at, last_used_at, expires_at, user_agent
+              (id, account_id, project_id, client_id, kind, status, expires_at, subject)
+            VALUES ($1, $2, $3, $4, $5, 'active', $6, $7)
+            RETURNING id, account_id, project_id, client_id, kind, status, created_at, updated_at, last_used_at, expires_at, user_agent, subject
             "#,
         )
         .bind(input.id)
@@ -996,6 +1047,7 @@ impl StoreRepo {
         .bind(input.client_id)
         .bind(input.kind)
         .bind(input.expires_at)
+        .bind(input.subject)
         .fetch_one(self.pool())
         .await?;
         Ok(row)
@@ -1028,7 +1080,7 @@ impl StoreRepo {
     ) -> Result<Option<BrowserSessionContextRow>> {
         let row = sqlx::query_as(
             r#"
-            SELECT account_id, project_id
+            SELECT account_id, project_id, subject
             FROM sessions
             WHERE id = $1
               AND kind = 'browser'
