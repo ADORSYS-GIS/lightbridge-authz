@@ -4,7 +4,7 @@ use lightbridge_authz_core::{
     RotateApiKey, async_trait,
     config::{
         ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetServer, IdpServer, ModelCatalog, Oauth2,
-        OauthClientType, OpaServer, QuotaTiers, Redis, UsageServiceClient,
+        OpaServer, QuotaTiers, Redis, UsageServiceClient,
     },
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
@@ -2210,23 +2210,22 @@ where
 }
 
 /// Derives the two `well_known_router` mount parameters (`token_exchange_scopes`,
-/// `private_key_jwt_supported`) from `oauth2`. Used by `build_idp_router` — `authz-idp` is now the
+/// `client_authentication`) from `oauth2`. Used by `build_idp_router` — `authz-idp` is now the
 /// only server that mounts `well_known_router` at all; `authz-api` stopped serving OIDC
 /// discovery/JWKS once the `auth.ai.camer.digital` ingress was repointed at `authz-idp` (see
 /// `build_api_router`'s doc comment). Kept as its own function rather than inlined into
 /// `build_idp_router` so a future second self-signed-JWKS server can reuse it the same way
 /// `build_api_router` used to.
-fn well_known_mount_params(oauth2: &Oauth2) -> (Option<Vec<String>>, bool) {
+fn well_known_mount_params(
+    oauth2: &Oauth2,
+) -> (Option<Vec<String>>, signing::ClientAuthenticationMetadata) {
     let token_exchange_scopes = oauth2
         .token_exchange
         .as_ref()
         .filter(|t| t.enabled)
         .map(|t| t.allowed_scopes.clone());
-    let private_key_jwt_supported = oauth2
-        .clients
-        .iter()
-        .any(|c| c.client_type == OauthClientType::Confidential);
-    (token_exchange_scopes, private_key_jwt_supported)
+    let client_authentication = signing::ClientAuthenticationMetadata::from_oauth2(oauth2);
+    (token_exchange_scopes, client_authentication)
 }
 
 /// Assembles the API server router: public probes plus the generated cratestack RPC CRUD surface
@@ -2712,7 +2711,7 @@ pub fn build_idp_router(
 ) -> Router {
     let mut router = probe_router(readiness_pool);
 
-    let (token_exchange_scopes, private_key_jwt_supported) = well_known_mount_params(oauth2);
+    let (token_exchange_scopes, client_authentication) = well_known_mount_params(oauth2);
     if oauth2.is_self_signed()
         && let Some(signing) = oauth2.signing.as_ref()
     {
@@ -2720,7 +2719,7 @@ pub fn build_idp_router(
             &signing.issuer,
             signing_repo,
             token_exchange_scopes,
-            private_key_jwt_supported,
+            client_authentication,
         ));
     }
 

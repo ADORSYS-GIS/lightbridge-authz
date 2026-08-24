@@ -31,9 +31,9 @@ configuration is enabled, it serves:
 
 | Surface | Current state |
 | --- | --- |
-| `GET /.well-known/openid-configuration`, `GET /.well-known/jwks.json` | Implemented for `oauth2.type: self` with signing configured. Discovery accurately advertises the narrow, currently mounted token-exchange/refresh grant surface. |
+| `GET /.well-known/openid-configuration`, `GET /.well-known/oauth-authorization-server`, `GET /.well-known/jwks.json` | Implemented for `oauth2.type: self` with signing configured. OIDC discovery and RFC 8414 authorization-server metadata advertise only the narrow, currently mounted token-exchange/refresh surface and its revocation endpoint. For an issuer with a path, OIDC discovery follows the issuer path (`/issuer/.well-known/openid-configuration`) while RFC 8414 inserts `.well-known` before it (`/.well-known/oauth-authorization-server/issuer`). |
 | `POST /oauth2/token` | Implemented for RFC 8693 token exchange and `refresh_token`; the hand-written HTTP boundary is [`token_exchange.rs`](../crates/lightbridge-authz-rest/src/token_exchange.rs) and the grant logic is [`oauth2_op/store.rs`](../crates/lightbridge-authz-rest/src/oauth2_op/store.rs). |
-| `POST /oauth2/revoke` | Implemented for the persisted refresh-token/session chain under RFC 7009. It is not advertised in discovery. |
+| `POST /oauth2/revoke` | Implemented for the persisted refresh-token/session chain under RFC 7009 and advertised as `revocation_endpoint` whenever the token surface is mounted. |
 | Device-code storage | The `device_authorizations` persistence and CAS-consuming [`DbDeviceCodeStore`](../crates/lightbridge-authz-rest/src/oauth2_op/device_store.rs) exist, but no device-authorization or verification endpoint mounts it. |
 | Hosted static assets | A same-origin SPA fallback exists ([`static_assets.rs`](../crates/lightbridge-authz-rest/src/static_assets.rs)); it serves files only. It does not authenticate, set cookies, or implement `/authorize`. |
 
@@ -123,21 +123,16 @@ contract.
 
 ## Discovery and authorization-server metadata gaps
 
-The current document correctly omits an authorization and device endpoint because neither is
-implemented. When they ship, update it according to
+The current documents correctly omit authorization, device, UserInfo, introspection, and logout
+endpoints because none is implemented. When a new surface ships, update the metadata according to
 [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) and
 [OpenID Connect Discovery](https://openid.net/specs/openid-connect-discovery-1_0.html), in lockstep
 with router tests:
 
-- publish `/.well-known/oauth-authorization-server` as the RFC 8414 authorization-server
-  metadata document alongside `/.well-known/openid-configuration`; account for RFC 8414's issuer
-  path transformation rules rather than assuming the two well-known URLs are interchangeable;
 - advertise `authorization_endpoint`, `response_types_supported` (at least `code`),
   `response_modes_supported`, `grant_types_supported`, and `code_challenge_methods_supported`
   (`S256`) only when the matching routes are enabled;
 - advertise `device_authorization_endpoint` only with a working RFC 8628 endpoint;
-- advertise the already-live `revocation_endpoint`; the current upstream discovery type cannot
-  represent it, so upgrade/extend the dependency or use a standards-complete metadata response;
 - add the standard introspection, UserInfo, and logout metadata only with their corresponding
   endpoints; and
 - keep `issuer`, endpoint URLs, signing algorithms, client-auth methods, scopes, and CORS behavior

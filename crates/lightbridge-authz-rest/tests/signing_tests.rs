@@ -7,7 +7,9 @@
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use lightbridge_authz_core::config::JwtSigning;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
-use lightbridge_authz_rest::signing::{ApiKeyJwtSigner, capped_expiry, generate_rs256_key};
+use lightbridge_authz_rest::signing::{
+    ApiKeyJwtSigner, ClientAuthenticationMetadata, capped_expiry, generate_rs256_key,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
@@ -108,16 +110,21 @@ async fn well_known_serves_cors_headers() {
     use lightbridge_authz_rest::signing::well_known_router;
     use tower::ServiceExt;
 
-    let response = well_known_router::<()>(ISSUER, lazy_repo(), None, false)
-        .oneshot(
-            Request::builder()
-                .uri("/.well-known/openid-configuration")
-                .header(header::ORIGIN, "https://example.com")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = well_known_router::<()>(
+        ISSUER,
+        lazy_repo(),
+        None,
+        ClientAuthenticationMetadata::default(),
+    )
+    .oneshot(
+        Request::builder()
+            .uri("/.well-known/openid-configuration")
+            .header(header::ORIGIN, "https://example.com")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         response
@@ -136,15 +143,20 @@ async fn jwks_endpoint_returns_server_error_when_repo_is_unreachable() {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    let response = well_known_router::<()>(ISSUER, lazy_repo(), None, false)
-        .oneshot(
-            Request::builder()
-                .uri("/.well-known/jwks.json")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = well_known_router::<()>(
+        ISSUER,
+        lazy_repo(),
+        None,
+        ClientAuthenticationMetadata::default(),
+    )
+    .oneshot(
+        Request::builder()
+            .uri("/.well-known/jwks.json")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -244,15 +256,20 @@ async fn discovery_advertises_exact_token_exchange_metadata_when_enabled() {
         "email".to_string(),
         "offline_access".to_string(),
     ];
-    let discovery = well_known_router::<()>(ISSUER, lazy_repo(), Some(scopes), false)
-        .oneshot(
-            Request::builder()
-                .uri("/.well-known/openid-configuration")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let discovery = well_known_router::<()>(
+        ISSUER,
+        lazy_repo(),
+        Some(scopes),
+        ClientAuthenticationMetadata::public_client(),
+    )
+    .oneshot(
+        Request::builder()
+            .uri("/.well-known/openid-configuration")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(discovery.status(), StatusCode::OK);
     let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
     let payload: Value = serde_json::from_slice(&body).unwrap();
@@ -270,12 +287,9 @@ async fn discovery_advertises_exact_token_exchange_metadata_when_enabled() {
         json!(["openid", "profile", "email", "offline_access"]),
         "scopes_supported must exactly match oauth2.token_exchange.allowed_scopes: {payload}"
     );
-    assert_eq!(
-        payload["response_types_supported"],
-        json!([]),
-        "response_types_supported describes the AUTHORIZATION endpoint (OIDC Discovery 1.0 §3), \
-         which this service never serves, on or off -- token-exchange is a direct token-endpoint \
-         grant (RFC 8693), not a redirect-based response_type negotiation: {payload}"
+    assert!(
+        payload.get("response_types_supported").is_none(),
+        "response_types_supported must be omitted without /authorize: {payload}"
     );
     assert_eq!(
         payload["token_endpoint"],
@@ -286,6 +300,108 @@ async fn discovery_advertises_exact_token_exchange_metadata_when_enabled() {
         payload["token_endpoint_auth_methods_supported"],
         json!(["none"]),
         "must never advertise client_secret_basic/client_secret_post (ADR-0011 Decision 6): {payload}"
+    );
+    assert_eq!(
+        payload["revocation_endpoint"],
+        format!("{ISSUER}/oauth2/revoke"),
+        "RFC 7009 revocation is mounted with the token surface and must be advertised: {payload}"
+    );
+}
+
+#[tokio::test]
+async fn oidc_and_oauth_metadata_use_their_distinct_issuer_path_rules() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use lightbridge_authz_rest::signing::well_known_router;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    let issuer = "https://authz.example.test/issuer/acme/";
+    let router = well_known_router::<()>(
+        issuer,
+        lazy_repo(),
+        Some(vec!["openid".to_string(), "offline_access".to_string()]),
+        ClientAuthenticationMetadata::default(),
+    );
+    let oidc = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/issuer/acme/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let oauth = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/oauth-authorization-server/issuer/acme")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(oidc.status(), StatusCode::OK);
+    assert_eq!(oauth.status(), StatusCode::OK);
+    let oidc: Value =
+        serde_json::from_slice(&to_bytes(oidc.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let oauth: Value =
+        serde_json::from_slice(&to_bytes(oauth.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        oidc, oauth,
+        "both metadata locations describe the same issuer"
+    );
+    assert_eq!(oauth["issuer"], issuer);
+    assert_eq!(
+        oauth["jwks_uri"],
+        "https://authz.example.test/.well-known/jwks.json"
+    );
+    assert_eq!(
+        oauth["token_endpoint"],
+        "https://authz.example.test/oauth2/token"
+    );
+    assert_eq!(
+        oauth["revocation_endpoint"],
+        "https://authz.example.test/oauth2/revoke"
+    );
+
+    let jwks = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/jwks.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        jwks.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the metadata must advertise the mounted JWKS path; this deliberately offline repo proves routing before the handler reaches its database"
+    );
+
+    let root = well_known_router::<()>(
+        ISSUER,
+        lazy_repo(),
+        Some(vec!["openid".to_string()]),
+        ClientAuthenticationMetadata::default(),
+    )
+    .oneshot(
+        Request::builder()
+            .uri("/.well-known/oauth-authorization-server")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        root.status(),
+        StatusCode::OK,
+        "root issuers use the root RFC 8414 path"
     );
 }
 
@@ -300,10 +416,13 @@ async fn discovery_advertises_exact_token_exchange_metadata_when_enabled() {
 /// when `oauth2.type: self` + `oauth2.signing` are configured (see call site in `lib.rs`), which
 /// makes this service an OIDC *issuer* independent of whether the token-exchange grant is enabled
 /// -- `ApiKeyJwtSigner` mints self-signed API-key JWTs through that path regardless. So the
-/// issuer-identity fields (`issuer`, `jwks_uri`, `subject_types_supported`,
-/// `id_token_signing_alg_values_supported`) must stay populated even with token-exchange disabled;
-/// only the grant-surface fields (`grant_types_supported`, `scopes_supported`, `token_endpoint`)
-/// go empty/absent. Two independent gates, not one flag driving everything.
+/// issuer-identity fields that don't depend on OIDC ID tokens specifically (`issuer`, `jwks_uri`)
+/// stay populated even with token-exchange disabled; the OIDC-specific fields
+/// (`subject_types_supported`, `id_token_signing_alg_values_supported`) are gated on
+/// `oidc_tokens_supported` in `discovery_document` -- token-exchange enabled *and* `openid` present
+/// in the configured scopes -- and go empty/absent here alongside the rest of the grant-surface
+/// fields (`grant_types_supported`, `scopes_supported`, `token_endpoint`) precisely because this
+/// test disables token-exchange entirely. Two independent gates, not one flag driving everything.
 #[tokio::test]
 async fn discovery_advertises_no_grants_when_exchange_disabled() {
     use axum::body::{Body, to_bytes};
@@ -312,40 +431,40 @@ async fn discovery_advertises_no_grants_when_exchange_disabled() {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    let discovery = well_known_router::<()>(ISSUER, lazy_repo(), None, false)
-        .oneshot(
-            Request::builder()
-                .uri("/.well-known/openid-configuration")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let discovery = well_known_router::<()>(
+        ISSUER,
+        lazy_repo(),
+        None,
+        ClientAuthenticationMetadata::default(),
+    )
+    .oneshot(
+        Request::builder()
+            .uri("/.well-known/openid-configuration")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(discovery.status(), StatusCode::OK);
     let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
     let payload: Value = serde_json::from_slice(&body).unwrap();
-    assert!(
-        payload["grant_types_supported"]
-            .as_array()
-            .unwrap()
-            .is_empty(),
-        "no grants must be advertised when token-exchange is disabled: {payload}"
-    );
-    assert!(
-        payload["response_types_supported"]
-            .as_array()
-            .unwrap()
-            .is_empty(),
-        "no response types must be advertised when token-exchange is disabled: {payload}"
-    );
-    assert!(
-        payload["scopes_supported"].as_array().unwrap().is_empty(),
-        "no scopes must be advertised when token-exchange is disabled: {payload}"
-    );
-    assert!(
-        payload.get("token_endpoint").is_none(),
-        "token_endpoint must stay absent when token-exchange is disabled: {payload}"
-    );
+    for field in [
+        "grant_types_supported",
+        "response_types_supported",
+        "response_modes_supported",
+        "scopes_supported",
+        "token_endpoint",
+        "revocation_endpoint",
+        "token_endpoint_auth_methods_supported",
+        "revocation_endpoint_auth_methods_supported",
+        "subject_types_supported",
+        "id_token_signing_alg_values_supported",
+    ] {
+        assert!(
+            payload.get(field).is_none(),
+            "{field} must be omitted when its capability is not mounted: {payload}"
+        );
+    }
 
     assert_eq!(
         payload["issuer"], ISSUER,
@@ -356,17 +475,6 @@ async fn discovery_advertises_no_grants_when_exchange_disabled() {
         format!("{ISSUER}/.well-known/jwks.json"),
         "JWKS is served whenever signing is configured, whether or not token-exchange is enabled \
          -- ApiKeyJwtSigner mints self-signed API-key JWTs through this path regardless: {payload}"
-    );
-    assert_eq!(
-        payload["subject_types_supported"],
-        serde_json::json!(["public"]),
-        "subject type is an issuer property, not a token-exchange one: {payload}"
-    );
-    assert_eq!(
-        payload["id_token_signing_alg_values_supported"],
-        serde_json::json!(["RS256"]),
-        "the signing algorithm is fixed by this deployment's key material, not by whether \
-         token-exchange is enabled: {payload}"
     );
 }
 
@@ -389,15 +497,20 @@ async fn discovery_omits_token_endpoint_when_exchange_disabled() {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    let discovery = well_known_router::<()>(ISSUER, lazy_repo(), None, false)
-        .oneshot(
-            Request::builder()
-                .uri("/.well-known/openid-configuration")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let discovery = well_known_router::<()>(
+        ISSUER,
+        lazy_repo(),
+        None,
+        ClientAuthenticationMetadata::default(),
+    )
+    .oneshot(
+        Request::builder()
+            .uri("/.well-known/openid-configuration")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(discovery.status(), StatusCode::OK);
     let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
     let payload: Value = serde_json::from_slice(&body).unwrap();
@@ -423,23 +536,33 @@ async fn discovery_advertises_private_key_jwt_only_when_a_confidential_client_is
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
-    let discovery = well_known_router::<()>(ISSUER, lazy_repo(), None, true)
-        .oneshot(
-            Request::builder()
-                .uri("/.well-known/openid-configuration")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let discovery = well_known_router::<()>(
+        ISSUER,
+        lazy_repo(),
+        Some(vec!["openid".to_string()]),
+        ClientAuthenticationMetadata::private_key_jwt(vec!["RS256".to_string()]),
+    )
+    .oneshot(
+        Request::builder()
+            .uri("/.well-known/openid-configuration")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(discovery.status(), StatusCode::OK);
     let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
     let payload: Value = serde_json::from_slice(&body).unwrap();
     let methods = payload["token_endpoint_auth_methods_supported"]
         .as_array()
         .unwrap();
-    assert!(methods.contains(&json!("none")));
     assert!(methods.contains(&json!("private_key_jwt")));
+    assert!(!methods.contains(&json!("none")));
+    assert_eq!(
+        payload["token_endpoint_auth_signing_alg_values_supported"],
+        json!(["RS256"]),
+        "private_key_jwt requires its supported signing algorithms in metadata: {payload}"
+    );
     assert!(
         !methods.contains(&json!("client_secret_basic"))
             && !methods.contains(&json!("client_secret_post")),
@@ -477,34 +600,31 @@ async fn discovery_never_advertises_response_types_or_modes() {
             Some(vec!["openid".to_string(), "offline_access".to_string()]),
         ),
     ] {
-        let discovery = well_known_router::<()>(ISSUER, lazy_repo(), scopes, false)
-            .oneshot(
-                Request::builder()
-                    .uri("/.well-known/openid-configuration")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let discovery = well_known_router::<()>(
+            ISSUER,
+            lazy_repo(),
+            scopes,
+            ClientAuthenticationMetadata::default(),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(discovery.status(), StatusCode::OK);
         let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
         let payload: Value = serde_json::from_slice(&body).unwrap();
 
         assert!(
-            payload["response_types_supported"]
-                .as_array()
-                .unwrap()
-                .is_empty(),
-            "[{label}] no authorization endpoint exists in this deployment -- \
-             response_types_supported must stay empty: {payload}"
+            payload.get("response_types_supported").is_none(),
+            "[{label}] response_types_supported must stay absent without /authorize: {payload}"
         );
         assert!(
-            payload["response_modes_supported"]
-                .as_array()
-                .unwrap()
-                .is_empty(),
-            "[{label}] no redirect-based flow is ever served -- response_modes_supported must \
-             stay empty: {payload}"
+            payload.get("response_modes_supported").is_none(),
+            "[{label}] response_modes_supported must stay absent without /authorize: {payload}"
         );
         assert!(
             payload.get("authorization_endpoint").is_none(),
@@ -1066,15 +1186,20 @@ mod db {
         .await
         .unwrap();
 
-        let jwks = well_known_router::<()>(ISSUER, repo.clone(), None, false)
-            .oneshot(
-                Request::builder()
-                    .uri("/.well-known/jwks.json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let jwks = well_known_router::<()>(
+            ISSUER,
+            repo.clone(),
+            None,
+            ClientAuthenticationMetadata::default(),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/jwks.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(jwks.status(), StatusCode::OK);
         let body = to_bytes(jwks.into_body(), usize::MAX).await.unwrap();
         let payload: Value = serde_json::from_slice(&body).unwrap();
@@ -1086,15 +1211,20 @@ mod db {
         assert_eq!(payload["keys"][0]["alg"], "RS256");
 
         let scopes = vec!["openid".to_string(), "offline_access".to_string()];
-        let discovery = well_known_router::<()>(ISSUER, repo, Some(scopes), false)
-            .oneshot(
-                Request::builder()
-                    .uri("/.well-known/openid-configuration")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let discovery = well_known_router::<()>(
+            ISSUER,
+            repo,
+            Some(scopes),
+            ClientAuthenticationMetadata::default(),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(discovery.status(), StatusCode::OK);
         let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
         let payload: Value = serde_json::from_slice(&body).unwrap();
@@ -1118,21 +1248,15 @@ mod db {
         let scopes_supported = payload["scopes_supported"].as_array().unwrap();
         assert!(scopes_supported.iter().any(|s| s == "openid"));
         assert!(scopes_supported.iter().any(|s| s == "offline_access"));
-        let auth_methods = payload["token_endpoint_auth_methods_supported"]
-            .as_array()
-            .unwrap();
-        assert_eq!(
-            auth_methods,
-            &[Value::String("none".to_string())],
-            "must never advertise client_secret_basic/client_secret_post -- \
-             this service never accepts secret-based client auth"
+        assert!(
+            payload
+                .get("token_endpoint_auth_methods_supported")
+                .is_none(),
+            "an empty client registry must not advertise a usable client-authentication method"
         );
-        let claims_supported = payload["claims_supported"].as_array().unwrap();
-        for claim in ["sub", "email", "email_verified", "auth_time", "at_hash"] {
-            assert!(
-                claims_supported.iter().any(|c| c == claim),
-                "claims_supported must list {claim}: {claims_supported:?}"
-            );
-        }
+        assert!(
+            payload.get("claims_supported").is_none(),
+            "optional claims metadata must stay absent until it has a dedicated, verified contract"
+        );
     }
 }
