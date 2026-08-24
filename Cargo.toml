@@ -114,9 +114,9 @@ jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
 # again. This repo has no downstream consumers of its own `Cargo.toml` (it produces binaries, not a
 # published library), so exact-pinning carries none of the "raises the floor for consumers" cost an
 # exact pin would have in a published crate.
-authkestra-resource = "=0.5.1"
-authkestra-op = "=0.5.1"
-authkestra-engine = "=0.5.1"
+authkestra-resource = "=0.5.3"
+authkestra-op = "=0.5.3"
+authkestra-engine = "=0.5.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "tracing", "net", "time"] }
 thiserror = "2"
 anyhow = "1"
@@ -187,10 +187,10 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "chrono", "js
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 utoipa = { version = "5", features = ["macros", "chrono"] }
 utoipa-swagger-ui = { version = "9", features = ["axum", "reqwest"] }
-regex = "1.10"
+regex = "1.13"
 flate2 = "1.1.9"
 
-rmcp = { version = "3.0.1", features = ["transport-streamable-http-server"] }
+rmcp = { version = "3.1", features = ["transport-streamable-http-server"] }
 
 mimalloc = "0"
 
@@ -402,7 +402,7 @@ cratestack-codec-json = "=0.8.10"
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
 # feature). See that module for why.
-minicbor = { version = "2.2", features = ["std", "half"] }
+minicbor = { version = "2.3", features = ["std", "half"] }
 # No direct `minicbor-serde` dependency here (2026-08-21 cratestack 0.8.6 bump removed it, see the
 # cratestack pin block's "BUMPED" note above). It still exists in the dependency graph -- pulled in
 # transitively via `cratestack-codec-cbor` -- but nothing in this workspace names it directly any
