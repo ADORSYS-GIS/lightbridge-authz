@@ -62,7 +62,7 @@ use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::config::Oauth2TokenExchange;
 use lightbridge_authz_core::crypto::hash_api_key;
 use lightbridge_authz_core::cuid::cuid2;
-use lightbridge_authz_core::dto::{ModelPolicy, ResourceStatus};
+use lightbridge_authz_core::dto::ModelPolicy;
 use lightbridge_authz_core::error::Error;
 use serde_json::Value;
 
@@ -413,16 +413,24 @@ impl TokenExchangeOpStore {
             }
             Err(_) => return Err(oauth_err("server_error", "context resolution failed")),
         };
-        let project = match self.repo.get_project_by_id(&context.project_id).await {
-            Ok(Some(project)) if project.status == ResourceStatus::Active => project,
-            Ok(_) => return Err(oauth_err("access_denied", "project is inactive")),
-            Err(_) => return Err(oauth_err("server_error", "project lookup failed")),
+        let project = match self
+            .repo
+            .require_active_project_and_account(&context.project_id, &context.account_id)
+            .await
+        {
+            Ok(project) => project,
+            // Deliberately uniform, not "project is inactive" vs. "account is inactive"
+            // separately: which one applied is not something the caller needs to distinguish,
+            // matching this repo's own "avoid leaking details in error responses" principle and
+            // `handle_refresh_token`'s equally uniform `invalid_grant` for the same case.
+            Err(Error::Forbidden(_)) => {
+                return Err(oauth_err(
+                    "access_denied",
+                    "account or project is not active",
+                ));
+            }
+            Err(_) => return Err(oauth_err("server_error", "status lookup failed")),
         };
-        match self.repo.get_account_by_id(&context.account_id).await {
-            Ok(Some(account)) if account.status == ResourceStatus::Active => {}
-            Ok(_) => return Err(oauth_err("access_denied", "account is inactive")),
-            Err(_) => return Err(oauth_err("server_error", "account lookup failed")),
-        }
         let scope = row.scope.clone();
         let offline = scope.as_deref().is_some_and(|scopes| {
             scopes
@@ -449,6 +457,7 @@ impl TokenExchangeOpStore {
                 client_id: Some(client_id.to_string()),
                 kind: "token".to_string(),
                 expires_at: session_expires_at,
+                subject: None,
             })
             .await
             .map_err(|_| oauth_err("server_error", "session persistence failed"))?;
@@ -824,6 +833,29 @@ impl TokenExchangeOpStore {
             }
         };
 
+        // Fail-closed Active-status gate (the gap this method previously had, unlike
+        // `issue_device_tokens`/`handle_refresh_token`, which both already call the same shared
+        // `require_active_project_and_account`): `resolve_context` above only checks
+        // ownership/membership, never `status`, so without this a suspended account or an
+        // inactive project could still exchange a subject_token for a fresh access token via
+        // this, the PRIMARY human-plane token grant (`TokenExchangeOpStore` is the actual
+        // token-issuing authority behind `authz-idp`'s `POST /oauth2/token`). A lookup ERROR
+        // refuses too, never falls through to permit -- see
+        // `StoreRepo::require_active_project_and_account`'s doc comment for why this is a single
+        // shared implementation rather than a fourth copy of the same match block.
+        if let Err(err) = self
+            .repo
+            .require_active_project_and_account(&context.project_id, &context.account_id)
+            .await
+        {
+            return Err(match err {
+                Error::Forbidden(_) => {
+                    oauth_err("access_denied", "account or project is not active")
+                }
+                _ => oauth_err("server_error", "status lookup failed"),
+            });
+        }
+
         let (allowed_models, model_policy) =
             self.resolve_project_model_access(&context.project_id).await;
 
@@ -863,6 +895,7 @@ impl TokenExchangeOpStore {
                 client_id: Some(client_id.clone()),
                 kind: "token".to_string(),
                 expires_at: session_expires_at,
+                subject: None,
             })
             .await
         {
@@ -1077,20 +1110,17 @@ impl TokenExchangeOpStore {
                 return Err(oauth_err("server_error", "context resolution failed"));
             }
         };
-        let project = match self.repo.get_project_by_id(&context.project_id).await {
-            Ok(Some(project)) if project.status == ResourceStatus::Active => project,
-            Ok(_) => return Err(invalid_grant()),
+        let project = match self
+            .repo
+            .require_active_project_and_account(&context.project_id, &context.account_id)
+            .await
+        {
+            Ok(project) => project,
+            Err(Error::Forbidden(_)) => return Err(invalid_grant()),
             Err(_) => {
                 return Err(oauth_err("server_error", "context resolution failed"));
             }
         };
-        match self.repo.get_account_by_id(&context.account_id).await {
-            Ok(Some(account)) if account.status == ResourceStatus::Active => {}
-            Ok(_) => return Err(invalid_grant()),
-            Err(_) => {
-                return Err(oauth_err("server_error", "context resolution failed"));
-            }
-        }
 
         let owner = KeyOwner {
             subject: old_row.subject.clone(),
