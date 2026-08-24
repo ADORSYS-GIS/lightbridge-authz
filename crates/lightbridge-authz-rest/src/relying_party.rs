@@ -24,6 +24,7 @@ use cratestack_axum::ratelimit::{RateLimitConfig, RateLimitStore};
 use jsonwebtoken::{Algorithm, Validation, decode_header};
 use serde::{Deserialize, Serialize};
 
+use lightbridge_authz_api_key::entities::federated_identity_row::UpsertFederatedIdentity;
 use lightbridge_authz_api_key::entities::session_row::NewSession;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::config::OidcRelyingParty;
@@ -73,6 +74,11 @@ pub struct KeycloakRelyingParty {
     config: OidcRelyingParty,
     callback_url: String,
     state_key: [u8; 32],
+    /// AES-256-GCM key for [`Self::persist_federated_identity`]'s
+    /// `lightbridge_authz_core::crypto::seal` call (ADR-0024). Deliberately a SEPARATE key from
+    /// `state_key` -- see [`OidcRelyingParty::token_encryption_key`]'s own doc comment for why,
+    /// and [`Self::new`] for the startup check that rejects a config where the two are equal.
+    token_key: [u8; 32],
     client: reqwest::Client,
     jwks: Arc<JwksCache>,
     jwks_url: String,
@@ -105,18 +111,130 @@ struct CallbackQuery {
     state: String,
 }
 
+/// Keycloak's `POST /token` response. `id_token` is the only field this codebase actually
+/// validates/uses for authentication (`KeycloakRelyingParty::validate_id_token`); every other
+/// field here exists so [`KeycloakRelyingParty::persist_federated_identity`] (ADR-0024) can seal
+/// the token set at rest -- none of them are ever forwarded to a caller or used for auth
+/// decisions. `pub` (unlike this module's other private structs) so
+/// [`token_response_debug_never_leaks_the_refresh_token`] in `relying_party_tests.rs` can
+/// construct one directly to exercise the hand-written [`std::fmt::Debug`] below.
 #[derive(Deserialize)]
-struct TokenResponse {
-    id_token: String,
+pub struct TokenResponse {
+    pub id_token: String,
+    #[serde(default)]
+    pub access_token: Option<String>,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub expires_in: Option<i64>,
+    #[serde(default)]
+    pub refresh_expires_in: Option<i64>,
+    #[serde(default)]
+    pub token_type: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub session_state: Option<String>,
+}
+
+/// Hand-written, redacting `Debug` -- precedent: `lightbridge_authz_bearer::TokenInfo`
+/// (`crates/lightbridge-authz-bearer/src/lib.rs`). `id_token`/`access_token`/`refresh_token` are
+/// all bearer-equivalent credentials (Q2: a raw ID token is replayable as a `subject_token` into
+/// this service's own RFC 8693 endpoint, which is exactly why it is never stored either -- see
+/// [`KeycloakTokenSet`]'s doc comment) and must never appear in a log line via an incidental
+/// `{:?}`.
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("id_token", &"<redacted>")
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expires_in", &self.expires_in)
+            .field("refresh_expires_in", &self.refresh_expires_in)
+            .field("token_type", &self.token_type)
+            .field("scope", &self.scope)
+            .field("session_state", &self.session_state)
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
 struct IdTokenClaims {
     sub: String,
+    iss: String,
     aud: Audience,
     azp: Option<String>,
     iat: i64,
+    exp: i64,
     nonce: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    email_verified: Option<bool>,
+    #[serde(default)]
+    preferred_username: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    auth_time: Option<i64>,
+    #[serde(default)]
+    sid: Option<String>,
+}
+
+/// The non-access-token slice of an ID-token's claims worth keeping alongside the sealed refresh
+/// token (ADR-0024, Q2) -- enough to recognize the person on a future read without ever storing a
+/// raw, replayable ID token JWT (see [`KeycloakTokenSet`]'s doc comment for why that distinction
+/// matters). `pub` for the same reason as [`TokenResponse`]: exercised directly by
+/// `relying_party_tests.rs`'s Debug-redaction test.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdTokenClaimsSnapshot {
+    pub sub: String,
+    pub iss: String,
+    pub email: Option<String>,
+    pub email_verified: Option<bool>,
+    pub preferred_username: Option<String>,
+    pub name: Option<String>,
+    pub auth_time: Option<i64>,
+    pub sid: Option<String>,
+    pub exp: i64,
+    pub iat: i64,
+}
+
+/// The sealed envelope contents (ADR-0024, Q2) -- what actually gets AES-256-GCM-encrypted onto
+/// `federated_identities.token_envelope` via `lightbridge_authz_core::crypto::seal`. Deliberately
+/// excludes the access token entirely (Q1: never stored, at rest or otherwise) and the raw ID
+/// token JWT (a raw ID token is replayable as a `subject_token` into this service's own RFC 8693
+/// token-exchange endpoint; [`IdTokenClaimsSnapshot`] captures what a future reader needs without
+/// that replay risk).
+#[derive(Serialize, Deserialize)]
+pub struct KeycloakTokenSet {
+    pub refresh_token: Option<String>,
+    pub id_token_claims: IdTokenClaimsSnapshot,
+    pub token_type: Option<String>,
+    pub session_state: Option<String>,
+}
+
+/// Hand-written, redacting `Debug` -- same rationale as [`TokenResponse`]'s. `id_token_claims` is
+/// printed via its own (non-redacting, derived) `Debug` -- those fields are profile claims, not a
+/// bearer credential.
+impl std::fmt::Debug for KeycloakTokenSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeycloakTokenSet")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("id_token_claims", &self.id_token_claims)
+            .field("token_type", &self.token_type)
+            .field("session_state", &self.session_state)
+            .finish()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -161,6 +279,23 @@ impl KeycloakRelyingParty {
                     .to_string(),
             )
         })?;
+        // ADR-0024: the SEPARATE key that seals the Keycloak token set at rest
+        // (`persist_federated_identity`). Same shape of offline validation as `state_key` above
+        // (base64url, exactly 32 bytes) -- the additional "must differ from state_key" check is
+        // added in a later, deliberately separate commit for reviewability.
+        let token_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&config.token_encryption_key)
+            .map_err(|_| {
+                Error::Server(
+                    "oauth2.relying_party.token_encryption_key must be base64url".to_string(),
+                )
+            })?;
+        let token_key: [u8; 32] = token_key_bytes.try_into().map_err(|_| {
+            Error::Server(
+                "oauth2.relying_party.token_encryption_key must decode to exactly 32 bytes"
+                    .to_string(),
+            )
+        })?;
         let callback_url = config.callback_url.clone();
         let callback = reqwest::Url::parse(&callback_url).map_err(|_| {
             Error::Server("oauth2.relying_party.callback_url must be an absolute URL".to_string())
@@ -199,6 +334,7 @@ impl KeycloakRelyingParty {
             config,
             callback_url,
             state_key,
+            token_key,
             client,
             jwks,
             jwks_url,
@@ -337,6 +473,14 @@ impl KeycloakRelyingParty {
                 "Keycloak ID token nonce mismatch".to_string(),
             ));
         }
+        // ADR-0024: the single funnel for BOTH device pairing and browser SSO -- this `complete`
+        // method is `callback()`'s only caller, so every successful login of either shape reaches
+        // here exactly once, after the ID token is already fully validated (issuer, audience,
+        // signature, nonce) and before either flow arm below runs its own side effects. Fail
+        // closed: a persistence failure propagates via `?` and `callback()` already maps any
+        // `Err` from `complete` to a generic failure response -- there is no flow-specific
+        // fallback that proceeds without a persisted federated identity.
+        self.persist_federated_identity(&claims, &token).await?;
         match flow {
             PendingFlow::Device { device_code } => {
                 let store = DbDeviceCodeStore::new(self.repo.clone());
@@ -385,6 +529,62 @@ impl KeycloakRelyingParty {
                 })
             }
         }
+    }
+
+    /// ADR-0024: seals `token`'s refresh token + `claims`' non-access-token profile fields under
+    /// `self.token_key` (never the access token, never the raw ID token JWT -- see
+    /// [`KeycloakTokenSet`]'s doc comment) and persists it via
+    /// [`StoreRepo::upsert_federated_identity`], keyed by `(claims.iss, claims.sub)`. Called from
+    /// [`Self::complete`] after ID-token validation, before either flow arm -- see that call
+    /// site's own doc comment for why. Fail-closed: any error here (serialization, sealing, or
+    /// the repo call, including the `Error::Conflict` a colliding second issuer produces)
+    /// propagates via `?` to `complete`'s caller, never silently skipped.
+    async fn persist_federated_identity(
+        &self,
+        claims: &IdTokenClaims,
+        token: &TokenResponse,
+    ) -> Result<()> {
+        let token_set = KeycloakTokenSet {
+            refresh_token: token.refresh_token.clone(),
+            id_token_claims: IdTokenClaimsSnapshot {
+                sub: claims.sub.clone(),
+                iss: claims.iss.clone(),
+                email: claims.email.clone(),
+                email_verified: claims.email_verified,
+                preferred_username: claims.preferred_username.clone(),
+                name: claims.name.clone(),
+                auth_time: claims.auth_time,
+                sid: claims.sid.clone(),
+                exp: claims.exp,
+                iat: claims.iat,
+            },
+            token_type: token.token_type.clone(),
+            session_state: token.session_state.clone(),
+        };
+        let plaintext = serde_json::to_vec(&token_set)
+            .map_err(|e| Error::Server(format!("failed to serialize Keycloak token set: {e}")))?;
+        // NOT the row id (which can be regenerated without invalidating anything sealed against
+        // this stable identity) -- see `lightbridge_authz_core::crypto::seal`'s own doc comment
+        // for why AAD is bound to the federation key instead.
+        let aad = format!("{}\u{1f}{}", claims.iss, claims.sub);
+        let envelope = lightbridge_authz_core::crypto::seal(&self.token_key, &aad, &plaintext)?;
+        let now = Utc::now();
+        self.repo
+            .upsert_federated_identity(UpsertFederatedIdentity {
+                issuer: claims.iss.clone(),
+                subject: claims.sub.clone(),
+                token_envelope: Some(envelope),
+                token_sealed_at: Some(now),
+                access_expires_at: token
+                    .expires_in
+                    .map(|seconds| now + ChronoDuration::seconds(seconds)),
+                refresh_expires_at: token
+                    .refresh_expires_in
+                    .map(|seconds| now + ChronoDuration::seconds(seconds)),
+                scope: token.scope.clone(),
+            })
+            .await?;
+        Ok(())
     }
 
     async fn validate_id_token(&self, token: &str) -> Result<IdTokenClaims> {

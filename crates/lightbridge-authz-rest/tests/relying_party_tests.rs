@@ -16,14 +16,17 @@ use httpmock::Method::{GET, POST};
 use httpmock::MockServer;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use lightbridge_authz_api_key::repo::StoreRepo;
+use lightbridge_authz_core::crypto::open;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_core::{
     config::OidcRelyingParty,
     dto::{CreateAccount, CreateProject, ResourceStatus},
 };
 use lightbridge_authz_rest::oauth2_op::device_store::DbDeviceCodeStore;
-use lightbridge_authz_rest::relying_party::{BrowserLoginTarget, KeycloakRelyingParty, router};
-use lightbridge_authz_rest::signing::generate_rs256_key;
+use lightbridge_authz_rest::relying_party::{
+    BrowserLoginTarget, KeycloakRelyingParty, KeycloakTokenSet, router,
+};
+use lightbridge_authz_rest::signing::{GeneratedKey, generate_rs256_key};
 use serde::Serialize;
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -1330,4 +1333,764 @@ async fn browser_session_persists_the_real_authenticated_member_subject(pool: Pg
         "account_id resolves to the project OWNER, but subject must be the real authenticated \
          member -- these must never collapse to the same value for a non-owner member"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// ADR-0024: the Keycloak token set is persisted (sealed) as a federated identity on every
+// successful callback, for both flows sharing `complete`'s single funnel.
+// ---------------------------------------------------------------------------------------------
+
+fn token_key_bytes() -> [u8; 32] {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(TOKEN_KEY)
+        .unwrap()
+        .try_into()
+        .unwrap()
+}
+
+fn state_key_bytes() -> [u8; 32] {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(STATE_KEY)
+        .unwrap()
+        .try_into()
+        .unwrap()
+}
+
+fn sign_id_token(key: &GeneratedKey, sub: &str, iss: &str, nonce: &str) -> String {
+    let mut jwt_header = Header::new(Algorithm::RS256);
+    jwt_header.kid = Some(key.kid.clone());
+    encode(
+        &jwt_header,
+        &IdToken {
+            sub,
+            iss,
+            aud: "authz-idp-rp",
+            nonce,
+            exp: (Utc::now() + Duration::minutes(5)).timestamp(),
+            iat: Utc::now().timestamp(),
+        },
+        &EncodingKey::from_rsa_pem(key.private_key_pem.as_bytes()).unwrap(),
+    )
+    .unwrap()
+}
+
+/// A `/token` response carrying a full Keycloak token set -- refresh token, expiries, scope,
+/// `session_state` -- so the ADR-0024 persistence tests below can assert on every sealed field,
+/// not just `id_token`.
+fn rich_token_response(id_token: &str, refresh_token: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id_token": id_token,
+        "access_token": "should-never-be-persisted-access-token",
+        "refresh_token": refresh_token,
+        "expires_in": 300,
+        "refresh_expires_in": 1800,
+        "token_type": "Bearer",
+        "scope": "openid profile email",
+        "session_state": "session-state-value",
+    })
+}
+
+async fn mock_discovery_and_jwks(keycloak: &MockServer, key: &GeneratedKey) {
+    keycloak
+        .mock_async(|when, then| {
+            when.method(GET).path("/.well-known/openid-configuration");
+            then.status(200).json_body(discovery_body(keycloak));
+        })
+        .await;
+    keycloak
+        .mock_async(|when, then| {
+            when.method(GET).path("/jwks");
+            then.status(200)
+                .json_body(serde_json::json!({ "keys": [key.public_jwk.clone()] }));
+        })
+        .await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn device_pairing_callback_persists_a_federated_identity_and_user(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let key = generate_rs256_key().unwrap();
+    mock_discovery_and_jwks(&keycloak, &key).await;
+    let repo = repo(pool.clone());
+    let store = DbDeviceCodeStore::new(repo.clone());
+    store.store_device_code(session()).await.unwrap();
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.url("/jwks"),
+            repo.clone(),
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+    let (router, state, cookie) = begin_pairing(router(rp)).await;
+    let decoded = OAuth2State::decrypt(&state, &state_key_bytes()).unwrap();
+    let token = sign_id_token(
+        &key,
+        "keycloak-subject",
+        &keycloak.base_url(),
+        decoded.nonce.as_deref().unwrap(),
+    );
+    keycloak
+        .mock_async(|when, then| {
+            when.method(POST).path("/token").body_includes("code=code");
+            then.status(200)
+                .json_body(rich_token_response(&token, "device-pairing-refresh"));
+        })
+        .await;
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(callback_uri(&state))
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let federation = repo
+        .find_federated_identity(&keycloak.base_url(), "keycloak-subject")
+        .await
+        .unwrap()
+        .expect("a federated identity row must exist after a successful device-pairing callback");
+    assert_eq!(federation.issuer, keycloak.base_url());
+    assert_eq!(federation.subject, "keycloak-subject");
+    assert_eq!(
+        federation.account_id, None,
+        "no pre-existing account shares this subject's id, so nothing is adopted"
+    );
+    let user_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
+        .bind(&federation.user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        user_exists,
+        "a users row must exist for the minted user_id {}",
+        federation.user_id
+    );
+    assert_ne!(
+        federation.user_id, "keycloak-subject",
+        "with no pre-existing account, a fresh user id must be minted, not the subject reused"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn browser_sso_callback_persists_the_same_federated_identity(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let key = generate_rs256_key().unwrap();
+    mock_discovery_and_jwks(&keycloak, &key).await;
+    let repo = repo(pool.clone());
+    let subject = "browser-federation-subject";
+    repo.create_account(
+        subject,
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .unwrap();
+    repo.create_project(
+        subject,
+        subject,
+        CreateProject {
+            name: "browser federation project".to_string(),
+            allowed_models: None,
+            default_limits: None,
+            billing_plan: "free".to_string(),
+            billing_identity: "browser-federation-binding".to_string(),
+            project_quota: None,
+        },
+        "browser-federation-project".to_string(),
+    )
+    .await
+    .unwrap();
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.url("/jwks"),
+            repo.clone(),
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+    let (location, cookie) = rp
+        .begin_browser(BrowserLoginTarget {
+            project_id: None,
+            resume_path: "/browser".to_string(),
+        })
+        .await
+        .unwrap();
+    let state = reqwest::Url::parse(&location)
+        .unwrap()
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .unwrap();
+    let decoded = OAuth2State::decrypt(&state, &state_key_bytes()).unwrap();
+    let token = sign_id_token(
+        &key,
+        subject,
+        &keycloak.base_url(),
+        decoded.nonce.as_deref().unwrap(),
+    );
+    keycloak
+        .mock_async(|when, then| {
+            when.method(POST).path("/token").body_includes("code=code");
+            then.status(200)
+                .json_body(rich_token_response(&token, "browser-refresh"));
+        })
+        .await;
+    let response = router(rp.clone())
+        .oneshot(
+            Request::builder()
+                .uri(callback_uri(&state))
+                .header(header::COOKIE, cookie.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let federation = repo
+        .find_federated_identity(&keycloak.base_url(), subject)
+        .await
+        .unwrap()
+        .expect("a federated identity row must exist after a successful browser SSO callback");
+    assert_eq!(federation.issuer, keycloak.base_url());
+    assert_eq!(federation.subject, subject);
+    assert_eq!(
+        federation.account_id,
+        Some(subject.to_string()),
+        "a pre-existing account whose id equals the subject must be adopted"
+    );
+    assert_eq!(
+        federation.user_id, subject,
+        "the adopted account's user_id (trigger-provisioned, id-reused) becomes this identity's user"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn stored_token_envelope_is_not_plaintext_at_rest(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let key = generate_rs256_key().unwrap();
+    mock_discovery_and_jwks(&keycloak, &key).await;
+    let repo = repo(pool.clone());
+    let store = DbDeviceCodeStore::new(repo.clone());
+    store.store_device_code(session()).await.unwrap();
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.url("/jwks"),
+            repo.clone(),
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+    let (router, state, cookie) = begin_pairing(router(rp)).await;
+    let decoded = OAuth2State::decrypt(&state, &state_key_bytes()).unwrap();
+    let token = sign_id_token(
+        &key,
+        "keycloak-subject",
+        &keycloak.base_url(),
+        decoded.nonce.as_deref().unwrap(),
+    );
+    keycloak
+        .mock_async(|when, then| {
+            when.method(POST).path("/token").body_includes("code=code");
+            then.status(200)
+                .json_body(rich_token_response(&token, "super-secret-refresh-value"));
+        })
+        .await;
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(callback_uri(&state))
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let raw_envelope: Option<String> = sqlx::query_scalar(
+        "SELECT token_envelope FROM federated_identities WHERE issuer = $1 AND subject = $2",
+    )
+    .bind(keycloak.base_url())
+    .bind("keycloak-subject")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let raw_envelope = raw_envelope.expect("a sealed envelope must be stored");
+    assert!(
+        !raw_envelope.contains("super-secret-refresh-value"),
+        "the raw column value must never contain the plaintext refresh token: {raw_envelope}"
+    );
+    assert!(
+        raw_envelope.starts_with("v1."),
+        "the envelope must carry the v1. version prefix: got {raw_envelope}"
+    );
+
+    let aad = format!("{}\u{1f}keycloak-subject", keycloak.base_url());
+    let opened = open(&token_key_bytes(), &aad, &raw_envelope)
+        .expect("opening under the real token_encryption_key and matching AAD must succeed");
+    let token_set: KeycloakTokenSet = serde_json::from_slice(&opened).unwrap();
+    assert_eq!(
+        token_set.refresh_token.as_deref(),
+        Some("super-secret-refresh-value")
+    );
+    assert_eq!(token_set.id_token_claims.sub, "keycloak-subject");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn token_envelope_does_not_open_under_the_state_encryption_key(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let key = generate_rs256_key().unwrap();
+    mock_discovery_and_jwks(&keycloak, &key).await;
+    let repo = repo(pool.clone());
+    let store = DbDeviceCodeStore::new(repo.clone());
+    store.store_device_code(session()).await.unwrap();
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.url("/jwks"),
+            repo.clone(),
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+    let (router, state, cookie) = begin_pairing(router(rp)).await;
+    let decoded = OAuth2State::decrypt(&state, &state_key_bytes()).unwrap();
+    let token = sign_id_token(
+        &key,
+        "keycloak-subject",
+        &keycloak.base_url(),
+        decoded.nonce.as_deref().unwrap(),
+    );
+    keycloak
+        .mock_async(|when, then| {
+            when.method(POST).path("/token").body_includes("code=code");
+            then.status(200)
+                .json_body(rich_token_response(&token, "super-secret-refresh-value"));
+        })
+        .await;
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(callback_uri(&state))
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let raw_envelope: String = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT token_envelope FROM federated_identities WHERE issuer = $1 AND subject = $2",
+    )
+    .bind(keycloak.base_url())
+    .bind("keycloak-subject")
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .unwrap();
+
+    let aad = format!("{}\u{1f}keycloak-subject", keycloak.base_url());
+    let opened_under_state_key = open(&state_key_bytes(), &aad, &raw_envelope);
+    assert!(
+        opened_under_state_key.is_err(),
+        "a token envelope sealed under token_encryption_key must not open under the separate \
+         state_encryption_key"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_second_login_updates_the_same_federated_identity_row_and_reseals(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let key = generate_rs256_key().unwrap();
+    mock_discovery_and_jwks(&keycloak, &key).await;
+    let repo = repo(pool.clone());
+    let subject = "reseal-subject";
+    repo.create_account(
+        subject,
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .unwrap();
+    repo.create_project(
+        subject,
+        subject,
+        CreateProject {
+            name: "reseal project".to_string(),
+            allowed_models: None,
+            default_limits: None,
+            billing_plan: "free".to_string(),
+            billing_identity: "reseal-binding".to_string(),
+            project_quota: None,
+        },
+        "reseal-project".to_string(),
+    )
+    .await
+    .unwrap();
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.url("/jwks"),
+            repo.clone(),
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+
+    // First login.
+    let (location, cookie) = rp
+        .begin_browser(BrowserLoginTarget {
+            project_id: None,
+            resume_path: "/browser".to_string(),
+        })
+        .await
+        .unwrap();
+    let state = reqwest::Url::parse(&location)
+        .unwrap()
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .unwrap();
+    let decoded = OAuth2State::decrypt(&state, &state_key_bytes()).unwrap();
+    let token = sign_id_token(
+        &key,
+        subject,
+        &keycloak.base_url(),
+        decoded.nonce.as_deref().unwrap(),
+    );
+    keycloak
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/token")
+                .body_includes("code=first-code");
+            then.status(200)
+                .json_body(rich_token_response(&token, "first-refresh-value"));
+        })
+        .await;
+    let response = router(rp.clone())
+        .oneshot(
+            Request::builder()
+                .uri(callback_uri_with_code(&state, "first-code"))
+                .header(header::COOKIE, cookie.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let first = repo
+        .find_federated_identity(&keycloak.base_url(), subject)
+        .await
+        .unwrap()
+        .expect("first login must persist a federated identity");
+
+    // Second login for the SAME (issuer, subject).
+    let (location, cookie) = rp
+        .begin_browser(BrowserLoginTarget {
+            project_id: None,
+            resume_path: "/browser".to_string(),
+        })
+        .await
+        .unwrap();
+    let state = reqwest::Url::parse(&location)
+        .unwrap()
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .unwrap();
+    let decoded = OAuth2State::decrypt(&state, &state_key_bytes()).unwrap();
+    let token = sign_id_token(
+        &key,
+        subject,
+        &keycloak.base_url(),
+        decoded.nonce.as_deref().unwrap(),
+    );
+    keycloak
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/token")
+                .body_includes("code=second-code");
+            then.status(200)
+                .json_body(rich_token_response(&token, "second-refresh-value"));
+        })
+        .await;
+    let response = router(rp.clone())
+        .oneshot(
+            Request::builder()
+                .uri(callback_uri_with_code(&state, "second-code"))
+                .header(header::COOKIE, cookie.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let row_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM federated_identities WHERE issuer = $1 AND subject = $2",
+    )
+    .bind(keycloak.base_url())
+    .bind(subject)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row_count, 1,
+        "a second login for the same (issuer, subject) must update the existing row, never insert \
+         a second one"
+    );
+
+    let second = repo
+        .find_federated_identity(&keycloak.base_url(), subject)
+        .await
+        .unwrap()
+        .expect("the row must still exist after the second login");
+    assert_eq!(
+        second.id, first.id,
+        "the second login must update the SAME row by id, not replace it"
+    );
+
+    let aad = format!("{}\u{1f}{}", keycloak.base_url(), subject);
+    let opened = open(
+        &token_key_bytes(),
+        &aad,
+        &second
+            .token_envelope
+            .expect("the resealed envelope must be present"),
+    )
+    .unwrap();
+    let token_set: KeycloakTokenSet = serde_json::from_slice(&opened).unwrap();
+    assert_eq!(
+        token_set.refresh_token.as_deref(),
+        Some("second-refresh-value"),
+        "the resealed envelope must reflect the second login's refresh token, not the first"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_second_issuer_with_a_colliding_subject_is_refused_not_merged(pool: PgPool) {
+    let keycloak_a = MockServer::start_async().await;
+    let key_a = generate_rs256_key().unwrap();
+    mock_discovery_and_jwks(&keycloak_a, &key_a).await;
+    let keycloak_b = MockServer::start_async().await;
+    let key_b = generate_rs256_key().unwrap();
+    mock_discovery_and_jwks(&keycloak_b, &key_b).await;
+
+    let repo = repo(pool.clone());
+    let subject = "colliding-subject";
+    repo.create_account(
+        subject,
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .unwrap();
+    repo.create_project(
+        subject,
+        subject,
+        CreateProject {
+            name: "colliding project".to_string(),
+            allowed_models: None,
+            default_limits: None,
+            billing_plan: "free".to_string(),
+            billing_identity: "colliding-binding".to_string(),
+            project_quota: None,
+        },
+        "colliding-project".to_string(),
+    )
+    .await
+    .unwrap();
+
+    let rp_a = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak_a),
+            keycloak_a.url("/jwks"),
+            repo.clone(),
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+    let rp_b = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak_b),
+            keycloak_b.url("/jwks"),
+            repo.clone(),
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+
+    // First login: issuer_a adopts the pre-existing account.
+    let (location, cookie) = rp_a
+        .begin_browser(BrowserLoginTarget {
+            project_id: None,
+            resume_path: "/browser".to_string(),
+        })
+        .await
+        .unwrap();
+    let state = reqwest::Url::parse(&location)
+        .unwrap()
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .unwrap();
+    let decoded = OAuth2State::decrypt(&state, &state_key_bytes()).unwrap();
+    let token = sign_id_token(
+        &key_a,
+        subject,
+        &keycloak_a.base_url(),
+        decoded.nonce.as_deref().unwrap(),
+    );
+    keycloak_a
+        .mock_async(|when, then| {
+            when.method(POST).path("/token").body_includes("code=code");
+            then.status(200)
+                .json_body(rich_token_response(&token, "issuer-a-refresh"));
+        })
+        .await;
+    let response = router(rp_a.clone())
+        .oneshot(
+            Request::builder()
+                .uri(callback_uri(&state))
+                .header(header::COOKIE, cookie.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let issuer_a_before = repo
+        .find_federated_identity(&keycloak_a.base_url(), subject)
+        .await
+        .unwrap()
+        .expect("issuer_a's login must adopt the pre-existing account");
+    assert_eq!(issuer_a_before.account_id, Some(subject.to_string()));
+
+    // Second login: issuer_b presents the SAME subject. Must be refused, not merged.
+    let (location, cookie) = rp_b
+        .begin_browser(BrowserLoginTarget {
+            project_id: None,
+            resume_path: "/browser".to_string(),
+        })
+        .await
+        .unwrap();
+    let state = reqwest::Url::parse(&location)
+        .unwrap()
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .unwrap();
+    let decoded = OAuth2State::decrypt(&state, &state_key_bytes()).unwrap();
+    let token = sign_id_token(
+        &key_b,
+        subject,
+        &keycloak_b.base_url(),
+        decoded.nonce.as_deref().unwrap(),
+    );
+    keycloak_b
+        .mock_async(|when, then| {
+            when.method(POST).path("/token").body_includes("code=code");
+            then.status(200)
+                .json_body(rich_token_response(&token, "issuer-b-refresh"));
+        })
+        .await;
+    let response = router(rp_b.clone())
+        .oneshot(
+            Request::builder()
+                .uri(callback_uri(&state))
+                .header(header::COOKIE, cookie.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "a second issuer presenting a subject that already adopted an account must be refused \
+         (complete()'s Err maps to a generic BAD_GATEWAY failure), never silently merged"
+    );
+
+    let issuer_b_row = repo
+        .find_federated_identity(&keycloak_b.base_url(), subject)
+        .await
+        .unwrap();
+    assert!(
+        issuer_b_row.is_none(),
+        "the refused attempt must leave no federated_identities row behind for issuer_b"
+    );
+
+    let issuer_a_after = repo
+        .find_federated_identity(&keycloak_a.base_url(), subject)
+        .await
+        .unwrap()
+        .expect("issuer_a's row must still exist");
+    assert_eq!(
+        issuer_a_after.account_id, issuer_a_before.account_id,
+        "issuer_a's own row must be completely untouched by issuer_b's refused attempt"
+    );
+    assert_eq!(issuer_a_after.id, issuer_a_before.id);
+}
+
+#[test]
+fn token_response_debug_never_leaks_the_refresh_token() {
+    use lightbridge_authz_rest::relying_party::TokenResponse;
+
+    let response: TokenResponse = serde_json::from_value(serde_json::json!({
+        "id_token": "eyJ.super-secret-id-token.value",
+        "access_token": "super-secret-access-token-value",
+        "refresh_token": "super-secret-refresh-token-value",
+        "expires_in": 300,
+        "refresh_expires_in": 1800,
+        "token_type": "Bearer",
+        "scope": "openid",
+        "session_state": "state-value",
+    }))
+    .unwrap();
+
+    let rendered = format!("{response:?}");
+
+    assert!(!rendered.contains("super-secret-id-token"));
+    assert!(!rendered.contains("super-secret-access-token-value"));
+    assert!(!rendered.contains("super-secret-refresh-token-value"));
+    assert!(rendered.contains("<redacted>"));
+    assert!(rendered.contains("openid"));
+}
+
+#[test]
+fn keycloak_token_set_debug_never_leaks_the_refresh_token() {
+    use lightbridge_authz_rest::relying_party::IdTokenClaimsSnapshot;
+
+    let token_set = KeycloakTokenSet {
+        refresh_token: Some("super-secret-refresh-token-value".to_string()),
+        id_token_claims: IdTokenClaimsSnapshot {
+            sub: "user-sub".to_string(),
+            iss: "https://keycloak.example.test".to_string(),
+            email: None,
+            email_verified: None,
+            preferred_username: None,
+            name: None,
+            auth_time: None,
+            sid: None,
+            exp: 42,
+            iat: 1,
+        },
+        token_type: Some("Bearer".to_string()),
+        session_state: None,
+    };
+
+    let rendered = format!("{token_set:?}");
+
+    assert!(!rendered.contains("super-secret-refresh-token-value"));
+    assert!(rendered.contains("<redacted>"));
+    assert!(rendered.contains("user-sub"));
 }
