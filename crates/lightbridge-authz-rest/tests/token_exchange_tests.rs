@@ -26,6 +26,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use base64::Engine;
 use cratestack::CratestackContext;
+use cratestack_axum::ratelimit::InMemoryRateLimitStore;
 use httpmock::Method::GET;
 use httpmock::MockServer;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
@@ -78,7 +79,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use cratestack_axum::ratelimit::InMemoryRateLimitStore;
 use tower::ServiceExt;
 
 const ISSUER: &str = "https://authz.example.test";
