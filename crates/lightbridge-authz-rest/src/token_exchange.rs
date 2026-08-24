@@ -34,10 +34,11 @@ use serde::{Deserialize, Serialize};
 use crate::oauth2_op::store::{RequestScopedOpStore, TokenExchangeOpStore};
 use crate::signing::ApiKeyJwtSigner;
 
-/// Also referenced from `crate::signing::discovery_document` so the discovery document's
-/// `grant_types_supported` stays in lockstep with what this endpoint actually dispatches.
+/// The exchange and refresh values are also referenced from `crate::signing::discovery_document`.
+/// Device authorization remains deliberately undiscoverable until the dedicated discovery work.
 pub(crate) const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 pub(crate) const REFRESH_TOKEN_GRANT: &str = "refresh_token";
+pub(crate) const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 /// Everything the native token-exchange endpoint needs: the self-signed-JWT signer (used only to
 /// build the per-request `TokenManager` `handle_token` requires), the OP-level config discovery
@@ -47,6 +48,9 @@ pub struct TokenExchangeState {
     signer: ApiKeyJwtSigner,
     op_config: OpConfig,
     op_store: Arc<TokenExchangeOpStore>,
+    device_verification_uri: String,
+    device_code_ttl_secs: u64,
+    device_poll_interval_secs: u64,
 }
 
 impl TokenExchangeState {
@@ -54,11 +58,17 @@ impl TokenExchangeState {
         signer: ApiKeyJwtSigner,
         op_config: OpConfig,
         op_store: Arc<TokenExchangeOpStore>,
+        device_verification_uri: String,
+        device_code_ttl_secs: u64,
+        device_poll_interval_secs: u64,
     ) -> Self {
         Self {
             signer,
             op_config,
             op_store,
+            device_verification_uri,
+            device_code_ttl_secs,
+            device_poll_interval_secs,
         }
     }
 }
@@ -80,6 +90,10 @@ where
         .route(
             "/oauth2/token",
             post(token_endpoint).layer(middleware::from_fn(apply_token_response_headers)),
+        )
+        .route(
+            "/oauth2/device_authorization",
+            post(device_authorization_endpoint),
         )
         .route("/oauth2/revoke", post(revoke_endpoint))
         .with_state(state)
@@ -111,6 +125,26 @@ struct RawTokenRequest {
     project_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DeviceAuthorizationRequest {
+    client_id: Option<String>,
+    scope: Option<String>,
+    project_id: Option<String>,
+    client_secret: Option<String>,
+    client_assertion: Option<String>,
+    client_assertion_type: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DeviceAuthorizationResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    verification_uri_complete: String,
+    expires_in: u64,
+    interval: u64,
+}
+
 impl From<RawTokenRequest> for AkTokenRequest {
     fn from(raw: RawTokenRequest) -> Self {
         AkTokenRequest {
@@ -135,8 +169,8 @@ impl From<RawTokenRequest> for AkTokenRequest {
     }
 }
 
-/// Token response. RFC 8693 §2.2.1 requires `issued_token_type` for token exchange, while other
-/// grants must not claim to be token-exchange responses.
+/// Token response. `issued_token_type` is retained only when a grant, such as RFC 8693 token
+/// exchange, requires it; RFC 8628 responses must not advertise an exchange-token type.
 #[derive(Serialize)]
 struct TokenResponseBody {
     access_token: String,
@@ -157,6 +191,9 @@ async fn token_endpoint(
     headers: HeaderMap,
     Form(raw): Form<RawTokenRequest>,
 ) -> Response {
+    if raw.grant_type == DEVICE_CODE_GRANT {
+        return device_token_endpoint(state, headers, raw).await;
+    }
     let auth_header = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
@@ -182,6 +219,140 @@ async fn token_endpoint(
     match handle_token(req, auth_header, &state.op_config, &scoped, &tokens).await {
         Ok(resp) => success_response(resp),
         Err(err) => error_response(&err),
+    }
+}
+
+async fn device_authorization_endpoint(
+    State(state): State<TokenExchangeState>,
+    headers: HeaderMap,
+    Form(request): Form<DeviceAuthorizationRequest>,
+) -> Response {
+    if headers.contains_key(header::AUTHORIZATION)
+        || request
+            .client_secret
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        || request.client_assertion.is_some()
+        || request.client_assertion_type.is_some()
+    {
+        return oauth_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "device clients must not present a client credential",
+        );
+    }
+    let Some(client_id) = request
+        .client_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "client_id is required",
+        );
+    };
+    let session = match state
+        .op_store
+        .create_device_authorization(
+            client_id,
+            request.scope.as_deref(),
+            request.project_id.as_deref(),
+        )
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => return error_response(&error),
+    };
+    let mut complete = match reqwest::Url::parse(&state.device_verification_uri) {
+        Ok(url) => url,
+        Err(_) => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "device verification URI is invalid",
+            );
+        }
+    };
+    complete
+        .query_pairs_mut()
+        .append_pair("user_code", &session.user_code);
+    (
+        StatusCode::OK,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        Json(DeviceAuthorizationResponse {
+            device_code: session.device_code,
+            user_code: session.user_code,
+            verification_uri: state.device_verification_uri,
+            verification_uri_complete: complete.to_string(),
+            expires_in: state.device_code_ttl_secs,
+            interval: state.device_poll_interval_secs,
+        }),
+    )
+        .into_response()
+}
+
+async fn device_token_endpoint(
+    state: TokenExchangeState,
+    headers: HeaderMap,
+    request: RawTokenRequest,
+) -> Response {
+    if headers.contains_key(header::AUTHORIZATION)
+        || request
+            .client_secret
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        || request.client_assertion.is_some()
+        || request.client_assertion_type.is_some()
+    {
+        return oauth_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "device clients must not present a client credential",
+        );
+    }
+    let Some(client_id) = request
+        .client_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "client_id is required",
+        );
+    };
+    let Some(device_code) = request
+        .device_code
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "device_code is required",
+        );
+    };
+    let tokens = match state.signer.token_manager().await {
+        Ok(tokens) => tokens,
+        Err(_) => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "signing key unavailable",
+            );
+        }
+    };
+    match state
+        .op_store
+        .poll_device_grant(client_id, device_code, &tokens)
+        .await
+    {
+        Ok(response) => success_response(response),
+        Err(error) => error_response(&error),
     }
 }
 

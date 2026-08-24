@@ -167,6 +167,9 @@ fn exchange_cfg() -> Oauth2TokenExchange {
             "offline_access".to_string(),
         ],
         refresh_absolute_ttl_seconds: 7_776_000,
+        device_code_ttl_seconds: 600,
+        device_poll_interval_seconds: 5,
+        device_verification_uri: "https://authz.example.test/device/verify".to_string(),
     }
 }
 
@@ -188,6 +191,20 @@ fn public_client(client_id: &str) -> OauthClient {
         scopes: client_scopes(),
         grant_types: client_grant_types(),
         allowed_audiences: vec![client_id.to_string()],
+        jwks: None,
+    }
+}
+
+fn device_client(client_id: &str) -> OauthClient {
+    OauthClient {
+        client_id: client_id.to_string(),
+        client_type: OauthClientType::Public,
+        scopes: vec!["openid".to_string(), "offline_access".to_string()],
+        grant_types: vec![
+            "urn:ietf:params:oauth:grant-type:device_code".to_string(),
+            "refresh_token".to_string(),
+        ],
+        allowed_audiences: Vec::new(),
         jwks: None,
     }
 }
@@ -367,6 +384,8 @@ fn state_with_cfg_and_budget_repo(
     redis_url: &str,
     cfg: Oauth2TokenExchange,
 ) -> TokenExchangeState {
+    let device_code_ttl_secs = cfg.device_code_ttl_seconds as u64;
+    let device_poll_interval_secs = cfg.device_poll_interval_seconds as u64;
     let signer = ApiKeyJwtSigner::from_config(&signing_cfg(), repo.clone()).unwrap();
     let client_store = ConfigClientStore::from_config(&clients);
     let assertions =
@@ -393,7 +412,14 @@ fn state_with_cfg_and_budget_repo(
         bearer,
         cfg,
     ));
-    TokenExchangeState::new(signer, op_config, op_store)
+    TokenExchangeState::new(
+        signer,
+        op_config,
+        op_store,
+        "https://authz.example.test/device/verify".to_string(),
+        device_code_ttl_secs,
+        device_poll_interval_secs,
+    )
 }
 
 /// Builds `TokenExchangeState` for a given client registry, bearer, and Redis URL. Most tests use
@@ -406,6 +432,18 @@ fn state_with(
     redis_url: &str,
 ) -> TokenExchangeState {
     state_with_cfg(repo, bearer, clients, redis_url, exchange_cfg())
+}
+
+fn device_state(repo: Arc<StoreRepo>, client_id: &str) -> TokenExchangeState {
+    let mut cfg = exchange_cfg();
+    cfg.device_poll_interval_seconds = 1;
+    state_with_cfg(
+        repo,
+        Arc::new(MockBearer::new(true, Vec::new())),
+        vec![device_client(client_id)],
+        &redis_url(),
+        cfg,
+    )
 }
 
 /// Presented-token plaintext -> its `(chain_id, chain_expires_at)` off the real DB row, for tests
@@ -498,6 +536,24 @@ async fn post_token_response(
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let json: Value = serde_json::from_slice(&bytes).unwrap();
     (status, headers, json)
+}
+
+async fn post_device_authorization(state: TokenExchangeState, body: &str) -> (StatusCode, Value) {
+    let response = token_exchange_router::<()>(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth2/device_authorization")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    (status, json)
 }
 
 fn decoding_key(jwk: &Value) -> DecodingKey {
@@ -4055,4 +4111,276 @@ async fn quota_tier_lookup_failure_refuses_the_refresh_even_though_context_resol
         body.get("access_token").is_none(),
         "no token of any kind may be issued on this path: {body}"
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn device_grant_persists_pending_state_enforces_polling_and_consumes_once(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let client_id = "opencode-cli";
+    let (status, body) = post_device_authorization(
+        device_state(repo.clone(), client_id),
+        &format!("client_id={client_id}&scope=openid%20offline_access&project_id={PROJECT_ID}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["verification_uri"],
+        "https://authz.example.test/device/verify"
+    );
+    assert!(
+        body["verification_uri_complete"]
+            .as_str()
+            .is_some_and(|uri| uri.contains("user_code="))
+    );
+    let device_code = body["device_code"].as_str().unwrap().to_string();
+
+    let (status, body) = post_token(
+        device_state(repo.clone(), client_id),
+        &format!("grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id={client_id}&device_code={device_code}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "authorization_pending");
+
+    let (status, body) = post_token(
+        device_state(repo.clone(), client_id),
+        &format!("grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id={client_id}&device_code={device_code}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "slow_down");
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let (status, body) = post_token(
+        device_state(repo.clone(), client_id),
+        &format!("grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id={client_id}&device_code={device_code}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "authorization_pending");
+
+    repo.approve_device_authorization(&device_code, SUBJECT, chrono::Utc::now())
+        .await
+        .unwrap()
+        .expect("pending device authorization must approve");
+    let (status, body) = post_token(
+        device_state(repo.clone(), client_id),
+        &format!("grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id={client_id}&device_code={device_code}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body.get("issued_token_type").is_none());
+    let refresh_token = body["refresh_token"]
+        .as_str()
+        .expect("offline_access must issue a refresh token")
+        .to_string();
+    let claims =
+        verify_access_token(&repo, body["access_token"].as_str().unwrap(), client_id).await;
+    assert_eq!(claims.sub, SUBJECT);
+    assert_eq!(claims.project_id, PROJECT_ID);
+
+    let (status, body) = post_token(
+        device_state(repo.clone(), client_id),
+        &format!("grant_type=refresh_token&client_id={client_id}&refresh_token={refresh_token}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body["refresh_token"].as_str().is_some());
+    assert_ne!(body["refresh_token"], refresh_token);
+
+    let (status, body) = post_token(
+        device_state(repo, client_id),
+        &format!("grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id={client_id}&device_code={device_code}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_grant");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn device_grant_omits_refresh_without_offline_access(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let client_id = "opencode-cli";
+    let (status, body) = post_device_authorization(
+        device_state(repo.clone(), client_id),
+        &format!("client_id={client_id}&scope=openid&project_id={PROJECT_ID}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let device_code = body["device_code"].as_str().unwrap().to_string();
+    repo.approve_device_authorization(&device_code, SUBJECT, chrono::Utc::now())
+        .await
+        .unwrap()
+        .expect("pending device authorization must approve");
+
+    let (status, body) = post_token(
+        device_state(repo, client_id),
+        &format!("grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id={client_id}&device_code={device_code}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body.get("refresh_token").is_none());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn device_grant_rejects_denied_expired_wrong_client_and_invalid_scope(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let client_id = "opencode-cli";
+    let other_client_id = "other-cli";
+    let clients = vec![device_client(client_id), device_client(other_client_id)];
+    let (status, body) = post_device_authorization(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, Vec::new())),
+            clients.clone(),
+            &redis_url(),
+        ),
+        &format!("client_id={client_id}&scope=not-permitted"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_scope");
+
+    let (status, body) = post_device_authorization(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, Vec::new())),
+            clients.clone(),
+            &redis_url(),
+        ),
+        &format!("client_id={client_id}&scope=openid"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let denied_code = body["device_code"].as_str().unwrap().to_string();
+    repo.deny_device_authorization(&denied_code, chrono::Utc::now())
+        .await
+        .unwrap()
+        .expect("pending device authorization must deny");
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, Vec::new())),
+            clients.clone(),
+            &redis_url(),
+        ),
+        &format!("grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id={client_id}&device_code={denied_code}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["error"], "access_denied");
+
+    let (status, body) = post_device_authorization(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, Vec::new())),
+            clients.clone(),
+            &redis_url(),
+        ),
+        &format!("client_id={client_id}&scope=openid"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let wrong_client_code = body["device_code"].as_str().unwrap().to_string();
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, Vec::new())),
+            clients.clone(),
+            &redis_url(),
+        ),
+        &format!("grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id={other_client_id}&device_code={wrong_client_code}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_grant");
+
+    let mut expiring_cfg = exchange_cfg();
+    expiring_cfg.device_code_ttl_seconds = 1;
+    let (status, body) = post_device_authorization(
+        state_with_cfg(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, Vec::new())),
+            clients.clone(),
+            &redis_url(),
+            expiring_cfg.clone(),
+        ),
+        &format!("client_id={client_id}&scope=openid"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["expires_in"], 1);
+    let expired_code = body["device_code"].as_str().unwrap().to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let (status, body) = post_token(
+        state_with_cfg(
+            repo,
+            Arc::new(MockBearer::new(true, Vec::new())),
+            clients,
+            &redis_url(),
+            expiring_cfg,
+        ),
+        &format!("grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id={client_id}&device_code={expired_code}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "expired_token");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn approved_device_code_is_one_shot_when_context_resolution_refuses(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    let client_id = "opencode-cli";
+    let (status, body) = post_device_authorization(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            vec![device_client(client_id)],
+            &redis_url(),
+        ),
+        &format!("client_id={client_id}&project_id=unknown-project"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let device_code = body["device_code"].as_str().unwrap().to_string();
+    repo.approve_device_authorization(&device_code, SUBJECT, chrono::Utc::now())
+        .await
+        .unwrap()
+        .expect("pending device authorization must approve");
+
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            vec![device_client(client_id)],
+            &redis_url(),
+        ),
+        &format!("grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id={client_id}&device_code={device_code}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["error"], "access_denied");
+
+    let (status, body) = post_token(
+        state_with(
+            repo,
+            Arc::new(MockBearer::new(true, vec![])),
+            vec![device_client(client_id)],
+            &redis_url(),
+        ),
+        &format!("grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id={client_id}&device_code={device_code}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_grant");
 }

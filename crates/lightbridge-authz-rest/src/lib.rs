@@ -2404,6 +2404,30 @@ fn build_token_exchange_state(
                 .to_string(),
         ));
     }
+    if cfg.device_code_ttl_seconds <= 0 || cfg.device_poll_interval_seconds <= 0 {
+        return Err(Error::Server(
+            "token_exchange device_code_ttl_seconds and device_poll_interval_seconds must be positive"
+                .to_string(),
+        ));
+    }
+    let device_verification_uri =
+        reqwest::Url::parse(&cfg.device_verification_uri).map_err(|_| {
+            Error::Server(
+                "token_exchange device_verification_uri must be an absolute URL".to_string(),
+            )
+        })?;
+    if device_verification_uri.scheme() != "https"
+        || device_verification_uri.path() != "/device/verify"
+        || !device_verification_uri.username().is_empty()
+        || device_verification_uri.password().is_some()
+        || device_verification_uri.query().is_some()
+        || device_verification_uri.fragment().is_some()
+    {
+        return Err(Error::Server(
+            "token_exchange device_verification_uri must be a credential-free, query-free HTTPS /device/verify URL"
+                .to_string(),
+        ));
+    }
     let signer = signing::ApiKeyJwtSigner::from_config(signing, repo.clone())?;
 
     let client_store = oauth2_op::client_store::ConfigClientStore::from_config(&oauth2.clients);
@@ -2429,15 +2453,21 @@ fn build_token_exchange_state(
         grant_types_supported: vec![
             token_exchange::TOKEN_EXCHANGE_GRANT.to_string(),
             token_exchange::REFRESH_TOKEN_GRANT.to_string(),
+            token_exchange::DEVICE_CODE_GRANT.to_string(),
         ],
         id_token_signing_alg: "RS256".to_string(),
         authorization_code_ttl_secs: 0,
         access_token_ttl_secs: cfg.access_ttl_seconds.max(0) as u64,
-        device_code_ttl_secs: 0,
+        device_code_ttl_secs: cfg.device_code_ttl_seconds as u64,
         token_exchange_enabled: cfg.enabled,
     };
     Ok(Some(token_exchange::TokenExchangeState::new(
-        signer, op_config, op_store,
+        signer,
+        op_config,
+        op_store,
+        cfg.device_verification_uri.clone(),
+        cfg.device_code_ttl_seconds as u64,
+        cfg.device_poll_interval_seconds as u64,
     )))
 }
 
@@ -3315,6 +3345,9 @@ mod tests {
             refresh_ttl_seconds: 2_592_000,
             allowed_scopes: vec!["openid".to_string()],
             refresh_absolute_ttl_seconds: 7_776_000,
+            device_code_ttl_seconds: 600,
+            device_poll_interval_seconds: 5,
+            device_verification_uri: "https://authz.example.test/device/verify".to_string(),
         }
     }
 
@@ -3398,6 +3431,29 @@ mod tests {
             panic!("expected an error for a non-positive ttl");
         };
         assert!(format!("{err}").contains("must be positive"));
+    }
+
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_unsafe_device_verification_uri() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        let mut cfg = exchange_cfg();
+        cfg.device_verification_uri =
+            "https://user:password@authz.example.test/device/verify?unexpected=1#fragment"
+                .to_string();
+        oauth2.token_exchange = Some(cfg);
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        ) else {
+            panic!("expected an error for an unsafe device verification URI");
+        };
+        assert!(format!("{err}").contains("credential-free"));
     }
 
     #[tokio::test]
