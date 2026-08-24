@@ -481,6 +481,7 @@ fn working_relying_party() -> lightbridge_authz_core::config::OidcRelyingParty {
         callback_url: "https://authz-idp.example.test/idp/callback".to_string(),
         client_secret: None,
         state_encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        token_encryption_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI".to_string(),
         timeout_ms: 500,
         browser_session_ttl_seconds: 28_800,
     }
@@ -1217,6 +1218,7 @@ mod db {
             callback_url: "https://authz.example.test/oauth2/callback".to_string(),
             client_secret: None,
             state_encryption_key: "not-32-bytes-of-key-material".to_string(),
+            token_encryption_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI".to_string(),
             timeout_ms: 5_000,
             browser_session_ttl_seconds: 28_800,
         }

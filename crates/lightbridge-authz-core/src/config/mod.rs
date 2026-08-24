@@ -834,6 +834,21 @@ pub struct OidcRelyingParty {
     /// Base64url-without-padding encoding of exactly 32 random bytes, used to encrypt the
     /// short-lived RP state cookie.
     pub state_encryption_key: String,
+    /// Base64url-without-padding encoding of exactly 32 random bytes, used with
+    /// [`crate::crypto::seal`]/[`crate::crypto::open`] (AES-256-GCM) to protect the Keycloak
+    /// token set (refresh token + ID-token claims snapshot, never the access token) persisted at
+    /// rest on `federated_identities.token_envelope` (ADR-0024). Deliberately a SEPARATE key from
+    /// [`Self::state_encryption_key`] -- `KeycloakRelyingParty::new` rejects a config where the
+    /// two are equal, since the state key protects a short-lived (10-minute) cookie the browser
+    /// itself holds, a very different exposure/rotation posture from a token set that can sit at
+    /// rest for a session's full lifetime. Non-`Option`, no `#[serde(default)]`: a deployment
+    /// that omits this field must fail config parsing outright rather than silently start with an
+    /// absent key -- see AGENTS.md's "authz-idp surface is mandatory" house rule for the same
+    /// shape applied to `oauth2.relying_party` as a whole. Rotation: there is no key history, so
+    /// rotating this value makes every previously-sealed `token_envelope` permanently unopenable;
+    /// `open()`'s failure is treated as "no stored token", never as a row to delete, and the row
+    /// re-seals itself on that identity's next successful login.
+    pub token_encryption_key: String,
     /// Bounded timeout for discovery and authorization-code redemption.
     #[serde(default = "default_rp_timeout_ms")]
     pub timeout_ms: u64,

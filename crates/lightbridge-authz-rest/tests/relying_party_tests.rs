@@ -29,6 +29,9 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 
 const STATE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+/// Deliberately distinct from [`STATE_KEY`] -- `KeycloakRelyingParty::new` rejects a config
+/// where `token_encryption_key == state_encryption_key` (ADR-0024).
+const TOKEN_KEY: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI";
 
 fn repo(pool: PgPool) -> Arc<StoreRepo> {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
@@ -54,6 +57,7 @@ fn rp_config(server: &MockServer) -> OidcRelyingParty {
         callback_url: "https://authz.example.test/idp/callback".to_string(),
         client_secret: None,
         state_encryption_key: STATE_KEY.to_string(),
+        token_encryption_key: TOKEN_KEY.to_string(),
         timeout_ms: 500,
         browser_session_ttl_seconds: 28_800,
     }

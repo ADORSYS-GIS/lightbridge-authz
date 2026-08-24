@@ -27,6 +27,12 @@ serde_json = "1.0"
 sha2 = "0.11"
 hex = "0.4"
 base64 = "0.23"
+# Already present in Cargo.lock as a transitive dependency of authkestra-engine (PKCE/state
+# encryption); promoted to a direct workspace dependency here because
+# `lightbridge-authz-core::crypto::{seal,open}` (ADR-0024) now calls it directly for the
+# Keycloak-token-set-at-rest envelope. Pinning the same 0.10 line authkestra-engine already
+# resolves to avoids carrying two `aes-gcm` majors in the lockfile.
+aes-gcm = "0.10"
 # ⚠️ THIS VERSION IS COUPLED TO `authkestra-resource` BELOW. Bump them together or not at all.
 #
 # `lightbridge-authz-bearer` passes `Validation`/`Algorithm` values straight into authkestra's

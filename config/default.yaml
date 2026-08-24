@@ -137,6 +137,12 @@ oauth2:
     callback_url: "https://localhost:13004/idp/callback"
     # Development-only fixed key. Production MUST set a unique base64url-encoded 32-byte key.
     state_encryption_key: "${KEYCLOAK_RP_STATE_ENCRYPTION_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA}"
+    # ADR-0024: separate AES-256-GCM key sealing the Keycloak token set (refresh token + ID-token
+    # claims snapshot) persisted on federated_identities.token_envelope. Development-only fixed
+    # key, deliberately different from state_encryption_key above (KeycloakRelyingParty::new
+    # refuses a config where the two are equal). Production MUST set a unique base64url-encoded
+    # 32-byte key.
+    token_encryption_key: "${KEYCLOAK_RP_TOKEN_ENCRYPTION_KEY:-QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI}"
     timeout_ms: ${KEYCLOAK_RP_TIMEOUT_MS:-5000}
     browser_session_ttl_seconds: ${BROWSER_SESSION_TTL_SECONDS:-28800}
   # Self-signed API-key JWTs (enterprise: the credential must be a JWT). When enabled, issued

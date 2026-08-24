@@ -273,6 +273,7 @@ fn relying_party_with_issuer(repo: Arc<StoreRepo>, issuer: &str) -> Arc<Keycloak
                 callback_url: "https://authz.example.test/idp/callback".to_string(),
                 client_secret: None,
                 state_encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                token_encryption_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI".to_string(),
                 timeout_ms: 500,
                 browser_session_ttl_seconds: 28_800,
             },
