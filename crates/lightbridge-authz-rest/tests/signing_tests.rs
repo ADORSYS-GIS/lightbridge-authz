@@ -241,10 +241,12 @@ fn at_hash_changes_with_the_access_token() {
 /// values must stay in lockstep with what `token_exchange::TOKEN_EXCHANGE_GRANT`/
 /// `REFRESH_TOKEN_GRANT` and `handle_token`'s real dispatch accept (see `token_exchange.rs`), not
 /// just "non-empty". `response_types_supported` is asserted empty here too, not merely omitted
-/// from this list -- see `discovery_never_advertises_response_types_or_modes` below for why that
-/// must hold regardless of the token-exchange gate, and for the regression this guards (this
-/// service served `["token", "id_token", "id_token token"]` here in production once token-exchange
-/// was enabled, claiming an authorization endpoint that has never existed).
+/// from this list -- see `discovery_advertises_response_types_and_modes_only_for_the_mounted_authorize_route`
+/// below for why that must hold when the `authorization_endpoint` capability isn't part of the
+/// `DiscoveryCapabilities` this test constructs (`token_surface()`, no `with_authorization_code()`),
+/// and for the regression this guards (this service served `["token", "id_token", "id_token
+/// token"]` here in production once token-exchange was enabled, claiming an authorization endpoint
+/// that has never existed).
 #[tokio::test]
 async fn discovery_advertises_exact_token_exchange_metadata_when_enabled() {
     use axum::body::{Body, to_bytes};
@@ -293,7 +295,10 @@ async fn discovery_advertises_exact_token_exchange_metadata_when_enabled() {
     );
     assert!(
         payload.get("response_types_supported").is_none(),
-        "response_types_supported must be omitted without /authorize: {payload}"
+        "response_types_supported must be omitted when this DiscoveryCapabilities value doesn't \
+         set with_authorization_code() -- authz-idp's own production capabilities \
+         (DiscoveryCapabilities::full_idp()) always sets it, but well_known_router stays generic \
+         over other callers that mount less: {payload}"
     );
     assert_eq!(
         payload["token_endpoint"],
@@ -430,8 +435,11 @@ async fn oidc_and_oauth_metadata_use_their_distinct_issuer_path_rules() {
 /// see `discovery_document`'s doc comment for why that would be inventing a capability.
 ///
 /// Also proves the other half of the same design point: `well_known_router` is only mounted at all
-/// when `oauth2.type: self` + `oauth2.signing` are configured (see call site in `lib.rs`), which
-/// makes this service an OIDC *issuer* independent of whether the token-exchange grant is enabled
+/// when `oauth2.type: self` + `oauth2.signing` are configured (see call site in `lib.rs`). Since
+/// ADR-0023 that `type:self` gate lives exclusively in `start_idp_server` -- `build_idp_router`
+/// itself no longer branches on it, it merges `well_known_router` unconditionally, so the gate is
+/// a startup-refusal decision, not a router-assembly one. This makes this service an OIDC
+/// *issuer* independent of whether the token-exchange grant is enabled
 /// -- `ApiKeyJwtSigner` mints self-signed API-key JWTs through that path regardless. So the
 /// issuer-identity fields that don't depend on OIDC ID tokens specifically (`issuer`, `jwks_uri`)
 /// stay populated even with token-exchange disabled; the OIDC-specific fields
@@ -540,7 +548,9 @@ async fn discovery_omits_token_endpoint_when_exchange_disabled() {
     );
     assert!(
         payload.get("authorization_endpoint").is_none(),
-        "authorization_endpoint must always be absent -- this service never serves /authorize: {payload}"
+        "authorization_endpoint must be absent when the capability is not mounted; authz-idp \
+         always mounts it (DiscoveryCapabilities::full_idp()) -- this test's DiscoveryCapabilities \
+         value (::default()) simply doesn't set with_authorization_code(): {payload}"
     );
 }
 
@@ -593,15 +603,25 @@ async fn discovery_advertises_private_key_jwt_only_when_a_confidential_client_is
 /// Regression guard for the capability gates in ADR-0019 Decision 5 and #426. This test used to
 /// prove that `response_types_supported` and `response_modes_supported` remained absent because
 /// `/authorize` did not exist. That premise changed when the persisted authorization-code route
-/// shipped; its purpose did not. The document must now advertise `code` and `query` only when the
-/// router has mounted `/authorize`, never merely because token exchange, a client entry, or the
-/// device route exists. The device grant gets the same independent route gate.
+/// shipped; its purpose did not. The document must advertise `code` and `query` only when the
+/// `DiscoveryCapabilities` value passed to `well_known_router` sets `with_authorization_code()`,
+/// never merely because token exchange, a client entry, or the device route exists. The device
+/// grant gets the same independent route gate.
+///
+/// Renamed from `discovery_never_advertises_response_types_or_modes`: since ADR-0023,
+/// `authz-idp`'s own production call site (`build_idp_router`) always passes
+/// `DiscoveryCapabilities::full_idp()`, so it always hits the authorization-code row now -- "never"
+/// stopped being true for that caller. `well_known_router` itself stays generic: the other rows
+/// checked below (disabled/token-only/device-only) still guard its OTHER callers/uses (this test
+/// file's own lower-level unit tests above, which construct narrower `DiscoveryCapabilities`
+/// values directly) -- this is a property of the function, not a claim about what `authz-idp`
+/// itself ships.
 ///
 /// Checking disabled, token-only, device-only, and authorization-code-only route combinations is
 /// deliberate. A prior production regression made response types appear when an unrelated
 /// token-exchange flag changed; a one-state test would let that coupling return.
 #[tokio::test]
-async fn discovery_never_advertises_response_types_or_modes() {
+async fn discovery_advertises_response_types_and_modes_only_for_the_mounted_authorize_route() {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use lightbridge_authz_rest::signing::well_known_router;
@@ -696,6 +716,26 @@ async fn discovery_never_advertises_response_types_or_modes() {
             }
         }
     }
+}
+
+/// `DiscoveryCapabilities::full_idp()` (Step 1, ADR-0023) must stay exactly equivalent to chaining
+/// its three named constructors by hand -- it exists as a documented shorthand for that chain, not
+/// a separately-maintained set of flags that could silently drift from it.
+///
+/// Prove-fail-first (recorded verbatim in the PR body): temporarily dropped
+/// `.with_authorization_code()` from `full_idp()` and reran -- this test failed on
+/// `authorization_endpoint` (`true` vs `false`). Restored it.
+#[test]
+fn full_idp_capabilities_match_the_chained_constructors() {
+    assert_eq!(
+        format!("{:?}", DiscoveryCapabilities::full_idp()),
+        format!(
+            "{:?}",
+            DiscoveryCapabilities::token_surface()
+                .with_device_authorization()
+                .with_authorization_code()
+        )
+    );
 }
 
 #[cfg(feature = "it-tests")]
