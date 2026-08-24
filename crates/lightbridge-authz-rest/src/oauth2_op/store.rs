@@ -410,10 +410,7 @@ impl TokenExchangeOpStore {
 
         let token_info = match self.bearer.validate_bearer_token(subject_token).await {
             Ok(info) if info.active => info,
-            Ok(_) => {
-                return Err(oauth_err("invalid_request", "subject_token is invalid"));
-            }
-            Err(_) => {
+            Ok(_) | Err(_) => {
                 return Err(oauth_err("invalid_request", "subject_token is invalid"));
             }
         };

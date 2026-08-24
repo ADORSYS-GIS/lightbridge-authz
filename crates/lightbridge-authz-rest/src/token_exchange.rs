@@ -31,7 +31,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::oauth2_op::ACCESS_TOKEN_TYPE;
 use crate::oauth2_op::store::{RequestScopedOpStore, TokenExchangeOpStore};
 use crate::signing::ApiKeyJwtSigner;
 
@@ -144,7 +143,7 @@ struct TokenResponseBody {
     token_type: String,
     expires_in: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    issued_token_type: Option<&'static str>,
+    issued_token_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     refresh_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -163,7 +162,6 @@ async fn token_endpoint(
         .and_then(|v| v.to_str().ok());
     let project_id = raw.project_id.clone();
     let req: AkTokenRequest = raw.into();
-    let grant_type = req.grant_type.clone();
 
     let tokens = match state.signer.token_manager().await {
         Ok(tokens) => tokens,
@@ -182,19 +180,19 @@ async fn token_endpoint(
     };
 
     match handle_token(req, auth_header, &state.op_config, &scoped, &tokens).await {
-        Ok(resp) => success_response(&grant_type, resp),
+        Ok(resp) => success_response(resp),
         Err(err) => error_response(&err),
     }
 }
 
-fn success_response(grant_type: &str, resp: AkTokenResponse) -> Response {
+fn success_response(resp: AkTokenResponse) -> Response {
     (
         StatusCode::OK,
         Json(TokenResponseBody {
             access_token: resp.access_token,
             token_type: resp.token_type,
             expires_in: resp.expires_in,
-            issued_token_type: (grant_type == TOKEN_EXCHANGE_GRANT).then_some(ACCESS_TOKEN_TYPE),
+            issued_token_type: resp.issued_token_type,
             refresh_token: resp.refresh_token,
             scope: resp.scope,
             id_token: resp.id_token,
@@ -236,11 +234,13 @@ fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
 
 /// `TokenErrorResponse` carries no HTTP status (`authkestra_op::handlers::token`'s own type
 /// docs it as opaque to transport), so this is the one place that decides it, from the `error`
-/// string alone. `invalid_client`/`invalid_token` (subject_token, presented like a bearer
-/// credential) map to 401; `access_denied` (non-member project, an authorization outcome, not an
-/// authentication one) maps to 403; `server_error` maps to 500; everything else RFC 6749 §5.2
-/// defines (`invalid_request`, `invalid_grant`, `invalid_scope`, `unsupported_grant_type`,
-/// `unauthorized_client`, `invalid_target`) maps to 400.
+/// string alone. `invalid_client`/`invalid_token` map to 401 (client-authentication failures);
+/// `access_denied` (non-member project, an authorization outcome, not an authentication one)
+/// maps to 403; `server_error` maps to 500; everything else RFC 6749 §5.2 defines
+/// (`invalid_request` -- including subject_token validation failures, which use this
+/// token-endpoint convention rather than RFC 6750's resource-server `invalid_token` -- plus
+/// `invalid_grant`, `invalid_scope`, `unsupported_grant_type`, `unauthorized_client`,
+/// `invalid_target`) maps to 400.
 fn status_for_oauth_error(error: &str) -> StatusCode {
     match error {
         "invalid_client" | "invalid_token" => StatusCode::UNAUTHORIZED,

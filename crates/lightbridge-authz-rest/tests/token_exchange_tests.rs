@@ -1695,7 +1695,7 @@ async fn unsupported_subject_token_type_is_invalid_request(pool: PgPool) {
     let (status, body) = post_token(
         state(repo.clone(), true),
         &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token=x\
              &subject_token_type=urn:ietf:params:oauth:token-type:saml2&project_id={PROJECT_ID}"
         ),
     )
