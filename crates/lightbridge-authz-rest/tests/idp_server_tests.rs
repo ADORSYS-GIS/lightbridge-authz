@@ -22,7 +22,9 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::async_trait;
-use lightbridge_authz_core::config::{IdpServer, JwtSigning, Oauth2, Oauth2Type, Tls};
+use lightbridge_authz_core::config::{
+    IdpServer, JwtSigning, Oauth2, Oauth2Type, OauthClient, OauthClientType, Tls,
+};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::{build_idp_router, start_idp_server};
 use tower::ServiceExt;
@@ -1103,5 +1105,112 @@ mod db {
         );
 
         let _ = std::fs::remove_dir_all(&static_dir);
+    }
+
+    /// Offline-constructible `oauth2.relying_party` -- `KeycloakRelyingParty::new` only validates
+    /// its shape synchronously (timeout, TTL, base64url state key, callback URL/path), it never
+    /// dials out, so this is enough to get `start_idp_server` past its own mandatory
+    /// `oauth2.relying_party` check without a live Keycloak. Needed here (and not by this file's
+    /// other `db` tests) because `validate_authorization_code_clients` -- what the two tests below
+    /// exercise -- runs only after that check, deep inside `build_token_exchange_state`.
+    fn working_relying_party() -> lightbridge_authz_core::config::OidcRelyingParty {
+        lightbridge_authz_core::config::OidcRelyingParty {
+            issuer: "https://keycloak.example.test".to_string(),
+            client_id: "authz-idp-rp".to_string(),
+            callback_url: "https://authz-idp.example.test/idp/callback".to_string(),
+            client_secret: None,
+            state_encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            timeout_ms: 500,
+            browser_session_ttl_seconds: 28_800,
+        }
+    }
+
+    fn authorization_code_client(
+        client_id: &str,
+        client_type: OauthClientType,
+        require_pkce: bool,
+    ) -> OauthClient {
+        OauthClient {
+            client_id: client_id.to_string(),
+            client_type,
+            scopes: vec!["openid".to_string()],
+            grant_types: vec!["authorization_code".to_string()],
+            allowed_audiences: vec![client_id.to_string()],
+            jwks: None,
+            redirect_uris: vec!["https://cb.example.test/callback".to_string()],
+            require_pkce,
+        }
+    }
+
+    /// Follow-up to PR #466's review finding: `validate_authorization_code_clients` (`lib.rs`)
+    /// used to gate the PKCE+redirect_uri requirement on `client_type == OauthClientType::Public`
+    /// alone, so a Confidential client configured with the `authorization_code` grant and
+    /// `require_pkce: false` started up cleanly -- and could then complete a full non-PKCE
+    /// authorization_code flow end to end (`/authorize` enforced PKCE off `client.require_pkce`
+    /// alone too, and the upstream `authkestra-op` token handler only verifies PKCE when a
+    /// `code_challenge` was actually stored). OAuth 2.1 and RFC 9700 (OAuth Security BCP) recommend
+    /// PKCE for every client type, not only public ones, to close authorization-code-injection
+    /// attacks. This proves the startup gate now rejects a Confidential client exactly like it
+    /// always rejected a Public one.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_idp_server_rejects_confidential_authorization_code_client_without_pkce(
+        pool: PgPool,
+    ) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let mut oauth2 = token_exchange_oauth2();
+        oauth2.relying_party = Some(working_relying_party());
+        oauth2.clients = vec![authorization_code_client(
+            "confidential-no-pkce",
+            OauthClientType::Confidential,
+            false,
+        )];
+        let idp = IdpServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+            static_dir: TEST_STATIC_DIR.to_string(),
+        };
+        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg())
+            .await
+            .expect_err(
+                "a Confidential authorization_code client with require_pkce: false must be \
+                 rejected at startup, not only a Public one",
+            );
+        let message = format!("{err}");
+        assert!(message.contains("authorization_code"), "got: {message}");
+        assert!(message.to_lowercase().contains("pkce"), "got: {message}");
+    }
+
+    /// The compliant half: a client with `require_pkce: true` and at least one `redirect_uri`
+    /// still passes startup validation regardless of `client_type` -- Public and Confidential
+    /// alike. `start_idp_server` proceeds past `validate_authorization_code_clients` and fails
+    /// only on the deliberately-bogus TLS cert path further down, same shape as every other
+    /// `start_idp_server_*` TLS-failure test in this module.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_idp_server_accepts_pkce_compliant_authorization_code_clients_of_any_type(
+        pool: PgPool,
+    ) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let mut oauth2 = token_exchange_oauth2();
+        oauth2.relying_party = Some(working_relying_party());
+        oauth2.clients = vec![
+            authorization_code_client("public-pkce", OauthClientType::Public, true),
+            authorization_code_client("confidential-pkce", OauthClientType::Confidential, true),
+        ];
+        let idp = IdpServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+            static_dir: TEST_STATIC_DIR.to_string(),
+        };
+        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg())
+            .await
+            .expect_err("missing TLS cert paths must surface as an error");
+        let message = format!("{err}").to_lowercase();
+        assert!(
+            !message.contains("pkce") && !message.contains("redirect_uri"),
+            "PKCE-compliant clients of any client_type must pass \
+             validate_authorization_code_clients and fail only on TLS load: got {message}"
+        );
     }
 }

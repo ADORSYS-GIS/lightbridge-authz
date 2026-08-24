@@ -240,6 +240,26 @@ fn browser_client(client_id: &str, redirect_uri: &str) -> OauthClient {
     }
 }
 
+/// A Confidential authorization_code client with `require_pkce: false` -- the exact shape
+/// `validate_authorization_code_clients` (`lib.rs`) now refuses at startup (follow-up to PR
+/// #466's review finding), used here to prove `/authorize` itself also refuses a codeless-
+/// challenge request for this client, independent of both `client_type` and the `require_pkce`
+/// flag on the client record. Defense-in-depth: even a client object that somehow reached this
+/// endpoint with `require_pkce: false` must not be able to start a non-PKCE authorization_code
+/// flow.
+fn confidential_browser_client_without_pkce(client_id: &str, redirect_uri: &str) -> OauthClient {
+    OauthClient {
+        client_id: client_id.to_string(),
+        client_type: OauthClientType::Confidential,
+        scopes: client_scopes(),
+        grant_types: vec!["authorization_code".to_string()],
+        allowed_audiences: vec![client_id.to_string()],
+        jwks: None,
+        redirect_uris: vec![redirect_uri.to_string()],
+        require_pkce: false,
+    }
+}
+
 fn relying_party(repo: Arc<StoreRepo>) -> Arc<KeycloakRelyingParty> {
     relying_party_with_issuer(repo, "https://keycloak.example.test")
 }
@@ -981,6 +1001,53 @@ async fn authorize_rejects_unregistered_redirects_and_pkce_before_relying_party(
         assert!(location.contains("error=invalid_request"));
         assert!(response.headers().get(header::SET_COOKIE).is_none());
     }
+}
+
+/// Runtime proof for the defense-in-depth half of the PKCE fix (follow-up to PR #466): `/authorize`
+/// now requires PKCE S256 unconditionally for every `authorization_code` client, never reading
+/// `client.require_pkce` at all. Before this change, the endpoint enforced PKCE off that flag
+/// alone with no `client_type` check -- so a Confidential client configured (however it got that
+/// way -- a bad startup config that predated `validate_authorization_code_clients` covering
+/// Confidential clients, or a future regression there) with `require_pkce: false` could start a
+/// non-PKCE authorization_code flow. This client fixture is exactly that shape; the request omits
+/// `code_challenge` entirely, and must still be refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorize_requires_pkce_for_confidential_clients_regardless_of_require_pkce_flag(
+    pool: PgPool,
+) {
+    const CLIENT: &str = "confidential-browser-client";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    let router = authorize_router(AuthorizeState::new(
+        relying_party(repo.clone()),
+        state_with(
+            repo,
+            Arc::new(MockBearer::new(true, vec![])),
+            vec![confidential_browser_client_without_pkce(
+                CLIENT,
+                REDIRECT_URI,
+            )],
+            &redis_url(),
+        ),
+    ));
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/authorize?client_id={CLIENT}&redirect_uri={REDIRECT_URI}&response_type=code&scope=openid"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(location.starts_with(REDIRECT_URI));
+    assert!(location.contains("error=invalid_request"));
+    assert!(response.headers().get(header::SET_COOKIE).is_none());
 }
 
 #[sqlx::test(migrations = "../../migrations")]

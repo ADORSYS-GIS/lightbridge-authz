@@ -2500,21 +2500,25 @@ fn token_endpoint_cors_origins(clients: &[OauthClient]) -> Result<Vec<String>> {
         .map(|origins| origins.into_iter().collect())
 }
 
+/// OAuth 2.1 and RFC 9700 (OAuth Security Best Current Practice) recommend PKCE for every client
+/// type, not only public ones, specifically to close authorization-code-injection attacks -- a
+/// confidential client's client-authentication step at the token endpoint proves who is redeeming
+/// the code, not that the code being redeemed is the one THIS session actually requested. This
+/// gate therefore applies to every `authorization_code` client regardless of `client_type`; do not
+/// reintroduce a `client_type == Public` condition here.
 fn validate_authorization_code_clients(clients: &[OauthClient]) -> Result<()> {
     for client in clients {
         for redirect_uri in &client.redirect_uris {
             redirect_origin(redirect_uri)?;
         }
-        if client.client_type == OauthClientType::Public
-            && client
-                .grant_types
-                .iter()
-                .any(|grant| grant == "authorization_code")
+        if client
+            .grant_types
+            .iter()
+            .any(|grant| grant == "authorization_code")
             && (!client.require_pkce || client.redirect_uris.is_empty())
         {
             return Err(Error::Server(
-                "public authorization_code clients require PKCE and at least one redirect_uri"
-                    .to_string(),
+                "authorization_code clients require PKCE and at least one redirect_uri".to_string(),
             ));
         }
     }
