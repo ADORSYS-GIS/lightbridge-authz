@@ -1,5 +1,27 @@
 # Changelog
 
+## [3.10.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.9.0...v3.10.0) (2026-08-24)
+
+
+### Features
+
+* **idp:** add Authorization Code flow with PKCE ([#466](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/466)) ([b4ff5ee](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/b4ff5ee3d35c9789f106760ffeefe43376d86d2e))
+* **idp:** add Keycloak RP device verification flow ([#463](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/463)) ([9e0ef4d](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/9e0ef4d800762538372ad94f5d3d4d28775046e4))
+* **oauth2:** advertise mounted flow capabilities ([#467](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/467)) ([2ea13a7](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/2ea13a7cb761ee2720b0b8556a31d29c5d7837a7))
+* **oauth2:** implement device authorization grant ([#464](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/464)) ([ea6e72d](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/ea6e72de4b13ede6d4a045f419a79f768c22e060))
+* **oauth2:** publish truthful authorization metadata ([#460](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/460)) ([004fc9f](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/004fc9fab5ddef1ee7ea8bf520c477a4c13bf8cb))
+
+
+### Bug Fixes
+
+* **idp:** reserve protocol namespaces from SPA fallback ([#462](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/462)) ([494df43](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/494df4344136251732446ed8122f3258ac3ec22f))
+* **oauth:** conform token exchange responses ([#461](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/461)) ([db9b266](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/db9b266aa1f78ddfcb292f26b64c3136d3d5a767))
+
+
+### Documentation
+
+* **oauth2:** add standards gap and delivery roadmap ([#458](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/458)) ([974d882](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/974d8821b56ca5a21c37f19a8137c50e2d949cdd))
+
 ## [3.9.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.8.0...v3.9.0) (2026-08-23)
 
 
