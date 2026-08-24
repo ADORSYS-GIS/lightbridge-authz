@@ -97,15 +97,19 @@ async fn authorize(
             "unsupported authorization request",
         );
     }
-    if client.require_pkce
-        && (request.code_challenge.is_none()
-            || request.code_challenge_method.as_deref() != Some("S256"))
+    // PKCE (RFC 7636, S256 only) is required for every authorization_code client, confidential
+    // included -- OAuth 2.1 / RFC 9700 (OAuth Security BCP) recommend it for all client types, not
+    // only public ones, because it defends against authorization-code injection, a threat client
+    // authentication at the token endpoint does not address (that proves who redeemed the code,
+    // not that the code belongs to the session redeeming it). `client.require_pkce` is validated
+    // to always be `true` for authorization_code clients at startup
+    // (`validate_authorization_code_clients` in `lib.rs`), but this check does not read that flag
+    // at all: it is unconditional defense-in-depth, so a config that somehow reached this endpoint
+    // with `require_pkce: false` still can never start a codeless-challenge authorization_code
+    // flow.
+    if request.code_challenge.is_none() || request.code_challenge_method.as_deref() != Some("S256")
     {
         return redirect_error(&request, "invalid_request", "PKCE S256 is required");
-    }
-    if request.code_challenge.is_some() && request.code_challenge_method.as_deref() != Some("S256")
-    {
-        return redirect_error(&request, "invalid_request", "only PKCE S256 is supported");
     }
     if !scopes_are_allowed(
         &request.scope,
