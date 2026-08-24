@@ -68,10 +68,10 @@ use serde_json::Value;
 
 use crate::signing::{KeyOwner, access_token_extra, id_token_extra, identity_for};
 
+use super::authorization_code_store::DbAuthorizationCodeStore;
 use super::client_assertion_store::RedisClientAssertionStore;
 use super::client_store::ConfigClientStore;
 use super::device_store::{DbDeviceCodeStore, create_pending_device_authorization};
-use super::noop_stores::NoAuthorizationCodeStore;
 use super::refresh_store::DbRefreshTokenStore;
 use super::{
     ACCESS_TOKEN_TYPE, OFFLINE_ACCESS_SCOPE, OPENID_SCOPE, decode_auth_time_and_nonce,
@@ -119,7 +119,7 @@ struct InitialRefreshToken<'a> {
 /// One instance is built once at server startup and shared (`Arc`) across every request.
 pub struct TokenExchangeOpStore {
     clients: ConfigClientStore,
-    codes: NoAuthorizationCodeStore,
+    codes: DbAuthorizationCodeStore,
     refresh: DbRefreshTokenStore,
     /// Real, CAS-consuming storage over `device_authorizations`. The native RFC 8628 endpoint
     /// creates and redeems its rows directly so token issuance can preserve this service's
@@ -164,7 +164,7 @@ impl TokenExchangeOpStore {
     ) -> Self {
         Self {
             clients,
-            codes: NoAuthorizationCodeStore,
+            codes: DbAuthorizationCodeStore::new(repo.clone()),
             refresh: DbRefreshTokenStore::new(repo.clone()),
             devices: DbDeviceCodeStore::new(repo.clone()),
             assertions,
@@ -181,6 +181,24 @@ impl TokenExchangeOpStore {
     /// (`signing::discovery_document`).
     pub fn has_confidential_client(&self) -> bool {
         self.clients.has_confidential_client()
+    }
+
+    pub async fn authorization_code_matches_binding(
+        &self,
+        code: &str,
+        client_id: &str,
+        redirect_uri: &str,
+    ) -> Result<bool, OpError> {
+        self.codes
+            .matches_binding(code, client_id, redirect_uri)
+            .await
+    }
+
+    pub(crate) async fn find_client_registration(
+        &self,
+        client_id: &str,
+    ) -> Result<Option<ClientRegistration>, OpError> {
+        self.clients.find_client(client_id).await
     }
 
     /// Revokes a single refresh token by its plaintext value, scoped to the presented

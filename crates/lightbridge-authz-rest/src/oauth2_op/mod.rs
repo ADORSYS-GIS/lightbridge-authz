@@ -10,8 +10,8 @@
 //! - [`device_store`]: `DeviceCodeStore` over `device_authorizations` (ADR-0012 Decision 7, #423)
 //!   -- real, CAS-consuming storage, replacing the permanent `NoDeviceCodeStore` stub ADR-0011
 //!   Decision 3 originally installed for both OP-side traits.
-//! - [`noop_stores`]: the one trait that IS still a permanent no-op --
-//!   `AuthorizationCodeStore` (ADR-0012 Decision 3 reaffirms this half, unchanged).
+//! - [`authorization_code_store`]: persisted, TTL-bound and CAS-consuming authorization codes
+//!   for ADR-0019's browser flow.
 //! - [`store`]: `TokenExchangeOpStore`, the `OpStore` implementation tying all of the above
 //!   together, with hand-rolled `handle_token_exchange`/`handle_refresh_token` overrides (the
 //!   upstream defaults are `pub(crate)` to `authkestra-op` and never stamp `extra` claims -- see
@@ -20,7 +20,6 @@
 pub mod client_assertion_store;
 pub mod client_store;
 pub mod device_store;
-pub mod noop_stores;
 pub mod refresh_store;
 pub mod store;
 
@@ -152,3 +151,4 @@ pub(crate) fn decode_auth_time_and_nonce(bearer_token: &str) -> (Option<i64>, Op
         .map(str::to_string);
     (auth_time, nonce)
 }
+pub mod authorization_code_store;

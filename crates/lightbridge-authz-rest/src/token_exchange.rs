@@ -51,6 +51,7 @@ pub struct TokenExchangeState {
     device_verification_uri: String,
     device_code_ttl_secs: u64,
     device_poll_interval_secs: u64,
+    cors_origins: Arc<Vec<String>>,
 }
 
 impl TokenExchangeState {
@@ -69,7 +70,25 @@ impl TokenExchangeState {
             device_verification_uri,
             device_code_ttl_secs,
             device_poll_interval_secs,
+            cors_origins: Arc::new(Vec::new()),
         }
+    }
+
+    pub fn with_cors_origins(mut self, cors_origins: Vec<String>) -> Self {
+        self.cors_origins = Arc::new(cors_origins);
+        self
+    }
+
+    pub(crate) fn op_config(&self) -> &OpConfig {
+        &self.op_config
+    }
+
+    pub(crate) fn op_store(&self) -> &TokenExchangeOpStore {
+        self.op_store.as_ref()
+    }
+
+    fn allows_cors_origin(&self, origin: &str) -> bool {
+        self.cors_origins.iter().any(|allowed| allowed == origin)
     }
 }
 
@@ -91,6 +110,7 @@ where
             "/oauth2/token",
             post(token_endpoint).layer(middleware::from_fn(apply_token_response_headers)),
         )
+        .route("/oauth2/token", axum::routing::options(token_preflight))
         .route(
             "/oauth2/device_authorization",
             post(device_authorization_endpoint),
@@ -191,8 +211,16 @@ async fn token_endpoint(
     headers: HeaderMap,
     Form(raw): Form<RawTokenRequest>,
 ) -> Response {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     if raw.grant_type == DEVICE_CODE_GRANT {
-        return device_token_endpoint(state, headers, raw).await;
+        return cors_response(
+            device_token_endpoint(state.clone(), headers, raw).await,
+            origin.as_deref(),
+            &state,
+        );
     }
     let auth_header = headers
         .get(header::AUTHORIZATION)
@@ -203,10 +231,14 @@ async fn token_endpoint(
     let tokens = match state.signer.token_manager().await {
         Ok(tokens) => tokens,
         Err(_) => {
-            return oauth_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "signing key unavailable",
+            return cors_response(
+                oauth_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "signing key unavailable",
+                ),
+                origin.as_deref(),
+                &state,
             );
         }
     };
@@ -216,10 +248,35 @@ async fn token_endpoint(
         project_id,
     };
 
-    match handle_token(req, auth_header, &state.op_config, &scoped, &tokens).await {
-        Ok(resp) => success_response(resp),
-        Err(err) => error_response(&err),
-    }
+    let binding = if req.grant_type == "authorization_code" {
+        match (&req.code, &req.client_id, &req.redirect_uri) {
+            (Some(code), Some(client_id), Some(redirect_uri)) => state
+                .op_store
+                .authorization_code_matches_binding(code, client_id, redirect_uri)
+                .await
+                .map(Some),
+            _ => Ok(Some(false)),
+        }
+    } else {
+        Ok(None)
+    };
+    let response = match binding {
+        Ok(Some(false)) => oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "authorization code is invalid",
+        ),
+        Err(_) => oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "authorization-code storage unavailable",
+        ),
+        Ok(_) => match handle_token(req, auth_header, &state.op_config, &scoped, &tokens).await {
+            Ok(resp) => success_response(resp),
+            Err(err) => error_response(&err),
+        },
+    };
+    cors_response(response, origin.as_deref(), &state)
 }
 
 async fn device_authorization_endpoint(
@@ -359,6 +416,10 @@ async fn device_token_endpoint(
 fn success_response(resp: AkTokenResponse) -> Response {
     (
         StatusCode::OK,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
         Json(TokenResponseBody {
             access_token: resp.access_token,
             token_type: resp.token_type,
@@ -395,12 +456,49 @@ fn error_response(err: &AkTokenErrorResponse) -> Response {
 fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
     (
         status,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
         Json(serde_json::json!({
             "error": error,
             "error_description": description,
         })),
     )
         .into_response()
+}
+
+async fn token_preflight(State(state): State<TokenExchangeState>, headers: HeaderMap) -> Response {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok());
+    cors_response(StatusCode::NO_CONTENT.into_response(), origin, &state)
+}
+
+fn cors_response(
+    mut response: Response,
+    origin: Option<&str>,
+    state: &TokenExchangeState,
+) -> Response {
+    response
+        .headers_mut()
+        .append(header::VARY, HeaderValue::from_static("Origin"));
+    if let Some(origin) = origin.filter(|origin| state.allows_cors_origin(origin))
+        && let Ok(value) = HeaderValue::from_str(origin)
+    {
+        response
+            .headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("POST"),
+        );
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("content-type"),
+        );
+    }
+    response
 }
 
 /// `TokenErrorResponse` carries no HTTP status (`authkestra_op::handlers::token`'s own type

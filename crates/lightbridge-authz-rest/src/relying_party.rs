@@ -223,6 +223,15 @@ impl KeycloakRelyingParty {
         self.begin(PendingFlow::Browser(target)).await
     }
 
+    pub async fn find_active_browser_session(
+        &self,
+        session_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<lightbridge_authz_api_key::entities::session_row::BrowserSessionContextRow>>
+    {
+        self.repo.find_active_browser_session(session_id, now).await
+    }
+
     async fn begin(&self, flow: PendingFlow) -> Result<(String, Cookie<'static>)> {
         let metadata = self.discover().await?;
         let pkce = Pkce::new();

@@ -15,6 +15,7 @@ use tracing::instrument;
 use crate::entities::account_row::AccountRow;
 use crate::entities::api_key_row::{ApiKeyChangeset, ApiKeyRow};
 use crate::entities::api_key_validation_row::ApiKeyValidationRow;
+use crate::entities::authorization_code_row::{AuthorizationCodeRow, NewAuthorizationCode};
 use crate::entities::device_authorization_row::{DeviceAuthorizationRow, NewDeviceAuthorization};
 use crate::entities::exchange_refresh_token_row::{
     ExchangeRefreshTokenRow, NewExchangeRefreshToken,
@@ -24,7 +25,9 @@ use crate::entities::new_api_key_row::NewApiKeyRow;
 use crate::entities::new_project_row::NewProjectRow;
 use crate::entities::project_member_row::ProjectMemberRow;
 use crate::entities::project_row::{ProjectChangeset, ProjectRow};
-use crate::entities::session_row::{NewSession, SessionRow, SessionStatusRow};
+use crate::entities::session_row::{
+    BrowserSessionContextRow, NewSession, SessionRow, SessionStatusRow,
+};
 use crate::entities::signing_key_row::{NewSigningKey, SigningKeyRow};
 
 #[derive(Debug, Clone)]
@@ -39,6 +42,80 @@ impl StoreRepo {
 
     fn pool(&self) -> &PgPool {
         self.pool.pool()
+    }
+
+    pub async fn create_authorization_code(&self, input: NewAuthorizationCode) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO authorization_codes
+              (id, code_hash, client_id, redirect_uri, scope, code_challenge, code_challenge_method, nonce, identity, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            "#,
+        )
+        .bind(input.id)
+        .bind(input.code_hash)
+        .bind(input.client_id)
+        .bind(input.redirect_uri)
+        .bind(input.scope)
+        .bind(input.code_challenge)
+        .bind(input.code_challenge_method)
+        .bind(input.nonce)
+        .bind(input.identity)
+        .bind(input.expires_at)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn consume_authorization_code(
+        &self,
+        code_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<AuthorizationCodeRow>> {
+        let row = sqlx::query_as(
+            r#"
+            UPDATE authorization_codes
+            SET consumed_at = $2
+            WHERE code_hash = $1
+              AND consumed_at IS NULL
+              AND expires_at > $2
+            RETURNING id, code_hash, client_id, redirect_uri, scope, code_challenge,
+                      code_challenge_method, nonce, identity, created_at, expires_at, consumed_at
+            "#,
+        )
+        .bind(code_hash)
+        .bind(now)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn authorization_code_matches(
+        &self,
+        code_hash: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let matches = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM authorization_codes
+                WHERE code_hash = $1
+                  AND client_id = $2
+                  AND redirect_uri = $3
+                  AND consumed_at IS NULL
+                  AND expires_at > $4
+            )
+            "#,
+        )
+        .bind(code_hash)
+        .bind(client_id)
+        .bind(redirect_uri)
+        .bind(now)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(matches)
     }
 
     /// Map an optional model list to the value stored in `projects.allowed_models`. `None` maps to
@@ -939,6 +1016,28 @@ impl StoreRepo {
             "#,
         )
         .bind(session_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn find_active_browser_session(
+        &self,
+        session_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<BrowserSessionContextRow>> {
+        let row = sqlx::query_as(
+            r#"
+            SELECT account_id, project_id
+            FROM sessions
+            WHERE id = $1
+              AND kind = 'browser'
+              AND status = 'active'
+              AND expires_at > $2
+            "#,
+        )
+        .bind(session_id)
+        .bind(now)
         .fetch_optional(self.pool())
         .await?;
         Ok(row)

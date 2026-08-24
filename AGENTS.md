@@ -821,6 +821,11 @@ hand-written SQL and direct `sqlx` dependencies.
     atomically claimed exactly once across concurrent poll requests (ADR-0012 Decision 7, #423;
     `consume_device_authorization`/`approve_device_authorization`/`deny_device_authorization` in
     `crates/lightbridge-authz-api-key/src/repo.rs`).
+  - `authorization_codes`: a short-lived opaque code must be claimed exactly once across
+    concurrent token redemptions with `UPDATE ... WHERE consumed_at IS NULL ... RETURNING`; the
+    code/client/redirect binding is an authentication boundary that generated CRUD cannot express
+    (ADR-0019, #425; `consume_authorization_code` in
+    `crates/lightbridge-authz-api-key/src/repo.rs`).
   - `lightbridge-authz-usage`: dynamic `QueryBuilder` aggregates against the Timescale-backed
     `usage_events` table (`query_usage` in `crates/lightbridge-authz-usage/src/repo.rs`).
 - This repo runs cratestack (`cratestack-pg`) `=0.8.0` (pinned exactly in the root `Cargo.toml`,
