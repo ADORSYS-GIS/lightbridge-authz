@@ -222,6 +222,10 @@ rcgen = { version = "0.14", features = ["pem"] }
 time = { version = "0.3", features = ["std"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "fs"] }
+# Already resolved transitively at 2.3.2 via axum itself; declared directly so
+# `static_assets.rs` can percent-decode the request path for its reserved-namespace comparison
+# without hand-rolling a `%XX` decoder.
+percent-encoding = "2.3"
 rsa = { version = "0.9", features = ["pem", "std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.13", features = ["json", "form"] }

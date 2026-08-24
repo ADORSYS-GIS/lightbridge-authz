@@ -155,6 +155,79 @@ async fn build_idp_router_omits_well_known_when_oauth2_is_external() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+/// Protocol namespaces belong to the authorization server even when a particular endpoint is not
+/// mounted. The hosted SPA must therefore not make a typo such as `/oauth2/future-grant` appear
+/// to be a successful browser page.
+#[tokio::test]
+async fn static_fallback_refuses_unknown_protocol_namespace_paths() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let static_dir =
+        std::env::temp_dir().join(format!("lightbridge-authz-idp-protocol-namespace-{nanos}"));
+    std::fs::create_dir_all(&static_dir).unwrap();
+    std::fs::write(static_dir.join("index.html"), b"hosted-login-placeholder").unwrap();
+
+    let pool = lazy_pool();
+    let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
+    let router = build_idp_router(&external_oauth2(), signing_repo, None, pool, &static_dir);
+
+    for path in [
+        "/.well-known/future-document",
+        "/oauth2/future-grant",
+        "/authorize",
+        "/authorize/future-handler",
+        "/userinfo",
+        "/device_authorization",
+        "/idp/callback",
+        // Percent-encoded `/`: `http::Uri::path()` never decodes it, so a naive raw-string
+        // `strip_prefix("/authorize")`/`starts_with(".../")` check sees a suffix that starts
+        // with `%2F`, not `/`, and lets the request fall through to the SPA fallback as if it
+        // were an unreserved path.
+        "/authorize%2Ffuture-handler",
+        "/oauth2%2Ftoken",
+        "/.well-known%2Fjwks.json",
+        // Mixed case: a byte-exact comparison against the lowercase reserved roots also lets
+        // these fall through to the SPA fallback.
+        "/OAuth2/token",
+        "/AUTHORIZE",
+    ] {
+        let response = router
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{path} must not fall through to index.html"
+        );
+    }
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/device/verify")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"hosted-login-placeholder"
+    );
+
+    std::fs::remove_dir_all(static_dir).unwrap();
+}
+
 struct UnreachableBearer;
 
 #[async_trait]

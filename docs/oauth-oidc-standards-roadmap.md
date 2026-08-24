@@ -115,11 +115,11 @@ contract.
   explicit origin allowlist (scheme, host, and port), then mount token CORS with exact allowed
   origins/methods/headers, preflight handling, and `Vary: Origin`; until then the endpoint emits no
   browser CORS permission.
-- **SPA fallback leaks into the protocol namespace:** the current catch-all static fallback can
-  answer an unknown `/oauth2/*`, `/.well-known/*`, or future protocol path with `index.html` and
-  `200`. Reserve protocol namespaces before the SPA fallback and return a normal `404` or the
-  applicable OAuth error. A missing protocol endpoint must never look like a successful browser
-  page.
+- **SPA fallback protocol-namespace leak — resolved:** unknown `/oauth2/*` and
+  `/.well-known/*` paths, plus allocated root protocol endpoints (`/authorize`, `/userinfo`,
+  `/device_authorization`, and `/idp/callback`), are reserved ahead of the SPA fallback and return
+  `404`; they can no longer return `index.html` with `200`. The browser-facing device verification
+  path remains available to hosted UI routing.
 
 ## Discovery and authorization-server metadata gaps
 

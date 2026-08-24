@@ -7,20 +7,20 @@
 //! or session/cookie issuance (#441, #443) all land as separate, later changes. Nothing in this
 //! module reads or writes a cookie, calls Keycloak, or knows what a session is.
 //!
-//! **Mount order is the whole safety property.** [`static_assets_fallback`] must be mounted via
-//! `.fallback_service(..)` on `build_idp_router`'s router, after every protocol route has already
-//! been merged in -- see that function's doc comment. `Router::fallback_service` is *always*
-//! axum's lowest-priority match regardless of call order (a request first tries the route table;
-//! the fallback only runs when nothing there matched), but the call is placed last anyway so the
-//! source reads the same way the ADR describes it.
+//! **Mount order and namespace reservation preserve protocol safety.**
+//! [`static_assets_fallback`] must be mounted via `.fallback_service(..)` on
+//! `build_idp_router`'s router after every protocol route has already been merged in. Axum tries
+//! the route table before the fallback, and this fallback independently refuses its reserved
+//! OAuth/OIDC namespaces so an unknown future protocol path cannot become a successful SPA page.
 
 use std::path::Path;
 
 use axum::Router;
 use axum::extract::Request;
-use axum::http::{HeaderValue, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
+use percent_encoding::percent_decode_str;
 use tower_http::services::{ServeDir, ServeFile};
 
 /// Vite's default production output directory for content-hashed JS/CSS
@@ -44,14 +44,28 @@ const NO_CACHE_CONTROL: &str = "no-cache";
 /// dev-mode HMR injection).
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; frame-ancestors 'none'";
 
+/// Root-level protocol endpoints already named by accepted ADRs or the current roadmap, plus the
+/// two discovery/token namespaces (`.well-known`, `oauth2`). Keep device verification out of this
+/// list: its `/device/verify` spelling remains hosted UI, not the machine-facing
+/// device-authorization endpoint. Matched case-insensitively against the percent-decoded request
+/// path -- see [`is_reserved_protocol_namespace`].
+const RESERVED_PROTOCOL_ROOTS: &[&str] = &[
+    "/authorize",
+    "/userinfo",
+    "/device_authorization",
+    "/idp/callback",
+    "/.well-known",
+    "/oauth2",
+];
+
 /// Builds the static-asset fallback service for `build_idp_router`.
 ///
 /// `static_dir` is the Vite build's `dist/` output (an `index.html` plus a content-hashed
 /// `assets/` directory). Serves a matching file when one exists; otherwise serves `index.html`
-/// with a `200` (client-side routing) -- **never a bare `404`**, which would otherwise let a
-/// client distinguish "unknown static path" from "protocol route that doesn't exist" by response
-/// shape. Every response -- asset, real `index.html`, or the SPA-fallback `index.html` -- carries
-/// Decision 10's cache headers and CSP.
+/// with a `200` for client-side routing. OAuth/OIDC protocol namespaces are reserved before that
+/// fallback, so an unknown endpoint can never appear to be a successful hosted page. Every static
+/// response -- asset, real `index.html`, or the SPA-fallback `index.html` -- carries Decision 10's
+/// cache headers and CSP.
 pub fn static_assets_fallback(static_dir: impl AsRef<Path>) -> Router {
     let static_dir = static_dir.as_ref();
     let index_html = static_dir.join("index.html");
@@ -67,6 +81,9 @@ pub fn static_assets_fallback(static_dir: impl AsRef<Path>) -> Router {
 /// `index.html`) has already been resolved -- this never changes *which* file is served, only the
 /// headers on the response.
 async fn apply_static_asset_headers(req: Request, next: Next) -> Response {
+    if is_reserved_protocol_namespace(req.uri().path()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let is_hashed_asset = req.uri().path().starts_with(HASHED_ASSET_PREFIX);
     let mut response = next.run(req).await;
 
@@ -85,4 +102,20 @@ async fn apply_static_asset_headers(req: Request, next: Next) -> Response {
     );
 
     response
+}
+
+/// Percent-decodes and lowercases `path` before comparing it against
+/// [`RESERVED_PROTOCOL_ROOTS`], so a disguised request (`/oauth2%2Ftoken`, `/OAuth2/token`)
+/// cannot slip past the raw, case-sensitive `http::Uri::path()` string and fall through to the
+/// SPA fallback as if it were an ordinary unrecognized path.
+fn is_reserved_protocol_namespace(path: &str) -> bool {
+    let decoded = percent_decode_str(path)
+        .decode_utf8_lossy()
+        .to_ascii_lowercase();
+    RESERVED_PROTOCOL_ROOTS.iter().any(|root| {
+        decoded == *root
+            || decoded
+                .strip_prefix(root)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
 }
