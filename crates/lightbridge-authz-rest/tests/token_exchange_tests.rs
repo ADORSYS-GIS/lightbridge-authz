@@ -159,6 +159,7 @@ fn exchange_cfg() -> Oauth2TokenExchange {
     Oauth2TokenExchange {
         enabled: true,
         access_ttl_seconds: 900,
+        authorization_code_ttl_seconds: 300,
         refresh_ttl_seconds: 2_592_000,
         allowed_scopes: vec![
             "openid".to_string(),
@@ -192,6 +193,8 @@ fn public_client(client_id: &str) -> OauthClient {
         grant_types: client_grant_types(),
         allowed_audiences: vec![client_id.to_string()],
         jwks: None,
+        redirect_uris: Vec::new(),
+        require_pkce: false,
     }
 }
 
@@ -228,6 +231,8 @@ fn confidential_client(client_id: &str) -> ConfidentialClientFixture {
         grant_types: client_grant_types(),
         allowed_audiences: vec![client_id.to_string()],
         jwks: Some(jwks),
+        redirect_uris: Vec::new(),
+        require_pkce: false,
     };
     ConfidentialClientFixture {
         client,

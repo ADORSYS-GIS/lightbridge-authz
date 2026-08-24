@@ -364,6 +364,7 @@ fn token_exchange_oauth2() -> Oauth2 {
     oauth2.token_exchange = Some(lightbridge_authz_core::config::Oauth2TokenExchange {
         enabled: true,
         access_ttl_seconds: 900,
+        authorization_code_ttl_seconds: 300,
         refresh_ttl_seconds: 2_592_000,
         allowed_scopes: vec!["openid".to_string(), "offline_access".to_string()],
         refresh_absolute_ttl_seconds: 7_776_000,
