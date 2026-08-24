@@ -28,6 +28,10 @@ pub struct SessionRow {
     pub last_used_at: Option<DateTime<Utc>>,
     pub expires_at: DateTime<Utc>,
     pub user_agent: Option<String>,
+    /// Raw authenticated IdP subject (Keycloak ID-token `sub`) for a `kind = "browser"` row --
+    /// `NULL` for `kind = "token"` rows and for any pre-migration browser row. See
+    /// `migrations/20260824000003_sessions_add_subject.sql` for the full rationale.
+    pub subject: Option<String>,
 }
 
 /// Everything `StoreRepo::create_session` needs to insert a new session row: `kind = "token"`
@@ -44,6 +48,11 @@ pub struct NewSession {
     pub client_id: Option<String>,
     pub kind: String,
     pub expires_at: DateTime<Utc>,
+    /// Raw authenticated IdP subject for a `kind = "browser"` row -- always `Some` for the
+    /// browser-SSO flow (`KeycloakRelyingParty::complete`'s `PendingFlow::Browser` arm), `None`
+    /// for `kind = "token"` rows, which mint the real subject directly into the issued token's
+    /// `Identity` instead (see `signing.rs::identity_for`) and have never needed to persist it.
+    pub subject: Option<String>,
 }
 
 /// The narrow slice of a `sessions` row introspection's fail-closed status check needs
@@ -58,4 +67,9 @@ pub struct SessionStatusRow {
 pub struct BrowserSessionContextRow {
     pub account_id: String,
     pub project_id: String,
+    /// The real authenticated IdP subject this browser session was minted for -- `None` only for
+    /// a session row created before `migrations/20260824000003_sessions_add_subject.sql`. Callers
+    /// must treat `None` as unusable and fail closed (see `authorize.rs`), never fall back to
+    /// `account_id` -- that fallback is exactly the identity-substitution bug this column fixes.
+    pub subject: Option<String>,
 }

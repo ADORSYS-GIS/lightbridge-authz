@@ -449,6 +449,7 @@ impl TokenExchangeOpStore {
                 client_id: Some(client_id.to_string()),
                 kind: "token".to_string(),
                 expires_at: session_expires_at,
+                subject: None,
             })
             .await
             .map_err(|_| oauth_err("server_error", "session persistence failed"))?;
@@ -863,6 +864,7 @@ impl TokenExchangeOpStore {
                 client_id: Some(client_id.clone()),
                 kind: "token".to_string(),
                 expires_at: session_expires_at,
+                subject: None,
             })
             .await
         {

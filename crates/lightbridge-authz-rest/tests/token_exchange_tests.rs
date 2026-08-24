@@ -998,6 +998,7 @@ async fn active_browser_session_authorizes_without_keycloak(pool: PgPool) {
         client_id: None,
         kind: "browser".to_string(),
         expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        subject: Some(SUBJECT.to_string()),
     })
     .await
     .unwrap();
@@ -1037,6 +1038,303 @@ async fn active_browser_session_authorizes_without_keycloak(pool: PgPool) {
         Some("client-state")
     );
     assert!(response.headers().get(header::SET_COOKIE).is_none());
+}
+
+/// Code-review follow-up to #463/#466/#467 (Finding B): the eventual access token's `sub` claim
+/// must be the REAL authenticated subject (`sessions.subject`), never `session.account_id`.
+/// `resolve_context` (`crates/lightbridge-authz-api-key/src/repo.rs`) always resolves
+/// `account_id` to the project's OWNING account -- here, `OWNER_ACCOUNT` -- even though `SUBJECT`
+/// only holds a `project_members` roster row, not ownership (`seed_member_project`). Proof this
+/// test catches the regression: reverting `issue_code` in `authorize.rs` to mint
+/// `external_id: account_id` (the pre-fix code, before the `subject` parameter was threaded
+/// through) makes `claims.sub` come back `OWNER_ACCOUNT` instead of `SUBJECT`, failing this
+/// test's first assertion.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorize_with_existing_session_mints_the_real_subject_not_the_owner_account(
+    pool: PgPool,
+) {
+    const CLIENT: &str = "browser-client";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+    const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed_member_project(&repo).await;
+    let session_id = cuid2();
+    repo.create_session(NewSession {
+        id: session_id.clone(),
+        account_id: OWNER_ACCOUNT.to_string(),
+        project_id: MEMBER_PROJECT_ID.to_string(),
+        client_id: None,
+        kind: "browser".to_string(),
+        expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        subject: Some(SUBJECT.to_string()),
+    })
+    .await
+    .unwrap();
+    let clients = vec![browser_client(CLIENT, REDIRECT_URI)];
+    let router = authorize_router(AuthorizeState::new(
+        relying_party(repo.clone()),
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            clients.clone(),
+            &redis_url(),
+        ),
+    ));
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/authorize?client_id={CLIENT}&redirect_uri={REDIRECT_URI}&response_type=code&scope=openid&state=client-state&code_challenge={}&code_challenge_method=S256",
+                    s256_challenge(VERIFIER)
+                ))
+                .header(header::COOKIE, format!("__Host-authz_session={session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location =
+        reqwest::Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let code = location
+        .query_pairs()
+        .find_map(|(k, v)| (k == "code").then(|| v.into_owned()))
+        .expect("authorize issues a code for the active session");
+
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            clients,
+            &redis_url(),
+        ),
+        &format!(
+            "grant_type=authorization_code&client_id={CLIENT}&code={code}&redirect_uri={REDIRECT_URI}&code_verifier={VERIFIER}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    // The `authorization_code` grant mints via `TokenManager::issue_user_token` with no `extra`
+    // claims (authkestra-op's `handle_authorization_code`), so `account_id`/`project_id` live
+    // under the nested `identity.attributes` object `issue_code` populated -- not top-level
+    // claims the typed `AccessClaims` struct expects (that struct's `api_key_id` is only ever
+    // set by the token-exchange/device/refresh grants' own `access_token_extra` call, so decoding
+    // an authorization_code-grant token through it fails on that missing field).
+    let claims =
+        decode_access_token_claims(&repo, body["access_token"].as_str().unwrap(), CLIENT).await;
+    assert_eq!(
+        claims["sub"], SUBJECT,
+        "sub must be the real authenticated member, not the project owner: {claims}"
+    );
+    assert_eq!(
+        claims["identity"]["attributes"]["account_id"], OWNER_ACCOUNT,
+        "account_id claim still correctly resolves to the owning account: {claims}"
+    );
+    assert_eq!(
+        claims["identity"]["attributes"]["project_id"],
+        MEMBER_PROJECT_ID
+    );
+}
+
+/// Code-review follow-up to #463/#466/#467 (Finding E, positive path): when a request's
+/// `project_id` differs from the project an existing browser session is pinned to, `/authorize`
+/// must NOT silently issue a code scoped to the session's own project -- it must re-resolve
+/// authorization for the REQUESTED project and issue for that instead. Proof this test catches
+/// the regression: reverting `authorize.rs` to always call
+/// `issue_code(&state, request, subject, session.account_id, session.project_id)` regardless of
+/// the request's `project_id` (the pre-fix behavior) makes the decoded access token's
+/// `project_id` come back `PROJECT_ID` instead of `SECOND_PROJECT_ID`, failing this test's
+/// assertion.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorize_reresolves_context_when_request_project_differs_from_session(pool: PgPool) {
+    const CLIENT: &str = "browser-client";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+    const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
+    const SECOND_PROJECT_ID: &str = "proj_second";
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+    repo.create_project(
+        SUBJECT,
+        ACCOUNT_ID,
+        CreateProject {
+            name: "second project".to_string(),
+            allowed_models: None,
+            default_limits: None,
+            billing_plan: "free".to_string(),
+            billing_identity: format!("bill-{}", cuid2()),
+            project_quota: None,
+        },
+        SECOND_PROJECT_ID.to_string(),
+    )
+    .await
+    .expect("seed second project owned by the same subject");
+
+    let session_id = cuid2();
+    repo.create_session(NewSession {
+        id: session_id.clone(),
+        account_id: ACCOUNT_ID.to_string(),
+        project_id: PROJECT_ID.to_string(),
+        client_id: None,
+        kind: "browser".to_string(),
+        expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        subject: Some(SUBJECT.to_string()),
+    })
+    .await
+    .unwrap();
+
+    let clients = vec![browser_client(CLIENT, REDIRECT_URI)];
+    let router = authorize_router(AuthorizeState::new(
+        relying_party(repo.clone()),
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            clients.clone(),
+            &redis_url(),
+        ),
+    ));
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/authorize?client_id={CLIENT}&redirect_uri={REDIRECT_URI}&response_type=code&scope=openid&state=client-state&code_challenge={}&code_challenge_method=S256&project_id={SECOND_PROJECT_ID}",
+                    s256_challenge(VERIFIER)
+                ))
+                .header(header::COOKIE, format!("__Host-authz_session={session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location =
+        reqwest::Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let code = location
+        .query_pairs()
+        .find_map(|(k, v)| (k == "code").then(|| v.into_owned()))
+        .expect("a code for the requested (second) project, not silently the session's own");
+
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            clients,
+            &redis_url(),
+        ),
+        &format!(
+            "grant_type=authorization_code&client_id={CLIENT}&code={code}&redirect_uri={REDIRECT_URI}&code_verifier={VERIFIER}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    // See the sibling Finding-B test's comment: `authorization_code`-grant tokens carry
+    // `account_id`/`project_id` under nested `identity.attributes`, not as top-level claims.
+    let claims =
+        decode_access_token_claims(&repo, body["access_token"].as_str().unwrap(), CLIENT).await;
+    assert_eq!(
+        claims["identity"]["attributes"]["project_id"], SECOND_PROJECT_ID,
+        "requesting a different project than the session's must not silently issue for the \
+         session's own project: {claims}"
+    );
+}
+
+/// Code-review follow-up to #463/#466/#467 (Finding E, negative path): a request naming a
+/// `project_id` the session's subject is NOT authorized for must be refused outright, not fall
+/// back to issuing a code for the session's own project. Proof this test catches the regression:
+/// reverting `authorize.rs` to ignore `project_id` once a session exists (the pre-fix behavior)
+/// would make this request instead succeed with a `code` scoped to `PROJECT_ID`, failing the
+/// `!params.contains_key("code")` assertion below.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorize_refuses_when_requested_project_is_not_authorized_for_the_session_subject(
+    pool: PgPool,
+) {
+    const CLIENT: &str = "browser-client";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+    const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
+    const UNRELATED_ACCOUNT: &str = "unrelated-account-e";
+    const UNRELATED_PROJECT: &str = "unrelated-project-e";
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+    repo.create_account(
+        UNRELATED_ACCOUNT,
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .unwrap();
+    repo.create_project(
+        UNRELATED_ACCOUNT,
+        UNRELATED_ACCOUNT,
+        CreateProject {
+            name: "unrelated project".to_string(),
+            allowed_models: None,
+            default_limits: None,
+            billing_plan: "free".to_string(),
+            billing_identity: format!("bill-{}", cuid2()),
+            project_quota: None,
+        },
+        UNRELATED_PROJECT.to_string(),
+    )
+    .await
+    .unwrap();
+
+    let session_id = cuid2();
+    repo.create_session(NewSession {
+        id: session_id.clone(),
+        account_id: ACCOUNT_ID.to_string(),
+        project_id: PROJECT_ID.to_string(),
+        client_id: None,
+        kind: "browser".to_string(),
+        expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        subject: Some(SUBJECT.to_string()),
+    })
+    .await
+    .unwrap();
+
+    let router = authorize_router(AuthorizeState::new(
+        relying_party(repo.clone()),
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            vec![browser_client(CLIENT, REDIRECT_URI)],
+            &redis_url(),
+        ),
+    ));
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/authorize?client_id={CLIENT}&redirect_uri={REDIRECT_URI}&response_type=code&scope=openid&state=client-state&code_challenge={}&code_challenge_method=S256&project_id={UNRELATED_PROJECT}",
+                    s256_challenge(VERIFIER)
+                ))
+                .header(header::COOKIE, format!("__Host-authz_session={session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location =
+        reqwest::Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    assert_eq!(
+        location.origin().ascii_serialization(),
+        "https://dashboard.example.test"
+    );
+    let params: HashMap<_, _> = location.query_pairs().into_owned().collect();
+    assert_eq!(
+        params.get("error").map(String::as_str),
+        Some("access_denied")
+    );
+    assert!(
+        !params.contains_key("code"),
+        "must never silently issue a code for a project the subject isn't authorized for"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

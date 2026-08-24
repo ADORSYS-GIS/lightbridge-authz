@@ -985,9 +985,9 @@ impl StoreRepo {
         let row: SessionRow = sqlx::query_as(
             r#"
             INSERT INTO sessions
-              (id, account_id, project_id, client_id, kind, status, expires_at)
-            VALUES ($1, $2, $3, $4, $5, 'active', $6)
-            RETURNING id, account_id, project_id, client_id, kind, status, created_at, updated_at, last_used_at, expires_at, user_agent
+              (id, account_id, project_id, client_id, kind, status, expires_at, subject)
+            VALUES ($1, $2, $3, $4, $5, 'active', $6, $7)
+            RETURNING id, account_id, project_id, client_id, kind, status, created_at, updated_at, last_used_at, expires_at, user_agent, subject
             "#,
         )
         .bind(input.id)
@@ -996,6 +996,7 @@ impl StoreRepo {
         .bind(input.client_id)
         .bind(input.kind)
         .bind(input.expires_at)
+        .bind(input.subject)
         .fetch_one(self.pool())
         .await?;
         Ok(row)
@@ -1028,7 +1029,7 @@ impl StoreRepo {
     ) -> Result<Option<BrowserSessionContextRow>> {
         let row = sqlx::query_as(
             r#"
-            SELECT account_id, project_id
+            SELECT account_id, project_id, subject
             FROM sessions
             WHERE id = $1
               AND kind = 'browser'
