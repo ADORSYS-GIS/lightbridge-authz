@@ -183,6 +183,17 @@ async fn static_fallback_refuses_unknown_protocol_namespace_paths() {
         "/userinfo",
         "/device_authorization",
         "/idp/callback",
+        // Percent-encoded `/`: `http::Uri::path()` never decodes it, so a naive raw-string
+        // `strip_prefix("/authorize")`/`starts_with(".../")` check sees a suffix that starts
+        // with `%2F`, not `/`, and lets the request fall through to the SPA fallback as if it
+        // were an unreserved path.
+        "/authorize%2Ffuture-handler",
+        "/oauth2%2Ftoken",
+        "/.well-known%2Fjwks.json",
+        // Mixed case: a byte-exact comparison against the lowercase reserved roots also lets
+        // these fall through to the SPA fallback.
+        "/OAuth2/token",
+        "/AUTHORIZE",
     ] {
         let response = router
             .clone()

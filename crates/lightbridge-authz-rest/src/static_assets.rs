@@ -20,6 +20,7 @@ use axum::extract::Request;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use percent_encoding::percent_decode_str;
 use tower_http::services::{ServeDir, ServeFile};
 
 /// Vite's default production output directory for content-hashed JS/CSS
@@ -43,14 +44,18 @@ const NO_CACHE_CONTROL: &str = "no-cache";
 /// dev-mode HMR injection).
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; frame-ancestors 'none'";
 
-/// Root-level protocol endpoints already named by accepted ADRs or the current roadmap. Keep
-/// device verification out of this list: its `/device/verify` spelling remains hosted UI, not the
-/// machine-facing device-authorization endpoint.
+/// Root-level protocol endpoints already named by accepted ADRs or the current roadmap, plus the
+/// two discovery/token namespaces (`.well-known`, `oauth2`). Keep device verification out of this
+/// list: its `/device/verify` spelling remains hosted UI, not the machine-facing
+/// device-authorization endpoint. Matched case-insensitively against the percent-decoded request
+/// path -- see [`is_reserved_protocol_namespace`].
 const RESERVED_PROTOCOL_ROOTS: &[&str] = &[
     "/authorize",
     "/userinfo",
     "/device_authorization",
     "/idp/callback",
+    "/.well-known",
+    "/oauth2",
 ];
 
 /// Builds the static-asset fallback service for `build_idp_router`.
@@ -99,14 +104,18 @@ async fn apply_static_asset_headers(req: Request, next: Next) -> Response {
     response
 }
 
+/// Percent-decodes and lowercases `path` before comparing it against
+/// [`RESERVED_PROTOCOL_ROOTS`], so a disguised request (`/oauth2%2Ftoken`, `/OAuth2/token`)
+/// cannot slip past the raw, case-sensitive `http::Uri::path()` string and fall through to the
+/// SPA fallback as if it were an ordinary unrecognized path.
 fn is_reserved_protocol_namespace(path: &str) -> bool {
-    matches!(path, "/.well-known" | "/oauth2")
-        || path.starts_with("/.well-known/")
-        || path.starts_with("/oauth2/")
-        || RESERVED_PROTOCOL_ROOTS.iter().any(|root| {
-            path == *root
-                || path
-                    .strip_prefix(root)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-        })
+    let decoded = percent_decode_str(path)
+        .decode_utf8_lossy()
+        .to_ascii_lowercase();
+    RESERVED_PROTOCOL_ROOTS.iter().any(|root| {
+        decoded == *root
+            || decoded
+                .strip_prefix(root)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
 }
