@@ -2303,6 +2303,74 @@ async fn exchange_for_non_member_project_is_denied(pool: PgPool) {
     assert_eq!(body["error"], "access_denied");
 }
 
+/// Code-review follow-up to #472 (drive-by finding, now folded into that same PR): unlike
+/// `issue_device_tokens` and `handle_refresh_token`, `handle_token_exchange` had NO
+/// account/project Active-status check at all -- `resolve_context` alone only checks
+/// ownership/membership, not status. This matters more than a symmetric gap: per this repo's
+/// docs, `TokenExchangeOpStore` is "the actual token-issuing authority for `authz-idp`'s `POST
+/// /oauth2/token`" -- i.e. the RFC 8693 exchange is the PRIMARY human-plane token grant. Proof
+/// this test catches the regression: reverting `handle_token_exchange`'s new
+/// `require_active_project_and_account` call (and the `Err` branch that follows it) back out
+/// makes this request return `200 OK` with a live access token instead of `403 access_denied`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn exchange_after_project_suspended_is_access_denied(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    repo.set_project_status(SUBJECT, PROJECT_ID, ResourceStatus::Suspended)
+        .await
+        .expect("owner suspends the project");
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a suspended project must not be able to obtain a fresh access token via token exchange: {body}"
+    );
+    assert_eq!(body["error"], "access_denied");
+    assert!(body.get("access_token").is_none());
+}
+
+/// Code-review follow-up to #472, account half of the same gap -- see
+/// `exchange_after_project_suspended_is_access_denied`'s doc comment for the full rationale.
+/// Proof this test catches the regression: same mechanism, reverting the same check makes this
+/// request return `200 OK` with a live access token for a SUSPENDED account instead of `403
+/// access_denied`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn exchange_after_account_suspended_is_access_denied(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    repo.set_account_status(SUBJECT, ACCOUNT_ID, ResourceStatus::Suspended)
+        .await
+        .expect("owner suspends the account");
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a suspended account must not be able to obtain a fresh access token via token exchange: {body}"
+    );
+    assert_eq!(body["error"], "access_denied");
+    assert!(body.get("access_token").is_none());
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn exchange_with_inactive_subject_token_is_invalid_request(pool: PgPool) {
     let repo = repo(pool);

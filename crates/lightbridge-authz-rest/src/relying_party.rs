@@ -28,7 +28,6 @@ use lightbridge_authz_api_key::entities::session_row::NewSession;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::config::OidcRelyingParty;
 use lightbridge_authz_core::cuid::cuid2;
-use lightbridge_authz_core::dto::ResourceStatus;
 use lightbridge_authz_core::error::{Error, Result};
 
 use crate::oauth2_op::device_store::{DbDeviceCodeStore, get_by_user_code_rate_limited};
@@ -233,41 +232,19 @@ impl KeycloakRelyingParty {
         self.repo.find_active_browser_session(session_id, now).await
     }
 
-    /// Resolves `{account_id, project_id}` for `subject` + `project_id`
-    /// (`StoreRepo::resolve_context`), gated by the Active-status check that function itself does
-    /// not apply (it only checks ownership/membership). Used by `authorize.rs` when a request's
-    /// `project_id` differs from an already-established browser session's own project -- see that
-    /// call site's doc comment for why silently issuing for the session's project instead would be
-    /// wrong.
+    /// Resolves `{account_id, project_id}` for `subject` + `project_id`, gated by the
+    /// Active-status check `StoreRepo::resolve_context` itself deliberately does not apply (see
+    /// `StoreRepo::resolve_active_context`'s doc comment -- the single shared implementation every
+    /// grant/session path in this codebase now routes through). Used by `authorize.rs` when a
+    /// request's `project_id` differs from an already-established browser session's own project --
+    /// see that call site's doc comment for why silently issuing for the session's project instead
+    /// would be wrong.
     pub async fn resolve_authorized_context(
         &self,
         subject: &str,
         project_id: &str,
     ) -> Result<lightbridge_authz_core::dto::ResolvedContext> {
-        self.resolve_active_context(subject, project_id).await
-    }
-
-    /// Fail-closed status gate (mirrors `issue_device_tokens` in `oauth2_op::store`):
-    /// `resolve_context` only checks ownership/membership, never `status` -- without this, a
-    /// suspended account or an inactive project would still resolve to a usable context. A
-    /// lookup ERROR must refuse too, never fall through to permit.
-    async fn resolve_active_context(
-        &self,
-        subject: &str,
-        project_id: &str,
-    ) -> Result<lightbridge_authz_core::dto::ResolvedContext> {
-        let context = self.repo.resolve_context(subject, project_id).await?;
-        match self.repo.get_project_by_id(&context.project_id).await {
-            Ok(Some(project)) if project.status == ResourceStatus::Active => {}
-            Ok(_) => return Err(Error::Forbidden("project is not active".to_string())),
-            Err(_) => return Err(Error::Server("project lookup failed".to_string())),
-        }
-        match self.repo.get_account_by_id(&context.account_id).await {
-            Ok(Some(account)) if account.status == ResourceStatus::Active => {}
-            Ok(_) => return Err(Error::Forbidden("account is suspended".to_string())),
-            Err(_) => return Err(Error::Server("account lookup failed".to_string())),
-        }
-        Ok(context)
+        self.repo.resolve_active_context(subject, project_id).await
     }
 
     async fn begin(&self, flow: PendingFlow) -> Result<(String, Cookie<'static>)> {
@@ -387,6 +364,7 @@ impl KeycloakRelyingParty {
                         .ok_or(Error::NotFound)?,
                 };
                 let context = self
+                    .repo
                     .resolve_active_context(&claims.sub, &project_id)
                     .await?;
                 let session = self
