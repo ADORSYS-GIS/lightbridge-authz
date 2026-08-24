@@ -1,5 +1,6 @@
 use lightbridge_authz_core::config::Database;
 use lightbridge_authz_core::db::DbPool;
+use std::time::Duration;
 
 fn unreachable_database(pool_size: u32) -> Database {
     Database {
@@ -8,11 +9,25 @@ fn unreachable_database(pool_size: u32) -> Database {
     }
 }
 
-#[tokio::test(start_paused = true)]
+// Bounded retry + acquire timeout so the failure path completes fast instead of
+// paying the production backoff (30 attempts, up to 5s each) and the 30s
+// `acquire_timeout` against an unreachable host.
+async fn new_failing(database: &Database) -> lightbridge_authz_core::Result<DbPool> {
+    DbPool::new_with_retry(
+        database,
+        2,
+        Duration::from_millis(1),
+        Duration::from_millis(1),
+        Duration::from_millis(100),
+    )
+    .await
+}
+
+#[tokio::test]
 async fn new_returns_error_after_exhausting_retries_against_unreachable_database() {
     let database = unreachable_database(3);
 
-    let result = DbPool::new(&database).await;
+    let result = new_failing(&database).await;
 
     assert!(
         result.is_err(),
@@ -20,14 +35,14 @@ async fn new_returns_error_after_exhausting_retries_against_unreachable_database
     );
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn new_defaults_pool_size_when_unset() {
     let database = Database {
         url: "postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz".to_string(),
         pool_size: None,
     };
 
-    let result = DbPool::new(&database).await;
+    let result = new_failing(&database).await;
 
     assert!(result.is_err());
 }
