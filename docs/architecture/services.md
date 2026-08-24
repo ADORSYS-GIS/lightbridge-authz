@@ -111,6 +111,11 @@ through `authz-api`. That ingress has since been repointed directly at `authz-id
 `auth.ai.camer.digital` is now load-bearing on its own, no same-surface fallback on `authz-api`.
 
 Router assembly: `build_idp_router`/`start_idp_server` in `crates/lightbridge-authz-rest/src/lib.rs`.
+The implemented surface below is intentionally narrower than the accepted ADR-0019/ADR-0021
+browser roadmap: `/authorize`, Authorization Code + PKCE, Keycloak browser-session brokering, and
+the device endpoints are not mounted yet. See
+[`docs/oauth-oidc-standards-roadmap.md`](../oauth-oidc-standards-roadmap.md) for the canonical
+implementation status and conformance sequence.
 
 | Route | Method | Protection | Notes |
 | --- | --- | --- | --- |

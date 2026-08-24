@@ -13,16 +13,13 @@ deliberately does not restate them:
   endpoint inventory, field-by-field lookup.
 - [`docs/token-exchange-integration.md`](../token-exchange-integration.md) — "how do I integrate
   against `/oauth2/token`", worked requests, Keycloak client setup.
+- [`docs/oauth-oidc-standards-roadmap.md`](../oauth-oidc-standards-roadmap.md) — the current
+  `authz-idp` OAuth/OIDC implementation inventory and what remains before browser
+  Authorization Code + PKCE or device authorization is available.
 
-Verified against `origin/main` commit `95327d6` (2026-08-15), the day the refresh-hardening
-(#316) and revocation-surface (#318) PRs both merged. Both are reflected below. **One real gap
-found while writing this:** #318 updated `docs/token-exchange-integration.md`'s "Revocation"
-section for the new `/oauth2/revoke` endpoint, and that section is accurate as of this commit —
-but #316 touched no doc at all. Neither `docs/token-exchange-integration.md`'s "Refresh" section
-nor `docs/auth-reference.md` mentions `chain_id`, `chain_expires_at`, the 90-day absolute cap, the
-re-validation step, or the reuse cascade anywhere (`grep -rn chain_id docs/` turns up nothing
-outside this file). §3–§4 below are, as of this commit, the only documentation of that hardening
-that exists anywhere in this repo.
+The native exchange/revocation routes below are served by **`authz-idp`**, not `authz-api`.
+They are a narrow RFC 8693/refresh/RFC 7009 surface, not a browser authorization-code or device
+server. For the current standards gap and delivery order, use the roadmap above.
 
 ## 1. API key validation — the gateway path
 
@@ -156,7 +153,7 @@ rejected. A subject with zero projects yet resolves identically to an unknown/no
 sequenceDiagram
     autonumber
     actor Client
-    participant API as authz-api (/oauth2/token)
+    participant API as authz-idp (/oauth2/token)
     participant Bearer as lightbridge-authz-bearer
     participant Store as TokenExchangeOpStore
     participant DB as Postgres
@@ -236,7 +233,7 @@ operator's explicit revoke action (§5), not by anything this check does.
 sequenceDiagram
     autonumber
     actor Client
-    participant API as authz-api (/oauth2/token)
+    participant API as authz-idp (/oauth2/token)
     participant Store as TokenExchangeOpStore
     participant DB as Postgres
 
@@ -298,7 +295,7 @@ sequenceDiagram
     autonumber
     actor Legit as Legitimate client
     actor Attacker
-    participant API as authz-api (/oauth2/token)
+    participant API as authz-idp (/oauth2/token)
     participant DB as Postgres
 
     Note over Legit,Attacker: Attacker holds a stolen copy of refresh token A (chain_id = X)
@@ -356,7 +353,7 @@ even looked up.
 sequenceDiagram
     autonumber
     actor Client
-    participant API as authz-api (/oauth2/revoke)
+    participant API as authz-idp (/oauth2/revoke)
     participant DB as Postgres
 
     Client->>API: POST /oauth2/revoke token=<refresh_token>, client_id[, client_assertion]

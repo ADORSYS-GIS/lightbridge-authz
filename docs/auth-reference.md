@@ -6,9 +6,14 @@ or a permission string and get a `file:line` citation, not prose. This does **no
 `docs/rbac.md` (the RBAC model in full) or the ADRs (the *why*) — it points at them instead of
 restating them.
 
-Verified against commit `9f095e0` on `origin/main` (2026-08-15). Every row below was checked
-against the code at that commit; anything that could not be confirmed by reading source or a
-passing test was left out rather than guessed.
+For the canonical OAuth/OIDC implementation inventory, standards gaps, and Authorization Code +
+PKCE/device-flow roadmap, see
+[`docs/oauth-oidc-standards-roadmap.md`](oauth-oidc-standards-roadmap.md). In particular, accepted
+ADR-0019/ADR-0021 design work is not evidence that `/authorize` or device endpoints are mounted.
+
+The OAuth/OIDC rows and endpoint inventory were reconciled against the current repository on
+2026-08-24. Other entries retain their source citations; when behavior changes, prefer the linked
+implementation and the canonical roadmap over an old verification date.
 
 ## 1. Config keys → effect
 
@@ -371,3 +376,5 @@ use `/v1/authorino/validate/introspect`. All three should be updated to match th
   `authkestra_engine::TokenManager` instead of hand-rolled `jsonwebtoken::encode`.
 - `docs/adr/0003-cratestack-crud-migration.md` — why the CRUD surface is `/rpc/*`, not REST.
 - `docs/authorino-usage.md` — the Authorino `AuthConfig` wiring for `/v1/authorino/validate/introspect`.
+- `docs/oauth-oidc-standards-roadmap.md` — current OAuth/OIDC implementation status and standards
+  conformance roadmap.
