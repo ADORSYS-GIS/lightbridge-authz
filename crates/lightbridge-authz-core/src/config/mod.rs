@@ -582,11 +582,11 @@ pub struct IdpServer {
     pub tls: Tls,
     /// ADR-0021 Decisions 1 + 10 (#442): filesystem path to the hosted login page's Vite
     /// production build (`web/hosted-login/dist` — an `index.html` plus a content-hashed
-    /// `assets/` directory), mounted as `build_idp_router`'s lowest-priority fallback. This
-    /// server always mounts the fallback unconditionally (AGENTS.md's "no dormant flags"
-    /// convention) -- an operator who has not built the frontend yet gets a working server whose
-    /// static fallback 404s until the assets exist, not a server with the feature silently
-    /// switched off.
+    /// `assets/` directory built with Vite `base: "/ui/"`), mounted under `build_idp_router`'s
+    /// `/ui` path prefix (`.nest_service("/ui", ..)`), never at the router root. This server
+    /// always mounts it unconditionally (AGENTS.md's "no dormant flags" convention) -- an
+    /// operator who has not built the frontend yet gets a working server whose `/ui/*` paths
+    /// 404 until the assets exist, not a server with the feature silently switched off.
     ///
     /// Defaults to [`default_idp_static_dir`] (`/app/static`) when the key is omitted from
     /// config -- **not optional in behavior, but optional in config**. This distinction is

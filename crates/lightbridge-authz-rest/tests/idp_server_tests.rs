@@ -43,10 +43,13 @@ fn lazy_pool() -> Arc<dyn DbPoolTrait> {
     Arc::new(DbPool::from_pool(pool))
 }
 
-/// A nonexistent directory is fine here: none of the tests in this file exercise the static
-/// fallback's actual file-serving behavior (that's `static_assets_tests.rs`'s job) -- they only
-/// assert that existing protocol routes still resolve with the fallback mounted, per ADR-0021's
-/// mount-order requirement (#442).
+/// A nonexistent directory is fine here: the tests that use this constant don't exercise the
+/// static build's actual file-serving behavior (that's `static_assets_tests.rs`'s job for the
+/// service in isolation, and this file's own `ui_static_dir`-based tests below for it mounted at
+/// `/ui`) -- they only assert that existing protocol routes still resolve correctly with the
+/// `/ui`-scoped static mount present, per ADR-0021's path-scoping property (#442): protocol
+/// routes and `/ui` occupy disjoint path spaces, so a real static build vs. this nonexistent one
+/// makes no difference to whether `.well-known/*`/`/oauth2/*`/the probe router still work.
 const TEST_STATIC_DIR: &str = "/nonexistent/idp-server-tests/static";
 
 fn bad_tls() -> Tls {
@@ -164,69 +167,117 @@ async fn build_idp_router_omits_well_known_when_oauth2_is_external() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
-/// Protocol namespaces belong to the authorization server even when a particular endpoint is not
-/// mounted. The hosted SPA must therefore not make a typo such as `/oauth2/future-grant` appear
-/// to be a successful browser page.
-#[tokio::test]
-async fn static_fallback_refuses_unknown_protocol_namespace_paths() {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+/// A real temp directory for the `/ui`-mounting tests below, mirroring
+/// `static_assets_tests.rs::build_dir` -- `ServeDir`/`ServeFile` do real filesystem I/O, so the
+/// behavior worth proving (which file gets served under `/ui`, and that nothing outside `/ui` is
+/// reachable at all) only means something against actual files on disk. Unique per call
+/// (nanosecond suffix) so parallel `#[tokio::test]` functions never collide.
+fn ui_static_dir(name: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let static_dir =
-        std::env::temp_dir().join(format!("lightbridge-authz-idp-protocol-namespace-{nanos}"));
-    std::fs::create_dir_all(&static_dir).unwrap();
-    std::fs::write(static_dir.join("index.html"), b"hosted-login-placeholder").unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "lightbridge-authz-idp-ui-mount-test-{name}-{nanos}"
+    ));
+    std::fs::create_dir_all(dir.join("assets")).unwrap();
+    std::fs::write(
+        dir.join("index.html"),
+        b"<!doctype html><title>hosted-login placeholder</title>",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("assets/index-deadbeef.js"),
+        b"console.log('placeholder');",
+    )
+    .unwrap();
+    dir
+}
 
+/// Builds a minimal offline `authz-idp` router for the `/ui`-mounting tests: `external_oauth2()`
+/// mounts neither `well_known_router` nor `token_exchange_router` (see
+/// `build_idp_router_omits_well_known_when_oauth2_is_external` above), which keeps these tests
+/// focused on exactly the thing they exist to prove -- where `static_dir` is reachable from --
+/// without needing a bootstrapped signing key or a real database.
+fn ui_mount_router(static_dir: &std::path::Path) -> axum::Router {
     let pool = lazy_pool();
     let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
-    let router = build_idp_router(
+    build_idp_router(
         &external_oauth2(),
         signing_repo,
         None,
         pool,
-        &static_dir,
+        static_dir,
         None,
-    );
+    )
+}
 
-    for path in [
-        "/.well-known/future-document",
-        "/oauth2/future-grant",
-        "/authorize",
-        "/authorize/future-handler",
-        "/userinfo",
-        "/device_authorization",
-        "/idp/callback",
-        // Percent-encoded `/`: `http::Uri::path()` never decodes it, so a naive raw-string
-        // `strip_prefix("/authorize")`/`starts_with(".../")` check sees a suffix that starts
-        // with `%2F`, not `/`, and lets the request fall through to the SPA fallback as if it
-        // were an unreserved path.
-        "/authorize%2Ffuture-handler",
-        "/oauth2%2Ftoken",
-        "/.well-known%2Fjwks.json",
-        // Mixed case: a byte-exact comparison against the lowercase reserved roots also lets
-        // these fall through to the SPA fallback.
-        "/OAuth2/token",
-        "/AUTHORIZE",
-    ] {
+/// ADR-0021 Decision 10's follow-up (#442): the hosted login build is mounted at `/ui`, not the
+/// router root, specifically so bare `GET /ui` (no trailing slash) is never a `404` -- the exact
+/// wrinkle the owner called out ("I hate the /index.html -> 200 but / is api only"). Both the
+/// bare and trailing-slash forms must resolve to the same `index.html`.
+#[tokio::test]
+async fn ui_bare_and_trailing_slash_both_serve_index_html() {
+    let dir = ui_static_dir("bare-and-slash");
+    let router = ui_mount_router(&dir);
+
+    for path in ["/ui", "/ui/"] {
         let response = router
             .clone()
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "GET {path}");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(
-            response.status(),
-            StatusCode::NOT_FOUND,
-            "{path} must not fall through to index.html"
+            &body[..],
+            b"<!doctype html><title>hosted-login placeholder</title>",
+            "GET {path} must serve index.html"
         );
     }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Client-side routing under `/ui`: any path under the prefix that isn't a real static file must
+/// still resolve to `index.html` with a `200`, exactly like the pre-`/ui` fallback behavior did,
+/// just scoped to the prefix now.
+#[tokio::test]
+async fn ui_unknown_spa_route_falls_back_to_index_html() {
+    let dir = ui_static_dir("spa-route");
+    let router = ui_mount_router(&dir);
 
     let response = router
         .oneshot(
             Request::builder()
-                .uri("/device/verify")
+                .uri("/ui/some/spa/route")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        &body[..],
+        b"<!doctype html><title>hosted-login placeholder</title>"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A real hashed asset must still be served, with Decision 10's immutable cache header, once
+/// nested under `/ui` -- proves `nest_service` strips the `/ui` prefix correctly before the
+/// request reaches `static_assets_fallback`'s own `/assets/` prefix check.
+#[tokio::test]
+async fn ui_serves_hashed_asset_with_immutable_cache_control() {
+    let dir = ui_static_dir("asset");
+    let router = ui_mount_router(&dir);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/ui/assets/index-deadbeef.js")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -234,14 +285,84 @@ async fn static_fallback_refuses_unknown_protocol_namespace_paths() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .as_ref(),
-        b"hosted-login-placeholder"
+        response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"console.log('placeholder');");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The acceptance-criteria case this whole change exists for: `GET /` must keep returning
+/// `authz-idp`'s own API-welcome-JSON `root_handler` response, never the SPA -- even with a real,
+/// fully-populated static build mounted at `/ui`. Asserts real JSON content, not just status, so
+/// a regression that accidentally routed `/` through the static fallback (getting `index.html`'s
+/// HTML back with a `200`, same status code) would still be caught.
+///
+/// Prove-fail-first (recorded verbatim, then reverted): temporarily deleted the
+/// `.route("/", get(root_handler))` line from `probe_router` in `lib.rs` and reran just this
+/// test. It failed with `assertion failed: left == right` on the status-code check --
+/// `StatusCode::NOT_FOUND` (404) vs the expected `StatusCode::OK` -- because with no `/` route
+/// registered, and no root-level fallback configured any more (the whole point of this PR:
+/// `/ui`-nesting replaced the old root `.fallback_service`), an unmatched `/` now correctly falls
+/// through to axum's default 404, proving this test actually depends on `root_handler` being
+/// mounted rather than trivially passing regardless. Restored the line; the test passes again.
+#[tokio::test]
+async fn root_path_stays_api_welcome_json_not_the_spa() {
+    let dir = ui_static_dir("root-not-spa");
+    let router = ui_mount_router(&dir);
+
+    let response = router
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body)
+        .unwrap_or_else(|e| panic!("GET / must return the API welcome JSON, not HTML: {e}"));
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["message"], "Welcome to Lightbridge Authz API");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The other half of the acceptance criteria: a path that is neither a protocol route nor under
+/// `/ui` must be a normal `404` -- the static build must not be a whole-server catch-all any
+/// more, unlike the pre-`/ui` root-level `.fallback_service` mount it replaces.
+///
+/// Prove-fail-first (recorded verbatim, then reverted): temporarily reverted
+/// `build_idp_router`'s last line from `router.nest_service("/ui", static_assets::
+/// static_assets_fallback(static_dir))` back to the pre-PR
+/// `router.fallback_service(static_assets::static_assets_fallback(static_dir))` and reran just
+/// this test. It failed with `assertion failed: left == right` -- `StatusCode::OK` (200) vs the
+/// expected `StatusCode::NOT_FOUND` -- because the old root-level fallback answers *every*
+/// unmatched path with the SPA's `index.html`, exactly the "split personality" behavior this PR
+/// removes. Restored the `nest_service` line; the test passes again.
+#[tokio::test]
+async fn unknown_path_outside_ui_prefix_returns_plain_404() {
+    let dir = ui_static_dir("outside-ui-404");
+    let router = ui_mount_router(&dir);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/some/unknown/path")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "a path outside /ui that matches no protocol route must be a plain 404, not the SPA"
     );
 
-    std::fs::remove_dir_all(static_dir).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 struct UnreachableBearer;
@@ -962,16 +1083,20 @@ mod db {
         }
     }
 
-    /// ADR-0021's highest-risk property (#442, "Risks" table in issue #442): mounting the static
-    /// fallback must never shadow an existing protocol route. Needs the DB-backed setup (a real
-    /// bootstrapped signing key) so `/.well-known/jwks.json` actually succeeds -- offline it
-    /// 500s for its own unrelated reason (no key to serialize), which would make a coarse
-    /// status-code assertion here meaningless. Builds the idp router with a REAL, on-disk static
-    /// build directory (not `TEST_STATIC_DIR`'s nonexistent path, so the fallback is actually
-    /// capable of answering every request) and proves both directions: every existing protocol
-    /// route still resolves to its own handler with real content, and only a genuinely unmatched
-    /// path reaches the static fallback (getting `index.html` back with a `200`, never a bare
-    /// `404`).
+    /// ADR-0021's highest-risk property (#442, "Risks" table in issue #442), updated for the
+    /// follow-up that scoped the static build under `/ui`: the `/ui`-nested static mount must
+    /// never shadow an existing protocol route, AND (the new half, since this used to be a
+    /// whole-server catch-all) the static build must never answer for a path outside `/ui`
+    /// either. Needs the DB-backed setup (a real bootstrapped signing key) so
+    /// `/.well-known/jwks.json` actually succeeds -- offline it 500s for its own unrelated reason
+    /// (no key to serialize), which would make a coarse status-code assertion here meaningless.
+    /// Builds the idp router with a REAL, on-disk static build directory (not `TEST_STATIC_DIR`'s
+    /// nonexistent path, so `/ui` is actually capable of answering every request under it) and
+    /// proves three things: every existing protocol route still resolves to its own handler with
+    /// real content; a genuinely unmatched path *under* `/ui` reaches the static build's SPA
+    /// fallback (`index.html`, `200`, never a bare `404`); and that exact same path *without* the
+    /// `/ui` prefix is a plain `404` -- proving the static build is scoped to `/ui`, not a
+    /// catch-all for the whole server any more.
     #[sqlx::test(migrations = "../../migrations")]
     async fn static_fallback_never_shadows_an_existing_protocol_route(pool: PgPool) {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -1082,6 +1207,35 @@ mod db {
         }
 
         let fallback_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/some/spa/route/that/is/not/a/protocol/route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fallback_response.status(),
+            StatusCode::OK,
+            "a genuinely unmatched path under /ui must reach the static build's SPA fallback and \
+             get index.html back, never a bare 404"
+        );
+        let body = to_bytes(fallback_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[..],
+            b"<!doctype html><title>hosted-login placeholder</title>"
+        );
+
+        // The other half of the path-scoping property (#442 follow-up): the exact same
+        // unmatched path WITHOUT the /ui prefix must be a plain 404 -- the static build is no
+        // longer a catch-all for the whole server. This is the assertion that would have caught
+        // the pre-follow-up bug: under the old root-level `.fallback_service(..)` mount, this
+        // same path answered 200 with the SPA's index.html instead.
+        let outside_ui_response = router
             .oneshot(
                 Request::builder()
                     .uri("/some/spa/route/that/is/not/a/protocol/route")
@@ -1091,17 +1245,10 @@ mod db {
             .await
             .unwrap();
         assert_eq!(
-            fallback_response.status(),
-            StatusCode::OK,
-            "a genuinely unmatched path must reach the static fallback and get index.html back, \
-             never a bare 404"
-        );
-        let body = to_bytes(fallback_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(
-            &body[..],
-            b"<!doctype html><title>hosted-login placeholder</title>"
+            outside_ui_response.status(),
+            StatusCode::NOT_FOUND,
+            "an unmatched path outside /ui must be a plain 404, not the static build's SPA \
+             fallback"
         );
 
         let _ = std::fs::remove_dir_all(&static_dir);

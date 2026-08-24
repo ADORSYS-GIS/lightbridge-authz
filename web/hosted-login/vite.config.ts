@@ -5,6 +5,14 @@ import { VitePWA } from "vite-plugin-pwa";
 
 // https://vite.dev/config/
 export default defineConfig({
+  // ADR-0021 Decision 10 (#442), narrowed by the follow-up that mounts this build under
+  // `/ui` instead of at the idp router root (docs/adr/0021-browser-sso-hosted-login-page-and-session-cookie.md):
+  // `authz-idp` serves `GET /` as its own API-welcome-JSON route (the same probe/root
+  // handler every server in this workspace shares) and this SPA exclusively under
+  // `/ui`, never at the root. Every emitted asset reference, the service worker's own
+  // registration URL, and its resulting scope must all carry that same `/ui/` prefix or
+  // the built page would 404 fetching its own bundle once served by `authz-idp`.
+  base: "/ui/",
   plugins: [
     react(),
     tailwindcss(),
