@@ -175,6 +175,31 @@
       ]
     },
     {
+      "clientId": "authz-idp-rp",
+      "name": "Authz IDP browser broker",
+      "description": "Public PKCE client used by authz-idp to broker browser login to Keycloak.",
+      "rootUrl": "",
+      "adminUrl": "",
+      "baseUrl": "",
+      "enabled": true,
+      "redirectUris": ["https://localhost:13004/idp/callback"],
+      "webOrigins": [],
+      "bearerOnly": false,
+      "consentRequired": false,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "publicClient": true,
+      "protocol": "openid-connect",
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "fullScopeAllowed": true,
+      "defaultClientScopes": ["web-origins", "acr", "profile", "roles", "basic", "email"],
+      "optionalClientScopes": ["address", "phone", "offline_access", "microprofile-jwt"]
+    },
+    {
       "clientId": "lightbridge-token-issuer",
       "name": "Lightbridge Token Issuer",
       "description": "Confidential client used by Lightbridge Authz to exchange user bearer tokens into API-key credentials.",

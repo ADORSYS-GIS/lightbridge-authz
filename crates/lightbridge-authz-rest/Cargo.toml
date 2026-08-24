@@ -36,6 +36,7 @@ lightbridge-authz-budget.workspace = true
 jsonwebtoken.workspace = true
 authkestra-op.workspace = true
 authkestra-engine.workspace = true
+authkestra-resource.workspace = true
 rsa.workspace = true
 rand_core.workspace = true
 sha2.workspace = true

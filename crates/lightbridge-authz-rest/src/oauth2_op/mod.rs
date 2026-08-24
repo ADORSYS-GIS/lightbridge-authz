@@ -88,14 +88,23 @@ pub(crate) fn scope_to_string(scopes: &[String]) -> Option<String> {
     }
 }
 
-pub(crate) fn generate_refresh_secret() -> String {
+/// Fills `bytes` random bytes from the OS CSPRNG and returns them URL-safe-base64-encoded
+/// (no padding). Shared by every call site in this crate that previously duplicated this exact
+/// "`OsRng` fill -> `URL_SAFE_NO_PAD` encode" sequence with its own byte count baked in --
+/// [`generate_refresh_secret`] below, [`device_store::generate_device_code`], and
+/// `relying_party`'s per-request state/nonce generation.
+pub(crate) fn random_urlsafe(bytes: usize) -> String {
     use base64::Engine;
     use rand_core::{OsRng, RngCore};
-    let mut buf = [0u8; REFRESH_TOKEN_BYTES];
+    let mut buf = vec![0u8; bytes];
     OsRng.fill_bytes(&mut buf);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+}
+
+pub(crate) fn generate_refresh_secret() -> String {
     format!(
         "{REFRESH_TOKEN_PREFIX}{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+        random_urlsafe(REFRESH_TOKEN_BYTES)
     )
 }
 

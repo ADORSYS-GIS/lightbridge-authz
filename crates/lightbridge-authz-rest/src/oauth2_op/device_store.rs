@@ -83,11 +83,7 @@ pub fn generate_user_code() -> String {
 /// Generates the opaque, high-entropy device-verification code the CLI polls with. Never shown
 /// to a human, so no readability constraint applies (unlike [`generate_user_code`]).
 pub fn generate_device_code() -> String {
-    use base64::Engine;
-    use rand_core::{OsRng, RngCore};
-    let mut buf = [0u8; DEVICE_CODE_ENTROPY_BYTES];
-    OsRng.fill_bytes(&mut buf);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+    super::random_urlsafe(DEVICE_CODE_ENTROPY_BYTES)
 }
 
 /// Strips anything that is not an ASCII alphanumeric and upper-cases the rest -- the store's own
@@ -158,6 +154,20 @@ pub struct DbDeviceCodeStore {
 impl DbDeviceCodeStore {
     pub fn new(repo: Arc<StoreRepo>) -> Self {
         Self { repo }
+    }
+
+    /// Transitions exactly one live pending device authorization to approved. Unlike the upstream
+    /// trait's `update_device_code` method, this exposes the CAS result to the browser callback so
+    /// it never claims success when a concurrent consume, expiry, or deny won the race.
+    pub async fn approve_pending(&self, device_code: &str, subject: &str) -> Result<bool, OpError> {
+        self.repo
+            .approve_device_authorization(device_code, subject, Utc::now())
+            .await
+            .map(|row| row.is_some())
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to approve device authorization");
+                OpError::Storage
+            })
     }
 }
 
