@@ -1,8 +1,3 @@
-#![expect(
-    clippy::unwrap_used,
-    reason = "test setup and assertions intentionally unwrap expected database results"
-)]
-
 use std::sync::Arc;
 
 use authkestra_engine::auth::state::Identity;
@@ -40,12 +35,11 @@ fn store(pool: PgPool) -> DbAuthorizationCodeStore {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn authorization_code_is_exactly_bound_and_consumed_once(pool: PgPool) {
+async fn authorization_code_is_exactly_bound_and_consumed_once(pool: PgPool) -> anyhow::Result<()> {
     let store = store(pool);
     store
         .store_code(code("opaque-code", Utc::now() + Duration::minutes(5)))
-        .await
-        .unwrap();
+        .await?;
 
     assert!(
         store
@@ -54,8 +48,7 @@ async fn authorization_code_is_exactly_bound_and_consumed_once(pool: PgPool) {
                 "browser-client",
                 "https://dashboard.example.test/oauth/callback"
             )
-            .await
-            .unwrap()
+            .await?
     );
     assert!(
         !store
@@ -64,8 +57,7 @@ async fn authorization_code_is_exactly_bound_and_consumed_once(pool: PgPool) {
                 "browser-client",
                 "https://dashboard.example.test/oauth/callback/"
             )
-            .await
-            .unwrap()
+            .await?
     );
     assert!(
         !store
@@ -74,8 +66,7 @@ async fn authorization_code_is_exactly_bound_and_consumed_once(pool: PgPool) {
                 "other-client",
                 "https://dashboard.example.test/oauth/callback"
             )
-            .await
-            .unwrap()
+            .await?
     );
 
     let (first, second) = tokio::join!(
@@ -83,17 +74,18 @@ async fn authorization_code_is_exactly_bound_and_consumed_once(pool: PgPool) {
         store.consume_code("opaque-code")
     );
     assert_eq!(
-        usize::from(first.unwrap().is_some()) + usize::from(second.unwrap().is_some()),
+        usize::from(first?.is_some()) + usize::from(second?.is_some()),
         1
     );
+    Ok(())
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn expired_authorization_code_cannot_be_consumed(pool: PgPool) {
+async fn expired_authorization_code_cannot_be_consumed(pool: PgPool) -> anyhow::Result<()> {
     let store = store(pool);
     store
         .store_code(code("expired-code", Utc::now() - Duration::seconds(1)))
-        .await
-        .unwrap();
-    assert!(store.consume_code("expired-code").await.unwrap().is_none());
+        .await?;
+    assert!(store.consume_code("expired-code").await?.is_none());
+    Ok(())
 }
