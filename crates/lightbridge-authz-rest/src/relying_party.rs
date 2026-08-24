@@ -127,7 +127,7 @@ enum PendingFlow {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct BrowserLoginTarget {
-    pub project_id: String,
+    pub project_id: Option<String>,
     pub resume_path: String,
 }
 
@@ -221,6 +221,15 @@ impl KeycloakRelyingParty {
             ));
         }
         self.begin(PendingFlow::Browser(target)).await
+    }
+
+    pub async fn find_active_browser_session(
+        &self,
+        session_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<lightbridge_authz_api_key::entities::session_row::BrowserSessionContextRow>>
+    {
+        self.repo.find_active_browser_session(session_id, now).await
     }
 
     async fn begin(&self, flow: PendingFlow) -> Result<(String, Cookie<'static>)> {
@@ -331,10 +340,15 @@ impl KeycloakRelyingParty {
             }
             PendingFlow::Browser(target) => {
                 let ttl = self.config.browser_session_ttl_seconds;
-                let context = self
-                    .repo
-                    .resolve_context(&claims.sub, &target.project_id)
-                    .await?;
+                let project_id = match target.project_id {
+                    Some(project_id) => project_id,
+                    None => self
+                        .repo
+                        .find_default_project_id(&claims.sub)
+                        .await?
+                        .ok_or(Error::NotFound)?,
+                };
+                let context = self.repo.resolve_context(&claims.sub, &project_id).await?;
                 let session = self
                     .repo
                     .create_session(NewSession {

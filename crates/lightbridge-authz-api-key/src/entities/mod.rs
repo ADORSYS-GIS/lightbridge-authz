@@ -1,6 +1,7 @@
 pub mod account_row;
 pub mod api_key_row;
 pub mod api_key_validation_row;
+pub mod authorization_code_row;
 pub mod device_authorization_row;
 pub mod exchange_refresh_token_row;
 pub mod new_account_row;

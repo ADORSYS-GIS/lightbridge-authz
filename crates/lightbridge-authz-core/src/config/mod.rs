@@ -853,9 +853,7 @@ fn default_browser_session_ttl_seconds() -> i64 {
 /// A registered OAuth2/OIDC client (ADR-0011, Decision 5). Mirrors
 /// `authkestra_op::client::ClientRegistration`'s 9 fields minus the two this service never needs:
 /// `client_secret_hash` (always `None` -- Decision 6 bans secret-based client auth outright) and
-/// `redirect_uris` (always empty -- these are machine clients presenting a `subject_token` they
-/// already hold, never a browser running the authorization-code flow this service structurally
-/// never serves; see ADR-0011 Context).
+/// `redirect_uris` and `require_pkce`, which are relevant to browser authorization-code clients.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OauthClient {
     pub client_id: String,
@@ -889,6 +887,13 @@ pub struct OauthClient {
     /// authentication, so a confidential client's public key is a config value, not a fetch.
     #[serde(default)]
     pub jwks: Option<serde_json::Value>,
+    /// Exact, byte-for-byte callback URLs accepted by `/authorize` for this client. Empty for
+    /// non-browser clients.
+    #[serde(default)]
+    pub redirect_uris: Vec<String>,
+    /// Whether the authorization request must carry an S256 PKCE challenge.
+    #[serde(default)]
+    pub require_pkce: bool,
 }
 
 /// A client's authentication method at the token endpoint (ADR-0011, Decision 6).
@@ -959,6 +964,10 @@ pub struct Oauth2TokenExchange {
     /// these tokens are only revocable by expiry; renewal flows through the refresh token.
     #[serde(default = "default_exchange_access_ttl_seconds")]
     pub access_ttl_seconds: i64,
+    /// Lifetime of a browser authorization code. Codes are persisted and single-use, so this is
+    /// intentionally short and must remain positive whenever the token endpoint is enabled.
+    #[serde(default = "default_authorization_code_ttl_seconds")]
+    pub authorization_code_ttl_seconds: i64,
     /// Lifetime of an issued refresh token, in seconds. Refresh tokens are stored hashed and are
     /// revocable, so they carry the long-lived session; only minted when `offline_access` is
     /// requested and permitted.
@@ -996,6 +1005,10 @@ pub struct Oauth2TokenExchange {
 
 fn default_exchange_access_ttl_seconds() -> i64 {
     900
+}
+
+fn default_authorization_code_ttl_seconds() -> i64 {
+    300
 }
 
 fn default_exchange_refresh_ttl_seconds() -> i64 {

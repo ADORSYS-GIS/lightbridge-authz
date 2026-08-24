@@ -159,6 +159,7 @@ oauth2:
   token_exchange:
     enabled: ${TOKEN_EXCHANGE_ENABLED:-true}
     access_ttl_seconds: ${TOKEN_EXCHANGE_ACCESS_TTL_SECONDS:-900}
+    authorization_code_ttl_seconds: ${AUTHORIZATION_CODE_TTL_SECONDS:-300}
     refresh_ttl_seconds: ${TOKEN_EXCHANGE_REFRESH_TTL_SECONDS:-2592000}
     # Absolute cap on a refresh-token chain's lifetime, independent of the per-rotation TTL above
     # -- see Oauth2TokenExchange::refresh_absolute_ttl_seconds's doc comment for why this exists.
@@ -171,8 +172,12 @@ oauth2:
     device_code_ttl_seconds: ${DEVICE_CODE_TTL_SECONDS:-600}
     device_poll_interval_seconds: ${DEVICE_POLL_INTERVAL_SECONDS:-5}
     device_verification_uri: "${DEVICE_VERIFICATION_URI:-https://localhost:13004/device/verify}"
-  # Config-sourced OAuth2/OIDC clients permitted to use the native grant endpoints above
-  # (ADR-0011, Decision 5). `public` clients present no credential beyond
+  # Real, config-sourced OAuth2/OIDC clients. Authorization-code clients must register exact
+  # redirect_uris and set require_pkce: true; S256 is the only accepted PKCE method. No concrete
+  # lightbridge-ss callback is configured in this repository, so it is intentionally not enabled.
+  # (ADR-0011, Decision 5). Empty here by default -- with no clients registered, every exchange
+  # fails client authentication (invalid_client), it is not left unprotected. Uncomment/adapt when
+  # enabling token_exchange for a real client. `public` clients present no credential beyond
   # client_id; `confidential` clients authenticate via `private_key_jwt` only (ADR-0011, Decision
   # 6 -- never client_secret_basic/client_secret_post) and need their public key inline as `jwks`
   # (a JWK Set: `{"keys": [...]}`) -- there is deliberately no `jwks_uri`.
@@ -188,6 +193,8 @@ oauth2:
   #       - "urn:ietf:params:oauth:grant-type:token-exchange"
   #       - refresh_token
   #     allowed_audiences: [lightbridge-ss]
+  #     redirect_uris: ["https://dashboard.example.invalid/oauth/callback"]
+  #     require_pkce: true
   #   - client_id: lightbridge-mcp
   #     type: confidential
   #     scopes: [openid, profile, email, offline_access]

@@ -543,7 +543,7 @@ async fn begin_browser_rejects_backslash_open_redirect_variants(pool: PgPool) {
     for resume_path in ["/\\evil.com", "/\\/evil.com", "//evil.com"] {
         assert!(
             rp.begin_browser(BrowserLoginTarget {
-                project_id: "some-project".to_string(),
+                project_id: Some("some-project".to_string()),
                 resume_path: resume_path.to_string(),
             })
             .await
@@ -555,7 +555,7 @@ async fn begin_browser_rejects_backslash_open_redirect_variants(pool: PgPool) {
     // Sanity check the guard is not simply rejecting every path: a real same-origin path passes.
     assert!(
         rp.begin_browser(BrowserLoginTarget {
-            project_id: "some-project".to_string(),
+            project_id: Some("some-project".to_string()),
             resume_path: "/browser".to_string(),
         })
         .await
@@ -756,6 +756,11 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
     )
     .await
     .unwrap();
+    let default_project_id = repo
+        .find_default_project_id("keycloak-subject")
+        .await
+        .unwrap()
+        .unwrap();
     repo.create_account(
         "other-subject",
         CreateAccount {
@@ -790,7 +795,7 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
     );
     let (location, cookie) = rp
         .begin_browser(BrowserLoginTarget {
-            project_id: "browser-project".to_string(),
+            project_id: None,
             resume_path: "/browser".to_string(),
         })
         .await
@@ -851,17 +856,11 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(
-        row,
-        (
-            "keycloak-subject".to_string(),
-            "browser-project".to_string()
-        )
-    );
+    assert_eq!(row, ("keycloak-subject".to_string(), default_project_id));
 
     let (location, cookie) = rp
         .begin_browser(BrowserLoginTarget {
-            project_id: "other-browser-project".to_string(),
+            project_id: Some("other-browser-project".to_string()),
             resume_path: "/browser".to_string(),
         })
         .await

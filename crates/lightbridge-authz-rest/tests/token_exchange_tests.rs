@@ -16,15 +16,23 @@
 //! tracking) -- `just it-tests` brings one up; `AUTHZ_REDIS_URL` overrides the default
 //! `redis://127.0.0.1:6379`, mirroring `rpc_it_tests.rs`'s own convention.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use authkestra_engine::auth::state::Identity;
+use authkestra_op::code::{AuthorizationCode, AuthorizationCodeStore};
 use axum::Form;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode, header};
+use base64::Engine;
 use cratestack::CratestackContext;
+use cratestack_axum::ratelimit::InMemoryRateLimitStore;
+use httpmock::Method::GET;
+use httpmock::MockServer;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api::schema::procedures::ProcedureRegistry;
+use lightbridge_authz_api_key::entities::session_row::NewSession;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
 use lightbridge_authz_budget::PolicyStore;
@@ -42,6 +50,7 @@ use lightbridge_authz_budget::tier::BudgetTier;
 use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::config::{
     BasicAuth, Billing, BillingPlan, JwtSigning, Oauth2TokenExchange, OauthClient, OauthClientType,
+    OidcRelyingParty,
 };
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
@@ -52,12 +61,15 @@ use lightbridge_authz_rest::OpaRepoTrait;
 use lightbridge_authz_rest::OpaState;
 use lightbridge_authz_rest::Procedures;
 use lightbridge_authz_rest::auth_provider::build_context;
+use lightbridge_authz_rest::authorize::{AuthorizeState, router as authorize_router};
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
 use lightbridge_authz_rest::handlers::introspect::introspect_api_key;
 use lightbridge_authz_rest::models::IntrospectRequest;
+use lightbridge_authz_rest::oauth2_op::authorization_code_store::DbAuthorizationCodeStore;
 use lightbridge_authz_rest::oauth2_op::client_assertion_store::RedisClientAssertionStore;
 use lightbridge_authz_rest::oauth2_op::client_store::ConfigClientStore;
 use lightbridge_authz_rest::oauth2_op::store::TokenExchangeOpStore;
+use lightbridge_authz_rest::relying_party::KeycloakRelyingParty;
 use lightbridge_authz_rest::rpc_authorize::RpcScope;
 use lightbridge_authz_rest::signing::{
     ApiKeyJwtSigner, KeyOwner, bootstrap_signing_key, generate_rs256_key,
@@ -65,6 +77,7 @@ use lightbridge_authz_rest::signing::{
 use lightbridge_authz_rest::token_exchange::{TokenExchangeState, token_exchange_router};
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -159,6 +172,7 @@ fn exchange_cfg() -> Oauth2TokenExchange {
     Oauth2TokenExchange {
         enabled: true,
         access_ttl_seconds: 900,
+        authorization_code_ttl_seconds: 300,
         refresh_ttl_seconds: 2_592_000,
         allowed_scopes: vec![
             "openid".to_string(),
@@ -192,6 +206,8 @@ fn public_client(client_id: &str) -> OauthClient {
         grant_types: client_grant_types(),
         allowed_audiences: vec![client_id.to_string()],
         jwks: None,
+        redirect_uris: Vec::new(),
+        require_pkce: false,
     }
 }
 
@@ -206,9 +222,47 @@ fn device_client(client_id: &str) -> OauthClient {
         ],
         allowed_audiences: Vec::new(),
         jwks: None,
+        redirect_uris: Vec::new(),
+        require_pkce: false,
     }
 }
 
+fn browser_client(client_id: &str, redirect_uri: &str) -> OauthClient {
+    OauthClient {
+        client_id: client_id.to_string(),
+        client_type: OauthClientType::Public,
+        scopes: client_scopes(),
+        grant_types: vec!["authorization_code".to_string()],
+        allowed_audiences: vec![client_id.to_string()],
+        jwks: None,
+        redirect_uris: vec![redirect_uri.to_string()],
+        require_pkce: true,
+    }
+}
+
+fn relying_party(repo: Arc<StoreRepo>) -> Arc<KeycloakRelyingParty> {
+    relying_party_with_issuer(repo, "https://keycloak.example.test")
+}
+
+fn relying_party_with_issuer(repo: Arc<StoreRepo>, issuer: &str) -> Arc<KeycloakRelyingParty> {
+    Arc::new(
+        KeycloakRelyingParty::new(
+            OidcRelyingParty {
+                issuer: issuer.to_string(),
+                client_id: "authz-idp-rp".to_string(),
+                callback_url: "https://authz.example.test/idp/callback".to_string(),
+                client_secret: None,
+                state_encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                timeout_ms: 500,
+                browser_session_ttl_seconds: 28_800,
+            },
+            format!("{issuer}/jwks"),
+            repo,
+            Arc::new(InMemoryRateLimitStore::new()),
+        )
+        .unwrap(),
+    )
+}
 /// A confidential client plus the private key material (PEM) and `kid` needed to sign
 /// `private_key_jwt` assertions on its behalf -- the public half is what
 /// `OauthClient.jwks`/`ClientRegistration.jwks` carries.
@@ -228,6 +282,8 @@ fn confidential_client(client_id: &str) -> ConfidentialClientFixture {
         grant_types: client_grant_types(),
         allowed_audiences: vec![client_id.to_string()],
         jwks: Some(jwks),
+        redirect_uris: Vec::new(),
+        require_pkce: false,
     };
     ConfidentialClientFixture {
         client,
@@ -394,10 +450,14 @@ fn state_with_cfg_and_budget_repo(
     let op_config = authkestra_op::config::OpConfig {
         issuer: ISSUER.to_string(),
         scopes_supported: cfg.allowed_scopes.clone(),
-        response_types_supported: vec!["token".to_string()],
-        grant_types_supported: client_grant_types(),
+        response_types_supported: vec!["code".to_string()],
+        grant_types_supported: vec![
+            TOKEN_EXCHANGE_GRANT.to_string(),
+            "refresh_token".to_string(),
+            "authorization_code".to_string(),
+        ],
         id_token_signing_alg: "RS256".to_string(),
-        authorization_code_ttl_secs: 0,
+        authorization_code_ttl_secs: cfg.authorization_code_ttl_seconds,
         access_token_ttl_secs: 900,
         device_code_ttl_secs: 0,
         token_exchange_enabled: true,
@@ -556,6 +616,62 @@ async fn post_device_authorization(state: TokenExchangeState, body: &str) -> (St
     (status, json)
 }
 
+async fn token_response(
+    state: TokenExchangeState,
+    method: &str,
+    body: &str,
+    origin: Option<&str>,
+) -> axum::response::Response {
+    let mut request = Request::builder()
+        .method(method)
+        .uri("/oauth2/token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    if let Some(origin) = origin {
+        request = request.header(header::ORIGIN, origin);
+    }
+    token_exchange_router::<()>(state)
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap()
+}
+
+fn s256_challenge(verifier: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+async fn store_browser_code(
+    repo: Arc<StoreRepo>,
+    code: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    verifier: &str,
+) {
+    let mut attributes = HashMap::new();
+    attributes.insert("account_id".to_string(), ACCOUNT_ID.to_string());
+    attributes.insert("project_id".to_string(), PROJECT_ID.to_string());
+    DbAuthorizationCodeStore::new(repo)
+        .store_code(AuthorizationCode {
+            code: code.to_string(),
+            client_id: client_id.to_string(),
+            redirect_uri: redirect_uri.to_string(),
+            scope: "openid profile".to_string(),
+            code_challenge: Some(s256_challenge(verifier)),
+            code_challenge_method: Some("S256".to_string()),
+            nonce: Some("browser-nonce".to_string()),
+            identity: Identity {
+                provider_id: "keycloak".to_string(),
+                external_id: SUBJECT.to_string(),
+                email: Some("user@example.test".to_string()),
+                username: None,
+                attributes,
+            },
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+            used: false,
+        })
+        .await
+        .unwrap();
+}
+
 fn decoding_key(jwk: &Value) -> DecodingKey {
     DecodingKey::from_rsa_components(jwk["n"].as_str().unwrap(), jwk["e"].as_str().unwrap())
         .unwrap()
@@ -627,6 +743,349 @@ async fn public_client_with_no_credential_authenticates(pool: PgPool) {
     .await;
 
     assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorization_code_token_endpoint_enforces_binding_pkce_and_single_use(pool: PgPool) {
+    const CLIENT: &str = "browser-client";
+    const OTHER_CLIENT: &str = "other-browser-client";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+    const OTHER_REDIRECT_URI: &str = "https://dashboard.example.test/oauth/other";
+    const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
+
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+    let clients = vec![
+        browser_client(CLIENT, REDIRECT_URI),
+        browser_client(OTHER_CLIENT, OTHER_REDIRECT_URI),
+    ];
+
+    store_browser_code(repo.clone(), "success-code", CLIENT, REDIRECT_URI, VERIFIER).await;
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            clients.clone(),
+            &redis_url(),
+        ),
+        &format!(
+            "grant_type=authorization_code&client_id={CLIENT}&code=success-code&redirect_uri={REDIRECT_URI}&code_verifier={VERIFIER}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body["access_token"].is_string(), "body: {body}");
+    let id_claims = verify_id_token(&repo, body["id_token"].as_str().unwrap(), CLIENT).await;
+    assert_eq!(id_claims["nonce"], "browser-nonce");
+
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            clients.clone(),
+            &redis_url(),
+        ),
+        &format!(
+            "grant_type=authorization_code&client_id={CLIENT}&code=success-code&redirect_uri={REDIRECT_URI}&code_verifier={VERIFIER}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_grant");
+    assert!(body.get("access_token").is_none());
+
+    store_browser_code(
+        repo.clone(),
+        "wrong-verifier",
+        CLIENT,
+        REDIRECT_URI,
+        VERIFIER,
+    )
+    .await;
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            clients.clone(),
+            &redis_url(),
+        ),
+        &format!(
+            "grant_type=authorization_code&client_id={CLIENT}&code=wrong-verifier&redirect_uri={REDIRECT_URI}&code_verifier=wrong-verifier-value"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_grant");
+    assert!(body.get("access_token").is_none());
+
+    store_browser_code(repo.clone(), "wrong-client", CLIENT, REDIRECT_URI, VERIFIER).await;
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            clients.clone(),
+            &redis_url(),
+        ),
+        &format!(
+            "grant_type=authorization_code&client_id={OTHER_CLIENT}&code=wrong-client&redirect_uri={OTHER_REDIRECT_URI}&code_verifier={VERIFIER}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_grant");
+    assert!(body.get("access_token").is_none());
+
+    store_browser_code(
+        repo.clone(),
+        "wrong-redirect",
+        CLIENT,
+        REDIRECT_URI,
+        VERIFIER,
+    )
+    .await;
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            clients,
+            &redis_url(),
+        ),
+        &format!(
+            "grant_type=authorization_code&client_id={CLIENT}&code=wrong-redirect&redirect_uri={REDIRECT_URI}/&code_verifier={VERIFIER}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_grant");
+    assert!(body.get("access_token").is_none());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn token_endpoint_cors_is_exact_and_never_wildcarded(pool: PgPool) {
+    const CLIENT: &str = "browser-client";
+    const ORIGIN: &str = "https://dashboard.example.test";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    let state = state_with(
+        repo,
+        Arc::new(MockBearer::new(true, vec![])),
+        vec![browser_client(CLIENT, REDIRECT_URI)],
+        &redis_url(),
+    )
+    .with_cors_origins(vec![ORIGIN.to_string()]);
+
+    let response = token_response(state.clone(), "OPTIONS", "", Some(ORIGIN)).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        ORIGIN
+    );
+    assert_eq!(
+        response.headers()[header::ACCESS_CONTROL_ALLOW_METHODS],
+        "POST"
+    );
+    assert_eq!(
+        response.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
+        "content-type"
+    );
+    assert_eq!(response.headers()[header::VARY], "Origin");
+
+    let response = token_response(
+        state.clone(),
+        "POST",
+        "grant_type=authorization_code&client_id=unknown",
+        Some(ORIGIN),
+    )
+    .await;
+    assert_eq!(
+        response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        ORIGIN
+    );
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(response.headers()[header::PRAGMA], "no-cache");
+
+    for origin in ["https://untrusted.example.test", "null"] {
+        for (method, body) in [
+            ("OPTIONS", ""),
+            ("POST", "grant_type=authorization_code&client_id=unknown"),
+        ] {
+            let response = token_response(state.clone(), method, body, Some(origin)).await;
+            assert!(
+                response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .is_none(),
+                "disallowed origin {origin} received ACAO"
+            );
+            assert_eq!(response.headers()[header::VARY], "Origin");
+        }
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorize_rejects_unregistered_redirects_and_pkce_before_relying_party(pool: PgPool) {
+    const CLIENT: &str = "browser-client";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    let router = authorize_router(AuthorizeState::new(
+        relying_party(repo.clone()),
+        state_with(
+            repo,
+            Arc::new(MockBearer::new(true, vec![])),
+            vec![browser_client(CLIENT, REDIRECT_URI)],
+            &redis_url(),
+        ),
+    ));
+
+    for redirect_uri in [
+        "https://dashboard.example.test/oauth/callback/",
+        "https://dashboard.example.test/oauth/callback?extra=value",
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/authorize?client_id={CLIENT}&redirect_uri={redirect_uri}&response_type=code&scope=openid&code_challenge=challenge&code_challenge_method=S256"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    for pkce in ["", "&code_challenge=challenge&code_challenge_method=plain"] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/authorize?client_id={CLIENT}&redirect_uri={REDIRECT_URI}&response_type=code&scope=openid{pkce}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response.headers()[header::LOCATION].to_str().unwrap();
+        assert!(location.starts_with(REDIRECT_URI));
+        assert!(location.contains("error=invalid_request"));
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn active_browser_session_authorizes_without_keycloak(pool: PgPool) {
+    const CLIENT: &str = "browser-client";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+    let session_id = cuid2();
+    repo.create_session(NewSession {
+        id: session_id.clone(),
+        account_id: ACCOUNT_ID.to_string(),
+        project_id: PROJECT_ID.to_string(),
+        client_id: None,
+        kind: "browser".to_string(),
+        expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+    })
+    .await
+    .unwrap();
+    let router = authorize_router(AuthorizeState::new(
+        relying_party(repo.clone()),
+        state_with(
+            repo,
+            Arc::new(MockBearer::new(true, vec![])),
+            vec![browser_client(CLIENT, REDIRECT_URI)],
+            &redis_url(),
+        ),
+    ));
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/authorize?client_id={CLIENT}&redirect_uri={REDIRECT_URI}&response_type=code&scope=openid&state=client-state&code_challenge=challenge&code_challenge_method=S256"
+                ))
+                .header(header::COOKIE, format!("__Host-authz_session={session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location =
+        reqwest::Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    assert_eq!(
+        location.origin().ascii_serialization(),
+        "https://dashboard.example.test"
+    );
+    let params: HashMap<_, _> = location.query_pairs().into_owned().collect();
+    assert!(params.contains_key("code"));
+    assert_eq!(
+        params.get("state").map(String::as_str),
+        Some("client-state")
+    );
+    assert!(response.headers().get(header::SET_COOKIE).is_none());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn missing_browser_session_falls_back_to_relying_party_login(pool: PgPool) {
+    const CLIENT: &str = "browser-client";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+    let keycloak = MockServer::start_async().await;
+    let _discovery = keycloak
+        .mock_async(|when, then| {
+            when.method(GET).path("/.well-known/openid-configuration");
+            then.status(200).json_body(serde_json::json!({
+                "issuer": keycloak.base_url(),
+                "authorization_endpoint": keycloak.url("/authorize"),
+                "token_endpoint": keycloak.url("/token"),
+                "jwks_uri": keycloak.url("/jwks")
+            }));
+        })
+        .await;
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    let router = authorize_router(AuthorizeState::new(
+        relying_party_with_issuer(repo.clone(), &keycloak.base_url()),
+        state_with(
+            repo,
+            Arc::new(MockBearer::new(true, vec![])),
+            vec![browser_client(CLIENT, REDIRECT_URI)],
+            &redis_url(),
+        ),
+    ));
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/authorize?client_id={CLIENT}&redirect_uri={REDIRECT_URI}&response_type=code&scope=openid&code_challenge=challenge&code_challenge_method=S256"
+                ))
+                .header(header::COOKIE, "__Host-authz_session=missing-session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert!(
+        response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .starts_with(&keycloak.url("/authorize"))
+    );
+    assert!(response.headers().get(header::SET_COOKIE).is_some());
 }
 
 #[sqlx::test(migrations = "../../migrations")]
