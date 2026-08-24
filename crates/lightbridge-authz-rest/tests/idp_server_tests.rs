@@ -1289,6 +1289,69 @@ mod db {
         );
     }
 
+    /// ADR-0024: `token_encryption_key` gets the SAME offline shape validation as
+    /// `state_encryption_key` (base64url, exactly 32 bytes) -- this exercises that half via the
+    /// full `start_idp_server` startup path, mirroring `start_idp_server_rejects_invalid_relying_party`
+    /// immediately above for the sibling key.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_idp_server_refuses_a_malformed_token_encryption_key(pool: PgPool) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let mut oauth2 = self_signed_oauth2();
+        let mut relying_party = working_relying_party();
+        relying_party.token_encryption_key = "not-32-bytes-of-key-material".to_string();
+        oauth2.relying_party = Some(relying_party);
+        let idp = IdpServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+            static_dir: TEST_STATIC_DIR.to_string(),
+        };
+        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg())
+            .await
+            .expect_err(
+                "a malformed oauth2.relying_party.token_encryption_key must be a hard startup \
+                 failure",
+            );
+        let message = format!("{err}");
+        assert!(
+            message.contains("token_encryption_key"),
+            "expected KeycloakRelyingParty::new's own validation error, got: {message}"
+        );
+    }
+
+    /// ADR-0024: `token_encryption_key` must differ from `state_encryption_key` -- the two
+    /// protect very different things (a short-lived browser-held cookie vs. a token set that can
+    /// sit at rest for a session's full lifetime) and must never share a key.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_idp_server_refuses_a_token_encryption_key_equal_to_the_state_key(pool: PgPool) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let mut oauth2 = self_signed_oauth2();
+        let mut relying_party = working_relying_party();
+        relying_party.token_encryption_key = relying_party.state_encryption_key.clone();
+        oauth2.relying_party = Some(relying_party);
+        let idp = IdpServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+            static_dir: TEST_STATIC_DIR.to_string(),
+        };
+        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg())
+            .await
+            .expect_err(
+                "a token_encryption_key equal to state_encryption_key must be a hard startup \
+                 failure",
+            );
+        let message = format!("{err}");
+        assert!(
+            message.contains("token_encryption_key"),
+            "expected KeycloakRelyingParty::new's own validation error, got: {message}"
+        );
+        assert!(
+            message.contains("state_encryption_key"),
+            "the error must name both keys so an operator can see the conflict, got: {message}"
+        );
+    }
+
     /// ADR-0023's other mandatory half: `oauth2.token_exchange` entirely absent (`None`, the
     /// deployment never configured the block at all) must be a hard startup failure -- there is no
     /// `/oauth2/token`, no `/oauth2/device_authorization`, and the always-mounted

@@ -281,8 +281,7 @@ impl KeycloakRelyingParty {
         })?;
         // ADR-0024: the SEPARATE key that seals the Keycloak token set at rest
         // (`persist_federated_identity`). Same shape of offline validation as `state_key` above
-        // (base64url, exactly 32 bytes) -- the additional "must differ from state_key" check is
-        // added in a later, deliberately separate commit for reviewability.
+        // (base64url, exactly 32 bytes), PLUS a third check below: it must not equal `state_key`.
         let token_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(&config.token_encryption_key)
             .map_err(|_| {
@@ -296,6 +295,17 @@ impl KeycloakRelyingParty {
                     .to_string(),
             )
         })?;
+        // The state cookie key protects a short-lived (10-minute), browser-held value; the token
+        // key protects a Keycloak token set that can sit at rest for a session's full lifetime --
+        // a very different exposure/rotation posture. Reusing one key for both would mean
+        // rotating either purpose's key silently weakens the other's isolation, so a config that
+        // sets them equal is refused outright rather than silently accepted.
+        if token_key == state_key {
+            return Err(Error::Server(
+                "oauth2.relying_party.token_encryption_key must differ from state_encryption_key"
+                    .to_string(),
+            ));
+        }
         let callback_url = config.callback_url.clone();
         let callback = reqwest::Url::parse(&callback_url).map_err(|_| {
             Error::Server("oauth2.relying_party.callback_url must be an absolute URL".to_string())
