@@ -415,7 +415,7 @@ async fn lookup_pending_session(
     state: &RpRouteState,
     addr: SocketAddr,
     user_code: &str,
-) -> std::result::Result<DeviceCodeSession, Response> {
+) -> std::result::Result<DeviceCodeSession, Box<Response>> {
     let caller_key = addr.ip().to_string();
     let config = RateLimitConfig::new(VERIFY_RATE_LIMIT_BURST, VERIFY_RATE_LIMIT_REFILL_PER_SECOND);
     match get_by_user_code_rate_limited(
@@ -428,13 +428,13 @@ async fn lookup_pending_session(
     .await
     {
         Ok(Some(session)) if matches!(session.status, DeviceCodeStatus::Pending) => Ok(session),
-        Ok(_) => Err(verification_response(
+        Ok(_) => Err(Box::new(verification_response(
             None,
             None,
             Some("That code cannot be used."),
             StatusCode::NOT_FOUND,
-        )),
-        Err(_) => Err(generic_failure(StatusCode::SERVICE_UNAVAILABLE)),
+        ))),
+        Err(_) => Err(Box::new(generic_failure(StatusCode::SERVICE_UNAVAILABLE))),
     }
 }
 
@@ -445,7 +445,7 @@ async fn verify_submit(
 ) -> Response {
     let session = match lookup_pending_session(&state, addr, &form.user_code).await {
         Ok(session) => session,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     // Bind this confirmation page to the `user_code` it displayed (CSRF fix): `verify_continue`
     // below requires this exact cookie, proving the caller's browser actually rendered this page
@@ -486,7 +486,7 @@ async fn verify_continue(
 ) -> Response {
     let session = match lookup_pending_session(&state, addr, &form.user_code).await {
         Ok(session) => session,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if !device_confirm_cookie_matches(&jar, &state.rp.state_key, &session.user_code) {
         return generic_failure(StatusCode::FORBIDDEN);
