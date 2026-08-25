@@ -28,9 +28,13 @@ pub struct SessionRow {
     pub last_used_at: Option<DateTime<Utc>>,
     pub expires_at: DateTime<Utc>,
     pub user_agent: Option<String>,
-    /// Raw authenticated IdP subject (Keycloak ID-token `sub`) for a `kind = "browser"` row --
-    /// `NULL` for `kind = "token"` rows and for any pre-migration browser row. See
-    /// `migrations/20260824000003_sessions_add_subject.sql` for the full rationale.
+    /// Raw authenticated IdP subject (Keycloak ID-token `sub`, or the token-exchange
+    /// `subject_token`'s validated `sub`) -- the real actor, distinct from `account_id`, which
+    /// always holds the project's OWNING account (see `revoke_sessions_and_cascade`'s doc
+    /// comment, #492, for why this distinction matters). Populated for `kind = "browser"` rows
+    /// since `migrations/20260824000003_sessions_add_subject.sql`, and for `kind = "token"` rows
+    /// since #492's companion fix to `oauth2_op::store::TokenExchangeOpStore`. `NULL` only for a
+    /// session row minted before whichever of those two changes applies to its `kind`.
     pub subject: Option<String>,
 }
 
@@ -48,10 +52,12 @@ pub struct NewSession {
     pub client_id: Option<String>,
     pub kind: String,
     pub expires_at: DateTime<Utc>,
-    /// Raw authenticated IdP subject for a `kind = "browser"` row -- always `Some` for the
-    /// browser-SSO flow (`KeycloakRelyingParty::complete`'s `PendingFlow::Browser` arm), `None`
-    /// for `kind = "token"` rows, which mint the real subject directly into the issued token's
-    /// `Identity` instead (see `signing.rs::identity_for`) and have never needed to persist it.
+    /// Raw authenticated IdP subject -- always `Some` for both the browser-SSO flow
+    /// (`KeycloakRelyingParty::complete`'s `PendingFlow::Browser` arm) and the token-exchange /
+    /// device-code flows (`TokenExchangeOpStore::handle_token_exchange`/`issue_device_tokens`).
+    /// This is the real actor, kept distinct from `account_id` (the project's owning account) so
+    /// `revoke_sessions_and_cascade` can target the person who actually holds the session rather
+    /// than whoever owns the project it was minted against (#492).
     pub subject: Option<String>,
 }
 

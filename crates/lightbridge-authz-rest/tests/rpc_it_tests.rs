@@ -2898,13 +2898,20 @@ async fn seed_active_session(pool: &sqlx::PgPool, subject: &str) -> String {
 /// `kind = "browser"` rows get no `exchange_refresh_tokens` row chained under them (ADR-0021
 /// Decision 3: a browser session is never presented as a bearer token, so it structurally cannot
 /// have a refresh-token chain) and no `client_id` (`sessions_kind_client_id_check`).
+///
+/// Sets BOTH `account_id` and `subject` to `subject` -- these tests each model a single caller
+/// acting on their own session, never the owner/roster-member split #492 is about (see
+/// `token_exchange_tests.rs`'s `seed_owner_and_member_sessions` for that scenario), so the two
+/// legitimately coincide here. `revoke_sessions_and_cascade` matches on `subject` (#492), so a
+/// row this helper leaves with `subject IS NULL` would never be reachable by any of these tests'
+/// revoke calls.
 async fn seed_session(pool: &sqlx::PgPool, subject: &str, kind: &str) -> String {
     let id = cuid2();
     let client_id: Option<String> = (kind == "token").then(|| "test-client".to_string());
     sqlx::query(
         r#"
-        INSERT INTO sessions (id, account_id, project_id, client_id, kind, status, expires_at)
-        VALUES ($1, $2, $3, $4, $5, 'active', now() + interval '1 hour')
+        INSERT INTO sessions (id, account_id, project_id, client_id, kind, status, expires_at, subject)
+        VALUES ($1, $2, $3, $4, $5, 'active', now() + interval '1 hour', $2)
         "#,
     )
     .bind(&id)
