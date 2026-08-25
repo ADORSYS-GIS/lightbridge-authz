@@ -188,6 +188,22 @@ oauth2:
       grant_types:
         - "urn:ietf:params:oauth:grant-type:device_code"
         - refresh_token
+    # it-idp.py (.docker/it/idp_it.py) IT clients: the browser authorization-code flow and RFC
+    # 8693 token exchange, both driven end to end by that suite -- never used outside it.
+    - client_id: it-browser
+      type: public
+      scopes: [openid, profile, email, offline_access]
+      grant_types:
+        - authorization_code
+        - refresh_token
+      redirect_uris: ["http://it-client.invalid/callback"]
+      require_pkce: true
+    - client_id: it-exchange
+      type: public
+      scopes: [openid, offline_access]
+      grant_types:
+        - "urn:ietf:params:oauth:grant-type:token-exchange"
+        - refresh_token
   #       - refresh_token
   #     allowed_audiences: [lightbridge-ss]
   #     redirect_uris: ["https://dashboard.example.invalid/oauth/callback"]

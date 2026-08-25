@@ -558,6 +558,11 @@ impl KeycloakRelyingParty {
                 Ok(Completion::Browser {
                     resume_path: target.resume_path,
                     session_cookie: build_session_cookie(session.id, time::Duration::seconds(ttl)),
+                    op_browser_state_cookie: Box::new(
+                        crate::session_management::build_op_browser_state_cookie(
+                            time::Duration::seconds(ttl),
+                        ),
+                    ),
                 })
             }
         }
@@ -660,6 +665,7 @@ enum Completion {
     Browser {
         resume_path: String,
         session_cookie: Cookie<'static>,
+        op_browser_state_cookie: Box<Cookie<'static>>,
     },
 }
 
@@ -807,6 +813,7 @@ async fn callback(
         Ok(Completion::Browser {
             resume_path,
             session_cookie,
+            op_browser_state_cookie,
         }) => {
             let mut response = Redirect::to(&resume_path).into_response();
             response.headers_mut().append(
@@ -816,6 +823,11 @@ async fn callback(
             response.headers_mut().append(
                 header::SET_COOKIE,
                 HeaderValue::from_str(&session_cookie.to_string())
+                    .expect("cookie is a valid header value"),
+            );
+            response.headers_mut().append(
+                header::SET_COOKIE,
+                HeaderValue::from_str(&op_browser_state_cookie.to_string())
                     .expect("cookie is a valid header value"),
             );
             response

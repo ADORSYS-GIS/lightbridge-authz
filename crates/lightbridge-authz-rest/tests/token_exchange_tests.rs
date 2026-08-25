@@ -1158,6 +1158,90 @@ async fn active_browser_session_authorizes_without_keycloak(pool: PgPool) {
     assert!(response.headers().get(header::SET_COOKIE).is_none());
 }
 
+/// OIDC Session Management 1.0 §3: a request that carries the `__Host-authz_op_state` cookie
+/// (`session_management::OP_BROWSER_STATE_COOKIE`) alongside an active browser session gets
+/// `session_state` appended to the authorization redirect (`authorize.rs`'s `issue_code` ->
+/// `append_session_state`) -- extends `active_browser_session_authorizes_without_keycloak` above
+/// (same session-resumed harness, no Keycloak round trip needed) with that cookie present. The
+/// salt rides in cleartext after the `.` in `session_state`, so recomputing the hash with the
+/// SAME client_id/origin/opbs/salt this request used -- via `session_management::session_state`,
+/// the exact function `issue_code`'s `fresh_session_state` wraps -- proves the value is not just
+/// present but the RIGHT one, not merely well-formed.
+///
+/// Prove-fail-first (recorded verbatim, then reverted): commented out the
+/// `session_state = op_browser_state.and_then(...)` computation's use in `authorize.rs`'s
+/// `issue_code` (forcing `session_state: None` unconditionally), reran just this test. It failed
+/// on `.expect("a request carrying the OP browser-state cookie must get session_state
+/// appended")` -- the redirect had no `session_state` query param at all. Restored the line.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorize_appends_session_state_when_op_browser_state_cookie_present(pool: PgPool) {
+    const CLIENT: &str = "browser-client";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+    const OPBS: &str = "opbs-test-value-not-a-secret";
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+    let session_id = cuid2();
+    repo.create_session(NewSession {
+        id: session_id.clone(),
+        account_id: ACCOUNT_ID.to_string(),
+        project_id: PROJECT_ID.to_string(),
+        client_id: None,
+        kind: "browser".to_string(),
+        expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        subject: Some(SUBJECT.to_string()),
+    })
+    .await
+    .unwrap();
+    let router = authorize_router(AuthorizeState::new(
+        relying_party(repo.clone()),
+        state_with(
+            repo,
+            Arc::new(MockBearer::new(true, vec![])),
+            vec![browser_client(CLIENT, REDIRECT_URI)],
+            &redis_url(),
+        ),
+    ));
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/authorize?client_id={CLIENT}&redirect_uri={REDIRECT_URI}&response_type=code&scope=openid&state=client-state&code_challenge=challenge&code_challenge_method=S256"
+                ))
+                .header(
+                    header::COOKIE,
+                    format!("__Host-authz_session={session_id}; __Host-authz_op_state={OPBS}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location =
+        reqwest::Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let session_state_param = location
+        .query_pairs()
+        .find_map(|(key, value)| (key == "session_state").then(|| value.into_owned()))
+        .expect("a request carrying the OP browser-state cookie must get session_state appended");
+    let salt = session_state_param
+        .rsplit('.')
+        .next()
+        .expect("session_state is salt-suffixed");
+    let expected = lightbridge_authz_rest::session_management::session_state(
+        CLIENT,
+        "https://dashboard.example.test",
+        OPBS,
+        salt,
+    );
+    assert_eq!(
+        session_state_param, expected,
+        "session_state must hash client_id + the redirect_uri's ORIGIN + the OP browser-state \
+         cookie's value + its own salt"
+    );
+}
+
 /// Code-review follow-up to #463/#466/#467 (Finding B): the eventual access token's `sub` claim
 /// must be the REAL authenticated subject (`sessions.subject`), never `session.account_id`.
 /// `resolve_context` (`crates/lightbridge-authz-api-key/src/repo.rs`) always resolves
@@ -4490,6 +4574,246 @@ async fn revoke_confidential_client_with_valid_assertion_succeeds(pool: PgPool) 
     .await;
 
     assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
+// ============================================================================================
+// RFC 7662 OAuth 2.0 Token Introspection (`POST /oauth2/introspect`). Client authentication is
+// byte-identical to `/oauth2/revoke`'s above (shared `extract_presented_credential`/
+// `resolve_presented_client_id`/`authenticate_presented_client`), so the client-auth failure
+// modes are not re-proven here -- `revoke_with_unknown_client_is_rejected`/
+// `revoke_confidential_client_with_missing_assertion_is_rejected`/
+// `revoke_with_missing_token_field_is_invalid_request` above already cover that shared code path,
+// and `idp_server_tests.rs`'s offline `introspect_with_unknown_client_is_rejected`/
+// `introspect_with_missing_token_field_is_invalid_request` re-prove the same two cases through
+// `/oauth2/introspect` specifically without needing a real database. What's unique to
+// introspection and needs a REAL Postgres to exercise: the two introspectable token families
+// (opaque refresh-token rows, self-signed access-token JWTs) and RFC 7662 §2.1's anti-oracle
+// collapse of "unknown"/"foreign client"/"azp mismatch" into an identical `{"active": false}`.
+// ============================================================================================
+
+async fn post_introspect(state: TokenExchangeState, body: &str) -> (StatusCode, Value) {
+    let response = token_exchange_router::<()>(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth2/introspect")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, json)
+}
+
+/// Test 1: a refresh token introspected by its OWNING client comes back `active: true` with the
+/// claims RFC 7662 §2.2 defines (`sub`, `client_id`, `exp`) plus this deployment's own additions
+/// (`account_id`/`project_id`/`iss`/`scope`/`iat`/`jti`), all traceable to the real row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn introspecting_a_refresh_token_as_its_owning_client_is_active_with_correct_claims(
+    pool: PgPool,
+) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let refresh_token = issue_refresh_token(state(repo.clone(), true), PUBLIC_CLIENT_ID).await;
+
+    let (status, body) = post_introspect(
+        state(repo.clone(), true),
+        &format!("token={refresh_token}&client_id={PUBLIC_CLIENT_ID}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["active"], true, "body: {body}");
+    assert!(
+        body.get("token_type").is_none(),
+        "refresh introspection must not claim a non-standard token_type (\"refresh_token\" \
+         is not an RFC 6749 §7.1 type): {body}"
+    );
+    assert_eq!(body["client_id"], PUBLIC_CLIENT_ID);
+    assert_eq!(body["sub"], SUBJECT);
+    assert_eq!(body["account_id"], ACCOUNT_ID);
+    assert_eq!(body["project_id"], PROJECT_ID);
+    assert!(body["exp"].is_number(), "body: {body}");
+    assert!(body["jti"].is_string(), "body: {body}");
+}
+
+/// Test 2: the SAME refresh token, introspected by a DIFFERENT registered client, must be
+/// indistinguishable from an unknown token -- RFC 7662 §2.1's anti-oracle posture. Proves
+/// `find_active_refresh_token_for_client` actually scopes the lookup to the caller's own
+/// `client_id`, not just any presented token string.
+#[sqlx::test(migrations = "../../migrations")]
+async fn introspecting_a_refresh_token_as_a_different_client_is_inactive(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let owner_client = "introspect-owner";
+    let other_client = "introspect-other";
+    let clients = || vec![public_client(owner_client), public_client(other_client)];
+
+    let refresh_token = issue_refresh_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![owner_client.to_string()])),
+            clients(),
+            &redis_url(),
+        ),
+        owner_client,
+    )
+    .await;
+
+    let (status, body) = post_introspect(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![other_client.to_string()])),
+            clients(),
+            &redis_url(),
+        ),
+        &format!("token={refresh_token}&client_id={other_client}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["active"], false, "body: {body}");
+}
+
+/// Test 3: after `/oauth2/revoke` kills a refresh token, introspecting it (by its own, owning
+/// client) must report `active: false` -- proves introspection actually reads live state off the
+/// same row revocation writes, not a stale/cached view.
+#[sqlx::test(migrations = "../../migrations")]
+async fn introspecting_a_revoked_refresh_token_is_inactive(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let refresh_token = issue_refresh_token(state(repo.clone(), true), PUBLIC_CLIENT_ID).await;
+
+    let (status, body) = post_revoke(
+        state(repo.clone(), true),
+        &format!("token={refresh_token}&client_id={PUBLIC_CLIENT_ID}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (status, body) = post_introspect(
+        state(repo.clone(), true),
+        &format!("token={refresh_token}&client_id={PUBLIC_CLIENT_ID}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["active"], false, "body: {body}");
+}
+
+/// Test 4: a self-signed access token (the OTHER introspectable family), introspected by the same
+/// client it was minted for (`azp == client_id`), comes back `active: true` -- the real RFC 7662
+/// `{"active": false}` counterpart to `idp_server_tests.rs`'s OFFLINE
+/// `introspect_with_garbage_token_against_unreachable_db_returns_server_error` (that test pins
+/// this offline harness's own DB-unreachable 500, not this contract).
+#[sqlx::test(migrations = "../../migrations")]
+async fn introspecting_a_garbage_token_returns_inactive(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_introspect(
+        state(repo.clone(), true),
+        &format!("token=totally-made-up-garbage&client_id={PUBLIC_CLIENT_ID}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["active"], false, "body: {body}");
+}
+
+/// Test 5: a self-signed access token minted via the exchange grant carries `azp == client_id`
+/// (`signing.rs`'s `access_token_extra`) -- introspecting it as that SAME client must be
+/// `active: true`, with the token's own claims (`sub`/`api_key_id`/`project_id`/`account_id`)
+/// riding along in the response body, per this endpoint's "return every claim the token already
+/// discloses to its holder" contract.
+#[sqlx::test(migrations = "../../migrations")]
+async fn introspecting_a_self_signed_access_token_with_matching_azp_is_active(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let access_token = body["access_token"].as_str().unwrap().to_string();
+
+    let (status, body) = post_introspect(
+        state(repo.clone(), true),
+        &format!("token={access_token}&client_id={PUBLIC_CLIENT_ID}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["active"], true, "body: {body}");
+    assert_eq!(body["token_type"], "Bearer");
+    assert_eq!(body["client_id"], PUBLIC_CLIENT_ID);
+    assert_eq!(body["sub"], SUBJECT);
+    assert_eq!(body["account_id"], ACCOUNT_ID);
+    assert_eq!(body["project_id"], PROJECT_ID);
+}
+
+/// Test 6: the same access token, introspected by a DIFFERENT registered client than the one it
+/// was minted for -- `azp` (fixed at mint time to the requesting client) no longer matches the
+/// caller's own `client_id`, so this must collapse to `active: false`, same anti-oracle posture
+/// as test 2's refresh-token case.
+#[sqlx::test(migrations = "../../migrations")]
+async fn introspecting_a_self_signed_access_token_with_azp_mismatch_is_inactive(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let minting_client = "introspect-azp-owner";
+    let other_client = "introspect-azp-other";
+    let clients = vec![public_client(minting_client), public_client(other_client)];
+
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![minting_client.to_string()])),
+            clients.clone(),
+            &redis_url(),
+        ),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={minting_client}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let access_token = body["access_token"].as_str().unwrap().to_string();
+
+    let (status, body) = post_introspect(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![other_client.to_string()])),
+            clients,
+            &redis_url(),
+        ),
+        &format!("token={access_token}&client_id={other_client}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["active"], false, "body: {body}");
 }
 
 // ============================================================================================

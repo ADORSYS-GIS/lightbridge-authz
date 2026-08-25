@@ -25,6 +25,7 @@ pub mod relying_party;
 pub mod routers;
 pub mod rpc_authorize;
 pub mod session_cookie;
+pub mod session_management;
 pub mod signing;
 pub mod static_assets;
 pub mod token_exchange;
@@ -2485,7 +2486,7 @@ fn build_token_exchange_state(
                 .to_string(),
         ));
     }
-    validate_authorization_code_clients(&oauth2.clients)?;
+    validate_authorization_code_clients(&oauth2.clients, signing.audience.as_deref())?;
     let signer = signing::ApiKeyJwtSigner::from_config(signing, repo.clone())?;
 
     // ADR-0025 Stage 1/2: `start_idp_server` (this function's sole production caller) already
@@ -2575,7 +2576,20 @@ fn token_endpoint_cors_origins(clients: &[OauthClient]) -> Result<Vec<String>> {
 /// the code, not that the code being redeemed is the one THIS session actually requested. This
 /// gate therefore applies to every `authorization_code` client regardless of `client_type`; do not
 /// reintroduce a `client_type == Public` condition here.
-fn validate_authorization_code_clients(clients: &[OauthClient]) -> Result<()> {
+///
+/// Also enforces an invariant the introspection endpoint's module doc comment
+/// (`token_exchange.rs`) relies on but nothing previously checked: no registered client's
+/// `client_id` may equal `oauth2.signing.audience`. That equality is exactly the condition under
+/// which a self-signed API-key JWT's `azp` (always the fixed `oauth2.signing.audience` value)
+/// would collide with a real OAuth2 client id, making an API-key JWT pass
+/// `introspect_endpoint`'s `azp == caller's client_id` gate and introspect as a live token-
+/// exchange access token -- defeating the "API keys are structurally not introspectable" claim
+/// that doc comment makes. Refusing to start is preferable to a config that silently invalidates
+/// that claim.
+fn validate_authorization_code_clients(
+    clients: &[OauthClient],
+    signing_audience: Option<&str>,
+) -> Result<()> {
     for client in clients {
         for redirect_uri in &client.redirect_uris {
             redirect_origin(redirect_uri)?;
@@ -2589,6 +2603,16 @@ fn validate_authorization_code_clients(clients: &[OauthClient]) -> Result<()> {
             return Err(Error::Server(
                 "authorization_code clients require PKCE and at least one redirect_uri".to_string(),
             ));
+        }
+        if let Some(audience) = signing_audience
+            && client.client_id == audience
+        {
+            return Err(Error::Server(format!(
+                "oauth2.clients client_id {:?} equals oauth2.signing.audience -- a self-signed \
+                 API-key JWT's azp would collide with this client id, making API keys \
+                 introspectable as token-exchange access tokens",
+                client.client_id
+            )));
         }
     }
     Ok(())
@@ -2961,6 +2985,7 @@ pub fn build_idp_router(
         token_exchange.clone(),
     )));
     router = router.merge(token_exchange::token_exchange_router(token_exchange));
+    router = router.merge(session_management::router());
     router = router.merge(relying_party::router(relying_party));
     router.nest_service("/ui", static_assets::static_assets_fallback(static_dir))
 }
@@ -3820,6 +3845,76 @@ mod tests {
     async fn build_token_exchange_state_builds_state_for_valid_config() {
         let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
         oauth2.signing = Some(signing_cfg());
+        oauth2.token_exchange = Some(exchange_cfg());
+        let result = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        )
+        .unwrap();
+        assert!(result.is_some());
+    }
+
+    /// F4 (adversarial-review follow-up): nothing previously stopped a registered client's
+    /// `client_id` from equaling `oauth2.signing.audience` -- the value a self-signed API-key
+    /// JWT's `azp` always carries. That equality is exactly the condition under which
+    /// `token_exchange::introspect_endpoint`'s `azp == caller's client_id` gate would admit an
+    /// API-key JWT as a live token-exchange access token, defeating the "API keys are
+    /// structurally not introspectable" invariant that module documents.
+    /// `validate_authorization_code_clients` must refuse to start in this configuration.
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_a_client_id_colliding_with_the_signing_audience() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        let mut signing = signing_cfg();
+        signing.audience = Some("shared-audience".to_string());
+        oauth2.signing = Some(signing);
+        oauth2.clients = vec![OauthClient {
+            client_id: "shared-audience".to_string(),
+            client_type: OauthClientType::Public,
+            scopes: vec!["openid".to_string()],
+            grant_types: vec!["refresh_token".to_string()],
+            allowed_audiences: vec!["shared-audience".to_string()],
+            jwks: None,
+            redirect_uris: Vec::new(),
+            require_pkce: false,
+        }];
+        oauth2.token_exchange = Some(exchange_cfg());
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        ) else {
+            panic!("expected an error when a client_id equals oauth2.signing.audience");
+        };
+        assert!(format!("{err}").contains("equals oauth2.signing.audience"));
+    }
+
+    /// Control: distinct client ids and a distinct signing audience must still start cleanly --
+    /// the new check above must not be a blanket refusal of every configured client.
+    #[tokio::test]
+    async fn build_token_exchange_state_allows_a_client_id_distinct_from_the_signing_audience() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        let mut signing = signing_cfg();
+        signing.audience = Some("api-key-audience".to_string());
+        oauth2.signing = Some(signing);
+        oauth2.clients = vec![OauthClient {
+            client_id: "a-real-oauth-client".to_string(),
+            client_type: OauthClientType::Public,
+            scopes: vec!["openid".to_string()],
+            grant_types: vec!["refresh_token".to_string()],
+            allowed_audiences: vec!["a-real-oauth-client".to_string()],
+            jwks: None,
+            redirect_uris: Vec::new(),
+            require_pkce: false,
+        }];
         oauth2.token_exchange = Some(exchange_cfg());
         let result = build_token_exchange_state(
             &oauth2,
