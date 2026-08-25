@@ -297,7 +297,24 @@ def drive_keycloak_login(authorize_location: str, cookies: CookieJar) -> str:
     assert status == 302, f"keycloak login submit failed: status={status}"
     location = headers.get("Location")
     assert location and "/idp/callback" in location, f"unexpected keycloak login redirect: {location}"
-    return location
+    return to_in_network(location)
+
+
+def to_in_network(url: str) -> str:
+    """Rewrites a browser-facing `https://localhost:13004/...` callback URL -- the RP's configured
+    `callback_url` that Keycloak echoes back -- to the in-network `authz-idp` address this container
+    can actually reach. A real browser on the host resolves `localhost:13004` to `authz-idp` via the
+    published port; inside the compose network this container's own `localhost:13004` has nothing
+    listening (ECONNREFUSED), and the RP state cookie is bound to the `authz-idp` origin the initial
+    `/authorize` was served from -- so both reachability and cookie continuity require this swap.
+    Path and query (`code`/`state`) are preserved untouched."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.hostname == "localhost" and parts.port == 13004:
+        idp = urllib.parse.urlsplit(IDP_URL)
+        return urllib.parse.urlunsplit(
+            (idp.scheme, idp.netloc, parts.path, parts.query, parts.fragment)
+        )
+    return url
 
 
 def session_state(client_id: str, origin: str, op_browser_state: str, salt: str) -> str:
