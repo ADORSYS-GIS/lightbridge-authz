@@ -147,10 +147,52 @@ impl SubjectResolver for FederatedSubjectResolver {
         if self.own_issuer.as_deref() == Some(iss) {
             return Ok(AccountId::assert_already_resolved(sub));
         }
-        self.repo
-            .resolve_account_for_federated_subject(iss, sub, &self.grandfather_issuer)
-            .await
-            .map(AccountId::assert_already_resolved)
+        match self
+            .repo
+            .resolve_account_for_federated_subject_detailed(iss, sub, &self.grandfather_issuer)
+            .await?
+        {
+            lightbridge_authz_api_key::repo::FederatedResolution::Resolved(account_id) => {
+                Ok(AccountId::assert_already_resolved(account_id))
+            }
+            // ================================================================================
+            // ADR-0025 Correction: the Stage 2..5 BOOTSTRAP WINDOW. TEMPORARY -- delete this
+            // whole arm together with the grandfather branch it depends on (same Stage-6 cleanup
+            // marker: `resolve_account_for_federated_subject_detailed`'s own doc comment, and
+            // ADR-0025's "Correction (2026-08-25): the Stage-2..5 bootstrap window" subsection).
+            //
+            // Stage 2 made every ingress translate (iss, sub) -> account id before any procedure
+            // runs, including `createAccount` itself -- but Stage 5 (accounts.id becomes a minted
+            // CUID2 for brand-new accounts, written by `createAccount` in the SAME transaction
+            // that also writes the adopting `federated_identities` row) is NOT YET IMPLEMENTED.
+            // Until it ships, a subject that has never touched this service before has no
+            // `accounts` row AND no `federated_identities` row -- `createAccount` is the ONLY
+            // operation that could ever create one, and Stage 2 was refusing it before it could
+            // run. Chicken-and-egg: a brand-new subject could never bootstrap at all.
+            //
+            // Fix: when the resolver's own detailed outcome says `NoAccount` -- which, by
+            // `resolve_account_for_federated_subject_detailed`'s own construction, can only occur
+            // when `iss` already equals `grandfather_issuer` (a non-grandfather issuer short-
+            // circuits to `RogueIssuer` first, below, and is refused unconditionally) -- fall back
+            // to `AccountId::assert_already_resolved(sub)`, i.e. the exact pre-ADR-0025 identity.
+            // This is exactly as safe as the state ADR-0025 is a hardening OF: every operation
+            // below this seam except `createAccount` itself already dead-ends on an accountless
+            // subject today (no `accounts` row means no project, no key, nothing to authorize
+            // against), so the fallback grants no more than "let `createAccount` run" -- and
+            // `createAccount` writes the account row `accounts.id == subject` describes, closing
+            // the gap for every subsequent call from the same subject via the normal grandfather
+            // adoption path (`upsert_federated_identity`/`resolve_account_for_federated_subject`'s
+            // own steady-state branch), not this fallback.
+            // ================================================================================
+            lightbridge_authz_api_key::repo::FederatedResolution::NoAccount => {
+                Ok(AccountId::assert_already_resolved(sub))
+            }
+            lightbridge_authz_api_key::repo::FederatedResolution::RogueIssuer => {
+                Err(lightbridge_authz_core::Error::Forbidden(
+                    "no federated identity for this subject".to_string(),
+                ))
+            }
+        }
     }
 }
 
