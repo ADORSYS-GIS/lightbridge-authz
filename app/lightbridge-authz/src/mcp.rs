@@ -1791,6 +1791,20 @@ pub async fn start_mcp_server(
     billing.validate()?;
     api_key_expiry.validate()?;
     oauth2.rbac.validate()?;
+    // ADR-0025 Stage 1: `lightbridge-mcp` is one of the five components mandated to carry
+    // `oauth2.federation.issuer` -- see `lightbridge_authz_rest`'s `require_federation` for the
+    // identical shape applied to `authz-api`/`authz-idp`/`authz-opa`/`authz-budget`. `mcp.rs`
+    // lives in a separate crate from `lightbridge-authz-rest`, so this is its own inline check
+    // rather than a shared helper call.
+    let federation = oauth2.federation.as_ref().ok_or_else(|| {
+        Error::Server(
+            "oauth2.federation.issuer is required for lightbridge-mcp (ADR-0025) -- set the \
+             oauth2.federation block naming the one issuer this deployment trusts for \
+             remote-subject-to-account-id translation"
+                .to_string(),
+        )
+    })?;
+    federation.validate()?;
     let readiness_pool = pool.clone();
     if oauth2.is_self_signed() {
         let signing = oauth2.signing.as_ref().ok_or_else(|| {
@@ -2504,6 +2518,9 @@ mod tests {
             relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
+            federation: Some(lightbridge_authz_core::config::Federation {
+                issuer: "https://keycloak.example.test/realms/dev".to_string(),
+            }),
         }
     }
 

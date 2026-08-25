@@ -129,6 +129,12 @@ oauth2:
     client_secret: "${KEYCLOAK_TOKEN_CLIENT_SECRET:-lightbridge-token-issuer-secret}"
     subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
     requested_token_type: "urn:ietf:params:oauth:token-type:access_token"
+  # ADR-0025 Stage 1: the ONE issuer this deployment trusts for remote-subject-to-account-id
+  # translation (StoreRepo::resolve_account_for_federated_subject). Mandatory for authz-api,
+  # authz-idp, authz-opa, authz-budget, and lightbridge-mcp -- each refuses to start without it.
+  # Matches relying_party.issuer below: authz-idp asserts the two are equal at startup.
+  federation:
+    issuer: "http://localhost:9100/realms/dev"
   # Outbound Keycloak OIDC RP used by /device/verify. This is deliberately distinct from
   # `issuance`: it is an interactive PKCE client, not a token-exchange service account.
   relying_party:

@@ -3,9 +3,9 @@ use lightbridge_authz_core::{
     Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
     RotateApiKey, async_trait,
     config::{
-        ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetServer, IdpServer, JwtSigning,
-        ModelCatalog, Oauth2, OauthClient, OauthClientType, OpaServer, QuotaTiers, Redis,
-        UsageServiceClient,
+        ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetServer, Federation, IdpServer,
+        JwtSigning, ModelCatalog, Oauth2, OauthClient, OauthClientType, OpaServer, QuotaTiers,
+        Redis, UsageServiceClient,
     },
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
@@ -2549,6 +2549,24 @@ fn redirect_origin(redirect_uri: &str) -> Result<String> {
     Ok(url.origin().ascii_serialization())
 }
 
+/// ADR-0025 Stage 1: every serving component -- `authz-api`, `authz-idp`, `authz-opa`,
+/// `authz-budget`, `lightbridge-mcp` -- refuses to start without `oauth2.federation.issuer`,
+/// loudly, naming both the missing field and the component (the same shape AGENTS.md's "Redis is
+/// a mandatory dependency" house rule documents for a different dependency). Presence PLUS
+/// [`Federation::validate`]'s offline shape check -- never a live reachability probe against the
+/// issuer, matching `oauth2.relying_party`'s own startup-validation posture.
+fn require_federation<'a>(oauth2: &'a Oauth2, component: &str) -> Result<&'a Federation> {
+    let federation = oauth2.federation.as_ref().ok_or_else(|| {
+        Error::Server(format!(
+            "oauth2.federation.issuer is required for {component} (ADR-0025) -- set the \
+             oauth2.federation block naming the one issuer this deployment trusts for \
+             remote-subject-to-account-id translation"
+        ))
+    })?;
+    federation.validate()?;
+    Ok(federation)
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "startup wiring for authz-api -- each parameter is a distinct, independently-loaded \
@@ -2570,6 +2588,7 @@ pub async fn start_api_server(
     billing.validate()?;
     api_key_expiry.validate()?;
     oauth2.rbac.validate()?;
+    require_federation(oauth2, "authz-api")?;
 
     // ADR-0007: load whatever is genuinely active in the DB right now, so a fresh startup always
     // agrees with the last successful activation -- this is what proves "no restart needed to see
@@ -2765,6 +2784,7 @@ pub async fn start_opa_server(
     billing: &Billing,
     oauth2: &Oauth2,
 ) -> Result<()> {
+    require_federation(oauth2, "authz-opa")?;
     let readiness_pool = pool.clone();
     let repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
     let api_key_audience = oauth2
@@ -2912,6 +2932,7 @@ pub async fn start_idp_server(
     let signing = oauth2.signing.as_ref().ok_or_else(|| {
         Error::Server("oauth2.type is 'self' but oauth2.signing is missing".to_string())
     })?;
+    let federation = require_federation(oauth2, "authz-idp")?;
 
     // Redis is required unconditionally for authz-idp -- every lightbridge-authz serving role
     // that isn't explicitly freed from it (authz-opa, lightbridge-mcp) needs Redis-backed caching,
@@ -2965,6 +2986,20 @@ pub async fn start_idp_server(
                 .to_string(),
         )
     })?;
+    // ADR-0025 Stage 1: `authz-idp` seals `federated_identities` rows under
+    // `oauth2.relying_party.issuer` (the browser-SSO login callback), but
+    // `resolve_account_for_federated_subject` grandfathers against `federation.issuer`. A
+    // deployment where these two drift would mint federated identity rows this service can never
+    // resolve back through the ADR-0025 seam -- so a mismatch is a hard startup failure, checked
+    // once, here, before either value is used further.
+    if federation.issuer != rp_config.issuer {
+        return Err(Error::Server(format!(
+            "oauth2.federation.issuer ('{}') must equal oauth2.relying_party.issuer ('{}') for \
+             authz-idp -- a mismatch would mint federated identity rows this service can never \
+             resolve back through the ADR-0025 translation seam",
+            federation.issuer, rp_config.issuer
+        )));
+    }
     let relying_party = Arc::new(relying_party::KeycloakRelyingParty::new(
         rp_config,
         oauth2.jwks_url.clone(),
@@ -3174,6 +3209,7 @@ pub async fn start_budget_server(
     billing.validate()?;
     api_key_expiry.validate()?;
     oauth2.rbac.validate()?;
+    require_federation(oauth2, "authz-budget")?;
 
     // ADR-0007: load whatever is genuinely active in the DB right now, so a fresh startup always
     // agrees with the last successful activation, exactly like `start_api_server`'s identical load
@@ -3488,6 +3524,9 @@ mod tests {
             relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
+            federation: Some(lightbridge_authz_core::config::Federation {
+                issuer: "https://keycloak.example.test/realms/dev".to_string(),
+            }),
         }
     }
 

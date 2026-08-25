@@ -5,6 +5,7 @@ pub mod crypto;
 pub mod db;
 pub mod dto;
 pub mod error;
+pub mod identity;
 pub mod migrate;
 #[cfg(feature = "axum")]
 pub mod server;
@@ -22,6 +23,7 @@ pub use crate::dto::{
     UpdateProject,
 };
 pub use crate::error::{Error, Result};
+pub use crate::identity::AccountId;
 
 pub use anyhow;
 pub use async_trait::async_trait;

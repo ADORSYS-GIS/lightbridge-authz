@@ -925,6 +925,9 @@ mod tests {
             rbac: Default::default(),
             clients: Vec::new(),
             issuance: None,
+            federation: Some(lightbridge_authz_core::config::Federation {
+                issuer: "https://keycloak.example.test/realms/dev".to_string(),
+            }),
         }
     }
 
@@ -1431,6 +1434,7 @@ mod tests {
             relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
+            federation: None,
             issuance: Some(Oauth2Issuance {
                 grant_type: Some("urn:ietf:params:oauth:grant-type:token-exchange".to_string()),
                 client_id: "test-client".to_string(),
@@ -1473,6 +1477,7 @@ mod tests {
             relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
+            federation: None,
             issuance: Some(Oauth2Issuance {
                 grant_type: None,
                 client_id: client_id.to_string(),
@@ -1502,6 +1507,7 @@ mod tests {
             relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
+            federation: None,
             issuance: None,
         };
         let err = OAuth2TokenIssuer::from_config(&cfg).unwrap_err();
