@@ -32,6 +32,7 @@ use httpmock::MockServer;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api::schema::procedures::ProcedureRegistry;
+use lightbridge_authz_api_key::entities::exchange_refresh_token_row::NewExchangeRefreshToken;
 use lightbridge_authz_api_key::entities::session_row::NewSession;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
@@ -3769,6 +3770,225 @@ async fn revoking_own_sessions_makes_the_callers_own_live_access_token_introspec
     assert_eq!(
         payload["active"], false,
         "the caller's own cached access token must go inactive after revokeOwnSessions: {payload}"
+    );
+}
+
+// ============================================================================================
+// #492: `StoreRepo::revoke_sessions_and_cascade` must target the ACTOR (`sessions.subject`),
+// not `sessions.account_id` -- which always holds the shared PROJECT'S OWNING account, identical
+// for every session ever created against that project regardless of which real person minted it
+// (`resolve_context`'s documented behavior, `crates/lightbridge-authz-api-key/src/repo.rs`).
+// `seed_member_project` gives exactly the shape #492 needs: `OWNER_ACCOUNT` owns
+// `MEMBER_PROJECT_ID` directly, `SUBJECT` holds only a roster `project_members` row on it -- so
+// every session either of them mints against that one shared project carries the SAME
+// `account_id` (`OWNER_ACCOUNT`), and only `subject` tells them apart. Sessions are built
+// directly via `StoreRepo::create_session` (not a real token-exchange grant) so each row's
+// `account_id`/`subject` pairing can be pinned exactly to what production code writes for an
+// owner-created vs. a member-created session on the same project, isolating this to
+// `revoke_sessions_and_cascade` itself rather than the whole HTTP token-exchange stack.
+// ============================================================================================
+
+async fn session_status(pool: &PgPool, session_id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM sessions WHERE id = $1")
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .expect("session row exists")
+}
+
+async fn seed_owner_and_member_sessions(
+    repo: &StoreRepo,
+    pool: &PgPool,
+) -> (
+    String, /* owner_session_id */
+    String, /* member_session_id */
+) {
+    seed_member_project(repo).await;
+    let now = chrono::Utc::now();
+
+    // The OWNER's own session on the shared project: minted when OWNER_ACCOUNT themselves
+    // exchange a token for MEMBER_PROJECT_ID -- `resolve_context`'s ownership branch resolves
+    // `account_id` to OWNER_ACCOUNT, and the real actor (also OWNER_ACCOUNT) is who
+    // `oauth2_op::store::TokenExchangeOpStore::handle_token_exchange` now persists into
+    // `subject` (this PR's fix to that call site).
+    let owner_session_id = cuid2();
+    repo.create_session(NewSession {
+        id: owner_session_id.clone(),
+        account_id: OWNER_ACCOUNT.to_string(),
+        project_id: MEMBER_PROJECT_ID.to_string(),
+        client_id: Some(PUBLIC_CLIENT_ID.to_string()),
+        kind: "token".to_string(),
+        expires_at: now + chrono::Duration::hours(1),
+        subject: Some(OWNER_ACCOUNT.to_string()),
+    })
+    .await
+    .expect("owner session persists");
+
+    // The MEMBER's session on the SAME shared project: `resolve_context` resolves `account_id`
+    // to the project's owning account (OWNER_ACCOUNT) here too -- identical to the row above --
+    // even though the real actor is SUBJECT, not OWNER_ACCOUNT. This is the exact collision
+    // #492 is about: only `subject` distinguishes the two rows.
+    let member_session_id = cuid2();
+    repo.create_session(NewSession {
+        id: member_session_id.clone(),
+        account_id: OWNER_ACCOUNT.to_string(),
+        project_id: MEMBER_PROJECT_ID.to_string(),
+        client_id: Some(PUBLIC_CLIENT_ID.to_string()),
+        kind: "token".to_string(),
+        expires_at: now + chrono::Duration::hours(1),
+        subject: Some(SUBJECT.to_string()),
+    })
+    .await
+    .expect("member session persists");
+
+    assert_eq!(session_status(pool, &owner_session_id).await, "active");
+    assert_eq!(session_status(pool, &member_session_id).await, "active");
+
+    (owner_session_id, member_session_id)
+}
+
+/// The issue's own scenario: a roster member calling "log out everywhere" on themselves
+/// (`revokeOwnSessions`, which passes the caller's own `auth().id` -- see
+/// `subject_from_ctx`/`AuthzStoreImpl::revoke_sessions`'s doc comment) must kill the MEMBER's own
+/// session and must NOT touch the project OWNER's session, even though both sessions carry the
+/// identical `account_id`. Pre-fix (`WHERE account_id = $1`), this assertion fails: matching on
+/// `account_id = SUBJECT` hits neither row (both have `account_id = OWNER_ACCOUNT`), so the
+/// member's own revoke is silently a no-op -- their session survives the very action meant to
+/// kill it. Verified by running this test against the pre-fix query (verbatim output logged to
+/// `/tmp/prove-fail-492.md`) before applying the `subject = $1` fix.
+#[sqlx::test(migrations = "../../migrations")]
+async fn roster_member_revoking_own_sessions_kills_only_the_members_session(pool: PgPool) {
+    let repo = repo(pool.clone());
+    let (owner_session_id, member_session_id) = seed_owner_and_member_sessions(&repo, &pool).await;
+
+    let revoked = repo
+        .revoke_sessions_and_cascade(SUBJECT)
+        .await
+        .expect("member's self-revoke should succeed");
+    assert_eq!(
+        revoked, 1,
+        "exactly the member's own session must be revoked, not the owner's, not zero"
+    );
+
+    assert_eq!(
+        session_status(&pool, &member_session_id).await,
+        "revoked",
+        "the acting member's own session must be dead after their own 'log out everywhere'"
+    );
+    assert_eq!(
+        session_status(&pool, &owner_session_id).await,
+        "active",
+        "the project owner's session must be untouched by a MEMBER's self-revoke"
+    );
+}
+
+/// Regression guard, the reverse action: when the project OWNER calls their own
+/// "log out everywhere," it must still kill the OWNER's own session -- and, now that the query is
+/// scoped to the real actor rather than the shared `account_id`, must NOT collaterally revoke a
+/// roster MEMBER's session on the same project (the pre-fix over-broad half of #492: matching on
+/// `account_id = OWNER_ACCOUNT` used to hit every session sharing that project, member sessions
+/// included, since they all carried the identical `account_id`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn project_owner_revoking_own_sessions_still_works_and_spares_the_member(pool: PgPool) {
+    let repo = repo(pool.clone());
+    let (owner_session_id, member_session_id) = seed_owner_and_member_sessions(&repo, &pool).await;
+
+    let revoked = repo
+        .revoke_sessions_and_cascade(OWNER_ACCOUNT)
+        .await
+        .expect("owner's self-revoke should succeed");
+    assert_eq!(
+        revoked, 1,
+        "exactly the owner's own session must be revoked, not the member's, not both"
+    );
+
+    assert_eq!(
+        session_status(&pool, &owner_session_id).await,
+        "revoked",
+        "the project owner's own session must still die on their own 'log out everywhere'"
+    );
+    assert_eq!(
+        session_status(&pool, &member_session_id).await,
+        "active",
+        "a roster member's session on the same project must survive the OWNER's self-revoke"
+    );
+}
+
+/// The cascade half of #492: revoking a subject's sessions must also revoke every
+/// `exchange_refresh_tokens` row chained under one of THAT subject's sessions -- scoped by the
+/// same actor semantic as the sessions themselves, not by the shared project owner.
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoke_cascade_kills_only_the_actors_own_refresh_chain(pool: PgPool) {
+    let repo = repo(pool.clone());
+    let (owner_session_id, member_session_id) = seed_owner_and_member_sessions(&repo, &pool).await;
+    let now = chrono::Utc::now();
+
+    let owner_refresh_id = cuid2();
+    repo.create_exchange_refresh_token(NewExchangeRefreshToken {
+        id: owner_refresh_id.clone(),
+        subject: OWNER_ACCOUNT.to_string(),
+        account_id: OWNER_ACCOUNT.to_string(),
+        project_id: MEMBER_PROJECT_ID.to_string(),
+        client_id: PUBLIC_CLIENT_ID.to_string(),
+        token_hash: format!("hash-{owner_refresh_id}"),
+        scope: Some("offline_access".to_string()),
+        email: None,
+        email_verified: None,
+        auth_time: None,
+        chain_id: cuid2(),
+        chain_expires_at: now + chrono::Duration::days(90),
+        session_id: owner_session_id.clone(),
+        created_at: now,
+        expires_at: now + chrono::Duration::days(30),
+    })
+    .await
+    .expect("owner refresh token persists");
+
+    let member_refresh_id = cuid2();
+    repo.create_exchange_refresh_token(NewExchangeRefreshToken {
+        id: member_refresh_id.clone(),
+        subject: SUBJECT.to_string(),
+        account_id: OWNER_ACCOUNT.to_string(),
+        project_id: MEMBER_PROJECT_ID.to_string(),
+        client_id: PUBLIC_CLIENT_ID.to_string(),
+        token_hash: format!("hash-{member_refresh_id}"),
+        scope: Some("offline_access".to_string()),
+        email: None,
+        email_verified: None,
+        auth_time: None,
+        chain_id: cuid2(),
+        chain_expires_at: now + chrono::Duration::days(90),
+        session_id: member_session_id.clone(),
+        created_at: now,
+        expires_at: now + chrono::Duration::days(30),
+    })
+    .await
+    .expect("member refresh token persists");
+
+    repo.revoke_sessions_and_cascade(SUBJECT)
+        .await
+        .expect("member's self-revoke should succeed");
+
+    let owner_refresh_status: String =
+        sqlx::query_scalar("SELECT status FROM exchange_refresh_tokens WHERE id = $1")
+            .bind(&owner_refresh_id)
+            .fetch_one(&pool)
+            .await
+            .expect("owner refresh row exists");
+    let member_refresh_status: String =
+        sqlx::query_scalar("SELECT status FROM exchange_refresh_tokens WHERE id = $1")
+            .bind(&member_refresh_id)
+            .fetch_one(&pool)
+            .await
+            .expect("member refresh row exists");
+
+    assert_eq!(
+        member_refresh_status, "revoked",
+        "the member's own refresh-token chain must be revoked by their own session revoke"
+    );
+    assert_eq!(
+        owner_refresh_status, "active",
+        "the owner's refresh-token chain must survive a MEMBER's self-revoke"
     );
 }
 

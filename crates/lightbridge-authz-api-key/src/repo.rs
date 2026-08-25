@@ -1274,13 +1274,28 @@ impl StoreRepo {
     /// active sessions of either kind. Two statements in one transaction, not a single query --
     /// see the module doc comment on why this repo keeps this operation hand-written rather than
     /// cratestack-generated (ADR-0020 Decision 9).
+    ///
+    /// Matches on `sessions.subject` (the real authenticated actor), never `sessions.account_id`
+    /// (#492): `account_id` always holds the PROJECT's OWNING account (`resolve_context`'s
+    /// documented behavior), identical for every session ever minted against a given project
+    /// regardless of which real person -- owner or roster member -- minted it. Keying this query
+    /// on `account_id` mixed up "which project" with "which person": a roster member's own
+    /// "log out everywhere" silently no-opped on their own session (it never matched), while the
+    /// project owner's own "log out everywhere" collaterally revoked every OTHER member's session
+    /// on a shared project too (it always matched). `subject` is populated for every session this
+    /// repo creates -- `kind = 'browser'` rows since
+    /// `migrations/20260824000003_sessions_add_subject.sql`, `kind = 'token'` rows since this
+    /// fix's companion change to `oauth2_op::store::TokenExchangeOpStore`'s two `create_session`
+    /// call sites -- so only sessions minted before this fix (`subject IS NULL`) go unmatched
+    /// here; those are TTL-bounded and self-heal on their own expiry, the same trade-off the
+    /// nullable-column migration already made for pre-migration browser rows.
     pub async fn revoke_sessions_and_cascade(&self, subject: &str) -> Result<u64> {
         let mut tx = self.pool().begin().await?;
         let revoked_sessions = sqlx::query(
             r#"
             UPDATE sessions
             SET status = 'revoked', updated_at = now()
-            WHERE account_id = $1
+            WHERE subject = $1
               AND status = 'active'
             "#,
         )
@@ -1292,7 +1307,7 @@ impl StoreRepo {
             UPDATE exchange_refresh_tokens
             SET status = 'revoked'
             WHERE status = 'active'
-              AND session_id IN (SELECT id FROM sessions WHERE account_id = $1)
+              AND session_id IN (SELECT id FROM sessions WHERE subject = $1)
             "#,
         )
         .bind(subject)
