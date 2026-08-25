@@ -16,13 +16,15 @@ was dropped entirely in the ADR-0006 migration batch
 `migrations/20260727000005_drop_account_memberships.sql`). See
 [ADR-0006](../adr/0006-project-membership-supersedes-account-roles.md) for the full rationale.
 
-**Amended by [ADR-0024](../adr/0024-we-own-our-users-accounts-are-federated-identities.md):**
-`accounts.id` is still the caller's stored `sub`, unchanged, but it is no longer *the* defining
-identity — a `sub` is only unique within one issuer, so the same real person authenticating
-through two issuers would otherwise collide or fork silently. The defining identity is now
-`users.id`; an account is a **federated identity** ("one account = one federated identity; a
-person may hold several"). Every table/paragraph below this note is otherwise exactly as ADR-0006
-left it — see the "Users and federated identities" section further down for what's new.
+**Amended by [ADR-0024](../adr/0024-we-own-our-users-accounts-are-federated-identities.md)
+(corrected 2026-08-25 — see that ADR's "Correction" section):** `accounts.id` is still the
+caller's stored `sub`, unchanged, but it is no longer *the* defining identity — a `sub` is only
+unique within one issuer, so the same real person authenticating through two issuers would
+otherwise collide or fork silently. The defining identity is now `users.id`; an account is a
+**federated identity** ("one account = one federated identity; a person may hold several"),
+reached only through an adopted account — there is no longer a way for a federated identity to
+exist without one. Every table/paragraph below this note is otherwise exactly as ADR-0006 left it
+— see the "Users and federated identities" section further down for what's new.
 
 Once identity collapses to "one account = one person, keyed by their own subject", membership as a
 concept moves entirely to the **project** level (`project_members`), and everything that used to
@@ -35,8 +37,7 @@ different parties (e.g. a consultant with three client projects, each invoiced s
 ```mermaid
 erDiagram
     USERS ||--o{ ACCOUNTS : "owns (user_id), ADR-0024"
-    USERS ||--o{ FEDERATED_IDENTITIES : "holds (user_id)"
-    ACCOUNTS |o--o{ FEDERATED_IDENTITIES : "adopted by AT MOST ONE (account_id)"
+    ACCOUNTS ||--o| FEDERATED_IDENTITIES : "federated login for (account_id), AT MOST ONE"
     ACCOUNTS ||--o{ PROJECTS : "owns (account_id)"
     ACCOUNTS ||--o{ PROJECT_MEMBERS : "is a member via (account_id)"
     PROJECTS ||--o{ PROJECT_MEMBERS : "has roster (project_id)"
@@ -45,7 +46,7 @@ erDiagram
     ACCOUNTS ||--o{ EXCHANGE_REFRESH_TOKENS : "sessions for (account_id)"
 
     USERS {
-        text id PK "cuid2, or the backfilled subject verbatim"
+        text id PK "the backfilled/adopted account's own id verbatim -- see CUID2 note below"
         text status "active"
         timestamptz created_at
         timestamptz updated_at
@@ -53,10 +54,9 @@ erDiagram
 
     FEDERATED_IDENTITIES {
         text id PK
-        text user_id FK
         text issuer "UK with subject"
         text subject "UK with issuer"
-        text account_id FK "nullable; adopted, AT MOST ONE identity per account"
+        text account_id FK "NOT NULL, ON DELETE CASCADE; adopted, AT MOST ONE identity per account"
         text token_envelope "sealed AES-256-GCM, ADR-0024"
         timestamptz token_sealed_at
         timestamptz access_expires_at
@@ -177,7 +177,7 @@ Notes that don't survive a schema dump:
   (`ensure_active_signing_key` in `crates/lightbridge-authz-api-key/src/repo.rs`); at most one row
   may hold `status = 'active'` at a time, enforced by a partial unique index.
 
-### Users and federated identities (ADR-0024)
+### Users and federated identities (ADR-0024, corrected 2026-08-25)
 
 - **`accounts.user_id`** is `NOT NULL`, populated by a `BEFORE INSERT` trigger
   (`accounts_set_user`, `migrations/20260825000001_users_and_federated_identities.sql`) that mints
@@ -187,12 +187,17 @@ Notes that don't survive a schema dump:
   handles new ones: `users.id := accounts.id` (an id-reuse of the already-stored subject, not a new
   mint — see the CUID2 section below).
 - **`federated_identities`** is keyed by `(issuer, subject)` — `UNIQUE (issuer, subject)` is the
-  federation key itself. `account_id` is nullable and **adopted at most once**: a partial unique
-  index (`WHERE account_id IS NOT NULL`) means the first issuer to present a subject matching a
-  pre-existing `accounts.id` adopts that account; any subsequent issuer presenting the *same*
-  subject value is refused outright (`23505` → `Error::Conflict`), never silently merged onto
-  someone else's projects/budget. `ON DELETE SET NULL` on `account_id`: deleting a tenant's account
-  must not delete the person who logged in as that tenant.
+  federation key itself. `account_id` is **`NOT NULL`** and **adopted at most once**: a subject
+  matching a pre-existing `accounts.id` adopts that account; a subject with no matching account is
+  REFUSED outright (`Error::Forbidden` — there is no mint-a-user branch any more, corrected
+  2026-08-25, see ADR-0024's "Correction" section), and any subsequent issuer presenting the
+  *same already-adopted* subject value is also refused (`23505` → `Error::Conflict`, unique index
+  unchanged), never silently merged onto someone else's projects/budget. `ON DELETE CASCADE` on
+  `account_id` (also corrected 2026-08-25, from the original `SET NULL`): deleting an account
+  removes its adopted federated identity, required because `account_id` is now `NOT NULL` — the
+  person (`users` row) itself is unaffected, since the user is derived, not stored on this row.
+  There is no `federated_identities.user_id` column any more; the owning `users` row is always
+  DERIVED via `federated_identities.account_id -> accounts.user_id -> users.id`.
 - **`federated_identities.token_envelope`** holds the sealed Keycloak token set (refresh token + a
   non-access-token claims snapshot — never the access token, never the raw ID token JWT) —
   AES-256-GCM via `lightbridge_authz_core::crypto::{seal,open}`, under a key wholly separate from
@@ -342,11 +347,13 @@ as issued, whatever shape it has. The same applies to any OIDC claim this servic
 forwards (`jti`, `sub`, `aud`, `iss` from an external token): read, never rewritten, never
 regenerated into CUID2 form.
 
-**ADR-0024 extends this, it doesn't bend it.** `users.id` for a backfilled/trigger-provisioned
-account is the account's own id verbatim — an id-reuse of an already-stored subject, which is
-"storing", not "minting", so it needs no exception of its own. A `users.id` or
-`federated_identities.id` minted fresh (a brand-new person with no pre-existing account) goes
-through the same one chokepoint, `cuid2()`, as everything else in this section.
+**ADR-0024 extends this, it doesn't bend it.** `users.id` is always the backfilled/
+trigger-provisioned account's own id verbatim — an id-reuse of an already-stored subject, which is
+"storing", not "minting", so it needs no exception of its own. Since the 2026-08-25 Correction there
+is no longer a code path that mints a `users` row without an `accounts` row alongside it, so
+`users.id` is *only ever* an account id, never a fresh `cuid2()`. `federated_identities.id` is the
+one id in this pair still minted fresh, through the same one chokepoint, `cuid2()`, as everything
+else in this section.
 
 ### ADR-0038 / cratestack
 

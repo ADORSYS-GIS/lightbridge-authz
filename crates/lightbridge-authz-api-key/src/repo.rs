@@ -1055,22 +1055,32 @@ impl StoreRepo {
         Ok(row)
     }
 
-    /// ADR-0024: seals-and-persists a login's Keycloak token set for `(input.issuer,
-    /// input.subject)`, inside one transaction (pattern: `rotate_api_key_transaction` above).
-    /// `SELECT ... FOR UPDATE` first, so a second call for the same `(issuer, subject)` racing
-    /// concurrently serializes onto the UPDATE branch rather than double-inserting.
+    /// ADR-0024, corrected 2026-08-25: seals-and-persists a login's Keycloak token set for
+    /// `(input.issuer, input.subject)`, inside one transaction (pattern:
+    /// `rotate_api_key_transaction` above). `SELECT ... FOR UPDATE` first, so a second call for the
+    /// same `(issuer, subject)` racing concurrently serializes onto the UPDATE branch rather than
+    /// double-inserting.
     ///
-    /// On this identity's FIRST login ever (no existing row), it either adopts a grandfathered
-    /// `accounts` row whose id equals the subject (a pre-ADR-0024 account, ADR-0006's "id is the
-    /// stored sub" property) or mints a brand-new `users` row when no such account exists. Never
-    /// rewrites `issuer`/`subject`/`user_id` on an update -- those are the federation key and its
-    /// owner, fixed at creation.
+    /// On this identity's FIRST login ever (no existing row): adopt-or-REFUSE, decided entirely
+    /// inside this same transaction, before any write. A subject matching a grandfathered
+    /// `accounts` row (a pre-ADR-0024 account, ADR-0006's "id is the stored sub" property) is
+    /// adopted. A subject with no `accounts` row at all has no relationship with this service --
+    /// there is no mint-a-user branch any more -- so the login is REFUSED (`Error::Forbidden`)
+    /// before any row is written; nothing is left behind. Bounded, not a new failure: an
+    /// accountless subject already dead-ended downstream in both flows (browser SSO's
+    /// `find_default_project_id`, device pairing's `issue_device_tokens`) -- this refuses earlier
+    /// and leaves nothing behind. Never rewrites `issuer`/`subject`/`account_id` on an update --
+    /// those are the federation key and its owner, fixed at creation.
     ///
     /// `federated_identities_issuer_subject_uidx`/`federated_identities_account_uidx` (the owning
-    /// migration, `20260825000001_users_and_federated_identities.sql`) make a concurrent insert
+    /// migration, `20260825000001_users_and_federated_identities.sql`, FK action corrected by
+    /// `20260825000002_federated_identities_link_accounts_not_users.sql`) make a concurrent insert
     /// racing on either index surface as `Error::Conflict` here, mirroring `create_account`'s own
     /// 23505 idiom above -- in particular, a second issuer presenting a subject that already
-    /// adopted an account is REFUSED, never silently merged onto that account.
+    /// adopted an account is REFUSED, never silently merged onto that account. A `23503` (the
+    /// adopted account was deleted between this method's own SELECT and its INSERT) maps to the
+    /// same `Error::Forbidden` as the no-account case above -- both are "this subject has no
+    /// lightbridge account right now."
     #[instrument(skip(self, input))]
     pub async fn upsert_federated_identity(
         &self,
@@ -1103,7 +1113,7 @@ impl StoreRepo {
                     last_authenticated_at = now(),
                     updated_at = now()
                 WHERE id = $6
-                RETURNING id, user_id, issuer, subject, account_id, token_envelope,
+                RETURNING id, issuer, subject, account_id, token_envelope,
                           token_sealed_at, access_expires_at, refresh_expires_at, scope,
                           last_authenticated_at, created_at, updated_at
                 "#,
@@ -1117,35 +1127,36 @@ impl StoreRepo {
             .fetch_one(&mut *tx)
             .await?
         } else {
-            let account_user_id: Option<(String,)> =
-                sqlx::query_as("SELECT user_id FROM accounts WHERE id = $1")
+            // ADR-0024 Correction (2026-08-25): a Keycloak identity links to an ACCOUNT and to
+            // nothing else. There is no mint-a-user branch: a subject with no accounts row has no
+            // relationship with this service, so the login is refused HERE -- inside the same
+            // transaction that would otherwise insert, so there is no window between the check and
+            // the write -- and federated_identities.account_id NOT NULL is the structural backstop
+            // behind this guard. Bounded, not a new failure: an accountless subject already
+            // dead-ended downstream in both flows (browser SSO's find_default_project_id, device
+            // pairing's issue_device_tokens); this refuses earlier and leaves nothing behind.
+            let account: Option<(String,)> =
+                sqlx::query_as("SELECT id FROM accounts WHERE id = $1")
                     .bind(&input.subject)
                     .fetch_optional(&mut *tx)
                     .await?;
-            let (user_id, account_id) = match account_user_id {
-                Some((user_id,)) => (user_id, Some(input.subject.clone())),
-                None => {
-                    let new_user_id = cuid2();
-                    sqlx::query("INSERT INTO users (id) VALUES ($1)")
-                        .bind(&new_user_id)
-                        .execute(&mut *tx)
-                        .await?;
-                    (new_user_id, None)
-                }
+            let Some((account_id,)) = account else {
+                return Err(Error::Forbidden(
+                    "federated subject has no lightbridge account".to_string(),
+                ));
             };
             sqlx::query_as(
                 r#"
                 INSERT INTO federated_identities
-                  (id, user_id, issuer, subject, account_id, token_envelope, token_sealed_at,
+                  (id, issuer, subject, account_id, token_envelope, token_sealed_at,
                    access_expires_at, refresh_expires_at, scope)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                RETURNING id, user_id, issuer, subject, account_id, token_envelope,
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                RETURNING id, issuer, subject, account_id, token_envelope,
                           token_sealed_at, access_expires_at, refresh_expires_at, scope,
                           last_authenticated_at, created_at, updated_at
                 "#,
             )
             .bind(cuid2())
-            .bind(&user_id)
             .bind(&input.issuer)
             .bind(&input.subject)
             .bind(&account_id)
@@ -1166,6 +1177,16 @@ impl StoreRepo {
                         input.subject
                     ));
                 }
+                if let sqlx::Error::Database(db_err) = &e
+                    && db_err.code().as_deref() == Some("23503")
+                {
+                    // The adopted account was deleted between this method's own SELECT above and
+                    // this INSERT -- the same "no lightbridge account" outcome as the early-return
+                    // refusal above, just discovered a few microseconds later.
+                    return Error::Forbidden(
+                        "federated subject has no lightbridge account".to_string(),
+                    );
+                }
                 Error::from(e)
             })?
         };
@@ -1185,7 +1206,7 @@ impl StoreRepo {
     ) -> Result<Option<FederatedIdentityRow>> {
         let row = sqlx::query_as(
             r#"
-            SELECT id, user_id, issuer, subject, account_id, token_envelope, token_sealed_at,
+            SELECT id, issuer, subject, account_id, token_envelope, token_sealed_at,
                    access_expires_at, refresh_expires_at, scope, last_authenticated_at,
                    created_at, updated_at
             FROM federated_identities

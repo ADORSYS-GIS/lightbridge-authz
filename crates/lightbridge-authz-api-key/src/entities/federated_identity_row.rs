@@ -16,13 +16,14 @@ use sqlx::FromRow;
 #[derive(Debug, Clone, FromRow)]
 pub struct FederatedIdentityRow {
     pub id: String,
-    pub user_id: String,
     pub issuer: String,
     pub subject: String,
-    /// `NULL` until (if ever) this identity adopts a grandfathered `accounts` row whose id equals
-    /// its `subject` -- see `federated_identities_account_uidx` in the owning migration for why
-    /// at most one federated identity may ever hold a given non-null `account_id`.
-    pub account_id: Option<String>,
+    /// `NOT NULL` since the ADR-0024 Correction (2026-08-25) -- a federated identity always links
+    /// to an `accounts` row; there is no longer a mint-a-user, accountless branch. The owning
+    /// `users` row is DERIVED, never stored here: `federated_identities.account_id ->
+    /// accounts.user_id -> users.id`. `federated_identities_account_uidx` in the owning migration
+    /// still enforces that at most one federated identity may ever hold a given `account_id`.
+    pub account_id: String,
     pub token_envelope: Option<String>,
     pub token_sealed_at: Option<DateTime<Utc>>,
     pub access_expires_at: Option<DateTime<Utc>>,

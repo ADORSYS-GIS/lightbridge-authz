@@ -437,8 +437,10 @@ model Session {
 // between two already-connected models -- see `ProjectMember.account`'s own removal and
 // `Session`'s comment above for the same precedent. Nothing needs the relation today: this model
 // has no `@@allow` to write one, and `accounts.user_id` is read/written exclusively through
-// hand-written SQL (the migration's trigger, `StoreRepo::upsert_federated_identity`), never
-// through the generated client.
+// hand-written SQL -- as of the ADR-0024 Correction (2026-08-25), only the migration's
+// `accounts_set_user` trigger writes it; `StoreRepo::upsert_federated_identity` reads `accounts.id`
+// to decide adopt-or-refuse but never touches `accounts.user_id` itself -- never through the
+// generated client.
 model User {
   @use(AuditFields)
 

@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-24
+- Corrected: 2026-08-25 (see "Correction" below)
 - Decision owners: Stephane Segning Lambou
 - Amends: ADR-0006 (see that ADR's own "## Related" section for the forward pointer)
 
@@ -49,6 +50,8 @@ Federation key = `(issuer, subject)` on a new, separate `federated_identities` t
   `INSERT INTO accounts (id, ...)` test fixture in the workspace, keep working unmodified).
 - **`federated_identities`**: the federation key plus the sealed token set (Q2) and an optional
   `account_id` (populated only when this identity adopts a pre-existing `accounts` row — see Q3).
+  **Corrected 2026-08-25**: `account_id` is `NOT NULL` and the mint-a-user branch is gone — see
+  "Correction" below.
 
 Cross-issuer collision is impossible **structurally**, not by convention:
 
@@ -131,6 +134,8 @@ session minted without a federated identity behind it.
      `INSERT ... account_id = NULL`.
    - A `23505` from either unique index (Q1) maps to `Error::Conflict`, reusing
      `create_account`'s own `code() == "23505"` idiom.
+   - **Corrected 2026-08-25**: step 4 is now adopt-or-REFUSE, not adopt-or-mint — see "Correction"
+     below for the full replacement.
 5. Commit.
 
 **Failure policy: fail closed.** Every step propagates `?`. `callback()` already maps any `Err`
@@ -216,6 +221,96 @@ placeholder (`${KEYCLOAK_RP_TOKEN_ENCRYPTION_KEY:-...}`), deliberately different
 the matching dev-shaped default with an explicit comment that production must override it via a
 `secretKeyRef` env, never inline in the rendered ConfigMap.
 
+## Correction (2026-08-25): a federated identity links to an ACCOUNT, never directly to a user
+
+**What was wrong.** The original schema gave `federated_identities` two ways to reach a person: the
+derived path (`account_id -> accounts.user_id -> users.id`, when this identity adopted a
+grandfathered account) and a second, direct `user_id` column, populated by minting a brand-new
+`users` row whenever no account matched (Q3 step 4's "mint" branch). That second edge was both
+redundant with the derived path and, worse, semantically wrong: a Keycloak login is not itself a
+person this service has a relationship with — `users` is supposed to mean "someone who is reachable
+through this service's own account/project/budget apparatus," and the mint branch created a `users`
+row for anyone who could merely authenticate against the configured Keycloak realm, with no
+`accounts` row, no project, nothing else reachable behind RBAC.
+
+This was not a hypothetical gap: the original "## Consequences" section's "ACCEPTED RISK" bullet
+already named it explicitly, and the acceptance was CONDITIONAL: "This is **attacker-controlled** only to the extent the realm itself
+permits self-registration or unthrottled account creation... If the realm's registration policy ever
+opens up... the owner must re-check this acceptance." The owner has since confirmed the configured
+realm DOES permit self-registration. The condition failed, so the acceptance is withdrawn here — not
+by re-accepting a wider risk, but by removing it structurally: an accountless login is now refused,
+not persisted.
+
+**The corrected rule.** `federated_identities.account_id` is `NOT NULL`; `federated_identities`
+loses its `user_id` column entirely. The owning `users` row is always DERIVED —
+`federated_identities.account_id -> accounts.user_id -> users.id` — never stored a second time.
+`accounts.user_id` keeps exactly the two writers it already had (the `accounts_set_user` `BEFORE
+INSERT` trigger for every new account, and the one-shot backfill for pre-existing ones);
+`StoreRepo::upsert_federated_identity` never wrote it and still doesn't. One practical consequence:
+`users.id` is now ALWAYS the backfilled/trigger-provisioned account id verbatim — the "fresh
+`cuid2()` for a newly-minted user" case in Q1/Q6 no longer arises, because there is no longer a code
+path that mints a `users` row without an `accounts` row alongside it.
+
+**Q3 step 4, replaced.** Where the original said:
+
+> 4. **Not found** → `SELECT user_id FROM accounts WHERE id = $subject`:
+>    - `Some(user_id)` → **adopt**: `INSERT ... account_id = $subject`.
+>    - `None` → **mint**: `INSERT INTO users (id) VALUES (cuid2())`, then `INSERT ... account_id =
+>      NULL`.
+
+the corrected step is adopt-or-REFUSE, decided in the same transaction, before any write:
+
+> 4. **Not found** → `SELECT id FROM accounts WHERE id = $subject`:
+>    - `Some(account_id)` → **adopt**: `INSERT ... account_id = $subject`.
+>    - `None` → **REFUSE**: return `Error::Forbidden` — no row is written, nothing is left behind.
+>    - A `23505` from either unique index (Q1, unchanged) still maps to `Error::Conflict`. A new
+>      `23503` (the adopted account was deleted between this step's own `SELECT` and the `INSERT` —
+>      a narrow race, not the common case) maps to the same `Error::Forbidden` as the `None` case:
+>      both mean "this subject has no lightbridge account right now."
+
+`KeycloakRelyingParty::complete`'s single funnel (Q3's own framing) is now also the GATE: the
+refusal happens inside `persist_federated_identity`, before either flow arm's side effects, so a
+refused login approves no device code and mints no browser session. `callback()`'s existing
+`Err -> BAD_GATEWAY` mapping is untouched and already uniform — a refusal and a collision
+(`Error::Conflict`) both reach the caller as the same generic 502, never revealing which case
+occurred or whether the presented subject has an account at all.
+
+**Why refusing here is bounded, not a new failure mode.** An accountless subject already dead-ended
+downstream in both flows before this correction: browser SSO's `find_default_project_id` returns
+`None` for a subject with no projects, which `complete`'s browser arm turns into `Error::NotFound`
+(a different failure, same shape of "this doesn't work"); device pairing's token-issuance leg
+independently rejects an approved-but-accountless subject with `access_denied: "subject has no
+default project"`. This correction moves the refusal earlier — to the callback, before any row is
+written — rather than introducing a new way for a login to fail. It also means the refusal is
+row-free: nothing to clean up, nothing left inconsistent.
+
+**`ON DELETE SET NULL` becomes `ON DELETE CASCADE`.** This is the one change in this correction that
+is not optional cleanup — it is required for the `NOT NULL` constraint above to be satisfiable at
+all. `SET NULL` on a column being made `NOT NULL` is a contradiction the database cannot honor; left
+alone, the live `deleteAccountPermanently` procedure (the only way an `accounts` row is ever
+deleted) would start failing every call that touched an adopted federated identity with `23502 null
+value in column "account_id" violates not-null constraint`. Under the corrected model this is also
+the semantically right behavior: a federated identity with no account is no longer a representable
+state, so deleting the account it is keyed to must delete the identity row too, not orphan it into
+an invalid `NULL`. The person (`users` row) itself is unaffected either way — deleting an account
+never deletes the `users` row it derives to.
+
+**Migration**: `migrations/20260825000002_federated_identities_link_accounts_not_users.sql` (see
+its own header comment for the full row-disposition algorithm, lock posture, and reasoning). In
+order: delete the `users` rows the old mint branch created (scoped narrowly — a `users` row
+legitimately orphaned by `deleteAccountPermanently` is left alone), delete any remaining accountless
+`federated_identities` row, drop the `user_id` column, swap the FK action to `ON DELETE CASCADE`,
+then set `account_id NOT NULL`.
+
+**Unchanged by this correction**: both unique indexes
+(`federated_identities_issuer_subject_uidx`, `federated_identities_account_uidx`) survive verbatim
+— the account-adoption uniqueness they enforce (Q1) is exactly as before, and the partial index's
+predicate (`WHERE account_id IS NOT NULL`) simply becomes vacuously true once `account_id` is `NOT
+NULL`. The token-sealing mechanism (Q2), the `authz.cstack` exception (Q4, still absent from the
+schema entirely, and `accounts.user_id` still never written through the generated client), the
+backfill (Q5, unaffected — it only ever touched `accounts`/`users`, never `federated_identities`),
+and the config/deployment requirement (Q7) are all untouched.
+
 ## Consequences
 
 - **ACCEPTED RISK — unauthenticated row growth is bounded by the realm's own authentication
@@ -229,6 +324,11 @@ the matching dev-shaped default with an explicit comment that production must ov
   registration policy ever opens up (self-service sign-up, a federated identity provider with lax
   vetting, etc.), the owner must re-check this acceptance; the fix, if needed, lives at the realm
   policy layer, not here.
+  - **This acceptance is WITHDRAWN as of the 2026-08-25 Correction below.** It was explicitly
+    conditional on the configured realm not permitting self-registration; the owner has confirmed
+    the realm DOES permit it, so the condition failed and the risk is now removed structurally
+    (the accountless login is refused, not persisted) rather than left as a standing exception. See
+    "Correction" below.
 - **Deployment note — the backfill migration takes an `AccessExclusiveLock` on `accounts` for
   ~500ms at 100k rows, and fails fast instead of queueing.** See
   `migrations/20260825000001_users_and_federated_identities.sql`'s own header comment for the full
