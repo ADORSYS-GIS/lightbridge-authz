@@ -207,6 +207,16 @@ async fn verified_keycloak_callback_transitions_pending_device_code_to_approved(
         })
         .await;
     let repo = repo(pool);
+    // ADR-0024 Correction (2026-08-25): upsert_federated_identity now refuses a subject with no
+    // pre-existing account, so this callback's identity must have one to adopt.
+    repo.create_account(
+        "keycloak-subject",
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .unwrap();
     let store = DbDeviceCodeStore::new(repo.clone());
     store.store_device_code(session()).await.unwrap();
     let mut config = rp_config(&keycloak);
@@ -1407,11 +1417,21 @@ async fn mock_discovery_and_jwks(keycloak: &MockServer, key: &GeneratedKey) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn device_pairing_callback_persists_a_federated_identity_and_user(pool: PgPool) {
+async fn device_pairing_callback_persists_a_federated_identity_for_an_existing_account(
+    pool: PgPool,
+) {
     let keycloak = MockServer::start_async().await;
     let key = generate_rs256_key().unwrap();
     mock_discovery_and_jwks(&keycloak, &key).await;
     let repo = repo(pool.clone());
+    repo.create_account(
+        "keycloak-subject",
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .unwrap();
     let store = DbDeviceCodeStore::new(repo.clone());
     store.store_device_code(session()).await.unwrap();
     let rp = Arc::new(
@@ -1458,22 +1478,85 @@ async fn device_pairing_callback_persists_a_federated_identity_and_user(pool: Pg
     assert_eq!(federation.issuer, keycloak.base_url());
     assert_eq!(federation.subject, "keycloak-subject");
     assert_eq!(
-        federation.account_id, None,
-        "no pre-existing account shares this subject's id, so nothing is adopted"
+        federation.account_id, "keycloak-subject",
+        "the pre-existing account sharing this subject's id must be adopted"
     );
-    let user_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
-        .bind(&federation.user_id)
-        .fetch_one(&pool)
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn device_pairing_callback_is_refused_for_a_subject_with_no_account(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let key = generate_rs256_key().unwrap();
+    mock_discovery_and_jwks(&keycloak, &key).await;
+    let repo = repo(pool.clone());
+    // Deliberately no repo.create_account() call -- this subject has no pre-existing account.
+    let store = DbDeviceCodeStore::new(repo.clone());
+    store.store_device_code(session()).await.unwrap();
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.url("/jwks"),
+            repo.clone(),
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+    let (router, state, cookie) = begin_pairing(router(rp)).await;
+    let decoded = OAuth2State::decrypt(&state, &state_key_bytes()).unwrap();
+    let token = sign_id_token(
+        &key,
+        "accountless-device-subject",
+        &keycloak.base_url(),
+        decoded.nonce.as_deref().unwrap(),
+    );
+    keycloak
+        .mock_async(|when, then| {
+            when.method(POST).path("/token").body_includes("code=code");
+            then.status(200)
+                .json_body(rich_token_response(&token, "accountless-device-refresh"));
+        })
+        .await;
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(callback_uri(&state))
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "a subject with no pre-existing account must be refused, not paired"
+    );
+
+    let federation = repo
+        .find_federated_identity(&keycloak.base_url(), "accountless-device-subject")
         .await
         .unwrap();
     assert!(
-        user_exists,
-        "a users row must exist for the minted user_id {}",
-        federation.user_id
+        federation.is_none(),
+        "the refused login must leave no federated_identities row behind"
     );
-    assert_ne!(
-        federation.user_id, "keycloak-subject",
-        "with no pre-existing account, a fresh user id must be minted, not the subject reused"
+
+    let user_count: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        user_count, 0,
+        "the refused login must never mint a users row -- there is no mint-a-user branch any more"
+    );
+
+    let store = DbDeviceCodeStore::new(repo);
+    let fetched = store.get_device_code("device-code").await.unwrap().unwrap();
+    assert!(
+        matches!(fetched.status, DeviceCodeStatus::Pending),
+        "the gate precedes the flow arm's own side effect -- the device code must remain Pending, \
+         never Approved, expected Pending got {:?}",
+        fetched.status
     );
 }
 
@@ -1563,12 +1646,8 @@ async fn browser_sso_callback_persists_the_same_federated_identity(pool: PgPool)
     assert_eq!(federation.subject, subject);
     assert_eq!(
         federation.account_id,
-        Some(subject.to_string()),
+        subject.to_string(),
         "a pre-existing account whose id equals the subject must be adopted"
-    );
-    assert_eq!(
-        federation.user_id, subject,
-        "the adopted account's user_id (trigger-provisioned, id-reused) becomes this identity's user"
     );
 }
 
@@ -1578,6 +1657,14 @@ async fn stored_token_envelope_is_not_plaintext_at_rest(pool: PgPool) {
     let key = generate_rs256_key().unwrap();
     mock_discovery_and_jwks(&keycloak, &key).await;
     let repo = repo(pool.clone());
+    repo.create_account(
+        "keycloak-subject",
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .unwrap();
     let store = DbDeviceCodeStore::new(repo.clone());
     store.store_device_code(session()).await.unwrap();
     let rp = Arc::new(
@@ -1651,6 +1738,14 @@ async fn token_envelope_does_not_open_under_the_state_encryption_key(pool: PgPoo
     let key = generate_rs256_key().unwrap();
     mock_discovery_and_jwks(&keycloak, &key).await;
     let repo = repo(pool.clone());
+    repo.create_account(
+        "keycloak-subject",
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .unwrap();
     let store = DbDeviceCodeStore::new(repo.clone());
     store.store_device_code(session()).await.unwrap();
     let rp = Arc::new(
@@ -1974,7 +2069,13 @@ async fn a_second_issuer_with_a_colliding_subject_is_refused_not_merged(pool: Pg
         .await
         .unwrap()
         .expect("issuer_a's login must adopt the pre-existing account");
-    assert_eq!(issuer_a_before.account_id, Some(subject.to_string()));
+    // ADR-0024 Correction (2026-08-25): account_id is a plain, NOT NULL String now -- the refusal
+    // exercised below still comes from the adopt-path's 23505 (issuer_b's subject already adopted
+    // an account via issuer_a), not the accountless-subject refusal this correction adds; that
+    // distinction matters because both now map to `Error::Forbidden`/`Error::Conflict` and the same
+    // uniform BAD_GATEWAY, so this test is what pins "refused, not merged" specifically for the
+    // already-has-an-account collision case.
+    assert_eq!(issuer_a_before.account_id, subject.to_string());
 
     // Second login: issuer_b presents the SAME subject. Must be refused, not merged.
     let (location, cookie) = rp_b

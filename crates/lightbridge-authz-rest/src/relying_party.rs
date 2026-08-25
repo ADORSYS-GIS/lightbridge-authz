@@ -483,12 +483,15 @@ impl KeycloakRelyingParty {
                 "Keycloak ID token nonce mismatch".to_string(),
             ));
         }
-        // ADR-0024: the single funnel for BOTH device pairing and browser SSO -- this `complete`
-        // method is `callback()`'s only caller, so every successful login of either shape reaches
-        // here exactly once, after the ID token is already fully validated (issuer, audience,
-        // signature, nonce) and before either flow arm below runs its own side effects. Fail
-        // closed: a persistence failure propagates via `?` and `callback()` already maps any
-        // `Err` from `complete` to a generic failure response -- there is no flow-specific
+        // ADR-0024 (corrected 2026-08-25): the single funnel for BOTH device pairing and browser
+        // SSO -- this `complete` method is `callback()`'s only caller, so every successful login
+        // of either shape reaches here exactly once, after the ID token is already fully validated
+        // (issuer, audience, signature, nonce) and before either flow arm below runs its own side
+        // effects. This funnel is now also the GATE: a subject with no pre-existing `accounts` row
+        // is refused right here (`Error::Forbidden` from `upsert_federated_identity`), before
+        // either flow arm's side effects -- no device approval, no session. Fail closed: a
+        // persistence failure (refusal included) propagates via `?` and `callback()` already maps
+        // any `Err` from `complete` to a generic failure response -- there is no flow-specific
         // fallback that proceeds without a persisted federated identity.
         self.persist_federated_identity(&claims, &token).await?;
         match flow {
@@ -541,14 +544,17 @@ impl KeycloakRelyingParty {
         }
     }
 
-    /// ADR-0024: seals `token`'s refresh token + `claims`' non-access-token profile fields under
-    /// `self.token_key` (never the access token, never the raw ID token JWT -- see
-    /// [`KeycloakTokenSet`]'s doc comment) and persists it via
+    /// ADR-0024 (corrected 2026-08-25): seals `token`'s refresh token + `claims`' non-access-token
+    /// profile fields under `self.token_key` (never the access token, never the raw ID token JWT
+    /// -- see [`KeycloakTokenSet`]'s doc comment) and persists it via
     /// [`StoreRepo::upsert_federated_identity`], keyed by `(claims.iss, claims.sub)`. Called from
     /// [`Self::complete`] after ID-token validation, before either flow arm -- see that call
     /// site's own doc comment for why. Fail-closed: any error here (serialization, sealing, or
-    /// the repo call, including the `Error::Conflict` a colliding second issuer produces)
-    /// propagates via `?` to `complete`'s caller, never silently skipped.
+    /// the repo call) propagates via `?` to `complete`'s caller, never silently skipped. The
+    /// propagated errors now include `Error::Forbidden` (the subject has no `accounts` row)
+    /// alongside `Error::Conflict` (a colliding second issuer) -- both reach the caller as the same
+    /// generic `BAD_GATEWAY` (uniform: this response never reveals whether a subject has an
+    /// account).
     async fn persist_federated_identity(
         &self,
         claims: &IdTokenClaims,
