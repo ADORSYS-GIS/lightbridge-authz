@@ -22,6 +22,7 @@ use lightbridge_authz_core::config::{ModelCatalog, ModelCatalogEntry};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_core::error::Error;
+use lightbridge_authz_core::identity::AccountId;
 use lightbridge_authz_core::{CreateAccount, CreateProject};
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
 use sqlx::PgPool;
@@ -66,7 +67,7 @@ async fn seed_owner_and_project(core: Arc<dyn DbPoolTrait>) -> (String, String) 
 
     let project = repo
         .create_project(
-            &owner_subject,
+            &AccountId::assert_already_resolved(owner_subject.clone()),
             &owner_account.id,
             CreateProject {
                 name: "proj".to_string(),

@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_core::error::{Error, Result};
+use lightbridge_authz_core::identity::AccountId;
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeyStatus, ApiKeyValidation, CreateAccount, CreateProject, DefaultLimits,
     ModelPolicy, Project, ProjectMember, ResolvedContext, ResourceStatus, UpdateAccount,
@@ -196,17 +197,17 @@ impl StoreRepo {
     /// to resolve the `role` claim for a native RFC 8693 exchange session at introspection time,
     /// the human/OIDC-plane mirror of `project_member_quota_tier` below (ADR-0017's same
     /// reasoning applies here).
-    #[instrument(skip(self, subject))]
+    #[instrument(skip(self, account_id))]
     pub async fn project_member_role(
         &self,
         project_id: &str,
-        subject: &str,
+        account_id: &AccountId,
     ) -> Result<Option<String>> {
         let role: Option<String> = sqlx::query_scalar(
             r#"SELECT role FROM project_members WHERE project_id = $1 AND account_id = $2"#,
         )
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         Ok(role)
@@ -225,7 +226,7 @@ impl StoreRepo {
     /// visibility into the project at all (not the owner, not on the roster in any role) gets
     /// `NotFound` so project existence isn't leaked; a subject who can see the project as a plain
     /// `member` but lacks lead standing gets `Forbidden`.
-    async fn authorize_project_lead(&self, project_id: &str, subject: &str) -> Result<()> {
+    async fn authorize_project_lead(&self, project_id: &str, account_id: &AccountId) -> Result<()> {
         let project_account_id: Option<String> =
             sqlx::query_scalar(r#"SELECT account_id FROM projects WHERE id = $1"#)
                 .bind(project_id)
@@ -234,11 +235,11 @@ impl StoreRepo {
         let Some(project_account_id) = project_account_id else {
             return Err(Error::NotFound);
         };
-        if project_account_id == subject {
+        if project_account_id == account_id.as_str() {
             return Ok(());
         }
         match self
-            .project_member_role(project_id, subject)
+            .project_member_role(project_id, account_id)
             .await?
             .as_deref()
         {
@@ -352,7 +353,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn list_accounts(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         offset: u32,
         limit: u32,
     ) -> Result<Vec<Account>> {
@@ -366,7 +367,7 @@ impl StoreRepo {
             OFFSET $3
             "#,
         )
-        .bind(subject)
+        .bind(account_id.as_str())
         .bind(i64::from(limit))
         .bind(i64::from(offset))
         .fetch_all(self.pool())
@@ -375,7 +376,11 @@ impl StoreRepo {
     }
 
     #[instrument(skip(self))]
-    pub async fn get_account(&self, subject: &str, account_id: &str) -> Result<Option<Account>> {
+    pub async fn get_account(
+        &self,
+        acting_account_id: &AccountId,
+        account_id: &str,
+    ) -> Result<Option<Account>> {
         let row = sqlx::query_as::<_, AccountRow>(
             r#"
             SELECT id, default_quota, status, created_at, updated_at
@@ -384,7 +389,7 @@ impl StoreRepo {
             "#,
         )
         .bind(account_id)
-        .bind(subject)
+        .bind(acting_account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(Self::to_account))
@@ -399,7 +404,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn update_account(
         &self,
-        subject: &str,
+        acting_account_id: &AccountId,
         account_id: &str,
         input: UpdateAccount,
     ) -> Result<Account> {
@@ -415,7 +420,7 @@ impl StoreRepo {
         .bind(input.default_quota)
         .bind(now)
         .bind(account_id)
-        .bind(subject)
+        .bind(acting_account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
@@ -432,7 +437,11 @@ impl StoreRepo {
     /// `projects.is_default` (default-*project*) survives, and it is enforced on `Project`, not
     /// here.
     #[instrument(skip(self))]
-    pub async fn delete_account(&self, subject: &str, account_id: &str) -> Result<Account> {
+    pub async fn delete_account(
+        &self,
+        acting_account_id: &AccountId,
+        account_id: &str,
+    ) -> Result<Account> {
         let row: Option<AccountRow> = sqlx::query_as(
             r#"
             DELETE FROM accounts
@@ -441,7 +450,7 @@ impl StoreRepo {
             "#,
         )
         .bind(account_id)
-        .bind(subject)
+        .bind(acting_account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
@@ -456,14 +465,14 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn add_project_member(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         target_account_id: &str,
         role: Option<&str>,
     ) -> Result<Project> {
         let role = role.unwrap_or("member");
         Self::validate_project_role(role)?;
-        self.authorize_project_lead(project_id, subject).await?;
+        self.authorize_project_lead(project_id, account_id).await?;
 
         sqlx::query(
             r#"
@@ -499,7 +508,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn list_project_roster(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
     ) -> Result<Vec<ProjectMember>> {
         let project_account_id: Option<String> =
@@ -510,9 +519,9 @@ impl StoreRepo {
         let Some(project_account_id) = project_account_id else {
             return Err(Error::NotFound);
         };
-        if project_account_id != subject
+        if project_account_id != account_id.as_str()
             && self
-                .project_member_role(project_id, subject)
+                .project_member_role(project_id, account_id)
                 .await?
                 .is_none()
         {
@@ -543,11 +552,11 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn remove_project_member(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         target_account_id: &str,
     ) -> Result<Project> {
-        self.authorize_project_lead(project_id, subject).await?;
+        self.authorize_project_lead(project_id, account_id).await?;
 
         sqlx::query(r#"DELETE FROM project_members WHERE project_id = $1 AND account_id = $2"#)
             .bind(project_id)
@@ -568,13 +577,13 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn set_project_member_role(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         target_account_id: &str,
         role: &str,
     ) -> Result<Project> {
         Self::validate_project_role(role)?;
-        self.authorize_project_lead(project_id, subject).await?;
+        self.authorize_project_lead(project_id, account_id).await?;
 
         let result = sqlx::query(
             r#"UPDATE project_members SET role = $1 WHERE project_id = $2 AND account_id = $3"#,
@@ -606,12 +615,12 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn set_project_member_quota_tier(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         target_account_id: &str,
         quota_tier: Option<&str>,
     ) -> Result<Project> {
-        self.authorize_project_lead(project_id, subject).await?;
+        self.authorize_project_lead(project_id, account_id).await?;
 
         let result = sqlx::query(
             r#"UPDATE project_members SET quota_tier = $1 WHERE project_id = $2 AND account_id = $3"#,
@@ -639,7 +648,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn create_project(
         &self,
-        subject: &str,
+        acting_account_id: &AccountId,
         account_id: &str,
         input: CreateProject,
         id: String,
@@ -677,7 +686,7 @@ impl StoreRepo {
             "#,
         )
         .bind(account_id)
-        .bind(subject)
+        .bind(acting_account_id.as_str())
         .bind(new_project.id)
         .bind(new_project.name)
         .bind(new_project.allowed_models)
@@ -715,8 +724,8 @@ impl StoreRepo {
     /// and the bootstrap "ensure default project" flow are two separate calls) -- callers must
     /// treat that identically to `resolve_context`'s own `NotFound`, not as a distinct error class,
     /// to preserve the same non-leaking behavior.
-    #[instrument(skip(self, subject))]
-    pub async fn find_default_project_id(&self, subject: &str) -> Result<Option<String>> {
+    #[instrument(skip(self, account_id))]
+    pub async fn find_default_project_id(&self, account_id: &AccountId) -> Result<Option<String>> {
         let row: Option<(String,)> = sqlx::query_as(
             r#"
             SELECT id
@@ -725,23 +734,23 @@ impl StoreRepo {
               AND is_default = true
             "#,
         )
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(|(id,)| id))
     }
 
-    /// Resolves the `{account_id, project_id}` context for a subject + project on behalf of the
-    /// `lightbridge-keycloak-spi` token-exchange adapter. Authorized when `subject` is the
-    /// project's account owner OR holds ANY `project_members` row on it (not lead-gated -- this is
-    /// a read, same visibility boundary as `Project`'s `@@allow("read", ...)`). Deliberately a
-    /// single query with one `NotFound` branch: "unknown project" and "known project the subject
-    /// can't see" must resolve identically so this endpoint never leaks project existence to a
-    /// non-member -- do not split these cases.
-    #[instrument(skip(self, subject))]
+    /// Resolves the `{account_id, project_id}` context for an (already-translated, ADR-0025) acting
+    /// account id + project on behalf of the `lightbridge-keycloak-spi` token-exchange adapter.
+    /// Authorized when `account_id` is the project's account owner OR holds ANY `project_members`
+    /// row on it (not lead-gated -- this is a read, same visibility boundary as `Project`'s
+    /// `@@allow("read", ...)`). Deliberately a single query with one `NotFound` branch: "unknown
+    /// project" and "known project the caller can't see" must resolve identically so this endpoint
+    /// never leaks project existence to a non-member -- do not split these cases.
+    #[instrument(skip(self, account_id))]
     pub async fn resolve_context(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
     ) -> Result<ResolvedContext> {
         let row: Option<(String, String)> = sqlx::query_as(
@@ -759,7 +768,7 @@ impl StoreRepo {
             "#,
         )
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let (account_id, project_id) = row.ok_or(Error::NotFound)?;
@@ -811,19 +820,19 @@ impl StoreRepo {
     /// the resolved ids, not the fetched `Project` value itself.
     pub async fn resolve_active_context(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
     ) -> Result<ResolvedContext> {
-        let context = self.resolve_context(subject, project_id).await?;
+        let context = self.resolve_context(account_id, project_id).await?;
         self.require_active_project_and_account(&context.project_id, &context.account_id)
             .await?;
         Ok(context)
     }
 
-    /// Resolves the acting `subject`'s per-member `quota_tier` on `project_id` (ADR-0017), the
+    /// Resolves the acting account's per-member `quota_tier` on `project_id` (ADR-0017), the
     /// human/OIDC-plane mirror of the API-key plane's `owner_quota_tier`
     /// (`api_key_validation` view, `migrations/20260731000001_api_keys_owner_account.sql`).
-    /// Deliberately keyed on `subject` (the acting person), not the project's owning account --
+    /// Deliberately keyed on `account_id` (the acting person), not the project's owning account --
     /// same reasoning as that view's `pm.account_id = k.owner_account_id` join: a lead acting on a
     /// project someone else owns is governed by their OWN roster row, not the owner's.
     ///
@@ -839,17 +848,17 @@ impl StoreRepo {
     /// availability failure becomes a quota bypass. See `TokenExchangeOpStore::resolve_quota_tier`
     /// for how the token-exchange/refresh call sites act on that distinction (refuse the mint
     /// rather than omit the claim).
-    #[instrument(skip(self, subject))]
+    #[instrument(skip(self, account_id))]
     pub async fn project_member_quota_tier(
         &self,
         project_id: &str,
-        subject: &str,
+        account_id: &AccountId,
     ) -> Result<Option<String>> {
         let quota_tier: Option<Option<String>> = sqlx::query_scalar(
             r#"SELECT quota_tier FROM project_members WHERE project_id = $1 AND account_id = $2"#,
         )
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         Ok(quota_tier.flatten())
@@ -1431,7 +1440,7 @@ impl StoreRepo {
     /// call sites -- so only sessions minted before this fix (`subject IS NULL`) go unmatched
     /// here; those are TTL-bounded and self-heal on their own expiry, the same trade-off the
     /// nullable-column migration already made for pre-migration browser rows.
-    pub async fn revoke_sessions_and_cascade(&self, subject: &str) -> Result<u64> {
+    pub async fn revoke_sessions_and_cascade(&self, account_id: &AccountId) -> Result<u64> {
         let mut tx = self.pool().begin().await?;
         let revoked_sessions = sqlx::query(
             r#"
@@ -1441,7 +1450,7 @@ impl StoreRepo {
               AND status = 'active'
             "#,
         )
-        .bind(subject)
+        .bind(account_id.as_str())
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -1452,7 +1461,7 @@ impl StoreRepo {
               AND session_id IN (SELECT id FROM sessions WHERE subject = $1)
             "#,
         )
-        .bind(subject)
+        .bind(account_id.as_str())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1466,7 +1475,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn list_projects(
         &self,
-        subject: &str,
+        acting_account_id: &AccountId,
         account_id: &str,
         offset: u32,
         limit: u32,
@@ -1502,7 +1511,7 @@ impl StoreRepo {
             "#,
         )
         .bind(account_id)
-        .bind(subject)
+        .bind(acting_account_id.as_str())
         .bind(i64::from(limit))
         .bind(i64::from(offset))
         .fetch_all(self.pool())
@@ -1511,7 +1520,11 @@ impl StoreRepo {
     }
 
     #[instrument(skip(self))]
-    pub async fn get_project(&self, subject: &str, project_id: &str) -> Result<Option<Project>> {
+    pub async fn get_project(
+        &self,
+        account_id: &AccountId,
+        project_id: &str,
+    ) -> Result<Option<Project>> {
         let row = sqlx::query_as(
             r#"
             SELECT
@@ -1540,7 +1553,7 @@ impl StoreRepo {
             "#,
         )
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(Self::to_project))
@@ -1583,7 +1596,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn update_project(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         input: UpdateProject,
     ) -> Result<Project> {
@@ -1639,7 +1652,7 @@ impl StoreRepo {
         .bind(changes.billing_plan)
         .bind(changes.updated_at)
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
@@ -1654,7 +1667,7 @@ impl StoreRepo {
     /// account.id == auth().id` schema policy, which is a separate code path this method does not
     /// back).
     #[instrument(skip(self))]
-    pub async fn delete_project(&self, subject: &str, project_id: &str) -> Result<()> {
+    pub async fn delete_project(&self, account_id: &AccountId, project_id: &str) -> Result<()> {
         let result = sqlx::query(
             r#"
             DELETE FROM projects
@@ -1669,7 +1682,7 @@ impl StoreRepo {
             "#,
         )
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .execute(self.pool())
         .await?;
         if result.rows_affected() == 0 {
@@ -1685,8 +1698,12 @@ impl StoreRepo {
     /// member may NOT create keys. Once authorized, the plain `INSERT` needs no further
     /// project-existence guard (`authorize_project_lead` already confirmed the project exists).
     #[instrument(skip(self))]
-    pub async fn create_api_key(&self, subject: &str, input: NewApiKeyRow) -> Result<ApiKey> {
-        self.authorize_project_lead(&input.project_id, subject)
+    pub async fn create_api_key(
+        &self,
+        account_id: &AccountId,
+        input: NewApiKeyRow,
+    ) -> Result<ApiKey> {
+        self.authorize_project_lead(&input.project_id, account_id)
             .await?;
         let row: ApiKeyRow = sqlx::query_as(
             r#"
@@ -1712,9 +1729,9 @@ impl StoreRepo {
         .bind(input.last_ip)
         .bind(input.revoked_at)
         .bind(input.billing_plan)
-        // The acting subject, not the project's owning account: a lead who is not the owner may
+        // The acting account, not the project's owning account: a lead who is not the owner may
         // mint keys, and it is THEIR per-member ceiling that should bound the key.
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_one(self.pool())
         .await?;
         Ok(Self::to_api_key(row))
@@ -1724,7 +1741,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn list_api_keys(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         offset: u32,
         limit: u32,
@@ -1761,7 +1778,7 @@ impl StoreRepo {
             "#,
         )
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .bind(i64::from(limit))
         .bind(i64::from(offset))
         .fetch_all(self.pool())
@@ -1770,7 +1787,11 @@ impl StoreRepo {
     }
 
     #[instrument(skip(self))]
-    pub async fn get_api_key(&self, subject: &str, key_id: &str) -> Result<Option<ApiKey>> {
+    pub async fn get_api_key(
+        &self,
+        account_id: &AccountId,
+        key_id: &str,
+    ) -> Result<Option<ApiKey>> {
         let row = sqlx::query_as(
             r#"
             SELECT
@@ -1800,7 +1821,7 @@ impl StoreRepo {
             "#,
         )
         .bind(key_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(Self::to_api_key))
@@ -1809,7 +1830,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn update_api_key(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         key_id: &str,
         input: UpdateApiKey,
     ) -> Result<ApiKey> {
@@ -1845,7 +1866,7 @@ impl StoreRepo {
         .bind(changes.name)
         .bind(changes.expires_at)
         .bind(key_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
@@ -1859,7 +1880,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn set_account_status(
         &self,
-        subject: &str,
+        acting_account_id: &AccountId,
         account_id: &str,
         status: ResourceStatus,
     ) -> Result<Account> {
@@ -1874,7 +1895,7 @@ impl StoreRepo {
         .bind(status.to_string())
         .bind(Utc::now())
         .bind(account_id)
-        .bind(subject)
+        .bind(acting_account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
@@ -1887,7 +1908,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn set_project_status(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         status: ResourceStatus,
     ) -> Result<Project> {
@@ -1922,7 +1943,7 @@ impl StoreRepo {
         .bind(status.to_string())
         .bind(Utc::now())
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
@@ -1943,7 +1964,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn update_account_default_quota(
         &self,
-        subject: &str,
+        acting_account_id: &AccountId,
         account_id: &str,
         default_quota: Option<&str>,
     ) -> Result<Account> {
@@ -1958,7 +1979,7 @@ impl StoreRepo {
         .bind(default_quota)
         .bind(Utc::now())
         .bind(account_id)
-        .bind(subject)
+        .bind(acting_account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
@@ -1977,7 +1998,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn set_project_quota(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         project_quota: Option<&str>,
     ) -> Result<Project> {
@@ -2012,7 +2033,7 @@ impl StoreRepo {
         .bind(project_quota)
         .bind(Utc::now())
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
@@ -2029,7 +2050,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn set_project_allowed_models(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         allowed_models: Option<Vec<String>>,
     ) -> Result<Project> {
@@ -2065,7 +2086,7 @@ impl StoreRepo {
         .bind(allowed_models_json)
         .bind(Utc::now())
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
@@ -2091,7 +2112,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn set_project_model_policy(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         model_policy: &str,
     ) -> Result<Project> {
@@ -2126,7 +2147,7 @@ impl StoreRepo {
             "#,
         )
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(&mut *tx)
         .await?;
         let current = current.ok_or(Error::NotFound)?;
@@ -2188,7 +2209,11 @@ impl StoreRepo {
     /// ADR-0006 dropped `accounts.is_default` outright once one subject could only ever have one
     /// account, so "default account" stopped being a meaningful concept.)
     #[instrument(skip(self))]
-    pub async fn set_default_project(&self, subject: &str, project_id: &str) -> Result<Project> {
+    pub async fn set_default_project(
+        &self,
+        acting_account_id: &AccountId,
+        project_id: &str,
+    ) -> Result<Project> {
         let mut tx: Transaction<'_, Postgres> = self.pool().begin().await?;
 
         let account_id: Option<String> = sqlx::query_scalar(
@@ -2206,7 +2231,7 @@ impl StoreRepo {
             "#,
         )
         .bind(project_id)
-        .bind(subject)
+        .bind(acting_account_id.as_str())
         .fetch_optional(&mut *tx)
         .await?;
         let account_id = account_id.ok_or(Error::NotFound)?;
@@ -2292,7 +2317,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn set_api_key_status(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         key_id: &str,
         status: ApiKeyStatus,
         revoked_at: Option<DateTime<Utc>>,
@@ -2324,7 +2349,7 @@ impl StoreRepo {
         .bind(revoked_at)
         .bind(expires_at)
         .bind(key_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
@@ -2332,12 +2357,12 @@ impl StoreRepo {
     }
 
     /// Project-scoped rule for both halves (not lead-gated, unlike `create_api_key`): revoking the
-    /// presented key and minting its successor both require `subject` to own the project's account
-    /// or hold ANY `project_members` row on it.
+    /// presented key and minting its successor both require `account_id` to own the project's
+    /// account or hold ANY `project_members` row on it.
     #[instrument(skip(self))]
     pub async fn rotate_api_key_transaction(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         key_id: &str,
         status: ApiKeyStatus,
         revoked_at: Option<DateTime<Utc>>,
@@ -2371,7 +2396,7 @@ impl StoreRepo {
         .bind(revoked_at)
         .bind(expires_at)
         .bind(key_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(&mut *tx)
         .await?;
         existing_update.ok_or(Error::NotFound)?;
@@ -2404,7 +2429,7 @@ impl StoreRepo {
             "#,
         )
         .bind(new_key.project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .bind(new_key.id)
         .bind(new_key.name)
         .bind(new_key.key_prefix)
@@ -2742,19 +2767,19 @@ impl StoreRepo {
         Ok(row)
     }
 
-    /// Atomically transitions a `pending` row to `approved`, stamping `subject` (the resolved
-    /// Keycloak `sub`) in the same statement -- a single `UPDATE ... WHERE status = 'pending' ...
-    /// RETURNING` is its own compare-and-swap, mirroring
-    /// [`Self::consume_exchange_refresh_token`] exactly: Postgres holds the row lock for the
-    /// statement's duration, so two concurrent approval attempts (or an approve racing a deny, see
-    /// [`Self::deny_device_authorization`]) can never both observe `status = 'pending'` and both
-    /// succeed. `Ok(None)` when the row is gone/expired/already decided -- the caller (a future
-    /// verification-page ticket) must treat that as "someone already acted on this code", not a
-    /// generic failure.
+    /// Atomically transitions a `pending` row to `approved`, stamping `subject` (ADR-0025: the
+    /// resolved acting account id, never the raw Keycloak `sub` directly) in the same statement --
+    /// a single `UPDATE ... WHERE status = 'pending' ... RETURNING` is its own compare-and-swap,
+    /// mirroring [`Self::consume_exchange_refresh_token`] exactly: Postgres holds the row lock for
+    /// the statement's duration, so two concurrent approval attempts (or an approve racing a deny,
+    /// see [`Self::deny_device_authorization`]) can never both observe `status = 'pending'` and
+    /// both succeed. `Ok(None)` when the row is gone/expired/already decided -- the caller (a
+    /// future verification-page ticket) must treat that as "someone already acted on this code",
+    /// not a generic failure.
     pub async fn approve_device_authorization(
         &self,
         device_code: &str,
-        subject: &str,
+        account_id: &AccountId,
         now: DateTime<Utc>,
     ) -> Result<Option<DeviceAuthorizationRow>> {
         let row: Option<DeviceAuthorizationRow> = sqlx::query_as(
@@ -2768,7 +2793,7 @@ impl StoreRepo {
             "#,
         )
         .bind(device_code)
-        .bind(subject)
+        .bind(account_id.as_str())
         .bind(now)
         .fetch_optional(self.pool())
         .await?;

@@ -17,6 +17,26 @@ fn lazy_pool() -> Arc<dyn DbPoolTrait> {
     Arc::new(DbPool::from_pool(pool))
 }
 
+/// A trust-everything [`lightbridge_authz_rest::auth_provider::SubjectResolver`] test double
+/// (ADR-0025): resolves any `(iss, sub)` to `AccountId::assert_already_resolved(sub)` unconditionally,
+/// never touching a database.
+struct TrustEverythingResolver;
+
+#[lightbridge_authz_core::async_trait]
+impl lightbridge_authz_rest::auth_provider::SubjectResolver for TrustEverythingResolver {
+    async fn resolve(
+        &self,
+        _iss: &str,
+        sub: &str,
+    ) -> lightbridge_authz_core::error::Result<lightbridge_authz_core::identity::AccountId> {
+        Ok(lightbridge_authz_core::identity::AccountId::assert_already_resolved(sub))
+    }
+}
+
+fn test_resolver() -> Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver> {
+    Arc::new(TrustEverythingResolver)
+}
+
 fn sample_redis() -> Option<Redis> {
     Some(Redis {
         url: "redis://127.0.0.1:6379".to_string(),
@@ -558,6 +578,7 @@ mod db {
         ));
         let router = lightbridge_authz_rest::build_api_router(
             bearer,
+            test_resolver(),
             issuer,
             policy_store,
             refill_service,
@@ -608,7 +629,7 @@ mod db {
             .unwrap();
         let project = seed
             .create_project(
-                subject,
+                &lightbridge_authz_core::identity::AccountId::assert_already_resolved(subject),
                 &account.id,
                 CreateProject {
                     name: "opa-trait-project".to_string(),

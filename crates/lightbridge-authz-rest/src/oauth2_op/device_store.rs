@@ -160,8 +160,19 @@ impl DbDeviceCodeStore {
     /// trait's `update_device_code` method, this exposes the CAS result to the browser callback so
     /// it never claims success when a concurrent consume, expiry, or deny won the race.
     pub async fn approve_pending(&self, device_code: &str, subject: &str) -> Result<bool, OpError> {
+        // ADR-0025: `subject` here is already the ADR-0025-resolved acting account id -- this
+        // method's only production caller, `relying_party::complete`'s `Completion::Device`
+        // branch, passes `identity.account_id` (the `FederatedIdentityRow` returned by
+        // `persist_federated_identity`, which resolves/adopts through
+        // `StoreRepo::upsert_federated_identity` before ever reaching this call). Not
+        // `verify_submit`, which only looks up the pending session by `user_code` and never
+        // touches subject resolution.
         self.repo
-            .approve_device_authorization(device_code, subject, Utc::now())
+            .approve_device_authorization(
+                device_code,
+                &lightbridge_authz_core::identity::AccountId::assert_already_resolved(subject),
+                Utc::now(),
+            )
             .await
             .map(|row| row.is_some())
             .map_err(|e| {
@@ -270,8 +281,18 @@ impl DeviceCodeStore for DbDeviceCodeStore {
                     .await
             }
             DeviceCodeStatus::Approved(identity) => {
+                // Not reachable in production today (see this impl's module doc comment) --
+                // `approve_pending` above is the real path. `identity.external_id` is treated the
+                // same way `approve_pending` treats its own `subject`: already an ADR-0025-resolved
+                // account id, not a raw upstream claim.
                 self.repo
-                    .approve_device_authorization(&session.device_code, &identity.external_id, now)
+                    .approve_device_authorization(
+                        &session.device_code,
+                        &lightbridge_authz_core::identity::AccountId::assert_already_resolved(
+                            identity.external_id.clone(),
+                        ),
+                        now,
+                    )
                     .await
             }
             DeviceCodeStatus::Denied => {

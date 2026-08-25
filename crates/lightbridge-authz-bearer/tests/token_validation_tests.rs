@@ -87,6 +87,13 @@ fn far_future_exp() -> u64 {
     4_102_444_800
 }
 
+/// The `iss` claim value used by every fixture in this file that needs one -- matches
+/// `oauth2_config`'s own `federation.issuer`, though nothing in this crate enforces `iss` against
+/// it today (deliberately -- see [`lightbridge_authz_bearer::TokenInfo::iss`]'s doc comment).
+fn test_issuer() -> &'static str {
+    "https://keycloak.example.test/realms/dev"
+}
+
 #[tokio::test]
 async fn empty_token_is_rejected() {
     let service = BearerTokenService::new(oauth2_config(
@@ -213,6 +220,35 @@ async fn expired_token_is_rejected() {
     assert_eq!(err.to_string(), "unauthorized");
 }
 
+/// ADR-0025 Stage 2 / Finding 4 (test review): `Claims.iss` is required, not `Option<String>` --
+/// a token that carries no `iss` claim at all must be rejected outright, not silently accepted
+/// with the field defaulted to empty. This is now load-bearing behavior (the resolver seam
+/// downstream trusts `TokenInfo::iss`), so it gets its own dedicated regression test rather than
+/// relying on the five other tests' fixtures happening to include the claim. Prove-fail: making
+/// `Claims.iss`/`TokenInfo::iss` `Option<String>` (or `#[serde(default)]`) makes this test red,
+/// since the token would then deserialize successfully instead of being refused.
+#[tokio::test]
+async fn missing_iss_is_rejected() {
+    let server = MockServer::start();
+    let key = generate_test_key("no-iss-kid");
+    server.mock(|when, then| {
+        when.method(GET).path("/jwks");
+        then.header("content-type", "application/json")
+            .status(200)
+            .body(jwks_body(&[&key.jwk]));
+    });
+
+    let token = sign(
+        &key,
+        &json!({"sub": "user-no-iss", "exp": far_future_exp()}),
+    );
+
+    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()));
+
+    let err = service.validate_bearer_token(&token).await.unwrap_err();
+    assert_eq!(err.to_string(), "unauthorized");
+}
+
 #[tokio::test]
 async fn successful_validation_without_audience_config_grants_admin_permissions() {
     let server = MockServer::start();
@@ -228,6 +264,7 @@ async fn successful_validation_without_audience_config_grants_admin_permissions(
         &key,
         &json!({
             "sub": "user-admin",
+            "iss": test_issuer(),
             "exp": far_future_exp(),
             "roles": ["lightbridge-admin"],
         }),
@@ -257,7 +294,7 @@ async fn caller_without_matching_role_is_denied_by_require() {
 
     let token = sign(
         &key,
-        &json!({"sub": "user-norole", "exp": far_future_exp()}),
+        &json!({"sub": "user-norole", "iss": test_issuer(), "exp": far_future_exp()}),
     );
 
     let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()));
@@ -284,6 +321,7 @@ async fn successful_validation_with_single_string_audience() {
         &key,
         &json!({
             "sub": "user-aud",
+            "iss": test_issuer(),
             "exp": far_future_exp(),
             "aud": "expected-aud",
         }),
@@ -314,6 +352,7 @@ async fn successful_validation_with_array_audience() {
         &key,
         &json!({
             "sub": "user-aud-array",
+            "iss": test_issuer(),
             "exp": far_future_exp(),
             "aud": ["other-aud", "expected-aud"],
         }),
@@ -426,6 +465,7 @@ async fn custom_roles_claim_is_honored() {
         &key,
         &json!({
             "sub": "user-custom",
+            "iss": test_issuer(),
             "exp": far_future_exp(),
             "roles": ["lightbridge-admin"],
             "lightbridge_api_roles": "lightbridge-viewer",

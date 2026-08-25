@@ -293,9 +293,15 @@ impl std::fmt::Debug for ApiKeyJwtSigner {
 /// Identity of the human who created or rotated the key, snapshotted into the issued JWT so the
 /// token mirrors a Keycloak access token. Captured at issuance from the creator's bearer token;
 /// frozen for the token's TTL and refreshed on rotation.
+///
+/// ADR-0025 Stage 2 groundwork: `account_id` -- the already-resolved acting account id, carried
+/// alongside the raw upstream `subject` -- is threaded through every construction site now, ahead
+/// of Stage 3 actually minting the token's `sub` from it (`identity_for` still reads `subject`
+/// here; that flip is Stage 3's own commit).
 #[derive(Debug, Clone, Default)]
 pub struct KeyOwner {
     pub subject: String,
+    pub account_id: String,
     pub email: Option<String>,
     pub email_verified: Option<bool>,
 }

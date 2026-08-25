@@ -142,6 +142,7 @@ fn build_router(bearer: Arc<dyn BearerTokenServiceTrait>, dev_cors: bool) -> Rou
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
         bearer,
+        common::test_resolver(),
         issuer,
         policy_store,
         refill_service,
@@ -169,6 +170,7 @@ fn build_router_with_billing(bearer: Arc<dyn BearerTokenServiceTrait>, billing: 
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
         bearer,
+        common::test_resolver(),
         issuer,
         policy_store,
         refill_service,
@@ -196,6 +198,7 @@ fn build_router_with_models(
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
         bearer,
+        common::test_resolver(),
         issuer,
         policy_store,
         refill_service,
@@ -223,6 +226,7 @@ fn build_router_at(
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
         bearer,
+        common::test_resolver(),
         issuer,
         policy_store,
         refill_service,

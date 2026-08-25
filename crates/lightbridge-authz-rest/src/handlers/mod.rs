@@ -14,8 +14,8 @@ use lightbridge_authz_core::config::{
 };
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey, ModelPolicy, Project,
-    ProjectMember, ResourceStatus, RotateApiKey, hash_api_key,
+    Account, AccountId, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey,
+    ModelPolicy, Project, ProjectMember, ResourceStatus, RotateApiKey, hash_api_key,
 };
 use lightbridge_authz_core::{
     db::DbPoolTrait,
@@ -136,14 +136,16 @@ impl AuthzStoreImpl {
         requested_expires_at: Option<DateTime<Utc>>,
     ) -> Result<IssuedSecret> {
         if let Some(signer) = &self.jwt_signer {
+            let account_id = AccountId::assert_already_resolved(subject);
             let project = self
                 .repo
-                .get_project(subject, project_id)
+                .get_project(&account_id, project_id)
                 .await?
                 .ok_or(Error::NotFound)?;
             let (email, email_verified) = decode_bearer_profile(bearer_token);
             let owner = crate::signing::KeyOwner {
                 subject: subject.to_string(),
+                account_id: account_id.into(),
                 email,
                 email_verified,
             };
@@ -465,7 +467,11 @@ impl AuthzStoreImpl {
         }
         let account = self
             .repo
-            .update_account_default_quota(subject, account_id, default_quota)
+            .update_account_default_quota(
+                &AccountId::assert_already_resolved(subject),
+                account_id,
+                default_quota,
+            )
             .await?;
         tracing::info!(
             operation = "update_account_default_quota",
@@ -527,7 +533,10 @@ impl AuthzStoreImpl {
             revoked_at: None,
             billing_plan: input.billing_plan,
         };
-        let api_key = self.repo.create_api_key(subject, row).await?;
+        let api_key = self
+            .repo
+            .create_api_key(&AccountId::assert_already_resolved(subject), row)
+            .await?;
         tracing::info!(
             operation = "create_api_key",
             subject = %subject,
@@ -561,14 +570,22 @@ impl AuthzStoreImpl {
     /// `StoreRepo::set_account_status` (membership enforced in SQL).
     pub async fn disable_account(&self, subject: &str, account_id: &str) -> Result<Account> {
         self.repo
-            .set_account_status(subject, account_id, ResourceStatus::Suspended)
+            .set_account_status(
+                &AccountId::assert_already_resolved(subject),
+                account_id,
+                ResourceStatus::Suspended,
+            )
             .await
     }
 
     /// Reactivate a suspended account (`status = 'active'`). Backs `enableAccount`.
     pub async fn enable_account(&self, subject: &str, account_id: &str) -> Result<Account> {
         self.repo
-            .set_account_status(subject, account_id, ResourceStatus::Active)
+            .set_account_status(
+                &AccountId::assert_already_resolved(subject),
+                account_id,
+                ResourceStatus::Active,
+            )
             .await
     }
 
@@ -576,14 +593,22 @@ impl AuthzStoreImpl {
     /// `StoreRepo::set_project_status` (membership enforced in SQL).
     pub async fn disable_project(&self, subject: &str, project_id: &str) -> Result<Project> {
         self.repo
-            .set_project_status(subject, project_id, ResourceStatus::Suspended)
+            .set_project_status(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                ResourceStatus::Suspended,
+            )
             .await
     }
 
     /// Reactivate a suspended project (`status = 'active'`). Backs `enableProject`.
     pub async fn enable_project(&self, subject: &str, project_id: &str) -> Result<Project> {
         self.repo
-            .set_project_status(subject, project_id, ResourceStatus::Active)
+            .set_project_status(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                ResourceStatus::Active,
+            )
             .await
     }
 
@@ -596,14 +621,18 @@ impl AuthzStoreImpl {
     /// procedures' own RBAC gates (`session:revoke-own` vs `session:revoke`, `docs/rbac.md`), not
     /// by anything in this method.
     pub async fn revoke_sessions(&self, subject: &str) -> Result<u64> {
-        self.repo.revoke_sessions_and_cascade(subject).await
+        self.repo
+            .revoke_sessions_and_cascade(&AccountId::assert_already_resolved(subject))
+            .await
     }
 
     /// Promote `project_id` to be its account's new default project. Backs `setDefaultProject`.
     /// Thin wrapper over `StoreRepo::set_default_project` (ownership + atomic unset/set enforced
     /// in SQL).
     pub async fn set_default_project(&self, subject: &str, project_id: &str) -> Result<Project> {
-        self.repo.set_default_project(subject, project_id).await
+        self.repo
+            .set_default_project(&AccountId::assert_already_resolved(subject), project_id)
+            .await
     }
 
     /// Sets `Project.projectQuota` post-creation. Backs `setProjectQuota` (#379, completing
@@ -627,7 +656,11 @@ impl AuthzStoreImpl {
             )));
         }
         self.repo
-            .set_project_quota(subject, project_id, project_quota)
+            .set_project_quota(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                project_quota,
+            )
             .await
     }
 
@@ -658,7 +691,11 @@ impl AuthzStoreImpl {
             )));
         }
         self.repo
-            .set_project_allowed_models(subject, project_id, allowed_models)
+            .set_project_allowed_models(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                allowed_models,
+            )
             .await
     }
 
@@ -696,7 +733,11 @@ impl AuthzStoreImpl {
             ))
         })?;
         self.repo
-            .set_project_model_policy(subject, project_id, &parsed.to_string())
+            .set_project_model_policy(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                &parsed.to_string(),
+            )
             .await
     }
 
@@ -705,7 +746,7 @@ impl AuthzStoreImpl {
         let api_key = self
             .repo
             .set_api_key_status(
-                subject,
+                &AccountId::assert_already_resolved(subject),
                 key_id,
                 ApiKeyStatus::Revoked,
                 Some(Utc::now()),
@@ -732,7 +773,12 @@ impl AuthzStoreImpl {
         role: Option<&str>,
     ) -> Result<Project> {
         self.repo
-            .add_project_member(subject, project_id, target_account_id, role)
+            .add_project_member(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                target_account_id,
+                role,
+            )
             .await
     }
 
@@ -747,7 +793,11 @@ impl AuthzStoreImpl {
         target_account_id: &str,
     ) -> Result<Project> {
         self.repo
-            .remove_project_member(subject, project_id, target_account_id)
+            .remove_project_member(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                target_account_id,
+            )
             .await
     }
 
@@ -761,7 +811,12 @@ impl AuthzStoreImpl {
         role: &str,
     ) -> Result<Project> {
         self.repo
-            .set_project_member_role(subject, project_id, target_account_id, role)
+            .set_project_member_role(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                target_account_id,
+                role,
+            )
             .await
     }
 
@@ -786,7 +841,12 @@ impl AuthzStoreImpl {
             )));
         }
         self.repo
-            .set_project_member_quota_tier(subject, project_id, target_account_id, quota_tier)
+            .set_project_member_quota_tier(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                target_account_id,
+                quota_tier,
+            )
             .await
     }
 
@@ -798,14 +858,18 @@ impl AuthzStoreImpl {
         subject: &str,
         project_id: &str,
     ) -> Result<Vec<ProjectMember>> {
-        self.repo.list_project_roster(subject, project_id).await
+        self.repo
+            .list_project_roster(&AccountId::assert_already_resolved(subject), project_id)
+            .await
     }
 
     /// Permanently delete an account, cascading to its projects and api-keys. Backs
     /// `deleteAccountPermanently`. Since ADR-0006 the authorization is simply "the caller is this
     /// account" — there is no role concept left to gate on.
     pub async fn delete_account(&self, subject: &str, account_id: &str) -> Result<Account> {
-        self.repo.delete_account(subject, account_id).await
+        self.repo
+            .delete_account(&AccountId::assert_already_resolved(subject), account_id)
+            .await
     }
 
     /// Rotate an API key: issue a fresh secret (generation/hashing unchanged from before the
@@ -823,9 +887,10 @@ impl AuthzStoreImpl {
         key_id: &str,
         input: RotateApiKey,
     ) -> Result<ApiKeySecret> {
+        let account_id = AccountId::assert_already_resolved(subject);
         let existing = self
             .repo
-            .get_api_key(subject, key_id)
+            .get_api_key(&account_id, key_id)
             .await?
             .ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
 
@@ -875,7 +940,14 @@ impl AuthzStoreImpl {
         };
         let api_key = self
             .repo
-            .rotate_api_key_transaction(subject, key_id, status, revoked_at, old_expires_at, row)
+            .rotate_api_key_transaction(
+                &account_id,
+                key_id,
+                status,
+                revoked_at,
+                old_expires_at,
+                row,
+            )
             .await?;
         tracing::info!(
             operation = "rotate_api_key",

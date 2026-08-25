@@ -448,6 +448,12 @@ fn offline_token_exchange_state(
         policy_engine,
         bearer,
         cfg,
+        oauth2
+            .federation
+            .as_ref()
+            .expect("caller supplies oauth2.federation")
+            .issuer
+            .clone(),
     ));
     TokenExchangeState::new(
         signer,
@@ -1066,12 +1072,31 @@ mod db {
     // import so a default-features `cargo test` on this binary (mod db compiled out) doesn't
     // warn `unused_imports` for them.
     use lightbridge_authz_core::config::{OauthClient, OauthClientType, Redis};
+    use lightbridge_authz_core::identity::AccountId;
+    use lightbridge_authz_rest::auth_provider::SubjectResolver;
     use lightbridge_authz_rest::build_api_router;
     use sqlx::PgPool;
 
     fn repo(pool: PgPool) -> Arc<StoreRepo> {
         let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
         Arc::new(StoreRepo::new(pool))
+    }
+
+    /// A trust-everything [`SubjectResolver`] test double: this file's `build_api_router` fixture
+    /// never actually dispatches an authenticated request through it (every test here is rejected
+    /// by the `rpc_authorize` gate before dispatch -- see `api_router_no_longer_serves_well_known`
+    /// and friends), so it only needs to construct, never resolve for real.
+    struct UnreachableResolver;
+
+    #[lightbridge_authz_core::async_trait]
+    impl SubjectResolver for UnreachableResolver {
+        async fn resolve(
+            &self,
+            _iss: &str,
+            sub: &str,
+        ) -> lightbridge_authz_core::error::Result<AccountId> {
+            Ok(AccountId::assert_already_resolved(sub))
+        }
     }
 
     /// Unreachable but syntactically valid -- `start_idp_server`'s mandatory-redis check is
@@ -1220,7 +1245,11 @@ mod db {
     /// (here: a `state_encryption_key` that isn't 32 bytes once base64url-decoded).
     fn invalid_relying_party_cfg() -> lightbridge_authz_core::config::OidcRelyingParty {
         lightbridge_authz_core::config::OidcRelyingParty {
-            issuer: "https://keycloak.example.test/realms/dev".to_string(),
+            // Must MATCH the fixture default's `federation.issuer` -- ADR-0025's
+            // startup equality check runs before `KeycloakRelyingParty::new`, and this
+            // fixture exists to reach new()'s own state-key validation, not the
+            // federation check (which has its own dedicated mismatch test).
+            issuer: "https://keycloak.example.test".to_string(),
             client_id: "authz-idp".to_string(),
             callback_url: "https://authz.example.test/oauth2/callback".to_string(),
             client_secret: None,
@@ -1693,6 +1722,7 @@ mod db {
         ));
         let api_router = build_api_router(
             bearer,
+            Arc::new(UnreachableResolver),
             issuer,
             policy_store,
             refill_service,

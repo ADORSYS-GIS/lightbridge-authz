@@ -394,6 +394,11 @@ pub struct ResolveContextRequest {
     /// account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// ADR-0025 Stage 2: the issuer `subject` was authenticated by. `None` (the legacy
+    /// `lightbridge-keycloak-spi` adapter's body shape -- it never sends this field) defaults to
+    /// `oauth2.federation.issuer` at the handler, the deployment's one configured issuer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
 }
 
 #[cfg(test)]

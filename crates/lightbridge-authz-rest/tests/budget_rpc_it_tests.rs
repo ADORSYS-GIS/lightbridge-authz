@@ -188,6 +188,7 @@ async fn setup(
         cdb,
         core.clone(),
         bearer,
+        common::test_resolver(),
         idempotency,
         rate_limit,
         false,

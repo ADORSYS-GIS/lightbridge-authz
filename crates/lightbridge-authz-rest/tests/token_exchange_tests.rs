@@ -55,13 +55,14 @@ use lightbridge_authz_core::config::{
 };
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
+use lightbridge_authz_core::identity::AccountId;
 use lightbridge_authz_core::{
     CreateAccount, CreateProject, Permission, ResourceStatus, hash_api_key,
 };
 use lightbridge_authz_rest::OpaRepoTrait;
 use lightbridge_authz_rest::OpaState;
 use lightbridge_authz_rest::Procedures;
-use lightbridge_authz_rest::auth_provider::build_context;
+use lightbridge_authz_rest::auth_provider::{SubjectResolver, build_context};
 use lightbridge_authz_rest::authorize::{AuthorizeState, router as authorize_router};
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
 use lightbridge_authz_rest::handlers::introspect::introspect_api_key;
@@ -83,7 +84,30 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 
 const ISSUER: &str = "https://authz.example.test";
+// ADR-0025: the ONE issuer these tests' `oauth2.federation`/`TokenExchangeOpStore` grandfather
+// against -- distinct from `ISSUER` above (this service's OWN self-signed-JWT issuer). Every
+// `MockBearer`-produced `TokenInfo.iss` in this file uses this value, matching a real Keycloak
+// `subject_token`'s issuer, so `resolve_account_for_federated_subject`'s self-healing adoption
+// branch fires for these grandfathered (`accounts.id == subject`) fixtures.
+const GRANDFATHER_ISSUER: &str = "https://keycloak.example.test/realms/dev";
 const SUBJECT: &str = "kc-user-123";
+
+/// A trust-everything [`SubjectResolver`] test double: resolves any `(iss, sub)` to
+/// `AccountId::assert_already_resolved(sub)` unconditionally, never touching a database -- this file's own
+/// tests either already hold an ADR-0025-resolved value (e.g. a real minted token's `sub`) or
+/// exercise `resolve_account_for_federated_subject` directly against `repo` where that matters.
+struct TrustEverythingResolver;
+
+#[async_trait]
+impl SubjectResolver for TrustEverythingResolver {
+    async fn resolve(
+        &self,
+        _iss: &str,
+        sub: &str,
+    ) -> lightbridge_authz_core::error::Result<AccountId> {
+        Ok(AccountId::assert_already_resolved(sub))
+    }
+}
 // `create_account` always sets the account's id to the creating subject (ADR-0006: an account IS
 // its owner) -- there is no independent account-id parameter to seed a different value with, so
 // this must alias `SUBJECT` rather than an arbitrary string.
@@ -116,11 +140,27 @@ struct AccessClaims {
 struct MockBearer {
     active: bool,
     aud: Vec<String>,
+    sub: String,
+    iss: String,
 }
 
 impl MockBearer {
     fn new(active: bool, aud: Vec<String>) -> Self {
-        Self { active, aud }
+        Self {
+            active,
+            aud,
+            sub: SUBJECT.to_string(),
+            iss: GRANDFATHER_ISSUER.to_string(),
+        }
+    }
+
+    /// ADR-0025: overrides the default (grandfathered) `sub`/`iss` this mock otherwise always
+    /// returns -- for tests that need a subject the federation seam must refuse (an untrusted
+    /// issuer, or an issuer-matching subject with no `accounts` row).
+    fn with_subject(mut self, sub: &str, iss: &str) -> Self {
+        self.sub = sub.to_string();
+        self.iss = iss.to_string();
+        self
     }
 }
 
@@ -129,7 +169,8 @@ impl BearerTokenServiceTrait for MockBearer {
     async fn validate_bearer_token(&self, _token: &str) -> anyhow::Result<TokenInfo> {
         Ok(TokenInfo {
             active: self.active,
-            sub: SUBJECT.to_string(),
+            sub: self.sub.clone(),
+            iss: self.iss.clone(),
             exp: 0,
             aud: self.aud.clone(),
             roles: vec![],
@@ -359,7 +400,7 @@ async fn seed(repo: &StoreRepo) {
     .await
     .expect("seed account");
     repo.create_project(
-        SUBJECT,
+        &AccountId::assert_already_resolved(SUBJECT),
         ACCOUNT_ID,
         CreateProject {
             name: "exchange-project".to_string(),
@@ -397,7 +438,7 @@ async fn seed_member_project(repo: &StoreRepo) {
     .await
     .expect("seed member account");
     repo.create_project(
-        OWNER_ACCOUNT,
+        &AccountId::assert_already_resolved(OWNER_ACCOUNT),
         OWNER_ACCOUNT,
         CreateProject {
             name: "member-scope-project".to_string(),
@@ -411,9 +452,14 @@ async fn seed_member_project(repo: &StoreRepo) {
     )
     .await
     .expect("seed member project");
-    repo.add_project_member(OWNER_ACCOUNT, MEMBER_PROJECT_ID, SUBJECT, Some("member"))
-        .await
-        .expect("add subject as a roster member");
+    repo.add_project_member(
+        &AccountId::assert_already_resolved(OWNER_ACCOUNT),
+        MEMBER_PROJECT_ID,
+        SUBJECT,
+        Some("member"),
+    )
+    .await
+    .expect("add subject as a roster member");
 }
 
 /// Builds `TokenExchangeState` for a given client registry, bearer, Redis URL, AND an explicit
@@ -494,6 +540,7 @@ fn state_with_cfg_and_budget_repo(
         policy_engine,
         bearer,
         cfg,
+        GRANDFATHER_ISSUER.to_string(),
     ));
     TokenExchangeState::new(
         signer,
@@ -573,6 +620,8 @@ fn opa_state(repo: Arc<StoreRepo>) -> Arc<OpaState> {
             }],
         }),
         api_key_audience: None,
+        resolver: Arc::new(TrustEverythingResolver),
+        federation_issuer: GRANDFATHER_ISSUER.to_string(),
     })
 }
 
@@ -1226,7 +1275,7 @@ async fn authorize_reresolves_context_when_request_project_differs_from_session(
     bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
     seed(&repo).await;
     repo.create_project(
-        SUBJECT,
+        &AccountId::assert_already_resolved(SUBJECT),
         ACCOUNT_ID,
         CreateProject {
             name: "second project".to_string(),
@@ -1337,7 +1386,7 @@ async fn authorize_refuses_when_requested_project_is_not_authorized_for_the_sess
     .await
     .unwrap();
     repo.create_project(
-        UNRELATED_ACCOUNT,
+        &AccountId::assert_already_resolved(UNRELATED_ACCOUNT),
         UNRELATED_ACCOUNT,
         CreateProject {
             name: "unrelated project".to_string(),
@@ -1759,6 +1808,7 @@ async fn azp_reliably_distinguishes_a_real_api_key_jwt_from_a_real_exchange_sess
     let signer = ApiKeyJwtSigner::from_config(&api_key_signing_cfg, repo.clone()).unwrap();
     let owner = KeyOwner {
         subject: SUBJECT.to_string(),
+        account_id: SUBJECT.to_string(),
         email: None,
         email_verified: None,
     };
@@ -1887,6 +1937,127 @@ async fn subject_token_aud_not_naming_the_requesting_client_is_invalid_grant(poo
 
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
     assert_eq!(body["error"], "invalid_grant");
+}
+
+/// ADR-0025 Stage 2 -- THE security test for this grant, mirroring
+/// `federated_subject_resolution_tests.rs`'s `a_second_issuer_presenting_the_same_subject_is_refused_not_merged`
+/// at the token-exchange ingress: `SUBJECT` here is a REAL, seeded account id (`seed(&repo)`
+/// already created it and gave it `PROJECT_ID`) -- if `handle_token_exchange` skipped
+/// `resolve_account_for_federated_subject` and trusted `token_info.sub` directly, this request
+/// would succeed outright (SUBJECT genuinely owns PROJECT_ID), which is exactly why this scenario
+/// -- an UNTRUSTED issuer presenting an otherwise-valid subject value -- is the one that actually
+/// proves resolution happens at THIS seam, not merely that some downstream check happens to
+/// reject an accountless subject too (which it also would, redundantly, but that redundancy
+/// would mask a skipped resolver call in a weaker test).
+#[sqlx::test(migrations = "../../migrations")]
+async fn exchange_refuses_when_the_subject_has_no_federated_identity(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let state = state_with(
+        repo.clone(),
+        Arc::new(
+            MockBearer::new(true, vec![PUBLIC_CLIENT_ID.to_string()])
+                .with_subject(SUBJECT, "https://untrusted-issuer.example"),
+        ),
+        vec![public_client(PUBLIC_CLIENT_ID)],
+        &redis_url(),
+    );
+
+    let (status, body) = post_token(
+        state,
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a subject value presented by an untrusted issuer must be refused even though the SAME \
+         subject value genuinely owns this project under the trusted issuer: {body}"
+    );
+    assert_eq!(body["error"], "access_denied");
+    assert!(body.get("access_token").is_none());
+}
+
+/// THE non-leaking-oracle test for the token-exchange grant, mirroring `opa_tests`'s identically-
+/// named-in-spirit `returns_404_not_403_for_an_unfederated_subject`: a resolver refusal (no
+/// federated identity) and a genuine "not a member of this project" refusal (a real account with
+/// no standing on the requested project) must produce byte-identical error responses -- same
+/// status, same body -- so a client can never distinguish "this subject doesn't exist to us" from
+/// "this subject exists but isn't authorized here".
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unfederated_subject_and_a_non_member_produce_byte_identical_error_responses(
+    pool: PgPool,
+) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+    // A second, unrelated project SUBJECT holds no standing on at all.
+    let other_owner = format!("other-owner-{}", cuid2());
+    repo.create_account(
+        &other_owner,
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .unwrap();
+    let other_project = format!("other-project-{}", cuid2());
+    repo.create_project(
+        &AccountId::assert_already_resolved(other_owner.clone()),
+        &other_owner,
+        CreateProject {
+            name: "unrelated".to_string(),
+            allowed_models: None,
+            default_limits: None,
+            billing_plan: "free".to_string(),
+            billing_identity: format!("bill-{}", cuid2()),
+            project_quota: None,
+        },
+        other_project.clone(),
+    )
+    .await
+    .unwrap();
+
+    let unfederated_state = state_with(
+        repo.clone(),
+        Arc::new(
+            MockBearer::new(true, vec![PUBLIC_CLIENT_ID.to_string()])
+                .with_subject("kc-sub-with-no-account", GRANDFATHER_ISSUER),
+        ),
+        vec![public_client(PUBLIC_CLIENT_ID)],
+        &redis_url(),
+    );
+    let (unfederated_status, unfederated_body) = post_token(
+        unfederated_state,
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
+        ),
+    )
+    .await;
+
+    // SUBJECT is a real, federation-resolvable account -- just not a member of `other_project`.
+    let non_member_state = state(repo.clone(), true);
+    let (non_member_status, non_member_body) = post_token(
+        non_member_state,
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={other_project}"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        unfederated_status, non_member_status,
+        "unfederated: {unfederated_body}, non-member: {non_member_body}"
+    );
+    assert_eq!(
+        unfederated_body, non_member_body,
+        "an unfederated subject and a genuine non-member must be indistinguishable on the wire"
+    );
 }
 
 // ============================================================================================
@@ -2059,6 +2230,7 @@ async fn request_refill_accepts_a_real_human_plane_token_that_still_carries_the_
     let token_info = TokenInfo {
         active: true,
         sub: real_sub.clone(),
+        iss: ISSUER.to_string(),
         exp: 0,
         aud: vec![],
         roles: vec![],
@@ -2066,7 +2238,10 @@ async fn request_refill_accepts_a_real_human_plane_token_that_still_carries_the_
         caller_kind: real_caller_kind,
         access_token: access_token.clone(),
     };
-    let ctx: CratestackContext = build_context(&token_info, RpcScope::Budget);
+    let ctx: CratestackContext =
+        build_context(&token_info, RpcScope::Budget, &TrustEverythingResolver)
+            .await
+            .expect("the trust-everything test resolver never refuses");
     let cratestack_db = lazy_cratestack_db();
 
     let args = schema::procedures::request_budget_refill::Args {
@@ -2387,9 +2562,13 @@ async fn exchange_after_project_suspended_is_access_denied(pool: PgPool) {
     bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
     seed(&repo).await;
 
-    repo.set_project_status(SUBJECT, PROJECT_ID, ResourceStatus::Suspended)
-        .await
-        .expect("owner suspends the project");
+    repo.set_project_status(
+        &AccountId::assert_already_resolved(SUBJECT),
+        PROJECT_ID,
+        ResourceStatus::Suspended,
+    )
+    .await
+    .expect("owner suspends the project");
 
     let (status, body) = post_token(
         state(repo.clone(), true),
@@ -2419,9 +2598,13 @@ async fn exchange_after_account_suspended_is_access_denied(pool: PgPool) {
     bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
     seed(&repo).await;
 
-    repo.set_account_status(SUBJECT, ACCOUNT_ID, ResourceStatus::Suspended)
-        .await
-        .expect("owner suspends the account");
+    repo.set_account_status(
+        &AccountId::assert_already_resolved(SUBJECT),
+        ACCOUNT_ID,
+        ResourceStatus::Suspended,
+    )
+    .await
+    .expect("owner suspends the account");
 
     let (status, body) = post_token(
         state(repo.clone(), true),
@@ -3251,9 +3434,13 @@ async fn refresh_after_member_removed_from_project_is_invalid_grant(pool: PgPool
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let refresh_token = body["refresh_token"].as_str().unwrap().to_string();
 
-    repo.remove_project_member(OWNER_ACCOUNT, MEMBER_PROJECT_ID, SUBJECT)
-        .await
-        .expect("owner removes the member");
+    repo.remove_project_member(
+        &AccountId::assert_already_resolved(OWNER_ACCOUNT),
+        MEMBER_PROJECT_ID,
+        SUBJECT,
+    )
+    .await
+    .expect("owner removes the member");
 
     let (status, body) = post_token(
         state(repo.clone(), true),
@@ -3291,7 +3478,7 @@ async fn refresh_after_project_deleted_is_invalid_grant_not_fail_open(pool: PgPo
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let refresh_token = body["refresh_token"].as_str().unwrap().to_string();
 
-    repo.delete_project(SUBJECT, PROJECT_ID)
+    repo.delete_project(&AccountId::assert_already_resolved(SUBJECT), PROJECT_ID)
         .await
         .expect("owner deletes the project");
 
@@ -3330,9 +3517,13 @@ async fn refresh_after_project_suspended_is_invalid_grant(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let refresh_token = body["refresh_token"].as_str().unwrap().to_string();
 
-    repo.set_project_status(SUBJECT, PROJECT_ID, ResourceStatus::Suspended)
-        .await
-        .expect("owner suspends the project");
+    repo.set_project_status(
+        &AccountId::assert_already_resolved(SUBJECT),
+        PROJECT_ID,
+        ResourceStatus::Suspended,
+    )
+    .await
+    .expect("owner suspends the project");
 
     let (status, body) = post_token(
         state(repo.clone(), true),
@@ -3368,9 +3559,13 @@ async fn refresh_after_account_suspended_is_invalid_grant(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let refresh_token = body["refresh_token"].as_str().unwrap().to_string();
 
-    repo.set_account_status(SUBJECT, ACCOUNT_ID, ResourceStatus::Suspended)
-        .await
-        .expect("owner suspends the account");
+    repo.set_account_status(
+        &AccountId::assert_already_resolved(SUBJECT),
+        ACCOUNT_ID,
+        ResourceStatus::Suspended,
+    )
+    .await
+    .expect("owner suspends the account");
 
     let (status, body) = post_token(
         state(repo.clone(), true),
@@ -3715,7 +3910,7 @@ async fn revoking_a_subjects_sessions_makes_a_live_access_token_introspect_inact
     );
 
     let revoked = repo
-        .revoke_sessions_and_cascade(ACCOUNT_ID)
+        .revoke_sessions_and_cascade(&AccountId::assert_already_resolved(ACCOUNT_ID))
         .await
         .expect("revoke should succeed");
     assert_eq!(
@@ -3761,7 +3956,7 @@ async fn revoking_own_sessions_makes_the_callers_own_live_access_token_introspec
 
     // Self-service revoke targets `auth().id` -- for this seed, that's ACCOUNT_ID (== SUBJECT,
     // ADR-0006), the exact same value `revokeOwnSessions` would receive from the caller's own JWT.
-    repo.revoke_sessions_and_cascade(ACCOUNT_ID)
+    repo.revoke_sessions_and_cascade(&AccountId::assert_already_resolved(ACCOUNT_ID))
         .await
         .expect("self-service revoke should succeed");
 
@@ -3862,7 +4057,7 @@ async fn roster_member_revoking_own_sessions_kills_only_the_members_session(pool
     let (owner_session_id, member_session_id) = seed_owner_and_member_sessions(&repo, &pool).await;
 
     let revoked = repo
-        .revoke_sessions_and_cascade(SUBJECT)
+        .revoke_sessions_and_cascade(&AccountId::assert_already_resolved(SUBJECT))
         .await
         .expect("member's self-revoke should succeed");
     assert_eq!(
@@ -3894,7 +4089,7 @@ async fn project_owner_revoking_own_sessions_still_works_and_spares_the_member(p
     let (owner_session_id, member_session_id) = seed_owner_and_member_sessions(&repo, &pool).await;
 
     let revoked = repo
-        .revoke_sessions_and_cascade(OWNER_ACCOUNT)
+        .revoke_sessions_and_cascade(&AccountId::assert_already_resolved(OWNER_ACCOUNT))
         .await
         .expect("owner's self-revoke should succeed");
     assert_eq!(
@@ -3965,7 +4160,7 @@ async fn revoke_cascade_kills_only_the_actors_own_refresh_chain(pool: PgPool) {
     .await
     .expect("member refresh token persists");
 
-    repo.revoke_sessions_and_cascade(SUBJECT)
+    repo.revoke_sessions_and_cascade(&AccountId::assert_already_resolved(SUBJECT))
         .await
         .expect("member's self-revoke should succeed");
 
@@ -4797,9 +4992,14 @@ async fn token_exchange_stamps_the_real_quota_tier_when_the_subject_has_one(pool
     let repo = repo(pool);
     bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
     seed_member_project(&repo).await;
-    repo.set_project_member_quota_tier(OWNER_ACCOUNT, MEMBER_PROJECT_ID, SUBJECT, Some("t-gold"))
-        .await
-        .expect("owner may set a roster member's quota tier");
+    repo.set_project_member_quota_tier(
+        &AccountId::assert_already_resolved(OWNER_ACCOUNT),
+        MEMBER_PROJECT_ID,
+        SUBJECT,
+        Some("t-gold"),
+    )
+    .await
+    .expect("owner may set a roster member's quota tier");
 
     let (status, body) = post_token(
         state(repo.clone(), true),
@@ -4887,9 +5087,14 @@ async fn refresh_re_resolves_the_quota_tier_live_rather_than_copying_the_old_cla
 
     // A lead sets the tier between the exchange and the refresh -- the claim must catch up on
     // the next refresh (bounded by access-token TTL / refresh timing), not require a fresh login.
-    repo.set_project_member_quota_tier(OWNER_ACCOUNT, MEMBER_PROJECT_ID, SUBJECT, Some("t-silver"))
-        .await
-        .expect("owner may set a roster member's quota tier");
+    repo.set_project_member_quota_tier(
+        &AccountId::assert_already_resolved(OWNER_ACCOUNT),
+        MEMBER_PROJECT_ID,
+        SUBJECT,
+        Some("t-silver"),
+    )
+    .await
+    .expect("owner may set a roster member's quota tier");
 
     let (status, body) = post_token(
         state(repo.clone(), true),
@@ -5128,9 +5333,14 @@ async fn quota_tier_lookup_failure_refuses_the_exchange_even_though_context_reso
     let repo = repo(pool);
     bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
     seed_member_project(&repo).await;
-    repo.set_project_member_quota_tier(OWNER_ACCOUNT, MEMBER_PROJECT_ID, SUBJECT, Some("t-gold"))
-        .await
-        .expect("owner may set a roster member's quota tier");
+    repo.set_project_member_quota_tier(
+        &AccountId::assert_already_resolved(OWNER_ACCOUNT),
+        MEMBER_PROJECT_ID,
+        SUBJECT,
+        Some("t-gold"),
+    )
+    .await
+    .expect("owner may set a roster member's quota tier");
 
     let state = state_with_cfg_and_budget_repo(
         repo.clone(),
@@ -5179,9 +5389,14 @@ async fn quota_tier_lookup_failure_refuses_the_refresh_even_though_context_resol
     let repo = repo(pool);
     bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
     seed_member_project(&repo).await;
-    repo.set_project_member_quota_tier(OWNER_ACCOUNT, MEMBER_PROJECT_ID, SUBJECT, Some("t-gold"))
-        .await
-        .expect("owner may set a roster member's quota tier");
+    repo.set_project_member_quota_tier(
+        &AccountId::assert_already_resolved(OWNER_ACCOUNT),
+        MEMBER_PROJECT_ID,
+        SUBJECT,
+        Some("t-gold"),
+    )
+    .await
+    .expect("owner may set a roster member's quota tier");
 
     let (status, body) = post_token(
         state(repo.clone(), true),
@@ -5276,10 +5491,14 @@ async fn device_grant_persists_pending_state_enforces_polling_and_consumes_once(
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
     assert_eq!(body["error"], "authorization_pending");
 
-    repo.approve_device_authorization(&device_code, SUBJECT, chrono::Utc::now())
-        .await
-        .unwrap()
-        .expect("pending device authorization must approve");
+    repo.approve_device_authorization(
+        &device_code,
+        &AccountId::assert_already_resolved(SUBJECT),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap()
+    .expect("pending device authorization must approve");
     let (status, body) = post_token(
         device_state(repo.clone(), client_id),
         &format!("grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id={client_id}&device_code={device_code}"),
@@ -5328,10 +5547,14 @@ async fn device_grant_omits_refresh_without_offline_access(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let device_code = body["device_code"].as_str().unwrap().to_string();
-    repo.approve_device_authorization(&device_code, SUBJECT, chrono::Utc::now())
-        .await
-        .unwrap()
-        .expect("pending device authorization must approve");
+    repo.approve_device_authorization(
+        &device_code,
+        &AccountId::assert_already_resolved(SUBJECT),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap()
+    .expect("pending device authorization must approve");
 
     let (status, body) = post_token(
         device_state(repo, client_id),
@@ -5467,10 +5690,14 @@ async fn approved_device_code_is_one_shot_when_context_resolution_refuses(pool: 
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let device_code = body["device_code"].as_str().unwrap().to_string();
-    repo.approve_device_authorization(&device_code, SUBJECT, chrono::Utc::now())
-        .await
-        .unwrap()
-        .expect("pending device authorization must approve");
+    repo.approve_device_authorization(
+        &device_code,
+        &AccountId::assert_already_resolved(SUBJECT),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap()
+    .expect("pending device authorization must approve");
 
     let (status, body) = post_token(
         state_with(

@@ -7,6 +7,7 @@
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use lightbridge_authz_core::config::JwtSigning;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
+use lightbridge_authz_core::identity::AccountId;
 use lightbridge_authz_rest::signing::{
     ApiKeyJwtSigner, ClientAuthenticationMetadata, DiscoveryCapabilities, capped_expiry,
     generate_rs256_key,
@@ -904,6 +905,7 @@ mod db {
         let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
         let owner = KeyOwner {
             subject: "kc-user-123".to_string(),
+            account_id: "kc-user-123".to_string(),
             email: Some("dev@example.test".to_string()),
             email_verified: Some(true),
         };
@@ -1053,6 +1055,7 @@ mod db {
 
         let owner = KeyOwner {
             subject: "kc-user-old-vs-new".to_string(),
+            account_id: "kc-user-old-vs-new".to_string(),
             email: Some("dev@example.test".to_string()),
             email_verified: Some(true),
         };
@@ -1222,7 +1225,7 @@ mod db {
         // this test only needs a project to exist so `create_api_key` can sign against it.
         let project = key_repo
             .create_project(
-                subject,
+                &AccountId::assert_already_resolved(subject),
                 &account.id,
                 CreateProject {
                     name: "p".to_string(),

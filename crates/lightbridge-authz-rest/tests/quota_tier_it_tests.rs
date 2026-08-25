@@ -32,6 +32,7 @@ use lightbridge_authz_core::config::{QuotaTier, QuotaTiers};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_core::error::Error;
+use lightbridge_authz_core::identity::AccountId;
 use lightbridge_authz_core::{CreateAccount, CreateProject};
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
 use sqlx::PgPool;
@@ -290,7 +291,7 @@ async fn seed_lead_and_target(core: Arc<dyn DbPoolTrait>) -> (String, String, St
 
     let project = repo
         .create_project(
-            &lead_subject,
+            &AccountId::assert_already_resolved(lead_subject.clone()),
             &lead_account.id,
             CreateProject {
                 name: "proj".to_string(),
@@ -305,9 +306,14 @@ async fn seed_lead_and_target(core: Arc<dyn DbPoolTrait>) -> (String, String, St
         .await
         .expect("project creation");
 
-    repo.add_project_member(&lead_subject, &project.id, &target_subject, Some("member"))
-        .await
-        .expect("add target as a project member");
+    repo.add_project_member(
+        &AccountId::assert_already_resolved(lead_subject.clone()),
+        &project.id,
+        &target_subject,
+        Some("member"),
+    )
+    .await
+    .expect("add target as a project member");
 
     (lead_subject, project.id, target_subject)
 }
@@ -319,7 +325,10 @@ async fn roster_quota_tier(
 ) -> Option<String> {
     let repo = StoreRepo::new(core);
     let roster = repo
-        .list_project_roster(target_subject, project_id)
+        .list_project_roster(
+            &AccountId::assert_already_resolved(target_subject),
+            project_id,
+        )
         .await
         .expect("roster read should succeed");
     roster
@@ -438,7 +447,7 @@ async fn seed_owner_and_project(core: Arc<dyn DbPoolTrait>) -> (String, String) 
 
     let project = repo
         .create_project(
-            &owner_subject,
+            &AccountId::assert_already_resolved(owner_subject.clone()),
             &owner_account.id,
             CreateProject {
                 name: "proj".to_string(),
