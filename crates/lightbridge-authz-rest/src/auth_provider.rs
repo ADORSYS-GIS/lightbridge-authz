@@ -77,12 +77,82 @@ use std::sync::Arc;
 
 use cratestack::axum::http;
 use cratestack::{AuthProvider, CratestackContext, CratestackError, RequestContext, Value};
+use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
 use lightbridge_authz_core::Permission;
+use lightbridge_authz_core::identity::AccountId;
 
 use crate::rpc_authorize::{
     BATCH_OP_ID, RpcScope, op_id_from_path, permission_field_name, required_permission,
 };
+
+/// ADR-0025 Stage 2: translates a validated bearer token's `(iss, sub)` into the acting account
+/// id -- the seam [`build_context`] routes `auth().id` through instead of trusting
+/// [`TokenInfo::sub`] directly. A trait (not a bare `Arc<StoreRepo>`) so tests can substitute a
+/// resolver that never touches a database.
+#[lightbridge_authz_core::async_trait]
+pub trait SubjectResolver: Send + Sync {
+    async fn resolve(
+        &self,
+        iss: &str,
+        sub: &str,
+    ) -> Result<AccountId, lightbridge_authz_core::Error>;
+}
+
+/// The real, Postgres-backed [`SubjectResolver`]. Handles TWO cases, deliberately not conflated:
+///
+/// 1. **A bearer token this service minted itself** (`iss` equals `own_issuer`, i.e.
+///    `oauth2.signing.issuer` under `oauth2.type: self`): `sub` is already the resolved acting
+///    account id by construction (ADR-0025 Stage 3 -- `ApiKeyJwtSigner`/`TokenExchangeOpStore`
+///    both mint `sub` from `KeyOwner::account_id`, never a raw upstream claim), so it is trusted
+///    directly with NO database call, rather than run back through
+///    `resolve_account_for_federated_subject` -- which would refuse it outright, since no
+///    `federated_identities` row is ever written for `(own_issuer, sub)`, and `own_issuer` is
+///    never `oauth2.federation.issuer`. This is the common case for every `oauth2.type: self`
+///    deployment (this repo's own dev/prod config): every RPC/MCP bearer token authz-api/
+///    authz-budget/lightbridge-mcp ever see was minted by this same service.
+/// 2. **Anything else** (a genuinely external issuer -- relevant under `oauth2.type: external`,
+///    where every bearer token presented to this surface IS an externally-issued one): delegates
+///    to `StoreRepo::resolve_account_for_federated_subject`, the real translation seam.
+///
+/// `own_issuer` is `None` under `oauth2.type: external` (there is no self-signed issuer to short-
+/// circuit against -- every token always needs real resolution).
+pub struct FederatedSubjectResolver {
+    repo: Arc<StoreRepo>,
+    own_issuer: Option<String>,
+    grandfather_issuer: String,
+}
+
+impl FederatedSubjectResolver {
+    pub fn new(
+        repo: Arc<StoreRepo>,
+        own_issuer: Option<String>,
+        grandfather_issuer: String,
+    ) -> Self {
+        Self {
+            repo,
+            own_issuer,
+            grandfather_issuer,
+        }
+    }
+}
+
+#[lightbridge_authz_core::async_trait]
+impl SubjectResolver for FederatedSubjectResolver {
+    async fn resolve(
+        &self,
+        iss: &str,
+        sub: &str,
+    ) -> Result<AccountId, lightbridge_authz_core::Error> {
+        if self.own_issuer.as_deref() == Some(iss) {
+            return Ok(AccountId::assert_already_resolved(sub));
+        }
+        self.repo
+            .resolve_account_for_federated_subject(iss, sub, &self.grandfather_issuer)
+            .await
+            .map(AccountId::assert_already_resolved)
+    }
+}
 
 /// Context key under which the validated caller's raw access token is stashed, so procedures that
 /// still need it (e.g. `rotateApiKey`'s downstream secret issuance / token exchange) can read it
@@ -109,11 +179,22 @@ pub struct CratestackAuthProvider {
     /// context's `rpcScope` auth field (see [`build_context`]), which is what lets `authz.cstack`
     /// close that same gap per frame today.
     scope: RpcScope,
+    /// ADR-0025 Stage 2: translates the validated bearer's `(iss, sub)` into the acting account
+    /// id before it ever reaches `auth().id` -- see [`build_context`]'s doc comment.
+    resolver: Arc<dyn SubjectResolver>,
 }
 
 impl CratestackAuthProvider {
-    pub fn new(bearer: Arc<dyn BearerTokenServiceTrait>, scope: RpcScope) -> Self {
-        Self { bearer, scope }
+    pub fn new(
+        bearer: Arc<dyn BearerTokenServiceTrait>,
+        scope: RpcScope,
+        resolver: Arc<dyn SubjectResolver>,
+    ) -> Self {
+        Self {
+            bearer,
+            scope,
+            resolver,
+        }
     }
 }
 
@@ -158,9 +239,22 @@ fn extract_bearer(headers: &http::HeaderMap) -> Option<String> {
 /// copies of this logic is an authorization bug, not a cosmetic one, so there is exactly one
 /// version now; see `mcp.rs`'s own `cratestack_context_from_token_info_matches_the_shared_helper` test for
 /// the regression coverage pinning "every context-construction path sets the full field set."
-pub fn build_context(info: &TokenInfo, scope: RpcScope) -> CratestackContext {
+///
+/// ADR-0025 Stage 2: `auth().id` is no longer `info.sub` directly -- it is
+/// `resolver.resolve(&info.iss, &info.sub)`'s result. A resolver error REFUSES the request
+/// (`CratestackError::Unauthorized`) rather than ever falling through to an unauthenticated or
+/// raw-subject context; see [`SubjectResolver`]'s own doc comment for what the resolver does with
+/// a self-signed-vs-external issuer.
+pub async fn build_context(
+    info: &TokenInfo,
+    scope: RpcScope,
+    resolver: &dyn SubjectResolver,
+) -> Result<CratestackContext, CratestackError> {
+    let account_id = resolver.resolve(&info.iss, &info.sub).await.map_err(|_| {
+        CratestackError::Unauthorized("unable to resolve caller identity".to_owned())
+    })?;
     let mut fields: Vec<(String, Value)> = Vec::with_capacity(Permission::ALL.len() + 2);
-    fields.push(("id".to_owned(), Value::String(info.sub.clone())));
+    fields.push(("id".to_owned(), Value::String(account_id.into())));
     fields.push((
         "rpcScope".to_owned(),
         Value::String(scope.wire_str().to_owned()),
@@ -188,7 +282,7 @@ pub fn build_context(info: &TokenInfo, scope: RpcScope) -> CratestackContext {
             Value::String(caller_kind.clone()),
         );
     }
-    ctx
+    Ok(ctx)
 }
 
 impl AuthProvider for CratestackAuthProvider {
@@ -200,6 +294,7 @@ impl AuthProvider for CratestackAuthProvider {
     ) -> impl core::future::Future<Output = Result<CratestackContext, Self::Error>> + Send {
         let bearer = self.bearer.clone();
         let scope = self.scope;
+        let resolver = self.resolver.clone();
         let token = extract_bearer(request.headers);
         // `request.path` is `/rpc/batch` (literal, envelope-level — see module docs) when this
         // call is authenticating a whole `POST /rpc/batch` request, or the canonical `/rpc/<op_id>`
@@ -223,7 +318,7 @@ impl AuthProvider for CratestackAuthProvider {
                     ));
                 };
                 return match bearer.validate_bearer_token(&token).await {
-                    Ok(info) if info.active => Ok(build_context(&info, scope)),
+                    Ok(info) if info.active => build_context(&info, scope, resolver.as_ref()).await,
                     Ok(_) | Err(_) => Err(CratestackError::Unauthorized(
                         "invalid bearer token".to_owned(),
                     )),
@@ -264,7 +359,7 @@ impl AuthProvider for CratestackAuthProvider {
                             "insufficient permissions".to_owned(),
                         ));
                     }
-                    Ok(build_context(&info, scope))
+                    build_context(&info, scope, resolver.as_ref()).await
                 }
                 // Invalid/inactive token or validation error → uniform 401, never leaking which step
                 // failed (matching the bearer service's existing security posture).

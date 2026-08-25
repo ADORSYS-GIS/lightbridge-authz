@@ -138,6 +138,19 @@ static IDEMPOTENCY_SCHEMA_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCe
 /// Build the full `build_api_router` for `bearer`, connecting the cratestack CRUD client,
 /// Postgres-backed idempotency store, and Redis rate-limit store to the live backends.
 async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
+    setup_with_resolver(bearer, common::test_resolver()).await
+}
+
+/// Like [`setup`], but with a caller-supplied [`SubjectResolver`] instead of the trust-everything
+/// default -- for `crud_authorizes_via_the_federated_account_not_the_raw_subject` below, which
+/// needs a REAL `FederatedSubjectResolver` against this test's own live Postgres to prove
+/// translation actually happens, not merely that a trust-everything stub passes the raw subject
+/// through unchanged (which every other test in this file relies on, deliberately, so bearer
+/// subjects can double as account ids without seeding a federated_identities row each time).
+async fn setup_with_resolver(
+    bearer: Arc<dyn BearerTokenServiceTrait>,
+    resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver>,
+) -> Ctx {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -199,6 +212,7 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
 
     let router = lightbridge_authz_rest::build_api_router(
         bearer,
+        resolver,
         issuer.clone(),
         policy_store.clone(),
         refill_service.clone(),
@@ -585,6 +599,73 @@ async fn crud_lifecycle_for_all_resources() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// ADR-0025 Stage 2: `auth().id` (set by `auth_provider::build_context` via
+/// `SubjectResolver::resolve`) must be the FEDERATED account id a `federated_identities` row
+/// resolves the presented bearer subject to -- never the raw subject claim itself. Deliberately
+/// seeds a `federated_identities` row where `subject != account_id` (a real Keycloak subject
+/// linked to a lightbridge account under a different id) via raw SQL, since none of this repo's
+/// own write paths in Stage 1-3 produce that shape yet (the self-healing grandfather branch
+/// always adopts `subject == account_id`) -- this test proves the GENERAL translation mechanism
+/// (`resolve_account_for_federated_subject`'s "existing row" fast path), not only the
+/// grandfathered special case every other test in this file relies on via the trust-everything
+/// resolver.
+#[tokio::test]
+async fn crud_authorizes_via_the_federated_account_not_the_raw_subject() {
+    const ISSUER: &str = "https://keycloak.example.test/realms/dev";
+    let account_id = format!("real-account-{}", cuid2());
+    let raw_kc_subject = format!("kc-raw-sub-{}", cuid2());
+
+    let core = core_pool().await;
+    let repo = StoreRepo::new(core.clone());
+    repo.create_account(
+        &account_id,
+        lightbridge_authz_core::CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .expect("account creation must succeed");
+    sqlx::query(
+        "INSERT INTO federated_identities (id, issuer, subject, account_id) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(cuid2())
+    .bind(ISSUER)
+    .bind(&raw_kc_subject)
+    .bind(&account_id)
+    .execute(core.pool())
+    .await
+    .expect("seeding the federated_identities row must succeed");
+
+    let resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver> = Arc::new(
+        lightbridge_authz_rest::auth_provider::FederatedSubjectResolver::new(
+            Arc::new(repo),
+            None,
+            ISSUER.to_string(),
+        ),
+    );
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&raw_kc_subject, admin_perms())));
+    let ctx = setup_with_resolver(bearer, resolver).await;
+
+    // `@@allow("read", account.id == auth().id)` on `Account` -- succeeds only if `auth().id`
+    // resolved to `account_id`, the federated target, not `raw_kc_subject`, the presented claim.
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "model.Account.get",
+        Wire::Cbor,
+        &json!({ "id": account_id }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a bearer subject with a federated_identities row must authorize as its target account: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(json_body(&body)["id"], account_id);
 }
 
 /// Regression for the legacy jsonb-`null` `allowed_models` decode failure (migration
@@ -1302,6 +1383,8 @@ fn opa_state(core: Arc<dyn DbPoolTrait>) -> Arc<OpaState> {
         },
         billing: Arc::new(billing()),
         api_key_audience: None,
+        resolver: common::test_resolver(),
+        federation_issuer: "https://keycloak.example.test/realms/dev".to_string(),
     })
 }
 
@@ -1699,7 +1782,11 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
         // `authz.cstack` declares no `@computed` field (see src/lib.rs's own call sites).
         (),
         CborCodec,
-        CratestackAuthProvider::new(admin_bearer(&subject), RpcScope::Crud),
+        CratestackAuthProvider::new(
+            admin_bearer(&subject),
+            RpcScope::Crud,
+            common::test_resolver(),
+        ),
         DEFAULT_BODY_LIMIT_BYTES,
     );
 

@@ -18,6 +18,7 @@ use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::DbPool;
 use lightbridge_authz_core::error::Error;
+use lightbridge_authz_core::identity::AccountId;
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -89,7 +90,11 @@ async fn approve_transitions_pending_to_approved_and_stamps_subject(pool: PgPool
         .unwrap();
 
     let approved = repo
-        .approve_device_authorization(&device_code, "kc-subject-1", Utc::now())
+        .approve_device_authorization(
+            &device_code,
+            &AccountId::assert_already_resolved("kc-subject-1"),
+            Utc::now(),
+        )
         .await
         .unwrap()
         .expect("a pending row must be approvable");
@@ -105,15 +110,23 @@ async fn approve_fails_once_the_row_is_no_longer_pending(pool: PgPool) {
     repo.create_device_authorization(new_pending(&device_code, "APRV0002", Duration::minutes(10)))
         .await
         .unwrap();
-    repo.approve_device_authorization(&device_code, "kc-subject-1", Utc::now())
-        .await
-        .unwrap()
-        .expect("first approval must succeed");
+    repo.approve_device_authorization(
+        &device_code,
+        &AccountId::assert_already_resolved("kc-subject-1"),
+        Utc::now(),
+    )
+    .await
+    .unwrap()
+    .expect("first approval must succeed");
 
     // Prove-fail-first target #1: a second approval attempt on an already-approved row must be
     // rejected by the CAS guard (`WHERE status = 'pending'`), not silently re-applied.
     let second = repo
-        .approve_device_authorization(&device_code, "kc-subject-2", Utc::now())
+        .approve_device_authorization(
+            &device_code,
+            &AccountId::assert_already_resolved("kc-subject-2"),
+            Utc::now(),
+        )
         .await
         .unwrap();
     assert!(
@@ -147,10 +160,14 @@ async fn consume_is_single_use(pool: PgPool) {
     repo.create_device_authorization(new_pending(&device_code, "CNSM0001", Duration::minutes(10)))
         .await
         .unwrap();
-    repo.approve_device_authorization(&device_code, "kc-subject-1", Utc::now())
-        .await
-        .unwrap()
-        .expect("approval must succeed");
+    repo.approve_device_authorization(
+        &device_code,
+        &AccountId::assert_already_resolved("kc-subject-1"),
+        Utc::now(),
+    )
+    .await
+    .unwrap()
+    .expect("approval must succeed");
 
     let first = repo
         .consume_device_authorization(&device_code, Utc::now())
@@ -213,9 +230,13 @@ async fn consumed_row_is_treated_as_absent_by_read_paths(pool: PgPool) {
     repo.create_device_authorization(new_pending(&device_code, "READ0001", Duration::minutes(10)))
         .await
         .unwrap();
-    repo.approve_device_authorization(&device_code, "kc-subject-1", Utc::now())
-        .await
-        .unwrap();
+    repo.approve_device_authorization(
+        &device_code,
+        &AccountId::assert_already_resolved("kc-subject-1"),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
     repo.consume_device_authorization(&device_code, Utc::now())
         .await
         .unwrap();
@@ -265,9 +286,13 @@ async fn concurrent_consume_of_the_same_approved_row_succeeds_exactly_once(pool:
     repo.create_device_authorization(new_pending(&device_code, "RACE0001", Duration::minutes(10)))
         .await
         .unwrap();
-    repo.approve_device_authorization(&device_code, "kc-subject-1", Utc::now())
-        .await
-        .unwrap();
+    repo.approve_device_authorization(
+        &device_code,
+        &AccountId::assert_already_resolved("kc-subject-1"),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
 
     let repo_a = repo.clone();
     let device_code_a = device_code.clone();

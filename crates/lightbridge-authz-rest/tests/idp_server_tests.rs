@@ -103,6 +103,13 @@ fn external_oauth2() -> Oauth2 {
         relying_party: None,
         rbac: Default::default(),
         clients: Vec::new(),
+        // Matches `working_relying_party()`'s own `issuer` below, so `full_idp_oauth2()` (which
+        // sets `relying_party = Some(working_relying_party())`) satisfies `start_idp_server`'s
+        // `federation.issuer == relying_party.issuer` check by default -- tests that need a
+        // mismatch override this field explicitly.
+        federation: Some(lightbridge_authz_core::config::Federation {
+            issuer: "https://keycloak.example.test".to_string(),
+        }),
     }
 }
 
@@ -441,6 +448,12 @@ fn offline_token_exchange_state(
         policy_engine,
         bearer,
         cfg,
+        oauth2
+            .federation
+            .as_ref()
+            .expect("caller supplies oauth2.federation")
+            .issuer
+            .clone(),
     ));
     TokenExchangeState::new(
         signer,
@@ -1059,12 +1072,31 @@ mod db {
     // import so a default-features `cargo test` on this binary (mod db compiled out) doesn't
     // warn `unused_imports` for them.
     use lightbridge_authz_core::config::{OauthClient, OauthClientType, Redis};
+    use lightbridge_authz_core::identity::AccountId;
+    use lightbridge_authz_rest::auth_provider::SubjectResolver;
     use lightbridge_authz_rest::build_api_router;
     use sqlx::PgPool;
 
     fn repo(pool: PgPool) -> Arc<StoreRepo> {
         let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
         Arc::new(StoreRepo::new(pool))
+    }
+
+    /// A trust-everything [`SubjectResolver`] test double: this file's `build_api_router` fixture
+    /// never actually dispatches an authenticated request through it (every test here is rejected
+    /// by the `rpc_authorize` gate before dispatch -- see `api_router_no_longer_serves_well_known`
+    /// and friends), so it only needs to construct, never resolve for real.
+    struct UnreachableResolver;
+
+    #[lightbridge_authz_core::async_trait]
+    impl SubjectResolver for UnreachableResolver {
+        async fn resolve(
+            &self,
+            _iss: &str,
+            sub: &str,
+        ) -> lightbridge_authz_core::error::Result<AccountId> {
+            Ok(AccountId::assert_already_resolved(sub))
+        }
     }
 
     /// Unreachable but syntactically valid -- `start_idp_server`'s mandatory-redis check is
@@ -1213,7 +1245,11 @@ mod db {
     /// (here: a `state_encryption_key` that isn't 32 bytes once base64url-decoded).
     fn invalid_relying_party_cfg() -> lightbridge_authz_core::config::OidcRelyingParty {
         lightbridge_authz_core::config::OidcRelyingParty {
-            issuer: "https://keycloak.example.test/realms/dev".to_string(),
+            // Must MATCH the fixture default's `federation.issuer` -- ADR-0025's
+            // startup equality check runs before `KeycloakRelyingParty::new`, and this
+            // fixture exists to reach new()'s own state-key validation, not the
+            // federation check (which has its own dedicated mismatch test).
+            issuer: "https://keycloak.example.test".to_string(),
             client_id: "authz-idp".to_string(),
             callback_url: "https://authz.example.test/oauth2/callback".to_string(),
             client_secret: None,
@@ -1415,6 +1451,166 @@ mod db {
         );
     }
 
+    /// ADR-0025 Stage 1: every serving component this crate starts refuses to start without
+    /// `oauth2.federation.issuer` -- the same shape as AGENTS.md's "Redis is a mandatory
+    /// dependency" house rule (`start_api_server_requires_redis`/`start_budget_server_requires_redis`
+    /// in `tests/lib_tests.rs`), applied to the new federation requirement across all four
+    /// servers `lightbridge-authz-rest` starts. `self_signed_oauth2()` deliberately lacks
+    /// `relying_party`/`token_exchange` (this file's own minimal fixture); that is fine here
+    /// because `require_federation` runs before either of those checks in every one of the four
+    /// `start_*_server` functions (verified by each assertion below naming ONLY the federation
+    /// field, never a downstream requirement) -- see each function's own call site in `lib.rs`.
+    #[tokio::test]
+    async fn each_server_refuses_to_start_without_oauth2_federation_issuer() {
+        use lightbridge_authz_core::config::{
+            ApiKeyExpiry, ApiServer, BasicAuth, Billing, BillingPlan, BudgetServer, ModelCatalog,
+            OpaServer, QuotaTiers,
+        };
+        use lightbridge_authz_rest::{start_api_server, start_budget_server, start_opa_server};
+
+        let mut oauth2 = self_signed_oauth2();
+        oauth2.federation = None;
+        let billing = Billing {
+            plans: vec![BillingPlan {
+                id: "free".to_string(),
+                name: "Free".to_string(),
+                limits: None,
+            }],
+        };
+        let quota_tiers = QuotaTiers::default();
+        let models = ModelCatalog::default();
+        let api_key_expiry = ApiKeyExpiry::default();
+
+        let api = ApiServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+            allowed_hosts: None,
+            rpc_base_path: None,
+        };
+        let err = start_api_server(
+            &api,
+            lazy_pool(),
+            &oauth2,
+            &billing,
+            &quota_tiers,
+            &models,
+            &api_key_expiry,
+            &None,
+            &None,
+        )
+        .await
+        .expect_err("authz-api must refuse to start with no oauth2.federation.issuer");
+        let message = format!("{err}");
+        assert!(
+            message.contains("oauth2.federation.issuer"),
+            "got: {message}"
+        );
+        assert!(message.contains("authz-api"), "got: {message}");
+
+        let opa = OpaServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+            basic_auth: BasicAuth {
+                username: "opa-user".to_string(),
+                password: "opa-pass".to_string(),
+            },
+        };
+        let err = start_opa_server(&opa, lazy_pool(), &billing, &oauth2)
+            .await
+            .expect_err("authz-opa must refuse to start with no oauth2.federation.issuer");
+        let message = format!("{err}");
+        assert!(
+            message.contains("oauth2.federation.issuer"),
+            "got: {message}"
+        );
+        assert!(message.contains("authz-opa"), "got: {message}");
+
+        let budget = BudgetServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+        };
+        let err = start_budget_server(
+            &budget,
+            lazy_pool(),
+            &oauth2,
+            &billing,
+            &quota_tiers,
+            &models,
+            &api_key_expiry,
+            &None,
+            &None,
+        )
+        .await
+        .expect_err("authz-budget must refuse to start with no oauth2.federation.issuer");
+        let message = format!("{err}");
+        assert!(
+            message.contains("oauth2.federation.issuer"),
+            "got: {message}"
+        );
+        assert!(message.contains("authz-budget"), "got: {message}");
+
+        let idp = IdpServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+            static_dir: TEST_STATIC_DIR.to_string(),
+        };
+        let err = start_idp_server(&idp, lazy_pool(), &oauth2, &None)
+            .await
+            .expect_err("authz-idp must refuse to start with no oauth2.federation.issuer");
+        let message = format!("{err}");
+        assert!(
+            message.contains("oauth2.federation.issuer"),
+            "got: {message}"
+        );
+        assert!(message.contains("authz-idp"), "got: {message}");
+    }
+
+    /// ADR-0025 Stage 1: `authz-idp` seals `federated_identities` rows under
+    /// `oauth2.relying_party.issuer` (the browser-SSO login callback), but
+    /// `resolve_account_for_federated_subject` grandfathers against `oauth2.federation.issuer`.
+    /// A deployment where the two drift would mint federated identity rows this service can
+    /// never resolve back through the ADR-0025 seam -- proves `start_idp_server` refuses to
+    /// start in that state rather than silently running with an unreachable identity.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn idp_refuses_when_federation_issuer_differs_from_relying_party_issuer(pool: PgPool) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let mut oauth2 = full_idp_oauth2();
+        assert_eq!(
+            oauth2.federation.as_ref().map(|f| f.issuer.as_str()),
+            oauth2.relying_party.as_ref().map(|rp| rp.issuer.as_str()),
+            "precondition: full_idp_oauth2()'s federation and relying_party issuers must agree \
+             before this test deliberately breaks that agreement"
+        );
+        oauth2.federation = Some(lightbridge_authz_core::config::Federation {
+            issuer: "https://a-different-issuer.example.test".to_string(),
+        });
+        let idp = IdpServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+            static_dir: TEST_STATIC_DIR.to_string(),
+        };
+        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg())
+            .await
+            .expect_err(
+                "a federation.issuer that disagrees with relying_party.issuer must be a hard \
+                 startup failure for authz-idp",
+            );
+        let message = format!("{err}");
+        assert!(
+            message.contains("oauth2.federation.issuer"),
+            "got: {message}"
+        );
+        assert!(
+            message.contains("oauth2.relying_party.issuer"),
+            "got: {message}"
+        );
+    }
+
     /// OIDC Discovery 1.0 §3: `scopes_supported` MUST include `openid` for an OpenID Provider.
     /// `authz-idp` always mounts the `/authorize` browser-SSO flow and advertises
     /// `authorization_endpoint`, so it is always an OpenID Provider, not a bare OAuth2
@@ -1526,6 +1722,7 @@ mod db {
         ));
         let api_router = build_api_router(
             bearer,
+            Arc::new(UnreachableResolver),
             issuer,
             policy_store,
             refill_service,

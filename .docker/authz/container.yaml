@@ -128,6 +128,11 @@ oauth2:
     requested_token_type: "urn:ietf:params:oauth:token-type:access_token"
     # Target audience for issued tokens - must match one of the valid audiences above
     # audience: "lightbridge-api-key"
+  # ADR-0025 Stage 1: the ONE issuer this deployment trusts for remote-subject-to-account-id
+  # translation. Mandatory for authz-api, authz-idp, authz-opa, authz-budget, and
+  # lightbridge-mcp. Matches relying_party.issuer below: authz-idp asserts the two are equal.
+  federation:
+    issuer: "http://keycloak:9100/realms/dev"
   # Local Compose's Keycloak RP client. The browser reaches authz-idp through localhost:13004;
   # production must replace both callback_url and the state-encryption key.
   relying_party:

@@ -24,7 +24,9 @@ use cratestack_axum::ratelimit::{RateLimitConfig, RateLimitStore};
 use jsonwebtoken::{Algorithm, Validation, decode_header};
 use serde::{Deserialize, Serialize};
 
-use lightbridge_authz_api_key::entities::federated_identity_row::UpsertFederatedIdentity;
+use lightbridge_authz_api_key::entities::federated_identity_row::{
+    FederatedIdentityRow, UpsertFederatedIdentity,
+};
 use lightbridge_authz_api_key::entities::session_row::NewSession;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::config::OidcRelyingParty;
@@ -390,7 +392,16 @@ impl KeycloakRelyingParty {
         subject: &str,
         project_id: &str,
     ) -> Result<lightbridge_authz_core::dto::ResolvedContext> {
-        self.repo.resolve_active_context(subject, project_id).await
+        // ADR-0025: `subject` here is always `sessions.subject` off an already-active browser
+        // session (this method's only call site, `authorize.rs`), which is the ADR-0025-resolved
+        // acting account id since this file's own `complete()` now stamps it that way at session
+        // creation -- never a raw upstream claim reaching this method directly.
+        self.repo
+            .resolve_active_context(
+                &lightbridge_authz_core::identity::AccountId::assert_already_resolved(subject),
+                project_id,
+            )
+            .await
     }
 
     async fn begin(&self, flow: PendingFlow) -> Result<(String, Cookie<'static>)> {
@@ -493,12 +504,20 @@ impl KeycloakRelyingParty {
         // persistence failure (refusal included) propagates via `?` and `callback()` already maps
         // any `Err` from `complete` to a generic failure response -- there is no flow-specific
         // fallback that proceeds without a persisted federated identity.
-        self.persist_federated_identity(&claims, &token).await?;
+        // ADR-0025 Stage 2: `persist_federated_identity` now returns the persisted row so both
+        // flow arms below act on `identity.account_id` -- the resolved acting account id -- never
+        // `claims.sub` (the raw upstream subject) directly. For a grandfathered account the two
+        // are byte-identical (`upsert_federated_identity`'s own adoption branch), which is exactly
+        // the wire-invariance property Stage 1-3 promises.
+        let identity = self.persist_federated_identity(&claims, &token).await?;
+        let account_id = lightbridge_authz_core::identity::AccountId::assert_already_resolved(
+            identity.account_id.clone(),
+        );
         match flow {
             PendingFlow::Device { device_code } => {
                 let store = DbDeviceCodeStore::new(self.repo.clone());
                 let approved = store
-                    .approve_pending(&device_code, &claims.sub)
+                    .approve_pending(&device_code, &identity.account_id)
                     .await
                     .map_err(|_| {
                         Error::Server("failed to approve device authorization".to_string())
@@ -516,13 +535,13 @@ impl KeycloakRelyingParty {
                     Some(project_id) => project_id,
                     None => self
                         .repo
-                        .find_default_project_id(&claims.sub)
+                        .find_default_project_id(&account_id)
                         .await?
                         .ok_or(Error::NotFound)?,
                 };
                 let context = self
                     .repo
-                    .resolve_active_context(&claims.sub, &project_id)
+                    .resolve_active_context(&account_id, &project_id)
                     .await?;
                 let session = self
                     .repo
@@ -533,7 +552,7 @@ impl KeycloakRelyingParty {
                         client_id: None,
                         kind: "browser".to_string(),
                         expires_at: Utc::now() + ChronoDuration::seconds(ttl),
-                        subject: Some(claims.sub),
+                        subject: Some(identity.account_id),
                     })
                     .await?;
                 Ok(Completion::Browser {
@@ -559,7 +578,7 @@ impl KeycloakRelyingParty {
         &self,
         claims: &IdTokenClaims,
         token: &TokenResponse,
-    ) -> Result<()> {
+    ) -> Result<FederatedIdentityRow> {
         let token_set = KeycloakTokenSet {
             refresh_token: token.refresh_token.clone(),
             id_token_claims: IdTokenClaimsSnapshot {
@@ -586,21 +605,27 @@ impl KeycloakRelyingParty {
         let envelope = lightbridge_authz_core::crypto::seal(&self.token_key, &aad, &plaintext)?;
         let now = Utc::now();
         self.repo
-            .upsert_federated_identity(UpsertFederatedIdentity {
-                issuer: claims.iss.clone(),
-                subject: claims.sub.clone(),
-                token_envelope: Some(envelope),
-                token_sealed_at: Some(now),
-                access_expires_at: token
-                    .expires_in
-                    .map(|seconds| now + ChronoDuration::seconds(seconds)),
-                refresh_expires_at: token
-                    .refresh_expires_in
-                    .map(|seconds| now + ChronoDuration::seconds(seconds)),
-                scope: token.scope.clone(),
-            })
-            .await?;
-        Ok(())
+            .upsert_federated_identity(
+                UpsertFederatedIdentity {
+                    issuer: claims.iss.clone(),
+                    subject: claims.sub.clone(),
+                    token_envelope: Some(envelope),
+                    token_sealed_at: Some(now),
+                    access_expires_at: token
+                        .expires_in
+                        .map(|seconds| now + ChronoDuration::seconds(seconds)),
+                    refresh_expires_at: token
+                        .refresh_expires_in
+                        .map(|seconds| now + ChronoDuration::seconds(seconds)),
+                    scope: token.scope.clone(),
+                },
+                // ADR-0025: `self.config.issuer` IS the grandfather pin here -- `start_idp_server`
+                // (`lib.rs`) already refuses to start unless `oauth2.federation.issuer` equals
+                // `oauth2.relying_party.issuer`, so this RP's own configured issuer is always the
+                // deployment's one designated grandfather issuer.
+                &self.config.issuer,
+            )
+            .await
     }
 
     async fn validate_id_token(&self, token: &str) -> Result<IdTokenClaims> {

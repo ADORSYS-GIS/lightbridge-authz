@@ -133,6 +133,7 @@ fn build_router(bearer: Arc<dyn BearerTokenServiceTrait>) -> Router {
         lazy_cratestack_db(),
         core,
         bearer,
+        common::test_resolver(),
         lazy_idempotency(),
         lazy_rate_limit(),
         false,

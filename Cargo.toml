@@ -271,6 +271,10 @@ percent-encoding = "2.3"
 rsa = { version = "0.9", features = ["pem", "std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.13", features = ["json", "form"] }
+# Already resolved transitively at 2.5.8 via reqwest itself; declared directly so
+# `Federation::validate` (ADR-0025) can do a cheap offline "does this parse as a URL" check on
+# `oauth2.federation.issuer` without pulling reqwest itself into the dependency-light `core` crate.
+url = "2.5"
 sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "chrono", "json", "macros"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 utoipa = { version = "5", features = ["macros", "chrono"] }

@@ -1,11 +1,11 @@
 use axum::{Json, Router, http::StatusCode, routing::get};
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
+    Account, AccountId, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
     RotateApiKey, async_trait,
     config::{
-        ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetServer, IdpServer, JwtSigning,
-        ModelCatalog, Oauth2, OauthClient, OauthClientType, OpaServer, QuotaTiers, Redis,
-        UsageServiceClient,
+        ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetServer, Federation, IdpServer,
+        JwtSigning, ModelCatalog, Oauth2, OauthClient, OauthClientType, OpaServer, QuotaTiers,
+        Redis, UsageServiceClient,
     },
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
@@ -86,6 +86,15 @@ pub struct OpaState {
     /// see that function's doc comment. `None` when `oauth2.type` is `external` (no self-signing
     /// at all) or when `oauth2.signing.audience` is left unconfigured under `type: self`.
     pub api_key_audience: Option<String>,
+    /// ADR-0025 Stage 2: translates `handlers::idp::resolve_context`'s presented
+    /// `(issuer, subject)` into the acting account id -- the real translation seam for that
+    /// endpoint, distinct from [`OpaRepoTrait`]'s own `subject: &str` methods (whose callers
+    /// already hold an ADR-0025-resolved value -- see the `OpaRepoTrait for StoreRepo` impl's own
+    /// doc comment).
+    pub resolver: Arc<dyn auth_provider::SubjectResolver>,
+    /// `oauth2.federation.issuer` -- the default `handlers::idp::resolve_context` uses when the
+    /// request body omits `issuer` (the legacy `lightbridge-keycloak-spi` adapter's shape).
+    pub federation_issuer: String,
 }
 
 #[async_trait]
@@ -167,12 +176,31 @@ impl OpaRepoTrait for StoreRepo {
         StoreRepo::find_api_key_validation_by_hash(self, key_hash).await
     }
 
+    // ADR-0025: `OpaRepoTrait`'s own `subject: &str` contract is UNCHANGED here on purpose --
+    // every caller of this trait (OPA/Authorino introspection, `handlers::opa`/
+    // `handlers::exchange_token`) already holds a value read straight off an `accounts.id`-anchored
+    // column (`owner_account_id`, a resolved exchange session's `account_id`, ...), never a raw
+    // bearer claim that has not passed through `StoreRepo::resolve_account_for_federated_subject`.
+    // Wrapping via `AccountId::assert_already_resolved` here is exactly the "already-legitimate account id,
+    // just not yet typed" case that constructor's own doc comment describes -- this trait is
+    // deliberately outside the ingress list ADR-0025 Stage 2 translates (auth_provider.rs,
+    // bearer, mcp.rs, handlers/idp.rs, relying_party.rs, oauth2_op/store.rs).
     async fn get_project(&self, subject: &str, project_id: &str) -> Result<Option<Project>> {
-        StoreRepo::get_project(self, subject, project_id).await
+        StoreRepo::get_project(
+            self,
+            &AccountId::assert_already_resolved(subject),
+            project_id,
+        )
+        .await
     }
 
     async fn get_account(&self, subject: &str, account_id: &str) -> Result<Option<Account>> {
-        StoreRepo::get_account(self, subject, account_id).await
+        StoreRepo::get_account(
+            self,
+            &AccountId::assert_already_resolved(subject),
+            account_id,
+        )
+        .await
     }
 
     async fn get_project_by_id(&self, project_id: &str) -> Result<Option<Project>> {
@@ -188,7 +216,12 @@ impl OpaRepoTrait for StoreRepo {
         subject: &str,
         project_id: &str,
     ) -> Result<lightbridge_authz_core::ResolvedContext> {
-        StoreRepo::resolve_context(self, subject, project_id).await
+        StoreRepo::resolve_context(
+            self,
+            &AccountId::assert_already_resolved(subject),
+            project_id,
+        )
+        .await
     }
 
     async fn project_member_quota_tier(
@@ -196,11 +229,21 @@ impl OpaRepoTrait for StoreRepo {
         project_id: &str,
         subject: &str,
     ) -> Result<Option<String>> {
-        StoreRepo::project_member_quota_tier(self, project_id, subject).await
+        StoreRepo::project_member_quota_tier(
+            self,
+            project_id,
+            &AccountId::assert_already_resolved(subject),
+        )
+        .await
     }
 
     async fn project_member_role(&self, project_id: &str, subject: &str) -> Result<Option<String>> {
-        StoreRepo::project_member_role(self, project_id, subject).await
+        StoreRepo::project_member_role(
+            self,
+            project_id,
+            &AccountId::assert_already_resolved(subject),
+        )
+        .await
     }
 
     async fn list_verification_jwks(&self) -> Result<Vec<serde_json::Value>> {
@@ -2248,6 +2291,7 @@ fn well_known_mount_params(
 #[allow(clippy::too_many_arguments)]
 pub fn build_api_router(
     bearer: Arc<dyn BearerTokenServiceTrait>,
+    resolver: Arc<dyn auth_provider::SubjectResolver>,
     issuer: Arc<AuthzStoreImpl>,
     policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
     refill_service: Arc<lightbridge_authz_budget::RefillService>,
@@ -2291,7 +2335,7 @@ pub fn build_api_router(
         // `impl ComputedFieldResolver for ()`) is the correct, zero-behavior-change value here.
         (),
         LenientCborCodec::default(),
-        CratestackAuthProvider::new(bearer.clone(), RpcScope::Crud),
+        CratestackAuthProvider::new(bearer.clone(), RpcScope::Crud, resolver),
         // cratestack 0.7.12 (#413) made this request-body-size bound an explicit parameter instead
         // of an axum implementation detail. `DEFAULT_BODY_LIMIT_BYTES` (2 MiB) is the value the
         // changelog documents as reproducing the pre-0.7.12 runtime behavior exactly — this call
@@ -2444,6 +2488,23 @@ fn build_token_exchange_state(
     validate_authorization_code_clients(&oauth2.clients)?;
     let signer = signing::ApiKeyJwtSigner::from_config(signing, repo.clone())?;
 
+    // ADR-0025 Stage 1/2: `start_idp_server` (this function's sole production caller) already
+    // enforces `oauth2.federation` via `require_federation` before this function ever runs; this
+    // check exists so a *test* fixture that forgets `federation` fails loudly here rather than
+    // the store silently grandfathering against an empty issuer string.
+    let grandfather_issuer = oauth2
+        .federation
+        .as_ref()
+        .ok_or_else(|| {
+            Error::Server(
+                "oauth2.federation.issuer is required to build the token-exchange store \
+                 (ADR-0025)"
+                    .to_string(),
+            )
+        })?
+        .issuer
+        .clone();
+
     let client_store = oauth2_op::client_store::ConfigClientStore::from_config(&oauth2.clients);
     let assertions = oauth2_op::client_assertion_store::RedisClientAssertionStore::connect(
         redis_url,
@@ -2459,6 +2520,7 @@ fn build_token_exchange_state(
         policy_engine,
         bearer,
         cfg.clone(),
+        grandfather_issuer,
     ));
     let op_config = authkestra_op::config::OpConfig {
         issuer: signing.issuer.clone(),
@@ -2549,6 +2611,24 @@ fn redirect_origin(redirect_uri: &str) -> Result<String> {
     Ok(url.origin().ascii_serialization())
 }
 
+/// ADR-0025 Stage 1: every serving component -- `authz-api`, `authz-idp`, `authz-opa`,
+/// `authz-budget`, `lightbridge-mcp` -- refuses to start without `oauth2.federation.issuer`,
+/// loudly, naming both the missing field and the component (the same shape AGENTS.md's "Redis is
+/// a mandatory dependency" house rule documents for a different dependency). Presence PLUS
+/// [`Federation::validate`]'s offline shape check -- never a live reachability probe against the
+/// issuer, matching `oauth2.relying_party`'s own startup-validation posture.
+fn require_federation<'a>(oauth2: &'a Oauth2, component: &str) -> Result<&'a Federation> {
+    let federation = oauth2.federation.as_ref().ok_or_else(|| {
+        Error::Server(format!(
+            "oauth2.federation.issuer is required for {component} (ADR-0025) -- set the \
+             oauth2.federation block naming the one issuer this deployment trusts for \
+             remote-subject-to-account-id translation"
+        ))
+    })?;
+    federation.validate()?;
+    Ok(federation)
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "startup wiring for authz-api -- each parameter is a distinct, independently-loaded \
@@ -2570,6 +2650,7 @@ pub async fn start_api_server(
     billing.validate()?;
     api_key_expiry.validate()?;
     oauth2.rbac.validate()?;
+    let federation = require_federation(oauth2, "authz-api")?;
 
     // ADR-0007: load whatever is genuinely active in the DB right now, so a fresh startup always
     // agrees with the last successful activation -- this is what proves "no restart needed to see
@@ -2674,6 +2755,13 @@ pub async fn start_api_server(
     )?);
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
+    // ADR-0025 Stage 2: `federation` above is already `require_federation`'s validated value.
+    let resolver: Arc<dyn auth_provider::SubjectResolver> =
+        Arc::new(auth_provider::FederatedSubjectResolver::new(
+            Arc::new(StoreRepo::new(pool.clone())),
+            oauth2.signing.as_ref().map(|s| s.issuer.clone()),
+            federation.issuer.clone(),
+        ));
 
     // Redis is required unconditionally for authz-api rate limiting.
     let redis = redis.as_ref().ok_or_else(|| {
@@ -2717,6 +2805,7 @@ pub async fn start_api_server(
     let dev_cors = dev_cors_enabled();
     let app = build_api_router(
         bearer_service,
+        resolver,
         issuer,
         policy_store,
         refill_service,
@@ -2765,7 +2854,15 @@ pub async fn start_opa_server(
     billing: &Billing,
     oauth2: &Oauth2,
 ) -> Result<()> {
+    let federation = require_federation(oauth2, "authz-opa")?;
     let readiness_pool = pool.clone();
+    // ADR-0025 Stage 2: `federation` above is already `require_federation`'s validated value.
+    let resolver: Arc<dyn auth_provider::SubjectResolver> =
+        Arc::new(auth_provider::FederatedSubjectResolver::new(
+            Arc::new(StoreRepo::new(pool.clone())),
+            oauth2.signing.as_ref().map(|s| s.issuer.clone()),
+            federation.issuer.clone(),
+        ));
     let repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
     let api_key_audience = oauth2
         .signing
@@ -2776,6 +2873,8 @@ pub async fn start_opa_server(
         basic_auth: opa.basic_auth.clone(),
         billing: Arc::new(billing.clone()),
         api_key_audience,
+        resolver,
+        federation_issuer: federation.issuer.clone(),
     });
 
     let app = build_opa_router(state, readiness_pool);
@@ -2912,6 +3011,7 @@ pub async fn start_idp_server(
     let signing = oauth2.signing.as_ref().ok_or_else(|| {
         Error::Server("oauth2.type is 'self' but oauth2.signing is missing".to_string())
     })?;
+    let federation = require_federation(oauth2, "authz-idp")?;
 
     // Redis is required unconditionally for authz-idp -- every lightbridge-authz serving role
     // that isn't explicitly freed from it (authz-opa, lightbridge-mcp) needs Redis-backed caching,
@@ -2965,6 +3065,20 @@ pub async fn start_idp_server(
                 .to_string(),
         )
     })?;
+    // ADR-0025 Stage 1: `authz-idp` seals `federated_identities` rows under
+    // `oauth2.relying_party.issuer` (the browser-SSO login callback), but
+    // `resolve_account_for_federated_subject` grandfathers against `federation.issuer`. A
+    // deployment where these two drift would mint federated identity rows this service can never
+    // resolve back through the ADR-0025 seam -- so a mismatch is a hard startup failure, checked
+    // once, here, before either value is used further.
+    if federation.issuer != rp_config.issuer {
+        return Err(Error::Server(format!(
+            "oauth2.federation.issuer ('{}') must equal oauth2.relying_party.issuer ('{}') for \
+             authz-idp -- a mismatch would mint federated identity rows this service can never \
+             resolve back through the ADR-0025 translation seam",
+            federation.issuer, rp_config.issuer
+        )));
+    }
     let relying_party = Arc::new(relying_party::KeycloakRelyingParty::new(
         rp_config,
         oauth2.jwks_url.clone(),
@@ -3101,6 +3215,7 @@ pub fn build_budget_router(
     cratestack_db: schema::Cratestack,
     readiness_pool: Arc<dyn DbPoolTrait>,
     bearer: Arc<dyn BearerTokenServiceTrait>,
+    resolver: Arc<dyn auth_provider::SubjectResolver>,
     idempotency_store: Arc<SqlxIdempotencyStore>,
     rate_limit_store: Arc<dyn RateLimitStore>,
     dev_cors: bool,
@@ -3121,7 +3236,7 @@ pub fn build_budget_router(
         // `impl ComputedFieldResolver for ()`) is the correct, zero-behavior-change value here.
         (),
         LenientCborCodec::default(),
-        CratestackAuthProvider::new(bearer.clone(), RpcScope::Budget),
+        CratestackAuthProvider::new(bearer.clone(), RpcScope::Budget, resolver),
         DEFAULT_BODY_LIMIT_BYTES,
     )
     .layer(IdempotencyLayer::new(idempotency_store, IDEMPOTENCY_TTL))
@@ -3174,6 +3289,7 @@ pub async fn start_budget_server(
     billing.validate()?;
     api_key_expiry.validate()?;
     oauth2.rbac.validate()?;
+    let federation = require_federation(oauth2, "authz-budget")?;
 
     // ADR-0007: load whatever is genuinely active in the DB right now, so a fresh startup always
     // agrees with the last successful activation, exactly like `start_api_server`'s identical load
@@ -3247,6 +3363,13 @@ pub async fn start_budget_server(
     )?);
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
+    // ADR-0025 Stage 2: `federation` above is already `require_federation`'s validated value.
+    let resolver: Arc<dyn auth_provider::SubjectResolver> =
+        Arc::new(auth_provider::FederatedSubjectResolver::new(
+            Arc::new(StoreRepo::new(pool.clone())),
+            oauth2.signing.as_ref().map(|s| s.issuer.clone()),
+            federation.issuer.clone(),
+        ));
 
     // Redis is required unconditionally for authz-budget rate limiting, mirroring authz-api's own
     // hard requirement (see `start_api_server`'s identical check).
@@ -3292,6 +3415,7 @@ pub async fn start_budget_server(
         cratestack_db,
         readiness_pool,
         bearer_service,
+        resolver,
         idempotency_store,
         rate_limit_store,
         dev_cors,
@@ -3488,6 +3612,9 @@ mod tests {
             relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
+            federation: Some(lightbridge_authz_core::config::Federation {
+                issuer: "https://keycloak.example.test/realms/dev".to_string(),
+            }),
         }
     }
 

@@ -24,6 +24,7 @@ use lightbridge_authz_core::CreateAccount;
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::DbPool;
 use lightbridge_authz_core::error::Error;
+use lightbridge_authz_core::identity::AccountId;
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -54,7 +55,10 @@ async fn upsert_federated_identity_refuses_a_subject_with_no_account(pool: PgPoo
     let subject = "accountless-subject";
 
     let err = repo
-        .upsert_federated_identity(bare_upsert("https://issuer.example", subject))
+        .upsert_federated_identity(
+            bare_upsert("https://issuer.example", subject),
+            "https://issuer.example",
+        )
         .await
         .expect_err(
             "a subject with no pre-existing accounts row must be refused, not minted a user",
@@ -97,7 +101,10 @@ async fn upsert_federated_identity_adopts_the_account_and_derives_its_user(pool:
     .expect("account creation must succeed");
 
     let row = repo
-        .upsert_federated_identity(bare_upsert("https://issuer.example", subject))
+        .upsert_federated_identity(
+            bare_upsert("https://issuer.example", subject),
+            "https://issuer.example",
+        )
         .await
         .expect("a subject matching a pre-existing account must be adopted");
     assert_eq!(
@@ -124,6 +131,62 @@ async fn upsert_federated_identity_adopts_the_account_and_derives_its_user(pool:
     );
 }
 
+/// ADR-0025 Finding 2: `upsert_federated_identity`'s first-adoption branch must refuse a subject
+/// presented by any issuer OTHER than the configured grandfather issuer, even when NOTHING has
+/// adopted the account yet -- i.e. the refusal must come from the issuer pin itself, not from a
+/// downstream unique-index collision with some other issuer's prior adoption. Deliberately run
+/// with no prior adoption at all (an entirely fresh account) so there is nothing to "lose a race"
+/// against; this is what distinguishes the pin from `federated_identities_account_uidx`'s
+/// structural backstop, which only bites once a FIRST adoption already exists.
+#[sqlx::test(migrations = "../../migrations")]
+async fn upsert_federated_identity_refuses_adoption_from_a_non_grandfather_issuer(pool: PgPool) {
+    let repo = build_repo(pool.clone());
+    let subject = "not-yet-adopted-subject";
+    repo.create_account(
+        subject,
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .expect("account creation must succeed");
+
+    let err = repo
+        .upsert_federated_identity(
+            bare_upsert("https://rogue-issuer.example", subject),
+            "https://issuer.example",
+        )
+        .await
+        .expect_err(
+            "a subject matching a pre-existing account, presented by a non-grandfather issuer, \
+             must be refused",
+        );
+    assert!(
+        matches!(err, Error::Forbidden(_)),
+        "expected Error::Forbidden, got {err:?}"
+    );
+
+    let fi_count: i64 = sqlx::query_scalar("SELECT count(*) FROM federated_identities")
+        .fetch_one(&pool)
+        .await
+        .expect("counting federated_identities must succeed");
+    assert_eq!(
+        fi_count, 0,
+        "a refused non-grandfather adoption must leave no federated_identities row behind"
+    );
+
+    // The SAME subject, presented by the actual grandfather issuer, must still adopt normally --
+    // proving the refusal above is specific to the mismatched issuer, not the account/subject.
+    let row = repo
+        .upsert_federated_identity(
+            bare_upsert("https://issuer.example", subject),
+            "https://issuer.example",
+        )
+        .await
+        .expect("the grandfather issuer must still be able to adopt the same account");
+    assert_eq!(row.account_id, subject);
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn deleting_the_account_removes_its_federated_identity_but_not_its_user(pool: PgPool) {
     let repo = build_repo(pool.clone());
@@ -136,9 +199,12 @@ async fn deleting_the_account_removes_its_federated_identity_but_not_its_user(po
     )
     .await
     .expect("account creation must succeed");
-    repo.upsert_federated_identity(bare_upsert("https://issuer.example", subject))
-        .await
-        .expect("adopting the pre-existing account must succeed");
+    repo.upsert_federated_identity(
+        bare_upsert("https://issuer.example", subject),
+        "https://issuer.example",
+    )
+    .await
+    .expect("adopting the pre-existing account must succeed");
 
     let user_id: String = sqlx::query_scalar("SELECT user_id FROM accounts WHERE id = $1")
         .bind(subject)
@@ -146,7 +212,7 @@ async fn deleting_the_account_removes_its_federated_identity_but_not_its_user(po
         .await
         .expect("the account's user_id must be readable before deletion");
 
-    repo.delete_account(subject, subject)
+    repo.delete_account(&AccountId::assert_already_resolved(subject), subject)
         .await
         .expect("deleting the account must succeed");
 

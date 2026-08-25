@@ -293,9 +293,20 @@ impl std::fmt::Debug for ApiKeyJwtSigner {
 /// Identity of the human who created or rotated the key, snapshotted into the issued JWT so the
 /// token mirrors a Keycloak access token. Captured at issuance from the creator's bearer token;
 /// frozen for the token's TTL and refreshed on rotation.
+///
+/// ADR-0025 Stage 3: `subject` and `account_id` are deliberately BOTH carried, and deliberately
+/// NOT the same field -- `subject` is the raw upstream claim, kept only as a log/email-resolution
+/// surface (it is never minted into the token itself any more); `account_id` is the already
+/// ADR-0025-resolved acting account id, and [`identity_for`] mints the token's `sub` from THAT,
+/// never from `subject`. For every existing (grandfathered) account the two are byte-identical
+/// today, which is exactly the wire-invariance property Stage 1-3 promises -- see
+/// `minted_sub_is_the_acting_account_id_not_the_upstream_subject` and
+/// `sub_and_account_id_differ_when_a_roster_member_acts_on_someone_elses_project` in
+/// `crates/lightbridge-authz-rest/tests/signing_tests.rs` for both halves proven directly.
 #[derive(Debug, Clone, Default)]
 pub struct KeyOwner {
     pub subject: String,
+    pub account_id: String,
     pub email: Option<String>,
     pub email_verified: Option<bool>,
 }
@@ -322,16 +333,22 @@ pub fn capped_expiry(
     }
 }
 
-/// Builds the `Identity` every derived token (access or id) is minted for. `sub`/`email` are
-/// upstream snapshots -- never re-minted (ADR-0011, Context and Decision 7). `attributes` starts
-/// empty here; `oauth2_op`'s refresh-token store uses it as the only extension point
+/// Builds the `Identity` every derived token (access or id) is minted for. `email` is an upstream
+/// snapshot -- never re-minted. `sub` (`external_id`) is DIFFERENT since ADR-0025 Stage 3: it is
+/// minted from `owner.account_id` -- the already-resolved acting account id -- never from
+/// `owner.subject` (the raw upstream claim, amending ADR-0011's Context/Decision 7 "sub copied
+/// from upstream, never re-minted": the upstream-validation posture survives verbatim, but the
+/// *value* placed on `sub` is now this service's own resolved account id, not a bare copy of the
+/// presented claim). For a grandfathered account (`accounts.id == subject`) this is byte-identical
+/// to the pre-Stage-3 behavior -- see [`KeyOwner`]'s own doc comment. `attributes` starts empty
+/// here; `oauth2_op`'s refresh-token store uses it as the only extension point
 /// `authkestra_op::refresh::RefreshToken` offers to round-trip `account_id`/`project_id` (which
 /// have no dedicated field on `Identity`) through the `RefreshTokenStore` trait boundary -- see
 /// that module for the full round trip.
 pub(crate) fn identity_for(owner: &KeyOwner) -> Identity {
     Identity {
         provider_id: IDENTITY_PROVIDER_ID.to_string(),
-        external_id: owner.subject.clone(),
+        external_id: owner.account_id.clone(),
         email: owner.email.clone(),
         username: None,
         attributes: HashMap::new(),

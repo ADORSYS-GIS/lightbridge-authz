@@ -64,6 +64,7 @@ use lightbridge_authz_core::crypto::hash_api_key;
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::dto::ModelPolicy;
 use lightbridge_authz_core::error::Error;
+use lightbridge_authz_core::identity::AccountId;
 use serde_json::Value;
 
 use crate::signing::{KeyOwner, access_token_extra, id_token_extra, identity_for};
@@ -148,6 +149,13 @@ pub struct TokenExchangeOpStore {
     policy_engine: Arc<dyn PolicyEngine>,
     bearer: Arc<dyn BearerTokenServiceTrait>,
     cfg: Oauth2TokenExchange,
+    /// ADR-0025 Stage 2: `oauth2.federation.issuer`, threaded through so
+    /// [`Self::handle_token_exchange`] can translate the presented `subject_token`'s `(iss, sub)`
+    /// into the acting account id via `StoreRepo::resolve_account_for_federated_subject` before
+    /// ever calling `resolve_context`/`find_default_project_id`. `start_idp_server` is this
+    /// store's only production constructor, and `require_federation` there already guarantees
+    /// `oauth2.federation` is `Some` by the time this is built.
+    grandfather_issuer: String,
 }
 
 impl TokenExchangeOpStore {
@@ -161,6 +169,7 @@ impl TokenExchangeOpStore {
         policy_engine: Arc<dyn PolicyEngine>,
         bearer: Arc<dyn BearerTokenServiceTrait>,
         cfg: Oauth2TokenExchange,
+        grandfather_issuer: String,
     ) -> Self {
         Self {
             clients,
@@ -174,6 +183,7 @@ impl TokenExchangeOpStore {
             policy_engine,
             bearer,
             cfg,
+            grandfather_issuer,
         }
     }
 
@@ -388,22 +398,27 @@ impl TokenExchangeOpStore {
         tokens: &TokenManager,
         now: DateTime<Utc>,
     ) -> Result<TokenResponse, TokenErrorResponse> {
+        // ADR-0025: `row.subject` is already the ADR-0025-resolved acting account id, not a raw
+        // Keycloak subject -- `relying_party::verify_submit`'s device-verification flow resolves
+        // through `StoreRepo::resolve_account_for_federated_subject` before ever calling
+        // `approve_device_authorization`, which is the only writer of this column.
         let subject = row.subject.clone().ok_or_else(|| {
             oauth_err(
                 "server_error",
                 "approved device authorization has no subject",
             )
         })?;
+        let account_id = AccountId::assert_already_resolved(&subject);
         let project_id = match row.project_id.as_deref() {
             Some(project_id) => project_id.to_string(),
             None => self
                 .repo
-                .find_default_project_id(&subject)
+                .find_default_project_id(&account_id)
                 .await
                 .map_err(|_| oauth_err("server_error", "context resolution failed"))?
                 .ok_or_else(|| oauth_err("access_denied", "subject has no default project"))?,
         };
-        let context = match self.repo.resolve_context(&subject, &project_id).await {
+        let context = match self.repo.resolve_context(&account_id, &project_id).await {
             Ok(context) => context,
             Err(Error::NotFound) => {
                 return Err(oauth_err(
@@ -463,13 +478,14 @@ impl TokenExchangeOpStore {
             .map_err(|_| oauth_err("server_error", "session persistence failed"))?;
         let owner = KeyOwner {
             subject: subject.clone(),
+            account_id: subject.clone(),
             email: None,
             email_verified: None,
         };
         let expires_in = self.cfg.access_ttl_seconds as u64;
         let budget_tier = self.resolve_budget_tier(&context.account_id, now).await;
         let quota_tier = self
-            .resolve_quota_tier(&context.project_id, &subject)
+            .resolve_quota_tier(&context.project_id, &account_id)
             .await?;
         let mut extra = access_token_extra(
             &owner,
@@ -657,16 +673,16 @@ impl TokenExchangeOpStore {
     async fn resolve_quota_tier(
         &self,
         project_id: &str,
-        subject: &str,
+        account_id: &AccountId,
     ) -> Result<Option<String>, TokenErrorResponse> {
         self.quota_repo
-            .project_member_quota_tier(project_id, subject)
+            .project_member_quota_tier(project_id, account_id)
             .await
             .map_err(|err| {
                 tracing::error!(
                     error = %err,
                     project_id = %project_id,
-                    subject = %subject,
+                    account_id = %account_id,
                     "quota tier resolution failed; refusing to mint rather than omitting the \
                      claim, which would be indistinguishable from a legitimate 'no per-member \
                      ceiling' account"
@@ -793,6 +809,33 @@ impl TokenExchangeOpStore {
             ));
         }
 
+        // ADR-0025 Stage 2: THE translation seam. `token_info.sub` is a raw upstream subject --
+        // resolve it into the acting account id here, immediately after bearer validation and
+        // before either context call below. A resolver Forbidden (untrusted issuer, or no
+        // federated identity / no grandfathered account) maps to the SAME "access_denied" message
+        // the not-a-member branches below already use, never a distinct status -- there is no
+        // account-existence oracle on this endpoint.
+        let account_id = match self
+            .repo
+            .resolve_account_for_federated_subject(
+                &token_info.iss,
+                &token_info.sub,
+                &self.grandfather_issuer,
+            )
+            .await
+        {
+            Ok(account_id) => AccountId::assert_already_resolved(account_id),
+            Err(Error::Forbidden(_)) => {
+                return Err(oauth_err(
+                    "access_denied",
+                    "subject is not a member of the requested project",
+                ));
+            }
+            Err(_) => {
+                return Err(oauth_err("server_error", "context resolution failed"));
+            }
+        };
+
         // No `project_id` on the request: resolve to the subject's own auto-provisioned default
         // project instead of rejecting -- see this method's doc comment. A subject with zero
         // projects yet (a real, reachable state: account creation and the bootstrap "ensure
@@ -802,7 +845,7 @@ impl TokenExchangeOpStore {
         // doesn't exist".
         let effective_project_id = match requested_project_id {
             Some(project_id) => project_id.to_string(),
-            None => match self.repo.find_default_project_id(&subject).await {
+            None => match self.repo.find_default_project_id(&account_id).await {
                 Ok(Some(project_id)) => project_id,
                 Ok(None) => {
                     return Err(oauth_err(
@@ -818,7 +861,7 @@ impl TokenExchangeOpStore {
 
         let context = match self
             .repo
-            .resolve_context(&subject, &effective_project_id)
+            .resolve_context(&account_id, &effective_project_id)
             .await
         {
             Ok(context) => context,
@@ -867,6 +910,7 @@ impl TokenExchangeOpStore {
         let (auth_time, nonce) = decode_auth_time_and_nonce(subject_token);
         let owner = KeyOwner {
             subject: subject.clone(),
+            account_id: account_id.as_str().to_string(),
             email,
             email_verified,
         };
@@ -895,7 +939,13 @@ impl TokenExchangeOpStore {
                 client_id: Some(client_id.clone()),
                 kind: "token".to_string(),
                 expires_at: session_expires_at,
-                subject: Some(subject.clone()),
+                // #492/#494: `sessions.subject` carries the real ACTING person, never the
+                // project's owning account -- and since ADR-0025 Stage 2 the acting person IS
+                // `account_id` (the resolved value), not the raw upstream `subject` claim. The two
+                // are byte-identical for every grandfathered account (the wire-invariance
+                // property Stage 1-3 promises), so this is not a behavior change for any existing
+                // deployment today.
+                subject: Some(account_id.as_str().to_string()),
             })
             .await
         {
@@ -906,7 +956,7 @@ impl TokenExchangeOpStore {
 
         let budget_tier = self.resolve_budget_tier(&context.account_id, now).await;
         let quota_tier = self
-            .resolve_quota_tier(&context.project_id, &subject)
+            .resolve_quota_tier(&context.project_id, &account_id)
             .await?;
         // ADR-0020 Decision 2 (#437's scoped-down interpretation, see `access_token_extra`'s doc
         // comment): `sid` and `api_key_id` carry the SAME real, persisted session id.
@@ -1099,9 +1149,14 @@ impl TokenExchangeOpStore {
         // Re-validation (gap 1 above): the same ownership/membership check the exchange grant
         // uses, plus the account/project suspension cascade `resolve_context` alone does not
         // cover. Any failure here refuses the refresh -- no permissive fallback.
+        //
+        // ADR-0025: `old_row.subject` is already the resolved acting account id (set at the
+        // initial `handle_token_exchange` mint via `refresh_identity`'s `external_id`), never a
+        // raw upstream claim -- no second resolver call needed on the refresh path.
+        let old_row_account_id = AccountId::assert_already_resolved(old_row.subject.clone());
         let context = match self
             .repo
-            .resolve_context(&old_row.subject, &old_row.project_id)
+            .resolve_context(&old_row_account_id, &old_row.project_id)
             .await
         {
             Ok(context) => context,
@@ -1124,6 +1179,7 @@ impl TokenExchangeOpStore {
 
         let owner = KeyOwner {
             subject: old_row.subject.clone(),
+            account_id: old_row.subject.clone(),
             email: old_row.email.clone(),
             email_verified: old_row.email_verified,
         };
@@ -1147,7 +1203,7 @@ impl TokenExchangeOpStore {
 
         let budget_tier = self.resolve_budget_tier(&context.account_id, now).await;
         let quota_tier = self
-            .resolve_quota_tier(&context.project_id, &old_row.subject)
+            .resolve_quota_tier(&context.project_id, &old_row_account_id)
             .await?;
         // ADR-0020 Decision 2 (#437's scoped-down interpretation, see `access_token_extra`'s doc
         // comment): `sid` and `api_key_id` carry the SAME real, persisted (reused) session id.
@@ -1320,7 +1376,12 @@ fn refresh_identity(
     attributes.insert("session_id".to_string(), session_id.to_string());
     Identity {
         provider_id: "keycloak".to_string(),
-        external_id: owner.subject.clone(),
+        // ADR-0025 Stage 2/#492: `external_id` becomes `exchange_refresh_tokens.subject` via
+        // `DbRefreshTokenStore::store_token` -- the real ACTING person, mirroring
+        // `sessions.subject`'s own #492 fix. Minted from `owner.account_id` (the resolved acting
+        // account id), never `owner.subject` (the raw upstream claim); byte-identical to the
+        // pre-Stage-3 value for every grandfathered account.
+        external_id: owner.account_id.clone(),
         email: owner.email.clone(),
         username: None,
         attributes,

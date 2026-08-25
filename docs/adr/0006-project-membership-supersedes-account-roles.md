@@ -147,6 +147,16 @@ and their resolutions:
 
 ### `accounts.id` is the JWT subject
 
+**Superseded by ADR-0025 for the read/authorization path today, and will be superseded for the
+write path (`createAccount` itself) once that ADR's Stage 5 ships.** ADR-0025 inverts the "no
+translation, subject IS account id" claim this section makes: every ingress now translates
+`(issuer, subject) -> account_id` through `federated_identities` before the value reaches any
+authorization check, and — once Stage 5 lands — `createAccount` mints a CUID2 instead of inserting
+the caller's subject as the id. For every account created before that stage, `account_id ==
+subject` remains true byte-for-byte (ADR-0025's "wire-invariance" property), so nothing below in
+this section is factually wrong about today's accounts — it is wrong about the *mechanism*
+producing that equality, and about what future accounts can assume.
+
 The schema above uses `id == auth().id` on `Account` and `account.id == auth().id` everywhere else.
 That only holds if the account's primary key *is* the caller's subject — otherwise every policy on
 every pre-existing row fail-closes the moment `account_memberships` disappears, because nothing else
@@ -323,3 +333,8 @@ history.
   account = one federated identity; a person may hold several") while leaving every other part of
   this ADR — `accounts.id` being the stored subject, no account-level membership, the whole
   project-membership/billing/quota apparatus below — unamended.
+- **ADR-0025 supersedes this ADR's "`accounts.id` is the JWT subject" section** (see the note
+  there) — every ingress now translates `(issuer, subject) -> account_id` through
+  `federated_identities` rather than trusting the raw bearer subject directly, and `createAccount`
+  will mint a CUID2 once that ADR's Stage 5 ships. Wire-invariant for every account that exists
+  today.

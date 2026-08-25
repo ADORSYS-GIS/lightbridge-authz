@@ -3,20 +3,43 @@ use axum::body::to_bytes;
 use axum::http::StatusCode;
 use chrono::{Duration, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use lightbridge_authz_core::identity::AccountId;
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeyStatus, ApiKeyValidation, ModelPolicy, Project, ResolvedContext,
-    ResourceStatus, async_trait,
+    Account, ApiKey, ApiKeyStatus, ApiKeyValidation, ModelPolicy, Project, ResolveContextRequest,
+    ResolvedContext, ResourceStatus, async_trait,
     config::{BasicAuth, Billing, BillingLimits, BillingPlan},
     error::{Error, Result},
 };
 use lightbridge_authz_rest::OpaState;
 use lightbridge_authz_rest::SessionStatusRow;
+use lightbridge_authz_rest::auth_provider::SubjectResolver;
+use lightbridge_authz_rest::handlers::idp::resolve_context as resolve_context_endpoint;
 use lightbridge_authz_rest::handlers::introspect::introspect_api_key;
 use lightbridge_authz_rest::models::IntrospectRequest;
 use lightbridge_authz_rest::signing::generate_rs256_key;
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
+
+/// ADR-0025 Stage 2: a controllable [`SubjectResolver`] test double for
+/// `handlers::idp::resolve_context` -- unlike every other test in this file (which never
+/// exercises that handler and so gets a trust-everything default via [`mk_state`]), the two
+/// resolve-context tests below need to control resolution outcome directly.
+struct MockResolver {
+    /// `Ok` resolves to this account id unconditionally; `Err` is cloned into a fresh
+    /// `Error::Forbidden` per call (`Error` is not `Clone`, so this stores just the message).
+    outcome: std::result::Result<String, String>,
+}
+
+#[async_trait]
+impl SubjectResolver for MockResolver {
+    async fn resolve(&self, _iss: &str, _sub: &str) -> Result<AccountId> {
+        match &self.outcome {
+            Ok(account_id) => Ok(AccountId::assert_already_resolved(account_id.clone())),
+            Err(message) => Err(Error::Forbidden(message.clone())),
+        }
+    }
+}
 
 type UsageCalls = Arc<Mutex<Vec<(String, Option<String>)>>>;
 
@@ -57,6 +80,11 @@ struct MockOpaRepo {
     /// ADR-0020/#437: what `find_session_status` answers for the `sid` the presented exchange
     /// token carries. See [`MockSessionStatus`].
     session_status: MockSessionStatus,
+    /// ADR-0025: when `Some`, `resolve_context` asserts the `subject` it is called with equals
+    /// this value, panicking otherwise -- lets `resolve_context_endpoint_resolves_through_federated_identities`
+    /// prove the RESOLVED account id (not the raw presented subject) is what reaches this
+    /// repository method. `None` (every other test in this file) skips the check.
+    expected_subject: Option<String>,
 }
 
 #[async_trait]
@@ -150,6 +178,13 @@ impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
         _subject: &str,
         _project_id: &str,
     ) -> Result<lightbridge_authz_core::ResolvedContext> {
+        if let Some(expected) = &self.expected_subject {
+            assert_eq!(
+                _subject, expected,
+                "resolve_context must be called with the RESOLVED account id, never the raw \
+                 presented subject"
+            );
+        }
         self.member_context.clone().ok_or(Error::NotFound)
     }
 
@@ -261,7 +296,134 @@ fn mk_state(repo: MockOpaRepo) -> Arc<OpaState> {
             }],
         }),
         api_key_audience: Some(TEST_API_KEY_AUDIENCE.to_string()),
+        // Trust-everything default: none of the pre-existing tests in this file exercise
+        // `handlers::idp::resolve_context` (the one handler that actually calls this) --
+        // `resolve_context_endpoint_resolves_through_federated_identities` and
+        // `returns_404_not_403_for_an_unfederated_subject` below build their own `OpaState`
+        // directly with a [`MockResolver`] instead of going through this helper.
+        resolver: Arc::new(MockResolver {
+            outcome: Ok("acct_1".to_string()),
+        }),
+        federation_issuer: "https://keycloak.example.test/realms/dev".to_string(),
     })
+}
+
+fn mk_state_with_resolver(repo: MockOpaRepo, resolver: MockResolver) -> Arc<OpaState> {
+    Arc::new(OpaState {
+        repo: Arc::new(repo),
+        basic_auth: BasicAuth {
+            username: "authorino".to_string(),
+            password: "change-me".to_string(),
+        },
+        billing: Arc::new(Billing {
+            plans: vec![BillingPlan {
+                id: "free".to_string(),
+                name: "Free".to_string(),
+                limits: None,
+            }],
+        }),
+        api_key_audience: None,
+        resolver: Arc::new(resolver),
+        federation_issuer: "https://keycloak.example.test/realms/dev".to_string(),
+    })
+}
+
+fn bare_mock_opa_repo(member_context: Option<ResolvedContext>) -> MockOpaRepo {
+    MockOpaRepo {
+        api_key: None,
+        project: None,
+        account: None,
+        usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: vec![],
+        member_context,
+        member_role: None,
+        member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
+        expected_subject: None,
+    }
+}
+
+/// ADR-0025 Stage 2: `handlers::idp::resolve_context` translates the presented `(issuer, subject)`
+/// through `SubjectResolver` before ever reaching `StoreRepo::resolve_context` -- proves the
+/// resolved account id (not the raw presented subject) is what reaches the tenant-context lookup
+/// and comes back on the wire.
+#[tokio::test]
+async fn resolve_context_endpoint_resolves_through_federated_identities() {
+    let context = ResolvedContext {
+        account_id: "resolved-acct".to_string(),
+        project_id: "proj_1".to_string(),
+    };
+    // `expected_subject` makes the mock PANIC (failing the test) unless
+    // `StoreRepo::resolve_context` is called with the RESOLVED value, never the raw presented
+    // "kc-sub-1" -- the two are deliberately DIFFERENT strings here so a call site that forwards
+    // the raw subject cannot pass by coincidence.
+    let mut repo = bare_mock_opa_repo(Some(context));
+    repo.expected_subject = Some("resolved-acct".to_string());
+    let state = mk_state_with_resolver(
+        repo,
+        MockResolver {
+            outcome: Ok("resolved-acct".to_string()),
+        },
+    );
+
+    let response = resolve_context_endpoint(
+        axum::extract::State(state),
+        axum::Json(ResolveContextRequest {
+            subject: Some("kc-sub-1".to_string()),
+            project_id: Some("proj_1".to_string()),
+            issuer: Some("https://keycloak.example.test/realms/dev".to_string()),
+        }),
+    )
+    .await
+    .expect("a resolvable subject must succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body should be readable");
+    let payload: ResolvedContext =
+        serde_json::from_slice(&body).expect("body should decode as ResolvedContext");
+    assert_eq!(payload.account_id, "resolved-acct");
+    assert_eq!(payload.project_id, "proj_1");
+}
+
+/// THE non-leaking-oracle test: a resolver refusal (untrusted issuer, or no federated identity/
+/// no grandfathered account) must map to the exact same uniform `Error::NotFound` this endpoint's
+/// own not-a-member branch already returns -- never a distinct status a caller could use to
+/// distinguish "wrong issuer"/"no such account" from "not a member of this project".
+#[tokio::test]
+async fn returns_404_not_403_for_an_unfederated_subject() {
+    // `member_context: Some(..)` deliberately: if the endpoint ever stopped calling the resolver
+    // (or ignored its error) and fell through to `resolve_context` directly, this mock would
+    // happily return a context and the test would observe a 200, not the expected refusal --
+    // proving the 404 here comes from the RESOLVER, not from a downstream not-a-member miss.
+    let state = mk_state_with_resolver(
+        bare_mock_opa_repo(Some(ResolvedContext {
+            account_id: "should-never-be-reached".to_string(),
+            project_id: "proj_1".to_string(),
+        })),
+        MockResolver {
+            outcome: Err("no federated identity for this subject".to_string()),
+        },
+    );
+
+    let err = resolve_context_endpoint(
+        axum::extract::State(state),
+        axum::Json(ResolveContextRequest {
+            subject: Some("unfederated-sub".to_string()),
+            project_id: Some("proj_1".to_string()),
+            issuer: Some("https://untrusted-issuer.example".to_string()),
+        }),
+    )
+    .await
+    .expect_err("a resolver refusal must surface as an error, not a 200");
+
+    assert!(
+        matches!(err, Error::NotFound),
+        "a resolver Forbidden must map to the SAME uniform NotFound resolve_context's own \
+         not-a-member branch returns -- never a distinct status that would let a caller \
+         distinguish \"wrong issuer\"/\"no such account\" from \"not a member\", got {err:?}"
+    );
 }
 
 async fn introspect(state: Arc<OpaState>, token: &str) -> (StatusCode, Value) {
@@ -296,6 +458,7 @@ async fn introspect_returns_active_with_context_and_records_usage() {
         member_role: None,
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -352,6 +515,7 @@ async fn introspect_omits_name_and_limits_for_plan_absent_from_catalogue() {
         member_role: None,
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -384,6 +548,7 @@ async fn introspect_returns_inactive_when_revoked() {
         member_role: None,
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_revoked").await;
@@ -406,6 +571,7 @@ async fn introspect_returns_inactive_when_missing() {
         member_role: None,
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_missing").await;
@@ -429,6 +595,7 @@ async fn introspect_returns_inactive_when_expired() {
         member_role: None,
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_expired").await;
@@ -451,6 +618,7 @@ async fn introspect_returns_inactive_when_account_suspended() {
         member_role: None,
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_suspended_account").await;
@@ -474,6 +642,7 @@ async fn introspect_returns_inactive_when_project_suspended() {
         member_role: None,
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_suspended_project").await;
@@ -496,6 +665,7 @@ async fn introspect_omits_allowed_models_when_null() {
         member_role: None,
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -526,6 +696,7 @@ async fn introspect_returns_empty_allowed_models_when_empty() {
         member_role: None,
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -557,6 +728,7 @@ async fn introspect_round_trips_each_model_policy_value() {
             member_role: None,
             member_quota_tier: None,
             session_status: MockSessionStatus::Active,
+            expected_subject: None,
         });
 
         let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -588,6 +760,7 @@ async fn introspect_fails_closed_to_deny_all_for_an_unknown_stored_model_policy_
         member_role: None,
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -695,6 +868,7 @@ async fn introspect_resolves_active_exchange_session_with_live_project_authoriza
         member_role: Some("lead".to_string()),
         member_quota_tier: Some("t-m".to_string()),
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -752,6 +926,7 @@ async fn introspect_returns_inactive_for_an_expired_exchange_token() {
         member_role: None,
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -788,6 +963,7 @@ async fn introspect_returns_inactive_for_a_token_signed_by_an_unknown_key() {
         member_role: None,
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -824,6 +1000,7 @@ async fn introspect_returns_inactive_for_a_self_issued_token_with_no_project_cla
         member_role: None,
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -859,6 +1036,7 @@ async fn introspect_returns_inactive_when_exchange_subject_is_no_longer_a_member
         member_role: None,
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -894,6 +1072,7 @@ async fn introspect_returns_inactive_when_exchange_project_is_suspended() {
         member_role: None,
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -929,6 +1108,7 @@ async fn introspect_returns_inactive_when_exchange_account_is_suspended() {
         member_role: None,
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -975,6 +1155,7 @@ async fn a_revoked_api_key_jwt_is_never_reinterpreted_as_an_active_exchange_sess
         member_role: Some("lead".to_string()),
         member_quota_tier: Some("t-m".to_string()),
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1022,6 +1203,7 @@ async fn a_token_carrying_the_api_key_audience_as_azp_is_refused_even_with_no_ap
         member_role: Some("lead".to_string()),
         member_quota_tier: Some("t-m".to_string()),
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1064,6 +1246,7 @@ async fn a_token_with_no_azp_claim_at_all_is_refused() {
         member_role: None,
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1106,6 +1289,7 @@ async fn introspect_returns_inactive_when_session_is_revoked() {
         member_role: Some("lead".to_string()),
         member_quota_tier: Some("t-m".to_string()),
         session_status: MockSessionStatus::Revoked,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1142,6 +1326,7 @@ async fn introspect_returns_inactive_when_session_is_expired() {
         member_role: Some("lead".to_string()),
         member_quota_tier: Some("t-m".to_string()),
         session_status: MockSessionStatus::Expired,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1175,6 +1360,7 @@ async fn introspect_returns_inactive_when_session_row_not_found() {
         member_role: Some("lead".to_string()),
         member_quota_tier: Some("t-m".to_string()),
         session_status: MockSessionStatus::NotFound,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1213,6 +1399,7 @@ async fn introspect_returns_inactive_when_no_sid_claim_at_all() {
         // Deliberately Active -- proves the ABSENCE of a `sid` claim alone is what resolves this
         // inactive, not the session lookup (which would never even be called).
         session_status: MockSessionStatus::Active,
+        expected_subject: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1256,6 +1443,7 @@ async fn resolve_exchange_token_context_errors_when_session_lookup_fails_never_a
         member_role: Some("lead".to_string()),
         member_quota_tier: Some("t-m".to_string()),
         session_status: MockSessionStatus::LookupErrors,
+        expected_subject: None,
     });
 
     let result = lightbridge_authz_rest::handlers::exchange_token::resolve_exchange_token_context(

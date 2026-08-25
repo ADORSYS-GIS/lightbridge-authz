@@ -759,7 +759,7 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
     .await
     .unwrap();
     repo.create_project(
-        "keycloak-subject",
+        &lightbridge_authz_core::identity::AccountId::assert_already_resolved("keycloak-subject"),
         "keycloak-subject",
         CreateProject {
             name: "browser project".to_string(),
@@ -774,7 +774,11 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
     .await
     .unwrap();
     let default_project_id = repo
-        .find_default_project_id("keycloak-subject")
+        .find_default_project_id(
+            &lightbridge_authz_core::identity::AccountId::assert_already_resolved(
+                "keycloak-subject",
+            ),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -787,7 +791,7 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
     .await
     .unwrap();
     repo.create_project(
-        "other-subject",
+        &lightbridge_authz_core::identity::AccountId::assert_already_resolved("other-subject"),
         "other-subject",
         CreateProject {
             name: "other browser project".to_string(),
@@ -971,7 +975,7 @@ async fn suspended_account_is_refused_a_browser_session(pool: PgPool) {
     .await
     .unwrap();
     repo.create_project(
-        "suspended-subject",
+        &lightbridge_authz_core::identity::AccountId::assert_already_resolved("suspended-subject"),
         "suspended-subject",
         CreateProject {
             name: "suspended account project".to_string(),
@@ -986,7 +990,7 @@ async fn suspended_account_is_refused_a_browser_session(pool: PgPool) {
     .await
     .unwrap();
     repo.set_account_status(
-        "suspended-subject",
+        &lightbridge_authz_core::identity::AccountId::assert_already_resolved("suspended-subject"),
         "suspended-subject",
         ResourceStatus::Suspended,
     )
@@ -1100,7 +1104,9 @@ async fn inactive_project_is_refused_a_browser_session(pool: PgPool) {
     .await
     .unwrap();
     repo.create_project(
-        "inactive-project-subject",
+        &lightbridge_authz_core::identity::AccountId::assert_already_resolved(
+            "inactive-project-subject",
+        ),
         "inactive-project-subject",
         CreateProject {
             name: "inactive project".to_string(),
@@ -1115,7 +1121,9 @@ async fn inactive_project_is_refused_a_browser_session(pool: PgPool) {
     .await
     .unwrap();
     repo.set_project_status(
-        "inactive-project-subject",
+        &lightbridge_authz_core::identity::AccountId::assert_already_resolved(
+            "inactive-project-subject",
+        ),
         "inactive-project",
         ResourceStatus::Suspended,
     )
@@ -1242,7 +1250,7 @@ async fn browser_session_persists_the_real_authenticated_member_subject(pool: Pg
     .await
     .unwrap();
     repo.create_project(
-        "owner-subject",
+        &lightbridge_authz_core::identity::AccountId::assert_already_resolved("owner-subject"),
         "owner-subject",
         CreateProject {
             name: "owner project".to_string(),
@@ -1257,7 +1265,7 @@ async fn browser_session_persists_the_real_authenticated_member_subject(pool: Pg
     .await
     .unwrap();
     repo.add_project_member(
-        "owner-subject",
+        &lightbridge_authz_core::identity::AccountId::assert_already_resolved("owner-subject"),
         "member-scope-project",
         "member-subject",
         Some("member"),
@@ -1342,6 +1350,145 @@ async fn browser_session_persists_the_real_authenticated_member_subject(pool: Pg
         ),
         "account_id resolves to the project OWNER, but subject must be the real authenticated \
          member -- these must never collapse to the same value for a non-owner member"
+    );
+}
+
+/// ADR-0025 Stage 2: `sessions.subject` must be the FEDERATED account id
+/// (`persist_federated_identity`'s returned row) -- never the raw Keycloak `sub` claim off the
+/// ID token directly -- once a `federated_identities` row already links that raw subject to a
+/// DIFFERENT id than itself. `browser_session_persists_the_real_authenticated_member_subject`
+/// above is the grandfathered-account sibling of this test (where the raw subject and the
+/// resolved account id happen to be byte-identical, proving wire-invariance); this test
+/// deliberately makes them differ, proving the general translation, not merely coincidence.
+#[sqlx::test(migrations = "../../migrations")]
+async fn browser_session_subject_is_the_acting_account_not_the_keycloak_sub(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let _discovery = keycloak
+        .mock_async(|when, then| {
+            when.method(GET).path("/.well-known/openid-configuration");
+            then.status(200).json_body(discovery_body(&keycloak));
+        })
+        .await;
+    let key = generate_rs256_key().unwrap();
+    let _jwks = keycloak
+        .mock_async(|when, then| {
+            when.method(GET).path("/jwks");
+            then.status(200)
+                .json_body(serde_json::json!({ "keys": [key.public_jwk] }));
+        })
+        .await;
+    let repo = repo(pool.clone());
+    let account_id = "federated-target-account";
+    let raw_keycloak_sub = "kc-raw-sub-differs-from-account";
+    repo.create_account(
+        account_id,
+        CreateAccount {
+            default_quota: None,
+        },
+    )
+    .await
+    .unwrap();
+    // Pre-seeds a federated_identities row where subject != account_id -- not producible by this
+    // repo's own write paths in Stage 1-3 (the self-healing grandfather branch always adopts
+    // subject == account_id), but a legitimate general shape `upsert_federated_identity`'s UPDATE
+    // branch (an already-existing row) must still resolve correctly through.
+    sqlx::query(
+        "INSERT INTO federated_identities (id, issuer, subject, account_id) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(lightbridge_authz_core::cuid::cuid2())
+    .bind(keycloak.base_url())
+    .bind(raw_keycloak_sub)
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .expect("seeding the federated_identities row must succeed");
+    repo.create_project(
+        &lightbridge_authz_core::identity::AccountId::assert_already_resolved(account_id),
+        account_id,
+        CreateProject {
+            name: "federated project".to_string(),
+            allowed_models: None,
+            default_limits: None,
+            billing_plan: "free".to_string(),
+            billing_identity: "federated-binding".to_string(),
+            project_quota: None,
+        },
+        "federated-project".to_string(),
+    )
+    .await
+    .unwrap();
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.url("/jwks"),
+            repo.clone(),
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+    let (location, cookie) = rp
+        .begin_browser(BrowserLoginTarget {
+            project_id: Some("federated-project".to_string()),
+            resume_path: "/browser".to_string(),
+        })
+        .await
+        .unwrap();
+    let state = reqwest::Url::parse(&location)
+        .unwrap()
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .unwrap();
+    let decoded = OAuth2State::decrypt(
+        &state,
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(STATE_KEY)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    )
+    .unwrap();
+    let mut jwt_header = Header::new(Algorithm::RS256);
+    jwt_header.kid = Some(key.kid);
+    let token = encode(
+        &jwt_header,
+        &IdToken {
+            sub: raw_keycloak_sub,
+            iss: &keycloak.base_url(),
+            aud: "authz-idp-rp",
+            nonce: decoded.nonce.as_deref().unwrap(),
+            exp: (Utc::now() + Duration::minutes(5)).timestamp(),
+            iat: Utc::now().timestamp(),
+        },
+        &EncodingKey::from_rsa_pem(key.private_key_pem.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    let _token = keycloak
+        .mock_async(|when, then| {
+            when.method(POST).path("/token").body_includes("code=code");
+            then.status(200)
+                .json_body(serde_json::json!({ "id_token": token }));
+        })
+        .await;
+    let response = router(rp)
+        .oneshot(
+            Request::builder()
+                .uri(callback_uri(&state))
+                .header(header::COOKIE, cookie.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let row: (Option<String>,) =
+        sqlx::query_as("SELECT subject FROM sessions WHERE kind = 'browser'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        row.0.as_deref(),
+        Some(account_id),
+        "sessions.subject must be the federated account id, never the raw Keycloak sub claim"
     );
 }
 
@@ -1576,7 +1723,7 @@ async fn browser_sso_callback_persists_the_same_federated_identity(pool: PgPool)
     .await
     .unwrap();
     repo.create_project(
-        subject,
+        &lightbridge_authz_core::identity::AccountId::assert_already_resolved(subject),
         subject,
         CreateProject {
             name: "browser federation project".to_string(),
@@ -1819,7 +1966,7 @@ async fn a_second_login_updates_the_same_federated_identity_row_and_reseals(pool
     .await
     .unwrap();
     repo.create_project(
-        subject,
+        &lightbridge_authz_core::identity::AccountId::assert_already_resolved(subject),
         subject,
         CreateProject {
             name: "reseal project".to_string(),
@@ -1972,6 +2119,22 @@ async fn a_second_login_updates_the_same_federated_identity_row_and_reseals(pool
     );
 }
 
+/// End-to-end (real HTTP callback, two independently-configured `KeycloakRelyingParty`
+/// instances) proof that a second issuer never silently merges into an account issuer_a already
+/// adopted. In THIS two-independent-RP shape the refusal still comes from
+/// `federated_identities_account_uidx` (each RP's own `config.issuer` self-satisfies ADR-0025's
+/// new `upsert_federated_identity` issuer pin, since `validate_id_token` already enforces
+/// `claims.iss == self.config.issuer` before the pin is ever reached) -- that DB-level backstop
+/// was already sufficient once an adoption exists to collide with, and remains exercised here.
+/// The pin's own, stronger guarantee -- refusing a non-grandfather issuer's FIRST adoption
+/// attempt, before anything exists to race against -- is order-independent and cannot be proven
+/// with two self-consistent RPs (a real deployment only ever runs one), so it is proven directly
+/// against the repo seam instead:
+/// `upsert_federated_identity_refuses_adoption_from_a_non_grandfather_issuer` in
+/// `crates/lightbridge-authz-api-key/tests/federated_identity_account_link_tests.rs` runs the
+/// non-grandfather issuer FIRST, against a freshly-created, never-adopted account, and asserts
+/// `Error::Forbidden` -- proving the refusal is the issuer pin itself, not a race lost to a prior
+/// adoption.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_second_issuer_with_a_colliding_subject_is_refused_not_merged(pool: PgPool) {
     let keycloak_a = MockServer::start_async().await;
@@ -1992,7 +2155,7 @@ async fn a_second_issuer_with_a_colliding_subject_is_refused_not_merged(pool: Pg
     .await
     .unwrap();
     repo.create_project(
-        subject,
+        &lightbridge_authz_core::identity::AccountId::assert_already_resolved(subject),
         subject,
         CreateProject {
             name: "colliding project".to_string(),

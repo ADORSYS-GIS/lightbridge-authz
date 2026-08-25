@@ -21,9 +21,33 @@ use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
 use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::authz::{Permission, PermissionSet};
 use lightbridge_authz_core::config::{Oauth2, Oauth2Type};
+use lightbridge_authz_core::identity::AccountId;
+use lightbridge_authz_rest::auth_provider::SubjectResolver;
 use serde::Serialize;
 use serde_json::Value;
+use std::sync::Arc;
 use tower::ServiceExt;
+
+/// A trust-everything [`SubjectResolver`] test double (ADR-0025): resolves any `(iss, sub)` to
+/// `AccountId::assert_already_resolved(sub)` unconditionally, never touching a database. Correct for every
+/// test that is not itself about resolver behavior (those live in `idp_server_tests.rs`'s own
+/// `federated_subject_resolution_tests.rs`-style coverage instead).
+pub struct TrustEverythingResolver;
+
+#[async_trait]
+impl SubjectResolver for TrustEverythingResolver {
+    async fn resolve(
+        &self,
+        _iss: &str,
+        sub: &str,
+    ) -> lightbridge_authz_core::error::Result<AccountId> {
+        Ok(AccountId::assert_already_resolved(sub))
+    }
+}
+
+pub fn test_resolver() -> Arc<dyn SubjectResolver> {
+    Arc::new(TrustEverythingResolver)
+}
 
 /// A bearer service that maps a token *string* to a preconfigured [`TokenInfo`], so a single router
 /// can serve several identities (admin / viewer / editor) just by varying the `Authorization`
@@ -62,6 +86,7 @@ pub fn token_info(subject: &str, perms: PermissionSet) -> TokenInfo {
     TokenInfo {
         active: true,
         sub: subject.to_owned(),
+        iss: "https://keycloak.example.test/realms/dev".to_string(),
         exp: 0,
         aud: vec![],
         roles: vec![],
@@ -119,6 +144,9 @@ pub fn external_oauth2() -> Oauth2 {
         relying_party: None,
         rbac: Default::default(),
         clients: Vec::new(),
+        federation: Some(lightbridge_authz_core::config::Federation {
+            issuer: "https://keycloak.example.test/realms/dev".to_string(),
+        }),
     }
 }
 

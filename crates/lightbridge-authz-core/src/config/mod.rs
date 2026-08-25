@@ -762,6 +762,50 @@ pub enum Oauth2Type {
     External,
 }
 
+/// ADR-0025 Stage 1: the identity of the ONE issuer this deployment trusts to translate a bearer
+/// token's `(iss, sub)` into the acting person's lightbridge account id
+/// (`StoreRepo::resolve_account_for_federated_subject`) -- the single seam every ingress now
+/// routes remote-subject translation through, instead of trusting `accounts.id == sub` directly
+/// (ADR-0006's original property). Mandatory for `authz-api`, `authz-idp`, `authz-opa`,
+/// `authz-budget`, and `lightbridge-mcp` -- each refuses to start without it, loudly, naming
+/// `oauth2.federation.issuer` and the component (see each `start_*_server` function in
+/// `crates/lightbridge-authz-rest/src/lib.rs`, and `app/lightbridge-authz/src/bin/lightbridge-mcp.rs`),
+/// the same shape AGENTS.md's "Redis is a mandatory dependency" house rule documents for a
+/// different dependency.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Federation {
+    /// The issuer URL every ADR-0025 ingress translation grandfathers a pre-ADR-0024
+    /// (`accounts.id == subject`) account against on its first resolution -- see
+    /// `StoreRepo::resolve_account_for_federated_subject`'s doc comment for the self-healing
+    /// adoption this enables. `authz-idp` additionally asserts this equals
+    /// `oauth2.relying_party.issuer`: a mismatch there would mean a subject presented via the
+    /// RP-leg login callback (which seals `federated_identities` rows under
+    /// `oauth2.relying_party.issuer`) can never be resolved via this issuer -- a permanently
+    /// un-matchable federated identity row -- so `authz-idp` refuses to start rather than run in
+    /// that state.
+    pub issuer: String,
+}
+
+impl Federation {
+    /// Offline validation only (ADR-0025): non-empty, and parses as a URL. No network call, no
+    /// discovery fetch against the issuer -- the same "presence PLUS offline validation, not a
+    /// live reachability check" posture `oauth2.relying_party`/`KeycloakRelyingParty::new`
+    /// already applies to a config-sourced external-IdP URL, for the identical reason
+    /// AGENTS.md's "Redis is a mandatory dependency" house rule gives for its own presence-only
+    /// enforcement: no startup-ordering dependency on a third party being reachable yet.
+    pub fn validate(&self) -> Result<()> {
+        if self.issuer.trim().is_empty() {
+            return Err(Error::Server(
+                "oauth2.federation.issuer must not be empty".to_string(),
+            ));
+        }
+        url::Url::parse(&self.issuer).map_err(|e| {
+            Error::Server(format!("oauth2.federation.issuer must be a valid URL: {e}"))
+        })?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Oauth2 {
     /// REQUIRED credential-issuance mode (`self` or `external`). No default — a missing `type`
@@ -816,6 +860,14 @@ pub struct Oauth2 {
     /// `authkestra-op`).
     #[serde(default)]
     pub clients: Vec<OauthClient>,
+    /// ADR-0025 Stage 1: the ONE issuer this deployment trusts for remote-subject-to-account-id
+    /// translation. `Option` at the type level ONLY because every other field on this struct
+    /// that starts life optional-and-becomes-mandatory-per-component follows that same shape
+    /// (`relying_party`, `token_exchange` -- see `start_idp_server`'s doc comment); every
+    /// component that actually serves traffic enforces this unconditionally at startup -- see
+    /// [`Federation`]'s own doc comment for the full list and the loud-refusal contract.
+    #[serde(default)]
+    pub federation: Option<Federation>,
 }
 
 /// Configuration for `authz-idp` acting as a Keycloak OIDC relying party (ADR-0012, ADR-0021).

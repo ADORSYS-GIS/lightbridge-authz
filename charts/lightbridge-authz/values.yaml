@@ -241,6 +241,13 @@ configMaps:
           # For local development with multiple audiences:
           #   audience: ["lightbridge-api-key", "lightbridge-token-issuer"]
           audience: []
+          # ADR-0025 Stage 1: the ONE issuer this deployment trusts for
+          # remote-subject-to-account-id translation. REQUIRED for every alias (api/opa/idp/
+          # budget) and for lightbridge-mcp -- each refuses to start without it. Matches
+          # relying_party.issuer below: authz-idp asserts the two are equal at startup. Real
+          # deployments MUST override this from their own values repo alongside relying_party.
+          federation:
+            issuer: "http://keycloak:9100/realms/dev"
           # REQUIRED for the `idp` alias only (ADR-0023: authz-idp is a full IdP — both this block
           # and `token_exchange` below are mandatory, `start_idp_server` refuses to start without
           # them). `authz-api`/`authz-opa`/`authz-budget` never read this block; it is harmless

@@ -56,6 +56,9 @@ fn external_oauth2() -> Oauth2 {
         relying_party: None,
         rbac: Default::default(),
         clients: Vec::new(),
+        federation: Some(lightbridge_authz_core::config::Federation {
+            issuer: "https://keycloak.example.test/realms/dev".to_string(),
+        }),
     }
 }
 

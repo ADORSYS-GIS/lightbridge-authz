@@ -88,11 +88,14 @@ async fn insert_account(pool: &PgPool, account_id: &str) {
 // doc already says permission DENIAL is not what's under test here, so this grants the full
 // permission set via the SAME shared helper `CratestackAuthProvider`/MCP use (`build_context`),
 // scoped `RpcScope::Budget`, rather than hand-rolling a second, out-of-sync context shape.
-fn ctx_for(subject: &str) -> CratestackContext {
+async fn ctx_for(subject: &str) -> CratestackContext {
     build_context(
         &common::token_info(subject, common::admin_perms()),
         RpcScope::Budget,
+        common::test_resolver().as_ref(),
     )
+    .await
+    .expect("the trust-everything test resolver never refuses")
 }
 
 /// Like [`ctx_for`], but stamped with [`auth_provider::CALLER_KIND_CONTEXT_KEY`] as
@@ -103,8 +106,8 @@ fn ctx_for(subject: &str) -> CratestackContext {
 /// unconditionally regardless of caller. Kept after #419 deleted `request_budget_refill`'s own
 /// `caller_kind` gate specifically to prove the claim is now irrelevant to that procedure's
 /// outcome -- see `request_refill_accepts_api_key_shaped_caller_holding_the_permission` below.
-fn ctx_for_api_key_caller(subject: &str) -> CratestackContext {
-    let mut ctx = ctx_for(subject);
+async fn ctx_for_api_key_caller(subject: &str) -> CratestackContext {
+    let mut ctx = ctx_for(subject).await;
     ctx.extensions.insert(
         auth_provider::CALLER_KIND_CONTEXT_KEY.to_owned(),
         Value::String(lightbridge_authz_bearer::API_KEY_CALLER_KIND.to_owned()),
@@ -145,7 +148,7 @@ async fn procedures_and_ctx(
         review_service,
         budget_repo.clone(),
     );
-    let ctx = ctx_for(subject);
+    let ctx = ctx_for(subject).await;
     (procedures, ctx, budget_repo)
 }
 
@@ -506,7 +509,7 @@ async fn request_refill_accepts_api_key_shaped_caller_holding_the_permission(poo
     let account_id = cuid2();
     insert_account(&pool, &account_id).await;
     let (procedures, _human_ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
-    let ctx = ctx_for_api_key_caller(&account_id);
+    let ctx = ctx_for_api_key_caller(&account_id).await;
     let db = lazy_cratestack_db();
 
     let output = request_refill(
@@ -597,7 +600,7 @@ async fn approve_grants_and_updates_status(pool: PgPool) {
     let reviewer_id = cuid2();
     insert_account(&pool, &reviewer_id).await;
     let (procedures, ctx, budget_repo) = procedures_and_ctx(pool, &account_id).await;
-    let reviewer_ctx = ctx_for(&reviewer_id);
+    let reviewer_ctx = ctx_for(&reviewer_id).await;
     let db = lazy_cratestack_db();
 
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
@@ -632,7 +635,7 @@ async fn reject_without_a_reason_is_rejected_at_the_schema_or_procedure_layer(po
     let reviewer_id = cuid2();
     insert_account(&pool, &reviewer_id).await;
     let (procedures, ctx, budget_repo) = procedures_and_ctx(pool, &account_id).await;
-    let reviewer_ctx = ctx_for(&reviewer_id);
+    let reviewer_ctx = ctx_for(&reviewer_id).await;
     let db = lazy_cratestack_db();
 
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
@@ -677,7 +680,7 @@ async fn reject_with_a_reason_succeeds_and_records_it(pool: PgPool) {
     let reviewer_id = cuid2();
     insert_account(&pool, &reviewer_id).await;
     let (procedures, ctx, budget_repo) = procedures_and_ctx(pool, &account_id).await;
-    let reviewer_ctx = ctx_for(&reviewer_id);
+    let reviewer_ctx = ctx_for(&reviewer_id).await;
     let db = lazy_cratestack_db();
 
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
@@ -857,7 +860,7 @@ async fn list_my_augmentation_requests_does_not_leak_another_callers_requests(po
     insert_account(&pool, &owner_id).await;
     insert_account(&pool, &bystander_id).await;
     let (procedures, owner_ctx, _budget_repo) = procedures_and_ctx(pool, &owner_id).await;
-    let bystander_ctx = ctx_for(&bystander_id);
+    let bystander_ctx = ctx_for(&bystander_id).await;
     let db = lazy_cratestack_db();
 
     let created = request_refill(
@@ -970,7 +973,7 @@ async fn get_my_budget_refill_ladder_is_scoped_to_the_callers_own_budget_account
     insert_account(&pool, &owner_id).await;
     insert_account(&pool, &bystander_id).await;
     let (procedures, owner_ctx, _budget_repo) = procedures_and_ctx(pool, &owner_id).await;
-    let bystander_ctx = ctx_for(&bystander_id);
+    let bystander_ctx = ctx_for(&bystander_id).await;
     let db = lazy_cratestack_db();
 
     let owner_status = get_ladder(&procedures, &db, &owner_ctx, ladder_args())

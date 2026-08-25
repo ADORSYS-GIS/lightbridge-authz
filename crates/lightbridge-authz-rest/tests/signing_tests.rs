@@ -7,6 +7,7 @@
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use lightbridge_authz_core::config::JwtSigning;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
+use lightbridge_authz_core::identity::AccountId;
 use lightbridge_authz_rest::signing::{
     ApiKeyJwtSigner, ClientAuthenticationMetadata, DiscoveryCapabilities, capped_expiry,
     generate_rs256_key,
@@ -904,6 +905,7 @@ mod db {
         let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
         let owner = KeyOwner {
             subject: "kc-user-123".to_string(),
+            account_id: "kc-user-123".to_string(),
             email: Some("dev@example.test".to_string()),
             email_verified: Some(true),
         };
@@ -940,6 +942,142 @@ mod db {
         assert_eq!(
             claims.caller_kind.as_deref(),
             Some(lightbridge_authz_bearer::API_KEY_CALLER_KIND)
+        );
+    }
+
+    /// ADR-0025 Stage 3: the minted `sub` comes from `KeyOwner::account_id` (the resolved acting
+    /// account id), never `KeyOwner::subject` (the raw upstream claim, kept only as a log/email
+    /// surface) -- the two are deliberately DIFFERENT strings here so a signer that still minted
+    /// from `subject` could not pass this test by coincidence.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn minted_sub_is_the_acting_account_id_not_the_upstream_subject(pool: PgPool) {
+        let repo = repo(pool);
+        bootstrap_signing_key(&repo, &signing_cfg(3600))
+            .await
+            .unwrap();
+        let active = repo.get_active_signing_key().await.unwrap().unwrap();
+
+        let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
+        let owner = KeyOwner {
+            subject: "kc-raw-upstream-sub".to_string(),
+            account_id: "resolved-acting-account".to_string(),
+            email: None,
+            email_verified: None,
+        };
+        let signed = signer
+            .sign(&owner, "key_1", "proj_1", "acct_1", None, Utc::now(), None)
+            .await
+            .unwrap();
+
+        let claims = verify_against(&active.public_jwk, &signed.token);
+        assert_eq!(
+            claims.sub, "resolved-acting-account",
+            "sub must be minted from KeyOwner::account_id"
+        );
+        assert_ne!(
+            claims.sub, "kc-raw-upstream-sub",
+            "sub must NEVER be the raw upstream KeyOwner::subject claim"
+        );
+    }
+
+    /// THE wire-invariance test (ADR-0025 Stages 1-3's central promise): for a grandfathered
+    /// account -- `accounts.id == subject`, the pre-ADR-0024 property every existing account
+    /// still has -- the minted token's `sub` is BYTE-IDENTICAL to what a pre-Stage-3 signer would
+    /// have produced, because `KeyOwner::account_id` (Stage 3's new source for `sub`) is, for a
+    /// grandfathered account, always equal to `KeyOwner::subject` (Stage 3's old source). This is
+    /// not an accident of these two particular test fixtures agreeing -- it is the actual
+    /// invariant `StoreRepo::resolve_account_for_federated_subject`'s grandfather branch
+    /// guarantees for every subject presented by the deployment's one configured
+    /// `oauth2.federation.issuer`. Asserted against `owner.subject` directly (not a hardcoded
+    /// literal) so this test fails if the two fields are ever seeded to differ by mistake, not
+    /// only if the signer's own wiring regresses.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn grandfathered_account_mints_a_byte_identical_sub_to_the_pre_stage_3_signer(
+        pool: PgPool,
+    ) {
+        let repo = repo(pool);
+        bootstrap_signing_key(&repo, &signing_cfg(3600))
+            .await
+            .unwrap();
+        let active = repo.get_active_signing_key().await.unwrap().unwrap();
+
+        let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
+        let grandfathered_id = "grandfathered-acct-42".to_string();
+        let owner = KeyOwner {
+            subject: grandfathered_id.clone(),
+            account_id: grandfathered_id.clone(),
+            email: None,
+            email_verified: None,
+        };
+        let signed = signer
+            .sign(&owner, "key_1", "proj_1", "acct_1", None, Utc::now(), None)
+            .await
+            .unwrap();
+
+        let claims = verify_against(&active.public_jwk, &signed.token);
+        assert_eq!(
+            claims.sub, owner.subject,
+            "a grandfathered account's minted sub must be byte-identical to its (pre-Stage-3) \
+             upstream subject claim"
+        );
+        assert_eq!(
+            claims.sub, owner.account_id,
+            "and identical to its (Stage-3) resolved account id -- the two are the same value \
+             for every grandfathered account, which is the whole wire-invariance guarantee"
+        );
+    }
+
+    /// ADR-0025 Stage 3 actor-vs-owner split: a roster member (`lead`) minting a key on a
+    /// project someone else's account owns must carry the MEMBER's own account id as `sub` (the
+    /// actor -- who is actually holding this credential), while `account_id` stays the project's
+    /// OWNING account (the context claim, unchanged from before this ADR) -- the two claims must
+    /// differ, and each must independently be correct, not merely "some subject or other".
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn sub_and_account_id_differ_when_a_roster_member_acts_on_someone_elses_project(
+        pool: PgPool,
+    ) {
+        let repo = repo(pool);
+        bootstrap_signing_key(&repo, &signing_cfg(3600))
+            .await
+            .unwrap();
+        let active = repo.get_active_signing_key().await.unwrap().unwrap();
+
+        let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
+        // The acting member: a real, resolved account id, distinct from the project owner below.
+        let owner = KeyOwner {
+            subject: "kc-member-raw-sub".to_string(),
+            account_id: "member-account".to_string(),
+            email: None,
+            email_verified: None,
+        };
+        let signed = signer
+            .sign(
+                &owner,
+                "key_1",
+                "proj_owned_by_someone_else",
+                // The CONTEXT claim: the project's owning account, a different person entirely.
+                "owner-account",
+                None,
+                Utc::now(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let claims = verify_against(&active.public_jwk, &signed.token);
+        assert_eq!(
+            claims.sub, "member-account",
+            "sub (the actor) must be the acting member's own account id"
+        );
+        assert_eq!(
+            claims.account_id, "owner-account",
+            "the account_id claim (the context) must stay the project's owning account, \
+             unaffected by who actually minted the key"
+        );
+        assert_ne!(
+            claims.sub, claims.account_id,
+            "actor and context must never be conflated -- this is precisely the two-ids \
+             distinction ADR-0025's own module doc comment (authorize.rs:202-211) documents"
         );
     }
 
@@ -1043,6 +1181,13 @@ mod db {
     /// so `signing.rs`'s `access_token_extra` supplies this repo's own `lgbr:`-prefixed CUID2
     /// through it -- this test now asserts `jti` is back to matching the old signer's format, not
     /// diverging from it.
+    ///
+    /// ADR-0025 Stage 3 note on `sub`: `owner.subject == owner.account_id` in this fixture
+    /// (`"kc-user-old-vs-new"` for both), so this test's `sub` equality assertion holds
+    /// regardless of whether the signer mints from `KeyOwner::subject` or `KeyOwner::account_id`
+    /// -- it is NOT the test that would catch a Stage-3 regression on which field feeds `sub`.
+    /// That distinction is `minted_sub_is_the_acting_account_id_not_the_upstream_subject` (and
+    /// its actor-vs-owner sibling) above, which deliberately makes the two fields differ.
     #[sqlx::test(migrations = "../../migrations")]
     async fn new_signer_claim_set_is_a_documented_superset_of_the_old_signer(pool: PgPool) {
         let repo = repo(pool);
@@ -1053,6 +1198,7 @@ mod db {
 
         let owner = KeyOwner {
             subject: "kc-user-old-vs-new".to_string(),
+            account_id: "kc-user-old-vs-new".to_string(),
             email: Some("dev@example.test".to_string()),
             email_verified: Some(true),
         };
@@ -1175,6 +1321,9 @@ mod db {
             relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
+            federation: Some(lightbridge_authz_core::config::Federation {
+                issuer: "https://keycloak.example.test/realms/dev".to_string(),
+            }),
         }
     }
 
@@ -1219,7 +1368,7 @@ mod db {
         // this test only needs a project to exist so `create_api_key` can sign against it.
         let project = key_repo
             .create_project(
-                subject,
+                &AccountId::assert_already_resolved(subject),
                 &account.id,
                 CreateProject {
                     name: "p".to_string(),

@@ -144,7 +144,10 @@ async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, Cratest
     let ctx = build_context(
         &common::token_info(subject, common::admin_perms()),
         RpcScope::Budget,
-    );
+        common::test_resolver().as_ref(),
+    )
+    .await
+    .expect("the trust-everything test resolver never refuses");
     (procedures, ctx)
 }
 

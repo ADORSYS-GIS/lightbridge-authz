@@ -5,6 +5,7 @@ use lightbridge_authz_api_key::entities::new_api_key_row::NewApiKeyRow;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::DbPool;
+use lightbridge_authz_core::identity::AccountId;
 use lightbridge_authz_core::{ApiKeyStatus, CreateAccount, CreateProject, ResourceStatus};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ async fn seed_key(
     subject: &str,
     expires_at: Option<chrono::DateTime<Utc>>,
 ) -> (String, String, String) {
+    let account_id = AccountId::assert_already_resolved(subject);
     let account = repo
         .create_account(
             subject,
@@ -39,7 +41,7 @@ async fn seed_key(
         .expect("account creation should succeed");
     let project = repo
         .create_project(
-            subject,
+            &account_id,
             &account.id,
             CreateProject {
                 name: "proj".to_string(),
@@ -55,7 +57,7 @@ async fn seed_key(
         .expect("project creation should succeed");
     let key_hash = format!("hash-{}", cuid2());
     repo.create_api_key(
-        subject,
+        &account_id,
         NewApiKeyRow {
             id: cuid2(),
             project_id: project.id.clone(),
@@ -92,17 +94,25 @@ async fn suspending_account_invalidates_its_keys(pool: PgPool) {
 
     assert_eq!(effective_status(&repo, &key_hash).await, "active");
 
-    repo.set_account_status(subject, &account_id, ResourceStatus::Suspended)
-        .await
-        .expect("suspend should succeed");
+    repo.set_account_status(
+        &AccountId::assert_already_resolved(subject),
+        &account_id,
+        ResourceStatus::Suspended,
+    )
+    .await
+    .expect("suspend should succeed");
     assert_eq!(
         effective_status(&repo, &key_hash).await,
         "account_suspended"
     );
 
-    repo.set_account_status(subject, &account_id, ResourceStatus::Active)
-        .await
-        .expect("re-enable should succeed");
+    repo.set_account_status(
+        &AccountId::assert_already_resolved(subject),
+        &account_id,
+        ResourceStatus::Active,
+    )
+    .await
+    .expect("re-enable should succeed");
     assert_eq!(effective_status(&repo, &key_hash).await, "active");
 }
 
@@ -114,9 +124,13 @@ async fn suspending_project_invalidates_its_keys(pool: PgPool) {
 
     assert_eq!(effective_status(&repo, &key_hash).await, "active");
 
-    repo.set_project_status(subject, &project_id, ResourceStatus::Suspended)
-        .await
-        .expect("suspend should succeed");
+    repo.set_project_status(
+        &AccountId::assert_already_resolved(subject),
+        &project_id,
+        ResourceStatus::Suspended,
+    )
+    .await
+    .expect("suspend should succeed");
     assert_eq!(
         effective_status(&repo, &key_hash).await,
         "project_suspended"
@@ -139,7 +153,11 @@ async fn set_account_status_requires_membership(pool: PgPool) {
     let (account_id, _project_id, _key_hash) = seed_key(&repo, "owner", far_future()).await;
 
     let err = repo
-        .set_account_status("intruder", &account_id, ResourceStatus::Suspended)
+        .set_account_status(
+            &AccountId::assert_already_resolved("intruder"),
+            &account_id,
+            ResourceStatus::Suspended,
+        )
         .await
         .expect_err("a non-member must not suspend the account");
     assert!(matches!(
