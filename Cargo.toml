@@ -32,7 +32,7 @@ base64 = "0.23"
 # `lightbridge-authz-core::crypto::{seal,open}` (ADR-0024) now calls it directly for the
 # Keycloak-token-set-at-rest envelope. Pinning the same 0.10 line authkestra-engine already
 # resolves to avoids carrying two `aes-gcm` majors in the lockfile.
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 # ⚠️ THIS VERSION IS COUPLED TO `authkestra-resource` BELOW. Bump them together or not at all.
 #
 # `lightbridge-authz-bearer` passes `Validation`/`Algorithm` values straight into authkestra's
