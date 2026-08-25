@@ -358,16 +358,23 @@ Tables (see `migrations/`):
 - `accounts`: **`id` is the caller's JWT `sub`** (ADR-0006; amended by ADR-0024 — see `users`
   below). Carries `default_quota` (the governance tier for work in the account's own default
   project) and `user_id` (`NOT NULL`, `BEFORE INSERT`-trigger-provisioned — see `users`).
-- `users` (ADR-0024): the actual defining identity — "one account = one federated identity; a
-  person may hold several." `id` is a CUID2 for a newly-minted user, or the backfilled/adopted
-  account's own id verbatim (an id-reuse, not a new mint — ADR-0039 bans minting, not storing).
-- `federated_identities` (ADR-0024; deliberately absent from `authz.cstack` — see "Persistence"
-  below): keyed by `(issuer, subject)`, the login federation key. Carries the sealed Keycloak
-  token set (`token_envelope`, AES-256-GCM, `lightbridge_authz_core::crypto`) — refresh token plus
-  a non-access-token ID-token claims snapshot, never the access token. `account_id` is nullable and
-  adopted by AT MOST ONE federated identity ever (a partial unique index enforces this): a second
+- `users` (ADR-0024; corrected 2026-08-25): the actual defining identity — "one account = one
+  federated identity; a person may hold several." Reached only THROUGH an account:
+  `federated_identities.account_id -> accounts.user_id -> users.id`. `id` is always the
+  backfilled/trigger-provisioned account's own id verbatim (an id-reuse, not a new mint — ADR-0039
+  bans minting, not storing) — the fresh-`cuid2()`-for-a-brand-new-person case no longer arises,
+  since a federated identity can no longer exist without an adopted account.
+- `federated_identities` (ADR-0024, corrected 2026-08-25; deliberately absent from `authz.cstack`
+  — see "Persistence" below): keyed by `(issuer, subject)`, the login federation key. Carries the
+  sealed Keycloak token set (`token_envelope`, AES-256-GCM, `lightbridge_authz_core::crypto`) —
+  refresh token plus a non-access-token ID-token claims snapshot, never the access token.
+  `account_id` is `NOT NULL` (no `user_id` column — the user is always derived) and adopted by AT
+  MOST ONE federated identity ever (a partial unique index enforces this): a subject with no
+  pre-existing `accounts` row is refused (`Error::Forbidden`, no mint-a-user branch), and a second
   issuer presenting a subject that already adopted an account is refused (`Error::Conflict`), never
-  silently merged.
+  silently merged. `ON DELETE CASCADE` on `account_id`: deleting an account removes its adopted
+  federated identity too (the person's `users` row itself is unaffected — it survives via any
+  other account, or with none).
 - `projects` (belongs to `accounts`): includes `billing_identity` (unique — "who is paying" moved
   here from `accounts`, so one person can bill projects to different parties), `project_quota` (the
   pooled ceiling), `is_default` (the auto-provisioned, roster-less project; server-computed by a
