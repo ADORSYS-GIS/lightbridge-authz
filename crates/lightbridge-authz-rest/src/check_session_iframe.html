@@ -1,0 +1,85 @@
+<!doctype html>
+<!--
+  OIDC Session Management 1.0 OP iframe (served at GET /oauth2/check_session_iframe).
+
+  Pure HTML + one inline script, zero external assets, zero framework -- this page is embedded
+  invisibly by relying parties and must load instantly from any origin. The RP posts
+  "<client_id> <session_state>" via postMessage; this script recomputes the Session State hash
+  from the OP browser-state cookie and the *sender's* origin (event.origin -- never a value the
+  message itself claims), and answers "changed", "unchanged", or "error" back to that origin.
+
+  The hash contract mirrors crate::session_management::session_state byte for byte:
+    base64url( SHA-256( client_id + " " + origin + " " + opbs + " " + salt ) ) + "." + salt
+  Change either side only together with the other.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Session check</title>
+</head>
+<body>
+<script>
+"use strict";
+var COOKIE_NAME = "__Host-authz_op_state";
+
+function readOpBrowserState() {
+  var parts = document.cookie ? document.cookie.split(";") : [];
+  for (var i = 0; i < parts.length; i++) {
+    var pair = parts[i].trim();
+    if (pair.indexOf(COOKIE_NAME + "=") === 0) {
+      return pair.substring(COOKIE_NAME.length + 1);
+    }
+  }
+  return null;
+}
+
+function base64url(buffer) {
+  var bytes = new Uint8Array(buffer);
+  var binary = "";
+  for (var i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function computeSessionState(clientId, origin, opbs, salt) {
+  var input = clientId + " " + origin + " " + opbs + " " + salt;
+  return crypto.subtle.digest("SHA-256", new TextEncoder().encode(input)).then(function (digest) {
+    return base64url(digest) + "." + salt;
+  });
+}
+
+window.addEventListener("message", function (event) {
+  if (typeof event.data !== "string") {
+    return;
+  }
+  var space = event.data.indexOf(" ");
+  var reply = function (result) {
+    event.source.postMessage(result, event.origin);
+  };
+  if (space < 1) {
+    reply("error");
+    return;
+  }
+  var clientId = event.data.substring(0, space);
+  var sessionState = event.data.substring(space + 1);
+  var dot = sessionState.lastIndexOf(".");
+  if (dot < 1) {
+    reply("error");
+    return;
+  }
+  var salt = sessionState.substring(dot + 1);
+  var opbs = readOpBrowserState();
+  if (opbs === null) {
+    reply("changed");
+    return;
+  }
+  computeSessionState(clientId, event.origin, opbs, salt).then(function (expected) {
+    reply(expected === sessionState ? "unchanged" : "changed");
+  }, function () {
+    reply("error");
+  });
+}, false);
+</script>
+</body>
+</html>

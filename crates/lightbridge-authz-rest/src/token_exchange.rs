@@ -116,6 +116,7 @@ where
             post(device_authorization_endpoint),
         )
         .route("/oauth2/revoke", post(revoke_endpoint))
+        .route("/oauth2/introspect", post(introspect_endpoint))
         .with_state(state)
 }
 
@@ -549,24 +550,24 @@ struct RevokeRequest {
 /// which registration it is checked against. `Secret` exists so a presented-but-doomed-to-fail
 /// secret is still routed through the same "at most one credential" and "unknown method ->
 /// invalid_client" logic real upstream code applies, rather than silently ignored.
-enum RevokeCredential {
+enum PresentedCredential {
     NoCredential,
     Secret { client_id: Option<String> },
     Assertion(String),
 }
 
 /// A `/oauth2/revoke` failure, kept small and `Response`-free until the final conversion at the
-/// handler boundary (`RevokeError::into_response`) -- returning `axum::response::Response`
+/// handler boundary (`EndpointAuthError::into_response`) -- returning `axum::response::Response`
 /// directly from a `Result::Err` trips `clippy::result_large_err` (a `Response` is well over the
 /// 128-byte threshold), the same reason `authkestra_op::handlers::token`'s own error path uses a
 /// small `TokenErrorResponse` struct instead of building a `Response` early.
-struct RevokeError {
+struct EndpointAuthError {
     status: StatusCode,
     error: &'static str,
     description: String,
 }
 
-impl RevokeError {
+impl EndpointAuthError {
     fn new(status: StatusCode, error: &'static str, description: impl Into<String>) -> Self {
         Self {
             status,
@@ -580,8 +581,8 @@ impl RevokeError {
     }
 }
 
-fn invalid_client() -> RevokeError {
-    RevokeError::new(
+fn invalid_client() -> EndpointAuthError {
+    EndpointAuthError::new(
         StatusCode::UNAUTHORIZED,
         "invalid_client",
         "Client authentication failed",
@@ -589,17 +590,17 @@ fn invalid_client() -> RevokeError {
 }
 
 /// Mirrors `authkestra_op::handlers::token::extract_credential` for the subset of
-/// [`RevokeCredential`] this deployment's clients ever present. Returns `Err` for a malformed
+/// [`PresentedCredential`] this deployment's clients ever present. Returns `Err` for a malformed
 /// *request* -- more than one credential presented at once (RFC 6749 §2.3 / RFC 7521 §4.2), or a
 /// `client_assertion` with a missing/wrong `client_assertion_type` -- which is distinct from a
 /// malformed *token value*, the case RFC 7009 §2.2 requires to be a bare 200 (see
 /// `revoke_endpoint`).
-fn extract_revoke_credential(
+fn extract_presented_credential(
     client_secret: Option<&str>,
     client_assertion: Option<&str>,
     client_assertion_type: Option<&str>,
     auth_header: Option<&str>,
-) -> Result<RevokeCredential, RevokeError> {
+) -> Result<PresentedCredential, EndpointAuthError> {
     let basic = auth_header
         .and_then(|auth| auth.strip_prefix("Basic "))
         .and_then(|stripped| {
@@ -617,7 +618,7 @@ fn extract_revoke_credential(
         Some(assertion) => match client_assertion_type {
             Some(CLIENT_ASSERTION_TYPE_JWT_BEARER) => Some(assertion.to_string()),
             _ => {
-                return Err(RevokeError::new(
+                return Err(EndpointAuthError::new(
                     StatusCode::BAD_REQUEST,
                     "invalid_request",
                     format!("client_assertion_type must be {CLIENT_ASSERTION_TYPE_JWT_BEARER}"),
@@ -630,7 +631,7 @@ fn extract_revoke_credential(
     let presented =
         u8::from(basic.is_some()) + u8::from(post.is_some()) + u8::from(assertion.is_some());
     if presented > 1 {
-        return Err(RevokeError::new(
+        return Err(EndpointAuthError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "Only one client authentication method may be used per request",
@@ -638,25 +639,25 @@ fn extract_revoke_credential(
     }
 
     Ok(match (basic, post, assertion) {
-        (Some(client_id), _, _) => RevokeCredential::Secret {
+        (Some(client_id), _, _) => PresentedCredential::Secret {
             client_id: Some(client_id),
         },
-        (_, Some(_), _) => RevokeCredential::Secret { client_id: None },
-        (_, _, Some(assertion)) => RevokeCredential::Assertion(assertion),
-        (None, None, None) => RevokeCredential::NoCredential,
+        (_, Some(_), _) => PresentedCredential::Secret { client_id: None },
+        (_, _, Some(assertion)) => PresentedCredential::Assertion(assertion),
+        (None, None, None) => PresentedCredential::NoCredential,
     })
 }
 
 /// Mirrors `authkestra_op::handlers::token::resolve_client_id`.
-fn resolve_revoke_client_id(
+fn resolve_presented_client_id(
     req_client_id: Option<&str>,
-    credential: &RevokeCredential,
+    credential: &PresentedCredential,
 ) -> Option<String> {
     match credential {
-        RevokeCredential::Secret {
+        PresentedCredential::Secret {
             client_id: Some(id),
         } => Some(id.clone()),
-        RevokeCredential::Assertion(assertion) => req_client_id
+        PresentedCredential::Assertion(assertion) => req_client_id
             .map(str::to_string)
             .or_else(|| peek_client_assertion_subject(assertion)),
         _ => req_client_id.map(str::to_string),
@@ -664,19 +665,19 @@ fn resolve_revoke_client_id(
 }
 
 /// Mirrors `authkestra_op::handlers::token::authenticate_client` for the two methods any client
-/// in this deployment ever registers (see [`RevokeCredential`]'s doc comment). Any other
+/// in this deployment ever registers (see [`PresentedCredential`]'s doc comment). Any other
 /// combination -- a presented secret, or a method/credential mismatch -- is an authentication
 /// failure. This is the one case RFC 7009 §2.2 carves out as NOT a bare 200: client-authentication
 /// failure is the only outcome this endpoint reports as an error.
-async fn authenticate_revoke_client(
+async fn authenticate_presented_client(
     client: &ClientRegistration,
-    credential: &RevokeCredential,
+    credential: &PresentedCredential,
     op_config: &OpConfig,
     op_store: &TokenExchangeOpStore,
-) -> Result<(), RevokeError> {
+) -> Result<(), EndpointAuthError> {
     match (client.token_endpoint_auth_method, credential) {
-        (Some(TokenEndpointAuthMethod::NoAuth), RevokeCredential::NoCredential) => Ok(()),
-        (Some(TokenEndpointAuthMethod::PrivateKeyJwt), RevokeCredential::Assertion(assertion)) => {
+        (Some(TokenEndpointAuthMethod::NoAuth), PresentedCredential::NoCredential) => Ok(()),
+        (Some(TokenEndpointAuthMethod::PrivateKeyJwt), PresentedCredential::Assertion(assertion)) => {
             let verified = verify_client_assertion(
                 assertion,
                 client,
@@ -695,7 +696,7 @@ async fn authenticate_revoke_client(
                     );
                     Err(invalid_client())
                 }
-                Err(_) => Err(RevokeError::new(
+                Err(_) => Err(EndpointAuthError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "server_error",
                     "internal error",
@@ -742,7 +743,7 @@ async fn revoke_endpoint(
         "revocation request received"
     );
 
-    let credential = match extract_revoke_credential(
+    let credential = match extract_presented_credential(
         raw.client_secret.as_deref(),
         raw.client_assertion.as_deref(),
         raw.client_assertion_type.as_deref(),
@@ -752,7 +753,7 @@ async fn revoke_endpoint(
         Err(err) => return err.into_response(),
     };
 
-    let Some(client_id) = resolve_revoke_client_id(raw.client_id.as_deref(), &credential) else {
+    let Some(client_id) = resolve_presented_client_id(raw.client_id.as_deref(), &credential) else {
         return invalid_client().into_response();
     };
 
@@ -769,7 +770,7 @@ async fn revoke_endpoint(
     };
 
     if let Err(err) =
-        authenticate_revoke_client(&client, &credential, &state.op_config, &state.op_store).await
+        authenticate_presented_client(&client, &credential, &state.op_config, &state.op_store).await
     {
         return err.into_response();
     }
@@ -790,4 +791,220 @@ async fn revoke_endpoint(
     // RFC 7009 §2.2: success, uniformly, whether a live token was actually revoked, was already
     // dead, never existed, or belonged to a different client -- see this function's doc comment.
     StatusCode::OK.into_response()
+}
+
+// --- RFC 7662 OAuth 2.0 Token Introspection (`POST /oauth2/introspect`) ----------------------
+//
+// Client authentication is byte-identical to `/oauth2/revoke`'s (the shared
+// `extract_presented_credential`/`resolve_presented_client_id`/`authenticate_presented_client`
+// machinery above), and the same anti-oracle posture applies: RFC 7662 §2.1 requires the endpoint
+// to prevent token scanning, so a token that does not verify, has expired, or was issued to a
+// DIFFERENT client than the authenticated caller all collapse to the identical
+// `{"active": false}` -- never an error, never a distinguishable response. The ONLY error this
+// endpoint returns is client-authentication failure, exactly like revocation.
+//
+// Two token families are introspectable, matching what this server actually issues:
+//
+// - Refresh tokens: opaque DB rows (`exchange_refresh_tokens`), looked up by hash and scoped to
+//   the caller's `client_id` (`TokenExchangeOpStore::find_active_refresh_token_for_client`).
+// - Access tokens: self-signed JWTs, verified against the same DB-backed JWK set
+//   `/.well-known/jwks.json` serves (active + stale keys, so tokens signed by a rotated-out key
+//   keep introspecting until they expire), then gated on `azp == <caller's client_id>` -- the
+//   same per-client azp discriminant `handlers/exchange_token.rs`'s `verify_self_issued_token`
+//   documents. A self-signed API-key JWT's `azp` is the fixed `oauth2.signing.audience` value,
+//   never a registered OAuth2 `client_id` (deployment convention, see that doc comment), so API
+//   keys are structurally not introspectable here regardless of who asks.
+
+/// RFC 7662 §2.1 request body. `token_type_hint` is accepted and ignored for the same reason
+/// revocation ignores it: both token families are always tried, cheapest first.
+#[derive(Debug, Deserialize)]
+struct IntrospectRequest {
+    token: Option<String>,
+    #[serde(default)]
+    token_type_hint: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    client_assertion: Option<String>,
+    client_assertion_type: Option<String>,
+}
+
+/// The uniform RFC 7662 §2.2 negative response -- see the module-section comment above for every
+/// case that must collapse to it.
+fn inactive_token_response() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        Json(serde_json::json!({ "active": false })),
+    )
+        .into_response()
+}
+
+fn active_token_response(body: serde_json::Value) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        Json(body),
+    )
+        .into_response()
+}
+
+/// Verifies a presented access token as one of this server's own self-signed JWTs: `kid` from the
+/// header, matching JWK from the DB-backed verification set, RS256 signature + `exp`/`nbf` via
+/// `jsonwebtoken`'s defaults (`validate_aud` off -- `aud` here is the requesting client's own id,
+/// not a fixed value). Returns the raw claims map so the introspection response can carry every
+/// claim the token itself already discloses to its holder, or `None` for anything that fails --
+/// indistinguishably, per the section comment above.
+async fn verify_own_access_token(
+    state: &TokenExchangeState,
+    token: &str,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::Jwk};
+
+    let header = decode_header(token).ok()?;
+    let kid = header.kid?;
+    let jwks = state.op_store.list_verification_jwks().await.ok()?;
+    let matching = jwks.into_iter().find(|raw| {
+        raw.get("kid").and_then(serde_json::Value::as_str) == Some(kid.as_str())
+    })?;
+    let jwk = serde_json::from_value::<Jwk>(matching).ok()?;
+    let decoding_key = DecodingKey::from_jwk(&jwk).ok()?;
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.algorithms = vec![Algorithm::RS256];
+    validation.validate_aud = false;
+    decode::<serde_json::Map<String, serde_json::Value>>(token, &decoding_key, &validation)
+        .ok()
+        .map(|data| data.claims)
+}
+
+/// `POST /oauth2/introspect` (RFC 7662). See the section comment above for the client-auth and
+/// anti-oracle contract; advertised by `signing::discovery_document` as `introspection_endpoint`
+/// the moment the token surface is mounted, because this route is mounted unconditionally right
+/// beside it (`token_exchange_router`).
+async fn introspect_endpoint(
+    State(state): State<TokenExchangeState>,
+    headers: HeaderMap,
+    Form(raw): Form<IntrospectRequest>,
+) -> Response {
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    let Some(token) = raw.token.as_deref().filter(|s| !s.trim().is_empty()) else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "token is required",
+        );
+    };
+    tracing::debug!(
+        token_type_hint = raw.token_type_hint.as_deref().unwrap_or("none"),
+        "introspection request received"
+    );
+
+    let credential = match extract_presented_credential(
+        raw.client_secret.as_deref(),
+        raw.client_assertion.as_deref(),
+        raw.client_assertion_type.as_deref(),
+        auth_header,
+    ) {
+        Ok(credential) => credential,
+        Err(err) => return err.into_response(),
+    };
+
+    let Some(client_id) = resolve_presented_client_id(raw.client_id.as_deref(), &credential)
+    else {
+        return invalid_client().into_response();
+    };
+
+    let client = match state.op_store.find_client(&client_id).await {
+        Ok(Some(client)) => client,
+        Ok(None) => return invalid_client().into_response(),
+        Err(_) => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "internal error",
+            );
+        }
+    };
+
+    if let Err(err) =
+        authenticate_presented_client(&client, &credential, &state.op_config, &state.op_store)
+            .await
+    {
+        return err.into_response();
+    }
+
+    let now = chrono::Utc::now();
+    match state
+        .op_store
+        .find_active_refresh_token_for_client(token, &client_id, now)
+        .await
+    {
+        Ok(Some(row)) => {
+            let mut body = serde_json::Map::new();
+            body.insert("active".to_string(), serde_json::Value::Bool(true));
+            body.insert(
+                "token_type".to_string(),
+                serde_json::Value::String("refresh_token".to_string()),
+            );
+            body.insert(
+                "client_id".to_string(),
+                serde_json::Value::String(row.client_id),
+            );
+            body.insert("sub".to_string(), serde_json::Value::String(row.subject));
+            body.insert(
+                "account_id".to_string(),
+                serde_json::Value::String(row.account_id),
+            );
+            body.insert(
+                "project_id".to_string(),
+                serde_json::Value::String(row.project_id),
+            );
+            body.insert(
+                "iss".to_string(),
+                serde_json::Value::String(state.op_config.issuer.clone()),
+            );
+            if let Some(scope) = row.scope {
+                body.insert("scope".to_string(), serde_json::Value::String(scope));
+            }
+            body.insert("iat".to_string(), row.created_at.timestamp().into());
+            body.insert("exp".to_string(), row.expires_at.timestamp().into());
+            body.insert("jti".to_string(), serde_json::Value::String(row.id));
+            return active_token_response(serde_json::Value::Object(body));
+        }
+        Ok(None) => {}
+        Err(_) => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "internal error",
+            );
+        }
+    }
+
+    match verify_own_access_token(&state, token).await {
+        Some(claims)
+            if claims.get("azp").and_then(serde_json::Value::as_str) == Some(client_id.as_str()) =>
+        {
+            let mut body = claims;
+            body.insert("active".to_string(), serde_json::Value::Bool(true));
+            body.insert(
+                "token_type".to_string(),
+                serde_json::Value::String("Bearer".to_string()),
+            );
+            body.insert(
+                "client_id".to_string(),
+                serde_json::Value::String(client_id),
+            );
+            active_token_response(serde_json::Value::Object(body))
+        }
+        _ => inactive_token_response(),
+    }
 }

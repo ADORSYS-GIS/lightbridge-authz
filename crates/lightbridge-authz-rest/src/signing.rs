@@ -610,7 +610,11 @@ fn to_jwks(raw: Vec<Value>) -> Vec<authkestra_engine::token::jwk::Jwk> {
 /// several unsupported endpoints and client-authentication defaults. This explicit, small model
 /// makes omission the default: a field appears only when this process mounts the corresponding
 /// route. `/authorize` and device authorization are represented by independent route facts;
-/// UserInfo, introspection, and logout remain absent until their handlers exist.
+/// introspection (`/oauth2/introspect`, RFC 7662) and the OIDC Session Management check-session
+/// iframe are advertised alongside the surfaces that mount them; UserInfo and logout remain
+/// absent until their handlers exist. `claims_parameter_supported` is advertised explicitly as
+/// `false` (OIDC Discovery 1.0 §3 -- the `claims` request parameter is not supported) rather
+/// than left to the spec's implicit default, so RPs need not guess.
 ///
 /// RFC 8414 requires zero-element arrays to be omitted from an authorization-server metadata
 /// response. The shared narrow document applies the same omission discipline to OIDC discovery:
@@ -646,6 +650,16 @@ struct DiscoveryDocument {
     revocation_endpoint_auth_methods_supported: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     revocation_endpoint_auth_signing_alg_values_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    introspection_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    introspection_endpoint_auth_methods_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    introspection_endpoint_auth_signing_alg_values_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    check_session_iframe: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claims_parameter_supported: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     subject_types_supported: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -734,8 +748,16 @@ fn discovery_document(
         },
         token_endpoint_auth_methods_supported: client_auth_methods.clone(),
         token_endpoint_auth_signing_alg_values_supported: client_auth_signing_algorithms.clone(),
-        revocation_endpoint_auth_methods_supported: client_auth_methods,
-        revocation_endpoint_auth_signing_alg_values_supported: client_auth_signing_algorithms,
+        revocation_endpoint_auth_methods_supported: client_auth_methods.clone(),
+        revocation_endpoint_auth_signing_alg_values_supported: client_auth_signing_algorithms
+            .clone(),
+        introspection_endpoint: token_endpoint_mounted
+            .then(|| format!("{endpoint_base}/oauth2/introspect")),
+        introspection_endpoint_auth_methods_supported: client_auth_methods,
+        introspection_endpoint_auth_signing_alg_values_supported: client_auth_signing_algorithms,
+        check_session_iframe: authorization_code_mounted
+            .then(|| format!("{endpoint_base}/oauth2/check_session_iframe")),
+        claims_parameter_supported: oidc_tokens_supported.then_some(false),
         subject_types_supported,
         id_token_signing_alg_values_supported,
     }

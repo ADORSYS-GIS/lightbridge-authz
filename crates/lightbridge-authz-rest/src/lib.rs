@@ -25,6 +25,7 @@ pub mod relying_party;
 pub mod routers;
 pub mod rpc_authorize;
 pub mod session_cookie;
+pub mod session_management;
 pub mod signing;
 pub mod static_assets;
 pub mod token_exchange;
@@ -2961,6 +2962,7 @@ pub fn build_idp_router(
         token_exchange.clone(),
     )));
     router = router.merge(token_exchange::token_exchange_router(token_exchange));
+    router = router.merge(session_management::router());
     router = router.merge(relying_party::router(relying_party));
     router.nest_service("/ui", static_assets::static_assets_fallback(static_dir))
 }

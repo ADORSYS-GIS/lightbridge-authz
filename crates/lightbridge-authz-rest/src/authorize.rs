@@ -76,6 +76,7 @@ async fn authorize(
     Query(browser_request): Query<BrowserAuthorizeRequest>,
 ) -> Response {
     let project_id = browser_request.project_id.clone();
+    let op_browser_state = crate::session_management::read_op_browser_state(&headers);
     let request: AuthorizeRequest = browser_request.into();
     let client = match state
         .token
@@ -156,6 +157,7 @@ async fn authorize(
                             subject,
                             context.account_id,
                             context.project_id,
+                            op_browser_state.as_deref(),
                         )
                         .await
                     }
@@ -173,6 +175,7 @@ async fn authorize(
                     subject,
                     session.account_id,
                     session.project_id,
+                    op_browser_state.as_deref(),
                 )
                 .await
             }
@@ -215,7 +218,18 @@ async fn issue_code(
     subject: String,
     account_id: String,
     project_id: String,
+    op_browser_state: Option<&str>,
 ) -> Response {
+    let session_state = op_browser_state.and_then(|opbs| {
+        let origin = reqwest::Url::parse(&request.redirect_uri)
+            .ok()
+            .map(|url| url.origin().ascii_serialization())?;
+        Some(crate::session_management::fresh_session_state(
+            &request.client_id,
+            &origin,
+            opbs,
+        ))
+    });
     let mut attributes = HashMap::new();
     attributes.insert("account_id".to_string(), account_id);
     attributes.insert("project_id".to_string(), project_id);
@@ -231,10 +245,32 @@ async fn issue_code(
         project_id: None,
     };
     match handle_authorize(request, identity, state.token.op_config(), &scoped).await {
-        AuthorizeOutcome::Redirect(location) => Redirect::temporary(&location).into_response(),
+        AuthorizeOutcome::Redirect(location) => {
+            let location = match session_state {
+                Some(session_state) => append_session_state(&location, &session_state),
+                None => location,
+            };
+            Redirect::temporary(&location).into_response()
+        }
         AuthorizeOutcome::DirectError(_) => {
             direct_error(StatusCode::INTERNAL_SERVER_ERROR, "authorization failed")
         }
+    }
+}
+
+/// Appends OIDC Session Management 1.0 §3's `session_state` parameter to the authorization
+/// response redirect `handle_authorize` built. Only successful code issuances carry it -- error
+/// redirects (`redirect_error`) never do, and a request arriving without an OP browser-state
+/// cookie (see `crate::session_management`) gets no `session_state` at all rather than a value
+/// the check-session iframe could never match.
+fn append_session_state(location: &str, session_state: &str) -> String {
+    match reqwest::Url::parse(location) {
+        Ok(mut url) => {
+            url.query_pairs_mut()
+                .append_pair("session_state", session_state);
+            url.into()
+        }
+        Err(_) => location.to_string(),
     }
 }
 

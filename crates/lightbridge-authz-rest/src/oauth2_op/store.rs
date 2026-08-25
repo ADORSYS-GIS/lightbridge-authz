@@ -229,6 +229,43 @@ impl TokenExchangeOpStore {
             })
     }
 
+    /// Looks up a still-active refresh token by its plaintext value, scoped to the presented
+    /// `client_id` the same way [`Self::revoke_refresh_token_for_client`] is (RFC 7662 §2.1 --
+    /// introspection must not become a cross-client token oracle, so a live row issued to a
+    /// DIFFERENT client resolves to `None` here, indistinguishable on the wire from an unknown
+    /// token). Backs `POST /oauth2/introspect` (`token_exchange::introspect_endpoint`).
+    pub async fn find_active_refresh_token_for_client(
+        &self,
+        token: &str,
+        client_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<
+        Option<lightbridge_authz_api_key::entities::exchange_refresh_token_row::ExchangeRefreshTokenRow>,
+        OpError,
+    > {
+        let hash = hash_api_key(token);
+        let row = self
+            .repo
+            .find_active_exchange_refresh_token(&hash, now)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to look up refresh token for introspection");
+                OpError::Storage
+            })?;
+        Ok(row.filter(|row| row.client_id == client_id))
+    }
+
+    /// The DB-backed verification JWK set (active + stale signing keys), the same set
+    /// `signing::well_known_router` serves at `/.well-known/jwks.json`. Backs
+    /// `POST /oauth2/introspect`'s access-token verification, which must accept tokens signed by
+    /// a rotated-out key until they expire -- exactly the JWKS route's own contract.
+    pub async fn list_verification_jwks(&self) -> Result<Vec<serde_json::Value>, OpError> {
+        self.repo.list_verification_jwks().await.map_err(|e| {
+            tracing::error!(error = %e, "failed to load verification JWKS for introspection");
+            OpError::Storage
+        })
+    }
+
     /// Spends a `private_key_jwt` client assertion's `jti` (ADR-0011, Decision 6). Exposed
     /// directly on `TokenExchangeOpStore` -- not only reachable through the `OpStore` trait on
     /// `RequestScopedOpStore` -- because `POST /oauth2/revoke` has no per-request `project_id` to
