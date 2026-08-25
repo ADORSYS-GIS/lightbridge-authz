@@ -28,8 +28,10 @@ fn period() -> Period {
     Period::parse("2026-08").expect("valid period")
 }
 
-/// Test 1 (minimum test list, client-side half): a known, non-null `total_cost` is converted to
-/// `Spend::Known` in the same micro-USD units `cost_to_micros` always used.
+/// Test 1 (minimum test list, client-side half): a known, non-null `total_cost` -- already
+/// micro-USD on the wire (#488) -- is passed through into `Spend::Known` unscaled. Realistic
+/// gateway figure: a request costing 1,234 micro-USD (~$0.001234). Prove-fail: reintroducing
+/// `validate_total_cost_micros`'s old `* 1_000_000.0` makes this assert `1_234_000_000` instead.
 #[tokio::test]
 async fn known_nonzero_total_cost_becomes_spend_known_in_micros() {
     let server = MockServer::start();
@@ -37,7 +39,7 @@ async fn known_nonzero_total_cost_becomes_spend_known_in_micros() {
         when.method(POST).path("/usage/v1/spend/query");
         then.status(200)
             .header("content-type", "application/json")
-            .json_body(serde_json::json!({ "total_cost": 3.75 }));
+            .json_body(serde_json::json!({ "total_cost": 1234.0 }));
     });
 
     let reader = reader_for(&server.base_url());
@@ -46,7 +48,7 @@ async fn known_nonzero_total_cost_becomes_spend_known_in_micros() {
         .await
         .expect("reader never returns Err");
 
-    assert_eq!(spend, Spend::Known(3_750_000));
+    assert_eq!(spend, Spend::Known(1_234));
 }
 
 /// Test 5 (minimum test list): a genuinely-zero spend must be `Spend::Known(0)`, not
