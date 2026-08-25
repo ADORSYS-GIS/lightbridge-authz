@@ -558,10 +558,11 @@ impl KeycloakRelyingParty {
                 Ok(Completion::Browser {
                     resume_path: target.resume_path,
                     session_cookie: build_session_cookie(session.id, time::Duration::seconds(ttl)),
-                    op_browser_state_cookie:
+                    op_browser_state_cookie: Box::new(
                         crate::session_management::build_op_browser_state_cookie(
                             time::Duration::seconds(ttl),
                         ),
+                    ),
                 })
             }
         }
@@ -664,7 +665,7 @@ enum Completion {
     Browser {
         resume_path: String,
         session_cookie: Cookie<'static>,
-        op_browser_state_cookie: Cookie<'static>,
+        op_browser_state_cookie: Box<Cookie<'static>>,
     },
 }
 

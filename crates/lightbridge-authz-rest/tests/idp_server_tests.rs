@@ -1027,6 +1027,282 @@ async fn discovery_always_carries_the_three_spec_required_keys() {
     );
 }
 
+/// A router built off a custom `Oauth2` block, mirroring `offline_idp_router` exactly (same
+/// fully-offline `TokenExchangeState`/`KeycloakRelyingParty` assembly) but for tests below that
+/// need a non-default `oauth2` -- specifically, a registered client, which `full_idp_oauth2()`
+/// carries none of, so `offline_idp_router` alone cannot exercise "does discovery mirror a
+/// non-empty client registry" or "does a registered client reach the token lookup" cases.
+fn offline_idp_router_with_oauth2(
+    oauth2: &Oauth2,
+    static_dir: impl AsRef<std::path::Path>,
+) -> axum::Router {
+    let pool = lazy_pool();
+    let signing_repo = Arc::new(StoreRepo::new(pool.clone()));
+    let token_exchange = offline_token_exchange_state(oauth2, signing_repo.clone());
+    let relying_party = offline_relying_party(signing_repo.clone());
+    build_idp_router(
+        oauth2,
+        oauth2.signing.as_ref().unwrap(),
+        signing_repo,
+        token_exchange,
+        pool,
+        static_dir,
+        relying_party,
+    )
+}
+
+/// A minimal Public, `NoAuth`-authenticating client -- enough for `ClientAuthenticationMetadata::
+/// from_oauth2` to populate `methods: ["none"]`, and enough for `/oauth2/introspect`'s client
+/// lookup + `authenticate_presented_client` to succeed offline (both are in-memory/config-only,
+/// never touch the database). Fully qualified rather than imported at file scope: `OauthClient`/
+/// `OauthClientType` are otherwise only used inside `mod db` below, and adding a duplicate
+/// top-level `use` would make that module's own import dead code under `-D warnings`.
+fn offline_public_client(client_id: &str) -> lightbridge_authz_core::config::OauthClient {
+    lightbridge_authz_core::config::OauthClient {
+        client_id: client_id.to_string(),
+        client_type: lightbridge_authz_core::config::OauthClientType::Public,
+        scopes: vec!["openid".to_string()],
+        grant_types: Vec::new(),
+        allowed_audiences: vec![client_id.to_string()],
+        jwks: None,
+        redirect_uris: Vec::new(),
+        require_pkce: false,
+    }
+}
+
+/// RFC 7662's `introspection_endpoint` and OIDC Session Management 1.0's `check_session_iframe`/
+/// `claims_parameter_supported` -- the discovery additions commit f45cc9c made. `scopes_supported`
+/// containing `openid` is already-served, pre-existing behavior (`token_exchange_oauth2()`'s
+/// `allowed_scopes`), pinned here per the task's explicit ask so a future change silently
+/// dropping it fails a test rather than only a docs mismatch.
+///
+/// Prove-fail-first (recorded verbatim, then reverted): changed `signing.rs`'s
+/// `introspection_endpoint: token_endpoint_mounted.then(...)` to always evaluate to `None` and
+/// reran just this test. It failed on `.expect("introspection_endpoint must be advertised...")`
+/// with `metadata["introspection_endpoint"]` being `Null`, not a string. Restored the line.
+#[tokio::test]
+async fn discovery_advertises_introspection_and_session_management_additions() {
+    let router = offline_idp_router(TEST_STATIC_DIR);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let metadata: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let introspection_endpoint = metadata["introspection_endpoint"]
+        .as_str()
+        .expect("introspection_endpoint must be advertised once the token surface is mounted");
+    assert!(
+        introspection_endpoint.ends_with("/oauth2/introspect"),
+        "got: {introspection_endpoint}"
+    );
+
+    let check_session_iframe = metadata["check_session_iframe"]
+        .as_str()
+        .expect("check_session_iframe must be advertised once authorization_code is mounted");
+    assert!(
+        check_session_iframe.ends_with("/oauth2/check_session_iframe"),
+        "got: {check_session_iframe}"
+    );
+
+    assert_eq!(metadata["claims_parameter_supported"], false);
+
+    let scopes = metadata["scopes_supported"]
+        .as_array()
+        .expect("scopes_supported must be a non-empty array");
+    assert!(
+        scopes.iter().any(|scope| scope == "openid"),
+        "scopes_supported must include openid: {scopes:?}"
+    );
+}
+
+/// `introspection_endpoint_auth_methods_supported`/`_auth_signing_alg_values_supported` are
+/// documented as mirroring revocation's own -- both derived from the same
+/// `ClientAuthenticationMetadata` value in `signing.rs`'s `discovery_document`. A single
+/// registered Public client is enough to move both fields off their (equal, but degenerate)
+/// omitted-when-empty default, proving the mirror against real, non-empty content rather than two
+/// absent fields trivially comparing equal.
+///
+/// Prove-fail-first (recorded verbatim, then reverted): temporarily changed
+/// `introspection_endpoint_auth_methods_supported: client_auth_methods` in `signing.rs`'s
+/// `discovery_document` to `Vec::new()`, reran just this test. It failed: `revocation_endpoint_
+/// auth_methods_supported` was `["none"]` but `introspection_endpoint_auth_methods_supported` was
+/// absent (`Null`) -- the assert_eq on the two fields failed with a type mismatch. Restored.
+#[tokio::test]
+async fn discovery_mirrors_introspection_and_revocation_auth_methods() {
+    let mut oauth2 = full_idp_oauth2();
+    oauth2.clients = vec![offline_public_client("offline-public-client")];
+    let router = offline_idp_router_with_oauth2(&oauth2, TEST_STATIC_DIR);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let metadata: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        metadata["revocation_endpoint_auth_methods_supported"],
+        serde_json::json!(["none"]),
+        "sanity check: a registered Public client must move the field off its omitted default"
+    );
+    assert_eq!(
+        metadata["introspection_endpoint_auth_methods_supported"],
+        metadata["revocation_endpoint_auth_methods_supported"]
+    );
+}
+
+/// `GET /oauth2/check_session_iframe` (OIDC Session Management 1.0): serves the static HTML page
+/// verbatim, `no-store` (never cached -- every RP embed must poll live), and the body must
+/// actually carry the OP browser-state cookie name and the `postMessage` call the RP-embedded
+/// script uses to answer polls -- proving the real inline script shipped, not just any HTML.
+///
+/// Prove-fail-first (recorded verbatim, then reverted): temporarily changed
+/// `session_management.rs`'s `check_session_iframe` handler's `Cache-Control` header value from
+/// `"no-store"` to `"no-cache"` and reran just this test. It failed:
+/// `assertion `left == right` failed` -- `"no-cache"` vs the expected `"no-store"`. Restored.
+#[tokio::test]
+async fn check_session_iframe_serves_static_html_with_no_store_and_op_cookie_script() {
+    let router = offline_idp_router(TEST_STATIC_DIR);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/oauth2/check_session_iframe")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"),
+        "must be served as HTML"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap(),
+        "no-store"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        html.contains("__Host-authz_op_state"),
+        "the inline script must reference the OP browser-state cookie name"
+    );
+    assert!(
+        html.contains("postMessage"),
+        "the inline script must actually answer RP polls via postMessage"
+    );
+}
+
+/// `POST /oauth2/introspect`, RFC 7662 §2.1: `token` is a REQUIRED form field, and its absence is
+/// a malformed *request* (400 `invalid_request`), never the uniform bare-inactive response --
+/// mirrors `revoke_with_missing_token_field_is_invalid_request`'s already-established polarity
+/// for the sibling `/oauth2/revoke` endpoint.
+#[tokio::test]
+async fn introspect_with_missing_token_field_is_invalid_request() {
+    let router = offline_idp_router(TEST_STATIC_DIR);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth2/introspect")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("client_id=whatever"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["error"], "invalid_request");
+}
+
+/// `POST /oauth2/introspect` with an unregistered `client_id`: client-authentication failure is
+/// the ONE case RFC 7662 §2.1's anti-oracle posture does not cover -- it must be `401
+/// invalid_client`, resolved entirely before the token itself is ever looked up (this offline
+/// router's DB pool is unreachable, so a client-lookup-before-token-lookup ordering is exactly
+/// what makes this test possible without a real database at all).
+#[tokio::test]
+async fn introspect_with_unknown_client_is_rejected() {
+    let router = offline_idp_router(TEST_STATIC_DIR);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth2/introspect")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("token=whatever&client_id=never-registered"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["error"], "invalid_client");
+}
+
+/// Pins this OFFLINE harness's own behavior for a registered client presenting a garbage token --
+/// deliberately NOT RFC 7662's `{"active": false}` contract. This router's pool
+/// (`lazy_pool()`) never actually connects, so `TokenExchangeOpStore::
+/// find_active_refresh_token_for_client`'s DB lookup errors before `introspect_endpoint` can ever
+/// reach the "not found -> inactive" branch, and the handler correctly reports that as `500
+/// server_error` rather than papering over it as `{"active": false}` (a real storage failure and
+/// a genuinely-inactive token are different facts; collapsing them would hide an outage as a
+/// mundane "no such token"). The true RFC 7662 `{"active": false}` case for a garbage/unknown
+/// token, proven against a real reachable Postgres, lives in `token_exchange_tests.rs`.
+#[tokio::test]
+async fn introspect_with_garbage_token_against_unreachable_db_returns_server_error() {
+    let mut oauth2 = full_idp_oauth2();
+    oauth2.clients = vec![offline_public_client("offline-public-client")];
+    let router = offline_idp_router_with_oauth2(&oauth2, TEST_STATIC_DIR);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth2/introspect")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "token=totally-made-up-garbage&client_id=offline-public-client",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["error"], "server_error");
+}
+
 /// `oauth2.type: external` has no signing key material for this service to serve discovery/JWKS
 /// or dispatch a token-exchange grant from -- `authz-idp` exists only to serve the self-signed
 /// surface, so it must refuse to start rather than come up half-configured. Offline: the check
