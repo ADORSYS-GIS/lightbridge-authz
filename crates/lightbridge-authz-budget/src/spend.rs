@@ -58,7 +58,7 @@ use crate::period::Period;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", content = "amount_micros", rename_all = "snake_case")]
 pub enum Spend {
-    /// `SUM(total_cost)` over at least one matching row, converted to non-negative micro-USD.
+    /// `SUM(total_cost)` over at least one matching row, validated as non-negative micro-USD.
     /// Zero is a legitimate, common value here (e.g. an account whose only logged events cost
     /// nothing) -- it is NOT the same thing as `Unavailable` below, and callers must not
     /// conflate them.
@@ -84,12 +84,36 @@ pub trait SpendReader: Send + Sync + std::fmt::Debug {
     ) -> Result<Spend, BudgetError>;
 }
 
-/// Converts a `total_cost` value (US dollars, as stored in `usage_events.total_cost`) into
-/// non-negative micro-USD. Rejects non-finite and negative inputs, and anything that doesn't fit
-/// in an `i64` once converted -- all three are treated as an unusable response from the usage
-/// service by `UsageServiceSpendReader` (see its doc comment), which routes them to
-/// `Spend::Unavailable` rather than propagating an error.
-fn cost_to_micros(total_cost: f64) -> Result<i64, BudgetError> {
+/// Validates and losslessly narrows a `total_cost` value -- **already micro-USD**, as stored in
+/// `usage_events.total_cost` -- into `i64`.
+///
+/// ## Unit contract (#488)
+///
+/// `usage_events.total_cost` is micro-USD, not US dollars. The gateway's `llm_custom_total_cost`
+/// CEL is the only production writer of this column (via
+/// `crates/lightbridge-authz-usage/src/handlers/ingest.rs`'s `COST_KEYS` extraction, landed
+/// verbatim, no scaling applied on the way in) and it emits micro-USD -- see the ai-helm
+/// cost-tracking doc (`docs/models-chart-docs/cost-tracking.md`, *"Micro-USD ... the chart stores
+/// request cost in this unit"*) in the `ADORSYS-GIS/ai-helm` repo. This function used to multiply
+/// by `1_000_000.0` here, which was correct only if the stored value were US dollars -- it is
+/// not, so that multiplication inflated every reported spend figure by roughly 10^6 and drove
+/// self-service refill decisions to the fail-closed floor. See
+/// https://github.com/ADORSYS-GIS/lightbridge-authz/issues/488.
+///
+/// This function therefore does not scale its input at all -- it only validates. The value still
+/// arrives as `f64` over the wire (`SpendQueryResponse::total_cost`, a SQL `double precision`
+/// `SUM`), so it must still be checked for the same three failure modes as before: non-finite
+/// (`NaN`/`±inf`), negative (a cost can never be negative), and too large to round-trip into
+/// `i64` exactly. All three are treated as an unusable response from the usage service by
+/// `UsageServiceSpendReader` (see its doc comment), which routes them to `Spend::Unavailable`
+/// rather than propagating an error.
+///
+/// Rounding: `f64` cannot represent every integer micro-USD value exactly (float summation drift
+/// from `SUM(total_cost)` over many rows), so this rounds to the nearest whole micro-USD using
+/// `f64::round` -- ties round away from zero (e.g. `1234.5` -> `1235`), not round-half-even. This
+/// is the same rounding semantics the pre-#488 code already used for its (wrong-unit) conversion;
+/// only the scaling factor changed, not the rounding rule.
+fn validate_total_cost_micros(total_cost: f64) -> Result<i64, BudgetError> {
     if !total_cost.is_finite() {
         return Err(BudgetError::StorageFailed(format!(
             "usage_events.total_cost is not finite: {total_cost}"
@@ -101,7 +125,7 @@ fn cost_to_micros(total_cost: f64) -> Result<i64, BudgetError> {
         )));
     }
 
-    let micros = (total_cost * 1_000_000.0).round();
+    let micros = total_cost.round();
     if micros > i64::MAX as f64 {
         return Err(BudgetError::StorageFailed(format!(
             "usage_events.total_cost overflows i64 micro-USD: {total_cost}"
@@ -196,7 +220,7 @@ struct SpendQueryResponse {
 ///   request timing out)
 /// - the response status is not `2xx` (any non-2xx, including `401`/`403`/`5xx`)
 /// - the response body cannot be decoded as the expected JSON shape
-/// - the decoded `total_cost` value is itself unusable (`cost_to_micros` rejects non-finite,
+/// - the decoded `total_cost` value is itself unusable (`validate_total_cost_micros` rejects non-finite,
 ///   negative, or overflowing values)
 ///
 /// All four map to `Ok(Spend::Unavailable)`. This is a deliberate strengthening over the old
@@ -391,7 +415,7 @@ impl SpendReader for UsageServiceSpendReader {
 
         match body.total_cost {
             None => Ok(Spend::Unavailable),
-            Some(total_cost) => match cost_to_micros(total_cost) {
+            Some(total_cost) => match validate_total_cost_micros(total_cost) {
                 Ok(micros) => Ok(Spend::Known(micros)),
                 Err(err) => {
                     tracing::warn!(
@@ -449,35 +473,44 @@ mod tests {
     }
 
     #[test]
-    fn cost_to_micros_zero_is_zero() {
-        assert_eq!(cost_to_micros(0.0).unwrap(), 0);
+    fn validate_total_cost_micros_zero_is_zero() {
+        assert_eq!(validate_total_cost_micros(0.0).unwrap(), 0);
+    }
+
+    /// #488 prove-fail (test 1): a realistic gateway payload figure -- a request costing 1,234
+    /// micro-USD (~$0.001234) -- passes through unchanged as 1,234 micro-USD. Break the fix by
+    /// reintroducing `* 1_000_000.0` in `validate_total_cost_micros` and this fails with
+    /// `1_234_000_000` instead.
+    #[test]
+    fn validate_total_cost_micros_passes_gateway_micro_usd_through_unscaled() {
+        assert_eq!(validate_total_cost_micros(1234.0).unwrap(), 1_234);
+    }
+
+    /// #488 prove-fail (test 3): fractional micro-USD (float summation drift from `SUM` over many
+    /// rows) rounds to the nearest whole micro-USD, ties away from zero -- `f64::round`'s
+    /// semantics, documented on `validate_total_cost_micros` and unchanged by this fix (only the
+    /// scaling factor was removed, not the rounding rule).
+    #[test]
+    fn validate_total_cost_micros_rounds_fractional_micro_usd_half_away_from_zero() {
+        assert_eq!(validate_total_cost_micros(1234.6).unwrap(), 1_235);
+        assert_eq!(validate_total_cost_micros(0.5).unwrap(), 1);
     }
 
     #[test]
-    fn cost_to_micros_converts_dollars_to_micros() {
-        assert_eq!(cost_to_micros(1.5).unwrap(), 1_500_000);
+    fn validate_total_cost_micros_rejects_negative() {
+        assert!(validate_total_cost_micros(-0.01).is_err());
     }
 
     #[test]
-    fn cost_to_micros_rounds_half_up() {
-        assert_eq!(cost_to_micros(0.0000005).unwrap(), 1);
+    fn validate_total_cost_micros_rejects_nan_and_infinite() {
+        assert!(validate_total_cost_micros(f64::NAN).is_err());
+        assert!(validate_total_cost_micros(f64::INFINITY).is_err());
+        assert!(validate_total_cost_micros(f64::NEG_INFINITY).is_err());
     }
 
     #[test]
-    fn cost_to_micros_rejects_negative() {
-        assert!(cost_to_micros(-0.01).is_err());
-    }
-
-    #[test]
-    fn cost_to_micros_rejects_nan_and_infinite() {
-        assert!(cost_to_micros(f64::NAN).is_err());
-        assert!(cost_to_micros(f64::INFINITY).is_err());
-        assert!(cost_to_micros(f64::NEG_INFINITY).is_err());
-    }
-
-    #[test]
-    fn cost_to_micros_rejects_i64_overflow() {
-        assert!(cost_to_micros(1e18).is_err());
+    fn validate_total_cost_micros_rejects_i64_overflow() {
+        assert!(validate_total_cost_micros(1e19).is_err());
     }
 
     #[test]
