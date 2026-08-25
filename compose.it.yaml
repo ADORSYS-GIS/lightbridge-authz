@@ -99,3 +99,31 @@ services:
       AUTHORINO_BASIC: "authorino:change-me"
       MAX_WAIT_SECONDS: "300"
     command: ["python", "/it/servers_it.py"]
+
+  it-idp:
+    image: python:3.12-slim
+    depends_on:
+      authz-idp:
+        condition: service_started
+      authz-api:
+        condition: service_started
+      keycloak:
+        condition: service_started
+      authz-tls:
+        condition: service_started
+    volumes:
+      - "./.docker/it/idp_it.py:/it/idp_it.py:ro"
+      # ADR-0013: authz-api's RPC surface is CBOR-only now (see cbor_min.py's own module doc for
+      # why this is hand-rolled rather than a pip-installed dependency) -- this suite provisions
+      # the account/project it needs through that surface before driving any IdP flow.
+      - "./.docker/it/cbor_min.py:/it/cbor_min.py:ro"
+      - "authz_tls:/tls:ro"
+    environment:
+      IDP_URL: "https://authz-idp:3004"
+      API_URL: "https://authz-api:3000"
+      KEYCLOAK_URL: "http://keycloak:9100"
+      CLIENT_ID: "test-client"
+      USERNAME: "test@admin"
+      PASSWORD: "test"
+      MAX_WAIT_SECONDS: "300"
+    command: ["python", "/it/idp_it.py"]
