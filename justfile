@@ -130,6 +130,16 @@ it-servers:
 it-servers-down:
 	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml down -v
 
+# Run end-to-end checks against authz-idp (discovery, browser/device flows, token exchange, introspection, revocation)
+it-idp:
+	@just it-idp-down
+	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml up -d --build
+	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml run --rm it-idp
+
+# Cleanup authz-idp integration test setup
+it-idp-down:
+	docker compose -p lightbridge-authz -f compose.yaml -f compose.it.yaml down -v
+
 # Show stats
 stats:
 	docker compose -p lightbridge-authz -f compose.yaml stats {{c}}
