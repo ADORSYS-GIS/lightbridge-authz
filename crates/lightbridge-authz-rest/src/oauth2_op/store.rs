@@ -242,7 +242,7 @@ impl TokenExchangeOpStore {
     ) -> Result<
         Option<lightbridge_authz_api_key::entities::exchange_refresh_token_row::ExchangeRefreshTokenRow>,
         OpError,
-    > {
+    >{
         let hash = hash_api_key(token);
         let row = self
             .repo
@@ -253,6 +253,66 @@ impl TokenExchangeOpStore {
                 OpError::Storage
             })?;
         Ok(row.filter(|row| row.client_id == client_id))
+    }
+
+    /// Layers [`Self::handle_refresh_token`]'s own re-validation on top of
+    /// [`Self::find_active_refresh_token_for_client`] (fixes a fail-open gap a security review
+    /// found: the base lookup only checks `status == 'active' AND expires_at > now AND client_id
+    /// matches`, which is not the full set of conditions the refresh grant itself requires before
+    /// it will actually rotate the token). A row this returns `None` for is one the refresh grant
+    /// would reject with `invalid_grant` if it were redeemed right now; RFC 7662 requires
+    /// introspection to report exactly that usability, not merely "a live row exists."
+    ///
+    /// Re-runs, in order: the absolute chain-expiry cap (`now >= chain_expires_at`, mirroring
+    /// `handle_refresh_token`'s own check), then `StoreRepo::resolve_context` (subject still
+    /// owns/is a member of the project) and `StoreRepo::require_active_project_and_account`
+    /// (account/project not suspended) via `StoreRepo::resolve_active_context`, exactly the calls
+    /// `handle_refresh_token` makes after consuming the token. `row.subject` is used for the
+    /// account id, not `row.account_id` -- the same choice `handle_refresh_token` makes and for
+    /// the same reason (ADR-0025: `subject` is already the resolved acting account id).
+    ///
+    /// Fail-closed on a genuine dependency failure: `resolve_context`/
+    /// `require_active_project_and_account` erroring for a reason OTHER than "not found" or
+    /// "forbidden" (a real DB outage) returns `Err(OpError::Storage)` here, which the caller maps
+    /// to `500 server_error` -- never silently downgraded to `active: false`. Collapsing a
+    /// dependency outage into "inactive" would let an attacker use a forced outage to make a
+    /// live, stolen token introspect as dead (or, the mirror failure mode were this NOT
+    /// fail-closed the other way, a legitimately-dead token introspect as alive); RFC 7662 gives
+    /// no license to guess in either direction when the check itself cannot run.
+    pub async fn find_introspectable_refresh_token_for_client(
+        &self,
+        token: &str,
+        client_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<
+        Option<lightbridge_authz_api_key::entities::exchange_refresh_token_row::ExchangeRefreshTokenRow>,
+        OpError,
+    >{
+        let Some(row) = self
+            .find_active_refresh_token_for_client(token, client_id, now)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if now >= row.chain_expires_at {
+            return Ok(None);
+        }
+        let account_id = AccountId::assert_already_resolved(row.subject.clone());
+        match self
+            .repo
+            .resolve_active_context(&account_id, &row.project_id)
+            .await
+        {
+            Ok(_) => Ok(Some(row)),
+            Err(Error::NotFound) | Err(Error::Forbidden(_)) => Ok(None),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "refresh-token introspection re-validation failed"
+                );
+                Err(OpError::Storage)
+            }
+        }
     }
 
     /// The DB-backed verification JWK set (active + stale signing keys), the same set

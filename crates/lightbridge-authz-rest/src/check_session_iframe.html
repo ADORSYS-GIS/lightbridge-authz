@@ -11,6 +11,11 @@
   The hash contract mirrors crate::session_management::session_state byte for byte:
     base64url( SHA-256( client_id + " " + origin + " " + opbs + " " + salt ) ) + "." + salt
   Change either side only together with the other.
+
+  A message with event.source === null (the sender's window has already been torn down) or an
+  opaque event.origin (the literal string "null" -- a sandboxed iframe, or a data:/file: sender)
+  is dropped before any reply is attempted: postMessage throws on both, and an opaque origin
+  offers no destination a reply could safely target anyway.
 -->
 <html lang="en">
 <head>
@@ -51,6 +56,9 @@ function computeSessionState(clientId, origin, opbs, salt) {
 
 window.addEventListener("message", function (event) {
   if (typeof event.data !== "string") {
+    return;
+  }
+  if (!event.source || !event.origin || event.origin === "null") {
     return;
   }
   var space = event.data.indexOf(" ");

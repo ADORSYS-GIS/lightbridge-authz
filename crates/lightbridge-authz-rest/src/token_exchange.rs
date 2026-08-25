@@ -677,7 +677,10 @@ async fn authenticate_presented_client(
 ) -> Result<(), EndpointAuthError> {
     match (client.token_endpoint_auth_method, credential) {
         (Some(TokenEndpointAuthMethod::NoAuth), PresentedCredential::NoCredential) => Ok(()),
-        (Some(TokenEndpointAuthMethod::PrivateKeyJwt), PresentedCredential::Assertion(assertion)) => {
+        (
+            Some(TokenEndpointAuthMethod::PrivateKeyJwt),
+            PresentedCredential::Assertion(assertion),
+        ) => {
             let verified = verify_client_assertion(
                 assertion,
                 client,
@@ -806,14 +809,29 @@ async fn revoke_endpoint(
 // Two token families are introspectable, matching what this server actually issues:
 //
 // - Refresh tokens: opaque DB rows (`exchange_refresh_tokens`), looked up by hash and scoped to
-//   the caller's `client_id` (`TokenExchangeOpStore::find_active_refresh_token_for_client`).
+//   the caller's `client_id`
+//   (`TokenExchangeOpStore::find_introspectable_refresh_token_for_client`), which layers the SAME
+//   re-validation `handle_refresh_token` (`oauth2_op/store.rs`) applies before it will actually
+//   rotate the token -- the absolute chain-expiry cap, `resolve_context` membership, and
+//   `require_active_project_and_account` suspension checks -- on top of the base row lookup.
+//   Without this, a token the refresh grant would itself refuse (chain expired, subject removed
+//   from the project, account/project suspended) could still introspect as `active: true`, which
+//   RFC 7662 forbids: introspection must report the token's real usability, not just "a row
+//   exists and hasn't expired yet."
 // - Access tokens: self-signed JWTs, verified against the same DB-backed JWK set
 //   `/.well-known/jwks.json` serves (active + stale keys, so tokens signed by a rotated-out key
 //   keep introspecting until they expire), then gated on `azp == <caller's client_id>` -- the
 //   same per-client azp discriminant `handlers/exchange_token.rs`'s `verify_self_issued_token`
-//   documents. A self-signed API-key JWT's `azp` is the fixed `oauth2.signing.audience` value,
-//   never a registered OAuth2 `client_id` (deployment convention, see that doc comment), so API
-//   keys are structurally not introspectable here regardless of who asks.
+//   documents -- AND `typ == "Bearer"`. The `typ` check matters because `azp` alone is not a
+//   token-type discriminant: `id_token_extra` (`signing.rs`) stamps the very same `azp` (the
+//   requesting client's own `client_id`) on ID tokens minted alongside an access token, so an
+//   `azp`-only gate would introspect a presented ID token as an active Bearer access token.
+//   `access_token_extra` (`signing.rs`) is the only place that stamps `typ: "Bearer"`;
+//   `id_token_extra` stamps no `typ` at all, so a genuine ID token fails this gate and falls
+//   through to `inactive_token_response`. A self-signed API-key JWT's `azp` is the fixed
+//   `oauth2.signing.audience` value, never a registered OAuth2 `client_id` (deployment
+//   convention, see that doc comment), so API keys are structurally not introspectable here
+//   regardless of who asks.
 
 /// RFC 7662 §2.1 request body. `token_type_hint` is accepted and ignored for the same reason
 /// revocation ignores it: both token families are always tried, cheapest first.
@@ -855,9 +873,14 @@ fn active_token_response(body: serde_json::Value) -> Response {
 }
 
 /// Verifies a presented access token as one of this server's own self-signed JWTs: `kid` from the
-/// header, matching JWK from the DB-backed verification set, RS256 signature + `exp`/`nbf` via
+/// header, matching JWK from the DB-backed verification set, RS256 signature + `exp` via
 /// `jsonwebtoken`'s defaults (`validate_aud` off -- `aud` here is the requesting client's own id,
-/// not a fixed value). Returns the raw claims map so the introspection response can carry every
+/// not a fixed value). `jsonwebtoken`'s `Validation::new` defaults are NOT "validate every
+/// standard claim": `validate_exp` is on with a 60-second leeway, but `validate_nbf` is off, so an
+/// `nbf` claim (this server never mints one) would not be checked even if present. Matches
+/// `handlers/exchange_token.rs`'s sibling `verify_self_issued_token`, which builds its
+/// `Validation` the same way and is left alone here for consistency rather than opting this path
+/// alone into `validate_nbf`. Returns the raw claims map so the introspection response can carry every
 /// claim the token itself already discloses to its holder, or `None` for anything that fails --
 /// indistinguishably, per the section comment above.
 async fn verify_own_access_token(
@@ -869,9 +892,9 @@ async fn verify_own_access_token(
     let header = decode_header(token).ok()?;
     let kid = header.kid?;
     let jwks = state.op_store.list_verification_jwks().await.ok()?;
-    let matching = jwks.into_iter().find(|raw| {
-        raw.get("kid").and_then(serde_json::Value::as_str) == Some(kid.as_str())
-    })?;
+    let matching = jwks
+        .into_iter()
+        .find(|raw| raw.get("kid").and_then(serde_json::Value::as_str) == Some(kid.as_str()))?;
     let jwk = serde_json::from_value::<Jwk>(matching).ok()?;
     let decoding_key = DecodingKey::from_jwk(&jwk).ok()?;
     let mut validation = Validation::new(Algorithm::RS256);
@@ -917,8 +940,7 @@ async fn introspect_endpoint(
         Err(err) => return err.into_response(),
     };
 
-    let Some(client_id) = resolve_presented_client_id(raw.client_id.as_deref(), &credential)
-    else {
+    let Some(client_id) = resolve_presented_client_id(raw.client_id.as_deref(), &credential) else {
         return invalid_client().into_response();
     };
 
@@ -935,8 +957,7 @@ async fn introspect_endpoint(
     };
 
     if let Err(err) =
-        authenticate_presented_client(&client, &credential, &state.op_config, &state.op_store)
-            .await
+        authenticate_presented_client(&client, &credential, &state.op_config, &state.op_store).await
     {
         return err.into_response();
     }
@@ -944,16 +965,16 @@ async fn introspect_endpoint(
     let now = chrono::Utc::now();
     match state
         .op_store
-        .find_active_refresh_token_for_client(token, &client_id, now)
+        .find_introspectable_refresh_token_for_client(token, &client_id, now)
         .await
     {
         Ok(Some(row)) => {
+            // No `token_type` here: RFC 7662 §2.2 lists it as OPTIONAL, and "refresh_token" is
+            // not an RFC 6749 §7.1 access token type -- the field only means something for an
+            // access-token response (the `"Bearer"` case below), so it is simply omitted rather
+            // than populated with a value the spec never defines.
             let mut body = serde_json::Map::new();
             body.insert("active".to_string(), serde_json::Value::Bool(true));
-            body.insert(
-                "token_type".to_string(),
-                serde_json::Value::String("refresh_token".to_string()),
-            );
             body.insert(
                 "client_id".to_string(),
                 serde_json::Value::String(row.client_id),
@@ -991,7 +1012,9 @@ async fn introspect_endpoint(
 
     match verify_own_access_token(&state, token).await {
         Some(claims)
-            if claims.get("azp").and_then(serde_json::Value::as_str) == Some(client_id.as_str()) =>
+            if claims.get("azp").and_then(serde_json::Value::as_str)
+                == Some(client_id.as_str())
+                && claims.get("typ").and_then(serde_json::Value::as_str) == Some("Bearer") =>
         {
             let mut body = claims;
             body.insert("active".to_string(), serde_json::Value::Bool(true));
