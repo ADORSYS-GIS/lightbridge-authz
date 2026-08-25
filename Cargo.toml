@@ -160,11 +160,47 @@ jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
 #   its own `RedisClientAssertionStore`; verify at review time that the constructor signature is
 #   unchanged (it compiled clean on `cargo check --workspace`, which is the actual proof).
 #
+# BUMPED (2026-08-25, authkestra 0.5.4 -> 0.5.5): same lockstep rule -- verified via GitHub's
+# compare API (`gh api repos/marcjazz/authkestra/compare/<crate>-v0.5.4...<crate>-v0.5.5`) rather
+# than trusting the per-crate changelog text alone, because the changelog for this release listed
+# PR #241 ("add SD-JWT runnable example, doctests, and book/README docs") under `authkestra-op`,
+# `authkestra-providers`, and `authkestra` too -- a release-plz artifact of the shared workspace
+# version, not evidence those crates' source changed. The compare API's file list is the ground
+# truth and is what the verdicts below are based on:
+#
+# - `authkestra-resource` 0.5.4..0.5.5: EMPTY diff outside `Cargo.lock`/`Cargo.toml`/CHANGELOGs --
+#   no `crates/authkestra-resource/**` file appears in the compare. `Pkce`/`OAuth2State`/
+#   `validate_jwt_generic`/`JwksCache` (the RP leg this repo's ADR-0021 Decision 5 depends on) are
+#   byte-for-byte unchanged. Not reachable, because there is nothing to reach.
+# - `authkestra-op` 0.5.4..0.5.5: same -- only `crates/authkestra-op/CHANGELOG.md` changed, no
+#   source file. `OpStore::handle_token_exchange` (overridden in
+#   `crates/lightbridge-authz-rest/src/oauth2_op/store.rs`), `TokenManager` issuance call sites,
+#   `RedisClientAssertionStore`, and `OidcDiscovery` are all unchanged -- confirmed by the empty
+#   diff, not merely inferred from the changelog.
+# - `authkestra-engine` 0.5.4..0.5.5: the one crate with a real source diff -- upstream PR #238
+#   (SD-JWT selective-disclosure issuance/verification) adds `crates/authkestra-engine/src/
+#   token/sd_jwt.rs` as a wholly new module, wired in via a single additive line in
+#   `token/mod.rs` (`pub mod sd_jwt;`), plus new examples/tests/docs. `token::TokenManager`'s
+#   existing issuance API (the surface `signing.rs` calls for jti-override access/id-token
+#   minting) is untouched by this diff -- confirmed via the compare API's file-level patch, not
+#   just the changelog. `authkestra-engine`'s own `Cargo.toml`/lockfile deps are unchanged (no new
+#   crate entries -- SD-JWT reuses the crate's existing `base64`/`serde` deps already in the
+#   graph), so nothing here should perturb dependency resolution.
+# - `authkestra-oidc` 0.5.4..0.5.5 (PR #228, ID-token `Validation` derived from discovery instead
+#   of `Validation::default()`): this workspace still deliberately does not depend on
+#   `authkestra-oidc` (ADR-0021 Decision 5 uses `authkestra-resource` for the RP leg instead), so
+#   unreachable regardless of the crate's own content.
+#
+# Net: this bump is functionally a no-op for every seam this repo touches (`TokenManager`
+# issuance, `OpStore::handle_token_exchange`, `RedisClientAssertionStore`,
+# `validate_jwt_generic`/`JwksCache`, `Pkce`/`OAuth2State`, `OidcDiscovery`) -- verified by
+# GitHub's compare API per crate above, not assumed from the shared changelog text.
+#
 # Exact `=` pins retained deliberately -- see the drift paragraphs above; a caret range here is
 # not durable against a lockfile-only Dependabot float.
-authkestra-resource = "=0.5.4"
-authkestra-op = "=0.5.4"
-authkestra-engine = "=0.5.4"
+authkestra-resource = "=0.5.5"
+authkestra-op = "=0.5.5"
+authkestra-engine = "=0.5.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "tracing", "net", "time"] }
 thiserror = "2"
 anyhow = "1"
