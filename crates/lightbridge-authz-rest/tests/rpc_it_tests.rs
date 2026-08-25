@@ -43,7 +43,7 @@ use cratestack_codec_cbor::CborCodec;
 use cratestack_core::CratestackCodec;
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
-use lightbridge_authz_bearer::BearerTokenServiceTrait;
+use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
 use lightbridge_authz_core::authz::Permission;
 use lightbridge_authz_core::config::{BasicAuth, Billing, BillingPlan};
 use lightbridge_authz_core::cuid::cuid2;
@@ -666,6 +666,129 @@ async fn crud_authorizes_via_the_federated_account_not_the_raw_subject() {
         String::from_utf8_lossy(&body)
     );
     assert_eq!(json_body(&body)["id"], account_id);
+}
+
+/// ADR-0025 Correction: the Stage 2..5 bootstrap window. With Stage 2 live (every ingress
+/// translates `(iss, sub)` to an account id BEFORE any procedure runs) and Stage 5 NOT YET
+/// IMPLEMENTED (a minted `accounts.id` for brand-new accounts, written by `createAccount` itself
+/// in the same transaction as the adopting `federated_identities` row), a subject the deployment
+/// has genuinely never seen before -- no `accounts` row, no `federated_identities` row -- has no
+/// way to bootstrap: `createAccount` is the ONLY procedure that could ever create the account
+/// resolution needs, and Stage 2's own translation seam was refusing it before it could run.
+/// Every other test in this file seeds an account first (directly or via `create_account`'s own
+/// helper against a resolver that already trusts the subject), so none of them exercised a
+/// truly-fresh subject; this is what a real compose e2e run (`just it-authorino`) hits the moment
+/// a genuinely new identity shows up, and unit/it coverage missed it entirely until then.
+///
+/// Proves the full bootstrap end-to-end: `createAccount` succeeds via the TEMPORARY
+/// grandfather-issuer fallback (`FederatedSubjectResolver::resolve`'s `NoAccount` arm, which
+/// resolves to the subject's own pre-Stage-5 identity), then `createProject` and `createApiKey`
+/// for the SAME subject succeed too -- by then `accounts.id == subject` exists, so those two
+/// calls go through the ORDINARY, pre-existing self-healing grandfather adoption path
+/// (`resolve_account_for_federated_subject`'s steady-state branch, unchanged by this fix), not
+/// the bootstrap fallback itself. Prove-fail: reverting the fallback (making `NoAccount` refuse,
+/// like `RogueIssuer`) reds this test's very first assertion with the 401/Unauthorized shape
+/// `build_context` maps every resolver refusal to.
+#[tokio::test]
+async fn a_brand_new_subject_bootstraps_create_account_then_project_then_key_end_to_end() {
+    const ISSUER: &str = "https://keycloak.example.test/realms/dev";
+    let subject = format!("brand-new-subject-{}", cuid2());
+
+    let core = core_pool().await;
+    let repo = StoreRepo::new(core.clone());
+    let resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver> = Arc::new(
+        lightbridge_authz_rest::auth_provider::FederatedSubjectResolver::new(
+            Arc::new(repo),
+            None,
+            ISSUER.to_string(),
+        ),
+    );
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&subject, admin_perms())));
+    let ctx = setup_with_resolver(bearer, resolver).await;
+
+    let account_id = create_account(&ctx.router, "admin", &subject).await;
+    assert_eq!(
+        account_id, subject,
+        "the bootstrap fallback must mint the account under the subject's own pre-Stage-5 \
+         identity (accounts.id == subject), matching the grandfather branch it stands in for"
+    );
+
+    let project_id = create_project(&ctx.router, "admin", &account_id, "bootstrap-project").await;
+    let (_key_id, secret) =
+        create_api_key(&ctx.router, "admin", &project_id, "bootstrap-key").await;
+    assert!(
+        !secret.is_empty(),
+        "createApiKey must succeed once the bootstrapped account/project exist"
+    );
+
+    let fi_row_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM federated_identities WHERE issuer = $1 AND subject = $2)",
+    )
+    .bind(ISSUER)
+    .bind(&subject)
+    .fetch_one(&ctx.verify)
+    .await
+    .expect("checking federated_identities must succeed");
+    assert!(
+        fi_row_exists,
+        "createProject's resolution must have self-healed a federated_identities row via the \
+         ordinary grandfather adoption path, now that the account exists"
+    );
+}
+
+/// Security twin of the bootstrap test above: a brand-new subject presented by a NON-grandfather
+/// issuer must still be refused outright, never bootstrapped -- the fallback is issuer-pinned
+/// exactly like the steady-state adoption path it temporarily stands in for
+/// (`FederatedResolution::RogueIssuer`, not `NoAccount`). Proves the fix did not widen the trust
+/// boundary: only the ONE configured `oauth2.federation.issuer` can bootstrap; every other issuer
+/// dead-ends exactly as it did before this fix.
+#[tokio::test]
+async fn a_brand_new_subject_from_a_rogue_issuer_cannot_bootstrap() {
+    const GRANDFATHER_ISSUER: &str = "https://keycloak.example.test/realms/dev";
+    const ROGUE_ISSUER: &str = "https://rogue-issuer.example/realms/evil";
+    let subject = format!("rogue-brand-new-subject-{}", cuid2());
+
+    let core = core_pool().await;
+    let repo = StoreRepo::new(core.clone());
+    let resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver> = Arc::new(
+        lightbridge_authz_rest::auth_provider::FederatedSubjectResolver::new(
+            Arc::new(repo),
+            None,
+            GRANDFATHER_ISSUER.to_string(),
+        ),
+    );
+    let info = TokenInfo {
+        iss: ROGUE_ISSUER.to_string(),
+        ..token_info(&subject, admin_perms())
+    };
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with("admin", info));
+    let ctx = setup_with_resolver(bearer, resolver).await;
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "procedure.createAccount",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a brand-new subject from a non-grandfather issuer must be refused, never bootstrapped: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1)")
+        .bind(&subject)
+        .fetch_one(&ctx.verify)
+        .await
+        .expect("checking accounts must succeed");
+    assert!(
+        !exists,
+        "a refused bootstrap attempt must leave no accounts row behind"
+    );
 }
 
 /// Regression for the legacy jsonb-`null` `allowed_models` decode failure (migration

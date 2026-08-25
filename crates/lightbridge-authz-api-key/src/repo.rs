@@ -33,6 +33,27 @@ use crate::entities::session_row::{
 };
 use crate::entities::signing_key_row::{NewSigningKey, SigningKeyRow};
 
+/// Fine-grained outcome of [`StoreRepo::resolve_account_for_federated_subject_detailed`]
+/// (ADR-0025 Correction, "the Stage 2..5 bootstrap window"). The two refusal variants exist ONLY
+/// so `FederatedSubjectResolver::resolve` (`lightbridge-authz-rest::auth_provider`) can decide
+/// whether the temporary grandfather-issuer bootstrap fallback applies -- every OTHER caller must
+/// keep using [`StoreRepo::resolve_account_for_federated_subject`], whose `Result<String>`
+/// collapses both variants to the identical `Error::Forbidden("no federated identity for this
+/// subject")` so no ingress becomes an account-existence oracle. Do not match on this enum
+/// anywhere else without re-reading that ADR section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FederatedResolution {
+    /// A `federated_identities` row already existed, or the grandfather-issuer subject was just
+    /// adopted -- the resolved acting account id.
+    Resolved(String),
+    /// The presented issuer is not the grandfather issuer, and no `federated_identities` row
+    /// exists either. Refuse unconditionally -- never eligible for the bootstrap fallback.
+    RogueIssuer,
+    /// The grandfather issuer presented a subject with no `federated_identities` row AND no
+    /// matching `accounts` row. Eligible for the temporary bootstrap fallback.
+    NoAccount,
+}
+
 #[derive(Debug, Clone)]
 pub struct StoreRepo {
     pub pool: Arc<dyn DbPoolTrait>,
@@ -1123,6 +1144,39 @@ impl StoreRepo {
         subject: &str,
         grandfather_issuer: &str,
     ) -> Result<String> {
+        match self
+            .resolve_account_for_federated_subject_detailed(issuer, subject, grandfather_issuer)
+            .await?
+        {
+            FederatedResolution::Resolved(account_id) => Ok(account_id),
+            // Deliberately the SAME variant and message for both refusal cases -- see
+            // `FederatedResolution`'s own doc comment for why, and
+            // `resolve_account_for_federated_subject_detailed` for the one caller allowed to tell
+            // them apart.
+            FederatedResolution::RogueIssuer | FederatedResolution::NoAccount => Err(
+                Error::Forbidden("no federated identity for this subject".to_string()),
+            ),
+        }
+    }
+
+    /// Fine-grained twin of [`Self::resolve_account_for_federated_subject`], which stays the
+    /// externally-uniform `Result<String>` every ingress except one already relies on. This
+    /// method exists ONLY for
+    /// `lightbridge_authz_rest::auth_provider::FederatedSubjectResolver::resolve` (ADR-0025
+    /// Correction, "the Stage 2..5 bootstrap window"): that caller needs to tell "wrong issuer"
+    /// apart from "no account yet" to decide whether the temporary grandfather-issuer bootstrap
+    /// fallback applies, WITHOUT the distinction ever leaking past that one internal seam --
+    /// `resolve_account_for_federated_subject` above still collapses both cases to the identical
+    /// `Error::Forbidden` message no caller can distinguish, so this repo remains exactly as much
+    /// of an account-existence non-oracle as it always was. Do not add a second caller without
+    /// re-reading that ADR section first.
+    #[instrument(skip(self, subject, grandfather_issuer))]
+    pub async fn resolve_account_for_federated_subject_detailed(
+        &self,
+        issuer: &str,
+        subject: &str,
+        grandfather_issuer: &str,
+    ) -> Result<FederatedResolution> {
         let mut tx = self.pool().begin().await?;
 
         let existing: Option<(String,)> = sqlx::query_as(
@@ -1134,13 +1188,11 @@ impl StoreRepo {
         .await?;
         if let Some((account_id,)) = existing {
             tx.commit().await?;
-            return Ok(account_id);
+            return Ok(FederatedResolution::Resolved(account_id));
         }
 
         if issuer != grandfather_issuer {
-            return Err(Error::Forbidden(
-                "no federated identity for this subject".to_string(),
-            ));
+            return Ok(FederatedResolution::RogueIssuer);
         }
 
         let account: Option<(String,)> =
@@ -1149,9 +1201,7 @@ impl StoreRepo {
                 .fetch_optional(&mut *tx)
                 .await?;
         let Some((account_id,)) = account else {
-            return Err(Error::Forbidden(
-                "no federated identity for this subject".to_string(),
-            ));
+            return Ok(FederatedResolution::NoAccount);
         };
 
         let inserted: Option<(String,)> = sqlx::query_as(
@@ -1211,7 +1261,7 @@ impl StoreRepo {
         };
 
         tx.commit().await?;
-        Ok(account_id)
+        Ok(FederatedResolution::Resolved(account_id))
     }
 
     /// `grandfather_issuer` mirrors `resolve_account_for_federated_subject`'s own parameter of the

@@ -185,6 +185,58 @@ non-leaking-404 contract, and `/idp/v1/resolve-context`'s Basic-auth-protected p
 This PR implements Stages 1-3 only. Stages 4-6 are designed here so the eventual PRs implementing
 them do not have to re-litigate these decisions, but no code for them exists yet.
 
+### Correction (2026-08-25): the Stage 2..5 bootstrap window
+
+Merging Stages 1-3 (`bffeaf5`) broke `main`: the compose e2e (`just it-authorino`) failed with
+HTTP 401 the instant it presented a genuinely fresh subject. Every unit/it test up to that point
+seeded an `accounts` row (directly, or via a resolver that already trusted the subject) before
+exercising anything, so none of them exercised what a real, never-before-seen login actually does.
+
+**The gap.** Stage 2 makes every ingress translate `(iss, sub)` into an account id BEFORE any
+procedure runs — `build_context` (`auth_provider.rs`, shared by the RPC surface and the MCP
+context path, one seam) calls the resolver first, and only a resolved account id ever reaches
+`auth().id`. Stage 5 (`accounts.id` becomes a minted CUID2 for brand-new accounts, written by
+`createAccount` itself in the same transaction as the adopting `federated_identities` row) is
+listed above as NOT YET IMPLEMENTED. Between the two: a subject the deployment has genuinely never
+seen has no `accounts` row and no `federated_identities` row, so `resolve_account_for_federated_subject`
+refuses it (`Error::Forbidden`) — but `createAccount` is the ONLY procedure that could ever create
+the row resolution needs. Chicken-and-egg: a brand-new subject could never bootstrap at all, for
+any operation, including the one operation whose entire job is to fix that.
+
+**The fix: an issuer-pinned bootstrap window, temporary and narrowly scoped.**
+`resolve_account_for_federated_subject` gained a fine-grained twin,
+`resolve_account_for_federated_subject_detailed` (`StoreRepo`), returning a `FederatedResolution`
+that distinguishes `NoAccount` (grandfather issuer, no account yet) from `RogueIssuer` (any other
+issuer) — internally only; the original method's externally-observable `Result<String>` still
+collapses both to the identical `Error::Forbidden("no federated identity for this subject")`, so
+no ingress becomes an account-existence oracle. `FederatedSubjectResolver::resolve`
+(`auth_provider.rs`) is the ONE caller allowed to branch on the distinction: on `NoAccount`, it
+falls back to `AccountId::assert_already_resolved(sub)` — the subject's own pre-ADR-0025
+identity — instead of refusing. `RogueIssuer` is refused exactly as before; nothing about a
+non-grandfather issuer's dead end changed.
+
+**Why this is exactly as safe as the state it temporarily preserves, not a new hole.** The
+fallback does not grant anything ADR-0025 took away — it grants exactly what every account had
+BEFORE this ADR shipped: `accounts.id == subject`. Every operation reachable through this identity
+except `createAccount` itself already dead-ends on an accountless subject, with or without this
+fix — no `accounts` row means no project, no roster membership, no key, nothing to authorize
+against. The fallback's only observable effect is letting `createAccount` run, which writes the
+`accounts` row the identity describes — after that, every subsequent call from the same subject
+resolves through the ORDINARY, pre-existing self-healing grandfather adoption path
+(`resolve_account_for_federated_subject`'s own steady-state branch, unchanged), not this fallback.
+It is issuer-pinned the same way that adoption path already is: only the ONE configured
+`oauth2.federation.issuer` bootstraps; every other issuer is refused outright, proven by
+`a_brand_new_subject_from_a_rogue_issuer_cannot_bootstrap` (`rpc_it_tests.rs`).
+
+**Deletion condition.** This is TEMPORARY, tied to the SAME Stage-6 cleanup marker as the
+grandfather branch it depends on (see `resolve_account_for_federated_subject`'s own doc comment
+and Stage 6 above): once Stage 5 ships, `createAccount` writes its own adopting
+`federated_identities` row in-transaction, so a brand-new subject never reaches `NoAccount` again
+— the window closes itself. Delete the `NoAccount` fallback arm in `FederatedSubjectResolver::resolve`,
+`resolve_account_for_federated_subject_detailed`, and `FederatedResolution` together with the
+grandfather branch, not separately — they exist for the identical reason and expire on the
+identical condition.
+
 ### SPI contract survives unchanged
 
 `lightbridge-keycloak-spi`'s `POST /idp/v1/resolve-context` body shape
