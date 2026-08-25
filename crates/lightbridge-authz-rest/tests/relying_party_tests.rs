@@ -26,6 +26,7 @@ use lightbridge_authz_rest::oauth2_op::device_store::DbDeviceCodeStore;
 use lightbridge_authz_rest::relying_party::{
     BrowserLoginTarget, KeycloakRelyingParty, KeycloakTokenSet, router,
 };
+use lightbridge_authz_rest::session_management::OP_BROWSER_STATE_COOKIE;
 use lightbridge_authz_rest::signing::{GeneratedKey, generate_rs256_key};
 use serde::Serialize;
 use sqlx::PgPool;
@@ -871,6 +872,28 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
     assert_eq!(
         response.headers().get(header::LOCATION).unwrap(),
         "/browser"
+    );
+    // The `Completion::Browser` arm sets a second `Set-Cookie` beside `__Host-authz_session`:
+    // the OIDC Session Management OP browser-state cookie. `axum::http::HeaderMap::get` only
+    // ever returns the FIRST `Set-Cookie` value, so this reads all of them via `get_all` --
+    // otherwise a regression that stopped setting the op-state cookie entirely could hide behind
+    // whichever cookie happens to serialize first.
+    let set_cookies: Vec<String> = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap().to_string())
+        .collect();
+    let op_state_cookie = set_cookies
+        .iter()
+        .find(|value| value.starts_with(&format!("{OP_BROWSER_STATE_COOKIE}=")))
+        .unwrap_or_else(|| {
+            panic!("no {OP_BROWSER_STATE_COOKIE} Set-Cookie header among: {set_cookies:?}")
+        });
+    assert!(
+        !op_state_cookie.contains("HttpOnly"),
+        "the OP browser-state cookie must be JS-readable by the check-session iframe, never \
+         HttpOnly -- unlike its __Host-authz_session sibling: {op_state_cookie}"
     );
     let row: (String, String) =
         sqlx::query_as("SELECT account_id, project_id FROM sessions WHERE kind = 'browser'")
