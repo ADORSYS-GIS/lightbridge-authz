@@ -157,7 +157,19 @@ controllers:
     # "inspectable" half of this same ADR; (3) `generateName` -- ArgoCD tracks/diffs managed
     # resources by exact name, so a random per-apply suffix cannot be reconciled against the
     # desired manifest and is a documented ArgoCD anti-pattern.
-    suffix: '{{ printf "%s:%s" .Values.global.authz.image.repository .Values.global.authz.image.version | sha256sum | trunc 10 }}'
+    # 2026-08-25 (#480, amending the paragraph above): the image alone is NOT the Job template's
+    # full identity -- bjw-s stamps a checksum/config annotation over the mounted ConfigMap into
+    # the pod template, so a CONFIG-only values change re-rendered the SAME Job name with a
+    # DIFFERENT template. Kubernetes rejects that (completed Jobs have an immutable spec.template)
+    # and, worse, ArgoCD's serverSideDiff dry-runs the apply, so the whole app's diff failed and
+    # NOTHING synced -- hit twice on 2026-08-24 during config-only rollouts. Folding the config
+    # content into the name hash restores the invariant the paragraph above intended: same
+    # inputs -> same name -> identical spec (true no-op); ANY changed input -> new name -> new Job.
+    # This is deliberately NOT the values-wide checksum rejected above: only the config data this
+    # Job actually mounts participates. Known residual: a change scoped purely to
+    # controllers.migrate's own env/values still collides (cannot self-reference the hash);
+    # remedy stays `kubectl delete job <name>` -- see #480.
+    suffix: '{{ printf "%s:%s:%s" .Values.global.authz.image.repository .Values.global.authz.image.version (.Values.configMaps.config.data | toYaml | sha256sum) | sha256sum | trunc 10 }}'
     job:
       backoffLimit: 3
       # Bounded retention, not the old hook-delete-policy's job of "clean up so the next deploy's
