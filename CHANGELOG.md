@@ -1,5 +1,32 @@
 # Changelog
 
+## [5.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v4.0.0...v5.0.0) (2026-08-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* **oauth2:** lightbridge owns its subjects — ADR-0025 stages 1-3 ([#498](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/498))
+* **budget:** every reported budget spend figure drops ~10^6x at deploy — this is the intended, correct behavior, not a regression. usage_events.total_cost is micro-USD as emitted verbatim by the gateway's llm_custom_total_cost CEL (ai-helm docs/models-chart-docs/cost-tracking.md), not US dollars. cost_to_micros (renamed validate_total_cost_micros) was multiplying an already-micro-USD value by 1_000_000.0, inflating every spend readout ~10^6x and driving self-service refill decisions to the fail-closed floor. The function now only validates (finite, non-negative, round-trips into i64) and no longer scales its input; the doc comment states the unit contract explicitly and cites #488 plus the ai-helm source.
+* **idp:** federated identities link to accounts, not users (ADR-0024 correction) ([#487](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/487))
+
+### Features
+
+* **oauth2:** lightbridge owns its subjects — ADR-0025 stages 1-3 ([#498](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/498)) ([bffeaf5](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/bffeaf57d8e5b9bfad1dc15b3be3ae1e367bc88c))
+
+
+### Bug Fixes
+
+* **budget:** usage_events.total_cost is micro-USD — stop multiplying by 1e6 ([#488](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/488)) ([#496](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/496)) ([0dde42f](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/0dde42f3324baa3aab69422583c54a83a275a84a))
+* **charts:** migrate Job name hash covers the config content, not only the image ([#480](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/480)) ([#485](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/485)) ([460b3fe](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/460b3fe0db7e53dd64df09b78b7b236d01267565))
+* **idp:** federated identities link to accounts, not users (ADR-0024 correction) ([#487](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/487)) ([afda936](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/afda9364473211deebe3b215fcd702e110ee624f))
+* **oauth2:** issuer-pinned bootstrap window for the Stage-2..5 gap (ADR-0025) ([#500](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/500)) ([9ab88af](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/9ab88af4a02878fa851eb015590fcabb20acbaa6))
+* **sessions:** revoke_sessions_and_cascade targets the actor, not the project owner ([#492](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/492)) ([#494](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/494)) ([d36381a](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/d36381a42bde80be5d8e616f52ad779c8d24cfbc))
+
+
+### Documentation
+
+* **research:** GenAI observability ingestion audit for the usage DB ([#490](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/490)) ([f526ccd](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/f526ccdc894ea781730f0af5c16c1ee50dfbd710))
+
 ## [4.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v3.10.1...v4.0.0) (2026-08-24)
 
 
