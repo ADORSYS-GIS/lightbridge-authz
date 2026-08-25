@@ -4634,7 +4634,11 @@ async fn introspecting_a_refresh_token_as_its_owning_client_is_active_with_corre
 
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["active"], true, "body: {body}");
-    assert_eq!(body["token_type"], "refresh_token");
+    assert!(
+        body.get("token_type").is_none(),
+        "refresh introspection must not claim a non-standard token_type (\"refresh_token\" \
+         is not an RFC 6749 §7.1 type): {body}"
+    );
     assert_eq!(body["client_id"], PUBLIC_CLIENT_ID);
     assert_eq!(body["sub"], SUBJECT);
     assert_eq!(body["account_id"], ACCOUNT_ID);

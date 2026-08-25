@@ -27,7 +27,10 @@
           "value": "test"
         }
       ],
-      "realmRoles": ["offline_access", "lightbridge-admin"]
+      "realmRoles": [
+        "offline_access",
+        "lightbridge-admin"
+      ]
     },
     {
       "email": "test@editor",
@@ -43,7 +46,10 @@
           "value": "test"
         }
       ],
-      "realmRoles": ["offline_access", "lightbridge-editor"]
+      "realmRoles": [
+        "offline_access",
+        "lightbridge-editor"
+      ]
     },
     {
       "email": "test@viewer",
@@ -59,7 +65,10 @@
           "value": "test"
         }
       ],
-      "realmRoles": ["offline_access", "lightbridge-viewer"]
+      "realmRoles": [
+        "offline_access",
+        "lightbridge-viewer"
+      ]
     }
   ],
   "roles": {
@@ -144,6 +153,17 @@
             "id.token.claim": "false",
             "userinfo.token.claim": "false"
           }
+        },
+        {
+          "name": "it-exchange-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "it-exchange",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
         }
       ],
       "attributes": {
@@ -182,7 +202,9 @@
       "adminUrl": "",
       "baseUrl": "",
       "enabled": true,
-      "redirectUris": ["https://localhost:13004/idp/callback"],
+      "redirectUris": [
+        "https://localhost:13004/idp/callback"
+      ],
       "webOrigins": [],
       "bearerOnly": false,
       "consentRequired": false,
@@ -196,8 +218,20 @@
         "pkce.code.challenge.method": "S256"
       },
       "fullScopeAllowed": true,
-      "defaultClientScopes": ["web-origins", "acr", "profile", "roles", "basic", "email"],
-      "optionalClientScopes": ["address", "phone", "offline_access", "microprofile-jwt"]
+      "defaultClientScopes": [
+        "web-origins",
+        "acr",
+        "profile",
+        "roles",
+        "basic",
+        "email"
+      ],
+      "optionalClientScopes": [
+        "address",
+        "phone",
+        "offline_access",
+        "microprofile-jwt"
+      ]
     },
     {
       "clientId": "lightbridge-token-issuer",
