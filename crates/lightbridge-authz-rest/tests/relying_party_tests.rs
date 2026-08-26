@@ -54,9 +54,8 @@ fn test_addr() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 4242))
 }
 
-fn rp_config(server: &MockServer) -> OidcRelyingParty {
+fn rp_config(_server: &MockServer) -> OidcRelyingParty {
     OidcRelyingParty {
-        issuer: server.base_url(),
         client_id: "authz-idp-rp".to_string(),
         callback_url: "https://authz.example.test/idp/callback".to_string(),
         client_secret: None,
@@ -190,6 +189,45 @@ async fn begin_pairing(router: axum::Router) -> (axum::Router, String, String) {
     (router, state, cookie)
 }
 
+/// Identity-vs-location split (ADR-0025 amendment): `KeycloakRelyingParty::new` now takes the
+/// IDENTITY issuer and the discovery-dial LOCATION as separate arguments. This proves both halves
+/// at once: (1) `discover()` actually dials `discovery_url`, not `issuer` -- the identity issuer
+/// here points at an address nothing is listening on, so if the code regressed to dialing it
+/// instead, this test would fail with a connection error, not the assertion below; and (2) the
+/// fetched document's own `issuer` field (the mock server's `base_url()`, per `discovery_body`) is
+/// still checked against the IDENTITY issuer, not against `discovery_url` -- a mismatch there must
+/// still be refused, never silently accepted just because the dial itself succeeded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn discover_dials_discovery_url_but_validates_issuer_against_identity(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let _discovery = keycloak
+        .mock_async(|when, then| {
+            when.method(GET).path("/.well-known/openid-configuration");
+            then.status(200).json_body(discovery_body(&keycloak));
+        })
+        .await;
+    let repo = repo(pool);
+    let identity_issuer = "https://unreachable-identity.example.test".to_string();
+    let rp = KeycloakRelyingParty::new(
+        rp_config(&keycloak),
+        identity_issuer,
+        keycloak.base_url(),
+        keycloak.url("/jwks"),
+        repo,
+        rate_limiter(),
+    )
+    .unwrap();
+    let err = rp.begin_device("device-code".to_string()).await.expect_err(
+        "a discovery document whose issuer differs from the configured identity issuer must \
+             be refused, even though the dial to discovery_url itself succeeded",
+    );
+    let message = format!("{err}");
+    assert!(
+        message.contains("issuer mismatch"),
+        "expected discover()'s own issuer-mismatch error, got: {message}"
+    );
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn verified_keycloak_callback_transitions_pending_device_code_to_approved(pool: PgPool) {
     let keycloak = MockServer::start_async().await;
@@ -223,8 +261,15 @@ async fn verified_keycloak_callback_transitions_pending_device_code_to_approved(
     let mut config = rp_config(&keycloak);
     config.client_secret = Some("confidential-secret".to_string());
     let rp = Arc::new(
-        KeycloakRelyingParty::new(config, keycloak.url("/jwks"), repo.clone(), rate_limiter())
-            .unwrap(),
+        KeycloakRelyingParty::new(
+            config,
+            keycloak.base_url(),
+            keycloak.base_url(),
+            keycloak.url("/jwks"),
+            repo.clone(),
+            rate_limiter(),
+        )
+        .unwrap(),
     );
     let router = router(rp);
     let (router, state, cookie) = begin_pairing(router).await;
@@ -305,6 +350,8 @@ async fn keycloak_token_failure_leaves_device_code_pending(pool: PgPool) {
     let rp = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
@@ -335,6 +382,8 @@ async fn invalid_device_codes_have_one_uniform_response_and_frame_protection(poo
     assert!(
         KeycloakRelyingParty::new(
             invalid_callback,
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo(pool.clone()),
             rate_limiter(),
@@ -370,6 +419,8 @@ async fn invalid_device_codes_have_one_uniform_response_and_frame_protection(poo
     let rp = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo,
             rate_limiter(),
@@ -443,6 +494,8 @@ async fn verify_continue_requires_the_confirmation_cookie_from_verify_submit(poo
     let rp = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo,
             rate_limiter(),
@@ -516,6 +569,8 @@ async fn relying_party_rejects_non_positive_runtime_limits(pool: PgPool) {
     assert!(
         KeycloakRelyingParty::new(
             zero_timeout,
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo(pool.clone()),
             rate_limiter(),
@@ -528,6 +583,8 @@ async fn relying_party_rejects_non_positive_runtime_limits(pool: PgPool) {
     assert!(
         KeycloakRelyingParty::new(
             zero_browser_ttl,
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo(pool),
             rate_limiter(),
@@ -552,6 +609,8 @@ async fn begin_browser_rejects_backslash_open_redirect_variants(pool: PgPool) {
         .await;
     let rp = KeycloakRelyingParty::new(
         rp_config(&keycloak),
+        keycloak.base_url(),
+        keycloak.base_url(),
         keycloak.url("/jwks"),
         repo(pool),
         rate_limiter(),
@@ -593,6 +652,8 @@ async fn callback_rejects_state_cookie_mismatch_before_contacting_keycloak(pool:
     let rp = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo(pool),
             rate_limiter(),
@@ -639,6 +700,8 @@ async fn invalid_id_token_profiles_fail_closed(pool: PgPool) {
     let rp = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo(pool),
             rate_limiter(),
@@ -809,6 +872,8 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
     let rp = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
@@ -1022,6 +1087,8 @@ async fn suspended_account_is_refused_a_browser_session(pool: PgPool) {
     let rp = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
@@ -1155,6 +1222,8 @@ async fn inactive_project_is_refused_a_browser_session(pool: PgPool) {
     let rp = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
@@ -1298,6 +1367,8 @@ async fn browser_session_persists_the_real_authenticated_member_subject(pool: Pg
     let rp = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
@@ -1443,6 +1514,8 @@ async fn browser_session_subject_is_the_acting_account_not_the_keycloak_sub(pool
     let rp = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
@@ -1607,6 +1680,8 @@ async fn device_pairing_callback_persists_a_federated_identity_for_an_existing_a
     let rp = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
@@ -1665,6 +1740,8 @@ async fn device_pairing_callback_is_refused_for_a_subject_with_no_account(pool: 
     let rp = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
@@ -1763,6 +1840,8 @@ async fn browser_sso_callback_persists_the_same_federated_identity(pool: PgPool)
     let rp = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
@@ -1840,6 +1919,8 @@ async fn stored_token_envelope_is_not_plaintext_at_rest(pool: PgPool) {
     let rp = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
@@ -1921,6 +2002,8 @@ async fn token_envelope_does_not_open_under_the_state_encryption_key(pool: PgPoo
     let rp = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
@@ -2006,6 +2089,8 @@ async fn a_second_login_updates_the_same_federated_identity_row_and_reseals(pool
     let rp = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
             keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
@@ -2196,6 +2281,8 @@ async fn a_second_issuer_with_a_colliding_subject_is_refused_not_merged(pool: Pg
     let rp_a = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak_a),
+            keycloak_a.base_url(),
+            keycloak_a.base_url(),
             keycloak_a.url("/jwks"),
             repo.clone(),
             rate_limiter(),
@@ -2205,6 +2292,8 @@ async fn a_second_issuer_with_a_colliding_subject_is_refused_not_merged(pool: Pg
     let rp_b = Arc::new(
         KeycloakRelyingParty::new(
             rp_config(&keycloak_b),
+            keycloak_b.base_url(),
+            keycloak_b.base_url(),
             keycloak_b.url("/jwks"),
             repo.clone(),
             rate_limiter(),

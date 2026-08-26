@@ -121,7 +121,8 @@ configMaps:
           # ADR-0025 Stage 1: the ONE issuer this deployment trusts for
           # remote-subject-to-account-id translation. REQUIRED -- lightbridge-mcp refuses to
           # start without it, the same as every authz-* component. MUST match the api service's
-          # oauth2.federation.issuer (and oauth2.relying_party.issuer, where configured).
+          # oauth2.federation.issuer. There is no longer a separate `oauth2.relying_party.issuer`
+          # to also match -- that field was removed.
           federation:
             issuer: "http://keycloak:9100/realms/dev"
         server:

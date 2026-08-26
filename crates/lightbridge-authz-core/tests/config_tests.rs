@@ -1,5 +1,7 @@
 use lightbridge_authz_core::Config;
-use lightbridge_authz_core::config::{IdpServer, JwtSigning, Oauth2TokenExchange, load_from_path};
+use lightbridge_authz_core::config::{
+    Federation, IdpServer, JwtSigning, Oauth2TokenExchange, load_from_path,
+};
 use std::fs;
 
 fn unique_temp_path(name: &str) -> std::path::PathBuf {
@@ -53,6 +55,78 @@ fn oauth2_token_exchange_honors_explicit_values() {
     assert_eq!(exchange.access_ttl_seconds, 1);
     assert_eq!(exchange.refresh_ttl_seconds, 2);
     assert_eq!(exchange.allowed_scopes, vec!["openid"]);
+}
+
+/// Identity-vs-location split (ADR-0025 amendment): `discovery_url` is optional and, when unset,
+/// `Federation::effective_discovery_url` must fall back to `issuer` -- most deployments never set
+/// `discovery_url` at all, since the same address is reachable both internally and externally.
+#[test]
+fn federation_discovery_url_defaults_to_issuer_when_unset() {
+    let federation: Federation =
+        serde_yaml::from_str("issuer: \"https://keycloak.example.test/realms/dev\"\n").unwrap();
+
+    assert_eq!(federation.discovery_url, None);
+    assert_eq!(
+        federation.effective_discovery_url(),
+        "https://keycloak.example.test/realms/dev"
+    );
+}
+
+/// The counterpart to the defaulting test above: an explicit `discovery_url` must win over
+/// `issuer` -- this is the local-Compose shape (`.docker/authz/container.yaml`), where the
+/// externally-reachable issuer and the in-network discovery dial target are deliberately
+/// different addresses.
+#[test]
+fn federation_discovery_url_honors_an_explicit_value_distinct_from_issuer() {
+    let federation: Federation = serde_yaml::from_str(
+        "issuer: \"http://localhost:9100/realms/dev\"\ndiscovery_url: \"http://keycloak:9100/realms/dev\"\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        federation.discovery_url.as_deref(),
+        Some("http://keycloak:9100/realms/dev")
+    );
+    assert_eq!(
+        federation.effective_discovery_url(),
+        "http://keycloak:9100/realms/dev",
+        "an explicit discovery_url must be dialed instead of the identity issuer"
+    );
+    assert_ne!(
+        federation.effective_discovery_url(),
+        federation.issuer,
+        "precondition: this test is only meaningful when the two addresses actually differ"
+    );
+}
+
+/// `Federation::validate` applies the same offline shape check to `discovery_url` as it already
+/// does to `issuer`: non-empty, and parses as a URL. No network call.
+#[test]
+fn federation_validate_rejects_a_malformed_discovery_url() {
+    let federation: Federation = serde_yaml::from_str(
+        "issuer: \"https://keycloak.example.test/realms/dev\"\ndiscovery_url: \"not a url\"\n",
+    )
+    .unwrap();
+
+    let err = federation
+        .validate()
+        .expect_err("a discovery_url that doesn't parse as a URL must fail validation");
+    assert!(
+        format!("{err}").contains("discovery_url"),
+        "error should name the offending field"
+    );
+}
+
+/// `Federation::validate` still passes when `discovery_url` is absent -- it is genuinely optional,
+/// not "optional but validated against a hidden requirement."
+#[test]
+fn federation_validate_accepts_a_valid_config_without_discovery_url() {
+    let federation: Federation =
+        serde_yaml::from_str("issuer: \"https://keycloak.example.test/realms/dev\"\n").unwrap();
+
+    federation
+        .validate()
+        .expect("issuer alone, with no discovery_url, is a valid federation config");
 }
 
 /// ADR-0021 Decisions 1 + 10 (#442): `IdpServer.static_dir` must default to `/app/static` when

@@ -2635,6 +2635,7 @@ mod tests {
             clients: Vec::new(),
             federation: Some(lightbridge_authz_core::config::Federation {
                 issuer: "https://keycloak.example.test/realms/dev".to_string(),
+                discovery_url: None,
             }),
         }
     }

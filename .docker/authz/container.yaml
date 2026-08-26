@@ -130,13 +130,24 @@ oauth2:
     # audience: "lightbridge-api-key"
   # ADR-0025 Stage 1: the ONE issuer this deployment trusts for remote-subject-to-account-id
   # translation. Mandatory for authz-api, authz-idp, authz-opa, authz-budget, and
-  # lightbridge-mcp. Matches relying_party.issuer below: authz-idp asserts the two are equal.
+  # lightbridge-mcp. This is the ONLY issuer field -- `relying_party.issuer` was removed (it used
+  # to have to be kept byte-equal to this one by hand; that config trap is gone).
+  #
+  # `issuer` is IDENTITY: it's what a browser on the HOST reaches Keycloak at (through the
+  # `13000`-range port mapping compose.yaml publishes), what every ID token's `iss` claim carries,
+  # and what `authz-idp` validates discovery's own `issuer` against. `discovery_url` is LOCATION:
+  # where `authz-idp`'s own container dials OIDC discovery from INSIDE the compose network, where
+  # `localhost` means the container itself, not the host -- so it must use the `keycloak` service
+  # DNS name instead. Without this split, `authz-idp` cannot dial discovery at all (it would try
+  # to reach `localhost:9100` from inside its own container and get a connection refused, which
+  # surfaces as `GET /authorize` returning 502 "sign-in unavailable").
   federation:
-    issuer: "http://keycloak:9100/realms/dev"
+    issuer: "http://localhost:9100/realms/dev"
+    discovery_url: "http://keycloak:9100/realms/dev"
   # Local Compose's Keycloak RP client. The browser reaches authz-idp through localhost:13004;
-  # production must replace both callback_url and the state-encryption key.
+  # production must replace both callback_url and the state-encryption key. The identity issuer
+  # now lives solely on `oauth2.federation.issuer` above.
   relying_party:
-    issuer: "http://keycloak:9100/realms/dev"
     client_id: "authz-idp-rp"
     callback_url: "https://localhost:13004/idp/callback"
     state_encryption_key: "${KEYCLOAK_RP_STATE_ENCRYPTION_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA}"

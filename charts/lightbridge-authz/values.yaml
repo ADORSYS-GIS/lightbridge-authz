@@ -243,9 +243,16 @@ configMaps:
           audience: []
           # ADR-0025 Stage 1: the ONE issuer this deployment trusts for
           # remote-subject-to-account-id translation. REQUIRED for every alias (api/opa/idp/
-          # budget) and for lightbridge-mcp -- each refuses to start without it. Matches
-          # relying_party.issuer below: authz-idp asserts the two are equal at startup. Real
-          # deployments MUST override this from their own values repo alongside relying_party.
+          # budget) and for lightbridge-mcp -- each refuses to start without it. This is the ONLY
+          # issuer field -- `relying_party.issuer` below was removed (it used to have to be kept
+          # byte-equal to this one by hand; that config trap is gone). Real deployments MUST
+          # override this from their own values repo alongside relying_party. `discovery_url` is
+          # left unset here (defaults to `issuer`): this chart's placeholder value already points
+          # at the in-cluster `keycloak` service for both identity and discovery-dial purposes. A
+          # deployment where the externally-reachable issuer differs from the in-cluster dial
+          # target (e.g. local Compose's `localhost` vs `keycloak` split -- see
+          # `.docker/authz/container.yaml`) should set `discovery_url` explicitly to the
+          # in-cluster address.
           federation:
             issuer: "http://keycloak:9100/realms/dev"
           # REQUIRED for the `idp` alias only (ADR-0023: authz-idp is a full IdP — both this block
@@ -253,12 +260,11 @@ configMaps:
           # them). `authz-api`/`authz-opa`/`authz-budget` never read this block; it is harmless
           # dead config for their subcommands, kept in the same shared config.yaml because all
           # four aliases mount it identically (see this subchart's persistence.config). Real
-          # deployments MUST override every value here from their own values repo (issuer,
-          # callback_url, and above all state_encryption_key) — these are local-dev-shaped
-          # placeholders, not production values, mirroring config/default.yaml's own precedent for
-          # this exact block.
+          # deployments MUST override every value here from their own values repo (callback_url,
+          # and above all state_encryption_key) — these are local-dev-shaped placeholders, not
+          # production values, mirroring config/default.yaml's own precedent for this exact block.
+          # The identity issuer now lives solely on `oauth2.federation.issuer` above.
           relying_party:
-            issuer: "http://keycloak:9100/realms/dev"
             client_id: "authz-idp-rp"
             callback_url: "https://authz-idp:3000/idp/callback"
             # Development-only fixed key. Production MUST override with a unique base64url-encoded
