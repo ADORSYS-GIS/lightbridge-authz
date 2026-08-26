@@ -178,13 +178,11 @@ whatever host actually dialled them. This is what makes `federation.issuer=local
 `token_endpoint`/`jwks_uri` it can actually reach, while the `issuer` field it validates against
 stays the one fixed value every token's `iss` also carries.
 
-**Caveat:** this exact split (pinned frontend URLs, dynamic backchannel) is Keycloak's own default
-behavior in this deployment — `compose.yaml`'s `keycloak` service does not set `KC_HOSTNAME` or
-`KC_HOSTNAME_BACKCHANNEL_DYNAMIC` explicitly at commit `fb22c92` (grepped for both; neither is
-present). A sibling commit (`f785ebf`, branch `feat/idp-issuer-split-local-dev`) adds both env vars
-explicitly plus the console's callback registration described below — pin to that commit (or merge
-it) if you want the behavior above guaranteed by config rather than by Keycloak 26's current
-defaults.
+This split is guaranteed by config, not by a Keycloak default: `compose.yaml`'s `keycloak`
+service sets `KC_HOSTNAME: "http://localhost:9100"` and `KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"`.
+Verified against the running stack — dialled from the host, every endpoint is `localhost:9100`;
+dialled from inside the compose network, `issuer` and `authorization_endpoint` stay
+`localhost:9100` while `token_endpoint` and `jwks_uri` become `keycloak:9100`.
 
 `oauth2.relying_party.issuer` no longer exists on this branch — `federation.issuer` is the single
 source of the identity issuer.
@@ -226,11 +224,11 @@ needs a `SESSION_SECRET` env var (32+ chars) — generate one with `openssl rand
 
 **Keycloak callback registration.** For the console to complete `authorization_code` + PKCE against
 `test-client`, its redirect URIs (`http://localhost:3000/*`, `http://localhost:12999/*`) must be
-registered on that client. At commit `fb22c92`, `test-client`'s `redirectUris` in
-`.docker/keycloak_config/realm.json` only include `http://localhost:8081/*` (the Expo app's
-callback) — the `:3000`/`:12999` entries are added by the same `f785ebf` commit mentioned above. If
-your realm predates that commit, add them yourself: Keycloak admin (`http://localhost:9100`) →
-realm `dev` → Clients → `test-client` → Valid Redirect URIs.
+registered on that client. Both are already registered in
+`.docker/keycloak_config/realm.json` alongside the Expo app's `http://localhost:8081/*`, so a fresh
+`just up` needs no manual Keycloak step. If your realm predates this and you do not want to
+re-import, add them by hand: Keycloak admin (`http://localhost:9100`, `admin`/`password`) → realm
+`dev` → Clients → `test-client` → Valid Redirect URIs.
 
 ## 5. What you can actually test, honestly
 
