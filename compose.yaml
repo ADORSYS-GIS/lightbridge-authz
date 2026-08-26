@@ -138,6 +138,8 @@ services:
       KEYCLOAK_ADMIN_PASSWORD: password
       KC_LOG_CONSOLE_COLOR: "true"
       KC_HTTP_PORT: 9100
+      KC_HOSTNAME: "http://localhost:9100"
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
     entrypoint: /bin/sh
     command:
       - -c
