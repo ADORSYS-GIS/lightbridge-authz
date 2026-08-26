@@ -923,6 +923,9 @@ hand-written SQL and direct `sqlx` dependencies.
 ## Docs Index
 
 - Overview and quickstart: `README.md`
+- Run the whole platform locally (backend + frontend console) and test it end to end — issuer vs
+  discovery split, seeded Keycloak users, RBAC gating, honest usage-chart limitations, automated
+  suites, troubleshooting table: `docs/local-testing.md`
 - Manual end-to-end protocol (OAuth2 + OPA): `docs/test-protocol.md`
 - Authorino endpoint usage + integration test: `docs/authorino-usage.md`
 - Usage ingest/query API: `docs/usage-api.md`
