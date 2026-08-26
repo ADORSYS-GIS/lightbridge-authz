@@ -74,6 +74,21 @@ const VERIFY_RATE_LIMIT_REFILL_PER_SECOND: f64 = 1.0;
 #[derive(Clone)]
 pub struct KeycloakRelyingParty {
     config: OidcRelyingParty,
+    /// The IDENTITY issuer (ADR-0025's "the ONE issuer this deployment trusts"): the `iss` claim
+    /// value every ID token must carry, what `discover()`'s fetched `metadata.issuer` is checked
+    /// against, what `persist_federated_identity` pins as the ADR-0025 grandfather issuer, and
+    /// what the browser is ultimately sent to via the discovered `authorization_endpoint`. Sourced
+    /// from `oauth2.federation.issuer` -- see [`Self::discovery_url`]'s doc comment for the
+    /// counterpart this is deliberately kept separate from.
+    issuer: String,
+    /// WHERE to dial OIDC discovery from inside this deployment's own network -- may differ from
+    /// [`Self::issuer`] whenever the externally-reachable issuer is not itself reachable from
+    /// inside the cluster (e.g. an in-cluster Keycloak fronted by a public hostname the container
+    /// network can't resolve/route to). Sourced from `oauth2.federation.discovery_url`, defaulting
+    /// to `oauth2.federation.issuer` when unset. `discover()` dials this URL but still validates
+    /// the returned `metadata.issuer` against [`Self::issuer`] -- the identity check is never
+    /// relaxed to compare against the dial target instead.
+    discovery_url: String,
     callback_url: String,
     state_key: [u8; 32],
     /// AES-256-GCM key for [`Self::persist_federated_identity`]'s
@@ -254,6 +269,8 @@ pub struct BrowserLoginTarget {
 impl KeycloakRelyingParty {
     pub fn new(
         config: OidcRelyingParty,
+        issuer: String,
+        discovery_url: String,
         jwks_url: String,
         repo: Arc<StoreRepo>,
         rate_limiter: Arc<dyn RateLimitStore>,
@@ -344,6 +361,8 @@ impl KeycloakRelyingParty {
         );
         Ok(Self {
             config,
+            issuer,
+            discovery_url,
             callback_url,
             state_key,
             token_key,
@@ -436,10 +455,15 @@ impl KeycloakRelyingParty {
     }
 
     async fn discover(&self) -> Result<ProviderMetadata> {
-        let (metadata, _) = ProviderMetadata::discover(&self.config.issuer, self.client.clone())
+        // Dial `discovery_url` (LOCATION -- may be an internal-only address), but validate the
+        // returned document's issuer against `self.issuer` (IDENTITY -- the externally-reachable
+        // value every ID token and the browser redirect must agree on). Never relax this to
+        // compare against `discovery_url` instead: that would let a deployment's internal dial
+        // target silently become the trusted issuer.
+        let (metadata, _) = ProviderMetadata::discover(&self.discovery_url, self.client.clone())
             .await
             .map_err(|e| Error::Server(format!("Keycloak discovery unavailable: {e}")))?;
-        if metadata.issuer != self.config.issuer {
+        if metadata.issuer != self.issuer {
             return Err(Error::Server(
                 "Keycloak discovery issuer mismatch".to_string(),
             ));
@@ -624,11 +648,11 @@ impl KeycloakRelyingParty {
                         .map(|seconds| now + ChronoDuration::seconds(seconds)),
                     scope: token.scope.clone(),
                 },
-                // ADR-0025: `self.config.issuer` IS the grandfather pin here -- `start_idp_server`
-                // (`lib.rs`) already refuses to start unless `oauth2.federation.issuer` equals
-                // `oauth2.relying_party.issuer`, so this RP's own configured issuer is always the
-                // deployment's one designated grandfather issuer.
-                &self.config.issuer,
+                // ADR-0025: `self.issuer` IS the grandfather pin here -- it is sourced from
+                // `oauth2.federation.issuer`, the one issuer this deployment trusts for
+                // remote-subject-to-account-id translation (there is no longer a separate
+                // `oauth2.relying_party.issuer` to drift from it).
+                &self.issuer,
             )
             .await
     }
@@ -643,7 +667,7 @@ impl KeycloakRelyingParty {
         }
         let mut validation = Validation::new(ACCEPTED_ALGORITHMS[0]);
         validation.algorithms = ACCEPTED_ALGORITHMS.to_vec();
-        validation.set_issuer(&[self.config.issuer.as_str()]);
+        validation.set_issuer(&[self.issuer.as_str()]);
         validation.set_audience(&[self.config.client_id.as_str()]);
         let claims: IdTokenClaims = validate_jwt_generic(token, &self.jwks, &validation)
             .await

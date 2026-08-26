@@ -71,6 +71,7 @@ fn oauth2_config(jwks_url: String, audience: Option<Vec<String>>, rbac: Rbac) ->
         clients: Vec::new(),
         federation: Some(lightbridge_authz_core::config::Federation {
             issuer: "https://keycloak.example.test/realms/dev".to_string(),
+            discovery_url: None,
         }),
     }
 }

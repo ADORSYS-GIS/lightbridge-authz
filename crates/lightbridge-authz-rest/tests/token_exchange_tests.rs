@@ -310,7 +310,6 @@ fn relying_party_with_issuer(repo: Arc<StoreRepo>, issuer: &str) -> Arc<Keycloak
     Arc::new(
         KeycloakRelyingParty::new(
             OidcRelyingParty {
-                issuer: issuer.to_string(),
                 client_id: "authz-idp-rp".to_string(),
                 callback_url: "https://authz.example.test/idp/callback".to_string(),
                 client_secret: None,
@@ -319,6 +318,8 @@ fn relying_party_with_issuer(repo: Arc<StoreRepo>, issuer: &str) -> Arc<Keycloak
                 timeout_ms: 500,
                 browser_session_ttl_seconds: 28_800,
             },
+            issuer.to_string(),
+            issuer.to_string(),
             format!("{issuer}/jwks"),
             repo,
             Arc::new(InMemoryRateLimitStore::new()),

@@ -132,13 +132,19 @@ oauth2:
   # ADR-0025 Stage 1: the ONE issuer this deployment trusts for remote-subject-to-account-id
   # translation (StoreRepo::resolve_account_for_federated_subject). Mandatory for authz-api,
   # authz-idp, authz-opa, authz-budget, and lightbridge-mcp -- each refuses to start without it.
-  # Matches relying_party.issuer below: authz-idp asserts the two are equal at startup.
+  # This is now the ONLY issuer field: `relying_party.issuer` was removed (it used to have to be
+  # kept byte-equal to this one by hand -- that config trap is gone). `discovery_url` is left
+  # unset here and defaults to `issuer`: this file runs binaries directly on the host (see
+  # "Running Locally (Without Compose)" in AGENTS.md), so the same `localhost:9100` address is
+  # reachable both for the browser/host tooling AND for the process's own discovery dial -- there
+  # is no internal-vs-external network split to express here (contrast
+  # `.docker/authz/container.yaml`, which sets `discovery_url` to the in-network Keycloak address).
   federation:
     issuer: "http://localhost:9100/realms/dev"
   # Outbound Keycloak OIDC RP used by /device/verify. This is deliberately distinct from
-  # `issuance`: it is an interactive PKCE client, not a token-exchange service account.
+  # `issuance`: it is an interactive PKCE client, not a token-exchange service account. The
+  # identity issuer now lives solely on `oauth2.federation.issuer` above.
   relying_party:
-    issuer: "http://localhost:9100/realms/dev"
     client_id: "authz-idp-rp"
     callback_url: "https://localhost:13004/idp/callback"
     # Development-only fixed key. Production MUST set a unique base64url-encoded 32-byte key.

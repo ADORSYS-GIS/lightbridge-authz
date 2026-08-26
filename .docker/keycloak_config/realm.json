@@ -102,7 +102,9 @@
       "redirectUris": [
         "http://localhost:8081",
         "http://localhost:8081/*",
-        "http://localhost:8081/auth"
+        "http://localhost:8081/auth",
+        "http://localhost:3000/*",
+        "http://localhost:12999/*"
       ],
       "webOrigins": [
         "+"
@@ -173,7 +175,8 @@
         "standard.token.exchange.enabled": "true",
         "oauth2.device.authorization.grant.enabled": "false",
         "backchannel.logout.revoke.offline.tokens": "false",
-        "use.offline.access.token.by.default": "true"
+        "use.offline.access.token.by.default": "true",
+        "post.logout.redirect.uris": "http://localhost:3000/*##http://localhost:12999/*"
       },
       "authenticationFlowBindingOverrides": {},
       "fullScopeAllowed": true,

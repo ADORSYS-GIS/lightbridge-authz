@@ -78,6 +78,12 @@ fn bad_tls() -> Tls {
     }
 }
 
+/// The single issuer identity every offline fixture in this file agrees on -- `external_oauth2()`'s
+/// `federation.issuer` and `offline_relying_party()`'s issuer argument both use this constant, so
+/// there is exactly one place to change it (no more hand-kept-in-sync `relying_party.issuer` field
+/// to drift from `federation.issuer`, now that the config-level equality trap is gone).
+const WORKING_ISSUER: &str = "https://keycloak.example.test";
+
 fn signing_cfg() -> JwtSigning {
     JwtSigning {
         issuer: "https://authz-idp.example.test".to_string(),
@@ -103,12 +109,13 @@ fn external_oauth2() -> Oauth2 {
         relying_party: None,
         rbac: Default::default(),
         clients: Vec::new(),
-        // Matches `working_relying_party()`'s own `issuer` below, so `full_idp_oauth2()` (which
-        // sets `relying_party = Some(working_relying_party())`) satisfies `start_idp_server`'s
-        // `federation.issuer == relying_party.issuer` check by default -- tests that need a
-        // mismatch override this field explicitly.
+        // Matches `offline_relying_party()`'s issuer argument, so `full_idp_oauth2()` builds a
+        // consistent identity across `federation.issuer` and the offline `KeycloakRelyingParty` --
+        // there is no longer a `relying_party.issuer` field for this to drift against; the config
+        // trap that check used to guard against is gone along with the duplicated field.
         federation: Some(lightbridge_authz_core::config::Federation {
-            issuer: "https://keycloak.example.test".to_string(),
+            issuer: WORKING_ISSUER.to_string(),
+            discovery_url: None,
         }),
     }
 }
@@ -489,7 +496,6 @@ fn token_exchange_oauth2() -> Oauth2 {
 /// `mod db` covers the deliberately-broken case).
 fn working_relying_party() -> lightbridge_authz_core::config::OidcRelyingParty {
     lightbridge_authz_core::config::OidcRelyingParty {
-        issuer: "https://keycloak.example.test".to_string(),
         client_id: "authz-idp-rp".to_string(),
         callback_url: "https://authz-idp.example.test/idp/callback".to_string(),
         client_secret: None,
@@ -512,6 +518,8 @@ fn offline_relying_party(
     Arc::new(
         lightbridge_authz_rest::relying_party::KeycloakRelyingParty::new(
             working_relying_party(),
+            WORKING_ISSUER.to_string(),
+            WORKING_ISSUER.to_string(),
             "https://keycloak.example.test/jwks".to_string(),
             repo,
             Arc::new(cratestack_axum::ratelimit::InMemoryRateLimitStore::new()),
@@ -1521,11 +1529,6 @@ mod db {
     /// (here: a `state_encryption_key` that isn't 32 bytes once base64url-decoded).
     fn invalid_relying_party_cfg() -> lightbridge_authz_core::config::OidcRelyingParty {
         lightbridge_authz_core::config::OidcRelyingParty {
-            // Must MATCH the fixture default's `federation.issuer` -- ADR-0025's
-            // startup equality check runs before `KeycloakRelyingParty::new`, and this
-            // fixture exists to reach new()'s own state-key validation, not the
-            // federation check (which has its own dedicated mismatch test).
-            issuer: "https://keycloak.example.test".to_string(),
             client_id: "authz-idp".to_string(),
             callback_url: "https://authz.example.test/oauth2/callback".to_string(),
             client_secret: None,
@@ -1845,24 +1848,23 @@ mod db {
         assert!(message.contains("authz-idp"), "got: {message}");
     }
 
-    /// ADR-0025 Stage 1: `authz-idp` seals `federated_identities` rows under
-    /// `oauth2.relying_party.issuer` (the browser-SSO login callback), but
-    /// `resolve_account_for_federated_subject` grandfathers against `oauth2.federation.issuer`.
-    /// A deployment where the two drift would mint federated identity rows this service can
-    /// never resolve back through the ADR-0025 seam -- proves `start_idp_server` refuses to
-    /// start in that state rather than silently running with an unreachable identity.
+    /// Identity-vs-location split (this branch): `oauth2.relying_party.issuer` was deleted --
+    /// `oauth2.federation.issuer` is now the ONE issuer field, and `oauth2.federation.discovery_url`
+    /// is a separate, optional LOCATION override for where `authz-idp` dials OIDC discovery from.
+    /// Before this change, the analogous scenario -- the deployment's two issuer-shaped config
+    /// values disagreeing -- was a hard startup failure (`idp_refuses_when_federation_issuer_
+    /// differs_from_relying_party_issuer`, deleted by this same change). That failure mode no
+    /// longer exists: a `federation.discovery_url` that names a different URL than
+    /// `federation.issuer` is now the INTENDED shape for a deployment where the two network planes
+    /// diverge (see `Federation::discovery_url`'s doc comment), so `start_idp_server` must start
+    /// successfully rather than refuse.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn idp_refuses_when_federation_issuer_differs_from_relying_party_issuer(pool: PgPool) {
+    async fn idp_starts_when_federation_discovery_url_differs_from_issuer(pool: PgPool) {
         let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
         let mut oauth2 = full_idp_oauth2();
-        assert_eq!(
-            oauth2.federation.as_ref().map(|f| f.issuer.as_str()),
-            oauth2.relying_party.as_ref().map(|rp| rp.issuer.as_str()),
-            "precondition: full_idp_oauth2()'s federation and relying_party issuers must agree \
-             before this test deliberately breaks that agreement"
-        );
         oauth2.federation = Some(lightbridge_authz_core::config::Federation {
-            issuer: "https://a-different-issuer.example.test".to_string(),
+            issuer: WORKING_ISSUER.to_string(),
+            discovery_url: Some("https://internal-keycloak.example.test".to_string()),
         });
         let idp = IdpServer {
             address: "127.0.0.1".to_string(),
@@ -1870,20 +1872,16 @@ mod db {
             tls: bad_tls(),
             static_dir: TEST_STATIC_DIR.to_string(),
         };
-        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg())
-            .await
-            .expect_err(
-                "a federation.issuer that disagrees with relying_party.issuer must be a hard \
-                 startup failure for authz-idp",
-            );
+        let result = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg()).await;
+        let err = result.expect_err(
+            "bad TLS cert paths still fail startup after the relying-party/federation checks \
+             pass -- this proves the discovery_url-vs-issuer divergence itself was NOT the cause",
+        );
         let message = format!("{err}");
         assert!(
-            message.contains("oauth2.federation.issuer"),
-            "got: {message}"
-        );
-        assert!(
-            message.contains("oauth2.relying_party.issuer"),
-            "got: {message}"
+            !message.to_lowercase().contains("issuer"),
+            "a federation.discovery_url that differs from federation.issuer must not be treated \
+             as an error anymore: got {message}"
         );
     }
 

@@ -281,6 +281,39 @@ only if this PR's own fixtures happen to agree.
   guards (ADR-0024) are what make a second issuer's arrival safe to configure later, not something
   this ADR needs to solve today.
 
+## Amendment: identity vs. location, and the single-issuer field (2026-08-26)
+
+`oauth2.federation.issuer` was originally kept byte-equal, by a dedicated startup assertion in
+`start_idp_server`, to a SECOND field: `oauth2.relying_party.issuer`. That second field did four
+jobs across two different network planes:
+
+1. the discovery DIAL target (`ProviderMetadata::discover(&self.config.issuer, ..)`) — INTERNAL
+   network;
+2. the expected issuer in the discovery doc;
+3. the ID-token `iss` validation;
+4. the ADR-0025 grandfather-adoption pin this ADR's Decision describes above.
+
+Jobs 2-4, plus the browser redirect to the discovered `authorization_endpoint`, are IDENTITY (must
+be the externally-reachable issuer — what a token validates against, what a browser is sent to).
+Only job 1 is LOCATION (must be reachable from inside this deployment's own network). Conflating
+them meant a deployment where internal ≠ external could not start `authz-idp` at all: pointing the
+issuer at the external address made the RP-leg dial that same external address from inside its own
+container, which failed with connection-refused, surfacing as `GET /authorize` returning 502
+"sign-in unavailable".
+
+**Decision (repo owner): one issuer field, `oauth2.federation.issuer`.** `oauth2.relying_party.issuer`
+is REMOVED — not deprecated, not defaulted-off. `Federation` gains `discovery_url: Option<String>`,
+defaulting to `issuer` when unset, naming WHERE to dial OIDC discovery
+(`Federation::effective_discovery_url`). `KeycloakRelyingParty::discover`
+(`crates/lightbridge-authz-rest/src/relying_party.rs`) dials `discovery_url` but still validates
+the returned document's `issuer` against `federation.issuer` — the identity check is never relaxed
+to compare against the dial target instead; a discovery document whose issuer disagrees with
+`federation.issuer` is still refused, exactly as before. The startup assertion that used to compare
+`federation.issuer` to `relying_party.issuer` is deleted outright: with one field, there is nothing
+left to compare. See `docs/auth-reference.md`'s "Identity vs. location" section for the config-key
+reference, and `.docker/authz/container.yaml` for the worked local-Compose example (external
+`localhost:9100` identity, internal `keycloak:9100` discovery dial).
+
 ## ADR-0039 reconciliation
 
 ADR-0039 bans MINTING a new id in any format other than `cuid2()`; it does not ban STORING an id

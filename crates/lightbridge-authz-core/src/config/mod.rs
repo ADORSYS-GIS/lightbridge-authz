@@ -774,16 +774,28 @@ pub enum Oauth2Type {
 /// different dependency.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Federation {
-    /// The issuer URL every ADR-0025 ingress translation grandfathers a pre-ADR-0024
-    /// (`accounts.id == subject`) account against on its first resolution -- see
-    /// `StoreRepo::resolve_account_for_federated_subject`'s doc comment for the self-healing
-    /// adoption this enables. `authz-idp` additionally asserts this equals
-    /// `oauth2.relying_party.issuer`: a mismatch there would mean a subject presented via the
-    /// RP-leg login callback (which seals `federated_identities` rows under
-    /// `oauth2.relying_party.issuer`) can never be resolved via this issuer -- a permanently
-    /// un-matchable federated identity row -- so `authz-idp` refuses to start rather than run in
-    /// that state.
+    /// The IDENTITY issuer (ADR-0025's "the ONE issuer this deployment trusts"): the `iss` claim
+    /// value every ID token must carry, what `authz-idp`'s Keycloak discovery response is checked
+    /// against, what the browser is ultimately sent to via the discovered
+    /// `authorization_endpoint`, and the issuer URL every ADR-0025 ingress translation
+    /// grandfathers a pre-ADR-0024 (`accounts.id == subject`) account against on its first
+    /// resolution -- see `StoreRepo::resolve_account_for_federated_subject`'s doc comment for the
+    /// self-healing adoption this enables. This is deliberately NOT the address `authz-idp` dials
+    /// to fetch OIDC discovery -- see [`Self::discovery_url`] for that, and why the two can
+    /// legitimately differ. There is no longer a separate `oauth2.relying_party.issuer` this must
+    /// be kept equal to (that field was deleted); this is the one and only issuer field.
     pub issuer: String,
+    /// WHERE `authz-idp` dials OIDC discovery from inside this deployment's own network. Defaults
+    /// to [`Self::issuer`] when unset -- most deployments don't need this at all, since most
+    /// issuers are reachable at the same address internally and externally. Set this only when
+    /// they diverge: e.g. a local-dev stack where the browser and host-side tooling reach
+    /// Keycloak via `http://localhost:9100/realms/dev` but `authz-idp`'s own container must dial
+    /// it via the in-network `http://keycloak:9100/realms/dev` instead. `discover()`
+    /// (`KeycloakRelyingParty`) fetches from this URL but still validates the returned
+    /// `metadata.issuer` against [`Self::issuer`] -- the identity check is never relaxed to
+    /// compare against this LOCATION value instead.
+    #[serde(default)]
+    pub discovery_url: Option<String>,
 }
 
 impl Federation {
@@ -792,7 +804,9 @@ impl Federation {
     /// live reachability check" posture `oauth2.relying_party`/`KeycloakRelyingParty::new`
     /// already applies to a config-sourced external-IdP URL, for the identical reason
     /// AGENTS.md's "Redis is a mandatory dependency" house rule gives for its own presence-only
-    /// enforcement: no startup-ordering dependency on a third party being reachable yet.
+    /// enforcement: no startup-ordering dependency on a third party being reachable yet. Applies
+    /// the identical shape check to `discovery_url` when set (non-empty, valid URL) -- it is just
+    /// as much an offline-checkable deployment value as `issuer` is.
     pub fn validate(&self) -> Result<()> {
         if self.issuer.trim().is_empty() {
             return Err(Error::Server(
@@ -802,7 +816,26 @@ impl Federation {
         url::Url::parse(&self.issuer).map_err(|e| {
             Error::Server(format!("oauth2.federation.issuer must be a valid URL: {e}"))
         })?;
+        if let Some(discovery_url) = &self.discovery_url {
+            if discovery_url.trim().is_empty() {
+                return Err(Error::Server(
+                    "oauth2.federation.discovery_url must not be empty when set".to_string(),
+                ));
+            }
+            url::Url::parse(discovery_url).map_err(|e| {
+                Error::Server(format!(
+                    "oauth2.federation.discovery_url must be a valid URL: {e}"
+                ))
+            })?;
+        }
         Ok(())
+    }
+
+    /// WHERE to dial OIDC discovery -- [`Self::discovery_url`] when set, otherwise
+    /// [`Self::issuer`]. See [`Self::discovery_url`]'s doc comment for the identity-vs-location
+    /// split this resolves.
+    pub fn effective_discovery_url(&self) -> &str {
+        self.discovery_url.as_deref().unwrap_or(&self.issuer)
     }
 }
 
@@ -873,8 +906,6 @@ pub struct Oauth2 {
 /// Configuration for `authz-idp` acting as a Keycloak OIDC relying party (ADR-0012, ADR-0021).
 #[derive(Debug, Clone, Deserialize)]
 pub struct OidcRelyingParty {
-    /// Keycloak realm issuer, used for discovery and the mandatory ID-token issuer check.
-    pub issuer: String,
     /// Registered Keycloak client ID. The ID-token audience must contain this exact value.
     pub client_id: String,
     /// The one fixed callback Keycloak is allowed to redirect to. This value is deployment

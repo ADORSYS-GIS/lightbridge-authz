@@ -1,5 +1,8 @@
 # Lightbridge Authz
 
+**Start here:** [`docs/local-testing.md`](docs/local-testing.md) — run the whole platform locally
+(backend + frontend console) and test it end to end.
+
 Lightbridge Authz is a multi-service backend for API key management and usage analytics:
 - `authz-api` and `authz-opa` handle key lifecycle and validation.
 - `lightbridge-authz-usage` ingests OTEL traffic data and serves Timescale-backed usage analytics.

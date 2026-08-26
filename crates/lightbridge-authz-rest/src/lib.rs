@@ -3085,27 +3085,23 @@ pub async fn start_idp_server(
         Error::Server(
             "oauth2.relying_party is required for authz-idp -- it is a full IdP: /authorize, \
              /device/verify and /idp/callback are always mounted and discovery always advertises \
-             authorization_endpoint. Set the oauth2.relying_party block (issuer, client_id, \
-             callback_url, state_encryption_key)."
+             authorization_endpoint. Set the oauth2.relying_party block (client_id, callback_url, \
+             state_encryption_key)."
                 .to_string(),
         )
     })?;
-    // ADR-0025 Stage 1: `authz-idp` seals `federated_identities` rows under
-    // `oauth2.relying_party.issuer` (the browser-SSO login callback), but
-    // `resolve_account_for_federated_subject` grandfathers against `federation.issuer`. A
-    // deployment where these two drift would mint federated identity rows this service can never
-    // resolve back through the ADR-0025 seam -- so a mismatch is a hard startup failure, checked
-    // once, here, before either value is used further.
-    if federation.issuer != rp_config.issuer {
-        return Err(Error::Server(format!(
-            "oauth2.federation.issuer ('{}') must equal oauth2.relying_party.issuer ('{}') for \
-             authz-idp -- a mismatch would mint federated identity rows this service can never \
-             resolve back through the ADR-0025 translation seam",
-            federation.issuer, rp_config.issuer
-        )));
-    }
+    // ADR-0025 Stage 1: `authz-idp` seals `federated_identities` rows under, and validates ID
+    // tokens against, `oauth2.federation.issuer` -- the ONE issuer field this deployment trusts
+    // (there is no longer a separate `oauth2.relying_party.issuer` for it to drift from; that
+    // field was deleted, closing the config trap where the two had to be kept byte-equal by
+    // hand). `oauth2.federation.discovery_url` is a distinct, optional LOCATION override for
+    // where `authz-idp` dials OIDC discovery from inside this deployment's own network -- see
+    // `KeycloakRelyingParty::discover`'s doc comment for why that dial target and the identity
+    // issuer are kept separate.
     let relying_party = Arc::new(relying_party::KeycloakRelyingParty::new(
         rp_config,
+        federation.issuer.clone(),
+        federation.effective_discovery_url().to_string(),
         oauth2.jwks_url.clone(),
         Arc::new(StoreRepo::new(pool.clone())),
         device_verify_rate_limit_store,
@@ -3639,6 +3635,7 @@ mod tests {
             clients: Vec::new(),
             federation: Some(lightbridge_authz_core::config::Federation {
                 issuer: "https://keycloak.example.test/realms/dev".to_string(),
+                discovery_url: None,
             }),
         }
     }

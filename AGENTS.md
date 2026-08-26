@@ -575,6 +575,13 @@ Key config fields:
   MUST differ from `oauth2.relying_party.state_encryption_key` — `KeycloakRelyingParty::new`
   refuses to start otherwise. Seals the Keycloak token set at rest; rotating it makes every
   previously-sealed row permanently unopenable (treated as "no stored token", never deleted).
+- `oauth2.federation.issuer` (ADR-0025) is the ONE issuer field — the `iss` claim value, what the
+  browser is sent to, what tokens validate against. `oauth2.relying_party.issuer` was REMOVED (it
+  used to have to be kept byte-equal to this by hand). `oauth2.federation.discovery_url` (optional,
+  defaults to `issuer`) is a separate LOCATION override for where `authz-idp` dials OIDC discovery
+  from inside this deployment's own network — see `docs/auth-reference.md`'s "Identity vs.
+  location" section and ADR-0025's amendment for the full story, and
+  `.docker/authz/container.yaml` for the local-Compose example where the two diverge.
 
 ### CBOR is the only transport codec for the RPC/CRUD surface (ADR-0013)
 
@@ -916,6 +923,9 @@ hand-written SQL and direct `sqlx` dependencies.
 ## Docs Index
 
 - Overview and quickstart: `README.md`
+- Run the whole platform locally (backend + frontend console) and test it end to end — issuer vs
+  discovery split, seeded Keycloak users, RBAC gating, honest usage-chart limitations, automated
+  suites, troubleshooting table: `docs/local-testing.md`
 - Manual end-to-end protocol (OAuth2 + OPA): `docs/test-protocol.md`
 - Authorino endpoint usage + integration test: `docs/authorino-usage.md`
 - Usage ingest/query API: `docs/usage-api.md`

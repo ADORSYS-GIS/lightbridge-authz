@@ -285,12 +285,14 @@ def drive_keycloak_login(authorize_location: str, cookies: CookieJar) -> str:
     returning the `Location` of the resulting redirect back to `authz-idp` (either `/idp/callback`
     directly, for a fresh Keycloak session, or an intermediate consent/step page -- this deployment
     has none configured, so it is always the callback)."""
-    status, headers, body = http_raw("GET", authorize_location, cookies=cookies)
+    status, headers, body = http_raw(
+        "GET", to_in_network(authorize_location), cookies=cookies
+    )
     assert status == 200, f"keycloak login page failed: status={status}"
     action = parse_login_form_action(body.decode("utf-8"))
     status, headers, _ = http_form(
         "POST",
-        action,
+        to_in_network(action),
         {"username": USERNAME, "password": PASSWORD, "credentialId": ""},
         cookies=cookies,
     )
@@ -301,18 +303,34 @@ def drive_keycloak_login(authorize_location: str, cookies: CookieJar) -> str:
 
 
 def to_in_network(url: str) -> str:
-    """Rewrites a browser-facing `https://localhost:13004/...` callback URL -- the RP's configured
-    `callback_url` that Keycloak echoes back -- to the in-network `authz-idp` address this container
-    can actually reach. A real browser on the host resolves `localhost:13004` to `authz-idp` via the
-    published port; inside the compose network this container's own `localhost:13004` has nothing
-    listening (ECONNREFUSED), and the RP state cookie is bound to the `authz-idp` origin the initial
-    `/authorize` was served from -- so both reachability and cookie continuity require this swap.
-    Path and query (`code`/`state`) are preserved untouched."""
+    """Rewrites a browser-facing URL to the in-network address this container can actually reach.
+
+    Two hosts need this, both for the same reason -- a frontchannel URL is built for a browser on
+    the HOST, and this runner is a container:
+
+    - `https://localhost:13004/idp/callback` -- the RP's configured `callback_url`, echoed back by
+      Keycloak -> `authz-idp:3004`.
+    - `http://localhost:9100/...` -- Keycloak's own frontchannel endpoints. Compose sets
+      `KC_HOSTNAME=http://localhost:9100` (+ `KC_HOSTNAME_BACKCHANNEL_DYNAMIC`) so Keycloak stamps
+      ONE stable external issuer while still handing in-network callers container-reachable
+      backchannel URLs; that makes `authorization_endpoint` and every login-form action point at
+      `localhost:9100`, which inside this container is the container itself -> `keycloak:9100`.
+
+    A real browser on the host resolves both via the published ports; A real browser on the host resolves `localhost:13004` to `authz-idp` via the
+    published port; inside the compose network they are
+    ECONNREFUSED, and the RP state cookie is additionally bound to the `authz-idp` origin the
+    initial `/authorize` was served from -- so both reachability and cookie continuity require these
+    swaps. Path and query (`code`/`state`) are preserved untouched."""
     parts = urllib.parse.urlsplit(url)
     if parts.hostname == "localhost" and parts.port == 13004:
         idp = urllib.parse.urlsplit(IDP_URL)
         return urllib.parse.urlunsplit(
             (idp.scheme, idp.netloc, parts.path, parts.query, parts.fragment)
+        )
+    if parts.hostname == "localhost" and parts.port == 9100:
+        kc = urllib.parse.urlsplit(KEYCLOAK_URL)
+        return urllib.parse.urlunsplit(
+            (kc.scheme, kc.netloc, parts.path, parts.query, parts.fragment)
         )
     return url
 
