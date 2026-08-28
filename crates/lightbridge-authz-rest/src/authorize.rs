@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use authkestra_engine::auth::state::Identity;
-use authkestra_op::client::GrantType;
+use authkestra_op::client::{ClientRegistration, GrantType, TokenEndpointAuthMethod};
 use authkestra_op::handlers::{AuthorizeOutcome, AuthorizeRequest, handle_authorize};
 use axum::Router;
 use axum::extract::{OriginalUri, Query, State};
@@ -68,6 +68,43 @@ impl From<BrowserAuthorizeRequest> for AuthorizeRequest {
     }
 }
 
+/// RFC 8252 §8.3 loopback redirect-URI carve-out for native apps.
+///
+/// A native app binds a **random** loopback port, so its redirect URI
+/// (`http://127.0.0.1:{port}/callback`) cannot be exact-matched against a
+/// fixed registration. `ClientRegistration::allows_redirect_uri` is
+/// exact-string-match only (no wildcards), so we carve out loopback URIs in
+/// addition to that check.
+///
+/// The carve-out is deliberately narrow:
+/// - **Public clients only** (`NoAuth`) — the only shape a native app can
+///   take (it ships to laptops and holds no secret).
+/// - **Only if the client registered a loopback redirect URI** — registering
+///   `http://127.0.0.1` is the operator's explicit "this is a native app"
+///   signal. A public client that registered only a real callback URL does
+///   not suddenly gain loopback redirects.
+/// - **Loopback hosts only** (`127.0.0.1`, `::1`, `localhost`) and `http`
+///   scheme only, any port — exactly what RFC 8252 §8.3 prescribes.
+fn is_loopback_redirect(client: &ClientRegistration, redirect_uri: &str) -> bool {
+    if client.token_endpoint_auth_method != Some(TokenEndpointAuthMethod::NoAuth) {
+        return false;
+    }
+    let registered_loopback = client.redirect_uris.iter().any(|u| is_loopback_uri(u));
+    registered_loopback && is_loopback_uri(redirect_uri)
+}
+
+fn is_loopback_uri(uri: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(uri) else {
+        return false;
+    };
+    // `host_str()` returns IPv6 addresses WITH brackets (e.g. `[::1]`), so match both.
+    url.scheme() == "http"
+        && matches!(
+            url.host_str(),
+            Some("127.0.0.1" | "::1" | "[::1]" | "localhost")
+        )
+}
+
 pub fn router<S>(state: AuthorizeState) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -96,7 +133,9 @@ async fn authorize(
         Ok(None) => return direct_error(StatusCode::BAD_REQUEST, "unknown client"),
         Err(_) => return direct_error(StatusCode::INTERNAL_SERVER_ERROR, "client lookup failed"),
     };
-    if !client.allows_redirect_uri(&request.redirect_uri) {
+    if !client.allows_redirect_uri(&request.redirect_uri)
+        && !is_loopback_redirect(&client, &request.redirect_uri)
+    {
         return direct_error(StatusCode::BAD_REQUEST, "invalid redirect_uri");
     }
     if request.response_type != "code" || !client.allows_grant_type(&GrantType::AuthorizationCode) {
@@ -410,5 +449,80 @@ mod tests {
 
         let appended = append_session_state(success_location, "deadbeef.salt");
         assert!(appended.contains("session_state=deadbeef.salt"));
+    }
+
+    // --- RFC 8252 §8.3 loopback redirect-URI carve-out (lightbridge-governance#168) ---
+
+    fn public_client_with_loopback() -> ClientRegistration {
+        ClientRegistration {
+            client_id: "governance-auth-cli".into(),
+            client_secret_hash: None,
+            redirect_uris: vec!["http://127.0.0.1".into()],
+            grant_types: vec![GrantType::AuthorizationCode],
+            scopes: vec!["openid".into()],
+            require_pkce: true,
+            allowed_audiences: vec![],
+            token_endpoint_auth_method: Some(TokenEndpointAuthMethod::NoAuth),
+            jwks: None,
+        }
+    }
+
+    fn public_client_without_loopback() -> ClientRegistration {
+        let mut c = public_client_with_loopback();
+        c.redirect_uris = vec!["https://rp.example.test/callback".into()];
+        c
+    }
+
+    fn confidential_client_with_loopback() -> ClientRegistration {
+        let mut c = public_client_with_loopback();
+        c.token_endpoint_auth_method = Some(TokenEndpointAuthMethod::PrivateKeyJwt);
+        c
+    }
+
+    #[test]
+    fn loopback_carveout_accepts_a_dynamic_port_for_a_public_native_app() {
+        let client = public_client_with_loopback();
+        // A random loopback port cannot be exact-matched, but the carve-out allows it.
+        assert!(is_loopback_redirect(&client, "http://127.0.0.1:54321/callback"));
+        assert!(is_loopback_redirect(&client, "http://localhost:8080/callback"));
+        assert!(is_loopback_redirect(&client, "http://[::1]:9000/callback"));
+    }
+
+    #[test]
+    fn loopback_carveout_requires_a_registered_loopback_uri() {
+        // A public client that registered only a real callback URL must NOT gain
+        // loopback redirects -- the registered loopback URI is the native-app signal.
+        let client = public_client_without_loopback();
+        assert!(!is_loopback_redirect(&client, "http://127.0.0.1:54321/callback"));
+    }
+
+    #[test]
+    fn loopback_carveout_is_public_clients_only() {
+        // A confidential client must never get the loopback carve-out, even if it
+        // registered a loopback URI.
+        let client = confidential_client_with_loopback();
+        assert!(!is_loopback_redirect(&client, "http://127.0.0.1:54321/callback"));
+    }
+
+    #[test]
+    fn loopback_carveout_rejects_non_loopback_and_non_http() {
+        let client = public_client_with_loopback();
+        // Non-loopback host.
+        assert!(!is_loopback_redirect(&client, "https://rp.example.test/callback"));
+        // Loopback host but https scheme (RFC 8252 §8.3 is http-only for loopback).
+        assert!(!is_loopback_redirect(&client, "https://127.0.0.1:54321/callback"));
+        // Unparseable.
+        assert!(!is_loopback_redirect(&client, "not a url"));
+    }
+
+    #[test]
+    fn is_loopback_uri_identifies_loopback_hosts() {
+        assert!(is_loopback_uri("http://127.0.0.1"));
+        assert!(is_loopback_uri("http://127.0.0.1:54321/callback"));
+        assert!(is_loopback_uri("http://localhost:8080"));
+        assert!(is_loopback_uri("http://[::1]:9000"));
+        assert!(!is_loopback_uri("https://127.0.0.1/callback"));
+        assert!(!is_loopback_uri("https://rp.example.test/callback"));
+        assert!(!is_loopback_uri("not a url"));
     }
 }
