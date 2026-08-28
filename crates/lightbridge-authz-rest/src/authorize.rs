@@ -47,16 +47,24 @@ struct BrowserAuthorizeRequest {
 
 impl From<BrowserAuthorizeRequest> for AuthorizeRequest {
     fn from(value: BrowserAuthorizeRequest) -> Self {
-        Self {
-            client_id: value.client_id,
-            redirect_uri: value.redirect_uri,
-            response_type: value.response_type,
-            scope: value.scope,
-            state: value.state,
-            code_challenge: value.code_challenge,
-            code_challenge_method: value.code_challenge_method,
-            nonce: value.nonce,
-        }
+        // `AuthorizeRequest` is `#[non_exhaustive]` upstream with NO constructor and no
+        // `Default` -- marcjazz/authkestra#271 added constructors to code.rs/device.rs/refresh.rs/
+        // token.rs/attestation.rs but missed handlers/authorize.rs, so a literal and functional-
+        // update syntax are both refused cross-crate. It does derive `Deserialize`, and serde's
+        // generated impl lives INSIDE that crate, so deserialization is the one construction path
+        // still open to us. Replace this with `AuthorizeRequest::new(..)` the moment upstream
+        // adds one -- this is a workaround for a gap, not a preferred idiom.
+        serde_json::from_value(serde_json::json!({
+            "client_id": value.client_id,
+            "redirect_uri": value.redirect_uri,
+            "response_type": value.response_type,
+            "scope": value.scope,
+            "state": value.state,
+            "code_challenge": value.code_challenge,
+            "code_challenge_method": value.code_challenge_method,
+            "nonce": value.nonce,
+        }))
+        .expect("AuthorizeRequest is built from its own field types, so this cannot fail")
     }
 }
 

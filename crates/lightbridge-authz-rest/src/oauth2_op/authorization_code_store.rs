@@ -76,17 +76,20 @@ impl AuthorizationCodeStore for DbAuthorizationCodeStore {
             })?;
         row.map(|row| {
             serde_json::from_value::<Identity>(row.identity)
-                .map(|identity| AuthorizationCode {
-                    code: code.to_owned(),
-                    client_id: row.client_id,
-                    redirect_uri: row.redirect_uri,
-                    scope: row.scope,
-                    code_challenge: row.code_challenge,
-                    code_challenge_method: row.code_challenge_method,
-                    nonce: row.nonce,
-                    identity,
-                    expires_at: row.expires_at,
-                    used: true,
+                .map(|identity| {
+                    let mut consumed = AuthorizationCode::new(
+                        code.to_owned(),
+                        row.client_id,
+                        row.redirect_uri,
+                        row.scope,
+                        identity,
+                        row.expires_at,
+                        true,
+                    );
+                    consumed.code_challenge = row.code_challenge;
+                    consumed.code_challenge_method = row.code_challenge_method;
+                    consumed.nonce = row.nonce;
+                    consumed
                 })
                 .map_err(|error| {
                     tracing::error!(%error, "stored authorization-code identity is invalid");

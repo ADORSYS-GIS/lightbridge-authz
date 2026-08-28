@@ -39,10 +39,7 @@ const REFRESH_TOKEN_BYTES: usize = 32;
 /// error type carries no HTTP status; `token_exchange::status_for_oauth_error` maps `error` back
 /// to one at the axum boundary, so error-string choices here are load-bearing, not cosmetic.
 pub(crate) fn oauth_err(error: &str, description: &str) -> TokenErrorResponse {
-    TokenErrorResponse {
-        error: error.to_string(),
-        error_description: description.to_string(),
-    }
+    TokenErrorResponse::new(error.to_string(), description.to_string())
 }
 
 /// Intersects the client's requested scopes with the server-wide allow-list AND the requesting

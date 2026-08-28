@@ -24,6 +24,7 @@ fn signing_cfg(ttl: i64) -> JwtSigning {
         audience: Some("lightbridge-api-key".to_string()),
         ttl_seconds: ttl,
         max_key_age_days: 30,
+        claim_mappers: Vec::new(),
     }
 }
 

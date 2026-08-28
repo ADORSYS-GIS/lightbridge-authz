@@ -59,7 +59,7 @@ use lightbridge_authz_bearer::BearerTokenServiceTrait;
 use lightbridge_authz_budget::repo::BudgetRepo;
 use lightbridge_authz_budget::{BudgetTier, Period, PolicyEngine};
 use lightbridge_authz_core::async_trait;
-use lightbridge_authz_core::config::Oauth2TokenExchange;
+use lightbridge_authz_core::config::{ClaimMapper, ClaimSource, Oauth2TokenExchange};
 use lightbridge_authz_core::crypto::hash_api_key;
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::dto::ModelPolicy;
@@ -148,6 +148,13 @@ pub struct TokenExchangeOpStore {
     /// `budget_policy_sets`/`budget_policy_revisions` tables for exactly this reason.
     policy_engine: Arc<dyn PolicyEngine>,
     bearer: Arc<dyn BearerTokenServiceTrait>,
+    /// Operator-declared extra claims (`oauth2.signing.claim_mappers`).
+    ///
+    /// Exists so this service can be the sole issuer for the human plane without borrowing claims
+    /// from the upstream IdP: every source a mapper may read is already resolved here while
+    /// minting, from data this deployment owns. Empty by default -- a deployment declaring none
+    /// mints exactly the claims it did before.
+    claim_mappers: Arc<Vec<ClaimMapper>>,
     cfg: Oauth2TokenExchange,
     /// ADR-0025 Stage 2: `oauth2.federation.issuer`, threaded through so
     /// [`Self::handle_token_exchange`] can translate the presented `subject_token`'s `(iss, sub)`
@@ -168,6 +175,7 @@ impl TokenExchangeOpStore {
         budget_repo: Arc<BudgetRepo>,
         policy_engine: Arc<dyn PolicyEngine>,
         bearer: Arc<dyn BearerTokenServiceTrait>,
+        claim_mappers: Arc<Vec<ClaimMapper>>,
         cfg: Oauth2TokenExchange,
         grandfather_issuer: String,
     ) -> Self {
@@ -182,6 +190,7 @@ impl TokenExchangeOpStore {
             budget_repo,
             policy_engine,
             bearer,
+            claim_mappers,
             cfg,
             grandfather_issuer,
         }
@@ -601,6 +610,12 @@ impl TokenExchangeOpStore {
             "model_policy".to_string(),
             Value::String(project.model_policy.to_string()),
         );
+        for (claim, value) in self
+            .resolve_mapped_claims(&context.project_id, &account_id, &context.account_id)
+            .await?
+        {
+            extra.insert(claim, value);
+        }
         let access_token = tokens
             .issue_user_token_with_extra(
                 identity_for(&owner),
@@ -644,15 +659,12 @@ impl TokenExchangeOpStore {
         } else {
             None
         };
-        Ok(TokenResponse {
-            access_token,
-            token_type: "Bearer".to_string(),
-            expires_in,
-            id_token,
-            refresh_token,
-            scope,
-            issued_token_type: None,
-        })
+        // `#[non_exhaustive]` upstream: constructor + field assignment, never a literal.
+        let mut response = TokenResponse::new(access_token, "Bearer".to_string(), expires_in);
+        response.id_token = id_token;
+        response.refresh_token = refresh_token;
+        response.scope = scope;
+        Ok(response)
     }
 
     async fn create_initial_refresh_token(
@@ -673,18 +685,80 @@ impl TokenExchangeOpStore {
             chain_expires_at,
             input.session_id,
         );
-        let refresh = RefreshToken {
-            token: plaintext.clone(),
-            client_id: input.client_id.to_string(),
+        let refresh = RefreshToken::new(
+            plaintext.clone(),
+            input.client_id.to_string(),
             identity,
-            scope: input.scope.unwrap_or_default().to_string(),
-            expires_at: now + Duration::seconds(self.cfg.refresh_ttl_seconds),
-        };
+            input.scope.unwrap_or_default().to_string(),
+            now + Duration::seconds(self.cfg.refresh_ttl_seconds),
+        );
         self.refresh
             .store_token(refresh)
             .await
             .map_err(|_| oauth_err("server_error", "refresh token persistence failed"))?;
         Ok(plaintext)
+    }
+
+    /// Evaluates `oauth2.signing.claim_mappers` into concrete claims for this token.
+    ///
+    /// Every source reads data this service already owns and has already resolved for this mint --
+    /// no extra hop, and nothing borrowed from the upstream IdP. That is the point: `authz-idp` is
+    /// the issuer for the human plane, so the RBAC roles claim it stamps must come from
+    /// `project_members`, not from a Keycloak token we happened to broker.
+    ///
+    /// Fail-closed, matching [`Self::resolve_quota_tier`] rather than
+    /// [`Self::resolve_budget_tier`]: a lookup failure REFUSES the mint. Omitting the claim
+    /// instead would produce a token whose roles are empty, which `permissions_for_roles` reads as
+    /// "no permissions" -- indistinguishable on the wire from a legitimately unprivileged user,
+    /// and it would turn a database blip into a silent, confusing authorization failure that looks
+    /// like a policy decision. Refusing says what actually happened.
+    async fn resolve_mapped_claims(
+        &self,
+        project_id: &str,
+        acting_account_id: &AccountId,
+        owning_account_id: &str,
+    ) -> Result<Vec<(String, Value)>, TokenErrorResponse> {
+        if self.claim_mappers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut resolved = Vec::with_capacity(self.claim_mappers.len());
+        for mapper in self.claim_mappers.iter() {
+            let source_value = match mapper.source {
+                ClaimSource::ProjectRole => {
+                    // The account owner is implicitly authorized and normally holds no roster row
+                    // -- the same rule `authorize_project_lead` layers on top of
+                    // `project_member_role`. Checked FIRST so an owner is never reported as
+                    // whatever roster row they may additionally hold.
+                    if owning_account_id == acting_account_id.as_str() {
+                        Some("owner".to_string())
+                    } else {
+                        self.quota_repo
+                            .project_member_role(project_id, acting_account_id)
+                            .await
+                            .map_err(|err| {
+                                tracing::error!(
+                                    error = %err,
+                                    project_id = %project_id,
+                                    claim = %mapper.claim,
+                                    "claim mapper source resolution failed; refusing to mint \
+                                     rather than stamping an empty claim, which would be \
+                                     indistinguishable from a legitimately unprivileged user"
+                                );
+                                oauth_err("server_error", "claim resolution failed")
+                            })?
+                    }
+                }
+            };
+            let values = source_value
+                .as_deref()
+                .and_then(|value| mapper.map.get(value))
+                .unwrap_or(&mapper.default_values);
+            resolved.push((
+                mapper.claim.clone(),
+                Value::Array(values.iter().cloned().map(Value::String).collect()),
+            ));
+        }
+        Ok(resolved)
     }
 
     /// Resolves the `budget_tier` claim to stamp on a minted access token (ADR-0014,
@@ -1074,6 +1148,12 @@ impl TokenExchangeOpStore {
             "model_policy".to_string(),
             Value::String(model_policy.to_string()),
         );
+        for (claim, value) in self
+            .resolve_mapped_claims(&context.project_id, &account_id, &context.account_id)
+            .await?
+        {
+            access_extra.insert(claim, value);
+        }
         let access_token = tokens
             .issue_user_token_with_extra(
                 identity_for(&owner),
@@ -1130,17 +1210,15 @@ impl TokenExchangeOpStore {
             "token-exchange issued access token"
         );
 
-        Ok(TokenResponse {
-            access_token,
-            token_type: "Bearer".to_string(),
-            expires_in: expires_in_secs,
-            id_token,
-            refresh_token,
-            scope: scope_str,
-            // RFC 8693 §2.2.1: REQUIRED on a token-exchange grant response, mirroring
-            // `default_handle_token_exchange`'s own value for this field.
-            issued_token_type: Some("urn:ietf:params:oauth:token-type:access_token".to_string()),
-        })
+        let mut response = TokenResponse::new(access_token, "Bearer".to_string(), expires_in_secs);
+        response.id_token = id_token;
+        response.refresh_token = refresh_token;
+        response.scope = scope_str;
+        // RFC 8693 §2.2.1: REQUIRED on a token-exchange grant response, mirroring
+        // `default_handle_token_exchange`'s own value for this field.
+        response.issued_token_type =
+            Some("urn:ietf:params:oauth:token-type:access_token".to_string());
+        Ok(response)
     }
 
     /// The `refresh_token` grant (ADR-0011, Decision 1): re-mints access + id_token symmetrically
@@ -1321,6 +1399,16 @@ impl TokenExchangeOpStore {
             "model_policy".to_string(),
             Value::String(model_policy.to_string()),
         );
+        for (claim, value) in self
+            .resolve_mapped_claims(
+                &context.project_id,
+                &old_row_account_id,
+                &context.account_id,
+            )
+            .await?
+        {
+            access_extra.insert(claim, value);
+        }
         let access_token = tokens
             .issue_user_token_with_extra(
                 identity_for(&owner),
@@ -1390,18 +1478,14 @@ impl TokenExchangeOpStore {
             "token-exchange refreshed access token"
         );
 
-        Ok(TokenResponse {
-            access_token,
-            token_type: "Bearer".to_string(),
-            expires_in: expires_in_secs,
-            id_token,
-            refresh_token: Some(new_plaintext),
-            scope: scope_str,
-            // Not a token-exchange response -- `default_handle_refresh_token` likewise leaves
-            // this `None` on the plain `refresh_token` grant; RFC 8693 §2.2.1 only requires it on
-            // a token-exchange response.
-            issued_token_type: None,
-        })
+        let mut response = TokenResponse::new(access_token, "Bearer".to_string(), expires_in_secs);
+        response.id_token = id_token;
+        response.refresh_token = Some(new_plaintext);
+        response.scope = scope_str;
+        // `issued_token_type` deliberately left as `new()`'s `None`: not a token-exchange
+        // response -- `default_handle_refresh_token` likewise leaves it `None` on the plain
+        // `refresh_token` grant; RFC 8693 §2.2.1 only requires it on a token-exchange response.
+        Ok(response)
     }
 
     /// RFC 6819 §5.2.2.3 reuse-detection cascade: called after a CAS consume

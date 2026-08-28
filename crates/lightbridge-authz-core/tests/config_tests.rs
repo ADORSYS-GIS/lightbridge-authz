@@ -296,3 +296,51 @@ fn checked_in_default_config_honors_database_url_env_override() {
         None => unsafe { std::env::remove_var("DATABASE_URL") },
     }
 }
+
+/// `oauth2.signing.claim_mappers` is what lets `authz-idp` stamp the RBAC roles claim from data it
+/// owns (`project_members`) instead of borrowing one from the brokered upstream IdP. Parsing is
+/// asserted here because the mapping table is operator-authored YAML: a silently-dropped `map`
+/// would mint tokens with the `default` (empty = no permissions) and look like a policy decision.
+#[test]
+fn claim_mappers_parse_source_map_and_default() {
+    let yaml = r#"
+issuer: "https://idp.example.test"
+ttl_seconds: 3600
+max_key_age_days: 30
+claim_mappers:
+  - claim: lightbridge_api_roles
+    source: project_role
+    map:
+      owner: ["lightbridge-admin"]
+      lead: ["lightbridge-editor"]
+    default: []
+"#;
+    let signing: lightbridge_authz_core::config::JwtSigning =
+        serde_yaml::from_str(yaml).expect("claim_mappers must parse");
+    assert_eq!(signing.claim_mappers.len(), 1);
+    let mapper = &signing.claim_mappers[0];
+    assert_eq!(mapper.claim, "lightbridge_api_roles");
+    assert_eq!(
+        mapper.source,
+        lightbridge_authz_core::config::ClaimSource::ProjectRole
+    );
+    assert_eq!(
+        mapper.map.get("owner").map(Vec::as_slice),
+        Some(["lightbridge-admin".to_string()].as_slice())
+    );
+    assert!(
+        mapper.default_values.is_empty(),
+        "an unmapped source value must fall through to NO roles -- the default-deny direction"
+    );
+}
+
+/// Absent `claim_mappers` must parse to empty, not fail: a deployment that declares none mints
+/// exactly the claims it did before this feature existed.
+#[test]
+fn claim_mappers_default_to_empty_when_absent() {
+    let signing: lightbridge_authz_core::config::JwtSigning = serde_yaml::from_str(
+        "issuer: \"https://idp.example.test\"\nttl_seconds: 3600\nmax_key_age_days: 30\n",
+    )
+    .expect("a signing block without claim_mappers must still parse");
+    assert!(signing.claim_mappers.is_empty());
+}

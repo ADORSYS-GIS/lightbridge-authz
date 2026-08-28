@@ -76,15 +76,14 @@ fn discovery_body(server: &MockServer) -> serde_json::Value {
 }
 
 fn session() -> DeviceCodeSession {
-    DeviceCodeSession {
-        device_code: "device-code".to_string(),
-        user_code: "PAIR1234".to_string(),
-        client_id: "cli".to_string(),
-        scope: "openid".to_string(),
-        expires_at: Utc::now() + Duration::minutes(10),
-        status: DeviceCodeStatus::Pending,
-        last_polled_at: None,
-    }
+    DeviceCodeSession::new(
+        "device-code".to_string(),
+        "PAIR1234".to_string(),
+        "cli".to_string(),
+        "openid".to_string(),
+        Utc::now() + Duration::minutes(10),
+        DeviceCodeStatus::Pending,
+    )
 }
 
 fn state_from_redirect(response: &axum::response::Response) -> String {

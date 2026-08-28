@@ -2522,6 +2522,9 @@ fn build_token_exchange_state(
         budget_repo,
         policy_engine,
         bearer,
+        // Declared in `oauth2.signing.claim_mappers`, evaluated at mint time against data this
+        // deployment owns -- see `TokenExchangeOpStore::resolve_mapped_claims`.
+        Arc::new(signing.claim_mappers.clone()),
         cfg.clone(),
         grandfather_issuer,
     ));
@@ -3700,6 +3703,7 @@ mod tests {
             audience: None,
             ttl_seconds: 7_776_000,
             max_key_age_days: 30,
+            claim_mappers: Vec::new(),
         }
     }
 

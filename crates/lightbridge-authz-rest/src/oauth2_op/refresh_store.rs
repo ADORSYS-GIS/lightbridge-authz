@@ -86,21 +86,21 @@ fn row_to_refresh_token(row: ExchangeRefreshTokenRow) -> RefreshToken {
         row.chain_expires_at.to_rfc3339(),
     );
     attributes.insert(ATTR_SESSION_ID.to_string(), row.session_id);
-    RefreshToken {
-        // See this module's doc comment: the plaintext was never stored, so this is the hash --
-        // never read back as a real secret by anything in this codebase.
-        token: row.token_hash,
-        client_id: row.client_id,
-        identity: Identity {
+    // See this module's doc comment: the plaintext was never stored, so `token` here is the
+    // hash -- never read back as a real secret by anything in this codebase.
+    RefreshToken::new(
+        row.token_hash,
+        row.client_id,
+        Identity {
             provider_id: IDENTITY_PROVIDER_ID.to_string(),
             external_id: row.subject,
             email: row.email,
             username: None,
             attributes,
         },
-        scope: row.scope.unwrap_or_default(),
-        expires_at: row.expires_at,
-    }
+        row.scope.unwrap_or_default(),
+        row.expires_at,
+    )
 }
 
 #[async_trait]

@@ -1068,6 +1068,52 @@ pub struct JwtSigning {
     /// startup). The rotated-out key is marked stale and kept in the JWKS for verification.
     #[serde(default = "default_max_key_age_days")]
     pub max_key_age_days: i64,
+    /// Extra claims stamped onto tokens this deployment signs, declared rather than hard-coded.
+    ///
+    /// Exists so `authz-idp` can be the sole issuer for the human plane without borrowing claims
+    /// from the upstream IdP. Everything a mapper needs is already resolved server-side at mint
+    /// time (`resolve_context` gives account/project; `project_members` gives the roster role), so
+    /// a claim like the RBAC roles claim is derived from data this service owns -- not copied out
+    /// of a Keycloak token.
+    ///
+    /// Empty by default: a deployment that stamps no extra claims behaves exactly as before.
+    #[serde(default)]
+    pub claim_mappers: Vec<ClaimMapper>,
+}
+
+/// One declared claim, its source, and how source values become claim values.
+///
+/// Deliberately data, not code: adding a role tier or renaming the RBAC claim is a values-file
+/// edit, not a release. The evaluation is intentionally trivial -- lookup, map, emit -- because a
+/// claim that feeds an authorization decision is the wrong place for an expression language.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClaimMapper {
+    /// The claim name to stamp, e.g. `lightbridge_api_roles` (whatever `rbac.roles_claim` names).
+    pub claim: String,
+    /// Where the value comes from. Server-side resolved data only.
+    pub source: ClaimSource,
+    /// Source value -> emitted claim values. A source value absent from this map falls through to
+    /// [`ClaimMapper::default_values`].
+    #[serde(default)]
+    pub map: std::collections::HashMap<String, Vec<String>>,
+    /// Emitted when the source resolves to a value `map` does not cover, or resolves to nothing.
+    ///
+    /// Defaults to EMPTY, which for the RBAC roles claim means "no permissions" -- the
+    /// default-deny direction. An operator wanting a baseline role must say so explicitly.
+    #[serde(default, rename = "default")]
+    pub default_values: Vec<String>,
+}
+
+/// The server-side facts a [`ClaimMapper`] may read. Closed on purpose: every variant must be
+/// something this service already resolves while minting, so a mapper can never introduce a new
+/// round-trip or read data the token subject does not own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimSource {
+    /// The subject's `project_members.role` on the token's project (`lead` / `member`), or
+    /// `owner` when they own the project's account and hold no roster row -- the same
+    /// owner-is-implicitly-authorized rule `authorize_project_lead` applies.
+    ProjectRole,
 }
 
 fn default_signing_ttl_seconds() -> i64 {

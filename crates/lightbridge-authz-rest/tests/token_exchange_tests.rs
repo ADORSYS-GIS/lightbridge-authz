@@ -207,6 +207,7 @@ fn signing_cfg() -> JwtSigning {
         audience: None,
         ttl_seconds: 7_776_000,
         max_key_age_days: 30,
+        claim_mappers: Vec::new(),
     }
 }
 
@@ -540,6 +541,7 @@ fn state_with_cfg_and_budget_repo(
         budget_repo,
         policy_engine,
         bearer,
+        std::sync::Arc::new(Vec::new()),
         cfg,
         GRANDFATHER_ISSUER.to_string(),
     ));
@@ -723,23 +725,26 @@ async fn store_browser_code(
     attributes.insert("account_id".to_string(), ACCOUNT_ID.to_string());
     attributes.insert("project_id".to_string(), PROJECT_ID.to_string());
     DbAuthorizationCodeStore::new(repo)
-        .store_code(AuthorizationCode {
-            code: code.to_string(),
-            client_id: client_id.to_string(),
-            redirect_uri: redirect_uri.to_string(),
-            scope: "openid profile".to_string(),
-            code_challenge: Some(s256_challenge(verifier)),
-            code_challenge_method: Some("S256".to_string()),
-            nonce: Some("browser-nonce".to_string()),
-            identity: Identity {
-                provider_id: "keycloak".to_string(),
-                external_id: SUBJECT.to_string(),
-                email: Some("user@example.test".to_string()),
-                username: None,
-                attributes,
-            },
-            expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
-            used: false,
+        .store_code({
+            let mut authorization_code = AuthorizationCode::new(
+                code.to_string(),
+                client_id.to_string(),
+                redirect_uri.to_string(),
+                "openid profile".to_string(),
+                Identity {
+                    provider_id: "keycloak".to_string(),
+                    external_id: SUBJECT.to_string(),
+                    email: Some("user@example.test".to_string()),
+                    username: None,
+                    attributes,
+                },
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                false,
+            );
+            authorization_code.code_challenge = Some(s256_challenge(verifier));
+            authorization_code.code_challenge_method = Some("S256".to_string());
+            authorization_code.nonce = Some("browser-nonce".to_string());
+            authorization_code
         })
         .await
         .unwrap();
@@ -1889,6 +1894,7 @@ async fn azp_reliably_distinguishes_a_real_api_key_jwt_from_a_real_exchange_sess
         audience: Some(API_KEY_AUDIENCE.to_string()),
         ttl_seconds: 3600,
         max_key_age_days: 30,
+        claim_mappers: Vec::new(),
     };
     let signer = ApiKeyJwtSigner::from_config(&api_key_signing_cfg, repo.clone()).unwrap();
     let owner = KeyOwner {

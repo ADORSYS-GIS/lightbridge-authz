@@ -168,25 +168,25 @@ struct DeviceAuthorizationResponse {
 
 impl From<RawTokenRequest> for AkTokenRequest {
     fn from(raw: RawTokenRequest) -> Self {
-        AkTokenRequest {
-            grant_type: raw.grant_type,
-            code: raw.code,
-            device_code: raw.device_code,
-            redirect_uri: raw.redirect_uri,
-            client_id: raw.client_id,
-            client_secret: raw.client_secret,
-            code_verifier: raw.code_verifier,
-            scope: raw.scope,
-            refresh_token: raw.refresh_token,
-            subject_token: raw.subject_token,
-            subject_token_type: raw.subject_token_type,
-            actor_token: raw.actor_token,
-            actor_token_type: raw.actor_token_type,
-            requested_token_type: raw.requested_token_type,
-            audience: raw.audience,
-            client_assertion: raw.client_assertion,
-            client_assertion_type: raw.client_assertion_type,
-        }
+        // `#[non_exhaustive]` upstream: constructor + field assignment, never a literal.
+        let mut req = AkTokenRequest::new(raw.grant_type);
+        req.code = raw.code;
+        req.device_code = raw.device_code;
+        req.redirect_uri = raw.redirect_uri;
+        req.client_id = raw.client_id;
+        req.client_secret = raw.client_secret;
+        req.code_verifier = raw.code_verifier;
+        req.scope = raw.scope;
+        req.refresh_token = raw.refresh_token;
+        req.subject_token = raw.subject_token;
+        req.subject_token_type = raw.subject_token_type;
+        req.actor_token = raw.actor_token;
+        req.actor_token_type = raw.actor_token_type;
+        req.requested_token_type = raw.requested_token_type;
+        req.audience = raw.audience;
+        req.client_assertion = raw.client_assertion;
+        req.client_assertion_type = raw.client_assertion_type;
+        req
     }
 }
 

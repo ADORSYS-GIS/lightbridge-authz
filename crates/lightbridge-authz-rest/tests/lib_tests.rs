@@ -354,6 +354,7 @@ mod db {
             audience: None,
             ttl_seconds: 7_776_000,
             max_key_age_days: 30,
+            claim_mappers: Vec::new(),
         }
     }
 

@@ -133,15 +133,16 @@ fn row_to_session(row: DeviceAuthorizationRow) -> Result<DeviceCodeSession, OpEr
             return Err(OpError::Storage);
         }
     };
-    Ok(DeviceCodeSession {
-        device_code: row.device_code,
-        user_code: row.user_code,
-        client_id: row.client_id,
-        scope: row.scope.unwrap_or_default(),
-        expires_at: row.expires_at,
+    let mut session = DeviceCodeSession::new(
+        row.device_code,
+        row.user_code,
+        row.client_id,
+        row.scope.unwrap_or_default(),
+        row.expires_at,
         status,
-        last_polled_at: row.last_polled_at,
-    })
+    );
+    session.last_polled_at = row.last_polled_at;
+    Ok(session)
 }
 
 /// Real, Postgres-backed [`DeviceCodeStore`]. See this module's doc comment for the two

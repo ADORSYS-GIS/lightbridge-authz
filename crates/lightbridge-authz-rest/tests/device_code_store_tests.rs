@@ -46,15 +46,14 @@ fn identity(sub: &str) -> Identity {
 #[sqlx::test(migrations = "../../migrations")]
 async fn store_then_get_round_trips_a_pending_session(pool: PgPool) {
     let store = DbDeviceCodeStore::new(repo(pool));
-    let session = DeviceCodeSession {
-        device_code: "dc-store-get".to_string(),
-        user_code: "STOREGET".to_string(),
-        client_id: "device-client".to_string(),
-        scope: "openid".to_string(),
-        expires_at: Utc::now() + Duration::minutes(10),
-        status: DeviceCodeStatus::Pending,
-        last_polled_at: None,
-    };
+    let session = DeviceCodeSession::new(
+        "dc-store-get".to_string(),
+        "STOREGET".to_string(),
+        "device-client".to_string(),
+        "openid".to_string(),
+        Utc::now() + Duration::minutes(10),
+        DeviceCodeStatus::Pending,
+    );
 
     store.store_device_code(session.clone()).await.unwrap();
 
@@ -70,15 +69,14 @@ async fn store_then_get_round_trips_a_pending_session(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn re_storing_a_pending_session_touches_last_polled_at_without_changing_status(pool: PgPool) {
     let store = DbDeviceCodeStore::new(repo(pool));
-    let session = DeviceCodeSession {
-        device_code: "dc-repoll".to_string(),
-        user_code: "REPOLL01".to_string(),
-        client_id: "device-client".to_string(),
-        scope: "openid".to_string(),
-        expires_at: Utc::now() + Duration::minutes(10),
-        status: DeviceCodeStatus::Pending,
-        last_polled_at: None,
-    };
+    let session = DeviceCodeSession::new(
+        "dc-repoll".to_string(),
+        "REPOLL01".to_string(),
+        "device-client".to_string(),
+        "openid".to_string(),
+        Utc::now() + Duration::minutes(10),
+        DeviceCodeStatus::Pending,
+    );
     store.store_device_code(session.clone()).await.unwrap();
 
     let mut polled = session.clone();
@@ -97,15 +95,14 @@ async fn re_storing_a_pending_session_touches_last_polled_at_without_changing_st
 #[sqlx::test(migrations = "../../migrations")]
 async fn update_device_code_with_approved_status_cas_approves_the_row(pool: PgPool) {
     let store = DbDeviceCodeStore::new(repo(pool));
-    let session = DeviceCodeSession {
-        device_code: "dc-approve".to_string(),
-        user_code: "APPROVE1".to_string(),
-        client_id: "device-client".to_string(),
-        scope: "openid".to_string(),
-        expires_at: Utc::now() + Duration::minutes(10),
-        status: DeviceCodeStatus::Pending,
-        last_polled_at: None,
-    };
+    let session = DeviceCodeSession::new(
+        "dc-approve".to_string(),
+        "APPROVE1".to_string(),
+        "device-client".to_string(),
+        "openid".to_string(),
+        Utc::now() + Duration::minutes(10),
+        DeviceCodeStatus::Pending,
+    );
     store.store_device_code(session.clone()).await.unwrap();
 
     let mut approved = session;
@@ -128,15 +125,14 @@ async fn update_device_code_with_approved_status_cas_approves_the_row(pool: PgPo
 #[sqlx::test(migrations = "../../migrations")]
 async fn consume_device_code_is_single_use(pool: PgPool) {
     let store = DbDeviceCodeStore::new(repo(pool));
-    let session = DeviceCodeSession {
-        device_code: "dc-consume".to_string(),
-        user_code: "CONSUME1".to_string(),
-        client_id: "device-client".to_string(),
-        scope: "openid".to_string(),
-        expires_at: Utc::now() + Duration::minutes(10),
-        status: DeviceCodeStatus::Pending,
-        last_polled_at: None,
-    };
+    let session = DeviceCodeSession::new(
+        "dc-consume".to_string(),
+        "CONSUME1".to_string(),
+        "device-client".to_string(),
+        "openid".to_string(),
+        Utc::now() + Duration::minutes(10),
+        DeviceCodeStatus::Pending,
+    );
     store.store_device_code(session.clone()).await.unwrap();
     let mut approved = session;
     approved.status = DeviceCodeStatus::Approved(identity("kc-sub-consume"));
@@ -179,15 +175,14 @@ async fn get_by_user_code_is_case_insensitive(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn delete_device_code_removes_the_row(pool: PgPool) {
     let store = DbDeviceCodeStore::new(repo(pool));
-    let session = DeviceCodeSession {
-        device_code: "dc-delete".to_string(),
-        user_code: "DELETE01".to_string(),
-        client_id: "device-client".to_string(),
-        scope: "openid".to_string(),
-        expires_at: Utc::now() + Duration::minutes(10),
-        status: DeviceCodeStatus::Pending,
-        last_polled_at: None,
-    };
+    let session = DeviceCodeSession::new(
+        "dc-delete".to_string(),
+        "DELETE01".to_string(),
+        "device-client".to_string(),
+        "openid".to_string(),
+        Utc::now() + Duration::minutes(10),
+        DeviceCodeStatus::Pending,
+    );
     store.store_device_code(session).await.unwrap();
     store.delete_device_code("dc-delete").await.unwrap();
 
