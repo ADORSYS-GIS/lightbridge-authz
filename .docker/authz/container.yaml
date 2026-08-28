@@ -287,3 +287,21 @@ models:
 # not "unlimited" -- see config/default.yaml's identical block for the full rationale.
 # api_key_expiry:
 #   max_lifetime_days: 90
+
+# GHSA-9pc6-965v-2c44 / #538: API key secrets created through lightbridge-mcp are NEVER returned
+# in the tool result -- an MCP result goes straight into the calling model's context. The secret is
+# sealed here and handed over as a single-use claim URL the requesting human redeems once, in a
+# browser, against authz-idp.
+#
+# MANDATORY for lightbridge-mcp (which issues claims) and authz-idp (which redeems them); both
+# refuse to start without it rather than degrade to returning secrets inline. authz-api/-opa/
+# -budget load this same file and ignore the section.
+secret_claim:
+  # Dev-only fixed key: base64url, exactly 32 bytes. Distinct from BOTH relying-party keys above --
+  # different data, different lifetime, different rotation posture. Production MUST override.
+  # Rotating it makes un-redeemed claims unopenable, which is cheap here: claims live ~5 minutes.
+  encryption_key: "${SECRET_CLAIM_ENCRYPTION_KEY:-Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M}"
+  ttl_seconds: 300
+  # Where the human collects it. The authz-idp origin, NOT authz-api/-mcp -- authz-idp is the only
+  # service holding browser sessions, which is what makes a claim URL useless to a model.
+  redeem_base_url: "${SECRET_CLAIM_REDEEM_BASE_URL:-https://authz-idp:3004}"

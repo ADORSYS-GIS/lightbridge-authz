@@ -32,6 +32,7 @@ use std::sync::Arc;
 use base64::Engine;
 use chrono::{Duration, Utc};
 use lightbridge_authz_api_key::repo::StoreRepo;
+use lightbridge_authz_core::config::SecretClaim;
 use lightbridge_authz_core::crypto::{open, seal};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::error::{Error, Result};
@@ -71,6 +72,29 @@ fn token_hash(token: &str) -> String {
 }
 
 impl SecretClaimStore {
+    /// Builds the store from operator config, validating the sealing key offline.
+    ///
+    /// Validation is shape-only and synchronous -- exactly the posture `KeycloakRelyingParty::new`
+    /// takes for its own keys, and for the same reason: it costs no startup-ordering dependency on
+    /// any external service, so a component can fail fast on a malformed key without needing the
+    /// database to be up first.
+    pub fn from_config(repo: Arc<StoreRepo>, config: &SecretClaim) -> Result<Self> {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&config.encryption_key)
+            .map_err(|_| {
+                Error::Server("secret_claim.encryption_key must be base64url".to_string())
+            })?;
+        let sealing_key: [u8; 32] = bytes.try_into().map_err(|_| {
+            Error::Server("secret_claim.encryption_key must decode to exactly 32 bytes".to_string())
+        })?;
+        if config.ttl_seconds <= 0 {
+            return Err(Error::Server(
+                "secret_claim.ttl_seconds must be positive".to_string(),
+            ));
+        }
+        Ok(Self::new(repo, sealing_key, config.ttl_seconds))
+    }
+
     pub fn new(repo: Arc<StoreRepo>, sealing_key: [u8; 32], ttl_seconds: i64) -> Self {
         Self {
             repo,

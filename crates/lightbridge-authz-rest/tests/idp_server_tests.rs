@@ -61,6 +61,20 @@ fn lazy_pool() -> Arc<dyn DbPoolTrait> {
     Arc::new(DbPool::from_pool(pool))
 }
 
+/// A claim-redeem state for router-shape tests. The pool is lazy, so nothing dials a database
+/// unless a test actually exercises redemption -- these tests only assert what is mounted.
+fn test_claim_redeem() -> lightbridge_authz_rest::claim_redeem::ClaimRedeemState {
+    let repo = std::sync::Arc::new(lightbridge_authz_api_key::repo::StoreRepo::new(lazy_pool()));
+    lightbridge_authz_rest::claim_redeem::ClaimRedeemState {
+        claims: std::sync::Arc::new(lightbridge_authz_rest::secret_claim::SecretClaimStore::new(
+            repo.clone(),
+            [7u8; 32],
+            300,
+        )),
+        repo,
+    }
+}
+
 /// A nonexistent directory is fine here: the tests that use this constant don't exercise the
 /// static build's actual file-serving behavior (that's `static_assets_tests.rs`'s job for the
 /// service in isolation, and this file's own `ui_static_dir`-based tests below for it mounted at
@@ -557,6 +571,7 @@ fn offline_idp_router(static_dir: impl AsRef<std::path::Path>) -> axum::Router {
         pool,
         static_dir,
         relying_party,
+        test_claim_redeem(),
     )
 }
 
@@ -615,6 +630,7 @@ async fn path_issuer_metadata_advertises_root_jwks_and_token_paths() {
         pool,
         TEST_STATIC_DIR,
         relying_party,
+        test_claim_redeem(),
     );
 
     let metadata = router
@@ -868,6 +884,7 @@ async fn build_idp_router_mount_does_not_consult_raw_token_exchange_config() {
         pool,
         TEST_STATIC_DIR,
         relying_party,
+        test_claim_redeem(),
     );
 
     let authorize = router
@@ -1056,6 +1073,7 @@ fn offline_idp_router_with_oauth2(
         pool,
         static_dir,
         relying_party,
+        test_claim_redeem(),
     )
 }
 
@@ -1323,7 +1341,7 @@ async fn start_idp_server_rejects_external_oauth2() {
         tls: bad_tls(),
         static_dir: TEST_STATIC_DIR.to_string(),
     };
-    let result = start_idp_server(&idp, lazy_pool(), &external_oauth2(), &None).await;
+    let result = start_idp_server(&idp, lazy_pool(), &external_oauth2(), &None, &None).await;
     let err = result.expect_err("authz-idp must reject oauth2.type: external");
     assert!(format!("{err}").contains("oauth2.type: self"), "got: {err}");
 }
@@ -1341,7 +1359,7 @@ async fn start_idp_server_rejects_self_signed_oauth2_without_signing_block() {
         tls: bad_tls(),
         static_dir: TEST_STATIC_DIR.to_string(),
     };
-    let result = start_idp_server(&idp, lazy_pool(), &oauth2, &None).await;
+    let result = start_idp_server(&idp, lazy_pool(), &oauth2, &None, &None).await;
     assert!(
         result.is_err(),
         "self-signed oauth2 without a signing block must be rejected"
@@ -1423,8 +1441,14 @@ mod db {
             tls: bad_tls(),
             static_dir: TEST_STATIC_DIR.to_string(),
         };
-        let result =
-            start_idp_server(&idp, db_pool, &full_idp_oauth2(), &unreachable_redis_cfg()).await;
+        let result = start_idp_server(
+            &idp,
+            db_pool,
+            &full_idp_oauth2(),
+            &unreachable_redis_cfg(),
+            &None,
+        )
+        .await;
         let err = result.expect_err("missing TLS cert paths must surface as an error");
         assert!(
             !format!("{err}").to_lowercase().contains("redis"),
@@ -1453,7 +1477,7 @@ mod db {
             tls: bad_tls(),
             static_dir: TEST_STATIC_DIR.to_string(),
         };
-        let err = start_idp_server(&idp, db_pool, &full_idp_oauth2(), &None)
+        let err = start_idp_server(&idp, db_pool, &full_idp_oauth2(), &None, &None)
             .await
             .expect_err("no redis config must be rejected");
         assert!(format!("{err}").contains("redis"), "got: {err}");
@@ -1483,7 +1507,7 @@ mod db {
             tls: bad_tls(),
             static_dir: TEST_STATIC_DIR.to_string(),
         };
-        let err = start_idp_server(&idp, db_pool, &self_signed_oauth2(), &None)
+        let err = start_idp_server(&idp, db_pool, &self_signed_oauth2(), &None, &None)
             .await
             .expect_err(
                 "authz-idp must refuse to start with no redis config even before relying_party/\
@@ -1515,8 +1539,14 @@ mod db {
             tls: bad_tls(),
             static_dir: TEST_STATIC_DIR.to_string(),
         };
-        let result =
-            start_idp_server(&idp, db_pool, &full_idp_oauth2(), &unreachable_redis_cfg()).await;
+        let result = start_idp_server(
+            &idp,
+            db_pool,
+            &full_idp_oauth2(),
+            &unreachable_redis_cfg(),
+            &None,
+        )
+        .await;
         let err = result.expect_err("missing TLS cert paths must surface as an error");
         assert!(
             !format!("{err}").to_lowercase().contains("redis"),
@@ -1563,7 +1593,7 @@ mod db {
             tls: bad_tls(),
             static_dir: TEST_STATIC_DIR.to_string(),
         };
-        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg())
+        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg(), &None)
             .await
             .expect_err(
                 "authz-idp is a full IdP (ADR-0023): a deployment that omits oauth2.relying_party \
@@ -1571,6 +1601,40 @@ mod db {
             );
         let message = format!("{err}");
         assert!(message.contains("oauth2.relying_party"), "got: {message}");
+        assert!(message.contains("authz-idp"), "got: {message}");
+    }
+
+    /// GHSA-9pc6-965v-2c44: authz-idp REDEEMS secret claims, so `secret_claim` is mandatory here.
+    /// Uses a fully valid IdP fixture so every earlier mandate (redis, relying_party,
+    /// token_exchange) passes and the assertion isolates this check -- otherwise an earlier
+    /// refusal would satisfy `expect_err` while proving nothing about this one.
+    ///
+    /// The failure must be at STARTUP. A deployment that came up without it would serve claim URLs
+    /// that 404 while lightbridge-mcp kept handing them out, which is exactly the
+    /// advertised-but-unmounted failure ADR-0023 exists to prevent.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_idp_server_requires_secret_claim(pool: PgPool) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let idp = IdpServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+            static_dir: TEST_STATIC_DIR.to_string(),
+        };
+        let err = start_idp_server(
+            &idp,
+            db_pool,
+            &full_idp_oauth2(),
+            &unreachable_redis_cfg(),
+            &None,
+        )
+        .await
+        .expect_err(
+            "authz-idp redeems secret claims: omitting secret_claim must be refused at startup, \
+             not degrade into 404ing every claim URL lightbridge-mcp hands out",
+        );
+        let message = format!("{err}");
+        assert!(message.contains("secret_claim"), "got: {message}");
         assert!(message.contains("authz-idp"), "got: {message}");
     }
 
@@ -1592,7 +1656,7 @@ mod db {
             tls: bad_tls(),
             static_dir: TEST_STATIC_DIR.to_string(),
         };
-        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg())
+        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg(), &None)
             .await
             .expect_err(
                 "an invalid oauth2.relying_party block must still be a hard startup failure",
@@ -1621,7 +1685,7 @@ mod db {
             tls: bad_tls(),
             static_dir: TEST_STATIC_DIR.to_string(),
         };
-        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg())
+        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg(), &None)
             .await
             .expect_err(
                 "a malformed oauth2.relying_party.token_encryption_key must be a hard startup \
@@ -1650,7 +1714,7 @@ mod db {
             tls: bad_tls(),
             static_dir: TEST_STATIC_DIR.to_string(),
         };
-        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg())
+        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg(), &None)
             .await
             .expect_err(
                 "a token_encryption_key equal to state_encryption_key must be a hard startup \
@@ -1688,7 +1752,7 @@ mod db {
             tls: bad_tls(),
             static_dir: TEST_STATIC_DIR.to_string(),
         };
-        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg())
+        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg(), &None)
             .await
             .expect_err(
                 "authz-idp is a full IdP (ADR-0023): a deployment that omits \
@@ -1716,7 +1780,7 @@ mod db {
             tls: bad_tls(),
             static_dir: TEST_STATIC_DIR.to_string(),
         };
-        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg())
+        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg(), &None)
             .await
             .expect_err(
                 "authz-idp is a full IdP (ADR-0023): oauth2.token_exchange.enabled: false must \
@@ -1837,7 +1901,7 @@ mod db {
             tls: bad_tls(),
             static_dir: TEST_STATIC_DIR.to_string(),
         };
-        let err = start_idp_server(&idp, lazy_pool(), &oauth2, &None)
+        let err = start_idp_server(&idp, lazy_pool(), &oauth2, &None, &None)
             .await
             .expect_err("authz-idp must refuse to start with no oauth2.federation.issuer");
         let message = format!("{err}");
@@ -1872,7 +1936,8 @@ mod db {
             tls: bad_tls(),
             static_dir: TEST_STATIC_DIR.to_string(),
         };
-        let result = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg()).await;
+        let result =
+            start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg(), &None).await;
         let err = result.expect_err(
             "bad TLS cert paths still fail startup after the relying-party/federation checks \
              pass -- this proves the discovery_url-vs-issuer divergence itself was NOT the cause",
@@ -1903,7 +1968,7 @@ mod db {
             tls: bad_tls(),
             static_dir: TEST_STATIC_DIR.to_string(),
         };
-        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg())
+        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg(), &None)
             .await
             .expect_err(
                 "oauth2.token_exchange.allowed_scopes without openid must be refused at startup",
@@ -1951,6 +2016,7 @@ mod db {
             db_pool.clone(),
             TEST_STATIC_DIR,
             idp_relying_party,
+            test_claim_redeem(),
         );
 
         // authz-api's router: no oauth2/signing_repo/token_exchange params anymore (it mounts
@@ -2098,6 +2164,7 @@ mod db {
             db_pool,
             &static_dir,
             relying_party,
+            test_claim_redeem(),
         );
 
         // A bare status-code check is not enough to prove non-shadowing: the SPA fallback also
@@ -2287,7 +2354,7 @@ mod db {
             tls: bad_tls(),
             static_dir: TEST_STATIC_DIR.to_string(),
         };
-        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg())
+        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg(), &None)
             .await
             .expect_err(
                 "a Confidential authorization_code client with require_pkce: false must be \
@@ -2320,7 +2387,7 @@ mod db {
             tls: bad_tls(),
             static_dir: TEST_STATIC_DIR.to_string(),
         };
-        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg())
+        let err = start_idp_server(&idp, db_pool, &oauth2, &unreachable_redis_cfg(), &None)
             .await
             .expect_err("missing TLS cert paths must surface as an error");
         let message = format!("{err}").to_lowercase();

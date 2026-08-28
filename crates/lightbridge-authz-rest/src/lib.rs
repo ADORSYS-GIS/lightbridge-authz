@@ -14,6 +14,7 @@ use lightbridge_authz_core::{
 
 pub mod auth_provider;
 pub mod authorize;
+pub mod claim_redeem;
 pub mod codec;
 pub mod handlers;
 pub mod middleware;
@@ -2962,6 +2963,12 @@ pub async fn start_opa_server(
 /// here: `relying_party` was already threaded through as a pre-validated `Arc` instead of being
 /// rebuilt inside this function; only the `Option` wrapper (and the mount-conditional branching it
 /// enabled) is removed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every parameter is a distinct mandatory dependency of the IdP surface (ADR-0023 \
+              mounts all routes unconditionally, so none can be folded away as optional); \
+              bundling them into a struct would only move the same arity behind a constructor"
+)]
 pub fn build_idp_router(
     oauth2: &Oauth2,
     signing: &JwtSigning,
@@ -2970,8 +2977,13 @@ pub fn build_idp_router(
     readiness_pool: Arc<dyn DbPoolTrait>,
     static_dir: impl AsRef<std::path::Path>,
     relying_party: Arc<relying_party::KeycloakRelyingParty>,
+    claim_redeem: claim_redeem::ClaimRedeemState,
 ) -> Router {
     let mut router = probe_router(readiness_pool);
+    // GHSA-9pc6-965v-2c44: mounted unconditionally, like every other authz-idp route (ADR-0023).
+    // A deployment where this 404s while lightbridge-mcp still issues claim URLs would hand users
+    // links they cannot use -- the exact advertised-but-unmounted failure ADR-0023 exists to stop.
+    router = router.merge(claim_redeem::router(claim_redeem));
     let (token_exchange_scopes, client_authentication) =
         well_known_mount_params(oauth2, &token_exchange);
     router = router.merge(signing::well_known_router(
@@ -3026,6 +3038,7 @@ pub async fn start_idp_server(
     pool: Arc<dyn DbPoolTrait>,
     oauth2: &Oauth2,
     redis: &Option<Redis>,
+    secret_claim: &Option<lightbridge_authz_core::config::SecretClaim>,
 ) -> Result<()> {
     if !oauth2.is_self_signed() {
         return Err(Error::Server(
@@ -3183,6 +3196,28 @@ pub async fn start_idp_server(
         ));
     }
 
+    // GHSA-9pc6-965v-2c44: authz-idp REDEEMS secret claims, so this section is mandatory here --
+    // the same posture as the redis/relying_party/token_exchange mandates above. A deployment
+    // where lightbridge-mcp issues claim URLs that this service cannot redeem would hand users
+    // links that 404, which is the advertised-but-unmounted failure ADR-0023 exists to prevent.
+    let secret_claim = secret_claim.as_ref().ok_or_else(|| {
+        Error::Server(
+            "secret_claim is required for authz-idp (GHSA-9pc6-965v-2c44) -- /api-keys/claim is \
+             always mounted, and lightbridge-mcp hands out claim URLs pointing at it"
+                .to_string(),
+        )
+    })?;
+    // Same repo the signing bootstrap already built over this pool -- one StoreRepo per
+    // pool, not a second connection path for the same database.
+    let claim_repo = signing_repo.clone();
+    let claim_redeem = claim_redeem::ClaimRedeemState {
+        claims: Arc::new(secret_claim::SecretClaimStore::from_config(
+            claim_repo.clone(),
+            secret_claim,
+        )?),
+        repo: claim_repo,
+    };
+
     let app = build_idp_router(
         oauth2,
         signing,
@@ -3191,6 +3226,7 @@ pub async fn start_idp_server(
         readiness_pool,
         &idp.static_dir,
         relying_party,
+        claim_redeem,
     );
 
     tracing::info!(
