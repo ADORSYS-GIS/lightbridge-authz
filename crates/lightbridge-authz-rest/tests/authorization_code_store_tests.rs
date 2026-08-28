@@ -9,15 +9,12 @@ use lightbridge_authz_rest::oauth2_op::authorization_code_store::DbAuthorization
 use sqlx::PgPool;
 
 fn code(value: &str, expires_at: chrono::DateTime<Utc>) -> AuthorizationCode {
-    AuthorizationCode {
-        code: value.to_string(),
-        client_id: "browser-client".to_string(),
-        redirect_uri: "https://dashboard.example.test/oauth/callback".to_string(),
-        scope: "openid profile".to_string(),
-        code_challenge: Some("challenge".to_string()),
-        code_challenge_method: Some("S256".to_string()),
-        nonce: Some("nonce".to_string()),
-        identity: Identity {
+    let mut code = AuthorizationCode::new(
+        value.to_string(),
+        "browser-client".to_string(),
+        "https://dashboard.example.test/oauth/callback".to_string(),
+        "openid profile".to_string(),
+        Identity {
             provider_id: "keycloak".to_string(),
             external_id: "subject".to_string(),
             email: None,
@@ -25,8 +22,12 @@ fn code(value: &str, expires_at: chrono::DateTime<Utc>) -> AuthorizationCode {
             attributes: Default::default(),
         },
         expires_at,
-        used: false,
-    }
+        false,
+    );
+    code.code_challenge = Some("challenge".to_string());
+    code.code_challenge_method = Some("S256".to_string());
+    code.nonce = Some("nonce".to_string());
+    code
 }
 
 fn store(pool: PgPool) -> DbAuthorizationCodeStore {

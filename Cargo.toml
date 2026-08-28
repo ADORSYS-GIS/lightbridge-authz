@@ -198,9 +198,16 @@ jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
 #
 # Exact `=` pins retained deliberately -- see the drift paragraphs above; a caret range here is
 # not durable against a lockfile-only Dependabot float.
-authkestra-resource = "=0.5.5"
-authkestra-op = "=0.5.5"
-authkestra-engine = "=0.5.5"
+# Bumped past the 0.6.1/0.6.2 window where most public store types were `#[non_exhaustive]`
+# without constructors, making the store traits unimplementable downstream
+# (marcjazz/authkestra#268, fixed by #271). 0.6.2 was tagged one commit BEFORE that fix landed, so
+# it was unusable; 0.6.3 is the first release carrying it.
+#
+# ⚠️ These three move in LOCKSTEP -- they share one `[workspace.package] version` upstream, and a
+# partial bump has broken this workspace before via a `jsonwebtoken` major mismatch.
+authkestra-resource = "=0.6.3"
+authkestra-op = "=0.6.3"
+authkestra-engine = "=0.6.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "tracing", "net", "time"] }
 thiserror = "2"
 anyhow = "1"

@@ -121,6 +121,7 @@ fn signing_cfg() -> JwtSigning {
         audience: None,
         ttl_seconds: 7_776_000,
         max_key_age_days: 30,
+        claim_mappers: Vec::new(),
     }
 }
 
@@ -200,6 +201,7 @@ fn state(repo: Arc<StoreRepo>) -> TokenExchangeState {
         budget_repo,
         Arc::new(FixedFloorPolicyEngine),
         Arc::new(MockBearer::new(true, vec![PUBLIC_CLIENT_ID.to_string()])),
+        std::sync::Arc::new(Vec::new()),
         cfg,
         GRANDFATHER_ISSUER.to_string(),
     ));

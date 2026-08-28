@@ -106,6 +106,7 @@ fn signing_cfg() -> JwtSigning {
         audience: Some("lightbridge-api-key".to_string()),
         ttl_seconds: 7_776_000,
         max_key_age_days: 30,
+        claim_mappers: Vec::new(),
     }
 }
 
@@ -470,6 +471,7 @@ fn offline_token_exchange_state(
         budget_repo,
         policy_engine,
         bearer,
+        std::sync::Arc::new(Vec::new()),
         cfg,
         oauth2
             .federation

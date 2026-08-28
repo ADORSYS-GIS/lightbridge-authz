@@ -171,6 +171,31 @@ oauth2:
     audience: "${JWT_SIGNING_AUDIENCE:-lightbridge-api-key}"
     ttl_seconds: ${JWT_SIGNING_TTL_SECONDS:-7776000}
     max_key_age_days: ${JWT_SIGNING_MAX_KEY_AGE_DAYS:-30}
+
+    # GHSA/#538-adjacent but separate: claims this deployment stamps on tokens it signs, declared
+    # rather than hard-coded.
+    #
+    # This is what lets `authz-idp` be the sole issuer for the human plane. The RBAC roles claim
+    # below is derived from `project_members` -- data this service owns -- not copied out of a
+    # Keycloak token we happened to broker. `authz-api` reads whatever `oauth2.rbac.roles_claim`
+    # names, so the `claim` here MUST match that setting.
+    #
+    # `source: project_role` resolves to `owner` (the subject owns the project's account and
+    # normally holds no roster row -- the same implicit authorization `authorize_project_lead`
+    # applies), or the subject's `project_members.role` (`lead` / `member`).
+    #
+    # A source value absent from `map` falls through to `default`, which is EMPTY here: no roles,
+    # therefore no permissions. That is the default-deny direction. A lookup FAILURE is different --
+    # it refuses the mint outright rather than stamping an empty claim, so a database blip can never
+    # masquerade as a legitimately unprivileged user.
+    claim_mappers:
+      - claim: lightbridge_api_roles
+        source: project_role
+        map:
+          owner: ["lightbridge-admin"]
+          lead: ["lightbridge-editor"]
+          member: ["lightbridge-viewer"]
+        default: []
   # Native RFC 8693 token-exchange and RFC 8628 device grant. Requires `signing`. Token exchange
   # exchanges an upstream IdP access token (+ project_id) for a short-lived project-scoped JWT;
   # the device flow delegates approval to the Keycloak relying-party verification page.
