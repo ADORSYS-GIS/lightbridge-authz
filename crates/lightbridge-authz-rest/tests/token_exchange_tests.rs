@@ -275,7 +275,13 @@ fn browser_client(client_id: &str, redirect_uri: &str) -> OauthClient {
         client_id: client_id.to_string(),
         client_type: OauthClientType::Public,
         scopes: client_scopes(),
-        grant_types: vec!["authorization_code".to_string()],
+        // `refresh_token` alongside `authorization_code`: since #525 this grant issues a rotating
+        // refresh token when `offline_access` is granted, and a browser client that cannot then
+        // redeem it would be handed a credential it is forbidden to use.
+        grant_types: vec![
+            "authorization_code".to_string(),
+            "refresh_token".to_string(),
+        ],
         allowed_audiences: vec![client_id.to_string()],
         jwks: None,
         redirect_uris: vec![redirect_uri.to_string()],
@@ -6129,5 +6135,101 @@ async fn authorization_code_grant_stamps_the_same_enforcement_claims_as_the_othe
     assert!(
         body.get("issued_token_type").is_none(),
         "issued_token_type belongs to the token-exchange response only: {body}"
+    );
+}
+
+/// #525: the browser grant must yield a rotating refresh token when `offline_access` is granted,
+/// and the superseded token must be refused on reuse -- the same single-use CAS + RFC 6819
+/// §5.2.2.3 cascade the device and exchange grants already get, because all three now mint
+/// through `mint_human_plane_tokens`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorization_code_grant_issues_a_rotating_refresh_token(pool: PgPool) {
+    const CLIENT: &str = "browser-client";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+    const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
+
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+    store_browser_code(repo.clone(), "refresh-code", CLIENT, REDIRECT_URI, VERIFIER).await;
+
+    let state = || {
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            vec![browser_client(CLIENT, REDIRECT_URI)],
+            &redis_url(),
+        )
+    };
+
+    let (status, body) = post_token(
+        state(),
+        &format!(
+            "grant_type=authorization_code&client_id={CLIENT}&code=refresh-code&redirect_uri={REDIRECT_URI}&code_verifier={VERIFIER}&scope=openid%20offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let first = body["refresh_token"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("offline_access on the browser grant must yield a refresh token: {body}")
+        })
+        .to_string();
+
+    let (status, body) = post_token(
+        state(),
+        &format!("grant_type=refresh_token&client_id={CLIENT}&refresh_token={first}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let second = body["refresh_token"].as_str().expect("rotated").to_string();
+    assert_ne!(
+        second, first,
+        "the refresh token must ROTATE, not be reissued"
+    );
+
+    let (status, body) = post_token(
+        state(),
+        &format!("grant_type=refresh_token&client_id={CLIENT}&refresh_token={first}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "replaying a superseded refresh token must be refused: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+}
+
+/// The other half of the contract: no `offline_access`, no refresh token. A browser client that
+/// did not ask for one must not silently receive a long-lived credential.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorization_code_grant_omits_refresh_without_offline_access(pool: PgPool) {
+    const CLIENT: &str = "browser-client";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+    const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
+
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+    store_browser_code(repo.clone(), "no-offline", CLIENT, REDIRECT_URI, VERIFIER).await;
+
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            vec![browser_client(CLIENT, REDIRECT_URI)],
+            &redis_url(),
+        ),
+        &format!(
+            "grant_type=authorization_code&client_id={CLIENT}&code=no-offline&redirect_uri={REDIRECT_URI}&code_verifier={VERIFIER}&scope=openid"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body.get("refresh_token").is_none() || body["refresh_token"].is_null(),
+        "no offline_access means no refresh token: {body}"
     );
 }
