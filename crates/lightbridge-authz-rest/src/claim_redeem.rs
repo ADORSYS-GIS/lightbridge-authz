@@ -32,7 +32,10 @@ use crate::session_cookie::read_session_cookie;
 
 #[derive(Clone)]
 pub struct ClaimRedeemState {
-    pub claims: Arc<SecretClaimStore>,
+    /// `None` when `secret_claim` is unconfigured. The route stays mounted and answers an explicit
+    /// 503 rather than 404: a claim URL that a misconfigured deployment cannot honour should say
+    /// so, not look like an expired or forged link and send the user off to rotate a key.
+    pub claims: Option<Arc<SecretClaimStore>>,
     pub repo: Arc<StoreRepo>,
 }
 
@@ -132,7 +135,14 @@ async fn redeem(
         return unavailable();
     };
 
-    match state.claims.redeem(&token, &subject).await {
+    let Some(claims) = state.claims.as_ref() else {
+        tracing::error!(
+            "a secret claim was presented but secret_claim is unconfigured on this deployment"
+        );
+        return not_configured();
+    };
+
+    match claims.redeem(&token, &subject).await {
         Ok(Some(secret)) => (
             StatusCode::OK,
             secure_headers(),
@@ -152,6 +162,22 @@ async fn redeem(
             store_unavailable()
         }
     }
+}
+
+/// Distinct from both `unavailable()` and `store_unavailable()`: the deployment cannot honour
+/// claims at all. Saying so plainly is what stops an operator debugging a "expired link" that was
+/// never redeemable, and it reveals nothing -- the claim's existence is not consulted.
+fn not_configured() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        secure_headers(),
+        page(
+            "Not available here",
+            "<h1>Not available here</h1><p>This deployment is not configured to hand over key \
+             secrets. Ask an operator to configure <code>secret_claim</code>.</p>",
+        ),
+    )
+        .into_response()
 }
 
 /// The store being unreachable is the one case that must NOT read as "no such claim": the claim

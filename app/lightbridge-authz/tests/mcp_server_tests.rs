@@ -99,12 +99,12 @@ async fn start_mcp_server_runs_without_redis_and_never_fails_on_it() {
         &QuotaTiers::default(),
         &ModelCatalog::default(),
         &ApiKeyExpiry::default(),
-        &lightbridge_authz_core::config::SecretClaim {
+        Some(&lightbridge_authz_core::config::SecretClaim {
             // base64url of 32 bytes of 0x07 -- a literal so this test crate needs no base64 dep.
             encryption_key: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".to_string(),
             ttl_seconds: 300,
             redeem_base_url: "https://auth.example.test".to_string(),
-        },
+        }),
         lazy_pool(),
     )
     .await;

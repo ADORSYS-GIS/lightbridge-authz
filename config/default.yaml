@@ -311,9 +311,14 @@ models:
 # sealed here and handed over as a single-use claim URL the requesting human redeems once, in a
 # browser, against authz-idp.
 #
-# MANDATORY for lightbridge-mcp (which issues claims) and authz-idp (which redeems them); both
-# refuse to start without it rather than degrade to returning secrets inline. authz-api/-opa/
-# -budget load this same file and ignore the section.
+# Deliberately NOT a startup mandate. An ABSENT block degrades safely: lightbridge-mcp REFUSES
+# create-api-key/rotate-api-key (it never falls back to returning the secret), and authz-idp
+# answers 503 on /api-keys/claim. A PRESENT but malformed block IS a hard startup failure --
+# tolerated case is "absent", never "wrong".
+#
+# The mandate was softened deliberately: authz-idp is the sole server of its issuer, and every
+# in-circulation API-key JWT names it in `iss`, so refusing to boot over a missing claim key would
+# take the issuer down to disable one page. authz-api/-opa/-budget ignore this section.
 secret_claim:
   # Dev-only fixed key: base64url, exactly 32 bytes. Distinct from BOTH relying-party keys above --
   # different data, different lifetime, different rotation posture. Production MUST override.

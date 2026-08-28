@@ -3196,25 +3196,24 @@ pub async fn start_idp_server(
         ));
     }
 
-    // GHSA-9pc6-965v-2c44: authz-idp REDEEMS secret claims, so this section is mandatory here --
-    // the same posture as the redis/relying_party/token_exchange mandates above. A deployment
-    // where lightbridge-mcp issues claim URLs that this service cannot redeem would hand users
-    // links that 404, which is the advertised-but-unmounted failure ADR-0023 exists to prevent.
-    let secret_claim = secret_claim.as_ref().ok_or_else(|| {
-        Error::Server(
-            "secret_claim is required for authz-idp (GHSA-9pc6-965v-2c44) -- /api-keys/claim is \
-             always mounted, and lightbridge-mcp hands out claim URLs pointing at it"
-                .to_string(),
-        )
-    })?;
-    // Same repo the signing bootstrap already built over this pool -- one StoreRepo per
-    // pool, not a second connection path for the same database.
+    // GHSA-9pc6-965v-2c44. Deliberately NOT a startup mandate, unlike the redis/relying_party/
+    // token_exchange checks above: authz-idp is the sole server of this deployment's issuer, and
+    // every in-circulation API-key JWT names it in `iss`. Refusing to boot over a missing
+    // claim-redemption key would take the whole issuer down to disable one page. An absent block
+    // instead makes /api-keys/claim answer an explicit 503.
+    //
+    // A PRESENT but malformed block is still a hard startup failure -- `from_config` validates
+    // offline. The tolerated case is "absent", never "wrong".
+    //
+    // Same repo the signing bootstrap already built over this pool -- one StoreRepo per pool, not
+    // a second connection path for the same database.
     let claim_repo = signing_repo.clone();
     let claim_redeem = claim_redeem::ClaimRedeemState {
-        claims: Arc::new(secret_claim::SecretClaimStore::from_config(
-            claim_repo.clone(),
-            secret_claim,
-        )?),
+        claims: secret_claim
+            .as_ref()
+            .map(|cfg| secret_claim::SecretClaimStore::from_config(claim_repo.clone(), cfg))
+            .transpose()?
+            .map(Arc::new),
         repo: claim_repo,
     };
 

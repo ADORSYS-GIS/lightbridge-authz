@@ -125,12 +125,18 @@ pub struct LightbridgeMcpHandler {
     /// comment for the self-signed-vs-external issuer cases this handles.
     resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver>,
     /// Stashes a freshly minted API key secret so it is handed to the human out of band instead
-    /// of returned in a tool result (GHSA-9pc6-965v-2c44). Not optional: without it there is no
-    /// safe way to answer `create-api-key` at all.
-    claim_store: Arc<SecretClaimStore>,
+    /// of returned in a tool result (GHSA-9pc6-965v-2c44).
+    ///
+    /// `None` when `secret_claim` is unconfigured. That does NOT re-enable returning the secret --
+    /// `create-api-key`/`rotate-api-key` REFUSE outright in that state. The alternative, failing at
+    /// startup, would take this service down on any deployment that upgrades the image before
+    /// provisioning the key, so the refusal was moved from process start to the affected operation.
+    /// Every other tool keeps working.
+    claim_store: Option<Arc<SecretClaimStore>>,
     /// Origin of the `authz-idp` that redeems claims, from `secret_claim.redeem_base_url`.
     /// Configured, never derived from a request header, which would be attacker-influenced.
-    redeem_base_url: Arc<String>,
+    /// `Some` exactly when `claim_store` is.
+    redeem_base_url: Option<Arc<String>>,
 }
 
 impl std::fmt::Debug for LightbridgeMcpHandler {
@@ -160,8 +166,8 @@ impl LightbridgeMcpHandler {
         api_key_audience: Option<String>,
         resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver>,
         federation_issuer: String,
-        claim_store: Arc<SecretClaimStore>,
-        redeem_base_url: Arc<String>,
+        claim_store: Option<Arc<SecretClaimStore>>,
+        redeem_base_url: Option<Arc<String>>,
     ) -> Self {
         let billing = Arc::new(billing.clone());
         let opa_state = Arc::new(OpaState {
@@ -1478,15 +1484,30 @@ impl LightbridgeMcpHandler {
         // so it must never carry the secret. Stash it and hand back a claim only the requesting
         // human, in a browser, can redeem. A failure to stash REFUSES the call -- there is no
         // fallback that returns the secret inline.
-        let claim = self
-            .claim_store
+        // Fail closed when unconfigured. The secret exists at this point and the key row is
+        // written, but there is nowhere safe to put the secret -- and a tool result is not it.
+        // Refusing is the only correct answer; returning it would reintroduce the exposure this
+        // whole mechanism exists to remove.
+        let (Some(claim_store), Some(redeem_base_url)) =
+            (self.claim_store.as_ref(), self.redeem_base_url.as_ref())
+        else {
+            return Err(ErrorData::internal_error(
+                "secret_claim is not configured on this deployment, so an API key secret cannot \
+                 be delivered safely. An MCP tool result is read by the model, so the secret is \
+                 never returned here. Configure secret_claim (encryption_key, redeem_base_url) \
+                 and retry."
+                    .to_string(),
+                None,
+            ));
+        };
+        let claim = claim_store
             .issue(&api_key_secret.secret, &subject)
             .await
             .map_err(to_tool_error)?;
         to_json_value(api_key_claim_response(
             &api_key_secret.api_key,
             api_key_secret.oauth2_url.as_deref(),
-            &self.redeem_base_url,
+            redeem_base_url,
             &claim.token,
             claim.expires_in_seconds,
         ))
@@ -1644,15 +1665,30 @@ impl LightbridgeMcpHandler {
         // so it must never carry the secret. Stash it and hand back a claim only the requesting
         // human, in a browser, can redeem. A failure to stash REFUSES the call -- there is no
         // fallback that returns the secret inline.
-        let claim = self
-            .claim_store
+        // Fail closed when unconfigured. The secret exists at this point and the key row is
+        // written, but there is nowhere safe to put the secret -- and a tool result is not it.
+        // Refusing is the only correct answer; returning it would reintroduce the exposure this
+        // whole mechanism exists to remove.
+        let (Some(claim_store), Some(redeem_base_url)) =
+            (self.claim_store.as_ref(), self.redeem_base_url.as_ref())
+        else {
+            return Err(ErrorData::internal_error(
+                "secret_claim is not configured on this deployment, so an API key secret cannot \
+                 be delivered safely. An MCP tool result is read by the model, so the secret is \
+                 never returned here. Configure secret_claim (encryption_key, redeem_base_url) \
+                 and retry."
+                    .to_string(),
+                None,
+            ));
+        };
+        let claim = claim_store
             .issue(&api_key_secret.secret, &subject)
             .await
             .map_err(to_tool_error)?;
         to_json_value(api_key_claim_response(
             &api_key_secret.api_key,
             api_key_secret.oauth2_url.as_deref(),
-            &self.redeem_base_url,
+            redeem_base_url,
             &claim.token,
             claim.expires_in_seconds,
         ))
@@ -1785,8 +1821,8 @@ fn build_mcp_router(
     resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver>,
     federation_issuer: String,
     readiness_pool: Arc<dyn DbPoolTrait>,
-    claim_store: Arc<SecretClaimStore>,
-    redeem_base_url: Arc<String>,
+    claim_store: Option<Arc<SecretClaimStore>>,
+    redeem_base_url: Option<Arc<String>>,
 ) -> Router {
     let app_state = Arc::new(lightbridge_authz_api::AppState {
         bearer: bearer_service,
@@ -1890,7 +1926,7 @@ pub async fn start_mcp_server(
     quota_tiers: &QuotaTiers,
     models: &ModelCatalog,
     api_key_expiry: &ApiKeyExpiry,
-    secret_claim: &lightbridge_authz_core::config::SecretClaim,
+    secret_claim: Option<&lightbridge_authz_core::config::SecretClaim>,
     pool: Arc<dyn DbPoolTrait>,
 ) -> Result<()> {
     billing.validate()?;
@@ -1940,10 +1976,14 @@ pub async fn start_mcp_server(
     // Validated offline here (base64url, exactly 32 bytes, positive TTL) so a malformed key is a
     // startup failure rather than a first-request failure -- the same posture
     // `KeycloakRelyingParty::new` takes, and for the same reason.
-    let claim_store = Arc::new(SecretClaimStore::from_config(
-        Arc::new(StoreRepo::new(pool.clone())),
-        secret_claim,
-    )?);
+    // Still validated OFFLINE when present (base64url, exactly 32 bytes, positive TTL), so a
+    // malformed key is a startup failure -- only an ABSENT block is tolerated, and it degrades to
+    // refusing key creation rather than to returning secrets unsafely.
+    let claim_store = secret_claim
+        .map(|cfg| {
+            SecretClaimStore::from_config(Arc::new(StoreRepo::new(pool.clone())), cfg).map(Arc::new)
+        })
+        .transpose()?;
     let opa_repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
     let bearer_service: Arc<dyn BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
@@ -1977,7 +2017,7 @@ pub async fn start_mcp_server(
         federation.issuer.clone(),
         readiness_pool,
         claim_store,
-        Arc::new(secret_claim.redeem_base_url.clone()),
+        secret_claim.map(|cfg| Arc::new(cfg.redeem_base_url.clone())),
     );
 
     let signing_enabled = oauth2.is_self_signed();
@@ -1998,18 +2038,10 @@ pub async fn start_mcp_server(
 pub async fn start_mcp_server_from_config(config: &Config) -> Result<()> {
     let pool: Arc<dyn DbPoolTrait> =
         Arc::new(lightbridge_authz_core::db::DbPool::new(&config.database).await?);
-    // GHSA-9pc6-965v-2c44: lightbridge-mcp ISSUES secret claims, so this section is mandatory
-    // here -- loudly at startup, never a silent degradation to returning secrets inline. Same
-    // shape as the federation/redis mandates: the field stays Option on Config because other
-    // components load the same type and never touch claims.
-    let secret_claim = config.secret_claim.as_ref().ok_or_else(|| {
-        Error::Server(
-            "secret_claim is required for lightbridge-mcp (GHSA-9pc6-965v-2c44) -- API key \
-             secrets are handed over as single-use claims, never returned in a tool result, so \
-             there is no safe way to serve create-api-key without it"
-                .to_string(),
-        )
-    })?;
+    // GHSA-9pc6-965v-2c44. Deliberately NOT a startup mandate: an absent block degrades to
+    // refusing create-api-key/rotate-api-key, never to returning a secret in a tool result. The
+    // startup-mandate version would take this service down on any deployment that ships the image
+    // before provisioning the key, which is a worse failure than one tool refusing.
     start_mcp_server(
         &config.server.api,
         &config.oauth2,
@@ -2018,7 +2050,7 @@ pub async fn start_mcp_server_from_config(config: &Config) -> Result<()> {
         &config.quota_tiers,
         &config.models,
         &config.api_key_expiry,
-        secret_claim,
+        config.secret_claim.as_ref(),
         pool,
     )
     .await
@@ -2099,6 +2131,51 @@ mod tests {
         assert!(
             !rendered.contains("hash-must-not-be-serialized"),
             "ApiKey::key_hash is #[serde(skip_serializing)] and must stay that way: {rendered}"
+        );
+    }
+
+    /// GHSA-9pc6-965v-2c44 softening contract: the service must come up with `secret_claim`
+    /// absent, with every tool still advertised. The refusal happens at `create-api-key`, not at
+    /// process start -- see that tool's early return. Booting is what makes this safe to deploy
+    /// ahead of provisioning the key.
+    #[tokio::test]
+    async fn the_handler_builds_and_advertises_every_tool_without_a_claim_store() {
+        let with_claims = LightbridgeMcpHandler::new(
+            lazy_cratestack_db(),
+            lazy_issuer(),
+            sample_repo(),
+            basic_auth(),
+            &sample_billing(),
+            None,
+            test_resolver(),
+            "https://keycloak.example.test/realms/dev".to_string(),
+            test_claim_store(),
+            test_redeem_base_url(),
+        );
+        let without_claims = LightbridgeMcpHandler::new(
+            lazy_cratestack_db(),
+            lazy_issuer(),
+            sample_repo(),
+            basic_auth(),
+            &sample_billing(),
+            None,
+            test_resolver(),
+            "https://keycloak.example.test/realms/dev".to_string(),
+            None,
+            None,
+        );
+        assert_eq!(
+            without_claims.advertised_tools().len(),
+            with_claims.advertised_tools().len(),
+            "an unconfigured secret_claim must not remove tools -- it must refuse the two that \
+             hand over a secret, at call time"
+        );
+        assert!(
+            without_claims
+                .advertised_tools()
+                .iter()
+                .any(|t| t.name == "create-api-key"),
+            "create-api-key stays advertised; it refuses when called"
         );
     }
 
@@ -2514,16 +2591,16 @@ mod tests {
 
     /// Claim store for handler-shape tests. The pool is lazy, so nothing dials a database unless a
     /// test actually issues a claim.
-    fn test_claim_store() -> Arc<SecretClaimStore> {
-        Arc::new(SecretClaimStore::new(
+    fn test_claim_store() -> Option<Arc<SecretClaimStore>> {
+        Some(Arc::new(SecretClaimStore::new(
             Arc::new(lightbridge_authz_api_key::repo::StoreRepo::new(lazy_pool())),
             [7u8; 32],
             300,
-        ))
+        )))
     }
 
-    fn test_redeem_base_url() -> Arc<String> {
-        Arc::new("https://auth.example.test".to_string())
+    fn test_redeem_base_url() -> Option<Arc<String>> {
+        Some(Arc::new("https://auth.example.test".to_string()))
     }
 
     /// The generated cratestack CRUD client over a lazily-connected pool pointed at an unreachable

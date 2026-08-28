@@ -66,10 +66,12 @@ fn lazy_pool() -> Arc<dyn DbPoolTrait> {
 fn test_claim_redeem() -> lightbridge_authz_rest::claim_redeem::ClaimRedeemState {
     let repo = std::sync::Arc::new(lightbridge_authz_api_key::repo::StoreRepo::new(lazy_pool()));
     lightbridge_authz_rest::claim_redeem::ClaimRedeemState {
-        claims: std::sync::Arc::new(lightbridge_authz_rest::secret_claim::SecretClaimStore::new(
-            repo.clone(),
-            [7u8; 32],
-            300,
+        claims: Some(std::sync::Arc::new(
+            lightbridge_authz_rest::secret_claim::SecretClaimStore::new(
+                repo.clone(),
+                [7u8; 32],
+                300,
+            ),
         )),
         repo,
     }
@@ -1604,16 +1606,15 @@ mod db {
         assert!(message.contains("authz-idp"), "got: {message}");
     }
 
-    /// GHSA-9pc6-965v-2c44: authz-idp REDEEMS secret claims, so `secret_claim` is mandatory here.
-    /// Uses a fully valid IdP fixture so every earlier mandate (redis, relying_party,
-    /// token_exchange) passes and the assertion isolates this check -- otherwise an earlier
-    /// refusal would satisfy `expect_err` while proving nothing about this one.
+    /// GHSA-9pc6-965v-2c44: `secret_claim` is deliberately NOT a startup mandate for authz-idp.
     ///
-    /// The failure must be at STARTUP. A deployment that came up without it would serve claim URLs
-    /// that 404 while lightbridge-mcp kept handing them out, which is exactly the
-    /// advertised-but-unmounted failure ADR-0023 exists to prevent.
+    /// authz-idp is the sole server of this deployment's issuer, and every in-circulation API-key
+    /// JWT names it in `iss`. Refusing to boot over a missing claim-redemption key would take the
+    /// whole issuer down in order to disable one page -- a far worse failure than that page
+    /// answering 503. This asserts the absent block is tolerated, by checking that startup gets
+    /// PAST this point and fails later on the deliberately-bad TLS instead.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn start_idp_server_requires_secret_claim(pool: PgPool) {
+    async fn start_idp_server_tolerates_absent_secret_claim(pool: PgPool) {
         let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
         let idp = IdpServer {
             address: "127.0.0.1".to_string(),
@@ -1629,13 +1630,43 @@ mod db {
             &None,
         )
         .await
-        .expect_err(
-            "authz-idp redeems secret claims: omitting secret_claim must be refused at startup, \
-             not degrade into 404ing every claim URL lightbridge-mcp hands out",
+        .expect_err("bad_tls() guarantees this cannot bind, whatever else happens");
+        let message = format!("{err}");
+        assert!(
+            !message.contains("secret_claim"),
+            "an ABSENT secret_claim must not stop authz-idp starting -- it degrades to a 503 on \
+             /api-keys/claim. Got: {message}"
         );
+    }
+
+    /// The other half of the contract: absent is tolerated, but PRESENT-but-malformed is still a
+    /// hard startup failure. Tolerating a bad key would leave every claim URL silently broken with
+    /// no signal, which is the failure mode the offline validation exists to prevent.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_idp_server_rejects_a_malformed_secret_claim_key(pool: PgPool) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let idp = IdpServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+            static_dir: TEST_STATIC_DIR.to_string(),
+        };
+        let bad = Some(lightbridge_authz_core::config::SecretClaim {
+            encryption_key: "not-32-bytes".to_string(),
+            ttl_seconds: 300,
+            redeem_base_url: "https://auth.example.test".to_string(),
+        });
+        let err = start_idp_server(
+            &idp,
+            db_pool,
+            &full_idp_oauth2(),
+            &unreachable_redis_cfg(),
+            &bad,
+        )
+        .await
+        .expect_err("a malformed secret_claim.encryption_key must refuse at startup");
         let message = format!("{err}");
         assert!(message.contains("secret_claim"), "got: {message}");
-        assert!(message.contains("authz-idp"), "got: {message}");
     }
 
     /// Renamed from `start_idp_server_rejects_invalid_relying_party_when_configured`: since
