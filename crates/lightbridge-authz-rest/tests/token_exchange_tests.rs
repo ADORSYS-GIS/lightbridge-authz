@@ -727,6 +727,30 @@ async fn store_browser_code(
     redirect_uri: &str,
     verifier: &str,
 ) {
+    store_browser_code_with_scope(
+        repo,
+        code,
+        client_id,
+        redirect_uri,
+        verifier,
+        "openid profile",
+    )
+    .await;
+}
+
+/// Stores an authorization code carrying an explicit granted scope.
+///
+/// The scope on the CODE is what the token response must honour (RFC 6749 §4.1.3): an
+/// authorization_code token request carries no `scope` parameter at all, so a test that passes one
+/// on the token call proves nothing about where the scope actually came from.
+async fn store_browser_code_with_scope(
+    repo: Arc<StoreRepo>,
+    code: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    verifier: &str,
+    scope: &str,
+) {
     let mut attributes = HashMap::new();
     attributes.insert("account_id".to_string(), ACCOUNT_ID.to_string());
     attributes.insert("project_id".to_string(), PROJECT_ID.to_string());
@@ -736,7 +760,7 @@ async fn store_browser_code(
                 code.to_string(),
                 client_id.to_string(),
                 redirect_uri.to_string(),
-                "openid profile".to_string(),
+                scope.to_string(),
                 Identity {
                     provider_id: "keycloak".to_string(),
                     external_id: SUBJECT.to_string(),
@@ -6151,7 +6175,15 @@ async fn authorization_code_grant_issues_a_rotating_refresh_token(pool: PgPool) 
     let repo = repo(pool);
     bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
     seed(&repo).await;
-    store_browser_code(repo.clone(), "refresh-code", CLIENT, REDIRECT_URI, VERIFIER).await;
+    store_browser_code_with_scope(
+        repo.clone(),
+        "refresh-code",
+        CLIENT,
+        REDIRECT_URI,
+        VERIFIER,
+        "openid offline_access",
+    )
+    .await;
 
     let state = || {
         state_with(
@@ -6165,7 +6197,12 @@ async fn authorization_code_grant_issues_a_rotating_refresh_token(pool: PgPool) 
     let (status, body) = post_token(
         state(),
         &format!(
-            "grant_type=authorization_code&client_id={CLIENT}&code=refresh-code&redirect_uri={REDIRECT_URI}&code_verifier={VERIFIER}&scope=openid%20offline_access"
+            // Deliberately NO `scope` parameter -- RFC 6749 §4.1.3 says an authorization_code
+            // token request carries none, and the granted scope is the authorization grant's own.
+            // `store_browser_code` issued this code with `offline_access`, so the refresh token
+            // must follow from that alone. Passing scope here would have hidden the bug where the
+            // token request's (absent) scope was used instead of the code's.
+            "grant_type=authorization_code&client_id={CLIENT}&code=refresh-code&redirect_uri={REDIRECT_URI}&code_verifier={VERIFIER}"
         ),
     )
     .await;

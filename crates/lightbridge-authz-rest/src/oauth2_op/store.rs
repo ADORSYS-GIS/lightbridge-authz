@@ -1231,13 +1231,23 @@ impl TokenExchangeOpStore {
             email: None,
             email_verified: None,
         };
+        // RFC 6749 §4.1.3: an authorization_code token request carries NO `scope` parameter --
+        // the granted scope is the scope of the authorization grant, fixed at `/authorize`. Passing
+        // `req.scope` here means passing `None`, and `grant_scopes` treats an unspecified request
+        // as "server defaults MINUS offline_access" (a deliberate guard so a scope-less request can
+        // never silently mint a refresh token). The effect was a browser login that asked for
+        // `offline_access`, was granted it at /authorize, and then got no refresh token at all --
+        // observed in prod as `offline=false` on a console login that requested it.
+        //
+        // The code's own stored scope is the authoritative grant.
+        let granted_scope = Some(auth_code.scope.clone());
         self.mint_human_plane_tokens(
             &owner,
             &account_id,
             &context,
             &client_id,
             &client.scopes,
-            &req.scope,
+            &granted_scope,
             None,
             auth_code.nonce.clone(),
             // Not a token-exchange response: RFC 8693 §2.2.1 only requires `issued_token_type`
