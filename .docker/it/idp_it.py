@@ -577,6 +577,7 @@ def section_browser_flow() -> None:
                 "redirect_uri": BROWSER_REDIRECT_URI,
                 "client_id": BROWSER_CLIENT_ID,
                 "code_verifier": verifier,
+                "scope": "openid offline_access",
             }
         ).encode(),
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -586,10 +587,64 @@ def section_browser_flow() -> None:
     access_token = token_body["access_token"]
     claims = decode_jwt_claims(access_token)
     assert claims.get("sub"), f"access token missing sub: {claims}"
-    identity_attrs = claims.get("identity", {}).get("attributes", {})
-    assert identity_attrs.get("account_id"), f"access token missing identity.attributes.account_id: {claims}"
-    assert identity_attrs.get("project_id"), f"access token missing identity.attributes.project_id: {claims}"
-    log("authorization_code redemption passed with the expected claim shape")
+
+    # lightbridge-authz#524: the browser grant mints through the same path as the device and
+    # exchange grants, so tenant context is a TOP-LEVEL claim. It used to arrive nested under
+    # `identity.attributes` purely because authkestra's default handler passed the authorization
+    # code's stored identity through verbatim -- a shape nothing downstream actually read.
+    assert claims.get("account_id"), f"access token missing account_id: {claims}"
+    assert claims.get("project_id"), f"access token missing project_id: {claims}"
+
+    # The whole point of #524: a browser login must carry the SAME enforcement claims a device
+    # login does. Without these the console is authenticated but unauthorized -- refused by every
+    # RBAC-gated procedure, with nothing in the token explaining why.
+    assert claims.get("budget_tier"), f"browser token missing budget_tier (ADR-0014): {claims}"
+    assert claims.get("sid"), f"browser login did not persist a revocable session: {claims}"
+    assert claims.get("model_policy"), f"browser token missing model_policy: {claims}"
+    # RFC 8693 §2.2.1 requires `issued_token_type` on a token-exchange response and ONLY there.
+    assert "issued_token_type" not in token_body, (
+        f"issued_token_type belongs to the token-exchange response only: {token_body}"
+    )
+    log("browser access token carries budget_tier, tenant context and a session id")
+
+    # lightbridge-authz#525: offline_access on the browser grant yields a ROTATING refresh token,
+    # and the superseded one must be refused -- the same single-use CAS the device grant gets.
+    browser_refresh = token_body.get("refresh_token")
+    assert browser_refresh, f"offline_access must yield a refresh token: {token_body}"
+    status, _, rotated_bytes = http_raw(
+        "POST",
+        f"{IDP_URL}/oauth2/token",
+        body=urllib.parse.urlencode(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": browser_refresh,
+                "client_id": BROWSER_CLIENT_ID,
+            }
+        ).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    rotated = json.loads(rotated_bytes)
+    assert status == 200, f"browser refresh failed: status={status}, body={rotated}"
+    assert rotated.get("refresh_token") and rotated["refresh_token"] != browser_refresh, (
+        f"the browser refresh token must ROTATE, not be reissued: {rotated}"
+    )
+    status, _, replayed_bytes = http_raw(
+        "POST",
+        f"{IDP_URL}/oauth2/token",
+        body=urllib.parse.urlencode(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": browser_refresh,
+                "client_id": BROWSER_CLIENT_ID,
+            }
+        ).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    replayed = json.loads(replayed_bytes)
+    assert status == 400 and replayed.get("error") == "invalid_grant", (
+        f"a superseded browser refresh token must be refused: status={status}, body={replayed}"
+    )
+    log("browser refresh token rotates and the superseded token is refused on reuse")
 
     status, _, replay_body = http_raw(
         "POST",
