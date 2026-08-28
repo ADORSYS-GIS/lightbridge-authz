@@ -1327,23 +1327,27 @@ async fn authorize_with_existing_session_mints_the_real_subject_not_the_owner_ac
     // The `authorization_code` grant mints via `TokenManager::issue_user_token` with no `extra`
     // claims (authkestra-op's `handle_authorization_code`), so `account_id`/`project_id` live
     // under the nested `identity.attributes` object `issue_code` populated -- not top-level
-    // claims the typed `AccessClaims` struct expects (that struct's `api_key_id` is only ever
-    // set by the token-exchange/device/refresh grants' own `access_token_extra` call, so decoding
-    // an authorization_code-grant token through it fails on that missing field).
+    // Decoded loosely rather than through the typed `AccessClaims`. That was originally because
+    // an authorization_code token lacked `api_key_id`; since #524 it has one (this grant mints
+    // through the same `access_token_extra` as the others), but the loose decode is kept so this
+    // test asserts the wire shape directly rather than whatever the struct happens to model.
     let claims =
         decode_access_token_claims(&repo, body["access_token"].as_str().unwrap(), CLIENT).await;
     assert_eq!(
         claims["sub"], SUBJECT,
         "sub must be the real authenticated member, not the project owner: {claims}"
     );
+    // #524: the browser grant now mints through `mint_human_plane_tokens`, the same path every
+    // other grant uses, so tenant context is a TOP-LEVEL claim (`access_token_extra`) rather than
+    // nested under `identity.attributes`. The nesting was an artifact of authkestra's default
+    // handler passing the authorization code's stored identity through verbatim; it never matched
+    // what the exchange or device grants produced, and it is not what authz-api/Authorino read.
     assert_eq!(
-        claims["identity"]["attributes"]["account_id"], OWNER_ACCOUNT,
-        "account_id claim still correctly resolves to the owning account: {claims}"
+        claims["account_id"], OWNER_ACCOUNT,
+        "account_id still correctly resolves to the OWNING account, not the acting member: \
+         {claims}"
     );
-    assert_eq!(
-        claims["identity"]["attributes"]["project_id"],
-        MEMBER_PROJECT_ID
-    );
+    assert_eq!(claims["project_id"], MEMBER_PROJECT_ID);
 }
 
 /// Code-review follow-up to #463/#466/#467 (Finding E, positive path): when a request's
@@ -1438,12 +1442,12 @@ async fn authorize_reresolves_context_when_request_project_differs_from_session(
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    // See the sibling Finding-B test's comment: `authorization_code`-grant tokens carry
-    // `account_id`/`project_id` under nested `identity.attributes`, not as top-level claims.
+    // #524: tenant context is a top-level claim on every grant now, including this one -- see
+    // the sibling test's comment for why the old `identity.attributes` nesting went away.
     let claims =
         decode_access_token_claims(&repo, body["access_token"].as_str().unwrap(), CLIENT).await;
     assert_eq!(
-        claims["identity"]["attributes"]["project_id"], SECOND_PROJECT_ID,
+        claims["project_id"], SECOND_PROJECT_ID,
         "requesting a different project than the session's must not silently issue for the \
          session's own project: {claims}"
     );
@@ -6055,4 +6059,75 @@ async fn approved_device_code_is_one_shot_when_context_resolution_refuses(pool: 
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
     assert_eq!(body["error"], "invalid_grant");
+}
+
+/// #524: the browser `authorization_code` grant must carry the SAME enforcement claims a device
+/// or exchange login already carries.
+///
+/// Before the `handle_authorization_code_grant` override this failed on the first assertion:
+/// authkestra's default handler minted a perfectly valid token with none of these claims, so a
+/// console authenticating here was authenticated but unauthorized -- refused by every RBAC-gated
+/// procedure, with nothing in the token to explain why.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorization_code_grant_stamps_the_same_enforcement_claims_as_the_other_grants(
+    pool: PgPool,
+) {
+    const CLIENT: &str = "browser-client";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+    const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
+
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+    store_browser_code(repo.clone(), "claims-code", CLIENT, REDIRECT_URI, VERIFIER).await;
+
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            vec![browser_client(CLIENT, REDIRECT_URI)],
+            &redis_url(),
+        ),
+        &format!(
+            "grant_type=authorization_code&client_id={CLIENT}&code=claims-code&redirect_uri={REDIRECT_URI}&code_verifier={VERIFIER}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let claims =
+        decode_access_token_claims(&repo, body["access_token"].as_str().unwrap(), CLIENT).await;
+
+    assert_eq!(
+        claims["budget_tier"], "b-15",
+        "the browser grant must resolve budget_tier live from the ledger, exactly as the exchange \
+         grant does -- an account with no grant history lands on the lowest rung: {claims:?}"
+    );
+    assert_eq!(
+        claims["project_id"], PROJECT_ID,
+        "the browser grant must carry tenant context: {claims:?}"
+    );
+    assert!(
+        claims.get("sid").is_some_and(|v| !v.is_null()),
+        "a session row must be created for a browser login, so the session is revocable: \
+         {claims:?}"
+    );
+    assert_eq!(
+        claims["model_policy"], "allow_all",
+        "model policy travels with every human-plane token: {claims:?}"
+    );
+    assert_eq!(
+        claims["account_id"], SUBJECT,
+        "tenant context must name the acting account: {claims:?}"
+    );
+    assert_eq!(
+        claims["azp"], CLIENT,
+        "azp binds the token to the client that redeemed the code: {claims:?}"
+    );
+    // `issued_token_type` is REQUIRED by RFC 8693 §2.2.1 on a token-exchange response and only
+    // there. Asserting its absence here keeps the two grants from silently converging.
+    assert!(
+        body.get("issued_token_type").is_none(),
+        "issued_token_type belongs to the token-exchange response only: {body}"
+    );
 }

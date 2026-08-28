@@ -66,6 +66,7 @@ use lightbridge_authz_core::dto::ModelPolicy;
 use lightbridge_authz_core::error::Error;
 use lightbridge_authz_core::identity::AccountId;
 use serde_json::Value;
+use sha2::Digest;
 
 use crate::signing::{KeyOwner, access_token_extra, id_token_extra, identity_for};
 
@@ -907,12 +908,347 @@ impl TokenExchangeOpStore {
         }
     }
 
-    /// The RFC 8693 token-exchange grant (ADR-0011, Decisions 1, 5, 7). `project_id` is this
-    /// crate's own extension to the request, threaded in by `RequestScopedOpStore` since it is
-    /// not a field `authkestra_op::handlers::token::TokenRequest` has room for. Optional: a
-    /// first-time caller has no way to know their project id, so an absent `project_id` falls back
-    /// to `subject`'s auto-provisioned default project (`StoreRepo::find_default_project_id`) once
-    /// the subject is known from the validated `subject_token`.
+    /// The single minting path for every human-plane grant.
+    ///
+    /// Extracted so `handle_token_exchange` and `handle_authorization_code_grant` cannot drift:
+    /// session creation, the live `budget_tier` / `quota_tier` / mapped-claim resolution and their
+    /// fail-closed branches, id-token minting and refresh-chain creation all live here exactly
+    /// once. Two copies of this on the authentication boundary is precisely the duplication this
+    /// repository's review guidance treats as the expensive kind.
+    ///
+    /// Only three things legitimately vary by grant, so only those are parameters:
+    ///
+    /// - `owner` / `auth_time` / `nonce` -- token-exchange decodes them from the presented
+    ///   `subject_token`; the authorization_code grant reads them off the consumed code's stored
+    ///   identity. Both are the authenticated user's own claims, just carried differently.
+    /// - `issued_token_type` -- `Some(...:access_token)` on token-exchange per RFC 8693 §2.2.1,
+    ///   `None` everywhere else.
+    /// - `grant_label` -- log field only.
+    ///
+    /// Everything else is deliberately NOT a parameter: a grant does not get to opt out of the
+    /// session row, the tier claims, or their refusal semantics.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each parameter is a distinct fact about the grant being minted; bundling them \
+                  into a struct would move the same arity behind a constructor without making \
+                  any call site clearer"
+    )]
+    async fn mint_human_plane_tokens(
+        &self,
+        owner: &KeyOwner,
+        account_id: &AccountId,
+        context: &lightbridge_authz_core::ResolvedContext,
+        client_id: &str,
+        client_scopes: &[String],
+        req_scope: &Option<String>,
+        auth_time: Option<i64>,
+        nonce: Option<String>,
+        issued_token_type: Option<String>,
+        grant_label: &'static str,
+        tokens: &TokenManager,
+    ) -> Result<TokenResponse, TokenErrorResponse> {
+        let (allowed_models, model_policy) =
+            self.resolve_project_model_access(&context.project_id).await;
+
+        let granted_scopes = grant_scopes(req_scope, &self.cfg.allowed_scopes, client_scopes);
+        let offline = granted_scopes.iter().any(|s| s == OFFLINE_ACCESS_SCOPE);
+        let openid = granted_scopes.iter().any(|s| s == OPENID_SCOPE);
+
+        let now = Utc::now();
+        let expires_in_secs = self.cfg.access_ttl_seconds.max(0) as u64;
+        let scope_str = scope_to_string(&granted_scopes);
+
+        // ADR-0020 Decision 1: a session row is created exactly once, at the initial
+        // handle_token_exchange grant -- unconditionally, whether or not offline_access was
+        // requested, since even an access-token-only grant needs a revocable identity.
+        // `expires_at` mirrors the refresh chain's own absolute cap (`chain_expires_at`, set
+        // below) when this grant has one, so the two agree; for an access-token-only grant there
+        // is no chain, so the session's own cap is just the access token's own TTL.
+        let session_expires_at = if offline {
+            now + Duration::seconds(self.cfg.refresh_absolute_ttl_seconds.max(0))
+        } else {
+            now + Duration::seconds(expires_in_secs as i64)
+        };
+        let session = match self
+            .repo
+            .create_session(NewSession {
+                id: cuid2(),
+                account_id: context.account_id.clone(),
+                project_id: context.project_id.clone(),
+                client_id: Some(client_id.to_string()),
+                kind: "token".to_string(),
+                expires_at: session_expires_at,
+                // #492/#494: `sessions.subject` carries the real ACTING person, never the
+                // project's owning account -- and since ADR-0025 Stage 2 the acting person IS
+                // `account_id` (the resolved value), not the raw upstream `subject` claim. The two
+                // are byte-identical for every grandfathered account (the wire-invariance
+                // property Stage 1-3 promises), so this is not a behavior change for any existing
+                // deployment today.
+                subject: Some(account_id.as_str().to_string()),
+            })
+            .await
+        {
+            Ok(session) => session,
+            Err(_) => return Err(oauth_err("server_error", "session persistence failed")),
+        };
+        let session_id = session.id;
+
+        let budget_tier = self.resolve_budget_tier(&context.account_id, now).await;
+        let quota_tier = self
+            .resolve_quota_tier(&context.project_id, account_id)
+            .await?;
+        // ADR-0020 Decision 2 (#437's scoped-down interpretation, see `access_token_extra`'s doc
+        // comment): `sid` and `api_key_id` carry the SAME real, persisted session id.
+        let mut access_extra = access_token_extra(
+            owner,
+            &session_id,
+            &session_id,
+            &context.project_id,
+            &context.account_id,
+            allowed_models,
+            Some(client_id),
+        );
+        access_extra.insert("budget_tier".to_string(), Value::String(budget_tier));
+        if let Some(quota_tier) = quota_tier {
+            access_extra.insert("quota_tier".to_string(), Value::String(quota_tier));
+        }
+        access_extra.insert(
+            "model_policy".to_string(),
+            Value::String(model_policy.to_string()),
+        );
+        for (claim, value) in self
+            .resolve_mapped_claims(&context.project_id, account_id, &context.account_id)
+            .await?
+        {
+            access_extra.insert(claim, value);
+        }
+        let access_token = tokens
+            .issue_user_token_with_extra(
+                identity_for(owner),
+                expires_in_secs,
+                scope_str.clone(),
+                Some(client_id.to_string()),
+                access_extra,
+            )
+            .map_err(|_| oauth_err("server_error", "access token signing failed"))?;
+
+        let id_token = if openid {
+            let extra = id_token_extra(owner, &access_token, auth_time, client_id);
+            match tokens.issue_id_token_with_extra(
+                identity_for(owner),
+                client_id,
+                nonce,
+                expires_in_secs,
+                extra,
+            ) {
+                Ok(t) => Some(t),
+                Err(_) => return Err(oauth_err("server_error", "id token signing failed")),
+            }
+        } else {
+            None
+        };
+
+        let refresh_token = if offline {
+            Some(
+                self.create_initial_refresh_token(
+                    InitialRefreshToken {
+                        owner,
+                        account_id: &context.account_id,
+                        project_id: &context.project_id,
+                        client_id,
+                        scope: scope_str.as_deref(),
+                        auth_time,
+                        session_id: &session_id,
+                    },
+                    now,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        tracing::info!(
+            subject = %owner.subject,
+            account_id = %context.account_id,
+            project_id = %context.project_id,
+            client_id = %client_id,
+            offline,
+            openid,
+            grant = grant_label,
+            "human-plane access token issued"
+        );
+
+        let mut response = TokenResponse::new(access_token, "Bearer".to_string(), expires_in_secs);
+        response.id_token = id_token;
+        response.refresh_token = refresh_token;
+        response.scope = scope_str;
+        // RFC 8693 §2.2.1 requires this on a token-exchange response and only there; the
+        // authorization_code caller passes `None`, matching `default_handle_authorization_code`.
+        response.issued_token_type = issued_token_type;
+        Ok(response)
+    }
+
+    /// The browser `authorization_code` grant (#524/#525), overriding authkestra's default so a
+    /// browser login gets the SAME claims a device or exchange login already gets.
+    ///
+    /// Without this override the default handler mints a token with no `budget_tier`, no
+    /// `quota_tier` and no mapped roles claim, because those live in
+    /// [`Self::mint_human_plane_tokens`] which the default never reaches. A console
+    /// authenticating here would then be refused by every RBAC-gated procedure -- authenticated
+    /// but unauthorized, which is the confusing half of a failure rather than the honest half.
+    ///
+    /// **The validation below is a deliberate, faithful copy of
+    /// `authkestra_op::handlers::token::default_handle_authorization_code`.** It cannot be
+    /// delegated: that function consumes the code itself, so calling it first would leave nothing
+    /// to mint from. Every check it performs is reproduced here in the same order -- expiry,
+    /// client binding, `redirect_uri` equality, PKCE S256, and the `require_pkce` fallback. If
+    /// upstream changes those semantics, this copy must be updated with them; that is the cost of
+    /// the seam and it is why each check carries its own refusal test.
+    async fn mint_from_authorization_code(
+        &self,
+        req: authkestra_op::handlers::token::TokenRequest,
+        client_id: String,
+        client: ClientRegistration,
+        tokens: &TokenManager,
+    ) -> Result<TokenResponse, TokenErrorResponse> {
+        if !client.allows_grant_type(&GrantType::AuthorizationCode) {
+            return Err(oauth_err(
+                "unauthorized_client",
+                "client is not authorized to use the authorization_code grant",
+            ));
+        }
+        let Some(code) = req.code.as_deref().filter(|c| !c.is_empty()) else {
+            return Err(oauth_err("invalid_request", "code is required"));
+        };
+
+        // Single-use CAS, the same one `consume_authorization_code` hand-writes (ADR-0019).
+        let auth_code = match self.codes.consume_code(code).await {
+            Ok(Some(auth_code)) => auth_code,
+            Ok(None) => {
+                return Err(oauth_err(
+                    "invalid_grant",
+                    "authorization code is invalid or already used",
+                ));
+            }
+            Err(_) => {
+                return Err(oauth_err(
+                    "server_error",
+                    "authorization code lookup failed",
+                ));
+            }
+        };
+
+        if Utc::now() > auth_code.expires_at {
+            return Err(oauth_err("invalid_grant", "authorization code has expired"));
+        }
+        if auth_code.client_id != client_id {
+            return Err(oauth_err(
+                "invalid_grant",
+                "authorization code was not issued to this client",
+            ));
+        }
+        if auth_code.redirect_uri != req.redirect_uri.as_deref().unwrap_or("") {
+            return Err(oauth_err(
+                "invalid_grant",
+                "redirect_uri does not match the one used during authorization",
+            ));
+        }
+        if let Some(challenge) = auth_code.code_challenge.as_deref() {
+            let verifier = req.code_verifier.as_deref().unwrap_or("");
+            if verifier.is_empty() {
+                return Err(oauth_err("invalid_grant", "code_verifier is required"));
+            }
+            if auth_code.code_challenge_method.as_deref() != Some("S256") {
+                // Plain is never accepted, and an unrecognised method is a server-side storage
+                // problem rather than a client error -- matching upstream's own classification.
+                return Err(oauth_err(
+                    "server_error",
+                    "unsupported PKCE challenge method",
+                ));
+            }
+            let computed = base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                sha2::Sha256::digest(verifier.as_bytes()),
+            );
+            if computed != challenge {
+                return Err(oauth_err("invalid_grant", "code_verifier is invalid"));
+            }
+        } else if client.require_pkce {
+            return Err(oauth_err(
+                "invalid_grant",
+                "PKCE is required for this client",
+            ));
+        }
+
+        // `authorize.rs` stamps the resolved account/project into the code's identity. The
+        // account id is trusted as the ACTING identity (it was resolved from an authenticated
+        // session), but the account->project relationship is re-resolved below rather than
+        // trusted: a roster membership revoked between /authorize and this call must not still
+        // mint a token.
+        // The ACTING identity is the code's `external_id` -- the authenticated person. The
+        // code's `account_id` attribute is `resolve_context`'s output, i.e. the project's OWNING
+        // account, which is identical for every member of a project. Using it here would mint a
+        // member's token under the owner's `sub`; `authorize_with_existing_session_mints_the_real_
+        // subject_not_the_owner_account` is exactly that regression, and it caught this.
+        let subject = auth_code.identity.external_id.clone();
+        let account_id = AccountId::assert_already_resolved(&subject);
+        let Some(project_id) = auth_code.identity.attributes.get("project_id").cloned() else {
+            return Err(oauth_err(
+                "server_error",
+                "authorization code carries no project context",
+            ));
+        };
+
+        let context = match self.repo.resolve_context(&account_id, &project_id).await {
+            Ok(context) => context,
+            Err(Error::NotFound) | Err(Error::Forbidden(_)) => {
+                return Err(oauth_err(
+                    "invalid_grant",
+                    "project is not resolvable for this subject",
+                ));
+            }
+            Err(_) => return Err(oauth_err("server_error", "context resolution failed")),
+        };
+        if let Err(err) = self
+            .repo
+            .require_active_project_and_account(&context.project_id, &context.account_id)
+            .await
+        {
+            return Err(match err {
+                Error::Forbidden(_) => {
+                    oauth_err("access_denied", "account or project is not active")
+                }
+                _ => oauth_err("server_error", "status lookup failed"),
+            });
+        }
+
+        let owner = KeyOwner {
+            subject,
+            account_id: account_id.as_str().to_string(),
+            // The browser leg never persists the upstream access token (ADR-0024), and the code's
+            // stored identity carries no email, so these stay `None` rather than being invented.
+            email: None,
+            email_verified: None,
+        };
+        self.mint_human_plane_tokens(
+            &owner,
+            &account_id,
+            &context,
+            &client_id,
+            &client.scopes,
+            &req.scope,
+            None,
+            auth_code.nonce.clone(),
+            // Not a token-exchange response: RFC 8693 §2.2.1 only requires `issued_token_type`
+            // there, and `default_handle_authorization_code` likewise leaves it unset.
+            None,
+            "authorization_code",
+            tokens,
+        )
+        .await
+    }
+
     async fn handle_token_exchange(
         &self,
         req: TokenRequest,
@@ -1070,13 +1406,6 @@ impl TokenExchangeOpStore {
             });
         }
 
-        let (allowed_models, model_policy) =
-            self.resolve_project_model_access(&context.project_id).await;
-
-        let granted_scopes = grant_scopes(&req.scope, &self.cfg.allowed_scopes, &client.scopes);
-        let offline = granted_scopes.iter().any(|s| s == OFFLINE_ACCESS_SCOPE);
-        let openid = granted_scopes.iter().any(|s| s == OPENID_SCOPE);
-
         let (email, email_verified) = decode_email(subject_token);
         let (auth_time, nonce) = decode_auth_time_and_nonce(subject_token);
         let owner = KeyOwner {
@@ -1085,140 +1414,21 @@ impl TokenExchangeOpStore {
             email,
             email_verified,
         };
-
-        let now = Utc::now();
-        let expires_in_secs = self.cfg.access_ttl_seconds.max(0) as u64;
-        let scope_str = scope_to_string(&granted_scopes);
-
-        // ADR-0020 Decision 1: a session row is created exactly once, at the initial
-        // handle_token_exchange grant -- unconditionally, whether or not offline_access was
-        // requested, since even an access-token-only grant needs a revocable identity.
-        // `expires_at` mirrors the refresh chain's own absolute cap (`chain_expires_at`, set
-        // below) when this grant has one, so the two agree; for an access-token-only grant there
-        // is no chain, so the session's own cap is just the access token's own TTL.
-        let session_expires_at = if offline {
-            now + Duration::seconds(self.cfg.refresh_absolute_ttl_seconds.max(0))
-        } else {
-            now + Duration::seconds(expires_in_secs as i64)
-        };
-        let session = match self
-            .repo
-            .create_session(NewSession {
-                id: cuid2(),
-                account_id: context.account_id.clone(),
-                project_id: context.project_id.clone(),
-                client_id: Some(client_id.clone()),
-                kind: "token".to_string(),
-                expires_at: session_expires_at,
-                // #492/#494: `sessions.subject` carries the real ACTING person, never the
-                // project's owning account -- and since ADR-0025 Stage 2 the acting person IS
-                // `account_id` (the resolved value), not the raw upstream `subject` claim. The two
-                // are byte-identical for every grandfathered account (the wire-invariance
-                // property Stage 1-3 promises), so this is not a behavior change for any existing
-                // deployment today.
-                subject: Some(account_id.as_str().to_string()),
-            })
-            .await
-        {
-            Ok(session) => session,
-            Err(_) => return Err(oauth_err("server_error", "session persistence failed")),
-        };
-        let session_id = session.id;
-
-        let budget_tier = self.resolve_budget_tier(&context.account_id, now).await;
-        let quota_tier = self
-            .resolve_quota_tier(&context.project_id, &account_id)
-            .await?;
-        // ADR-0020 Decision 2 (#437's scoped-down interpretation, see `access_token_extra`'s doc
-        // comment): `sid` and `api_key_id` carry the SAME real, persisted session id.
-        let mut access_extra = access_token_extra(
-            &owner,
-            &session_id,
-            &session_id,
-            &context.project_id,
-            &context.account_id,
-            allowed_models,
-            Some(&client_id),
-        );
-        access_extra.insert("budget_tier".to_string(), Value::String(budget_tier));
-        if let Some(quota_tier) = quota_tier {
-            access_extra.insert("quota_tier".to_string(), Value::String(quota_tier));
-        }
-        access_extra.insert(
-            "model_policy".to_string(),
-            Value::String(model_policy.to_string()),
-        );
-        for (claim, value) in self
-            .resolve_mapped_claims(&context.project_id, &account_id, &context.account_id)
-            .await?
-        {
-            access_extra.insert(claim, value);
-        }
-        let access_token = tokens
-            .issue_user_token_with_extra(
-                identity_for(&owner),
-                expires_in_secs,
-                scope_str.clone(),
-                Some(client_id.clone()),
-                access_extra,
-            )
-            .map_err(|_| oauth_err("server_error", "access token signing failed"))?;
-
-        let id_token = if openid {
-            let extra = id_token_extra(&owner, &access_token, auth_time, &client_id);
-            match tokens.issue_id_token_with_extra(
-                identity_for(&owner),
+        return self
+            .mint_human_plane_tokens(
+                &owner,
+                &account_id,
+                &context,
                 &client_id,
+                &client.scopes,
+                &req.scope,
+                auth_time,
                 nonce,
-                expires_in_secs,
-                extra,
-            ) {
-                Ok(t) => Some(t),
-                Err(_) => return Err(oauth_err("server_error", "id token signing failed")),
-            }
-        } else {
-            None
-        };
-
-        let refresh_token = if offline {
-            Some(
-                self.create_initial_refresh_token(
-                    InitialRefreshToken {
-                        owner: &owner,
-                        account_id: &context.account_id,
-                        project_id: &context.project_id,
-                        client_id: &client_id,
-                        scope: scope_str.as_deref(),
-                        auth_time,
-                        session_id: &session_id,
-                    },
-                    now,
-                )
-                .await?,
+                Some("urn:ietf:params:oauth:token-type:access_token".to_string()),
+                "token-exchange",
+                tokens,
             )
-        } else {
-            None
-        };
-
-        tracing::info!(
-            subject = %subject,
-            account_id = %context.account_id,
-            project_id = %context.project_id,
-            client_id = %client_id,
-            offline,
-            openid,
-            "token-exchange issued access token"
-        );
-
-        let mut response = TokenResponse::new(access_token, "Bearer".to_string(), expires_in_secs);
-        response.id_token = id_token;
-        response.refresh_token = refresh_token;
-        response.scope = scope_str;
-        // RFC 8693 §2.2.1: REQUIRED on a token-exchange grant response, mirroring
-        // `default_handle_token_exchange`'s own value for this field.
-        response.issued_token_type =
-            Some("urn:ietf:params:oauth:token-type:access_token".to_string());
-        Ok(response)
+            .await;
     }
 
     /// The `refresh_token` grant (ADR-0011, Decision 1): re-mints access + id_token symmetrically
@@ -1738,6 +1948,22 @@ impl OpStore for RequestScopedOpStore<'_> {
         expires_at: DateTime<Utc>,
     ) -> Result<bool, OpError> {
         self.inner.assertions.record_jti(jti, expires_at).await
+    }
+
+    /// Forwarded for the same reason as `handle_token_exchange` above: this wrapper implements
+    /// `OpStore` by explicit delegation, so any trait method it does NOT name silently falls
+    /// through to the trait default and the inner store's override never runs.
+    async fn handle_authorization_code_grant(
+        &self,
+        req: TokenRequest,
+        client_id: String,
+        client: ClientRegistration,
+        _config: &OpConfig,
+        tokens: &TokenManager,
+    ) -> Result<TokenResponse, TokenErrorResponse> {
+        self.inner
+            .mint_from_authorization_code(req, client_id, client, tokens)
+            .await
     }
 
     async fn handle_token_exchange(
