@@ -81,6 +81,48 @@ pub struct Config {
     /// reason.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub api_key_expiry: ApiKeyExpiry,
+    /// Single-use secret-claim delivery (GHSA-9pc6-965v-2c44, #538). Mandatory for
+    /// `lightbridge-mcp`, which issues the claims, and for `authz-idp`, which redeems them; both
+    /// refuse to start without it rather than fall back to returning a secret inline.
+    ///
+    /// `Option` at this level for the same reason `redis` above is: `authz-api`, `authz-opa`,
+    /// `authz-budget` and the usage service all load this same `Config` and never touch secret
+    /// claims, so a config omitting the section entirely must still load for them. Enforcement is
+    /// per-component at startup, never by making the field required for every consumer.
+    #[serde(default)]
+    pub secret_claim: Option<SecretClaim>,
+}
+
+/// Configuration for single-use, subject-bound API key secret claims (GHSA-9pc6-965v-2c44).
+///
+/// MCP tool results are returned into the calling model's context, so they cannot carry
+/// credential material. Instead the secret is sealed under [`SecretClaim::encryption_key`] and
+/// handed over as an opaque token the human redeems once, in a browser, against `authz-idp`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SecretClaim {
+    /// base64url-encoded, exactly 32 bytes. Seals the pending secret at rest, with the creating
+    /// subject as AES-GCM associated data.
+    ///
+    /// Rotating it makes every un-redeemed claim permanently unopenable. That is the intended
+    /// posture and it is cheap here, unlike `OidcRelyingParty::token_encryption_key`: claims live
+    /// for minutes, so the blast radius of a rotation is whatever was issued in the last TTL
+    /// window, not every stored session.
+    pub encryption_key: String,
+    /// How long a human has to collect their secret. Deliberately short -- an unredeemed claim is
+    /// a credential sitting at rest for no reason.
+    #[serde(default = "default_secret_claim_ttl_seconds")]
+    pub ttl_seconds: i64,
+    /// Origin of the `authz-idp` deployment that serves redemption, e.g.
+    /// `https://auth.example.com`. The issued URL is `{redeem_base_url}/api-keys/claim/{token}`.
+    ///
+    /// Configured rather than derived from the request: the issuer (`lightbridge-mcp`) and the
+    /// redeemer (`authz-idp`) are different services on different hosts, and a URL built from an
+    /// inbound request header would be attacker-influenced.
+    pub redeem_base_url: String,
+}
+
+const fn default_secret_claim_ttl_seconds() -> i64 {
+    300
 }
 
 /// The operator-configured catalogue of billing plans. Populated from env — either a single

@@ -151,7 +151,14 @@ async fn main() -> Result<()> {
                     "server.idp config is required to run the idp command".to_string(),
                 )
             })?;
-            start_idp_server(idp, pool, &config.oauth2, &config.redis).await?;
+            start_idp_server(
+                idp,
+                pool,
+                &config.oauth2,
+                &config.redis,
+                &config.secret_claim,
+            )
+            .await?;
             Ok(())
         }
         Some(Commands::Budget { config_path }) => {
