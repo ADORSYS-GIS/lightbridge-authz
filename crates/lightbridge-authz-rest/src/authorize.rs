@@ -483,8 +483,14 @@ mod tests {
     fn loopback_carveout_accepts_a_dynamic_port_for_a_public_native_app() {
         let client = public_client_with_loopback();
         // A random loopback port cannot be exact-matched, but the carve-out allows it.
-        assert!(is_loopback_redirect(&client, "http://127.0.0.1:54321/callback"));
-        assert!(is_loopback_redirect(&client, "http://localhost:8080/callback"));
+        assert!(is_loopback_redirect(
+            &client,
+            "http://127.0.0.1:54321/callback"
+        ));
+        assert!(is_loopback_redirect(
+            &client,
+            "http://localhost:8080/callback"
+        ));
         assert!(is_loopback_redirect(&client, "http://[::1]:9000/callback"));
     }
 
@@ -493,7 +499,10 @@ mod tests {
         // A public client that registered only a real callback URL must NOT gain
         // loopback redirects -- the registered loopback URI is the native-app signal.
         let client = public_client_without_loopback();
-        assert!(!is_loopback_redirect(&client, "http://127.0.0.1:54321/callback"));
+        assert!(!is_loopback_redirect(
+            &client,
+            "http://127.0.0.1:54321/callback"
+        ));
     }
 
     #[test]
@@ -501,16 +510,25 @@ mod tests {
         // A confidential client must never get the loopback carve-out, even if it
         // registered a loopback URI.
         let client = confidential_client_with_loopback();
-        assert!(!is_loopback_redirect(&client, "http://127.0.0.1:54321/callback"));
+        assert!(!is_loopback_redirect(
+            &client,
+            "http://127.0.0.1:54321/callback"
+        ));
     }
 
     #[test]
     fn loopback_carveout_rejects_non_loopback_and_non_http() {
         let client = public_client_with_loopback();
         // Non-loopback host.
-        assert!(!is_loopback_redirect(&client, "https://rp.example.test/callback"));
+        assert!(!is_loopback_redirect(
+            &client,
+            "https://rp.example.test/callback"
+        ));
         // Loopback host but https scheme (RFC 8252 §8.3 is http-only for loopback).
-        assert!(!is_loopback_redirect(&client, "https://127.0.0.1:54321/callback"));
+        assert!(!is_loopback_redirect(
+            &client,
+            "https://127.0.0.1:54321/callback"
+        ));
         // Unparseable.
         assert!(!is_loopback_redirect(&client, "not a url"));
     }
