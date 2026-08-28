@@ -24,6 +24,7 @@ pub mod redis_tls;
 pub mod relying_party;
 pub mod routers;
 pub mod rpc_authorize;
+pub mod secret_claim;
 pub mod session_cookie;
 pub mod session_management;
 pub mod signing;
