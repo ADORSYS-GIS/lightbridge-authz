@@ -1,175 +1,161 @@
 //! Behaviour tests for the single-use, subject-bound secret claim store
-//! (`crate::secret_claim`, GHSA-9pc6-965v-2c44, #538).
+//! (`lightbridge_authz_rest::secret_claim`, GHSA-9pc6-965v-2c44, #538).
 //!
-//! The two fail-closed tests run unconditionally -- they need no Redis, because "Redis is
-//! unreachable" is exactly what they assert. Everything else is gated behind `it-tests` and needs
-//! a real Redis on `localhost:6379` (`just it-tests` brings one up), for the same reason the rest
-//! of this repo prefers a real container over a mock: the bugs that matter live in the seam, and
-//! `GETDEL`'s exactly-once semantics are precisely such a seam.
+//! Postgres-backed via `sqlx::test`, which gives every test its own migrated database. That
+//! isolation matters here more than usual: these tests deliberately race concurrent redemptions
+//! against one another, and a shared database would turn a real exactly-once violation into an
+//! intermittent failure someone would eventually paper over with a retry.
 //!
-//! Every test uses a per-test key prefix. Shared-store tests that collide on keys have already
-//! caused real flakes in this repo; the prefix, not a retry budget, is the fix.
+//! The properties under test, in order of how much damage their absence does:
+//!
+//! 1. A subject that does not own a claim cannot redeem it, **and cannot burn it either**.
+//! 2. A claim is redeemable exactly once, including under concurrent redemption.
+//! 3. An expired claim is unredeemable.
+//! 4. An unknown token is a miss, not an error.
 
-use lightbridge_authz_rest::secret_claim::RedisSecretClaimStore;
+#![cfg(feature = "it-tests")]
+
+use lightbridge_authz_api_key::repo::StoreRepo;
+use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
+use lightbridge_authz_rest::secret_claim::SecretClaimStore;
+use sqlx::PgPool;
+use std::sync::Arc;
 
 const KEY: [u8; 32] = [7u8; 32];
-/// A port nothing listens on, so the connection attempt fails rather than hanging.
-const UNREACHABLE: &str = "redis://127.0.0.1:1/";
+const SECRET: &str = "lbk_the_secret";
 
-fn unreachable_store() -> RedisSecretClaimStore {
-    RedisSecretClaimStore::connect(UNREACHABLE, None, "test:", KEY, 300)
-        .expect("construction is lazy and must succeed even against an unreachable server")
+fn store(pool: PgPool, ttl_seconds: i64) -> SecretClaimStore {
+    let core: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+    SecretClaimStore::new(Arc::new(StoreRepo::new(core)), KEY, ttl_seconds)
 }
 
-/// The whole point of the design is that a secret never reaches the model. If the claim store is
-/// down, the only safe answer is to refuse the operation -- an `Ok` here would push the caller
-/// toward returning the secret inline, which is the exposure this module exists to remove.
-#[tokio::test]
-async fn issue_refuses_rather_than_succeeding_when_the_store_is_unreachable() {
-    let result = unreachable_store()
-        .issue("lbk_the_secret", "subject-a")
-        .await;
-    assert!(
-        result.is_err(),
-        "an unreachable claim store must refuse to issue, never report success: {result:?}"
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_owning_subject_redeems_the_secret_exactly_once(pool: PgPool) {
+    let store = store(pool, 300);
+    let claim = store.issue(SECRET, "subject-a").await.expect("issue");
+
+    let first = store
+        .redeem(&claim.token, "subject-a")
+        .await
+        .expect("redeem");
+    assert_eq!(
+        first.as_deref(),
+        Some(SECRET),
+        "the owning subject must get the secret back"
+    );
+
+    let second = store
+        .redeem(&claim.token, "subject-a")
+        .await
+        .expect("redeem");
+    assert_eq!(
+        second, None,
+        "a claim is single-use: the second redemption must be a miss"
     );
 }
 
-/// Redemption must distinguish "no such claim" (`Ok(None)`) from "the store is broken" (`Err`).
-/// Collapsing the second into the first would let an outage read as a clean miss.
-#[tokio::test]
-async fn redeem_errors_rather_than_reporting_a_clean_miss_when_the_store_is_unreachable() {
-    let result = unreachable_store().redeem("some-token", "subject-a").await;
-    assert!(
-        result.is_err(),
-        "an unreachable claim store must error, not report Ok(None): {result:?}"
+/// The security property the entire design rests on. A model that holds the claim token -- which
+/// it always does, since handing it over is the point -- must be able to do nothing with it: not
+/// redeem it, and not destroy it.
+///
+/// The second assertion is the one that is easy to get wrong. Consuming the row before checking
+/// the subject would still block the wrong redeemer, so it *looks* correct, while quietly handing
+/// every token-holder a denial of service against the legitimate owner.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_different_subject_cannot_redeem_and_does_not_consume_the_claim(pool: PgPool) {
+    let store = store(pool, 300);
+    let claim = store.issue(SECRET, "subject-a").await.expect("issue");
+
+    let attacker = store
+        .redeem(&claim.token, "subject-b")
+        .await
+        .expect("redeem");
+    assert_eq!(
+        attacker, None,
+        "possession of the token must not be sufficient to redeem it"
+    );
+
+    let owner = store
+        .redeem(&claim.token, "subject-a")
+        .await
+        .expect("redeem");
+    assert_eq!(
+        owner.as_deref(),
+        Some(SECRET),
+        "a refused attempt must NOT consume the claim -- otherwise anyone holding the token can \
+         destroy the owner's one chance to collect their key"
     );
 }
 
-#[cfg(feature = "it-tests")]
-mod with_redis {
-    use super::{KEY, RedisSecretClaimStore};
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unknown_token_is_a_miss_not_an_error(pool: PgPool) {
+    let store = store(pool, 300);
+    let result = store
+        .redeem("definitely-not-a-real-token", "subject-a")
+        .await
+        .expect("an unknown token is a normal miss, not a store failure");
+    assert_eq!(result, None);
+}
 
-    const URL: &str = "redis://127.0.0.1:6379/";
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_is_unredeemable_once_it_has_expired(pool: PgPool) {
+    // Negative TTL: already expired at the moment it is written, so the test asserts the expiry
+    // predicate rather than waiting on a clock.
+    let store = store(pool, -1);
+    let claim = store.issue(SECRET, "subject-a").await.expect("issue");
+    let result = store
+        .redeem(&claim.token, "subject-a")
+        .await
+        .expect("redeem");
+    assert_eq!(result, None, "an expired claim must not be redeemable");
+}
 
-    fn store(prefix: &str, ttl_seconds: u64) -> RedisSecretClaimStore {
-        RedisSecretClaimStore::connect(URL, None, prefix, KEY, ttl_seconds)
-            .expect("store construction")
+/// Concurrent redemptions by the legitimate owner. The consuming `UPDATE` is the exactly-once
+/// boundary; without it a double-submit would hand out the secret twice and leave no trace.
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_redemptions_by_the_owner_yield_exactly_one_winner(pool: PgPool) {
+    let store = Arc::new(store(pool, 300));
+    let claim = store.issue(SECRET, "subject-a").await.expect("issue");
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let store = Arc::clone(&store);
+        let token = claim.token.clone();
+        handles.push(tokio::spawn(async move {
+            store.redeem(&token, "subject-a").await.expect("redeem")
+        }));
     }
-
-    #[tokio::test]
-    async fn the_owning_subject_redeems_the_secret_exactly_once() {
-        let store = store("t_once:", 300);
-        let claim = store
-            .issue("lbk_the_secret", "subject-a")
-            .await
-            .expect("issue");
-
-        let first = store
-            .redeem(&claim.token, "subject-a")
-            .await
-            .expect("redeem");
-        assert_eq!(
-            first.as_deref(),
-            Some("lbk_the_secret"),
-            "the owning subject must get the secret back"
-        );
-
-        let second = store
-            .redeem(&claim.token, "subject-a")
-            .await
-            .expect("redeem");
-        assert_eq!(
-            second, None,
-            "a claim is single-use: the second redemption must be a miss"
-        );
-    }
-
-    /// The security property the entire design rests on. A model that holds the claim URL --
-    /// which it always does, since handing it over is the point -- must not be able to redeem it,
-    /// and must not be able to destroy it either.
-    #[tokio::test]
-    async fn a_different_subject_cannot_redeem_and_does_not_consume_the_claim() {
-        let store = store("t_wrong_subject:", 300);
-        let claim = store
-            .issue("lbk_the_secret", "subject-a")
-            .await
-            .expect("issue");
-
-        let attacker = store
-            .redeem(&claim.token, "subject-b")
-            .await
-            .expect("redeem");
-        assert_eq!(
-            attacker, None,
-            "possession of the token must not be sufficient to redeem it"
-        );
-
-        let owner = store
-            .redeem(&claim.token, "subject-a")
-            .await
-            .expect("redeem");
-        assert_eq!(
-            owner.as_deref(),
-            Some("lbk_the_secret"),
-            "a refused attempt must NOT consume the claim -- otherwise anyone holding the token \
-             can destroy the owner's one chance to collect their key"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_unknown_token_is_a_miss_not_an_error() {
-        let store = store("t_unknown:", 300);
-        let result = store
-            .redeem("definitely-not-a-real-token", "subject-a")
-            .await
-            .expect("an unknown token is a normal miss, not a store failure");
-        assert_eq!(result, None);
-    }
-
-    #[tokio::test]
-    async fn a_claim_is_unredeemable_once_its_ttl_has_elapsed() {
-        let store = store("t_ttl:", 1);
-        let claim = store
-            .issue("lbk_the_secret", "subject-a")
-            .await
-            .expect("issue");
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        let result = store
-            .redeem(&claim.token, "subject-a")
-            .await
-            .expect("redeem");
-        assert_eq!(result, None, "an expired claim must not be redeemable");
-    }
-
-    /// Two concurrent redemptions by the legitimate owner: `GETDEL` is the exactly-once boundary,
-    /// so exactly one must win. Without it, a double-submit would hand out the secret twice and
-    /// leave no record that it happened.
-    #[tokio::test]
-    async fn concurrent_redemptions_by_the_owner_yield_exactly_one_winner() {
-        let store = std::sync::Arc::new(store("t_race:", 300));
-        let claim = store
-            .issue("lbk_the_secret", "subject-a")
-            .await
-            .expect("issue");
-
-        let mut handles = Vec::new();
-        for _ in 0..8 {
-            let store = std::sync::Arc::clone(&store);
-            let token = claim.token.clone();
-            handles.push(tokio::spawn(async move {
-                store.redeem(&token, "subject-a").await.expect("redeem")
-            }));
+    let mut winners = 0;
+    for handle in handles {
+        if handle.await.expect("task").is_some() {
+            winners += 1;
         }
-        let mut winners = 0;
-        for handle in handles {
-            if handle.await.expect("task").is_some() {
-                winners += 1;
-            }
-        }
-        assert_eq!(
-            winners, 1,
-            "exactly one concurrent redemption may return the secret, got {winners}"
-        );
     }
+    assert_eq!(
+        winners, 1,
+        "exactly one concurrent redemption may return the secret, got {winners}"
+    );
+}
+
+/// The token is a bearer credential in transit, so it must not be recoverable from the table.
+/// Storing only its hash is the same discipline `api_keys` applies to `key_hash`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_claim_token_and_the_secret_are_never_stored_in_the_clear(pool: PgPool) {
+    let store = store(pool.clone(), 300);
+    let claim = store.issue(SECRET, "subject-a").await.expect("issue");
+
+    let (token_hash, sealed): (String, String) =
+        sqlx::query_as("SELECT token_hash, sealed_secret FROM secret_claims")
+            .fetch_one(&pool)
+            .await
+            .expect("row");
+
+    assert_ne!(
+        token_hash, claim.token,
+        "the claim token must be stored hashed, never verbatim"
+    );
+    assert!(
+        !sealed.contains(SECRET),
+        "the secret must be sealed at rest, never stored in the clear"
+    );
 }
