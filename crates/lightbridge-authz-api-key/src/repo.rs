@@ -1458,9 +1458,11 @@ impl StoreRepo {
         Ok(row)
     }
 
-    /// Read-side counterpart to [`Self::upsert_federated_identity`]. Not yet wired to any RPC
-    /// surface -- ADR-0024's Follow-ups list "refreshing stored tokens" as a later consumer; this
-    /// exists now so that consumer does not also need a new repo method.
+    /// Read-side counterpart to [`Self::upsert_federated_identity`], and the reason it was
+    /// written ahead of a caller: its consumer arrived as RP-initiated logout's back-channel leg
+    /// (`KeycloakRelyingParty::end_upstream_session`), which needs the sealed token set to
+    /// terminate the upstream Keycloak SSO session. Still not wired to any RPC surface -- nothing
+    /// exposes a federated identity to a client.
     #[instrument(skip(self, subject))]
     pub async fn find_federated_identity(
         &self,
