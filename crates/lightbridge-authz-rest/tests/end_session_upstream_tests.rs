@@ -38,7 +38,8 @@
 //!   0 against an expected 1.
 //! - Making the upstream leg fatal (`relying_party.end_upstream_session(..).await.map_err(|_| ())?`
 //!   in place of the swallowing call) turns `an_unreachable_keycloak_does_not_block_local_logout`
-//!   and `a_keycloak_that_refuses_the_logout_does_not_block_local_logout` red: `Err(())` where
+//!   and `a_keycloak_that_refuses_the_logout_does_not_block_local_logout` red:
+//!   `Err(LocalRevocationFailed)` where
 //!   `Ok(true)` was expected, which at the router is the hard `500`.
 //! - Propagating `crypto::open`'s failure with `?` instead of degrading to "no stored credential"
 //!   turns `an_envelope_under_a_rotated_key_is_treated_as_no_stored_credential` red on its
