@@ -4,8 +4,8 @@ description: >-
   Umbrella chart deploying the full lightbridge-authz stack (api, opa, idp,
   budget, usage, mcp)
 type: application
-version: 5.0.0
-appVersion: 5.0.0
+version: 6.0.0
+appVersion: 6.0.0
 icon: https://adorsys.com/favicon.svg?v=05f867cc1aa036716c10a6c1d4ad6365
 home: https://github.com/ADORSYS-GIS/lightbridge-authz
 kubeVersion: '>=1.20.0-0'

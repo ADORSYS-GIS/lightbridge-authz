@@ -1,5 +1,38 @@
 # Changelog
 
+## [6.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v5.0.0...v6.0.0) (2026-08-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* **mcp:** hand API key secrets over as single-use claims, never in tool results ([#540](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/540))
+* **idp:** split issuer identity from discovery location, one issuer field, + local testing guide ([#504](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/504))
+
+### Features
+
+* **api:** give Account a human-facing name ([#551](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/551)) ([b531109](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/b531109c4fb8515614ff0d8ba15a8d7e5dc7d9b9))
+* **idp:** browser authorization_code grant mints the same claims as every other grant ([#542](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/542)) ([689ea19](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/689ea1943a9e9b3a67dedffc60014a0cff535e64))
+* **idp:** declared claim mappers + authkestra 0.6.3 ([#541](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/541)) ([ed33486](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/ed334860ca9e0e985e1e98e3ac90126d3c17168c))
+* **idp:** RFC 7662 introspection, OIDC session management, spec-complete discovery + e2e suite ([#502](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/502)) ([8d4ff7a](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/8d4ff7a6aff95a2ff28ec3b36ad99025250eb01b))
+* **idp:** RP-initiated logout + UserInfo ([#544](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/544)) ([#545](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/545)) ([f670ccc](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/f670ccc727b51ca39ef200a7e7fc92c55c137077))
+* **idp:** split issuer identity from discovery location, one issuer field, + local testing guide ([#504](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/504)) ([4f9e17d](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/4f9e17d63d543c57318b8b12835578fc8351fcec))
+* **mcp:** hand API key secrets over as single-use claims, never in tool results ([#540](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/540)) ([8f998e1](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/8f998e1730523d62b3354e9d4f96e37a9f381684))
+* **usage:** capture request latency and report real percentiles ([#552](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/552)) ([1af2f3d](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/1af2f3d12c3619e5fc2792dded0a6068b45d16a4))
+
+
+### Bug Fixes
+
+* **idp:** give logout's failure a name instead of Result&lt;bool, ()&gt; ([#554](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/554)) ([127daf9](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/127daf990965c6392e54b6cf2ebfc7605610d017))
+* **idp:** RP-initiated logout terminates the upstream Keycloak SSO session ([#550](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/550)) ([a08e89c](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/a08e89c7b12843b9cffc6c2d854b7bfca5ebd097))
+* **idp:** take the authorization_code grant scope from the code, not the request ([#543](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/543)) ([797b95a](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/797b95a7b0f4130cf54a093dd079050fec3b9b3e))
+* **it:** register update-account-name in the expected MCP tool set ([#555](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/555)) ([d95b2aa](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/d95b2aa6348bd367669eee42509d59640e1a2a34))
+* **test:** restore main by giving CreateAccount its required name ([#553](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/553)) ([566c9f1](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/566c9f1990bd156221b6ea805ef9c5a792f502ab))
+
+
+### Documentation
+
+* record the code-size baseline and the compose.it ports trap ([#537](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/537)) ([2c5c0e3](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/2c5c0e36bee647f1059425b690bbc4d0f1cd7759)), closes [#517](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/517) [#515](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/515)
+
 ## [5.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v4.0.0...v5.0.0) (2026-08-25)
 
 
