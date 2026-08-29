@@ -20,6 +20,7 @@ async fn seed_project(repo: &StoreRepo, subject: &str) -> (String, String) {
             subject,
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
@@ -119,6 +120,7 @@ async fn find_default_project_id_is_none_without_any_projects(pool: PgPool) {
         "user-1",
         lightbridge_authz_core::CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -164,6 +166,7 @@ async fn resolve_context_is_unchanged_for_an_account_created_before_the_users_mi
         member,
         lightbridge_authz_core::CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await

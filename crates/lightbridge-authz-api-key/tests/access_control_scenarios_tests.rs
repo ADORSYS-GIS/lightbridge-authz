@@ -62,6 +62,7 @@ async fn access_control_allows_project_members_and_rejects_non_members(pool: PgP
             owner,
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
@@ -121,6 +122,7 @@ async fn access_control_allows_project_members_and_rejects_non_members(pool: PgP
             invited,
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
@@ -453,6 +455,7 @@ async fn access_control_allows_project_members_and_rejects_non_members(pool: PgP
             owner,
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
@@ -475,6 +478,7 @@ async fn deleting_an_account_deletes_its_projects_and_keys(pool: PgPool) {
             subject,
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await

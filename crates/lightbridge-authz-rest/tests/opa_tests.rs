@@ -271,6 +271,7 @@ fn mk_account() -> Account {
         id: "acct_1".to_string(),
         default_quota: None,
         status: ResourceStatus::Active,
+        name: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

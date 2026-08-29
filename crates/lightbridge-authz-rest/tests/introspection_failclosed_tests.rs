@@ -260,6 +260,7 @@ async fn seed(repo: &StoreRepo) {
         SUBJECT,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -289,6 +290,7 @@ async fn seed_member_project(repo: &StoreRepo) {
         OWNER_ACCOUNT,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -297,6 +299,7 @@ async fn seed_member_project(repo: &StoreRepo) {
         SUBJECT,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await

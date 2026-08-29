@@ -574,6 +574,7 @@ fn to_schema_account(a: Account) -> schema::Account {
         id: a.id,
         defaultQuota: a.default_quota,
         status: a.status.to_string(),
+        name: a.name,
     }
 }
 
@@ -820,11 +821,18 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
         let default_quota = args.args.defaultQuota;
+        let name = args.args.name;
         async move {
             let subject = subject
                 .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let account = issuer
-                .create_account(&subject, CreateAccount { default_quota })
+                .create_account(
+                    &subject,
+                    CreateAccount {
+                        default_quota,
+                        name,
+                    },
+                )
                 .await
                 .map_err(to_cratestack_error)?;
             Ok(to_schema_account(account))
@@ -852,6 +860,33 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let account = issuer
                 .update_account_default_quota(&subject, &account_id, default_quota.as_deref())
+                .await
+                .map_err(to_cratestack_error)?;
+            Ok(to_schema_account(account))
+        }
+    }
+
+    fn update_account_name(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::update_account_name::Args,
+        _authorized: schema::procedures::update_account_name::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::update_account_name::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let account_id = args.args.accountId;
+        let name = args.args.name;
+        async move {
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            let account = issuer
+                .update_account_name(&subject, &account_id, name.as_deref())
                 .await
                 .map_err(to_cratestack_error)?;
             Ok(to_schema_account(account))
@@ -3013,6 +3048,7 @@ pub fn build_idp_router(
         Arc::clone(&claim_redeem_repo),
         token_exchange.clone(),
         &oauth2.clients,
+        Arc::clone(&relying_party),
     )));
     router = router.merge(token_exchange::token_exchange_router(token_exchange));
     router = router.merge(session_management::router());

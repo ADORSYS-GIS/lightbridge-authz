@@ -436,6 +436,10 @@ impl AuthzStoreImpl {
                 self.quota_tiers.tier_ids().join(", ")
             )));
         }
+        let input = CreateAccount {
+            name: Self::normalize_account_name(input.name.as_deref()).map(str::to_owned),
+            ..input
+        };
         let account = self.repo.create_account(subject, input).await?;
         tracing::info!(
             operation = "create_account",
@@ -478,6 +482,53 @@ impl AuthzStoreImpl {
             subject = %subject,
             account_id = %account.id,
             "account defaultQuota updated"
+        );
+        Ok(account)
+    }
+
+    /// Collapses a blank or whitespace-only account name to "no name". `NULL` is the single
+    /// representation of unnamed everywhere below this point -- in the DTO, in the column, and in
+    /// what a console reads back -- so an empty string must never survive as a *set* name; if it
+    /// did, a console could no longer distinguish "named" from "not named yet" and could not
+    /// offer a name-me affordance. Trimming is normalisation, not validation: a name is free text
+    /// with no catalogue behind it, so surrounding whitespace is silently dropped rather than
+    /// rejected, and anything non-blank is stored verbatim. The DB
+    /// `CHECK (name IS NULL OR btrim(name) <> '')`
+    /// (`migrations/20260829000001_accounts_add_name.sql`) is the backstop that keeps this true
+    /// for any future write path, not the primary enforcement.
+    fn normalize_account_name(name: Option<&str>) -> Option<&str> {
+        name.map(str::trim).filter(|trimmed| !trimmed.is_empty())
+    }
+
+    /// Sets `Account.name` post-creation. Backs `updateAccountName` -- the sole write path for that
+    /// field: it is `@readonly` in the schema and `model.Account.update` was removed outright by
+    /// #398, so there is no generic verb it could ride. Shaped like
+    /// `update_account_default_quota` above, minus the catalogue check: a name is free text with
+    /// nothing to validate it against. `None` (and, via [`Self::normalize_account_name`], a blank
+    /// string) clears it back to unnamed; this always writes, it is not a PATCH.
+    ///
+    /// The name itself is deliberately NOT logged. It is user-supplied free text on a tenant row,
+    /// and the account id already identifies the row for any audit purpose.
+    pub async fn update_account_name(
+        &self,
+        subject: &str,
+        account_id: &str,
+        name: Option<&str>,
+    ) -> Result<Account> {
+        let account = self
+            .repo
+            .update_account_name(
+                &AccountId::assert_already_resolved(subject),
+                account_id,
+                Self::normalize_account_name(name),
+            )
+            .await?;
+        tracing::info!(
+            operation = "update_account_name",
+            subject = %subject,
+            account_id = %account.id,
+            cleared = account.name.is_none(),
+            "account name updated"
         );
         Ok(account)
     }
@@ -1105,6 +1156,7 @@ mod tests {
                     "subject",
                     CreateAccount {
                         default_quota: Some(tier.to_string()),
+                        name: None,
                     },
                 )
                 .await
@@ -1138,6 +1190,7 @@ mod tests {
                 "subject",
                 CreateAccount {
                     default_quota: None,
+                    name: None,
                 },
             )
             .await

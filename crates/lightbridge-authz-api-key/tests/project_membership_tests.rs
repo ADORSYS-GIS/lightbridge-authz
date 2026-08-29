@@ -24,6 +24,7 @@ async fn seed_account(repo: &StoreRepo, subject: &str) -> String {
         subject,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await

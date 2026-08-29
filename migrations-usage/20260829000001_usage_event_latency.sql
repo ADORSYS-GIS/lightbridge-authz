@@ -1,0 +1,24 @@
+-- Per-request latency, so `/usage/v1/usage/query` can report real percentiles instead of the
+-- console rendering a permanent "latency isn't available" apology.
+--
+-- STORAGE COST (deliberate, and bounded -- see ADORSYS-GIS/lightbridge-authz#549, where this
+-- table's unbounded growth contributed to a production volume exhaustion):
+--   latency_ms  DOUBLE PRECISION NULL  =  8 bytes per row when present, 0 when NULL.
+--   At the measured production rate of ~43,000 rows/day that is ~344 KB/day, i.e. ~0.34% of the
+--   table's measured ~100 MB/day. For comparison, the `attributes` jsonb column averages 1,461
+--   bytes/row -- 178x this column -- and is write-only.
+--
+-- This is a single fixed-width numeric column ON PURPOSE. Raw per-request duration arrays or
+-- per-row histogram buckets stored as jsonb were rejected: they would reproduce exactly the
+-- unbounded-wide-column failure #549 is about. Percentiles are computed at query time with
+-- Postgres' ordered-set aggregates (`percentile_cont`) over these per-row values, which needs no
+-- extra storage at all.
+--
+-- No index. Percentiles are always computed inside an existing `observed_at`-bounded, grouped
+-- aggregate, which sorts the group's rows regardless; a btree on `latency_ms` would add ~28
+-- bytes/row (more than 3x the column itself) and serve no query we run.
+--
+-- Production is PLAIN POSTGRES, not Timescale (#549 Finding 2: `SELECT count(*) FROM pg_extension
+-- WHERE extname='timescaledb'` is 0). Nothing here may depend on hypertable functions or
+-- continuous aggregates.
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS latency_ms DOUBLE PRECISION;

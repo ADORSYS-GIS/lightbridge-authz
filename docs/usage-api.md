@@ -62,6 +62,21 @@ accepts the same set of dimensions. See
 [`docs/lightbridge-query-api.md`](lightbridge-query-api.md) for the full field
 reference.
 
+## Latency
+
+Each `usage_events` row carries an optional `latency_ms` (a single `DOUBLE PRECISION` column, 8
+bytes/row), and `/usage/v1/usage/query` returns `latency_samples` plus `latency_p50_ms` /
+`latency_p95_ms` / `latency_p99_ms` per point, computed with Postgres' `percentile_cont`
+ordered-set aggregate at query time. Nothing about the distribution is stored -- no sample arrays,
+no histogram buckets -- which keeps this out of the unbounded-wide-column territory that made this
+table a contributing factor in the 2026-08-29 outage (#549).
+
+Latency is genuinely absent for some signals (aggregate metric data points carry a bucketed
+distribution, not one observation), and the API reports that as `latency_samples: 0` with `null`
+percentiles rather than a zero. See
+[`docs/lightbridge-query-api.md`](lightbridge-query-api.md)'s "Latency, and when it is legitimately
+absent" for the full source table and the honesty contract consumers are expected to honour.
+
 ## Migrations
 
 Usage storage migrations are separate from authz migrations:

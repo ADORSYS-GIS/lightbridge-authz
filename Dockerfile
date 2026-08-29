@@ -4,7 +4,7 @@
 # can serve them same-origin. Only `runtime` (the image `authz-idp` actually runs from -- see
 # compose.yaml, which shares one `lightbridge-authz` image across api/opa/idp/budget) consumes
 # this stage's output; the other runtime stages below don't need it.
-FROM node:22-alpine as frontend
+FROM node:26-alpine as frontend
 
 WORKDIR /app/web/hosted-login
 

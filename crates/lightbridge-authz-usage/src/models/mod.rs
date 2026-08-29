@@ -84,6 +84,23 @@ pub struct UsageSeriesPoint {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    /// How many rows in this bucket actually carried a latency measurement. A percentile computed
+    /// over a handful of samples is noise, and `p99` needs ~100 samples before it means anything,
+    /// so this count is returned alongside the percentiles rather than left for the caller to
+    /// guess. `0` means no row in this bucket reported latency at all -- which is a legitimate,
+    /// per-series outcome (see `UsageEvent::latency_ms`), not an error.
+    pub latency_samples: i64,
+    /// Median request latency in milliseconds, `percentile_cont(0.5)` over the bucket's
+    /// `latency_ms` values. `None` exactly when `latency_samples == 0` -- never collapsed to `0.0`,
+    /// because "no latency was reported" and "every request took 0 ms" are different facts and the
+    /// console has to be able to say which one it is.
+    pub latency_p50_ms: Option<f64>,
+    /// 95th-percentile request latency in milliseconds. `None` when `latency_samples == 0`.
+    pub latency_p95_ms: Option<f64>,
+    /// 99th-percentile request latency in milliseconds. `None` when `latency_samples == 0`.
+    /// Meaningful only once `latency_samples` is large (~100+); below that it degenerates towards
+    /// the bucket maximum.
+    pub latency_p99_ms: Option<f64>,
 }
 
 fn default_bucket() -> String {

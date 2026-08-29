@@ -1,0 +1,45 @@
+-- Gives `accounts` a human-facing display label. Until now an account had no name at all, so
+-- every console surface could only ever render its opaque id -- and since ADR-0006 that id IS the
+-- caller's JWT `sub` (an externally-issued opaque string, ours to store but never to mint or
+-- reshape, ADR-0039), so there is nothing human-readable to fall back on.
+--
+-- NULLABLE, NOT `NOT NULL` + backfill -- deliberate, and the reasoning belongs here rather than in
+-- a PR description:
+--
+--   * There is no truthful value to backfill with. The only account-scoped strings that already
+--     exist are the id (== the JWT subject) and `default_quota` (a governance tier). Backfilling
+--     the id into `name` would reproduce the exact defect this column exists to fix, while making
+--     it *look* like a real name -- a console cannot then tell "the user named their account
+--     `9f3a-...`" apart from "nobody has named it yet", so it can never render a
+--     name-me affordance. That is the "a missing value is not a default, it is unknown" rule from
+--     CLAUDE.md applied to a display field.
+--   * A `NOT NULL DEFAULT ''` variant is worse still: it makes the empty string a legal *set*
+--     name, collapsing the same distinction at the type level instead of the data level.
+--   * NULL is already this table's established shape for "not assigned yet" -- `default_quota` was
+--     added exactly this way, for exactly this reason
+--     (`20260727000003_accounts_drop_billing_identity_add_default_quota.sql`: "Left NULL for
+--     existing accounts -- there's no prior [...] value to backfill it from").
+--
+-- Consequence, stated plainly so nobody is surprised in production: every pre-existing account
+-- reads back `name = NULL` after this migration and stays that way until its owner sets one
+-- through `procedure.updateAccountName`. Choosing a placeholder is a rendering decision that
+-- belongs to the console, not a persisted lie in this table.
+--
+-- Adding a nullable column with no default is catalog-only in Postgres (no table rewrite, no
+-- backfill statement), so this is safe to apply to a live, populated `accounts` table.
+--
+-- The CHECK follows this repo's convention of making an invariant true regardless of code path
+-- (`accounts.status`/`projects.model_policy` do the same for their enum-like values): it forbids a
+-- present-but-blank name, so `NULL` stays the single, unambiguous representation of "no name".
+-- The application layer normalises blank input to `NULL` before it ever reaches here
+-- (`AuthzStoreImpl::normalize_account_name`), so this constraint should never fire from our own
+-- write paths -- it exists to keep that true for any future one. Safe to add unconditionally: the
+-- column is brand new, so no pre-existing row can violate it.
+--
+-- Deliberately NOT unique and deliberately not indexed. A name is a label, never an identifier:
+-- no lookup path resolves an account by name, two people may legitimately name their accounts the
+-- same thing, and a unique constraint would leak the existence of other tenants' account names
+-- through conflict errors.
+ALTER TABLE accounts
+    ADD COLUMN name TEXT
+        CHECK (name IS NULL OR btrim(name) <> '');

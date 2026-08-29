@@ -251,6 +251,7 @@ async fn verified_keycloak_callback_transitions_pending_device_code_to_approved(
         "keycloak-subject",
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -817,6 +818,7 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
         "keycloak-subject",
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -849,6 +851,7 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
         "other-subject",
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -1057,6 +1060,7 @@ async fn suspended_account_is_refused_a_browser_session(pool: PgPool) {
         "suspended-subject",
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -1188,6 +1192,7 @@ async fn inactive_project_is_refused_a_browser_session(pool: PgPool) {
         "inactive-project-subject",
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -1328,6 +1333,7 @@ async fn browser_session_persists_the_real_authenticated_member_subject(pool: Pg
         "owner-subject",
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -1336,6 +1342,7 @@ async fn browser_session_persists_the_real_authenticated_member_subject(pool: Pg
         "member-subject",
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -1477,6 +1484,7 @@ async fn browser_session_subject_is_the_acting_account_not_the_keycloak_sub(pool
         account_id,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -1670,6 +1678,7 @@ async fn device_pairing_callback_persists_a_federated_identity_for_an_existing_a
         "keycloak-subject",
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -1817,6 +1826,7 @@ async fn browser_sso_callback_persists_the_same_federated_identity(pool: PgPool)
         subject,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -1909,6 +1919,7 @@ async fn stored_token_envelope_is_not_plaintext_at_rest(pool: PgPool) {
         "keycloak-subject",
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -1992,6 +2003,7 @@ async fn token_envelope_does_not_open_under_the_state_encryption_key(pool: PgPoo
         "keycloak-subject",
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -2066,6 +2078,7 @@ async fn a_second_login_updates_the_same_federated_identity_row_and_reseals(pool
         subject,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -2257,6 +2270,7 @@ async fn a_second_issuer_with_a_colliding_subject_is_refused_not_merged(pool: Pg
         subject,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await

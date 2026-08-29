@@ -71,6 +71,7 @@ async fn create_account_accepts_a_configured_default_quota(pool: PgPool) {
             &subject,
             CreateAccount {
                 default_quota: Some("gold".to_string()),
+                name: None,
             },
         )
         .await
@@ -90,6 +91,7 @@ async fn create_account_rejects_an_unconfigured_default_quota(pool: PgPool) {
             &subject,
             CreateAccount {
                 default_quota: Some("medim".to_string()),
+                name: None,
             },
         )
         .await
@@ -122,6 +124,7 @@ async fn create_account_accepts_missing_default_quota(pool: PgPool) {
             &subject,
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
@@ -142,6 +145,7 @@ async fn create_account_accepts_anything_when_catalogue_is_empty(pool: PgPool) {
             &subject,
             CreateAccount {
                 default_quota: Some("anything-goes".to_string()),
+                name: None,
             },
         )
         .await
@@ -165,6 +169,7 @@ async fn update_account_default_quota_accepts_a_configured_tier(pool: PgPool) {
             &subject,
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
@@ -188,6 +193,7 @@ async fn update_account_default_quota_rejects_an_unconfigured_tier(pool: PgPool)
         &subject,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -221,6 +227,7 @@ async fn update_account_default_quota_accepts_none_to_clear(pool: PgPool) {
             &subject,
             CreateAccount {
                 default_quota: Some("gold".to_string()),
+                name: None,
             },
         )
         .await
@@ -245,6 +252,7 @@ async fn update_account_default_quota_accepts_anything_when_catalogue_is_empty(p
             &subject,
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
@@ -276,6 +284,7 @@ async fn seed_lead_and_target(core: Arc<dyn DbPoolTrait>) -> (String, String, St
             &lead_subject,
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
@@ -284,6 +293,7 @@ async fn seed_lead_and_target(core: Arc<dyn DbPoolTrait>) -> (String, String, St
         &target_subject,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -440,6 +450,7 @@ async fn seed_owner_and_project(core: Arc<dyn DbPoolTrait>) -> (String, String) 
             &owner_subject,
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
