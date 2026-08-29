@@ -659,6 +659,10 @@ struct DiscoveryDocument {
     #[serde(skip_serializing_if = "Option::is_none")]
     check_session_iframe: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    end_session_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    userinfo_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     claims_parameter_supported: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     subject_types_supported: Vec<String>,
@@ -757,6 +761,19 @@ fn discovery_document(
         introspection_endpoint_auth_signing_alg_values_supported: client_auth_signing_algorithms,
         check_session_iframe: authorization_code_mounted
             .then(|| format!("{endpoint_base}/oauth2/check_session_iframe")),
+        // OIDC RP-Initiated Logout 1.0 §3. Gated on the authorization-code surface, not on the
+        // token surface: logout ends the BROWSER session, and the browser session only exists
+        // where `/authorize` is mounted. `frontchannel_logout_supported`/
+        // `backchannel_logout_supported` stay absent -- this OP implements neither, and the
+        // omission discipline this document follows means never advertising a capability whose
+        // handler does not exist (ADR-0023's whole lesson).
+        end_session_endpoint: authorization_code_mounted
+            .then(|| format!("{endpoint_base}/oauth2/end_session")),
+        // OIDC Core §5.3. Gated on `oidc_tokens_supported` rather than the route table alone: the
+        // endpoint refuses any token lacking the `openid` scope, so where `openid` is not an
+        // issuable scope it would answer nothing but `insufficient_scope`.
+        userinfo_endpoint: oidc_tokens_supported
+            .then(|| format!("{endpoint_base}/oauth2/userinfo")),
         claims_parameter_supported: oidc_tokens_supported.then_some(false),
         subject_types_supported,
         id_token_signing_alg_values_supported,

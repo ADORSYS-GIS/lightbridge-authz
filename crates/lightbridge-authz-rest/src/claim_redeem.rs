@@ -21,12 +21,13 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use chrono::Utc;
 use lightbridge_authz_api_key::repo::StoreRepo;
 
+use crate::html_page::{escape, page, secure_headers};
 use crate::secret_claim::SecretClaimStore;
 use crate::session_cookie::read_session_cookie;
 
@@ -37,43 +38,6 @@ pub struct ClaimRedeemState {
     /// so, not look like an expired or forged link and send the user off to rotate a key.
     pub claims: Option<Arc<SecretClaimStore>>,
     pub repo: Arc<StoreRepo>,
-}
-
-/// Minimal escaping for the one untrusted-ish value this page interpolates. The secret is
-/// server-generated, but it is rendered inside an element, so it is escaped rather than trusted
-/// on the strength of where it came from.
-fn escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-/// Headers applied to every response from this route. `no-store` keeps the secret out of the
-/// browser's disk cache and out of intermediary caches; `no-referrer` stops the claim token
-/// leaking through a `Referer` header if the page ever links out; the CSP forbids any script or
-/// external fetch, so nothing on the page can exfiltrate what it displays.
-fn secure_headers() -> [(header::HeaderName, &'static str); 4] {
-    [
-        (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-        (header::CACHE_CONTROL, "no-store"),
-        (header::REFERRER_POLICY, "no-referrer"),
-        (
-            header::CONTENT_SECURITY_POLICY,
-            "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
-        ),
-    ]
-}
-
-fn page(title: &str, body: &str) -> String {
-    format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <meta name=\"robots\" content=\"noindex,nofollow\"><title>{title}</title>\
-         <style>body{{font:16px system-ui,sans-serif;margin:3rem auto;max-width:34rem;padding:0 1rem}}\
-         code{{display:block;padding:.75rem;background:#f4f4f5;border-radius:6px;word-break:break-all}}\
-         p{{color:#3f3f46}}</style></head><body>{body}</body></html>"
-    )
 }
 
 /// Deliberately identical for every failure: unknown token, expired, already redeemed, or owned by

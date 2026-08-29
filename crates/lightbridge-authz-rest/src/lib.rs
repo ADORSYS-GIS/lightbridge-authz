@@ -16,10 +16,13 @@ pub mod auth_provider;
 pub mod authorize;
 pub mod claim_redeem;
 pub mod codec;
+pub mod end_session;
 pub mod handlers;
+pub mod html_page;
 pub mod middleware;
 pub mod models;
 pub mod oauth2_op;
+pub mod post_logout;
 pub mod ratelimit_redis;
 pub mod redis_tls;
 pub mod relying_party;
@@ -31,6 +34,7 @@ pub mod session_management;
 pub mod signing;
 pub mod static_assets;
 pub mod token_exchange;
+pub mod userinfo;
 
 use auth_provider::{ACCESS_TOKEN_CONTEXT_KEY, CratestackAuthProvider};
 use codec::LenientCborCodec;
@@ -2983,6 +2987,7 @@ pub fn build_idp_router(
     claim_redeem: claim_redeem::ClaimRedeemState,
 ) -> Router {
     let mut router = probe_router(readiness_pool);
+    let claim_redeem_repo = Arc::clone(&claim_redeem.repo);
     // GHSA-9pc6-965v-2c44: mounted unconditionally, like every other authz-idp route (ADR-0023).
     // A deployment where this 404s while lightbridge-mcp still issues claim URLs would hand users
     // links they cannot use -- the exact advertised-but-unmounted failure ADR-0023 exists to stop.
@@ -2999,6 +3004,15 @@ pub fn build_idp_router(
     router = router.merge(authorize::router(authorize::AuthorizeState::new(
         Arc::clone(&relying_party),
         token_exchange.clone(),
+    )));
+    router = router.merge(userinfo::router(token_exchange.clone()));
+    // OIDC RP-Initiated Logout. Mounted unconditionally beside every other authz-idp route
+    // (ADR-0023): discovery advertises it whenever `/authorize` is mounted, and the two must not
+    // be able to disagree.
+    router = router.merge(end_session::router(end_session::EndSessionState::new(
+        Arc::clone(&claim_redeem_repo),
+        token_exchange.clone(),
+        &oauth2.clients,
     )));
     router = router.merge(token_exchange::token_exchange_router(token_exchange));
     router = router.merge(session_management::router());
@@ -3917,6 +3931,7 @@ mod tests {
             allowed_audiences: vec!["shared-audience".to_string()],
             jwks: None,
             redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
             require_pkce: false,
         }];
         oauth2.token_exchange = Some(exchange_cfg());
@@ -3950,6 +3965,7 @@ mod tests {
             allowed_audiences: vec!["a-real-oauth-client".to_string()],
             jwks: None,
             redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
             require_pkce: false,
         }];
         oauth2.token_exchange = Some(exchange_cfg());

@@ -9,8 +9,12 @@ This repository provides API key management plus usage analytics:
 - `authz-opa`: Basic-auth protected validation API intended to be called by Authorino (or similar external auth components). It validates API keys and returns rich context plus dynamic metadata.
 - `authz-idp`: OIDC broker server (ADR-0012, ADR-0019, ADR-0023) exposing
   `.well-known/openid-configuration`, `.well-known/jwks.json`, `/oauth2/token`, `/oauth2/revoke`,
-  `/oauth2/device_authorization`, `/authorize`, `/device/verify`, and `/idp/callback` — every route
-  is public, the presented token/assertion (or completed Keycloak login) is itself the credential.
+  `/oauth2/device_authorization`, `/oauth2/userinfo`, `/oauth2/end_session`, `/authorize`,
+  `/device/verify`, and `/idp/callback` — every route is public, the presented token/assertion
+  (or completed Keycloak login) is itself the credential. `/oauth2/end_session` (OIDC RP-Initiated
+  Logout 1.0) takes its subject from the `__Host-authz_session` cookie, never from
+  `id_token_hint`, and cascades to every session that subject holds plus their refresh chains;
+  `/oauth2/userinfo` (OIDC Core §5.3) returns identity claims only and never authorization data.
   It is a full IdP: `oauth2.relying_party` and an enabled `oauth2.token_exchange` are both
   MANDATORY, and every route above is mounted unconditionally — see "The authz-idp surface is
   mandatory" below.
@@ -648,7 +652,8 @@ dependencies:
   (`crates/lightbridge-authz-rest/src/lib.rs`), not a config-driven mount decision.
 - **There is no neutralisation escape hatch and no mount-conditional gate.** `build_idp_router`
   takes `relying_party`/`token_exchange` as owned, non-`Option` parameters — `/authorize`,
-  `/device/verify`, `/idp/callback`, `/oauth2/token`, `/oauth2/revoke`, and
+  `/device/verify`, `/idp/callback`, `/oauth2/token`, `/oauth2/revoke`, `/oauth2/userinfo`,
+  `/oauth2/end_session`, and
   `/oauth2/device_authorization` are all mounted unconditionally, and discovery
   (`DiscoveryCapabilities::full_idp()`) always advertises all of them.
 - **Enforcement for `relying_party` is presence PLUS the existing offline validation** — unlike the

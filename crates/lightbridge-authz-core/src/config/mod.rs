@@ -1031,6 +1031,19 @@ pub struct OauthClient {
     /// non-browser clients.
     #[serde(default)]
     pub redirect_uris: Vec<String>,
+    /// Exact, byte-for-byte URLs `/oauth2/end_session` will redirect to after ending the session
+    /// (OIDC RP-Initiated Logout 1.0 §2, `post_logout_redirect_uri`). Deliberately a SEPARATE list
+    /// from `redirect_uris` rather than reusing it: the two are reached under different
+    /// conditions, and the logout endpoint accepts a redirect target from an unauthenticated,
+    /// CSRF-able GET. Folding them together would silently turn every registered callback into a
+    /// logout landing page.
+    ///
+    /// Empty (the default) means this client gets NO redirect: `/oauth2/end_session` still ends
+    /// the session and renders its own confirmation page. An unregistered
+    /// `post_logout_redirect_uri` is never honoured -- that is the whole open-redirect boundary
+    /// (see `end_session::resolve_post_logout_redirect`).
+    #[serde(default)]
+    pub post_logout_redirect_uris: Vec<String>,
     /// Whether the authorization request must carry an S256 PKCE challenge.
     #[serde(default)]
     pub require_pkce: bool,

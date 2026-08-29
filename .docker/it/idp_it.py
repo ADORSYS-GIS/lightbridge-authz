@@ -400,6 +400,12 @@ def section_discovery() -> None:
     assert doc["code_challenge_methods_supported"] == ["S256"], "discovery code_challenge mismatch"
     assert doc["introspection_endpoint"], "discovery missing introspection_endpoint"
     assert doc["check_session_iframe"], "discovery missing check_session_iframe"
+    assert doc["end_session_endpoint"], "discovery missing end_session_endpoint"
+    assert doc["userinfo_endpoint"], "discovery missing userinfo_endpoint"
+    # Neither logout channel is implemented, so neither may be advertised. ADR-0023's rule: a
+    # capability in this document is a promise that a handler exists.
+    for unimplemented in ("frontchannel_logout_supported", "backchannel_logout_supported"):
+        assert unimplemented not in doc, f"discovery advertises unimplemented {unimplemented}"
     assert doc["claims_parameter_supported"] is False, "claims_parameter_supported must be false"
 
     status, alt_doc, _ = http_json("GET", f"{IDP_URL}/.well-known/oauth-authorization-server")
@@ -507,9 +513,13 @@ def section_authorize_negatives() -> None:
 # --- 6. Full browser flow -----------------------------------------------------------------------
 
 
-def section_browser_flow() -> None:
-    """Self-contained: drives the full browser authorization-code flow end to end and asserts
-    along the way. Nothing it mints is reused by a later section."""
+def section_browser_flow() -> tuple["CookieJar", str, str, str]:
+    """Drives the full browser authorization-code flow end to end and asserts along the way.
+
+    Returns the live browser session it established -- cookie jar, access token, id_token and a
+    current refresh token -- because `section_end_session` needs a REAL session to end. Asserting
+    that logout works requires something to log out of; minting a second one would test a
+    different session than the one the rest of this section proved out."""
     cookies = CookieJar()
     verifier, challenge = pkce_pair()
     state = "it-idp-" + uuid_hex()
@@ -686,6 +696,8 @@ def section_browser_flow() -> None:
     second_code = second_params.get("code")
     assert second_code and second_code != code, "second /authorize did not mint a fresh code"
     log("a second /authorize with the session cookie skips Keycloak entirely")
+
+    return cookies, token_body["access_token"], token_body["id_token"], rotated["refresh_token"]
 
 
 # --- 7. check_session_iframe -----------------------------------------------------------------------
@@ -1014,6 +1026,137 @@ def section_revocation(device_refresh_token: str) -> None:
     log("revoke is idempotent on a second call")
 
 
+# --- 11. UserInfo + RP-Initiated Logout -------------------------------------------------------
+
+
+def section_userinfo(browser_access_token: str) -> None:
+    """OIDC Core §5.3. The important assertion is the NEGATIVE one: authorization data must not be
+    reachable through this endpoint. `budget_tier`/`quota_tier`/roles all sit one `claims.get`
+    away in the same token, so nothing but a deliberate allow-list keeps them out."""
+    status, body, _ = http_json(
+        "GET",
+        f"{IDP_URL}/oauth2/userinfo",
+        headers={"Authorization": f"Bearer {browser_access_token}"},
+    )
+    assert status == 200, f"userinfo rejected a live browser token: status={status}, body={body}"
+    assert body.get("sub"), f"userinfo response missing the required sub claim: {body}"
+    assert body.get("account_id") and body.get("project_id"), (
+        f"userinfo must carry this deployment's tenant context: {body}"
+    )
+    # KNOWN GAP, pinned deliberately rather than asserted away. A browser (authorization_code)
+    # login mints `email: None` at source -- `mint_from_authorization_code` says so outright:
+    # "the code's stored identity carries no email, so these stay `None` rather than being
+    # invented". The upstream email IS available, sealed in
+    # `federated_identities.token_envelope` (ADR-0024's ID-token claims snapshot); nothing on the
+    # /authorize -> code -> token path opens it. So UserInfo cannot return an email for the
+    # console's own users, even though they granted the `email` scope.
+    #
+    # This assertion is a TRIPWIRE: wiring that snapshot through will turn it red, which is the
+    # point -- the fix must come with this line and the `email` scope gating being re-checked
+    # together. The device/token-exchange path is unaffected (it decodes email straight off the
+    # presented Keycloak token), so this is specifically the browser leg.
+    assert "email" not in body, (
+        "a browser-login token now carries email -- if that was intentional, update this "
+        f"assertion and confirm the email scope actually gates it: {body}"
+    )
+    for authorization_claim in (
+        "budget_tier",
+        "quota_tier",
+        "model_policy",
+        "allowed_models",
+        "lightbridge_api_roles",
+    ):
+        assert authorization_claim not in body, (
+            f"userinfo leaked authorization data ({authorization_claim}): {body}"
+        )
+    log("userinfo returns identity claims and no authorization data")
+
+    status, headers, _ = http_raw("GET", f"{IDP_URL}/oauth2/userinfo")
+    assert status == 401, f"userinfo without a bearer must be 401: status={status}"
+    assert headers.get("WWW-Authenticate") == "Bearer", (
+        "RFC 6750 §3.1: a missing credential gets the bare challenge, never invalid_token "
+        f"-- got {headers.get('WWW-Authenticate')!r}"
+    )
+
+    status, headers, _ = http_raw(
+        "GET", f"{IDP_URL}/oauth2/userinfo", headers={"Authorization": "Bearer not-a-jwt"}
+    )
+    assert status == 401, f"userinfo with a malformed bearer must be 401: status={status}"
+    assert 'error="invalid_token"' in (headers.get("WWW-Authenticate") or ""), (
+        f"expected invalid_token challenge, got {headers.get('WWW-Authenticate')!r}"
+    )
+    log("userinfo distinguishes a missing credential from a bad one")
+
+
+def section_end_session(cookies: CookieJar, id_token: str, refresh_token: str) -> None:
+    """OIDC RP-Initiated Logout 1.0, driven against the live session `section_browser_flow` left
+    behind.
+
+    Three properties, in the order they matter:
+
+    1. An UNREGISTERED `post_logout_redirect_uri` never reaches a Location header. This is checked
+       FIRST, while the session is still live, because it is the security property -- and because
+       running it first also proves the refusal did not depend on the session already being gone.
+    2. A registered one is honoured, with `state` round-tripped, and the session cookie is cleared.
+    3. The refresh token is DEAD afterwards. Without this the whole endpoint would be theatre: the
+       cookie would be gone from the browser while every issued refresh chain kept renewing."""
+    hostile = f"{IDP_URL}/oauth2/end_session?" + urllib.parse.urlencode(
+        {
+            "client_id": BROWSER_CLIENT_ID,
+            "post_logout_redirect_uri": "http://attacker.invalid/steal",
+        }
+    )
+    status, headers, _ = http_raw("GET", hostile, cookies=CookieJar())
+    assert status == 200, f"an unregistered redirect must render the OP page: status={status}"
+    assert not headers.get("Location"), (
+        f"an unregistered post_logout_redirect_uri reached a Location header: "
+        f"{headers.get('Location')!r}"
+    )
+    log("end_session refuses an unregistered post_logout_redirect_uri")
+
+    logout_url = f"{IDP_URL}/oauth2/end_session?" + urllib.parse.urlencode(
+        {
+            "client_id": BROWSER_CLIENT_ID,
+            "id_token_hint": id_token,
+            "post_logout_redirect_uri": "http://it-client.invalid/signed-out",
+            "state": "it-logout-state",
+        }
+    )
+    status, headers, _ = http_raw("GET", logout_url, cookies=cookies)
+    assert status == 303, f"logout with a registered redirect must 303: status={status}"
+    location = headers.get("Location") or ""
+    assert location.startswith("http://it-client.invalid/signed-out"), (
+        f"logout redirected somewhere unexpected: {location}"
+    )
+    assert query_params(location).get("state") == "it-logout-state", (
+        f"state must round-trip to the RP: {location}"
+    )
+    set_cookie = headers.get("Set-Cookie") or ""
+    assert "__Host-authz_session=" in set_cookie and "Max-Age=0" in set_cookie, (
+        f"logout must clear the session cookie: {set_cookie!r}"
+    )
+    log("end_session honours a registered redirect, round-trips state and clears the cookie")
+
+    status, _, refused_bytes = http_raw(
+        "POST",
+        f"{IDP_URL}/oauth2/token",
+        body=urllib.parse.urlencode(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": BROWSER_CLIENT_ID,
+            }
+        ).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    refused = json.loads(refused_bytes)
+    assert status == 400 and refused.get("error") == "invalid_grant", (
+        "logout must cascade to the refresh chain -- a still-renewable token after logout means "
+        f"the session only LOOKS ended: status={status}, body={refused}"
+    )
+    log("logout cascaded: the browser session's refresh token is refused afterwards")
+
+
 def main() -> int:
     try:
         wait_until_ready()
@@ -1027,12 +1170,17 @@ def main() -> int:
         section_discovery()
         section_jwks()
         section_authorize_negatives()
-        section_browser_flow()
+        browser_cookies, browser_access, browser_id_token, browser_refresh = (
+            section_browser_flow()
+        )
         section_check_session_iframe()
+        section_userinfo(browser_access)
         device_access_token, device_refresh_token = section_device_flow()
         exchange_access_token, exchange_refresh_token = section_token_exchange(project_id)
         section_introspection(exchange_access_token, exchange_refresh_token, device_access_token)
         section_revocation(device_refresh_token)
+        # Last: it ends the browser session every earlier section relied on.
+        section_end_session(browser_cookies, browser_id_token, browser_refresh)
 
         return 0
     except Exception as err:

@@ -91,6 +91,7 @@ mod tests {
             allowed_audiences: vec![client_id.to_string()],
             jwks: None,
             redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
             require_pkce: false,
         }
     }
