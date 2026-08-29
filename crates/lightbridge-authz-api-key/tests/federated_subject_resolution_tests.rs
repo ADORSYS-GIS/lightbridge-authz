@@ -39,6 +39,7 @@ async fn existing_fi_row_resolves_to_its_account_id(pool: PgPool) {
         account_id,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -86,6 +87,7 @@ async fn grandfathered_account_is_adopted_on_first_resolution_and_the_row_persis
         subject,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -132,6 +134,7 @@ async fn a_second_issuer_presenting_the_same_subject_is_refused_not_merged(pool:
         subject,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -193,6 +196,7 @@ async fn adoption_is_idempotent_under_concurrency(pool: PgPool) {
             subject,
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await

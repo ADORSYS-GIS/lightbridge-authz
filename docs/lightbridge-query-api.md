@@ -184,7 +184,11 @@ Successful response is HTTP `200` with JSON:
       "total_cost": 12.34,
       "prompt_tokens": 20000,
       "completion_tokens": 14567,
-      "total_tokens": 34567
+      "total_tokens": 34567,
+      "latency_samples": 118,
+      "latency_p50_ms": 412.0,
+      "latency_p95_ms": 1180.5,
+      "latency_p99_ms": 2404.0
     }
   ]
 }
@@ -216,6 +220,39 @@ Each point is an aggregate across matching `usage_events` rows for:
 | `prompt_tokens` | int64 | yes | `SUM(prompt_tokens)`.
 | `completion_tokens` | int64 | yes | `SUM(completion_tokens)`.
 | `total_tokens` | int64 | yes | `SUM(total_tokens)`.
+| `latency_samples` | int64 | yes | `COUNT(latency_ms)` -- how many of this group's rows actually carried a per-request duration. `0` is a legitimate outcome, not an error (see below).
+| `latency_p50_ms` | float64 or null | yes | `percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms)`. `null` exactly when `latency_samples` is `0`.
+| `latency_p95_ms` | float64 or null | yes | `percentile_cont(0.95) …`. `null` when `latency_samples` is `0`.
+| `latency_p99_ms` | float64 or null | yes | `percentile_cont(0.99) …`. `null` when `latency_samples` is `0`.
+
+#### Latency, and when it is legitimately absent
+
+`latency_ms` is captured per event at ingest, and the percentiles are ordered-set aggregates
+computed at query time -- there is no stored histogram and no stored sample array. Sources, in the
+order they are tried:
+
+| Signal | Source | Notes |
+|---|---|---|
+| trace | the span's own `end_time_unix_nano - start_time_unix_nano` | Authoritative; wins over any duration attribute on the same span. |
+| trace / log / metric | a duration attribute | Millisecond-named keys (`duration`, `x-envoy-upstream-service-time`, `duration_ms`, …) and second-named keys (every OpenTelemetry semantic-convention `*.duration`, which are seconds) are kept in separate lists so the unit is never guessed. |
+| metric (gauge / sum) | the data point's own value, when the metric is *named* as a duration | e.g. `gen_ai.server.request.duration`. |
+| metric (histogram / exponential histogram / summary) | **nothing** | A bucketed distribution is not one observation. `sum / count` is a mean, and feeding a mean into `percentile_cont` would fabricate a percentile out of data that never contained one. These rows deliberately store `NULL`. |
+
+What actually reaches this service in the deployed stack today is the **log** path: the AI gateway
+configures Envoy's OpenTelemetry access-log sink with `duration: "%DURATION%"` and
+`x-envoy-upstream-service-time: "%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%"` (both milliseconds, both
+delivered as OTLP LogRecord attributes on `/v1/otel/logs`). The AI Gateway ExtProc's
+`llmRequestCosts` dynamic metadata -- the channel that produces
+`io.envoy.ai_gateway.llm_custom_total_cost` -- carries token and cost keys only, never a duration.
+
+Consumers must therefore treat `latency_samples == 0` as a **per-series** fact and say so for that
+series, rather than blanking a whole panel. `null` percentiles are never collapsed to `0.0`: "no
+latency was reported" and "every request took 0 ms" are different facts.
+
+`latency_p99_ms` needs roughly 100 samples before it means anything; below that it degenerates
+towards the group's maximum, and at `latency_samples == 1` all three percentiles collapse onto that
+single observation. `latency_samples` is returned precisely so a caller can mark that unstable
+instead of drawing a confident tail.
 
 ### Error behaviour
 

@@ -4,11 +4,12 @@
 //!
 //! ## The `open()` failure contract every production caller MUST follow
 //!
-//! No production call site opens a sealed envelope yet -- `federated_identities.token_envelope`
-//! (ADR-0024) is written by `KeycloakRelyingParty::persist_federated_identity` today, but nothing
-//! reads it back; that lands with ADR-0024's own follow-up 4. This paragraph is the contract
-//! the future caller MUST implement, written down now so it isn't rediscovered under pressure
-//! later:
+//! `federated_identities.token_envelope` (ADR-0024) is written by
+//! `KeycloakRelyingParty::persist_federated_identity` and read back by
+//! `KeycloakRelyingParty::end_upstream_session` -- RP-initiated logout's back-channel leg, which
+//! needs the sealed refresh token to terminate the upstream Keycloak SSO session. That is
+//! ADR-0024's own follow-up 4, and it is the first and (so far) only production caller of
+//! [`open`]. It implements the contract below; any second caller must too:
 //!
 //! - Treat any `open()` failure as **"no stored credential"**, never as a request-failing error.
 //!   A bad/rotated key, a tampered row, or a stale format must all degrade to "this identity has
@@ -19,9 +20,9 @@
 //!   call site (they're required inputs to the call), and nothing else from this module's failure
 //!   path is safe to put in a log line.
 //!
-//! The first real consumer of `open()` owns implementing this contract; `seal`/`open` themselves
-//! only guarantee the cryptographic property (wrong key/AAD/ciphertext all fail the same generic
-//! way) -- they do not and cannot enforce how a caller reacts to that failure.
+//! `seal`/`open` themselves only guarantee the cryptographic property (wrong key/AAD/ciphertext
+//! all fail the same generic way) -- they do not and cannot enforce how a caller reacts to that
+//! failure, which is why the contract is written here rather than expressed in a type.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};

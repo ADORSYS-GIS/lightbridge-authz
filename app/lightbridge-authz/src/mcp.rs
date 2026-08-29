@@ -467,7 +467,7 @@ fn required_tool_permission(tool: &str) -> Option<Permission> {
     Some(match tool {
         "create-account" => Permission::AccountCreate,
         "list-accounts" | "get-account" => Permission::AccountRead,
-        "update-account" => Permission::AccountUpdate,
+        "update-account" | "update-account-name" => Permission::AccountUpdate,
         "delete-account" => Permission::AccountDelete,
         "disable-account" | "enable-account" => Permission::AccountDisable,
         // Roster management (ADR-0006). The capability moved with the concept: `project:member`,
@@ -712,6 +712,11 @@ struct CreateAccountParams {
     /// account's id is taken from the caller's JWT subject rather than any input field.
     #[serde(default)]
     default_quota: Option<String>,
+    /// Optional human-facing display label for the account. Blank/whitespace-only is treated as
+    /// "no name" rather than rejected. Purely a label: it is never unique and nothing resolves an
+    /// account by it -- `account_id` (the caller's JWT subject) remains the only handle.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -736,6 +741,16 @@ struct UpdateAccountParams {
     /// `SetProjectMemberQuotaTierParams::quota_tier` below.
     #[serde(default)]
     default_quota: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct UpdateAccountNameParams {
+    account_id: String,
+    /// The new display label, or omitted/`null`/blank to clear it back to unnamed. Like
+    /// `UpdateAccountParams::default_quota` above this always writes -- there is no PATCH
+    /// "leave untouched" state.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -927,6 +942,7 @@ impl LightbridgeMcpHandler {
                 &subject,
                 CreateAccount {
                     default_quota: params.default_quota,
+                    name: params.name,
                 },
             )
             .await
@@ -1006,6 +1022,29 @@ impl LightbridgeMcpHandler {
                 &params.account_id,
                 params.default_quota.as_deref(),
             )
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(account)
+    }
+
+    #[tool(
+        name = "update-account-name",
+        description = "Set or clear an account's human-facing display name (RPC procedure.updateAccountName); the name is a label, never an identifier"
+    )]
+    async fn update_account_name_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<UpdateAccountNameParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        // Separate from `update-account` rather than another optional field on it: that tool is a
+        // single-field write onto `updateAccountDefaultQuota`, and folding a second column into it
+        // would resurrect exactly the "which fields did the caller mean to leave alone" ambiguity
+        // #379 removed from the account surface. Same `account:update` permission either way.
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
+        let account = self
+            .issuer
+            .update_account_name(&subject, &params.account_id, params.name.as_deref())
             .await
             .map_err(to_tool_error)?;
 
@@ -2344,6 +2383,7 @@ mod tests {
             id: "acct_1".to_string(),
             default_quota: None,
             status: lightbridge_authz_core::ResourceStatus::Active,
+            name: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -2742,6 +2782,10 @@ mod tests {
                 "update-account",
                 json!({ "account_id": "acct_1", "default_quota": "medium" }),
             ),
+            (
+                "update-account-name",
+                json!({ "account_id": "acct_1", "name": "Acme Corp" }),
+            ),
             ("disable-account", json!({ "account_id": "acct_1" })),
             ("enable-account", json!({ "account_id": "acct_1" })),
             ("list-project-roster", json!({ "project_id": "proj_1" })),
@@ -3021,6 +3065,7 @@ mod tests {
             "set-project-model-policy",
             "set-project-quota",
             "update-account",
+            "update-account-name",
             "update-api-key",
             "update-project",
             "validate-authorino-api-key",

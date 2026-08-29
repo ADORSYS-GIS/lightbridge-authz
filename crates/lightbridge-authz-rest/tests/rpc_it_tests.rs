@@ -623,6 +623,7 @@ async fn crud_authorizes_via_the_federated_account_not_the_raw_subject() {
         &account_id,
         lightbridge_authz_core::CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -2565,6 +2566,110 @@ async fn promoting_a_second_project_to_default_frees_the_old_default_for_deletio
         !status.is_success(),
         "the newly-promoted default project must be refused deletion (got {status}: {})",
         String::from_utf8_lossy(&body)
+    );
+}
+
+/// `Account.name` end-to-end over the real CBOR RPC dispatch pipeline: settable at creation,
+/// renameable afterwards through `procedure.updateAccountName` (the only write path -- the field
+/// is `@readonly` and `model.Account.update` was removed by #398), and gated on the SAME
+/// `account:update` permission `updateAccountDefaultQuota` already required, not a new one.
+///
+/// The rename path is not a nicety: every account that predates
+/// `migrations/20260829000001_accounts_add_name.sql` reads back `name = null`, so without this
+/// procedure they would all be permanently unnamed.
+#[tokio::test]
+async fn account_name_is_settable_at_creation_and_renameable_afterwards() {
+    let admin_subject = format!("owner-name-{}", cuid2());
+    let viewer_subject = format!("viewer-name-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("admin", token_info(&admin_subject, admin_perms()))
+            .with("viewer", token_info(&viewer_subject, viewer_perms())),
+    );
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.createAccount",
+        Wire::Cbor,
+        &json!({ "args": { "name": "Acme Corp" } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "createAccount with a name: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let created = json_body(&body);
+    let account_id = created["id"].as_str().expect("account id").to_string();
+    assert_eq!(
+        created["name"], "Acme Corp",
+        "the created account must carry the name back on the wire"
+    );
+
+    // Reading it back through the generic read verb -- what a console actually calls -- must also
+    // carry `name`, not just the procedure's own response.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Account.get",
+        Wire::Cbor,
+        &json!({ "id": account_id }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json_body(&body)["name"], "Acme Corp");
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.updateAccountName",
+        Wire::Cbor,
+        &json!({ "args": { "accountId": account_id, "name": "Acme Holdings" } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "updateAccountName: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(json_body(&body)["name"], "Acme Holdings");
+
+    // A read-only caller holds `account:read` but not `account:update`, so the rename is refused
+    // by the same coarse gate the quota update already sits behind -- the new procedure did not
+    // widen anything.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.updateAccountName",
+        Wire::Cbor,
+        &json!({ "args": { "accountId": account_id, "name": "Hijacked" } }),
+        Some("viewer"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a caller without account:update must be refused the rename: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Account.get",
+        Wire::Cbor,
+        &json!({ "id": account_id }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json_body(&body)["name"],
+        "Acme Holdings",
+        "the refused rename must not have landed"
     );
 }
 

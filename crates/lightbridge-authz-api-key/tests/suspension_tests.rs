@@ -35,6 +35,7 @@ async fn seed_key(
             subject,
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await

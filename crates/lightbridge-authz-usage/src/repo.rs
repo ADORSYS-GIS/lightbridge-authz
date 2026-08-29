@@ -25,6 +25,15 @@ pub struct UsageEvent {
     pub completion_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
     pub total_cost: Option<f64>,
+    /// Wall-clock duration of the single request this event describes, in milliseconds.
+    ///
+    /// `None` is a first-class, honest outcome, not a failure: it means this signal genuinely
+    /// carries no per-request duration. Aggregate metric points (histogram / exponential-histogram
+    /// / summary) are the standing example -- a bucketed distribution is not one observation, and
+    /// synthesising `sum / count` into this column would feed a fabricated value into
+    /// `percentile_cont`. Query results surface that as `latency_samples == 0` for the affected
+    /// series rather than as a zero.
+    pub latency_ms: Option<f64>,
     pub attributes: Value,
 }
 
@@ -50,6 +59,10 @@ struct UsageQueryRow {
     completion_tokens: Option<i64>,
     total_tokens: Option<i64>,
     total_cost: Option<f64>,
+    latency_samples: Option<i64>,
+    latency_p50_ms: Option<f64>,
+    latency_p95_ms: Option<f64>,
+    latency_p99_ms: Option<f64>,
 }
 
 impl StoreRepo {
@@ -69,7 +82,7 @@ impl StoreRepo {
         }
 
         let mut builder = QueryBuilder::<Postgres>::new(
-            "INSERT INTO usage_events (observed_at, signal_type, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, usage_value, request_count, prompt_tokens, completion_tokens, total_tokens, total_cost, attributes) ",
+            "INSERT INTO usage_events (observed_at, signal_type, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, usage_value, request_count, prompt_tokens, completion_tokens, total_tokens, total_cost, latency_ms, attributes) ",
         );
 
         builder.push_values(events, |mut row, event| {
@@ -89,6 +102,7 @@ impl StoreRepo {
                 .push_bind(event.completion_tokens)
                 .push_bind(event.total_tokens)
                 .push_bind(event.total_cost.unwrap_or(0.0))
+                .push_bind(event.latency_ms)
                 .push_bind(&event.attributes);
         });
 
@@ -209,6 +223,16 @@ impl StoreRepo {
         builder.push(", SUM(completion_tokens)::bigint AS completion_tokens");
         builder.push(", SUM(total_tokens)::bigint AS total_tokens");
         builder.push(", SUM(total_cost)::double precision AS total_cost");
+        builder.push(", COUNT(latency_ms)::bigint AS latency_samples");
+        builder.push(
+            ", percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms)::double precision AS latency_p50_ms",
+        );
+        builder.push(
+            ", percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)::double precision AS latency_p95_ms",
+        );
+        builder.push(
+            ", percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms)::double precision AS latency_p99_ms",
+        );
 
         builder.push(" FROM usage_events WHERE observed_at >= ");
         builder.push_bind(input.start_time);
@@ -296,6 +320,10 @@ impl StoreRepo {
                 prompt_tokens: row.prompt_tokens.unwrap_or(0),
                 completion_tokens: row.completion_tokens.unwrap_or(0),
                 total_tokens: row.total_tokens.unwrap_or(0),
+                latency_samples: row.latency_samples.unwrap_or(0),
+                latency_p50_ms: row.latency_p50_ms,
+                latency_p95_ms: row.latency_p95_ms,
+                latency_p99_ms: row.latency_p99_ms,
             })
             .collect())
     }

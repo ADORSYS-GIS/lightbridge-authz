@@ -245,7 +245,7 @@ scope for #401.
 | ----------------- | ---------------------------------------------------- | ----------------------------------- |
 | `account:create`  | `procedure.createAccount`                            | `create-account`                    |
 | `account:read`    | `model.Account.list`, `model.Account.get`, `model.AccountSummary.list`, `model.AccountSummary.get` | `list-accounts`, `get-account` |
-| `account:update`  | `procedure.updateAccountDefaultQuota` | `update-account`          |
+| `account:update`  | `procedure.updateAccountDefaultQuota`, `procedure.updateAccountName` | `update-account`, `update-account-name` |
 | `account:delete`  | `procedure.deleteAccountPermanently`                 | `delete-account`                    |
 | `account:disable` | `procedure.disableAccount`, `procedure.enableAccount`| `disable-account`, `enable-account` |
 | `project:create`  | `model.Project.create`                               | `create-project`                    |
@@ -534,7 +534,10 @@ wildcard, exactly as already advised for the existing resources.
   unconditionally, for every caller, regardless of permission — a live endpoint that could only
   ever fail. The schema's `@@allow("update")` was removed alongside this, so the op-id is now
   fail-closed at both layers, same as `model.ApiKey.create` above. Account default-quota updates
-  go exclusively through `procedure.updateAccountDefaultQuota`.
+  go exclusively through `procedure.updateAccountDefaultQuota`, and account renames through
+  `procedure.updateAccountName`. `Account.name` was added `@readonly` for exactly this reason
+  rather than resurrecting the removed verb to carry it — both procedures sit behind the same
+  `account:update` permission, so nothing was widened to make room for the new field.
 - `model.ProjectMember.*` — that model is policy-locked to read-only with no generated mutation
   verbs; roster changes go through the `addProjectMember` / `removeProjectMember` /
   `setProjectMemberRole` / `setProjectMemberQuotaTier` procedures, which enforce the lead check in

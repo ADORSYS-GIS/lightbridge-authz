@@ -11,6 +11,13 @@
 //! can actually terminate the RP sessions it authorised. Leaving them alive would make logout a
 //! cosmetic act -- the cookie gone, every downstream token still renewing.
 //!
+//! **Logout also cascades UPSTREAM, back-channel, to the Keycloak SSO session.** Without it the
+//! whole act is theatre: the local sessions die, the cookie clears, and the user's very next
+//! `/authorize` silently re-authenticates through a Keycloak session that never ended -- no
+//! prompt, no credentials, straight back in. `KeycloakRelyingParty::end_upstream_session` POSTs
+//! the stored refresh token to the discovered `end_session_endpoint`; see its doc comment for why
+//! that, and not a browser redirect carrying an `id_token_hint`.
+//!
 //! What logout does NOT do is kill an access token already in flight. Nothing consults `sessions`
 //! on the resource-server path (`lightbridge-authz-bearer` validates the JWT and stops), so a
 //! bearer minted seconds before logout stays valid for the remainder of
@@ -19,10 +26,19 @@
 //!
 //! Two failure directions, resolved opposite ways on purpose:
 //!
-//! - Revocation itself failing is a hard `500`. Redirecting a user to "you are logged out" while
+//! - LOCAL revocation failing is a hard `500`. Redirecting a user to "you are logged out" while
 //!   their session is live is the one outcome worse than an error page.
-//! - Everything else -- no cookie, dead session, bad hint, unregistered redirect -- is a success.
-//!   Logout is idempotent, and a user who is already logged out asked for the state they are in.
+//! - Everything else -- no cookie, dead session, bad hint, unregistered redirect, **and every
+//!   upstream failure** -- is a success. Logout is idempotent, and a user who is already logged
+//!   out asked for the state they are in.
+//!
+//! That second bullet is load-bearing for the upstream leg specifically, so it is worth stating
+//! flatly: an unreachable Keycloak, an expired refresh token, or an envelope sealed under a
+//! since-rotated `token_encryption_key` must NEVER stop the local session from being revoked, the
+//! cookie from being cleared, or the redirect from being honoured. Those are logged loudly and
+//! then dropped. The hard `500` above stays reserved for local revocation, and must not widen:
+//! failing logout because a third party is down would leave the user *more* signed in than if we
+//! had never called it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,6 +57,7 @@ use serde::Deserialize;
 
 use crate::html_page::{page, secure_headers};
 use crate::post_logout::{registry_from_clients, resolve_client_id, resolve_post_logout_redirect};
+use crate::relying_party::{KeycloakRelyingParty, UpstreamLogout};
 use crate::session_cookie::{clear_session_cookie, read_session_cookie};
 use crate::token_exchange::{TokenExchangeState, verify_own_token};
 
@@ -52,14 +69,24 @@ pub struct EndSessionState {
     /// `client_id -> post_logout_redirect_uris`, read once from config at router-build time, like
     /// `ConfigClientStore` (ADR-0011 Decision 5: clients are a config change plus redeploy).
     pub post_logout_redirect_uris: Arc<HashMap<String, Vec<String>>>,
+    /// The upstream leg. Held for one call -- `end_upstream_session` -- and never to mint,
+    /// validate, or redirect anything: this endpoint's authority over *whose* session ends is
+    /// still the cookie alone.
+    pub relying_party: Arc<KeycloakRelyingParty>,
 }
 
 impl EndSessionState {
-    pub fn new(repo: Arc<StoreRepo>, token: TokenExchangeState, clients: &[OauthClient]) -> Self {
+    pub fn new(
+        repo: Arc<StoreRepo>,
+        token: TokenExchangeState,
+        clients: &[OauthClient],
+        relying_party: Arc<KeycloakRelyingParty>,
+    ) -> Self {
         Self {
             repo,
             token,
             post_logout_redirect_uris: Arc::new(registry_from_clients(clients)),
+            relying_party,
         }
     }
 }
@@ -75,13 +102,37 @@ pub struct EndSessionRequest {
     state: Option<String>,
 }
 
-/// Ends every session held by the cookie's subject. `Ok(false)` means there was nothing to end.
-async fn revoke_current_session(state: &EndSessionState, headers: &HeaderMap) -> Result<bool, ()> {
+/// The single failure [`revoke_sessions_for_cookie`] reports: the LOCAL revocation did not happen,
+/// so the user's session is still live and the router owes them a hard `500`.
+///
+/// A named unit struct rather than `()`. It is deliberately not an [`Error`] variant and carries
+/// no detail, because widening what this can express is exactly the change this module's own doc
+/// comment argues against: an upstream Keycloak fault must NOT reach the caller as a failure, or
+/// a Keycloak outage starts refusing local logouts. One named type with one meaning keeps that
+/// property visible at the signature instead of resting on a comment. The underlying cause is
+/// logged at the point of failure; the caller's only decision is `500` or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalRevocationFailed;
+
+/// Ends every session held by the cookie's subject, locally and then upstream at Keycloak.
+/// `Ok(false)` means there was nothing to end. `Err(LocalRevocationFailed)` -- the caller's hard
+/// `500` -- is reserved for LOCAL revocation failing and is never returned for an upstream fault
+/// (see this module's own doc comment for why widening it would make logout worse, not safer).
+///
+/// `pub`, and taking its two collaborators directly rather than an `EndSessionState`, so
+/// `end_session_upstream_tests.rs` can drive exactly this seam: it is where the two failure
+/// directions are decided, and an integration test is a separate crate that cannot see a private
+/// function. The narrow parameters also keep the test free of the whole `TokenExchangeState`
+/// apparatus, which this function provably never touches.
+pub async fn revoke_sessions_for_cookie(
+    repo: &StoreRepo,
+    relying_party: &KeycloakRelyingParty,
+    headers: &HeaderMap,
+) -> Result<bool, LocalRevocationFailed> {
     let Some(session_id) = read_session_cookie(headers) else {
         return Ok(false);
     };
-    let session = match state
-        .repo
+    let session = match repo
         .find_active_browser_session(&session_id, Utc::now())
         .await
     {
@@ -89,7 +140,7 @@ async fn revoke_current_session(state: &EndSessionState, headers: &HeaderMap) ->
         Ok(None) => return Ok(false),
         Err(error) => {
             tracing::error!(?error, "logout failed: session lookup");
-            return Err(());
+            return Err(LocalRevocationFailed);
         }
     };
     // `None` only for a row predating `migrations/20260824000003_sessions_add_subject.sql`. There
@@ -101,18 +152,51 @@ async fn revoke_current_session(state: &EndSessionState, headers: &HeaderMap) ->
         tracing::warn!("logout: session row predates the subject column; clearing cookie only");
         return Ok(false);
     };
-    match state
-        .repo
+    match repo
         .revoke_sessions_and_cascade(&AccountId::assert_already_resolved(&subject))
         .await
     {
         Ok(revoked) => {
             tracing::info!(revoked, "rp-initiated logout ended the subject's sessions");
-            Ok(true)
         }
         Err(error) => {
             tracing::error!(?error, "logout failed: session revocation");
-            Err(())
+            return Err(LocalRevocationFailed);
+        }
+    }
+    // Strictly after local revocation, and strictly best-effort. Ordered this way so the outcome
+    // this endpoint is judged on -- the local session being gone -- is already durable before a
+    // third party gets a chance to be slow or down.
+    end_upstream_session(relying_party, &subject).await;
+    Ok(true)
+}
+
+/// The upstream half, with every outcome absorbed. Returns nothing on purpose: there is no
+/// upstream result the caller is allowed to act on, so handing it one would be an invitation to
+/// start failing logout on it.
+async fn end_upstream_session(relying_party: &KeycloakRelyingParty, subject: &str) {
+    match relying_party.end_upstream_session(subject).await {
+        Ok(UpstreamLogout::Terminated) => {
+            tracing::info!("rp-initiated logout ended the upstream Keycloak SSO session");
+        }
+        Ok(UpstreamLogout::NoStoredCredential) => {
+            // Ordinary, not exceptional: an aged-out refresh token or an envelope predating a
+            // `token_encryption_key` rotation both land here. Worth a line, because it means this
+            // logout did NOT reach Keycloak and the next `/authorize` may still be silent.
+            tracing::info!(
+                "rp-initiated logout had no usable stored Keycloak refresh token; upstream SSO \
+                 session left untouched"
+            );
+        }
+        Err(error) => {
+            // Loud, and deliberately not fatal. `Error`'s own `Display`/`Debug` carry no
+            // credential -- `end_upstream_session` builds its messages from a status code, never
+            // from a response body or the token it sent.
+            tracing::warn!(
+                ?error,
+                "rp-initiated logout could not end the upstream Keycloak SSO session; local \
+                 logout still applied"
+            );
         }
     }
 }
@@ -122,7 +206,10 @@ async fn end_session(
     headers: HeaderMap,
     request: EndSessionRequest,
 ) -> Response {
-    if revoke_current_session(&state, &headers).await.is_err() {
+    if revoke_sessions_for_cookie(&state.repo, &state.relying_party, &headers)
+        .await
+        .is_err()
+    {
         // No cookie clearing here, deliberately: the session is still live, and a cleared cookie
         // would leave the user believing otherwise with no way to retry.
         return (

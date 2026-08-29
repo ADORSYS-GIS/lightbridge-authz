@@ -277,6 +277,41 @@ mod tests {
         );
     }
 
+    /// Guards the seam between this service and the console. `converse-frontends` hand-maintains
+    /// `openapi/usage.backend.yaml` and generates its typed client from it, so a latency field
+    /// that silently stops being published here would surface over there as a chart of nothing --
+    /// exactly the "permanent apology" state this whole change exists to remove. Asserting the
+    /// published schema, not just the Rust struct, is what makes that drift fail here first.
+    #[test]
+    fn usage_openapi_should_publish_the_latency_percentile_contract() {
+        let doc = usage_openapi();
+        let point = &doc["components"]["schemas"]["UsageSeriesPoint"]["properties"];
+
+        for field in [
+            "latency_samples",
+            "latency_p50_ms",
+            "latency_p95_ms",
+            "latency_p99_ms",
+        ] {
+            assert!(
+                point.get(field).is_some(),
+                "expected UsageSeriesPoint.{field} in the published schema"
+            );
+        }
+
+        let required: Vec<&str> = doc["components"]["schemas"]["UsageSeriesPoint"]["required"]
+            .as_array()
+            .expect("UsageSeriesPoint should declare required fields")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+
+        assert!(
+            required.contains(&"latency_samples"),
+            "latency_samples is always present and must be required, got {required:?}"
+        );
+    }
+
     #[test]
     fn usage_openapi_should_be_openapi_3() {
         let doc = usage_openapi();
