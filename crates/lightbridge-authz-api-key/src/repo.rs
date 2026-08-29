@@ -247,6 +247,7 @@ impl StoreRepo {
             id: row.id,
             default_quota: row.default_quota,
             status: ResourceStatus::from(row.status),
+            name: row.name,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -342,7 +343,7 @@ impl StoreRepo {
     async fn load_account_row_optional(&self, account_id: &str) -> Result<Option<AccountRow>> {
         let row = sqlx::query_as::<_, AccountRow>(
             r#"
-            SELECT id, default_quota, status, created_at, updated_at
+            SELECT id, default_quota, status, name, created_at, updated_at
             FROM accounts
             WHERE id = $1
             "#,
@@ -400,18 +401,20 @@ impl StoreRepo {
         let new_account = NewAccountRow {
             id: subject.to_string(),
             default_quota: input.default_quota,
+            name: input.name,
             created_at: now,
             updated_at: now,
         };
 
         sqlx::query(
             r#"
-            INSERT INTO accounts (id, default_quota, created_at, updated_at)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO accounts (id, default_quota, name, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5)
             "#,
         )
         .bind(new_account.id.clone())
         .bind(new_account.default_quota.clone())
+        .bind(new_account.name.clone())
         .bind(new_account.created_at)
         .bind(new_account.updated_at)
         .execute(self.pool())
@@ -442,7 +445,7 @@ impl StoreRepo {
     ) -> Result<Vec<Account>> {
         let rows: Vec<AccountRow> = sqlx::query_as(
             r#"
-            SELECT id, default_quota, status, created_at, updated_at
+            SELECT id, default_quota, status, name, created_at, updated_at
             FROM accounts
             WHERE id = $1
             ORDER BY created_at ASC
@@ -466,7 +469,7 @@ impl StoreRepo {
     ) -> Result<Option<Account>> {
         let row = sqlx::query_as::<_, AccountRow>(
             r#"
-            SELECT id, default_quota, status, created_at, updated_at
+            SELECT id, default_quota, status, name, created_at, updated_at
             FROM accounts
             WHERE id = $1 AND id = $2
             "#,
@@ -497,7 +500,7 @@ impl StoreRepo {
             UPDATE accounts
             SET default_quota = COALESCE($1, default_quota), updated_at = $2
             WHERE id = $3 AND id = $4
-            RETURNING id, default_quota, status, created_at, updated_at
+            RETURNING id, default_quota, status, name, created_at, updated_at
             "#,
         )
         .bind(input.default_quota)
@@ -529,7 +532,7 @@ impl StoreRepo {
             r#"
             DELETE FROM accounts
             WHERE id = $1 AND id = $2
-            RETURNING id, default_quota, status, created_at, updated_at
+            RETURNING id, default_quota, status, name, created_at, updated_at
             "#,
         )
         .bind(account_id)
@@ -2001,7 +2004,7 @@ impl StoreRepo {
             UPDATE accounts
             SET status = $1, updated_at = $2
             WHERE id = $3 AND id = $4
-            RETURNING id, default_quota, status, created_at, updated_at
+            RETURNING id, default_quota, status, name, created_at, updated_at
             "#,
         )
         .bind(status.to_string())
@@ -2085,10 +2088,48 @@ impl StoreRepo {
             UPDATE accounts
             SET default_quota = $1, updated_at = $2
             WHERE id = $3 AND id = $4
-            RETURNING id, default_quota, status, created_at, updated_at
+            RETURNING id, default_quota, status, name, created_at, updated_at
             "#,
         )
         .bind(default_quota)
+        .bind(Utc::now())
+        .bind(account_id)
+        .bind(acting_account_id.as_str())
+        .fetch_optional(self.pool())
+        .await?;
+        let row = row.ok_or(Error::NotFound)?;
+        Ok(Self::to_account(row))
+    }
+
+    /// Sets `Account.name`. Backs `updateAccountName` -- the sole write path for that column, since
+    /// `model.Account.update` does not exist (#398) and the field is `@readonly` in the schema.
+    /// Authorization is identical to [`Self::update_account_default_quota`] directly above: since
+    /// ADR-0006 there is no owner/role concept left, so "the caller is this account"
+    /// (`id = account_id = subject`) is the entire check and it lives in the `WHERE` clause -- a
+    /// mismatched `account_id`/`subject` pair and an unknown account are the same `NotFound`, so
+    /// this cannot be used to probe which accounts exist.
+    ///
+    /// `name` is free text with no catalogue to validate against, but it MUST already be
+    /// normalised (blank/whitespace-only collapsed to `None`) by
+    /// `AuthzStoreImpl::update_account_name` before it reaches here -- same layering as the
+    /// quota-tier checks -- so the DB `CHECK (name IS NULL OR btrim(name) <> '')` never fires from
+    /// this path. Passing `None` clears the name back to unnamed; this is a set, not a PATCH.
+    #[instrument(skip(self))]
+    pub async fn update_account_name(
+        &self,
+        acting_account_id: &AccountId,
+        account_id: &str,
+        name: Option<&str>,
+    ) -> Result<Account> {
+        let row: Option<AccountRow> = sqlx::query_as(
+            r#"
+            UPDATE accounts
+            SET name = $1, updated_at = $2
+            WHERE id = $3 AND id = $4
+            RETURNING id, default_quota, status, name, created_at, updated_at
+            "#,
+        )
+        .bind(name)
         .bind(Utc::now())
         .bind(account_id)
         .bind(acting_account_id.as_str())

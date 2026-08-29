@@ -148,6 +148,7 @@ async fn create_account_still_works_and_is_still_conflict_on_a_second_call(pool:
             subject,
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
@@ -159,6 +160,7 @@ async fn create_account_still_works_and_is_still_conflict_on_a_second_call(pool:
             subject,
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await

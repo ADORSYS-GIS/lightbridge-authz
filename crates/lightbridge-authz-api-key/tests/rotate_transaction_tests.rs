@@ -23,6 +23,7 @@ async fn rotate_rolls_back_on_create_failure(pool: PgPool) {
             subject,
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await

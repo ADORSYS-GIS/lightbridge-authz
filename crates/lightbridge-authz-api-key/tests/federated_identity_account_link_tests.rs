@@ -95,6 +95,7 @@ async fn upsert_federated_identity_adopts_the_account_and_derives_its_user(pool:
         subject,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -146,6 +147,7 @@ async fn upsert_federated_identity_refuses_adoption_from_a_non_grandfather_issue
         subject,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -195,6 +197,7 @@ async fn deleting_the_account_removes_its_federated_identity_but_not_its_user(po
         subject,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -289,18 +292,21 @@ async fn the_correction_migration_removes_accountless_rows_and_keeps_adopted_one
     .await
     .expect("seeding the accountless federated identity must succeed");
 
-    // An adopted pair: a real account (via StoreRepo::create_account, which already works against
-    // this schema stage) plus its adopting federated identity.
-    let repo = build_repo(pool.clone());
+    // An adopted pair: a real account plus its adopting federated identity.
+    //
+    // Seeded with raw SQL naming only the columns that exist AT THIS MIGRATION STAGE, deliberately
+    // NOT via `StoreRepo::create_account`. This test pins the schema to an intermediate point in
+    // migration history, so any repo method it calls is today's code running against yesterday's
+    // table -- it broke the moment `accounts` gained a column (`name`,
+    // `20260829000001_accounts_add_name.sql`) that `create_account` now writes and this stage does
+    // not have. The correction migration's row cleanup is what is under test here; how the row got
+    // there is incidental, so it no longer rides on a moving target.
     let adopted_subject = "adopted-subject";
-    repo.create_account(
-        adopted_subject,
-        CreateAccount {
-            default_quota: None,
-        },
-    )
-    .await
-    .expect("seeding the adopted account must succeed");
+    sqlx::query("INSERT INTO accounts (id, created_at, updated_at) VALUES ($1, now(), now())")
+        .bind(adopted_subject)
+        .execute(&pool)
+        .await
+        .expect("seeding the adopted account must succeed");
     let adopted_user_id: String = sqlx::query_scalar("SELECT user_id FROM accounts WHERE id = $1")
         .bind(adopted_subject)
         .fetch_one(&pool)

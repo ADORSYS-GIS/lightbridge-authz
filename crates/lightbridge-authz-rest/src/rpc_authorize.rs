@@ -59,7 +59,9 @@ use serde_json::json;
 ///   unconditionally regardless of permission, a live endpoint that could only ever fail. The
 ///   schema removed its `@@allow("update")` alongside this, so both layers now fail-closed the
 ///   same way `model.ApiKey.create` above does. Account default-quota updates go exclusively
-///   through `procedure.updateAccountDefaultQuota`.
+///   through `procedure.updateAccountDefaultQuota`, and account renames through
+///   `procedure.updateAccountName` — `Account.name` (added 2026-08-29) is `@readonly` for exactly
+///   this reason, rather than resurrecting the removed generic verb to carry a cosmetic field.
 /// - `model.ProjectMember.*` — that model is policy-locked to read-only and has no generated
 ///   mutation verbs; denied here too for defense in depth. Roster changes go through
 ///   `procedure.addProjectMember` / `procedure.removeProjectMember` / `procedure.setProjectMemberRole`
@@ -143,6 +145,11 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         // `updateAccountDefaultQuota` is the sole write path -- same coarse permission, matching
         // the acceptance criteria's "existing permission granularity" requirement.
         "procedure.updateAccountDefaultQuota" => AccountUpdate,
+        // Same story, same permission, for `Account.name`: also `@readonly`, also with no generic
+        // update verb to ride, so also a dedicated single-field procedure. Deliberately NOT a new
+        // `account:rename` permission -- one resource's writes stay behind one permission, and a
+        // display label is not a narrower-privilege operation than the quota tier next to it.
+        "procedure.updateAccountName" => AccountUpdate,
         // model.Account.delete is intentionally absent (falls through to `_ => None`, denied): the
         // schema carries no `@@allow("delete", ...)` on Account, so the cratestack policy layer
         // already fail-closes this op-id -- omitted here too, same defense-in-depth pattern as
@@ -293,6 +300,7 @@ pub const MAPPED_OP_ID_PERMISSIONS: &[(&str, Permission)] = &[
         "procedure.updateAccountDefaultQuota",
         Permission::AccountUpdate,
     ),
+    ("procedure.updateAccountName", Permission::AccountUpdate),
     ("procedure.disableAccount", Permission::AccountDisable),
     ("procedure.enableAccount", Permission::AccountDisable),
     (
@@ -691,6 +699,7 @@ mod tests {
                 "model.Account.list",
                 "model.Account.get",
                 "procedure.updateAccountDefaultQuota",
+                "procedure.updateAccountName",
                 "procedure.disableAccount",
                 "procedure.enableAccount",
                 "procedure.deleteAccountPermanently",

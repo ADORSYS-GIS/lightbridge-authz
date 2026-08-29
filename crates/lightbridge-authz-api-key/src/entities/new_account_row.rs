@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub struct NewAccountRow {
     pub id: String,
     pub default_quota: Option<String>,
+    /// Optional human-facing label; already normalised (blank -> `None`) by the time it gets here.
+    pub name: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
