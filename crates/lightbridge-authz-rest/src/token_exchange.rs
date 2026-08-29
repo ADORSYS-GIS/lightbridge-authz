@@ -887,6 +887,32 @@ async fn verify_own_access_token(
     state: &TokenExchangeState,
     token: &str,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
+    verify_own_token(state, token, true).await
+}
+
+/// Signature-verifies a token this deployment itself minted, against the live JWKS.
+///
+/// `validate_exp` is the only axis callers differ on, and both settings are load-bearing:
+///
+/// - `true` for anything that grants access off the token (introspection, `/oauth2/userinfo`). An
+///   expired token is not a credential.
+/// - `false` for an `id_token_hint` at `/oauth2/end_session`. OIDC RP-Initiated Logout 1.0 §2 is
+///   explicit that the OP MUST NOT reject the hint merely for being expired -- logging out is the
+///   single most likely thing a user does *after* their tokens have aged out, and refusing the
+///   hint there would take the endpoint's only means of identifying the client (and therefore its
+///   only means of validating a `post_logout_redirect_uri`) away in exactly the common case. The
+///   hint is not a credential: it never authorises anything, it only names a client whose
+///   *registered* redirect list is then consulted.
+///
+/// `aud` is never validated here. This process mints two token families under one signing key
+/// (`oauth2.signing.audience` for data-plane API-key JWTs, the OIDC `aud = client_id` for
+/// OP-issued human-plane tokens), so a single audience check would be wrong for one of them.
+/// Callers discriminate on claims they actually care about (`azp`, `typ`, `scope`) instead.
+pub(crate) async fn verify_own_token(
+    state: &TokenExchangeState,
+    token: &str,
+    validate_exp: bool,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::Jwk};
 
     let header = decode_header(token).ok()?;
@@ -900,6 +926,7 @@ async fn verify_own_access_token(
     let mut validation = Validation::new(Algorithm::RS256);
     validation.algorithms = vec![Algorithm::RS256];
     validation.validate_aud = false;
+    validation.validate_exp = validate_exp;
     decode::<serde_json::Map<String, serde_json::Value>>(token, &decoding_key, &validation)
         .ok()
         .map(|data| data.claims)

@@ -65,6 +65,31 @@ pub fn build_session_cookie(session_id: String, ttl: Duration) -> Cookie<'static
         .build()
 }
 
+/// Builds the `Set-Cookie` value that removes the browser-session cookie, for
+/// `/oauth2/end_session` (OIDC RP-Initiated Logout 1.0).
+///
+/// Every attribute except `Max-Age` MUST match [`build_session_cookie`] exactly. A browser matches
+/// a removal against `(name, domain, path)`; a mismatch on any of them leaves the original cookie
+/// in place and silently ships a *second*, differently-scoped cookie of the same name instead --
+/// a failure that looks like a working logout right up until the next request still carries the
+/// live session id. That is why this duplicates the attribute list rather than calling
+/// `Cookie::make_removal`, whose output carries only the name.
+///
+/// This is a convenience for the browser, never the authority: the session row was already
+/// revoked before this is sent, and `/authorize` re-checks `status`/`expires_at` fail-closed on
+/// every hit. A client that ignores the removal, or replays the old cookie value verbatim, gets
+/// nothing back -- see [`build_session_cookie`]'s "Value" reasoning for why the cookie carries an
+/// opaque row id and not a self-contained token.
+pub fn clear_session_cookie() -> Cookie<'static> {
+    Cookie::build((SESSION_COOKIE_NAME, ""))
+        .secure(true)
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .path("/")
+        .max_age(Duration::seconds(0))
+        .build()
+}
+
 /// Reads the browser-session cookie's raw value (the opaque `sessions.id`) out of an incoming
 /// request's `Cookie` header, if present.
 pub fn read_session_cookie(headers: &HeaderMap) -> Option<String> {

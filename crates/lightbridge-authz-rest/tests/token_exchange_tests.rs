@@ -250,6 +250,7 @@ fn public_client(client_id: &str) -> OauthClient {
         allowed_audiences: vec![client_id.to_string()],
         jwks: None,
         redirect_uris: Vec::new(),
+        post_logout_redirect_uris: Vec::new(),
         require_pkce: false,
     }
 }
@@ -266,6 +267,7 @@ fn device_client(client_id: &str) -> OauthClient {
         allowed_audiences: Vec::new(),
         jwks: None,
         redirect_uris: Vec::new(),
+        post_logout_redirect_uris: Vec::new(),
         require_pkce: false,
     }
 }
@@ -285,6 +287,7 @@ fn browser_client(client_id: &str, redirect_uri: &str) -> OauthClient {
         allowed_audiences: vec![client_id.to_string()],
         jwks: None,
         redirect_uris: vec![redirect_uri.to_string()],
+        post_logout_redirect_uris: Vec::new(),
         require_pkce: true,
     }
 }
@@ -305,6 +308,7 @@ fn confidential_browser_client_without_pkce(client_id: &str, redirect_uri: &str)
         allowed_audiences: vec![client_id.to_string()],
         jwks: None,
         redirect_uris: vec![redirect_uri.to_string()],
+        post_logout_redirect_uris: Vec::new(),
         require_pkce: false,
     }
 }
@@ -354,6 +358,7 @@ fn confidential_client(client_id: &str) -> ConfidentialClientFixture {
         allowed_audiences: vec![client_id.to_string()],
         jwks: Some(jwks),
         redirect_uris: Vec::new(),
+        post_logout_redirect_uris: Vec::new(),
         require_pkce: false,
     };
     ConfidentialClientFixture {

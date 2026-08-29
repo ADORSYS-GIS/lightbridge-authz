@@ -1096,6 +1096,7 @@ fn offline_public_client(client_id: &str) -> lightbridge_authz_core::config::Oau
         allowed_audiences: vec![client_id.to_string()],
         jwks: None,
         redirect_uris: Vec::new(),
+        post_logout_redirect_uris: Vec::new(),
         require_pkce: false,
     }
 }
@@ -2355,6 +2356,7 @@ mod db {
             allowed_audiences: vec![client_id.to_string()],
             jwks: None,
             redirect_uris: vec!["https://cb.example.test/callback".to_string()],
+            post_logout_redirect_uris: Vec::new(),
             require_pkce,
         }
     }
@@ -2430,4 +2432,188 @@ mod db {
              validate_authorization_code_clients and fail only on TLS load: got {message}"
         );
     }
+}
+
+// --- OIDC RP-Initiated Logout 1.0 + OIDC Core §5.3 UserInfo -----------------------------------
+//
+// ADR-0023's rule, applied to the two routes added alongside it: a route that discovery
+// advertises MUST be mounted. #473 shipped the inverse (discovery advertised `device_code` while
+// `/device/verify` 404'd) and it reached production, so each new endpoint gets both halves
+// asserted -- advertised, and actually answering -- rather than one standing in for the other.
+//
+// Both requests below are fully offline. `/oauth2/end_session` without a session cookie never
+// reaches the repository (`revoke_current_session` returns early), and `/oauth2/userinfo` with no
+// `Authorization` header is refused before any JWKS lookup, so the lazy, never-dialed pool is
+// never touched.
+
+/// Prove-fail-first (recorded verbatim, then reverted): changed `signing.rs`'s
+/// `end_session_endpoint: authorization_code_mounted.then(...)` to `None` and reran this test. It
+/// failed with `metadata["end_session_endpoint"]` being `Null`. Same for `userinfo_endpoint`.
+/// Restored both lines.
+#[tokio::test]
+async fn discovery_advertises_end_session_and_userinfo() {
+    let router = offline_idp_router(TEST_STATIC_DIR);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let metadata: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        metadata["end_session_endpoint"].as_str(),
+        Some("https://authz-idp.example.test/oauth2/end_session"),
+        "RP-Initiated Logout 1.0 §3 -- an RP discovers logout here or not at all"
+    );
+    assert_eq!(
+        metadata["userinfo_endpoint"].as_str(),
+        Some("https://authz-idp.example.test/oauth2/userinfo")
+    );
+    // Neither logout channel is implemented, so neither may be advertised -- the omission
+    // discipline `signing::discovery_document` exists to enforce.
+    assert!(
+        metadata.get("frontchannel_logout_supported").is_none()
+            && metadata.get("backchannel_logout_supported").is_none(),
+        "advertising a logout channel with no handler is exactly the ADR-0023 failure"
+    );
+}
+
+/// Logout with no session is a success, not an error: it is idempotent, and a user who is already
+/// signed out asked for the state they are in. The cookie is cleared regardless, so a browser
+/// holding a stale cookie for an already-dead session stops sending it.
+#[tokio::test]
+async fn end_session_without_a_session_succeeds_and_clears_the_cookie() {
+    let router = offline_idp_router(TEST_STATIC_DIR);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/oauth2/end_session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let set_cookie = response
+        .headers()
+        .get("set-cookie")
+        .expect("logout must clear the session cookie even when there was nothing to end")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        set_cookie.starts_with("__Host-authz_session="),
+        "the removal must name the same cookie, got {set_cookie}"
+    );
+    assert!(
+        set_cookie.contains("Max-Age=0"),
+        "the removal must expire the cookie, got {set_cookie}"
+    );
+    // `__Host-` conformance: a browser rejects the removal outright if these drift from
+    // `build_session_cookie`'s attributes, silently leaving the live cookie in place.
+    assert!(
+        set_cookie.contains("Secure") && set_cookie.contains("Path=/"),
+        "the removal must keep the __Host- attribute set, got {set_cookie}"
+    );
+    assert!(
+        !set_cookie.contains("Domain="),
+        "a Domain attribute makes the cookie non-__Host- and the removal a no-op, got {set_cookie}"
+    );
+}
+
+/// An unregistered `post_logout_redirect_uri` must not become a `Location`. Asserted at the route
+/// level as well as in `end_session_tests.rs` because the failure mode being guarded against is a
+/// handler that resolves the redirect correctly and then emits it anyway.
+#[tokio::test]
+async fn end_session_never_redirects_to_an_unregistered_uri() {
+    let router = offline_idp_router(TEST_STATIC_DIR);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(
+                    "/oauth2/end_session?client_id=lightbridge-console\
+                     &post_logout_redirect_uri=https://attacker.example/steal",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "an unregistered redirect is refused by rendering the OP's own page, not by erroring"
+    );
+    assert!(
+        response.headers().get("location").is_none(),
+        "an unregistered post_logout_redirect_uri must never reach a Location header"
+    );
+}
+
+/// RFC 6750 §3.1: no credential gets the bare challenge, not `invalid_token` -- an RP library
+/// keys its refresh-and-retry decision on that error code.
+#[tokio::test]
+async fn userinfo_without_a_bearer_challenges_without_an_error_code() {
+    let router = offline_idp_router(TEST_STATIC_DIR);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/oauth2/userinfo")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let challenge = response
+        .headers()
+        .get("www-authenticate")
+        .expect("RFC 6750 §3 requires a challenge on a 401")
+        .to_str()
+        .unwrap();
+    assert_eq!(challenge, "Bearer");
+}
+
+/// A syntactically-invalid token fails at `decode_header`, before any JWKS lookup -- which is what
+/// keeps this test offline, and is also why the response can be `invalid_token` without the
+/// service having consulted anything.
+#[tokio::test]
+async fn userinfo_with_a_malformed_bearer_is_invalid_token() {
+    let router = offline_idp_router(TEST_STATIC_DIR);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/oauth2/userinfo")
+                .header("authorization", "Bearer not-a-jwt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let challenge = response
+        .headers()
+        .get("www-authenticate")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        challenge.contains("error=\"invalid_token\""),
+        "got {challenge}"
+    );
 }
