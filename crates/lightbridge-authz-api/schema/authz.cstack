@@ -159,6 +159,28 @@ model Account {
   // generated create/update inputs so a raw RPC caller cannot supply a born-suspended
   // status, matching `ApiKey.status` below.
   status String @readonly
+  // Human-facing display label, so a console has something to render other than `id` -- which,
+  // since ADR-0006, IS the caller's opaque JWT subject. Follows `Project.name`'s conventions
+  // (plain `String`, no `@length`/`@regex`: this schema carries no validation attributes on any
+  // name field today, and inventing a ceiling for `Account.name` alone would be a silent
+  // divergence) with one unavoidable difference -- `String?`, not `String`. Existing accounts
+  // predate this field and there is no truthful value to backfill them with, so "unnamed" has to
+  // be a representable state; see `migrations/20260829000001_accounts_add_name.sql` for the full
+  // nullable-vs-backfill reasoning.
+  //
+  // NOT an identifier, and nothing may treat it as one: not unique, not indexed, never a lookup
+  // key. `accounts.id` remains the only way to address an account.
+  //
+  // `@readonly` (matching `defaultQuota`/`status` above): `Account` has carried zero generically
+  // settable fields since #379, and #398 removed `model.Account.update` outright rather than leave
+  // a verb that could only ever 422 -- so there is no generic update verb for a settable `name` to
+  // reach. Adding one back would mean re-registering a deliberately-removed op-id and re-adding an
+  // `@@allow("update", ...)` clause to this model, widening the reachable RPC surface for a
+  // cosmetic field. `procedure.updateAccountName` below is the write path instead, gated on the
+  // SAME `account:update` permission `updateAccountDefaultQuota` already uses -- one more
+  // dedicated single-field procedure on a model that is already entirely built out of them, and no
+  // new permission.
+  name String? @readonly
   projects Project[] @relation(fields:[id],references:[accountId])
 
   // NOTE: no `@@allow("create", ...)`. Account creation stays exclusively through the
@@ -560,8 +582,12 @@ mutation procedure rotateApiKey(args: RotateApiKeyInput): ApiKeySecret
 // `defaultQuota` (governance tier for the account's own default-project usage, validated against
 // the operator-configured catalog at write time -- config, not DB; status defaults to 'active' at
 // the DB level).
+// `name` is the optional human-facing label (see `Account.name`); blank/whitespace-only input is
+// normalised to "no name" rather than rejected, so `NULL` stays the single representation of
+// unnamed.
 type CreateAccountInput {
   defaultQuota String?
+  name String?
 }
 
 mutation procedure createAccount(args: CreateAccountInput): Account
@@ -584,6 +610,29 @@ type UpdateAccountDefaultQuotaInput {
 }
 
 mutation procedure updateAccountDefaultQuota(args: UpdateAccountDefaultQuotaInput): Account
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permAccountUpdate == true)
+
+// Sets `Account.name` post-creation -- the sole write path for it, for the reasons spelled out on
+// the field itself (`model.Account.update` does not exist; #398 removed it). Shaped exactly like
+// `updateAccountDefaultQuota` immediately above, deliberately: an explicit `accountId` argument
+// even though only a self-update can ever succeed, with `id = accountId AND id = auth().id`
+// enforced in the hand-written SQL `WHERE` clause, so a mismatched pair or an unknown account is
+// an indistinguishable `NotFound` rather than a probe for which accounts exist. Implemented as
+// hand-written sqlx (`AuthzStoreImpl::update_account_name` -> `StoreRepo::update_account_name`).
+//
+// Unlike `defaultQuota` there is no catalogue to validate against -- a name is free text. `null`
+// (or a blank/whitespace-only string, normalised identically) clears it back to unnamed; this is
+// a set, not a PATCH, matching `updateAccountDefaultQuota`'s own "always writes" contract.
+//
+// Gated on the existing `account:update` permission, NOT a new one: this is a second write on a
+// resource whose single write permission already exists, and inventing `account:rename` would
+// split one concept across two permissions every deployment would then have to grant in lockstep.
+type UpdateAccountNameInput {
+  accountId String
+  name String?
+}
+
+mutation procedure updateAccountName(args: UpdateAccountNameInput): Account
   @allow((auth() != null) && auth().rpcScope == "crud" && auth().permAccountUpdate == true)
 
 // Server-side API-key creation (ADR-0003 follow-up). Replaces the now-denied generic

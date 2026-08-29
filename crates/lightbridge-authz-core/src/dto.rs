@@ -62,6 +62,13 @@ pub struct Account {
     pub default_quota: Option<String>,
     #[serde(default)]
     pub status: ResourceStatus,
+    /// Human-facing display label, so a console has something to render other than `id` (which,
+    /// per ADR-0006, IS the caller's opaque JWT subject). `None` means "not named yet" -- a real
+    /// state every account predating this field is in, never a placeholder to be invented here;
+    /// see `migrations/20260829000001_accounts_add_name.sql`. Not an identifier: not unique, and
+    /// no lookup path resolves an account by it.
+    #[serde(default)]
+    pub name: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -74,6 +81,11 @@ pub struct Account {
 pub struct CreateAccount {
     #[serde(default)]
     pub default_quota: Option<String>,
+    /// Optional display label. Blank/whitespace-only input is normalised to `None` by
+    /// `AuthzStoreImpl::create_account` rather than rejected, keeping `NULL` the single
+    /// representation of "unnamed" all the way down to the DB `CHECK`.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

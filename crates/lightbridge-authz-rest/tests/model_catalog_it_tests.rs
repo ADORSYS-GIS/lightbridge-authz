@@ -60,6 +60,7 @@ async fn seed_owner_and_project(core: Arc<dyn DbPoolTrait>) -> (String, String) 
             &owner_subject,
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await

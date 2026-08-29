@@ -10,6 +10,10 @@ pub struct AccountRow {
     pub id: String,
     pub default_quota: Option<String>,
     pub status: String,
+    /// `NULL` for every account created before `migrations/20260829000001_accounts_add_name.sql`,
+    /// and for any account whose owner has not set one -- a real "unnamed" state, not a missing
+    /// value to be papered over.
+    pub name: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

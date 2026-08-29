@@ -408,6 +408,7 @@ async fn seed(repo: &StoreRepo) {
         SUBJECT,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -438,6 +439,7 @@ async fn seed_member_project(repo: &StoreRepo) {
         OWNER_ACCOUNT,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -446,6 +448,7 @@ async fn seed_member_project(repo: &StoreRepo) {
         SUBJECT,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -1510,6 +1513,7 @@ async fn authorize_refuses_when_requested_project_is_not_authorized_for_the_sess
         UNRELATED_ACCOUNT,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -2132,6 +2136,7 @@ async fn an_unfederated_subject_and_a_non_member_produce_byte_identical_error_re
         &other_owner,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -2816,6 +2821,7 @@ async fn missing_project_id_with_no_projects_is_denied(pool: PgPool) {
         SUBJECT,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
