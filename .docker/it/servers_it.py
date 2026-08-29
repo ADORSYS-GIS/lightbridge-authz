@@ -35,6 +35,7 @@ EXPECTED_MCP_TOOLS = {
     "list-accounts",
     "get-account",
     "update-account",
+    "update-account-name",
     "delete-account",
     "disable-account",
     "enable-account",
