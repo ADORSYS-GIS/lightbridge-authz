@@ -3013,6 +3013,7 @@ pub fn build_idp_router(
         Arc::clone(&claim_redeem_repo),
         token_exchange.clone(),
         &oauth2.clients,
+        Arc::clone(&relying_party),
     )));
     router = router.merge(token_exchange::token_exchange_router(token_exchange));
     router = router.merge(session_management::router());
