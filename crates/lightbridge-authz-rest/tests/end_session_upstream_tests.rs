@@ -208,6 +208,7 @@ async fn seed_browser_session(repo: &StoreRepo) -> String {
         SUBJECT,
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
