@@ -100,6 +100,76 @@ const COST_KEYS: [&str; 4] = [
     "gen_ai.usage.custom_total_cost",
 ];
 
+/// Attribute names whose value is a request duration expressed in **milliseconds**.
+///
+/// Split from [`LATENCY_SECONDS_KEYS`] on purpose. Duration units are the one place this
+/// extraction can be wrong by a factor of 1000 while still looking plausible on a chart, so the
+/// unit is carried by which list a name appears in, never inferred at runtime.
+///
+/// The first two entries are the ones that actually arrive in production. The AI gateway
+/// (`ai-helm`, `charts/core-gateway/templates/envoy-proxy.yaml`) configures Envoy's OpenTelemetry
+/// access-log sink with `duration: "%DURATION%"` and
+/// `x-envoy-upstream-service-time: "%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%"`, both Envoy command
+/// operators denominated in milliseconds, and both delivered as OTLP **LogRecord attributes** on
+/// `/v1/otel/logs`. `duration` leads because it is the whole time the caller waited;
+/// `x-envoy-upstream-service-time` excludes the gateway's own processing. Envoy renders them as
+/// JSON strings, which [`extract_f64`] already parses.
+///
+/// A bare `duration` key would normally be too ambiguous to trust -- it names no unit. It is here
+/// because this deployment's emitter is known, not guessed: no `gen_ai.*` or `http.*` latency
+/// attribute exists anywhere in that gateway's config, and the AI Gateway ExtProc's
+/// `llmRequestCosts` dynamic metadata (the channel that produces
+/// `io.envoy.ai_gateway.llm_custom_total_cost` above) exposes token and cost keys only, never a
+/// duration. The remaining entries are conventional names kept so a different emitter is not
+/// silently dropped.
+///
+/// `http.server.duration` sits here because the pre-1.23 HTTP semantic conventions specified it in
+/// milliseconds; its successor `http.server.request.duration` is in seconds and lives in the other
+/// list.
+const LATENCY_MS_KEYS: [&str; 9] = [
+    "duration",
+    "x-envoy-upstream-service-time",
+    "duration_ms",
+    "latency_ms",
+    "request_duration_ms",
+    "response_duration_ms",
+    "gen_ai.server.request.duration_ms",
+    "http.server.duration",
+    "http.client.duration",
+];
+
+/// Attribute names whose value is a request duration expressed in **seconds**.
+///
+/// Every OpenTelemetry semantic-convention duration instrument is a `double` count of seconds --
+/// including all of the GenAI ones -- so these are multiplied by 1000 on the way in. See
+/// [`LATENCY_MS_KEYS`] for why the unit is encoded in the list rather than sniffed.
+const LATENCY_SECONDS_KEYS: [&str; 5] = [
+    "gen_ai.server.request.duration",
+    "gen_ai.client.operation.duration",
+    "gen_ai.server.time_to_first_token",
+    "http.server.request.duration",
+    "http.client.request.duration",
+];
+
+/// Metric names that are themselves a duration in **seconds**, for the case where a gateway
+/// reports latency as a gauge/sum data point rather than as an attribute on a usage event.
+const DURATION_METRIC_SECONDS_NAMES: [&str; 5] = [
+    "gen_ai.server.request.duration",
+    "gen_ai.client.operation.duration",
+    "gen_ai.server.time_to_first_token",
+    "http.server.request.duration",
+    "http.client.request.duration",
+];
+
+/// Metric names that are themselves a duration in **milliseconds** (see
+/// [`DURATION_METRIC_SECONDS_NAMES`]).
+const DURATION_METRIC_MS_NAMES: [&str; 4] = [
+    "http.server.duration",
+    "http.client.duration",
+    "envoy_cluster_upstream_rq_time",
+    "upstream_rq_time",
+];
+
 #[utoipa::path(
     post,
     path = "/v1/otel/traces",
@@ -256,6 +326,15 @@ fn validate_events(events: &[UsageEvent]) -> Result<()> {
             return Err(Error::BadRequest("total_cost must be finite".to_string()));
         }
 
+        if event
+            .latency_ms
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(Error::BadRequest(
+                "latency_ms must be finite and non-negative".to_string(),
+            ));
+        }
+
         if event.request_count < 0 {
             return Err(Error::BadRequest(
                 "request_count cannot be negative".to_string(),
@@ -324,6 +403,7 @@ fn extract_log_events(payload: ExportLogsServiceRequest) -> Vec<UsageEvent> {
                     model: extract_string(&attrs, &MODEL_KEYS),
                     metric_name: non_empty(Some(log_record.severity_text)),
                     usage_value,
+                    latency_ms: extract_latency_ms(&attrs),
                     request_count: 1,
                     prompt_tokens,
                     completion_tokens,
@@ -403,6 +483,10 @@ fn extract_trace_events(payload: ExportTraceServiceRequest) -> Vec<UsageEvent> {
                     span.start_time_unix_nano
                 };
 
+                let latency_ms =
+                    span_duration_ms(span.start_time_unix_nano, span.end_time_unix_nano)
+                        .or_else(|| extract_latency_ms(&attrs));
+
                 events.push(UsageEvent {
                     observed_at: nanos_to_datetime(observed_nanos),
                     signal_type: "trace".to_string(),
@@ -415,6 +499,7 @@ fn extract_trace_events(payload: ExportTraceServiceRequest) -> Vec<UsageEvent> {
                     metric_name: non_empty(Some(span.name)),
                     usage_value,
                     total_cost,
+                    latency_ms,
                     request_count: 1,
                     prompt_tokens,
                     completion_tokens,
@@ -527,6 +612,8 @@ fn number_data_point_to_event(
         user_id: extract_string(&attrs, &USER_KEYS),
         user_name: extract_string(&attrs, &USER_NAME_KEYS),
         model: extract_string(&attrs, &MODEL_KEYS),
+        latency_ms: extract_latency_ms(&attrs)
+            .or_else(|| duration_metric_value_to_ms(metric_name.as_deref(), value)),
         metric_name,
         usage_value: value,
         request_count: request_count_from_metric_value(value),
@@ -560,6 +647,7 @@ fn histogram_data_point_to_event(
         metric_name,
         usage_value,
         total_cost,
+        latency_ms: extract_latency_ms(&attrs),
         request_count: count.max(1),
         prompt_tokens: extract_i64(&attrs, &PROMPT_TOKENS_KEYS),
         completion_tokens: extract_i64(&attrs, &COMPLETION_TOKENS_KEYS),
@@ -590,6 +678,7 @@ fn exponential_histogram_data_point_to_event(
         metric_name,
         usage_value,
         total_cost,
+        latency_ms: extract_latency_ms(&attrs),
         request_count: count.max(1),
         prompt_tokens: extract_i64(&attrs, &PROMPT_TOKENS_KEYS),
         completion_tokens: extract_i64(&attrs, &COMPLETION_TOKENS_KEYS),
@@ -618,6 +707,7 @@ fn summary_data_point_to_event(
         model: extract_string(&attrs, &MODEL_KEYS),
         metric_name,
         total_cost,
+        latency_ms: extract_latency_ms(&attrs),
         usage_value: point.sum,
         request_count: count.max(1),
         prompt_tokens: extract_i64(&attrs, &PROMPT_TOKENS_KEYS),
@@ -746,6 +836,56 @@ fn extract_f64(attrs: &HashMap<String, Value>, keys: &[&str]) -> Option<f64> {
             _ => None,
         })
     })
+}
+
+/// Pulls a per-request duration out of OTLP attributes, normalised to milliseconds.
+///
+/// Millisecond-named keys win over second-named ones only because they are tried first; a payload
+/// carrying both is already self-contradictory and either answer is as good. Non-finite and
+/// negative values are dropped rather than stored -- a negative duration is a broken clock, and
+/// letting it reach `percentile_cont` would drag a real percentile below zero.
+fn extract_latency_ms(attrs: &HashMap<String, Value>) -> Option<f64> {
+    extract_f64(attrs, &LATENCY_MS_KEYS)
+        .or_else(|| extract_f64(attrs, &LATENCY_SECONDS_KEYS).map(|seconds| seconds * 1_000.0))
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+/// Span wall-clock duration in milliseconds, from the span's own start/end timestamps.
+///
+/// This is preferred over any attribute for traces: it is what the span actually measured, and it
+/// is present on every well-formed span whether or not the emitter bothered to also stamp a
+/// duration attribute. Returns `None` for an unset or non-monotonic timestamp pair rather than a
+/// zero or a negative.
+fn span_duration_ms(start_time_unix_nano: u64, end_time_unix_nano: u64) -> Option<f64> {
+    if start_time_unix_nano == 0 || end_time_unix_nano < start_time_unix_nano {
+        return None;
+    }
+
+    Some((end_time_unix_nano - start_time_unix_nano) as f64 / 1_000_000.0)
+}
+
+/// Interprets a metric data point's own value as a duration when the metric is named as one.
+///
+/// Covers gateways that publish latency as a gauge/sum rather than as an attribute on a usage
+/// event. Deliberately NOT applied to histogram, exponential-histogram or summary points: those
+/// carry a bucketed distribution, and `sum / count` is a mean, not one observation. Feeding a mean
+/// into `percentile_cont` would fabricate a percentile out of data that never contained one.
+fn duration_metric_value_to_ms(metric_name: Option<&str>, value: f64) -> Option<f64> {
+    let name = metric_name?;
+
+    let millis = if DURATION_METRIC_MS_NAMES.contains(&name) {
+        value
+    } else if DURATION_METRIC_SECONDS_NAMES.contains(&name) {
+        value * 1_000.0
+    } else {
+        return None;
+    };
+
+    if millis.is_finite() && millis >= 0.0 {
+        Some(millis)
+    } else {
+        None
+    }
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -1184,7 +1324,9 @@ mod tests {
                                         {"key": "project_id", "value": {"stringValue": "proj_1"}},
                                         {"key": "api_key_id", "value": {"stringValue": "key_1"}},
                                         {"key": "user_id", "value": {"stringValue": "user_1"}},
-                                        {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4.1"}}
+                                        {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4.1"}},
+                                        {"key": "duration", "value": {"stringValue": "51042"}},
+                                        {"key": "x-envoy-upstream-service-time", "value": {"stringValue": "50011"}}
                                     ]
                                 }
                             ]
@@ -1204,6 +1346,11 @@ mod tests {
         assert_eq!(event.api_key_id.as_deref(), Some("key_1"));
         assert_eq!(event.user_id.as_deref(), Some("user_1"));
         assert_eq!(event.model.as_deref(), Some("gpt-4.1"));
+        // `%DURATION%` is Envoy's total request duration in milliseconds, rendered as a JSON
+        // string. This is the only latency signal that actually reaches this service today: the
+        // AI Gateway ExtProc's `llmRequestCosts` dynamic metadata carries token/cost keys only,
+        // and neither `/v1/otel/traces` nor `/v1/otel/metrics` is fed by that deployment.
+        assert_eq!(event.latency_ms, Some(51_042.0));
     }
 
     #[test]
@@ -1253,6 +1400,7 @@ mod tests {
     fn base_usage_event() -> UsageEvent {
         UsageEvent {
             observed_at: Utc::now(),
+            latency_ms: None,
             signal_type: "trace".to_string(),
             account_id: None,
             project_id: None,
@@ -1905,5 +2053,287 @@ mod tests {
             .expect("partial insert should still be treated as accepted");
 
         assert_eq!(accepted, 2);
+    }
+
+    #[test]
+    fn extract_trace_events_should_take_latency_from_the_span_s_own_timestamps() {
+        let payload: ExportTraceServiceRequest = serde_json::from_value(json!({
+            "resourceSpans": [{
+                "scopeSpans": [{
+                    "spans": [{
+                        "traceId": "00000000000000000000000000000001",
+                        "spanId": "0000000000000001",
+                        "name": "chat.completion",
+                        "startTimeUnixNano": "1735689600000000000",
+                        "endTimeUnixNano": "1735689600412000000"
+                    }]
+                }]
+            }]
+        }))
+        .expect("valid trace payload");
+
+        let events = extract_trace_events(payload);
+
+        assert_eq!(events[0].latency_ms, Some(412.0));
+    }
+
+    #[test]
+    fn extract_trace_events_should_prefer_the_span_duration_over_a_duration_attribute() {
+        let payload: ExportTraceServiceRequest = serde_json::from_value(json!({
+            "resourceSpans": [{
+                "scopeSpans": [{
+                    "spans": [{
+                        "traceId": "00000000000000000000000000000001",
+                        "spanId": "0000000000000001",
+                        "name": "chat.completion",
+                        "startTimeUnixNano": "1735689600000000000",
+                        "endTimeUnixNano": "1735689600412000000",
+                        "attributes": [
+                            {"key": "duration", "value": {"stringValue": "999999"}}
+                        ]
+                    }]
+                }]
+            }]
+        }))
+        .expect("valid trace payload");
+
+        let events = extract_trace_events(payload);
+
+        assert_eq!(events[0].latency_ms, Some(412.0));
+    }
+
+    #[test]
+    fn extract_trace_events_should_fall_back_to_a_duration_attribute_when_the_span_has_no_end() {
+        let payload: ExportTraceServiceRequest = serde_json::from_value(json!({
+            "resourceSpans": [{
+                "scopeSpans": [{
+                    "spans": [{
+                        "traceId": "00000000000000000000000000000001",
+                        "spanId": "0000000000000001",
+                        "name": "chat.completion",
+                        "startTimeUnixNano": "1735689600000000000",
+                        "attributes": [
+                            {"key": "duration", "value": {"stringValue": "51042"}}
+                        ]
+                    }]
+                }]
+            }]
+        }))
+        .expect("valid trace payload");
+
+        let events = extract_trace_events(payload);
+
+        assert_eq!(events[0].latency_ms, Some(51_042.0));
+    }
+
+    #[test]
+    fn extract_log_events_should_read_the_envoy_access_log_duration_field_as_milliseconds() {
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![opentelemetry_proto::tonic::logs::v1::ResourceLogs {
+                resource: None,
+                scope_logs: vec![opentelemetry_proto::tonic::logs::v1::ScopeLogs {
+                    scope: None,
+                    log_records: vec![opentelemetry_proto::tonic::logs::v1::LogRecord {
+                        time_unix_nano: 1_735_689_601_000_000_000,
+                        severity_text: "INFO".to_string(),
+                        attributes: vec![
+                            string_kv("duration", "51042"),
+                            string_kv("x-envoy-upstream-service-time", "50011"),
+                        ],
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let events = extract_log_events(request);
+
+        assert_eq!(events[0].latency_ms, Some(51_042.0));
+    }
+
+    #[test]
+    fn extract_log_events_should_use_upstream_service_time_when_duration_is_absent() {
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![opentelemetry_proto::tonic::logs::v1::ResourceLogs {
+                resource: None,
+                scope_logs: vec![opentelemetry_proto::tonic::logs::v1::ScopeLogs {
+                    scope: None,
+                    log_records: vec![opentelemetry_proto::tonic::logs::v1::LogRecord {
+                        time_unix_nano: 1_735_689_601_000_000_000,
+                        severity_text: "INFO".to_string(),
+                        attributes: vec![string_kv("x-envoy-upstream-service-time", "50011")],
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let events = extract_log_events(request);
+
+        assert_eq!(events[0].latency_ms, Some(50_011.0));
+    }
+
+    #[test]
+    fn extract_log_events_should_leave_latency_unset_when_envoy_renders_a_missing_field() {
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![opentelemetry_proto::tonic::logs::v1::ResourceLogs {
+                resource: None,
+                scope_logs: vec![opentelemetry_proto::tonic::logs::v1::ScopeLogs {
+                    scope: None,
+                    log_records: vec![opentelemetry_proto::tonic::logs::v1::LogRecord {
+                        time_unix_nano: 1_735_689_601_000_000_000,
+                        severity_text: "INFO".to_string(),
+                        attributes: vec![string_kv("duration", "-")],
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let events = extract_log_events(request);
+
+        assert_eq!(events[0].latency_ms, None);
+    }
+
+    #[test]
+    fn extract_latency_ms_should_multiply_semantic_convention_seconds_by_a_thousand() {
+        let attrs = HashMap::from([(
+            "gen_ai.server.request.duration".to_string(),
+            json!(0.412_f64),
+        )]);
+
+        assert_eq!(extract_latency_ms(&attrs), Some(412.0));
+    }
+
+    #[test]
+    fn extract_latency_ms_should_prefer_a_millisecond_key_over_a_second_key() {
+        let attrs = HashMap::from([
+            ("duration".to_string(), json!(412_i64)),
+            ("http.server.request.duration".to_string(), json!(9.0_f64)),
+        ]);
+
+        assert_eq!(extract_latency_ms(&attrs), Some(412.0));
+    }
+
+    #[test]
+    fn extract_latency_ms_should_drop_a_negative_duration_from_a_broken_clock() {
+        let attrs = HashMap::from([("duration".to_string(), json!(-5_i64))]);
+
+        assert_eq!(extract_latency_ms(&attrs), None);
+    }
+
+    #[test]
+    fn extract_latency_ms_should_be_absent_when_nothing_reports_a_duration() {
+        let attrs = HashMap::from([("model".to_string(), json!("gpt-4.1"))]);
+
+        assert_eq!(extract_latency_ms(&attrs), None);
+    }
+
+    #[test]
+    fn span_duration_ms_should_reject_unset_and_non_monotonic_timestamps() {
+        assert_eq!(span_duration_ms(0, 1_000_000), None);
+        assert_eq!(span_duration_ms(2_000_000, 1_000_000), None);
+        assert_eq!(span_duration_ms(1_000_000, 1_000_000), Some(0.0));
+    }
+
+    #[test]
+    fn duration_metric_value_to_ms_should_honour_the_unit_the_metric_name_implies() {
+        assert_eq!(
+            duration_metric_value_to_ms(Some("gen_ai.server.request.duration"), 0.412),
+            Some(412.0)
+        );
+        assert_eq!(
+            duration_metric_value_to_ms(Some("upstream_rq_time"), 412.0),
+            Some(412.0)
+        );
+        assert_eq!(
+            duration_metric_value_to_ms(Some("gen_ai.usage.total_tokens"), 412.0),
+            None
+        );
+        assert_eq!(duration_metric_value_to_ms(None, 412.0), None);
+    }
+
+    #[test]
+    fn histogram_data_points_should_not_synthesise_a_latency_from_sum_over_count() {
+        let point = HistogramDataPoint {
+            time_unix_nano: 1_735_689_601_000_000_000,
+            count: 10,
+            sum: Some(4_120.0),
+            ..Default::default()
+        };
+
+        let event = histogram_data_point_to_event(
+            &HashMap::new(),
+            Some("gen_ai.server.request.duration".to_string()),
+            point,
+        );
+
+        assert_eq!(event.latency_ms, None);
+    }
+
+    #[test]
+    fn summary_data_points_should_not_synthesise_a_latency_from_sum_over_count() {
+        let point = SummaryDataPoint {
+            time_unix_nano: 1_735_689_601_000_000_000,
+            count: 10,
+            sum: 4_120.0,
+            ..Default::default()
+        };
+
+        let event = summary_data_point_to_event(
+            &HashMap::new(),
+            Some("gen_ai.server.request.duration".to_string()),
+            point,
+        );
+
+        assert_eq!(event.latency_ms, None);
+    }
+
+    #[test]
+    fn number_data_points_should_read_a_duration_metric_s_own_value() {
+        let point = NumberDataPoint {
+            time_unix_nano: 1_735_689_601_000_000_000,
+            value: Some(number_data_point::Value::AsDouble(0.412)),
+            ..Default::default()
+        };
+
+        let event = number_data_point_to_event(
+            &HashMap::new(),
+            Some("gen_ai.server.request.duration".to_string()),
+            point,
+        );
+
+        assert_eq!(event.latency_ms, Some(412.0));
+    }
+
+    #[test]
+    fn validate_events_should_reject_a_negative_latency() {
+        let event = UsageEvent {
+            latency_ms: Some(-1.0),
+            ..base_usage_event()
+        };
+
+        let error = validate_events(&[event]).expect_err("negative latency should be rejected");
+
+        assert!(matches!(
+            error,
+            Error::BadRequest(message) if message == "latency_ms must be finite and non-negative"
+        ));
+    }
+
+    #[test]
+    fn validate_events_should_reject_a_non_finite_latency() {
+        let event = UsageEvent {
+            latency_ms: Some(f64::NAN),
+            ..base_usage_event()
+        };
+
+        assert!(validate_events(&[event]).is_err());
     }
 }
