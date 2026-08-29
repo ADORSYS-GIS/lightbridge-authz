@@ -102,10 +102,22 @@ pub struct EndSessionRequest {
     state: Option<String>,
 }
 
+/// The single failure [`revoke_sessions_for_cookie`] reports: the LOCAL revocation did not happen,
+/// so the user's session is still live and the router owes them a hard `500`.
+///
+/// A named unit struct rather than `()`. It is deliberately not an [`Error`] variant and carries
+/// no detail, because widening what this can express is exactly the change this module's own doc
+/// comment argues against: an upstream Keycloak fault must NOT reach the caller as a failure, or
+/// a Keycloak outage starts refusing local logouts. One named type with one meaning keeps that
+/// property visible at the signature instead of resting on a comment. The underlying cause is
+/// logged at the point of failure; the caller's only decision is `500` or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalRevocationFailed;
+
 /// Ends every session held by the cookie's subject, locally and then upstream at Keycloak.
-/// `Ok(false)` means there was nothing to end. `Err(())` -- the caller's hard `500` -- is reserved
-/// for LOCAL revocation failing and is never returned for an upstream fault (see this module's own
-/// doc comment for why widening it would make logout worse, not safer).
+/// `Ok(false)` means there was nothing to end. `Err(LocalRevocationFailed)` -- the caller's hard
+/// `500` -- is reserved for LOCAL revocation failing and is never returned for an upstream fault
+/// (see this module's own doc comment for why widening it would make logout worse, not safer).
 ///
 /// `pub`, and taking its two collaborators directly rather than an `EndSessionState`, so
 /// `end_session_upstream_tests.rs` can drive exactly this seam: it is where the two failure
@@ -116,7 +128,7 @@ pub async fn revoke_sessions_for_cookie(
     repo: &StoreRepo,
     relying_party: &KeycloakRelyingParty,
     headers: &HeaderMap,
-) -> Result<bool, ()> {
+) -> Result<bool, LocalRevocationFailed> {
     let Some(session_id) = read_session_cookie(headers) else {
         return Ok(false);
     };
@@ -128,7 +140,7 @@ pub async fn revoke_sessions_for_cookie(
         Ok(None) => return Ok(false),
         Err(error) => {
             tracing::error!(?error, "logout failed: session lookup");
-            return Err(());
+            return Err(LocalRevocationFailed);
         }
     };
     // `None` only for a row predating `migrations/20260824000003_sessions_add_subject.sql`. There
@@ -149,7 +161,7 @@ pub async fn revoke_sessions_for_cookie(
         }
         Err(error) => {
             tracing::error!(?error, "logout failed: session revocation");
-            return Err(());
+            return Err(LocalRevocationFailed);
         }
     }
     // Strictly after local revocation, and strictly best-effort. Ordered this way so the outcome
