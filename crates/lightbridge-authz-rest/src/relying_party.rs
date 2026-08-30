@@ -676,6 +676,18 @@ impl KeycloakRelyingParty {
                         .refresh_expires_in
                         .map(|seconds| now + ChronoDuration::seconds(seconds)),
                     scope: token.scope.clone(),
+                    // Plaintext, queryable metadata (ADR-0024 Q2's own category for
+                    // `issuer`/`subject`/`scope` above) -- written unconditionally on every login
+                    // so a claim that disappears upstream is reflected as `None` here too, not
+                    // left stale from a previous login. This is the source `oauth2_op::store`'s
+                    // browser `authorization_code` grant reads at token-mint time via
+                    // `StoreRepo::find_federated_identity_by_account_id`: that minting path holds
+                    // no `token_key`, so it cannot open `token_envelope` (the sealed copy of these
+                    // same four claims, kept for `end_upstream_session`'s back-channel logout).
+                    email: claims.email.clone(),
+                    email_verified: claims.email_verified,
+                    preferred_username: claims.preferred_username.clone(),
+                    name: claims.name.clone(),
                 },
                 // ADR-0025: `self.issuer` IS the grandfather pin here -- it is sourced from
                 // `oauth2.federation.issuer`, the one issuer this deployment trusts for

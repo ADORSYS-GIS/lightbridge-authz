@@ -42,13 +42,17 @@ pub struct UserInfoForm {
 
 /// Claims copied through verbatim when present, beyond the always-required `sub`.
 ///
-/// `email`/`email_verified` are gated on the `email` scope per OIDC Core §5.4. The tenant pair is
-/// not a standard OIDC claim and is not scope-gated: it is this deployment's own identity context,
-/// always present on a human-plane token, and the console's reason for calling this endpoint at
-/// all. `profile` grants nothing today -- this IdP holds no name, picture, or locale for anyone,
-/// so advertising support for claims it would always omit would be a lie in the discovery
-/// document.
+/// `email`/`email_verified` are gated on the `email` scope per OIDC Core §5.4.
+/// `name`/`preferred_username` are gated on the `profile` scope the same way (OIDC Core §5.4's
+/// `profile` scope value is a much longer claim list than these two -- `given_name`, `picture`,
+/// `locale`, and a dozen others -- but `name`/`preferred_username` are the only ones this IdP ever
+/// has a value for, via `signing::KeyOwner`/`oauth2_op::store`; the rest stay permanently absent,
+/// the same "omit, never mint an empty string" contract every claim here already follows). The
+/// tenant pair is not a standard OIDC claim and is not scope-gated: it is this deployment's own
+/// identity context, always present on a human-plane token, and the console's reason for calling
+/// this endpoint at all.
 const EMAIL_SCOPED_CLAIMS: [&str; 2] = ["email", "email_verified"];
+const PROFILE_SCOPED_CLAIMS: [&str; 2] = ["name", "preferred_username"];
 const TENANT_CLAIMS: [&str; 2] = ["account_id", "project_id"];
 
 fn bearer_from_headers(headers: &HeaderMap) -> Option<String> {
@@ -88,6 +92,13 @@ fn scope_grants_email(claims: &Map<String, Value>) -> bool {
         .is_some_and(|scope| scope.split_whitespace().any(|s| s == "email"))
 }
 
+fn scope_grants_profile(claims: &Map<String, Value>) -> bool {
+    claims
+        .get("scope")
+        .and_then(Value::as_str)
+        .is_some_and(|scope| scope.split_whitespace().any(|s| s == "profile"))
+}
+
 /// Projects a verified access token's claims onto the UserInfo response.
 ///
 /// `sub` is mandatory (OIDC Core §5.3.2) and its absence is a malformed token, not an empty
@@ -102,6 +113,13 @@ pub fn user_info_claims(claims: &Map<String, Value>) -> Option<Map<String, Value
     body.insert("sub".to_string(), Value::String(sub.to_string()));
     if scope_grants_email(claims) {
         for claim in EMAIL_SCOPED_CLAIMS {
+            if let Some(value) = claims.get(claim) {
+                body.insert(claim.to_string(), value.clone());
+            }
+        }
+    }
+    if scope_grants_profile(claims) {
+        for claim in PROFILE_SCOPED_CLAIMS {
             if let Some(value) = claims.get(claim) {
                 body.insert(claim.to_string(), value.clone());
             }

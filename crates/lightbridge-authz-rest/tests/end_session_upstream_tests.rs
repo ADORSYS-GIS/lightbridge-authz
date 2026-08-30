@@ -194,6 +194,10 @@ async fn store_federated_identity(
             access_expires_at: Some(Utc::now() + Duration::minutes(5)),
             refresh_expires_at: Some(Utc::now() + Duration::minutes(30)),
             scope: Some("openid profile email".to_string()),
+            email: None,
+            email_verified: None,
+            preferred_username: None,
+            name: None,
         },
         issuer,
     )

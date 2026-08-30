@@ -957,9 +957,9 @@ impl StoreRepo {
         let row: ExchangeRefreshTokenRow = sqlx::query_as(
             r#"
             INSERT INTO exchange_refresh_tokens
-              (id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, chain_id, chain_expires_at, session_id, created_at, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, $10, $11, $12, $13, $14, $15)
-            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at
+              (id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at
             "#,
         )
         .bind(input.id)
@@ -972,6 +972,8 @@ impl StoreRepo {
         .bind(input.email)
         .bind(input.email_verified)
         .bind(input.auth_time)
+        .bind(input.preferred_username)
+        .bind(input.name)
         .bind(input.chain_id)
         .bind(input.chain_expires_at)
         .bind(input.session_id)
@@ -989,7 +991,7 @@ impl StoreRepo {
     ) -> Result<Option<ExchangeRefreshTokenRow>> {
         let row = sqlx::query_as(
             r#"
-            SELECT id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at
+            SELECT id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at
             FROM exchange_refresh_tokens
             WHERE token_hash = $1
               AND status = 'active'
@@ -1016,7 +1018,7 @@ impl StoreRepo {
     ) -> Result<Option<ExchangeRefreshTokenRow>> {
         let row = sqlx::query_as(
             r#"
-            SELECT id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at
+            SELECT id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at
             FROM exchange_refresh_tokens
             WHERE token_hash = $1
             "#,
@@ -1071,7 +1073,7 @@ impl StoreRepo {
             WHERE token_hash = $1
               AND status = 'active'
               AND expires_at > $2
-            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at
+            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at
             "#,
         )
         .bind(presented_hash)
@@ -1366,11 +1368,16 @@ impl StoreRepo {
                     access_expires_at = $3,
                     refresh_expires_at = $4,
                     scope = $5,
+                    email = $6,
+                    email_verified = $7,
+                    preferred_username = $8,
+                    name = $9,
                     last_authenticated_at = now(),
                     updated_at = now()
-                WHERE id = $6
+                WHERE id = $10
                 RETURNING id, issuer, subject, account_id, token_envelope,
                           token_sealed_at, access_expires_at, refresh_expires_at, scope,
+                          email, email_verified, preferred_username, name,
                           last_authenticated_at, created_at, updated_at
                 "#,
             )
@@ -1379,6 +1386,10 @@ impl StoreRepo {
             .bind(input.access_expires_at)
             .bind(input.refresh_expires_at)
             .bind(&input.scope)
+            .bind(&input.email)
+            .bind(input.email_verified)
+            .bind(&input.preferred_username)
+            .bind(&input.name)
             .bind(&id)
             .fetch_one(&mut *tx)
             .await?
@@ -1415,10 +1426,12 @@ impl StoreRepo {
                 r#"
                 INSERT INTO federated_identities
                   (id, issuer, subject, account_id, token_envelope, token_sealed_at,
-                   access_expires_at, refresh_expires_at, scope)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                   access_expires_at, refresh_expires_at, scope,
+                   email, email_verified, preferred_username, name)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 RETURNING id, issuer, subject, account_id, token_envelope,
                           token_sealed_at, access_expires_at, refresh_expires_at, scope,
+                          email, email_verified, preferred_username, name,
                           last_authenticated_at, created_at, updated_at
                 "#,
             )
@@ -1431,6 +1444,10 @@ impl StoreRepo {
             .bind(input.access_expires_at)
             .bind(input.refresh_expires_at)
             .bind(&input.scope)
+            .bind(&input.email)
+            .bind(input.email_verified)
+            .bind(&input.preferred_username)
+            .bind(&input.name)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| {
@@ -1475,14 +1492,46 @@ impl StoreRepo {
         let row = sqlx::query_as(
             r#"
             SELECT id, issuer, subject, account_id, token_envelope, token_sealed_at,
-                   access_expires_at, refresh_expires_at, scope, last_authenticated_at,
-                   created_at, updated_at
+                   access_expires_at, refresh_expires_at, scope,
+                   email, email_verified, preferred_username, name,
+                   last_authenticated_at, created_at, updated_at
             FROM federated_identities
             WHERE issuer = $1 AND subject = $2
             "#,
         )
         .bind(issuer)
         .bind(subject)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// The by-`account_id` twin of [`Self::find_federated_identity`] (which looks up by the
+    /// `(issuer, subject)` federation key instead). Exists because several human-plane token-
+    /// minting paths -- `oauth2_op::store::TokenExchangeOpStore::mint_from_authorization_code`
+    /// (the browser flow) and `issue_device_tokens` -- only ever have the ADR-0025-resolved
+    /// ACCOUNT id in hand at mint time, never the raw upstream `(issuer, subject)` pair: the
+    /// authorization code's stored identity carries `external_id = account_id`, not the Keycloak
+    /// subject (see `authorize.rs::issue_code`'s own doc comment). `account_id` is a safe lookup
+    /// key here because `federated_identities_account_uidx` (ADR-0024 Q1) already enforces at
+    /// most one federated identity may ever hold a given `account_id`, so this can never return
+    /// more than one candidate row to begin with.
+    #[instrument(skip(self))]
+    pub async fn find_federated_identity_by_account_id(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<FederatedIdentityRow>> {
+        let row = sqlx::query_as(
+            r#"
+            SELECT id, issuer, subject, account_id, token_envelope, token_sealed_at,
+                   access_expires_at, refresh_expires_at, scope,
+                   email, email_verified, preferred_username, name,
+                   last_authenticated_at, created_at, updated_at
+            FROM federated_identities
+            WHERE account_id = $1
+            "#,
+        )
+        .bind(account_id)
         .fetch_optional(self.pool())
         .await?;
         Ok(row)

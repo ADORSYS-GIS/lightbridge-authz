@@ -26,6 +26,13 @@ pub struct ExchangeRefreshTokenRow {
     /// describes when the original authentication happened, which does not change on refresh
     /// (unlike `nonce`, deliberately not persisted here -- see `mint_from_refresh`'s doc comment).
     pub auth_time: Option<i64>,
+    /// Snapshot of `KeyOwner::preferred_username`/`KeyOwner::name` at the grant that created this
+    /// refresh-token chain (migration
+    /// `20260830000002_exchange_refresh_tokens_add_profile_claims.sql`), carried across every
+    /// rotation exactly like `email`/`email_verified` above -- otherwise a refresh would silently
+    /// drop these two claims even though the initial token in the chain carried them.
+    pub preferred_username: Option<String>,
+    pub name: Option<String>,
     /// The rotation-chain family this token belongs to (RFC 6819 §5.2.2.3 reuse-detection
     /// cascade): shared by every token minted across one chain, starting at the offline_access
     /// exchange grant that gave birth to it. Replaying an already-rotated token revokes every
@@ -58,6 +65,8 @@ pub struct NewExchangeRefreshToken {
     pub email: Option<String>,
     pub email_verified: Option<bool>,
     pub auth_time: Option<i64>,
+    pub preferred_username: Option<String>,
+    pub name: Option<String>,
     pub chain_id: String,
     pub chain_expires_at: DateTime<Utc>,
     /// See [`ExchangeRefreshTokenRow::session_id`]'s doc comment.

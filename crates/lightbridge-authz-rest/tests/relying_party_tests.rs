@@ -1634,6 +1634,55 @@ fn sign_id_token(key: &GeneratedKey, sub: &str, iss: &str, nonce: &str) -> Strin
     .unwrap()
 }
 
+/// A separate fixture struct from [`IdToken`] rather than adding optional profile fields to it:
+/// `IdToken` is constructed as a literal at every one of this file's other login-flow tests, none
+/// of which care about `email`/`preferred_username`/`name`, so this keeps their fixtures untouched
+/// and isolates the one test that actually exercises the ADR-0024 plaintext-column persistence
+/// path (`federated_identities_persists_the_plaintext_profile_claim_snapshot` below).
+#[derive(Serialize)]
+struct IdTokenWithProfile<'a> {
+    sub: &'a str,
+    iss: &'a str,
+    aud: &'a str,
+    nonce: &'a str,
+    exp: i64,
+    iat: i64,
+    email: &'a str,
+    email_verified: bool,
+    preferred_username: &'a str,
+    name: &'a str,
+}
+
+fn sign_id_token_with_profile(
+    key: &GeneratedKey,
+    sub: &str,
+    iss: &str,
+    nonce: &str,
+    email: &str,
+    preferred_username: &str,
+    name: &str,
+) -> String {
+    let mut jwt_header = Header::new(Algorithm::RS256);
+    jwt_header.kid = Some(key.kid.clone());
+    encode(
+        &jwt_header,
+        &IdTokenWithProfile {
+            sub,
+            iss,
+            aud: "authz-idp-rp",
+            nonce,
+            exp: (Utc::now() + Duration::minutes(5)).timestamp(),
+            iat: Utc::now().timestamp(),
+            email,
+            email_verified: true,
+            preferred_username,
+            name,
+        },
+        &EncodingKey::from_rsa_pem(key.private_key_pem.as_bytes()).unwrap(),
+    )
+    .unwrap()
+}
+
 /// A `/token` response carrying a full Keycloak token set -- refresh token, expiries, scope,
 /// `session_state` -- so the ADR-0024 persistence tests below can assert on every sealed field,
 /// not just `id_token`.
@@ -1907,6 +1956,139 @@ async fn browser_sso_callback_persists_the_same_federated_identity(pool: PgPool)
         subject.to_string(),
         "a pre-existing account whose id equals the subject must be adopted"
     );
+}
+
+/// ADR-0024 Q2 already documents plaintext, queryable metadata sitting alongside the sealed
+/// envelope (`issuer`/`subject`/`scope`/the expiry columns); migration
+/// `20260830000001_federated_identities_add_profile_claims.sql` adds
+/// `email`/`email_verified`/`preferred_username`/`name` to that same plaintext set so
+/// `oauth2_op::store`'s browser `authorization_code` grant -- which holds no
+/// `token_encryption_key` and so can never open `token_envelope` -- can still read them at
+/// token-mint time. This is the persistence half of that fix: proves a real login round trip
+/// (discovery -> callback -> `persist_federated_identity`) leaves the four claims readable as
+/// plain columns, not only inside the sealed blob. The minting half (a token actually carrying
+/// these claims) is `token_exchange_tests.rs`'s
+/// `browser_authorization_code_grant_mints_profile_claims_from_federated_identity`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn federated_identities_persists_the_plaintext_profile_claim_snapshot(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let key = generate_rs256_key().unwrap();
+    mock_discovery_and_jwks(&keycloak, &key).await;
+    let repo = repo(pool.clone());
+    let subject = "profile-claims-subject";
+    repo.create_account(
+        subject,
+        CreateAccount {
+            default_quota: None,
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    // `complete`'s browser arm resolves the subject's default project (`find_default_project_id`)
+    // when the login carries none -- without a project, that resolution fails `NotFound` and the
+    // callback never reaches the point of returning `SEE_OTHER`, well before this test's own
+    // assertions about persisted profile claims.
+    repo.create_project(
+        &lightbridge_authz_core::identity::AccountId::assert_already_resolved(subject),
+        subject,
+        CreateProject {
+            name: "profile-claims-project".to_string(),
+            allowed_models: None,
+            default_limits: None,
+            billing_plan: "free".to_string(),
+            billing_identity: "profile-claims-binding".to_string(),
+            project_quota: None,
+        },
+        "profile-claims-project".to_string(),
+    )
+    .await
+    .unwrap();
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
+            keycloak.url("/jwks"),
+            repo.clone(),
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+    let (location, cookie) = rp
+        .begin_browser(BrowserLoginTarget {
+            project_id: None,
+            resume_path: "/browser".to_string(),
+        })
+        .await
+        .unwrap();
+    let state = reqwest::Url::parse(&location)
+        .unwrap()
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .unwrap();
+    let decoded = OAuth2State::decrypt(&state, &state_key_bytes()).unwrap();
+    let token = sign_id_token_with_profile(
+        &key,
+        subject,
+        &keycloak.base_url(),
+        decoded.nonce.as_deref().unwrap(),
+        "profile-claims@example.test",
+        "profile-claims-handle",
+        "Profile Claims User",
+    );
+    keycloak
+        .mock_async(|when, then| {
+            when.method(POST).path("/token").body_includes("code=code");
+            then.status(200)
+                .json_body(rich_token_response(&token, "profile-claims-refresh"));
+        })
+        .await;
+    let response = router(rp.clone())
+        .oneshot(
+            Request::builder()
+                .uri(callback_uri(&state))
+                .header(header::COOKIE, cookie.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let federation = repo
+        .find_federated_identity(&keycloak.base_url(), subject)
+        .await
+        .unwrap()
+        .expect("a federated identity row must exist after a successful browser SSO callback");
+    assert_eq!(
+        federation.email.as_deref(),
+        Some("profile-claims@example.test")
+    );
+    assert_eq!(federation.email_verified, Some(true));
+    assert_eq!(
+        federation.preferred_username.as_deref(),
+        Some("profile-claims-handle")
+    );
+    assert_eq!(federation.name.as_deref(), Some("Profile Claims User"));
+
+    let by_account = repo
+        .find_federated_identity_by_account_id(&federation.account_id)
+        .await
+        .unwrap()
+        .expect(
+            "find_federated_identity_by_account_id must resolve the same row -- it is what \
+             mint_from_authorization_code reads at token-mint time",
+        );
+    assert_eq!(
+        by_account.email.as_deref(),
+        Some("profile-claims@example.test")
+    );
+    assert_eq!(
+        by_account.preferred_username.as_deref(),
+        Some("profile-claims-handle")
+    );
+    assert_eq!(by_account.name.as_deref(), Some("Profile Claims User"));
 }
 
 #[sqlx::test(migrations = "../../migrations")]

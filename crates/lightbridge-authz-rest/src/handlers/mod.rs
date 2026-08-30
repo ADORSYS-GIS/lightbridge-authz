@@ -142,12 +142,15 @@ impl AuthzStoreImpl {
                 .get_project(&account_id, project_id)
                 .await?
                 .ok_or(Error::NotFound)?;
-            let (email, email_verified) = decode_bearer_profile(bearer_token);
+            let (email, email_verified, preferred_username, name) =
+                decode_bearer_profile(bearer_token);
             let owner = crate::signing::KeyOwner {
                 subject: subject.to_string(),
                 account_id: account_id.into(),
                 email,
                 email_verified,
+                preferred_username,
+                name,
             };
             let signed = signer
                 .sign(
@@ -332,15 +335,17 @@ impl OAuth2TokenIssuer {
     }
 }
 
-fn decode_bearer_profile(bearer_token: Option<&str>) -> (Option<String>, Option<bool>) {
+fn decode_bearer_profile(
+    bearer_token: Option<&str>,
+) -> (Option<String>, Option<bool>, Option<String>, Option<String>) {
     let Some(payload) = bearer_token.and_then(|token| token.split('.').nth(1)) else {
-        return (None, None);
+        return (None, None, None, None);
     };
     let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
-        return (None, None);
+        return (None, None, None, None);
     };
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return (None, None);
+        return (None, None, None, None);
     };
     let email = value
         .get("email")
@@ -349,7 +354,15 @@ fn decode_bearer_profile(bearer_token: Option<&str>) -> (Option<String>, Option<
     let email_verified = value
         .get("email_verified")
         .and_then(serde_json::Value::as_bool);
-    (email, email_verified)
+    let preferred_username = value
+        .get("preferred_username")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let name = value
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    (email, email_verified, preferred_username, name)
 }
 
 fn resolve_rotated_expires_at(

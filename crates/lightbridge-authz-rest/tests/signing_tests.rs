@@ -768,6 +768,8 @@ mod db {
         allowed_models: Option<Vec<String>>,
         email: Option<String>,
         email_verified: Option<bool>,
+        name: Option<String>,
+        preferred_username: Option<String>,
         typ: Option<String>,
         scope: Option<String>,
         #[serde(rename = "lightbridge_caller_kind")]
@@ -909,6 +911,8 @@ mod db {
             account_id: "kc-user-123".to_string(),
             email: Some("dev@example.test".to_string()),
             email_verified: Some(true),
+            preferred_username: Some("dev".to_string()),
+            name: Some("Dev User".to_string()),
         };
         let signed = signer
             .sign(
@@ -931,6 +935,8 @@ mod db {
         assert_eq!(claims.account_id, "acct_1");
         assert_eq!(claims.email.as_deref(), Some("dev@example.test"));
         assert_eq!(claims.email_verified, Some(true));
+        assert_eq!(claims.preferred_username.as_deref(), Some("dev"));
+        assert_eq!(claims.name.as_deref(), Some("Dev User"));
         assert_eq!(claims.typ.as_deref(), Some("Bearer"));
         assert_eq!(claims.scope.as_deref(), Some("profile email"));
         assert_eq!(
@@ -943,6 +949,48 @@ mod db {
         assert_eq!(
             claims.caller_kind.as_deref(),
             Some(lightbridge_authz_bearer::API_KEY_CALLER_KIND)
+        );
+    }
+
+    /// Companion to `signer_signs_verifiable_against_active_jwk`: an owner with no
+    /// `name`/`preferred_username` (the shape of every login before this claim propagation fix,
+    /// and still the shape of any login for a subject Keycloak never gave one) must mint a token
+    /// that OMITS both claims entirely -- never an empty-string placeholder. Asserted against the
+    /// raw wire JSON (`decode_untyped`), not the typed `ApiKeyClaims` struct: a typed
+    /// `Option<String>` field would read back `None` for both "claim absent" and "claim present
+    /// but empty string", so only the untyped claim set actually distinguishes them.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn absent_profile_claims_are_omitted_not_minted_as_empty_strings(pool: PgPool) {
+        let repo = repo(pool);
+        bootstrap_signing_key(&repo, &signing_cfg(3600))
+            .await
+            .unwrap();
+        let active = repo.get_active_signing_key().await.unwrap().unwrap();
+
+        let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
+        let owner = KeyOwner {
+            subject: "kc-user-no-profile".to_string(),
+            account_id: "kc-user-no-profile".to_string(),
+            email: None,
+            email_verified: None,
+            preferred_username: None,
+            name: None,
+        };
+        let signed = signer
+            .sign(&owner, "key_1", "proj_1", "acct_1", None, Utc::now(), None)
+            .await
+            .unwrap();
+
+        let claims = decode_untyped(&active.public_jwk, &signed.token);
+        let body = claims.as_object().unwrap();
+        assert!(
+            !body.contains_key("name"),
+            "name must be omitted, not minted as null/empty, when the owner carries none: {body:?}"
+        );
+        assert!(
+            !body.contains_key("preferred_username"),
+            "preferred_username must be omitted, not minted as null/empty, when the owner \
+             carries none: {body:?}"
         );
     }
 
@@ -964,6 +1012,7 @@ mod db {
             account_id: "resolved-acting-account".to_string(),
             email: None,
             email_verified: None,
+            ..Default::default()
         };
         let signed = signer
             .sign(&owner, "key_1", "proj_1", "acct_1", None, Utc::now(), None)
@@ -1009,6 +1058,7 @@ mod db {
             account_id: grandfathered_id.clone(),
             email: None,
             email_verified: None,
+            ..Default::default()
         };
         let signed = signer
             .sign(&owner, "key_1", "proj_1", "acct_1", None, Utc::now(), None)
@@ -1050,6 +1100,7 @@ mod db {
             account_id: "member-account".to_string(),
             email: None,
             email_verified: None,
+            ..Default::default()
         };
         let signed = signer
             .sign(
@@ -1202,6 +1253,7 @@ mod db {
             account_id: "kc-user-old-vs-new".to_string(),
             email: Some("dev@example.test".to_string()),
             email_verified: Some(true),
+            ..Default::default()
         };
         let allowed_models = Some(vec!["gpt-4.1-mini".to_string()]);
         let now = Utc::now();

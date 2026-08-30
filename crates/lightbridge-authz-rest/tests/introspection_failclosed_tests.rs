@@ -366,6 +366,8 @@ async fn insert_refresh_token_row(
         email: None,
         email_verified: None,
         auth_time: None,
+        preferred_username: None,
+        name: None,
         chain_id: cuid2(),
         chain_expires_at,
         session_id: session.id,
