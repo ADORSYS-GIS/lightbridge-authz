@@ -667,11 +667,48 @@ def section_browser_flow() -> tuple["CookieJar", str, str, str]:
         ).encode(),
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
+    # #569 changed this contract deliberately, after the 2026-08-30 console-401s incident: a
+    # rotated token replayed within `refresh_reuse_grace_seconds` (deployed default 30) is a benign
+    # race, not theft, so it mints a SECOND independent successor instead of cascading. This replay
+    # is immediate, so it is always inside the window.
+    #
+    # Asserting only `status == 200` would be a hollow test -- a server that simply replayed the
+    # first rotation's cached response would pass it. The two assertions that carry weight are that
+    # the graced replay mints a genuinely NEW token, and that the first successor is still alive
+    # afterwards: "a racing client no longer kills its own chain" is the entire point of #569, and
+    # a cascade would have killed it. The cascade OUTSIDE the window is not re-proven here (it
+    # would cost a 30s sleep) -- `refresh_reuse_outside_grace_window_still_cascades` and
+    # `refresh_reuse_grace_disabled_cascades_on_immediate_replay` in
+    # `crates/lightbridge-authz-rest/tests/token_exchange_tests.rs` own that, against a
+    # configurable clock. What this suite adds is that the DEPLOYED config behaves this way.
     replayed = json.loads(replayed_bytes)
-    assert status == 400 and replayed.get("error") == "invalid_grant", (
-        f"a superseded browser refresh token must be refused: status={status}, body={replayed}"
+    assert status == 200, (
+        "a replay inside the reuse-grace window must be graced, not cascaded: "
+        f"status={status}, body={replayed}"
     )
-    log("browser refresh token rotates and the superseded token is refused on reuse")
+    graced_refresh = replayed.get("refresh_token")
+    assert graced_refresh and graced_refresh not in (browser_refresh, rotated["refresh_token"]), (
+        "a graced replay must mint a second INDEPENDENT successor, not reissue the replayed token "
+        f"nor echo the first rotation's: {replayed}"
+    )
+    status, _, survivor_bytes = http_raw(
+        "POST",
+        f"{IDP_URL}/oauth2/token",
+        body=urllib.parse.urlencode(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": rotated["refresh_token"],
+                "client_id": BROWSER_CLIENT_ID,
+            }
+        ).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    survivor = json.loads(survivor_bytes)
+    assert status == 200 and survivor.get("refresh_token"), (
+        "the graced replay must NOT have cascaded the chain -- the first successor has to still "
+        f"renew afterwards: status={status}, body={survivor}"
+    )
+    log("browser refresh rotates; a replay inside the grace window is graced without cascading")
 
     status, _, replay_body = http_raw(
         "POST",
@@ -714,7 +751,11 @@ def section_browser_flow() -> tuple["CookieJar", str, str, str]:
     assert second_code and second_code != code, "second /authorize did not mint a fresh code"
     log("a second /authorize with the session cookie skips Keycloak entirely")
 
-    return cookies, token_body["access_token"], token_body["id_token"], rotated["refresh_token"]
+    # `survivor`, not `rotated`: the assertion above consumed `rotated` to prove the chain outlived
+    # the graced replay, so it is itself rotated now. `section_end_session` needs a LIVE token to
+    # prove logout cascades, and a token that was already spent would pass that test for the wrong
+    # reason.
+    return cookies, token_body["access_token"], token_body["id_token"], survivor["refresh_token"]
 
 
 # --- 7. check_session_iframe -----------------------------------------------------------------------
@@ -838,11 +879,20 @@ def section_device_flow() -> tuple[str, str]:
         ).encode(),
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
+    # Same #569 grace window as the browser leg above -- reuse classification is shared
+    # (`TokenExchangeOpStore::classify_replayed_refresh_token`), so the device grant inherits it.
+    # Kept lighter than the browser assertions on purpose: the browser leg is the one the
+    # 2026-08-30 incident actually happened on, so it carries the full no-cascade proof, and
+    # duplicating that here would only re-test shared code through a second door.
     reuse_body = json.loads(reuse_bytes)
-    assert status == 400 and reuse_body.get("error") == "invalid_grant", (
-        f"reused refresh_token was not rejected: status={status}, body={reuse_body}"
+    assert status == 200, (
+        "a replay inside the reuse-grace window must be graced, not cascaded: "
+        f"status={status}, body={reuse_body}"
     )
-    log("device refresh_token rotates, and the superseded token is invalid on reuse")
+    assert reuse_body.get("refresh_token") not in (None, refresh_token, new_refresh_token), (
+        f"a graced replay must mint a second independent successor: {reuse_body}"
+    )
+    log("device refresh_token rotates; a replay inside the grace window is graced")
     return refreshed_body["access_token"], new_refresh_token
 
 
@@ -1046,10 +1096,18 @@ def section_revocation(device_refresh_token: str) -> None:
 # --- 11. UserInfo + RP-Initiated Logout -------------------------------------------------------
 
 
-def section_userinfo(browser_access_token: str) -> None:
+def section_userinfo(browser_access_token: str, no_profile_scope_access_token: str) -> None:
     """OIDC Core §5.3. The important assertion is the NEGATIVE one: authorization data must not be
     reachable through this endpoint. `budget_tier`/`quota_tier`/roles all sit one `claims.get`
-    away in the same token, so nothing but a deliberate allow-list keeps them out."""
+    away in the same token, so nothing but a deliberate allow-list keeps them out.
+
+    `no_profile_scope_access_token` is `section_token_exchange`'s token, minted with
+    `openid offline_access` and neither `email` nor `profile`. It is the scope gate's only real
+    end-to-end negative: it DOES carry `email`/`name`/`preferred_username` claims (that grant
+    decodes them straight off the presented Keycloak token, unconditionally), so the sole thing
+    that can keep them out of the response is `scope_grants_email`/`scope_grants_profile` actually
+    running. Answering the second half of the tripwire #565 fired -- "confirm the email scope
+    actually gates it"."""
     status, body, _ = http_json(
         "GET",
         f"{IDP_URL}/oauth2/userinfo",
@@ -1060,21 +1118,23 @@ def section_userinfo(browser_access_token: str) -> None:
     assert body.get("account_id") and body.get("project_id"), (
         f"userinfo must carry this deployment's tenant context: {body}"
     )
-    # KNOWN GAP, pinned deliberately rather than asserted away. A browser (authorization_code)
-    # login mints `email: None` at source -- `mint_from_authorization_code` says so outright:
-    # "the code's stored identity carries no email, so these stay `None` rather than being
-    # invented". The upstream email IS available, sealed in
-    # `federated_identities.token_envelope` (ADR-0024's ID-token claims snapshot); nothing on the
-    # /authorize -> code -> token path opens it. So UserInfo cannot return an email for the
-    # console's own users, even though they granted the `email` scope.
+    # This was a TRIPWIRE pinning a known gap -- a browser login used to mint `email: None` at
+    # source, so UserInfo could never return one. #565 closed that by persisting the profile-claim
+    # snapshot as plaintext columns on `federated_identities` and loading it at mint time, which
+    # fired the tripwire exactly as designed. Its instruction was to update the assertion AND
+    # re-confirm the scope gating; both happen here (the gate itself is the negative below).
     #
-    # This assertion is a TRIPWIRE: wiring that snapshot through will turn it red, which is the
-    # point -- the fix must come with this line and the `email` scope gating being re-checked
-    # together. The device/token-exchange path is unaffected (it decodes email straight off the
-    # presented Keycloak token), so this is specifically the browser leg.
-    assert "email" not in body, (
-        "a browser-login token now carries email -- if that was intentional, update this "
-        f"assertion and confirm the email scope actually gates it: {body}"
+    # Exact-match, not a presence check: a presence check would pass on someone ELSE's email. The
+    # realm seeds `USERNAME`'s user with its username as its email and a distinct display name
+    # (`.docker/keycloak_config/realm.json`), so these pin the right person's claims specifically.
+    assert body.get("email") == USERNAME, (
+        f"userinfo must return the email #565 snapshotted at login for {USERNAME}: {body}"
+    )
+    assert body.get("email_verified") is True, (
+        f"userinfo must return email_verified for a realm-verified user: {body}"
+    )
+    assert body.get("preferred_username") == USERNAME and body.get("name"), (
+        f"userinfo must return the profile claims #565 added under the profile scope: {body}"
     )
     for authorization_claim in (
         "budget_tier",
@@ -1087,6 +1147,26 @@ def section_userinfo(browser_access_token: str) -> None:
             f"userinfo leaked authorization data ({authorization_claim}): {body}"
         )
     log("userinfo returns identity claims and no authorization data")
+
+    status, scopeless_body, _ = http_json(
+        "GET",
+        f"{IDP_URL}/oauth2/userinfo",
+        headers={"Authorization": f"Bearer {no_profile_scope_access_token}"},
+    )
+    assert status == 200, (
+        f"userinfo rejected a live exchange token: status={status}, body={scopeless_body}"
+    )
+    minted = decode_jwt_claims(no_profile_scope_access_token)
+    assert "email" in minted and "name" in minted, (
+        "this negative only proves something if the token itself carries the claims being "
+        f"withheld -- if the exchange grant stopped minting them, rewrite this: {minted}"
+    )
+    for gated in ("email", "email_verified", "name", "preferred_username"):
+        assert gated not in scopeless_body, (
+            f"userinfo returned {gated} for a token minted without the email/profile scope: "
+            f"{scopeless_body}"
+        )
+    log("userinfo withholds email and profile claims from a token minted without those scopes")
 
     status, headers, _ = http_raw("GET", f"{IDP_URL}/oauth2/userinfo")
     assert status == 401, f"userinfo without a bearer must be 401: status={status}"
@@ -1191,9 +1271,11 @@ def main() -> int:
             section_browser_flow()
         )
         section_check_session_iframe()
-        section_userinfo(browser_access)
         device_access_token, device_refresh_token = section_device_flow()
         exchange_access_token, exchange_refresh_token = section_token_exchange(project_id)
+        # After the exchange, not before: the scope gate's negative needs a token minted WITHOUT
+        # the email/profile scopes, and the exchange grant is the only place one exists.
+        section_userinfo(browser_access, exchange_access_token)
         section_introspection(exchange_access_token, exchange_refresh_token, device_access_token)
         section_revocation(device_refresh_token)
         # Last: it ends the browser session every earlier section relied on.

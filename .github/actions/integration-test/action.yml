@@ -115,12 +115,26 @@ runs:
         run_migration authz-usage-migrate
 
         echo "== starting app services =="
-        $compose up -d --no-deps authz-api authz-opa authz-mcp authz-usage
+        # authz-idp joins the set for it-idp below. It is the only app service here that is NOT
+        # exercised by it-authorino/it-servers, so before it-idp ran in CI there was no reason to
+        # start it -- and no reason to notice it had drifted.
+        $compose up -d --no-deps authz-api authz-opa authz-mcp authz-usage authz-idp
         wait_ready_hc authz-api 3000
         wait_ready_hc authz-opa 3001
         wait_ready_hc authz-mcp 3000
         wait_ready_hc authz-usage 3002
+        wait_ready_hc authz-idp 3004
 
         echo "== running IT suites =="
         run_suite it-authorino
         run_suite it-servers
+        # it-idp was authored but never wired in here, so `just it-idp` was the only thing that
+        # ever ran it -- and nothing forced anyone to. Two merged PRs changed behaviour the suite
+        # asserts and left it red without anyone noticing: #569's refresh-reuse grace window, and
+        # #565's profile claims (which fired a tripwire #545 had planted for exactly that moment,
+        # into an empty room). Running it here is what makes those tripwires mean something.
+        #
+        # Sequential, like the two above -- every suite provisions against the same Keycloak user,
+        # so running them concurrently would race on that account (the same collision
+        # `compose.it.yaml`'s `it` profile exists to prevent).
+        run_suite it-idp
