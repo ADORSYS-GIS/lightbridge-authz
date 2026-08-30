@@ -207,6 +207,13 @@ oauth2:
     # Absolute cap on a refresh-token chain's lifetime, independent of the per-rotation TTL above
     # -- see Oauth2TokenExchange::refresh_absolute_ttl_seconds's doc comment for why this exists.
     refresh_absolute_ttl_seconds: ${TOKEN_EXCHANGE_REFRESH_ABSOLUTE_TTL_SECONDS:-7776000}
+    # Bounded idempotent-replay grace window for a refresh token presented just after it was
+    # rotated -- added after the 2026-08-30 console-401s incident (two replicas raced their own
+    # refresh single-flight and one replayed the other's already-rotated token, triggering the
+    # strict RFC 6819 §5.2.2.3 cascade on a benign race). See
+    # Oauth2TokenExchange::refresh_reuse_grace_seconds's doc comment. 0 disables the grace window
+    # (strict cascade on every post-rotation replay, the pre-incident behavior).
+    refresh_reuse_grace_seconds: ${TOKEN_EXCHANGE_REFRESH_REUSE_GRACE_SECONDS:-30}
     allowed_scopes:
       - openid
       - profile

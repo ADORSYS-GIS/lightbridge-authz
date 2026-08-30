@@ -51,6 +51,18 @@ pub struct ExchangeRefreshTokenRow {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
+    /// Refresh-reuse grace window (migration
+    /// `20260830000004_exchange_refresh_tokens_add_reuse_grace.sql`, added after the 2026-08-30
+    /// console-401s incident -- see that migration's doc comment): when this row's single-use CAS
+    /// consume flipped it from `active` to `rotated`. `NULL` for a row that has never been
+    /// rotated, and for rows rotated before the migration ran. `TokenExchangeOpStore::
+    /// classify_replayed_refresh_token` treats `NULL` as OUTSIDE the grace window -- fail closed,
+    /// same as today's pre-grace cascade -- never as "always graced".
+    pub rotated_at: Option<DateTime<Utc>>,
+    /// The id of the row this one was rotated into, written atomically with `rotated_at`.
+    /// Informational lineage only -- see the owning migration's doc comment for why it is not a
+    /// foreign key, and why a graced replay's own new successor does not overwrite it.
+    pub successor_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]

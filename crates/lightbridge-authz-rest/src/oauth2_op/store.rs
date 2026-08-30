@@ -52,7 +52,9 @@ use authkestra_op::handlers::token::{TokenErrorResponse, TokenRequest, TokenResp
 use authkestra_op::refresh::{RefreshToken, RefreshTokenStore};
 use authkestra_op::store::OpStore;
 use chrono::{DateTime, Duration, Utc};
-use lightbridge_authz_api_key::entities::exchange_refresh_token_row::NewExchangeRefreshToken;
+use lightbridge_authz_api_key::entities::exchange_refresh_token_row::{
+    ExchangeRefreshTokenRow, NewExchangeRefreshToken,
+};
 use lightbridge_authz_api_key::entities::session_row::NewSession;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::BearerTokenServiceTrait;
@@ -1538,8 +1540,22 @@ impl TokenExchangeOpStore {
     ///    RFC 6819 §5.2.2.3 calls this out by name: a reused refresh token is the strongest signal
     ///    this codebase has that a token was stolen, and the whole family must die, not just the
     ///    replayed member. `find_exchange_refresh_token_by_hash` distinguishes "already rotated"
-    ///    (cascade) from "unknown/expired/revoked" (plain `invalid_grant`, no cascade) after the
-    ///    CAS fails, and `revoke_exchange_refresh_token_chain` performs the cascade.
+    ///    (cascade, subject to gap 4's grace window below) from "unknown/expired/revoked" (plain
+    ///    `invalid_grant`, no cascade) after the CAS fails, and `revoke_exchange_refresh_token_
+    ///    chain` performs the cascade.
+    ///
+    /// 4. **Reuse-detection grace window** (added after a real incident, not a security-review
+    ///    gap like 1-3 above): 2026-08-30, the console (2 replicas, each with its own in-memory,
+    ///    per-pod refresh single-flight) raced its own refresh -- one pod rotated the presented
+    ///    token, the other replayed the exact same, now-superseded token seconds later, and gap
+    ///    3's cascade revoked the WHOLE chain as if it had been stolen, even though both pods were
+    ///    the same already-authenticated client -- the user's session died with intermittent 401s.
+    ///    Log line observed in production: "refresh token reuse detected (an already-rotated token
+    ///    was replayed); revoking its chain". `oauth2.token_exchange.refresh_reuse_grace_seconds`
+    ///    (default 30s, `0` disables it) now bounds gap 3's cascade: a replay presented within the
+    ///    grace window of the ORIGINAL token's own rotation is treated as a benign race rather than
+    ///    theft -- see `classify_replayed_refresh_token`'s doc comment for exactly what happens
+    ///    instead of cascading, and why.
     ///
     /// Still matches `default_handle_refresh_token`'s own client-binding shape: a refresh token
     /// presented by a different client than the one it was issued to is burned (single-use,
@@ -1575,16 +1591,31 @@ impl TokenExchangeOpStore {
             )
         };
 
+        // Generated BEFORE the CAS consume, not after, specifically so it can be written as
+        // `successor_id` in the SAME `UPDATE` that flips the presented row to `rotated` (see
+        // `consume_exchange_refresh_token`'s doc comment) -- and so the identical value can be
+        // reused below as the id of the row this function mints, on BOTH the normal path (CAS
+        // succeeds) and the graced-replay path (CAS fails, but the row is within its grace
+        // window -- see `classify_replayed_refresh_token`).
+        let new_id = cuid2();
+
+        let mut is_graced_replay = false;
         let old_row = match self
             .repo
-            .consume_exchange_refresh_token(&presented_hash, now)
+            .consume_exchange_refresh_token(&presented_hash, now, Some(&new_id))
             .await
         {
             Ok(Some(row)) => row,
-            Ok(None) => {
-                self.revoke_chain_on_reuse(&presented_hash).await;
-                return Err(invalid_grant());
-            }
+            Ok(None) => match self
+                .classify_replayed_refresh_token(&presented_hash, now)
+                .await
+            {
+                Some(row) => {
+                    is_graced_replay = true;
+                    row
+                }
+                None => return Err(invalid_grant()),
+            },
             Err(_) => {
                 return Err(oauth_err("server_error", "refresh token rotation failed"));
             }
@@ -1725,7 +1756,11 @@ impl TokenExchangeOpStore {
 
         let new_plaintext = generate_refresh_secret();
         let new_row = NewExchangeRefreshToken {
-            id: cuid2(),
+            // The SAME id generated above, before the CAS consume -- see `new_id`'s own comment.
+            // On the graced-replay path this is the first time it is actually written anywhere;
+            // on the normal path it was already recorded as `successor_id` on the row just
+            // consumed, so this INSERT is what makes that pointer valid.
+            id: new_id,
             subject: old_row.subject.clone(),
             account_id: context.account_id.clone(),
             project_id: context.project_id.clone(),
@@ -1765,6 +1800,7 @@ impl TokenExchangeOpStore {
             project_id = %context.project_id,
             chain_id = %old_row.chain_id,
             openid,
+            graced_replay = is_graced_replay,
             "token-exchange refreshed access token"
         );
 
@@ -1778,24 +1814,83 @@ impl TokenExchangeOpStore {
         Ok(response)
     }
 
-    /// RFC 6819 §5.2.2.3 reuse-detection cascade: called after a CAS consume
-    /// (`consume_exchange_refresh_token`) has already returned `None` for `presented_hash`, to
-    /// decide whether that `None` means "replay of an already-rotated token" (revoke the whole
-    /// chain) or something else (unknown/expired/already-revoked -- no cascade, see
-    /// `find_exchange_refresh_token_by_hash`'s own doc comment for why only `status == "rotated"`
-    /// triggers this). Never logs the token or its hash -- only `subject`/`chain_id`, matching
+    /// RFC 6819 §5.2.2.3 reuse-detection, with the 2026-08-30 grace-window exception: called after
+    /// a CAS consume (`consume_exchange_refresh_token`) has already returned `None` for
+    /// `presented_hash`, to decide what that `None` means and what to do about it. Three
+    /// outcomes, all in one place because they share the same `find_exchange_refresh_token_by_hash`
+    /// lookup and the same `status == "rotated"` gate:
+    ///
+    /// - **Not a replay at all** (unknown token, expired, or already explicitly `revoked`) --
+    ///   `find_exchange_refresh_token_by_hash`'s own doc comment explains why only `status ==
+    ///   "rotated"` means "replay". No cascade. Returns `None`; the caller's `invalid_grant` needs
+    ///   no further action.
+    /// - **Replay outside the grace window** (or the grace window is disabled, `grace_seconds ==
+    ///   0`) -- the real theft signal RFC 6819 §5.2.2.3 describes: revoke the WHOLE chain via
+    ///   `revoke_exchange_refresh_token_chain`, exactly as before this incident. Returns `None`;
+    ///   the caller's `invalid_grant` stands, now backed by a drained chain.
+    /// - **Replay WITHIN the grace window** -- the console-401s incident this exists to fix (see
+    ///   `handle_refresh_token`'s doc comment, gap 4): presented no more than
+    ///   `refresh_reuse_grace_seconds` after `rotated_at`. Returns `Some(row)`, and the caller
+    ///   treats it exactly like a fresh CAS-consumed row: `handle_refresh_token`'s remaining logic
+    ///   (client-binding check, absolute-cap check, re-validation, minting) runs unmodified on it.
+    ///   The one thing this does NOT do is reissue the FIRST successor's own response -- that
+    ///   token's plaintext was never persisted (only its hash), so it cannot be reconstructed and
+    ///   handed to the second caller. Instead, `handle_refresh_token` mints a SECOND, independent
+    ///   successor chained off the SAME replayed row: the chain briefly has two live leaves
+    ///   (`successor_id` on the replayed row still only names the first one -- see that column's
+    ///   own doc comment). This is accepted, not a gap: both leaves were requested by the SAME
+    ///   already-authenticated client instance racing itself, which is exactly what this incident
+    ///   was; a genuinely stolen token replayed by an attacker who is NOT that client gets no
+    ///   special treatment once the grace window passes -- gap 3's full cascade still applies past
+    ///   `refresh_reuse_grace_seconds`, and a real thief racing inside the window still only ever
+    ///   obtains one extra, fully-attributed token, not persistent access.
+    ///
+    /// A `rotated_at` of `NULL` (a row rotated before this feature's migration ran) is always
+    /// treated as outside the grace window -- fail closed, identical to `grace_seconds == 0`.
+    ///
+    /// Never logs the token or its hash -- only `subject`/`chain_id`/the replay's age, matching
     /// this repo's existing rule against logging secret-shaped material.
-    async fn revoke_chain_on_reuse(&self, presented_hash: &str) {
+    async fn classify_replayed_refresh_token(
+        &self,
+        presented_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Option<ExchangeRefreshTokenRow> {
         let Ok(Some(row)) = self
             .repo
             .find_exchange_refresh_token_by_hash(presented_hash)
             .await
         else {
-            return;
+            return None;
         };
         if row.status != "rotated" {
-            return;
+            return None;
         }
+
+        // `grace_seconds == 0` (the config default's own escape hatch) short-circuits to `None`
+        // here without even looking at `rotated_at` -- "disabled" must behave identically to
+        // "every replay is outside the window", never as "a zero-width window some replay could
+        // still land inside". A `NULL` `rotated_at` (never rotated under this feature, i.e. rotated
+        // before the owning migration ran) also falls through to `None` -- fail closed, same as
+        // `grace_seconds == 0`, never "always graced".
+        let grace_seconds = self.cfg.refresh_reuse_grace_seconds.max(0);
+        let graced_age = row.rotated_at.and_then(|rotated_at| {
+            let age = now.signed_duration_since(rotated_at);
+            (grace_seconds > 0
+                && age >= Duration::zero()
+                && age <= Duration::seconds(grace_seconds))
+            .then_some(age)
+        });
+        if let Some(age) = graced_age {
+            tracing::warn!(
+                subject = %row.subject,
+                chain_id = %row.chain_id,
+                age_seconds = age.num_seconds(),
+                "refresh token reuse within grace window; minting a fresh pair instead of \
+                 revoking its chain"
+            );
+            return Some(row);
+        }
+
         tracing::warn!(
             subject = %row.subject,
             chain_id = %row.chain_id,
@@ -1812,6 +1907,7 @@ impl TokenExchangeOpStore {
                 "failed to revoke refresh token chain after reuse detection"
             );
         }
+        None
     }
 }
 

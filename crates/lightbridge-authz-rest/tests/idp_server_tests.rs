@@ -499,6 +499,7 @@ fn token_exchange_oauth2() -> Oauth2 {
         refresh_ttl_seconds: 2_592_000,
         allowed_scopes: vec!["openid".to_string(), "offline_access".to_string()],
         refresh_absolute_ttl_seconds: 7_776_000,
+        refresh_reuse_grace_seconds: 30,
         device_code_ttl_seconds: 600,
         device_poll_interval_seconds: 5,
         device_verification_uri: "https://authz.example.test/device/verify".to_string(),

@@ -224,9 +224,13 @@ impl RefreshTokenStore for DbRefreshTokenStore {
 
     async fn consume_token(&self, token: &str) -> Result<Option<RefreshToken>, OpError> {
         let hash = hash_api_key(token);
+        // No successor to record: this generic `RefreshTokenStore::consume_token` path only ever
+        // consumes -- it never mints a replacement row itself (see this module's own doc comment:
+        // `TokenExchangeOpStore::handle_refresh_token` bypasses this trait entirely and calls
+        // `consume_exchange_refresh_token` directly with a pre-generated successor id instead).
         let row = self
             .repo
-            .consume_exchange_refresh_token(&hash, Utc::now())
+            .consume_exchange_refresh_token(&hash, Utc::now(), None)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to consume refresh token");

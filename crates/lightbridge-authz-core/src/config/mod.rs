@@ -1188,6 +1188,28 @@ pub struct Oauth2TokenExchange {
     /// session cannot outlive it indefinitely.
     #[serde(default = "default_exchange_refresh_absolute_ttl_seconds")]
     pub refresh_absolute_ttl_seconds: i64,
+    /// Bounded idempotent-replay grace window, in seconds, for a refresh token presented AFTER it
+    /// was already rotated (RFC 6819 §5.2.2.3 reuse detection). Added after a real production
+    /// incident (2026-08-30): the console runs 2 replicas, each with its own in-memory, per-pod
+    /// refresh single-flight, and raced its own refresh -- one pod rotated the presented token,
+    /// the other replayed the same pre-rotation token seconds later, and the strict reuse cascade
+    /// (`TokenExchangeOpStore::classify_replayed_refresh_token`) revoked the WHOLE chain as if the
+    /// token had been stolen, killing the user's session with intermittent 401s even though
+    /// nothing was actually stolen -- both pods were the same already-authenticated client.
+    ///
+    /// A replay presented within this many seconds of the ORIGINAL token's own `rotated_at` is
+    /// treated as a benign race, not theft: it mints a fresh access+refresh pair (a second live
+    /// leaf on the same chain -- see `classify_replayed_refresh_token`'s doc comment for why a
+    /// graced replay cannot simply replay the first rotation's response) instead of cascading. A
+    /// replay presented after this window still cascades exactly as before -- the grace window
+    /// bounds how long a rotated token retains this power, it does not remove reuse detection.
+    /// Standard practice for exactly this race: Keycloak's "revoke refresh token: max reuse",
+    /// Auth0's reuse interval. Defaults to 30 seconds -- long enough to absorb a same-request-cycle
+    /// race between replicas, short enough that a genuinely stolen-and-replayed token is still
+    /// caught almost immediately. `0` disables the grace window entirely (today's pre-incident
+    /// strict behavior: every post-rotation replay cascades).
+    #[serde(default = "default_refresh_reuse_grace_seconds")]
+    pub refresh_reuse_grace_seconds: i64,
     /// RFC 8628 device and user-code lifetime. Device authorization is mounted with the native
     /// token endpoint, so this is an operational value rather than a separate feature flag.
     #[serde(default = "default_device_code_ttl_seconds")]
@@ -1216,6 +1238,10 @@ fn default_exchange_refresh_ttl_seconds() -> i64 {
 
 fn default_exchange_refresh_absolute_ttl_seconds() -> i64 {
     7_776_000
+}
+
+fn default_refresh_reuse_grace_seconds() -> i64 {
+    30
 }
 
 fn default_device_code_ttl_seconds() -> i64 {
