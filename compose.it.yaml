@@ -34,6 +34,19 @@ services:
     ports: !reset []
 
   it-authorino:
+    # Gated behind the `it` profile so a plain `up -d` (which every `just it-*` recipe runs to
+    # bring the stack up) starts ONLY the infrastructure, never the suites themselves. Without
+    # this, `up -d` launched all THREE suites concurrently and then `run --rm <suite>` executed a
+    # fourth -- four scenarios racing on one Keycloak user's account and projects in the same
+    # database. `docker compose run` auto-enables the named service's own profiles, so the recipes
+    # need no `--profile` flag.
+    #
+    # The race used to be invisible: concurrent `createAccount` calls collided on the accounts
+    # primary key, and every suite tolerated the 409 as "already provisioned", so they all
+    # converged on one account by accident. ADR-0026 makes a repeat call mint a NEW account
+    # instead, which turned that latent concurrency into three accounts created inside 5ms and a
+    # failing anchor assertion -- surfacing the problem rather than causing it.
+    profiles: ["it"]
     image: python:3.12-slim
     depends_on:
       authz-api:
@@ -60,6 +73,19 @@ services:
     command: ["python", "/it/authorino_it.py"]
 
   it-servers:
+    # Gated behind the `it` profile so a plain `up -d` (which every `just it-*` recipe runs to
+    # bring the stack up) starts ONLY the infrastructure, never the suites themselves. Without
+    # this, `up -d` launched all THREE suites concurrently and then `run --rm <suite>` executed a
+    # fourth -- four scenarios racing on one Keycloak user's account and projects in the same
+    # database. `docker compose run` auto-enables the named service's own profiles, so the recipes
+    # need no `--profile` flag.
+    #
+    # The race used to be invisible: concurrent `createAccount` calls collided on the accounts
+    # primary key, and every suite tolerated the 409 as "already provisioned", so they all
+    # converged on one account by accident. ADR-0026 makes a repeat call mint a NEW account
+    # instead, which turned that latent concurrency into three accounts created inside 5ms and a
+    # failing anchor assertion -- surfacing the problem rather than causing it.
+    profiles: ["it"]
     image: python:3.12-slim
     depends_on:
       authz-api:
@@ -101,6 +127,19 @@ services:
     command: ["python", "/it/servers_it.py"]
 
   it-idp:
+    # Gated behind the `it` profile so a plain `up -d` (which every `just it-*` recipe runs to
+    # bring the stack up) starts ONLY the infrastructure, never the suites themselves. Without
+    # this, `up -d` launched all THREE suites concurrently and then `run --rm <suite>` executed a
+    # fourth -- four scenarios racing on one Keycloak user's account and projects in the same
+    # database. `docker compose run` auto-enables the named service's own profiles, so the recipes
+    # need no `--profile` flag.
+    #
+    # The race used to be invisible: concurrent `createAccount` calls collided on the accounts
+    # primary key, and every suite tolerated the 409 as "already provisioned", so they all
+    # converged on one account by accident. ADR-0026 makes a repeat call mint a NEW account
+    # instead, which turned that latent concurrency into three accounts created inside 5ms and a
+    # failing anchor assertion -- surfacing the problem rather than causing it.
+    profiles: ["it"]
     image: python:3.12-slim
     depends_on:
       authz-idp:
