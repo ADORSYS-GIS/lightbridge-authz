@@ -26,11 +26,30 @@ reached only through an adopted account — there is no longer a way for a feder
 exist without one. Every table/paragraph below this note is otherwise exactly as ADR-0006 left it
 — see the "Users and federated identities" section further down for what's new.
 
-Once identity collapses to "one account = one person, keyed by their own subject", membership as a
-concept moves entirely to the **project** level (`project_members`), and everything that used to
-be an account-level property that could legitimately vary per *billing relationship*
-(`billing_identity`) moved to `projects` too — a single person can bill different projects to
-different parties (e.g. a consultant with three client projects, each invoiced separately).
+**Amended again by [ADR-0026](../adr/0026-one-identity-may-own-many-accounts.md) (2026-08-30):**
+one identity may now own SEVERAL accounts. The ownership edge is `accounts.user_id -> users.id` —
+already present since ADR-0024 and always 1:N-capable; what pinned it to 1:1 was the
+`accounts_set_user` trigger forcing `NEW.user_id := NEW.id`, relaxed by
+`migrations/20260830000001_accounts_owned_by_users.sql`. Concretely:
+
+- An identity's **first** account is its **anchor**: it keeps `id = subject`, because
+  `federated_identities` adopts an account by matching `accounts.id == subject`. Exactly one
+  anchor per identity, still enforced by `federated_identities_account_uidx`.
+- **Subsequent** accounts get a minted CUID2 `id` and inherit the anchor's `user_id`. They anchor
+  no identity; they are owned tenants.
+- So `accounts.user_id` is always the owner's anchor-account id — which is always `auth().id`.
+  That is why the ownership policies read `userId == auth().id` rather than introducing a separate
+  `auth().userId`, and it is a load-bearing invariant, pinned by
+  `accounts_user_id_is_always_a_home_account_id`.
+
+Membership as a concept still lives entirely at the **project** level (`project_members`), and
+everything that used to be an account-level property that could legitimately vary per *billing
+relationship* (`billing_identity`) moved to `projects` too — a single person can bill different
+projects to different parties (e.g. a consultant with three client projects, each invoiced
+separately). Note `project_members.account_id` still references an account, and the roster
+policies still compare it against `auth().id`, so a roster may only name an **anchor** account —
+`addProjectMember` refuses a secondary one rather than writing a row that could never grant access
+(ADR-0026 D5).
 
 ## Core authz schema
 

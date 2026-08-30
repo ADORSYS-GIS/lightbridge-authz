@@ -453,7 +453,10 @@ impl AuthzStoreImpl {
             name: Self::normalize_account_name(input.name.as_deref()).map(str::to_owned),
             ..input
         };
-        let account = self.repo.create_account(subject, input).await?;
+        let account = self
+            .repo
+            .create_account(&AccountId::assert_already_resolved(subject), input)
+            .await?;
         tracing::info!(
             operation = "create_account",
             subject = %subject,

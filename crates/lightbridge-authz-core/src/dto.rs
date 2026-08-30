@@ -69,6 +69,12 @@ pub struct Account {
     /// no lookup path resolves an account by it.
     #[serde(default)]
     pub name: Option<String>,
+    /// The owning person (`accounts.user_id`). ADR-0026: one identity may own several accounts,
+    /// and this is what groups them. Always the owner's HOME-account id, which is what makes the
+    /// `userId == auth().id` read policy sound -- see the LOAD-BEARING INVARIANT block on
+    /// `Account.userId` in `crates/lightbridge-authz-api/schema/authz.cstack`.
+    #[serde(default)]
+    pub user_id: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

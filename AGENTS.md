@@ -359,9 +359,16 @@ Primary local stack is in `compose.yaml`:
 
 Tables (see `migrations/`):
 
-- `accounts`: **`id` is the caller's JWT `sub`** (ADR-0006; amended by ADR-0024 — see `users`
-  below). Carries `default_quota` (the governance tier for work in the account's own default
-  project) and `user_id` (`NOT NULL`, `BEFORE INSERT`-trigger-provisioned — see `users`).
+- `accounts`: **`id` is the caller's JWT `sub` for an identity's FIRST (anchor) account, and a
+  minted CUID2 for every account after that** (ADR-0006; amended by ADR-0024, then by ADR-0026 —
+  see `users` below). Since ADR-0026 one identity may own several accounts; the anchor keeps the
+  subject as its id because `federated_identities` adopts by matching `accounts.id == subject`.
+  Carries `default_quota` (the governance tier for work in the account's own default project) and
+  `user_id` (`NOT NULL`, `BEFORE INSERT`-trigger-provisioned when not supplied — see `users`).
+  **`accounts.user_id` is always the owner's anchor-account id**, i.e. always `auth().id`; the
+  ownership `@@allow` clauses depend on this and it is pinned by
+  `accounts_user_id_is_always_a_home_account_id`. Two id populations coexist permanently — never
+  branch on an id's shape (see "Identifier Format").
 - `users` (ADR-0024; corrected 2026-08-25): the actual defining identity — "one account = one
   federated identity; a person may hold several." Reached only THROUGH an account:
   `federated_identities.account_id -> accounts.user_id -> users.id`. `id` is always the
@@ -906,10 +913,22 @@ hand-written SQL and direct `sqlx` dependencies.
     `crates/lightbridge-authz-api-key/src/repo.rs`).
   - `lightbridge-authz-usage`: dynamic `QueryBuilder` aggregates against the Timescale-backed
     `usage_events` table (`query_usage` in `crates/lightbridge-authz-usage/src/repo.rs`).
-- This repo runs cratestack (`cratestack-pg`) `=0.8.0` (pinned exactly in the root `Cargo.toml`,
+  - `federated_identities`: deliberately ABSENT from `authz.cstack` entirely, not merely
+    `@@allow`-less -- it carries the sealed Keycloak token envelope, so a credential-bearing table
+    must be unreachable from any generated read path, not just gated behind the coarse-RBAC check
+    a present-but-unallowed model would still have (ADR-0024 Q4; created by
+    `migrations/20260825000001_users_and_federated_identities.sql`; justified in the `User` model
+    comment in `crates/lightbridge-authz-api/schema/authz.cstack`).
+  - `secret_claims`: single-use, subject-bound claims for handing an API key secret to a human
+    without routing it through a model's context (GHSA-9pc6-965v-2c44, #538); redemption needs a
+    single-statement CAS so concurrent requests can never both obtain the same secret, which
+    generated CRUD cannot express -- the same exception class as `authorization_codes`
+    (`migrations/20260827000001_secret_claims.sql`; `consume_secret_claim` in
+    `crates/lightbridge-authz-api-key/src/repo.rs`).
+- This repo runs cratestack (`cratestack-pg`) `=0.8.12` (pinned exactly in the root `Cargo.toml`,
   which also documents why the pin cannot float past it -- see that file's `cratestack-core =
-  "=0.8.0"` block); ADR-0038's capability findings were verified against 0.7.8. Re-verify any
-  capability claim against `0.8.0` here before relying on it -- "0.5.1" was stale as of #379
+  "=0.8.12"` block); ADR-0038's capability findings were verified against 0.7.8. Re-verify any
+  capability claim against `0.8.12` here before relying on it -- "0.5.1" was stale as of #379
   (2026-08-20), which also corrected #375's own PR description, which had already found the pin
   was 0.7.16 at authoring time and out of date by the time #379 landed.
 

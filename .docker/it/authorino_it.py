@@ -164,30 +164,53 @@ def account_id_from_token(token: str) -> str:
 
 
 def ensure_account(authz_headers: dict, token: str) -> str:
-    """Create the caller's account, tolerating the one that already exists.
+    """Provision the caller's ANCHOR account, idempotently.
 
-    `createAccount` is once-per-subject since ADR-0006 -- a second call is a 409, not a second
-    row. This suite hits that routinely rather than exceptionally: it shares a compose stack (and
-    therefore a database) with the servers suite, both authenticate as the same Keycloak user, and
-    the CI runner retries a suite up to three times. So a 409 here means "already provisioned",
-    and the id is the subject.
+    ADR-0026 changed the mechanism this used to rely on. `createAccount` was once-per-subject, so
+    a replay returned 409 and the 409 itself WAS the "already provisioned" signal. One identity may
+    now own several accounts, so a replay returns 200 and a genuinely NEW account -- catching 409
+    would never fire again, and every re-run would silently mint another account instead of reusing
+    the one it wants. That matters here rather than theoretically: this suite shares a compose stack
+    (and therefore a database) with the other IT suites, all authenticate as the same Keycloak user,
+    and the CI runner retries a suite up to three times.
+
+    So provisioning is now keyed on the ANCHOR account instead of on an error code. An identity's
+    first account keeps `id = subject` (ADR-0026 D3) precisely because it anchors the identity, so
+    the subject read off the token IS the id to look for. Read it first; only create when it is
+    genuinely absent, and assert the created id matches -- which also keeps this suite exercising
+    the anchor path rather than drifting onto the secondary-account one.
     """
+    anchor_id = account_id_from_token(token)
+    # A read policy FILTERS rather than rejects, so an absent (or unreadable) account is a 404,
+    # which `urlopen` raises. Absent is the expected first-run case, not an error.
     try:
-        status, account = request_rpc(
+        status, existing = request_rpc(
             "POST",
-            f"{API_URL}/rpc/procedure.createAccount",
-            {"args": {}},
+            f"{API_URL}/rpc/model.Account.get",
+            {"id": anchor_id},
             headers=authz_headers,
             insecure_tls=True,
         )
-        assert status == 200, f"create account failed: status={status}, body={account}"
-        return account["id"]
+        if status == 200 and isinstance(existing, dict) and existing.get("id") == anchor_id:
+            log(f"anchor account already provisioned; reusing {anchor_id}")
+            return anchor_id
     except urllib.error.HTTPError as err:
-        if err.code != 409:
+        if err.code != 404:
             raise
-        account_id = account_id_from_token(token)
-        log(f"account already exists for this subject; reusing {account_id}")
-        return account_id
+
+    status, account = request_rpc(
+        "POST",
+        f"{API_URL}/rpc/procedure.createAccount",
+        {"args": {}},
+        headers=authz_headers,
+        insecure_tls=True,
+    )
+    assert status == 200, f"create account failed: status={status}, body={account}"
+    assert account["id"] == anchor_id, (
+        "the first account for a subject must be the anchor, keyed by the subject itself "
+        f"(ADR-0026 D3): got {account['id']}, expected {anchor_id}"
+    )
+    return anchor_id
 
 
 def main() -> int:

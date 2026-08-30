@@ -59,7 +59,7 @@ async fn access_control_allows_project_members_and_rejects_non_members(pool: PgP
 
     let account = repo
         .create_account(
-            owner,
+            &AccountId::assert_already_resolved(owner),
             CreateAccount {
                 default_quota: None,
                 name: None,
@@ -119,7 +119,7 @@ async fn access_control_allows_project_members_and_rejects_non_members(pool: PgP
     // real account to point at first.
     let invited_account = repo
         .create_account(
-            invited,
+            &AccountId::assert_already_resolved(invited),
             CreateAccount {
                 default_quota: None,
                 name: None,
@@ -448,20 +448,86 @@ async fn access_control_allows_project_members_and_rejects_non_members(pool: PgP
         .unwrap_err();
     assert!(matches!(other_subject_delete, Error::NotFound));
 
-    // And a subject can only ever have one account: the id IS their subject, so a second
-    // createAccount is a Conflict rather than a second row.
-    let second_attempt = repo
+    // ADR-0026 reverses what this used to assert. A second `createAccount` for the same subject was
+    // a `Conflict` (the id WAS the subject, so the second row collided on the primary key); it is
+    // now an ordinary success, and the two accounts are distinguished by how they are identified:
+    // the first keeps `id = subject` because it anchors the identity, the second gets a minted
+    // CUID2 because it anchors nothing.
+    let second = repo
         .create_account(
-            owner,
+            &AccountId::assert_already_resolved(owner),
             CreateAccount {
                 default_quota: None,
                 name: None,
             },
         )
         .await
-        .unwrap_err();
-    assert!(matches!(second_attempt, Error::Conflict(_)));
+        .unwrap();
+    assert_ne!(second.id, account.id, "a second account is a second row");
+    assert_ne!(
+        second.id, owner,
+        "only the identity's ANCHOR account is keyed by the subject"
+    );
+    assert_eq!(
+        second.user_id, account.user_id,
+        "both accounts belong to the same person -- this is what the `userId == auth().id` read \
+         policy matches on"
+    );
+    assert_eq!(
+        account.user_id, owner,
+        "the home account owns itself: the LOAD-BEARING INVARIANT the read policy rests on"
+    );
 
+    // Both list for that subject -- issue #563's acceptance criterion, and the thing the old
+    // `WHERE id = $1` lookup could not do however the policy was written.
+    let owned = repo
+        .list_accounts(&AccountId::assert_already_resolved(owner), 0, 50)
+        .await
+        .unwrap();
+    let mut owned_ids: Vec<&str> = owned.iter().map(|a| a.id.as_str()).collect();
+    owned_ids.sort_unstable();
+    let mut expected = vec![account.id.as_str(), second.id.as_str()];
+    expected.sort_unstable();
+    assert_eq!(owned_ids, expected, "an owner sees every account they own");
+
+    // A stranger sees neither of them -- by OWNERSHIP now, not by identity equality. (`invited`
+    // holds an account of their own from earlier in this test, so the assertion is "none of
+    // owner's", not "nothing at all" -- which is also the sharper property: the widened
+    // `user_id`-scoped lookup must not have widened into someone else's rows.)
+    let invited_sees = repo
+        .list_accounts(&AccountId::assert_already_resolved(invited), 0, 50)
+        .await
+        .unwrap();
+    assert!(
+        !invited_sees
+            .iter()
+            .any(|a| a.id == account.id || a.id == second.id),
+        "ownership-scoped listing must not leak another person's accounts: {invited_sees:?}"
+    );
+    assert!(
+        repo.get_account(&AccountId::assert_already_resolved(invited), &second.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a secondary account is no more reachable to an outsider than a primary one"
+    );
+
+    // The anchor cannot be deleted out from under the account it owns -- doing so would cascade
+    // away the `federated_identities` row and strand `second` permanently.
+    let orphaning_delete = repo
+        .delete_account(&AccountId::assert_already_resolved(owner), &account.id)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(orphaning_delete, Error::BadRequest(_)),
+        "deleting the primary while others are owned must be refused explicitly, not surface as \
+         NotFound: got {orphaning_delete:?}"
+    );
+
+    // Delete the secondary first, and the primary becomes deletable again exactly as before.
+    repo.delete_account(&AccountId::assert_already_resolved(owner), &second.id)
+        .await
+        .unwrap();
     repo.delete_account(&AccountId::assert_already_resolved(owner), &account.id)
         .await
         .unwrap();
@@ -475,7 +541,7 @@ async fn deleting_an_account_deletes_its_projects_and_keys(pool: PgPool) {
 
     let account = repo
         .create_account(
-            subject,
+            &AccountId::assert_already_resolved(subject),
             CreateAccount {
                 default_quota: None,
                 name: None,
@@ -524,5 +590,127 @@ async fn deleting_an_account_deletes_its_projects_and_keys(pool: PgPool) {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+/// Issue #563's "policies grant the owner the same rights on both" criterion, at the level the
+/// cratestack `@@allow` clauses cannot reach: the hand-written procedure surface.
+///
+/// Every ownership check in `repo.rs` used to read `projects.account_id = <acting account>`, which
+/// silently means "the project's account IS me". Once a person owns a second account, a project
+/// inside it is theirs but its `account_id` is NOT their acting id, so every one of those checks
+/// would have returned `NotFound` on the owner's own project. This pins the widened form (compare
+/// by OWNER, via `accounts.user_id`) across the three shapes that matter: a lead-gated mutation
+/// (`create_api_key` -> `authorize_project_lead`), a project-scoped read (`list_api_keys`), and a
+/// project mutation (`update_project`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_owner_has_the_same_rights_inside_a_secondary_account(pool: PgPool) {
+    let repo = build_repo(pool.clone());
+    let owner = "multi-owner";
+    let stranger = "stranger-sub";
+
+    let anchor = repo
+        .create_account(
+            &AccountId::assert_already_resolved(owner),
+            CreateAccount {
+                default_quota: None,
+                name: None,
+            },
+        )
+        .await
+        .unwrap();
+    let secondary = repo
+        .create_account(
+            &AccountId::assert_already_resolved(owner),
+            CreateAccount {
+                default_quota: None,
+                name: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(secondary.id, anchor.id);
+
+    let project = repo
+        .create_project(
+            &AccountId::assert_already_resolved(owner),
+            &secondary.id,
+            CreateProject {
+                name: "inside-the-second-account".to_string(),
+                allowed_models: None,
+                default_limits: None,
+                billing_plan: "pro".to_string(),
+                billing_identity: format!("bill-{}", cuid2()),
+                project_quota: None,
+            },
+            "proj_secondary".to_string(),
+        )
+        .await
+        .expect("the owner must be able to create a project in an account they own");
+
+    let key = repo
+        .create_api_key(
+            &AccountId::assert_already_resolved(owner),
+            build_new_api_key_row(&project.id, "secondary-key", "hash_secondary_owner"),
+        )
+        .await
+        .expect("minting a key in an owned account's project must be authorized by ownership");
+
+    let listed = repo
+        .list_api_keys(
+            &AccountId::assert_already_resolved(owner),
+            &project.id,
+            0,
+            50,
+        )
+        .await
+        .unwrap();
+    assert!(listed.iter().any(|k| k.id == key.id));
+
+    repo.update_project(
+        &AccountId::assert_already_resolved(owner),
+        &project.id,
+        UpdateProject {
+            name: Some("renamed".to_string()),
+            allowed_models: None,
+            default_limits: None,
+            billing_plan: None,
+        },
+    )
+    .await
+    .expect("the owner must be able to update a project in an account they own");
+
+    // Widening by owner must not widen to anyone else: a stranger holding their own account has a
+    // different `user_id`, so none of the three paths open up.
+    repo.create_account(
+        &AccountId::assert_already_resolved(stranger),
+        CreateAccount {
+            default_quota: None,
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let stranger_key_create = repo
+        .create_api_key(
+            &AccountId::assert_already_resolved(stranger),
+            build_new_api_key_row(&project.id, "nope", "hash_stranger"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(stranger_key_create, Error::NotFound),
+        "ownership widening must not leak across owners: got {stranger_key_create:?}"
+    );
+    assert!(
+        repo.list_api_keys(
+            &AccountId::assert_already_resolved(stranger),
+            &project.id,
+            0,
+            50
+        )
+        .await
+        .unwrap()
+        .is_empty()
     );
 }

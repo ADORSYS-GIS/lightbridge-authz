@@ -21,7 +21,7 @@ fn build_repo(pool: PgPool) -> StoreRepo {
 
 async fn seed_account(repo: &StoreRepo, subject: &str) -> String {
     repo.create_account(
-        subject,
+        &AccountId::assert_already_resolved(subject),
         CreateAccount {
             default_quota: None,
             name: None,

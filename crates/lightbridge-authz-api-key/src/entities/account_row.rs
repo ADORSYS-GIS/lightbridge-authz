@@ -14,6 +14,11 @@ pub struct AccountRow {
     /// and for any account whose owner has not set one -- a real "unnamed" state, not a missing
     /// value to be papered over.
     pub name: Option<String>,
+    /// The owning person (`accounts.user_id -> users.id`, ADR-0024), and since ADR-0026 the column
+    /// that answers "whose account is this" now that one identity may own several. Always the
+    /// owner's HOME-account id -- see the LOAD-BEARING INVARIANT block on `Account.userId` in
+    /// `crates/lightbridge-authz-api/schema/authz.cstack`.
+    pub user_id: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

@@ -166,7 +166,7 @@ async fn update_account_default_quota_accepts_a_configured_tier(pool: PgPool) {
     let subject = format!("subj-{}", cuid2());
     StoreRepo::new(core)
         .create_account(
-            &subject,
+            &AccountId::assert_already_resolved(subject.clone()),
             CreateAccount {
                 default_quota: None,
                 name: None,
@@ -190,7 +190,7 @@ async fn update_account_default_quota_rejects_an_unconfigured_tier(pool: PgPool)
     let subject = format!("subj-{}", cuid2());
     let repo = StoreRepo::new(core.clone());
     repo.create_account(
-        &subject,
+        &AccountId::assert_already_resolved(subject.clone()),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -224,7 +224,7 @@ async fn update_account_default_quota_accepts_none_to_clear(pool: PgPool) {
     let subject = format!("subj-{}", cuid2());
     StoreRepo::new(core)
         .create_account(
-            &subject,
+            &AccountId::assert_already_resolved(subject.clone()),
             CreateAccount {
                 default_quota: Some("gold".to_string()),
                 name: None,
@@ -249,7 +249,7 @@ async fn update_account_default_quota_accepts_anything_when_catalogue_is_empty(p
     let subject = format!("subj-{}", cuid2());
     StoreRepo::new(core)
         .create_account(
-            &subject,
+            &AccountId::assert_already_resolved(subject.clone()),
             CreateAccount {
                 default_quota: None,
                 name: None,
@@ -281,7 +281,7 @@ async fn seed_lead_and_target(core: Arc<dyn DbPoolTrait>) -> (String, String, St
 
     let lead_account = repo
         .create_account(
-            &lead_subject,
+            &AccountId::assert_already_resolved(lead_subject.clone()),
             CreateAccount {
                 default_quota: None,
                 name: None,
@@ -290,7 +290,7 @@ async fn seed_lead_and_target(core: Arc<dyn DbPoolTrait>) -> (String, String, St
         .await
         .expect("lead account creation");
     repo.create_account(
-        &target_subject,
+        &AccountId::assert_already_resolved(target_subject.clone()),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -447,7 +447,7 @@ async fn seed_owner_and_project(core: Arc<dyn DbPoolTrait>) -> (String, String) 
 
     let owner_account = repo
         .create_account(
-            &owner_subject,
+            &AccountId::assert_already_resolved(owner_subject.clone()),
             CreateAccount {
                 default_quota: None,
                 name: None,

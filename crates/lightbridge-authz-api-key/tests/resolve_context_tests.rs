@@ -17,7 +17,7 @@ async fn seed_project(repo: &StoreRepo, subject: &str) -> (String, String) {
     let account_id = AccountId::assert_already_resolved(subject);
     let account = repo
         .create_account(
-            subject,
+            &AccountId::assert_already_resolved(subject),
             CreateAccount {
                 default_quota: None,
                 name: None,
@@ -117,7 +117,7 @@ async fn find_default_project_id_returns_the_auto_provisioned_project(pool: PgPo
 async fn find_default_project_id_is_none_without_any_projects(pool: PgPool) {
     let repo = build_repo(pool);
     repo.create_account(
-        "user-1",
+        &AccountId::assert_already_resolved("user-1"),
         lightbridge_authz_core::CreateAccount {
             default_quota: None,
             name: None,
@@ -163,7 +163,7 @@ async fn resolve_context_is_unchanged_for_an_account_created_before_the_users_mi
 
     let member = "member-subject";
     repo.create_account(
-        member,
+        &AccountId::assert_already_resolved(member),
         lightbridge_authz_core::CreateAccount {
             default_quota: None,
             name: None,

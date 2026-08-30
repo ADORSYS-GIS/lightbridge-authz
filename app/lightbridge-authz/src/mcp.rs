@@ -2381,6 +2381,9 @@ mod tests {
     fn fixture_account() -> Account {
         Account {
             id: "acct_1".to_string(),
+            // A home account owns itself (`user_id == id`) -- the ADR-0026 invariant the
+            // `userId == auth().id` read policy rests on.
+            user_id: "acct_1".to_string(),
             default_quota: None,
             status: lightbridge_authz_core::ResourceStatus::Active,
             name: None,

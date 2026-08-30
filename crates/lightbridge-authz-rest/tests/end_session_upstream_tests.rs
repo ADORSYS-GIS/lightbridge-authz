@@ -210,7 +210,7 @@ async fn store_federated_identity(
 /// Returns the session id, which the cookie below carries.
 async fn seed_browser_session(repo: &StoreRepo) -> String {
     repo.create_account(
-        SUBJECT,
+        &AccountId::assert_already_resolved(SUBJECT),
         CreateAccount {
             default_quota: None,
             name: None,

@@ -248,6 +248,7 @@ impl StoreRepo {
             default_quota: row.default_quota,
             status: ResourceStatus::from(row.status),
             name: row.name,
+            user_id: row.user_id,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -311,15 +312,36 @@ impl StoreRepo {
     /// `NotFound` so project existence isn't leaked; a subject who can see the project as a plain
     /// `member` but lacks lead standing gets `Forbidden`.
     async fn authorize_project_lead(&self, project_id: &str, account_id: &AccountId) -> Result<()> {
-        let project_account_id: Option<String> =
-            sqlx::query_scalar(r#"SELECT account_id FROM projects WHERE id = $1"#)
-                .bind(project_id)
-                .fetch_optional(self.pool())
-                .await?;
-        let Some(project_account_id) = project_account_id else {
+        // COALESCE is load-bearing, not defensive noise: an actor with no `accounts` row at all
+        // (a bootstrapping identity) makes the inner subquery NULL, so the comparison is NULL
+        // rather than false, and decoding NULL into `bool` fails -- turning a clean `NotFound`
+        // into a database error. Caught by `access_control_allows_project_members_and_rejects_
+        // non_members`, which asserts the exact error VARIANT an outsider gets.
+        //
+        // ADR-0026: "the project's account owner" is no longer "the project's account IS me" --
+        // one person may own several accounts, and a project inside a secondary account is just as
+        // much theirs. Compare by OWNER, not by account identity, or the owner gets `NotFound` on
+        // their own project. The member branch below deliberately still compares `auth().id`
+        // directly (ADR-0026 D5: a roster may only ever name an anchor account).
+        let owns_project: Option<bool> = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(
+                a.user_id = (SELECT user_id FROM accounts WHERE id = $2),
+                false
+            )
+            FROM projects p
+            JOIN accounts a ON a.id = p.account_id
+            WHERE p.id = $1
+            "#,
+        )
+        .bind(project_id)
+        .bind(account_id.as_str())
+        .fetch_optional(self.pool())
+        .await?;
+        let Some(owns_project) = owns_project else {
             return Err(Error::NotFound);
         };
-        if project_account_id == account_id.as_str() {
+        if owns_project {
             return Ok(());
         }
         match self
@@ -335,15 +357,10 @@ impl StoreRepo {
         }
     }
 
-    async fn load_account_row(&self, account_id: &str) -> Result<AccountRow> {
-        let row = self.load_account_row_optional(account_id).await?;
-        row.ok_or(Error::NotFound)
-    }
-
     async fn load_account_row_optional(&self, account_id: &str) -> Result<Option<AccountRow>> {
         let row = sqlx::query_as::<_, AccountRow>(
             r#"
-            SELECT id, default_quota, status, name, created_at, updated_at
+            SELECT id, default_quota, status, name, user_id, created_at, updated_at
             FROM accounts
             WHERE id = $1
             "#,
@@ -390,16 +407,60 @@ impl StoreRepo {
         }
     }
 
-    /// `id` **is** `subject` per ADR-0006 -- there is no more server-generated or caller-supplied
-    /// account id, and no membership row to insert alongside it (one account = one person, no
-    /// account-level membership of any kind). A second call for the same subject hits the `accounts`
-    /// primary key and is surfaced as `Conflict`, matching the cstack schema doc's stated contract
-    /// ("a second call for the same subject is `Error::Conflict`, not an upsert").
+    /// Creates an account owned by the caller. ADR-0026: an identity may hold SEVERAL, so this is
+    /// no longer "the account IS the subject" and a second call is no longer a `Conflict`.
+    ///
+    /// Which id the new account gets is decided here, and the rule is not arbitrary:
+    ///
+    /// * **The identity's FIRST account keeps `id = subject`.** That account is the identity's
+    ///   ANCHOR -- `federated_identities` adopts an account by matching `accounts.id == subject`
+    ///   (`resolve_account_for_federated_subject_detailed`), and it is the only account
+    ///   `auth().id` is ever set to. Minting a CUID2 here instead would break adoption for every
+    ///   brand-new signup: the grandfather lookup would find nothing, the resolver would fall
+    ///   through to ADR-0025's `NoAccount` bootstrap arm forever, and the person's own account
+    ///   would be invisible to them. ADR-0025 Stage 5 anticipated this and required
+    ///   `createAccount` to write the adopting `federated_identities` row itself; keeping
+    ///   `id = subject` for the anchor achieves the same end without this method needing the
+    ///   issuer, and without a second account ever being able to adopt the identity (which
+    ///   `federated_identities_account_uidx` forbids, ADR-0026 D6).
+    /// * **Every subsequent account gets a minted CUID2** (ADR-0039, via the one chokepoint) and
+    ///   INHERITS the owner's existing `user_id`. It anchors no identity; it is a pure owned
+    ///   tenant.
+    ///
+    /// The consequence both branches preserve, and which the `@@allow` clauses in
+    /// `authz.cstack` depend on: **`accounts.user_id` is always the owner's home-account id**,
+    /// i.e. always `auth().id`. See that file's "LOAD-BEARING INVARIANT" block on `Account.userId`.
+    ///
+    /// One transaction, because the owner lookup and the insert must not interleave with a
+    /// concurrent first-account bootstrap for the same identity.
     #[instrument(skip(self))]
-    pub async fn create_account(&self, subject: &str, input: CreateAccount) -> Result<Account> {
+    pub async fn create_account(
+        &self,
+        acting_account_id: &AccountId,
+        input: CreateAccount,
+    ) -> Result<Account> {
         let now = Utc::now();
+        let mut tx = self.pool().begin().await?;
+
+        // The acting account is the caller's home account (or nothing at all, if this identity is
+        // bootstrapping its very first one). `FOR UPDATE` serializes two concurrent creates by the
+        // same person so they cannot both read "no owner yet" and both try to claim the anchor.
+        let existing_owner: Option<(String,)> =
+            sqlx::query_as("SELECT user_id FROM accounts WHERE id = $1 FOR UPDATE")
+                .bind(acting_account_id.as_str())
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        let (new_id, owner_user_id) = match existing_owner {
+            // Bootstrap: the anchor. `user_id` stays NULL so the `accounts_set_user` trigger
+            // provisions it (and the `users` row) exactly as it always has.
+            None => (acting_account_id.as_str().to_string(), None),
+            // Second and subsequent: minted id, inherited owner.
+            Some((user_id,)) => (cuid2(), Some(user_id)),
+        };
+
         let new_account = NewAccountRow {
-            id: subject.to_string(),
+            id: new_id,
             default_quota: input.default_quota,
             name: input.name,
             created_at: now,
@@ -408,52 +469,87 @@ impl StoreRepo {
 
         sqlx::query(
             r#"
-            INSERT INTO accounts (id, default_quota, name, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO accounts (id, user_id, default_quota, name, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
             "#,
         )
         .bind(new_account.id.clone())
+        .bind(owner_user_id)
         .bind(new_account.default_quota.clone())
         .bind(new_account.name.clone())
         .bind(new_account.created_at)
         .bind(new_account.updated_at)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
-            if let sqlx::Error::Database(db_err) = &e
-                && db_err.code().as_deref() == Some("23505")
-            {
-                return Error::Conflict(format!("account already exists for subject '{subject}'"));
+            if let sqlx::Error::Database(db_err) = &e {
+                match db_err.code().as_deref() {
+                    // Two concurrent bootstraps for the same identity raced for the anchor id.
+                    // Still a `Conflict`, and still the ONLY way this method produces one -- an
+                    // ordinary second account can no longer collide, since its id is minted.
+                    Some("23505") => {
+                        return Error::Conflict(
+                            "account already exists for this subject".to_string(),
+                        );
+                    }
+                    // `user_id` referenced a `users` row that vanished, i.e. the acting account was
+                    // deleted between this transaction's own SELECT and this INSERT. Same meaning,
+                    // and the same error, as `upsert_federated_identity`'s 23503 arm: "this subject
+                    // has no lightbridge account right now."
+                    Some("23503") => {
+                        return Error::Forbidden("acting account no longer exists".to_string());
+                    }
+                    _ => {}
+                }
             }
             Error::from(e)
         })?;
 
-        let account = self.load_account_row(&new_account.id).await?;
+        let account: AccountRow = sqlx::query_as(
+            r#"
+            SELECT id, default_quota, status, name, user_id, created_at, updated_at
+            FROM accounts
+            WHERE id = $1
+            "#,
+        )
+        .bind(&new_account.id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
         Ok(Self::to_account(account))
     }
 
-    /// Lists accounts visible to `subject`. Per ADR-0006 `accounts.id` IS the subject, so this
-    /// returns at most the caller's own single account (there is no membership fan-out left to
-    /// enumerate); kept as a list for API-shape compatibility with the generic `model.Account.list`
-    /// verb it backs.
+    /// Lists every account the caller OWNS (ADR-0026), not just the one that IS them.
+    ///
+    /// The owner is derived rather than passed: `accounts.user_id` is always the owner's
+    /// home-account id, and `acting_account_id` is always that home account, so the correlated
+    /// subquery is an indexed PK lookup that reads "everyone owned by the same person as me".
+    /// Deriving it here rather than threading a `UserId` down from the ingress keeps the seam in
+    /// one place and means an acting account that does not exist (a bootstrapping identity)
+    /// yields `user_id = NULL`, which matches no row -- fail-closed, an empty list, never a
+    /// wildcard.
+    ///
+    /// `ORDER BY created_at` (never by id -- ADR-0039: CUID2 has no ordering) is covered by
+    /// `idx_accounts_user_id_created_at`.
     #[instrument(skip(self))]
     pub async fn list_accounts(
         &self,
-        account_id: &AccountId,
+        acting_account_id: &AccountId,
         offset: u32,
         limit: u32,
     ) -> Result<Vec<Account>> {
         let rows: Vec<AccountRow> = sqlx::query_as(
             r#"
-            SELECT id, default_quota, status, name, created_at, updated_at
+            SELECT id, default_quota, status, name, user_id, created_at, updated_at
             FROM accounts
-            WHERE id = $1
+            WHERE user_id = (SELECT user_id FROM accounts WHERE id = $1)
             ORDER BY created_at ASC
             LIMIT $2
             OFFSET $3
             "#,
         )
-        .bind(account_id.as_str())
+        .bind(acting_account_id.as_str())
         .bind(i64::from(limit))
         .bind(i64::from(offset))
         .fetch_all(self.pool())
@@ -461,6 +557,11 @@ impl StoreRepo {
         Ok(rows.into_iter().map(Self::to_account).collect())
     }
 
+    /// Reads one account the caller OWNS. Was `WHERE id = $1 AND id = $2` ("the target must BE
+    /// me"); ADR-0026 makes it "the target must be owned by the same person as me", via the same
+    /// derived-owner subquery as [`Self::list_accounts`]. A target the caller does not own is
+    /// `None`, exactly as before -- not an error, and indistinguishable from a target that does
+    /// not exist, so this never becomes an account-existence oracle.
     #[instrument(skip(self))]
     pub async fn get_account(
         &self,
@@ -469,9 +570,10 @@ impl StoreRepo {
     ) -> Result<Option<Account>> {
         let row = sqlx::query_as::<_, AccountRow>(
             r#"
-            SELECT id, default_quota, status, name, created_at, updated_at
+            SELECT id, default_quota, status, name, user_id, created_at, updated_at
             FROM accounts
-            WHERE id = $1 AND id = $2
+            WHERE id = $1
+              AND user_id = (SELECT user_id FROM accounts WHERE id = $2)
             "#,
         )
         .bind(account_id)
@@ -499,8 +601,9 @@ impl StoreRepo {
             r#"
             UPDATE accounts
             SET default_quota = COALESCE($1, default_quota), updated_at = $2
-            WHERE id = $3 AND id = $4
-            RETURNING id, default_quota, status, name, created_at, updated_at
+            WHERE id = $3
+              AND user_id = (SELECT user_id FROM accounts WHERE id = $4)
+            RETURNING id, default_quota, status, name, user_id, created_at, updated_at
             "#,
         )
         .bind(input.default_quota)
@@ -528,18 +631,65 @@ impl StoreRepo {
         acting_account_id: &AccountId,
         account_id: &str,
     ) -> Result<Account> {
-        let row: Option<AccountRow> = sqlx::query_as(
+        let mut tx = self.pool().begin().await?;
+
+        // Ownership, plus one thing the WHERE clause alone must not decide silently. ADR-0026 lets
+        // a person own several accounts, and exactly one of them is the HOME account -- the
+        // identity's anchor, the row `federated_identities` adopted by matching
+        // `accounts.id == subject`, and the only id `auth().id` is ever set to.
+        //
+        // Deleting the anchor while other accounts are still owned would ORPHAN them: the
+        // `federated_identities` row cascades away with it, the next login resolves through
+        // ADR-0025's bootstrap fallback to a subject with no `accounts` row, and
+        // `user_id = (SELECT user_id FROM accounts WHERE id = $subject)` then yields NULL -- so the
+        // surviving accounts match nothing and become permanently unreachable, with their projects
+        // and keys still live. Refuse it explicitly; a `WHERE` clause that just failed to match
+        // would surface as `NotFound` and read like the account did not exist.
+        //
+        // Deleting the home account when it is the ONLY one is untouched, pre-ADR-0026 behaviour.
+        let target: Option<(bool, bool)> = sqlx::query_as(
             r#"
-            DELETE FROM accounts
-            WHERE id = $1 AND id = $2
-            RETURNING id, default_quota, status, name, created_at, updated_at
+            SELECT
+                (a.id = a.user_id) AS is_home,
+                EXISTS (
+                    SELECT 1 FROM accounts o
+                    WHERE o.user_id = a.user_id AND o.id <> a.id
+                ) AS has_siblings
+            FROM accounts a
+            WHERE a.id = $1
+              AND a.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+            FOR UPDATE
             "#,
         )
         .bind(account_id)
         .bind(acting_account_id.as_str())
-        .fetch_optional(self.pool())
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        match target {
+            None => return Err(Error::NotFound),
+            Some((true, true)) => {
+                return Err(Error::BadRequest(
+                    "cannot delete your primary account while you still own others; delete or \
+                     transfer them first"
+                        .to_string(),
+                ));
+            }
+            Some(_) => {}
+        }
+
+        let row: Option<AccountRow> = sqlx::query_as(
+            r#"
+            DELETE FROM accounts
+            WHERE id = $1
+            RETURNING id, default_quota, status, name, user_id, created_at, updated_at
+            "#,
+        )
+        .bind(account_id)
+        .fetch_optional(&mut *tx)
         .await?;
         let row = row.ok_or(Error::NotFound)?;
+        tx.commit().await?;
         Ok(Self::to_account(row))
     }
 
@@ -559,6 +709,39 @@ impl StoreRepo {
         let role = role.unwrap_or("member");
         Self::validate_project_role(role)?;
         self.authorize_project_lead(project_id, account_id).await?;
+
+        // ADR-0026 D5: the roster names an ACCOUNT ("a project member IS an account",
+        // 20260727000001), and the `Project`/`ApiKey` membership policies compare that account
+        // against `auth().id` -- which is only ever a person's HOME account. Once one person can
+        // own several accounts, adding a NON-home account to a roster is a silent dead end: the
+        // row exists, the member is listed, and they never gain access, because they will never
+        // act as that account. Refuse it at the point of insert instead of shipping a roster entry
+        // that cannot work.
+        //
+        // A home account is one that owns itself (`id = user_id`) -- see the LOAD-BEARING
+        // INVARIANT block on `Account.userId` in authz.cstack. Checked against `accounts` rather
+        // than `federated_identities` deliberately: equivalent under that invariant, and it keeps
+        // the credential-bearing table out of an ordinary CRUD path.
+        //
+        // `BadRequest`, not `NotFound`: the lead is already authorized on this project (the check
+        // above passed), so there is no existence to leak here -- and a silent no-op would be the
+        // worst outcome of the three.
+        let target_is_home_account: Option<(bool,)> =
+            sqlx::query_as("SELECT (user_id = id) FROM accounts WHERE id = $1")
+                .bind(target_account_id)
+                .fetch_optional(self.pool())
+                .await?;
+        match target_is_home_account {
+            Some((true,)) => {}
+            Some((false,)) => {
+                return Err(Error::BadRequest(
+                    "target account is a secondary account and cannot hold project membership; \
+                     use the owner's primary account"
+                        .to_string(),
+                ));
+            }
+            None => return Err(Error::NotFound),
+        }
 
         sqlx::query(
             r#"
@@ -758,7 +941,7 @@ impl StoreRepo {
                 SELECT id AS account_id
                 FROM accounts
                 WHERE id = $1
-                  AND id = $2
+                  AND user_id = (SELECT user_id FROM accounts WHERE id = $2)
             )
             INSERT INTO projects (
               id, account_id, name, allowed_models, default_limits, billing_plan, billing_identity,
@@ -845,7 +1028,10 @@ impl StoreRepo {
             FROM projects
             WHERE projects.id = $1
               AND (
-                projects.account_id = $2
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $2
@@ -1665,7 +1851,10 @@ impl StoreRepo {
             FROM projects
             WHERE projects.account_id = $1
               AND (
-                projects.account_id = $2
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $2
@@ -1710,7 +1899,10 @@ impl StoreRepo {
             FROM projects
             WHERE projects.id = $1
               AND (
-                projects.account_id = $2
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $2
@@ -1789,7 +1981,10 @@ impl StoreRepo {
               updated_at = $6
             WHERE projects.id = $7
               AND (
-                projects.account_id = $8
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $8)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $8
@@ -1839,7 +2034,10 @@ impl StoreRepo {
             DELETE FROM projects
             WHERE projects.id = $1
               AND (
-                projects.account_id = $2
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $2
@@ -1932,7 +2130,10 @@ impl StoreRepo {
             JOIN projects ON projects.id = api_keys.project_id
             WHERE api_keys.project_id = $1
               AND (
-                projects.account_id = $2
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $2
@@ -1978,7 +2179,10 @@ impl StoreRepo {
             JOIN projects ON projects.id = api_keys.project_id
             WHERE api_keys.id = $1
               AND (
-                projects.account_id = $2
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $2
@@ -2018,7 +2222,10 @@ impl StoreRepo {
             WHERE api_keys.project_id = projects.id
               AND api_keys.id = $3
               AND (
-                projects.account_id = $4
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $4)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $4
@@ -2054,8 +2261,9 @@ impl StoreRepo {
             r#"
             UPDATE accounts
             SET status = $1, updated_at = $2
-            WHERE id = $3 AND id = $4
-            RETURNING id, default_quota, status, name, created_at, updated_at
+            WHERE id = $3
+              AND user_id = (SELECT user_id FROM accounts WHERE id = $4)
+            RETURNING id, default_quota, status, name, user_id, created_at, updated_at
             "#,
         )
         .bind(status.to_string())
@@ -2084,7 +2292,10 @@ impl StoreRepo {
             SET status = $1, updated_at = $2
             WHERE projects.id = $3
               AND (
-                projects.account_id = $4
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $4)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $4
@@ -2138,8 +2349,9 @@ impl StoreRepo {
             r#"
             UPDATE accounts
             SET default_quota = $1, updated_at = $2
-            WHERE id = $3 AND id = $4
-            RETURNING id, default_quota, status, name, created_at, updated_at
+            WHERE id = $3
+              AND user_id = (SELECT user_id FROM accounts WHERE id = $4)
+            RETURNING id, default_quota, status, name, user_id, created_at, updated_at
             "#,
         )
         .bind(default_quota)
@@ -2176,8 +2388,9 @@ impl StoreRepo {
             r#"
             UPDATE accounts
             SET name = $1, updated_at = $2
-            WHERE id = $3 AND id = $4
-            RETURNING id, default_quota, status, name, created_at, updated_at
+            WHERE id = $3
+              AND user_id = (SELECT user_id FROM accounts WHERE id = $4)
+            RETURNING id, default_quota, status, name, user_id, created_at, updated_at
             "#,
         )
         .bind(name)
@@ -2212,7 +2425,10 @@ impl StoreRepo {
             SET project_quota = $1, updated_at = $2
             WHERE projects.id = $3
               AND (
-                projects.account_id = $4
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $4)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $4
@@ -2265,7 +2481,10 @@ impl StoreRepo {
             SET allowed_models = $1, updated_at = $2
             WHERE projects.id = $3
               AND (
-                projects.account_id = $4
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $4)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $4
@@ -2341,7 +2560,10 @@ impl StoreRepo {
             FROM projects
             WHERE projects.id = $1
               AND (
-                projects.account_id = $2
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $2
@@ -2426,7 +2648,10 @@ impl StoreRepo {
             FROM projects
             WHERE projects.id = $1
               AND (
-                projects.account_id = $2
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $2
@@ -2538,7 +2763,10 @@ impl StoreRepo {
             WHERE api_keys.project_id = projects.id
               AND api_keys.id = $4
               AND (
-                projects.account_id = $5
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $5)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $5
@@ -2585,7 +2813,10 @@ impl StoreRepo {
             WHERE api_keys.project_id = projects.id
               AND api_keys.id = $4
               AND (
-                projects.account_id = $5
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $5)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $5
@@ -2611,7 +2842,10 @@ impl StoreRepo {
                 FROM projects
                 WHERE projects.id = $1
                   AND (
-                    projects.account_id = $2
+                    projects.account_id IN (
+                      SELECT owned.id FROM accounts owned
+                      WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                    )
                     OR EXISTS (
                       SELECT 1 FROM project_members pm
                       WHERE pm.project_id = projects.id AND pm.account_id = $2

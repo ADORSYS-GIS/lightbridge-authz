@@ -216,22 +216,39 @@ def ensure_account_and_project(token: str) -> tuple[str, str]:
 
     The IdP refuses login for a subject with no `accounts` row (ADR-0024) and 502s the browser
     callback when the account has no default project -- so this must run before any browser or
-    device approval below. `createAccount` is once-per-subject (409 on replay, tolerated exactly
-    like `servers_it.py`'s `ensure_account`); the project this mints becomes that account's
+    device approval below. Account provisioning is keyed on the ANCHOR account (`id = subject`,
+    ADR-0026 D3) rather than on `createAccount` returning 409 -- since ADR-0026 a replay returns
+    200 and a NEW account, so the old 409 signal would never fire and every re-run would mint a
+    stray one; see `servers_it.py`'s `ensure_account` for the full reasoning. The project this
+    mints becomes that account's
     default project (server-computed `is_default`, AGENTS.md) since accounts provisioned this way
     start with none.
     """
     authz_headers = {"Authorization": f"Bearer {token}"}
+    account_id = account_id_from_token(token)
+    provisioned = False
+    # A read policy FILTERS rather than rejects, so an absent account is a 404, which `urlopen`
+    # raises. Absent is the expected first-run case, not an error.
     try:
+        status, existing = request_rpc(
+            "POST", f"{API_URL}/rpc/model.Account.get", {"id": account_id}, authz_headers
+        )
+        provisioned = (
+            status == 200 and isinstance(existing, dict) and existing.get("id") == account_id
+        )
+    except urllib.error.HTTPError as err:
+        if err.code != 404:
+            raise
+    if provisioned:
+        log(f"anchor account already provisioned; reusing {account_id}")
+    else:
         _, account = request_rpc(
             "POST", f"{API_URL}/rpc/procedure.createAccount", {"args": {}}, authz_headers
         )
-        account_id = account["id"]
-    except urllib.error.HTTPError as err:
-        if err.code != 409:
-            raise
-        account_id = account_id_from_token(token)
-        log(f"account already exists for this subject; reusing {account_id}")
+        assert account["id"] == account_id, (
+            "the first account for a subject must be the anchor, keyed by the subject itself "
+            f"(ADR-0026 D3): got {account['id']}, expected {account_id}"
+        )
 
     billing_identity = f"it-idp-{uuid_hex()}"
     project_id = "c" + uuid_hex()

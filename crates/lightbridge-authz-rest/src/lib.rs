@@ -575,6 +575,7 @@ fn to_schema_account(a: Account) -> schema::Account {
         defaultQuota: a.default_quota,
         status: a.status.to_string(),
         name: a.name,
+        userId: a.user_id,
     }
 }
 
