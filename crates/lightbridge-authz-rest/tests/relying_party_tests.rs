@@ -1978,7 +1978,10 @@ async fn federated_identities_persists_the_plaintext_profile_claim_snapshot(pool
     let repo = repo(pool.clone());
     let subject = "profile-claims-subject";
     repo.create_account(
-        subject,
+        // Same promise the file's other post-ADR-0026 call sites make (lines ~252/~819): in this
+        // test the subject IS the home-account id -- #564 and #565 merged minutes apart and this
+        // #565-added call site missed #564's `&AccountId` migration (main was red at E0308).
+        &AccountId::assert_already_resolved(subject),
         CreateAccount {
             default_quota: None,
             name: None,
