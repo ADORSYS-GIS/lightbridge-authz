@@ -1,5 +1,37 @@
 -- ADR-0026: one identity may own many accounts.
 --
+-- RENUMBERED from 20260830000001 to 20260830000003 by #568, after the fact. Recorded here because
+-- the rename was a pure `git mv` and leaves no trace of why, and because the failure mode is one
+-- the next same-day pair of PRs will hit again.
+--
+-- #565 landed the same day carrying its OWN 20260830000001
+-- (`federated_identities_add_profile_claims`). sqlx keys `_sqlx_migrations` by the numeric
+-- VERSION, not the filename, so two files sharing a prefix collide on `_sqlx_migrations_pkey`:
+-- the second to apply fails with 23505 and aborts the entire migration run. Locally that is every
+-- `sqlx::test` in the workspace dying at setup; in a deployment it is `authz-migrate` failing at
+-- startup, so the stack never comes up at all.
+--
+-- Neither PR's CI could have caught it. Each branch contained only its own migration, so the
+-- collision existed solely in the merge result -- #564 and #565 were both green individually and
+-- `main` went red the moment they met.
+--
+-- WHICH FILE MOVES IS NOT ARBITRARY, and this is the part worth remembering: production had
+-- ALREADY recorded 20260830000001 as #565's migration. A version that some environment has
+-- durably applied cannot be reused or reassigned -- `_sqlx_migrations` is the record of what ran
+-- there, and rewriting a live row's meaning is how you get a database that silently disagrees with
+-- its own schema. THIS file had never been applied anywhere durable, so it is the one that could
+-- safely move. Renumbering is legitimate only under exactly that condition (the same bar ADR-0006
+-- records for its own 20260724 -> 20260727 renumber, where none of the four had ever reached
+-- `main`); when both sides have been applied, the answer is a new forward migration instead.
+--
+-- The same rule constrains this very comment. sqlx stores a CHECKSUM of each migration's bytes in
+-- `_sqlx_migrations` and validates it on every run, so editing an applied migration -- even to add
+-- a comment -- makes the next `authz-migrate` abort with a version mismatch. Adding this text was
+-- only safe because the latest release at the time (v6.0.0, 51cc9cf) predates this file entirely
+-- and the 7.0.0 release PR was still open, so no durable environment had recorded it. Once this
+-- ships, treat the file as frozen: corrections go in ADR-0026 or in the code that reads the
+-- schema, never here.
+--
 -- `accounts.user_id -> users.id` (ADR-0024) has ALWAYS been a 1:N-capable edge -- a plain FK with
 -- a NON-unique index (`idx_accounts_user_id`, 20260825000001:50). What pinned it to exactly one
 -- row on the N side was never the schema; it was this trigger:
