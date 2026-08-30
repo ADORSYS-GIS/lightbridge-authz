@@ -34,6 +34,16 @@ services:
     ports: !reset []
 
   it-authorino:
+    # `profiles` keeps the three IT runners out of a bare `docker compose up`. Without it, the
+    # `just it-*` recipes' `up -d --build` (no service list) starts ALL THREE suites at once, and
+    # they race: every suite provisions a project for the SAME Keycloak subject, so two concurrent
+    # inserts both try to claim that account's default project and one loses on
+    # `projects_account_id_default_uidx` -- surfacing as an opaque `500 rpc error` that looks like
+    # a product bug rather than a harness collision (exactly the parallel-shared-database hazard
+    # AGENTS.md warns about). `docker compose run <service>` enables the named service's own
+    # profiles automatically, so both the `just` recipes and CI's `run --rm --no-deps` keep
+    # working unchanged; CI never relied on `up` starting these (it names services explicitly).
+    profiles: ["it"]
     image: python:3.12-slim
     depends_on:
       authz-api:
@@ -60,6 +70,8 @@ services:
     command: ["python", "/it/authorino_it.py"]
 
   it-servers:
+    # Same `["it"]` profile as `it-authorino` above, for the same reason -- see that comment.
+    profiles: ["it"]
     image: python:3.12-slim
     depends_on:
       authz-api:
@@ -101,6 +113,8 @@ services:
     command: ["python", "/it/servers_it.py"]
 
   it-idp:
+    # Same `["it"]` profile as `it-authorino` above, for the same reason -- see that comment.
+    profiles: ["it"]
     image: python:3.12-slim
     depends_on:
       authz-idp:
