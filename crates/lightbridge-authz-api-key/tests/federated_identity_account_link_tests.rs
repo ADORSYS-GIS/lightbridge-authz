@@ -92,7 +92,7 @@ async fn upsert_federated_identity_adopts_the_account_and_derives_its_user(pool:
     let repo = build_repo(pool.clone());
     let subject = "adopting-subject";
     repo.create_account(
-        subject,
+        &AccountId::assert_already_resolved(subject),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -144,7 +144,7 @@ async fn upsert_federated_identity_refuses_adoption_from_a_non_grandfather_issue
     let repo = build_repo(pool.clone());
     let subject = "not-yet-adopted-subject";
     repo.create_account(
-        subject,
+        &AccountId::assert_already_resolved(subject),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -194,7 +194,7 @@ async fn deleting_the_account_removes_its_federated_identity_but_not_its_user(po
     let repo = build_repo(pool.clone());
     let subject = "deletable-subject";
     repo.create_account(
-        subject,
+        &AccountId::assert_already_resolved(subject),
         CreateAccount {
             default_quota: None,
             name: None,

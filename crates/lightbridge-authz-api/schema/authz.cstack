@@ -181,6 +181,44 @@ model Account {
   // dedicated single-field procedure on a model that is already entirely built out of them, and no
   // new permission.
   name String? @readonly
+  // ADR-0026: the owning person -- `accounts.user_id -> users.id`, the edge ADR-0024 added and
+  // that has always been 1:N-capable (plain FK, non-unique index). What pinned it to 1:1 was the
+  // `accounts_set_user` trigger forcing `NEW.user_id := NEW.id`; relaxed by
+  // `migrations/20260830000001_accounts_owned_by_users.sql`.
+  //
+  // ================= LOAD-BEARING INVARIANT: `accounts.user_id` IS A HOME-ACCOUNT ID ==========
+  // The `@@allow` below compares this against `auth().id`, an ACCOUNT id -- not against some
+  // separate `auth().userId`. That is sound, and it is sound for a reason worth stating, because
+  // the day it stops being true these policies silently authorize the wrong rows:
+  //
+  //   * A person's HOME account (the one `federated_identities` adopts, the ONLY value
+  //     `auth().id` is ever set to) always has `id == subject` AND `user_id == id`. True for
+  //     grandfathered rows (ADR-0024 Q5 backfilled `users.id := accounts.id`) and for every new
+  //     bootstrap account (`create_account` keeps `id = subject` for an identity's FIRST account
+  //     and lets the trigger fill `user_id = id`).
+  //   * A SECOND account gets a minted CUID2 `id` but INHERITS the owner's existing `user_id`.
+  //
+  //   => `accounts.user_id` is always the owner's home-account id, which is always `auth().id`.
+  //
+  // So DO NOT re-key `users.id` to a freshly minted id for new people without also introducing a
+  // real `auth().userId` field and re-pointing these clauses at it. ADR-0024's original design
+  // DID mint a fresh `users.id`; its own 2026-08-25 Correction removed that branch, and this
+  // invariant now depends on it staying removed. Pinned by
+  // `accounts_user_id_is_always_a_home_account_id` (lightbridge-authz-api-key tests).
+  // ============================================================================================
+  //
+  // A plain SCALAR, deliberately NOT a relation. ADR-0024 recorded a measured cratestack codegen
+  // blowup (~51GB RAM, 36 minutes, CI-killed) from a second relation path between two
+  // already-connected models and rejected `Account.user User @relation(...)` for exactly that
+  // reason -- that rejection still stands. A scalar carries none of it, and
+  // `Project.account.userId` traverses only the ONE relation that already exists.
+  //
+  // `@readonly` keeps it out of the generated create/update inputs. Safe here specifically because
+  // `Account` has no generic create verb at all (see the NOTE below) -- `createAccount` is a
+  // procedure with hand-written SQL, which is what actually sets this. On a model that DID have a
+  // generic create, a required `@readonly` column with no DB default would break every insert with
+  // a NOT NULL violation.
+  userId String @readonly
   projects Project[] @relation(fields:[id],references:[accountId])
 
   // NOTE: no `@@allow("create", ...)`. Account creation stays exclusively through the
@@ -203,7 +241,7 @@ model Account {
   // pattern as `model.ApiKey.create`'s NOTE on the `ApiKey` model further down this file.
   @@audit
   @@paged
-  @@allow("read", (id == auth().id) && auth().rpcScope == "crud" && auth().permAccountRead == true)
+  @@allow("read", (userId == auth().id) && auth().rpcScope == "crud" && auth().permAccountRead == true)
 }
 
 model Project {
@@ -303,10 +341,10 @@ model Project {
 
   @@audit
   @@paged
-  @@allow("create", (account.id == auth().id) && auth().rpcScope == "crud" && auth().permProjectCreate == true)
-  @@allow("read", (account.id == auth().id || members.some.accountId == auth().id) && auth().rpcScope == "crud" && auth().permProjectRead == true)
-  @@allow("update", (account.id == auth().id || members.some.accountId == auth().id) && auth().rpcScope == "crud" && auth().permProjectUpdate == true)
-  @@allow("delete", (isDefault != true && account.id == auth().id) && auth().rpcScope == "crud" && auth().permProjectDelete == true)
+  @@allow("create", (account.userId == auth().id) && auth().rpcScope == "crud" && auth().permProjectCreate == true)
+  @@allow("read", (account.userId == auth().id || members.some.accountId == auth().id) && auth().rpcScope == "crud" && auth().permProjectRead == true)
+  @@allow("update", (account.userId == auth().id || members.some.accountId == auth().id) && auth().rpcScope == "crud" && auth().permProjectUpdate == true)
+  @@allow("delete", (isDefault != true && account.userId == auth().id) && auth().rpcScope == "crud" && auth().permProjectDelete == true)
   // Lead-only mutations are NOT expressible as `@@allow` -- same class of problem ADR-0005 hit
   // with account roles: "the member row matching my subject must ALSO have role=lead" is a
   // compound condition on one related row, and cratestack's relation-quantifier policy can't
@@ -387,9 +425,9 @@ model ApiKey {
   @@soft_delete
   @@audit
   @@paged
-  @@allow("read", (project.account.id == auth().id || project.members.some.accountId == auth().id) && auth().rpcScope == "crud" && auth().permApikeyRead == true)
-  @@allow("update", (project.account.id == auth().id || project.members.some.accountId == auth().id) && auth().rpcScope == "crud" && auth().permApikeyUpdate == true)
-  @@allow("delete", (project.account.id == auth().id || project.members.some.accountId == auth().id) && auth().rpcScope == "crud" && auth().permApikeyDelete == true)
+  @@allow("read", (project.account.userId == auth().id || project.members.some.accountId == auth().id) && auth().rpcScope == "crud" && auth().permApikeyRead == true)
+  @@allow("update", (project.account.userId == auth().id || project.members.some.accountId == auth().id) && auth().rpcScope == "crud" && auth().permApikeyUpdate == true)
+  @@allow("delete", (project.account.userId == auth().id || project.members.some.accountId == auth().id) && auth().rpcScope == "crud" && auth().permApikeyDelete == true)
 }
 
 // ADR-0020 Decision 9: `sessions` is a normal cratestack-modelled table (unlike
@@ -523,7 +561,7 @@ model ProjectMember {
   // `Account` deliberately has no `members ProjectMember[]` back-reference for the same reason.
 
   @@paged
-  @@allow("read", accountId == auth().id || project.account.id == auth().id)
+  @@allow("read", accountId == auth().id || project.account.userId == auth().id)
 }
 
 // Stale-tolerant dashboard aggregate only -- explicitly NOT used for any
@@ -573,12 +611,21 @@ mutation procedure rotateApiKey(args: RotateApiKeyInput): ApiKeySecret
 // Server-side account creation (ADR-0003 follow-up; re-scoped by ADR-0006). Replaces the
 // now-denied generic `model.Account.create` verb -- kept as a procedure not because of any
 // membership seeding anymore (ADR-0006 removed account-level membership entirely, so there is no
-// second row to insert transactionally), but because the account `id` is no longer
-// server-generated or caller-supplied: it IS the caller's JWT subject (`auth().id`), read
-// straight off the bearer token, never trusted from the request body. Implemented as
-// hand-written sqlx in the ProcedureRegistry impl (reusing `AuthzStoreImpl::create_account` ->
-// `StoreRepo::create_account`); a second call for the same subject is `Error::Conflict`
-// ("account already exists for this subject"), not an upsert. The caller supplies only
+// second row to insert transactionally), but because the account `id` is never caller-supplied:
+// it is decided server-side, from the acting identity, and never trusted from the request body.
+// Implemented as hand-written sqlx in the ProcedureRegistry impl (reusing
+// `AuthzStoreImpl::create_account` -> `StoreRepo::create_account`).
+//
+// ADR-0026 CHANGED THIS CONTRACT. A second call for the same subject used to be `Error::Conflict`
+// ("account already exists for this subject"); one identity may now own SEVERAL accounts, so a
+// repeat call is an ordinary success returning a NEW account. `Conflict` survives for exactly one
+// case: two concurrent bootstraps racing to create the identity's very first account.
+//
+// Which id the new account gets is decided in `StoreRepo::create_account` and is not arbitrary --
+// the identity's FIRST account keeps `id = subject` because it ANCHORS the identity
+// (`federated_identities` adopts an account by matching `accounts.id == subject`), and every
+// subsequent account gets a minted CUID2 and inherits the owner's `user_id`. See that method's doc
+// comment, and the LOAD-BEARING INVARIANT block on `Account.userId` above. The caller supplies only
 // `defaultQuota` (governance tier for the account's own default-project usage, validated against
 // the operator-configured catalog at write time -- config, not DB; status defaults to 'active' at
 // the DB level).

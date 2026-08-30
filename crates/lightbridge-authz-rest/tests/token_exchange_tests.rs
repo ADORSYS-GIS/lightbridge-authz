@@ -405,7 +405,7 @@ fn repo(pool: PgPool) -> Arc<StoreRepo> {
 
 async fn seed(repo: &StoreRepo) {
     repo.create_account(
-        SUBJECT,
+        &AccountId::assert_already_resolved(SUBJECT),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -436,7 +436,7 @@ async fn seed(repo: &StoreRepo) {
 /// so removing the membership is the only thing that can revoke SUBJECT's access.
 async fn seed_member_project(repo: &StoreRepo) {
     repo.create_account(
-        OWNER_ACCOUNT,
+        &AccountId::assert_already_resolved(OWNER_ACCOUNT),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -445,7 +445,7 @@ async fn seed_member_project(repo: &StoreRepo) {
     .await
     .expect("seed owner account");
     repo.create_account(
-        SUBJECT,
+        &AccountId::assert_already_resolved(SUBJECT),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -1510,7 +1510,7 @@ async fn authorize_refuses_when_requested_project_is_not_authorized_for_the_sess
     bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
     seed(&repo).await;
     repo.create_account(
-        UNRELATED_ACCOUNT,
+        &AccountId::assert_already_resolved(UNRELATED_ACCOUNT),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -2133,7 +2133,7 @@ async fn an_unfederated_subject_and_a_non_member_produce_byte_identical_error_re
     // A second, unrelated project SUBJECT holds no standing on at all.
     let other_owner = format!("other-owner-{}", cuid2());
     repo.create_account(
-        &other_owner,
+        &AccountId::assert_already_resolved(other_owner.clone()),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -2818,7 +2818,7 @@ async fn missing_project_id_with_no_projects_is_denied(pool: PgPool) {
     // separate "ensure default project" bootstrap call), so this subject legitimately has zero
     // projects and therefore no default to fall back to.
     repo.create_account(
-        SUBJECT,
+        &AccountId::assert_already_resolved(SUBJECT),
         CreateAccount {
             default_quota: None,
             name: None,

@@ -57,7 +57,7 @@ async fn seed_owner_and_project(core: Arc<dyn DbPoolTrait>) -> (String, String) 
 
     let owner_account = repo
         .create_account(
-            &owner_subject,
+            &AccountId::assert_already_resolved(owner_subject.clone()),
             CreateAccount {
                 default_quota: None,
                 name: None,

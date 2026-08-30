@@ -19,7 +19,7 @@ async fn test_project_limits_persistence(pool: PgPool) {
     // 1. Create Account
     let account = repo
         .create_account(
-            subject,
+            &AccountId::assert_already_resolved(subject),
             CreateAccount {
                 default_quota: None,
                 name: None,
@@ -104,7 +104,7 @@ async fn test_create_project_without_limits_uses_default(pool: PgPool) {
 
     let account = repo
         .create_account(
-            subject,
+            &AccountId::assert_already_resolved(subject),
             CreateAccount {
                 default_quota: None,
                 name: None,
@@ -143,7 +143,7 @@ async fn test_update_project_clears_allowed_models(pool: PgPool) {
 
     let account = repo
         .create_account(
-            subject,
+            &AccountId::assert_already_resolved(subject),
             CreateAccount {
                 default_quota: None,
                 name: None,

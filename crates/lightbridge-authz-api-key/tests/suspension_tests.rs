@@ -32,7 +32,7 @@ async fn seed_key(
     let account_id = AccountId::assert_already_resolved(subject);
     let account = repo
         .create_account(
-            subject,
+            &AccountId::assert_already_resolved(subject),
             CreateAccount {
                 default_quota: None,
                 name: None,

@@ -257,7 +257,7 @@ impl lightbridge_authz_budget::PolicyEngine for FixedFloorPolicyEngine {
 
 async fn seed(repo: &StoreRepo) {
     repo.create_account(
-        SUBJECT,
+        &AccountId::assert_already_resolved(SUBJECT),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -287,7 +287,7 @@ async fn seed(repo: &StoreRepo) {
 /// `SUBJECT` and a `resolve_context` `NotFound`.
 async fn seed_member_project(repo: &StoreRepo) {
     repo.create_account(
-        OWNER_ACCOUNT,
+        &AccountId::assert_already_resolved(OWNER_ACCOUNT),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -296,7 +296,7 @@ async fn seed_member_project(repo: &StoreRepo) {
     .await
     .expect("seed owner account");
     repo.create_account(
-        SUBJECT,
+        &AccountId::assert_already_resolved(SUBJECT),
         CreateAccount {
             default_quota: None,
             name: None,

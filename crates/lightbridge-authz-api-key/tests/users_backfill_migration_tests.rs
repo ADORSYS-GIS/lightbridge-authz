@@ -21,7 +21,7 @@ use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::CreateAccount;
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::DbPool;
-use lightbridge_authz_core::error::Error;
+use lightbridge_authz_core::identity::AccountId;
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -139,31 +139,120 @@ async fn the_trigger_provisions_a_user_for_an_account_inserted_without_one(pool:
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn create_account_still_works_and_is_still_conflict_on_a_second_call(pool: PgPool) {
+async fn a_second_create_account_is_a_second_row_not_a_conflict(pool: PgPool) {
     let repo = StoreRepo::new(Arc::new(DbPool::from_pool(pool)));
-    let subject = "conflict-subject";
+    let subject = "multi-account-subject";
 
-    let account = repo
+    let first = repo
         .create_account(
-            subject,
+            &AccountId::assert_already_resolved(subject),
             CreateAccount {
                 default_quota: None,
                 name: None,
             },
         )
         .await
-        .expect("StoreRepo::create_account must be unchanged by the accounts_set_user trigger");
-    assert_eq!(account.id, subject);
+        .expect("the first account for an identity must be created");
+    assert_eq!(
+        first.id, subject,
+        "the identity's ANCHOR account keeps `id = subject` -- `federated_identities` adopts an \
+         account by matching exactly this, so minting a CUID2 here would break adoption for every \
+         brand-new signup"
+    );
 
-    let err = repo
+    // ADR-0026: this call used to be `Error::Conflict` on the accounts primary key.
+    let second = repo
         .create_account(
-            subject,
+            &AccountId::assert_already_resolved(subject),
             CreateAccount {
                 default_quota: None,
                 name: None,
             },
         )
         .await
-        .expect_err("a second create_account call for the same subject must still be a conflict");
-    assert!(matches!(err, Error::Conflict(_)));
+        .expect("a second account for the same identity must now succeed");
+
+    assert_ne!(second.id, first.id);
+    assert_ne!(
+        second.id, subject,
+        "a non-anchor account gets a minted id, never the subject"
+    );
+    assert_eq!(
+        second.user_id, first.user_id,
+        "the second account joins the EXISTING person rather than minting a new one"
+    );
+}
+
+/// The invariant every ownership `@@allow` in `authz.cstack` rests on, asserted against the
+/// database rather than against the doc comment that states it: **`accounts.user_id` is always a
+/// HOME-account id**, i.e. always a value `auth().id` can equal.
+///
+/// The policies compare `userId == auth().id` -- an account-id-shaped auth field against the
+/// owner column -- rather than introducing a separate `auth().userId`. That is only sound while
+/// every `accounts.user_id` value is itself the id of an account that owns itself. If someone
+/// re-keys `users.id` to a freshly minted CUID2 for new people (ADR-0024's ORIGINAL design did
+/// exactly that; its 2026-08-25 Correction removed the branch), this test goes red and the
+/// policies would otherwise have started silently matching nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn accounts_user_id_is_always_a_home_account_id(pool: PgPool) {
+    let repo = StoreRepo::new(Arc::new(DbPool::from_pool(pool.clone())));
+
+    for subject in ["invariant-a", "invariant-b"] {
+        for _ in 0..3 {
+            repo.create_account(
+                &AccountId::assert_already_resolved(subject),
+                CreateAccount {
+                    default_quota: None,
+                    name: None,
+                },
+            )
+            .await
+            .expect("account creation must succeed");
+        }
+    }
+
+    let dangling: Vec<(String, String)> = sqlx::query_as(
+        r#"
+        SELECT a.id, a.user_id
+        FROM accounts a
+        WHERE NOT EXISTS (
+            SELECT 1 FROM accounts home
+            WHERE home.id = a.user_id AND home.user_id = home.id
+        )
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("the invariant query must run");
+
+    assert!(
+        dangling.is_empty(),
+        "every accounts.user_id must be the id of a self-owning (home) account, or the \
+         `userId == auth().id` policies stop matching the right rows; offenders: {dangling:?}"
+    );
+
+    // Count DISTINCT owners, not subject-prefixed rows. An earlier version of this filtered on
+    // `id LIKE 'invariant-%'`, which silently excluded the minted-CUID2 rows -- i.e. exactly the
+    // rows that would prove a regression -- and the assertion passed under a mutation that made
+    // every second account mint its own user. Found by mutation testing, not by review.
+    let (owners, accounts, homes): (i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT count(DISTINCT user_id), count(*), count(*) FILTER (WHERE id = user_id)
+        FROM accounts
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("counting owners and home accounts must succeed");
+
+    assert_eq!(accounts, 6, "two identities, three accounts each");
+    assert_eq!(
+        owners, 2,
+        "six accounts must roll up to exactly TWO people -- a second account joins the existing \
+         owner instead of minting one, which is what makes `userId == auth().id` group them"
+    );
+    assert_eq!(
+        homes, 2,
+        "exactly one home account per identity, however many accounts that identity owns"
+    );
 }

@@ -30,6 +30,7 @@
 
 mod common;
 
+use lightbridge_authz_core::identity::AccountId;
 use std::sync::Arc;
 
 use axum::Router;
@@ -620,7 +621,7 @@ async fn crud_authorizes_via_the_federated_account_not_the_raw_subject() {
     let core = core_pool().await;
     let repo = StoreRepo::new(core.clone());
     repo.create_account(
-        &account_id,
+        &AccountId::assert_already_resolved(account_id.clone()),
         lightbridge_authz_core::CreateAccount {
             default_quota: None,
             name: None,
@@ -2674,15 +2675,20 @@ async fn account_name_is_settable_at_creation_and_renameable_afterwards() {
 }
 
 #[tokio::test]
-async fn a_second_account_for_the_same_subject_is_refused() {
-    // Replaces the old `promoting_a_second_account_to_default_frees_the_old_default_for_deletion`.
-    // Since ADR-0006 the account id IS the caller's subject, so there is no second account to
-    // promote and no default-account concept to reassign — a repeat createAccount conflicts.
+async fn a_second_account_for_the_same_subject_is_a_second_account() {
+    // ADR-0026 reverses this test's original assertion. Under ADR-0006 the account id WAS the
+    // caller's subject, so a repeat createAccount collided on the primary key and returned 409;
+    // one identity may now own several accounts, so it returns 200 and a genuinely new row. The
+    // anchor keeps `id = subject`; the second gets a minted id and inherits the anchor's owner.
     let subject = format!("owner-single-acct-{}", cuid2());
     let ctx = setup(admin_bearer(&subject)).await;
     let r = &ctx.router;
 
     let account_id = create_account(r, "admin", "unused").await;
+    assert_eq!(
+        account_id, subject,
+        "the identity's anchor account is keyed by the subject"
+    );
 
     let (status, body) = rpc_call(
         r.clone(),
@@ -2694,8 +2700,51 @@ async fn a_second_account_for_the_same_subject_is_refused() {
     .await;
     assert_eq!(
         status,
-        StatusCode::CONFLICT,
-        "a subject's second createAccount must conflict, not mint a second account: {}",
+        StatusCode::OK,
+        "a subject's second createAccount now mints a second account: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let second = json_body(&body);
+    assert_ne!(second["id"], json!(account_id), "a distinct row");
+    assert_ne!(
+        second["id"],
+        json!(subject),
+        "only the anchor is keyed by the subject"
+    );
+    assert_eq!(
+        second["userId"],
+        json!(subject),
+        "the second account inherits the anchor's owner -- this is what `userId == auth().id` \
+         matches on"
+    );
+
+    // The anchor cannot be deleted while the secondary is still owned (it would strand it).
+    let (status, _) = rpc_call(
+        r.clone(),
+        "procedure.deleteAccountPermanently",
+        Wire::Cbor,
+        &json!({ "args": { "accountId": account_id } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "deleting the anchor while another account is owned must be refused"
+    );
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.deleteAccountPermanently",
+        Wire::Cbor,
+        &json!({ "args": { "accountId": second["id"].as_str().unwrap() } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a secondary account is deletable by its owner: {}",
         String::from_utf8_lossy(&body)
     );
 
@@ -3636,7 +3685,8 @@ async fn viewer_and_editor_can_self_provision_their_own_account() {
         let created = json_body(&body);
         assert_eq!(
             created["id"], subject,
-            "{role}'s created account id must equal their own JWT subject"
+            "{role}'s ANCHOR account id must equal their own JWT subject -- \
+             `federated_identities` adopts by matching exactly this"
         );
 
         let (status, body) = rpc_call(
@@ -3649,10 +3699,16 @@ async fn viewer_and_editor_can_self_provision_their_own_account() {
         .await;
         assert_eq!(
             status,
-            StatusCode::CONFLICT,
-            "{role}'s second createAccount for the same subject must conflict, not mint a \
-             second account: {}",
+            StatusCode::OK,
+            "{role}'s second createAccount now mints a second account (ADR-0026); it used to \
+             conflict on the accounts primary key: {}",
             String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            json_body(&body)["userId"],
+            created["id"],
+            "{role}'s second account must join the person the anchor already established, not \
+             mint a new one"
         );
     }
 }

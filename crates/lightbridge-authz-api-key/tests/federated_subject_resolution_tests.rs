@@ -17,6 +17,7 @@ use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::CreateAccount;
 use lightbridge_authz_core::db::DbPool;
 use lightbridge_authz_core::error::Error;
+use lightbridge_authz_core::identity::AccountId;
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -36,7 +37,7 @@ async fn existing_fi_row_resolves_to_its_account_id(pool: PgPool) {
     let repo = build_repo(pool.clone());
     let account_id = "owning-account";
     repo.create_account(
-        account_id,
+        &AccountId::assert_already_resolved(account_id),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -84,7 +85,7 @@ async fn grandfathered_account_is_adopted_on_first_resolution_and_the_row_persis
     let repo = build_repo(pool.clone());
     let subject = "grandfathered-subject";
     repo.create_account(
-        subject,
+        &AccountId::assert_already_resolved(subject),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -131,7 +132,7 @@ async fn a_second_issuer_presenting_the_same_subject_is_refused_not_merged(pool:
     let repo = build_repo(pool.clone());
     let subject = "shared-subject-value";
     repo.create_account(
-        subject,
+        &AccountId::assert_already_resolved(subject),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -193,7 +194,7 @@ async fn adoption_is_idempotent_under_concurrency(pool: PgPool) {
     let subject = "concurrently-adopted-subject";
     repo_a
         .create_account(
-            subject,
+            &AccountId::assert_already_resolved(subject),
             CreateAccount {
                 default_quota: None,
                 name: None,

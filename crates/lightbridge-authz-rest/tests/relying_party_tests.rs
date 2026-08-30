@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 #![cfg(feature = "it-tests")]
 
+use lightbridge_authz_core::identity::AccountId;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -248,7 +249,7 @@ async fn verified_keycloak_callback_transitions_pending_device_code_to_approved(
     // ADR-0024 Correction (2026-08-25): upsert_federated_identity now refuses a subject with no
     // pre-existing account, so this callback's identity must have one to adopt.
     repo.create_account(
-        "keycloak-subject",
+        &AccountId::assert_already_resolved("keycloak-subject"),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -815,7 +816,7 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
         .await;
     let repo = repo(pool.clone());
     repo.create_account(
-        "keycloak-subject",
+        &AccountId::assert_already_resolved("keycloak-subject"),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -848,7 +849,7 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
         .unwrap()
         .unwrap();
     repo.create_account(
-        "other-subject",
+        &AccountId::assert_already_resolved("other-subject"),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -1057,7 +1058,7 @@ async fn suspended_account_is_refused_a_browser_session(pool: PgPool) {
         .await;
     let repo = repo(pool.clone());
     repo.create_account(
-        "suspended-subject",
+        &AccountId::assert_already_resolved("suspended-subject"),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -1189,7 +1190,7 @@ async fn inactive_project_is_refused_a_browser_session(pool: PgPool) {
         .await;
     let repo = repo(pool.clone());
     repo.create_account(
-        "inactive-project-subject",
+        &AccountId::assert_already_resolved("inactive-project-subject"),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -1330,7 +1331,7 @@ async fn browser_session_persists_the_real_authenticated_member_subject(pool: Pg
         .await;
     let repo = repo(pool.clone());
     repo.create_account(
-        "owner-subject",
+        &AccountId::assert_already_resolved("owner-subject"),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -1339,7 +1340,7 @@ async fn browser_session_persists_the_real_authenticated_member_subject(pool: Pg
     .await
     .unwrap();
     repo.create_account(
-        "member-subject",
+        &AccountId::assert_already_resolved("member-subject"),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -1481,7 +1482,7 @@ async fn browser_session_subject_is_the_acting_account_not_the_keycloak_sub(pool
     let account_id = "federated-target-account";
     let raw_keycloak_sub = "kc-raw-sub-differs-from-account";
     repo.create_account(
-        account_id,
+        &AccountId::assert_already_resolved(account_id),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -1675,7 +1676,7 @@ async fn device_pairing_callback_persists_a_federated_identity_for_an_existing_a
     mock_discovery_and_jwks(&keycloak, &key).await;
     let repo = repo(pool.clone());
     repo.create_account(
-        "keycloak-subject",
+        &AccountId::assert_already_resolved("keycloak-subject"),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -1823,7 +1824,7 @@ async fn browser_sso_callback_persists_the_same_federated_identity(pool: PgPool)
     let repo = repo(pool.clone());
     let subject = "browser-federation-subject";
     repo.create_account(
-        subject,
+        &AccountId::assert_already_resolved(subject),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -1916,7 +1917,7 @@ async fn stored_token_envelope_is_not_plaintext_at_rest(pool: PgPool) {
     mock_discovery_and_jwks(&keycloak, &key).await;
     let repo = repo(pool.clone());
     repo.create_account(
-        "keycloak-subject",
+        &AccountId::assert_already_resolved("keycloak-subject"),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -2000,7 +2001,7 @@ async fn token_envelope_does_not_open_under_the_state_encryption_key(pool: PgPoo
     mock_discovery_and_jwks(&keycloak, &key).await;
     let repo = repo(pool.clone());
     repo.create_account(
-        "keycloak-subject",
+        &AccountId::assert_already_resolved("keycloak-subject"),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -2075,7 +2076,7 @@ async fn a_second_login_updates_the_same_federated_identity_row_and_reseals(pool
     let repo = repo(pool.clone());
     let subject = "reseal-subject";
     repo.create_account(
-        subject,
+        &AccountId::assert_already_resolved(subject),
         CreateAccount {
             default_quota: None,
             name: None,
@@ -2267,7 +2268,7 @@ async fn a_second_issuer_with_a_colliding_subject_is_refused_not_merged(pool: Pg
     let repo = repo(pool.clone());
     let subject = "colliding-subject";
     repo.create_account(
-        subject,
+        &AccountId::assert_already_resolved(subject),
         CreateAccount {
             default_quota: None,
             name: None,
