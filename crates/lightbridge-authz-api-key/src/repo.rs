@@ -1145,7 +1145,7 @@ impl StoreRepo {
             INSERT INTO exchange_refresh_tokens
               (id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at
+            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at, rotated_at, successor_id
             "#,
         )
         .bind(input.id)
@@ -1177,7 +1177,7 @@ impl StoreRepo {
     ) -> Result<Option<ExchangeRefreshTokenRow>> {
         let row = sqlx::query_as(
             r#"
-            SELECT id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at
+            SELECT id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at, rotated_at, successor_id
             FROM exchange_refresh_tokens
             WHERE token_hash = $1
               AND status = 'active'
@@ -1204,7 +1204,7 @@ impl StoreRepo {
     ) -> Result<Option<ExchangeRefreshTokenRow>> {
         let row = sqlx::query_as(
             r#"
-            SELECT id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at
+            SELECT id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at, rotated_at, successor_id
             FROM exchange_refresh_tokens
             WHERE token_hash = $1
             "#,
@@ -1247,23 +1247,35 @@ impl StoreRepo {
     /// (`create_exchange_refresh_token`, driving `RefreshTokenStore::store_token`) -- the trait
     /// splits "atomically revoke" from "store a new one" into two methods, so this mirrors that
     /// shape rather than reintroducing the old single-transaction combo.
+    ///
+    /// Also stamps `rotated_at = $2` and `successor_id = $3` in the SAME statement (refresh-reuse
+    /// grace window, migration `20260830000004_exchange_refresh_tokens_add_reuse_grace.sql`, added
+    /// after the 2026-08-30 console-401s incident -- see that migration's doc comment). `successor
+    /// _id` is the id of the row about to be minted by the caller's own follow-up
+    /// `create_exchange_refresh_token` call; the caller generates it BEFORE calling this method
+    /// specifically so it can be recorded here atomically, rather than only existing after a
+    /// second, separate `INSERT` this method has no transaction spanning into. Pass `None` when
+    /// the caller has no successor to record (e.g. the generic `RefreshTokenStore::consume_token`
+    /// path, which only ever consumes -- it never mints a replacement row itself).
     pub async fn consume_exchange_refresh_token(
         &self,
         presented_hash: &str,
         now: DateTime<Utc>,
+        successor_id: Option<&str>,
     ) -> Result<Option<ExchangeRefreshTokenRow>> {
         let row: Option<ExchangeRefreshTokenRow> = sqlx::query_as(
             r#"
             UPDATE exchange_refresh_tokens
-            SET status = 'rotated', last_used_at = $2
+            SET status = 'rotated', last_used_at = $2, rotated_at = $2, successor_id = $3
             WHERE token_hash = $1
               AND status = 'active'
               AND expires_at > $2
-            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at
+            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at, rotated_at, successor_id
             "#,
         )
         .bind(presented_hash)
         .bind(now)
+        .bind(successor_id)
         .fetch_optional(self.pool())
         .await?;
         Ok(row)

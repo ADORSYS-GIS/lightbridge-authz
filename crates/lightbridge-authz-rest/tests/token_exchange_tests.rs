@@ -225,6 +225,7 @@ fn exchange_cfg() -> Oauth2TokenExchange {
             "offline_access".to_string(),
         ],
         refresh_absolute_ttl_seconds: 7_776_000,
+        refresh_reuse_grace_seconds: 30,
         device_code_ttl_seconds: 600,
         device_poll_interval_seconds: 5,
         device_verification_uri: "https://authz.example.test/device/verify".to_string(),
@@ -617,6 +618,25 @@ fn state(repo: Arc<StoreRepo>, active: bool) -> TokenExchangeState {
         Arc::new(MockBearer::new(active, vec![PUBLIC_CLIENT_ID.to_string()])),
         vec![public_client(PUBLIC_CLIENT_ID)],
         &redis_url(),
+    )
+}
+
+/// Same as [`state`], but with `refresh_reuse_grace_seconds: 0` -- the refresh-reuse grace window
+/// (2026-08-30 console-401s incident, `Oauth2TokenExchange::refresh_reuse_grace_seconds`'s own doc
+/// comment) disabled. Tests that assert an IMMEDIATE replay of a just-rotated token cascades (the
+/// pre-incident, strict RFC 6819 §5.2.2.3 behavior) use this instead of [`state`]: `exchange_cfg`'s
+/// real default (30s) would otherwise put that immediate replay INSIDE the grace window and turn
+/// the cascade this file is asserting into a graced, 200 OK rotation instead.
+fn state_no_reuse_grace(repo: Arc<StoreRepo>, active: bool) -> TokenExchangeState {
+    state_with_cfg(
+        repo,
+        Arc::new(MockBearer::new(active, vec![PUBLIC_CLIENT_ID.to_string()])),
+        vec![public_client(PUBLIC_CLIENT_ID)],
+        &redis_url(),
+        Oauth2TokenExchange {
+            refresh_reuse_grace_seconds: 0,
+            ..exchange_cfg()
+        },
     )
 }
 
@@ -2961,6 +2981,11 @@ async fn missing_project_id_with_no_projects_is_denied(pool: PgPool) {
     assert_eq!(body["error"], "access_denied");
 }
 
+/// Uses [`state_no_reuse_grace`], not [`state`]: the final replay below is presented immediately
+/// after rotation, which the real default `refresh_reuse_grace_seconds` (30s) would treat as a
+/// graced replay (200 OK, a fresh pair) rather than the strict `invalid_grant` this test asserts
+/// -- see `refresh_reuse_grace_within_window_mints_a_fresh_pair_without_cascading` and friends,
+/// below, for the grace-window behavior itself.
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_rotates_and_rejects_replay(pool: PgPool) {
     let repo = repo(pool);
@@ -2968,7 +2993,7 @@ async fn refresh_rotates_and_rejects_replay(pool: PgPool) {
     seed(&repo).await;
 
     let (status, body) = post_token(
-        state(repo.clone(), true),
+        state_no_reuse_grace(repo.clone(), true),
         &format!(
             "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
         ),
@@ -2978,7 +3003,7 @@ async fn refresh_rotates_and_rejects_replay(pool: PgPool) {
     let first_refresh = body["refresh_token"].as_str().unwrap().to_string();
 
     let (status, body) = post_token(
-        state(repo.clone(), true),
+        state_no_reuse_grace(repo.clone(), true),
         &format!(
             "grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={first_refresh}"
         ),
@@ -3001,7 +3026,7 @@ async fn refresh_rotates_and_rejects_replay(pool: PgPool) {
     assert_eq!(claims.account_id, ACCOUNT_ID);
 
     let (status, body) = post_token(
-        state(repo.clone(), true),
+        state_no_reuse_grace(repo.clone(), true),
         &format!(
             "grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={first_refresh}"
         ),
@@ -3914,7 +3939,9 @@ async fn refresh_after_account_suspended_is_invalid_grant(pool: PgPool) {
 /// Gap 3 (reuse cascade): replaying a token that was already rotated must revoke the WHOLE chain,
 /// not just reject the replay -- the newer, still-live successor must stop working too. This is
 /// the RFC 6819 §5.2.2.3 behavior the single-use CAS alone does not provide (it only ever rejects
-/// the presented token, never touches what superseded it).
+/// the presented token, never touches what superseded it). Uses [`state_no_reuse_grace`] -- the
+/// replay below is immediate, which the real default grace window would treat as benign, not
+/// theft; see that helper's doc comment.
 #[sqlx::test(migrations = "../../migrations")]
 async fn replaying_a_rotated_refresh_token_revokes_the_whole_chain(pool: PgPool) {
     let repo = repo(pool);
@@ -3922,7 +3949,7 @@ async fn replaying_a_rotated_refresh_token_revokes_the_whole_chain(pool: PgPool)
     seed(&repo).await;
 
     let (status, body) = post_token(
-        state(repo.clone(), true),
+        state_no_reuse_grace(repo.clone(), true),
         &format!(
             "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
         ),
@@ -3932,7 +3959,7 @@ async fn replaying_a_rotated_refresh_token_revokes_the_whole_chain(pool: PgPool)
     let first = body["refresh_token"].as_str().unwrap().to_string();
 
     let (status, body) = post_token(
-        state(repo.clone(), true),
+        state_no_reuse_grace(repo.clone(), true),
         &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={first}"),
     )
     .await;
@@ -3941,7 +3968,7 @@ async fn replaying_a_rotated_refresh_token_revokes_the_whole_chain(pool: PgPool)
 
     // Replay the SUPERSEDED (already-rotated) first token.
     let (status, body) = post_token(
-        state(repo.clone(), true),
+        state_no_reuse_grace(repo.clone(), true),
         &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={first}"),
     )
     .await;
@@ -3954,7 +3981,7 @@ async fn replaying_a_rotated_refresh_token_revokes_the_whole_chain(pool: PgPool)
 
     // The newer, previously-valid token must now be dead too -- the whole chain was revoked.
     let (status, body) = post_token(
-        state(repo.clone(), true),
+        state_no_reuse_grace(repo.clone(), true),
         &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={second}"),
     )
     .await;
@@ -4003,6 +4030,261 @@ async fn unknown_refresh_token_is_invalid_grant_without_cascading(pool: PgPool) 
         StatusCode::OK,
         "an unrecognized refresh token must not revoke an unrelated, real chain: {body}"
     );
+}
+
+// ============================================================================================
+// Refresh-reuse grace window (2026-08-30 console-401s incident): a replay of a just-rotated
+// token, presented within `refresh_reuse_grace_seconds` of its own `rotated_at`, must NOT trigger
+// gap 3's cascade -- it must mint a fresh, independent access+refresh pair instead. See
+// `TokenExchangeOpStore::classify_replayed_refresh_token`'s doc comment for the full design,
+// including why this is a SECOND live leaf on the chain rather than a replay of the first
+// rotation's own response.
+// ============================================================================================
+
+/// The core grace-window behavior: replaying `first` immediately after it rotated to `second`
+/// (well within the real default `refresh_reuse_grace_seconds: 30`, via plain [`state`]) succeeds
+/// with a brand-new pair, AND -- the part that distinguishes this from the pre-incident cascade --
+/// `second` (the original rotation's successor) is still live afterward. If the graced replay had
+/// cascaded like an out-of-window one, `second` would be dead too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn refresh_reuse_within_grace_window_mints_a_fresh_pair_without_cascading(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let first = body["refresh_token"].as_str().unwrap().to_string();
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={first}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let second = body["refresh_token"].as_str().unwrap().to_string();
+
+    // Replay `first` immediately -- inside the grace window.
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={first}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a replay within the grace window must succeed with a fresh pair, not cascade: {body}"
+    );
+    let third = body["refresh_token"]
+        .as_str()
+        .expect("a graced replay must still mint a refresh token")
+        .to_string();
+    assert_ne!(third, first, "the graced replay's own token must be fresh");
+    assert_ne!(
+        third, second,
+        "the graced replay must mint its OWN successor, not reissue the original rotation's"
+    );
+    let claims = verify_access_token(
+        &repo,
+        body["access_token"].as_str().unwrap(),
+        PUBLIC_CLIENT_ID,
+    )
+    .await;
+    assert_eq!(claims.project_id, PROJECT_ID);
+    assert_eq!(claims.account_id, ACCOUNT_ID);
+
+    // The chain must NOT have been cascaded: `second`, the original rotation's successor, is
+    // still live.
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={second}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a graced replay must not revoke the chain -- the earlier successor must still work: {body}"
+    );
+}
+
+/// The other half of the design: a replay presented AFTER the grace window has elapsed is not
+/// forgiven -- gap 3's full cascade still applies, exactly as it did before this feature existed.
+/// Uses a trivially short `refresh_reuse_grace_seconds: 1` (mirroring how
+/// `refresh_after_absolute_cap_is_invalid_grant` makes its own TTL reachable) so the window can be
+/// exceeded with a short, deterministic sleep instead of a mocked clock.
+#[sqlx::test(migrations = "../../migrations")]
+async fn refresh_reuse_outside_grace_window_still_cascades(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let cfg = Oauth2TokenExchange {
+        refresh_reuse_grace_seconds: 1,
+        ..exchange_cfg()
+    };
+    let state = || {
+        state_with_cfg(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![PUBLIC_CLIENT_ID.to_string()])),
+            vec![public_client(PUBLIC_CLIENT_ID)],
+            &redis_url(),
+            cfg.clone(),
+        )
+    };
+
+    let (status, body) = post_token(
+        state(),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let first = body["refresh_token"].as_str().unwrap().to_string();
+
+    let (status, body) = post_token(
+        state(),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={first}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let second = body["refresh_token"].as_str().unwrap().to_string();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    // Replay `first` AFTER its 1-second grace window has elapsed.
+    let (status, body) = post_token(
+        state(),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={first}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a replay past the grace window must still be refused: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+
+    // And the cascade must still have fired: `second` is dead too.
+    let (status, body) = post_token(
+        state(),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={second}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a replay outside the grace window must still cascade-revoke the chain: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+}
+
+/// `refresh_reuse_grace_seconds: 0` must reproduce today's pre-incident strict behavior exactly:
+/// even an IMMEDIATE replay (age effectively 0 seconds) cascades, because `0` disables the grace
+/// window rather than granting a zero-width one. This is what every other reuse-cascade test in
+/// this file relies on via [`state_no_reuse_grace`]; this test asserts it directly, once, as its
+/// own point.
+#[sqlx::test(migrations = "../../migrations")]
+async fn refresh_reuse_grace_disabled_cascades_on_immediate_replay(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state_no_reuse_grace(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let first = body["refresh_token"].as_str().unwrap().to_string();
+
+    let (status, body) = post_token(
+        state_no_reuse_grace(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={first}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Replay `first` with NO delay at all -- `grace_seconds: 0` must still refuse it.
+    let (status, body) = post_token(
+        state_no_reuse_grace(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={first}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "grace_seconds: 0 must disable the grace window entirely, not grant a zero-width one: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+}
+
+/// Two racing pods can each replay the same rotated token during the same window (the actual
+/// 2026-08-30 incident shape, generalized: nothing bounds this to exactly one extra replay).
+/// Replaying `first` TWICE in a row, both within the grace window, must succeed both times, each
+/// minting its own independent successor.
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_sequential_graced_replays_of_the_same_token_each_succeed(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let first = body["refresh_token"].as_str().unwrap().to_string();
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={first}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let second = body["refresh_token"].as_str().unwrap().to_string();
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={first}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the first graced replay must succeed: {body}"
+    );
+    let third = body["refresh_token"].as_str().unwrap().to_string();
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={first}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a SECOND graced replay of the same original token must also succeed: {body}"
+    );
+    let fourth = body["refresh_token"].as_str().unwrap().to_string();
+
+    assert_ne!(
+        third, fourth,
+        "each graced replay must mint its own successor"
+    );
+    assert_ne!(second, third);
+    assert_ne!(second, fourth);
 }
 
 /// Migration backfill (`20260815000001_exchange_refresh_tokens_add_chain`): a row created under
@@ -5066,7 +5348,7 @@ async fn introspecting_a_self_signed_access_token_with_azp_mismatch_is_inactive(
 
 // ============================================================================================
 // Composition: this file's own RFC 7009 revoke path vs. the reuse-detection cascade
-// (`TokenExchangeOpStore::revoke_chain_on_reuse`, hardening PR #316). The two mechanisms flip
+// (`TokenExchangeOpStore::classify_replayed_refresh_token`, hardening PR #316). The two mechanisms flip
 // `status` on the SAME rows via DIFFERENT triggers (explicit client action vs. automatic replay
 // detection), so it is worth proving directly, not just by inspection, that neither confuses the
 // other: an explicit revoke is never mistaken for a "stolen token" signal, and the cascade's own
@@ -5078,21 +5360,22 @@ async fn introspecting_a_self_signed_access_token_with_azp_mismatch_is_inactive(
 /// Sequence: exchange (token1, chain born) -> refresh (token1 rotates to token2) -> explicitly
 /// revoke token2 via `/oauth2/revoke` (the chain now has ZERO active rows: token1 is `rotated`,
 /// token2 is `revoked`) -> replay the older, already-rotated token1. `consume_exchange_refresh_
-/// token`'s CAS fails (token1 isn't `active`), `revoke_chain_on_reuse` fires because token1's
-/// status is `rotated`, and `revoke_exchange_refresh_token_chain`'s `WHERE status = 'active'`
-/// update matches nothing -- a documented no-op, not an error. The replay must still be a clean
-/// `400 invalid_grant`, proving the cascade composes safely with a chain this file's own revoke
-/// path already fully drained.
+/// token`'s CAS fails (token1 isn't `active`), `classify_replayed_refresh_token` cascades because
+/// token1's status is `rotated` and (via [`state_no_reuse_grace`]) the grace window is disabled,
+/// and `revoke_exchange_refresh_token_chain`'s `WHERE status = 'active'` update matches nothing --
+/// a documented no-op, not an error. The replay must still be a clean `400 invalid_grant`, proving
+/// the cascade composes safely with a chain this file's own revoke path already fully drained.
 #[sqlx::test(migrations = "../../migrations")]
 async fn reuse_cascade_is_a_clean_noop_on_a_chain_already_drained_by_explicit_revoke(pool: PgPool) {
     let repo = repo(pool);
     bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
     seed(&repo).await;
 
-    let token1 = issue_refresh_token(state(repo.clone(), true), PUBLIC_CLIENT_ID).await;
+    let token1 =
+        issue_refresh_token(state_no_reuse_grace(repo.clone(), true), PUBLIC_CLIENT_ID).await;
 
     let (status, body) = post_token(
-        state(repo.clone(), true),
+        state_no_reuse_grace(repo.clone(), true),
         &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={token1}"),
     )
     .await;
@@ -5102,17 +5385,18 @@ async fn reuse_cascade_is_a_clean_noop_on_a_chain_already_drained_by_explicit_re
     // Explicitly revoke the chain's current (only active) tip via this file's own RFC 7009
     // endpoint -- NOT via rotation. The chain now has no `active` row at all.
     let (status, body) = post_revoke(
-        state(repo.clone(), true),
+        state_no_reuse_grace(repo.clone(), true),
         &format!("token={token2}&client_id={PUBLIC_CLIENT_ID}"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
 
-    // Replay the OLDER, already-rotated token1 -- this is what makes `revoke_chain_on_reuse`
-    // fire (its trigger is `status == "rotated"`, which token1 satisfies regardless of what has
-    // since happened to the rest of its chain).
+    // Replay the OLDER, already-rotated token1 -- this is what makes
+    // `classify_replayed_refresh_token` cascade (its trigger is `status == "rotated"` outside the
+    // grace window, which token1 satisfies regardless of what has since happened to the rest of
+    // its chain).
     let (status, body) = post_token(
-        state(repo.clone(), true),
+        state_no_reuse_grace(repo.clone(), true),
         &format!("grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={token1}"),
     )
     .await;
@@ -5126,8 +5410,9 @@ async fn reuse_cascade_is_a_clean_noop_on_a_chain_already_drained_by_explicit_re
 }
 
 /// The other direction: an explicitly-revoked token (never rotated -- a single-member chain) is
-/// NOT treated as a reuse-of-a-stolen-token signal when replayed. `revoke_chain_on_reuse` only
-/// cascades when the presented token's own row has `status == "rotated"`; an explicit
+/// NOT treated as a reuse-of-a-stolen-token signal when replayed. `classify_replayed_refresh_token`
+/// only cascades (or grants a grace) when the presented token's own row has `status == "rotated"`;
+/// an explicit
 /// `/oauth2/revoke` call sets `status = "revoked"`, a different value, so replaying it must be a
 /// plain `invalid_grant` with no cascade side effects -- verified here by confirming a second,
 /// completely unrelated chain for the SAME subject is untouched by the replay attempt.
@@ -6372,7 +6657,9 @@ async fn authorization_code_grant_stamps_the_same_enforcement_claims_as_the_othe
 /// #525: the browser grant must yield a rotating refresh token when `offline_access` is granted,
 /// and the superseded token must be refused on reuse -- the same single-use CAS + RFC 6819
 /// §5.2.2.3 cascade the device and exchange grants already get, because all three now mint
-/// through `mint_human_plane_tokens`.
+/// through `mint_human_plane_tokens`. `refresh_reuse_grace_seconds: 0` -- the final replay below
+/// is immediate, which the real default grace window would treat as benign rather than the refusal
+/// this test asserts; see [`state_no_reuse_grace`]'s doc comment.
 #[sqlx::test(migrations = "../../migrations")]
 async fn authorization_code_grant_issues_a_rotating_refresh_token(pool: PgPool) {
     const CLIENT: &str = "browser-client";
@@ -6393,11 +6680,15 @@ async fn authorization_code_grant_issues_a_rotating_refresh_token(pool: PgPool) 
     .await;
 
     let state = || {
-        state_with(
+        state_with_cfg(
             repo.clone(),
             Arc::new(MockBearer::new(true, vec![])),
             vec![browser_client(CLIENT, REDIRECT_URI)],
             &redis_url(),
+            Oauth2TokenExchange {
+                refresh_reuse_grace_seconds: 0,
+                ..exchange_cfg()
+            },
         )
     };
 
