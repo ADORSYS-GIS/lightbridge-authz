@@ -522,16 +522,53 @@ mimalloc = "0"
 # `undefined`-vs-`null` normalization, the migration generator, or `push_scoped_conditions` --
 # confirmed by grepping cratestack's own CHANGELOG.md for those terms across the 0.8.11-0.8.12 range
 # (zero matches) in addition to reading both features' full changelog prose.
-cratestack-core = "=0.8.12"
-cratestack-axum = "=0.8.12"
-cratestack-redis = "=0.8.12"
+#
+# BUMPED (2026-08-30, cratestack 0.8.12 -> 0.9.4). Verified against crates.io that all six package
+# names below actually publish 0.9.4 (`curl -s https://crates.io/api/v1/crates/<pkg>/versions`) --
+# this is a real Rust-family release, not just an npm/codegen-toolchain version. Note 0.9.0 does NOT
+# exist on crates.io: per cratestack's own CHANGELOG.md ("Released as 0.9.1, not 0.9.0"), v0.9.0 was
+# tagged and its GitHub Release cut, but a publish pre-flight gate (added the same cycle) caught that
+# nothing had actually reached any registry and blocked it; 0.9.1 is the real first 0.9.x publish, so
+# crates.io jumps 0.8.15 -> 0.9.1 directly, same shape as the earlier 0.8.7->0.8.9 gap.
+#
+# Read cratestack's full CHANGELOG.md for every entry between 0.8.12 and 0.9.4 (0.8.13/0.8.14/0.8.15
+# have real per-version headers; 0.9.1-0.9.4's entries are all still squashed under that changelog's
+# own "Unreleased" heading as of this bump, ungrouped by version -- upstream's changelog-splitting
+# lags its actual crates.io publishes). Every Rust/backend-facing breaking entry in that range was
+# checked against this repo and is a no-op here, confirmed by grep returning zero matches unless
+# noted:
+#   - #742 `@@unique`/`@@index` gain `where: "<sql predicate>"` (partial index DDL), breaking for
+#     `cratestack_core::schema::composite_unique::parse_composite_unique_attribute` callers -- this
+#     repo never calls that function directly (grep for `@@unique`/`@@index` and the function name:
+#     zero matches).
+#   - #741 `ConflictTarget` gains a partial-index variant, breaking for exhaustive external matches --
+#     grep for `ConflictTarget`: zero matches, nothing here pattern-matches it.
+#   - #745 `.upsert(..).run(..)` no longer reports `Created` for an update it lost a race on -- grep
+#     for `.upsert(`: zero matches, this repo doesn't use cratestack's upsert builder.
+#   - #743 `@@internal("action")` route suppression -- new opt-in attribute; `authz.cstack` has no
+#     `@@internal` (zero matches), so nothing is newly suppressed.
+#   - #747 `CRATESTACK_REQUIRE_DB` now fails when no DB backend is configured -- this repo always
+#     configures a Postgres backend, so the new failure mode is unreachable.
+#   - #666 read policies gain `in`/`not in` set-membership comparisons -- purely additive new syntax,
+#     `authz.cstack` doesn't use it and doesn't need to.
+# Everything else in the range (0.9.x's own "Dependency and toolchain audit" -- sqlx 0.8.6->0.9.0,
+# minicbor 2.3, sha2 0.11, tower-http 0.7, etc.) is internal to cratestack's own build, not
+# API-surface-facing: this workspace already pins `sqlx = "0.9"` and `minicbor = "2.3"` directly
+# above, so nothing here forces a change to either. No touch found (grepping the same terms as the
+# 0.8.11-0.8.12 check above) to `@@allow`/`@allow` policy evaluation, `LenientCborCodec`/the
+# `undefined`-vs-`null` CBOR normalization, the migration generator, `push_scoped_conditions`,
+# `AuthProvider`/`CachedAuthProvider`, or `/rpc/batch` dispatch -- the RPC-batch-auth seam this pin
+# block's FOURTH OCCURRENCE/RESOLVED history is about is untouched between 0.8.12 and 0.9.4.
+cratestack-core = "=0.9.4"
+cratestack-axum = "=0.9.4"
+cratestack-redis = "=0.9.4"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
 # `include_server_schema!` macro emits `::cratestack::*` paths (see cratestack-pg lib docs). The
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
 # it to build the RPC router (ADR-0003).
-cratestack = { package = "cratestack-pg", version = "=0.8.12" }
-cratestack-codec-cbor = "=0.8.12"
-cratestack-codec-json = "=0.8.12"
+cratestack = { package = "cratestack-pg", version = "=0.9.4" }
+cratestack-codec-cbor = "=0.9.4"
+cratestack-codec-json = "=0.9.4"
 # Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
