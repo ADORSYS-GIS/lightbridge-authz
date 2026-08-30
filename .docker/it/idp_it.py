@@ -1029,10 +1029,16 @@ def section_revocation(device_refresh_token: str) -> None:
 # --- 11. UserInfo + RP-Initiated Logout -------------------------------------------------------
 
 
-def section_userinfo(browser_access_token: str) -> None:
+def section_userinfo(browser_access_token: str, no_email_scope_access_token: str) -> None:
     """OIDC Core §5.3. The important assertion is the NEGATIVE one: authorization data must not be
     reachable through this endpoint. `budget_tier`/`quota_tier`/roles all sit one `claims.get`
-    away in the same token, so nothing but a deliberate allow-list keeps them out."""
+    away in the same token, so nothing but a deliberate allow-list keeps them out.
+
+    `no_email_scope_access_token` is the token-exchange token from `section_token_exchange`, minted
+    with `openid offline_access` and no `email` scope. It is the scope gate's real end-to-end
+    negative: unlike the browser token it DOES carry an `email` claim (that grant decodes it
+    straight off the presented Keycloak token), so the only thing that can keep it out of the
+    response is `scope_grants_email` actually running."""
     status, body, _ = http_json(
         "GET",
         f"{IDP_URL}/oauth2/userinfo",
@@ -1043,21 +1049,19 @@ def section_userinfo(browser_access_token: str) -> None:
     assert body.get("account_id") and body.get("project_id"), (
         f"userinfo must carry this deployment's tenant context: {body}"
     )
-    # KNOWN GAP, pinned deliberately rather than asserted away. A browser (authorization_code)
-    # login mints `email: None` at source -- `mint_from_authorization_code` says so outright:
-    # "the code's stored identity carries no email, so these stay `None` rather than being
-    # invented". The upstream email IS available, sealed in
-    # `federated_identities.token_envelope` (ADR-0024's ID-token claims snapshot); nothing on the
-    # /authorize -> code -> token path opens it. So UserInfo cannot return an email for the
-    # console's own users, even though they granted the `email` scope.
-    #
-    # This assertion is a TRIPWIRE: wiring that snapshot through will turn it red, which is the
-    # point -- the fix must come with this line and the `email` scope gating being re-checked
-    # together. The device/token-exchange path is unaffected (it decodes email straight off the
-    # presented Keycloak token), so this is specifically the browser leg.
-    assert "email" not in body, (
-        "a browser-login token now carries email -- if that was intentional, update this "
-        f"assertion and confirm the email scope actually gates it: {body}"
+    # Was a TRIPWIRE pinning a known gap: a browser (authorization_code) login used to mint
+    # `email: None` at source, so UserInfo could never return an email for the console's own users
+    # even though they granted the `email` scope. `authorize::issue_code` now opens the sealed
+    # ID-token claims snapshot (ADR-0024's `federated_identities.token_envelope`) and stamps the
+    # pair onto the authorization code's identity, so the browser leg carries what the device and
+    # token-exchange legs always did. `USERNAME`'s realm user is seeded with its username as its
+    # email (`.docker/keycloak_config/realm.json`), which is what makes this an exact-match
+    # assertion rather than a presence check -- a wrong-person email would pass a presence check.
+    assert body.get("email") == USERNAME, (
+        f"userinfo must return the email sealed at login for {USERNAME}: {body}"
+    )
+    assert body.get("email_verified") is True, (
+        f"userinfo must return email_verified for a realm-verified user: {body}"
     )
     for authorization_claim in (
         "budget_tier",
@@ -1070,6 +1074,28 @@ def section_userinfo(browser_access_token: str) -> None:
             f"userinfo leaked authorization data ({authorization_claim}): {body}"
         )
     log("userinfo returns identity claims and no authorization data")
+
+    # The other half of the email fix: possession of the token is not the grant. This token's own
+    # claims contain `email`, and UserInfo must still withhold it, because the grant it was minted
+    # under never asked for the `email` scope (OIDC Core §5.4). Unit-covered by
+    # `email_claims_require_the_email_scope` in
+    # `crates/lightbridge-authz-rest/tests/userinfo_tests.rs`; asserted here against a
+    # really-minted token so a scope string that never reaches the `scope` claim is still caught.
+    status, scopeless_body, _ = http_json(
+        "GET",
+        f"{IDP_URL}/oauth2/userinfo",
+        headers={"Authorization": f"Bearer {no_email_scope_access_token}"},
+    )
+    assert status == 200, (
+        f"userinfo rejected a live exchange token: status={status}, body={scopeless_body}"
+    )
+    assert "email" in decode_jwt_claims(no_email_scope_access_token), (
+        "this negative only proves anything if the token itself carries an email claim to withhold"
+    )
+    assert "email" not in scopeless_body and "email_verified" not in scopeless_body, (
+        f"userinfo returned email for a token minted without the email scope: {scopeless_body}"
+    )
+    log("userinfo withholds email from a token minted without the email scope")
 
     status, headers, _ = http_raw("GET", f"{IDP_URL}/oauth2/userinfo")
     assert status == 401, f"userinfo without a bearer must be 401: status={status}"
@@ -1174,9 +1200,11 @@ def main() -> int:
             section_browser_flow()
         )
         section_check_session_iframe()
-        section_userinfo(browser_access)
         device_access_token, device_refresh_token = section_device_flow()
         exchange_access_token, exchange_refresh_token = section_token_exchange(project_id)
+        # After the exchange, not before: `section_userinfo` needs a token minted WITHOUT the
+        # `email` scope to prove the scope gate, and the exchange grant is where one exists.
+        section_userinfo(browser_access, exchange_access_token)
         section_introspection(exchange_access_token, exchange_refresh_token, device_access_token)
         section_revocation(device_refresh_token)
         # Last: it ends the browser session every earlier section relied on.

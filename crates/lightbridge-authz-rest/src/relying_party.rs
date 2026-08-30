@@ -423,6 +423,70 @@ impl KeycloakRelyingParty {
             .await
     }
 
+    /// Opens the sealed Keycloak token set adopted by `account_id` and returns the
+    /// `email`/`email_verified` pair from its ID-token claims snapshot (ADR-0024, Q2).
+    ///
+    /// This is the ONLY reader of that snapshot on the browser leg, and it exists because
+    /// `/authorize` is the only place on that leg where the person's upstream identity is still
+    /// recoverable: the browser flow deliberately never persists the upstream access token, so
+    /// `oauth2_op::decode_email` -- how the device and RFC 8693 grants get the same pair, straight
+    /// off the presented Keycloak token -- has nothing to decode here. `authorize::issue_code`
+    /// stamps the result into the authorization code's own `Identity`, so the token grant redeems
+    /// a complete identity and never has to decrypt anything itself.
+    ///
+    /// **Best-effort by construction, never fail-closed-to-refusal.** Every miss -- no adopted
+    /// federated identity, a self-healed row with a `NULL` envelope (see
+    /// `StoreRepo::upsert_federated_identity`), a rotated `token_encryption_key` that makes the
+    /// envelope permanently unopenable (ADR-0024's documented rotation posture, no key history),
+    /// or a DB error -- collapses to `(None, None)`, i.e. exactly the behaviour that shipped
+    /// before this existed. `email` is a profile claim, not an authorization input: nothing in
+    /// this codebase makes an access decision on it (`docs/rbac.md` gates on `lightbridge_api_roles`
+    /// alone), so withholding it degrades a UserInfo response rather than opening a hole, and
+    /// refusing the whole login over an unopenable envelope would turn a key rotation into a
+    /// platform-wide outage.
+    pub async fn stored_email(&self, account_id: &str) -> (Option<String>, Option<bool>) {
+        let row = match self
+            .repo
+            .find_federated_identity_by_account(account_id)
+            .await
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => return (None, None),
+            Err(error) => {
+                tracing::warn!(%error, "failed to look up the federated identity for a browser authorization");
+                return (None, None);
+            }
+        };
+        let Some(envelope) = row.token_envelope.as_deref() else {
+            return (None, None);
+        };
+        // Same AAD `persist_federated_identity` sealed under: the federation key, taken from the
+        // row's own columns rather than reconstructed from config, so a row sealed under a
+        // previous `oauth2.federation.issuer` still opens.
+        let aad = format!("{}\u{1f}{}", row.issuer, row.subject);
+        let plaintext = match lightbridge_authz_core::crypto::open(&self.token_key, &aad, envelope)
+        {
+            Ok(plaintext) => plaintext,
+            Err(_) => {
+                // Never logs the error itself: `crypto::open` collapses a rotated key, a tampered
+                // envelope and a truncated one into one message by design, so there is nothing to
+                // distinguish here, and this is an expected steady state after a key rotation.
+                tracing::debug!("stored Keycloak token set could not be opened; no email snapshot");
+                return (None, None);
+            }
+        };
+        match serde_json::from_slice::<KeycloakTokenSet>(&plaintext) {
+            Ok(token_set) => (
+                token_set.id_token_claims.email,
+                token_set.id_token_claims.email_verified,
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "sealed Keycloak token set is not deserializable");
+                (None, None)
+            }
+        }
+    }
+
     async fn begin(&self, flow: PendingFlow) -> Result<(String, Cookie<'static>)> {
         let metadata = self.discover().await?;
         let pkce = Pkce::new();

@@ -33,6 +33,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, deco
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api::schema::procedures::ProcedureRegistry;
 use lightbridge_authz_api_key::entities::exchange_refresh_token_row::NewExchangeRefreshToken;
+use lightbridge_authz_api_key::entities::federated_identity_row::UpsertFederatedIdentity;
 use lightbridge_authz_api_key::entities::session_row::NewSession;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
@@ -71,7 +72,9 @@ use lightbridge_authz_rest::oauth2_op::authorization_code_store::DbAuthorization
 use lightbridge_authz_rest::oauth2_op::client_assertion_store::RedisClientAssertionStore;
 use lightbridge_authz_rest::oauth2_op::client_store::ConfigClientStore;
 use lightbridge_authz_rest::oauth2_op::store::TokenExchangeOpStore;
-use lightbridge_authz_rest::relying_party::KeycloakRelyingParty;
+use lightbridge_authz_rest::relying_party::{
+    IdTokenClaimsSnapshot, KeycloakRelyingParty, KeycloakTokenSet,
+};
 use lightbridge_authz_rest::rpc_authorize::RpcScope;
 use lightbridge_authz_rest::signing::{
     ApiKeyJwtSigner, KeyOwner, bootstrap_signing_key, generate_rs256_key,
@@ -313,8 +316,66 @@ fn confidential_browser_client_without_pkce(client_id: &str, redirect_uri: &str)
     }
 }
 
+/// The base64url-encoded 32-byte AES-256-GCM key every relying party built in this file seals
+/// `federated_identities.token_envelope` under (ADR-0024). Hoisted out of
+/// [`relying_party_with_issuer`] so [`seal_federated_email`] can seal a fixture row under the
+/// exact same key the RP will later open it with -- a test that sealed under a different key
+/// would still pass the "no email" assertions for the wrong reason.
+const RP_TOKEN_ENCRYPTION_KEY: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI";
+const RP_ISSUER: &str = "https://keycloak.example.test";
+
+/// Seeds the `federated_identities` row a completed Keycloak browser login would have written:
+/// an adopted account plus a sealed [`KeycloakTokenSet`] whose ID-token claims snapshot carries
+/// `email`/`email_verified`. Mirrors `KeycloakRelyingParty::persist_federated_identity` exactly --
+/// same key, same `iss \u{1f} sub` AAD -- because that is the only thing
+/// `KeycloakRelyingParty::stored_email` will accept.
+async fn seal_federated_email(repo: &StoreRepo, subject: &str, email: &str, verified: bool) {
+    let token_set = KeycloakTokenSet {
+        refresh_token: Some("upstream-refresh-token".to_string()),
+        id_token_claims: IdTokenClaimsSnapshot {
+            sub: subject.to_string(),
+            iss: RP_ISSUER.to_string(),
+            email: Some(email.to_string()),
+            email_verified: Some(verified),
+            preferred_username: None,
+            name: None,
+            auth_time: None,
+            sid: None,
+            exp: 0,
+            iat: 0,
+        },
+        token_type: Some("Bearer".to_string()),
+        session_state: None,
+    };
+    let key: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(RP_TOKEN_ENCRYPTION_KEY)
+        .expect("token encryption key is base64url")
+        .try_into()
+        .expect("token encryption key is 32 bytes");
+    let envelope = lightbridge_authz_core::crypto::seal(
+        &key,
+        &format!("{RP_ISSUER}\u{1f}{subject}"),
+        &serde_json::to_vec(&token_set).unwrap(),
+    )
+    .expect("seal the fixture token set");
+    repo.upsert_federated_identity(
+        UpsertFederatedIdentity {
+            issuer: RP_ISSUER.to_string(),
+            subject: subject.to_string(),
+            token_envelope: Some(envelope),
+            token_sealed_at: Some(chrono::Utc::now()),
+            access_expires_at: None,
+            refresh_expires_at: None,
+            scope: Some("openid email".to_string()),
+        },
+        RP_ISSUER,
+    )
+    .await
+    .expect("seed the federated identity");
+}
+
 fn relying_party(repo: Arc<StoreRepo>) -> Arc<KeycloakRelyingParty> {
-    relying_party_with_issuer(repo, "https://keycloak.example.test")
+    relying_party_with_issuer(repo, RP_ISSUER)
 }
 
 fn relying_party_with_issuer(repo: Arc<StoreRepo>, issuer: &str) -> Arc<KeycloakRelyingParty> {
@@ -325,7 +386,7 @@ fn relying_party_with_issuer(repo: Arc<StoreRepo>, issuer: &str) -> Arc<Keycloak
                 callback_url: "https://authz.example.test/idp/callback".to_string(),
                 client_secret: None,
                 state_encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                token_encryption_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI".to_string(),
+                token_encryption_key: RP_TOKEN_ENCRYPTION_KEY.to_string(),
                 timeout_ms: 500,
                 browser_session_ttl_seconds: 28_800,
             },
@@ -1383,6 +1444,155 @@ async fn authorize_with_existing_session_mints_the_real_subject_not_the_owner_ac
          {claims}"
     );
     assert_eq!(claims["project_id"], MEMBER_PROJECT_ID);
+}
+
+/// The browser leg must mint `email`/`email_verified` from the sealed ID-token claims snapshot
+/// (ADR-0024), the same pair the device and RFC 8693 grants read straight off the presented
+/// Keycloak token via `oauth2_op::decode_email`. Before this, `mint_from_authorization_code`
+/// hardcoded `email: None`, so `/oauth2/userinfo` could never return an email for a console user
+/// no matter what scope they were granted -- the gap `.docker/it/idp_it.py`'s `section_userinfo`
+/// tripwire pinned.
+///
+/// Proof this test catches the regression: reverting `issue_code` (`authorize.rs`) to
+/// `email: None` with no `stored_email` call, or reverting the `KeyOwner` in
+/// `mint_from_authorization_code` to `email: None, email_verified: None`, makes both the access
+/// token and the id_token come back without `email`, failing the first assertion. Asserted on
+/// BOTH tokens because `access_token_extra` and `id_token_extra` read `owner.email` through two
+/// separate call sites.
+#[sqlx::test(migrations = "../../migrations")]
+async fn browser_login_mints_the_email_sealed_at_login(pool: PgPool) {
+    const CLIENT: &str = "browser-client";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+    const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed_member_project(&repo).await;
+    seal_federated_email(&repo, SUBJECT, "member@example.test", true).await;
+
+    let claims = browser_login_access_claims(&repo, CLIENT, REDIRECT_URI, VERIFIER, true).await;
+    assert_eq!(
+        claims["access"]["email"], "member@example.test",
+        "the access token must carry the email sealed at login: {claims}"
+    );
+    assert_eq!(
+        claims["access"]["email_verified"],
+        Value::Bool(true),
+        "email_verified must survive the bool -> attribute-string -> bool round trip: {claims}"
+    );
+    assert_eq!(
+        claims["id"]["email"], "member@example.test",
+        "the id_token must carry it too: {claims}"
+    );
+    assert_eq!(claims["id"]["email_verified"], Value::Bool(true));
+}
+
+/// The complement, and the reason `KeycloakRelyingParty::stored_email` is best-effort rather than
+/// fail-closed: a person whose account has no adopted federated identity at all -- or whose
+/// envelope no longer opens after a `token_encryption_key` rotation, which reaches
+/// `mint_from_authorization_code` as the very same "no email" state -- must still get a working
+/// token. An unopenable envelope turning a key rotation into a login outage would be a far worse
+/// failure than a UserInfo response missing one profile claim, and `email` gates nothing: RBAC
+/// reads `lightbridge_api_roles` alone (`docs/rbac.md`).
+///
+/// Proof this test catches the regression: making `stored_email` propagate its lookup/open
+/// failure instead of collapsing to `(None, None)` -- or making `issue_code` refuse when it comes
+/// back empty -- turns the 200 assertion red.
+#[sqlx::test(migrations = "../../migrations")]
+async fn browser_login_without_a_sealed_email_still_mints_a_token(pool: PgPool) {
+    const CLIENT: &str = "browser-client";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+    const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed_member_project(&repo).await;
+
+    let claims = browser_login_access_claims(&repo, CLIENT, REDIRECT_URI, VERIFIER, true).await;
+    assert_eq!(
+        claims["access"]["sub"], SUBJECT,
+        "the token must still be minted: {claims}"
+    );
+    assert!(
+        claims["access"].get("email").is_none() && claims["access"].get("email_verified").is_none(),
+        "an absent snapshot must be omitted, never invented or defaulted: {claims}"
+    );
+    assert!(claims["id"].get("email").is_none());
+}
+
+/// Drives `/authorize` (with an already-active browser session for `SUBJECT`) through to
+/// `POST /oauth2/token`, returning `{"access": <access-token claims>, "id": <id_token claims>}`.
+/// Factored out of the two tests above rather than copied: they differ only in what was seeded
+/// beforehand, so a shared driver keeps the *assertions* the only visible difference between them.
+async fn browser_login_access_claims(
+    repo: &Arc<StoreRepo>,
+    client_id: &str,
+    redirect_uri: &str,
+    verifier: &str,
+    openid: bool,
+) -> Value {
+    let session_id = cuid2();
+    repo.create_session(NewSession {
+        id: session_id.clone(),
+        account_id: OWNER_ACCOUNT.to_string(),
+        project_id: MEMBER_PROJECT_ID.to_string(),
+        client_id: None,
+        kind: "browser".to_string(),
+        expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        subject: Some(SUBJECT.to_string()),
+    })
+    .await
+    .unwrap();
+    let clients = vec![browser_client(client_id, redirect_uri)];
+    let router = authorize_router(AuthorizeState::new(
+        relying_party(repo.clone()),
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            clients.clone(),
+            &redis_url(),
+        ),
+    ));
+    let scope = if openid { "openid+email" } else { "email" };
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/authorize?client_id={client_id}&redirect_uri={redirect_uri}&response_type=code&scope={scope}&state=client-state&code_challenge={}&code_challenge_method=S256",
+                    s256_challenge(verifier)
+                ))
+                .header(header::COOKIE, format!("__Host-authz_session={session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location =
+        reqwest::Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let code = location
+        .query_pairs()
+        .find_map(|(k, v)| (k == "code").then(|| v.into_owned()))
+        .expect("authorize issues a code for the active session");
+
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            clients,
+            &redis_url(),
+        ),
+        &format!(
+            "grant_type=authorization_code&client_id={client_id}&code={code}&redirect_uri={redirect_uri}&code_verifier={verifier}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let access =
+        decode_access_token_claims(repo, body["access_token"].as_str().unwrap(), client_id).await;
+    let id = match body["id_token"].as_str() {
+        Some(id_token) => verify_id_token(repo, id_token, client_id).await,
+        None => Value::Object(serde_json::Map::new()),
+    };
+    serde_json::json!({ "access": access, "id": id })
 }
 
 /// Code-review follow-up to #463/#466/#467 (Finding E, positive path): when a request's

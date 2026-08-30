@@ -1483,6 +1483,37 @@ impl StoreRepo {
         Ok(row)
     }
 
+    /// Looks the adopted federated identity up by the ACCOUNT it adopted, rather than by the
+    /// `(issuer, subject)` federation key [`Self::find_federated_identity`] takes. That is the
+    /// direction `/authorize` needs: a browser session persists the ADR-0025-resolved acting
+    /// account id in `sessions.subject` (`relying_party::KeycloakRelyingParty::complete` stamps
+    /// `identity.account_id` there), never the raw upstream subject, so the federation key is not
+    /// available at that call site at all.
+    ///
+    /// At most one row can ever match: `federated_identities_account_uidx`
+    /// (`migrations/20260825000001_users_and_federated_identities.sql:108`, a partial unique index
+    /// on `account_id`) is what enforces ADR-0024's "an account is adopted by AT MOST ONE
+    /// federated identity ever".
+    #[instrument(skip(self))]
+    pub async fn find_federated_identity_by_account(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<FederatedIdentityRow>> {
+        let row = sqlx::query_as(
+            r#"
+            SELECT id, issuer, subject, account_id, token_envelope, token_sealed_at,
+                   access_expires_at, refresh_expires_at, scope, last_authenticated_at,
+                   created_at, updated_at
+            FROM federated_identities
+            WHERE account_id = $1
+            "#,
+        )
+        .bind(account_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
     /// ADR-0020 Decision 4 / #437: the current `status`/`expires_at` of the `sessions` row named
     /// `session_id`, for introspection's fail-closed status check. `Ok(None)` (never an error) for
     /// an unrecognized `session_id` -- distinguishing "not found" from a real DB error is exactly

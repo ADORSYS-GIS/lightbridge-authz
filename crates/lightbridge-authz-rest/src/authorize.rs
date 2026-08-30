@@ -14,6 +14,7 @@ use axum::routing::get;
 use chrono::Utc;
 use serde::Deserialize;
 
+use crate::oauth2_op::refresh_store::ATTR_EMAIL_VERIFIED;
 use crate::oauth2_op::store::RequestScopedOpStore;
 use crate::relying_party::{BrowserLoginTarget, KeycloakRelyingParty};
 use crate::session_cookie::read_session_cookie;
@@ -238,13 +239,35 @@ async fn issue_code(
             opbs,
         ))
     });
+    // The browser leg's ONLY chance to recover the person's upstream email. Unlike the device
+    // and RFC 8693 grants -- which decode it straight off the presented Keycloak token
+    // (`oauth2_op::decode_email`) -- this flow never persists that token, so the sealed ID-token
+    // claims snapshot (ADR-0024) is the sole surviving copy, and `/authorize` is the only step
+    // that still knows which account to open it for. Stamping it into the code here is what lets
+    // `mint_from_authorization_code` stay a pure redemption: no key, no decrypt, no extra query
+    // on the token endpoint. A miss yields `(None, None)` and mints exactly what shipped before
+    // -- see `KeycloakRelyingParty::stored_email` for why that is best-effort rather than fatal.
+    //
+    // Keyed on `subject`, NEVER `account_id`. `subject` is the ACTING person's own account id
+    // (`sessions.subject`); `account_id` is `resolve_context`'s output, i.e. the project's OWNING
+    // account, identical for every member of a project. `federated_identities.account_id` records
+    // which account a login adopted, so looking up by `account_id` would hand a roster member the
+    // project owner's email -- the same identity-substitution shape `external_id` below already
+    // guards against, and what `browser_login_mints_the_email_sealed_at_login` caught here.
+    let (email, email_verified) = state.rp.stored_email(&subject).await;
     let mut attributes = HashMap::new();
     attributes.insert("account_id".to_string(), account_id);
     attributes.insert("project_id".to_string(), project_id);
+    // `Identity::email` is a native field; `email_verified` is a bool with nowhere else to live,
+    // so it rides `attributes` as a string -- the same convention `oauth2_op::refresh_store`
+    // already uses to round-trip this exact pair through `RefreshToken`'s `Identity`.
+    if let Some(verified) = email_verified {
+        attributes.insert(ATTR_EMAIL_VERIFIED.to_string(), verified.to_string());
+    }
     let identity = Identity {
         provider_id: "keycloak".to_string(),
         external_id: subject,
-        email: None,
+        email,
         username: None,
         attributes,
     };

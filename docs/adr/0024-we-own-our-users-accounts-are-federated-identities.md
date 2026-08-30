@@ -141,7 +141,15 @@ session minted without a federated identity behind it.
 **Failure policy: fail closed.** Every step propagates `?`. `callback()` already maps any `Err`
 from `complete` to a generic `BAD_GATEWAY` failure — there is no flow-specific fallback that
 proceeds without a persisted federated identity. No refresh-against-Keycloak background job exists
-yet (Follow-ups); reads are on-demand only, once a consumer exists.
+yet (Follow-ups); reads are on-demand only. **The first consumer now exists:**
+`KeycloakRelyingParty::stored_email` opens the envelope at `/authorize` so the browser
+`authorization_code` leg can mint the `email`/`email_verified` claims the device and RFC 8693 legs
+get from `decode_email` — that leg never persists the upstream access token, so this snapshot is
+the only surviving copy. That read is deliberately **best-effort, not fail-closed** (unlike the
+write above): a missing row, a `NULL` envelope, or an envelope left unopenable by a
+`token_encryption_key` rotation all collapse to "no email". `email` gates nothing — RBAC reads
+`lightbridge_api_roles` alone — so withholding it degrades a UserInfo response, whereas refusing
+would turn a key rotation into a login outage.
 
 ### Q4 — ADR-0038: `federated_identities` stays hand-written SQL
 

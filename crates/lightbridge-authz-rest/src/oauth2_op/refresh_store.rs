@@ -45,7 +45,11 @@ use lightbridge_authz_core::cuid::cuid2;
 const IDENTITY_PROVIDER_ID: &str = "keycloak";
 const ATTR_ACCOUNT_ID: &str = "account_id";
 const ATTR_PROJECT_ID: &str = "project_id";
-const ATTR_EMAIL_VERIFIED: &str = "email_verified";
+/// `pub(crate)` because `authorize.rs` and `oauth2_op::store` now write/read this same attribute
+/// on the authorization code's `Identity` -- the authorization-code grant carries the pair
+/// exactly the way a refresh token already did, so the key stays defined once here rather than
+/// being spelled as a literal at three call sites.
+pub(crate) const ATTR_EMAIL_VERIFIED: &str = "email_verified";
 const ATTR_AUTH_TIME: &str = "auth_time";
 /// Round-trips `exchange_refresh_tokens.chain_id`/`chain_expires_at` (the rotation-family and its
 /// absolute cap -- see that table's migration) through `Identity.attributes`, same convention as

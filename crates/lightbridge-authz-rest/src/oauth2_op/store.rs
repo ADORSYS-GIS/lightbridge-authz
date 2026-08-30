@@ -68,6 +68,7 @@ use lightbridge_authz_core::identity::AccountId;
 use serde_json::Value;
 use sha2::Digest;
 
+use crate::oauth2_op::refresh_store::ATTR_EMAIL_VERIFIED;
 use crate::signing::{KeyOwner, access_token_extra, id_token_extra, identity_for};
 
 use super::authorization_code_store::DbAuthorizationCodeStore;
@@ -1226,10 +1227,19 @@ impl TokenExchangeOpStore {
         let owner = KeyOwner {
             subject,
             account_id: account_id.as_str().to_string(),
-            // The browser leg never persists the upstream access token (ADR-0024), and the code's
-            // stored identity carries no email, so these stay `None` rather than being invented.
-            email: None,
-            email_verified: None,
+            // Read back, never re-derived: `authorize::issue_code` already opened the sealed
+            // ID-token claims snapshot (ADR-0024) and stamped the pair onto the code's identity,
+            // precisely so this grant needs no decryption key and no extra query. A code minted
+            // for a person whose envelope was missing or unopenable simply carries neither, and
+            // mints the same token this grant produced before -- the absence is never invented
+            // into a value, and `email_verified` is never defaulted to `true`/`false` (an
+            // unparseable attribute is "unknown", so it is dropped rather than guessed).
+            email: auth_code.identity.email.clone(),
+            email_verified: auth_code
+                .identity
+                .attributes
+                .get(ATTR_EMAIL_VERIFIED)
+                .and_then(|verified| verified.parse::<bool>().ok()),
         };
         // RFC 6749 §4.1.3: an authorization_code token request carries NO `scope` parameter --
         // the granted scope is the scope of the authorization grant, fixed at `/authorize`. Passing

@@ -212,7 +212,7 @@ by `authkestra_engine::token::TokenManager` itself: `iss`, `sub`, `aud`, `exp`, 
 | `lightbridge_caller_kind` | Constant `API_KEY_CALLER_KIND` from `lightbridge_authz_bearer` (`signing.rs:203-206`) | Minted — this is the claim `requestBudgetRefill` checks to refuse API-key-derived callers under `oauth2.type: self` (see `docs/rbac.md`'s "#191/#216" note) |
 | `sid` | Plain `cuid2()`, no prefix (`signing.rs:207`) | Minted, per-issuance session id |
 | `api_key_id`, `project_id`, `account_id` | Passed in by the caller of `sign`/the exchange handler | Minted (tenant context resolved server-side) |
-| `email` / `email_verified` | `owner.email` / `owner.email_verified`, populated via `decode_email(subject_token)` on the exchange path (`oauth2_op/mod.rs:113-123`) — best-effort, unverified re-decode of an already-signature-verified upstream token | **Propagated upstream snapshot**, omitted (not `null`) when absent |
+| `email` / `email_verified` | `owner.email` / `owner.email_verified`. **Two sources, one per leg.** Device + RFC 8693 exchange: `decode_email(subject_token)` (`oauth2_op/mod.rs:113-123`) — best-effort, unverified re-decode of an already-signature-verified upstream token. Browser `authorization_code`: the sealed ID-token claims snapshot in `federated_identities.token_envelope` (ADR-0024), opened by `KeycloakRelyingParty::stored_email` at `/authorize` and stamped onto the authorization code's `Identity`, because that leg deliberately never persists the upstream access token there is nothing to decode at redemption time. Both are best-effort: a miss omits the pair rather than refusing the grant | **Propagated upstream snapshot**, omitted (not `null`) when absent |
 | `allowed_models` | Project's `allowed_models`, if `Some` | Minted from DB state |
 | `at_hash`, `auth_time`, `nonce` | **Not on the access token** — only on the `id_token` (see below) | — |
 
@@ -221,7 +221,7 @@ by `authkestra_engine::token::TokenManager` itself: `iss`, `sub`, `aud`, `exp`, 
 | Claim | Source | Minted or propagated |
 |---|---|---|
 | `jti` | Same `lgbr:`-prefixed `cuid2()` pattern as the access token (`signing.rs:250-252`) | Minted |
-| `email` / `email_verified` | Same upstream snapshot as the access token (`signing.rs:253-257`) | Propagated |
+| `email` / `email_verified` | Same upstream snapshot as the access token, from whichever of the two sources that leg uses (`signing.rs:253-257`) | Propagated |
 | `auth_time` | `decode_auth_time_and_nonce(subject_token)` — **propagated only if the upstream token carried one, never defaulted to "now"** (`oauth2_op/mod.rs:125-134`; this service authenticates nobody itself, so it has no authentication instant of its own to report) | Propagated-or-omitted |
 | `nonce` | Same decode, passed as a separate parameter to `issue_id_token_with_extra` (not via the `extra` map) (`oauth2_op/store.rs:247-255`) — **propagated only if present, never invented** (a token exchange runs no authorization request for a nonce to bind to) | Propagated-or-omitted |
 | `azp` | The exchange client's `client_id` (`signing.rs:262`) | Minted |
