@@ -30,7 +30,7 @@ exist without one. Every table/paragraph below this note is otherwise exactly as
 one identity may now own SEVERAL accounts. The ownership edge is `accounts.user_id -> users.id` —
 already present since ADR-0024 and always 1:N-capable; what pinned it to 1:1 was the
 `accounts_set_user` trigger forcing `NEW.user_id := NEW.id`, relaxed by
-`migrations/20260830000001_accounts_owned_by_users.sql`. Concretely:
+`migrations/20260830000003_accounts_owned_by_users.sql`. Concretely:
 
 - An identity's **first** account is its **anchor**: it keeps `id = subject`, because
   `federated_identities` adopts an account by matching `accounts.id == subject`. Exactly one

@@ -1978,7 +1978,7 @@ async fn federated_identities_persists_the_plaintext_profile_claim_snapshot(pool
     let repo = repo(pool.clone());
     let subject = "profile-claims-subject";
     repo.create_account(
-        subject,
+        &AccountId::assert_already_resolved(subject),
         CreateAccount {
             default_quota: None,
             name: None,

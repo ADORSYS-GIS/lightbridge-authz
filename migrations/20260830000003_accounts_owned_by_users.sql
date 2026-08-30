@@ -1,5 +1,14 @@
 -- ADR-0026: one identity may own many accounts.
 --
+-- Renumbered from 20260830000001 to 20260830000003 after the fact. #565 landed the same day with
+-- its own 20260830000001 (`federated_identities_add_profile_claims`), and sqlx keys
+-- `_sqlx_migrations` by the numeric VERSION, not the filename -- so two files sharing a prefix
+-- collide on `_sqlx_migrations_pkey` and the second one to apply fails with 23505. Neither PR's CI
+-- could see it: each branch contained only its own migration, and the collision existed only in
+-- the merge. Nothing had applied this version anywhere durable yet, which is the only reason
+-- renumbering is legitimate here rather than a new migration -- same bar as the 20260724 -> 20260727
+-- renumber recorded in ADR-0006.
+--
 -- `accounts.user_id -> users.id` (ADR-0024) has ALWAYS been a 1:N-capable edge -- a plain FK with
 -- a NON-unique index (`idx_accounts_user_id`, 20260825000001:50). What pinned it to exactly one
 -- row on the N side was never the schema; it was this trigger:

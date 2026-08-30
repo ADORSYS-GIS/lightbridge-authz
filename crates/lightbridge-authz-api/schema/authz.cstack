@@ -184,7 +184,7 @@ model Account {
   // ADR-0026: the owning person -- `accounts.user_id -> users.id`, the edge ADR-0024 added and
   // that has always been 1:N-capable (plain FK, non-unique index). What pinned it to 1:1 was the
   // `accounts_set_user` trigger forcing `NEW.user_id := NEW.id`; relaxed by
-  // `migrations/20260830000001_accounts_owned_by_users.sql`.
+  // `migrations/20260830000003_accounts_owned_by_users.sql`.
   //
   // ================= LOAD-BEARING INVARIANT: `accounts.user_id` IS A HOME-ACCOUNT ID ==========
   // The `@@allow` below compares this against `auth().id`, an ACCOUNT id -- not against some
