@@ -77,7 +77,7 @@ use super::device_store::{DbDeviceCodeStore, create_pending_device_authorization
 use super::refresh_store::DbRefreshTokenStore;
 use super::{
     ACCESS_TOKEN_TYPE, OFFLINE_ACCESS_SCOPE, OPENID_SCOPE, decode_auth_time_and_nonce,
-    decode_email, generate_refresh_secret, grant_scopes, oauth_err, scope_to_string,
+    decode_profile_claims, generate_refresh_secret, grant_scopes, oauth_err, scope_to_string,
 };
 
 /// The `budget_tier` claim's wire label for an arbitrary amount, in micros. ADR-0008's ladder
@@ -583,11 +583,20 @@ impl TokenExchangeOpStore {
             })
             .await
             .map_err(|_| oauth_err("server_error", "session persistence failed"))?;
+        // Device pairing never holds an upstream bearer token at this point either (the pairing
+        // browser tab completed the Keycloak login separately -- see
+        // `relying_party::KeycloakRelyingParty::complete`'s `PendingFlow::Device` arm), so this
+        // reads the same plaintext `federated_identities` snapshot the browser
+        // `authorization_code` grant does -- see `Self::load_profile_claims`'s doc comment.
+        let (email, email_verified, preferred_username, name) =
+            self.load_profile_claims(&subject).await;
         let owner = KeyOwner {
             subject: subject.clone(),
             account_id: subject.clone(),
-            email: None,
-            email_verified: None,
+            email,
+            email_verified,
+            preferred_username,
+            name,
         };
         let expires_in = self.cfg.access_ttl_seconds as u64;
         let budget_tier = self.resolve_budget_tier(&context.account_id, now).await;
@@ -908,6 +917,51 @@ impl TokenExchangeOpStore {
         }
     }
 
+    /// Loads the plaintext profile-claim snapshot (`email`/`email_verified`/`preferred_username`/
+    /// `name`) for `account_id` from `federated_identities` -- see that table's own migration
+    /// (`20260830000001_federated_identities_add_profile_claims.sql`) for why these four are
+    /// plaintext columns rather than living only inside the sealed `token_envelope`. Used by the
+    /// two minting paths that hold only the already-resolved ACCOUNT id at issuance time -- the
+    /// browser `authorization_code` grant ([`Self::mint_from_authorization_code`]) and the device
+    /// grant ([`Self::issue_device_tokens`]) -- neither of which has the upstream bearer token in
+    /// hand to decode claims from directly the way [`Self::handle_token_exchange`] does via
+    /// `decode_profile_claims`.
+    ///
+    /// Fail-OPEN, deliberately unlike this store's tenant/budget/quota resolvers
+    /// ([`Self::resolve_budget_tier`]/[`Self::resolve_quota_tier`]/
+    /// [`Self::resolve_project_model_access`]): these are cosmetic display claims, not an
+    /// authorization decision, so a lookup failure or a missing row degrades to "no profile claims
+    /// on this mint" (a token with `sub` and full tenant context but no `name`/
+    /// `preferred_username`/`email` -- the previous, unconditional behavior for every browser/
+    /// device login, now the fallback rather than the rule) instead of refusing the whole token
+    /// issuance over a claim nobody's authorization decision depends on.
+    async fn load_profile_claims(
+        &self,
+        account_id: &str,
+    ) -> (Option<String>, Option<bool>, Option<String>, Option<String>) {
+        match self
+            .repo
+            .find_federated_identity_by_account_id(account_id)
+            .await
+        {
+            Ok(Some(identity)) => (
+                identity.email,
+                identity.email_verified,
+                identity.preferred_username,
+                identity.name,
+            ),
+            Ok(None) => (None, None, None, None),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    account_id = %account_id,
+                    "failed to load federated-identity profile claims; minting without them"
+                );
+                (None, None, None, None)
+            }
+        }
+    }
+
     /// The single minting path for every human-plane grant.
     ///
     /// Extracted so `handle_token_exchange` and `handle_authorization_code_grant` cannot drift:
@@ -1223,13 +1277,22 @@ impl TokenExchangeOpStore {
             });
         }
 
+        // The browser leg never persists the upstream access token or ID token (ADR-0024), and
+        // the authorization code's own stored `Identity` carries no email either (see
+        // `authorize.rs::issue_code`'s doc comment) -- there is no bearer token to decode claims
+        // from at redemption time, unlike `handle_token_exchange`. `load_profile_claims` is the
+        // fix: it reads the plaintext snapshot `KeycloakRelyingParty::persist_federated_identity`
+        // wrote into `federated_identities` at the login that created this session, keyed by the
+        // same account id this code was issued for.
+        let (email, email_verified, preferred_username, name) =
+            self.load_profile_claims(account_id.as_str()).await;
         let owner = KeyOwner {
             subject,
             account_id: account_id.as_str().to_string(),
-            // The browser leg never persists the upstream access token (ADR-0024), and the code's
-            // stored identity carries no email, so these stay `None` rather than being invented.
-            email: None,
-            email_verified: None,
+            email,
+            email_verified,
+            preferred_username,
+            name,
         };
         // RFC 6749 §4.1.3: an authorization_code token request carries NO `scope` parameter --
         // the granted scope is the scope of the authorization grant, fixed at `/authorize`. Passing
@@ -1416,13 +1479,16 @@ impl TokenExchangeOpStore {
             });
         }
 
-        let (email, email_verified) = decode_email(subject_token);
+        let (email, email_verified, preferred_username, name) =
+            decode_profile_claims(subject_token);
         let (auth_time, nonce) = decode_auth_time_and_nonce(subject_token);
         let owner = KeyOwner {
             subject: subject.clone(),
             account_id: account_id.as_str().to_string(),
             email,
             email_verified,
+            preferred_username,
+            name,
         };
         return self
             .mint_human_plane_tokens(
@@ -1577,6 +1643,8 @@ impl TokenExchangeOpStore {
             account_id: old_row.subject.clone(),
             email: old_row.email.clone(),
             email_verified: old_row.email_verified,
+            preferred_username: old_row.preferred_username.clone(),
+            name: old_row.name.clone(),
         };
         let allowed_models = project.allowed_models;
         let model_policy = project.model_policy;
@@ -1667,6 +1735,8 @@ impl TokenExchangeOpStore {
             email: old_row.email.clone(),
             email_verified: old_row.email_verified,
             auth_time: old_row.auth_time,
+            preferred_username: old_row.preferred_username.clone(),
+            name: old_row.name.clone(),
             // Inherited unchanged from the token just consumed -- this is what makes it one
             // chain, not a new one born on every rotation.
             chain_id: old_row.chain_id.clone(),
@@ -1769,6 +1839,14 @@ fn refresh_identity(
     if let Some(auth_time) = auth_time {
         attributes.insert("auth_time".to_string(), auth_time.to_string());
     }
+    // `name` has no dedicated field on `Identity` (only `email`/`username`), so it rides
+    // `attributes` -- same convention `signing::identity_for` uses, and the same reason
+    // `DbRefreshTokenStore` already round-trips `account_id`/`project_id`/`email_verified`/
+    // `auth_time` through here: `preferred_username` DOES have a dedicated field (`username`,
+    // set below) and does not need this treatment.
+    if let Some(name) = owner.name.as_deref() {
+        attributes.insert("name".to_string(), name.to_string());
+    }
     attributes.insert("chain_id".to_string(), chain_id.to_string());
     attributes.insert(
         "chain_expires_at".to_string(),
@@ -1784,7 +1862,7 @@ fn refresh_identity(
         // pre-Stage-3 value for every grandfathered account.
         external_id: owner.account_id.clone(),
         email: owner.email.clone(),
-        username: None,
+        username: owner.preferred_username.clone(),
         attributes,
     }
 }

@@ -33,6 +33,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, deco
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api::schema::procedures::ProcedureRegistry;
 use lightbridge_authz_api_key::entities::exchange_refresh_token_row::NewExchangeRefreshToken;
+use lightbridge_authz_api_key::entities::federated_identity_row::UpsertFederatedIdentity;
 use lightbridge_authz_api_key::entities::session_row::NewSession;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
@@ -832,8 +833,8 @@ async fn verify_id_token(repo: &StoreRepo, token: &str, client_id: &str) -> Valu
 }
 
 /// Builds a fake `subject_token` (unverified by the `MockBearer` used throughout this file) whose
-/// payload segment carries exactly `claims`, so `decode_email`/`decode_auth_time_and_nonce` in
-/// `oauth2_op` have something real to snapshot from.
+/// payload segment carries exactly `claims`, so `decode_profile_claims`/`decode_auth_time_and_nonce`
+/// in `oauth2_op` have something real to snapshot from.
 fn subject_token_with_claims(claims: &Value) -> String {
     use base64::Engine;
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
@@ -975,6 +976,128 @@ async fn authorization_code_token_endpoint_enforces_binding_pkce_and_single_use(
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
     assert_eq!(body["error"], "invalid_grant");
     assert!(body.get("access_token").is_none());
+}
+
+/// The defect this whole claim-propagation change exists to fix: unlike the token-exchange grant
+/// (`exchange_snapshots_email_claims_from_subject_token`), the browser `authorization_code` grant
+/// has no upstream bearer token in hand at redemption time to decode claims from -- the
+/// authorization code's own stored `Identity` carries no email either (`store_browser_code`'s
+/// fixture above sets one only for a different, unrelated reason -- it is never read by
+/// `mint_from_authorization_code`, see that function's own doc comment). Before this fix
+/// `mint_from_authorization_code` hardcoded `KeyOwner { email: None, email_verified: None, .. }`
+/// unconditionally, so a console login never carried a name/username/email no matter what
+/// Keycloak's id-token had. The fix: `TokenExchangeOpStore::load_profile_claims` reads the
+/// plaintext snapshot `KeycloakRelyingParty::persist_federated_identity` writes into
+/// `federated_identities` at the login that created this session -- seeded here directly via
+/// `upsert_federated_identity` rather than driving a real Keycloak-login round trip (that flow is
+/// covered end-to-end by `relying_party_tests.rs`; this test isolates the minting half).
+#[sqlx::test(migrations = "../../migrations")]
+async fn browser_authorization_code_grant_mints_profile_claims_from_federated_identity(
+    pool: PgPool,
+) {
+    const CLIENT: &str = "browser-client";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+    const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
+
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+    repo.upsert_federated_identity(
+        UpsertFederatedIdentity {
+            issuer: GRANDFATHER_ISSUER.to_string(),
+            subject: SUBJECT.to_string(),
+            token_envelope: None,
+            token_sealed_at: None,
+            access_expires_at: None,
+            refresh_expires_at: None,
+            scope: None,
+            email: Some("console-user@example.test".to_string()),
+            email_verified: Some(true),
+            preferred_username: Some("console-handle".to_string()),
+            name: Some("Console User".to_string()),
+        },
+        GRANDFATHER_ISSUER,
+    )
+    .await
+    .expect("seed federated identity");
+
+    store_browser_code(repo.clone(), "profile-code", CLIENT, REDIRECT_URI, VERIFIER).await;
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            vec![browser_client(CLIENT, REDIRECT_URI)],
+            &redis_url(),
+        ),
+        &format!(
+            "grant_type=authorization_code&client_id={CLIENT}&code=profile-code&redirect_uri={REDIRECT_URI}&code_verifier={VERIFIER}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let access_claims =
+        decode_access_token_claims(&repo, body["access_token"].as_str().unwrap(), CLIENT).await;
+    assert_eq!(access_claims["email"], "console-user@example.test");
+    assert_eq!(access_claims["email_verified"], true);
+    assert_eq!(access_claims["preferred_username"], "console-handle");
+    assert_eq!(access_claims["name"], "Console User");
+
+    let id_claims = verify_id_token(&repo, body["id_token"].as_str().unwrap(), CLIENT).await;
+    assert_eq!(id_claims["email"], "console-user@example.test");
+    assert_eq!(id_claims["email_verified"], true);
+    assert_eq!(id_claims["preferred_username"], "console-handle");
+    assert_eq!(id_claims["name"], "Console User");
+}
+
+/// The other half of the same fix's fallback path: a subject with NO `federated_identities` row
+/// at all (a session predating this feature, or a self-healed grandfather adoption that never ran
+/// a real login) must still mint a token -- just one that omits the profile claims, never one that
+/// fails the whole grant over a missing display string.
+#[sqlx::test(migrations = "../../migrations")]
+async fn browser_authorization_code_grant_omits_profile_claims_with_no_federated_identity_row(
+    pool: PgPool,
+) {
+    const CLIENT: &str = "browser-client";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+    const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
+
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+    // Deliberately no `upsert_federated_identity` call -- no federated_identities row exists.
+
+    store_browser_code(
+        repo.clone(),
+        "no-profile-code",
+        CLIENT,
+        REDIRECT_URI,
+        VERIFIER,
+    )
+    .await;
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            vec![browser_client(CLIENT, REDIRECT_URI)],
+            &redis_url(),
+        ),
+        &format!(
+            "grant_type=authorization_code&client_id={CLIENT}&code=no-profile-code&redirect_uri={REDIRECT_URI}&code_verifier={VERIFIER}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let access_claims =
+        decode_access_token_claims(&repo, body["access_token"].as_str().unwrap(), CLIENT).await;
+    for claim in ["email", "email_verified", "preferred_username", "name"] {
+        assert!(
+            access_claims.get(claim).is_none(),
+            "{claim} must be omitted, not minted as null, with no federated_identities row: \
+             {access_claims}"
+        );
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -1945,6 +2068,7 @@ async fn azp_reliably_distinguishes_a_real_api_key_jwt_from_a_real_exchange_sess
         account_id: SUBJECT.to_string(),
         email: None,
         email_verified: None,
+        ..Default::default()
     };
     let signed = signer
         .sign(
@@ -3140,6 +3264,50 @@ async fn exchange_snapshots_email_claims_from_subject_token(pool: PgPool) {
     assert_eq!(claims.email.as_deref(), Some("owner@example.test"));
 }
 
+/// `preferred_username`/`name`'s own version of `exchange_snapshots_email_claims_from_subject_token`
+/// above: the token-exchange grant decodes them straight off the presented `subject_token`
+/// (`decode_profile_claims`, `oauth2_op::mod`), same as `email`/`email_verified` already did.
+/// Asserted via the untyped claim set (`decode_access_token_claims`) since `AccessClaims` has no
+/// field for either -- `signing_tests.rs` already covers the typed shape at the `ApiKeyJwtSigner`
+/// layer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn exchange_snapshots_name_and_preferred_username_claims_from_subject_token(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    let subject_token = subject_token_with_claims(&serde_json::json!({
+        "preferred_username": "owner-handle",
+        "name": "Owner Name",
+    }));
+
+    let (status, body) = post_token(
+        state(repo.clone(), true),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token={subject_token}\
+             &project_id={PROJECT_ID}&scope=openid+profile"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let claims = decode_access_token_claims(
+        &repo,
+        body["access_token"].as_str().unwrap(),
+        PUBLIC_CLIENT_ID,
+    )
+    .await;
+    assert_eq!(claims["preferred_username"], "owner-handle");
+    assert_eq!(claims["name"], "Owner Name");
+
+    let id_token = body["id_token"]
+        .as_str()
+        .expect("openid was granted, so an id_token must be issued");
+    let id_claims = verify_id_token(&repo, id_token, PUBLIC_CLIENT_ID).await;
+    assert_eq!(id_claims["preferred_username"], "owner-handle");
+    assert_eq!(id_claims["name"], "Owner Name");
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn exchange_tolerates_a_subject_token_with_an_unparsable_payload_segment(pool: PgPool) {
     let repo = repo(pool);
@@ -3317,6 +3485,12 @@ async fn exchange_id_token_omits_auth_time_and_nonce_when_absent(pool: PgPool) {
 /// one it replaced. The phase-2 refresh grant re-mints through the *same* signing calls the
 /// exchange grant uses (`oauth2_op::store::TokenExchangeOpStore::handle_refresh_token`), so there
 /// is structurally no second, thinner code path to regress into.
+///
+/// `preferred_username`/`name` ride the SAME `exchange_refresh_tokens` row-snapshot mechanism as
+/// `email`/`email_verified` (migration
+/// `20260830000002_exchange_refresh_tokens_add_profile_claims.sql`) and are asserted here
+/// alongside them for exactly that reason: a refresh chain that preserved email but dropped these
+/// two would be the identical bug shape one migration later.
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_reissues_id_token_and_preserves_email(pool: PgPool) {
     let repo = repo(pool);
@@ -3326,6 +3500,8 @@ async fn refresh_reissues_id_token_and_preserves_email(pool: PgPool) {
     let subject_token = subject_token_with_claims(&serde_json::json!({
         "email": "owner@example.test",
         "email_verified": true,
+        "preferred_username": "owner-handle",
+        "name": "Owner Name",
         "auth_time": 1_700_000_000,
         "nonce": "nonce-from-original-exchange",
     }));
@@ -3334,7 +3510,7 @@ async fn refresh_reissues_id_token_and_preserves_email(pool: PgPool) {
         state(repo.clone(), true),
         &format!(
             "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token={subject_token}\
-             &project_id={PROJECT_ID}&scope=openid+offline_access"
+             &project_id={PROJECT_ID}&scope=openid+profile+offline_access"
         ),
     )
     .await;
@@ -3361,6 +3537,20 @@ async fn refresh_reissues_id_token_and_preserves_email(pool: PgPool) {
         Some("owner@example.test"),
         "refreshed access token must preserve email, not drop it"
     );
+    let access_claims_untyped = decode_access_token_claims(
+        &repo,
+        body["access_token"].as_str().unwrap(),
+        PUBLIC_CLIENT_ID,
+    )
+    .await;
+    assert_eq!(
+        access_claims_untyped["preferred_username"], "owner-handle",
+        "refreshed access token must preserve preferred_username, not drop it"
+    );
+    assert_eq!(
+        access_claims_untyped["name"], "Owner Name",
+        "refreshed access token must preserve name, not drop it"
+    );
 
     let id_token = body["id_token"]
         .as_str()
@@ -3368,6 +3558,8 @@ async fn refresh_reissues_id_token_and_preserves_email(pool: PgPool) {
     let id_claims = verify_id_token(&repo, id_token, PUBLIC_CLIENT_ID).await;
     assert_eq!(id_claims["email"], "owner@example.test");
     assert_eq!(id_claims["email_verified"], true);
+    assert_eq!(id_claims["preferred_username"], "owner-handle");
+    assert_eq!(id_claims["name"], "Owner Name");
     assert_eq!(
         id_claims["auth_time"], 1_700_000_000,
         "auth_time describes the original authentication and must survive a refresh"
@@ -4266,6 +4458,8 @@ async fn revoke_cascade_kills_only_the_actors_own_refresh_chain(pool: PgPool) {
         email: None,
         email_verified: None,
         auth_time: None,
+        preferred_username: None,
+        name: None,
         chain_id: cuid2(),
         chain_expires_at: now + chrono::Duration::days(90),
         session_id: owner_session_id.clone(),
@@ -4287,6 +4481,8 @@ async fn revoke_cascade_kills_only_the_actors_own_refresh_chain(pool: PgPool) {
         email: None,
         email_verified: None,
         auth_time: None,
+        preferred_username: None,
+        name: None,
         chain_id: cuid2(),
         chain_expires_at: now + chrono::Duration::days(90),
         session_id: member_session_id.clone(),

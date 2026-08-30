@@ -309,6 +309,17 @@ pub struct KeyOwner {
     pub account_id: String,
     pub email: Option<String>,
     pub email_verified: Option<bool>,
+    /// The upstream `preferred_username` claim, mirrored as-is -- never derived, never
+    /// defaulted to `email`/`subject` when absent. Minted as [`identity_for`]'s
+    /// `Identity::username` and, at the wire level, `access_token_extra`/`id_token_extra`'s
+    /// `preferred_username` claim -- present only when the upstream login actually carried one
+    /// (the same "omit, never mint an empty string" contract `email` already follows).
+    pub preferred_username: Option<String>,
+    /// The upstream `name` claim, mirrored as-is. `authkestra_engine::auth::state::Identity` has
+    /// no dedicated `name` field (only `email`/`username`), so [`identity_for`] carries this
+    /// through `Identity::attributes` instead; the wire claim itself is minted directly by
+    /// `access_token_extra`/`id_token_extra`, which do not read `Identity` at all.
+    pub name: Option<String>,
 }
 
 /// A freshly signed API-key JWT and the expiry stamped into it.
@@ -341,17 +352,30 @@ pub fn capped_expiry(
 /// *value* placed on `sub` is now this service's own resolved account id, not a bare copy of the
 /// presented claim). For a grandfathered account (`accounts.id == subject`) this is byte-identical
 /// to the pre-Stage-3 behavior -- see [`KeyOwner`]'s own doc comment. `attributes` starts empty
-/// here; `oauth2_op`'s refresh-token store uses it as the only extension point
-/// `authkestra_op::refresh::RefreshToken` offers to round-trip `account_id`/`project_id` (which
-/// have no dedicated field on `Identity`) through the `RefreshTokenStore` trait boundary -- see
-/// that module for the full round trip.
+/// here except for `name` (see below); `oauth2_op`'s refresh-token store uses it as the only
+/// extension point `authkestra_op::refresh::RefreshToken` offers to round-trip
+/// `account_id`/`project_id` (which have no dedicated field on `Identity`) through the
+/// `RefreshTokenStore` trait boundary -- see that module for the full round trip. `username` is
+/// minted from `owner.preferred_username` -- `Identity`'s own field for exactly this claim.
+/// `name` has no dedicated field on `Identity` at all (only `email`/`username`), so it rides
+/// `attributes["name"]` instead, the same "extension point for whatever `Identity` has no field
+/// for" role `attributes` already plays for `account_id`/`project_id` elsewhere. None of this
+/// nested `Identity` is what actually reaches the wire as `name`/`preferred_username` claims --
+/// `TokenManager` embeds it verbatim under the token's own `identity` claim (informational,
+/// mirroring `sub`/`email`); the real wire claims are minted directly by
+/// `access_token_extra`/`id_token_extra` below, which read `owner` directly and never this
+/// `Identity`.
 pub(crate) fn identity_for(owner: &KeyOwner) -> Identity {
+    let mut attributes = HashMap::new();
+    if let Some(name) = owner.name.as_deref() {
+        attributes.insert("name".to_string(), name.to_string());
+    }
     Identity {
         provider_id: IDENTITY_PROVIDER_ID.to_string(),
         external_id: owner.account_id.clone(),
         email: owner.email.clone(),
-        username: None,
-        attributes: HashMap::new(),
+        username: owner.preferred_username.clone(),
+        attributes,
     }
 }
 
@@ -425,6 +449,15 @@ pub(crate) fn access_token_extra(
     if let Some(verified) = owner.email_verified {
         extra.insert("email_verified".to_string(), Value::Bool(verified));
     }
+    if let Some(name) = owner.name.as_deref() {
+        extra.insert("name".to_string(), Value::String(name.to_string()));
+    }
+    if let Some(preferred_username) = owner.preferred_username.as_deref() {
+        extra.insert(
+            "preferred_username".to_string(),
+            Value::String(preferred_username.to_string()),
+        );
+    }
     if let Some(models) = allowed_models {
         extra.insert(
             "allowed_models".to_string(),
@@ -435,12 +468,19 @@ pub(crate) fn access_token_extra(
 }
 
 /// Builds the `extra` claim map every derived `id_token` carries (ADR-0011, Decision 7):
-/// `email`/`email_verified` upstream snapshots, `auth_time` propagated only when the upstream
-/// token carried one (never defaulted to "now"), `azp` naming the client the tokens were issued
-/// to, and `at_hash` binding this `id_token` to the `access_token` minted alongside it in the same
-/// response. Tenant context (`api_key_id`/`project_id`/`account_id`) and role/quota data never
-/// appear here -- see [`compute_at_hash`]. `jti` is stamped as this repo's own `lgbr:`-prefixed
-/// CUID2, same as [`access_token_extra`] and for the same ADR-0039 reason.
+/// `email`/`email_verified`/`name`/`preferred_username` upstream snapshots, `auth_time`
+/// propagated only when the upstream token carried one (never defaulted to "now"), `azp` naming
+/// the client the tokens were issued to, and `at_hash` binding this `id_token` to the
+/// `access_token` minted alongside it in the same response. Tenant context
+/// (`api_key_id`/`project_id`/`account_id`) and role/quota data never appear here -- see
+/// [`compute_at_hash`]. `jti` is stamped as this repo's own `lgbr:`-prefixed CUID2, same as
+/// [`access_token_extra`] and for the same ADR-0039 reason.
+///
+/// Every claim here is inserted unconditionally when `owner` carries a value for it -- minting
+/// never gates on the granted `scope` (an id_token is only ever minted when `openid` was granted
+/// in the first place; `mint_human_plane_tokens` checks that before calling this). Scope-gating
+/// `profile`/`email` claims is `userinfo`'s job alone, at read time, over an access token's own
+/// claim set -- not this function's.
 pub(crate) fn id_token_extra(
     owner: &KeyOwner,
     access_token: &str,
@@ -457,6 +497,15 @@ pub(crate) fn id_token_extra(
     }
     if let Some(verified) = owner.email_verified {
         extra.insert("email_verified".to_string(), Value::Bool(verified));
+    }
+    if let Some(name) = owner.name.as_deref() {
+        extra.insert("name".to_string(), Value::String(name.to_string()));
+    }
+    if let Some(preferred_username) = owner.preferred_username.as_deref() {
+        extra.insert(
+            "preferred_username".to_string(),
+            Value::String(preferred_username.to_string()),
+        );
     }
     if let Some(auth_time) = auth_time {
         extra.insert("auth_time".to_string(), Value::from(auth_time));

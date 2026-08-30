@@ -47,6 +47,11 @@ const ATTR_ACCOUNT_ID: &str = "account_id";
 const ATTR_PROJECT_ID: &str = "project_id";
 const ATTR_EMAIL_VERIFIED: &str = "email_verified";
 const ATTR_AUTH_TIME: &str = "auth_time";
+/// Round-trips `exchange_refresh_tokens.name` through `Identity.attributes` -- `Identity` has no
+/// dedicated `name` field (only `email`/`username`), so this follows the same convention as
+/// `ATTR_EMAIL_VERIFIED`/`ATTR_AUTH_TIME` above. `preferred_username` needs no attribute constant:
+/// it round-trips through `Identity.username`, which IS a dedicated field.
+const ATTR_NAME: &str = "name";
 /// Round-trips `exchange_refresh_tokens.chain_id`/`chain_expires_at` (the rotation-family and its
 /// absolute cap -- see that table's migration) through `Identity.attributes`, same convention as
 /// `account_id`/`project_id` above. Only exercised by `store_token`, since this store's own
@@ -80,6 +85,9 @@ fn row_to_refresh_token(row: ExchangeRefreshTokenRow) -> RefreshToken {
     if let Some(auth_time) = row.auth_time {
         attributes.insert(ATTR_AUTH_TIME.to_string(), auth_time.to_string());
     }
+    if let Some(name) = row.name {
+        attributes.insert(ATTR_NAME.to_string(), name);
+    }
     attributes.insert(ATTR_CHAIN_ID.to_string(), row.chain_id);
     attributes.insert(
         ATTR_CHAIN_EXPIRES_AT.to_string(),
@@ -95,7 +103,7 @@ fn row_to_refresh_token(row: ExchangeRefreshTokenRow) -> RefreshToken {
             provider_id: IDENTITY_PROVIDER_ID.to_string(),
             external_id: row.subject,
             email: row.email,
-            username: None,
+            username: row.preferred_username,
             attributes,
         },
         row.scope.unwrap_or_default(),
@@ -128,6 +136,7 @@ impl RefreshTokenStore for DbRefreshTokenStore {
             .attributes
             .get(ATTR_AUTH_TIME)
             .and_then(|v| v.parse::<i64>().ok());
+        let name = token.identity.attributes.get(ATTR_NAME).cloned();
         // Fail closed, unlike account_id/project_id above: a chain with no id or no cap is not a
         // meaningful "unknown" to default away -- every caller of `store_token` in this codebase
         // (`TokenExchangeOpStore::handle_token_exchange`) always sets both, so a missing/
@@ -171,6 +180,8 @@ impl RefreshTokenStore for DbRefreshTokenStore {
             email: token.identity.email,
             email_verified,
             auth_time,
+            preferred_username: token.identity.username,
+            name,
             chain_id,
             chain_expires_at,
             session_id,

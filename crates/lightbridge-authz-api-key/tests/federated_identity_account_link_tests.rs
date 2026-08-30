@@ -46,6 +46,10 @@ fn bare_upsert(issuer: &str, subject: &str) -> UpsertFederatedIdentity {
         access_expires_at: None,
         refresh_expires_at: None,
         scope: None,
+        email: None,
+        email_verified: None,
+        preferred_username: None,
+        name: None,
     }
 }
 

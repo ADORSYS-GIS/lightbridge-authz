@@ -118,18 +118,41 @@ fn decode_payload(bearer_token: &str) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Snapshots `email`/`email_verified` from the presented upstream token so the exchanged JWT
-/// mirrors a Keycloak access token. Best-effort: a token without these claims yields `None`.
-pub(crate) fn decode_email(bearer_token: &str) -> (Option<String>, Option<bool>) {
+/// Snapshots `email`/`email_verified`/`preferred_username`/`name` from the presented upstream
+/// token so the exchanged JWT mirrors a Keycloak access token. Best-effort: a token without a
+/// given claim yields `None` for it, never an invented default -- same "omit, never mint a lie"
+/// contract every other claim in this codebase follows.
+///
+/// This is the token-exchange grant's own source for these four claims, deliberately NOT a
+/// database lookup: the presented `subject_token` already carries them (once
+/// `BearerTokenServiceTrait::validate_bearer_token` has verified its signature -- both callers run
+/// that first), so decoding it directly is both simpler and fresher than round-tripping through
+/// `federated_identities` -- and a subject_token presented here need not even belong to someone
+/// who ever completed a login through this service's own `KeycloakRelyingParty` (a
+/// `federated_identities` row is not guaranteed to exist for it). Contrast the browser
+/// `authorization_code` grant (`TokenExchangeOpStore::mint_from_authorization_code`), which has no
+/// upstream token in hand at redemption time and reads
+/// `StoreRepo::find_federated_identity_by_account_id` instead.
+pub(crate) fn decode_profile_claims(
+    bearer_token: &str,
+) -> (Option<String>, Option<bool>, Option<String>, Option<String>) {
     let Some(value) = decode_payload(bearer_token) else {
-        return (None, None);
+        return (None, None, None, None);
     };
     let email = value
         .get("email")
         .and_then(Value::as_str)
         .map(str::to_string);
     let email_verified = value.get("email_verified").and_then(Value::as_bool);
-    (email, email_verified)
+    let preferred_username = value
+        .get("preferred_username")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    (email, email_verified, preferred_username, name)
 }
 
 /// Snapshots `auth_time`/`nonce` from the presented upstream token for the derived `id_token`

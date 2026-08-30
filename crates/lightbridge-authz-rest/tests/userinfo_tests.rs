@@ -33,6 +33,8 @@ fn access_token_claims(scope: &str) -> Map<String, Value> {
         "typ": "Bearer",
         "email": "alice@example.test",
         "email_verified": true,
+        "name": "Alice Example",
+        "preferred_username": "alice",
         "account_id": "acct_owner",
         "project_id": "proj_main",
         "sid": "sess_abc",
@@ -77,6 +79,32 @@ fn email_claims_require_the_email_scope() {
         Some("alice@example.test")
     );
     assert_eq!(with.get("email_verified"), Some(&Value::Bool(true)));
+}
+
+/// `name`/`preferred_username`'s own version of `email_claims_require_the_email_scope` above:
+/// gated on the `profile` scope, not `email`, and independent of it in both directions -- granting
+/// one must never leak the other.
+#[test]
+fn profile_claims_require_the_profile_scope() {
+    let without = user_info_claims(&access_token_claims("openid email")).expect("sub present");
+    assert!(
+        !without.contains_key("name") && !without.contains_key("preferred_username"),
+        "profile claims must not be projected without the profile scope, got {without:?}"
+    );
+
+    let with = user_info_claims(&access_token_claims("openid profile")).expect("sub present");
+    assert_eq!(
+        with.get("name").and_then(Value::as_str),
+        Some("Alice Example")
+    );
+    assert_eq!(
+        with.get("preferred_username").and_then(Value::as_str),
+        Some("alice")
+    );
+    assert!(
+        !with.contains_key("email") && !with.contains_key("email_verified"),
+        "the profile scope must not leak email on its own: {with:?}"
+    );
 }
 
 /// The tenant pair is this deployment's own identity context and is what the console calls this
@@ -126,7 +154,15 @@ fn only_identity_claims_are_projected() {
     projected.sort_unstable();
     assert_eq!(
         projected,
-        ["account_id", "email", "email_verified", "project_id", "sub"],
+        [
+            "account_id",
+            "email",
+            "email_verified",
+            "name",
+            "preferred_username",
+            "project_id",
+            "sub",
+        ],
         "the projection is an allow-list; adding to it is a deliberate act that updates this test"
     );
 }
