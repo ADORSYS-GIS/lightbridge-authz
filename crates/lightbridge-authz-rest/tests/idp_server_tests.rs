@@ -202,6 +202,14 @@ fn ui_static_dir(name: &str) -> std::path::PathBuf {
         b"console.log('placeholder');",
     )
     .unwrap();
+    // #598: the route allowlist manifest every test using this fixture now needs -- without it,
+    // every test below silently degrades to `load_route_manifest`'s `{"/"}` fallback and several
+    // would pass for the wrong reason.
+    std::fs::write(
+        dir.join("routes.json"),
+        br#"{"version":1,"basename":"/ui","routes":["/","/device","/device/confirm"]}"#,
+    )
+    .unwrap();
     dir
 }
 
@@ -242,11 +250,21 @@ async fn ui_bare_and_trailing_slash_both_serve_index_html() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Client-side routing under `/ui`: any path under the prefix that isn't a real static file must
-/// still resolve to `index.html` with a `200`, exactly like the pre-`/ui` fallback behavior did,
-/// just scoped to the prefix now.
+/// #598: `/ui` is a route ALLOWLIST now, not a catch-all -- any path under the prefix that is not
+/// one of the manifest's entries must be a bare `404`, not `index.html`.
+///
+/// Prove-fail-first (recorded verbatim against unfixed code, pre-B4): with `static_assets_fallback`
+/// still `ServeDir::new(dir).fallback(ServeFile::new(index))` (the old whole-subtree catch-all),
+/// this test failed with:
+/// ```text
+/// thread 'ui_unknown_spa_route_returns_404' (3774949) panicked at
+/// crates/lightbridge-authz-rest/tests/idp_server_tests.rs:280:5:
+/// assertion `left == right` failed
+///   left: 200
+///  right: 404
+/// ```
 #[tokio::test]
-async fn ui_unknown_spa_route_falls_back_to_index_html() {
+async fn ui_unknown_spa_route_returns_404() {
     let dir = ui_static_dir("spa-route");
     let router = ui_mount_router(&dir);
 
@@ -254,6 +272,27 @@ async fn ui_unknown_spa_route_falls_back_to_index_html() {
         .oneshot(
             Request::builder()
                 .uri("/ui/some/spa/route")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The positive counterpart to [`ui_unknown_spa_route_returns_404`]: a path the manifest DOES
+/// list must still resolve to `index.html` with a `200`, once nested under `/ui`.
+#[tokio::test]
+async fn ui_allowlisted_route_serves_index_html() {
+    let dir = ui_static_dir("allowlisted-route");
+    let router = ui_mount_router(&dir);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/ui/device")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -364,6 +403,66 @@ async fn unknown_path_outside_ui_prefix_returns_plain_404() {
         StatusCode::NOT_FOUND,
         "a path outside /ui that matches no protocol route must be a plain 404, not the SPA"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE CROSS-REPO DRIFT GUARD (#598's own Risks section, made mechanical): every SPA route
+/// `relying_party.rs`'s `UI_*` constants redirect into must appear in the artifact's shipped
+/// `dist/routes.json`, or the redirect lands on a path `static_assets` 404s. This builds the
+/// router with a `routes.json` that is a VERBATIM copy of `apps/authz-ui`'s manifest (the same
+/// six-route shape converse-frontends' `vite.config.ts` route-manifest emitter produces, plan
+/// A15) and proves every one of the five `/ui/device*`/`/ui/error` redirect targets resolves.
+///
+/// Not a prove-fail-first case: against unfixed code (pre-B4) this passes already, trivially --
+/// the old whole-subtree catch-all answers every `/ui/*` path with `200` regardless of any
+/// manifest, so this assertion is vacuous until B4's per-route allowlist loop makes `200` mean
+/// "this route is actually allowlisted." Kept here (not deferred) because it is the guard B1's
+/// `UI_*` constants' own doc comment names by name.
+#[tokio::test]
+async fn redirect_targets_are_all_allowlisted() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "lightbridge-authz-idp-redirect-targets-allowlisted-{nanos}"
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("index.html"),
+        b"<!doctype html><title>hosted-login placeholder</title>",
+    )
+    .unwrap();
+    // Verbatim copy of apps/authz-ui's dist/routes.json (converse-frontends#409's
+    // vite.config.ts manifest emitter, plan A15) -- NOT hand-trimmed, so this test fails the
+    // moment either side's route set drifts from the other.
+    std::fs::write(
+        dir.join("routes.json"),
+        br#"{
+  "version": 1,
+  "basename": "/ui",
+  "routes": ["/", "/device", "/device/invalid", "/device/confirm", "/device/success", "/error"]
+}
+"#,
+    )
+    .unwrap();
+    let router = ui_mount_router(&dir);
+
+    for path in [
+        "/ui/device",
+        "/ui/device/invalid",
+        "/ui/device/confirm",
+        "/ui/device/success",
+        "/ui/error",
+    ] {
+        let response = router
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "GET {path}");
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -789,7 +888,8 @@ async fn build_idp_router_serves_oauth2_token_route() {
 /// of the three routes needs a live database or Redis to prove it's mounted: `/authorize` and
 /// `/idp/callback` both fail query-extraction before touching any store (`422`, not `404`), and
 /// `verify_page` (`GET /device/verify`) is `Query`-only -- no `ConnectInfo`, no store lookup --
-/// so it answers `200` unconditionally.
+/// so it answers unconditionally (a `303` handoff to the SPA since lightbridge-authz#598, `200`
+/// HTML before it; either way, never a `404`).
 ///
 /// Prove-fail-first (recorded verbatim in the PR body): deleted the `relying_party::router`
 /// merge from `build_idp_router` and reran -- `/device/verify` and `/idp/callback` both returned
@@ -825,9 +925,12 @@ async fn build_idp_router_mounts_authorize_device_verify_and_callback_unconditio
         )
         .await
         .unwrap();
-    assert_eq!(
+    // #598: `verify_page` is a 303 handoff into the SPA now, not a 200 HTML page -- this test is
+    // about mount presence, not response shape, so `assert_ne!(.., NOT_FOUND)` is the right
+    // property (matching the sibling assertions on /authorize and /idp/callback above/below).
+    assert_ne!(
         device_verify.status(),
-        StatusCode::OK,
+        StatusCode::NOT_FOUND,
         "/device/verify must be mounted unconditionally"
     );
 
@@ -923,9 +1026,12 @@ async fn build_idp_router_mount_does_not_consult_raw_token_exchange_config() {
         )
         .await
         .unwrap();
-    assert_eq!(
+    // #598: same "mount presence, not response shape" correction as
+    // build_idp_router_mounts_authorize_device_verify_and_callback_unconditionally above --
+    // verify_page is a 303 handoff now, not a 200 HTML page.
+    assert_ne!(
         device_verify.status(),
-        StatusCode::OK,
+        StatusCode::NOT_FOUND,
         "/device/verify must be mounted regardless of oauth2.token_exchange's raw config"
     );
 
@@ -2154,19 +2260,20 @@ mod db {
     }
 
     /// ADR-0021's highest-risk property (#442, "Risks" table in issue #442), updated for the
-    /// follow-up that scoped the static build under `/ui`: the `/ui`-nested static mount must
-    /// never shadow an existing protocol route, AND (the new half, since this used to be a
-    /// whole-server catch-all) the static build must never answer for a path outside `/ui`
-    /// either. Needs the DB-backed setup (a real bootstrapped signing key) so
-    /// `/.well-known/jwks.json` actually succeeds -- offline it 500s for its own unrelated reason
-    /// (no key to serialize), which would make a coarse status-code assertion here meaningless.
-    /// Builds the idp router with a REAL, on-disk static build directory (not `TEST_STATIC_DIR`'s
-    /// nonexistent path, so `/ui` is actually capable of answering every request under it) and
-    /// proves three things: every existing protocol route still resolves to its own handler with
-    /// real content; a genuinely unmatched path *under* `/ui` reaches the static build's SPA
-    /// fallback (`index.html`, `200`, never a bare `404`); and that exact same path *without* the
-    /// `/ui` prefix is a plain `404` -- proving the static build is scoped to `/ui`, not a
-    /// catch-all for the whole server any more.
+    /// follow-up that scoped the static build under `/ui`, and updated again for #598's route
+    /// allowlist: the `/ui`-nested static mount must never shadow an existing protocol route, AND
+    /// (the new half, since this used to be a whole-server catch-all) the static build must never
+    /// answer for a path outside `/ui` either. Needs the DB-backed setup (a real bootstrapped
+    /// signing key) so `/.well-known/jwks.json` actually succeeds -- offline it 500s for its own
+    /// unrelated reason (no key to serialize), which would make a coarse status-code assertion
+    /// here meaningless. Builds the idp router with a REAL, on-disk static build directory (not
+    /// `TEST_STATIC_DIR`'s nonexistent path, so `/ui` is actually capable of answering every
+    /// request under it) and proves three things: every existing protocol route still resolves to
+    /// its own handler with real content; a genuinely unmatched path *under* `/ui` -- one that is
+    /// not in the manifest -- is a bare `404` (inverted by #598: this used to prove the opposite,
+    /// that an unmatched path fell back to `index.html`); and that exact same path *without* the
+    /// `/ui` prefix is ALSO a plain `404` -- so both shapes now agree, rather than one being a
+    /// `200` SPA-shell and the other a `404`.
     #[sqlx::test(migrations = "../../migrations")]
     async fn static_fallback_never_shadows_an_existing_protocol_route(pool: PgPool) {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -2181,6 +2288,15 @@ mod db {
         std::fs::write(
             static_dir.join("index.html"),
             b"<!doctype html><title>hosted-login placeholder</title>",
+        )
+        .unwrap();
+        // #598: without a manifest here, this fixture degrades to the `{"/"}` fallback and the
+        // `/authorize`/`/device/verify`/`/idp/callback` non-404 assertions below would still pass,
+        // but for reasons unrelated to what this test proves. Not adding "/device"/etc: this
+        // test is about protocol-route shadowing, not the allowlist's own contents.
+        std::fs::write(
+            static_dir.join("routes.json"),
+            br#"{"version":1,"basename":"/ui","routes":["/"]}"#,
         )
         .unwrap();
 
@@ -2301,6 +2417,20 @@ mod db {
             );
         }
 
+        // #598: a genuinely unmatched path under /ui -- one the manifest does not list -- is now
+        // a bare 404, never the SPA shell. Inverted from the pre-#598 assertion this test made
+        // (200 + index.html) -- see the surrounding doc comment.
+        //
+        // Prove-fail-first (recorded verbatim against unfixed code, pre-B4): with
+        // `static_assets_fallback` still the old whole-subtree catch-all, this failed with:
+        // ```text
+        // thread 'db::static_fallback_never_shadows_an_existing_protocol_route' (3776699)
+        // panicked at crates/lightbridge-authz-rest/tests/idp_server_tests.rs:2434:9:
+        // assertion `left == right` failed: a genuinely unmatched path under /ui -- outside the
+        // route allowlist -- must be a bare 404, never the SPA shell
+        //   left: 200
+        //  right: 404
+        // ```
         let fallback_response = router
             .clone()
             .oneshot(
@@ -2313,23 +2443,15 @@ mod db {
             .unwrap();
         assert_eq!(
             fallback_response.status(),
-            StatusCode::OK,
-            "a genuinely unmatched path under /ui must reach the static build's SPA fallback and \
-             get index.html back, never a bare 404"
-        );
-        let body = to_bytes(fallback_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(
-            &body[..],
-            b"<!doctype html><title>hosted-login placeholder</title>"
+            StatusCode::NOT_FOUND,
+            "a genuinely unmatched path under /ui -- outside the route allowlist -- must be a \
+             bare 404, never the SPA shell"
         );
 
-        // The other half of the path-scoping property (#442 follow-up): the exact same
-        // unmatched path WITHOUT the /ui prefix must be a plain 404 -- the static build is no
-        // longer a catch-all for the whole server. This is the assertion that would have caught
-        // the pre-follow-up bug: under the old root-level `.fallback_service(..)` mount, this
-        // same path answered 200 with the SPA's index.html instead.
+        // The other half of the path-scoping property (#442 follow-up, now also #598's "both
+        // shapes agree" property): the exact same unmatched path WITHOUT the /ui prefix must ALSO
+        // be a plain 404 -- the static build is no longer a catch-all for the whole server, and
+        // since #598 it isn't a catch-all for its own /ui subtree either.
         let outside_ui_response = router
             .oneshot(
                 Request::builder()
