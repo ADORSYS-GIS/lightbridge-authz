@@ -875,6 +875,32 @@ This is a documented ADR-0038 exception (see "Persistence" below), not the targe
 schema goes through `crates/lightbridge-authz-api/schema/authz.cstack` and cratestack's migration
 generator where it can.
 
+**Before adding a migration, check that its version prefix is free — including on `main`:**
+
+```bash
+git fetch origin && git ls-tree --name-only origin/main migrations/ | sed 's#.*/##; s/_.*//' | sort | uniq -d
+```
+
+SQLx keys `_sqlx_migrations` by the numeric **version**, not the filename, so two files sharing a
+prefix collide on that table's primary key: the second to apply fails `23505` and aborts the whole
+run. Locally that is every `sqlx::test` in the workspace dying at setup; in a deployment it is
+`authz-migrate` failing at startup, so nothing comes up at all.
+
+**Neither PR's CI can catch this** — each branch contains only its own migration, so the collision
+exists solely in the merge result. Two green PRs turned `main` red exactly this way on 2026-08-30
+(#564 × #565, healed by #568). A same-day pair is the common case, since everyone reaches for
+today's date as the prefix.
+
+Two rules once a collision has happened:
+
+- **A version any environment has durably applied cannot be reassigned** — `_sqlx_migrations` is
+  the record of what actually ran there. The file that moves is the one that has *not* been applied
+  anywhere durable. If both have, renumbering is not available and the fix is a new forward
+  migration.
+- **An applied migration's bytes are frozen.** SQLx stores a checksum per migration and validates
+  it on every run, so editing one — *even to add a comment* — aborts the next migrate with a
+  version mismatch. Corrections go in the owning ADR, not in the file.
+
 ## Persistence: cratestack is the only sanctioned database API (ADR-0038)
 
 webank-context [ADR-0038](https://github.com/ADORSYS-GIS/webank-context/blob/master/decisions/0038-cratestack-is-the-only-database-api.md)

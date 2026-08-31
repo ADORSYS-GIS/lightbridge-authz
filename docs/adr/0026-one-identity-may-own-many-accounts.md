@@ -312,6 +312,43 @@ express ownership.
 Rejected — see D6. Trades a structural cross-tenant-merge guarantee for a relation `user_id`
 already provides.
 
+## Postscript (2026-08-30): the migration was renumbered after merge
+
+`migrations/20260830000001_accounts_owned_by_users.sql` is now
+`migrations/20260830000003_accounts_owned_by_users.sql`. #568 renamed it as a pure `git mv`, so the
+file itself carries no record of why — and it must stay that way, which is the point of putting
+this here instead.
+
+**What happened.** #565 landed the same day carrying its own `20260830000001`
+(`federated_identities_add_profile_claims`). SQLx keys `_sqlx_migrations` by the numeric VERSION,
+not the filename, so two files sharing a prefix collide on that table's primary key: the second to
+apply fails `23505` and aborts the entire migration run. Locally that is every `sqlx::test` in the
+workspace dying at setup; in a deployment it is `authz-migrate` failing at startup, so nothing comes
+up at all. `main` went red at `8625902`.
+
+**Neither PR's CI could have caught it.** Each branch contained only its own migration, so the
+collision existed solely in the merge result — #564 and #565 were both green individually.
+
+**Which file moved, and why that is not arbitrary.** Production had ALREADY recorded
+`20260830000001` as #565's migration. A version some environment has durably applied cannot be
+reassigned: `_sqlx_migrations` is the record of what actually ran there, and rewriting a live row's
+meaning leaves a database silently disagreeing with its own schema. THIS migration had never been
+applied anywhere durable, so it was the one that could safely move. Renumbering is legitimate only
+under exactly that condition — the same bar ADR-0006 records for its own `20260724` -> `20260727`
+renumber, where none of the four had ever reached `main`. When both sides have been applied,
+renumbering is off the table and the answer is a new forward migration.
+
+**Why this text is here and not in the migration.** SQLx stores a checksum of each migration's
+BYTES and validates it on every run, so editing an applied migration — even to add a comment —
+aborts the next migrate with a version mismatch. Drafting this as a header comment on the `.sql`
+was rejected for exactly that reason: the safety of such an edit depends on no environment having
+applied the file yet, which is a property that can lapse between opening a PR and merging it (the
+7.0.0 release PR was open at the time). A migration's bytes are frozen the moment they ship;
+its reasoning belongs somewhere that can still be corrected.
+
+The reusable form of all of this — the pre-flight check and the two rules — is in AGENTS.md's
+Migrations section.
+
 ## Related
 
 - ADR-0006 (amended — the cardinality half retired here)
