@@ -1,5 +1,39 @@
 # Changelog
 
+## [7.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v6.0.0...v7.0.0) (2026-08-31)
+
+
+### ⚠ BREAKING CHANGES
+
+* **ci:** tests and Trivy gate the cosign signature ([#499](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/499)) (#590)
+* **deps:** cratestack family 0.8.12 -> 0.9.4, lockstep ([#574](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/574))
+* **authz:** `procedure.createAccount` no longer returns 409 on a second call for the same subject -- it returns 200 and a new account. `Account` gains a `userId` field. `StoreRepo::create_account` takes `&AccountId` instead of `&str`.
+* **idp:** mint and serve profile claims — the browser grant dropped every identity claim ([#565](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/565))
+
+### Features
+
+* **authz:** one identity may own many accounts (ADR-0026) ([#564](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/564)) ([8625902](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/8625902e959ca0e5c1ae758f5f4f3f13eb2a0810))
+* **idp:** 30s refresh-reuse grace window — a racing client no longer kills its own chain ([#569](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/569)) ([8abf756](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/8abf7567daf0f7ddc16289d4cadcaaeacc725630))
+* **idp:** mint and serve profile claims — the browser grant dropped every identity claim ([#565](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/565)) ([50a8c13](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/50a8c13b38fbb813423eb8747e2482bd3403137a))
+
+
+### Bug Fixes
+
+* **ci:** tests and Trivy gate the cosign signature ([#499](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/499)) ([#590](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/590)) ([6d33df4](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/6d33df4fb054165e8ca42d92c3ba4b962513d9ca))
+* heal the [#564](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/564) x [#565](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/565) merge seam — migration version collision and AccountId call site ([#568](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/568)) ([5f41e22](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/5f41e2268a8efea16f1f1cd94e1def2adf7933ce))
+* **it:** repair it-idp's stale assertions and run it in CI ([#580](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/580)) ([b3a47d1](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/b3a47d11966c735f95e28834680a07bf783de9c5))
+
+
+### Build System
+
+* **deps:** cratestack family 0.8.12 -&gt; 0.9.4, lockstep ([#574](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/574)) ([25f0417](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/25f04174154fbbf37efe0afec233e81a2765043b))
+
+
+### Documentation
+
+* **adr:** ADR-0027 — one usage store, partitioned by grain, source is a dimension ([#579](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/579)) ([01ecfd0](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/01ecfd072daf828e4df1e12af8e1bc0bb311cd81))
+* record the ADR-0026 migration renumber, and guard the collision ([#576](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/576)) ([27dd878](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/27dd87859d29e43ae10a9242d8d9e162bac22ab2))
+
 ## [6.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v5.0.0...v6.0.0) (2026-08-29)
 
 
