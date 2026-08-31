@@ -341,6 +341,63 @@ mod tests {
         );
     }
 
+    /// #578: pins `UsageQueryResponse.truncated` in the published schema, the same seam
+    /// `usage_openapi_should_publish_the_latency_percentile_contract` above guards for the
+    /// latency fields -- a client generated from `openapi/usage.backend.yaml` needs this field to
+    /// exist and be required to ever render a truncation notice at all.
+    #[test]
+    fn usage_openapi_should_publish_the_truncated_field() {
+        let doc = usage_openapi();
+        let response = &doc["components"]["schemas"]["UsageQueryResponse"];
+
+        assert!(
+            response["properties"].get("truncated").is_some(),
+            "expected UsageQueryResponse.truncated in the published schema"
+        );
+
+        let required: Vec<&str> = response["required"]
+            .as_array()
+            .expect("UsageQueryResponse should declare required fields")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert!(
+            required.contains(&"truncated"),
+            "truncated is always present and must be required, got {required:?}"
+        );
+    }
+
+    /// #570: pins the 401/403 responses `/usage/v1/usage/query` now documents (bearer
+    /// authentication + ownership check), so a silent regression back to "no auth check
+    /// documented" fails here first.
+    #[test]
+    fn usage_openapi_should_publish_query_endpoint_auth_responses() {
+        let doc = usage_openapi();
+        let responses = &doc["paths"]["/usage/v1/usage/query"]["post"]["responses"];
+
+        assert!(
+            responses.get("401").is_some(),
+            "expected /usage/v1/usage/query to document a 401 response"
+        );
+        assert!(
+            responses.get("403").is_some(),
+            "expected /usage/v1/usage/query to document a 403 response"
+        );
+    }
+
+    /// #570: `/usage/v1/spend/query` now refuses a request carrying an `Authorization` header --
+    /// pins the 403 response that behavior is documented under.
+    #[test]
+    fn usage_openapi_should_publish_spend_endpoint_forbidden_response() {
+        let doc = usage_openapi();
+        let responses = &doc["paths"]["/usage/v1/spend/query"]["post"]["responses"];
+
+        assert!(
+            responses.get("403").is_some(),
+            "expected /usage/v1/spend/query to document a 403 response"
+        );
+    }
+
     #[test]
     fn usage_openapi_should_be_openapi_3() {
         let doc = usage_openapi();

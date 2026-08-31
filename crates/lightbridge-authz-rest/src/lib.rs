@@ -4083,6 +4083,22 @@ mod tests {
         );
     }
 
+    /// #570: pins `POST /idp/v1/authorize-usage-scope` (the ownership authority
+    /// `lightbridge-authz-usage`'s query listener calls) in the published OPA OpenAPI contract,
+    /// mirroring `resolve_context_endpoint_should_exist_in_opa_openapi` above.
+    #[test]
+    fn authorize_usage_scope_endpoint_should_exist_in_opa_openapi() {
+        let doc = opa_openapi();
+        let paths = doc["paths"]
+            .as_object()
+            .expect("openapi paths should be an object");
+
+        assert!(
+            paths.contains_key("/idp/v1/authorize-usage-scope"),
+            "expected the OPA server to expose the usage-scope ownership authority endpoint"
+        );
+    }
+
     #[test]
     fn introspect_response_should_expose_active_flag() {
         let doc = opa_openapi();
