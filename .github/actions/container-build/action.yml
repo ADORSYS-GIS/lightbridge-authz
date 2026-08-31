@@ -125,8 +125,8 @@ runs:
     # is minted here: signing ran seconds after the push, before `test`/`integration-test` had a
     # verdict and before Trivy had looked at the image, so a red-main build (bffeaf5) reached prod
     # while CI was still red. Signing now lives in `ci.yml`'s `container-build` job, after the
-    # Trivy gate and behind `needs: [test, integration-test]`, where the ordering is visible in
-    # the workflow instead of buried in a composite step.
+    # Trivy gate and behind `needs: [sast, binaries, test, integration-test]`, where the ordering
+    # is visible in the workflow instead of buried in a composite step.
     #
     # `image-ref` is exported for that signing step: cosign signs `ref@digest`, never a tag.
 

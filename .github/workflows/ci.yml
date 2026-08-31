@@ -99,7 +99,15 @@ jobs:
     # A flaky test now blocks publishing. That is the intended trade -- an unpublished image is a
     # deploy that did not happen, whereas an unverified signed image is a deploy that cannot be
     # taken back. Investigate the flake; do not weaken this edge to route around it.
-    needs: [binaries, test, integration-test]
+    #
+    # `sast` (cargo-deny) is in this list by an explicit decision, and it behaves unlike the other
+    # three: it can go red with no change on our side, when a new RUSTSEC advisory is published
+    # against a dependency we already ship. So this edge can block an unrelated hotfix at 3am, and
+    # that is accepted -- an image with a known advisory should not promote itself to production
+    # just because the advisory landed inconveniently. The unblock is to fix or triage the finding
+    # in `deny.toml` (which is a real decision, recorded in the file), never to drop `sast` from
+    # this list.
+    needs: [sast, binaries, test, integration-test]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     strategy:
@@ -142,17 +150,17 @@ jobs:
           severity: 'HIGH,CRITICAL'
 
       # The promotion token, minted last and only here. Everything upstream of this point has
-      # already had its say: `test` and `integration-test` directly via `needs`, `code-checks`
-      # transitively (all three of this job's dependencies need it), and Trivy in the step above,
-      # which fails the job before this one runs. An image that reaches GHCR without clearing them
-      # stays unsigned, and argocd-image-updater will not promote an unsigned image.
+      # already had its say: `sast`, `test` and `integration-test` directly via `needs`,
+      # `code-checks` transitively (every one of this job's dependencies needs it), and Trivy in
+      # the step above, which fails the job before this one runs. Both halves of the supply-chain
+      # check are therefore ahead of the signature -- cargo-deny over the dependency graph we
+      # build from, Trivy over the image we ship. An image that reaches GHCR without clearing all
+      # of them stays unsigned, and argocd-image-updater will not promote an unsigned image.
       #
-      # NOT gated on `sast` (cargo-deny) or `frontend`, deliberately. cargo-deny can go red from a
-      # newly published upstream advisory with no change on our side, and wiring that into the
-      # promotion path would let a 3am RUSTSEC publication block an unrelated hotfix -- that is a
-      # policy call worth making on purpose, not a side effect of this fix. `frontend` is already
-      # covered for the image: `binaries` stages the same Vite build into `dist/static`, which is
-      # what `Dockerfile.dist` copies, so that job is a second proof rather than the image's
+      # `frontend` is deliberately NOT in the list, and its absence is not a gap: `binaries` stages
+      # the same Vite build into `dist/static`, which is what `Dockerfile.dist` copies
+      # (`COPY dist/static /app/static`), so the image's UI comes from `binaries` and that job
+      # already gates this one. `frontend` is a second, faster proof for PRs, not the image's
       # source of truth.
       - name: Install cosign
         uses: sigstore/cosign-installer@v3.7.0
