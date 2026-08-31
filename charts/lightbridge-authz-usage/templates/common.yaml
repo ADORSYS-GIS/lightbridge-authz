@@ -1,1 +1,18 @@
+{{- /*
+The query listener (`/usage/v1/usage/query`, `/usage/v1/spend/query`) has no in-app auth of its
+own -- mTLS at the TLS handshake IS the access control (see
+`docs/lightbridge-query-api.md`'s warning banner and `Tls::client_ca_bundle_path`'s doc comment in
+crates/lightbridge-authz-core/src/config/mod.rs). `values.yaml`'s
+`config.query.tls.clientCaBundlePath` defaults to a real CA bundle path so mTLS is on by default,
+but an operator can explicitly set it to "" to run without mTLS (e.g. no shared CA exists yet).
+That case must never leave the query port reachable-but-unauthenticated: values.yaml alone can't
+conditionally drop a list entry (it is raw YAML data, not templated, except for the specific
+string fields bjw-s's own templates run `tpl` over, like ConfigMap data), so this pre-processes
+`.Values` here, before delegating to the bjw-s common loader, to drop both the query
+containerPort and the query Service port whenever the CA bundle path is empty.
+*/ -}}
+{{- if not .Values.config.query.tls.clientCaBundlePath }}
+{{- $_ := set .Values.controllers.main.containers.authz "ports" (list (dict "name" "http" "containerPort" 3000 "protocol" "TCP")) }}
+{{- $_ := unset .Values.service.authz.ports "query" }}
+{{- end }}
 {{- include "bjw-s.common.loader.all" . -}}
