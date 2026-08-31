@@ -106,5 +106,15 @@ runs:
           echo "::error::dist/static/routes.json does not declare basename '/ui' -- the bundle and this server disagree about the mount prefix"
           exit 1
         fi
+        # R4: check the REAL, pinned artifact's route set, not just a fixture on the Rust side.
+        # These five are the RP leg's own redirect targets (relying_party.rs's UI_* constants) --
+        # a bundle missing one turns a successful pairing (or a genuine error) into a 404 at the
+        # authentication boundary, not a rendered page.
+        for route in /device /device/invalid /device/confirm /device/success /error; do
+          if ! grep -q "\"${route}\"" dist/static/routes.json; then
+            echo "::error::dist/static/routes.json is missing route \"${route}\" -- relying_party.rs redirects into this path and static_assets.rs will 404 it"
+            exit 1
+          fi
+        done
         echo "staged bundle OK:"
         printf '  %s\n' "${hashed[@]}"

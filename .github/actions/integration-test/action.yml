@@ -13,8 +13,11 @@ runs:
     # that would have caught it were cancelled, not failed).
     #
     # This is also the step that makes `run_suite it-idp` below meaningful: .docker/it/idp_it.py's
-    # `section_root_and_spa` asserts GET /ui/ and GET /ui/login return 200 with an HTML
-    # content-type. That assertion is now the live, end-to-end proof that the digest-pinned
+    # `section_root_and_spa` asserts GET /ui/, /ui/device, /ui/device/invalid, /ui/device/confirm,
+    # /ui/device/success, and /ui/error all return 200 with an HTML content-type -- every route
+    # dist/routes.json lists -- while GET /ui/login 404s (there is no such route; #598 made /ui a
+    # route ALLOWLIST, not a catch-all, so a stray path must fail closed instead of quietly serving
+    # the SPA shell). That assertion is now the live, end-to-end proof that the digest-pinned
     # external bundle really lands at /app/static in a running authz-idp -- the single most
     # valuable gate on this whole cutover.
     - uses: ./.github/actions/stage-authz-ui

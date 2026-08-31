@@ -546,12 +546,11 @@ async fn invalid_device_codes_have_one_uniform_response_and_frame_protection(poo
     // #598: D9 -- unknown/expired/consumed still share `lookup_pending_session`, so uniformity
     // now holds structurally, via one identical 303 -> /ui/device/invalid, rather than one
     // identical HTML body. Headers (CSP/X-Frame-Options/no-store) still ride along on
-    // `redirect_to`, so those assertions stay; the body-equality assertions are dropped -- every
-    // redirect body is empty, so equality there would be vacuous.
+    // `redirect_to`, so those assertions stay.
     // Prove-fail-first (recorded verbatim, unfixed code): `assertion `left == right` failed`,
     // `left: 404`, `right: 303` (the OLD `verification_response(.., StatusCode::NOT_FOUND)` for
     // an unusable code, against the flipped expectation of a 303).
-    for response in [&unknown, &expired, &consumed] {
+    for response in [unknown, expired, consumed] {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(
             response.headers().get(header::LOCATION).unwrap(),
@@ -571,6 +570,13 @@ async fn invalid_device_codes_have_one_uniform_response_and_frame_protection(poo
         assert_eq!(
             response.headers().get(header::CACHE_CONTROL).unwrap(),
             "no-store"
+        );
+        // R12: closes the reopened-oracle path if `redirect_to` ever grows a body -- three
+        // BYTE-IDENTICAL empty bodies is a stronger claim than "the same status/headers".
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            body.is_empty(),
+            "every uniform-failure redirect body must be empty, not just header-identical"
         );
     }
 }

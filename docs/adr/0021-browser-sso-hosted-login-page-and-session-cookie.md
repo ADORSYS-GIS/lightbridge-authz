@@ -581,14 +581,20 @@ login.
 > The same change also retires the RP leg's own server-rendered HTML entirely: `verify_page`,
 > `verify_submit`, `verify_continue`, and the `callback` handler's device-completion arm all now
 > `303` into the SPA (`/ui/device`, `/ui/device/confirm`, `/ui/device/invalid`,
-> `/ui/device/success`) instead of rendering a page, and every former failure response
-> (`400`/`403`/`404`/`502`/`503`, previously distinct per failure) collapses to a uniform `303` to
-> `/ui/error`. **The status-code distinction does not disappear — it moves to a
-> `tracing::warn!(reason = "...")` log line at each site**, a deliberate trade recorded here because
-> it is the kind of thing a future reader would otherwise read as an accident: every one of these
-> responses is a browser navigation (`GET /device/verify`, `GET /idp/callback`, two form posts), not
-> something a machine parses (the device client polls `/oauth2/token`, an entirely different
-> endpoint), so a redirect losing the status-code granularity costs nothing a consumer depended on.
+> `/ui/device/success`) instead of rendering a page. An unknown, expired, or already-consumed
+> `user_code` — the one case with its own dedicated target — uniformly `303`s to
+> `/ui/device/invalid`, never to the generic `/ui/error`: `lookup_pending_session`'s
+> `LookupFailure::NotUsable` variant is deliberately one case, not one per reason, so
+> `verify_submit`/`verify_continue` (and `verify_context`'s `404` arm, D10 below) structurally
+> cannot leak which of the three applied. Every OTHER former failure response — genuine store,
+> cookie, or completion failures, not an unusable code (`400`/`403`/`502`/`503`, previously
+> distinct per failure) — collapses to a uniform `303` to `/ui/error`. **The status-code
+> distinction does not disappear — it moves to a `tracing::warn!(reason = "...")` log line at each
+> site**, a deliberate trade recorded here because it is the kind of thing a future reader would
+> otherwise read as an accident: every one of these responses is a browser navigation (`GET
+> /device/verify`, `GET /idp/callback`, two form posts), not something a machine parses (the device
+> client polls `/oauth2/token`, an entirely different endpoint), so a redirect losing the
+> status-code granularity costs nothing a consumer depended on.
 > A new `GET /device/verify/context` endpoint, bound to the same `__Host-authz_device_confirm`
 > cookie `verify_continue` already required, now serves the confirmation data the deleted page used
 > to print (`user_code`, `client_id`, never `device_code`) as JSON, uniformly `404` for every

@@ -77,10 +77,14 @@ const DEVICE_CONFIRM_TTL_SECONDS: i64 = 300;
 const DEVICE_CONFIRM_PROVIDER_ID: &str = "device-confirm";
 
 /// Rate limit applied to every `user_code` lookup on the public, unauthenticated verification
-/// pages (`verify_submit`/`verify_continue`), keyed by caller IP (see [`lookup_pending_session`]).
-/// Generous enough that a human retyping a mistyped code a few times never gets throttled, tight
-/// enough that scripted brute-forcing of the 8-character `user_code` space
-/// (`device_store::USER_CODE_ALPHABET`) is not viable within a device code's short TTL.
+/// surface, keyed by caller IP (see [`lookup_pending_session`]). Three callers share this one
+/// budget: `verify_submit`, `verify_continue`, and -- since the `/device/verify/context` endpoint
+/// -- `verify_context` too, which means a single browser confirm-page RELOAD spends a burst unit
+/// on top of the submit that got the caller there in the first place, not just the two form posts.
+/// Generous enough that a human retyping a mistyped code a few times (plus an incidental reload of
+/// the confirm page) never gets throttled, tight enough that scripted brute-forcing of the
+/// 8-character `user_code` space (`device_store::USER_CODE_ALPHABET`) is not viable within a
+/// device code's short TTL.
 const VERIFY_RATE_LIMIT_BURST: u32 = 20;
 const VERIFY_RATE_LIMIT_REFILL_PER_SECOND: f64 = 1.0;
 
@@ -927,13 +931,20 @@ async fn verify_page(Query(query): Query<VerifyQuery>) -> Response {
     redirect_to(&target)
 }
 
-/// Keeps `[0-9A-Z-]` after upper-casing and clamps to 16 characters -- `device_store.rs`'s
-/// `USER_CODE_ALPHABET` (Crockford-style, no `I`/`L`/`O`/`U`) plus the display separator `-`.
-/// Applied to a value that arrives off the URL bar (`?user_code=` on `GET /device/verify`), so
-/// this is the one and only filter standing between an attacker-controlled query string and the
-/// `Location` header [`verify_page`] emits -- see `verify_page_sanitizes_user_code_for_the_handoff`
-/// for the falsification this exists to close (a `<script>` tag surviving into the redirect
-/// target).
+/// Keeps `[0-9A-Z-]` after upper-casing and clamps to 16 characters. **This is deliberately a
+/// SUPERSET of `device_store.rs`'s real `USER_CODE_ALPHABET`** (Crockford-style, no `I`/`L`/`O`/
+/// `U`) plus the display separator `-` -- it accepts every ASCII alphanumeric, not just the 32
+/// characters a real code can ever contain, because this function's only job is making the
+/// `Location` header safe to emit, not validating that the code is real (an unusable code still
+/// round-trips through this handoff and 303s to `/ui/device/invalid` once the SPA submits it, via
+/// `lookup_pending_session`'s own lookup -- this function is not the place that decision is made).
+/// `apps/authz-ui`'s own JS twin of this filter is tighter, matching the real alphabet exactly,
+/// since it is validating a value the user is about to submit, not merely making one safe to
+/// display. Applied to a value that arrives off the URL bar (`?user_code=` on `GET
+/// /device/verify`), so this is the one and only filter standing between an attacker-controlled
+/// query string and the `Location` header [`verify_page`] emits -- see
+/// `verify_page_sanitizes_user_code_for_the_handoff` for the falsification this exists to close (a
+/// `<script>` tag surviving into the redirect target).
 fn sanitize_user_code_for_display(raw: &str) -> String {
     let cleaned: String = raw
         .to_uppercase()
@@ -1146,6 +1157,23 @@ struct VerifyContext {
     client_id: String,
 }
 
+/// The shared security-header set every [`verify_context`] response carries -- the `200`, the
+/// `404`, and the `503` alike -- so header shape can never distinguish "session found" from "not
+/// found" from "store unavailable" (the review finding this closes: before this helper, only the
+/// `200` arm carried `X-Content-Type-Options` and none of the three carried CSP/`X-Frame-Options`,
+/// so the three responses were not actually byte-for-byte comparable the way the doc comments
+/// claimed). Same same-origin/unembeddable/uncacheable/no-sniff posture [`redirect_to`] uses for
+/// the RP leg's browser-navigation responses -- this is the equivalent set for this endpoint's
+/// same-origin `fetch`, not a redirect.
+fn verify_context_headers() -> [(header::HeaderName, &'static str); 4] {
+    [
+        (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
+        (header::X_FRAME_OPTIONS, "DENY"),
+        (header::CACHE_CONTROL, "no-store"),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+    ]
+}
+
 /// D10: renders exactly what the deleted server-rendered confirmation page used to print, as JSON
 /// for the SPA's `/ui/device/confirm` route to fetch -- authorized entirely by the same
 /// `__Host-authz_device_confirm` cookie [`verify_continue`] requires, never by anything in the
@@ -1168,10 +1196,7 @@ async fn verify_context(
     match lookup_pending_session(&state, addr, &user_code).await {
         Ok(session) => (
             StatusCode::OK,
-            [
-                (header::CACHE_CONTROL, "no-store"),
-                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-            ],
+            verify_context_headers(),
             Json(VerifyContext {
                 user_code: session.user_code,
                 client_id: session.client_id,
@@ -1185,16 +1210,14 @@ async fn verify_context(
         // does not depend on `user_code` and so is not an enumeration oracle -- 404ing there would
         // lie about an outage (D10).
         Err(LookupFailure::NotUsable) => context_not_found(),
-        Err(LookupFailure::Unavailable) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(header::CACHE_CONTROL, "no-store")],
-        )
-            .into_response(),
+        Err(LookupFailure::Unavailable) => {
+            (StatusCode::SERVICE_UNAVAILABLE, verify_context_headers()).into_response()
+        }
     }
 }
 
 fn context_not_found() -> Response {
-    (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response()
+    (StatusCode::NOT_FOUND, verify_context_headers()).into_response()
 }
 
 fn with_cookie(mut response: Response, cookie: Cookie<'static>) -> Response {

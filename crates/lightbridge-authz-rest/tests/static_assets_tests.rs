@@ -174,6 +174,20 @@ async fn unknown_path_is_a_bare_404_not_the_spa_shell() {
         StatusCode::NOT_FOUND,
         "an unrecognized path must be a bare 404 under the route allowlist"
     );
+    // The module doc comment claims header-shape uniformity ("the 404 gets them too, via the same
+    // middleware layer, so it is never distinguishable from an allowlisted response by header
+    // shape alone") -- pin it here rather than trusting the doc comment alone.
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-cache"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap(),
+        "default-src 'self'; frame-ancestors 'none'"
+    );
 }
 
 /// A genuinely missing static directory (e.g. the frontend has not been built yet) must not
@@ -264,10 +278,15 @@ async fn manifest_absent_degrades_to_root_only() {
     let dir = std::env::temp_dir().join(format!(
         "lightbridge-authz-static-assets-test-no-manifest-{nanos}"
     ));
-    fs::create_dir_all(&dir).unwrap();
+    fs::create_dir_all(dir.join("assets")).unwrap();
     fs::write(
         dir.join("index.html"),
         b"<!doctype html><title>hosted-login</title>",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("assets/index-deadbeef.js"),
+        b"console.log('placeholder');",
     )
     .unwrap();
     let router = static_assets_fallback(&dir);
@@ -281,6 +300,25 @@ async fn manifest_absent_degrades_to_root_only() {
         root.status(),
         StatusCode::OK,
         "no routes.json: / must still serve"
+    );
+
+    // #598 review: a broken/missing manifest degrades the ROUTE allowlist, never the plain
+    // ServeDir fallback -- a hashed asset is not a manifest entry at all, so it must keep serving
+    // even while every deep link 404s below.
+    let asset = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/assets/index-deadbeef.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        asset.status(),
+        StatusCode::OK,
+        "no routes.json: a real hashed asset must still serve"
     );
 
     let deep_link = router
@@ -324,10 +362,15 @@ async fn malformed_manifest_route_is_ignored_without_panicking() {
     let dir = std::env::temp_dir().join(format!(
         "lightbridge-authz-static-assets-test-malformed-manifest-{nanos}"
     ));
-    fs::create_dir_all(&dir).unwrap();
+    fs::create_dir_all(dir.join("assets")).unwrap();
     fs::write(
         dir.join("index.html"),
         b"<!doctype html><title>hosted-login</title>",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("assets/index-deadbeef.js"),
+        b"console.log('placeholder');",
     )
     .unwrap();
     fs::write(
@@ -359,4 +402,172 @@ async fn malformed_manifest_route_is_ignored_without_panicking() {
             "a malformed manifest entry must never be routable: {path}"
         );
     }
+
+    // #598 review: assets must survive a broken manifest -- a hashed asset is served by
+    // `ServeDir` regardless of what the (partially unusable) manifest says.
+    let asset = router
+        .oneshot(
+            Request::builder()
+                .uri("/assets/index-deadbeef.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        asset.status(),
+        StatusCode::OK,
+        "a real hashed asset must survive a malformed manifest"
+    );
+}
+
+/// R1 (lightbridge-authz#598 consolidated review): a manifest route must never SHADOW a real
+/// static file -- `route_service` registrations win a literal path collision over the
+/// `fallback_service`'d `ServeDir` regardless of registration order, so `static_assets_fallback`
+/// must skip any manifest entry that already names a real file on disk, or that file becomes
+/// permanently unreachable.
+///
+/// Prove-fail-first (recorded verbatim against unfixed code, pre-#598-remediation): with the
+/// shadow-skip check removed from `static_assets_fallback`'s registration loop, `GET /sw.js`
+/// returned the placeholder `index.html` bytes instead of the real service worker:
+/// ```text
+/// thread 'manifest_route_never_shadows_a_real_file' panicked at
+/// crates/lightbridge-authz-rest/tests/static_assets_tests.rs:...
+/// assertion `left == right` failed: /sw.js must serve the REAL file, not index.html
+///   left: [60, 33, 100, 111, 99, 116, 121, 112, 101, 62, ...]
+///  right: [115, 101, 108, 102, ...]
+/// ```
+#[tokio::test]
+async fn manifest_route_never_shadows_a_real_file() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "lightbridge-authz-static-assets-test-manifest-shadow-{nanos}"
+    ));
+    fs::create_dir_all(dir.join("assets")).unwrap();
+    fs::write(
+        dir.join("index.html"),
+        b"<!doctype html><title>hosted-login</title>",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("assets/index-deadbeef.js"),
+        b"console.log('placeholder');",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("sw.js"),
+        b"self.addEventListener('fetch', () => {});",
+    )
+    .unwrap();
+    // A manifest that (wrongly) lists two paths that are ALSO real files on disk -- exactly the
+    // shape that shadowed `/sw.js` before the fix.
+    fs::write(
+        dir.join("routes.json"),
+        br#"{"version":1,"basename":"/ui","routes":["/","/sw.js","/assets/index-deadbeef.js"]}"#,
+    )
+    .unwrap();
+
+    let router = static_assets_fallback(&dir);
+
+    let sw = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/sw.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sw.status(), StatusCode::OK);
+    let sw_body = to_bytes(sw.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        &sw_body[..],
+        b"self.addEventListener('fetch', () => {});",
+        "/sw.js must serve the REAL file, not index.html, even though routes.json also lists it"
+    );
+
+    let asset = router
+        .oneshot(
+            Request::builder()
+                .uri("/assets/index-deadbeef.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asset.status(), StatusCode::OK);
+    let asset_body = to_bytes(asset.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        &asset_body[..],
+        b"console.log('placeholder');",
+        "/assets/index-deadbeef.js must serve the REAL file, not index.html"
+    );
+}
+
+/// R2 (lightbridge-authz#598 consolidated review): `RouteManifest.version` was previously
+/// ignored entirely, so a future incompatible schema change on the producing side would be read
+/// as if it were today's shape. A version this server does not recognize must degrade fail-closed
+/// to the `{"/"}` fallback, exactly like a missing or unparseable manifest.
+///
+/// Prove-fail-first (recorded verbatim, pre-fix): with the version check removed (or the `version`
+/// field absent from `RouteManifest` entirely), `/device` served `index.html` instead of 404ing:
+/// ```text
+/// thread 'unrecognized_manifest_version_degrades_to_root_only' panicked at
+/// crates/lightbridge-authz-rest/tests/static_assets_tests.rs:...
+/// assertion `left == right` failed: an unrecognized manifest version must degrade to / only
+///   left: 200
+///  right: 404
+/// ```
+#[tokio::test]
+async fn unrecognized_manifest_version_degrades_to_root_only() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "lightbridge-authz-static-assets-test-manifest-version-{nanos}"
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("index.html"),
+        b"<!doctype html><title>hosted-login</title>",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("routes.json"),
+        br#"{"version":99,"basename":"/ui","routes":["/","/device"]}"#,
+    )
+    .unwrap();
+
+    let router = static_assets_fallback(&dir);
+
+    let root = router
+        .clone()
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        root.status(),
+        StatusCode::OK,
+        "an unrecognized manifest version must still keep / serving"
+    );
+
+    let device = router
+        .oneshot(
+            Request::builder()
+                .uri("/device")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        device.status(),
+        StatusCode::NOT_FOUND,
+        "an unrecognized manifest version must degrade to / only"
+    );
 }

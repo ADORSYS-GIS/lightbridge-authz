@@ -36,7 +36,7 @@
 use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode};
+use axum::http::{Request, StatusCode, header};
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::config::{IdpServer, JwtSigning, Oauth2, Oauth2Type, Tls};
@@ -284,6 +284,14 @@ async fn ui_unknown_spa_route_returns_404() {
 
 /// The positive counterpart to [`ui_unknown_spa_route_returns_404`]: a path the manifest DOES
 /// list must still resolve to `index.html` with a `200`, once nested under `/ui`.
+///
+/// Not a prove-fail-first case, same as its `static_assets_tests.rs` twin
+/// (`allowlisted_client_route_serves_index_html`): run against unfixed code (pre-B4, the old
+/// whole-subtree `.fallback(ServeFile::new(index))` catch-all), this test PASSES already -- for
+/// the wrong reason, since that catch-all answers every path with `index.html` regardless of any
+/// manifest. `ui_unknown_spa_route_returns_404` right above is what actually falsifies the old
+/// behavior; this test only starts passing for the RIGHT reason once the manifest-driven allowlist
+/// lands.
 #[tokio::test]
 async fn ui_allowlisted_route_serves_index_html() {
     let dir = ui_static_dir("allowlisted-route");
@@ -407,12 +415,20 @@ async fn unknown_path_outside_ui_prefix_returns_plain_404() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE CROSS-REPO DRIFT GUARD (#598's own Risks section, made mechanical): every SPA route
-/// `relying_party.rs`'s `UI_*` constants redirect into must appear in the artifact's shipped
-/// `dist/routes.json`, or the redirect lands on a path `static_assets` 404s. This builds the
-/// router with a `routes.json` that is a VERBATIM copy of `apps/authz-ui`'s manifest (the same
-/// six-route shape converse-frontends' `vite.config.ts` route-manifest emitter produces, plan
-/// A15) and proves every one of the five `/ui/device*`/`/ui/error` redirect targets resolves.
+/// A DRIFT GUARD AGAINST THE RUST LOADER, NOT AGAINST THE SHIPPED ARTIFACT (#598's own Risks
+/// section, made mechanical, corrected by the consolidated review): every SPA route
+/// `relying_party.rs`'s `UI_*` constants redirect into must appear in `dist/routes.json`, or the
+/// redirect lands on a path `static_assets` 404s. This builds the router with a `routes.json` that
+/// is a VERBATIM copy of `apps/authz-ui`'s manifest shape (the same six-route shape
+/// converse-frontends' `vite.config.ts` route-manifest emitter produces, plan A15) and proves every
+/// one of the five `/ui/device*`/`/ui/error` redirect targets resolves against `load_route_manifest`
+/// -- **but this is a FIXTURE, copied by hand into this test, not the artifact this repo actually
+/// ships.** It guards `load_route_manifest`'s parsing/registration logic against a manifest shaped
+/// like the real one; it cannot catch the real `apps/authz-ui` build drifting from this fixture.
+/// That artifact-level guard lives in two other places instead: `.docker/it/idp_it.py`'s
+/// `section_root_and_spa` (asserts the pinned, running artifact's actual routes over real HTTP) and
+/// `.github/actions/stage-authz-ui`'s post-pull `grep` of the five non-root routes against the
+/// staged `dist/static/routes.json` (fails CI before a container is even built if one is missing).
 ///
 /// Not a prove-fail-first case: against unfixed code (pre-B4) this passes already, trivially --
 /// the old whole-subtree catch-all answers every `/ui/*` path with `200` regardless of any
@@ -925,13 +941,21 @@ async fn build_idp_router_mounts_authorize_device_verify_and_callback_unconditio
         )
         .await
         .unwrap();
-    // #598: `verify_page` is a 303 handoff into the SPA now, not a 200 HTML page -- this test is
-    // about mount presence, not response shape, so `assert_ne!(.., NOT_FOUND)` is the right
-    // property (matching the sibling assertions on /authorize and /idp/callback above/below).
-    assert_ne!(
+    // #598: `verify_page` is a 303 handoff into the SPA now, not a 200 HTML page -- assert the
+    // actual response shape (a mount-presence-only `assert_ne!(.., NOT_FOUND)` would also pass for
+    // a route that answered something other than the real handoff).
+    assert_eq!(
         device_verify.status(),
-        StatusCode::NOT_FOUND,
-        "/device/verify must be mounted unconditionally"
+        StatusCode::SEE_OTHER,
+        "/device/verify must be mounted unconditionally and answer with the SPA handoff"
+    );
+    // Pins the sanitiser end-to-end, not just via its own unit tests: `sanitize_user_code_for_display`
+    // keeps `-`, so it survives into the handoff target, then `utf8_percent_encode`'s
+    // `NON_ALPHANUMERIC` set (which percent-encodes every non-alphanumeric ASCII byte, `-`
+    // included) turns it into `%2D` in the `Location` header the browser actually receives.
+    assert_eq!(
+        device_verify.headers().get(header::LOCATION).unwrap(),
+        "/ui/device?user_code=WDJB%2DMJHT"
     );
 
     let callback = router
@@ -1026,13 +1050,18 @@ async fn build_idp_router_mount_does_not_consult_raw_token_exchange_config() {
         )
         .await
         .unwrap();
-    // #598: same "mount presence, not response shape" correction as
+    // #598: same "assert the actual response shape" correction as
     // build_idp_router_mounts_authorize_device_verify_and_callback_unconditionally above --
     // verify_page is a 303 handoff now, not a 200 HTML page.
-    assert_ne!(
+    assert_eq!(
         device_verify.status(),
-        StatusCode::NOT_FOUND,
-        "/device/verify must be mounted regardless of oauth2.token_exchange's raw config"
+        StatusCode::SEE_OTHER,
+        "/device/verify must be mounted regardless of oauth2.token_exchange's raw config, and \
+         answer with the SPA handoff"
+    );
+    assert_eq!(
+        device_verify.headers().get(header::LOCATION).unwrap(),
+        "/ui/device?user_code=WDJB%2DMJHT"
     );
 
     let callback = router

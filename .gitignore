@@ -16,3 +16,10 @@ tls
 # trips a secret scanner even as test-only material (PR #604).
 .docker/it/generated/
 .docker/authz/container.it.yaml
+
+# ADR-0029: /dist is a staging area `just stage-authz-ui` (local) / the `stage-authz-ui` composite
+# action (CI) populates by pulling the pinned, externally-built `authz-ui` OCI artifact -- never a
+# build output of this repo, and never the artifact itself (the artifact is the GHCR image). ~100
+# of these files were committed by accident in #599; this entry, plus `git rm -r --cached dist/`,
+# untracks them going forward.
+/dist/

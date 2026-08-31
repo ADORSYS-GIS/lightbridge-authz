@@ -400,7 +400,20 @@ def section_root_and_spa() -> None:
     # #598: /ui is a route ALLOWLIST now, not a catch-all. `/ui/login` used to pass here
     # VACUOUSLY -- no such route has ever existed; the old SPA fallback answered 200 for any
     # path at all. Now it must 404, and that assertion is what proves the allowlist is real.
-    for path in ("/ui/", "/ui/device", "/ui/device/confirm", "/ui/error"):
+    #
+    # Consolidated review (R4): this loop is the ONLY place that checks the REAL, pinned artifact's
+    # actual route set over real HTTP -- `idp_server_tests.rs`'s equivalent assertions all run
+    # against hand-built fixtures, not the shipped bundle. All six of `dist/routes.json`'s routes
+    # go through here, not just a subset, so a route the artifact forgot to list is caught here
+    # even if every Rust-side fixture still agrees with itself.
+    for path in (
+        "/ui/",
+        "/ui/device",
+        "/ui/device/invalid",
+        "/ui/device/confirm",
+        "/ui/device/success",
+        "/ui/error",
+    ):
         status, headers, body = http_raw("GET", f"{IDP_URL}{path}")
         assert status == 200, f"{path} failed: status={status}"
         content_type = headers.get("Content-Type", "")
