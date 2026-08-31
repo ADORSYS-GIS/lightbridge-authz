@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use lightbridge_authz_core::Result;
 use lightbridge_authz_core::error::Error;
-use lightbridge_authz_core::{ResolveContextRequest, ResolvedContext};
+use lightbridge_authz_core::{AuthorizeUsageScopeRequest, ResolveContextRequest, ResolvedContext};
 use tracing::instrument;
 
 use crate::OpaState;
@@ -60,4 +60,61 @@ pub async fn resolve_context(
         "resolved tenant context"
     );
     Ok((StatusCode::OK, Json(context)).into_response())
+}
+
+/// Ownership authority for `lightbridge-authz-usage`'s query listener (#570): does the
+/// authenticated end user (`issuer`, `subject`) own `scope_id` under `scope`? The usage service
+/// has no `accounts`/`projects`/`project_members` tables of its own -- this is the one place that
+/// question is answered, over the same Basic-auth boundary `resolve_context` already uses.
+///
+/// Follows `resolve_context`'s exact non-leaking-oracle shape: `input.subject` is translated
+/// through [`crate::auth_provider::SubjectResolver`] first (a resolver refusal maps to the same
+/// uniform 404 an ownership miss produces), then [`crate::OpaState::repo`]'s
+/// `authorize_usage_scope` evaluates the ownership predicate itself
+/// (`StoreRepo::authorize_usage_scope`) -- one query per scope, one `NotFound` branch, never a
+/// distinct status a caller could use to tell "wrong issuer"/"unknown scope_id" apart from "known
+/// but not owned".
+#[utoipa::path(
+    post,
+    path = "/idp/v1/authorize-usage-scope",
+    request_body = AuthorizeUsageScopeRequest,
+    responses(
+        (status = 200, description = "Authorized"),
+        (status = 404, description = "Not authorized, unknown scope_id, or unrecognized scope")
+    ),
+    tag = "idp"
+)]
+#[instrument(skip(state, input))]
+pub async fn authorize_usage_scope(
+    State(state): State<Arc<OpaState>>,
+    Json(input): Json<AuthorizeUsageScopeRequest>,
+) -> Result<axum::response::Response> {
+    let subject = input.subject.unwrap_or_default();
+    let scope = input.scope.unwrap_or_default();
+    let scope_id = input.scope_id.unwrap_or_default();
+    let issuer = input
+        .issuer
+        .unwrap_or_else(|| state.federation_issuer.clone());
+
+    let account_id = state
+        .resolver
+        .resolve(&issuer, &subject)
+        .await
+        .map_err(|err| match err {
+            Error::Forbidden(_) => Error::NotFound,
+            other => other,
+        })?;
+
+    state
+        .repo
+        .authorize_usage_scope(account_id.as_str(), &scope, &scope_id)
+        .await?;
+
+    tracing::info!(
+        subject = %subject,
+        scope = %scope,
+        scope_id = %scope_id,
+        "authorized usage scope"
+    );
+    Ok(StatusCode::OK.into_response())
 }

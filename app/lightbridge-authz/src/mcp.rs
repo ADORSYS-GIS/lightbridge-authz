@@ -2300,6 +2300,15 @@ mod tests {
             Err(lightbridge_authz_core::error::Error::NotFound)
         }
 
+        async fn authorize_usage_scope(
+            &self,
+            _subject: &str,
+            _scope: &str,
+            _scope_id: &str,
+        ) -> Result<()> {
+            Err(lightbridge_authz_core::error::Error::NotFound)
+        }
+
         async fn get_project_by_id(&self, project_id: &str) -> Result<Option<Project>> {
             if project_id == self.project.id {
                 return Ok(Some(self.project.clone()));
@@ -2429,6 +2438,15 @@ mod tests {
             _subject: &str,
             _project_id: &str,
         ) -> Result<lightbridge_authz_core::ResolvedContext> {
+            Err(Error::NotFound)
+        }
+
+        async fn authorize_usage_scope(
+            &self,
+            _subject: &str,
+            _scope: &str,
+            _scope_id: &str,
+        ) -> Result<()> {
             Err(Error::NotFound)
         }
 

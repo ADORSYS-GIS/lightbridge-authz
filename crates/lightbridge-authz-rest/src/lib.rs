@@ -124,6 +124,14 @@ pub trait OpaRepoTrait: Send + Sync {
         subject: &str,
         project_id: &str,
     ) -> Result<lightbridge_authz_core::ResolvedContext>;
+    /// Backs `POST /idp/v1/authorize-usage-scope` (#570): does `subject` (already ADR-0025-
+    /// resolved to an account id, exactly like every other `subject: &str` method on this trait)
+    /// own `scope_id` under `scope` (`"account"` or `"project"`)? `Ok(())` when authorized,
+    /// `Err(Error::NotFound)` for every refusal (unowned, unknown scope_id, or an unrecognized
+    /// `scope`) -- see `StoreRepo::authorize_usage_scope`'s doc comment for the full predicate and
+    /// why refusal is uniform.
+    async fn authorize_usage_scope(&self, subject: &str, scope: &str, scope_id: &str)
+    -> Result<()>;
     /// `subject`'s per-member `quota_tier` on `project_id` (ADR-0017), or `None` for "no
     /// per-member ceiling" -- see `StoreRepo::project_member_quota_tier`'s doc comment for the
     /// full `Ok(None)` vs `Err` distinction. Used by introspection to resolve the `quota_tier`
@@ -227,6 +235,21 @@ impl OpaRepoTrait for StoreRepo {
             self,
             &AccountId::assert_already_resolved(subject),
             project_id,
+        )
+        .await
+    }
+
+    async fn authorize_usage_scope(
+        &self,
+        subject: &str,
+        scope: &str,
+        scope_id: &str,
+    ) -> Result<()> {
+        StoreRepo::authorize_usage_scope(
+            self,
+            &AccountId::assert_already_resolved(subject),
+            scope,
+            scope_id,
         )
         .await
     }
@@ -3574,7 +3597,8 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
 #[openapi(
     paths(
         crate::handlers::introspect::introspect_api_key,
-        crate::handlers::idp::resolve_context
+        crate::handlers::idp::resolve_context,
+        crate::handlers::idp::authorize_usage_scope
     ),
     components(
         schemas(
@@ -3584,7 +3608,8 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
             lightbridge_authz_core::Project,
             lightbridge_authz_core::Account,
             lightbridge_authz_core::ResolveContextRequest,
-            lightbridge_authz_core::ResolvedContext
+            lightbridge_authz_core::ResolvedContext,
+            lightbridge_authz_core::AuthorizeUsageScopeRequest
         )
     ),
     tags(

@@ -419,6 +419,40 @@ pub struct ResolveContextRequest {
     pub issuer: Option<String>,
 }
 
+/// Request body for the Basic-auth-protected `POST /idp/v1/authorize-usage-scope` endpoint
+/// (#570): answers "does the authenticated end user (`issuer`, `subject`) own `scope_id` under
+/// `scope`?" for `lightbridge-authz-usage`'s query listener, which has no database of its own to
+/// answer that question directly.
+///
+/// Every field is optional so a malformed/partial body resolves to the SAME uniform `404` the
+/// not-authorized branch returns, mirroring [`ResolveContextRequest`]'s own reasoning: this
+/// endpoint must never let a caller distinguish "bad request" from "not authorized" for what is,
+/// from the outside, an authorization boundary. `scope` is a plain `String` rather than a schema
+/// enum for the identical reason -- an unrecognized value (including the `user`/`api_key` scopes
+/// `lightbridge-authz-usage` never actually sends here, since those have no resolvable authority
+/// and are refused unconditionally before this endpoint is ever called) falls through to the same
+/// `NotFound` branch [`crate`]'s callers already produce for "not authorized", not a distinct
+/// `400`/`422`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AuthorizeUsageScopeRequest {
+    /// Issuer that authenticated `subject` -- the end user's bearer token `iss` claim, exactly as
+    /// `lightbridge-authz-usage`'s query listener validated it via JWKS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// Authenticated subject the usage query is being answered for -- the end user's bearer token
+    /// `sub` claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// `"account"` or `"project"` -- the two scopes that have a resolvable ownership predicate.
+    /// Any other value (including `"user"`/`"api_key"`) is refused with the same uniform `404`
+    /// as a failed ownership check -- see this type's own doc comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// The account id or project id being queried, depending on `scope`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

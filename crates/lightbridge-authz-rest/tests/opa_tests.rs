@@ -5,14 +5,15 @@ use chrono::{Duration, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use lightbridge_authz_core::identity::AccountId;
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeyStatus, ApiKeyValidation, ModelPolicy, Project, ResolveContextRequest,
-    ResolvedContext, ResourceStatus, async_trait,
+    Account, ApiKey, ApiKeyStatus, ApiKeyValidation, AuthorizeUsageScopeRequest, ModelPolicy,
+    Project, ResolveContextRequest, ResolvedContext, ResourceStatus, async_trait,
     config::{BasicAuth, Billing, BillingLimits, BillingPlan},
     error::{Error, Result},
 };
 use lightbridge_authz_rest::OpaState;
 use lightbridge_authz_rest::SessionStatusRow;
 use lightbridge_authz_rest::auth_provider::SubjectResolver;
+use lightbridge_authz_rest::handlers::idp::authorize_usage_scope as authorize_usage_scope_endpoint;
 use lightbridge_authz_rest::handlers::idp::resolve_context as resolve_context_endpoint;
 use lightbridge_authz_rest::handlers::introspect::introspect_api_key;
 use lightbridge_authz_rest::models::IntrospectRequest;
@@ -85,6 +86,12 @@ struct MockOpaRepo {
     /// prove the RESOLVED account id (not the raw presented subject) is what reaches this
     /// repository method. `None` (every other test in this file) skips the check.
     expected_subject: Option<String>,
+    /// #570: what `authorize_usage_scope` answers -- `true` authorizes (`Ok(())`), `false`
+    /// refuses (`Err(Error::NotFound)`, mirroring the real `StoreRepo::authorize_usage_scope`'s
+    /// uniform-404 contract). `false` by default so every pre-existing test in this file (none of
+    /// which exercises this endpoint) keeps its fail-closed posture even though it never sets this
+    /// field explicitly.
+    usage_scope_authorized: bool,
 }
 
 #[async_trait]
@@ -186,6 +193,19 @@ impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
             );
         }
         self.member_context.clone().ok_or(Error::NotFound)
+    }
+
+    async fn authorize_usage_scope(
+        &self,
+        _subject: &str,
+        _scope: &str,
+        _scope_id: &str,
+    ) -> Result<()> {
+        if self.usage_scope_authorized {
+            Ok(())
+        } else {
+            Err(Error::NotFound)
+        }
     }
 
     async fn project_member_role(
@@ -344,6 +364,7 @@ fn bare_mock_opa_repo(member_context: Option<ResolvedContext>) -> MockOpaRepo {
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     }
 }
 
@@ -430,6 +451,97 @@ async fn returns_404_not_403_for_an_unfederated_subject() {
     );
 }
 
+/// #570 happy path: an authorized scope returns a bare 200, no body to leak.
+#[tokio::test]
+async fn authorize_usage_scope_endpoint_returns_200_when_authorized() {
+    let mut repo = bare_mock_opa_repo(None);
+    repo.usage_scope_authorized = true;
+    let state = mk_state_with_resolver(
+        repo,
+        MockResolver {
+            outcome: Ok("resolved-acct".to_string()),
+        },
+    );
+
+    let response = authorize_usage_scope_endpoint(
+        axum::extract::State(state),
+        axum::Json(AuthorizeUsageScopeRequest {
+            issuer: Some("https://keycloak.example.test/realms/dev".to_string()),
+            subject: Some("kc-sub-1".to_string()),
+            scope: Some("account".to_string()),
+            scope_id: Some("resolved-acct".to_string()),
+        }),
+    )
+    .await
+    .expect("an authorized scope must succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// #570 decisive negative: the repo's ownership check refuses -- must surface as the SAME uniform
+/// 404 an unauthorized resolver produces, never a distinct status.
+#[tokio::test]
+async fn authorize_usage_scope_endpoint_returns_404_when_repo_refuses() {
+    let mut repo = bare_mock_opa_repo(None);
+    repo.usage_scope_authorized = false;
+    let state = mk_state_with_resolver(
+        repo,
+        MockResolver {
+            outcome: Ok("resolved-acct".to_string()),
+        },
+    );
+
+    let err = authorize_usage_scope_endpoint(
+        axum::extract::State(state),
+        axum::Json(AuthorizeUsageScopeRequest {
+            issuer: Some("https://keycloak.example.test/realms/dev".to_string()),
+            subject: Some("kc-sub-1".to_string()),
+            scope: Some("account".to_string()),
+            scope_id: Some("someone-elses-account".to_string()),
+        }),
+    )
+    .await
+    .expect_err("an unowned scope must refuse, not succeed");
+
+    assert!(matches!(err, Error::NotFound));
+}
+
+/// Mirrors `returns_404_not_403_for_an_unfederated_subject`: a resolver refusal must map to the
+/// same uniform 404 an ownership miss produces, never a distinct status a caller could use to
+/// distinguish "wrong issuer" from "not authorized".
+#[tokio::test]
+async fn authorize_usage_scope_endpoint_returns_404_not_403_for_an_unfederated_subject() {
+    let mut repo = bare_mock_opa_repo(None);
+    // Deliberately `true`: if the endpoint ever stopped calling the resolver (or ignored its
+    // error) and fell through to the repo check directly, this mock would happily authorize and
+    // the test would observe a 200 -- proving the 404 here comes from the RESOLVER.
+    repo.usage_scope_authorized = true;
+    let state = mk_state_with_resolver(
+        repo,
+        MockResolver {
+            outcome: Err("no federated identity for this subject".to_string()),
+        },
+    );
+
+    let err = authorize_usage_scope_endpoint(
+        axum::extract::State(state),
+        axum::Json(AuthorizeUsageScopeRequest {
+            issuer: Some("https://untrusted-issuer.example".to_string()),
+            subject: Some("unfederated-sub".to_string()),
+            scope: Some("account".to_string()),
+            scope_id: Some("resolved-acct".to_string()),
+        }),
+    )
+    .await
+    .expect_err("a resolver refusal must surface as an error, not a 200");
+
+    assert!(
+        matches!(err, Error::NotFound),
+        "a resolver Forbidden must map to the SAME uniform NotFound the repo's own refusal \
+         branch returns, got {err:?}"
+    );
+}
+
 async fn introspect(state: Arc<OpaState>, token: &str) -> (StatusCode, Value) {
     let response = introspect_api_key(
         axum::extract::State(state),
@@ -463,6 +575,7 @@ async fn introspect_returns_active_with_context_and_records_usage() {
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -520,6 +633,7 @@ async fn introspect_omits_name_and_limits_for_plan_absent_from_catalogue() {
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -553,6 +667,7 @@ async fn introspect_returns_inactive_when_revoked() {
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_revoked").await;
@@ -576,6 +691,7 @@ async fn introspect_returns_inactive_when_missing() {
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_missing").await;
@@ -600,6 +716,7 @@ async fn introspect_returns_inactive_when_expired() {
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_expired").await;
@@ -623,6 +740,7 @@ async fn introspect_returns_inactive_when_account_suspended() {
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_suspended_account").await;
@@ -647,6 +765,7 @@ async fn introspect_returns_inactive_when_project_suspended() {
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_suspended_project").await;
@@ -670,6 +789,7 @@ async fn introspect_omits_allowed_models_when_null() {
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -701,6 +821,7 @@ async fn introspect_returns_empty_allowed_models_when_empty() {
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -733,6 +854,7 @@ async fn introspect_round_trips_each_model_policy_value() {
             member_quota_tier: None,
             session_status: MockSessionStatus::Active,
             expected_subject: None,
+            usage_scope_authorized: false,
         });
 
         let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -765,6 +887,7 @@ async fn introspect_fails_closed_to_deny_all_for_an_unknown_stored_model_policy_
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -873,6 +996,7 @@ async fn introspect_resolves_active_exchange_session_with_live_project_authoriza
         member_quota_tier: Some("t-m".to_string()),
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -931,6 +1055,7 @@ async fn introspect_returns_inactive_for_an_expired_exchange_token() {
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -968,6 +1093,7 @@ async fn introspect_returns_inactive_for_a_token_signed_by_an_unknown_key() {
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1005,6 +1131,7 @@ async fn introspect_returns_inactive_for_a_self_issued_token_with_no_project_cla
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1041,6 +1168,7 @@ async fn introspect_returns_inactive_when_exchange_subject_is_no_longer_a_member
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1077,6 +1205,7 @@ async fn introspect_returns_inactive_when_exchange_project_is_suspended() {
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1113,6 +1242,7 @@ async fn introspect_returns_inactive_when_exchange_account_is_suspended() {
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1160,6 +1290,7 @@ async fn a_revoked_api_key_jwt_is_never_reinterpreted_as_an_active_exchange_sess
         member_quota_tier: Some("t-m".to_string()),
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1208,6 +1339,7 @@ async fn a_token_carrying_the_api_key_audience_as_azp_is_refused_even_with_no_ap
         member_quota_tier: Some("t-m".to_string()),
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1251,6 +1383,7 @@ async fn a_token_with_no_azp_claim_at_all_is_refused() {
         member_quota_tier: None,
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1294,6 +1427,7 @@ async fn introspect_returns_inactive_when_session_is_revoked() {
         member_quota_tier: Some("t-m".to_string()),
         session_status: MockSessionStatus::Revoked,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1331,6 +1465,7 @@ async fn introspect_returns_inactive_when_session_is_expired() {
         member_quota_tier: Some("t-m".to_string()),
         session_status: MockSessionStatus::Expired,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1365,6 +1500,7 @@ async fn introspect_returns_inactive_when_session_row_not_found() {
         member_quota_tier: Some("t-m".to_string()),
         session_status: MockSessionStatus::NotFound,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1404,6 +1540,7 @@ async fn introspect_returns_inactive_when_no_sid_claim_at_all() {
         // inactive, not the session lookup (which would never even be called).
         session_status: MockSessionStatus::Active,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1448,6 +1585,7 @@ async fn resolve_exchange_token_context_errors_when_session_lookup_fails_never_a
         member_quota_tier: Some("t-m".to_string()),
         session_status: MockSessionStatus::LookupErrors,
         expected_subject: None,
+        usage_scope_authorized: false,
     });
 
     let result = lightbridge_authz_rest::handlers::exchange_token::resolve_exchange_token_context(
