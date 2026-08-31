@@ -299,15 +299,15 @@ def wait_until_ready() -> None:
             time.sleep(2)
 
 
-def fetch_token() -> str:
+def fetch_token(username: str = USERNAME, password: str = PASSWORD) -> str:
     token_url = f"{KEYCLOAK_URL}/realms/dev/protocol/openid-connect/token"
     status, payload = post_form(
         token_url,
         {
             "grant_type": "password",
             "client_id": CLIENT_ID,
-            "username": USERNAME,
-            "password": PASSWORD,
+            "username": username,
+            "password": password,
         },
     )
     if status != 200 or "access_token" not in payload:
@@ -605,6 +605,95 @@ def main() -> int:
         assert spend_status == 200, f"spend query failed: status={spend_status}, body={spend_body}"
         assert "total_cost" in spend_body, f"unexpected spend query body: {spend_body}"
         log("spend query listener accepts a trusted client certificate")
+
+        # #570: two-tenant end-to-end proof that `/usage/v1/usage/query` enforces ownership, not
+        # just mTLS. `test@admin` (this suite's primary tenant, `token`/`account_id` above) and
+        # `test@editor` (a second, distinct Keycloak subject seeded by the same realm import --
+        # `.docker/keycloak_config/realm.json` -- and therefore a distinct `accounts.id` anchor
+        # per ADR-0006/ADR-0026) each query their OWN account scope (200) and each other's (403).
+        other_token = fetch_token(username="test@editor", password="test")
+        other_headers = {"Authorization": f"Bearer {other_token}"}
+        other_account_id = ensure_account(other_headers, other_token)
+        assert other_account_id != account_id, (
+            "the second tenant must resolve to a DIFFERENT account than the primary tenant, or "
+            "this test proves nothing"
+        )
+
+        def usage_query_status(bearer_token: str, scope_id: str) -> tuple:
+            body = {
+                "scope": "account",
+                "scope_id": scope_id,
+                "start_time": "2026-03-01T00:00:00Z",
+                "end_time": "2026-03-02T00:00:00Z",
+                "bucket": "1 day",
+                "group_by": [],
+                "filters": {},
+                "limit": 10,
+            }
+            try:
+                status, payload, _ = request_raw(
+                    "POST",
+                    f"{USAGE_QUERY_URL}/usage/v1/usage/query",
+                    body=body,
+                    headers={"Authorization": f"Bearer {bearer_token}"},
+                    ssl_context=MTLS_CLIENT_TLS,
+                )
+                return status, payload
+            except urllib.error.HTTPError as err:
+                return err.code, err.read().decode("utf-8")
+
+        status, payload = usage_query_status(token, account_id)
+        assert status == 200, (
+            f"tenant A must be authorized for their own account scope: status={status}, "
+            f"body={payload}"
+        )
+        log("usage query: tenant A authorized for their own account scope")
+
+        status, payload = usage_query_status(other_token, other_account_id)
+        assert status == 200, (
+            f"tenant B must be authorized for their own account scope: status={status}, "
+            f"body={payload}"
+        )
+        log("usage query: tenant B authorized for their own account scope")
+
+        status, payload = usage_query_status(other_token, account_id)
+        assert status == 403, (
+            f"tenant B must be refused for tenant A's account scope: status={status}, "
+            f"body={payload}"
+        )
+        assert not payload or "points" not in payload, (
+            f"a refused cross-tenant query must never leak tenant A's data: {payload}"
+        )
+        log("usage query: tenant B refused for tenant A's account scope (#570)")
+
+        status, payload = usage_query_status(token, other_account_id)
+        assert status == 403, (
+            f"tenant A must be refused for tenant B's account scope: status={status}, "
+            f"body={payload}"
+        )
+        log("usage query: tenant A refused for tenant B's account scope (#570)")
+
+        status, payload = None, None
+        try:
+            request_raw(
+                "POST",
+                f"{USAGE_QUERY_URL}/usage/v1/usage/query",
+                body={
+                    "scope": "account",
+                    "scope_id": account_id,
+                    "start_time": "2026-03-01T00:00:00Z",
+                    "end_time": "2026-03-02T00:00:00Z",
+                    "bucket": "1 day",
+                    "group_by": [],
+                    "filters": {},
+                    "limit": 10,
+                },
+                ssl_context=MTLS_CLIENT_TLS,
+            )
+            raise AssertionError("usage query succeeded with no bearer token")
+        except urllib.error.HTTPError as err:
+            assert err.code == 401, f"expected 401 with no bearer token, got {err.code}"
+        log("usage query: missing bearer token refused with 401 (#570)")
 
         expect_http_error(
             401,
