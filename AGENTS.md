@@ -1063,6 +1063,7 @@ hand-written SQL and direct `sqlx` dependencies.
 
 ## Docs Index
 
+- **Documentation navigation map (start here to find a doc):** `docs/README.md`
 - Overview and quickstart: `README.md`
 - Run the whole platform locally (backend + frontend console) and test it end to end — issuer vs
   discovery split, seeded Keycloak users, RBAC gating, honest usage-chart limitations, automated

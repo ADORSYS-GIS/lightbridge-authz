@@ -23,3 +23,5 @@ tls
 # of these files were committed by accident in #599; this entry, plus `git rm -r --cached dist/`,
 # untracks them going forward.
 /dist/
+
+.lci
