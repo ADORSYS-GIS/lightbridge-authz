@@ -27,8 +27,8 @@
 # explicitly configured to ignore this image (see the `ignore:` block there). An automated digest
 # bump would be an unreviewed UI deploy to the authentication boundary, arriving as a "chore".
 #
-#   tag: ghcr.io/adorsys-gis/converse-frontends/authz-ui:sha-f5376de
-ARG AUTHZ_UI_REF=ghcr.io/adorsys-gis/converse-frontends/authz-ui@sha256:08a77826dfd6999d06e7dc18f1f6e10573db22fdda75b9aa7039d5a97c7315a2
+#   tag: ghcr.io/adorsys-gis/converse-frontends/authz-ui:sha-a01fba3
+ARG AUTHZ_UI_REF=ghcr.io/adorsys-gis/converse-frontends/authz-ui@sha256:731025acbbb9a439abfa324a3c27ac863c825d156bfc2891d5c1a5f0f3198ef0
 
 # `--platform=linux/amd64` because the published image is single-arch amd64 and this stage holds
 # nothing executable — it is a tarball of HTML/JS/CSS. Forcing the platform here keeps an arm64
