@@ -94,6 +94,32 @@ locally, TLS reusing the same `authz-tls`-derived secret's `tls.crt`/`tls.key` p
 not before (the config would reference a port the old image doesn't serve) and not
 long after (the new image won't start without it).
 
+**#570 adds two MORE mandatory blocks to that same config, ratified as mandatory (not
+optional) exactly like `server.query` above — this is not a new decision, it is the
+same "hard-cutover, not a dormant flag" rule applied twice more.** `UsageConfig::
+oauth2` and `UsageConfig::scope_authority` (`crates/lightbridge-authz-usage/src/
+config.rs`) are also non-`Option` fields: a config omitting `oauth2.jwks_url` or any of
+`scope_authority.{base_url,username,password,ca_bundle_path}` fails to load, exactly
+the same failure mode `server.query`'s own rollout already produced once. The
+consequence is the same too, just doubled: a config-load failure kills BOTH listeners
+at once, not just the query one — the ingest listener's OTLP writes are refused
+(usage/billing data loss for every request in the outage window) at the same moment
+the query listener's spend reads for `authz-budget` degrade to `Spend::Unavailable`
+(routing every self-service refill decision that depends on them to `manual_review`,
+never `auto_approve`, until the config is fixed). Because the `migrate` Job runs at an
+earlier ArgoCD sync-wave than the main Deployment (`docs/adr/0016-migrate-job-sync-
+wave-not-hook.md`) and loads this identical config, a bad value here fails the
+`migrate` Job first — which fails the WHOLE app's ArgoCD sync, not merely this
+service's own rollout. **Deploy order, extended:** `ai-helm-values` MUST set
+`oauth2.jwks_url` (the same Keycloak/OIDC JWKS endpoint `authz-api`/`authz-opa`
+already point at) and all four `scope_authority` fields (`base_url` pointing at
+`authz-opa`'s in-cluster address, `username`/`password` matching `authz-opa`'s own
+`server.opa.basic_auth` credential exactly, and `ca_bundle_path` pointed at the same
+CA bundle `server.query.tls.client_ca_bundle_path` already uses) **in the same
+rollout** as this repo's image bump that introduces #570 — the chart's own
+`charts/lightbridge-authz-usage/values.yaml` documents this identically at
+`config.oauth2`/`config.scopeAuthority`.
+
 ### Endpoint
 
 - Method: `POST`
@@ -205,11 +231,12 @@ Successful response is HTTP `200` with JSON:
 }
 ```
 
-`truncated` (#578): `true` when more than `limit` buckets matched the query and the OLDEST
-buckets were dropped to fit — `points` still holds at most `limit` entries in ascending
-`bucket_start` order. `false` means every matching bucket is present. See
-`docs/usage-api.md`'s "Response shape and truncation" for the known mid-bucket-cut caveat
-(#586).
+`truncated` (#578): `true` when more than `limit` DISTINCT buckets matched the query and the
+OLDEST one was dropped WHOLE to fit. `limit` bounds bucket count, not `points.len()` -- with a
+non-empty `group_by`, `points` can hold more entries than `limit` (one per series per surviving
+bucket), and every surviving bucket keeps its FULL series set, never an arbitrary subset. `false`
+means every matching bucket is present. See `docs/usage-api.md`'s "Response shape and truncation"
+for the known mid-bucket-cut caveat (#586).
 
 #### Point fields
 

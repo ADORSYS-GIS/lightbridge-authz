@@ -74,11 +74,15 @@
 
 ## Response shape and truncation (#578)
 
-The response is `{ "points": [...], "truncated": bool }`. `truncated: true` means more than
-`limit` buckets matched the query and the OLDEST ones were dropped to fit — `points` still holds
-at most `limit` entries in ascending `bucket_start` order. Truncation always drops whole buckets
-from the oldest end, never the newest; a bucket that straddles the truncation boundary is dropped
-or kept as a whole bucket, not split (a known caveat tracked as #586).
+The response is `{ "points": [...], "truncated": bool }`. `limit` bounds the number of DISTINCT
+`bucket_start` values returned, not the number of `points` entries (rows) -- with a non-empty
+`group_by`, each bucket can contribute multiple `points` (one per series), so `points.len()` can
+exceed `limit` even when `truncated` is `false`. `truncated: true` means more than `limit`
+DISTINCT buckets matched the query and the OLDEST one was dropped to fit; `points` then holds
+every series for exactly the newest `limit` buckets, in ascending `bucket_start` order. Truncation
+always drops a bucket WHOLE — every series that bucket had, together, never an arbitrary subset of
+one bucket's series while its sibling buckets keep theirs; a bucket that straddles the truncation
+boundary is dropped or kept as a whole bucket, not split (a known caveat tracked as #586).
 
 ## Scope semantics
 

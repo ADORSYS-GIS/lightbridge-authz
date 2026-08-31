@@ -337,3 +337,20 @@ rule keys on `self_service_grant_count`, not on either spend field — so today,
 `SpendReader` doesn't change any live refill outcome; it would only matter the moment a policy
 revision is activated that adds a spend-based rule. At that point the behavior above is what
 governs it.
+
+**#570 gave `/usage/v1/spend/query` one more, diagnostically-quiet failure mode: it now refuses
+any request carrying an `Authorization` header.** This endpoint has no per-caller ownership check
+at all (unlike its sibling `/usage/v1/usage/query`, which #570 added one to) — it answers about
+ANY account this reader asks for, gated only by mTLS — so it has no legitimate reason to ever
+receive a user's bearer token, and now refuses outright rather than silently ignoring one (closing
+a "console catch-all-proxy" hole where a misrouted browser bearer token could otherwise reach this
+ownerless cross-account read). `UsageServiceSpendReader` itself never sends an `Authorization`
+header, so this changes nothing for the happy path today — but if a future service mesh sidecar,
+ambient proxy, or a misconfigured shared HTTP client ever starts injecting one onto this specific
+outbound call, every spend read silently becomes `Spend::Unavailable` (routing every refill
+decision that depends on it to `manual_review`, never `auto_approve` — the same fail-closed
+direction as every other failure mode on this page, so nothing becomes UNSAFE) with the only
+signal being a `warn!` line on the *usage service's* side
+(`crates/lightbridge-authz-usage/src/handlers/spend.rs`), not anywhere in `authz-budget`'s own
+logs — so if refill decisions unexpectedly start manual-reviewing everything, check the usage
+service's logs for this refusal before assuming the usage service itself is down.
