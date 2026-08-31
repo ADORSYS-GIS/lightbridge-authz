@@ -20,7 +20,7 @@
   superseded (D0 below).
 - Source of truth: [#581](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/581) and the
   decision memo posted against it (`docs/plans/0581-multi-source-usage-plan-of-work.md` §1,
-  decisions D1–D8, D14–D16, D18 and D19–D23; D17 recorded as a recommendation only). The rulings
+  decisions D1–D8, D14–D18 and D19–D23 — all ruled). The rulings
   recorded here are the repo owner's, 2026-08-31.
 - Re-affirms as a rule: the #345/#346 spend-data dependency inversion (`3b34de2`) — see D14.
 - Mirror: ADR-0027's mirror in `lightbridge-governance`
@@ -375,17 +375,14 @@ the F3 failure that double-counted every KPI, and in a tenant-scoped read it is 
 ### D16 — gov#181's failing verify job is **retired**, not fixed
 
 Binds **#588** and **gov#196 AC5**. The job has been red; a red control is not a control, and
-repairing it would restore a check over bookkeeping that D17's recommendation re-points anyway.
+repairing it would restore a check over bookkeeping that D17 re-points anyway.
 
 **Retirement must not leave zero controls**, which is the only way this ruling goes wrong. The
 successors are named: #588's cutover count assertions (per-table and per-`(day, report)`, mismatch
 blocks loudly, rehearsed with a deliberately corrupted row that must block), plus the re-pointed
 verify described under D17. The retirement lands in the same change as its successor, not before it.
 
-### D17 — `ingest_manifests` — recommendation recorded, **pending owner confirmation**
-
-Not ruled. The recommendation on record, so the implementer has something to argue against rather
-than a blank:
+### D17 — `ingest_manifests` stays governance-side — **ruled 2026-08-31**
 
 - `ingest_manifests` **stays governance-side**, as the collector's own *sent*-bookkeeping — what it
   believes it shipped, which is a fact about the collector, not about the store.
@@ -394,8 +391,8 @@ than a blank:
 - **Server-side idempotency is carried by the grain dedup keys** (D22), not by a manifest. Manifests
   describe intent; the unique index is what makes replay safe.
 
-Confirm or overturn before #588 (PR-4a) writes its assertions — it is the consumer of whichever
-answer lands.
+#588 (PR-4a) writes its count assertions against this shape: manifest counts (governance-side)
+compared with usage-query-API counts, across the boundary, never via a shared-DB read (D14).
 
 ### D18 — Latency is stored as `duration_ms` / `upstream_ms`; the honesty contract is untouched
 
@@ -583,12 +580,12 @@ argument that says the window is safe, not a substitute for the measurement.
 
 - **D3's literal reach into the day and seat grains** — see the reading recorded under D3. The
   reading stands unobjected; the confirm flag stays until it is stated one way or the other.
-- **D17** — recommendation recorded above, pending confirmation before PR-4a writes its assertions.
+- ~~D17~~ — ruled 2026-08-31: `ingest_manifests` stays governance-side (see D17 above).
 - **#534's grant shape** (D8 leg 3): which machine-to-machine grant authz-idp issues, and to whom,
   is the subject of the #534 PR itself — this ADR rules that it is *in scope and needed*, not what
   it looks like.
 - Everything the plan of work still lists as open: **D9–D13** (the archive and normalizer-ownership
-  questions) and **D17**.
+  questions).
 
 ## Related
 
