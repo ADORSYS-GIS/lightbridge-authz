@@ -234,6 +234,34 @@ configMaps:
               {{- with .Values.config.query.tls.clientCaBundlePath }}
               client_ca_bundle_path: {{ . | quote }}
               {{- end }}
+        # #570: validates the end-user bearer token `/usage/v1/usage/query` now requires. Same
+        # dev-local-shaped placeholder `charts/lightbridge-authz/values.yaml`'s own
+        # `oauth2.jwks_url` uses -- real deployments MUST override with the actual in-cluster (or
+        # external) Keycloak/OIDC provider JWKS endpoint. `type` is required by the shared Oauth2
+        # struct but has no effect here since this service never mints anything.
+        oauth2:
+          type: external
+          jwks_url: http://keycloak:9100/realms/dev/protocol/openid-connect/certs
+        # #570: the ownership authority `/usage/v1/usage/query` calls for `account`/`project`
+        # scopes -- authz-opa's POST /idp/v1/authorize-usage-scope. `base_url` here is a
+        # dev-local-shaped placeholder ONLY, the same unsettled-cross-chart-address caveat this
+        # chart's sibling `usage_service.base_url` (see `charts/lightbridge-authz/values.yaml`)
+        # documents for the budget domain's reverse direction -- this chart and
+        # `charts/lightbridge-authz` are separate Helm releases, so the real in-cluster
+        # authz-opa Service DNS name depends on the umbrella chart's release/alias naming and is
+        # NOT settled here. Real deployments MUST override `base_url` with that resolved address,
+        # and `username`/`password` MUST match `charts/lightbridge-authz/values.yaml`'s
+        # `server.opa.basic_auth` for whatever release they deploy against.
+        scope_authority:
+          base_url: "https://authz-opa:3001"
+          username: authorino
+          # Dev-local-shaped placeholder, inline like `charts/lightbridge-authz/values.yaml`'s own
+          # `relying_party.state_encryption_key` -- NOT a secretKeyRef, because that would need a
+          # Secret this chart does not create (the same unsettled cross-chart-wiring gap
+          # `base_url` above documents). Real deployments MUST override this from their own
+          # values/secret mechanism, kept in sync with whatever `server.opa.basic_auth.password`
+          # resolves to on the `lightbridge-authz` release being deployed against.
+          password: "change-me"
 
 
 service:

@@ -37,3 +37,20 @@ otel:
   enabled: true
   otlp_endpoint: "http://localhost:4317"
   service_name: "lightbridge-authz-usage"
+# #570: validates the end-user bearer token `/usage/v1/usage/query` now requires. Reuses the same
+# JWKS this deployment's Keycloak realm already serves for authz-api/authz-opa (see
+# config/default.yaml's own oauth2.jwks_url) -- this service only ever reads jwks_url off this
+# block (plus audience/rbac if set); `type` is required by the shared Oauth2 struct but has no
+# effect here since this service never mints anything.
+oauth2:
+  type: external
+  jwks_url: "http://localhost:9100/realms/dev/protocol/openid-connect/certs"
+# #570: the ownership authority `/usage/v1/usage/query` calls for `account`/`project` scopes --
+# authz-opa's POST /idp/v1/authorize-usage-scope. Basic-auth credential must match authz-opa's own
+# server.opa.basic_auth (see config/default.yaml). insecure_skip_verify is only for local/dev runs
+# against a self-signed certificate with no shared CA bundle mounted here.
+scope_authority:
+  base_url: "https://localhost:13001"
+  username: "authorino"
+  password: "change-me"
+  insecure_skip_verify: true
