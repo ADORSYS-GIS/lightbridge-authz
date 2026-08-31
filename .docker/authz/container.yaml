@@ -31,7 +31,7 @@ server:
     tls:
       cert_path: "${IDP_TLS_CERT_PATH:-/tls/idp.crt}"
       key_path: "${IDP_TLS_KEY_PATH:-/tls/idp.key}"
-    # ADR-0021 Decisions 1 + 10, amended by ADR-0028: the hosted login page's Vite production
+    # ADR-0021 Decisions 1 + 10, amended by ADR-0029: the hosted login page's Vite production
     # build, baked into the image at /app/static by Dockerfile/Dockerfile.dist from the
     # digest-pinned converse-frontends `authz-ui` artifact (this repo builds no JavaScript).
     static_dir: "${IDP_STATIC_DIR:-/app/static}"

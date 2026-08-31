@@ -6,7 +6,7 @@ runs:
     - uses: ./.github/actions/rust-setup
     - uses: ./.github/actions/build-binaries
 
-    # ADR-0021 Decisions 1 + 10, amended by ADR-0028 (#591): compose.ci.yaml builds the `runtime`
+    # ADR-0021 Decisions 1 + 10, amended by ADR-0029 (#591): compose.ci.yaml builds the `runtime`
     # target (authz-migrate, authz-api) from Dockerfile.dist, which COPYs dist/static. Without
     # this, `docker compose build` fails with "/dist/static": not found (#446 introduced the COPY;
     # the populating step was once missing and the break was masked for 3 merges because the runs

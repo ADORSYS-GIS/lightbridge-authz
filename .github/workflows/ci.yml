@@ -43,7 +43,7 @@ jobs:
         uses: actions/checkout@v7
       - uses: ./.github/actions/code-checks
 
-  # ADR-0021 Decisions 1 + 10, amended by ADR-0028 (#591). This job used to be `frontend` and ran
+  # ADR-0021 Decisions 1 + 10, amended by ADR-0029 (#591). This job used to be `frontend` and ran
   # `npm ci` + `vite build` on `web/hosted-login`. That project no longer exists here: the login
   # page's source home is converse-frontends' `apps/authz-ui`, and this repo consumes it as a
   # digest-pinned, assets-only OCI artifact.

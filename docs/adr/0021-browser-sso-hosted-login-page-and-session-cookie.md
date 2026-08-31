@@ -124,7 +124,7 @@ browser cookie's session row never is.
 > digest-pinned, assets-only OCI artifact rather than from an `npm ci` in this repo's `Dockerfile`.
 > "Explicitly rejected: a separately deployed Next.js frontend" still stands and is **not** what
 > this is — a separately *built* artifact served from this origin is the opposite of a separately
-> *deployed* origin. See **ADR-0028** for the artifact contract, the pin policy and the
+> *deployed* origin. See **ADR-0029** for the artifact contract, the pin policy and the
 > version-skew rule.
 
 The login/consent UI is a Vite React project, built to static assets, and served from
@@ -564,7 +564,7 @@ login.
 > and the service-worker-scope verifier (the SW-level twin of
 > `static_fallback_never_shadows_an_existing_protocol_route`) both now run inside the producing
 > repo's build, and the pin-checking action here re-asserts the content-hash property against the
-> pulled artifact. See **ADR-0028**.
+> pulled artifact. See **ADR-0029**.
 
 `tower-http` is already a direct dependency but pinned with only the `cors` feature
 (`Cargo.toml:155`) — no static-file-serving feature is enabled anywhere in this workspace today.

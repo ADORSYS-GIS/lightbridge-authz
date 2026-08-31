@@ -3,7 +3,7 @@ description: >
   Pull the pinned, externally-built authz-ui bundle out of its assets-only GHCR image and stage it
   into dist/static for Dockerfile.dist. Replaces the deleted `build-frontend` composite action
   (ADORSYS-GIS/lightbridge-authz#591): the bundle's source home is converse-frontends'
-  `apps/authz-ui` (ADR-0028), so this repo runs no npm, no Vite, and no Node at all.
+  `apps/authz-ui` (ADR-0029), so this repo runs no npm, no Vite, and no Node at all.
 runs:
   using: composite
   steps:
@@ -24,7 +24,7 @@ runs:
         fi
         case "${ref}" in
           *@sha256:*) : ;;
-          *) echo "::error file=Dockerfile::AUTHZ_UI_REF must be digest-pinned (…@sha256:…), got '${ref}'. A mutable tag is not an artifact; see ADR-0028's pin policy."; exit 1 ;;
+          *) echo "::error file=Dockerfile::AUTHZ_UI_REF must be digest-pinned (…@sha256:…), got '${ref}'. A mutable tag is not an artifact; see ADR-0029's pin policy."; exit 1 ;;
         esac
         case "${ref}" in
           *:latest*|*@sha256:REPLACE_ME*) echo "::error file=Dockerfile::AUTHZ_UI_REF is a placeholder or 'latest'"; exit 1 ;;
@@ -54,7 +54,7 @@ runs:
     # Every call site of this action (ci.yml's authz-ui-bundle job, build-release, integration-test)
     # runs on ubuntu-latest, which has a Docker daemon; integration-test already depends on it for
     # `docker compose`. A daemonless alternative using skopeo is in this action's git history /
-    # ADR-0028 if a runner ever loses the daemon.
+    # ADR-0029 if a runner ever loses the daemon.
     - name: Pull and stage the bundle into dist/static
       shell: bash
       env:

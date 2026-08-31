@@ -234,7 +234,7 @@ re-import, add them by hand: Keycloak admin (`http://localhost:9100`, `admin`/`p
 
 The page `authz-idp` serves at `https://localhost:13004/ui/` is **not built in this repo**. Its
 source home is `converse-frontends`' `apps/authz-ui`; this repo consumes the built bundle as a
-digest-pinned, assets-only OCI image (ADR-0028). There is exactly one pin, the `ARG AUTHZ_UI_REF=`
+digest-pinned, assets-only OCI image (ADR-0029). There is exactly one pin, the `ARG AUTHZ_UI_REF=`
 line at the top of `./Dockerfile`.
 
 ### Just run it
@@ -292,7 +292,7 @@ Two things to know while iterating:
 ### Shipping a UI change
 
 The UI ships first and must be backward-compatible; the **pin bump in `./Dockerfile` is the
-deploy** (ADR-0028). Merge in `converse-frontends`, read the published digest from that repo's
+deploy** (ADR-0029). Merge in `converse-frontends`, read the published digest from that repo's
 `authz-ui-image` workflow run summary, update the two lines under `ARG AUTHZ_UI_REF=` here, open a
 PR. `it-idp` proves `/ui/` still serves.
 

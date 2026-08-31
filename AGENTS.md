@@ -332,7 +332,7 @@ use crate::repo::StoreRepo;
 - There is **no `web/` directory and no JavaScript in this repository.** `authz-idp`'s hosted login
   page is built in `converse-frontends` as `apps/authz-ui` and consumed here as a digest-pinned,
   assets-only OCI image (`ghcr.io/adorsys-gis/converse-frontends/authz-ui`, bundle at `/dist`).
-  See ADR-0028.
+  See ADR-0029.
 - `config/`: local default config (non-container paths).
 - `.docker/`: docker assets (service config, Keycloak realm import, Envoy example, IT scripts).
 - `compose.yaml`: local dev stack (Postgres, Keycloak, API/OPA, migrations, TLS generator).
@@ -851,7 +851,7 @@ Traces capture the full lifecycle of a validation request, including database lo
   boundary, so it is reviewed like a code change: dependency automation is explicitly configured
   not to touch it (`.github/dependabot.yml`'s `docker` `ignore:` block), and the bump procedure is
   documented at the ARG itself. The UI ships first and stays backward-compatible; the pin bump is
-  what makes it live (ADR-0028).
+  what makes it live (ADR-0029).
 
 ## Security Notes
 

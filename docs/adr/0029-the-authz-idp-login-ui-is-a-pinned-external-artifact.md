@@ -1,4 +1,4 @@
-# ADR-0028: the `authz-idp` login UI is a pinned external artifact, not a build stage
+# ADR-0029: the `authz-idp` login UI is a pinned external artifact, not a build stage
 
 - Status: Accepted
 - Date: 2026-08-31

@@ -33,7 +33,7 @@ server:
     tls:
       cert_path: "./config/tls/idp.crt"
       key_path: "./config/tls/idp.key"
-    # ADR-0021 Decisions 1 + 10, amended by ADR-0028 (#591): the hosted login page's Vite
+    # ADR-0021 Decisions 1 + 10, amended by ADR-0029 (#591): the hosted login page's Vite
     # production build. This repo no longer builds it -- its source home is converse-frontends'
     # `apps/authz-ui` -- so there is no in-repo path to point at any more. `./dist/static` is the
     # same staging location CI uses (`.github/actions/stage-authz-ui` -> `Dockerfile.dist`'s

@@ -6,7 +6,7 @@
 # exact file so that the Dockerfile.dist/CI path and this Dockerfile can never disagree about
 # which bundle ships. If you move or rename this ARG, fix that action in the same commit.
 #
-# ADR-0021 Decisions 1 + 10, as amended by ADR-0028: the hosted login page's source home is
+# ADR-0021 Decisions 1 + 10, as amended by ADR-0029: the hosted login page's source home is
 # `converse-frontends`' `apps/authz-ui` (ADORSYS-GIS/converse-frontends#408), NOT this repo. This
 # repo builds no JavaScript. The bundle arrives as an assets-only `FROM scratch` OCI image whose
 # entire contents are the Vite build output at `/dist`.
@@ -14,7 +14,7 @@
 # PINNED BY DIGEST, NEVER BY TAG. A tag is mutable; a digest is the artifact. The tag below is a
 # comment for humans reading the diff — it is NOT what gets resolved.
 #
-# HOW TO BUMP (this is the deploy — see ADR-0028's version-skew rule):
+# HOW TO BUMP (this is the deploy — see ADR-0029's version-skew rule):
 #   1. Merge the UI change in converse-frontends; let `authz-ui-image.yml` publish.
 #   2. Read the run's job summary for the `pinned reference` row, or:
 #        skopeo inspect docker://ghcr.io/adorsys-gis/converse-frontends/authz-ui:sha-<gitsha> \
@@ -105,7 +105,7 @@ WORKDIR /app
 COPY --from=builder /app/lightbridge-authz /usr/local/bin/lightbridge-authz
 COPY --from=builder /app/lightbridge-authz-healthcheck /usr/local/bin/lightbridge-authz-healthcheck
 
-# Hosted login page static build (ADR-0021 Decisions 1 + 10, amended by ADR-0028) -- authz-idp
+# Hosted login page static build (ADR-0021 Decisions 1 + 10, amended by ADR-0029) -- authz-idp
 # serves this from `server.idp.static_dir` (.docker/authz/container.yaml defaults to this path).
 # Harmless on api/opa/budget, which never mount the static fallback at all.
 #

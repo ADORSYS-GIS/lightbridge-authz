@@ -13,7 +13,7 @@ WORKDIR /app
 COPY dist/lightbridge-authz /usr/local/bin/lightbridge-authz
 COPY dist/lightbridge-authz-healthcheck /usr/local/bin/lightbridge-authz-healthcheck
 
-# Hosted login page static build (ADR-0021 Decisions 1 + 10, amended by ADR-0028) -- staged into
+# Hosted login page static build (ADR-0021 Decisions 1 + 10, amended by ADR-0029) -- staged into
 # dist/static by the `stage-authz-ui` composite action, which pulls it out of the digest-pinned
 # assets-only image named by ./Dockerfile's `ARG AUTHZ_UI_REF=` (the one pin location) and rides
 # the same dist-binaries.tar.gz as the prebuilt binaries above. This file needs no pin of its own,

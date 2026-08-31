@@ -6,7 +6,7 @@ runs:
     - uses: ./.github/actions/rust-setup
     - uses: ./.github/actions/build-binaries
 
-    # ADR-0021 Decisions 1 + 10, as amended by ADR-0028 (#591): stages the EXTERNALLY BUILT hosted
+    # ADR-0021 Decisions 1 + 10, as amended by ADR-0029 (#591): stages the EXTERNALLY BUILT hosted
     # login bundle into dist/static, alongside the binaries above, so it rides the same
     # dist-binaries.tar.gz into container-build and Dockerfile.dist's runtime stage. This used to
     # be `build-frontend` (npm ci + vite build inside this repo); the source now lives in
