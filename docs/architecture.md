@@ -12,8 +12,8 @@ The workspace produces four runtime surfaces backed by two databases.
 | --- | --- | --- |
 | `authz-api` | OAuth2/JWT bearer | Account, project, and API-key CRUD; optional OIDC discovery, JWKS, and token exchange |
 | `authz-opa` | HTTP Basic | RFC 7662-style API-key introspection and subject/project context resolution |
-| `authz-mcp` | OAuth2/JWT bearer | Nineteen MCP tools, OAuth metadata, and dynamic client-registration proxying |
-| `authz-usage` | None | OTLP/HTTP trace, metric, and log ingestion plus aggregated usage queries |
+| `authz-mcp` | OAuth2/JWT bearer | MCP tools (exact set generated from `#[tool]`-annotated methods in `mcp.rs`, not duplicated here), OAuth metadata, and dynamic client-registration proxying |
+| `authz-usage` | Ingest: none. Query: mTLS + Bearer JWT + ownership (`/usage/v1/usage/query`, #570/#603) or mTLS-only (`/usage/v1/spend/query`) | OTLP/HTTP trace, metric, and log ingestion plus aggregated usage queries |
 
 ```mermaid
 flowchart LR
@@ -263,6 +263,10 @@ When local signing and token exchange are both enabled, `POST /oauth2/token` sup
 
 - RFC 8693 token exchange using an upstream bearer token and requested `project_id`.
 - Refresh-token rotation for scopes that include `offline_access`.
+- RFC 8628 device-code redemption (mounted alongside the exchange grant on `authz-idp`).
+- `authorization_code` redemption (ADR-0019, Authorization Code + PKCE).
+- RFC 6749 §4.4 `client_credentials` (M2M, ADR-0030, #534) — a disjoint machine-plane grant on the
+  same route, `private_key_jwt`-only, minting a token with no `roles` claim.
 
 The access JWT is locally signed. Refresh-token secrets are random and only their hashes are
 persisted.
@@ -299,7 +303,10 @@ flowchart LR
 
 The usage schema becomes a Timescale hypertable when the extension is available and requests a
 thirty-day retention policy. The query endpoint always aggregates by time bucket and can group by
-tenant, user, model, metric, and signal dimensions.
+tenant, user, model, metric, and signal dimensions. Since #570/#603, `Query` above sits behind mTLS
+plus an end-user bearer token and an ownership check (`/usage/v1/usage/query`) or mTLS-only with no
+per-caller ownership check (`/usage/v1/spend/query`) — see
+[`docs/lightbridge-query-api.md`](lightbridge-query-api.md) for the full gate.
 
 ## Budget domain
 

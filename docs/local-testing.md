@@ -82,7 +82,7 @@ once and exit.
 | --- | --- | --- |
 | `authz-api` | 13000 | CRUD + budget-domain client surface (RPC) |
 | `authz-opa` | 13001 | Authorino/OPA validation (basic auth) |
-| `authz-usage` | 13002 (ingest), 13006 (query, mTLS-only) | OTEL ingest / usage query |
+| `authz-usage` | 13002 (ingest), 13006 (query, mTLS + Bearer JWT + ownership on `/usage/v1/usage/query`; mTLS-only on `/usage/v1/spend/query`) | OTEL ingest / usage query |
 | `authz-idp` | 13004 | OIDC broker (discovery, JWKS, token exchange, device grant) |
 | `authz-budget` | 13005 | Budget-domain RPC |
 | `authz-mcp` | 13003 | MCP streamable HTTP |
@@ -344,11 +344,15 @@ PR. `it-idp` proves `/ui/` still serves.
 
 Usage/spend charts don't render locally, for two unrelated reasons:
 
-1. **Backend:** the usage query listener (`:13006`) requires mTLS
+1. **Backend, doubled:** the usage query listener (`:13006`) requires mTLS
    (`AGENTS.md`'s "Security Notes"; `crates/lightbridge-authz-usage/src/config.rs`), and the
    console's proxy makes a plain `fetch()` with no client certificate — leaving `usageUrl` unset in
    the console config is the *correct* local setting (`config.local-authz.yaml`'s own comment:
-   "the plain-HTTP proxy cannot reach it, so `/api/usage` answers `503`").
+   "the plain-HTTP proxy cannot reach it, so `/api/usage` answers `503`"). Even a client
+   certificate alone is not enough since #570/#603: `/usage/v1/usage/query` also requires an
+   end-user `Authorization: Bearer` token plus an ownership check against `authz-opa`, which the
+   console's plain proxy fetch supplies neither of — so "just add the client cert" is not a valid
+   local fix on its own.
 2. **Frontend:** independent of the backend, the console's usage dashboards and the budget hero on
    `/` have **no query client wired up at all yet** — `packages/api-rest` has zero importers
    (`converse-frontends/apps/console/README.md`, "Known gaps"). This is a scaffold gap, not
@@ -375,10 +379,18 @@ DB-backed persistence tests (`lightbridge-authz-api-key`, `lightbridge-authz-bud
 just it-idp
 ```
 
-11-section end-to-end coverage of the whole IdP surface (`.docker/it/idp_it.py`): health probes,
+14-section end-to-end coverage of the whole IdP surface (`.docker/it/idp_it.py`): health probes,
 `/` + SPA static assets, discovery, JWKS, `/authorize` negatives, browser SSO (including the OIDC
 Session Management `session_state` hash contract), `check_session_iframe`, the device grant, native
-RFC 8693 token exchange, RFC 7662 introspection, and revocation.
+RFC 8693 token exchange, `client_credentials` (M2M, ADR-0030), RFC 7662 introspection, revocation,
+`/oauth2/userinfo`, and `/oauth2/end_session`.
+
+Before the test runner starts, the `it-machine-keygen` one-shot compose service
+(`.docker/it/generate_it_machine_fixtures.py`) generates the `it-machine` `client_credentials`
+keypair fresh and renders an IT-only `container.it.yaml` (the checked-in `container.yaml` read
+unmodified, plus the `it-machine` client entry) that `compose.it.yaml` mounts in place of the
+checked-in config for the IT run only — a real RSA private key is never checked into the repo
+(both files are gitignored, `.gitignore`'s `#534/ADR-0030` entry).
 
 ```bash
 just it-servers

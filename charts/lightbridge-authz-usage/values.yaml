@@ -19,12 +19,16 @@ config:
       # Path (inside the mounted `*-tls` secret -- see `persistence.tls` below) to a PEM CA
       # bundle used to require and verify a client certificate on the query listener
       # (`Tls::client_ca_bundle_path`, crates/lightbridge-authz-core/src/config/mod.rs). The
-      # query listener's router has no in-app auth of its own (mTLS at the TLS handshake IS the
-      # access control for `/usage/v1/usage/query` + `/usage/v1/spend/query` -- see
-      # `docs/lightbridge-query-api.md`'s warning banner), so an empty value here is a fail-OPEN
-      # default, not a conservative one: the listener would still bind and its Service/container
-      # port would still be reachable from any pod in the cluster, just with no client-certificate
-      # check. `Tls::client_ca_bundle_path`'s own doc comment
+      # query listener's router has no in-app auth of its own for `/usage/v1/spend/query` --
+      # for that route, mTLS at the TLS handshake IS the whole access control (see
+      # `docs/lightbridge-query-api.md`'s warning banner). `/usage/v1/usage/query` is no longer
+      # in that category as of #570: it additionally requires and validates an end-user bearer
+      # token, then checks scope ownership against `authz-opa` -- but it still sits BEHIND this
+      # same mTLS-required listener, so an empty value here still fail-OPENs the TLS layer for
+      # BOTH routes: the listener would still bind and its Service/container port would still be
+      # reachable from any pod in the cluster, just with no client-certificate check (the #570
+      # bearer/ownership check on `/usage/v1/usage/query` is not a substitute for mTLS -- it is an
+      # additional gate on top of it). `Tls::client_ca_bundle_path`'s own doc comment
       # (crates/lightbridge-authz-core/src/config/mod.rs) is explicit that there is deliberately
       # no "accept but don't require" mode for this reason. Default here is therefore
       # `/etc/lightbridge/tls/ca.crt` -- matching `docs/lightbridge-query-api.md`, the local

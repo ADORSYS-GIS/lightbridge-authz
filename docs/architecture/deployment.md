@@ -110,13 +110,23 @@ dependencies, each aliased and independently toggleable:
 being the same image run with a different `args:` subcommand (see above), configured differently
 per alias in the umbrella chart's values.
 
-Schema migrations run as a Helm hook `Job` (`controllers.migrate` in
-`charts/lightbridge-authz/values.yaml`, built on the `bjw-s/common` v4 app-template library),
-annotated `helm.sh/hook: post-install,post-upgrade` with `ttlSecondsAfterFinished: 300` so a
-completed job self-cleans instead of blocking the next deploy if ArgoCD's own hook-delete-policy
-cleanup doesn't fire. It reuses the ambient config map and shares the same image as the `api`/`opa`
-alias it's attached to. This runs as part of the shared `lightbridge-authz` chart, not as a
-separate migration chart — see "Corrections to prior docs" below.
+Schema migrations run as `controllers.migrate` in `charts/lightbridge-authz/values.yaml` (built on
+the `bjw-s/common` v4 app-template library). Per ADR-0016
+(`docs/adr/0016-migrate-job-sync-wave-not-hook.md`) this is deliberately **not** a Helm hook — it
+used to be `helm.sh/hook: post-install,post-upgrade`, but ArgoCD runs that as a PostSync hook that
+only fires once every non-hook resource (including the main Deployment) is already Healthy, which
+deadlocks the moment a migration is itself a precondition for the new pods' readiness probe
+(confirmed live in prod 2026-08-19: zero `Job` objects anywhere in the synced tree). It is instead
+an ordinary, ArgoCD-tracked `Job` annotated `argocd.argoproj.io/sync-wave: "1"`, one wave earlier
+than `main`'s wave `"2"`, so it runs regardless of whether the Deployment's pods are, or will ever
+be, ready. Its `suffix` folds the image tag and the rendered config data into the Job name (a
+config-only change would otherwise re-render the same Job name with a different, immutable
+`spec.template` and fail the whole app's sync — hit twice in prod 2026-08-24, #480); Kubernetes'
+native Job-controller GC (`ttlSecondsAfterFinished: 604800`, 7 days) keeps a completed Job
+inspectable instead of a Helm hook-delete policy cleaning it up. It reuses the ambient config map
+and shares the same image as the `api`/`opa` alias it's attached to. This runs as part of the
+shared `lightbridge-authz` chart, not as a separate migration chart — see "Corrections to prior
+docs" below.
 
 For actual install/config/deploy commands per platform (macOS+Docker Desktop, Linux, TLS
 provisioning via the built-in job vs. cert-manager, ingress vs. internal-only OPA), see
@@ -124,11 +134,11 @@ provisioning via the built-in job vs. cert-manager, ingress vs. internal-only OP
 
 ## Corrections to prior docs
 
-- The root `AGENTS.md` describes "A brand-new `lightbridge-migrate` chart (aliased `migration`
-  under `charts/lightbridge-authz-stack`) runs `lightbridge-authz migrate` ... as a
+- The root `AGENTS.md` used to describe "A brand-new `lightbridge-migrate` chart (aliased
+  `migration` under `charts/lightbridge-authz-stack`) runs `lightbridge-authz migrate` ... as a
   `pre-install/pre-upgrade` job." No such chart or alias exists in
-  `charts/lightbridge-authz-stack/Chart.yaml` today (its four dependencies are `api`, `opa`,
-  `usage`, `mcp` only). The actual migration job is `controllers.migrate` inside the shared
-  `lightbridge-authz` chart (see above), hooked `post-install,post-upgrade`, not
-  `pre-install,pre-upgrade`. Flagged for `AGENTS.md` maintenance separately; not corrected here
-  since `AGENTS.md` is outside this PR's file scope.
+  `charts/lightbridge-authz-stack/Chart.yaml` (its six dependencies are `api`, `opa`, `idp`,
+  `budget`, `usage`, `mcp`). The actual migration job is `controllers.migrate` inside the shared
+  `lightbridge-authz` chart (see above) — an ArgoCD sync-wave-ordered `Job` (ADR-0016), not a Helm
+  hook of any kind. This has since been corrected in `AGENTS.md`'s own "Helm / deployment notes"
+  section; this note is left here as the historical record of the discrepancy.

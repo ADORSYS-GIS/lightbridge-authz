@@ -5,8 +5,9 @@
 
 Lightbridge Authz is a multi-service backend for API key management and usage analytics:
 - `authz-api` and `authz-opa` handle key lifecycle and validation.
-- `authz-idp` is the OIDC broker for the human plane (browser SSO, RFC 8628 device flow, token
-  exchange). It renders no HTML of its own — see its entry under Services below.
+- `authz-idp` is the OIDC broker for both the human plane (browser SSO, RFC 8628 device flow, token
+  exchange) and the machine plane (RFC 6749 §4.4 `client_credentials`, M2M, ADR-0030). It renders
+  no HTML of its own — see its entry under Services below.
 - `lightbridge-authz-usage` ingests OTEL traffic data and serves Timescale-backed usage analytics.
 - `lightbridge-mcp` exposes all `lightbridge-authz` endpoints as MCP tools over streamable HTTP (`/mcp`).
 
@@ -17,16 +18,21 @@ the `resolve-context` + Authorino validation flows (mermaid diagrams).
 
 - **authz-api** (frontend CRUD, OAuth2)
   - TLS on `:3000` inside the container, exposed as `:13000` via compose.
-  - Public routes: `GET /` and `GET /health`
-  - Probe routes: `GET /health` (liveness), `GET /health/startup` (startup), `GET /health/ready` (DB readiness)
+  - Public routes: `GET /` and `GET /healthz`
+  - Probe routes: `GET /healthz` (liveness), `GET /healthz/startup` (startup), `GET /healthz/ready` (DB readiness)
   - Protected routes under `/api/v1` (OAuth2 bearer token).
-- **authz-opa** (Authorino, basic auth)
+- **authz-opa** (Authorino, basic auth; also the ownership authority for the usage query API)
   - TLS on `:3001` inside the container, exposed as `:13001` via compose.
   - `POST /v1/authorino/validate/introspect` (basic auth, RFC 7662 introspection) — the only
     key-validation route; see `docs/authorino-usage.md`.
   - `POST /idp/v1/resolve-context` (basic auth) — resolves tenant context for token-exchange.
-  - Probe routes: `GET /health`, `GET /health/startup`, `GET /health/ready`
-- **authz-idp** (OIDC broker: browser SSO, RFC 8628 device flow, token exchange)
+  - `POST /idp/v1/authorize-usage-scope` (basic auth) — body `{issuer, subject, scope, scope_id}`;
+    the ownership authority `lightbridge-authz-usage`'s query listener calls for `account`/`project`
+    usage-query scopes (#570). Uniform `404` on any miss, same non-oracle convention as
+    `resolve-context`.
+  - Probe routes: `GET /healthz`, `GET /healthz/startup`, `GET /healthz/ready`
+- **authz-idp** (OIDC broker: browser SSO, RFC 8628 device flow, token exchange, and the
+  `client_credentials` machine plane, ADR-0030)
   - TLS on `:3004` inside the container, exposed as `:13004` via compose.
   - Every route is public — the presented token/assertion or a completed Keycloak login is itself
     the credential. See `docs/architecture/services.md`'s `authz-idp` section for the full route
@@ -47,14 +53,20 @@ the `resolve-context` + Authorino validation flows (mermaid diagrams).
   - MCP streamable HTTP endpoint: `POST/GET /mcp`
   - OAuth metadata/discovery endpoints: `GET /.well-known/oauth-authorization-server`, `GET /.well-known/openid-configuration`
   - OAuth dynamic client registration proxy endpoint: `POST /oauth/register`
-  - Health probes: `GET /health` (liveness), `GET /health/ready` (DB readiness), `GET /health/startup` (startup)
+  - Health probes: `GET /healthz` (liveness), `GET /healthz/ready` (DB readiness), `GET /healthz/startup` (startup)
   - Protected with OAuth2/JWT bearer validation (same JWKS flow as `authz-api`).
   - Reuses the same config file as `lightbridge-authz` (API bind/tls + shared DB settings).
-- **lightbridge-authz-usage** (OTEL ingest + usage query)
-  - OTEL ingest endpoints (no auth): `POST /v1/otel/traces`, `POST /v1/otel/metrics`
-  - Usage query endpoint: `POST /v1/usage/query`
-  - OpenAPI docs: `/v1/usage/docs`
-  - Probe routes: `GET /health`, `GET /health/startup`, `GET /health/ready`
+- **lightbridge-authz-usage** (OTEL ingest + usage query, split across two listeners since #347)
+  - Ingest listener — TLS on `:3002` inside the container (compose), unauthenticated:
+    `POST /v1/otel/traces`, `POST /v1/otel/metrics`, `POST /v1/otel/logs`; OpenAPI docs at
+    `/usage/v1/usage/docs`.
+  - Query listener — TLS on `:3006` inside the container (compose; the umbrella chart uses `:3000`
+    ingest / `:3006` query instead), mTLS-required: `POST /usage/v1/usage/query` (mTLS **plus** an
+    end-user `Authorization: Bearer` token and an ownership check via `authz-opa`'s
+    `authorize-usage-scope`, #570/#603) and `POST /usage/v1/spend/query` (mTLS-only,
+    service-to-service, refuses any request carrying an `Authorization` header, #603). See
+    `docs/usage-api.md` and `docs/lightbridge-query-api.md` for the full auth contract.
+  - Probe routes on both listeners: `GET /healthz`, `GET /healthz/startup`, `GET /healthz/ready`
 - **postgresql**, **keycloak**, **adminer**, **authz-tls**
 
 ## Quick start (Docker Compose)
@@ -66,18 +78,18 @@ just up
 Verify health:
 
 ```bash
-curl -k https://localhost:13000/health
-curl -k https://localhost:13000/health/ready
-curl -k https://localhost:13000/health/startup
-curl -k https://localhost:13001/health
-curl -k https://localhost:13001/health/ready
-curl -k https://localhost:13001/health/startup
-curl -k https://localhost:13002/health
-curl -k https://localhost:13002/health/ready
-curl -k https://localhost:13002/health/startup
-curl -k https://localhost:13003/health
-curl -k https://localhost:13003/health/ready
-curl -k https://localhost:13003/health/startup
+curl -k https://localhost:13000/healthz
+curl -k https://localhost:13000/healthz/ready
+curl -k https://localhost:13000/healthz/startup
+curl -k https://localhost:13001/healthz
+curl -k https://localhost:13001/healthz/ready
+curl -k https://localhost:13001/healthz/startup
+curl -k https://localhost:13002/healthz
+curl -k https://localhost:13002/healthz/ready
+curl -k https://localhost:13002/healthz/startup
+curl -k https://localhost:13003/healthz
+curl -k https://localhost:13003/healthz/ready
+curl -k https://localhost:13003/healthz/startup
 ```
 
 `-k` is required because the certs are self‑signed.
@@ -94,11 +106,18 @@ Default container config is mounted from `.docker/authz/container.yaml`:
 
 ## Helm deployment
 
-- Install the `charts/lightbridge` umbrella chart—the shared `global.config` block is rendered into a single config map (`global.configMapName`, defaults to `lightbridge-authz-config`) that both `lightbridge-api` and `lightbridge-opa` mount at `/etc/lightbridge/config.yaml`. Use YAML anchors (see `charts/lightbridge/values.yaml`) to keep the base `logging`, `database`, `oauth2`, and `server` sections in sync while overriding the API/OPA ports or service-specific knobs.
+- Install the `charts/lightbridge-authz-stack` umbrella chart — it wires six aliased dependencies
+  (`api`/`opa`/`idp`/`budget` from `charts/lightbridge-authz`, `usage` from
+  `charts/lightbridge-authz-usage`, `mcp` from `charts/lightbridge-mcp`). The shared `global.config`
+  block is rendered into a single config map (`global.configMapName`, defaults to
+  `lightbridge-authz-config`) that the `api`/`opa` aliases mount at `/etc/lightbridge/config.yaml`.
+  Use YAML anchors (see `charts/lightbridge-authz-stack/values.yaml`) to keep the base `logging`,
+  `database`, `oauth2`, and `server` sections in sync while overriding the API/OPA ports or
+  service-specific knobs.
 - The same umbrella chart also owns the TLS secret (`global.tlsSecretName`, defaults to `lightbridge-authz-tls`) via a pre-install/pre-upgrade `global-tls` job. The job skips generation if the secret already exists, so reruns are safe; disable it (e.g., when cert-manager manages certs) with `--set global.tls.job.enabled=false`.
-- Every dependency still renders its own hooks locally, but the umbrella chart disables the per-service TLS job/configmap so the shared resources are reused. Each `lightbridge-authz` release now also has a pre-install/pre-upgrade `migrate` job that writes the templated config to `/tmp/lightbridge-config/config.yaml` and runs `lightbridge-authz migrate --config-path ...`, keeping the schema ready before the servers start.
+- Every dependency still renders its own hooks locally, but the umbrella chart disables the per-service TLS job/configmap so the shared resources are reused. Each `lightbridge-authz` release also runs its own `controllers.migrate` Job (`charts/lightbridge-authz/values.yaml`), writing the templated config to `/etc/lightbridge/config.yaml` and running `lightbridge-authz migrate --config-path ...` — an ordinary ArgoCD-tracked resource on an earlier sync-wave than the main Deployment (ADR-0016), not a Helm hook — keeping the schema ready before the servers start. See `docs/platform-guides.md`'s "Migration job" section for the full mechanism.
 - Override TLS paths, service types, image tags, etc., via the per-release `lightbridge-api` and `lightbridge-opa` value blocks; for example, bump `lightbridge-api.service.type` to `LoadBalancer` or tweak `lightbridge-opa.image.tag` while relying on the shared `global.config`.
-- Validate the charts before deployment with `helm lint charts/lightbridge-authz` and `helm lint charts/lightbridge`. You can preview the combined output (config map, TLS secret job, migrations job, and services) with `helm template charts/lightbridge`. After installing, run `helm test <release>` to exercise the `lightbridge-authz` test pod that hits the rendered service port.
+- Validate the charts before deployment with `helm lint charts/lightbridge-authz` and `helm lint charts/lightbridge-authz-stack`. You can preview the combined output (config map, TLS secret job, migration jobs, and services) with `helm template charts/lightbridge-authz-stack`. After installing, run `helm test <release>` to exercise the `lightbridge-authz` test pod that hits the rendered service port.
 
 
 ## API overview
@@ -115,6 +134,7 @@ Default container config is mounted from `.docker/authz/container.yaml`:
   route (the earlier JSON `POST /v1/authorino/validate` endpoint, with a `metadata`
   passthrough/enrichment field, was removed — see `docs/authorino-usage.md`).
 - `POST /idp/v1/resolve-context` — resolves the tenant context for a subject scoped to a project (body `{subject, project_id}`) → `{account_id, project_id}`. Membership-enforced; any miss is a uniform `404`. Called by the Keycloak IdP adapter during token exchange; Basic-auth protected (the adapter presents the OPA credentials).
+- `POST /idp/v1/authorize-usage-scope` — body `{issuer, subject, scope, scope_id}`; the ownership authority `lightbridge-authz-usage`'s query listener calls for `account`/`project` usage-query scopes (#570/#603). Non-oracle: any miss (unknown scope_id, non-member subject) is the same uniform `404` `resolve-context` uses. Basic-auth protected.
 - OpenAPI docs: `https://localhost:13001/v1/opa/docs`
 
 This backend is intended to be called by Authorino, not by end users or client
@@ -159,10 +179,23 @@ See `docs/rbac.md` for the full permission mapping, `docs/budget-decision-contra
 policy-engine contract, and `docs/budget-refill-ui-contract.md` for the RPC shapes and
 UI-relevant behaviors (reset-not-add semantics, token-refresh delay).
 
-**Usage API (No auth on ingest/query endpoints)**
-- `POST /v1/otel/traces` (OTLP/HTTP traces, protobuf or JSON)
-- `POST /v1/otel/metrics` (OTLP/HTTP metrics, protobuf or JSON)
-- `POST /v1/usage/query` (bucketed timeseries for `user`, `project`, or `account` scopes)
+**Usage API (ingest is unauthenticated; the query endpoint is not)**
+
+Split across two listeners since #347 — ingest `:3002` (compose) / query `:3006` (compose; mTLS):
+
+- `POST /v1/otel/traces` (OTLP/HTTP traces, protobuf or JSON) — ingest listener, no auth.
+- `POST /v1/otel/metrics` (OTLP/HTTP metrics, protobuf or JSON) — ingest listener, no auth.
+- `POST /v1/otel/logs` (OTLP/HTTP logs, protobuf or JSON) — ingest listener, no auth.
+- `POST /usage/v1/usage/query` (bucketed timeseries for `user`, `project`, `account`, or `all`
+  scopes) — query listener: requires mTLS (#347) **plus** `Authorization: Bearer <end-user access
+  token>` and an ownership check against `authz-opa`'s `authorize-usage-scope` for `account`/
+  `project` scopes; `scope=all` instead requires the `usage:read-all` permission (#570/#603/#605).
+  `scope=api_key` has no resolvable ownership authority and is always `403`.
+- `POST /usage/v1/spend/query` (summed spend for an account/period) — query listener: mTLS-only,
+  `authz-budget`'s service-to-service reader; refuses any request carrying an `Authorization`
+  header (#603).
+
+See `docs/usage-api.md` and `docs/lightbridge-query-api.md` for the full contract.
 
 Example query body:
 
@@ -253,6 +286,11 @@ just up-no-build
 just logs-api
 just logs-opa
 just migrate
+just usage-migrate
+just stage-authz-ui
 just it-authorino
 just it-servers
+just it-tests
+just it-idp
+just all-checks
 ```

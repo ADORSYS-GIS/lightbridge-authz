@@ -331,7 +331,8 @@ actually live versus merely implemented — is in [`budget.md`](./budget.md).
 `usage_events` (`migrations-usage/`) is **not** in the schema above — it lives in its own
 Timescale-compatible database (`lightbridge-authz-usage`'s own `DATABASE_URL`, provisioned
 independently from the authz Postgres instance), ingested via unprotected OTLP/HTTP
-(`/v1/otel/traces`, `/v1/otel/metrics`) and queried via `/usage/v1/usage/query`. It carries
+(`/v1/otel/traces`, `/v1/otel/metrics`, `/v1/otel/logs`) and queried via
+`/usage/v1/usage/query` (mTLS + Bearer JWT + ownership since #570/#603). It carries
 `account_id`/`project_id` as plain `TEXT` columns with no foreign key back into `accounts`/
 `projects` — there is no live referential relationship, only a shared convention of which id
 format each column holds. The budget domain reads spend directly from this table
