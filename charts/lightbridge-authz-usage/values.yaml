@@ -44,6 +44,48 @@ config:
       # trade is "query endpoint unreachable" in exchange for "config still loads", never
       # "reachable and unauthenticated".
       clientCaBundlePath: "/etc/lightbridge/tls/ca.crt"
+  # #570: `oauth2`/`scopeAuthority` below are exposed as real `.Values.config.*` knobs (mirroring
+  # `config.query.tls.clientCaBundlePath` above) rather than hardcoded scalars inside
+  # `configMaps.config.data."config.yaml"`'s text block, specifically so a values-repo override
+  # can `--set`/patch just the field that needs to change (e.g. `scopeAuthority.baseUrl` once the
+  # real in-cluster authz-opa address is known) without having to replace the entire rendered
+  # config.yaml verbatim.
+  #
+  # DEPLOY ORDERING (see `docs/lightbridge-query-api.md`'s "#347 needs a companion ai-helm-values
+  # change" paragraph for the full consequence chain): both `oauth2.jwksUrl` and every
+  # `scopeAuthority.*` field below are MANDATORY -- `UsageConfig::oauth2`/`UsageConfig::
+  # scope_authority` are non-`Option` fields (crates/lightbridge-authz-usage/src/config.rs), so a
+  # config omitting either fails to load, taking down BOTH listeners (ingest -- usage/billing data
+  # loss -- and query -- authz-budget's spend reads degrade to `Spend::Unavailable`, routing every
+  # refill decision that depends on them to `manual_review`, never `auto_approve`). Because the
+  # `migrate` Job runs at `argocd.argoproj.io/sync-wave: "1"` (before `main`'s wave `"2"`) and
+  # ALSO loads this same config, a bad value here fails the migrate Job first and the whole
+  # ArgoCD app sync with it -- not a partial degrade. These values MUST be supplied correctly in
+  # THE SAME ROLLOUT that enables this version of the chart, not as a follow-up.
+  oauth2:
+    # Dev-local-shaped placeholder, same convention `charts/lightbridge-authz/values.yaml`'s own
+    # `oauth2.jwks_url` uses -- real deployments MUST override with the actual in-cluster (or
+    # external) Keycloak/OIDC provider JWKS endpoint.
+    jwksUrl: "http://keycloak:9100/realms/dev/protocol/openid-connect/certs"
+  scopeAuthority:
+    # Dev-local-shaped placeholder ONLY, the same unsettled-cross-chart-address caveat this
+    # chart's sibling `usage_service.base_url` (see `charts/lightbridge-authz/values.yaml`)
+    # documents for the budget domain's reverse direction -- this chart and
+    # `charts/lightbridge-authz` are separate Helm releases, so the real in-cluster authz-opa
+    # Service DNS name depends on the umbrella chart's release/alias naming and is NOT settled
+    # here. Real deployments MUST override this with that resolved address.
+    baseUrl: "https://authz-opa:3001"
+    # MUST match whatever `server.opa.basic_auth.username` resolves to on the
+    # `lightbridge-authz` release being deployed against.
+    username: authorino
+    # Same CA bundle already mounted at this path for the query listener's own mTLS verification
+    # above (`persistence.tls` mounts the whole `*-tls` secret at `/etc/lightbridge/tls`) --
+    # authz-opa's server certificate is signed by the same cluster CA, so reusing this path (
+    # rather than leaving `ca_bundle_path` unset, which falls back to the platform's default trust
+    # store and would refuse to verify a private-CA-signed authz-opa certificate) is what lets
+    # `RemoteScopeAuthority` actually verify authz-opa's TLS certificate instead of every usage
+    # query failing closed to 403 at request time.
+    caBundlePath: "/etc/lightbridge/tls/ca.crt"
 
 controllers:
   main:
@@ -105,6 +147,21 @@ controllers:
               secretKeyRef:
                 name: db-secret
                 key: DATABASE_URL
+          # #570: the Basic-auth credential `scope_authority.password` (rendered as `${DATABASE_URL}`-
+          # style env interpolation below, never inlined as plain text in the ConfigMap) presents to
+          # authz-opa's `POST /idp/v1/authorize-usage-scope`. Sourced from the SAME `opa-secret` Secret
+          # and key `charts/lightbridge-authz/values.yaml:74-78` already reads for `authz-opa`'s own
+          # `server.opa.basic_auth.password` -- this is one shared credential, not two, so both charts
+          # MUST be pointed at the same Secret in the same namespace. IMPORTANT: this credential
+          # unlocks the WHOLE authz-opa Basic-auth-protected router, not just the new
+          # `authorize-usage-scope` route -- it is the identical credential Authorino itself presents
+          # to `POST /v1/authorino/validate/introspect`, so treat it with the same sensitivity as any
+          # other authz-opa client secret.
+          OPA_PASSWORD:
+            valueFrom:
+              secretKeyRef:
+                name: opa-secret
+                key: OPA_PASSWORD
         # Probes stay pointed at the ingest listener (`http`/3000) even though the query listener
         # exposes its own `/healthz*` routes too (UsageServerGroup::query's doc comment). With
         # `config.query.tls.clientCaBundlePath` defaulting to a real CA bundle (see that value's
@@ -234,34 +291,28 @@ configMaps:
               {{- with .Values.config.query.tls.clientCaBundlePath }}
               client_ca_bundle_path: {{ . | quote }}
               {{- end }}
-        # #570: validates the end-user bearer token `/usage/v1/usage/query` now requires. Same
-        # dev-local-shaped placeholder `charts/lightbridge-authz/values.yaml`'s own
-        # `oauth2.jwks_url` uses -- real deployments MUST override with the actual in-cluster (or
-        # external) Keycloak/OIDC provider JWKS endpoint. `type` is required by the shared Oauth2
-        # struct but has no effect here since this service never mints anything.
+        # #570: validates the end-user bearer token `/usage/v1/usage/query` now requires. `type`
+        # is required by the shared Oauth2 struct but has no effect here since this service never
+        # mints anything. See `.Values.config.oauth2` above for the override knob and the
+        # mandatory-deploy-ordering note.
         oauth2:
           type: external
-          jwks_url: http://keycloak:9100/realms/dev/protocol/openid-connect/certs
+          jwks_url: {{ .Values.config.oauth2.jwksUrl | quote }}
         # #570: the ownership authority `/usage/v1/usage/query` calls for `account`/`project`
-        # scopes -- authz-opa's POST /idp/v1/authorize-usage-scope. `base_url` here is a
-        # dev-local-shaped placeholder ONLY, the same unsettled-cross-chart-address caveat this
-        # chart's sibling `usage_service.base_url` (see `charts/lightbridge-authz/values.yaml`)
-        # documents for the budget domain's reverse direction -- this chart and
-        # `charts/lightbridge-authz` are separate Helm releases, so the real in-cluster
-        # authz-opa Service DNS name depends on the umbrella chart's release/alias naming and is
-        # NOT settled here. Real deployments MUST override `base_url` with that resolved address,
-        # and `username`/`password` MUST match `charts/lightbridge-authz/values.yaml`'s
-        # `server.opa.basic_auth` for whatever release they deploy against.
+        # scopes -- authz-opa's POST /idp/v1/authorize-usage-scope. See `.Values.config.scopeAuthority`
+        # above for the override knobs and the mandatory-deploy-ordering note. `password` is NEVER
+        # inlined as plain text here -- it is `${OPA_PASSWORD}` env interpolation
+        # (`lightbridge_authz_core::config`'s `${VAR}` support), resolved at process startup from the
+        # `OPA_PASSWORD` env var `controllers.main` sources from the `opa-secret` Secret above, the
+        # same secret/key `charts/lightbridge-authz/values.yaml` already reads for authz-opa's own
+        # `server.opa.basic_auth.password` -- never rendered into this ConfigMap in the clear.
         scope_authority:
-          base_url: "https://authz-opa:3001"
-          username: authorino
-          # Dev-local-shaped placeholder, inline like `charts/lightbridge-authz/values.yaml`'s own
-          # `relying_party.state_encryption_key` -- NOT a secretKeyRef, because that would need a
-          # Secret this chart does not create (the same unsettled cross-chart-wiring gap
-          # `base_url` above documents). Real deployments MUST override this from their own
-          # values/secret mechanism, kept in sync with whatever `server.opa.basic_auth.password`
-          # resolves to on the `lightbridge-authz` release being deployed against.
-          password: "change-me"
+          base_url: {{ .Values.config.scopeAuthority.baseUrl | quote }}
+          username: {{ .Values.config.scopeAuthority.username | quote }}
+          password: "${OPA_PASSWORD}"
+          {{- with .Values.config.scopeAuthority.caBundlePath }}
+          ca_bundle_path: {{ . | quote }}
+          {{- end }}
 
 
 service:
