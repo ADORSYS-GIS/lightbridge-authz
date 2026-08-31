@@ -19,12 +19,20 @@ pub fn ingest_router() -> Router<Arc<UsageState>> {
 
 /// The internal query routes (#347): `/usage/v1/usage/query` and `/usage/v1/spend/query`, mounted
 /// on `UsageServerGroup::query` -- the listener that requires and verifies a client certificate
-/// via `Tls::client_ca_bundle_path`. This application code applies no auth check of its own; the
-/// TLS-layer client-certificate requirement is the actual gate (see
-/// `lightbridge_authz_core::server::serve_tls`'s `build_mtls_config`), which is also why these two
-/// routes moved off the shared `usage` listener above rather than growing a second, in-app
-/// authorization mechanism -- `axum-server`'s rustls integration enforces client-cert verification
-/// per-listener, not per-route.
+/// via `Tls::client_ca_bundle_path` (see `lightbridge_authz_core::server::serve_tls`'s
+/// `build_mtls_config`). Both routes moved off the shared `usage` listener above rather than
+/// growing a second, in-app authorization mechanism, because `axum-server`'s rustls integration
+/// enforces client-cert verification per-listener, not per-route.
+///
+/// The two routes diverge above the TLS layer, though (#570): `/usage/v1/spend/query`
+/// (`handlers::spend::query_spend`) applies no further app-level check -- it is `authz-budget`'s
+/// legitimate cross-account service reader and now REFUSES any request carrying an `Authorization`
+/// header, since it has no business ever receiving one. `/usage/v1/usage/query`
+/// (`handlers::query::query_usage`) is no longer "no auth check of its own": it additionally
+/// requires and validates an end-user bearer token via JWKS, then calls `UsageState::
+/// scope_authority` to check that the token's subject actually owns the requested `account`/
+/// `project` scope (`user`/`api_key` scopes are refused unconditionally, having no resolvable
+/// ownership authority at all) -- see `query_usage`'s own doc comment for the full gate.
 pub fn query_router() -> Router<Arc<UsageState>> {
     Router::new()
         .route("/usage/v1/usage/query", post(query_usage))

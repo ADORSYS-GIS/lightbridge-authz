@@ -1050,6 +1050,77 @@ impl StoreRepo {
         })
     }
 
+    /// Backs `authz-opa`'s `POST /idp/v1/authorize-usage-scope` (#570): does the already-ADR-0025-
+    /// resolved `account_id` own `scope_id` under `scope`? `lightbridge-authz-usage`'s query
+    /// listener has no database of its own to answer "does this end user own this account/
+    /// project" -- this is the one place that predicate is evaluated, mirroring `resolve_context`'s
+    /// own ownership semantics exactly rather than inventing a second one:
+    ///
+    /// - `scope == "account"`: `account_id` owns `scope_id` when they share the same ADR-0026
+    ///   identity anchor (`accounts.user_id`), the identical `owned.user_id = (SELECT user_id FROM
+    ///   accounts WHERE id = $2)` join `resolve_context`'s ownership branch uses.
+    /// - `scope == "project"`: identical predicate to `resolve_context` itself -- owns the
+    ///   project's account (by the same anchor join) OR holds a `project_members` row on it.
+    /// - anything else (including `"user"`/`"api_key"`, which have no resolvable authority) is an
+    ///   immediate `NotFound`, with no query at all -- there is no ownership predicate to evaluate
+    ///   for them, so refusing here also can never leak whether `scope_id` exists.
+    ///
+    /// One query per scope, one `NotFound` branch each: "unknown scope_id" and "known scope_id the
+    /// caller doesn't own" must resolve identically, exactly like `resolve_context`'s own
+    /// non-leaking-oracle contract.
+    #[instrument(skip(self, account_id))]
+    pub async fn authorize_usage_scope(
+        &self,
+        account_id: &AccountId,
+        scope: &str,
+        scope_id: &str,
+    ) -> Result<()> {
+        match scope {
+            "account" => {
+                let row: Option<(String,)> = sqlx::query_as(
+                    r#"
+                    SELECT owned.id
+                    FROM accounts owned
+                    WHERE owned.id = $1
+                      AND owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                    "#,
+                )
+                .bind(scope_id)
+                .bind(account_id.as_str())
+                .fetch_optional(self.pool())
+                .await?;
+                row.ok_or(Error::NotFound)?;
+                Ok(())
+            }
+            "project" => {
+                let row: Option<(String,)> = sqlx::query_as(
+                    r#"
+                    SELECT projects.id
+                    FROM projects
+                    WHERE projects.id = $1
+                      AND (
+                        projects.account_id IN (
+                          SELECT owned.id FROM accounts owned
+                          WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM project_members pm
+                          WHERE pm.project_id = projects.id AND pm.account_id = $2
+                        )
+                      )
+                    "#,
+                )
+                .bind(scope_id)
+                .bind(account_id.as_str())
+                .fetch_optional(self.pool())
+                .await?;
+                row.ok_or(Error::NotFound)?;
+                Ok(())
+            }
+            _ => Err(Error::NotFound),
+        }
+    }
+
     /// Enforces the Active-status gate `resolve_context` itself deliberately does not apply (that
     /// function only checks ownership/membership). Single source of truth for every grant/session
     /// path that must refuse a suspended account or an inactive project rather than silently

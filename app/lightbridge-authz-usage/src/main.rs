@@ -35,7 +35,14 @@ async fn main() -> Result<()> {
         Some(Commands::Serve { config_path }) => {
             info!("{}", BANNER);
             let config = load_from_path(&config_path)?;
-            start_usage_server(&config.server.usage, &config.server.query, &config.database).await
+            start_usage_server(
+                &config.server.usage,
+                &config.server.query,
+                &config.database,
+                &config.oauth2,
+                &config.scope_authority,
+            )
+            .await
         }
         Some(Commands::Migrate { config_path }) => {
             let config = load_from_path(&config_path)?;

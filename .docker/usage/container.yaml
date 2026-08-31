@@ -35,3 +35,20 @@ otel:
   enabled: true
   otlp_endpoint: "http://jaeger:4317"
   service_name: "lightbridge-authz-usage"
+# #570: validates the end-user bearer token `/usage/v1/usage/query` now requires. Same JWKS URL
+# (inside the compose network) as .docker/authz/container.yaml's oauth2.jwks_url -- this service
+# only ever reads jwks_url off this block; `type` is required by the shared Oauth2 struct but has
+# no effect here since this service never mints anything.
+oauth2:
+  type: external
+  jwks_url: "http://keycloak:9100/realms/dev/protocol/openid-connect/certs"
+# #570: the ownership authority `/usage/v1/usage/query` calls for `account`/`project` scopes --
+# authz-opa's POST /idp/v1/authorize-usage-scope, reached over the compose network at its internal
+# port 3001. username/password MUST match .docker/authz/container.yaml's server.opa.basic_auth.
+# insecure_skip_verify: true matches every other in-compose TLS client here (self-signed certs,
+# no shared CA bundle mounted) -- see usage_service's identical posture above.
+scope_authority:
+  base_url: "https://authz-opa:3001"
+  username: "authorino"
+  password: "change-me"
+  insecure_skip_verify: true

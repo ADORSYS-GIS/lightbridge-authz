@@ -34,13 +34,16 @@ tracing-opentelemetry.workspace = true
 utoipa.workspace = true
 utoipa-swagger-ui.workspace = true
 lightbridge-authz-core = { workspace = true, features = ["axum"] }
+lightbridge-authz-bearer.workspace = true
 flate2.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
 tokio.workspace = true
 sqlx.workspace = true
 tower.workspace = true
+httpmock.workspace = true
 
 [features]
 it-tests = []
@@ -53,4 +56,9 @@ required-features = ["it-tests"]
 [[test]]
 name = "spend_query_it_tests"
 path = "tests/spend_query_it_tests.rs"
+required-features = ["it-tests"]
+
+[[test]]
+name = "scope_ownership_it_tests"
+path = "tests/scope_ownership_it_tests.rs"
 required-features = ["it-tests"]

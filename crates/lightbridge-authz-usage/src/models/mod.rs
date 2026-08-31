@@ -62,12 +62,22 @@ pub struct UsageQueryFilters {
     pub signal_type: Option<String>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UsageQueryResponse {
     pub points: Vec<UsageSeriesPoint>,
+    /// #578: `true` when more than `limit` DISTINCT `bucket_start` values matched the query and
+    /// the OLDEST one was dropped WHOLE to fit. `limit` bounds bucket count, not `points.len()`
+    /// (a row count) -- with a non-empty `group_by`, `points` can hold more entries than `limit`
+    /// (one per series per surviving bucket), still in the same ascending `bucket_start` order as
+    /// before this field existed, and every surviving bucket keeps its FULL series set, never an
+    /// arbitrary subset while a sibling bucket keeps all of its own. `false` means every matching
+    /// bucket is present. See `StoreRepo::query_usage`'s doc comment for why truncation drops the
+    /// oldest bucket, not the newest, why it must be bucket-scoped rather than row-scoped, and for
+    /// the known mid-bucket-cut caveat tracked as #586.
+    pub truncated: bool,
 }
 
-#[derive(Debug, Serialize, ToSchema, Clone)]
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
 pub struct UsageSeriesPoint {
     pub bucket_start: DateTime<Utc>,
     pub account_id: Option<String>,
@@ -111,7 +121,9 @@ fn default_limit() -> u32 {
     1_000
 }
 
-/// Request body for the internal, Basic-auth-protected `/usage/v1/spend/query` endpoint. Answers
+/// Request body for the internal, mTLS-protected `/usage/v1/spend/query` endpoint (the query
+/// listener requires and verifies a client certificate -- see `UsageServerGroup::query`'s doc
+/// comment; this route carries no Basic-auth or bearer check of its own). Answers
 /// exactly the question `lightbridge-authz-budget`'s `SpendReader` asks: the summed
 /// `usage_events.total_cost` for one account over a half-open `[start, end)` interval. Deliberately
 /// takes explicit `start`/`end` bounds rather than a `Period` -- period-to-bounds conversion

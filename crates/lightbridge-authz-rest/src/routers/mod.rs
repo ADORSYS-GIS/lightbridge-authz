@@ -4,13 +4,15 @@ use axum::Router;
 use axum::routing::post;
 
 use crate::OpaState;
-use crate::handlers::idp::resolve_context;
+use crate::handlers::idp::{authorize_usage_scope, resolve_context};
 use crate::handlers::introspect::introspect_api_key;
 use crate::middleware::basic_auth;
 
 /// Returns the OPA/Authorino validation router. Every route sits behind Basic auth; the IdP
-/// `resolve-context` endpoint lives here because it returns tenant context and must not be publicly
-/// reachable.
+/// `resolve-context` endpoint lives here because it returns tenant context and must not be
+/// publicly reachable, and `authorize-usage-scope` (#570) lives beside it for the identical
+/// reason -- it is the ownership authority `lightbridge-authz-usage`'s query listener calls, and
+/// answers a tenant-scoped yes/no that must not be reachable without the same credential.
 pub fn opa_router(state: Arc<OpaState>) -> Router<Arc<OpaState>> {
     Router::new()
         .route(
@@ -18,5 +20,6 @@ pub fn opa_router(state: Arc<OpaState>) -> Router<Arc<OpaState>> {
             post(introspect_api_key),
         )
         .route("/idp/v1/resolve-context", post(resolve_context))
+        .route("/idp/v1/authorize-usage-scope", post(authorize_usage_scope))
         .layer(axum::middleware::from_fn_with_state(state, basic_auth))
 }
