@@ -37,6 +37,11 @@ pull:
 build:
 	docker compose -p lightbridge-authz -f compose.yaml build {{c}}
 
+# Stage the pinned authz-ui bundle into ./dist/static (what config/default.yaml's static_dir
+# defaults to). Uses the ONE pin in ./Dockerfile -- never restate it here.
+stage-authz-ui:
+	@bash -ec 'set -euo pipefail; ref="$(sed -n "s/^ARG AUTHZ_UI_REF=//p" Dockerfile | head -n1)"; [ -n "$ref" ] || { echo "no ARG AUTHZ_UI_REF= in ./Dockerfile" >&2; exit 1; }; echo "staging $ref"; ctr="authz-ui-stage-$$"; docker pull --platform linux/amd64 "$ref"; docker create --name "$ctr" "$ref" /nonexistent >/dev/null; trap "docker rm -f \"$ctr\" >/dev/null 2>&1 || true" EXIT; mkdir -p dist/static; docker cp "$ctr:/dist/." dist/static/; ls -lash dist/static/'
+
 # Start the project
 up:
 	docker compose -p lightbridge-authz -f compose.yaml up -d --remove-orphans --build {{c}}
