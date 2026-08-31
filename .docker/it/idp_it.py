@@ -397,11 +397,18 @@ def section_root_and_spa() -> None:
     content_type = headers.get("Content-Type", "")
     assert "html" not in content_type.lower(), f"root served HTML, not JSON: {content_type}"
 
-    for path in ("/ui/", "/ui/login"):
+    # #598: /ui is a route ALLOWLIST now, not a catch-all. `/ui/login` used to pass here
+    # VACUOUSLY -- no such route has ever existed; the old SPA fallback answered 200 for any
+    # path at all. Now it must 404, and that assertion is what proves the allowlist is real.
+    for path in ("/ui/", "/ui/device", "/ui/device/confirm", "/ui/error"):
         status, headers, body = http_raw("GET", f"{IDP_URL}{path}")
         assert status == 200, f"{path} failed: status={status}"
         content_type = headers.get("Content-Type", "")
         assert "html" in content_type.lower(), f"{path} did not serve the SPA index: {content_type}"
+
+    for path in ("/ui/login", "/ui/does-not-exist", "/ui/device/nope"):
+        status, _, _ = http_raw("GET", f"{IDP_URL}{path}")
+        assert status == 404, f"unallowlisted {path} did not 404: status={status}"
 
     status, _, _ = http_raw("GET", f"{IDP_URL}/does-not-exist")
     assert status == 404, f"unknown non-/ui path did not 404: status={status}"
@@ -830,14 +837,35 @@ def section_device_flow() -> tuple[str, str]:
     log("device poll reports authorization_pending before approval")
 
     cookies = CookieJar()
-    status, _, _ = http_raw("GET", f"{IDP_URL}/device/verify?user_code={user_code}", cookies=cookies)
-    assert status == 200, f"device verify page failed: status={status}"
+    status, headers, _ = http_raw(
+        "GET", f"{IDP_URL}/device/verify?user_code={user_code}", cookies=cookies
+    )
+    # #598: RFC 8628 `verification_uri_complete` still lands on a live URL; it hands off to the
+    # SPA now rather than rendering. The prefill survives the hop.
+    assert status == 303, f"device verify page did not hand off to the SPA: status={status}"
+    assert headers.get("Location", "").startswith("/ui/device"), headers.get("Location")
+    assert user_code in headers.get("Location", ""), "user_code prefill was dropped in the handoff"
 
     status, headers, _ = http_form(
         "POST", f"{IDP_URL}/device/verify", {"user_code": user_code}, cookies=cookies
     )
-    assert status == 200, f"device verify submit failed: status={status}"
+    assert status == 303, f"device verify submit did not redirect: status={status}"
+    assert headers.get("Location") == "/ui/device/confirm", headers.get("Location")
     assert cookies.get("__Host-authz_device_confirm"), "device confirm cookie was not set"
+
+    # The confirmation page's data, cookie-bound. Same cookie the CSRF check requires.
+    status, _, ctx_bytes = http_raw(
+        "GET", f"{IDP_URL}/device/verify/context", cookies=cookies
+    )
+    assert status == 200, f"device verify context failed: status={status}"
+    ctx = json.loads(ctx_bytes)
+    assert ctx["user_code"] == user_code, ctx
+    assert ctx["client_id"] == DEVICE_CLIENT_ID, ctx
+    assert "device_code" not in ctx_bytes.decode("utf-8"), "context leaked the device_code"
+
+    # No cookie -> uniform 404, never an enumeration oracle.
+    status, _, _ = http_raw("GET", f"{IDP_URL}/device/verify/context")
+    assert status == 404, f"context without the confirm cookie did not 404: status={status}"
 
     status, headers, _ = http_form(
         "POST", f"{IDP_URL}/device/verify/continue", {"user_code": user_code}, cookies=cookies
@@ -847,8 +875,9 @@ def section_device_flow() -> tuple[str, str]:
     assert keycloak_location, "device verify continue missing keycloak redirect"
 
     callback_location = drive_keycloak_login(keycloak_location, cookies)
-    status, _, _ = http_raw("GET", callback_location, cookies=cookies)
-    assert status == 200, f"device callback did not complete pairing: status={status}"
+    status, headers, _ = http_raw("GET", callback_location, cookies=cookies)
+    assert status == 303, f"device callback did not complete pairing: status={status}"
+    assert headers.get("Location") == "/ui/device/success", headers.get("Location")
     log("device pairing approved through the browser")
 
     status, _, token_bytes = http_raw(
