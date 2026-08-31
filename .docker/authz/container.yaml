@@ -31,8 +31,9 @@ server:
     tls:
       cert_path: "${IDP_TLS_CERT_PATH:-/tls/idp.crt}"
       key_path: "${IDP_TLS_KEY_PATH:-/tls/idp.key}"
-    # ADR-0021 Decisions 1 + 10 (#442): the hosted login page's Vite production build, baked into
-    # the image at /app/static by Dockerfile/Dockerfile.dist.
+    # ADR-0021 Decisions 1 + 10, amended by ADR-0029: the hosted login page's Vite production
+    # build, baked into the image at /app/static by Dockerfile/Dockerfile.dist from the
+    # digest-pinned converse-frontends `authz-ui` artifact (this repo builds no JavaScript).
     static_dir: "${IDP_STATIC_DIR:-/app/static}"
   # authz-budget: the budget-domain microservice carrying every budget:*-gated RPC procedure off
   # authz-api (hard cutover, not a transitional duplication like idp above -- see

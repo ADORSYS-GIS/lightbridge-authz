@@ -148,11 +148,11 @@ fn idp_server_static_dir_defaults_to_app_static_when_unset() {
 #[test]
 fn idp_server_static_dir_honors_an_explicit_value() {
     let idp: IdpServer = serde_yaml::from_str(
-        "address: \"0.0.0.0\"\nport: 3004\ntls:\n  cert_path: \"./idp.crt\"\n  key_path: \"./idp.key\"\nstatic_dir: \"./web/hosted-login/dist\"\n",
+        "address: \"0.0.0.0\"\nport: 3004\ntls:\n  cert_path: \"./idp.crt\"\n  key_path: \"./idp.key\"\nstatic_dir: \"./dist/static\"\n",
     )
     .expect("valid idp block should deserialize");
 
-    assert_eq!(idp.static_dir, "./web/hosted-login/dist");
+    assert_eq!(idp.static_dir, "./dist/static");
 }
 
 fn minimal_config_yaml() -> String {

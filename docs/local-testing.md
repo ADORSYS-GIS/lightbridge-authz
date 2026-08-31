@@ -10,7 +10,7 @@ console. Written for someone who just cloned the repo.
 | Docker + Docker Compose | The whole backend (`just up`) |
 | Rust (stable toolchain) | `cargo` commands, `just all-checks` |
 | [`just`](https://github.com/casey/just) | Every command in this guide |
-| Node + `pnpm` | The console (separate repo — see below) |
+| Node + `pnpm` | The console and the `authz-idp` login page (both live in the separate `converse-frontends` repo — see below) |
 
 ## How the pieces talk
 
@@ -230,7 +230,73 @@ registered on that client. Both are already registered in
 re-import, add them by hand: Keycloak admin (`http://localhost:9100`, `admin`/`password`) → realm
 `dev` → Clients → `test-client` → Valid Redirect URIs.
 
-## 5. What you can actually test, honestly
+## 5. The `authz-idp` login page (`/ui`)
+
+The page `authz-idp` serves at `https://localhost:13004/ui/` is **not built in this repo**. Its
+source home is `converse-frontends`' `apps/authz-ui`; this repo consumes the built bundle as a
+digest-pinned, assets-only OCI image (ADR-0029). There is exactly one pin, the `ARG AUTHZ_UI_REF=`
+line at the top of `./Dockerfile`.
+
+### Just run it
+
+`just up` builds the root `Dockerfile`, which pulls the pinned bundle and bakes it into
+`/app/static`. Nothing extra to do:
+
+```bash
+just up
+curl -ks -o /dev/null -w '%{http_code}\n' https://localhost:13004/ui/    # 200
+curl -ksI https://localhost:13004/ui/ | grep -i '^cache-control'         # cache-control: no-cache
+```
+
+If the GHCR package is private, `docker login ghcr.io -u <you> -p <PAT with read:packages>` once,
+first. (It is expected to be public, like `…/converse-frontends/console`.)
+
+### Iterating on the page itself (cross-repo loop)
+
+Do **not** rebuild the container for every UI change. Point `authz-idp` at a locally built
+`dist/` instead. Both the local config and the container config read the same env var,
+`IDP_STATIC_DIR`.
+
+```bash
+# 1. Build the bundle in your converse-frontends checkout (sibling to this repo)
+cd ../converse-frontends
+pnpm install
+pnpm --filter authz-ui build:web        # -> apps/authz-ui/dist/{index.html,sw.js,assets/*}
+
+# 2a. Bare cargo run (no container): config/default.yaml's static_dir honours IDP_STATIC_DIR
+cd ../lightbridge-authz
+IDP_STATIC_DIR="$(cd ../converse-frontends && pwd)/apps/authz-ui/dist" \
+  cargo run --bin lightbridge-authz -- idp
+
+# 2b. Or against the compose stack: bind-mount over the baked-in bundle. Add to a local
+#     compose override (do not commit) — the container path is /app/static:
+#       services:
+#         authz-idp:
+#           volumes:
+#             - ../converse-frontends/apps/authz-ui/dist:/app/static:ro
+#     then: just up-no-build authz-idp
+```
+
+Two things to know while iterating:
+
+- **The service worker.** `apps/authz-ui` ships a real service worker (`sw.js`) that precaches the
+  content-hashed bundle. A stale SW is the usual explanation for "my change isn't showing" —
+  unregister it in DevTools → Application → Service Workers, or use a private window. The SW is
+  disabled in that app's `vite dev` server on purpose, so `pnpm --filter authz-ui dev` never has
+  this problem; only real production builds do.
+- **The CSP.** Every `/ui` response carries `default-src 'self'; frame-ancestors 'none'`
+  (`crates/lightbridge-authz-rest/src/static_assets.rs`). No inline `<script>` will run. If a UI
+  change works under `vite dev` and breaks here, check the browser console for a CSP violation
+  before anything else.
+
+### Shipping a UI change
+
+The UI ships first and must be backward-compatible; the **pin bump in `./Dockerfile` is the
+deploy** (ADR-0029). Merge in `converse-frontends`, read the published digest from that repo's
+`authz-ui-image` workflow run summary, update the two lines under `ARG AUTHZ_UI_REF=` here, open a
+PR. `it-idp` proves `/ui/` still serves.
+
+## 6. What you can actually test, honestly
 
 | Area | Status | Notes |
 | --- | --- | --- |
@@ -256,7 +322,7 @@ Both surface as an inline "unwired"/offline status line, never a fake zero — t
 does **not** produce usage/budget charts either, for the same "no query client" reason — there is
 nothing in that repo today for wiremock to stand in for on that surface.
 
-## 6. Automated suites
+## 7. Automated suites
 
 From `justfile`:
 
@@ -303,7 +369,7 @@ machine's memory"):
 CARGO_BUILD_JOBS=4 cargo check --all-targets
 ```
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
@@ -311,7 +377,7 @@ CARGO_BUILD_JOBS=4 cargo check --all-targets
 | `404` on `/api/rpc/...` | Console/client `apiBasePath` set to `/api` | `authz-api`'s `rpc_base_path` is unset, so ops live at the root — use `apiBasePath: '/'` |
 | `406 Not Acceptable` | Request sent `Accept: application/json` (most JSON HTTP clients default to this) | ADR-0013 made CBOR the only codec and deleted the JSON variant; `Accept` is validated *before* `Content-Type`, so a naive all-JSON client hits `406` here, not `415` (`docs/adr/0013-cbor-is-the-only-transport-codec.md:91-97`) |
 | `415 Unsupported Media Type` | Valid `Accept: application/cbor` but `Content-Type: application/json` body | Send CBOR, not JSON, as the request body |
-| TLS/cert errors from any non-`curl` client | The generated certs' SAN (if present) names the in-network service, never `localhost`; the currently-running dev volume's cert has no SAN at all | Disable certificate verification for local use (`curl -k`, `NODE_TLS_REJECT_UNAUTHORIZED=0`, etc.) — see section 1 |
+| TLS/cert errors from any non-`curl` client | The generated certs' SAN (if present) names the in-network service, never `localhost`; the currently-running dev volume's cert has no SAN at all | Disable certificate verification for local use (`curl -k`, `NODE_TLS_REJECT_UNAUTHORIZED=0`, etc.) — see section 1 (Backend) |
 | `502 sign-in unavailable` on `authz-idp` `/authorize` | The relying party can't reach `oauth2.federation.discovery_url` from inside the Docker network | Confirm `discovery_url` is the in-network Keycloak address (`http://keycloak:9100/realms/dev`), not `localhost` |
 | `just it-idp` fails at the browser-flow section | The RP's `callback_url` is `https://localhost:13004/...`, unreachable from inside the `it-idp` test container | Expected to be handled automatically — `idp_it.py`'s `to_in_network()` (`.docker/it/idp_it.py:303-320`) rewrites the callback to the in-network `authz-idp` address before following it |
 | Connection refused on 13000–13003, 9100, 5432, 5433 or 6379 — while `docker compose ps` shows every container healthy, and 13004/13005 still answer | You ran a `just it-*` target. `compose.it.yaml` applies `ports: !reset []` to 11 services (`compose.it.yaml:4-34`), un-publishing their host ports so the test runner reaches them over the Docker network instead. `authz-idp` and `authz-budget` are **not** in that list, which is why those two keep working and the failure looks selective rather than total | `just up` re-applies the base compose file and restores every published port. Nothing is broken and no data is lost — the containers were reachable in-network the whole time |

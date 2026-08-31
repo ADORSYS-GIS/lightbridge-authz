@@ -623,7 +623,8 @@ pub struct IdpServer {
     pub port: u16,
     pub tls: Tls,
     /// ADR-0021 Decisions 1 + 10 (#442): filesystem path to the hosted login page's Vite
-    /// production build (`web/hosted-login/dist` — an `index.html` plus a content-hashed
+    /// production build (built in `converse-frontends` as `apps/authz-ui`, consumed here as a
+    /// digest-pinned OCI artifact — see ADR-0029; an `index.html` plus a content-hashed
     /// `assets/` directory built with Vite `base: "/ui/"`), mounted under `build_idp_router`'s
     /// `/ui` path prefix (`.nest_service("/ui", ..)`), never at the router root. This server
     /// always mounts it unconditionally (AGENTS.md's "no dormant flags" convention) -- an

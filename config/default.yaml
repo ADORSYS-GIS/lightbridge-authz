@@ -33,9 +33,16 @@ server:
     tls:
       cert_path: "./config/tls/idp.crt"
       key_path: "./config/tls/idp.key"
-    # ADR-0021 Decisions 1 + 10 (#442): the hosted login page's Vite production build
-    # (`npm run build` inside web/hosted-login), served as authz-idp's lowest-priority fallback.
-    static_dir: "./web/hosted-login/dist"
+    # ADR-0021 Decisions 1 + 10, amended by ADR-0029 (#591): the hosted login page's Vite
+    # production build. This repo no longer builds it -- its source home is converse-frontends'
+    # `apps/authz-ui` -- so there is no in-repo path to point at any more. `./dist/static` is the
+    # same staging location CI uses (`.github/actions/stage-authz-ui` -> `Dockerfile.dist`'s
+    # `COPY dist/static /app/static`), so `just stage-authz-ui` populates it for a bare
+    # `cargo run`. To iterate against a live local UI checkout instead, override it:
+    #   IDP_STATIC_DIR=../converse-frontends/apps/authz-ui/dist cargo run -- idp
+    # An empty/absent directory is not fatal: /ui/* 404s until the assets exist (see
+    # `IdpServer::static_dir`'s doc comment and `missing_static_dir_degrades_to_404_without_panicking`).
+    static_dir: "${IDP_STATIC_DIR:-./dist/static}"
   # authz-budget: the budget-domain microservice carrying every budget:*-gated RPC procedure off
   # authz-api (hard cutover, not a transitional duplication like idp above -- see
   # docs/architecture/budget.md). Its RPC surface is mounted under a fixed /budget prefix

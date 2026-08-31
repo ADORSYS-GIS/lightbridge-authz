@@ -1,18 +1,40 @@
 # Multi-stage build for optimized production image
 
-# ADR-0021 Decisions 1 + 10 (#442): builds the hosted login page's static assets so `authz-idp`
-# can serve them same-origin. Only `runtime` (the image `authz-idp` actually runs from -- see
-# compose.yaml, which shares one `lightbridge-authz` image across api/opa/idp/budget) consumes
-# this stage's output; the other runtime stages below don't need it.
-FROM node:26-alpine as frontend
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# THE AUTHZ-UI PIN — this ARG is the ONLY place the hosted-login bundle's version is written
+# down in this repository. `.github/actions/stage-authz-ui` greps this exact line out of this
+# exact file so that the Dockerfile.dist/CI path and this Dockerfile can never disagree about
+# which bundle ships. If you move or rename this ARG, fix that action in the same commit.
+#
+# ADR-0021 Decisions 1 + 10, as amended by ADR-0029: the hosted login page's source home is
+# `converse-frontends`' `apps/authz-ui` (ADORSYS-GIS/converse-frontends#408), NOT this repo. This
+# repo builds no JavaScript. The bundle arrives as an assets-only `FROM scratch` OCI image whose
+# entire contents are the Vite build output at `/dist`.
+#
+# PINNED BY DIGEST, NEVER BY TAG. A tag is mutable; a digest is the artifact. The tag below is a
+# comment for humans reading the diff — it is NOT what gets resolved.
+#
+# HOW TO BUMP (this is the deploy — see ADR-0029's version-skew rule):
+#   1. Merge the UI change in converse-frontends; let `authz-ui-image.yml` publish.
+#   2. Read the run's job summary for the `pinned reference` row, or:
+#        skopeo inspect docker://ghcr.io/adorsys-gis/converse-frontends/authz-ui:sha-<gitsha> \
+#          --format '{{.Digest}}'
+#   3. Update BOTH lines below (the comment tag and the digest) in one commit.
+#   4. `just all-checks` + let CI's `it-idp` suite prove `/ui/` still serves the SPA.
+# Nothing else in this repo changes. There is no second place to edit.
+#
+# DEPENDENCY AUTOMATION MUST NOT TOUCH THIS. `.github/dependabot.yml`'s `docker` ecosystem is
+# explicitly configured to ignore this image (see the `ignore:` block there). An automated digest
+# bump would be an unreviewed UI deploy to the authentication boundary, arriving as a "chore".
+#
+#   tag: ghcr.io/adorsys-gis/converse-frontends/authz-ui:sha-a01fba3
+ARG AUTHZ_UI_REF=ghcr.io/adorsys-gis/converse-frontends/authz-ui@sha256:731025acbbb9a439abfa324a3c27ac863c825d156bfc2891d5c1a5f0f3198ef0
 
-WORKDIR /app/web/hosted-login
-
-COPY web/hosted-login/package.json web/hosted-login/package-lock.json ./
-RUN npm ci
-
-COPY web/hosted-login/ ./
-RUN npm run build
+# `--platform=linux/amd64` because the published image is single-arch amd64 and this stage holds
+# nothing executable — it is a tarball of HTML/JS/CSS. Forcing the platform here keeps an arm64
+# host (a developer's Mac running `just up`) from failing to resolve a manifest for its own arch
+# while the `builder` stage below still cross-builds correctly via TARGETARCH.
+FROM --platform=linux/amd64 ${AUTHZ_UI_REF} AS frontend
 
 FROM rust:1-alpine as builder
 
@@ -83,10 +105,13 @@ WORKDIR /app
 COPY --from=builder /app/lightbridge-authz /usr/local/bin/lightbridge-authz
 COPY --from=builder /app/lightbridge-authz-healthcheck /usr/local/bin/lightbridge-authz-healthcheck
 
-# Hosted login page static build (ADR-0021 Decisions 1 + 10, #442) -- authz-idp serves this from
-# `server.idp.static_dir` (config/default.yaml / .docker/authz/container.yaml default to this
-# path). Harmless on api/opa/budget, which never mount the static fallback at all.
-COPY --from=frontend /app/web/hosted-login/dist /app/static
+# Hosted login page static build (ADR-0021 Decisions 1 + 10, amended by ADR-0029) -- authz-idp
+# serves this from `server.idp.static_dir` (.docker/authz/container.yaml defaults to this path).
+# Harmless on api/opa/budget, which never mount the static fallback at all.
+#
+# `/dist` is converse-frontends' published contract for this image, not a path this repo chose;
+# see the AUTHZ_UI_REF block at the top of this file and apps/authz-ui/Containerfile there.
+COPY --from=frontend /dist /app/static
 
 # Expose port
 EXPOSE 3000

@@ -6,13 +6,18 @@ runs:
     - uses: ./.github/actions/rust-setup
     - uses: ./.github/actions/build-binaries
 
-    # ADR-0021 Decisions 1 + 10 (#442): compose.ci.yaml builds the `runtime` target (authz-migrate,
-    # authz-api) from Dockerfile.dist, which COPYs dist/static -- the same tarball layout
-    # build-release stages for container-build. Without this, `docker compose build` fails with
-    # "/dist/static": not found (#446 introduced the COPY; this action never populated it, and the
-    # break was masked for 3 merges because the runs that would have caught it were cancelled, not
-    # failed -- see PR description for the full timeline).
-    - uses: ./.github/actions/build-frontend
+    # ADR-0021 Decisions 1 + 10, amended by ADR-0029 (#591): compose.ci.yaml builds the `runtime`
+    # target (authz-migrate, authz-api) from Dockerfile.dist, which COPYs dist/static. Without
+    # this, `docker compose build` fails with "/dist/static": not found (#446 introduced the COPY;
+    # the populating step was once missing and the break was masked for 3 merges because the runs
+    # that would have caught it were cancelled, not failed).
+    #
+    # This is also the step that makes `run_suite it-idp` below meaningful: .docker/it/idp_it.py's
+    # `section_root_and_spa` asserts GET /ui/ and GET /ui/login return 200 with an HTML
+    # content-type. That assertion is now the live, end-to-end proof that the digest-pinned
+    # external bundle really lands at /app/static in a running authz-idp -- the single most
+    # valuable gate on this whole cutover.
+    - uses: ./.github/actions/stage-authz-ui
 
     - name: Integration tests (docker compose)
       shell: bash

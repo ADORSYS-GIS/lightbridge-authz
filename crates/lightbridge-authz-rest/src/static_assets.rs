@@ -1,6 +1,7 @@
 //! ADR-0021 (`docs/adr/0021-browser-sso-hosted-login-page-and-session-cookie.md`) Decisions 1 +
-//! 10: serves the hosted-login Vite React static build (`web/hosted-login/`, built with Vite
-//! `base: "/ui/"`) under `authz-idp`'s `/ui` path prefix, with Decision 10's content-hash-aware
+//! 10, amended by ADR-0029: serves the hosted-login Vite React static build (built in
+//! `converse-frontends` as `apps/authz-ui`, consumed here as a digest-pinned OCI artifact, with
+//! Vite `base: "/ui/"`) under `authz-idp`'s `/ui` path prefix, with Decision 10's content-hash-aware
 //! caching and strict CSP.
 //!
 //! **Scaffold only (#442).** This module makes the built assets reachable; it does not implement
