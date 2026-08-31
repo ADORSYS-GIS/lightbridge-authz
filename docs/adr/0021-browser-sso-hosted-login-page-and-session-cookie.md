@@ -566,6 +566,41 @@ login.
 > repo's build, and the pin-checking action here re-asserts the content-hash property against the
 > pulled artifact. See **ADR-0029**.
 
+> **Update (lightbridge-authz#598, 2026-08-31) — `/ui` is a route allowlist now, not a catch-all;
+> the RP-leg's own HTML pages are gone.**
+>
+> The bullet below still describing `GET /ui/<anything-else>` as falling back to `index.html`
+> ("client-side routing") is **superseded**. `static_assets.rs` now reads the artifact's own
+> `dist/routes.json` (ADR-0029's Update) and serves `index.html` only for the paths it lists; a real
+> file under `assets/` still serves regardless, and every other `/ui/<anything>` — like any path
+> outside `/ui` matching no protocol route — is a plain `404`. This closes the #598 acceptance
+> criterion: an unlisted `/ui` path (including `/ui/login`, before #478's SSO chooser exists) was
+> previously indistinguishable from a listed one by response shape; now a `200` means "this route
+> exists" and a `404` means it doesn't, on both sides of the `/ui` boundary alike.
+>
+> The same change also retires the RP leg's own server-rendered HTML entirely: `verify_page`,
+> `verify_submit`, `verify_continue`, and the `callback` handler's device-completion arm all now
+> `303` into the SPA (`/ui/device`, `/ui/device/confirm`, `/ui/device/invalid`,
+> `/ui/device/success`) instead of rendering a page. An unknown, expired, or already-consumed
+> `user_code` — the one case with its own dedicated target — uniformly `303`s to
+> `/ui/device/invalid`, never to the generic `/ui/error`: `lookup_pending_session`'s
+> `LookupFailure::NotUsable` variant is deliberately one case, not one per reason, so
+> `verify_submit`/`verify_continue` (and `verify_context`'s `404` arm, D10 below) structurally
+> cannot leak which of the three applied. Every OTHER former failure response — genuine store,
+> cookie, or completion failures, not an unusable code (`400`/`403`/`502`/`503`, previously
+> distinct per failure) — collapses to a uniform `303` to `/ui/error`. **The status-code
+> distinction does not disappear — it moves to a `tracing::warn!(reason = "...")` log line at each
+> site**, a deliberate trade recorded here because it is the kind of thing a future reader would
+> otherwise read as an accident: every one of these responses is a browser navigation (`GET
+> /device/verify`, `GET /idp/callback`, two form posts), not something a machine parses (the device
+> client polls `/oauth2/token`, an entirely different endpoint), so a redirect losing the
+> status-code granularity costs nothing a consumer depended on.
+> A new `GET /device/verify/context` endpoint, bound to the same `__Host-authz_device_confirm`
+> cookie `verify_continue` already required, now serves the confirmation data the deleted page used
+> to print (`user_code`, `client_id`, never `device_code`) as JSON, uniformly `404` for every
+> absence and `503` only for a genuine store outage. See ADR-0029's own Update block for the bundle
+> contract's side of this change.
+
 `tower-http` is already a direct dependency but pinned with only the `cors` feature
 (`Cargo.toml:155`) — no static-file-serving feature is enabled anywhere in this workspace today.
 This ADR decides the serving layer and posture, leaving only the frontend project scaffold itself

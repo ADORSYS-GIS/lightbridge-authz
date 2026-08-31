@@ -142,6 +142,17 @@ struct IdToken<'a> {
     iat: i64,
 }
 
+/// #598/B2/B3: flipped from asserting a `200` HTML confirmation page to asserting a `303` handoff
+/// to `/ui/device/confirm` plus a same-cookie fetch of the new `GET /device/verify/context`
+/// endpoint -- see the body below for exactly what changed and why (D9's uniformity, the
+/// "never leak device_code" property preserved against JSON instead of HTML).
+///
+/// Prove-fail-first (recorded verbatim, unfixed code): every caller of this helper below fails
+/// here first, at the `confirmation.status()` assertion, with `assertion `left == right` failed`,
+/// `left: 200`, `right: 303` -- `verify_submit` still returns the old `200` HTML confirmation
+/// page against unfixed code. Individual callers' OWN status-code flips (device-success,
+/// device-invalid, /ui/error, etc.) are downstream of this and are never reached until this
+/// assertion passes, which only happens once B2/B3 land.
 async fn begin_pairing(router: axum::Router) -> (axum::Router, String, String) {
     let confirmation = router
         .clone()
@@ -156,19 +167,40 @@ async fn begin_pairing(router: axum::Router) -> (axum::Router, String, String) {
         )
         .await
         .unwrap();
-    assert_eq!(confirmation.status(), StatusCode::OK);
+    // #598: the RP leg hands off to the SPA now -- verify_submit 303s to /ui/device/confirm
+    // instead of rendering the confirmation HTML itself.
+    assert_eq!(confirmation.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        confirmation.headers().get(header::LOCATION).unwrap(),
+        "/ui/device/confirm"
+    );
     // The CSRF-binding cookie `verify_submit` sets for this `user_code` -- `verify_continue`
     // below requires it (proof this same caller was shown the confirmation page), so a real
     // browser client forwards it exactly like this on the "Continue" form submission.
     let confirm_cookie = rp_cookie(&confirmation);
-    let confirmation_body = to_bytes(confirmation.into_body(), usize::MAX)
+    // What the confirmation page used to print in HTML is now served by GET
+    // /device/verify/context, cookie-bound to this same confirm_cookie. Asserted here (against
+    // the JSON body, not HTML) so the "never leak the device_code" property survives the move.
+    let context_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/device/verify/context")
+                .header(header::COOKIE, confirm_cookie.clone())
+                .extension(ConnectInfo(test_addr()))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    let confirmation_body = String::from_utf8(confirmation_body.to_vec()).unwrap();
-    assert!(confirmation_body.contains("Requesting client: <strong>cli</strong>"));
-    assert!(confirmation_body.contains("Code: <strong>PAIR1234</strong>"));
-    assert!(confirmation_body.contains("name=\"user_code\" value=\"PAIR1234\""));
-    assert!(!confirmation_body.contains("device-code"));
+    assert_eq!(context_response.status(), StatusCode::OK);
+    let context_body = to_bytes(context_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let context_body = String::from_utf8(context_body.to_vec()).unwrap();
+    assert!(context_body.contains("\"client_id\":\"cli\""));
+    assert!(context_body.contains("\"user_code\":\"PAIR1234\""));
+    assert!(!context_body.contains("device-code"));
     let response = router
         .clone()
         .oneshot(
@@ -187,6 +219,59 @@ async fn begin_pairing(router: axum::Router) -> (axum::Router, String, String) {
     let state = state_from_redirect(&response);
     let cookie = rp_cookie(&response);
     (router, state, cookie)
+}
+
+/// B-F9 falsification: `GET /device/verify?user_code=<script>alert(1)</script>` -- the RP leg
+/// still 303s (it never inspects `user_code` for validity, only forwards it), but the tag must be
+/// gone before the SPA ever sees it. Proves `verify_page`'s handoff at the full HTTP level, not
+/// only via `sanitize_user_code_for_display`'s own unit tests -- this is what
+/// `sanitize_user_code_for_display`'s doc comment refers to by name.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_page_sanitizes_user_code_for_the_handoff(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
+            keycloak.url("/jwks"),
+            repo(pool),
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+    let router = router(rp);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/device/verify?user_code=%3Cscript%3Ealert(1)%3C%2Fscript%3E")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        !location.contains('<') && !location.contains('>'),
+        "the tag delimiters must never reach the Location header: {location}"
+    );
+    assert!(
+        location.starts_with("/ui/device?user_code="),
+        "the handoff target itself must be unaffected: {location}"
+    );
+    let user_code = location.strip_prefix("/ui/device?user_code=").unwrap();
+    assert_eq!(
+        user_code, "SCRIPTALERT1SCRI",
+        "only the sanitised, percent-encoded (here: none needed, since only \
+         alphanumerics/hyphens survive) code should appear"
+    );
 }
 
 /// Identity-vs-location split (ADR-0025 amendment): `KeycloakRelyingParty::new` now takes the
@@ -320,7 +405,15 @@ async fn verified_keycloak_callback_transitions_pending_device_code_to_approved(
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    // #598: the callback's Device-completion arm 303s to /ui/device/success now (with the
+    // device-confirm cookie cleared), instead of rendering the "Device paired" HTML itself.
+    // Prove-fail-first: fails upstream, inside `begin_pairing` (see that helper's own doc
+    // comment) -- `left: 200`, `right: 303` at the confirmation-status assertion.
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        "/ui/device/success"
+    );
     let fetched = store.get_device_code("device-code").await.unwrap().unwrap();
     match fetched.status {
         DeviceCodeStatus::Approved(identity) => {
@@ -370,7 +463,16 @@ async fn keycloak_token_failure_leaves_device_code_pending(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    // #598/D8: `complete`'s Err(_) arm 303s to /ui/error now, in place of the deleted
+    // generic_failure's BAD_GATEWAY -- the distinction lives only in a `reason`-tagged
+    // `tracing::warn!` now, never in the HTTP status.
+    // Prove-fail-first: fails upstream, inside `begin_pairing` (see that helper's own doc
+    // comment) -- `left: 200`, `right: 303` at the confirmation-status assertion.
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        "/ui/error"
+    );
     let fetched = store.get_device_code("device-code").await.unwrap().unwrap();
     assert!(matches!(fetched.status, DeviceCodeStatus::Pending));
 }
@@ -441,8 +543,19 @@ async fn invalid_device_codes_have_one_uniform_response_and_frame_protection(poo
     let unknown = router.clone().oneshot(request("missing")).await.unwrap();
     let expired = router.clone().oneshot(request("EXPIRED1")).await.unwrap();
     let consumed = router.oneshot(request("CONSUMED1")).await.unwrap();
-    for response in [&unknown, &expired, &consumed] {
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // #598: D9 -- unknown/expired/consumed still share `lookup_pending_session`, so uniformity
+    // now holds structurally, via one identical 303 -> /ui/device/invalid, rather than one
+    // identical HTML body. Headers (CSP/X-Frame-Options/no-store) still ride along on
+    // `redirect_to`, so those assertions stay.
+    // Prove-fail-first (recorded verbatim, unfixed code): `assertion `left == right` failed`,
+    // `left: 404`, `right: 303` (the OLD `verification_response(.., StatusCode::NOT_FOUND)` for
+    // an unusable code, against the flipped expectation of a 303).
+    for response in [unknown, expired, consumed] {
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/ui/device/invalid"
+        );
         assert_eq!(
             response.headers().get(header::X_FRAME_OPTIONS).unwrap(),
             "DENY"
@@ -458,12 +571,14 @@ async fn invalid_device_codes_have_one_uniform_response_and_frame_protection(poo
             response.headers().get(header::CACHE_CONTROL).unwrap(),
             "no-store"
         );
+        // R12: closes the reopened-oracle path if `redirect_to` ever grows a body -- three
+        // BYTE-IDENTICAL empty bodies is a stronger claim than "the same status/headers".
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            body.is_empty(),
+            "every uniform-failure redirect body must be empty, not just header-identical"
+        );
     }
-    let unknown_body = to_bytes(unknown.into_body(), usize::MAX).await.unwrap();
-    let expired_body = to_bytes(expired.into_body(), usize::MAX).await.unwrap();
-    let consumed_body = to_bytes(consumed.into_body(), usize::MAX).await.unwrap();
-    assert_eq!(unknown_body, expired_body);
-    assert_eq!(unknown_body, consumed_body);
 }
 
 /// CSRF regression coverage for `POST /device/verify/continue`: without the mechanism this test
@@ -517,7 +632,11 @@ async fn verify_continue_requires_the_confirmation_cookie_from_verify_submit(poo
         builder.body(Body::from("user_code=PAIR1234")).unwrap()
     };
 
-    // (a) No confirmation cookie at all.
+    // (a) No confirmation cookie at all. #598: the RP leg is a 303 handoff now -- the FORBIDDEN
+    // status collapses into a uniform 303 -> /ui/error (D8), with the distinction preserved only
+    // in a `tracing::warn!(reason = "...")` log line, not in the HTTP response.
+    // Prove-fail-first (recorded verbatim, unfixed code): "a bare POST with no confirmation
+    // cookie must never pair a device", `left: 403`, `right: 303`.
     let no_cookie = router
         .clone()
         .oneshot(continue_request(None))
@@ -525,8 +644,12 @@ async fn verify_continue_requires_the_confirmation_cookie_from_verify_submit(poo
         .unwrap();
     assert_eq!(
         no_cookie.status(),
-        StatusCode::FORBIDDEN,
+        StatusCode::SEE_OTHER,
         "a bare POST with no confirmation cookie must never pair a device"
+    );
+    assert_eq!(
+        no_cookie.headers().get(header::LOCATION).unwrap(),
+        "/ui/error"
     );
 
     // (b) A confirmation cookie minted for a *different* user_code (obtained by visiting the
@@ -544,7 +667,7 @@ async fn verify_continue_requires_the_confirmation_cookie_from_verify_submit(poo
         )
         .await
         .unwrap();
-    assert_eq!(other_confirmation.status(), StatusCode::OK);
+    assert_eq!(other_confirmation.status(), StatusCode::SEE_OTHER);
     let mismatched_cookie = rp_cookie(&other_confirmation);
     let mismatched = router
         .clone()
@@ -553,13 +676,192 @@ async fn verify_continue_requires_the_confirmation_cookie_from_verify_submit(poo
         .unwrap();
     assert_eq!(
         mismatched.status(),
-        StatusCode::FORBIDDEN,
+        StatusCode::SEE_OTHER,
         "a confirmation cookie bound to a different user_code must not authorize this one"
     );
+    assert_eq!(
+        mismatched.headers().get(header::LOCATION).unwrap(),
+        "/ui/error"
+    );
 
-    // Neither rejected attempt actually approved the device.
+    // Neither rejected attempt actually approved the device -- this is the real security
+    // property, and (per D8) it is now the assertion doing the load-bearing work: the HTTP status
+    // alone no longer distinguishes "rejected" from "succeeded differently".
     let still_pending = store.get_device_code("device-code").await.unwrap().unwrap();
     assert!(matches!(still_pending.status, DeviceCodeStatus::Pending));
+}
+
+/// D10: `GET /device/verify/context` answers an identical `404` for every shape of "no live
+/// confirmation for this browser" -- no cookie, a cookie bound to a DIFFERENT user_code, and a
+/// cookie whose `provider_id` is not [`DEVICE_CONFIRM_PROVIDER_ID`] (e.g. a real Keycloak-callback
+/// state cookie presented here by mistake/malice). A caller must never be able to learn WHICH of
+/// these applied.
+///
+/// Not a prove-fail-first case in the usual sense: against unfixed code (the route does not exist
+/// at all, pre-B2) every one of these three requests already 404s via axum's own unmounted-route
+/// default -- so this assertion PASSES already, vacuously, for a reason unrelated to
+/// [`D10`]'s uniform-404 design. It only starts proving the real property once B2 mounts
+/// `verify_context` and `context_not_found()` becomes the reason for the 404 instead of routing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_context_is_a_uniform_404_without_the_confirm_cookie(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let repo = repo(pool);
+    let store = DbDeviceCodeStore::new(repo.clone());
+    store.store_device_code(session()).await.unwrap();
+
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
+            keycloak.url("/jwks"),
+            repo,
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+    let router = router(rp);
+
+    let context_request = |cookie: Option<String>| {
+        let mut builder = Request::builder()
+            .uri("/device/verify/context")
+            .extension(ConnectInfo(test_addr()));
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+
+    // (a) No cookie at all.
+    let no_cookie = router.clone().oneshot(context_request(None)).await.unwrap();
+
+    // (b) A well-formed, correctly-`provider_id`'d confirm cookie, but bound to a `user_code` with
+    // NO live `Pending` session at all -- e.g. the session was consumed or expired between the
+    // confirmation page rendering and this fetch. `verify_context` re-resolves the session from
+    // the cookie's OWN embedded `user_code` (there is no separate "code under test" to compare
+    // against, unlike `verify_continue`'s CSRF check), so this is the real 404 case here, not a
+    // cookie/session mismatch.
+    let unknown_code_envelope = OAuth2State {
+        state: "GONE1234".to_string(),
+        nonce: None,
+        code_verifier: None,
+        success_url: None,
+        provider_id: "device-confirm".to_string(),
+        expires_at: (Utc::now() + Duration::minutes(5)).timestamp(),
+    };
+    let unknown_code_value = unknown_code_envelope.encrypt(&state_key_bytes()).unwrap();
+    let mismatched = router
+        .clone()
+        .oneshot(context_request(Some(format!(
+            "__Host-authz_device_confirm={unknown_code_value}"
+        ))))
+        .await
+        .unwrap();
+
+    // (c) A cookie shaped like the real device-confirm envelope but minted with a non-
+    // "device-confirm" `provider_id` (e.g. what a real Keycloak-callback RP-state cookie would
+    // decrypt to, if it ever ended up on this cookie name by mistake).
+    let wrong_provider_envelope = OAuth2State {
+        state: "PAIR1234".to_string(),
+        nonce: None,
+        code_verifier: None,
+        success_url: None,
+        provider_id: "keycloak".to_string(),
+        expires_at: (Utc::now() + Duration::minutes(5)).timestamp(),
+    };
+    let wrong_provider_value = wrong_provider_envelope.encrypt(&state_key_bytes()).unwrap();
+    let wrong_provider = router
+        .oneshot(context_request(Some(format!(
+            "__Host-authz_device_confirm={wrong_provider_value}"
+        ))))
+        .await
+        .unwrap();
+
+    // B-F8: three BYTE-IDENTICAL 404s, bodies included -- `context_not_found()` is a fixed
+    // function with no input-dependent content, so this is never merely "same status code".
+    let mut bodies = Vec::new();
+    for response in [no_cookie, mismatched, wrong_provider] {
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        bodies.push(to_bytes(response.into_body(), usize::MAX).await.unwrap());
+    }
+    assert_eq!(bodies[0], bodies[1]);
+    assert_eq!(bodies[0], bodies[2]);
+}
+
+/// D3/D10: `GET /device/verify/context` returns exactly `{user_code, client_id}` -- the same two
+/// values the deleted server-rendered confirmation page already printed -- and NEVER the
+/// `device_code` a live confirmation session also carries. Asserted at the raw-bytes level, not
+/// just via the typed struct's field set, so a future field addition that accidentally includes
+/// `device_code` would fail here even if [`VerifyContext`]'s own definition looked correct.
+///
+/// Prove-fail-first (recorded verbatim against unfixed code, pre-B2/B3): the route does not exist
+/// yet, so this failed on the status assertion, not the leak assertion:
+/// `assertion `left == right` failed\n  left: 404\n right: 200`
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_context_never_returns_the_device_code(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let repo = repo(pool);
+    let store = DbDeviceCodeStore::new(repo.clone());
+    store.store_device_code(session()).await.unwrap();
+
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
+            keycloak.url("/jwks"),
+            repo,
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+    let router = router(rp);
+
+    let confirmation = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/device/verify")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .extension(ConnectInfo(test_addr()))
+                .body(Body::from("user_code=pair-1234"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let confirm_cookie = rp_cookie(&confirmation);
+
+    let context_response = router
+        .oneshot(
+            Request::builder()
+                .uri("/device/verify/context")
+                .header(header::COOKIE, confirm_cookie)
+                .extension(ConnectInfo(test_addr()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(context_response.status(), StatusCode::OK);
+    let body = to_bytes(context_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let object = payload.as_object().unwrap();
+    let keys: std::collections::BTreeSet<&str> =
+        object.keys().map(std::string::String::as_str).collect();
+    assert_eq!(
+        keys,
+        ["client_id", "user_code"].into_iter().collect(),
+        "the context response must carry exactly client_id and user_code, nothing else"
+    );
+    assert!(
+        !body
+            .windows(b"device-code".len())
+            .any(|w| w == b"device-code"),
+        "the context response must never leak the device_code: {body:?}"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -677,7 +979,15 @@ async fn callback_rejects_state_cookie_mismatch_before_contacting_keycloak(pool:
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // #598/D8: the state-cookie-mismatch arm 303s to /ui/error now (reason =
+    // "callback_state_mismatch"), in place of the deleted generic_failure's BAD_REQUEST.
+    // Prove-fail-first (recorded verbatim, unfixed code): `assertion `left == right` failed`,
+    // `left: 400`, `right: 303`.
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        "/ui/error"
+    );
     assert_ne!(state, "different-state");
 }
 
@@ -792,7 +1102,17 @@ async fn invalid_id_token_profiles_fail_closed(pool: PgPool) {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{profile}");
+        // #598/D8: every invalid-ID-token profile still fails `complete()`, and every such
+        // failure now 303s to /ui/error (reason = "callback_completion_failed") in place of the
+        // deleted generic_failure's BAD_GATEWAY.
+        // Prove-fail-first (recorded verbatim, unfixed code, first profile "wrong-nonce"):
+        // `assertion `left == right` failed: wrong-nonce`, `left: 502`, `right: 303`.
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{profile}");
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/ui/error",
+            "{profile}"
+        );
         assert_eq!(_token.calls_async().await, 1, "{profile}");
     }
 }
@@ -1023,7 +1343,16 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    // #598/D8: `resolve_active_context`'s NotFound (the project id is not bound to this account)
+    // propagates through `complete()`'s Err arm the same as any other callback failure -- 303 to
+    // /ui/error, never the deleted generic_failure's BAD_GATEWAY.
+    // Prove-fail-first (recorded verbatim, unfixed code): `assertion `left == right` failed`,
+    // `left: 502`, `right: 303`.
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        "/ui/error"
+    );
     let browser_sessions: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE kind = 'browser'")
             .fetch_one(&pool)
@@ -1152,10 +1481,17 @@ async fn suspended_account_is_refused_a_browser_session(pool: PgPool) {
         )
         .await
         .unwrap();
+    // #598/D8: same 303-to-/ui/error collapse as every other `complete()` failure.
+    // Prove-fail-first (recorded verbatim, unfixed code): "a suspended account must not
+    // complete browser SSO", `left: 502`, `right: 303`.
     assert_eq!(
         response.status(),
-        StatusCode::BAD_GATEWAY,
+        StatusCode::SEE_OTHER,
         "a suspended account must not complete browser SSO"
+    );
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        "/ui/error"
     );
     let browser_sessions: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE kind = 'browser'")
@@ -1288,10 +1624,17 @@ async fn inactive_project_is_refused_a_browser_session(pool: PgPool) {
         )
         .await
         .unwrap();
+    // #598/D8: same 303-to-/ui/error collapse as every other `complete()` failure.
+    // Prove-fail-first (recorded verbatim, unfixed code): "an inactive project must not
+    // complete browser SSO", `left: 502`, `right: 303`.
     assert_eq!(
         response.status(),
-        StatusCode::BAD_GATEWAY,
+        StatusCode::SEE_OTHER,
         "an inactive project must not complete browser SSO"
+    );
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        "/ui/error"
     );
     let browser_sessions: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE kind = 'browser'")
@@ -1771,7 +2114,14 @@ async fn device_pairing_callback_persists_a_federated_identity_for_an_existing_a
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    // #598: Device-completion 303s to /ui/device/success now.
+    // Prove-fail-first: fails upstream, inside `begin_pairing` (see that helper's own
+    // doc comment) -- `left: 200`, `right: 303` at the confirmation-status assertion.
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        "/ui/device/success"
+    );
 
     let federation = repo
         .find_federated_identity(&keycloak.base_url(), "keycloak-subject")
@@ -1831,10 +2181,17 @@ async fn device_pairing_callback_is_refused_for_a_subject_with_no_account(pool: 
         )
         .await
         .unwrap();
+    // #598/D8: same 303-to-/ui/error collapse as every other `complete()` failure.
+    // Prove-fail-first: fails upstream, inside `begin_pairing` (see that helper's own doc
+    // comment) -- `left: 200`, `right: 303` at the confirmation-status assertion.
     assert_eq!(
         response.status(),
-        StatusCode::BAD_GATEWAY,
+        StatusCode::SEE_OTHER,
         "a subject with no pre-existing account must be refused, not paired"
+    );
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        "/ui/error"
     );
 
     let federation = repo
@@ -2148,7 +2505,10 @@ async fn stored_token_envelope_is_not_plaintext_at_rest(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    // #598: Device-completion 303s to /ui/device/success now.
+    // Prove-fail-first: fails upstream, inside `begin_pairing` (see that helper's own
+    // doc comment) -- `left: 200`, `right: 303` at the confirmation-status assertion.
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
     let raw_envelope: Option<String> = sqlx::query_scalar(
         "SELECT token_envelope FROM federated_identities WHERE issuer = $1 AND subject = $2",
@@ -2232,7 +2592,10 @@ async fn token_envelope_does_not_open_under_the_state_encryption_key(pool: PgPoo
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    // #598: Device-completion 303s to /ui/device/success now.
+    // Prove-fail-first: fails upstream, inside `begin_pairing` (see that helper's own
+    // doc comment) -- `left: 200`, `right: 303` at the confirmation-status assertion.
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
     let raw_envelope: String = sqlx::query_scalar::<_, Option<String>>(
         "SELECT token_envelope FROM federated_identities WHERE issuer = $1 AND subject = $2",
@@ -2588,11 +2951,19 @@ async fn a_second_issuer_with_a_colliding_subject_is_refused_not_merged(pool: Pg
         )
         .await
         .unwrap();
+    // #598/D8: same 303-to-/ui/error collapse as every other `complete()` failure.
+    // Prove-fail-first (recorded verbatim, unfixed code): "a second issuer presenting a subject
+    // that already adopted an account must be refused ... never silently merged", `left: 502`,
+    // `right: 303`.
     assert_eq!(
         response.status(),
-        StatusCode::BAD_GATEWAY,
+        StatusCode::SEE_OTHER,
         "a second issuer presenting a subject that already adopted an account must be refused \
-         (complete()'s Err maps to a generic BAD_GATEWAY failure), never silently merged"
+         (complete()'s Err maps to a generic 303 -> /ui/error), never silently merged"
+    );
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        "/ui/error"
     );
 
     let issuer_b_row = repo
