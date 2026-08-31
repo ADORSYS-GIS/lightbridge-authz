@@ -18,26 +18,32 @@ config:
     tls:
       # Path (inside the mounted `*-tls` secret -- see `persistence.tls` below) to a PEM CA
       # bundle used to require and verify a client certificate on the query listener
-      # (`Tls::client_ca_bundle_path`, crates/lightbridge-authz-core/src/config/mod.rs). That
-      # field is `Option<String>`, so leaving this empty (the default) omits
-      # `client_ca_bundle_path` from the rendered config entirely and the query listener falls
-      # back to server-only TLS -- no client-certificate requirement, but still a config that
-      # loads and a binary that starts. That is the deliberately least-disruptive default here.
+      # (`Tls::client_ca_bundle_path`, crates/lightbridge-authz-core/src/config/mod.rs). The
+      # query listener's router has no in-app auth of its own (mTLS at the TLS handshake IS the
+      # access control for `/usage/v1/usage/query` + `/usage/v1/spend/query` -- see
+      # `docs/lightbridge-query-api.md`'s warning banner), so an empty value here is a fail-OPEN
+      # default, not a conservative one: the listener would still bind and its Service/container
+      # port would still be reachable from any pod in the cluster, just with no client-certificate
+      # check. `Tls::client_ca_bundle_path`'s own doc comment
+      # (crates/lightbridge-authz-core/src/config/mod.rs) is explicit that there is deliberately
+      # no "accept but don't require" mode for this reason. Default here is therefore
+      # `/etc/lightbridge/tls/ca.crt` -- matching `docs/lightbridge-query-api.md`, the local
+      # Compose config (`.docker/usage/container.yaml`), and `config/usage.yaml` -- so mTLS is ON
+      # unless an operator explicitly turns it off.
       #
-      # Set this to a path such as "/etc/lightbridge/tls/ca.crt" once you have confirmed the
-      # `*-tls` secret this chart mounts actually contains a CA entry there -- e.g. a cert-manager
-      # Certificate backed by a CA-type Issuer emits `ca.crt` alongside `tls.crt`/`tls.key`
-      # automatically (the same convention `Config::usage_service`'s doc comment documents for
-      # the calling side, in `.docker/authz/container.yaml`).
+      # An unreadable/empty `ca.crt` at that path (e.g. the mounted `*-tls` secret has no CA entry
+      # yet -- the built-in `global.tls.job` in charts/lightbridge-authz-stack mints independent
+      # self-signed leaf certs per service today and does not publish one, unlike the local
+      # Compose TLS generator, which signs every leaf off one shared CA) makes the usage binary
+      # refuse to start LOUDLY (`crates/lightbridge-authz-core/src/server.rs`'s `build_mtls_config`)
+      # -- the correct direction: fail closed and visibly, never silently unauthenticated.
       #
-      # THE BUILT-IN `global.tls.job` in charts/lightbridge-authz-stack DOES NOT produce a CA at
-      # all for this secret today -- it mints independent self-signed leaf certs per service
-      # (api.crt, opa.crt, ..., usage.crt), unlike the local Compose TLS generator
-      # (`compose.yaml`'s `authz-tls` service), which signs every leaf off one shared CA and
-      # writes `ca.crt` alongside them. Do not point this at that job's secret without first
-      # giving it a shared CA to sign from -- an unreadable `client_ca_bundle_path` is a hard
-      # startup failure (see that field's doc comment), not a silent fallback.
-      clientCaBundlePath: ""
+      # To run WITHOUT mTLS on this listener -- e.g. a local/dev install where no shared CA
+      # exists at all -- set this to "" explicitly. `templates/common.yaml` then drops the query
+      # listener's containerPort AND Service port entirely (see that file), so the deliberate
+      # trade is "query endpoint unreachable" in exchange for "config still loads", never
+      # "reachable and unauthenticated".
+      clientCaBundlePath: "/etc/lightbridge/tls/ca.crt"
 
 controllers:
   main:
@@ -75,12 +81,21 @@ controllers:
           - name: http
             containerPort: 3000
             protocol: TCP
-          # mTLS-required query listener (#347). Port 3006 mirrors the local Compose config
+          # mTLS-required query listener (#347). Port 3006 matches the local Compose config
           # (`.docker/usage/container.yaml`) and the port already named in
           # `.docker/authz/container.yaml`'s `usage_service.base_url` comment
           # ("port 3006, UsageServerGroup::query") -- i.e. the port every other reference to this
-          # listener in the repo already assumes. `http` (ingest, 3000) is left unchanged so
-          # nothing that already points at this chart's existing port breaks.
+          # listener in the repo already assumes. This is NOT full parity with Compose, though:
+          # Compose's ingest listener is 3002, while this chart's ingest listener (`http`, below)
+          # stays 3000 -- that was this chart's port before this PR and is left unchanged
+          # deliberately so nothing that already points at it breaks. Only the query port had no
+          # prior chart convention to preserve, so it takes the value every other reference in
+          # the repo already uses.
+          #
+          # This entry (and the matching `service.authz.ports.query` below) is dropped entirely
+          # by `templates/common.yaml` when `.Values.config.query.tls.clientCaBundlePath` is
+          # empty -- see that value's comment for why an unauthenticated-but-reachable query port
+          # is never an acceptable default.
           - name: query
             containerPort: 3006
             protocol: TCP
@@ -91,12 +106,14 @@ controllers:
                 name: db-secret
                 key: DATABASE_URL
         # Probes stay pointed at the ingest listener (`http`/3000) even though the query listener
-        # exposes its own `/healthz*` routes too (UsageServerGroup::query's doc comment). The
-        # query listener requires a client certificate at the TLS handshake, before any HTTP
-        # request is even read (`Tls::client_ca_bundle_path`'s doc comment) -- a plain kubelet
-        # `httpGet` probe presents none, so probing that port would refuse the handshake and the
-        # pod would never go healthy. This mirrors the ingest-listener-only probing compose and
-        # `config/usage.yaml` already use.
+        # exposes its own `/healthz*` routes too (UsageServerGroup::query's doc comment). With
+        # `config.query.tls.clientCaBundlePath` defaulting to a real CA bundle (see that value's
+        # comment), the query listener requires a client certificate at the TLS handshake, before
+        # any HTTP request is even read (`Tls::client_ca_bundle_path`'s doc comment) -- a plain
+        # kubelet `httpGet` probe presents none, so probing that port would refuse the handshake
+        # and the pod would never go healthy. This mirrors Compose's own healthcheck
+        # (`compose.yaml`'s `authz-usage` service), which also only ever probes the ingest port
+        # (3002 there).
         probes:
           liveness:
             enabled: true
@@ -143,13 +160,30 @@ controllers:
     # permanently the moment a migration is itself a precondition for the new pods to pass their
     # readiness probe. `argocd.argoproj.io/sync-wave: "1"` runs this Job in an earlier wave than
     # `main`'s wave "2" instead, unconditionally.
-    suffix: '{{ printf "%s:%s" .Values.global.authz_usage.image.repository .Values.global.authz_usage.image.version | sha256sum | trunc 10 }}'
+    #
+    # `suffix` folds the rendered config data into the Job name, not just the image, mirroring
+    # `charts/lightbridge-authz/values.yaml`'s identical `migrate.suffix` (see that file's much
+    # longer comment for the full incident history and rejected alternatives). Short version,
+    # ported here because this chart hit the exact same bug class: bjw-s stamps a
+    # checksum/config annotation over the mounted ConfigMap into the pod template, so hashing the
+    # image alone means a CONFIG-only values change (e.g. this very PR, which changes
+    # `configMaps.config.data` without bumping `global.authz_usage.image.version`) re-renders the
+    # SAME Job name with a DIFFERENT pod template. Kubernetes Jobs have an immutable
+    # `spec.template`, so that apply is rejected outright, and ArgoCD's serverSideDiff dry-runs
+    # the apply during diffing -- so the WHOLE app's sync fails, not just this Job (hit twice in
+    # prod on 2026-08-24, #480). Folding `configMaps.config.data`'s own content into the hash
+    # restores "same inputs -> same name -> identical spec; any changed input -> new name -> new
+    # Job" for this chart too. Known residual, same as the sibling chart: a change scoped purely
+    # to `controllers.migrate`'s own env/values still collides (cannot self-reference the hash)
+    # -- remedy is `kubectl delete job <name>`, see #480.
+    suffix: '{{ printf "%s:%s:%s" .Values.global.authz_usage.image.repository .Values.global.authz_usage.image.version (.Values.configMaps.config.data | toYaml | sha256sum) | sha256sum | trunc 10 }}'
     job:
       backoffLimit: 3
       # 7-day retention for post-incident inspection, on the native Kubernetes Job-controller GC
       # path -- see the matching comment in charts/lightbridge-authz/values.yaml for why this is
       # no longer "clean up before the next deploy's static name collides" (the `suffix` above
-      # means each distinct image gets its own Job name, so there is nothing left to collide).
+      # means each distinct image+config combination gets its own Job name, so there is nothing
+      # left to collide).
       ttlSecondsAfterFinished: 604800
     annotations:
       "argocd.argoproj.io/sync-wave": "1"
