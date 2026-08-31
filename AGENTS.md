@@ -977,12 +977,28 @@ hand-written SQL and direct `sqlx` dependencies.
     generated CRUD cannot express -- the same exception class as `authorization_codes`
     (`migrations/20260827000001_secret_claims.sql`; `consume_secret_claim` in
     `crates/lightbridge-authz-api-key/src/repo.rs`).
-- This repo runs cratestack (`cratestack-pg`) `=0.8.12` (pinned exactly in the root `Cargo.toml`,
+- This repo runs cratestack (`cratestack-pg`) `=0.10.0` (pinned exactly in the root `Cargo.toml`,
   which also documents why the pin cannot float past it -- see that file's `cratestack-core =
-  "=0.8.12"` block); ADR-0038's capability findings were verified against 0.7.8. Re-verify any
-  capability claim against `0.8.12` here before relying on it -- "0.5.1" was stale as of #379
-  (2026-08-20), which also corrected #375's own PR description, which had already found the pin
-  was 0.7.16 at authoring time and out of date by the time #379 landed.
+  "=0.10.0"` block); ADR-0038's capability findings were verified against 0.7.8. Re-verify any
+  capability claim against `0.10.0` here before relying on it -- this line has gone stale at every
+  single bump so far ("0.5.1" as of #379 on 2026-08-20, which also corrected #375's own PR
+  description, itself already out of date at authoring time; then "0.8.12", which survived the
+  0.9.4 bump unnoticed). **Treat it as part of the pin, not as prose:** whoever moves
+  `cratestack-core` in `Cargo.toml` moves this line in the same commit.
+- **The cratestack version must move in lockstep with the `converse-frontends` monorepo**, which
+  consumes the same schema through `@cratestack/*` and regenerates its TypeScript client with the
+  matching `@cratestack/cli`. A generated client carries version bounds derived from the generator's
+  own release line (cratestack#838), so a one-sided bump leaves the two repos resolving different
+  major-equivalent lines. Bump `Cargo.toml` here and, over there, `apps/console/package.json`,
+  `packages/authz-rpc/package.json`, and every `@cratestack/*` entry in `pnpm-workspace.yaml`'s
+  `minimumReleaseAgeExclude` (that last one is what lets a same-day release install at all).
+- **cratestack's MSRV is 1.98.0** (unchanged across the 0.9.4 -> 0.10.0 bump; it was already
+  1.98.0 at 0.9.4). CI installs `stable` via `.github/actions/rust-setup`, so it is satisfied
+  there automatically. A local toolchain older than 1.98 fails the whole workspace at resolution
+  time with `rustc 1.x is not supported by the following packages`, listing every `cratestack-*`
+  crate -- that is a stale local `rustup` default, **not** a regression introduced by the bump.
+  Fix it with `rustup update stable`, or run a one-off gate as
+  `RUSTUP_TOOLCHAIN=1.98.0 just all-checks`.
 
 ## Troubleshooting and Gotchas
 

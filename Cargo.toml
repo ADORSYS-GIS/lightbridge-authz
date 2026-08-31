@@ -559,16 +559,61 @@ mimalloc = "0"
 # `undefined`-vs-`null` CBOR normalization, the migration generator, `push_scoped_conditions`,
 # `AuthProvider`/`CachedAuthProvider`, or `/rpc/batch` dispatch -- the RPC-batch-auth seam this pin
 # block's FOURTH OCCURRENCE/RESOLVED history is about is untouched between 0.8.12 and 0.9.4.
-cratestack-core = "=0.9.4"
-cratestack-axum = "=0.9.4"
-cratestack-redis = "=0.9.4"
+#
+# BUMPED (2026-08-31, cratestack 0.9.4 -> 0.10.0). Verified against crates.io that all six package
+# names below actually publish 0.10.0 (`curl -H 'User-Agent: <contact>'
+# https://crates.io/api/v1/crates/<pkg>/versions`) -- unlike the 0.8.7->0.8.9, 0.8.4->0.8.6 and
+# 0.9.0 gaps this block records, 0.10.0 published cleanly across the whole family with no skipped
+# version, so there is nothing to route around here. NOTE the UA: crates.io answers a bare
+# `curl -s` with a rate-limit/403 body that `jq`/`python -c json.load` then dies on, which reads as
+# "package has no such version" if you don't look at the raw body. Send a User-Agent.
+#
+# 0.10.0 is a MINOR bump and, pre-1.0, therefore a semver-breaking one. cratestack's CHANGELOG.md
+# calls out exactly three breaking changes; all three are no-ops for this workspace, each confirmed
+# by grep returning zero matches across `--include=*.rs --include=*.cstack --include=*.toml`:
+#   - #842 **the geospatial query surface moved behind a `postgis` Cargo feature**. `SpatialFilter`,
+#     `SpatialPoint`, `point()`, `FilterExpr::Spatial` and `FieldRef::covers_geography`/
+#     `dwithin_geography` shipped unconditionally from 0.6 and are now feature-gated (off by
+#     default). Zero matches for every one of those names, plus `Geography`/`Geometry`/`postgis`/
+#     `pgvector` -- this workspace declares no spatial column and issues no spatial filter, so
+#     there is NO feature to enable here. Do not add `features = ["postgis"]` to the
+#     `cratestack-pg` line below "to be safe": it is an API-surface gate on code nothing calls.
+#   - #843 **`cratestack_sqlx::Migration` gains an `up_pre: Option<String>` field**, breaking any
+#     struct-literal construction. Zero matches for `cratestack_sqlx` or `up_pre`. This repo does
+#     not use cratestack's migration runner at all -- migrations are SQLx embedded migrations under
+#     `migrations/`, run by `app/lightbridge-authz/src/migrate.rs` via the `authz-migrate` container
+#     (see "Migrations" in CLAUDE.md, and ADR-0003 which explicitly defers cratestack-owned
+#     migrations until `migrate diff --backend postgres` can read a live database).
+#   - the same #843 also makes `migrate diff` stop emitting `ALTER COLUMN ... DROP DEFAULT` when a
+#     column moves to or from `@default(dbgenerated())`. This is the ONE 0.10.0 change that names
+#     something `authz.cstack` actually contains -- the `AuditFields` mixin's `createdAt`/
+#     `updatedAt` are both `@default(dbgenerated())` (schema/authz.cstack:124-125). It is still
+#     inert here, but for a reason worth stating rather than assuming: the change is in DDL
+#     *emission*, and this repo never runs the emitter. If cratestack-owned migrations are ever
+#     adopted (ADR-0003's "Revisit"), re-read this entry first -- under 0.9.4 the generator would
+#     have silently dropped the trigger-supplied defaults on those two columns.
+# The rest of 0.10.0 is codegen- and client-facing, not Rust-runtime-facing: #838 makes the emitted
+# npm/Dart client version floors release-line-derived ranges rather than carets, the #845 revert
+# restores a hand-written floor literal inside cratestack's own test suite, and `cratestack-cli` now
+# enables `pgvector`/`postgis` on its `cratestack-migrate` edge so `migrate diff` stops panicking on
+# a `pgvector` schema. #838 DOES land downstream -- it changes what
+# `cratestack generate-typescript` writes into the generated client's `package.json` -- but that
+# output lives in the converse-frontends monorepo (`packages/authz-rpc/generated/`), not here. The
+# two repos' cratestack versions must move together; see that repo's `pnpm-workspace.yaml`.
+# Re-checked and untouched between 0.9.4 and 0.10.0, same terms as the 0.8.12->0.9.4 sweep above:
+# `@@allow`/`@allow` policy evaluation, `LenientCborCodec`/the `undefined`-vs-`null` CBOR
+# normalization, `push_scoped_conditions`, `AuthProvider`/`CachedAuthProvider`, and `/rpc/batch`
+# dispatch -- the RPC-batch-auth seam remains untouched.
+cratestack-core = "=0.10.0"
+cratestack-axum = "=0.10.0"
+cratestack-redis = "=0.10.0"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
 # `include_server_schema!` macro emits `::cratestack::*` paths (see cratestack-pg lib docs). The
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
 # it to build the RPC router (ADR-0003).
-cratestack = { package = "cratestack-pg", version = "=0.9.4" }
-cratestack-codec-cbor = "=0.9.4"
-cratestack-codec-json = "=0.9.4"
+cratestack = { package = "cratestack-pg", version = "=0.10.0" }
+cratestack-codec-cbor = "=0.10.0"
+cratestack-codec-json = "=0.10.0"
 # Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
