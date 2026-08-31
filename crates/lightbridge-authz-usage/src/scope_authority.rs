@@ -54,12 +54,25 @@ pub trait ScopeAuthority: Send + Sync {
 /// (`crates/lightbridge-authz-budget/src/spend.rs`): CA bundle / mTLS client-identity
 /// configuration, hard construction errors on partial config (never a silent "connect without an
 /// identity" fallback), and a fail-closed read side (see this module's doc comment).
-#[derive(Debug)]
 pub struct RemoteScopeAuthority {
     client: reqwest::Client,
     base_url: String,
     username: String,
     password: String,
+}
+
+/// Hand-written, redacting `Debug` impl -- `password` is a credential
+/// (`ScopeAuthorityConfig.password`, the same Basic-auth secret that unlocks authz-opa's whole
+/// router, not just this route -- see that field's doc comment) and must never be derived
+/// verbatim into a log line or panic message (AGENTS.md's "Keep secrets out of logs" rule).
+impl std::fmt::Debug for RemoteScopeAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteScopeAuthority")
+            .field("base_url", &self.base_url)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 impl RemoteScopeAuthority {
@@ -205,7 +218,24 @@ impl ScopeAuthority for RemoteScopeAuthority {
 
         match response.status() {
             reqwest::StatusCode::OK => Ok(true),
-            reqwest::StatusCode::NOT_FOUND => Ok(false),
+            reqwest::StatusCode::NOT_FOUND => {
+                // A `404` here is normally authz-opa's `authorize_usage_scope`'s own uniform
+                // not-authorized answer (see its doc comment) -- but a `404` is ALSO exactly what
+                // an old/mismatched authz-opa build with no `/idp/v1/authorize-usage-scope` route
+                // at all would return, i.e. a version-skew scenario during a rollout where the
+                // usage service's image ships #570 before authz-opa's does. Both cases correctly
+                // fail closed to `Ok(false)` (never a permissive default either way), but they are
+                // operationally very different -- "every query is being correctly refused" vs.
+                // "authz-opa needs to be rolled out" -- so this is `debug!`, not silent, to give
+                // an operator investigating "why is every usage query 403" a way to at least see
+                // that the authority route was reached and rule this scenario in or out from logs
+                // alone, without needing to also correlate authz-opa's own deploy history.
+                tracing::debug!(
+                    "scope-authority returned 404; either genuinely not-authorized or the route \
+                     doesn't exist yet on this authz-opa build (version skew) -- refusing either way"
+                );
+                Ok(false)
+            }
             status => {
                 tracing::warn!(
                     status = %status,
