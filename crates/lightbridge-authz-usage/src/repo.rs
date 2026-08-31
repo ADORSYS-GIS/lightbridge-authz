@@ -141,8 +141,31 @@ impl StoreRepo {
         Ok(total_cost)
     }
 
+    /// Returns up to `input.limit` buckets plus whether more existed (#578). `Vec<UsageSeriesPoint>`
+    /// comes back in the same ascending-`bucket_start` order this method has always returned; the
+    /// `bool` is `true` exactly when truncation happened, i.e. when more than `input.limit`
+    /// buckets matched the query.
+    ///
+    /// ## #578: truncation must drop the OLDEST buckets, not the newest
+    ///
+    /// The query used to `ORDER BY bucket_start ASC LIMIT $n` directly -- for a series with more
+    /// than `$n` buckets, an ascending sort followed by `LIMIT` keeps the buckets from the START
+    /// of the time range and silently drops everything after, which is backwards for a
+    /// monitoring/dashboard query: a caller hitting the limit lost their most RECENT data while
+    /// keeping the oldest. The fix asks Postgres for the newest `$n + 1` buckets first
+    /// (`ORDER BY bucket_start DESC LIMIT $n + 1`, wrapped so the outer query can still hand back
+    /// ascending order for a byte-stable response shape), then, in Rust, drops the single oldest
+    /// row of that set when more than `$n` came back -- fetching one extra row rather than just
+    /// `$n` is what turns "did we truncate" into an observable fact instead of a guess.
+    ///
+    /// Known caveat (#586): a bucket that straddles the truncation boundary is dropped or kept as
+    /// a whole bucket, not split -- this fix does not attempt partial-bucket truncation, only
+    /// which whole buckets survive.
     #[instrument(skip(self))]
-    pub async fn query_usage(&self, input: &UsageQueryRequest) -> Result<Vec<UsageSeriesPoint>> {
+    pub async fn query_usage(
+        &self,
+        input: &UsageQueryRequest,
+    ) -> Result<(Vec<UsageSeriesPoint>, bool)> {
         debug!(
             "querying usage with scope={:?}, scope_id={}, bucket={}, limit={}",
             input.scope, input.scope_id, input.bucket, input.limit
@@ -154,7 +177,7 @@ impl StoreRepo {
             group_set.insert(group.clone());
         }
 
-        let mut builder = QueryBuilder::<Postgres>::new("SELECT date_bin(CAST(");
+        let mut builder = QueryBuilder::<Postgres>::new("SELECT * FROM (SELECT date_bin(CAST(");
         builder.push_bind(&input.bucket).push(
             " AS interval), observed_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS bucket_start",
         );
@@ -297,12 +320,28 @@ impl StoreRepo {
             builder.push(col);
         }
 
-        builder.push(" ORDER BY bucket_start ASC LIMIT ");
-        builder.push_bind(i64::from(input.limit));
+        // #578: order DESC and fetch one MORE than the caller's limit inside the subquery -- the
+        // newest `limit + 1` buckets, not the oldest `limit` -- then re-sort ASC in the outer
+        // query so the response's ordering is unchanged from before this fix. The `+ 1` is what
+        // lets the Rust side below tell "there were exactly `limit` buckets" apart from "there
+        // were more and we truncated."
+        let fetch_limit = i64::from(input.limit).saturating_add(1);
+        builder.push(" ORDER BY bucket_start DESC LIMIT ");
+        builder.push_bind(fetch_limit);
+        builder.push(") t ORDER BY bucket_start ASC");
 
-        let rows: Vec<UsageQueryRow> = builder.build_query_as().fetch_all(self.pool()).await?;
+        let mut rows: Vec<UsageQueryRow> = builder.build_query_as().fetch_all(self.pool()).await?;
 
-        Ok(rows
+        let limit = input.limit as usize;
+        let truncated = rows.len() > limit;
+        if truncated {
+            // Ascending order means the single extra row (there can be at most one, since the
+            // subquery's own LIMIT caps `rows.len()` at `limit + 1`) is the OLDEST bucket in this
+            // set -- drop it, keeping the newest `limit` buckets in ascending order.
+            rows.drain(0..(rows.len() - limit));
+        }
+
+        let points = rows
             .into_iter()
             .map(|row| UsageSeriesPoint {
                 bucket_start: row.bucket_start,
@@ -325,7 +364,9 @@ impl StoreRepo {
                 latency_p95_ms: row.latency_p95_ms,
                 latency_p99_ms: row.latency_p99_ms,
             })
-            .collect())
+            .collect();
+
+        Ok((points, truncated))
     }
 }
 
