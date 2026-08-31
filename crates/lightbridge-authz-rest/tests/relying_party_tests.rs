@@ -221,6 +221,59 @@ async fn begin_pairing(router: axum::Router) -> (axum::Router, String, String) {
     (router, state, cookie)
 }
 
+/// B-F9 falsification: `GET /device/verify?user_code=<script>alert(1)</script>` -- the RP leg
+/// still 303s (it never inspects `user_code` for validity, only forwards it), but the tag must be
+/// gone before the SPA ever sees it. Proves `verify_page`'s handoff at the full HTTP level, not
+/// only via `sanitize_user_code_for_display`'s own unit tests -- this is what
+/// `sanitize_user_code_for_display`'s doc comment refers to by name.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_page_sanitizes_user_code_for_the_handoff(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
+            keycloak.url("/jwks"),
+            repo(pool),
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+    let router = router(rp);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/device/verify?user_code=%3Cscript%3Ealert(1)%3C%2Fscript%3E")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        !location.contains('<') && !location.contains('>'),
+        "the tag delimiters must never reach the Location header: {location}"
+    );
+    assert!(
+        location.starts_with("/ui/device?user_code="),
+        "the handoff target itself must be unaffected: {location}"
+    );
+    let user_code = location.strip_prefix("/ui/device?user_code=").unwrap();
+    assert_eq!(
+        user_code, "SCRIPTALERT1SCRI",
+        "only the sanitised, percent-encoded (here: none needed, since only \
+         alphanumerics/hyphens survive) code should appear"
+    );
+}
+
 /// Identity-vs-location split (ADR-0025 amendment): `KeycloakRelyingParty::new` now takes the
 /// IDENTITY issuer and the discovery-dial LOCATION as separate arguments. This proves both halves
 /// at once: (1) `discover()` actually dials `discovery_url`, not `issuer` -- the identity issuer
@@ -718,9 +771,15 @@ async fn verify_context_is_a_uniform_404_without_the_confirm_cookie(pool: PgPool
         .await
         .unwrap();
 
-    for response in [&no_cookie, &mismatched, &wrong_provider] {
+    // B-F8: three BYTE-IDENTICAL 404s, bodies included -- `context_not_found()` is a fixed
+    // function with no input-dependent content, so this is never merely "same status code".
+    let mut bodies = Vec::new();
+    for response in [no_cookie, mismatched, wrong_provider] {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        bodies.push(to_bytes(response.into_body(), usize::MAX).await.unwrap());
     }
+    assert_eq!(bodies[0], bodies[1]);
+    assert_eq!(bodies[0], bodies[2]);
 }
 
 /// D3/D10: `GET /device/verify/context` returns exactly `{user_code, client_id}` -- the same two

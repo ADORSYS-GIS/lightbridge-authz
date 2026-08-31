@@ -57,9 +57,10 @@ const NO_CACHE_CONTROL: &str = "no-cache";
 /// production build does not require any -- verified against a real `vite build` output, not
 /// dev-mode HMR injection).
 ///
-/// `pub(crate)` so `crate::relying_party` -- whose device-verification/callback pages share the
-/// exact same same-origin, unembeddable posture -- can reuse this constant instead of declaring a
-/// byte-identical copy of its own.
+/// `pub(crate)` so `crate::relying_party` -- whose device-verification/callback 303 redirects
+/// (`redirect_to`, lightbridge-authz#598: the RP leg hands off to the SPA now, it no longer
+/// renders any HTML of its own) carry the exact same same-origin, unembeddable posture -- can
+/// reuse this constant instead of declaring a byte-identical copy of its own.
 pub(crate) const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; frame-ancestors 'none'";
 
 /// Builds the static-asset service `build_idp_router` mounts under `/ui` (`.nest_service("/ui",

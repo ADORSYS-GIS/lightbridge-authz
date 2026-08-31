@@ -11,10 +11,10 @@ use authkestra_engine::{
 use authkestra_op::device::{DeviceCodeSession, DeviceCodeStatus};
 use authkestra_resource::jwt::{JwksCache, ValidationConfig, validate_jwt_generic};
 use axum::{
-    Router,
+    Json, Router,
     extract::{ConnectInfo, Form, Query, State},
     http::{HeaderValue, StatusCode, header},
-    response::{AppendHeaders, Html, IntoResponse, Redirect, Response},
+    response::{AppendHeaders, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
@@ -22,6 +22,7 @@ use base64::Engine;
 use chrono::{Duration as ChronoDuration, Utc};
 use cratestack_axum::ratelimit::{RateLimitConfig, RateLimitStore};
 use jsonwebtoken::{Algorithm, Validation, decode_header};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 
 use lightbridge_authz_api_key::entities::federated_identity_row::{
@@ -40,6 +41,18 @@ use crate::static_assets::CONTENT_SECURITY_POLICY;
 
 const CALLBACK_PATH: &str = "/idp/callback";
 const DEVICE_VERIFY_PATH: &str = "/device/verify";
+const DEVICE_VERIFY_CONTEXT_PATH: &str = "/device/verify/context";
+
+/// SPA route targets under `build_idp_router`'s `.nest_service("/ui", ..)` mount (`lib.rs`).
+/// Every one of these MUST appear in the artifact's `dist/routes.json`, or the redirect lands on
+/// a path `static_assets` 404s (lightbridge-authz#598). `redirect_targets_are_all_allowlisted`
+/// in `idp_server_tests.rs` is the mechanical cross-check; this comment is the reason it exists.
+const UI_DEVICE_ENTRY: &str = "/ui/device";
+const UI_DEVICE_INVALID: &str = "/ui/device/invalid";
+const UI_DEVICE_CONFIRM: &str = "/ui/device/confirm";
+const UI_DEVICE_SUCCESS: &str = "/ui/device/success";
+const UI_ERROR: &str = "/ui/error";
+
 const RP_STATE_COOKIE_NAME: &str = "__Host-authz_rp_state";
 const RP_STATE_TTL_SECONDS: i64 = 600;
 const ACCEPTED_ALGORITHMS: [Algorithm; 1] = [Algorithm::RS256];
@@ -886,25 +899,74 @@ struct RpRouteState {
 pub fn router(rp: Arc<KeycloakRelyingParty>) -> Router {
     Router::new()
         .route(DEVICE_VERIFY_PATH, get(verify_page).post(verify_submit))
+        .route(DEVICE_VERIFY_CONTEXT_PATH, get(verify_context))
         .route("/device/verify/continue", post(verify_continue))
         .route(CALLBACK_PATH, get(callback))
         .with_state(RpRouteState { rp })
 }
 
+/// `GET /device/verify` **stays a real route** -- V6/`lib.rs`'s config validation pins it as the
+/// exact, query-free, credential-free path RFC 8628's `verification_uri` (`token_exchange.rs`)
+/// names, so it cannot move under `/ui`. It becomes a pure handoff instead: forwards
+/// `verification_uri_complete`'s `user_code` prefill into the SPA's entry route, sanitising and
+/// percent-encoding it first so nothing but the device-code alphabet can ever reach the SPA's
+/// query string (this is the Rust twin of `apps/authz-ui`'s own `sanitiseUserCode` -- neither side
+/// depends on the other's filtering).
 async fn verify_page(Query(query): Query<VerifyQuery>) -> Response {
-    verification_response(query.user_code.as_deref(), None, None, StatusCode::OK)
+    let target = match query
+        .user_code
+        .as_deref()
+        .map(sanitize_user_code_for_display)
+    {
+        Some(code) if !code.is_empty() => format!(
+            "{UI_DEVICE_ENTRY}?user_code={}",
+            utf8_percent_encode(&code, NON_ALPHANUMERIC)
+        ),
+        _ => UI_DEVICE_ENTRY.to_string(),
+    };
+    redirect_to(&target)
 }
 
-/// Shared by [`verify_submit`] and [`verify_continue`]: rate-limits (keyed by caller IP -- see
-/// [`VERIFY_RATE_LIMIT_BURST`]'s doc comment) and looks up a `user_code`, returning the live
-/// `Pending` session or the exact uniform failure response both callers already returned before
-/// this helper existed (deliberately identical for "unknown"/"expired"/"consumed"/anything else
-/// non-pending, so the response never discloses which case applied).
+/// Keeps `[0-9A-Z-]` after upper-casing and clamps to 16 characters -- `device_store.rs`'s
+/// `USER_CODE_ALPHABET` (Crockford-style, no `I`/`L`/`O`/`U`) plus the display separator `-`.
+/// Applied to a value that arrives off the URL bar (`?user_code=` on `GET /device/verify`), so
+/// this is the one and only filter standing between an attacker-controlled query string and the
+/// `Location` header [`verify_page`] emits -- see `verify_page_sanitizes_user_code_for_the_handoff`
+/// for the falsification this exists to close (a `<script>` tag surviving into the redirect
+/// target).
+fn sanitize_user_code_for_display(raw: &str) -> String {
+    let cleaned: String = raw
+        .to_uppercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    cleaned.chars().take(16).collect()
+}
+
+/// What [`lookup_pending_session`] found short of a live `Pending` session -- a typed alternative
+/// to sniffing a helper-built `Response`'s `Location` header (see [`verify_context`]'s own doc
+/// comment for why that sniff would otherwise be tempting): each of this RP leg's three callers
+/// (`verify_submit`, `verify_continue`, `verify_context`) maps a variant to its OWN response shape
+/// -- two of them a 303 (D9's uniformity), the third (`verify_context`) a 404/503 pair (D10) --
+/// without any of them needing to know how another caller responds.
+enum LookupFailure {
+    /// Unknown/expired/consumed/anything else non-`Pending` -- deliberately one variant, not one
+    /// per case, so a caller structurally cannot respond differently per case even if tempted to.
+    NotUsable,
+    /// The rate-limited store call itself failed -- an outage, not an answer about `user_code`.
+    Unavailable,
+}
+
+/// Shared by [`verify_submit`], [`verify_continue`], and [`verify_context`]: rate-limits (keyed by
+/// caller IP -- see [`VERIFY_RATE_LIMIT_BURST`]'s doc comment) and looks up a `user_code`,
+/// returning the live `Pending` session or a [`LookupFailure`] that deliberately does not
+/// distinguish "unknown"/"expired"/"consumed"/anything else non-pending -- so no caller's response
+/// can disclose which case applied.
 async fn lookup_pending_session(
     state: &RpRouteState,
     addr: SocketAddr,
     user_code: &str,
-) -> std::result::Result<DeviceCodeSession, Box<Response>> {
+) -> std::result::Result<DeviceCodeSession, LookupFailure> {
     let caller_key = addr.ip().to_string();
     let config = RateLimitConfig::new(VERIFY_RATE_LIMIT_BURST, VERIFY_RATE_LIMIT_REFILL_PER_SECOND);
     match get_by_user_code_rate_limited(
@@ -917,13 +979,11 @@ async fn lookup_pending_session(
     .await
     {
         Ok(Some(session)) if matches!(session.status, DeviceCodeStatus::Pending) => Ok(session),
-        Ok(_) => Err(Box::new(verification_response(
-            None,
-            None,
-            Some("That code cannot be used."),
-            StatusCode::NOT_FOUND,
-        ))),
-        Err(_) => Err(Box::new(generic_failure(StatusCode::SERVICE_UNAVAILABLE))),
+        Ok(_) => Err(LookupFailure::NotUsable),
+        Err(_) => {
+            tracing::warn!(reason = "device_code_store_unavailable", "rp leg failure");
+            Err(LookupFailure::Unavailable)
+        }
     }
 }
 
@@ -934,7 +994,8 @@ async fn verify_submit(
 ) -> Response {
     let session = match lookup_pending_session(&state, addr, &form.user_code).await {
         Ok(session) => session,
-        Err(response) => return *response,
+        Err(LookupFailure::NotUsable) => return redirect_to(UI_DEVICE_INVALID),
+        Err(LookupFailure::Unavailable) => return redirect_to(UI_ERROR),
     };
     // Bind this confirmation page to the `user_code` it displayed (CSRF fix): `verify_continue`
     // below requires this exact cookie, proving the caller's browser actually rendered this page
@@ -943,17 +1004,18 @@ async fn verify_submit(
     let confirm_cookie = match build_device_confirm_cookie(&session.user_code, &state.rp.state_key)
     {
         Ok(cookie) => cookie,
-        Err(_) => return generic_failure(StatusCode::SERVICE_UNAVAILABLE),
+        Err(_) => {
+            tracing::warn!(
+                reason = "device_confirm_cookie_build_failed",
+                "rp leg failure"
+            );
+            return redirect_to(UI_ERROR);
+        }
     };
-    with_cookie(
-        verification_response(
-            Some(&session.user_code),
-            Some(&session.client_id),
-            Some("Confirm that this code and requesting client match your application."),
-            StatusCode::OK,
-        ),
-        confirm_cookie,
-    )
+    // The cookie still rides the redirect: `SameSite=Strict` survives a same-origin 303 (the
+    // browser's own follow-up `GET /ui/device/confirm` is same-site), which is exactly what
+    // `verify_context` then requires.
+    with_cookie(redirect_to(UI_DEVICE_CONFIRM), confirm_cookie)
 }
 
 /// Completes device pairing. **CSRF-critical:** requires [`DEVICE_CONFIRM_COOKIE_NAME`], set only
@@ -975,10 +1037,12 @@ async fn verify_continue(
 ) -> Response {
     let session = match lookup_pending_session(&state, addr, &form.user_code).await {
         Ok(session) => session,
-        Err(response) => return *response,
+        Err(LookupFailure::NotUsable) => return redirect_to(UI_DEVICE_INVALID),
+        Err(LookupFailure::Unavailable) => return redirect_to(UI_ERROR),
     };
     if !device_confirm_cookie_matches(&jar, &state.rp.state_key, &session.user_code) {
-        return generic_failure(StatusCode::FORBIDDEN);
+        tracing::warn!(reason = "device_confirm_cookie_mismatch", "rp leg failure");
+        return redirect_to(UI_ERROR);
     }
     match state.rp.begin_device(session.device_code).await {
         Ok((location, cookie)) => with_cookie(
@@ -989,7 +1053,10 @@ async fn verify_continue(
                 .into_response(),
             clear_device_confirm_cookie(),
         ),
-        Err(_) => generic_failure(StatusCode::SERVICE_UNAVAILABLE),
+        Err(_) => {
+            tracing::warn!(reason = "begin_device_failed", "rp leg failure");
+            redirect_to(UI_ERROR)
+        }
     }
 }
 
@@ -1000,25 +1067,26 @@ async fn callback(
 ) -> Response {
     let clear = clear_rp_state_cookie();
     let Some(cookie) = jar.get(RP_STATE_COOKIE_NAME) else {
-        return with_cookie(generic_failure(StatusCode::BAD_REQUEST), clear);
+        tracing::warn!(reason = "callback_state_cookie_missing", "rp leg failure");
+        return with_cookie(redirect_to(UI_ERROR), clear);
     };
     if cookie.value() != query.state {
-        return with_cookie(generic_failure(StatusCode::BAD_REQUEST), clear);
+        tracing::warn!(reason = "callback_state_mismatch", "rp leg failure");
+        return with_cookie(redirect_to(UI_ERROR), clear);
     }
     let pending = match OAuth2State::decrypt(&query.state, &state.rp.state_key) {
         Ok(pending) => pending,
-        Err(_) => return with_cookie(generic_failure(StatusCode::BAD_REQUEST), clear),
+        Err(_) => {
+            tracing::warn!(reason = "callback_state_undecryptable", "rp leg failure");
+            return with_cookie(redirect_to(UI_ERROR), clear);
+        }
     };
     match state.rp.complete(pending, &query.code).await {
-        Ok(Completion::Device) => with_cookie(
-            verification_response(
-                None,
-                None,
-                Some("Device paired. You can return to your application."),
-                StatusCode::OK,
-            ),
-            clear,
-        ),
+        // `clear` here is the RP-state cookie -- its job ends the moment this callback resolves,
+        // same as before. The device-confirm cookie was already cleared earlier, on
+        // `verify_continue`'s own success path (`clear_device_confirm_cookie()`), before the
+        // browser was ever sent to Keycloak.
+        Ok(Completion::Device) => with_cookie(redirect_to(UI_DEVICE_SUCCESS), clear),
         Ok(Completion::Browser {
             resume_path,
             session_cookie,
@@ -1041,64 +1109,92 @@ async fn callback(
             );
             response
         }
-        Err(_) => with_cookie(generic_failure(StatusCode::BAD_GATEWAY), clear),
+        Err(_) => {
+            tracing::warn!(reason = "callback_completion_failed", "rp leg failure");
+            with_cookie(redirect_to(UI_ERROR), clear)
+        }
     }
 }
 
-fn verification_response(
-    user_code: Option<&str>,
-    client_id: Option<&str>,
-    message: Option<&str>,
-    status: StatusCode,
-) -> Response {
-    let form_value = escape_html(user_code.unwrap_or_default());
-    let message = message.unwrap_or("Enter the code shown by your application.");
-    let confirmation = match client_id {
-        Some(client_id) => format!(
-            "<p>Code: <strong>{}</strong></p><p>Requesting client: <strong>{}</strong></p><form method=\"post\" action=\"/device/verify/continue\"><input type=\"hidden\" name=\"user_code\" value=\"{}\"><button type=\"submit\">Continue to Keycloak</button></form>",
-            escape_html(user_code.unwrap_or_default()),
-            escape_html(client_id),
-            form_value,
-        ),
-        _ => format!(
-            "<form method=\"post\" action=\"{DEVICE_VERIFY_PATH}\"><label>User code <input name=\"user_code\" value=\"{form_value}\" autocomplete=\"one-time-code\" required></label><button type=\"submit\">Continue</button></form>"
-        ),
-    };
-    let body = format!(
-        "<!doctype html><html><head><title>Device verification</title></head><body><main><h1>Verify your device</h1><p>{}</p>{confirmation}</main></body></html>",
-        escape_html(message),
-    );
+/// Every human-facing RP-leg response is now a 303 into the SPA. The security headers ride along
+/// because a redirect can still be framed and cached: `no-store` keeps a `Location` naming a
+/// one-shot flow out of shared caches, and `frame-ancestors`/`X-Frame-Options` preserve the
+/// clickjacking posture the deleted pages carried.
+fn redirect_to(path: &str) -> Response {
     (
-        status,
+        StatusCode::SEE_OTHER,
         [
             (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
             (header::X_FRAME_OPTIONS, "DENY"),
             (header::CACHE_CONTROL, "no-store"),
+            (header::LOCATION, path),
         ],
-        Html(body),
     )
         .into_response()
 }
 
-fn escape_html(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#x27;")
+/// What the confirmation page displays, and nothing more.
+///
+/// Bound to the SAME `__Host-authz_device_confirm` cookie [`verify_continue`] requires -- the
+/// cookie IS the authorization; there is no other input. It carries no secret beyond the two
+/// values the deleted server-rendered confirmation page already printed in HTML (the `user_code`
+/// the caller just typed, and the `client_id` of the session it names). No `device_code`, no
+/// scope, no project.
+#[derive(Serialize)]
+struct VerifyContext {
+    user_code: String,
+    client_id: String,
 }
 
-fn generic_failure(status: StatusCode) -> Response {
-    (
-        status,
-        [
-            (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
-            (header::X_FRAME_OPTIONS, "DENY"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        Html("<!doctype html><title>Sign-in unavailable</title><p>Unable to complete sign-in. Please try again.</p>"),
-    ).into_response()
+/// D10: renders exactly what the deleted server-rendered confirmation page used to print, as JSON
+/// for the SPA's `/ui/device/confirm` route to fetch -- authorized entirely by the same
+/// `__Host-authz_device_confirm` cookie [`verify_continue`] requires, never by anything in the
+/// request body or query string.
+async fn verify_context(
+    State(state): State<RpRouteState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    jar: CookieJar,
+) -> Response {
+    // UNIFORM 404 for every absence: no cookie, an expired/undecryptable cookie, a cookie whose
+    // `provider_id` is not ours, a code that is gone or no longer Pending. A caller can never
+    // learn WHICH applied, so this endpoint is not an enumeration oracle -- and it cannot be
+    // reached without a cookie only this server can mint, so there is nothing to enumerate with.
+    let Some(user_code) = device_confirm_cookie_user_code(&jar, &state.rp.state_key) else {
+        return context_not_found();
+    };
+    // Re-uses the SAME rate-limited store path `verify_submit`/`verify_continue` use, keyed by
+    // caller IP, rather than trusting the cookie's embedded code as fact: the cookie proves the
+    // browser saw a confirmation page, not that the session is still live.
+    match lookup_pending_session(&state, addr, &user_code).await {
+        Ok(session) => (
+            StatusCode::OK,
+            [
+                (header::CACHE_CONTROL, "no-store"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            Json(VerifyContext {
+                user_code: session.user_code,
+                client_id: session.client_id,
+            }),
+        )
+            .into_response(),
+        // `lookup_pending_session` already told the "device_code_store_unavailable" branch to log
+        // at `warn` -- this is a same-origin fetch, not a browser navigation, so unlike
+        // `verify_submit`/`verify_continue` it must never be told to "go" anywhere. `NotUsable`
+        // collapses to the uniform 404 above; `Unavailable` is honestly a 503, since that outcome
+        // does not depend on `user_code` and so is not an enumeration oracle -- 404ing there would
+        // lie about an outage (D10).
+        Err(LookupFailure::NotUsable) => context_not_found(),
+        Err(LookupFailure::Unavailable) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CACHE_CONTROL, "no-store")],
+        )
+            .into_response(),
+    }
+}
+
+fn context_not_found() -> Response {
+    (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response()
 }
 
 fn with_cookie(mut response: Response, cookie: Cookie<'static>) -> Response {
@@ -1173,6 +1269,18 @@ fn clear_device_confirm_cookie() -> Cookie<'static> {
         .build()
 }
 
+/// The `user_code` a live [`DEVICE_CONFIRM_COOKIE_NAME`] cookie is bound to, or `None` for every
+/// shape of "not a usable device-confirm cookie" -- absent, undecryptable/expired
+/// (`OAuth2State::decrypt` already folds both into one `Err`), or minted with a `provider_id`
+/// other than [`DEVICE_CONFIRM_PROVIDER_ID`] (e.g. a real Keycloak-callback RP-state envelope that
+/// ended up on this cookie name by mistake). The one decrypt path both [`device_confirm_cookie_matches`]
+/// and [`verify_context`] go through, so the CSRF check and the context endpoint cannot drift.
+fn device_confirm_cookie_user_code(jar: &CookieJar, state_key: &[u8; 32]) -> Option<String> {
+    let cookie = jar.get(DEVICE_CONFIRM_COOKIE_NAME)?;
+    let envelope = OAuth2State::decrypt(cookie.value(), state_key).ok()?;
+    (envelope.provider_id == DEVICE_CONFIRM_PROVIDER_ID).then_some(envelope.state)
+}
+
 /// True when `jar` carries a live [`DEVICE_CONFIRM_COOKIE_NAME`] cookie whose embedded
 /// `user_code` matches `expected_user_code` exactly. Both sides compare the canonical,
 /// already-normalized `user_code` off a fresh `DeviceCodeSession` lookup (never the raw form
@@ -1183,16 +1291,7 @@ fn device_confirm_cookie_matches(
     state_key: &[u8; 32],
     expected_user_code: &str,
 ) -> bool {
-    let Some(cookie) = jar.get(DEVICE_CONFIRM_COOKIE_NAME) else {
-        return false;
-    };
-    match OAuth2State::decrypt(cookie.value(), state_key) {
-        Ok(envelope) => {
-            envelope.provider_id == DEVICE_CONFIRM_PROVIDER_ID
-                && envelope.state == expected_user_code
-        }
-        Err(_) => false,
-    }
+    device_confirm_cookie_user_code(jar, state_key).as_deref() == Some(expected_user_code)
 }
 
 /// Encodes the post-authentication continuation (which device code to approve, or which browser
@@ -1273,5 +1372,33 @@ mod tests {
         assert!(is_unsafe_resume_path("/\\evil.com"));
         assert!(is_unsafe_resume_path("/\\/evil.com"));
         assert!(is_unsafe_resume_path("\\\\evil.com"));
+    }
+
+    // #598/D4/B2: `sanitize_user_code_for_display` is the one filter standing between an
+    // attacker-controlled `?user_code=` query param and the `Location` header `verify_page`
+    // emits -- these pin the falsification B-F9 names (a `<script>` tag surviving into the
+    // redirect target) directly, at the unit level, rather than only through the slower
+    // end-to-end HTTP falsification.
+
+    #[test]
+    fn sanitize_user_code_for_display_uppercases() {
+        assert_eq!(sanitize_user_code_for_display("pair-1234"), "PAIR-1234");
+    }
+
+    #[test]
+    fn sanitize_user_code_for_display_strips_a_script_tag() {
+        let sanitized = sanitize_user_code_for_display("<script>alert(1)</script>");
+        assert!(
+            !sanitized.contains('<') && !sanitized.contains('>'),
+            "the tag delimiters must never survive: {sanitized:?}"
+        );
+        assert_eq!(sanitized, "SCRIPTALERT1SCRI");
+    }
+
+    #[test]
+    fn sanitize_user_code_for_display_clamps_to_sixteen_chars() {
+        let sanitized = sanitize_user_code_for_display("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+        assert_eq!(sanitized.chars().count(), 16);
+        assert_eq!(sanitized, "ABCDEFGHIJKLMNOP");
     }
 }
