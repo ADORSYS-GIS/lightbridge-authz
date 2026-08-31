@@ -82,11 +82,32 @@ jobs:
       - uses: ./.github/actions/integration-test
 
   container-build:
-    # Only depends on `binaries` (it consumes dist-binaries.tar.gz). Deliberately NOT `test` or
-    # `integration-test`: image builds must not be gated on the test suites, so a flaky/slow test
-    # can't block publishing. `test` + `integration-test` run in parallel and gate CI status only;
-    # deployment gating (if any) lives downstream in GitOps, not here.
-    needs: [binaries]
+    # #499: `needs` used to be `[binaries]` alone, on the reasoning that "image builds must not be
+    # gated on the test suites" and "deployment gating (if any) lives downstream in GitOps". The
+    # second half was wrong, and it cost a production incident. There is no downstream gate:
+    # argocd-image-updater's `newest-build` strategy promotes on the COSIGN SIGNATURE alone, so
+    # the signature minted at the end of this job IS the production gate. On 2026-08-25 bffeaf5
+    # built, pushed and signed while `integration-test` was still running, and prod rolled a
+    # red-main image minutes before CI went red. Rollback did not help either: `newest-build`
+    # simply re-promotes the newest signed image.
+    #
+    # So the test suites now gate this job. The measured cost is ~1 minute of total run time, not
+    # the pipeline delay the original comment feared: `test` is already the critical path at
+    # ~11m49s versus `integration-test`'s ~4m30s and this job's ~1m, so the run could never finish
+    # before `test` did anyway (run 33353413433, 2026-08-31).
+    #
+    # A flaky test now blocks publishing. That is the intended trade -- an unpublished image is a
+    # deploy that did not happen, whereas an unverified signed image is a deploy that cannot be
+    # taken back. Investigate the flake; do not weaken this edge to route around it.
+    #
+    # `sast` (cargo-deny) is in this list by an explicit decision, and it behaves unlike the other
+    # three: it can go red with no change on our side, when a new RUSTSEC advisory is published
+    # against a dependency we already ship. So this edge can block an unrelated hotfix at 3am, and
+    # that is accepted -- an image with a known advisory should not promote itself to production
+    # just because the advisory landed inconveniently. The unblock is to fix or triage the finding
+    # in `deny.toml` (which is a real decision, recorded in the file), never to drop `sast` from
+    # this list.
+    needs: [sast, binaries, test, integration-test]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     strategy:
@@ -112,6 +133,10 @@ jobs:
           platform: linux/amd64
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Scans the pushed image, so it necessarily runs after the push -- but it now runs BEFORE
+      # signing. Previously the composite action signed immediately after pushing, so a
+      # HIGH/CRITICAL finding failed this job with the image already signed and therefore already
+      # promotable: the same shape of hole as #499, one step further down.
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@v0.36.0
         env:
@@ -123,6 +148,37 @@ jobs:
           exit-code: '1'
           ignore-unfixed: true
           severity: 'HIGH,CRITICAL'
+
+      # The promotion token, minted last and only here. Everything upstream of this point has
+      # already had its say: `sast`, `test` and `integration-test` directly via `needs`,
+      # `code-checks` transitively (every one of this job's dependencies needs it), and Trivy in
+      # the step above, which fails the job before this one runs. Both halves of the supply-chain
+      # check are therefore ahead of the signature -- cargo-deny over the dependency graph we
+      # build from, Trivy over the image we ship. An image that reaches GHCR without clearing all
+      # of them stays unsigned, and argocd-image-updater will not promote an unsigned image.
+      #
+      # `frontend` is deliberately NOT in the list, and its absence is not a gap: `binaries` stages
+      # the same Vite build into `dist/static`, which is what `Dockerfile.dist` copies
+      # (`COPY dist/static /app/static`), so the image's UI comes from `binaries` and that job
+      # already gates this one. `frontend` is a second, faster proof for PRs, not the image's
+      # source of truth.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Sign image (keyless, GitHub OIDC)
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.build-image.outputs.image-ref }}
+          DIGEST: ${{ steps.build-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Fail loudly rather than silently skipping the signature: an unsigned image is simply
+          # never promoted, so a no-op here would look green while quietly halting deployment.
+          if [ -z "${IMAGE_REF}" ] || [ -z "${DIGEST}" ]; then
+            echo "::error::refusing to sign: empty image-ref or digest from the build step"
+            exit 1
+          fi
+          cosign sign --yes "${IMAGE_REF}@${DIGEST}"
   release-please:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
