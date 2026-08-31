@@ -262,7 +262,7 @@ fn extract_bearer(headers: &http::HeaderMap) -> Option<String> {
 /// never anything narrower than the caller's actual grants. This is the single most
 /// security-sensitive function in this crate: every `authz.cstack` `@allow`/`@@allow` clause's
 /// permission gate is only as fail-closed as the values populated here. Looping over
-/// [`Permission::ALL`] rather than 31 hand-written field insertions is deliberate — a variant
+/// [`Permission::ALL`] rather than 32 hand-written field insertions is deliberate — a variant
 /// added to `Permission` later is picked up automatically, with no separate list to remember to
 /// update here.
 ///

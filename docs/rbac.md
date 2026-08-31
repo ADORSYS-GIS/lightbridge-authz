@@ -274,8 +274,20 @@ scope for #401.
 | `budget:policy-write`    | `procedure.createBudgetPolicyRevision`          | — (no MCP tool yet)                 |
 | `session:revoke-own`     | `procedure.revokeOwnSessions`                        | — (no MCP tool yet)                 |
 | `session:revoke`         | `procedure.revokeSubjectSessions`                    | — (no MCP tool yet)                 |
+| `usage:read-all`         | — (not an RPC op-id; see note below)                 | — (no MCP tool)                     |
 
 `read` covers both the list and get operations for a resource.
+
+`usage:read-all` is the one permission in this table that never gates a `POST /rpc/{op_id}` call on
+`authz-api`/`authz-budget` at all — it exists purely for `lightbridge-authz-usage`'s own
+`/usage/v1/usage/query` endpoint (`crates/lightbridge-authz-usage/src/handlers/query.rs`), which
+reads `TokenInfo::has_permission(Permission::UsageReadAll)` directly off the already-JWKS-validated
+bearer token to gate `scope=all` (estate-wide usage with no `account_id`/`project_id` filter). It
+still needs a `permUsageReadAll Boolean` field in `authz.cstack`'s `auth Principal` block (every
+`Permission::ALL` variant gets one, unconditionally — see `auth_provider.rs::build_context`'s doc
+comment) even though no `@allow`/`@@allow` clause reads it. Granted to `lightbridge-admin` via that
+role's default `*` grant; an operator restricting `role_permissions` explicitly must add
+`usage:read-all` (or `usage:*`) back to whichever role should keep estate-wide usage access.
 
 ### Read verbs filter, they do not refuse (`POST /rpc/batch` only) — #401
 

@@ -123,12 +123,25 @@ pub enum Permission {
     /// that otherwise requires a manual SQL `UPDATE` against prod.
     #[serde(rename = "session:revoke")]
     SessionRevoke,
+
+    /// Query usage across the whole estate (`UsageScope::All`, no `account_id`/`project_id`
+    /// filter at all) on `lightbridge-authz-usage`'s `/usage/v1/usage/query` endpoint. Deliberately
+    /// its own permission rather than reuse of [`Permission::BudgetRead`]/[`Permission::BudgetAuditRead`]
+    /// (a different resource, different service, different blast radius: this is a read of raw
+    /// usage/cost telemetry across every account, not a budget-ledger read) or a hardcoded role
+    /// name (see `crates/lightbridge-authz-usage/src/handlers/query.rs`'s `query_usage`) -- an
+    /// operator grants it to whichever role they configure via `oauth2.rbac.role_permissions`,
+    /// same as every other permission here. Included in the default `lightbridge-admin`'s `*`
+    /// grant (see [`default_role_permissions`]), so an unconfigured deployment still restricts
+    /// `scope=all` to admins out of the box.
+    #[serde(rename = "usage:read-all")]
+    UsageReadAll,
 }
 
 impl Permission {
     /// Every permission, in declaration order. The single source of truth for wildcard expansion
     /// and documentation.
-    pub const ALL: [Permission; 31] = [
+    pub const ALL: [Permission; 32] = [
         Permission::AccountCreate,
         Permission::AccountRead,
         Permission::AccountUpdate,
@@ -160,6 +173,7 @@ impl Permission {
         Permission::BudgetPolicyActivate,
         Permission::SessionRevokeOwn,
         Permission::SessionRevoke,
+        Permission::UsageReadAll,
     ];
 
     /// Canonical `resource:action` string.
@@ -196,6 +210,7 @@ impl Permission {
             Permission::BudgetPolicyActivate => "budget:policy-activate",
             Permission::SessionRevokeOwn => "session:revoke-own",
             Permission::SessionRevoke => "session:revoke",
+            Permission::UsageReadAll => "usage:read-all",
         }
     }
 
@@ -493,6 +508,23 @@ mod tests {
             .expect("admin role present");
         assert_eq!(admin.len(), Permission::ALL.len());
         assert!(admin.contains(Permission::AccountDelete));
+        assert!(
+            admin.contains(Permission::UsageReadAll),
+            "lightbridge-admin's wildcard grant must cover usage:read-all out of the box, so \
+             scope=all is admin-only even for an operator who never configures role_permissions"
+        );
+    }
+
+    /// `usage:read-all` (`Permission::UsageReadAll`) expands the same way every other exact grant
+    /// does, and is covered by its own resource wildcard -- pinned explicitly since this is the
+    /// permission `lightbridge-authz-usage`'s `scope=all` gate reads.
+    #[test]
+    fn usage_read_all_expands_via_exact_and_resource_wildcard_grants() {
+        assert_eq!(
+            expand_grant("usage:read-all"),
+            vec![Permission::UsageReadAll]
+        );
+        assert_eq!(expand_grant("usage:*"), vec![Permission::UsageReadAll]);
     }
 
     #[test]

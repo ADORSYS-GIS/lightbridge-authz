@@ -25,10 +25,16 @@
 > `authz-opa`'s `POST /idp/v1/authorize-usage-scope` (`ScopeAuthority`,
 > `crates/lightbridge-authz-usage/src/scope_authority.rs`) — the same real,
 > Postgres-backed ownership predicate `resolve_context` already enforces for the OIDC
-> token-exchange path. `user`/`api_key` scopes have no resolvable ownership authority
-> at all and are refused unconditionally (403), matching the console's own guard.
-> Missing/invalid bearer → `401`; authenticated but not authorized → `403` with an
-> opaque body. `/usage/v1/spend/query` stays exempt from this bearer requirement — it
+> token-exchange path. `scope=api_key` has no resolvable ownership authority at all
+> and is refused unconditionally (403), matching the console's own guard. `scope=user`
+> is allowed ONLY when `scope_id` equals the caller's own validated subject
+> (self-ownership, answered from the token directly, no `authz-opa` round trip);
+> anything else is `403`. `scope=all` (estate-wide, no entity filter) requires the
+> caller's token to hold the `usage:read-all` permission — granted to
+> `lightbridge-admin` by default, configurable via `oauth2.rbac.role_permissions` like
+> every other permission (`docs/rbac.md`); `authz-opa` is not consulted for this scope
+> either. Missing/invalid bearer → `401`; authenticated but not authorized → `403`
+> with an opaque body. `/usage/v1/spend/query` stays exempt from this bearer requirement — it
 > is `authz-budget`'s legitimate cross-account service reader, mTLS-only, and now
 > REFUSES any request carrying an `Authorization` header (closing the "console
 > catch-all-proxy" hole where a misrouted browser bearer token could otherwise reach
@@ -86,14 +92,18 @@ boundary is dropped or kept as a whole bucket, not split (a known caveat tracked
 
 ## Scope semantics
 
-- `scope=user` filters by `user_id = scope_id` — no resolvable ownership authority; every
-  request is refused with `403` regardless of the caller (#570).
-- `scope=api_key` filters by `api_key_id = scope_id` — same unconditional `403` as `user` above.
+- `scope=user` filters by `user_id = scope_id` — allowed ONLY when `scope_id` equals the
+  caller's own validated subject (self-ownership); any other subject is refused with `403`.
+- `scope=api_key` filters by `api_key_id = scope_id` — no resolvable ownership authority at
+  all; every request is refused with `403` regardless of the caller (#570).
 - `scope=project` filters by `project_id = scope_id` — requires the bearer token's subject to
   own the project's account OR hold a `project_members` roster row for it.
 - `scope=account` filters by `account_id = scope_id` — requires the bearer token's subject to
   own the account (ADR-0026 anchor semantics: same `accounts.user_id` identity, not merely the
   same `accounts.id`).
+- `scope=all` adds no entity filter at all (estate-wide) — requires the bearer token to hold
+  the `usage:read-all` permission (`Permission::UsageReadAll`); `scope_id` is ignored and
+  should be sent as `""`.
 
 `filters` also accepts `api_key_id` and `user_name` (in addition to `account_id`,
 `project_id`, `user_id`, `model`, `metric_name`, `signal_type`), and `group_by`

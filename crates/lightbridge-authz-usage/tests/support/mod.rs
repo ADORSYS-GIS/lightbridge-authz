@@ -13,7 +13,7 @@ use lightbridge_authz_usage_rest::scope_authority::ScopeAuthority;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-fn token_info(iss: &str, sub: &str, token: &str) -> TokenInfo {
+fn token_info(iss: &str, sub: &str, token: &str, permissions: PermissionSet) -> TokenInfo {
     TokenInfo {
         active: true,
         sub: sub.to_string(),
@@ -21,7 +21,7 @@ fn token_info(iss: &str, sub: &str, token: &str) -> TokenInfo {
         exp: 9_999_999_999,
         aud: vec![],
         roles: vec![],
-        permissions: PermissionSet::default(),
+        permissions,
         caller_kind: None,
         access_token: token.to_string(),
     }
@@ -42,8 +42,25 @@ impl FakeBearer {
 
     #[must_use]
     pub fn with_token(mut self, token: &str, iss: &str, sub: &str) -> Self {
+        self.tokens.insert(
+            token.to_string(),
+            token_info(iss, sub, token, PermissionSet::default()),
+        );
+        self
+    }
+
+    /// Like [`Self::with_token`], but the resulting caller also holds `permissions` -- for tests
+    /// exercising a permission-gated scope (`scope=all`, see [`Permission::UsageReadAll`]).
+    #[must_use]
+    pub fn with_token_and_permissions(
+        mut self,
+        token: &str,
+        iss: &str,
+        sub: &str,
+        permissions: PermissionSet,
+    ) -> Self {
         self.tokens
-            .insert(token.to_string(), token_info(iss, sub, token));
+            .insert(token.to_string(), token_info(iss, sub, token, permissions));
         self
     }
 }
@@ -70,6 +87,17 @@ pub fn bearer_with(token: &str, iss: &str, sub: &str) -> Arc<dyn BearerTokenServ
     Arc::new(FakeBearer::new().with_token(token, iss, sub))
 }
 
+/// Like [`bearer_with`], but the resulting caller also holds `permissions` -- for tests
+/// exercising `scope=all` (gated on `Permission::UsageReadAll`).
+pub fn bearer_with_permissions(
+    token: &str,
+    iss: &str,
+    sub: &str,
+    permissions: PermissionSet,
+) -> Arc<dyn BearerTokenServiceTrait> {
+    Arc::new(FakeBearer::new().with_token_and_permissions(token, iss, sub, permissions))
+}
+
 /// A configurable [`ScopeAuthority`] test double: authorizes exactly the `(issuer, subject,
 /// scope, scope_id)` tuples registered via [`Self::authorize`], refusing everything else --
 /// mirroring the real `RemoteScopeAuthority`'s fail-closed default for an unrecognized
@@ -85,6 +113,7 @@ fn scope_key(scope: &UsageScope) -> &'static str {
         UsageScope::Project => "project",
         UsageScope::User => "user",
         UsageScope::ApiKey => "api_key",
+        UsageScope::All => "all",
     }
 }
 

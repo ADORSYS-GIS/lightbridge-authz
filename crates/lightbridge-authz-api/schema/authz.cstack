@@ -21,7 +21,7 @@ datasource db {
   url = env("DATABASE_URL")
 }
 
-// `rpcScope` + the 31 `perm*` booleans below are issue #383's fix, not part of the original
+// `rpcScope` + the 32 `perm*` booleans below are issue #383's fix, not part of the original
 // ADR-0003 migration. Background: cratestack 0.8.4 rewrote `POST /rpc/batch` to authenticate the
 // envelope exactly once (`CachedAuthProvider`), so `CratestackAuthProvider::authenticate` --
 // previously the sole per-frame RBAC enforcement point -- can no longer see an individual batch
@@ -111,6 +111,13 @@ auth Principal {
   permBudgetPolicyActivate Boolean
   permSessionRevokeOwn Boolean
   permSessionRevoke Boolean
+  // `permUsageReadAll` (Permission::UsageReadAll, "usage:read-all") has no MAPPED_OP_ID_PERMISSIONS
+  // entry -- no authz-api op-id gates on it -- but every Permission::ALL variant still gets a
+  // field here because CratestackAuthProvider::build_context populates one boolean per variant
+  // unconditionally (auth_provider.rs). It backs lightbridge-authz-usage's own
+  // /usage/v1/usage/query scope=all gate instead (handlers/query.rs), which reads
+  // TokenInfo::has_permission directly and never touches this schema.
+  permUsageReadAll Boolean
 }
 
 mixin AuditFields {
