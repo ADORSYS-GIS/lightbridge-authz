@@ -4,16 +4,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use authkestra_engine::auth::state::Identity;
+use authkestra_op::OpError;
 use authkestra_op::client::{ClientRegistration, GrantType, TokenEndpointAuthMethod};
+use authkestra_op::code::AuthorizationCode;
+use authkestra_op::config::OpConfig;
 use authkestra_op::handlers::{AuthorizeOutcome, AuthorizeRequest, handle_authorize};
+use authkestra_op::store::OpStore;
 use axum::Router;
 use axum::extract::{OriginalUri, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use serde::Deserialize;
 
+use crate::oauth2_op::random_urlsafe;
 use crate::oauth2_op::store::RequestScopedOpStore;
 use crate::relying_party::{BrowserLoginTarget, KeycloakRelyingParty};
 use crate::session_cookie::read_session_cookie;
@@ -97,12 +102,9 @@ fn is_loopback_uri(uri: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(uri) else {
         return false;
     };
-    // `host_str()` returns IPv6 addresses WITH brackets (e.g. `[::1]`), so match both.
-    url.scheme() == "http"
-        && matches!(
-            url.host_str(),
-            Some("127.0.0.1" | "::1" | "[::1]" | "localhost")
-        )
+    // `host_str()` returns IPv6 addresses WITH brackets (e.g. `[::1]`), so the
+    // bracketed form is the only one that can ever match a v6 loopback.
+    url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "localhost"))
 }
 
 pub fn router<S>(state: AuthorizeState) -> Router<S>
@@ -200,6 +202,7 @@ async fn authorize(
                     Ok(context) => {
                         issue_code(
                             &state,
+                            &client,
                             request,
                             subject,
                             context.account_id,
@@ -218,6 +221,7 @@ async fn authorize(
             _ => {
                 issue_code(
                     &state,
+                    &client,
                     request,
                     subject,
                     session.account_id,
@@ -267,6 +271,7 @@ async fn authorize(
 /// every other grant (`identity_for`/`access_token_extra` in `crates/lightbridge-authz-rest/src/signing.rs`).
 async fn issue_code(
     state: &AuthorizeState,
+    client: &ClientRegistration,
     request: AuthorizeRequest,
     subject: String,
     account_id: String,
@@ -297,7 +302,17 @@ async fn issue_code(
         inner: state.token.op_store(),
         project_id: None,
     };
-    match handle_authorize(request, identity, state.token.op_config(), &scoped).await {
+    // `handle_authorize` re-validates `redirect_uri` with a plain exact-match
+    // (`ClientRegistration::allows_redirect_uri`) that knows nothing about the loopback
+    // carve-out, so a dynamic-port loopback URI this endpoint admitted would be refused
+    // inside `handle_authorize` and never reach code issuance. For the carve-out case we
+    // issue the code directly instead (see [`issue_loopback_code`]).
+    let outcome = if is_loopback_redirect(client, &request.redirect_uri) {
+        issue_loopback_code(client, request, identity, state.token.op_config(), &scoped).await
+    } else {
+        handle_authorize(request, identity, state.token.op_config(), &scoped).await
+    };
+    match outcome {
         AuthorizeOutcome::Redirect(location) => {
             let location = match session_state {
                 Some(session_state) if !redirect_carries_error(&location) => {
@@ -311,6 +326,62 @@ async fn issue_code(
             direct_error(StatusCode::INTERNAL_SERVER_ERROR, "authorization failed")
         }
     }
+}
+
+/// Issues an authorization code for a loopback redirect URI the RFC 8252 §8.3 carve-out permits
+/// but the vendored `handle_authorize` would refuse.
+///
+/// `handle_authorize` (`authkestra_op::handlers`) re-validates `req.redirect_uri` against the
+/// client's registrations with `ClientRegistration::allows_redirect_uri` -- a plain `==` with no
+/// knowledge of the loopback carve-out `authorize()` applied at its gate. A dynamic-port loopback
+/// URI therefore passes the gate but is refused inside `handle_authorize`, so the native-app flow
+/// never issues a code. This function mirrors `handle_authorize`'s mint/store/redirect steps while
+/// keeping the ACTUAL requested redirect URI in both the stored code and the redirect target.
+///
+/// Keeping the actual URI matters: the token endpoint's `matches_binding`
+/// (`authorization_code_matches` in `crates/lightbridge-authz-api-key/src/repo.rs`) compares the
+/// `redirect_uri` presented at redemption to the one stored with the code, exactly -- substituting
+/// the registered loopback URI (no port) would make the real dynamic-port URI fail redemption.
+///
+/// The caller (`authorize()`) has already validated `response_type`, grant type, and PKCE before
+/// this runs, so only the mint/store/redirect steps are replicated here; on any failure the caller
+/// maps the returned `AuthorizeOutcome::DirectError` to a refusal, never a silent success.
+async fn issue_loopback_code(
+    client: &ClientRegistration,
+    request: AuthorizeRequest,
+    identity: Identity,
+    config: &OpConfig,
+    op_store: &dyn OpStore,
+) -> AuthorizeOutcome {
+    let code_val = random_urlsafe(32);
+    let expires_at = Utc::now() + Duration::seconds(config.authorization_code_ttl_secs);
+    let mut auth_code = AuthorizationCode::new(
+        code_val.clone(),
+        client.client_id.clone(),
+        request.redirect_uri.clone(),
+        request.scope.clone(),
+        identity,
+        expires_at,
+        false,
+    );
+    auth_code.code_challenge = request.code_challenge.clone();
+    auth_code.code_challenge_method = request.code_challenge_method.clone();
+    auth_code.nonce = request.nonce.clone();
+    if let Err(error) = op_store.store_code(auth_code).await {
+        tracing::error!(%error, "failed to store loopback authorization code");
+        return AuthorizeOutcome::DirectError(OpError::Storage);
+    }
+    let Ok(mut url) = reqwest::Url::parse(&request.redirect_uri) else {
+        return AuthorizeOutcome::DirectError(OpError::RedirectUriMismatch);
+    };
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("code", &code_val);
+        if let Some(state) = &request.state {
+            query.append_pair("state", state);
+        }
+    }
+    AuthorizeOutcome::Redirect(url.into())
 }
 
 /// Appends OIDC Session Management 1.0 §3's `session_state` parameter to the authorization
@@ -542,5 +613,132 @@ mod tests {
         assert!(!is_loopback_uri("https://127.0.0.1/callback"));
         assert!(!is_loopback_uri("https://rp.example.test/callback"));
         assert!(!is_loopback_uri("not a url"));
+    }
+
+    use authkestra_engine::auth::state::Identity;
+    use authkestra_engine::store::KvStore;
+    use authkestra_engine::store::memory::MemoryStore;
+    use authkestra_op::code::AuthorizationCodeStore;
+    use authkestra_op::config::OpConfig;
+    use authkestra_op::device::DeviceCodeSession;
+    use authkestra_op::refresh::RefreshToken;
+    use authkestra_op::store::CompositeOpStore;
+
+    fn test_op_config() -> OpConfig {
+        OpConfig {
+            issuer: "https://op.example.test".to_string(),
+            scopes_supported: vec!["openid".to_string()],
+            response_types_supported: vec!["code".to_string()],
+            grant_types_supported: vec!["authorization_code".to_string()],
+            id_token_signing_alg: "RS256".to_string(),
+            authorization_code_ttl_secs: 60,
+            access_token_ttl_secs: 3600,
+            device_code_ttl_secs: 600,
+            token_exchange_enabled: false,
+        }
+    }
+
+    fn test_identity() -> Identity {
+        Identity {
+            provider_id: "keycloak".to_string(),
+            external_id: "subject-1".to_string(),
+            email: None,
+            username: None,
+            attributes: std::collections::HashMap::new(),
+        }
+    }
+
+    async fn test_op_store(
+        client: ClientRegistration,
+    ) -> CompositeOpStore<
+        MemoryStore<ClientRegistration>,
+        MemoryStore<AuthorizationCode>,
+        MemoryStore<RefreshToken>,
+        MemoryStore<DeviceCodeSession>,
+    > {
+        let clients = MemoryStore::<ClientRegistration>::new();
+        let codes = MemoryStore::<AuthorizationCode>::new();
+        let refresh = MemoryStore::<RefreshToken>::new();
+        let device = MemoryStore::<DeviceCodeSession>::new();
+        let client_id = client.client_id.clone();
+        clients
+            .set(&client_id, client, std::time::Duration::from_secs(31536000))
+            .await
+            .expect("registering the test client must not error");
+        CompositeOpStore::new(clients, codes, refresh, device)
+    }
+
+    /// The core regression test proving the loopback carve-out ISSUES a code end to end.
+    ///
+    /// Before the fix, `issue_code` handed every request to the vendored `handle_authorize`,
+    /// which re-validates `redirect_uri` with a plain exact-match and refused the dynamic-port
+    /// URI, so no code was ever minted. This exercises the actual `issue_loopback_code` code-
+    /// issuance path and asserts (a) a `Redirect` with `code=` comes back, and (b) the stored
+    /// code carries the ACTUAL dynamic-port redirect URI, so redemption against that URI
+    /// succeeds (the exact-match `authorization_code_matches` binding).
+    #[tokio::test]
+    async fn loopback_carveout_issues_a_code_with_the_actual_redirect_uri() {
+        let client = public_client_with_loopback();
+        let store = test_op_store(client.clone()).await;
+        let request = serde_json::from_value(serde_json::json!({
+            "client_id": client.client_id,
+            "redirect_uri": "http://127.0.0.1:54321/callback",
+            "response_type": "code",
+            "scope": "openid",
+            "state": "xyz",
+            "code_challenge": "spkce",
+            "code_challenge_method": "S256",
+        }))
+        .expect("request must deserialize");
+
+        let outcome =
+            issue_loopback_code(&client, request, test_identity(), &test_op_config(), &store).await;
+
+        // The carve-out must mint a code, not refuse with an error redirect.
+        let AuthorizeOutcome::Redirect(location) = outcome else {
+            panic!("loopback carve-out did not issue a code: {outcome:?}");
+        };
+        let url = reqwest::Url::parse(&location).expect("redirect must be a valid URL");
+        let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        let code = params.get("code").expect("code param must be present");
+        assert_eq!(params.get("state").map(|s| s.as_str()), Some("xyz"));
+
+        // The stored code must be bound to the ACTUAL dynamic-port URI, not the registered
+        // loopback URI, or the token endpoint's exact-match redemption check would fail.
+        let stored = store
+            .consume_code(code)
+            .await
+            .expect("consume must not error")
+            .expect("issued code must be persisted");
+        assert_eq!(stored.redirect_uri, "http://127.0.0.1:54321/callback");
+    }
+
+    /// Proves the bug the fix addresses: the vendored `handle_authorize` REFUSES the same
+    /// dynamic-port loopback URI the carve-out admits, with `RedirectUriMismatch`. This is why
+    /// `issue_loopback_code` must bypass it -- routing every request through `handle_authorize`
+    /// (the pre-fix `issue_code`) never reaches code issuance.
+    #[tokio::test]
+    async fn handle_authorize_refuses_the_dynamic_port_loopback_uri() {
+        let client = public_client_with_loopback();
+        let store = test_op_store(client.clone()).await;
+        let request = serde_json::from_value(serde_json::json!({
+            "client_id": client.client_id,
+            "redirect_uri": "http://127.0.0.1:54321/callback",
+            "response_type": "code",
+            "scope": "openid",
+            "code_challenge": "spkce",
+            "code_challenge_method": "S256",
+        }))
+        .expect("request must deserialize");
+
+        let outcome = handle_authorize(request, test_identity(), &test_op_config(), &store).await;
+
+        assert!(
+            matches!(
+                outcome,
+                AuthorizeOutcome::DirectError(OpError::RedirectUriMismatch)
+            ),
+            "handle_authorize must refuse the dynamic-port URI; got {outcome:?}"
+        );
     }
 }
