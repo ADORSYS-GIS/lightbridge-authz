@@ -565,8 +565,13 @@ def main() -> int:
             pass
         log("usage query listener rejects a connection with no client certificate")
 
-        # #347, acceptance criterion 2: authz-api's configured client certificate -> succeeds
-        # (reaches the router; the invalid time window still gets its ordinary 400/500).
+        # #347, acceptance criterion 2: authz-api's configured client certificate -> reaches the
+        # router (TLS-layer mTLS is satisfied). #570 review remediation: authentication now runs
+        # BEFORE body validation in the handler (crates/lightbridge-authz-usage/src/handlers/
+        # query.rs), specifically so an unauthenticated caller can never distinguish a malformed
+        # request from a well-formed one via a differentiated 400 -- this request carries a
+        # trusted client certificate but NO Authorization header, so it must be refused with 401,
+        # never the invalid-time-window 400 it used to get before that reordering.
         usage_status = None
         usage_error_body = ""
         try:
@@ -581,13 +586,46 @@ def main() -> int:
             usage_status = err.code
             usage_error_body = err.read().decode("utf-8")
 
+        if usage_status != 401:
+            raise AssertionError(
+                f"a trusted-mTLS request with no bearer token must be refused with 401 "
+                f"(auth runs before body validation), got {usage_status}: {usage_error_body}"
+            )
+        log(
+            "usage query listener accepts a trusted client certificate but refuses a request "
+            "with no bearer token (401, auth-before-validation)"
+        )
+
+        # Bearer-carrying variant of the same malformed body, so the invalid-time-window
+        # validation itself stays covered even though the unauthenticated variant above no longer
+        # reaches it: with a valid bearer token, the SAME malformed request must now get the
+        # ordinary 400 "start_time must be before end_time" the pre-#570 assertion checked for.
+        usage_status = None
+        usage_error_body = ""
+        try:
+            request_raw(
+                "POST",
+                f"{USAGE_QUERY_URL}/usage/v1/usage/query",
+                body=usage_query_body,
+                headers={"Authorization": f"Bearer {token}"},
+                ssl_context=MTLS_CLIENT_TLS,
+            )
+            raise AssertionError("usage query unexpectedly succeeded")
+        except urllib.error.HTTPError as err:
+            usage_status = err.code
+            usage_error_body = err.read().decode("utf-8")
+
         if usage_status not in (400, 500):
             raise AssertionError(
-                f"usage query should reject invalid time window, got {usage_status}: {usage_error_body}"
+                f"an authenticated usage query should reject an invalid time window, got "
+                f"{usage_status}: {usage_error_body}"
             )
         if "start_time must be before end_time" not in usage_error_body:
             raise AssertionError(f"unexpected usage error body: {usage_error_body}")
-        log("usage query listener accepts a trusted client certificate and rejects invalid request")
+        log(
+            "usage query listener accepts a trusted client certificate and a valid bearer "
+            "token, and rejects an invalid request (400)"
+        )
 
         # #347 covers both routes named in its acceptance criteria -- prove /usage/v1/spend/query
         # is reachable with the trusted client certificate too (no client cert -> same TLS-layer

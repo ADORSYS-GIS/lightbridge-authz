@@ -65,12 +65,42 @@ fn forbidden() -> Response {
     ),
     tag = "usage"
 )]
-#[instrument(skip(state, headers))]
+// `input` is deliberately skipped too (not just `state`/`headers`): `#[instrument]` records every
+// non-skipped parameter into the span at function ENTRY, before any code in this body runs -- so
+// leaving `input` unskipped would still have put `scope_id` into the trace span for an
+// unauthenticated caller no matter where the `info!` call below moved to. The `info!` line after
+// the bearer check is what actually logs the request's shape now, and only once the caller is
+// authenticated.
+#[instrument(skip(state, headers, input))]
 pub async fn query_usage(
     State(state): State<Arc<UsageState>>,
     headers: HeaderMap,
     Json(input): Json<UsageQueryRequest>,
 ) -> Result<Response> {
+    // #570: authentication runs BEFORE body validation, deliberately -- an unauthenticated caller
+    // must never be able to distinguish a well-formed from a malformed request (a differentiated
+    // 400 is itself a signal), and `input.scope_id` must never reach this span (or any other log
+    // line) before the caller presenting it has been authenticated. This is the query listener's
+    // own authentication boundary, layered on top of the mTLS the listener already requires at
+    // the TLS level. A missing/invalid token is "unknown", which per AGENTS.md's fail-closed rule
+    // routes to the strictest branch: refuse, never proceed, and never validate the body first.
+    let Some(token) = extract_bearer_token(&headers) else {
+        warn!("query_usage: no bearer token presented");
+        return Ok(unauthorized());
+    };
+
+    let token_info = match state.bearer.validate_bearer_token(&token).await {
+        Ok(info) if info.active => info,
+        Ok(_) => {
+            warn!("query_usage: bearer token validated but not active");
+            return Ok(unauthorized());
+        }
+        Err(err) => {
+            warn!(error = %err, "query_usage: bearer token validation failed");
+            return Ok(unauthorized());
+        }
+    };
+
     info!(
         "querying usage with scope={:?}, scope_id={}, bucket={}, limit={}",
         input.scope, input.scope_id, input.bucket, input.limit
@@ -98,27 +128,6 @@ pub async fn query_usage(
             "limit must be greater than zero".to_string(),
         ));
     }
-
-    // #570: `/usage/v1/usage/query` now requires an end-user bearer token, validated via JWKS --
-    // this is the query listener's own authentication boundary, layered on top of the mTLS the
-    // listener already requires at the TLS level. A missing/invalid token is "unknown", which per
-    // AGENTS.md's fail-closed rule routes to the strictest branch: refuse, never proceed.
-    let Some(token) = extract_bearer_token(&headers) else {
-        warn!("query_usage: no bearer token presented");
-        return Ok(unauthorized());
-    };
-
-    let token_info = match state.bearer.validate_bearer_token(&token).await {
-        Ok(info) if info.active => info,
-        Ok(_) => {
-            warn!("query_usage: bearer token validated but not active");
-            return Ok(unauthorized());
-        }
-        Err(err) => {
-            warn!(error = %err, "query_usage: bearer token validation failed");
-            return Ok(unauthorized());
-        }
-    };
 
     // `user`/`api_key` scopes have no resolvable ownership authority at all (no `accounts`/
     // `projects` row is ever keyed by a raw `user_id`/`api_key_id`) -- refused unconditionally,

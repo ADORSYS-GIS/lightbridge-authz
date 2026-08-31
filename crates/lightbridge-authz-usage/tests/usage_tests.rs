@@ -346,6 +346,30 @@ async fn query_usage_refuses_missing_bearer_with_401() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// Auth-before-validation, proved directly: an unauthenticated caller sending a BOTH-invalid
+/// request (malformed time window, no bearer token) must get 401, never a differentiated 400 --
+/// a 400 here would itself be a signal ("your bearer would have been checked, but your body was
+/// bad first") that an unauthenticated caller must never receive. Pairs with
+/// `query_usage_returns_bad_request_when_time_window_is_invalid` above (same malformed body, but
+/// WITH a valid bearer) so validation coverage isn't lost by moving the auth check first.
+#[tokio::test]
+async fn query_usage_refuses_malformed_body_with_401_when_bearer_is_also_missing() {
+    let req = UsageQueryRequest {
+        start_time: Utc::now(),
+        end_time: Utc::now() - Duration::hours(1),
+        ..base_request()
+    };
+
+    let response = call_query_usage(mock_state(), HeaderMap::new(), req).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "authentication must be checked before body validation, so a malformed body from an \
+         unauthenticated caller must still be refused with 401, not a differentiated 400"
+    );
+}
+
 /// #570: a bearer token the fake service does not recognize -- 401, no data.
 #[tokio::test]
 async fn query_usage_refuses_unrecognized_bearer_with_401() {
