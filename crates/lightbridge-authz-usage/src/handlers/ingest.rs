@@ -2029,8 +2029,8 @@ mod tests {
             async fn query_usage(
                 &self,
                 _input: &crate::models::UsageQueryRequest,
-            ) -> Result<Vec<crate::models::UsageSeriesPoint>> {
-                Ok(vec![])
+            ) -> Result<(Vec<crate::models::UsageSeriesPoint>, bool)> {
+                Ok((vec![], false))
             }
 
             async fn spend_for_account(
@@ -2043,8 +2043,35 @@ mod tests {
             }
         }
 
+        struct RefuseEverythingBearer;
+        #[lightbridge_authz_core::async_trait]
+        impl lightbridge_authz_bearer::BearerTokenServiceTrait for RefuseEverythingBearer {
+            async fn validate_bearer_token(
+                &self,
+                _token: &str,
+            ) -> anyhow::Result<lightbridge_authz_bearer::TokenInfo> {
+                Err(anyhow::anyhow!("unauthorized"))
+            }
+        }
+
+        struct RefuseEverythingScopeAuthority;
+        #[lightbridge_authz_core::async_trait]
+        impl crate::scope_authority::ScopeAuthority for RefuseEverythingScopeAuthority {
+            async fn authorize(
+                &self,
+                _issuer: &str,
+                _subject: &str,
+                _scope: &crate::models::UsageScope,
+                _scope_id: &str,
+            ) -> Result<bool> {
+                Ok(false)
+            }
+        }
+
         let state = crate::UsageState {
             repo: Arc::new(PartialInsertRepo { persisted: 1 }),
+            bearer: Arc::new(RefuseEverythingBearer),
+            scope_authority: Arc::new(RefuseEverythingScopeAuthority),
         };
         let events = vec![base_usage_event(), base_usage_event()];
 

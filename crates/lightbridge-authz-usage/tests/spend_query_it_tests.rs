@@ -1,5 +1,8 @@
 #![cfg(feature = "it-tests")]
 
+#[path = "support/mod.rs"]
+mod support;
+
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use chrono::{DateTime, Utc};
@@ -32,7 +35,11 @@ fn parse_timestamp(value: &str) -> DateTime<Utc> {
 async fn app(pool: PgPool) -> axum::Router {
     let readiness_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
     let repo = Arc::new(StoreRepo::new(Arc::new(DbPool::from_pool(pool))));
-    let state = Arc::new(UsageState { repo });
+    let state = Arc::new(UsageState {
+        repo,
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
+    });
     build_query_router(state, readiness_pool, false)
 }
 
@@ -203,10 +210,24 @@ async fn spend_query_reports_null_when_no_rows_match(pool: PgPool) {
 
 /// `/usage/v1/usage/query`'s application logic is unaffected by #347's mTLS requirement -- that
 /// requirement lives at the TLS layer, not in this handler, so exercising it directly via
-/// `.oneshot()` (no TLS, no client certificate) must still succeed. See `app`'s doc comment.
+/// `.oneshot()` (no TLS, no client certificate) must still succeed once the #570 bearer/ownership
+/// gate this handler now applies is satisfied. See `app`'s doc comment.
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn usage_query_endpoint_application_logic_is_unaffected_by_mtls(pool: PgPool) {
-    let router = app(pool).await;
+    let readiness_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
+    let repo = Arc::new(StoreRepo::new(Arc::new(DbPool::from_pool(pool))));
+    let state = Arc::new(UsageState {
+        repo,
+        bearer: support::bearer_with("valid-token", "https://issuer.test", "sub-1"),
+        scope_authority: Arc::new(support::FakeScopeAuthority::new().authorizing(
+            "https://issuer.test",
+            "sub-1",
+            &lightbridge_authz_usage_rest::models::UsageScope::Account,
+            "acct_1",
+        )),
+    });
+    let router = build_query_router(state, readiness_pool, false);
+
     let body = json!({
         "scope": "account",
         "scope_id": "acct_1",
@@ -217,6 +238,7 @@ async fn usage_query_endpoint_application_logic_is_unaffected_by_mtls(pool: PgPo
         .method("POST")
         .uri("/usage/v1/usage/query")
         .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer valid-token")
         .body(Body::from(
             serde_json::to_vec(&body).expect("request body must serialize"),
         ))
@@ -227,4 +249,42 @@ async fn usage_query_endpoint_application_logic_is_unaffected_by_mtls(pool: PgPo
         .await
         .expect("router must produce a response");
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// #570: `/usage/v1/spend/query` is a service-to-service route with no per-caller ownership
+/// check -- it now refuses outright any request carrying an `Authorization` header, closing the
+/// "console catch-all-proxy" hole where a misrouted browser bearer token could otherwise reach
+/// this ownerless cross-account read.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn spend_query_refuses_a_request_carrying_an_authorization_header(pool: PgPool) {
+    let account_id = cuid2();
+    let start = parse_timestamp("2026-08-01T00:00:00Z");
+    let end = parse_timestamp("2026-09-01T00:00:00Z");
+
+    let body = json!({
+        "account_id": account_id,
+        "start": start.to_rfc3339(),
+        "end": end.to_rfc3339(),
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/usage/v1/spend/query")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer some-users-token")
+        .body(Body::from(
+            serde_json::to_vec(&body).expect("request body must serialize"),
+        ))
+        .expect("request must build");
+
+    let response = app(pool)
+        .await
+        .oneshot(request)
+        .await
+        .expect("router must produce a response");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "a spend query carrying an Authorization header must be refused, not answered"
+    );
 }

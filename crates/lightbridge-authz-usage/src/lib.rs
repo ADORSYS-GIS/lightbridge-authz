@@ -1,8 +1,9 @@
 use axum::{Json, Router, http::StatusCode, routing::get};
 use chrono::{DateTime, Utc};
+use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait};
 use lightbridge_authz_core::{
     Result, async_trait,
-    config::Database,
+    config::{Database, Oauth2},
     db::{DbPool, DbPoolTrait, is_database_ready},
     server::{dev_cors_enabled, serve_tls},
 };
@@ -19,10 +20,12 @@ pub mod instrumentation;
 pub mod models;
 pub mod repo;
 pub mod routers;
+pub mod scope_authority;
 
-pub use config::{UsageConfig, UsageServer, load_from_path};
+pub use config::{ScopeAuthorityConfig, UsageConfig, UsageServer, load_from_path};
 use models::{UsageQueryRequest, UsageSeriesPoint};
 use repo::{StoreRepo, UsageEvent};
+use scope_authority::{RemoteScopeAuthority, ScopeAuthority};
 
 #[derive(Serialize, Deserialize)]
 struct RootResponse {
@@ -32,17 +35,30 @@ struct RootResponse {
 
 /// Shared between both listeners `start_usage_server` binds (#347): the unauthenticated ingest
 /// listener (`UsageServerGroup::usage`) and the mTLS-required query listener
-/// (`UsageServerGroup::query`, `/usage/v1/usage/query` + `/usage/v1/spend/query`). This state
-/// carries no auth gate of its own -- the query listener's client-certificate requirement is
-/// enforced at the TLS layer (`Tls::client_ca_bundle_path`), before any handler here runs.
+/// (`UsageServerGroup::query`, `/usage/v1/usage/query` + `/usage/v1/spend/query`).
+///
+/// The ingest listener carries no auth gate of its own beyond the ClusterIP-only mitigation
+/// (`AGENTS.md`'s Security Notes) -- it never reads `bearer`/`scope_authority`. The query
+/// listener's mTLS requirement is enforced at the TLS layer (`Tls::client_ca_bundle_path`) before
+/// any handler here runs, but `/usage/v1/usage/query` additionally requires and validates an
+/// end-user bearer token (#570, `handlers::query::query_usage`) -- `bearer`/`scope_authority`
+/// below back that check. `/usage/v1/spend/query` (`handlers::spend::query_spend`) stays exempt
+/// (mTLS-only, no bearer -- it is `authz-budget`'s legitimate cross-account service reader).
 pub struct UsageState {
     pub repo: Arc<dyn UsageRepoTrait>,
+    /// Validates the end-user bearer token `/usage/v1/usage/query` requires (#570).
+    pub bearer: Arc<dyn BearerTokenServiceTrait>,
+    /// Ownership authority for `/usage/v1/usage/query`'s `account`/`project` scopes (#570).
+    pub scope_authority: Arc<dyn ScopeAuthority>,
 }
 
 #[async_trait]
 pub trait UsageRepoTrait: Send + Sync {
     async fn insert_usage_events(&self, events: &[UsageEvent]) -> Result<usize>;
-    async fn query_usage(&self, input: &UsageQueryRequest) -> Result<Vec<UsageSeriesPoint>>;
+    /// Returns `(points, truncated)` -- see `StoreRepo::query_usage`'s doc comment for the #578
+    /// truncation contract `truncated` documents.
+    async fn query_usage(&self, input: &UsageQueryRequest)
+    -> Result<(Vec<UsageSeriesPoint>, bool)>;
     async fn spend_for_account(
         &self,
         account_id: &str,
@@ -57,7 +73,10 @@ impl UsageRepoTrait for StoreRepo {
         StoreRepo::insert_usage_events(self, events).await
     }
 
-    async fn query_usage(&self, input: &UsageQueryRequest) -> Result<Vec<UsageSeriesPoint>> {
+    async fn query_usage(
+        &self,
+        input: &UsageQueryRequest,
+    ) -> Result<(Vec<UsageSeriesPoint>, bool)> {
         StoreRepo::query_usage(self, input).await
     }
 
@@ -141,10 +160,20 @@ pub async fn start_usage_server(
     usage: &UsageServer,
     query: &UsageServer,
     database: &Database,
+    oauth2: &Oauth2,
+    scope_authority: &ScopeAuthorityConfig,
 ) -> Result<()> {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(database).await?);
     let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool.clone()));
-    let state = Arc::new(UsageState { repo });
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(BearerTokenService::new(oauth2.clone()));
+    let scope_authority: Arc<dyn ScopeAuthority> =
+        Arc::new(RemoteScopeAuthority::new(scope_authority)?);
+    let state = Arc::new(UsageState {
+        repo,
+        bearer,
+        scope_authority,
+    });
 
     let dev_cors = dev_cors_enabled();
     if dev_cors {
@@ -232,7 +261,7 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
     ),
     tags(
         (name = "ingest", description = "OTEL ingest endpoints (unauthenticated, ClusterIP-only -- see AGENTS.md's Security Notes)"),
-        (name = "usage", description = "Timeseries usage query endpoint -- mTLS-required listener (#347), see UsageServerGroup::query"),
+        (name = "usage", description = "Timeseries usage query endpoint -- mTLS-required listener (#347) plus an end-user bearer token and ownership check (#570), see UsageServerGroup::query"),
         (name = "spend", description = "Internal spend-query endpoint used by the budget domain -- mTLS-required listener (#347), see UsageServerGroup::query")
     )
 )]

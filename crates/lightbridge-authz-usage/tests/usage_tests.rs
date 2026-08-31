@@ -1,4 +1,7 @@
-use axum::body::Body;
+#[path = "support/mod.rs"]
+mod support;
+
+use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use axum::{Json, body::Bytes, http::HeaderMap};
 use chrono::{Duration, Utc};
@@ -9,7 +12,8 @@ use lightbridge_authz_usage_rest::UsageState;
 use lightbridge_authz_usage_rest::handlers::ingest::{ingest_logs, ingest_metrics, ingest_traces};
 use lightbridge_authz_usage_rest::handlers::query::query_usage;
 use lightbridge_authz_usage_rest::models::{
-    UsageGroupBy, UsageQueryFilters, UsageQueryRequest, UsageScope, UsageSeriesPoint,
+    UsageGroupBy, UsageQueryFilters, UsageQueryRequest, UsageQueryResponse, UsageScope,
+    UsageSeriesPoint,
 };
 use lightbridge_authz_usage_rest::repo::{StoreRepo, UsageEvent};
 use lightbridge_authz_usage_rest::{build_ingest_router, build_query_router};
@@ -33,6 +37,7 @@ struct MockUsageRepo {
     points: Vec<UsageSeriesPoint>,
     inserted_events: usize,
     spend: Option<f64>,
+    truncated: bool,
 }
 
 #[async_trait]
@@ -41,8 +46,11 @@ impl UsageRepoTrait for MockUsageRepo {
         Ok(self.inserted_events)
     }
 
-    async fn query_usage(&self, _input: &UsageQueryRequest) -> Result<Vec<UsageSeriesPoint>> {
-        Ok(self.points.clone())
+    async fn query_usage(
+        &self,
+        _input: &UsageQueryRequest,
+    ) -> Result<(Vec<UsageSeriesPoint>, bool)> {
+        Ok((self.points.clone(), self.truncated))
     }
 
     async fn spend_for_account(
@@ -87,9 +95,21 @@ fn mock_state() -> Arc<UsageState> {
             points: vec![],
             inserted_events: 0,
             spend: None,
+            truncated: false,
         }),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: Arc::new(support::FakeScopeAuthority::new().authorizing(
+            TEST_ISSUER,
+            TEST_SUBJECT,
+            &UsageScope::Project,
+            "proj_1",
+        )),
     })
 }
+
+const TEST_TOKEN: &str = "test-bearer-token";
+const TEST_ISSUER: &str = "https://issuer.test";
+const TEST_SUBJECT: &str = "sub-1";
 
 /// The ingest listener's router (#347 split): probes, Swagger docs, `/v1/otel/*` only --
 /// `/usage/v1/usage/query`/`/usage/v1/spend/query` moved to `query_app` below.
@@ -219,6 +239,38 @@ async fn build_ingest_router_no_longer_serves_the_query_routes() {
     );
 }
 
+fn authorized_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        format!("Bearer {TEST_TOKEN}")
+            .parse()
+            .expect("bearer header value should be a valid header value"),
+    );
+    headers
+}
+
+async fn call_query_usage(
+    state: Arc<UsageState>,
+    headers: HeaderMap,
+    req: UsageQueryRequest,
+) -> axum::response::Response {
+    query_usage(axum::extract::State(state), headers, Json(req))
+        .await
+        .expect("handler should not propagate an Err for an auth refusal")
+}
+
+async fn body_json(response: axum::response::Response) -> serde_json::Value {
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should be readable");
+    if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+}
+
 #[tokio::test]
 async fn query_usage_returns_bad_request_when_time_window_is_invalid() {
     let req = UsageQueryRequest {
@@ -227,15 +279,9 @@ async fn query_usage_returns_bad_request_when_time_window_is_invalid() {
         ..base_request()
     };
 
-    let state = Arc::new(UsageState {
-        repo: Arc::new(MockUsageRepo {
-            points: vec![],
-            inserted_events: 0,
-            spend: None,
-        }),
-    });
+    let state = mock_state();
 
-    let result = query_usage(axum::extract::State(state), Json(req)).await;
+    let result = query_usage(axum::extract::State(state), authorized_headers(), Json(req)).await;
 
     assert!(matches!(
         result,
@@ -271,17 +317,122 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
                 latency_p99_ms: Some(1_240.0),
             }],
             spend: None,
+            truncated: false,
         }),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: Arc::new(support::FakeScopeAuthority::new().authorizing(
+            TEST_ISSUER,
+            TEST_SUBJECT,
+            &UsageScope::Project,
+            "proj_1",
+        )),
     });
 
     let req = base_request();
-    let response = query_usage(axum::extract::State(state), Json(req))
-        .await
-        .expect("query should succeed");
+    let response = call_query_usage(state, authorized_headers(), req).await;
 
-    assert_eq!(response.0, StatusCode::OK);
-    assert_eq!(response.1.0.points.len(), 1);
-    assert_eq!(response.1.0.points[0].project_id.as_deref(), Some("proj_1"));
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: UsageQueryResponse = serde_json::from_value(body_json(response).await)
+        .expect("response body must decode as UsageQueryResponse");
+    assert_eq!(payload.points.len(), 1);
+    assert_eq!(payload.points[0].project_id.as_deref(), Some("proj_1"));
+    assert!(!payload.truncated);
+}
+
+/// #570: no `Authorization` header at all -- 401, no data.
+#[tokio::test]
+async fn query_usage_refuses_missing_bearer_with_401() {
+    let response = call_query_usage(mock_state(), HeaderMap::new(), base_request()).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// #570: a bearer token the fake service does not recognize -- 401, no data.
+#[tokio::test]
+async fn query_usage_refuses_unrecognized_bearer_with_401() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::AUTHORIZATION, "Bearer garbage".parse().unwrap());
+    let response = call_query_usage(mock_state(), headers, base_request()).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// #570 decisive negative case: a validly-authenticated caller whose `scope_authority` refuses
+/// the requested scope must get 403, never the underlying repo's data.
+#[tokio::test]
+async fn query_usage_refuses_when_scope_authority_declines() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![UsageSeriesPoint {
+                bucket_start: Utc::now(),
+                account_id: None,
+                project_id: Some("proj_1".to_string()),
+                api_key_id: None,
+                user_id: None,
+                user_name: None,
+                model: None,
+                metric_name: None,
+                signal_type: None,
+                requests: 1,
+                total_cost: 1.0,
+                usage_value: 1.0,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                latency_samples: 0,
+                latency_p50_ms: None,
+                latency_p95_ms: None,
+                latency_p99_ms: None,
+            }],
+            inserted_events: 0,
+            spend: None,
+            truncated: false,
+        }),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: support::refuse_everything_scope_authority(),
+    });
+
+    let response = call_query_usage(state, authorized_headers(), base_request()).await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await, serde_json::Value::Null);
+}
+
+/// #570: `user`/`api_key` scopes are refused unconditionally, even when `scope_authority` would
+/// authorize everything -- there is no resolvable ownership predicate for them at all.
+#[tokio::test]
+async fn query_usage_refuses_user_and_api_key_scopes_unconditionally() {
+    struct AuthorizeEverything;
+    #[async_trait]
+    impl lightbridge_authz_usage_rest::scope_authority::ScopeAuthority for AuthorizeEverything {
+        async fn authorize(
+            &self,
+            _issuer: &str,
+            _subject: &str,
+            _scope: &UsageScope,
+            _scope_id: &str,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    for scope in [UsageScope::User, UsageScope::ApiKey] {
+        let state = Arc::new(UsageState {
+            repo: Arc::new(MockUsageRepo::default()),
+            bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+            scope_authority: Arc::new(AuthorizeEverything),
+        });
+
+        let req = UsageQueryRequest {
+            scope: scope.clone(),
+            scope_id: "whatever".to_string(),
+            ..base_request()
+        };
+        let response = call_query_usage(state, authorized_headers(), req).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "scope {scope:?} must be refused unconditionally"
+        );
+    }
 }
 
 #[tokio::test]
@@ -291,7 +442,10 @@ async fn ingest_logs_treats_noop_insert_as_success() {
             points: vec![],
             inserted_events: 0,
             spend: None,
+            truncated: false,
         }),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
     });
 
     let response = ingest_logs(
@@ -313,7 +467,10 @@ async fn ingest_logs_rejects_invalid_protobuf_as_bad_request() {
             points: vec![],
             inserted_events: 0,
             spend: None,
+            truncated: false,
         }),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
     });
 
     let result = ingest_logs(
@@ -452,7 +609,10 @@ async fn ingest_traces_treats_noop_insert_as_success() {
             points: vec![],
             inserted_events: 0,
             spend: None,
+            truncated: false,
         }),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
     });
 
     let response = ingest_traces(
@@ -474,7 +634,10 @@ async fn ingest_traces_rejects_invalid_protobuf_as_bad_request() {
             points: vec![],
             inserted_events: 0,
             spend: None,
+            truncated: false,
         }),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
     });
 
     let result = ingest_traces(
@@ -498,7 +661,10 @@ async fn ingest_metrics_treats_noop_insert_as_success() {
             points: vec![],
             inserted_events: 0,
             spend: None,
+            truncated: false,
         }),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
     });
 
     let response = ingest_metrics(
@@ -520,7 +686,10 @@ async fn ingest_metrics_rejects_invalid_protobuf_as_bad_request() {
             points: vec![],
             inserted_events: 0,
             spend: None,
+            truncated: false,
         }),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
     });
 
     let result = ingest_metrics(
@@ -544,7 +713,10 @@ async fn ingest_logs_accepts_json_content_type_payload() {
             points: vec![],
             inserted_events: 0,
             spend: None,
+            truncated: false,
         }),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
     });
 
     let body = serde_json::json!({
@@ -591,7 +763,10 @@ async fn ingest_logs_accepts_gzip_encoded_body() {
             points: vec![],
             inserted_events: 0,
             spend: None,
+            truncated: false,
         }),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
     });
 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
