@@ -143,8 +143,9 @@ runs:
         CARGO_INCREMENTAL: "0"
 
     # lightbridge-authz-usage-rest's own ephemeral sqlx::test suite (repo_it_tests.rs,
-    # spend_query_it_tests.rs) against the SAME plain Postgres container as the step above -- not
-    # a dedicated TimescaleDB. `migrations-usage/20260829000001_usage_event_latency.sql` is
+    # spend_query_it_tests.rs, scope_ownership_it_tests.rs -- #570/#578) against the SAME plain
+    # Postgres container as the step above -- not a dedicated TimescaleDB.
+    # `migrations-usage/20260829000001_usage_event_latency.sql` is
     # deliberately written to degrade on vanilla Postgres (no Timescale-only functions), and
     # production runs plain Postgres today (#549 Finding 2); a real Timescale image produced an
     # identical schema in local verification (hypertable creation fails and is swallowed) at the
@@ -155,8 +156,9 @@ runs:
     # the shared `lightbridge_authz` database the step above uses nor with itself across the two
     # binaries.
     #
-    # Test targets are named explicitly (`--test repo_it_tests --test spend_query_it_tests`)
-    # rather than `--tests`, for two reasons: it avoids re-running the 88 non-DB-gated tests in
+    # Test targets are named explicitly (`--test repo_it_tests --test spend_query_it_tests
+    # --test scope_ownership_it_tests`) rather than `--tests`, for two reasons: it avoids
+    # re-running the 88 non-DB-gated tests in
     # this crate's lib target and `usage_tests.rs` that `cargo test --workspace` already ran above,
     # and it makes a broken `--features`/`required-features` wiring a hard `cargo` error (exit
     # 101, "requires the features: `it-tests`") instead of cargo silently matching zero targets.
@@ -171,7 +173,8 @@ runs:
         set -euo pipefail
         log_file="$(mktemp)"
         cargo test -p lightbridge-authz-usage-rest --features it-tests \
-          --test repo_it_tests --test spend_query_it_tests 2>&1 | tee "${log_file}"
+          --test repo_it_tests --test spend_query_it_tests \
+          --test scope_ownership_it_tests 2>&1 | tee "${log_file}"
         total_passed=0
         while read -r n; do
           total_passed=$((total_passed + n))
