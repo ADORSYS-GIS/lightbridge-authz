@@ -331,7 +331,7 @@ just it-tests
 ```
 
 DB-backed persistence tests (`lightbridge-authz-api-key`, `lightbridge-authz-budget`,
-`lightbridge-authz-rest`, `--features it-tests`).
+`lightbridge-authz-rest`, `lightbridge-authz-usage-rest`, `--features it-tests`).
 
 ```bash
 just it-idp

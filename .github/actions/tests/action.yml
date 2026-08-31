@@ -1,7 +1,7 @@
 name: Workspace Tests
 description: >-
   Start Postgres + Redis (docker), run the workspace test suite, then the Postgres/Redis-backed
-  `it-tests` feature suite (api-key, budget, rest) against the same containers.
+  `it-tests` feature suite (api-key, budget, rest, usage) against the same Postgres container.
 inputs:
   database-url:
     description: Postgres connection string
@@ -70,9 +70,10 @@ runs:
         CARGO_BUILD_JOBS: "2"
         CARGO_INCREMENTAL: "0"
 
-    # it-tests (api-key/budget/rest, `just it-tests`'s three crates -- `lightbridge-authz-usage`'s
-    # it-tests needs Timescale, out of scope here) exercise real migrations against a live
-    # DATABASE_URL, unlike the sqlx::test-isolated suites above. Mirrors `just it-tests`'s own
+    # it-tests (api-key/budget/rest, three of `just it-tests`'s four crates -- the fourth,
+    # `lightbridge-authz-usage-rest`, runs separately below against this same Postgres container)
+    # exercise real migrations against a live DATABASE_URL, unlike the sqlx::test-isolated suites
+    # above. Mirrors `just it-tests`'s own
     # migration step (`authz-migrate`) via the binary directly, since there's no compose stack in
     # this job. #219 tracks 7 tests in rpc_it_tests.rs that fail deterministically even against a
     # freshly migrated DB (marked `#[ignore = "tracked in #219"]`); #220 tracks one already-ignored
@@ -138,6 +139,50 @@ runs:
       env:
         DATABASE_URL: ${{ inputs.database-url }}
         AUTHZ_REDIS_URL: redis://127.0.0.1:6379
+        CARGO_BUILD_JOBS: "2"
+        CARGO_INCREMENTAL: "0"
+
+    # lightbridge-authz-usage-rest's own ephemeral sqlx::test suite (repo_it_tests.rs,
+    # spend_query_it_tests.rs) against the SAME plain Postgres container as the step above -- not
+    # a dedicated TimescaleDB. `migrations-usage/20260829000001_usage_event_latency.sql` is
+    # deliberately written to degrade on vanilla Postgres (no Timescale-only functions), and
+    # production runs plain Postgres today (#549 Finding 2); a real Timescale image produced an
+    # identical schema in local verification (hypertable creation fails and is swallowed) at the
+    # cost of an extra 2.4 GB pull and ~690 MiB idle RSS inside this OOM-sensitive build job, so it
+    # bought nothing. Timescale-shaped CI is deferred to the epic's Phase 1 storage rewrite, gated
+    # on the #581 D1 image decision -- do not reintroduce a Timescale container here before that
+    # lands. `#[sqlx::test]` creates its own ephemeral DB per test, so this collides with neither
+    # the shared `lightbridge_authz` database the step above uses nor with itself across the two
+    # binaries.
+    #
+    # Test targets are named explicitly (`--test repo_it_tests --test spend_query_it_tests`)
+    # rather than `--tests`, for two reasons: it avoids re-running the 88 non-DB-gated tests in
+    # this crate's lib target and `usage_tests.rs` that `cargo test --workspace` already ran above,
+    # and it makes a broken `--features`/`required-features` wiring a hard `cargo` error (exit
+    # 101, "requires the features: `it-tests`") instead of cargo silently matching zero targets.
+    # The `total passed > 0` check below is now sound (only these two it-tests binaries run under
+    # these flags) and catches the one residual silent-skip case a hard cargo error can't: an
+    # inner `#![cfg(feature = "it-tests")]` guard surviving after `required-features` is removed
+    # from Cargo.toml, which makes cargo build an empty test binary that reports "0 tests" and
+    # exits 0 (AGENTS.md: "a skipped test is not a passing test").
+    - name: Run it-tests (usage)
+      shell: bash
+      run: |
+        set -euo pipefail
+        log_file="$(mktemp)"
+        cargo test -p lightbridge-authz-usage-rest --features it-tests \
+          --test repo_it_tests --test spend_query_it_tests 2>&1 | tee "${log_file}"
+        total_passed=0
+        while read -r n; do
+          total_passed=$((total_passed + n))
+        done < <(grep -oE '[0-9]+ passed' "${log_file}" | grep -oE '^[0-9]+' || true)
+        echo "lightbridge-authz-usage-rest it-tests passed: ${total_passed}"
+        if [ "${total_passed}" -eq 0 ]; then
+          echo "::error::lightbridge-authz-usage-rest it-tests reported 0 passed tests -- a skip is not a pass."
+          exit 1
+        fi
+      env:
+        DATABASE_URL: ${{ inputs.database-url }}
         CARGO_BUILD_JOBS: "2"
         CARGO_INCREMENTAL: "0"
 

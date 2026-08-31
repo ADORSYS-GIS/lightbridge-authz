@@ -774,9 +774,9 @@ These tests include:
 
 ### Persistence tests (it-tests)
 
-The Postgres-backed `lightbridge-authz-api-key` tests (rotate/limits) and `lightbridge-authz-budget` tests (ledger writes, replay, policy store, refill/review services) are guarded by the `it-tests` feature so they only compile/run when requested. This keeps the default `cargo test` free of database setup, and lets us treat these as Docker-backed integration tests.
+The Postgres-backed `lightbridge-authz-api-key` tests (rotate/limits), `lightbridge-authz-budget` tests (ledger writes, replay, policy store, refill/review services), and `lightbridge-authz-usage-rest` tests (`repo_it_tests`, `spend_query_it_tests`) are guarded by the `it-tests` feature so they only compile/run when requested. This keeps the default `cargo test` free of database setup, and lets us treat these as Docker-backed integration tests.
 
-Run them with `just it-tests`, which brings up the `postgresql`/`redis` services, waits a moment, then sets `DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"` before invoking `lightbridge-authz-api-key`, `lightbridge-authz-budget`, and `lightbridge-authz-rest` with `--features it-tests`. These tests exercise the migrations under `sqlx::test`.
+Run them with `just it-tests`, which brings up the `postgresql`/`redis` services, waits a moment, then sets `DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"` before invoking `lightbridge-authz-api-key`, `lightbridge-authz-budget`, `lightbridge-authz-rest`, and `lightbridge-authz-usage-rest` with `--features it-tests`. These tests exercise the migrations under `sqlx::test` — `lightbridge-authz-usage-rest`'s own migrations under `migrations-usage/` are deliberately written to run against this same plain Postgres, not a dedicated TimescaleDB (production runs plain Postgres today; Timescale-shaped CI is deferred to a later phase of #581, gated on that epic's storage-image decision).
 
 ### Load Tests
 
