@@ -139,7 +139,7 @@ conformance-sequence status of each grant.
 | `/oauth2/token` | POST | none (credential is the presented token/assertion) | RFC 8693 token exchange + `authorization_code` + `refresh_token` + RFC 8628 device-code grants, all unconditional (ADR-0023). `project_id` is an optional form param. |
 | `/oauth2/device_authorization` | POST | none | RFC 8628 device-authorization endpoint, unconditional. |
 | `/oauth2/revoke` | POST | none (credential is the presented token) | RFC 7009. |
-| `/ui/*` | GET | none | The hosted-login SPA build, path-scoped under `/ui` (ADR-0021 Decision 10 follow-up) — never a whole-server catch-all; a path outside `/ui` matching no protocol route above is a plain `404`. |
+| `/ui/*` | GET | none | The hosted-login SPA build, path-scoped under `/ui` (ADR-0021 Decision 10 follow-up) — never a whole-server catch-all; a path outside `/ui` matching no protocol route above is a plain `404`. The bundle is built in `converse-frontends` (`apps/authz-ui`) and consumed here as a digest-pinned OCI artifact, not built in this repo (ADR-0028). |
 
 Deliberately thin next to `authz-api`: no RPC CRUD surface, no budget domain, no idempotency/rate-
 limit tower layers on the protocol routes — every route this server mounts is public by design

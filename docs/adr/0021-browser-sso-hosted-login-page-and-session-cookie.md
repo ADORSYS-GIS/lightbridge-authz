@@ -113,6 +113,20 @@ browser cookie's session row never is.
 
 ### 1. The hosted page is a same-origin Vite React static build, served by `authz-idp` itself; Rust owns every protocol step
 
+> **Update (2026-08-31, follow-up to #591):** the page's **source home moved out of this
+> repository** to `converse-frontends`' `apps/authz-ui`; `web/hosted-login/` is deleted and this
+> repo builds no JavaScript. **Nothing this Decision argues has changed.** The two load-bearing
+> properties are unaffected: the bundle is still served **same-origin** by `authz-idp`'s own Axum
+> server (so the `__Host-` cookie prefix of Decision 4 remains available), and there is still
+> **one authentication boundary in Rust** — the page remains pure presentation, makes no
+> authentication decision, and every redirect, `Set-Cookie` and ID-token verification still happens
+> in this codebase. What changed is only *who compiles the HTML*: the bundle arrives as a
+> digest-pinned, assets-only OCI artifact rather than from an `npm ci` in this repo's `Dockerfile`.
+> "Explicitly rejected: a separately deployed Next.js frontend" still stands and is **not** what
+> this is — a separately *built* artifact served from this origin is the opposite of a separately
+> *deployed* origin. See **ADR-0028** for the artifact contract, the pin policy and the
+> version-skew rule.
+
 The login/consent UI is a Vite React project, built to static assets, and served from
 `https://auth.ai.camer.digital` — the same origin as the issuer, by `authz-idp`'s own Axum server,
 not a separately deployed frontend. This is not the default choice for a UI team and is adopted
@@ -536,6 +550,21 @@ login.
 > API-only, unconditionally. The bullets below describe the corrected shape; the safety property
 > is now **path-scoping**, not **mount-order** — static assets and protocol routes occupy disjoint
 > path spaces, so they cannot collide at all, regardless of merge order.
+
+> **Update (2026-08-31, follow-up to #591):** the serving side of this Decision is unchanged —
+> `static_assets.rs`, the `/assets/`-prefixed `immutable` vs `no-cache` split, the
+> `default-src 'self'; frame-ancestors 'none'` CSP, and the `.nest_service("/ui", ..)` path-scoping
+> all still hold, and their tests (`static_assets_tests.rs`, `idp_server_tests.rs`'s
+> `static_fallback_never_shadows_an_existing_protocol_route` and the `ui_*` family) pass unmodified,
+> because every one of them builds its own fixture directory and never read `web/hosted-login/dist`
+> in the first place. What changed is the *provenance* of the directory `static_dir` points at: the
+> Vite build now happens in `converse-frontends` (`apps/authz-ui`) and arrives as a digest-pinned
+> OCI artifact. Two assertions this Decision depends on moved with it and did **not** disappear:
+> the content-hash assertion (without which the `immutable` half of the caching posture is wrong)
+> and the service-worker-scope verifier (the SW-level twin of
+> `static_fallback_never_shadows_an_existing_protocol_route`) both now run inside the producing
+> repo's build, and the pin-checking action here re-asserts the content-hash property against the
+> pulled artifact. See **ADR-0028**.
 
 `tower-http` is already a direct dependency but pinned with only the `cors` feature
 (`Cargo.toml:155`) — no static-file-serving feature is enabled anywhere in this workspace today.
