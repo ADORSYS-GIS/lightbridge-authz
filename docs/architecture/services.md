@@ -128,6 +128,23 @@ since ADR-0023, always mounted. See
 [`docs/oauth-oidc-standards-roadmap.md`](../oauth-oidc-standards-roadmap.md) for the canonical
 conformance-sequence status of each grant.
 
+**Human plane.** `authz-idp` is the OIDC broker for people, not machines — browser SSO, RFC 8628
+device pairing, and the token exchange those flows land in. Since lightbridge-authz#607 it renders
+no HTML on that leg at all: the pages are a React SPA, `apps/authz-ui` in the `converse-frontends`
+monorepo, built on the estate's `ui-web` design system and served same-origin under `/ui` as a
+digest-pinned, assets-only OCI artifact (ADR-0029) — the pin is the single `ARG AUTHZ_UI_REF=` at
+the top of `./Dockerfile`, and pin + Rust handoff + `/ui` allowlist are one rollback unit, not
+three independently revertible pieces. `GET /device/verify` is a pure `303` handoff into the SPA's
+entry route; every decision downstream (`POST /device/verify`, `POST /device/verify/continue`) also
+`303`s, never renders; `GET /device/verify/context` is the one JSON escape hatch, feeding the SPA's
+confirmation screen exactly the two values (`user_code`, `client_id`) the deleted server-rendered
+page used to print. `/ui` itself is a route ALLOWLIST, not a catch-all — see that row below. Three
+surfaces still render HTML server-side (`check_session_iframe`, `claim_redeem`, `end_session`) —
+each for a reason specific to it (a protocol artifact, a script-free CSP as the actual security
+property, and a not-yet-migrated legacy page respectively), tracked for eventual migration rather
+than an oversight. All protocol decisions — every redirect, `Set-Cookie`, and ID-token verification
+— stay in this Rust codebase regardless (ADR-0029 Decision 5); the SPA is presentation only.
+
 | Route | Method | Protection | Notes |
 | --- | --- | --- | --- |
 | `/`, `/healthz`, `/healthz/startup`, `/healthz/ready` | GET | none | Same probe wiring as every other server (`probe_router`), `/healthz/ready` checks DB reachability. |

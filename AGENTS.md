@@ -10,9 +10,17 @@ This repository provides API key management plus usage analytics:
 - `authz-idp`: OIDC broker server (ADR-0012, ADR-0019, ADR-0023) exposing
   `.well-known/openid-configuration`, `.well-known/jwks.json`, `/oauth2/token`, `/oauth2/revoke`,
   `/oauth2/device_authorization`, `/oauth2/userinfo`, `/oauth2/end_session`, `/authorize`,
-  `/device/verify`, and `/idp/callback` — every route is public, the presented token/assertion
-  (or completed Keycloak login) is itself the credential. `/oauth2/end_session` (OIDC RP-Initiated
-  Logout 1.0) takes its subject from the `__Host-authz_session` cookie, never from
+  `/device/verify`, `/device/verify/context`, and `/idp/callback` — every route is public, the
+  presented token/assertion (or completed Keycloak login) is itself the credential. **`authz-idp`
+  renders no HTML on the RP/device leg** (ADR-0029, lightbridge-authz#607): `GET /device/verify`
+  is a pure 303 handoff into the SPA's `/ui/device` route (the `verification_uri` RFC 8628 names,
+  so the path itself cannot move); `POST /device/verify` and `POST /device/verify/continue` decide
+  and 303 onward (`/ui/device/confirm`, `/ui/device/invalid`, `/ui/error`); `GET
+  /device/verify/context` is a cookie-bound JSON endpoint (uniform `404`/`503`, never `200` with a
+  body the cookie doesn't authorize) feeding the SPA's confirmation page. The pages themselves are
+  a React SPA (`apps/authz-ui` in the `converse-frontends` monorepo) served under `/ui` — see the
+  `web/`-directory bullet under Top-Level Layout below, and ADR-0029. `/oauth2/end_session` (OIDC
+  RP-Initiated Logout 1.0) takes its subject from the `__Host-authz_session` cookie, never from
   `id_token_hint`, and cascades to every session that subject holds plus their refresh chains;
   `/oauth2/userinfo` (OIDC Core §5.3) returns identity claims only and never authorization data.
   It is a full IdP: `oauth2.relying_party` and an enabled `oauth2.token_exchange` are both
@@ -329,10 +337,12 @@ use crate::repo::StoreRepo;
   - `crates/lightbridge-authz-proto/`: proto-related exports (currently minimal).
 - `migrations/`: SQLx migrations.
 - `migrations-usage/`: SQLx migrations for usage events storage (Timescale-compatible schema).
-- There is **no `web/` directory and no JavaScript in this repository.** `authz-idp`'s hosted login
-  page is built in `converse-frontends` as `apps/authz-ui` and consumed here as a digest-pinned,
-  assets-only OCI image (`ghcr.io/adorsys-gis/converse-frontends/authz-ui`, bundle at `/dist`).
-  See ADR-0029.
+- There is **no `web/` directory and no JavaScript in this repository.** `authz-idp` renders no
+  HTML on the RP/device leg (see the `authz-idp` bullet above) — its pages are a React SPA built in
+  `converse-frontends` as `apps/authz-ui`, on the estate's `ui-web` design system, and consumed here
+  as a digest-pinned, assets-only OCI image (`ghcr.io/adorsys-gis/converse-frontends/authz-ui`,
+  bundle at `/dist` including `dist/routes.json`, the `/ui` route allowlist `static_assets.rs`
+  reads at startup). See ADR-0029.
 - `config/`: local default config (non-container paths).
 - `.docker/`: docker assets (service config, Keycloak realm import, Envoy example, IT scripts).
 - `compose.yaml`: local dev stack (Postgres, Keycloak, API/OPA, migrations, TLS generator).
@@ -851,7 +861,12 @@ Traces capture the full lifecycle of a validation request, including database lo
   boundary, so it is reviewed like a code change: dependency automation is explicitly configured
   not to touch it (`.github/dependabot.yml`'s `docker` `ignore:` block), and the bump procedure is
   documented at the ARG itself. The UI ships first and stays backward-compatible; the pin bump is
-  what makes it live (ADR-0029).
+  what makes it live (ADR-0029). **Since lightbridge-authz#607, the pin is no longer independently
+  revertible** (ADR-0029's Update): the RP leg `303`s into SPA routes (`/ui/device`,
+  `/ui/device/confirm`, `/ui/device/invalid`, `/ui/device/success`, `/ui/error`) that only exist in
+  artifacts carrying `dist/routes.json`, so reverting the pin alone can leave Rust redirecting into
+  paths an older bundle has no manifest for — a 404 at the authentication boundary. The rollback
+  unit is the whole cutover PR (pin + handoff + allowlist), not the pin alone.
 
 ## Security Notes
 
