@@ -10,6 +10,20 @@
 - Mirror: `lightbridge-governance` `docs/adr/0014-usage-telemetry-consolidates-into-the-authz-usage-store.md`
   — the two ADRs are written to agree; amending one without the other reopens #535.
 
+> **Update (2026-08-31):** `docs/adr/0028-finops-first-settles-the-usage-store-conventions.md`
+> amends several of this ADR's storage-convention details, decided before the first migration
+> shipped. It leaves the boundary decision, the four-grain taxonomy, "grain partitions storage,
+> vendor never does," and decision 4's *principle* (no unauthenticated door for developer-attributed
+> telemetry) untouched. What it supersedes, per ADR-0028's own "What this supersedes in ADR-0027":
+> decision 2's mermaid `source` tokens (`claude_code`/`microsoft_foundry`/`github_copilot`) are
+> replaced by ADR-0028 D4's kebab-case set (`claude-code`/`microsoft-foundry`/`github-copilot`);
+> decision 3's execution-grain dedup key `(trace_id, span_id)` is replaced by D22's
+> `(observed_at, trace_id, span_id)`; decision 3's uniform "retention 90 days" is replaced by D6's
+> tiered table (13 months raw, 25 months for day/seat facts and aggregates) — "compression at 7
+> days" survives; and decision 4's per-collector projected-ServiceAccount-token mechanism is
+> replaced by D8 (the principle is unchanged, only the mechanism). The section below is left as
+> originally written; read it together with ADR-0028 for the current state.
+
 ## Context
 
 Two repositories have been building two normalized, micro-USD, AI-usage telemetry stores, each

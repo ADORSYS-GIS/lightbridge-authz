@@ -108,9 +108,14 @@ optional) exactly like `server.query` above — this is not a new decision, it i
 same "hard-cutover, not a dormant flag" rule applied twice more.** `UsageConfig::
 oauth2` and `UsageConfig::scope_authority` (`crates/lightbridge-authz-usage/src/
 config.rs`) are also non-`Option` fields: a config omitting `oauth2.jwks_url` or any of
-`scope_authority.{base_url,username,password,ca_bundle_path}` fails to load, exactly
-the same failure mode `server.query`'s own rollout already produced once. The
-consequence is the same too, just doubled: a config-load failure kills BOTH listeners
+`scope_authority.{base_url,username,password}` fails to load, exactly
+the same failure mode `server.query`'s own rollout already produced once.
+(`scope_authority.ca_bundle_path` is `#[serde(default)] Option<String>` and does NOT
+gate config load — omitting it against a private-CA-signed `authz-opa` instead fails
+closed at REQUEST time: TLS verification fails on every `scope=account`/`scope=project`
+query, which `RemoteScopeAuthority` treats as "not authorized," i.e. every such query
+gets a `403`, not a startup crash.) The consequence of a genuine config-load failure
+is the same too, just doubled: it kills BOTH listeners
 at once, not just the query one — the ingest listener's OTLP writes are refused
 (usage/billing data loss for every request in the outage window) at the same moment
 the query listener's spend reads for `authz-budget` degrade to `Spend::Unavailable`
@@ -121,11 +126,12 @@ wave-not-hook.md`) and loads this identical config, a bad value here fails the
 `migrate` Job first — which fails the WHOLE app's ArgoCD sync, not merely this
 service's own rollout. **Deploy order, extended:** `ai-helm-values` MUST set
 `oauth2.jwks_url` (the same Keycloak/OIDC JWKS endpoint `authz-api`/`authz-opa`
-already point at) and all four `scope_authority` fields (`base_url` pointing at
-`authz-opa`'s in-cluster address, `username`/`password` matching `authz-opa`'s own
-`server.opa.basic_auth` credential exactly, and `ca_bundle_path` pointed at the same
-CA bundle `server.query.tls.client_ca_bundle_path` already uses) **in the same
-rollout** as this repo's image bump that introduces #570 — the chart's own
+already point at) and the three mandatory `scope_authority` fields (`base_url` pointing
+at `authz-opa`'s in-cluster address, `username`/`password` matching `authz-opa`'s own
+`server.opa.basic_auth` credential exactly) — plus the optional-but-effectively-required
+`ca_bundle_path`, pointed at the same CA bundle `server.query.tls.client_ca_bundle_path`
+already uses, or every account/project query fails closed once TLS verification fails —
+**in the same rollout** as this repo's image bump that introduces #570 — the chart's own
 `charts/lightbridge-authz-usage/values.yaml` documents this identically at
 `config.oauth2`/`config.scopeAuthority`.
 
@@ -404,12 +410,12 @@ coordinated change outside this repo).
 ### Integration notes
 
 - This repository does not include a Lightbridge frontend, so there are no in-repo UI call sites to enumerate.
-- The usage query endpoint is exercised by the integration test runner in [`.docker/it/servers_it.py`](.docker/it/servers_it.py:1).
-- The endpoint is also described at a high level in [`README.md`](README.md:118) and [`docs/usage-api.md`](docs/usage-api.md:1).
+- The usage query endpoint is exercised by the integration test runner in [`.docker/it/servers_it.py`](../.docker/it/servers_it.py).
+- The endpoint is also described at a high level in [`README.md`](../README.md:162) and [`docs/usage-api.md`](usage-api.md).
 
 ### Known quirks and limitations
 
-- Input validation errors currently surface as plain-text errors (often with HTTP 500) due to the shared error-to-response mapping in [`crates/lightbridge-authz-core/src/error.rs`](crates/lightbridge-authz-core/src/error.rs:1).
+- Input validation errors currently surface as plain-text errors (often with HTTP 500) due to the shared error-to-response mapping in [`crates/lightbridge-authz-core/src/error.rs`](../crates/lightbridge-authz-core/src/error.rs).
 - The API is aggregation-first: no raw events, no server-side ranking/top-N, no offset pagination, and fixed ordering by time bucket.
 
 ## How to?

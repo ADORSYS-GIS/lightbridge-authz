@@ -128,9 +128,20 @@ since ADR-0023, always mounted. See
 [`docs/oauth-oidc-standards-roadmap.md`](../oauth-oidc-standards-roadmap.md) for the canonical
 conformance-sequence status of each grant.
 
-**Human plane.** `authz-idp` is the OIDC broker for people, not machines — browser SSO, RFC 8628
-device pairing, and the token exchange those flows land in. Since lightbridge-authz#607 it renders
-no HTML on that leg at all: the pages are a React SPA, `apps/authz-ui` in the `converse-frontends`
+**Human plane, plus a disjoint machine plane on the same `/oauth2/token` route (ADR-0030, #534).**
+`authz-idp` is the OIDC broker for people — browser SSO, RFC 8628 device pairing, and the token
+exchange those flows land in — but `/oauth2/token` also serves RFC 6749 §4.4 `client_credentials`
+(M2M): intercepted before upstream dispatch (mirroring the pre-existing device-code intercept),
+`private_key_jwt`-only (`OauthClientType::Service`, behaviorally identical to `Confidential`),
+minting `sub = "svc:<client_id>"` with no `roles` claim — so a machine token holds zero permissions
+against every RPC op-id by the same "no roles claim -> empty `PermissionSet`" mechanism every other
+zero-role caller already goes through. There is no separate route or enable flag for this grant: it
+rides the always-mounted `/oauth2/token` handler and is advertised in discovery unconditionally,
+in the same block as the token-exchange/refresh grants (`signing.rs:838-848`), never gated on
+whether any `oauth2.clients` entry actually lists it.
+
+Since lightbridge-authz#607 the human-plane browser/device leg renders
+no HTML at all: the pages are a React SPA, `apps/authz-ui` in the `converse-frontends`
 monorepo, built on the estate's `ui-web` design system and served same-origin under `/ui` as a
 digest-pinned, assets-only OCI artifact (ADR-0029) — the pin is the single `ARG AUTHZ_UI_REF=` at
 the top of `./Dockerfile`, and pin + Rust handoff + `/ui` allowlist are one rollback unit, not
@@ -200,13 +211,13 @@ flowchart TD
 | Route | Method | Protection | Notes |
 | --- | --- | --- | --- |
 | `/`, `/healthz`, `/healthz/startup`, `/healthz/ready` | GET | none | Same probe wiring as every other server (`probe_router`), `/healthz/ready` checks DB reachability. |
-| `/.well-known/openid-configuration`, `/.well-known/oauth-authorization-server` | GET | none | `signing::well_known_router`, unconditional. `DiscoveryCapabilities::full_idp()` (ADR-0023): `grant_types_supported` always advertises token-exchange, `refresh_token`, `device_code`, and `authorization_code`; `authorization_endpoint`, `response_types_supported: ["code"]`, `response_modes_supported: ["query"]`, and `code_challenge_methods_supported: ["S256"]` are always present (#471). |
+| `/.well-known/openid-configuration`, `/.well-known/oauth-authorization-server` | GET | none | `signing::well_known_router`, unconditional. `DiscoveryCapabilities::full_idp()` (ADR-0023): `grant_types_supported` always advertises token-exchange, `refresh_token`, `client_credentials` (ADR-0030, #534 — unconditional, same block as token-exchange/refresh, never gated on a route mount), `device_code`, and `authorization_code`; `authorization_endpoint`, `response_types_supported: ["code"]`, `response_modes_supported: ["query"]`, and `code_challenge_methods_supported: ["S256"]` are always present (#471). |
 | `/.well-known/jwks.json` | GET | none | Same router, reads the shared `signing_keys` table. |
 | `/authorize` | GET | none (redirects to Keycloak login) | ADR-0019 Authorization Code + PKCE. Mandatory PKCE for every client type (#471), exact-match `redirect_uris` only. |
 | `/device/verify`, `/device/verify/continue` | GET, POST | none (rate-limited by caller IP, not authenticated) | `/device/verify` hands off to the SPA (lightbridge-authz#598: a 303 to `/ui/device`, RFC 8628 `verification_uri_complete`'s `user_code` prefill forwarded and sanitised) rather than rendering a page itself; `/device/verify/continue` still redirects on to Keycloak. |
 | `/device/verify/context` | GET | none (bound to the `__Host-authz_device_confirm` cookie `/device/verify` sets — see below) | Added by #598: what the SPA's `/ui/device/confirm` route fetches to render the confirmation the deleted server-rendered page used to print (`user_code`, `client_id`, never `device_code`). Uniform `404` for every absence (no cookie, wrong code, wrong `provider_id`); `503` only for a store outage. |
 | `/idp/callback` | GET | none | The fixed Keycloak OAuth2 redirect target both `/authorize` and `/device/verify` route through. |
-| `/oauth2/token` | POST | none (credential is the presented token/assertion) | RFC 8693 token exchange + `authorization_code` + `refresh_token` + RFC 8628 device-code grants, all unconditional (ADR-0023). `project_id` is an optional form param. |
+| `/oauth2/token` | POST | none (credential is the presented token/assertion) | RFC 8693 token exchange + `authorization_code` + `refresh_token` + RFC 8628 device-code grants, all unconditional (ADR-0023), plus RFC 6749 §4.4 `client_credentials` (M2M, ADR-0030, #534): `private_key_jwt`-only, intercepted before upstream dispatch via `client_credentials_token_endpoint`, mints `sub = "svc:<client_id>"` with no `roles` claim (zero RBAC permissions), never a refresh or ID token. `project_id` is an optional form param. |
 | `/oauth2/device_authorization` | POST | none | RFC 8628 device-authorization endpoint, unconditional. |
 | `/oauth2/revoke` | POST | none (credential is the presented token) | RFC 7009. |
 | `/ui/*` | GET | none | The hosted-login SPA build, path-scoped under `/ui` (ADR-0021 Decision 10 follow-up). Since lightbridge-authz#598, `/ui` is a route ALLOWLIST sourced from the artifact's own `dist/routes.json`, not a whole-subtree catch-all: only the manifest's listed paths resolve to `index.html`, a real file under `assets/` still serves regardless, and every other `/ui/*` path (like any path outside `/ui` matching no protocol route above) is a plain `404`. The bundle is built in `converse-frontends` (`apps/authz-ui`) and consumed here as a digest-pinned OCI artifact, not built in this repo (ADR-0029). |
@@ -234,6 +245,7 @@ in `crates/lightbridge-authz-rest/src/routers/mod.rs::opa_router`.
 | `/v1/opa/docs`, `/v1/opa/openapi.json` | GET | none | The one server in this repo that still publishes Swagger UI/OpenAPI — see `AGENTS.md`. |
 | `/v1/authorino/validate/introspect` | POST | Basic auth | Form-encoded, RFC 7662-shaped. Hashes the presented secret, loads `api_keys` by hash, rejects unknown/revoked/expired/suspended (account or project) as `{"active": false}`, updates telemetry, returns enriched context. |
 | `/idp/v1/resolve-context` | POST | Basic auth | `{subject, project_id} -> {account_id, project_id}`. A project resolves when the subject owns its account or holds a `project_members` row for it (ADR-0006); non-member and unknown-project are the same uniform `404`, deliberately, so the endpoint never leaks which projects exist. |
+| `/idp/v1/authorize-usage-scope` | POST | Basic auth | `{issuer, subject, scope, scope_id} -> 200` or uniform `404` (#570). The ownership authority `lightbridge-authz-usage`'s query listener calls for `account`/`project` usage-query scopes — same non-oracle convention and same real, Postgres-backed predicate as `resolve-context`. |
 
 **Correction to prior docs:** `AGENTS.md` and the pre-existing `docs/architecture.md` describe a
 `POST /v1/opa/validate` "minimal validation endpoint." No such route exists in
@@ -284,16 +296,18 @@ health probes, plus whatever routes are theirs below.
 | `/v1/otel/traces` | POST | `usage` (ingest) | **none** | OTLP trace ingest; caller is an AI Envoy/OpenTelemetry exporter outside this repo's deploy surface. |
 | `/v1/otel/metrics` | POST | `usage` (ingest) | **none** | OTLP metric ingest. |
 | `/v1/otel/logs` | POST | `usage` (ingest) | **none** | OTLP log ingest. |
-| `/usage/v1/usage/query` | POST | `query` | **mTLS (#347)** | Scoped, date-bin-aggregated usage query; TLS-layer client-cert requirement, no `scope_id` ownership check. |
-| `/usage/v1/spend/query` | POST | `query` | **mTLS (#347)** | Summed spend for an account/period, called by `lightbridge-authz-budget`'s `UsageServiceSpendReader`. |
+| `/usage/v1/usage/query` | POST | `query` | **mTLS (#347) + Bearer JWT + ownership (#570/#603/#605)** | Scoped, date-bin-aggregated usage query. On top of the TLS-layer client-cert requirement, the handler requires `Authorization: Bearer <end-user token>` (JWKS-validated) and, for `scope=account`/`scope=project`, checks the token's subject owns the scope via `authz-opa`'s `POST /idp/v1/authorize-usage-scope`; `scope=user` is self-ownership from the token, `scope=all` requires `usage:read-all`, `scope=api_key` is always refused. |
+| `/usage/v1/spend/query` | POST | `query` | **mTLS (#347)** | Summed spend for an account/period, called by `lightbridge-authz-budget`'s `UsageServiceSpendReader`; refuses any request carrying an `Authorization` header (#603). |
 
-This service has no application-level authentication anywhere on its data-plane routes — mTLS on
-the `query` listener authenticates the caller (any workload holding a CA-signed cert), not which
-`scope_id`/`account_id` it's entitled to see, and the `usage` (ingest) listener has none at all.
-That ownership gap is a known, accepted one today — see [`README.md`](./README.md)'s
-context-diagram notes and [`deployment.md`](./deployment.md) for why it is currently safe (network
-topology, not application auth) and what would need to change before it could be routed
-externally.
+This service's ingest listener (`usage`) has no application-level authentication at all — its
+caller is an AI Envoy/OpenTelemetry exporter outside this repo's deploy surface. The `query`
+listener's mTLS authenticates the caller (any workload holding a CA-signed cert), not by itself
+which `scope_id`/`account_id` it's entitled to see — but `/usage/v1/usage/query` now closes that
+gap with the bearer/ownership check in the row above; `/usage/v1/spend/query` remains a
+service-to-service route with no per-caller ownership check by design (its only legitimate caller,
+`authz-budget`, asks about any account). See [`README.md`](./README.md)'s context-diagram notes and
+[`deployment.md`](./deployment.md) for the network-topology posture (`ClusterIP`-only, no ingress)
+that remains the primary containment for the ingest listener and for `/usage/v1/spend/query`.
 
 ## Crate layering behind `authz-api` / `authz-opa`
 

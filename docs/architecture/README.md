@@ -42,6 +42,7 @@ flowchart LR
     KcAdapter -->|"Basic auth: resolve-context"| OPA
     McpClient -->|"Bearer JWT"| MCP
     OtelExporters -->|"OTLP/HTTP, unauthenticated"| Usage
+    Frontend -->|"mTLS + Bearer JWT + ownership"| Usage
 
     API -->|"validate via JWKS"| Keycloak
     Budget -->|"validate via JWKS"| Keycloak
@@ -93,9 +94,16 @@ Notes grounded in code, not intent:
   stays unprotected (its caller is an AI Envoy/OpenTelemetry exporter outside this repo's deploy
   surface); `/usage/v1/usage/query` and `/usage/v1/spend/query` moved to a separate listener that
   requires and verifies a client certificate (mTLS) — see `UsageServerGroup` in
-  `crates/lightbridge-authz-usage/src/config.rs`. Neither route has an ownership check on
-  `scope_id`/`account_id` — mTLS authenticates the caller, not what it's entitled to see. Safe
-  only because the service is not externally routable in the deployed topology regardless; see
+  `crates/lightbridge-authz-usage/src/config.rs`. **The two routes diverge above the TLS layer
+  (#570/#603/#605):** `/usage/v1/usage/query` additionally requires an end-user
+  `Authorization: Bearer` token (JWKS-validated) and, for `scope=account`/`scope=project`, checks
+  the token's subject actually owns the requested scope via `authz-opa`'s
+  `POST /idp/v1/authorize-usage-scope`; `scope=user` is self-ownership answered from the token
+  directly, `scope=all` requires the `usage:read-all` permission, and `scope=api_key` has no
+  resolvable ownership authority and is always refused. `/usage/v1/spend/query` stays mTLS-only —
+  it is `authz-budget`'s legitimate cross-account service reader with no per-caller ownership check
+  by design — but now REFUSES any request carrying an `Authorization` header. Safe only because the
+  service is not externally routable in the deployed topology regardless; see
   `docs/architecture/deployment.md`.
 
 ## Containers: the six deployables
@@ -114,7 +122,7 @@ flowchart TB
     Budget["authz-budget\nport 3005"]
     Idp["authz-idp\nport 3004"]
     MCP["lightbridge-mcp\nport 3000"]
-    Usage["lightbridge-authz-usage\nport 3002"]
+    Usage["lightbridge-authz-usage\nport 3002 (ingest) / 3006 (query, mTLS)\n(the umbrella chart uses 3000 ingest instead)"]
 
     AuthzDB[("Postgres - authz db\n(shared)")]
     UsageDB[("Timescale/Postgres - usage db")]
@@ -124,6 +132,7 @@ flowchart TB
     C1 -->|"Bearer JWT"| MCP
     C2 -->|"Basic auth"| OPA
     C3 -->|"unprotected"| Usage
+    C1 -->|"mTLS + Bearer JWT + ownership"| Usage
     C4 -->|"public discovery/JWKS + RFC 8693 exchange"| Idp
 
     API --> AuthzDB

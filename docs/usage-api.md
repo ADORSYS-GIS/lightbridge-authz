@@ -1,6 +1,6 @@
 # Usage API (lightbridge-authz-usage)
 
-`lightbridge-authz-usage` ingests OTLP/HTTP traces + metrics from AI Envoy/OpenTelemetry exporters and stores normalized usage events in Timescale/Postgres.
+`lightbridge-authz-usage` ingests OTLP/HTTP traces + metrics + logs from AI Envoy/OpenTelemetry exporters and stores normalized usage events in Timescale/Postgres.
 
 > [!WARNING]
 > **The ingest routes are unauthenticated.** This service splits its TLS surface
@@ -59,6 +59,11 @@
 - `POST /usage/v1/usage/query`
   - Single query endpoint for scoped, bucketed usage retrieval. Requires
     `Authorization: Bearer <end-user access token>` (#570) — see the warning above.
+- `POST /usage/v1/spend/query`
+  - Summed spend for an account/period, called by `lightbridge-authz-budget`'s
+    `UsageServiceSpendReader`. mTLS-only, no bearer token, no per-caller ownership check (it is a
+    legitimate cross-account service-to-service reader) — and since #603 REFUSES any request
+    carrying an `Authorization` header, returning `403`.
 
 ## Query request
 
