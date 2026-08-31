@@ -13,6 +13,8 @@ use axum::http::{Request, StatusCode, header};
 use chrono::{DateTime, Utc};
 use httpmock::Method::POST;
 use httpmock::MockServer;
+use lightbridge_authz_core::Permission;
+use lightbridge_authz_core::authz::PermissionSet;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_usage_rest::UsageState;
 use lightbridge_authz_usage_rest::build_query_router;
@@ -239,9 +241,12 @@ async fn own_project_scope_returns_200_and_other_tenants_is_refused(pool: PgPool
     assert_eq!(body, serde_json::Value::Null);
 }
 
-/// Test 4: `user`/`api_key` scopes have no resolvable ownership authority and are refused
-/// unconditionally -- never reaching `scope_authority` at all, so authorizing EVERYTHING there
-/// still must not let these scopes through.
+/// Test 4: `api_key` has no resolvable ownership authority and is refused unconditionally --
+/// never reaching `scope_authority` at all, so authorizing EVERYTHING there still must not let it
+/// through. `user` is refused here too, but for a DIFFERENT reason since the self-ownership
+/// change below: `scope_id="user_1"` simply isn't the caller's own subject (`"sub-a"`) -- see
+/// `own_user_scope_returns_200_with_data`/`other_subjects_user_scope_is_refused` for the
+/// self-ownership rule's positive/negative cases.
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn user_and_api_key_scopes_are_refused_unconditionally(pool: PgPool) {
     seed(&pool, "acct-tenant-a", "proj-tenant-a").await;
@@ -424,4 +429,173 @@ async fn spend_endpoint_refuses_bearer_carrying_requests(pool: PgPool) {
         .await
         .expect("router must produce a response");
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// A seeded event whose `user_id` is the caller's own subject -- distinct from `sample_event`
+/// (which hardcodes `user_id: "user_1"`) specifically so the self-ownership tests below can prove
+/// "the caller's own subject" is what unlocks `scope=user`, not any fixed string.
+fn sample_event_for_user(user_id: &str, observed_at: DateTime<Utc>) -> UsageEvent {
+    UsageEvent {
+        observed_at,
+        signal_type: "trace".to_string(),
+        account_id: Some("acct-tenant-a".to_string()),
+        project_id: Some("proj-tenant-a".to_string()),
+        api_key_id: Some("key_1".to_string()),
+        user_id: Some(user_id.to_string()),
+        user_name: None,
+        model: None,
+        metric_name: None,
+        usage_value: 1.0,
+        request_count: 1,
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
+        total_cost: Some(1.0),
+        latency_ms: None,
+        attributes: json!({}),
+    }
+}
+
+/// Test 8: `scope=user` self-ownership (the un-break for the console's own `/settings/overview/
+/// user` lens #603 broke) -- the caller reading `scope_id` equal to THEIR OWN validated subject
+/// gets `200` with their data, with no `scope_authority` round trip at all (`refuse_everything_
+/// scope_authority` proves this: it refuses everything, and the request still succeeds because
+/// `scope=user` never reaches it for the self case).
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn own_user_scope_returns_200_with_data(pool: PgPool) {
+    let subject = "sub-a";
+    let repo = StoreRepo::new(Arc::new(DbPool::from_pool(pool.clone())));
+    repo.insert_usage_events(&[sample_event_for_user(
+        subject,
+        parse_timestamp("2026-08-15T12:00:00Z"),
+    )])
+    .await
+    .expect("seeding a usage_events row must succeed");
+
+    let bearer = support::bearer_with("token-a", ISSUER, subject);
+    let scope_authority = support::refuse_everything_scope_authority();
+
+    let (status, body) = query(
+        app(pool, bearer, scope_authority),
+        Some("Bearer token-a"),
+        "user",
+        subject,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let response: UsageQueryResponse =
+        serde_json::from_value(body).expect("response must be a UsageQueryResponse");
+    assert_eq!(
+        response.points.len(),
+        1,
+        "the caller must see their own seeded user-scoped data"
+    );
+}
+
+/// Test 9: the negative case for self-ownership -- a caller asking for a DIFFERENT subject's
+/// `scope=user` data is refused with 403 and no data, exactly like the pre-existing account/
+/// project ownership checks, even though `scope_authority` would authorize everything (proving
+/// this is decided from the token's own subject, never delegated to the authority for `user`).
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn other_subjects_user_scope_is_refused(pool: PgPool) {
+    let repo = StoreRepo::new(Arc::new(DbPool::from_pool(pool.clone())));
+    repo.insert_usage_events(&[sample_event_for_user(
+        "sub-victim",
+        parse_timestamp("2026-08-15T12:00:00Z"),
+    )])
+    .await
+    .expect("seeding a usage_events row must succeed");
+
+    struct AuthorizeEverything;
+    #[lightbridge_authz_core::async_trait]
+    impl lightbridge_authz_usage_rest::scope_authority::ScopeAuthority for AuthorizeEverything {
+        async fn authorize(
+            &self,
+            _issuer: &str,
+            _subject: &str,
+            _scope: &UsageScope,
+            _scope_id: &str,
+        ) -> lightbridge_authz_core::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    let bearer = support::bearer_with("token-attacker", ISSUER, "sub-attacker");
+
+    let (status, body) = query(
+        app(pool, bearer, Arc::new(AuthorizeEverything)),
+        Some("Bearer token-attacker"),
+        "user",
+        "sub-victim",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        body,
+        serde_json::Value::Null,
+        "a refused scope=user query must never leak another subject's data"
+    );
+}
+
+/// Test 10: `scope=all` requires `Permission::UsageReadAll` -- a caller without it is refused
+/// with 403 and no data, even though `scope_authority` would authorize everything (proving this
+/// is a coarse RBAC gate, not delegated to the ownership authority, which has no "all" predicate
+/// at all).
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn all_scope_without_permission_is_refused(pool: PgPool) {
+    seed(&pool, "acct-tenant-a", "proj-tenant-a").await;
+
+    let bearer = support::bearer_with("token-a", ISSUER, "sub-a");
+
+    let (status, body) = query(
+        app(pool, bearer, support::refuse_everything_scope_authority()),
+        Some("Bearer token-a"),
+        "all",
+        "",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, serde_json::Value::Null);
+}
+
+/// Test 11: `scope=all` for a caller holding `Permission::UsageReadAll` returns `200` with rows
+/// spanning MULTIPLE `account_id`s -- proving `scope=all` genuinely adds no entity filter at all,
+/// not merely "works for one account like `scope=account` would."
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn all_scope_with_permission_returns_200_across_accounts(pool: PgPool) {
+    seed(&pool, "acct-tenant-a", "proj-tenant-a").await;
+    seed(&pool, "acct-tenant-b", "proj-tenant-b").await;
+
+    let bearer = support::bearer_with_permissions(
+        "token-admin",
+        ISSUER,
+        "sub-admin",
+        PermissionSet::from_iter([Permission::UsageReadAll]),
+    );
+
+    let (status, body) = query(
+        app(pool, bearer, support::refuse_everything_scope_authority()),
+        Some("Bearer token-admin"),
+        "all",
+        "",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let response: UsageQueryResponse =
+        serde_json::from_value(body).expect("response must be a UsageQueryResponse");
+    assert_eq!(
+        response.points.len(),
+        1,
+        "both accounts' events land in the same time bucket with no group_by, so they aggregate \
+         into a single point"
+    );
+    assert_eq!(
+        response.points[0].requests, 2,
+        "scope=all must sum requests across BOTH tenant-a's and tenant-b's seeded events -- proof \
+         no entity filter was added"
+    );
 }

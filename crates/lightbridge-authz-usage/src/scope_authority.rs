@@ -20,17 +20,19 @@ use lightbridge_authz_core::{AuthorizeUsageScopeRequest, Result, async_trait};
 use crate::models::UsageScope;
 
 /// Maps [`UsageScope`] to the wire string `authz-opa`'s `authorize_usage_scope` predicate
-/// matches on (`"account"` / `"project"`). `User`/`ApiKey` have no resolvable ownership
-/// predicate at all -- callers must refuse those scopes unconditionally before ever reaching this
-/// trait (see `handlers::query::query_usage`), so this function is never called with them, but it
-/// still maps them to a value `authz-opa`'s own `_ => Err(Error::NotFound)` arm refuses uniformly,
-/// as defense in depth.
+/// matches on (`"account"` / `"project"`). `User`/`ApiKey`/`All` have no resolvable ownership
+/// predicate at all -- callers must refuse/resolve those scopes before ever reaching this trait
+/// (`User` against the caller's own subject, `All` against `Permission::UsageReadAll`, `ApiKey`
+/// unconditionally -- see `handlers::query::query_usage`), so this function is never called with
+/// them, but it still maps every variant to a value `authz-opa`'s own `_ => Err(Error::NotFound)`
+/// arm refuses uniformly, as defense in depth.
 fn scope_wire_value(scope: &UsageScope) -> &'static str {
     match scope {
         UsageScope::Account => "account",
         UsageScope::Project => "project",
         UsageScope::User => "user",
         UsageScope::ApiKey => "api_key",
+        UsageScope::All => "all",
     }
 }
 
@@ -276,6 +278,7 @@ mod tests {
         assert_eq!(scope_wire_value(&UsageScope::Project), "project");
         assert_eq!(scope_wire_value(&UsageScope::User), "user");
         assert_eq!(scope_wire_value(&UsageScope::ApiKey), "api_key");
+        assert_eq!(scope_wire_value(&UsageScope::All), "all");
     }
 
     #[tokio::test]

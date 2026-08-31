@@ -29,6 +29,13 @@ than asserted.
 
 ### Verified current state (against `origin/main`, not this worktree)
 
+> **Update (2026-08-31):** `UsageScope` below has since grown a 5th variant, `All`
+> (estate-wide, no entity filter, gated on the `usage:read-all` permission rather than
+> an ownership predicate) — the closed-schema property this section verifies is
+> unaffected by that addition (still enum-constrained, no free-text field). See
+> `crates/lightbridge-authz-usage/src/models/mod.rs` and `docs/lightbridge-query-api.md`
+> for the current shape; the bullet below is left as originally verified.
+
 **The usage query API itself:**
 
 - `UsageQueryRequest` (`crates/lightbridge-authz-usage/src/models/mod.rs:15-28`) has exactly eight

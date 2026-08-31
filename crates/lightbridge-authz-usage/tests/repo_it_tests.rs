@@ -178,6 +178,49 @@ async fn query_usage_scopes_by_account_project_api_key_and_user(pool: PgPool) {
     }
 }
 
+/// `scope=all` adds no entity filter at all (`repo::push_scope_filters`'s `All` arm is a no-op
+/// beyond the time range) -- proved here by seeding events under TWO different `account_id`s and
+/// asserting a single `scope=all` query sums requests across BOTH of them, not just one.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn query_usage_scope_all_spans_multiple_accounts(pool: PgPool) {
+    let repo = build_repo(pool);
+    let now = Utc::now();
+    let event_a = UsageEvent {
+        account_id: Some("acct_a".to_string()),
+        project_id: Some("proj_a".to_string()),
+        ..sample_event(now)
+    };
+    let event_b = UsageEvent {
+        account_id: Some("acct_b".to_string()),
+        project_id: Some("proj_b".to_string()),
+        ..sample_event(now)
+    };
+    repo.insert_usage_events(&[event_a, event_b])
+        .await
+        .expect("insert should succeed");
+
+    let request = UsageQueryRequest {
+        scope: UsageScope::All,
+        scope_id: String::new(),
+        ..base_query(now)
+    };
+
+    let (points, _truncated) = repo
+        .query_usage(&request)
+        .await
+        .expect("query should succeed");
+
+    assert_eq!(
+        points.len(),
+        1,
+        "both accounts' events land in the same bucket with no group_by"
+    );
+    assert_eq!(
+        points[0].requests, 2,
+        "scope=all must sum requests across both acct_a and acct_b"
+    );
+}
+
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn query_usage_returns_empty_when_scope_id_does_not_match(pool: PgPool) {
     let repo = build_repo(pool);

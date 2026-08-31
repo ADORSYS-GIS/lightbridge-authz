@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use lightbridge_authz_core::{Error, Result};
+use lightbridge_authz_core::{Error, Permission, Result};
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
@@ -115,7 +115,11 @@ pub async fn query_usage(
         ));
     }
 
-    if input.scope_id.trim().is_empty() {
+    // `scope_id` stays a required wire field (`UsageQueryRequest::scope_id` is not `Option`) for
+    // every scope, but `UsageScope::All` has no `scope_id` to validate -- there is no single ID an
+    // estate-wide query is "about" -- so an empty value is the documented, expected shape for that
+    // one scope and must not be rejected here.
+    if !matches!(input.scope, UsageScope::All) && input.scope_id.trim().is_empty() {
         warn!("missing scope_id for usage query");
         return Err(Error::BadRequest(
             "scope_id is required for usage queries".to_string(),
@@ -129,16 +133,46 @@ pub async fn query_usage(
         ));
     }
 
-    // `user`/`api_key` scopes have no resolvable ownership authority at all (no `accounts`/
-    // `projects` row is ever keyed by a raw `user_id`/`api_key_id`) -- refused unconditionally,
-    // matching the console's own guard, and never reaching `scope_authority` at all.
     match &input.scope {
-        UsageScope::User | UsageScope::ApiKey => {
+        // Self-ownership: the caller reading their OWN usage. `user_id` is never a row any
+        // `accounts`/`projects` table is keyed by, so there is no `scope_authority` predicate to
+        // call for it (unlike account/project) -- but "is this token's own subject" needs no
+        // remote call at all, it is answered entirely from the already-JWKS-validated
+        // `token_info.sub`. Any `scope_id` other than the caller's own subject is refused --
+        // there is still no ownership predicate that would let a caller read someone ELSE's
+        // per-user usage.
+        UsageScope::User => {
+            if input.scope_id != token_info.sub {
+                warn!(
+                    scope = ?input.scope,
+                    "query_usage: scope=user requested for a subject other than the caller's own; refusing"
+                );
+                return Ok(forbidden());
+            }
+        }
+        // `api_key` has no resolvable ownership authority at all (no `accounts`/`projects` row is
+        // ever keyed by a raw `api_key_id`) and no caller-subject shortcut either (an API key's
+        // bearer token, if one even existed here, is not "the API key itself") -- refused
+        // unconditionally, matching the console's own guard, and never reaching `scope_authority`.
+        UsageScope::ApiKey => {
             warn!(
                 scope = ?input.scope,
                 "query_usage: scope has no resolvable ownership authority; refusing"
             );
             return Ok(forbidden());
+        }
+        // Estate-wide: no per-row ownership predicate exists for "everything", by definition, so
+        // this is gated on a coarse RBAC permission instead -- the SAME `Permission::UsageReadAll`
+        // check regardless of what (if anything) `scope_id` was set to (already validated above to
+        // be the "ignored" empty-or-anything shape `UsageScope::All` documents).
+        UsageScope::All => {
+            if !token_info.has_permission(Permission::UsageReadAll) {
+                warn!(
+                    scope = ?input.scope,
+                    "query_usage: scope=all requires usage:read-all; refusing"
+                );
+                return Ok(forbidden());
+            }
         }
         UsageScope::Account | UsageScope::Project => {
             let authorized = state

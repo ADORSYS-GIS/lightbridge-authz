@@ -35,6 +35,14 @@ pub enum UsageScope {
     ApiKey,
     Project,
     Account,
+    /// Estate-wide query: no `account_id`/`project_id`/`user_id`/`api_key_id` filter is added at
+    /// all (`repo::push_scope_filters`'s `All` arm), so the query spans every account. Requires
+    /// the caller's validated bearer token to hold `Permission::UsageReadAll`
+    /// (`handlers::query::query_usage`) -- there is no per-row ownership predicate for "all", by
+    /// definition, so this is gated on a coarse RBAC permission instead of `ScopeAuthority`.
+    /// `scope_id` is still a required wire field (see `UsageQueryRequest::scope_id`) but is
+    /// ignored for this scope; callers should send `""`.
+    All,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema, PartialEq, Eq, Hash)]

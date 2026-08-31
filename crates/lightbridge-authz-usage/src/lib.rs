@@ -261,7 +261,7 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
     ),
     tags(
         (name = "ingest", description = "OTEL ingest endpoints (unauthenticated, ClusterIP-only -- see AGENTS.md's Security Notes)"),
-        (name = "usage", description = "Timeseries usage query endpoint -- mTLS-required listener (#347) plus an end-user bearer token and ownership check (#570), see UsageServerGroup::query"),
+        (name = "usage", description = "Timeseries usage query endpoint -- mTLS-required listener (#347) plus an end-user bearer token and ownership check (#570); scope=user is self-ownership-only and scope=all requires the usage:read-all permission, see UsageServerGroup::query"),
         (name = "spend", description = "Internal spend-query endpoint used by the budget domain -- mTLS-required listener (#347), see UsageServerGroup::query")
     )
 )]

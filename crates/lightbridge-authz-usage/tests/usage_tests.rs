@@ -420,43 +420,177 @@ async fn query_usage_refuses_when_scope_authority_declines() {
     assert_eq!(body_json(response).await, serde_json::Value::Null);
 }
 
-/// #570: `user`/`api_key` scopes are refused unconditionally, even when `scope_authority` would
-/// authorize everything -- there is no resolvable ownership predicate for them at all.
+struct AuthorizeEverything;
+#[async_trait]
+impl lightbridge_authz_usage_rest::scope_authority::ScopeAuthority for AuthorizeEverything {
+    async fn authorize(
+        &self,
+        _issuer: &str,
+        _subject: &str,
+        _scope: &UsageScope,
+        _scope_id: &str,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+}
+
+/// `api_key` has no resolvable ownership predicate at all (no `accounts`/`projects` row is ever
+/// keyed by a raw `api_key_id`, and unlike `user` there is no caller-subject shortcut either) --
+/// refused unconditionally, even when `scope_authority` would authorize everything.
 #[tokio::test]
-async fn query_usage_refuses_user_and_api_key_scopes_unconditionally() {
-    struct AuthorizeEverything;
-    #[async_trait]
-    impl lightbridge_authz_usage_rest::scope_authority::ScopeAuthority for AuthorizeEverything {
-        async fn authorize(
-            &self,
-            _issuer: &str,
-            _subject: &str,
-            _scope: &UsageScope,
-            _scope_id: &str,
-        ) -> Result<bool> {
-            Ok(true)
-        }
-    }
+async fn query_usage_refuses_api_key_scope_unconditionally() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo::default()),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: Arc::new(AuthorizeEverything),
+    });
 
-    for scope in [UsageScope::User, UsageScope::ApiKey] {
-        let state = Arc::new(UsageState {
+    let req = UsageQueryRequest {
+        scope: UsageScope::ApiKey,
+        scope_id: "whatever".to_string(),
+        ..base_request()
+    };
+    let response = call_query_usage(state, authorized_headers(), req).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "scope=api_key must be refused unconditionally"
+    );
+}
+
+/// `scope=user` self-ownership: the caller asking for THEIR OWN subject's usage is allowed, with
+/// no `scope_authority` round trip at all -- `refuse_everything_scope_authority` proves the point
+/// (the request still succeeds even though the authority refuses everything, because `scope=user`
+/// self never reaches it).
+#[tokio::test]
+async fn query_usage_allows_own_user_scope() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+            spend: None,
+            truncated: false,
+        }),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: support::refuse_everything_scope_authority(),
+    });
+
+    let req = UsageQueryRequest {
+        scope: UsageScope::User,
+        scope_id: TEST_SUBJECT.to_string(),
+        ..base_request()
+    };
+    let response = call_query_usage(state, authorized_headers(), req).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// `scope=user` for any subject OTHER than the caller's own is still refused, even when
+/// `scope_authority` would authorize everything -- proving self-ownership is decided from the
+/// token, never delegated to the authority for this scope.
+#[tokio::test]
+async fn query_usage_refuses_other_subjects_user_scope() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo::default()),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: Arc::new(AuthorizeEverything),
+    });
+
+    let req = UsageQueryRequest {
+        scope: UsageScope::User,
+        scope_id: "someone-else".to_string(),
+        ..base_request()
+    };
+    let response = call_query_usage(state, authorized_headers(), req).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await, serde_json::Value::Null);
+}
+
+/// `scope=all` requires `Permission::UsageReadAll` -- a caller without it is refused, even when
+/// `scope_authority` would authorize everything (there is no "all" predicate on that authority at
+/// all; this is a coarse RBAC gate, decided entirely from the token's own permissions).
+#[tokio::test]
+async fn query_usage_refuses_all_scope_without_permission() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo::default()),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: Arc::new(AuthorizeEverything),
+    });
+
+    let req = UsageQueryRequest {
+        scope: UsageScope::All,
+        scope_id: String::new(),
+        ..base_request()
+    };
+    let response = call_query_usage(state, authorized_headers(), req).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await, serde_json::Value::Null);
+}
+
+/// `scope=all` for a caller holding `Permission::UsageReadAll` is allowed, with an empty
+/// `scope_id` (the documented "ignored" shape) and no `scope_authority` round trip at all.
+#[tokio::test]
+async fn query_usage_allows_all_scope_with_permission() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo::default()),
+        bearer: support::bearer_with_permissions(
+            TEST_TOKEN,
+            TEST_ISSUER,
+            TEST_SUBJECT,
+            lightbridge_authz_core::authz::PermissionSet::from_iter([
+                lightbridge_authz_core::Permission::UsageReadAll,
+            ]),
+        ),
+        scope_authority: support::refuse_everything_scope_authority(),
+    });
+
+    let req = UsageQueryRequest {
+        scope: UsageScope::All,
+        scope_id: String::new(),
+        ..base_request()
+    };
+    let response = call_query_usage(state, authorized_headers(), req).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// `scope_id` stays required for every scope except `all`, which has none to validate.
+#[tokio::test]
+async fn query_usage_all_scope_does_not_require_scope_id() {
+    let req = UsageQueryRequest {
+        scope: UsageScope::All,
+        scope_id: String::new(),
+        ..base_request()
+    };
+    let result = query_usage(
+        axum::extract::State(Arc::new(UsageState {
             repo: Arc::new(MockUsageRepo::default()),
-            bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
-            scope_authority: Arc::new(AuthorizeEverything),
-        });
+            bearer: support::bearer_with_permissions(
+                TEST_TOKEN,
+                TEST_ISSUER,
+                TEST_SUBJECT,
+                lightbridge_authz_core::authz::PermissionSet::from_iter([
+                    lightbridge_authz_core::Permission::UsageReadAll,
+                ]),
+            ),
+            scope_authority: support::refuse_everything_scope_authority(),
+        })),
+        authorized_headers(),
+        Json(req),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "scope=all with an empty scope_id must not be rejected as a bad request"
+    );
+}
 
-        let req = UsageQueryRequest {
-            scope: scope.clone(),
-            scope_id: "whatever".to_string(),
-            ..base_request()
-        };
-        let response = call_query_usage(state, authorized_headers(), req).await;
-        assert_eq!(
-            response.status(),
-            StatusCode::FORBIDDEN,
-            "scope {scope:?} must be refused unconditionally"
-        );
-    }
+/// Serde round-trip for `UsageScope::All` -- the wire representation is `"all"`.
+#[test]
+fn usage_scope_all_serializes_as_lowercase_all() {
+    let json = serde_json::to_string(&UsageScope::All).expect("UsageScope::All must serialize");
+    assert_eq!(json, "\"all\"");
+    let parsed: UsageScope =
+        serde_json::from_str("\"all\"").expect("\"all\" must deserialize to UsageScope::All");
+    assert!(matches!(parsed, UsageScope::All));
 }
 
 #[tokio::test]

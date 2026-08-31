@@ -408,6 +408,13 @@ fn push_scope_filters(builder: &mut QueryBuilder<Postgres>, input: &UsageQueryRe
             builder.push(" AND account_id = ");
             builder.push_bind(&input.scope_id);
         }
+        // Estate-wide: deliberately no entity filter at all -- this is the one arm of this match
+        // that adds nothing to the `WHERE` clause beyond the time range already pushed above.
+        // Authorization for this scope is enforced entirely in
+        // `handlers::query::query_usage` (requires `Permission::UsageReadAll`) before this
+        // function is ever called; by the time a query reaches this repo, `scope=all` is already
+        // known-authorized.
+        UsageScope::All => {}
     }
 
     if let Some(account_id) = &input.filters.account_id {

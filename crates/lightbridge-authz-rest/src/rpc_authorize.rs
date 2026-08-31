@@ -394,7 +394,7 @@ pub const MAPPED_OP_ID_PERMISSIONS: &[(&str, Permission)] = &[
 /// The `auth().<field>` name `CratestackAuthProvider` bakes each [`Permission`]'s boolean grant
 /// into, and every generated `@allow`/`@@allow` clause in `authz.cstack` reads. Mechanically
 /// derived from [`Permission::as_str`]'s canonical `resource:action` string (splitting further on
-/// `-` for hyphenated actions like `read-own`) rather than a second hand-typed list of 31 names —
+/// `-` for hyphenated actions like `read-own`) rather than a second hand-typed list of 32 names —
 /// same single-source-of-truth reasoning as [`MAPPED_OP_ID_PERMISSIONS`] above. E.g.
 /// `"account:create"` -> `"permAccountCreate"`, `"budget:read-own"` -> `"permBudgetReadOwn"`.
 pub fn permission_field_name(permission: Permission) -> String {

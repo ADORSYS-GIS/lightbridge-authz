@@ -15,10 +15,19 @@
 > `authz-opa`'s `POST /idp/v1/authorize-usage-scope`
 > (`ScopeAuthority`, [`crates/lightbridge-authz-usage/src/scope_authority.rs`](../crates/lightbridge-authz-usage/src/scope_authority.rs))
 > to check the token's subject actually owns the requested `account`/`project` scope
-> before running the query. `scope=user`/`scope=api_key` have no resolvable ownership
-> predicate at all and are refused unconditionally (`403`). Missing/invalid bearer →
-> `401`; authenticated but not authorized, or the authority being unreachable/erroring
-> → `403` with an opaque body (fail-closed — never treated as authorized).
+> before running the query. `scope=api_key` has no resolvable ownership predicate at
+> all and is refused unconditionally (`403`). `scope=user` is allowed ONLY when
+> `scope_id` equals the validated token's own `sub` (self-ownership — the caller
+> reading their own usage; anything else is `403`, and `scope_authority` is never
+> consulted for this scope either way). `scope=all` (estate-wide, no entity filter at
+> all) requires the validated token to hold the `usage:read-all` permission
+> (`Permission::UsageReadAll`, `lightbridge-authz-core::authz`) — granted to
+> `lightbridge-admin` by that role's default `*` grant, configurable like every other
+> permission via `oauth2.rbac.role_permissions`; `scope_authority` is not consulted
+> for this scope either, since there is no per-row ownership predicate for
+> "everything." Missing/invalid bearer → `401`; authenticated but not authorized, or
+> the authority being unreachable/erroring (`account`/`project` only) → `403` with an
+> opaque body (fail-closed — never treated as authorized).
 >
 > **Divergence, stated not hidden:** the backend predicate (account owner, OR project
 > owner/roster member) is deliberately WIDER than the console UI's own client-side
@@ -149,8 +158,8 @@ The request is JSON and matches the `UsageQueryRequest` model.
 
 | Field | Type | Required | Default | Meaning |
 |---|---|---:|---|---|
-| `scope` | enum: `user` \| `api_key` \| `project` \| `account` | yes | none | Primary scoping dimension. Adds a mandatory equality filter based on `scope_id`. |
-| `scope_id` | string | yes | none | The ID value for the chosen `scope`. Must be non-empty. |
+| `scope` | enum: `user` \| `api_key` \| `project` \| `account` \| `all` | yes | none | Primary scoping dimension. Adds a mandatory equality filter based on `scope_id`, except `all` (see below). |
+| `scope_id` | string | yes | none | The ID value for the chosen `scope`. Must be non-empty for every scope except `all`, where it is ignored -- send `""`. |
 | `start_time` | RFC3339 datetime | yes | none | Inclusive start of the time window (`observed_at >= start_time`). |
 | `end_time` | RFC3339 datetime | yes | none | Exclusive end of the time window (`observed_at < end_time`). Must be after `start_time`. |
 | `bucket` | string interval | no | `"1 hour"` | Bucket size for time aggregation. Must match `^\d+\s+(second|seconds|minute|minutes|hour|hours|day|days)$`. Examples: `"5 minutes"`, `"1 hour"`, `"30 days"`. |
@@ -353,15 +362,36 @@ through `authz-api` first):
    already enforces for the OIDC token-exchange path (own the account/project, or hold
    a `project_members` roster row) — see
    [`crates/lightbridge-authz-api-key/src/repo.rs`](../crates/lightbridge-authz-api-key/src/repo.rs)'s
-   `authorize_usage_scope`. `scope=user`/`scope=api_key` have no resolvable ownership
-   predicate at all (no `accounts`/`projects` row is ever keyed by a raw `user_id`/
-   `api_key_id`) and are refused unconditionally, before ever calling the authority.
-3. **Fail-closed on every authority failure mode.** A transport error, timeout,
+   `authorize_usage_scope`. `scope=api_key` has no resolvable ownership predicate at
+   all (no `accounts`/`projects` row is ever keyed by a raw `api_key_id`) and is
+   refused unconditionally, before ever calling the authority.
+3. **Self-ownership for `scope=user`.** Answered entirely from the already-validated
+   token, no remote call: allowed iff `scope_id` equals the token's own `sub`, refused
+   otherwise. There is still no `accounts`/`projects` row keyed by a raw `user_id`, so
+   there is nothing for `scope_authority` to check even for the caller's own subject —
+   this closes the gap #570 left where the console's own `/settings/overview/user` lens
+   (a caller reading their own usage) was unconditionally `403`.
+4. **Estate-wide `scope=all`.** No entity filter is added at all — the query spans
+   every account. There is no per-row ownership predicate for "everything" by
+   definition, so this is gated on a coarse RBAC permission instead:
+   `Permission::UsageReadAll` (`usage:read-all`,
+   [`crates/lightbridge-authz-core/src/authz.rs`](../crates/lightbridge-authz-core/src/authz.rs)),
+   read directly off `TokenInfo::has_permission` — the same permission-set machinery
+   `authz-api`'s RPC surface uses, reusing the SAME `oauth2.rbac` config this service
+   already loads for JWT validation (`docs/rbac.md`). Granted to `lightbridge-admin` by
+   that role's default `*` grant, so an unconfigured deployment restricts `scope=all`
+   to admins with no extra setup; an operator narrowing `role_permissions` explicitly
+   must grant `usage:read-all` (or `usage:*`) back to whichever role should keep
+   estate-wide access. This answers the repo-owner ruling that operators should not
+   need per-account enumeration to see estate-wide usage — see issue #602.
+5. **Fail-closed on every authority failure mode.** A transport error, timeout,
    non-`200`/`404` status, or unparseable response from `authz-opa` is treated as "not
    authorized", never as "authorized" — see
    [`crates/lightbridge-authz-usage/src/scope_authority.rs`](../crates/lightbridge-authz-usage/src/scope_authority.rs)'s
    `RemoteScopeAuthority`, mirroring `UsageServiceSpendReader`'s identical posture for
-   the sibling `/usage/v1/spend/query` call.
+   the sibling `/usage/v1/spend/query` call. `scope=user` self and `scope=all` never
+   reach this authority at all (steps 3/4 above), so this fail-closed contract only
+   applies to `scope=account`/`scope=project`.
 
 This still needs a corresponding fix on the ingest side (`/v1/otel/traces`,
 `/v1/otel/metrics`, `/v1/otel/logs`) before it is safe to expose externally — those
