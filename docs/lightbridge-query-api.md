@@ -1,22 +1,28 @@
 # Lightbridge Usage Query API
 
 > [!WARNING]
-> **This endpoint requires mTLS (#347) but still has no ownership check on
-> `scope_id`.** `/usage/v1/usage/query` moved to a dedicated query listener
-> (`UsageServerGroup::query` in
+> **This endpoint requires mTLS (#347) AND, as of #570, an end-user bearer token plus
+> an ownership check on `scope_id`.** `/usage/v1/usage/query` sits on a dedicated
+> query listener (`UsageServerGroup::query` in
 > [`crates/lightbridge-authz-usage/src/config.rs`](../crates/lightbridge-authz-usage/src/config.rs),
 > `routers::query_router()`) that requires and verifies a client certificate before any
-> handler runs. That authenticates "a legitimate lightbridge workload holding a
-> CA-signed cert" — it does **not** bind `scope`/`scope_id` to a caller identity. The
+> handler runs — that authenticates "a legitimate lightbridge workload holding a
+> CA-signed cert", not which `scope_id` a given end user is entitled to see. The
 > handler
 > ([`crates/lightbridge-authz-usage/src/handlers/query.rs`](../crates/lightbridge-authz-usage/src/handlers/query.rs))
-> still validates only the time range, that `scope_id` is non-empty, and `limit`.
-> Concretely: any trusted caller (any workload presenting a cert signed by the
-> configured CA — today, that's `authz-api`/`authz-budget`, sharing one cert) that
-> knows a valid CUID2 `scope_id` can read that tenant's usage data, cross-tenant.
-> `scope_id` values are unguessable (CUID2, 24 chars) and the API offers no
-> enumeration, but ids do leak through other channels (URLs, logs, JWT claims, error
-> messages), so "unguessable" is not a substitute for authorization.
+> closes that gap by ALSO requiring `Authorization: Bearer <end-user access token>`
+> (validated via JWKS, `lightbridge-authz-bearer::BearerTokenService`) and calling
+> `authz-opa`'s `POST /idp/v1/authorize-usage-scope`
+> (`ScopeAuthority`, [`crates/lightbridge-authz-usage/src/scope_authority.rs`](../crates/lightbridge-authz-usage/src/scope_authority.rs))
+> to check the token's subject actually owns the requested `account`/`project` scope
+> before running the query. `scope=user`/`scope=api_key` have no resolvable ownership
+> predicate at all and are refused unconditionally (`403`). Missing/invalid bearer →
+> `401`; authenticated but not authorized, or the authority being unreachable/erroring
+> → `403` with an opaque body (fail-closed — never treated as authorized).
+>
+> **Divergence, stated not hidden:** the backend predicate (account owner, OR project
+> owner/roster member) is deliberately WIDER than the console UI's own client-side
+> guard (owner-only) — see `docs/usage-api.md`'s identical note.
 >
 > The `/v1/otel/traces`, `/v1/otel/metrics`, and `/v1/otel/logs` ingest endpoints stay
 > on a separate, unauthenticated listener (`UsageServerGroup::usage`) — their caller is
@@ -25,10 +31,14 @@
 > scope). An unauthenticated write path there means anyone who can reach it can
 > fabricate usage/billing records for any account or project.
 >
+> `/usage/v1/spend/query` stays mTLS-only, exempt from the bearer requirement above —
+> it is `authz-budget`'s legitimate cross-account service reader — but now REFUSES any
+> request carrying an `Authorization` header, closing a live "console catch-all-proxy"
+> hole where a misrouted browser bearer token could otherwise reach this ownerless
+> cross-account read.
+>
 > `lightbridge-authz-usage` is `ClusterIP`-only in prod today, by design, regardless of
-> mTLS — see the **Service** section below. **Do not add an external route
-> (Ingress/HTTPRoute/Gateway) to this service without first fixing the `scope_id`
-> ownership gap.** See "Recommended direction" below.
+> mTLS — see the **Service** section below.
 
 ## Why?
 
@@ -190,9 +200,16 @@ Successful response is HTTP `200` with JSON:
       "latency_p95_ms": 1180.5,
       "latency_p99_ms": 2404.0
     }
-  ]
+  ],
+  "truncated": false
 }
 ```
+
+`truncated` (#578): `true` when more than `limit` buckets matched the query and the OLDEST
+buckets were dropped to fit — `points` still holds at most `limit` entries in ascending
+`bucket_start` order. `false` means every matching bucket is present. See
+`docs/usage-api.md`'s "Response shape and truncation" for the known mid-bucket-cut caveat
+(#586).
 
 #### Point fields
 
@@ -282,31 +299,48 @@ Database error: start_time must be before end_time
 - Pagination is limited to a simple `limit`; there is no `offset`.
 - Filters are equality filters only.
 
-## Security: recommended fix direction
+## Security: the ownership fix (#570)
 
-This section exists because the warning at the top of this document needs somewhere
-to point. #347 answered "who can call this endpoint at all" with mTLS (client
-certificates, verified at the TLS layer, before this endpoint's own handler runs —
-see the warning above and `docs/architecture/budget.md`'s "Spend dependency" section).
-That is authentication, not authorization: it does not solve cross-tenant reads,
-because a shared client-certificate trust anchor authenticates *a caller* (any
-lightbridge workload holding a CA-signed cert), not which `scope_id` that caller is
-entitled to see. Before this endpoint is given any externally reachable route, it
-still needs an ownership check:
+This section used to describe a recommended fix direction; #570 implements it.
+#347 answered "who can call this endpoint at all" with mTLS (client certificates,
+verified at the TLS layer, before this endpoint's own handler runs — see the warning
+above and `docs/architecture/budget.md`'s "Spend dependency" section). That is
+authentication, not authorization: a shared client-certificate trust anchor
+authenticates *a caller* (any lightbridge workload holding a CA-signed cert), not
+which `scope_id` that caller is entitled to see.
 
-- **Fold the query behind `authz-api`'s JWT middleware, with an ownership check.**
-  Resolve the caller's `account_id`/`project_id` from their JWT (the same claims
-  `/idp/v1/resolve-context` already resolves and seals into tokens — see
-  [`crates/lightbridge-authz-rest/src/handlers/idp.rs`](../crates/lightbridge-authz-rest/src/handlers/idp.rs)),
-  and require the requested `scope`/`scope_id` to match — or be owned by — that
-  identity before running the query. This is the option that actually fixes the
-  remaining gap; mTLS alone does not.
+`/usage/v1/usage/query`'s handler now closes that gap directly, rather than folding
+the query behind `authz-api`'s own JWT middleware (a separate service on a separate
+port, which would have meant either merging the two services or proxying every query
+through `authz-api` first):
+
+1. **Bearer validation.** The request must carry `Authorization: Bearer <token>`, an
+   end-user access token validated via JWKS
+   (`lightbridge_authz_bearer::BearerTokenService`, the same crate `authz-api`/
+   `authz-opa`/`authz-budget` use). Missing or invalid → `401`.
+2. **Ownership check.** For `scope=account`/`scope=project`, the validated token's
+   `(iss, sub)` is sent to `authz-opa`'s new Basic-auth-protected
+   `POST /idp/v1/authorize-usage-scope` endpoint
+   ([`crates/lightbridge-authz-rest/src/handlers/idp.rs`](../crates/lightbridge-authz-rest/src/handlers/idp.rs)),
+   which runs the SAME real, Postgres-backed ownership predicate `resolve_context`
+   already enforces for the OIDC token-exchange path (own the account/project, or hold
+   a `project_members` roster row) — see
+   [`crates/lightbridge-authz-api-key/src/repo.rs`](../crates/lightbridge-authz-api-key/src/repo.rs)'s
+   `authorize_usage_scope`. `scope=user`/`scope=api_key` have no resolvable ownership
+   predicate at all (no `accounts`/`projects` row is ever keyed by a raw `user_id`/
+   `api_key_id`) and are refused unconditionally, before ever calling the authority.
+3. **Fail-closed on every authority failure mode.** A transport error, timeout,
+   non-`200`/`404` status, or unparseable response from `authz-opa` is treated as "not
+   authorized", never as "authorized" — see
+   [`crates/lightbridge-authz-usage/src/scope_authority.rs`](../crates/lightbridge-authz-usage/src/scope_authority.rs)'s
+   `RemoteScopeAuthority`, mirroring `UsageServiceSpendReader`'s identical posture for
+   the sibling `/usage/v1/spend/query` call.
 
 This still needs a corresponding fix on the ingest side (`/v1/otel/traces`,
 `/v1/otel/metrics`, `/v1/otel/logs`) before it is safe to expose externally — those
-stay on a separate, unauthenticated listener even after #347 (see the warning above
-for why: their caller cannot be given a client certificate without a coordinated
-change outside this repo).
+stay on a separate, unauthenticated listener even after #347/#570 (see the warning
+above for why: their caller cannot be given a client certificate without a
+coordinated change outside this repo).
 
 ## Findings
 
@@ -323,11 +357,16 @@ change outside this repo).
 
 ## How to?
 
+Every example below omits `-H 'Authorization: Bearer <token>'` for brevity — since #570 it is
+REQUIRED (see the warning at the top of this document); every example as written now returns
+`401`, not `200`, without it.
+
 ### Example 1: Total cost for a project over the last 30 days
 
 ```bash
 curl -k https://lightbridge-usage.converse.svc.cluster.local:3000/usage/v1/usage/query \
   -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <end-user access token>' \
   -d '{
     "scope": "project",
     "scope_id": "proj_123",
