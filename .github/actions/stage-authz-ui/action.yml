@@ -94,5 +94,17 @@ runs:
           echo "::error::dist/static/index.html does not reference /ui/-prefixed assets -- the bundle was not built with Vite base '/ui/' and will 404 fetching its own JS under authz-idp's /ui mount"
           exit 1
         fi
+        # lightbridge-authz#598 / ADR-0029's Update: `dist/routes.json` is now a REQUIRED bundle
+        # member, not optional. A hard error, not a warning -- once the Rust RP leg redirects into
+        # SPA routes, a manifest-less artifact is a broken login page, and ADR-0029 Decision 4's
+        # "the pin bump is the deploy" means this is exactly where a bad deploy should be stopped.
+        if [ ! -f dist/static/routes.json ]; then
+          echo "::error::dist/static/routes.json is missing -- this pin predates the /ui route allowlist (lightbridge-authz#598). static_assets.rs would fail closed to '/' alone and every device page would 404. Bump AUTHZ_UI_REF to an artifact built after converse-frontends#409's route work."
+          exit 1
+        fi
+        if ! grep -q '"basename": *"/ui"' dist/static/routes.json; then
+          echo "::error::dist/static/routes.json does not declare basename '/ui' -- the bundle and this server disagree about the mount prefix"
+          exit 1
+        fi
         echo "staged bundle OK:"
         printf '  %s\n' "${hashed[@]}"
