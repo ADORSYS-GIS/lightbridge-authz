@@ -1,7 +1,8 @@
 name: Workspace Tests
 description: >-
   Start Postgres + Redis (docker), run the workspace test suite, then the Postgres/Redis-backed
-  `it-tests` feature suite (api-key, budget, rest) against the same containers.
+  `it-tests` feature suite (api-key, budget, rest) against the same containers, plus a separate
+  Timescale-backed `it-tests` run for lightbridge-authz-usage-rest.
 inputs:
   database-url:
     description: Postgres connection string
@@ -57,6 +58,31 @@ runs:
         docker logs --tail 50 lightbridge-redis || true
         exit 1
 
+    # lightbridge-authz-usage-rest's own it-tests (repo_it_tests.rs, spend_query_it_tests.rs) need
+    # a real TimescaleDB, not vanilla Postgres -- their migrations under `migrations-usage/` use
+    # Timescale-specific functions. Mirrors compose.yaml's `timescaledb` service (same image, same
+    # DB name) rather than the plain `postgres:17` image started above.
+    - name: Start TimescaleDB (docker)
+      shell: bash
+      run: |
+        set -euo pipefail
+        docker run -d --name lightbridge-timescaledb \
+          -e POSTGRES_PASSWORD=postgres \
+          -e POSTGRES_DB=lightbridge_authz_usage \
+          -p 5433:5432 \
+          docker.io/timescale/timescaledb:2.17.2-pg17
+        echo "Waiting for TimescaleDB to accept connections..."
+        for i in $(seq 1 60); do
+          if docker exec lightbridge-timescaledb pg_isready -U postgres -d lightbridge_authz_usage >/dev/null 2>&1; then
+            echo "TimescaleDB is ready."
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "TimescaleDB did not become ready in time; recent logs:"
+        docker logs --tail 50 lightbridge-timescaledb || true
+        exit 1
+
     # Same memory guard as code-checks, for both reasons: this links the 24 test binaries AND it
     # compiles `lightbridge-authz-api`, the ~8 GB single-rustc `include_server_schema!` expansion
     # that reach ~6 GB each; jobs=2 keeps two of them from landing alongside each other.
@@ -70,8 +96,9 @@ runs:
         CARGO_BUILD_JOBS: "2"
         CARGO_INCREMENTAL: "0"
 
-    # it-tests (api-key/budget/rest, `just it-tests`'s three crates -- `lightbridge-authz-usage`'s
-    # it-tests needs Timescale, out of scope here) exercise real migrations against a live
+    # it-tests (api-key/budget/rest, three of `just it-tests`'s four crates -- the fourth,
+    # `lightbridge-authz-usage-rest`, runs separately below against the TimescaleDB container
+    # started above, not this Postgres one) exercise real migrations against a live
     # DATABASE_URL, unlike the sqlx::test-isolated suites above. Mirrors `just it-tests`'s own
     # migration step (`authz-migrate`) via the binary directly, since there's no compose stack in
     # this job. #219 tracks 7 tests in rpc_it_tests.rs that fail deterministically even against a
@@ -141,9 +168,40 @@ runs:
         CARGO_BUILD_JOBS: "2"
         CARGO_INCREMENTAL: "0"
 
-    - name: Stop PostgreSQL and Redis
+    # Its own ephemeral sqlx::test suite (`--tests`, like api-key/budget above) against the
+    # TimescaleDB container, not the Postgres one -- no separate migrate step needed, since
+    # `#[sqlx::test(migrations = "../../migrations-usage")]` runs its own migrations per test.
+    #
+    # `set -euo pipefail` makes `cargo test` failures fail the step already; the extra check below
+    # guards a different, silent failure mode (AGENTS.md: "a skipped test is not a passing test"):
+    # a `--features it-tests` typo or a `required-features` mismatch makes cargo skip both test
+    # binaries with no error and exit 0, reporting green having run nothing. Summing every
+    # "<N> passed" occurrence across both binaries and failing on zero makes that impossible to
+    # miss silently.
+    - name: Run it-tests (usage)
+      shell: bash
+      run: |
+        set -euo pipefail
+        log_file="$(mktemp)"
+        cargo test -p lightbridge-authz-usage-rest --features it-tests --tests 2>&1 | tee "${log_file}"
+        total_passed=0
+        while read -r n; do
+          total_passed=$((total_passed + n))
+        done < <(grep -oE '[0-9]+ passed' "${log_file}" | grep -oE '^[0-9]+' || true)
+        echo "lightbridge-authz-usage-rest it-tests passed: ${total_passed}"
+        if [ "${total_passed}" -eq 0 ]; then
+          echo "::error::lightbridge-authz-usage-rest it-tests reported 0 passed tests -- a skip is not a pass."
+          exit 1
+        fi
+      env:
+        DATABASE_URL: postgres://postgres:postgres@localhost:5433/lightbridge_authz_usage
+        CARGO_BUILD_JOBS: "2"
+        CARGO_INCREMENTAL: "0"
+
+    - name: Stop PostgreSQL, Redis, and TimescaleDB
       if: always()
       shell: bash
       run: |
         docker rm -f lightbridge-pg || true
         docker rm -f lightbridge-redis || true
+        docker rm -f lightbridge-timescaledb || true

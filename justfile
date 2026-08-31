@@ -152,8 +152,12 @@ load-test:
 # Brings up Postgres + Redis (the cratestack RPC surface's rate limiter is Redis-backed, ADR-0003)
 # and runs migrations against the shared DB (the rest crate's RPC integration tests connect the
 # cratestack pool directly to DATABASE_URL, unlike the api-key crate's ephemeral sqlx::test DBs).
+# Also brings up `timescaledb` (compose.yaml's real timescale/timescaledb image, host port 5433,
+# DB `lightbridge_authz_usage`) for lightbridge-authz-usage-rest's own ephemeral sqlx::test suites
+# (`repo_it_tests`, `spend_query_it_tests`) -- these need Timescale, not vanilla Postgres, so they
+# cannot share the `postgresql` service the other three crates use.
 it-tests:
-	@bash -ec 'set -euo pipefail; cmd="docker compose -p lightbridge-authz -f compose.yaml"; ${cmd} up -d postgresql redis; ${cmd} up authz-migrate --exit-code-from authz-migrate; trap "${cmd} down postgresql redis authz-migrate" EXIT; sleep 2; export DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"; export AUTHZ_REDIS_URL="redis://127.0.0.1:6379"; cargo test -p lightbridge-authz-api-key --features it-tests --tests; cargo test -p lightbridge-authz-budget --features it-tests --tests; cargo test -p lightbridge-authz-rest --features it-tests'
+	@bash -ec 'set -euo pipefail; cmd="docker compose -p lightbridge-authz -f compose.yaml"; ${cmd} up -d postgresql redis timescaledb; ${cmd} up authz-migrate --exit-code-from authz-migrate; trap "${cmd} down postgresql redis timescaledb authz-migrate" EXIT; sleep 2; echo "Waiting for timescaledb..."; for i in $(seq 1 30); do ${cmd} exec -T timescaledb pg_isready -U postgres -d lightbridge_authz_usage >/dev/null 2>&1 && break; sleep 2; done; export DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"; export AUTHZ_REDIS_URL="redis://127.0.0.1:6379"; cargo test -p lightbridge-authz-api-key --features it-tests --tests; cargo test -p lightbridge-authz-budget --features it-tests --tests; cargo test -p lightbridge-authz-rest --features it-tests; log_file=$(mktemp); DATABASE_URL="postgres://postgres:postgres@localhost:5433/lightbridge_authz_usage" cargo test -p lightbridge-authz-usage-rest --features it-tests --tests 2>&1 | tee "${log_file}"; total_passed=0; while read -r n; do total_passed=$((total_passed + n)); done < <(grep -oE "[0-9]+ passed" "${log_file}" | grep -oE "^[0-9]+" || true); echo "lightbridge-authz-usage-rest it-tests passed: ${total_passed}"; if [ "${total_passed}" -eq 0 ]; then echo "lightbridge-authz-usage-rest it-tests reported 0 passed tests -- a skip is not a pass"; exit 1; fi'
 
 all-checks:
 	@echo "Running Rust formatting, lint, and checks"
