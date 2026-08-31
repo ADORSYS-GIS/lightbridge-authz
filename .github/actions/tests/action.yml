@@ -156,32 +156,67 @@ runs:
     # the shared `lightbridge_authz` database the step above uses nor with itself across the two
     # binaries.
     #
-    # Test targets are named explicitly (`--test repo_it_tests --test spend_query_it_tests
-    # --test scope_ownership_it_tests`) rather than `--tests`, for two reasons: it avoids
-    # re-running the 88 non-DB-gated tests in
-    # this crate's lib target and `usage_tests.rs` that `cargo test --workspace` already ran above,
-    # and it makes a broken `--features`/`required-features` wiring a hard `cargo` error (exit
-    # 101, "requires the features: `it-tests`") instead of cargo silently matching zero targets.
-    # The `total passed > 0` check below is now sound (only these two it-tests binaries run under
-    # these flags) and catches the one residual silent-skip case a hard cargo error can't: an
-    # inner `#![cfg(feature = "it-tests")]` guard surviving after `required-features` is removed
-    # from Cargo.toml, which makes cargo build an empty test binary that reports "0 tests" and
-    # exits 0 (AGENTS.md: "a skipped test is not a passing test").
-    - name: Run it-tests (usage)
+    # Test targets are named explicitly (one `--test` flag per binary, run as three SEPARATE
+    # `cargo test` invocations below) rather than `--tests`, for three reasons: it avoids
+    # re-running the 88 non-DB-gated tests in this crate's lib target and `usage_tests.rs` that
+    # `cargo test --workspace` already ran above; it makes a broken `--features`/
+    # `required-features` wiring a hard `cargo` error (exit 101, "requires the features:
+    # `it-tests`") instead of cargo silently matching zero targets; and running each binary as its
+    # own invocation makes the `0 passed` guard PER-BINARY, not aggregated across all three. An
+    # aggregate guard is unsound the moment there are 2+ binaries: one binary silently reporting
+    # "0 tests, exit 0" (the residual silent-skip case a hard cargo error can't catch -- an inner
+    # `#![cfg(feature = "it-tests")]` guard surviving after `required-features` is removed from
+    # Cargo.toml) is invisible in a summed total as long as the OTHER binaries still pass a
+    # nonzero count, which is exactly the "a skipped test is not a passing test" failure mode
+    # AGENTS.md warns about, just moved one level up from an individual test to an individual
+    # binary. Each invocation below checks its own binary's count independently instead.
+    - name: Run it-tests (usage) - repo_it_tests
       shell: bash
       run: |
         set -euo pipefail
         log_file="$(mktemp)"
         cargo test -p lightbridge-authz-usage-rest --features it-tests \
-          --test repo_it_tests --test spend_query_it_tests \
+          --test repo_it_tests 2>&1 | tee "${log_file}"
+        passed=$(grep -oE '[0-9]+ passed' "${log_file}" | grep -oE '^[0-9]+' | tail -1 || true)
+        echo "repo_it_tests passed: ${passed:-0}"
+        if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then
+          echo "::error::repo_it_tests reported 0 passed tests -- a skip is not a pass."
+          exit 1
+        fi
+      env:
+        DATABASE_URL: ${{ inputs.database-url }}
+        CARGO_BUILD_JOBS: "2"
+        CARGO_INCREMENTAL: "0"
+
+    - name: Run it-tests (usage) - spend_query_it_tests
+      shell: bash
+      run: |
+        set -euo pipefail
+        log_file="$(mktemp)"
+        cargo test -p lightbridge-authz-usage-rest --features it-tests \
+          --test spend_query_it_tests 2>&1 | tee "${log_file}"
+        passed=$(grep -oE '[0-9]+ passed' "${log_file}" | grep -oE '^[0-9]+' | tail -1 || true)
+        echo "spend_query_it_tests passed: ${passed:-0}"
+        if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then
+          echo "::error::spend_query_it_tests reported 0 passed tests -- a skip is not a pass."
+          exit 1
+        fi
+      env:
+        DATABASE_URL: ${{ inputs.database-url }}
+        CARGO_BUILD_JOBS: "2"
+        CARGO_INCREMENTAL: "0"
+
+    - name: Run it-tests (usage) - scope_ownership_it_tests
+      shell: bash
+      run: |
+        set -euo pipefail
+        log_file="$(mktemp)"
+        cargo test -p lightbridge-authz-usage-rest --features it-tests \
           --test scope_ownership_it_tests 2>&1 | tee "${log_file}"
-        total_passed=0
-        while read -r n; do
-          total_passed=$((total_passed + n))
-        done < <(grep -oE '[0-9]+ passed' "${log_file}" | grep -oE '^[0-9]+' || true)
-        echo "lightbridge-authz-usage-rest it-tests passed: ${total_passed}"
-        if [ "${total_passed}" -eq 0 ]; then
-          echo "::error::lightbridge-authz-usage-rest it-tests reported 0 passed tests -- a skip is not a pass."
+        passed=$(grep -oE '[0-9]+ passed' "${log_file}" | grep -oE '^[0-9]+' | tail -1 || true)
+        echo "scope_ownership_it_tests passed: ${passed:-0}"
+        if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then
+          echo "::error::scope_ownership_it_tests reported 0 passed tests -- a skip is not a pass."
           exit 1
         fi
       env:
