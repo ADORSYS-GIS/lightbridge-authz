@@ -141,22 +141,43 @@ impl StoreRepo {
         Ok(total_cost)
     }
 
-    /// Returns up to `input.limit` buckets plus whether more existed (#578). `Vec<UsageSeriesPoint>`
-    /// comes back in the same ascending-`bucket_start` order this method has always returned; the
-    /// `bool` is `true` exactly when truncation happened, i.e. when more than `input.limit`
-    /// buckets matched the query.
+    /// Returns up to `input.limit` WHOLE buckets plus whether more existed (#578). `truncated` is
+    /// derived from the count of DISTINCT `bucket_start` values that matched, never from row
+    /// count -- see this method's own doc comment below for why that distinction is load-bearing
+    /// whenever `group_by` is non-empty. `Vec<UsageSeriesPoint>` comes back in the same
+    /// ascending-`bucket_start` order this method has always returned.
     ///
-    /// ## #578: truncation must drop the OLDEST buckets, not the newest
+    /// ## #578 (and its own bucket-scoping correction): truncation is BUCKET-scoped, not row-scoped
     ///
     /// The query used to `ORDER BY bucket_start ASC LIMIT $n` directly -- for a series with more
     /// than `$n` buckets, an ascending sort followed by `LIMIT` keeps the buckets from the START
     /// of the time range and silently drops everything after, which is backwards for a
     /// monitoring/dashboard query: a caller hitting the limit lost their most RECENT data while
-    /// keeping the oldest. The fix asks Postgres for the newest `$n + 1` buckets first
-    /// (`ORDER BY bucket_start DESC LIMIT $n + 1`, wrapped so the outer query can still hand back
-    /// ascending order for a byte-stable response shape), then, in Rust, drops the single oldest
-    /// row of that set when more than `$n` came back -- fetching one extra row rather than just
-    /// `$n` is what turns "did we truncate" into an observable fact instead of a guess.
+    /// keeping the oldest.
+    ///
+    /// The first fix for this applied `LIMIT` to ROWS, not distinct buckets -- correct only when
+    /// `group_by` is empty (one row per bucket). With a non-empty `group_by` (one row per
+    /// `(bucket, series)` pair), that is wrong in three independent ways: (1) `LIMIT`ing rows
+    /// counts each bucket once per series, so N series x M buckets can trip `truncated: true` at
+    /// a row count that is really only M whole buckets -- spurious truncation; (2) the boundary
+    /// bucket -- whichever one lands astride the row-count cutoff -- gets an ARBITRARY SUBSET of
+    /// its series while every OTHER bucket keeps its full set, presented as an ordinary point with
+    /// no signal that its per-series sums are understated relative to its siblings -- exactly the
+    /// silent-undercount dishonesty this whole epic exists to eliminate; (3) with no deterministic
+    /// tiebreaker on which rows survive at that cutoff, WHICH series got dropped from the boundary
+    /// bucket was nondeterministic across otherwise-identical runs.
+    ///
+    /// The actual fix: two queries, both scoped to distinct `bucket_start` values, never to rows.
+    /// [`Self::select_kept_buckets`] runs first and returns the newest `limit + 1` DISTINCT
+    /// `bucket_start` values (fetching one extra is what turns "were there more buckets" into an
+    /// observable fact); this method drops the single oldest one when more than `limit` came back
+    /// (`truncated: true`), then runs the full grouped aggregation FILTERED to exactly the kept
+    /// `bucket_start` values (`= ANY($kept_buckets)`) -- every bucket in the result set is
+    /// therefore either fully present (every series that has any row in it) or fully absent, never
+    /// partially present. The aggregation query's `ORDER BY` also names every dimension column
+    /// (grouped or constant-`NULL`) as an explicit tiebreaker after `bucket_start`, so which row
+    /// comes first within a bucket is deterministic run to run, not an artifact of Postgres' free
+    /// choice among ties.
     ///
     /// Known caveat (#586): a bucket that straddles the truncation boundary is dropped or kept as
     /// a whole bucket, not split -- this fix does not attempt partial-bucket truncation, only
@@ -172,12 +193,17 @@ impl StoreRepo {
         );
         validate_bucket_interval(&input.bucket)?;
 
+        let (kept_buckets, truncated) = self.select_kept_buckets(input).await?;
+        if kept_buckets.is_empty() {
+            return Ok((Vec::new(), truncated));
+        }
+
         let mut group_set = HashSet::new();
         for group in &input.group_by {
             group_set.insert(group.clone());
         }
 
-        let mut builder = QueryBuilder::<Postgres>::new("SELECT * FROM (SELECT date_bin(CAST(");
+        let mut builder = QueryBuilder::<Postgres>::new("SELECT date_bin(CAST(");
         builder.push_bind(&input.bucket).push(
             " AS interval), observed_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS bucket_start",
         );
@@ -257,62 +283,18 @@ impl StoreRepo {
             ", percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms)::double precision AS latency_p99_ms",
         );
 
-        builder.push(" FROM usage_events WHERE observed_at >= ");
-        builder.push_bind(input.start_time);
-        builder.push(" AND observed_at < ");
-        builder.push_bind(input.end_time);
+        builder.push(" FROM usage_events WHERE ");
+        push_scope_filters(&mut builder, input);
 
-        match input.scope {
-            UsageScope::User => {
-                builder.push(" AND user_id = ");
-                builder.push_bind(&input.scope_id);
-            }
-            UsageScope::ApiKey => {
-                builder.push(" AND api_key_id = ");
-                builder.push_bind(&input.scope_id);
-            }
-            UsageScope::Project => {
-                builder.push(" AND project_id = ");
-                builder.push_bind(&input.scope_id);
-            }
-            UsageScope::Account => {
-                builder.push(" AND account_id = ");
-                builder.push_bind(&input.scope_id);
-            }
-        }
-
-        if let Some(account_id) = &input.filters.account_id {
-            builder.push(" AND account_id = ");
-            builder.push_bind(account_id);
-        }
-        if let Some(project_id) = &input.filters.project_id {
-            builder.push(" AND project_id = ");
-            builder.push_bind(project_id);
-        }
-        if let Some(api_key_id) = &input.filters.api_key_id {
-            builder.push(" AND api_key_id = ");
-            builder.push_bind(api_key_id);
-        }
-        if let Some(user_id) = &input.filters.user_id {
-            builder.push(" AND user_id = ");
-            builder.push_bind(user_id);
-        }
-        if let Some(user_name) = &input.filters.user_name {
-            builder.push(" AND user_name = ");
-            builder.push_bind(user_name);
-        }
-        if let Some(model) = &input.filters.model {
-            builder.push(" AND model = ");
-            builder.push_bind(model);
-        }
-        if let Some(metric_name) = &input.filters.metric_name {
-            builder.push(" AND metric_name = ");
-            builder.push_bind(metric_name);
-        }
-        if let Some(signal_type) = &input.filters.signal_type {
-            builder.push(" AND signal_type = ");
-            builder.push_bind(signal_type);
-        }
+        // Bucket-scoped limit (#578 correction): restrict to exactly the buckets
+        // `select_kept_buckets` chose, so a bucket is either fully represented (every series with
+        // any matching row) or fully absent -- never a partial row subset.
+        builder.push(" AND date_bin(CAST(");
+        builder
+            .push_bind(&input.bucket)
+            .push(" AS interval), observed_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') = ANY(");
+        builder.push_bind(kept_buckets);
+        builder.push(")");
 
         builder.push(" GROUP BY bucket_start");
         for col in grouped_columns {
@@ -320,26 +302,15 @@ impl StoreRepo {
             builder.push(col);
         }
 
-        // #578: order DESC and fetch one MORE than the caller's limit inside the subquery -- the
-        // newest `limit + 1` buckets, not the oldest `limit` -- then re-sort ASC in the outer
-        // query so the response's ordering is unchanged from before this fix. The `+ 1` is what
-        // lets the Rust side below tell "there were exactly `limit` buckets" apart from "there
-        // were more and we truncated."
-        let fetch_limit = i64::from(input.limit).saturating_add(1);
-        builder.push(" ORDER BY bucket_start DESC LIMIT ");
-        builder.push_bind(fetch_limit);
-        builder.push(") t ORDER BY bucket_start ASC");
+        // Deterministic tiebreaker: every dimension column, grouped or not (an ungrouped column is
+        // a `NULL` constant across every row, so ordering by it is free and changes nothing when
+        // it isn't grouped -- but it means the ORDER BY clause's shape never depends on `group_by`
+        // and a grouped dimension always gets a real, stable sort key).
+        builder.push(
+            " ORDER BY bucket_start ASC, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, signal_type",
+        );
 
-        let mut rows: Vec<UsageQueryRow> = builder.build_query_as().fetch_all(self.pool()).await?;
-
-        let limit = input.limit as usize;
-        let truncated = rows.len() > limit;
-        if truncated {
-            // Ascending order means the single extra row (there can be at most one, since the
-            // subquery's own LIMIT caps `rows.len()` at `limit + 1`) is the OLDEST bucket in this
-            // set -- drop it, keeping the newest `limit` buckets in ascending order.
-            rows.drain(0..(rows.len() - limit));
-        }
+        let rows: Vec<UsageQueryRow> = builder.build_query_as().fetch_all(self.pool()).await?;
 
         let points = rows
             .into_iter()
@@ -367,6 +338,109 @@ impl StoreRepo {
             .collect();
 
         Ok((points, truncated))
+    }
+
+    /// The bucket-scoped half of #578's fix: returns the newest `input.limit` DISTINCT
+    /// `bucket_start` values matching `input`'s time range/scope/filters (ascending order, ready
+    /// to bind straight into the aggregation query's `= ANY(...)`), plus whether more than
+    /// `input.limit` distinct buckets existed at all. Deliberately ignores `group_by` entirely --
+    /// this is a `SELECT DISTINCT` over `bucket_start` alone, which is what makes the resulting
+    /// `truncated` flag and kept-bucket set BUCKET-scoped rather than row-scoped (see
+    /// `query_usage`'s own doc comment for the failure mode this replaces).
+    async fn select_kept_buckets(
+        &self,
+        input: &UsageQueryRequest,
+    ) -> Result<(Vec<DateTime<Utc>>, bool)> {
+        let mut builder = QueryBuilder::<Postgres>::new("SELECT DISTINCT date_bin(CAST(");
+        builder.push_bind(&input.bucket).push(
+            " AS interval), observed_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS bucket_start FROM usage_events WHERE ",
+        );
+        push_scope_filters(&mut builder, input);
+
+        let fetch_limit = i64::from(input.limit).saturating_add(1);
+        builder.push(" ORDER BY bucket_start DESC LIMIT ");
+        builder.push_bind(fetch_limit);
+
+        let mut buckets: Vec<(DateTime<Utc>,)> =
+            builder.build_query_as().fetch_all(self.pool()).await?;
+
+        let limit = input.limit as usize;
+        let truncated = buckets.len() > limit;
+        if truncated {
+            // DESC order means the single extra bucket (there can be at most one, since the
+            // query's own LIMIT caps `buckets.len()` at `limit + 1`) is the OLDEST -- drop it.
+            buckets.truncate(limit);
+        }
+
+        let mut kept: Vec<DateTime<Utc>> = buckets.into_iter().map(|(b,)| b).collect();
+        kept.reverse(); // ascending, matching this method's own doc comment.
+
+        Ok((kept, truncated))
+    }
+}
+
+/// Appends the shared time-range/scope/filter predicates both `StoreRepo::query_usage`'s
+/// aggregation query and `StoreRepo::select_kept_buckets`'s bucket-selection query need --
+/// duplicated across the two queries rather than run once and reused, since they answer two
+/// different questions (which buckets exist vs. what do they sum to) that must stay
+/// bit-for-bit consistent with each other or `truncated`/the kept-bucket filter could silently
+/// drift from what the aggregation actually returns.
+fn push_scope_filters(builder: &mut QueryBuilder<Postgres>, input: &UsageQueryRequest) {
+    builder.push("observed_at >= ");
+    builder.push_bind(input.start_time);
+    builder.push(" AND observed_at < ");
+    builder.push_bind(input.end_time);
+
+    match input.scope {
+        UsageScope::User => {
+            builder.push(" AND user_id = ");
+            builder.push_bind(&input.scope_id);
+        }
+        UsageScope::ApiKey => {
+            builder.push(" AND api_key_id = ");
+            builder.push_bind(&input.scope_id);
+        }
+        UsageScope::Project => {
+            builder.push(" AND project_id = ");
+            builder.push_bind(&input.scope_id);
+        }
+        UsageScope::Account => {
+            builder.push(" AND account_id = ");
+            builder.push_bind(&input.scope_id);
+        }
+    }
+
+    if let Some(account_id) = &input.filters.account_id {
+        builder.push(" AND account_id = ");
+        builder.push_bind(account_id);
+    }
+    if let Some(project_id) = &input.filters.project_id {
+        builder.push(" AND project_id = ");
+        builder.push_bind(project_id);
+    }
+    if let Some(api_key_id) = &input.filters.api_key_id {
+        builder.push(" AND api_key_id = ");
+        builder.push_bind(api_key_id);
+    }
+    if let Some(user_id) = &input.filters.user_id {
+        builder.push(" AND user_id = ");
+        builder.push_bind(user_id);
+    }
+    if let Some(user_name) = &input.filters.user_name {
+        builder.push(" AND user_name = ");
+        builder.push_bind(user_name);
+    }
+    if let Some(model) = &input.filters.model {
+        builder.push(" AND model = ");
+        builder.push_bind(model);
+    }
+    if let Some(metric_name) = &input.filters.metric_name {
+        builder.push(" AND metric_name = ");
+        builder.push_bind(metric_name);
+    }
+    if let Some(signal_type) = &input.filters.signal_type {
+        builder.push(" AND signal_type = ");
+        builder.push_bind(signal_type);
     }
 }
 

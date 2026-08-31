@@ -65,11 +65,15 @@ pub struct UsageQueryFilters {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UsageQueryResponse {
     pub points: Vec<UsageSeriesPoint>,
-    /// #578: `true` when more than `limit` buckets matched the query and the OLDEST ones were
-    /// dropped to fit -- `points` still holds at most `limit` entries in the same ascending
-    /// `bucket_start` order as before this field existed. `false` means every matching bucket is
-    /// present. See `StoreRepo::query_usage`'s doc comment for why truncation drops the oldest
-    /// buckets, not the newest, and for the known mid-bucket-cut caveat tracked as #586.
+    /// #578: `true` when more than `limit` DISTINCT `bucket_start` values matched the query and
+    /// the OLDEST one was dropped WHOLE to fit. `limit` bounds bucket count, not `points.len()`
+    /// (a row count) -- with a non-empty `group_by`, `points` can hold more entries than `limit`
+    /// (one per series per surviving bucket), still in the same ascending `bucket_start` order as
+    /// before this field existed, and every surviving bucket keeps its FULL series set, never an
+    /// arbitrary subset while a sibling bucket keeps all of its own. `false` means every matching
+    /// bucket is present. See `StoreRepo::query_usage`'s doc comment for why truncation drops the
+    /// oldest bucket, not the newest, why it must be bucket-scoped rather than row-scoped, and for
+    /// the known mid-bucket-cut caveat tracked as #586.
     pub truncated: bool,
 }
 
