@@ -145,6 +145,58 @@ property, and a not-yet-migrated legacy page respectively), tracked for eventual
 than an oversight. All protocol decisions — every redirect, `Set-Cookie`, and ID-token verification
 — stay in this Rust codebase regardless (ADR-0029 Decision 5); the SPA is presentation only.
 
+The whole device pairing, end to end — every human-facing response from Rust is a `303`; the SPA
+renders, Rust decides:
+
+```mermaid
+sequenceDiagram
+    participant CLI as Device client (CLI)
+    participant Browser
+    participant SPA as apps/authz-ui<br/>(served at /ui, allowlisted)
+    participant Rust as authz-idp (Rust)<br/>relying_party.rs
+    participant KC as Keycloak
+
+    CLI->>Rust: POST /oauth2/device_authorization
+    Rust-->>CLI: user_code + verification_uri (/device/verify)
+    Note over CLI: prints the URL; starts polling POST /oauth2/token
+
+    Browser->>Rust: GET /device/verify?user_code=X
+    Rust-->>Browser: 303 /ui/device?user_code=X (sanitised, percent-encoded)
+    Browser->>SPA: GET /ui/device → entry form (native <form>)
+    Browser->>Rust: POST /device/verify {user_code}
+    alt code unknown / expired / consumed (uniform)
+        Rust-->>Browser: 303 /ui/device/invalid
+    else code pending
+        Rust-->>Browser: 303 /ui/device/confirm<br/>Set-Cookie: __Host-authz_device_confirm
+    end
+    Browser->>SPA: GET /ui/device/confirm
+    SPA->>Rust: fetch GET /device/verify/context (cookie-bound)
+    Rust-->>SPA: 200 {user_code, client_id} — or uniform 404 without the cookie
+    Browser->>Rust: POST /device/verify/continue (cookie cross-checked)
+    Rust-->>Browser: 303 Keycloak authorization URL
+    Browser->>KC: login
+    KC-->>Browser: 302 /idp/callback?code=…
+    Browser->>Rust: GET /idp/callback (verify, mark code approved)
+    Rust-->>Browser: 303 /ui/device/success (cookie cleared)
+    CLI->>Rust: POST /oauth2/token (poll)
+    Rust-->>CLI: tokens
+```
+
+And how a `GET /ui/<path>` is answered since #598 — allowlist first, real files always, never a
+catch-all (`static_assets.rs`):
+
+```mermaid
+flowchart TD
+    REQ["GET /ui/&lt;path&gt;"] --> STRIP["nest_service strips /ui"]
+    STRIP --> ALLOW{"path in routes.json's<br/>validated allowlist<br/>(and not shadowing a real file)?"}
+    ALLOW -- yes --> INDEX["index.html<br/>Cache-Control: no-cache + CSP"]
+    ALLOW -- no --> FILE{"real file in the bundle?<br/>(ServeDir)"}
+    FILE -- "yes (assets/*-hash.*)" --> ASSET["file bytes<br/>immutable, max-age=1y"]
+    FILE -- yes --> RAW["file bytes (e.g. sw.js, routes.json)<br/>no-cache"]
+    FILE -- no --> NF["404"]
+    MANIFEST["dist/routes.json<br/>(from the artifact)"] -. "validated at startup:<br/>version==1, basename==/ui,<br/>route syntax, dedup —<br/>any failure ⇒ fail closed to { / }" .-> ALLOW
+```
+
 | Route | Method | Protection | Notes |
 | --- | --- | --- | --- |
 | `/`, `/healthz`, `/healthz/startup`, `/healthz/ready` | GET | none | Same probe wiring as every other server (`probe_router`), `/healthz/ready` checks DB reachability. |
