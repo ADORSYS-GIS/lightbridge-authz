@@ -454,6 +454,7 @@ fn offline_token_exchange_state(
             "refresh_token".to_string(),
             "authorization_code".to_string(),
             "urn:ietf:params:oauth:grant-type:device_code".to_string(),
+            "client_credentials".to_string(),
         ],
         id_token_signing_alg: "RS256".to_string(),
         authorization_code_ttl_secs: cfg.authorization_code_ttl_seconds,
@@ -503,6 +504,7 @@ fn token_exchange_oauth2() -> Oauth2 {
         device_code_ttl_seconds: 600,
         device_poll_interval_seconds: 5,
         device_verification_uri: "https://authz.example.test/device/verify".to_string(),
+        client_credentials_ttl_seconds: 900,
     });
     oauth2
 }
@@ -673,11 +675,14 @@ async fn path_issuer_metadata_advertises_root_jwks_and_token_paths() {
         serde_json::json!([
             "urn:ietf:params:oauth:grant-type:token-exchange",
             "refresh_token",
+            "client_credentials",
             "urn:ietf:params:oauth:grant-type:device_code",
             "authorization_code"
         ]),
         "authz-idp is a full IdP (ADR-0023): the authorization_code grant is always advertised \
-         alongside the device grant, never conditionally"
+         alongside the device grant, never conditionally -- and since #534, client_credentials is \
+         advertised unconditionally too, regardless of whether any oauth2.clients entry is \
+         actually configured for it"
     );
     assert_eq!(
         metadata["authorization_endpoint"],
@@ -2344,18 +2349,31 @@ mod db {
         let _ = std::fs::remove_dir_all(&static_dir);
     }
 
+    /// A `Confidential`/`Service` client needs a real, parseable `jwks` since #534/ADR-0030's
+    /// `validate_client_credentials_and_service_clients` startup check -- a `None` jwks used to
+    /// start cleanly (the exact discovery-vs-store disagreement that check now closes) and would
+    /// now be refused before this function's own PKCE assertion is ever reached. `Public` clients
+    /// authenticate with no credential at all, so they stay `jwks: None` unchanged.
     fn authorization_code_client(
         client_id: &str,
         client_type: OauthClientType,
         require_pkce: bool,
     ) -> OauthClient {
+        let jwks = match client_type {
+            OauthClientType::Public => None,
+            OauthClientType::Confidential | OauthClientType::Service => {
+                let key = lightbridge_authz_rest::signing::generate_rs256_key()
+                    .expect("rsa keypair generation");
+                Some(serde_json::json!({ "keys": [key.public_jwk] }))
+            }
+        };
         OauthClient {
             client_id: client_id.to_string(),
             client_type,
             scopes: vec!["openid".to_string()],
             grant_types: vec!["authorization_code".to_string()],
             allowed_audiences: vec![client_id.to_string()],
-            jwks: None,
+            jwks,
             redirect_uris: vec!["https://cb.example.test/callback".to_string()],
             post_logout_redirect_uris: Vec::new(),
             require_pkce,

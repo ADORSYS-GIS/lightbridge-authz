@@ -405,6 +405,16 @@ credential. The honest operational cost: every confidential client needs keypair
 way to publish/rotate its public key into config, which is strictly more work than rotating a
 shared secret.
 
+**Correction (added 2026-08-31, ADR-0030, #534):** `OauthClientType` gains a third variant,
+`Service`, alongside `Public`/`Confidential` — for `client_credentials` (M2M) clients. `Service`
+maps to the exact same `TokenEndpointAuthMethod::PrivateKeyJwt` this Decision already mandates for
+`Confidential`; the two are behaviorally identical and are not distinguished anywhere in the
+authentication code path (`oauth2_op::client_store::to_registration`). This is a config-review
+legibility decision, not a new authentication method or a relaxation of "no client secrets, ever" —
+that rule, and everything else in this Decision (fail-closed Redis-backed `jti` replay tracking,
+static inline `jwks`, no `jwks_uri`), applies to `Service` clients unchanged. See ADR-0030 Decision
+3 for the full reasoning.
+
 ### 7. The id_token is not a second home for authorization data — and asserts nothing beyond what upstream told us
 
 `docs/governance-model-and-enforcement.md:272-282` already made this call deliberately for the
@@ -593,3 +603,6 @@ from authkestra even though `handle_token_exchange` itself is not (yet) reachabl
 - Issue #94 / PR #95 (native RFC 8693 token-exchange), PR #98 (offline_access fix), PR #114
   (`oauth2.type` required enum) — the surface this ADR extends.
 - The cratestack lockstep prerequisite (Decision 4) — its own PR, tracked separately from this ADR.
+- ADR-0030 (`client_credentials` is a first-class `authz-idp` grant) — adds the `Service`
+  `OauthClientType` variant this Decision 6's correction records, and extends this ADR's own
+  Decision 3 "adopt dispatch, reimplement grant bodies" pattern to a third grant.

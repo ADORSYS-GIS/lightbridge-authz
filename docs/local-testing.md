@@ -42,11 +42,31 @@ flowchart LR
     IdP -.->|"not used by the console today"| Console
 ```
 
-`authz-api`/`authz-budget` trust **only** Keycloak's JWKS (`oauth2.jwks_url`,
-`crates/lightbridge-authz-bearer/src/lib.rs:225-230`). `authz-idp` mints its own tokens with a
-signing keypair generated on first startup and stored in the DB
-(`crates/lightbridge-authz-api-key/src/repo.rs:2601` `ensure_active_signing_key`). These are two
-independent trust roots today — a token from one is not valid against the other.
+*This diagram depicts THIS LOCAL compose stack specifically (`API -->|validates via JWKS| Keycloak`
+is the local-dev drift the note below explains) — production wires `API`/`Budget` to validate
+against `IdP` instead. Do not read this diagram as the platform's general architecture.*
+
+**Platform rule (owner, 2026-08-31): every authz resource server validates against `authz-idp`'s
+own JWKS — `authz-idp` alone brokers the Keycloak login leg.** Production already complies:
+`ai-helm-values`' `environments/prod/values/lightbridge-app.yaml` sets the `api`, `mcp`, and
+`budget` components' `oauth2.jwks_url` to `https://auth.ai.camer.digital/.well-known/jwks.json` —
+`authz-idp`'s own discovery JWKS — and Keycloak's JWKS is configured only inside the `idp`
+component itself. `authz-idp` mints its own tokens with a signing keypair generated on first
+startup and stored in the DB (`crates/lightbridge-authz-api-key/src/repo.rs:2601`
+`ensure_active_signing_key`); in prod, that is the ONE trust root every resource server (including
+`authz-api`/`authz-budget`) actually validates against.
+
+**This LOCAL compose stack is the one place that still diverges from that rule, and it is dated
+local-dev drift, not the platform's architecture.** `authz-api`/`authz-budget` here trust **only**
+Keycloak's JWKS directly (`oauth2.jwks_url` in `.docker/authz/container.yaml`/`config/default.yaml`,
+read by `crates/lightbridge-authz-bearer/src/lib.rs:225-230`) — never migrated to `authz-idp`'s own
+JWKS when ADR-0023 made it the full IdP, and kept on Keycloak specifically because every local IT
+suite (`it-authorino`, `it-servers`, the browser/device/token-exchange sections of `it-idp`) mints
+raw Keycloak tokens directly against `authz-api`. Migrating this local config to match production's
+already-correct posture is a tracked follow-up (ADR-0030 Decision 6/Neutral-follow-ups) — it
+requires converting those IT suites too, so it is not a drop-in config change. Until that lands,
+this compose stack has two independent trust roots where prod has one: a token minted by one
+(Keycloak or `authz-idp`) is not valid against a resource server trusting the other, LOCALLY ONLY.
 
 ## 1. Backend
 

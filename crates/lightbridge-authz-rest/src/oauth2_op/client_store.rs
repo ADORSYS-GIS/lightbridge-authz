@@ -22,15 +22,6 @@ impl ConfigClientStore {
             .collect();
         Self { clients }
     }
-
-    /// Whether any registered client is `confidential` (bound to `private_key_jwt`). Drives
-    /// whether the discovery document advertises `private_key_jwt` at all (see
-    /// `signing::discovery_document`'s doc comment).
-    pub fn has_confidential_client(&self) -> bool {
-        self.clients
-            .values()
-            .any(|c| c.token_endpoint_auth_method == Some(TokenEndpointAuthMethod::PrivateKeyJwt))
-    }
 }
 
 #[async_trait]
@@ -42,7 +33,9 @@ impl ClientStore for ConfigClientStore {
 
 /// Maps our config shape onto `authkestra_op::client::ClientRegistration`'s 9 fields.
 /// `client_secret_hash` is always `None`; browser registration settings are sourced directly from
-/// the reviewed config.
+/// the reviewed config. `Service` (#534, ADR-0030: `client_credentials`/M2M clients) maps to the
+/// SAME `PrivateKeyJwt` method as `Confidential` -- ADR-0011 Decision 6 draws no exception for
+/// machine clients, so the two variants only differ at the config-review layer, never here.
 fn to_registration(client: &OauthClient) -> ClientRegistration {
     ClientRegistration {
         client_id: client.client_id.clone(),
@@ -58,7 +51,9 @@ fn to_registration(client: &OauthClient) -> ClientRegistration {
         allowed_audiences: client.allowed_audiences.clone(),
         token_endpoint_auth_method: Some(match client.client_type {
             OauthClientType::Public => TokenEndpointAuthMethod::NoAuth,
-            OauthClientType::Confidential => TokenEndpointAuthMethod::PrivateKeyJwt,
+            OauthClientType::Confidential | OauthClientType::Service => {
+                TokenEndpointAuthMethod::PrivateKeyJwt
+            }
         }),
         jwks: client.jwks.clone(),
     }
@@ -127,13 +122,18 @@ mod tests {
             found.token_endpoint_auth_method,
             Some(TokenEndpointAuthMethod::PrivateKeyJwt)
         );
-        assert!(store.has_confidential_client());
     }
 
+    /// #534/ADR-0030: `Service` (`client_credentials`/M2M) clients authenticate identically to
+    /// `Confidential` -- ADR-0011 Decision 6 draws no exception for machine clients.
     #[tokio::test]
-    async fn public_only_registry_has_no_confidential_client() {
+    async fn service_client_maps_to_private_key_jwt() {
         let store =
-            ConfigClientStore::from_config(&[client("lightbridge-ss", OauthClientType::Public)]);
-        assert!(!store.has_confidential_client());
+            ConfigClientStore::from_config(&[client("it-machine", OauthClientType::Service)]);
+        let found = store.find_client("it-machine").await.unwrap().unwrap();
+        assert_eq!(
+            found.token_endpoint_auth_method,
+            Some(TokenEndpointAuthMethod::PrivateKeyJwt)
+        );
     }
 }

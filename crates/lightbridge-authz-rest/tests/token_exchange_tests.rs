@@ -121,6 +121,7 @@ const PROJECT_ID: &str = "proj_xchg";
 const OWNER_ACCOUNT: &str = "kc-owner-999";
 const MEMBER_PROJECT_ID: &str = "proj_member_scope";
 const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+const CLIENT_CREDENTIALS_GRANT: &str = "client_credentials";
 const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const PUBLIC_CLIENT_ID: &str = "lightbridge-ss";
 const CONFIDENTIAL_CLIENT_ID: &str = "lightbridge-mcp";
@@ -229,6 +230,7 @@ fn exchange_cfg() -> Oauth2TokenExchange {
         device_code_ttl_seconds: 600,
         device_poll_interval_seconds: 5,
         device_verification_uri: "https://authz.example.test/device/verify".to_string(),
+        client_credentials_ttl_seconds: 900,
     }
 }
 
@@ -358,6 +360,36 @@ fn confidential_client(client_id: &str) -> ConfidentialClientFixture {
         scopes: client_scopes(),
         grant_types: client_grant_types(),
         allowed_audiences: vec![client_id.to_string()],
+        jwks: Some(jwks),
+        redirect_uris: Vec::new(),
+        post_logout_redirect_uris: Vec::new(),
+        require_pkce: false,
+    };
+    ConfidentialClientFixture {
+        client,
+        private_key_pem: key.private_key_pem,
+        kid: key.kid,
+    }
+}
+
+/// A `Service` (`client_credentials`/M2M, #534/ADR-0030) client plus its private key, matching
+/// [`confidential_client`]'s shape but with `type: service` and `grant_types: [client_credentials]`
+/// -- authentication is byte-identical (`private_key_jwt`) between the two, so this exists purely
+/// to name the intent at each call site and to default to a realistic `scopes`/`allowed_audiences`
+/// pair a machine client would actually be configured with.
+fn service_client(
+    client_id: &str,
+    scopes: Vec<String>,
+    allowed_audiences: Vec<String>,
+) -> ConfidentialClientFixture {
+    let key = generate_rs256_key().expect("rsa keypair generation");
+    let jwks = serde_json::json!({ "keys": [key.public_jwk] });
+    let client = OauthClient {
+        client_id: client_id.to_string(),
+        client_type: OauthClientType::Service,
+        scopes,
+        grant_types: vec![CLIENT_CREDENTIALS_GRANT.to_string()],
+        allowed_audiences,
         jwks: Some(jwks),
         redirect_uris: Vec::new(),
         post_logout_redirect_uris: Vec::new(),
@@ -6766,5 +6798,615 @@ async fn authorization_code_grant_omits_refresh_without_offline_access(pool: PgP
     assert!(
         body.get("refresh_token").is_none() || body["refresh_token"].is_null(),
         "no offline_access means no refresh token: {body}"
+    );
+}
+
+// ============================================================================================
+// RFC 6749 §4.4 `client_credentials` (M2M, #534/ADR-0030). This grant is intercepted BEFORE
+// `handle_token` ever runs (`token_exchange::client_credentials_token_endpoint`), so none of the
+// `MockBearer`/`seed`/`ACCOUNT_ID`/`PROJECT_ID` fixtures the token-exchange grant above needs are
+// relevant here -- a machine client authenticates and is minted a token with no subject_token, no
+// account, and no project in the picture at all.
+// ============================================================================================
+
+fn client_credentials_state(
+    repo: Arc<StoreRepo>,
+    clients: Vec<OauthClient>,
+    redis_url: &str,
+) -> TokenExchangeState {
+    // The client_credentials grant never calls into `BearerTokenServiceTrait` at all (there is no
+    // subject_token to validate), so any implementation satisfies the type -- `MockBearer::new`
+    // with an empty `aud` mirrors what every other non-exchange-grant fixture in this file already
+    // passes (see `device_state`).
+    state_with(
+        repo,
+        Arc::new(MockBearer::new(true, Vec::new())),
+        clients,
+        redis_url,
+    )
+}
+
+/// Test 1: no credential presented at all against a `Service` (private_key_jwt-bound) client ->
+/// `401 invalid_client`, the same outcome `confidential_client_with_missing_assertion_is_refused`
+/// already proves for the token-exchange grant, now proven for `client_credentials` too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn client_credentials_with_no_credential_is_refused(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+
+    let fixture = service_client(
+        "it-machine",
+        vec!["read:usage".to_string()],
+        vec!["lightbridge-api-key".to_string()],
+    );
+    let state = client_credentials_state(repo, vec![fixture.client], &redis_url());
+
+    let (status, body) = post_token(
+        state,
+        &format!("grant_type={CLIENT_CREDENTIALS_GRANT}&client_id=it-machine"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"], "invalid_client");
+}
+
+/// Test 2: an assertion signed by the WRONG key (not the client's own) -> `401 invalid_client`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn client_credentials_signed_by_wrong_key_is_refused(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+
+    let fixture = service_client(
+        "it-machine",
+        vec!["read:usage".to_string()],
+        vec!["lightbridge-api-key".to_string()],
+    );
+    let forger = generate_rs256_key().unwrap();
+    let bad_assertion = sign_client_assertion(
+        &forger.private_key_pem,
+        &fixture.kid,
+        "it-machine",
+        &cuid2(),
+        300,
+    );
+    let state = client_credentials_state(repo, vec![fixture.client], &redis_url());
+
+    let (status, body) = post_token(
+        state,
+        &format!(
+            "grant_type={CLIENT_CREDENTIALS_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}&client_assertion={bad_assertion}"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"], "invalid_client");
+}
+
+/// Test 3: the replay polarity test -- the SAME assertion presented twice must succeed once and be
+/// refused the second time (mirrors `replayed_client_assertion_jti_is_refused` for the token-
+/// exchange grant).
+#[sqlx::test(migrations = "../../migrations")]
+async fn client_credentials_replayed_assertion_jti_is_refused(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+
+    let fixture = service_client(
+        "it-machine",
+        vec!["read:usage".to_string()],
+        vec!["lightbridge-api-key".to_string()],
+    );
+    let jti = cuid2();
+    let assertion = sign_client_assertion(
+        &fixture.private_key_pem,
+        &fixture.kid,
+        "it-machine",
+        &jti,
+        300,
+    );
+    let redis = redis_url();
+    let body_str = format!(
+        "grant_type={CLIENT_CREDENTIALS_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}&client_assertion={assertion}"
+    );
+
+    let state1 = client_credentials_state(repo.clone(), vec![fixture.client.clone()], &redis);
+    let (status, body) = post_token(state1, &body_str).await;
+    assert_eq!(status, StatusCode::OK, "first use must succeed: {body}");
+
+    // Fresh state (jti tracking lives in Redis, not in-process).
+    let state2 = client_credentials_state(repo, vec![fixture.client], &redis);
+    let (status, body) = post_token(state2, &body_str).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "replayed assertion must be refused: {body}"
+    );
+    assert_eq!(body["error"], "invalid_client");
+}
+
+/// Test 4 (DECISIVE): Redis unreachable while spending the assertion's `jti` must refuse with
+/// `server_error`/500 -- NEVER a mint, and NEVER collapsed into `invalid_client` the way upstream
+/// `handle_token`'s own `authenticate_client` would (see `authenticate_presented_client`'s doc
+/// comment / this file's `redis_unreachable_refuses_confidential_client_rather_than_admitting` for
+/// why the two grants deliberately differ here). Prove-fail-first, actually run (recorded verbatim
+/// in the PR body -- pointing this endpoint at upstream's own `pub(crate)`
+/// `extract_credential`/`resolve_client_id`/`authenticate_client` is not an achievable mutation
+/// from this crate, since none of the three is reachable outside `authkestra-op`; the mutation
+/// below is the smallest one that actually compiles and exercises the same claim): temporarily
+/// changed `authenticate_presented_client`'s `Err(_) =>` arm (`token_exchange.rs`) from
+/// `EndpointAuthError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", ...)` to
+/// `Err(invalid_client())`, reran just this test, and it went red for the predicted reason --
+/// `401 invalid_client` instead of `500 server_error` -- confirming the assertion actually
+/// distinguishes the two outcomes rather than passing vacuously. Reverted immediately after.
+#[sqlx::test(migrations = "../../migrations")]
+async fn client_credentials_redis_unreachable_is_server_error_never_a_mint(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+
+    let fixture = service_client(
+        "it-machine",
+        vec!["read:usage".to_string()],
+        vec!["lightbridge-api-key".to_string()],
+    );
+    let assertion = sign_client_assertion(
+        &fixture.private_key_pem,
+        &fixture.kid,
+        "it-machine",
+        &cuid2(),
+        300,
+    );
+    let state = client_credentials_state(repo, vec![fixture.client], UNREACHABLE_REDIS_URL);
+
+    let (status, body) = post_token(
+        state,
+        &format!(
+            "grant_type={CLIENT_CREDENTIALS_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}&client_assertion={assertion}"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "redis-down must refuse as server_error, never mint and never collapse into \
+         invalid_client: {body}"
+    );
+    assert_eq!(body["error"], "server_error");
+    assert!(
+        body.get("access_token").is_none(),
+        "no access_token may ever be present on a failure response: {body}"
+    );
+}
+
+/// Test 5: a `Service` client that is correctly authenticated but whose `grant_types` does not
+/// list `client_credentials` -> `400 unauthorized_client`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn client_credentials_absent_from_client_grant_types_is_unauthorized_client(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+
+    let mut fixture = service_client(
+        "it-machine",
+        vec!["read:usage".to_string()],
+        vec!["lightbridge-api-key".to_string()],
+    );
+    // A Service client legitimately holding some OTHER grant only -- e.g. it also participates in
+    // token-exchange -- must still be refused this ONE grant it never registered for.
+    fixture.client.grant_types = vec![TOKEN_EXCHANGE_GRANT.to_string()];
+    let assertion = sign_client_assertion(
+        &fixture.private_key_pem,
+        &fixture.kid,
+        "it-machine",
+        &cuid2(),
+        300,
+    );
+    let state = client_credentials_state(repo, vec![fixture.client], &redis_url());
+
+    let (status, body) = post_token(
+        state,
+        &format!(
+            "grant_type={CLIENT_CREDENTIALS_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}&client_assertion={assertion}"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "unauthorized_client");
+}
+
+/// Test 6: a requested `audience` outside `client.allowed_audiences` -> `400 invalid_target`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn client_credentials_disallowed_audience_is_invalid_target(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+
+    let fixture = service_client(
+        "it-machine",
+        vec!["read:usage".to_string()],
+        vec!["lightbridge-api-key".to_string()],
+    );
+    let assertion = sign_client_assertion(
+        &fixture.private_key_pem,
+        &fixture.kid,
+        "it-machine",
+        &cuid2(),
+        300,
+    );
+    let state = client_credentials_state(repo, vec![fixture.client], &redis_url());
+
+    let (status, body) = post_token(
+        state,
+        &format!(
+            "grant_type={CLIENT_CREDENTIALS_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}&client_assertion={assertion}&audience=not-allowed"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_target");
+}
+
+/// Test 7: a requested scope not listed on `client.scopes` -> `400 invalid_scope`. Also proves the
+/// server-wide `oauth2.token_exchange.allowed_scopes` ceiling is NOT consulted for this grant --
+/// `openid` is never in `client.scopes` here, so requesting it must fail even though it is very
+/// much a member of `exchange_cfg().allowed_scopes`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn client_credentials_scope_outside_client_scopes_is_invalid_scope(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+
+    let fixture = service_client(
+        "it-machine",
+        vec!["read:usage".to_string()],
+        vec!["lightbridge-api-key".to_string()],
+    );
+    let assertion = sign_client_assertion(
+        &fixture.private_key_pem,
+        &fixture.kid,
+        "it-machine",
+        &cuid2(),
+        300,
+    );
+    let state = client_credentials_state(repo, vec![fixture.client], &redis_url());
+
+    let (status, body) = post_token(
+        state,
+        &format!(
+            "grant_type={CLIENT_CREDENTIALS_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}&client_assertion={assertion}&scope=openid"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_scope");
+}
+
+/// Test 10: an unregistered `client_id` is REFUSED indistinguishably from a wrong key -- the same
+/// anti-oracle posture `unknown_client_id_is_rejected` already proves for the token-exchange grant.
+#[sqlx::test(migrations = "../../migrations")]
+async fn client_credentials_unknown_client_id_is_rejected(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+
+    let state = client_credentials_state(repo, Vec::new(), &redis_url());
+
+    let (status, body) = post_token(
+        state,
+        &format!("grant_type={CLIENT_CREDENTIALS_GRANT}&client_id=never-registered"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"], "invalid_client");
+}
+
+/// Test 11: the happy path -- `200 OK`, and RFC 6749 §4.4.3's MUST NOT is honored: no
+/// `refresh_token`, and no `id_token` (there is no human identity to describe one).
+#[sqlx::test(migrations = "../../migrations")]
+async fn client_credentials_happy_path_has_no_refresh_token_and_no_id_token(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+
+    let fixture = service_client(
+        "it-machine",
+        vec!["read:usage".to_string()],
+        vec!["lightbridge-api-key".to_string()],
+    );
+    let assertion = sign_client_assertion(
+        &fixture.private_key_pem,
+        &fixture.kid,
+        "it-machine",
+        &cuid2(),
+        300,
+    );
+    let state = client_credentials_state(repo, vec![fixture.client], &redis_url());
+
+    let (status, body) = post_token(
+        state,
+        &format!(
+            "grant_type={CLIENT_CREDENTIALS_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}&client_assertion={assertion}"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["token_type"], "Bearer");
+    assert!(body["access_token"].as_str().is_some_and(|t| !t.is_empty()));
+    assert!(
+        body.get("refresh_token").is_none() || body["refresh_token"].is_null(),
+        "RFC 6749 §4.4.3 MUST NOT: {body}"
+    );
+    assert!(
+        body.get("id_token").is_none() || body["id_token"].is_null(),
+        "no human identity to describe: {body}"
+    );
+    assert!(
+        body.get("issued_token_type").is_none() || body["issued_token_type"].is_null(),
+        "issued_token_type is a token-exchange (RFC 8693) concept, not RFC 6749 §4.4: {body}"
+    );
+}
+
+/// Tests 12 & 14: the full claim-shape contract, decoded and signature-verified against the SAME
+/// JWKS `/.well-known/jwks.json` serves (proving it verifies against the real `kid`) -- `sub =
+/// "svc:<client_id>"`, `azp = <client_id>` (never the `svc:`-prefixed sub), `typ = "Bearer"`, `jti`
+/// carries this repo's own `lgbr:` prefix (never a bare UUIDv4), `lightbridge_caller_kind =
+/// "service"`, granted `scope`, and every tenant/session claim (`account_id`, `project_id`,
+/// `api_key_id`, `sid`) plus `identity`/`budget_tier`/`quota_tier` are ALL absent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn client_credentials_claim_shape_matches_the_service_token_contract(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+
+    let fixture = service_client(
+        "it-machine",
+        vec!["read:usage".to_string(), "write:usage".to_string()],
+        vec!["lightbridge-api-key".to_string()],
+    );
+    let assertion = sign_client_assertion(
+        &fixture.private_key_pem,
+        &fixture.kid,
+        "it-machine",
+        &cuid2(),
+        300,
+    );
+    let state = client_credentials_state(repo.clone(), vec![fixture.client], &redis_url());
+
+    let (status, body) = post_token(
+        state,
+        &format!(
+            "grant_type={CLIENT_CREDENTIALS_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}&client_assertion={assertion}&scope=read%3Ausage"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["scope"], "read:usage");
+
+    let access_token = body["access_token"].as_str().unwrap().to_string();
+    // Signature verification against the real DB-backed JWKS (`/.well-known/jwks.json` serves
+    // exactly this set) IS test 14 -- `decode_access_token_claims` panics if this doesn't verify.
+    let claims = decode_access_token_claims(&repo, &access_token, "it-machine").await;
+
+    assert_eq!(claims["sub"], "svc:it-machine", "claims: {claims}");
+    assert_eq!(claims["azp"], "it-machine", "claims: {claims}");
+    assert_eq!(claims["typ"], "Bearer", "claims: {claims}");
+    assert_eq!(
+        claims["lightbridge_caller_kind"], "service",
+        "claims: {claims}"
+    );
+    assert!(
+        claims["jti"]
+            .as_str()
+            .is_some_and(|jti| jti.starts_with("lgbr:")),
+        "jti must be this repo's own CUID2, never a bare UUIDv4: {claims}"
+    );
+    for absent in [
+        "account_id",
+        "project_id",
+        "api_key_id",
+        "sid",
+        "identity",
+        "budget_tier",
+        "quota_tier",
+        "allowed_models",
+    ] {
+        assert!(
+            claims.get(absent).is_none() || claims[absent].is_null(),
+            "{absent} must be absent from a client_credentials token: {claims}"
+        );
+    }
+}
+
+/// Test 13 (both directions): with no `audience` requested, `aud` defaults to the client's own
+/// `client_id`; with an explicitly requested, allowed audience, `aud` is that value instead -- the
+/// ONE grant where a granted `aud` may legitimately differ from `azp`/the authenticated client.
+#[sqlx::test(migrations = "../../migrations")]
+async fn client_credentials_audience_defaults_to_client_id_or_honors_an_allowed_one(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+
+    let fixture = service_client(
+        "it-machine",
+        vec!["read:usage".to_string()],
+        vec!["lightbridge-api-key".to_string()],
+    );
+
+    // No audience requested -> defaults to the client's own client_id.
+    let assertion = sign_client_assertion(
+        &fixture.private_key_pem,
+        &fixture.kid,
+        "it-machine",
+        &cuid2(),
+        300,
+    );
+    let state = client_credentials_state(repo.clone(), vec![fixture.client.clone()], &redis_url());
+    let (status, body) = post_token(
+        state,
+        &format!(
+            "grant_type={CLIENT_CREDENTIALS_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}&client_assertion={assertion}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let access_token = body["access_token"].as_str().unwrap().to_string();
+    let claims = decode_access_token_claims(&repo, &access_token, "it-machine").await;
+    assert_eq!(
+        claims["aud"], "it-machine",
+        "no audience requested must default to the client's own client_id: {claims}"
+    );
+
+    // Explicit, allowed audience -> `aud` is that value, DIFFERENT from `azp`.
+    let assertion = sign_client_assertion(
+        &fixture.private_key_pem,
+        &fixture.kid,
+        "it-machine",
+        &cuid2(),
+        300,
+    );
+    let state = client_credentials_state(repo.clone(), vec![fixture.client], &redis_url());
+    let (status, body) = post_token(
+        state,
+        &format!(
+            "grant_type={CLIENT_CREDENTIALS_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}&client_assertion={assertion}&audience=lightbridge-api-key"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let access_token = body["access_token"].as_str().unwrap().to_string();
+    let claims = decode_access_token_claims(&repo, &access_token, "lightbridge-api-key").await;
+    assert_eq!(claims["aud"], "lightbridge-api-key", "claims: {claims}");
+    assert_eq!(
+        claims["azp"], "it-machine",
+        "azp must still name the authenticated client, even when aud names a different \
+         resource: {claims}"
+    );
+}
+
+/// Test 15: `/oauth2/introspect` (RFC 7662) reports `active: true` for a freshly minted
+/// `client_credentials` access token, introspected by the same client it was minted for.
+#[sqlx::test(migrations = "../../migrations")]
+async fn client_credentials_introspects_as_active(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+
+    let fixture = service_client(
+        "it-machine",
+        vec!["read:usage".to_string()],
+        vec!["lightbridge-api-key".to_string()],
+    );
+    let mint_assertion = sign_client_assertion(
+        &fixture.private_key_pem,
+        &fixture.kid,
+        "it-machine",
+        &cuid2(),
+        300,
+    );
+    let state = client_credentials_state(repo.clone(), vec![fixture.client.clone()], &redis_url());
+    let (status, body) = post_token(
+        state,
+        &format!(
+            "grant_type={CLIENT_CREDENTIALS_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}&client_assertion={mint_assertion}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let access_token = body["access_token"].as_str().unwrap().to_string();
+
+    let introspect_assertion = sign_client_assertion(
+        &fixture.private_key_pem,
+        &fixture.kid,
+        "it-machine",
+        &cuid2(),
+        300,
+    );
+    let state = client_credentials_state(repo, vec![fixture.client], &redis_url());
+    let (status, body) = post_introspect(
+        state,
+        &format!(
+            "token={access_token}&client_assertion_type={CLIENT_ASSERTION_TYPE}&client_assertion={introspect_assertion}"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["active"], true, "body: {body}");
+    assert_eq!(body["token_type"], "Bearer");
+    assert_eq!(body["client_id"], "it-machine");
+    assert_eq!(body["sub"], "svc:it-machine");
+    assert_eq!(body["lightbridge_caller_kind"], "service", "body: {body}");
+}
+
+/// Test 16: scope narrowing -- requesting a strict subset of `client.scopes` grants exactly that
+/// subset, not the client's full configured scope list.
+#[sqlx::test(migrations = "../../migrations")]
+async fn client_credentials_scope_narrows_to_the_requested_subset(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+
+    let fixture = service_client(
+        "it-machine",
+        vec!["read:usage".to_string(), "write:usage".to_string()],
+        vec!["lightbridge-api-key".to_string()],
+    );
+    let assertion = sign_client_assertion(
+        &fixture.private_key_pem,
+        &fixture.kid,
+        "it-machine",
+        &cuid2(),
+        300,
+    );
+    let state = client_credentials_state(repo, vec![fixture.client], &redis_url());
+
+    let (status, body) = post_token(
+        state,
+        &format!(
+            "grant_type={CLIENT_CREDENTIALS_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}&client_assertion={assertion}&scope=read%3Ausage"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["scope"], "read:usage",
+        "requesting a subset must narrow, not grant the full configured scope list: {body}"
+    );
+}
+
+/// The default-scope companion to the narrowing test above: no `scope` requested at all grants
+/// EVERY scope the client is configured for.
+#[sqlx::test(migrations = "../../migrations")]
+async fn client_credentials_absent_scope_grants_every_configured_client_scope(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+
+    let fixture = service_client(
+        "it-machine",
+        vec!["read:usage".to_string(), "write:usage".to_string()],
+        vec!["lightbridge-api-key".to_string()],
+    );
+    let assertion = sign_client_assertion(
+        &fixture.private_key_pem,
+        &fixture.kid,
+        "it-machine",
+        &cuid2(),
+        300,
+    );
+    let state = client_credentials_state(repo, vec![fixture.client], &redis_url());
+
+    let (status, body) = post_token(
+        state,
+        &format!(
+            "grant_type={CLIENT_CREDENTIALS_GRANT}&client_assertion_type={CLIENT_ASSERTION_TYPE}&client_assertion={assertion}"
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let scope = body["scope"].as_str().expect("scope present");
+    let granted: std::collections::BTreeSet<&str> = scope.split_whitespace().collect();
+    assert_eq!(
+        granted,
+        std::collections::BTreeSet::from(["read:usage", "write:usage"]),
+        "an absent scope parameter must grant every scope the client is configured for: {body}"
     );
 }

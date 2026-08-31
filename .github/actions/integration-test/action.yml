@@ -119,6 +119,16 @@ runs:
         run_migration authz-migrate
         run_migration authz-usage-migrate
 
+        # #534/ADR-0030 (PR #604): authz-idp's compose.it.yaml override mounts a generated,
+        # IT-only config (container.it.yaml) that this one-shot service renders -- it does not
+        # exist on disk until this runs. `--no-deps` throughout this script means compose's own
+        # `depends_on: it-machine-keygen: condition: service_completed_successfully` on authz-idp
+        # is never consulted here, so this step is not optional/redundant with that dependency --
+        # it is the ONLY thing that runs it in this CI job.
+        echo "== generating it-machine client_credentials test fixtures =="
+        $compose up -d --no-deps it-machine-keygen
+        wait_completed it-machine-keygen
+
         echo "== starting app services =="
         # authz-idp joins the set for it-idp below. It is the only app service here that is NOT
         # exercised by it-authorino/it-servers, so before it-idp ran in CI there was no reason to

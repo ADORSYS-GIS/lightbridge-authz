@@ -199,12 +199,6 @@ impl TokenExchangeOpStore {
         }
     }
 
-    /// Whether the discovery document should advertise `private_key_jwt`
-    /// (`signing::discovery_document`).
-    pub fn has_confidential_client(&self) -> bool {
-        self.clients.has_confidential_client()
-    }
-
     pub async fn authorization_code_matches_binding(
         &self,
         code: &str,

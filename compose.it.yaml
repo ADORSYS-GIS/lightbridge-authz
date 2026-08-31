@@ -33,6 +33,46 @@ services:
   mcp-inspector:
     ports: !reset []
 
+  # #534/ADR-0030: generates the `it-machine` `client_credentials` (M2M) IT fixture keypair fresh
+  # at every IT-stack-up and renders the IT-only `authz-idp` config that registers it -- mirrors
+  # `authz-tls`'s "generate into a shared location at compose-up time, never commit it" shape.
+  # See `generate_it_machine_fixtures.py`'s own doc comment for why a checked-in private key is
+  # not an option here (PR #604: Gitleaks/Trivy both correctly flag a real RSA key as a secret,
+  # even test-only material with no scanner allowlist to carve an exception into).
+  #
+  # No `profiles: ["it"]` here, unlike the three suite runners below: this service must run
+  # whenever `compose.it.yaml` is loaded at all (every `just it-*` recipe), not only when a
+  # specific suite's own profile is explicitly requested -- `authz-idp`'s override below depends
+  # on it unconditionally. Harmless for `it-authorino`/`it-servers`, which do not need the
+  # `it-machine` client at all: the rendered config is additive over the checked-in one.
+  it-machine-keygen:
+    image: python:3.12-slim
+    volumes:
+      - "./.docker:/repo/.docker"
+    working_dir: /repo/.docker/it
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends openssl > /dev/null
+        python3 generate_it_machine_fixtures.py
+
+  # `!override` (not the default append-merge) because this REPLACES the base `container.yaml`
+  # mount at `/tmp/config.yaml` with the generated IT-only variant -- appending a second mount at
+  # the identical container path would be a duplicate-mount-point error, not a merge.
+  # `container.it.yaml` is `container.yaml` (read unmodified) PLUS the `it-machine` client entry;
+  # the checked-in `container.yaml` itself never carries an `it-machine` entry, so the plain
+  # `just up` stack (which never loads this file) never has one to validate at startup either.
+  authz-idp:
+    volumes: !override
+      - ./.docker/authz/container.it.yaml:/tmp/config.yaml:ro
+      - "authz_tls:/tls:ro"
+    depends_on:
+      it-machine-keygen:
+        condition: service_completed_successfully
+
   it-authorino:
     # Gated behind the `it` profile so a plain `up -d` (which every `just it-*` recipe runs to
     # bring the stack up) starts ONLY the infrastructure, never the suites themselves. Without
@@ -150,12 +190,23 @@ services:
         condition: service_started
       authz-tls:
         condition: service_started
+      # #534/ADR-0030: this suite reads the it-machine private key directly (below) -- explicit,
+      # not merely relied on transitively via authz-idp's own dependency on the same service, so a
+      # future change to authz-idp's deps can't silently break this one.
+      it-machine-keygen:
+        condition: service_completed_successfully
     volumes:
       - "./.docker/it/idp_it.py:/it/idp_it.py:ro"
       # ADR-0013: authz-api's RPC surface is CBOR-only now (see cbor_min.py's own module doc for
       # why this is hand-rolled rather than a pip-installed dependency) -- this suite provisions
       # the account/project it needs through that surface before driving any IdP flow.
       - "./.docker/it/cbor_min.py:/it/cbor_min.py:ro"
+      # #534/ADR-0030: the dependency-free RS256 signer/verifier for the live client_credentials
+      # coverage (see jwt_min.py's own module doc for why this is hand-rolled too), and the
+      # `it-machine` client's freshly generated private key (never checked into the repo --
+      # `generate_it_machine_fixtures.py`'s own doc comment explains why) it signs assertions with.
+      - "./.docker/it/jwt_min.py:/it/jwt_min.py:ro"
+      - "./.docker/it/generated:/it/generated:ro"
       - "authz_tls:/tls:ro"
     environment:
       IDP_URL: "https://authz-idp:3004"
@@ -165,4 +216,5 @@ services:
       USERNAME: "test@admin"
       PASSWORD: "test"
       MAX_WAIT_SECONDS: "300"
+      IT_MACHINE_KEY_PATH: "/it/generated/it-machine-key.pem"
     command: ["python", "/it/idp_it.py"]

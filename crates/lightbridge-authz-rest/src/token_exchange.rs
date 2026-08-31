@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use authkestra_op::client::{ClientRegistration, ClientStore, TokenEndpointAuthMethod};
+use authkestra_op::client::{ClientRegistration, ClientStore, GrantType, TokenEndpointAuthMethod};
 use authkestra_op::client_assertion::{
     CLIENT_ASSERTION_TYPE_JWT_BEARER, peek_client_assertion_subject, verify_client_assertion,
 };
@@ -39,6 +39,14 @@ use crate::signing::ApiKeyJwtSigner;
 pub(crate) const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 pub(crate) const REFRESH_TOKEN_GRANT: &str = "refresh_token";
 pub(crate) const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+/// RFC 6749 §4.4 (M2M/`client_credentials`, #534/ADR-0030). Intercepted BEFORE this request ever
+/// reaches `authkestra_op::handlers::token::handle_token` -- see [`client_credentials_token_endpoint`]'s
+/// own doc comment for why: upstream's own `handle_client_credentials` (already present and
+/// reachable in `authkestra-op` 0.6.3, unused only because no configured client previously listed
+/// this grant) mints the wrong claim shape for this platform (no `svc:`-prefixed `sub`, a UUIDv4
+/// `jti` rather than this repo's CUID2 convention, no `lightbridge_caller_kind`), so this service
+/// mints the token itself, mirroring the [`DEVICE_CODE_GRANT`] intercept immediately below.
+pub(crate) const CLIENT_CREDENTIALS_GRANT: &str = "client_credentials";
 
 /// Everything the native token-exchange endpoint needs: the self-signed-JWT signer (used only to
 /// build the per-request `TokenManager` `handle_token` requires), the OP-level config discovery
@@ -52,6 +60,13 @@ pub struct TokenExchangeState {
     device_code_ttl_secs: u64,
     device_poll_interval_secs: u64,
     cors_origins: Arc<Vec<String>>,
+    /// `oauth2.token_exchange.client_credentials_ttl_seconds` (#534, ADR-0030). Defaults to 900
+    /// (matching the config-level default) so every existing `TokenExchangeState::new` call site
+    /// -- production and the many test fixtures alike -- keeps compiling and behaving exactly as
+    /// before unless it explicitly opts into a different value via
+    /// [`Self::with_client_credentials_ttl_seconds`], the same additive-builder shape
+    /// [`Self::with_cors_origins`] already uses.
+    client_credentials_ttl_seconds: i64,
 }
 
 impl TokenExchangeState {
@@ -71,11 +86,17 @@ impl TokenExchangeState {
             device_code_ttl_secs,
             device_poll_interval_secs,
             cors_origins: Arc::new(Vec::new()),
+            client_credentials_ttl_seconds: 900,
         }
     }
 
     pub fn with_cors_origins(mut self, cors_origins: Vec<String>) -> Self {
         self.cors_origins = Arc::new(cors_origins);
+        self
+    }
+
+    pub fn with_client_credentials_ttl_seconds(mut self, ttl_seconds: i64) -> Self {
+        self.client_credentials_ttl_seconds = ttl_seconds;
         self
     }
 
@@ -219,6 +240,13 @@ async fn token_endpoint(
     if raw.grant_type == DEVICE_CODE_GRANT {
         return cors_response(
             device_token_endpoint(state.clone(), headers, raw).await,
+            origin.as_deref(),
+            &state,
+        );
+    }
+    if raw.grant_type == CLIENT_CREDENTIALS_GRANT {
+        return cors_response(
+            client_credentials_token_endpoint(state.clone(), headers, raw).await,
             origin.as_deref(),
             &state,
         );
@@ -411,6 +439,202 @@ async fn device_token_endpoint(
     {
         Ok(response) => success_response(response),
         Err(error) => error_response(&error),
+    }
+}
+
+// --- RFC 6749 §4.4 Client Credentials Grant (M2M, #534/ADR-0030) -----------------------------
+//
+// Intercepted here, before `handle_token` ever sees `grant_type=client_credentials` -- see
+// `CLIENT_CREDENTIALS_GRANT`'s own doc comment for why. Client authentication is byte-identical to
+// `/oauth2/revoke`'s and `/oauth2/introspect`'s (the shared `extract_presented_credential`/
+// `resolve_presented_client_id`/`authenticate_presented_client` machinery below), deliberately NOT
+// upstream `handle_token`'s own `extract_credential`/`resolve_client_id`/`authenticate_client`:
+// those collapse every authentication failure -- including a `record_client_assertion_jti` storage
+// error (Redis unreachable) -- into a uniform `invalid_client`/401 (see
+// `authkestra_op::handlers::token::authenticate_client`, which propagates any `OpError` via `?`
+// straight into that one branch). This repo's own mirrored `authenticate_presented_client`
+// distinguishes the two: a genuine authentication failure (missing/wrong/replayed assertion) is
+// `invalid_client`/401, but a storage failure while trying to spend the assertion's `jti` is
+// `server_error`/500 -- Redis down must never look identical to "the client just isn't who it
+// claims to be", and it must never result in a mint either way.
+
+async fn client_credentials_token_endpoint(
+    state: TokenExchangeState,
+    headers: HeaderMap,
+    request: RawTokenRequest,
+) -> Response {
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    let credential = match extract_presented_credential(
+        request.client_secret.as_deref(),
+        request.client_assertion.as_deref(),
+        request.client_assertion_type.as_deref(),
+        auth_header,
+    ) {
+        Ok(credential) => credential,
+        Err(err) => return err.into_response(),
+    };
+
+    // Deliberately indistinguishable from an unknown client below (RFC 6749 §5.2 does not require
+    // -- and RFC 7523's assertion-based flavor of this endpoint would happily leak -- which of
+    // "no such client_id" and "wrong key for a real client_id" is the actual cause).
+    let Some(client_id) = resolve_presented_client_id(request.client_id.as_deref(), &credential)
+    else {
+        return invalid_client().into_response();
+    };
+
+    let client = match state.op_store.find_client(&client_id).await {
+        Ok(Some(client)) => client,
+        Ok(None) => return invalid_client().into_response(),
+        Err(_) => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "internal error",
+            );
+        }
+    };
+
+    if let Err(err) =
+        authenticate_presented_client(&client, &credential, &state.op_config, &state.op_store).await
+    {
+        return err.into_response();
+    }
+
+    if !client.allows_grant_type(&GrantType::ClientCredentials) {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "unauthorized_client",
+            "client is not authorized to use the client_credentials grant type",
+        );
+    }
+
+    let granted_scopes = match client_credentials_scopes(&request.scope, &client.scopes) {
+        Ok(scopes) => scopes,
+        Err(rejected_scope) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_scope",
+                &format!("scope {rejected_scope:?} is not allowed for this client"),
+            );
+        }
+    };
+    let scope = crate::oauth2_op::scope_to_string(&granted_scopes);
+
+    // RFC 8707 resource indicators: an audience defaults to the client's own `client_id`
+    // (RFC 6749 §4.4 mints no `aud` at all; that default is this deployment's own convention, kept
+    // for consistency with `handle_client_credentials` upstream), or must be explicitly listed in
+    // `client.allowed_audiences` -- this is the ONE grant where a granted `aud` may legitimately
+    // differ from the token's own `azp`/authenticated client (ADR-0011 Decision 5 otherwise ties
+    // the two together for every other grant this service mints).
+    let aud = match request
+        .audience
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(requested) => {
+            if !client.allowed_audiences.iter().any(|a| a == requested) {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_target",
+                    "requested audience is not allowed for this client",
+                );
+            }
+            requested.to_string()
+        }
+        None => client_id.clone(),
+    };
+
+    let tokens = match state.signer.token_manager().await {
+        Ok(tokens) => tokens,
+        Err(_) => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "signing key unavailable",
+            );
+        }
+    };
+
+    let ttl_seconds = state.client_credentials_ttl_seconds.max(0) as u64;
+    let extra = crate::signing::service_token_extra(&client_id, scope.as_deref().unwrap_or(""));
+    // `sub` is minted `svc:<client_id>` -- NEVER the bare `client_id` -- so that
+    // `auth_provider::FederatedSubjectResolver`'s own-issuer short-circuit (which trusts a
+    // self-signed token's `sub` as an already-resolved account id verbatim) can never collide a
+    // machine client with a real account id of the same string. See that resolver's own doc
+    // comment.
+    let access_token = match tokens.issue_client_token_with_extra(
+        &format!("svc:{client_id}"),
+        ttl_seconds,
+        scope.clone(),
+        Some(aud),
+        extra,
+    ) {
+        Ok(token) => token,
+        Err(_) => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "token signing failed",
+            );
+        }
+    };
+
+    tracing::info!(client_id = %client_id, "issued client_credentials service token");
+
+    // RFC 6749 §4.4.3: this grant MUST NOT return a refresh token. No `id_token` either -- there is
+    // no human identity to describe one. `TokenResponseBody`'s `skip_serializing_if` omits both.
+    (
+        StatusCode::OK,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        Json(TokenResponseBody {
+            access_token,
+            token_type: "Bearer".to_string(),
+            expires_in: ttl_seconds,
+            issued_token_type: None,
+            refresh_token: None,
+            scope,
+            id_token: None,
+        }),
+    )
+        .into_response()
+}
+
+/// RFC 6749 §4.4: checks the requested scope against the AUTHENTICATED CLIENT's OWN `scopes`
+/// only -- deliberately NOT `Oauth2TokenExchange.allowed_scopes`, the server-wide ceiling every
+/// other grant additionally intersects against (`oauth2_op::grant_scopes`). Machine scopes are a
+/// separate namespace from the human-plane `openid`/`profile`/`email`/`offline_access` scopes that
+/// ceiling exists to bound (ADR-0030). An absent/blank `scope` parameter grants every scope the
+/// client is configured for -- RFC 6749 §3.3 leaves the no-scope default up to the authorization
+/// server, and there is no narrower "default scope" concept for a machine client to fall back to.
+/// Returns the first requested scope NOT in `client_scopes` as `Err`, mirroring upstream
+/// `handle_client_credentials`'s own per-scope rejection (`authkestra_op` 0.6.3) -- reproduced here
+/// because this repo intercepts the grant before upstream ever runs it (see this section's own
+/// header comment).
+fn client_credentials_scopes<'a>(
+    requested: &'a Option<String>,
+    client_scopes: &[String],
+) -> Result<Vec<String>, &'a str> {
+    match requested
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        None => Ok(client_scopes.to_vec()),
+        Some(requested) => {
+            for scope in requested.split_whitespace() {
+                if !client_scopes.iter().any(|s| s == scope) {
+                    return Err(scope);
+                }
+            }
+            Ok(requested.split_whitespace().map(str::to_string).collect())
+        }
     }
 }
 

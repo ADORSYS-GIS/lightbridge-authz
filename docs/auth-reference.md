@@ -216,6 +216,27 @@ by `authkestra_engine::token::TokenManager` itself: `iss`, `sub`, `aud`, `exp`, 
 | `allowed_models` | Project's `allowed_models`, if `Some` | Minted from DB state |
 | `at_hash`, `auth_time`, `nonce` | **Not on the access token** — only on the `id_token` (see below) | — |
 
+### `client_credentials` (M2M) access token — a DIFFERENT, smaller claim set (`service_token_extra`, ADR-0030, #534)
+
+The table above describes the human-plane access token (`access_token_extra`). A `client_credentials`
+grant (RFC 6749 §4.4) mints a deliberately separate, smaller shape via `signing::service_token_extra`
+— do not assume the table above applies to it:
+
+| Claim | Value | Note |
+|---|---|---|
+| `sub` | `"svc:<client_id>"` | Never the bare `client_id` — the `svc:` prefix is the namespace guard `auth_provider::FederatedSubjectResolver`'s own-issuer short-circuit relies on |
+| `azp` | The bare, unprefixed `client_id` | |
+| `typ` | `"Bearer"` | Same constant as the human-plane token, so `/oauth2/introspect`'s `typ == "Bearer"` gate recognizes it with no new branch |
+| `jti` | `"lgbr:<cuid2()>"` | Same ADR-0039 convention, same `extra["jti"]` override mechanism |
+| `lightbridge_caller_kind` | `"service"` (`lightbridge_authz_bearer::SERVICE_CALLER_KIND`) | A third value alongside the absent-claim (human) and `"api_key"` cases — see §5 below |
+| `aud` | Requested `audience` if listed in the client's `allowed_audiences`, else the client's own `client_id` | The ONE grant where `aud` may legitimately differ from `azp` |
+| `scope` | Requested scope narrowed against `client.scopes` (or every configured scope if none requested) | Checked against `client.scopes` ONLY — never `oauth2.token_exchange.allowed_scopes` |
+
+**Absent, by omission:** `account_id`, `project_id`, `api_key_id`, `sid`, `identity`,
+`budget_tier`, `quota_tier`, `allowed_models`, `email`/`email_verified`, `at_hash`/`auth_time`/
+`nonce`. No refresh token, no id_token (RFC 6749 §4.4.3). There is no account, project, API key, or
+human identity behind a machine client for any of these to describe.
+
 ### ID token (`id_token_extra`, only issued when the `openid` scope is granted)
 
 | Claim | Source | Minted or propagated |
@@ -321,6 +342,18 @@ catalogue + RBAC compilation), `app/lightbridge-authz/src/mcp.rs:378-403` (MCP t
 - `requestBudgetRefill` additionally refuses any caller whose token carries
   `lightbridge_caller_kind: api_key` — see `docs/rbac.md`'s "#191/#216" note for the `self` vs
   `external` coverage gap (fully closed under `self`, not yet closed under `external`).
+- A THIRD `lightbridge_caller_kind` value, `service`, marks a `client_credentials` (M2M) access
+  token (ADR-0030, #534). A machine token mints no `roles` claim at all, so it holds ZERO
+  permissions on the RPC surface unconditionally — it is refused by every `@allow`/`@@allow` clause,
+  not only `requestBudgetRefill`'s own explicit `api_key` check. **In deployed environments (prod:
+  `ai-helm-values`) this RBAC outcome IS what stops such a token**: `authz-api`/`authz-budget`
+  there validate against `authz-idp`'s own JWKS (the platform rule — every authz resource server
+  validates against `authz-idp`), so the token's signature checks out and the empty permission set
+  is what refuses it. **Only in the LOCAL compose stack** is the token rejected earlier, at
+  signature validation, before any permission is ever checked — `.docker/authz/container.yaml`/
+  `config/default.yaml` still point `oauth2.jwks_url` directly at Keycloak, a local-dev drift
+  tracked separately (`docs/local-testing.md`), not the platform's actual posture. See
+  `docs/rbac.md`'s "Machine (`client_credentials`) callers" note and ADR-0030 Decision 6.
 
 ### `session:revoke-own` / `session:revoke`
 

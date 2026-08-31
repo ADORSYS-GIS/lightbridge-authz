@@ -23,6 +23,15 @@ pub const CALLER_KIND_CLAIM: &str = "lightbridge_caller_kind";
 /// not carry it until that flow is updated to stamp it.
 pub const API_KEY_CALLER_KIND: &str = "api_key";
 
+/// The [`CALLER_KIND_CLAIM`] value stamped onto a token minted for the `client_credentials` (M2M)
+/// grant (#534, ADR-0030), as opposed to a human OIDC login (no claim at all) or an API-key JWT
+/// ([`API_KEY_CALLER_KIND`]). A machine token also mints no roster/roles claim at all, so
+/// [`TokenInfo::permissions`] resolves empty for it regardless of this value -- RBAC fail-closed
+/// does not depend on this constant being checked anywhere. It exists purely so a caller that
+/// needs to tell "no signal" apart from "this genuinely is a service token" can (e.g. for audit
+/// logging), without inventing a second ad hoc string.
+pub const SERVICE_CALLER_KIND: &str = "service";
+
 /// Token information returned by JWT validation.
 #[derive(Clone, Deserialize)]
 pub struct TokenInfo {

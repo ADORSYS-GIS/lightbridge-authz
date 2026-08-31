@@ -998,21 +998,36 @@ fn default_browser_session_ttl_seconds() -> i64 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct OauthClient {
     pub client_id: String,
-    /// `public` (no client authentication beyond the `client_id` itself) or `confidential`
+    /// `public` (no client authentication beyond the `client_id` itself), `confidential`
     /// (`private_key_jwt` only -- ADR-0011 Decision 6 bans `client_secret_basic`/
-    /// `client_secret_post` for every client this service registers).
+    /// `client_secret_post` for every client this service registers), or `service` (also
+    /// `private_key_jwt` -- #534/ADR-0030: a `client_credentials` (M2M) client, identical
+    /// authentication to `confidential` but a distinct config-level name so a reviewer can see
+    /// at a glance which registered clients are machines rather than browser/native RP legs; see
+    /// `oauth2_op::client_store::to_registration`, which maps both `confidential` and `service`
+    /// onto `TokenEndpointAuthMethod::PrivateKeyJwt`). `start_idp_server`'s startup validation
+    /// refuses a `public` client that lists the `client_credentials` grant -- see that check's own
+    /// doc comment for why a config-only enable of that combination is a live footgun.
     #[serde(rename = "type")]
     pub client_type: OauthClientType,
-    /// Scopes this client may request. Intersected with `Oauth2TokenExchange.allowed_scopes` (the
-    /// server-wide ceiling) at exchange/refresh time -- neither list alone is authoritative.
+    /// Scopes this client may request. For every grant except `client_credentials`, intersected
+    /// with `Oauth2TokenExchange.allowed_scopes` (the server-wide ceiling) at exchange/refresh time
+    /// -- neither list alone is authoritative. `client_credentials` (#534/ADR-0030) is the ONE
+    /// deliberate exception: machine scopes are a separate namespace from the human-plane
+    /// `openid`/`profile`/`email`/`offline_access` ceiling, so that grant checks a requested scope
+    /// against THIS list alone -- see `token_exchange::client_credentials_scopes`'s own doc
+    /// comment.
     #[serde(default)]
     pub scopes: Vec<String>,
     /// Grant types this client may use, as raw RFC 8693/OAuth2 grant-type strings (e.g.
-    /// `"urn:ietf:params:oauth:grant-type:token-exchange"`, `"refresh_token"`). Only those two are
-    /// ever meaningful here -- this service never runs `authorization_code` or the device flow (no
-    /// user store, ADR-0011 Context) -- but the list is not restricted at the config-parsing layer
-    /// so an operator typo surfaces as "client not authorized for this grant type" at request time
-    /// rather than a silent config-load failure.
+    /// `"urn:ietf:params:oauth:grant-type:token-exchange"`, `"refresh_token"`,
+    /// `"client_credentials"` -- #534/ADR-0030 added the last of these; before it, only the first
+    /// two were ever meaningful here, since this service ran no other machine-facing grant). The
+    /// list is not restricted at the config-parsing layer so an operator typo surfaces as "client
+    /// not authorized for this grant type" at request time rather than a silent config-load
+    /// failure -- `start_idp_server`'s startup validation catches the one combination that would
+    /// otherwise be a live footgun (`type: public` + `client_credentials`, see that check's own
+    /// doc comment) rather than every possible typo.
     #[serde(default)]
     pub grant_types: Vec<String>,
     /// Downstream audiences this client may request via the token-exchange `audience` parameter.
@@ -1056,6 +1071,13 @@ pub struct OauthClient {
 pub enum OauthClientType {
     Public,
     Confidential,
+    /// A `client_credentials` (M2M) client (#534, ADR-0030). Authenticates identically to
+    /// `Confidential` (`private_key_jwt` only -- ADR-0011 Decision 6 draws no exception for
+    /// machine clients) -- this is a separate variant purely so config/discovery/startup
+    /// validation can name "this registration is a machine client" without overloading
+    /// `Confidential`, which predates the `client_credentials` grant entirely and originally meant
+    /// only "a browser/native RP leg that happens to hold a keypair".
+    Service,
 }
 
 impl Oauth2 {
@@ -1223,6 +1245,15 @@ pub struct Oauth2TokenExchange {
     /// the device-authorization response.
     #[serde(default = "default_device_verification_uri")]
     pub device_verification_uri: String,
+    /// Lifetime of a `client_credentials` (M2M) access token, in seconds (#534, ADR-0030).
+    /// Deliberately its OWN field, not reused from `access_ttl_seconds`: that field is the
+    /// human-plane token-exchange access-token lifetime, and the two are allowed to diverge (a
+    /// machine token is revoked by removing its `jwks` entry from config and redeploying, per
+    /// ADR-0030 -- there is no refresh token to rotate away from, so this TTL doubles as the
+    /// window an already-issued token remains usable after that revocation). Defaults to 900
+    /// seconds, matching `access_ttl_seconds`' own default.
+    #[serde(default = "default_client_credentials_ttl_seconds")]
+    pub client_credentials_ttl_seconds: i64,
 }
 
 fn default_exchange_access_ttl_seconds() -> i64 {
@@ -1255,6 +1286,10 @@ fn default_device_poll_interval_seconds() -> i32 {
 
 fn default_device_verification_uri() -> String {
     "https://localhost:13004/device/verify".to_string()
+}
+
+fn default_client_credentials_ttl_seconds() -> i64 {
+    900
 }
 
 fn default_exchange_allowed_scopes() -> Vec<String> {
