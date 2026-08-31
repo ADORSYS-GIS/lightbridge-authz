@@ -5,6 +5,8 @@
 
 Lightbridge Authz is a multi-service backend for API key management and usage analytics:
 - `authz-api` and `authz-opa` handle key lifecycle and validation.
+- `authz-idp` is the OIDC broker for the human plane (browser SSO, RFC 8628 device flow, token
+  exchange). It renders no HTML of its own — see its entry under Services below.
 - `lightbridge-authz-usage` ingests OTEL traffic data and serves Timescale-backed usage analytics.
 - `lightbridge-mcp` exposes all `lightbridge-authz` endpoints as MCP tools over streamable HTTP (`/mcp`).
 
@@ -24,6 +26,20 @@ the `resolve-context` + Authorino validation flows (mermaid diagrams).
     key-validation route; see `docs/authorino-usage.md`.
   - `POST /idp/v1/resolve-context` (basic auth) — resolves tenant context for token-exchange.
   - Probe routes: `GET /health`, `GET /health/startup`, `GET /health/ready`
+- **authz-idp** (OIDC broker: browser SSO, RFC 8628 device flow, token exchange)
+  - TLS on `:3004` inside the container, exposed as `:13004` via compose.
+  - Every route is public — the presented token/assertion or a completed Keycloak login is itself
+    the credential. See `docs/architecture/services.md`'s `authz-idp` section for the full route
+    table.
+  - Renders no HTML: the browser/device-flow pages are a React SPA, `apps/authz-ui` in the
+    [`ADORSYS-GIS/converse-frontends`](https://github.com/ADORSYS-GIS/converse-frontends) monorepo,
+    built on the estate's `ui-web` design system. `authz-idp` serves the built bundle same-origin
+    under `/ui`, consumed as a digest-pinned, assets-only OCI artifact
+    (`ghcr.io/adorsys-gis/converse-frontends/authz-ui`) rather than compiled in this repo — the one
+    pin is `Dockerfile`'s `ARG AUTHZ_UI_REF=`. `/ui` is a route ALLOWLIST sourced from the
+    artifact's own `dist/routes.json`, not a catch-all: only the manifest's listed paths resolve to
+    `index.html`, everything else under `/ui` is a plain `404`. See **ADR-0029** for the full
+    artifact contract and pin policy, and `docs/local-testing.md` §5 for the cross-repo dev loop.
 - **authz-migrate**
   - Runs SQL migrations before the API services start.
 - **lightbridge-mcp**

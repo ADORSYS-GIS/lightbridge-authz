@@ -257,6 +257,24 @@ source home is `converse-frontends`' `apps/authz-ui`; this repo consumes the bui
 digest-pinned, assets-only OCI image (ADR-0029). There is exactly one pin, the `ARG AUTHZ_UI_REF=`
 line at the top of `./Dockerfile`.
 
+**`authz-idp` renders no HTML on the RP/device leg (lightbridge-authz#607).** `GET /device/verify`
+(the RFC 8628 `verification_uri`) `303`s into the SPA's `/ui/device` route, prefilling a sanitised
+`?user_code=`; `POST /device/verify` and `POST /device/verify/continue` decide and `303` onward
+too (`/ui/device/confirm` on success, `/ui/device/invalid` for an unknown/expired/consumed code,
+`/ui/error` on a store outage); `GET /device/verify/context` is a cookie-bound JSON endpoint (a
+uniform `404` on absence, `503` on outage) the confirmation page fetches for `{user_code,
+client_id}`; the Keycloak callback finishes at `/ui/device/success`. **`/ui` is a route ALLOWLIST,
+not a catch-all:** `static_assets.rs` reads the bundle's own `dist/routes.json` at startup and only
+resolves those listed paths to `index.html` — every other `/ui/*` path is a plain `404`, even if it
+"looks like" a client-side route. In local practice the manifest lists six routes: `/` plus the
+five RP-leg redirect targets above (`/device`, `/device/invalid`, `/device/confirm`,
+`/device/success`, `/error`, each relative to the `/ui` mount). **This means a route added in the
+SPA is not reachable here until two things both happen: the manifest picks it up (Vite emits
+`routes.json` from `apps/authz-ui`'s own react-router table — nothing to hand-edit) and you rebuild
+the bundle** (`pnpm --filter authz-ui build:web`, step 1 below) — `pnpm --filter authz-ui dev`'s
+dev server does not go through this allowlist at all, so a route that works there can still 404
+against a locally built `dist/`.
+
 ### Just run it
 
 `just up` builds the root `Dockerfile`, which pulls the pinned bundle and bakes it into

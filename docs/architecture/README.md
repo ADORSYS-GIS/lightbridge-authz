@@ -79,8 +79,12 @@ Notes grounded in code, not intent:
   issuer has been cut over to it and `authz-api` no longer mounts the same routes (see
   [`services.md`](./services.md#authz-idp)). Every route it mounts is public because the presented
   token/assertion is itself the credential; it validates an RFC 8693 `subject_token` against
-  Keycloak's JWKS. The accepted browser/device roadmap is not yet a deployed grant surface; see
-  [`../oauth-oidc-standards-roadmap.md`](../oauth-oidc-standards-roadmap.md).
+  Keycloak's JWKS. **The browser/device roadmap is a deployed grant surface, unconditionally
+  mounted (ADR-0023)** — `/authorize`, `/device/verify`, and the Keycloak RP leg are all
+  implemented and live, not merely accepted design; since lightbridge-authz#607 that leg renders no
+  HTML itself and hands off to a React SPA served under `/ui` (ADR-0029) — see
+  [`../oauth-oidc-standards-roadmap.md`](../oauth-oidc-standards-roadmap.md) for the per-grant
+  conformance status.
 - **Redis is `authz-api`/`authz-budget`/`authz-idp`-only** today: `authz-idp` requires it at
   startup even if token exchange is disabled; when exchange is enabled it backs the
   `private_key_jwt` replay-tracking store (`crates/lightbridge-authz-rest/src/lib.rs`).
