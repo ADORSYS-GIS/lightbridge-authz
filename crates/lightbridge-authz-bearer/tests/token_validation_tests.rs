@@ -486,6 +486,74 @@ async fn custom_roles_claim_is_honored() {
     assert!(!info.has_permission(Permission::AccountDelete));
 }
 
+/// #534/ADR-0030, test 17: a `client_credentials` (M2M) access token carries the exact claim
+/// shape `lightbridge_authz_rest::signing::service_token_extra` mints -- `sub = "svc:<client_id>"`,
+/// `azp`, `typ: "Bearer"`, `lightbridge_caller_kind: "service"`, and deliberately NO `roles` claim
+/// at all (or any tenant claim a roster/roles mapping could otherwise ride in on). Fed through the
+/// SAME `BearerTokenService::validate_bearer_token` every RPC call site
+/// (`auth_provider::CratestackAuthProvider::authenticate`) actually calls, this proves the
+/// mechanism that makes "no roster row" become "zero permissions" for EVERY `Permission` this
+/// service defines -- the exact thing that makes every `@allow`/`@@allow` clause on the RPC surface
+/// deny a machine token, since `build_context` bakes `info.has_permission(permission)` into every
+/// `perm*` context field cratestack's generated policy checks read.
+///
+/// This is a stronger, more general version of `caller_without_matching_role_is_denied_by_require`
+/// above (which checks one permission): here every `Permission::ALL` member is asserted denied,
+/// and the token's claim shape is pinned to the real client_credentials contract rather than a
+/// bare no-`roles`-claim token.
+#[tokio::test]
+async fn client_credentials_style_token_has_no_roles_and_zero_permissions_for_every_permission() {
+    let server = MockServer::start();
+    let key = generate_test_key("service-kid");
+    server.mock(|when, then| {
+        when.method(GET).path("/jwks");
+        then.header("content-type", "application/json")
+            .status(200)
+            .body(jwks_body(&[&key.jwk]));
+    });
+
+    // Mirrors `service_token_extra`'s exact claim set (`crates/lightbridge-authz-rest/src/signing.rs`)
+    // plus the `sub`/`exp`/`iss`/`aud` this crate's own `Claims` type requires -- no `roles` claim
+    // anywhere, matching what that function actually stamps.
+    let token = sign(
+        &key,
+        &json!({
+            "sub": "svc:it-machine",
+            "iss": test_issuer(),
+            "exp": far_future_exp(),
+            "aud": "it-machine",
+            "azp": "it-machine",
+            "typ": "Bearer",
+            "jti": "lgbr:abc123",
+            "lightbridge_caller_kind": "service",
+            "scope": "read:usage write:usage",
+        }),
+    );
+
+    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()));
+
+    let info: TokenInfo = service.validate_bearer_token(&token).await.unwrap();
+    assert!(info.active);
+    assert_eq!(info.sub, "svc:it-machine");
+    assert!(
+        info.roles.is_empty(),
+        "a client_credentials token stamps no roles claim at all: {:?}",
+        info.roles
+    );
+    for permission in Permission::ALL {
+        assert!(
+            !info.has_permission(permission),
+            "a machine token must hold ZERO permissions -- {permission:?} was unexpectedly \
+             granted, which would let this token pass an @allow clause on the RPC surface"
+        );
+        assert!(
+            info.require(permission).is_err(),
+            "require({permission:?}) must refuse a machine token exactly like it refuses any \
+             other zero-permission caller"
+        );
+    }
+}
+
 #[tokio::test]
 async fn service_debug_output_exposes_jwks_url_and_roles_claim_only() {
     let service = BearerTokenService::new(oauth2_config(

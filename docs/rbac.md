@@ -449,6 +449,28 @@ rest of the budget domain — the real authorization is entirely the RBAC permis
 > for the regression coverage — minted through the real signing path, not a hand-built context —
 > that would have caught this before it shipped.
 
+**Machine (`client_credentials`) callers hold no permissions at all (ADR-0030, #534).** A THIRD
+`lightbridge_caller_kind` value, `service` (`lightbridge_authz_bearer::SERVICE_CALLER_KIND`), marks
+an `authz-idp` `client_credentials` (M2M) access token — distinct from the absent-claim (human)
+and `api_key` cases the `#419` note above walks through. Unlike the `api_key` case, this is not
+something any procedure needs its own explicit check for: a `client_credentials` token mints NO
+`roles` claim at all (`signing::service_token_extra` never stamps one), so `TokenInfo::permissions`
+resolves to an empty `PermissionSet` the same way any other zero-roles caller's does, and every
+`@allow`/`@@allow` clause on the RPC surface denies it — not only `requestBudgetRefill`. See
+ADR-0030 Decision 6 and
+`crates/lightbridge-authz-bearer/tests/token_validation_tests.rs`'s
+`client_credentials_style_token_has_no_roles_and_zero_permissions_for_every_permission` for the
+direct proof against every `Permission` this service defines. **In deployed environments (prod:
+`ai-helm-values`), the zero-permissions property above is exactly what protects the RPC surface**:
+`authz-api`/`authz-budget` there validate against `authz-idp`'s own JWKS (the owner's platform
+rule -- every authz resource server validates against `authz-idp`, which alone brokers the
+Keycloak login leg), so a real `client_credentials` token DOES reach this RBAC check, and IS
+refused by it. **Only in the LOCAL compose stack** does the token never reach this check at all: it
+is rejected earlier, at signature validation, because `.docker/authz/container.yaml`/
+`config/default.yaml` still point `oauth2.jwks_url` directly at Keycloak -- a local-dev drift never
+migrated when ADR-0023 made `authz-idp` the full IdP, tracked separately (see
+`docs/local-testing.md` and ADR-0030 Decision 6), not the platform's actual posture.
+
 **Role grant (#294):** `lightbridge-editor` holds `budget:self-refill` in the shipped configs
 (`config/default.yaml`, `.docker/authz/container.yaml`) — a caller with any budget role can
 self-refill their own budget, capped by the active policy's `self_service_grant_count` threshold

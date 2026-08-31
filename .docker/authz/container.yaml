@@ -106,6 +106,14 @@ oauth2:
   #   self     → mint self-signed JWT API keys (uses `signing`). external → Keycloak-exchanged
   #   tokens (uses `issuance`).
   type: self
+  # ⚠️ LOCAL-STACK DIVERGENCE, do not generalize: this points at Keycloak directly, but the
+  # platform rule (owner, 2026-08-31) is that ALL authz resource servers validate against
+  # AUTHZ-IDP's JWKS -- which prod does (ai-helm-values `lightbridge-app.yaml`: the api/mcp/budget
+  # components all set oauth2.jwks_url to https://auth.ai.camer.digital/.well-known/jwks.json;
+  # only the idp component itself validates the Keycloak leg, as the broker). This local config
+  # predates ADR-0023's full-IdP cutover and stays on Keycloak ONLY because every IT suite still
+  # mints raw Keycloak tokens directly -- migrating the local trust root to authz-idp is a tracked
+  # follow-up (ADR-0030 Decision 6/Neutral-follow-ups) and means converting those suites too.
   jwks_url: "http://keycloak:9100/realms/dev/protocol/openid-connect/certs"
   oauth2_url: "http://keycloak:9100/realms/dev/protocol/openid-connect/token"
   # Expected audience claim(s) in JWT tokens.

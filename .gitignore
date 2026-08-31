@@ -9,3 +9,10 @@ charts/*/charts
 __pycache__
 tls
 !.roo/rules/AGENTS.md
+
+# #534/ADR-0030: the it-machine client_credentials keypair and the rendered IT-only authz-idp
+# config that registers it are generated fresh at IT-stack-up time
+# (.docker/it/generate_it_machine_fixtures.py) -- never committed, so a real private key never
+# trips a secret scanner even as test-only material (PR #604).
+.docker/it/generated/
+.docker/authz/container.it.yaml

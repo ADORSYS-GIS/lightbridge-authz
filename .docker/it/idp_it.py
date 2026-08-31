@@ -33,6 +33,7 @@ import urllib.request
 import uuid
 
 import cbor_min
+import jwt_min
 
 IDP_URL = os.environ.get("IDP_URL", "https://authz-idp:3004").rstrip("/")
 API_URL = os.environ.get("API_URL", "https://authz-api:3000").rstrip("/")
@@ -46,9 +47,28 @@ BROWSER_CLIENT_ID = "it-browser"
 BROWSER_REDIRECT_URI = "http://it-client.invalid/callback"
 EXCHANGE_CLIENT_ID = "it-exchange"
 DEVICE_CLIENT_ID = "opencode-cli"
+# #534/ADR-0030: the live client_credentials (M2M) IT client -- see
+# `generate_it_machine_fixtures.py`'s own doc comment for the full picture. Its `it-machine`
+# registration exists ONLY in the generated `container.it.yaml` (`compose.it.yaml` mounts that,
+# not the checked-in `container.yaml`, as `authz-idp`'s config for this run), and its private key
+# is generated fresh at every IT-stack-up, never checked into the repo (PR #604) -- `it-idp`
+# reads it from wherever `IT_MACHINE_KEY_PATH` points, defaulting to the path
+# `generate_it_machine_fixtures.py` itself writes to when run directly (outside compose) for local
+# debugging.
+MACHINE_CLIENT_ID = "it-machine"
+MACHINE_CLIENT_AUDIENCE = "lightbridge-api-key"
+MACHINE_PRIVATE_KEY_PATH = os.environ.get(
+    "IT_MACHINE_KEY_PATH",
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "generated", "it-machine-key.pem"
+    ),
+)
+MACHINE_KID = "it-machine-2026-08"
 
 TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
 DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+CLIENT_CREDENTIALS_GRANT = "client_credentials"
+CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 
 INSECURE_TLS = ssl.create_default_context()
 INSECURE_TLS.check_hostname = False
@@ -412,6 +432,7 @@ def section_discovery() -> None:
         "urn:ietf:params:oauth:grant-type:device_code",
         TOKEN_EXCHANGE_GRANT,
         "refresh_token",
+        CLIENT_CREDENTIALS_GRANT,
     ):
         assert grant in doc["grant_types_supported"], f"discovery missing grant type {grant}"
     assert doc["code_challenge_methods_supported"] == ["S256"], "discovery code_challenge mismatch"
@@ -947,6 +968,115 @@ def section_token_exchange(project_id: str) -> tuple[str, str]:
     return rotated_body["access_token"], rotated_body["refresh_token"]
 
 
+# --- 9b. client_credentials (M2M, #534/ADR-0030) --------------------------------------------------
+
+
+def section_client_credentials() -> None:
+    """Live end-to-end coverage of the `client_credentials` grant: `it-machine` signs a real
+    `private_key_jwt` assertion (`jwt_min.py`, against the keypair
+    `generate_it_machine_fixtures.py` generates fresh at IT-stack-up time -- never checked into
+    the repo, see that script's own doc comment), mints via `POST /oauth2/token`, the resulting
+    access token verifies against the exact JWKS `/.well-known/jwks.json` serves, and
+    `POST /oauth2/introspect` reports it `active: true`.
+
+    Deliberately does NOT attempt a live call against `authz-api`'s RPC surface with this token --
+    but ONLY because of a LOCAL-COMPOSE-SPECIFIC drift, not a platform limitation: in production
+    (`ai-helm-values`), `authz-api`/`authz-budget` validate against `authz-idp`'s own JWKS (the
+    platform rule -- every authz resource server validates against `authz-idp`, which alone brokers
+    the Keycloak login leg), so a self-signed `client_credentials` token DOES pass signature
+    validation there and IS refused by the empty permission set instead, exactly as designed. THIS
+    local stack's `.docker/authz/container.yaml` still points `oauth2.jwks_url` directly at
+    Keycloak -- never migrated when ADR-0023 made `authz-idp` the full IdP (tracked separately, see
+    `docs/local-testing.md`) -- so here, and only here, the token is rejected at signature
+    validation before any permission is ever checked, making a live RPC call pointless to attempt
+    in this suite. The zero-permissions property itself (no roles claim -> zero `Permission`s ->
+    every `@allow` denies) is instead proven directly against the real
+    `BearerTokenService::validate_bearer_token` code path in
+    `crates/lightbridge-authz-bearer/tests/token_validation_tests.rs`'s
+    `client_credentials_style_token_has_no_roles_and_zero_permissions_for_every_permission`.
+    """
+    status, discovery, _ = http_json("GET", f"{IDP_URL}/.well-known/openid-configuration")
+    assert status == 200, f"discovery failed: status={status}"
+    issuer = discovery["issuer"]
+
+    with open(MACHINE_PRIVATE_KEY_PATH, encoding="utf-8") as key_file:
+        private_key_pem = key_file.read()
+
+    def sign_assertion() -> str:
+        return jwt_min.sign_private_key_jwt(
+            private_key_pem,
+            MACHINE_KID,
+            MACHINE_CLIENT_ID,
+            issuer,
+            str(uuid.uuid4()),
+            300,
+            int(time.time()),
+        )
+
+    status, _, body_bytes = http_form(
+        "POST",
+        f"{IDP_URL}/oauth2/token",
+        {
+            "grant_type": CLIENT_CREDENTIALS_GRANT,
+            "client_assertion_type": CLIENT_ASSERTION_TYPE,
+            "client_assertion": sign_assertion(),
+            "scope": "read:usage",
+        },
+    )
+    body = json.loads(body_bytes)
+    assert status == 200, f"client_credentials mint failed: status={status}, body={body}"
+    assert "refresh_token" not in body or body["refresh_token"] is None, (
+        f"RFC 6749 Sec4.4.3 MUST NOT: client_credentials must never return a refresh_token: {body}"
+    )
+    assert "id_token" not in body or body["id_token"] is None, (
+        f"client_credentials must never return an id_token: {body}"
+    )
+    access_token = body["access_token"]
+
+    header, claims = jwt_min.decode_header_and_claims(access_token)
+    assert claims.get("sub") == f"svc:{MACHINE_CLIENT_ID}", f"unexpected sub: {claims}"
+    assert claims.get("azp") == MACHINE_CLIENT_ID, f"unexpected azp: {claims}"
+    assert claims.get("typ") == "Bearer", f"unexpected typ: {claims}"
+    assert claims.get("lightbridge_caller_kind") == "service", f"unexpected claims: {claims}"
+    assert str(claims.get("jti", "")).startswith("lgbr:"), f"jti must be this repo's own CUID2 convention, not a bare UUIDv4: {claims}"
+    for absent in ("account_id", "project_id", "api_key_id", "sid", "budget_tier", "quota_tier"):
+        assert absent not in claims, f"{absent} must be absent from a client_credentials token: {claims}"
+    log("client_credentials access token carries the expected service-token claim shape")
+
+    status, jwks_body, _ = http_json("GET", f"{IDP_URL}/.well-known/jwks.json")
+    assert status == 200, f"jwks failed: status={status}"
+    matching_jwk = next(
+        (k for k in jwks_body.get("keys", []) if k.get("kid") == header.get("kid")), None
+    )
+    assert matching_jwk, f"no jwks key matches the access token's kid {header.get('kid')!r}"
+    assert jwt_min.verify_rs256(access_token, matching_jwk), (
+        "client_credentials access token does not verify against the server's own published JWKS"
+    )
+    log("client_credentials access token verifies against the same JWKS discovery serves")
+
+    status, _, introspect_bytes = http_raw(
+        "POST",
+        f"{IDP_URL}/oauth2/introspect",
+        body=urllib.parse.urlencode(
+            {
+                "token": access_token,
+                "client_assertion_type": CLIENT_ASSERTION_TYPE,
+                "client_assertion": sign_assertion(),
+            }
+        ).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    introspect_body = json.loads(introspect_bytes)
+    assert status == 200 and introspect_body.get("active") is True, (
+        f"client_credentials access token did not introspect active: status={status}, "
+        f"body={introspect_body}"
+    )
+    assert introspect_body.get("client_id") == MACHINE_CLIENT_ID, (
+        f"unexpected introspection client_id: {introspect_body}"
+    )
+    log("client_credentials access token introspects active:true")
+
+
 # --- 10. Introspection ---------------------------------------------------------------------------
 
 
@@ -1276,6 +1406,7 @@ def main() -> int:
         # After the exchange, not before: the scope gate's negative needs a token minted WITHOUT
         # the email/profile scopes, and the exchange grant is the only place one exists.
         section_userinfo(browser_access, exchange_access_token)
+        section_client_credentials()
         section_introspection(exchange_access_token, exchange_refresh_token, device_access_token)
         section_revocation(device_refresh_token)
         # Last: it ends the browser session every earlier section relied on.

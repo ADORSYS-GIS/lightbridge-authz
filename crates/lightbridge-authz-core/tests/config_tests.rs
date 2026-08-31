@@ -42,12 +42,15 @@ fn oauth2_token_exchange_defaults_when_unset() {
         exchange.allowed_scopes,
         vec!["openid", "profile", "email", "offline_access"]
     );
+    // #534/ADR-0030: defaults to the same 900s as access_ttl_seconds, but is its own independent
+    // field -- see Oauth2TokenExchange::client_credentials_ttl_seconds's own doc comment for why.
+    assert_eq!(exchange.client_credentials_ttl_seconds, 900);
 }
 
 #[test]
 fn oauth2_token_exchange_honors_explicit_values() {
     let exchange: Oauth2TokenExchange = serde_yaml::from_str(
-        "enabled: true\naccess_ttl_seconds: 1\nrefresh_ttl_seconds: 2\nallowed_scopes: [\"openid\"]\n",
+        "enabled: true\naccess_ttl_seconds: 1\nrefresh_ttl_seconds: 2\nallowed_scopes: [\"openid\"]\nclient_credentials_ttl_seconds: 3\n",
     )
     .unwrap();
 
@@ -55,6 +58,7 @@ fn oauth2_token_exchange_honors_explicit_values() {
     assert_eq!(exchange.access_ttl_seconds, 1);
     assert_eq!(exchange.refresh_ttl_seconds, 2);
     assert_eq!(exchange.allowed_scopes, vec!["openid"]);
+    assert_eq!(exchange.client_credentials_ttl_seconds, 3);
 }
 
 /// Identity-vs-location split (ADR-0025 amendment): `discovery_url` is optional and, when unset,

@@ -287,8 +287,11 @@ async fn discovery_advertises_exact_token_exchange_metadata_when_enabled() {
         json!([
             "urn:ietf:params:oauth:grant-type:token-exchange",
             "refresh_token",
+            "client_credentials",
         ]),
-        "grant_types_supported must exactly match what handle_token dispatches: {payload}"
+        "grant_types_supported must exactly match what handle_token dispatches, plus \
+         client_credentials -- advertised unconditionally alongside the token surface since #534 \
+         (ADR-0030), regardless of whether any oauth2.clients entry is configured for it: {payload}"
     );
     assert_eq!(
         payload["scopes_supported"],
@@ -644,7 +647,8 @@ async fn discovery_advertises_response_types_and_modes_only_for_the_mounted_auth
             serde_json::json!({
                 "grant_types_supported": [
                     "urn:ietf:params:oauth:grant-type:token-exchange",
-                    "refresh_token"
+                    "refresh_token",
+                    "client_credentials"
                 ]
             }),
         ),
@@ -657,6 +661,7 @@ async fn discovery_advertises_response_types_and_modes_only_for_the_mounted_auth
                 "grant_types_supported": [
                     "urn:ietf:params:oauth:grant-type:token-exchange",
                     "refresh_token",
+                    "client_credentials",
                     "urn:ietf:params:oauth:grant-type:device_code"
                 ]
             }),
@@ -670,6 +675,7 @@ async fn discovery_advertises_response_types_and_modes_only_for_the_mounted_auth
                 "grant_types_supported": [
                     "urn:ietf:params:oauth:grant-type:token-exchange",
                     "refresh_token",
+                    "client_credentials",
                     "authorization_code"
                 ],
                 "response_types_supported": ["code"],

@@ -116,6 +116,14 @@ oauth2:
   #   self     → this service mints self-signed JWT API keys (uses `signing` below).
   #   external → API keys are exchanged at the upstream IdP/Keycloak (uses `issuance` below).
   type: self
+  # ⚠️ LOCAL-STACK DIVERGENCE, do not generalize: this points at Keycloak directly, but the
+  # platform rule (owner, 2026-08-31) is that ALL authz resource servers validate against
+  # AUTHZ-IDP's JWKS -- which prod does (ai-helm-values `lightbridge-app.yaml`: the api/mcp/budget
+  # components all set oauth2.jwks_url to https://auth.ai.camer.digital/.well-known/jwks.json;
+  # only the idp component itself validates the Keycloak leg, as the broker). This local config
+  # predates ADR-0023's full-IdP cutover and stays on Keycloak ONLY because every IT suite still
+  # mints raw Keycloak tokens directly -- migrating the local trust root to authz-idp is a tracked
+  # follow-up (ADR-0030 Decision 6/Neutral-follow-ups) and means converting those suites too.
   jwks_url: "http://localhost:9100/realms/dev/protocol/openid-connect/certs"
   oauth2_url: "http://localhost:9100/realms/dev/protocol/openid-connect/token"
   # Expected audience claim(s) in JWT tokens. If set, tokens must contain at least one of these values.
@@ -237,7 +245,13 @@ oauth2:
   # enabling token_exchange for a real client. `public` clients present no credential beyond
   # client_id; `confidential` clients authenticate via `private_key_jwt` only (ADR-0011, Decision
   # 6 -- never client_secret_basic/client_secret_post) and need their public key inline as `jwks`
-  # (a JWK Set: `{"keys": [...]}`) -- there is deliberately no `jwks_uri`.
+  # (a JWK Set: `{"keys": [...]}`) -- there is deliberately no `jwks_uri`. `service` clients (#534,
+  # ADR-0030: the `client_credentials`/M2M grant) authenticate identically to `confidential`
+  # (`private_key_jwt` only) but are a separate config-level type name so a reviewer can see at a
+  # glance which registered clients are machines rather than browser/native RP legs -- see
+  # `start_idp_server`'s startup validation for why `type: public` + `client_credentials` is
+  # refused outright, and why every `confidential`/`service` client needs a real, parseable `jwks`
+  # or startup itself refuses.
   clients:
     - client_id: opencode-cli
       type: public
@@ -265,6 +279,29 @@ oauth2:
   #           kid: "lightbridge-mcp-2026-08"
   #           alg: RS256
   #           n: "<base64url-encoded RSA modulus of lightbridge-mcp's public key>"
+  #           e: "AQAB"
+  #   # A client_credentials (M2M) client -- #534, ADR-0030. `scopes` here is its OWN namespace,
+  #   # checked independently of oauth2.token_exchange.allowed_scopes (the human-plane ceiling).
+  #   # `redirect_uris` MUST stay empty/absent -- this is a non-browser, non-redirect grant.
+  #   # NOTE: in THIS LOCAL config, a token minted from this example is not accepted by authz-api --
+  #   # this file's own oauth2.jwks_url (above) still points at Keycloak directly, a local-dev drift
+  #   # never migrated when ADR-0023 made authz-idp the full IdP (tracked separately, see
+  #   # docs/local-testing.md). Deployed environments validate against authz-idp's own JWKS (the
+  #   # platform rule -- every authz resource server validates against authz-idp), where a token
+  #   # like this one DOES pass signature validation and is refused by its empty permission set
+  #   # instead -- see ADR-0030 Decision 6.
+  #   - client_id: acme-usage-exporter
+  #     type: service
+  #     scopes: [read:usage]
+  #     grant_types:
+  #       - client_credentials
+  #     allowed_audiences: [lightbridge-api-key]
+  #     jwks:
+  #       keys:
+  #         - kty: RSA
+  #           kid: "acme-usage-exporter-2026-08"
+  #           alg: RS256
+  #           n: "<base64url-encoded RSA modulus of acme-usage-exporter's public key>"
   #           e: "AQAB"
   # Role-based access control. Roles arrive on the JWT in a single, flat, top-level claim
   # (`roles_claim`, configurable). Each role maps to the permissions it grants; a grant is `*`

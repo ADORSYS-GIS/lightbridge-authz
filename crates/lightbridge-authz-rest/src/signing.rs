@@ -100,6 +100,13 @@ impl DiscoveryCapabilities {
 
 impl ClientAuthenticationMetadata {
     /// Derives supported client-authentication methods from the configured client registry.
+    /// `Confidential` and `Service` (#534, ADR-0030: `client_credentials`/M2M clients) are both
+    /// bound to `private_key_jwt` (`oauth2_op::client_store::to_registration`), so both contribute
+    /// to the advertised signing algorithms here. This function's own inline filter chain and
+    /// [`client_has_a_parseable_jwk`] (used by `start_idp_server`'s startup validation) are two
+    /// separate call sites, not a single shared predicate, but both bottom out in the same
+    /// `parse_public_jwk` call -- see that function's own doc comment for why a JWK either one
+    /// accepts/rejects is judged identically.
     pub fn from_oauth2(oauth2: &Oauth2) -> Self {
         let public_client_registered = oauth2
             .clients
@@ -109,7 +116,12 @@ impl ClientAuthenticationMetadata {
         let signing_algorithms: Vec<String> = oauth2
             .clients
             .iter()
-            .filter(|client| client.client_type == OauthClientType::Confidential)
+            .filter(|client| {
+                matches!(
+                    client.client_type,
+                    OauthClientType::Confidential | OauthClientType::Service
+                )
+            })
             .filter_map(|client| client.jwks.as_ref())
             .filter_map(|jwks| jwks.get("keys").and_then(Value::as_array))
             .flat_map(|keys| keys.iter())
@@ -147,6 +159,51 @@ impl ClientAuthenticationMetadata {
             methods: vec!["private_key_jwt".to_string()],
             signing_algorithms,
         }
+    }
+}
+
+/// True if `jwks` (a client's configured `{"keys": [...]}`, or `None`) contains at least one JWK
+/// [`parse_public_jwk`] can actually use for `private_key_jwt` verification.
+///
+/// Used directly by `start_idp_server`'s startup validation (which confidential/service clients
+/// are actually usable, #534/ADR-0030). [`ClientAuthenticationMetadata::from_oauth2`] (which
+/// JWK-derived signing algorithms to advertise in discovery) does NOT call this function -- it
+/// keeps its own inline filter chain, since it needs to walk every key to collect algorithms
+/// rather than answer a single yes/no -- but both bottom out in the same `parse_public_jwk` call,
+/// so a JWK either one accepts/rejects is judged identically. Before this ADR, nothing enforced
+/// even that weaker guarantee: `ConfigClientStore::to_registration` mapped ANY `confidential`/
+/// `service` client to `TokenEndpointAuthMethod::PrivateKeyJwt` regardless of whether its `jwks`
+/// parsed to anything at all, while `from_oauth2` silently dropped an unparseable one from
+/// `token_endpoint_auth_methods_supported` -- the store kept answering "this client authenticates
+/// via private_key_jwt" while discovery said the deployment supported no such method, and nothing
+/// caught the disagreement at startup. This function's introduction, plus the startup guard that
+/// calls it, closes that gap; it does not make `from_oauth2` and the guard share literal code.
+pub(crate) fn client_has_a_parseable_jwk(jwks: Option<&Value>) -> bool {
+    jwks.and_then(|jwks| jwks.get("keys"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|jwk| parse_public_jwk(jwk).is_ok_and(|jwk| jwk_meets_minimum_strength(&jwk)))
+}
+
+/// RFC 7518 §6.3.1 places no minimum RSA modulus size on a JWK, and `parse_public_jwk` validates
+/// shape only (a well-formed-but-tiny key parses fine) -- so without this, a 512-bit RSA key would
+/// pass [`client_has_a_parseable_jwk`]'s gate, whose whole point (and whose error text, "could
+/// never actually authenticate") is "this client can genuinely use `private_key_jwt`." A key this
+/// weak genuinely CAN authenticate -- just not safely -- so "parseable" alone is the wrong bar.
+/// 2048 bits matches this repo's own generated keys (`generate_rs256_key`, `RSA_KEY_BITS`) and
+/// NIST SP 800-131A's floor for RSA signing keys. EC/OKP keys are unconditionally accepted here:
+/// every curve `client_assertion_algorithms` recognizes (P-256, P-384, Ed25519) is already at or
+/// above an equivalent strength, so there is no weak-but-parseable variant of those key types the
+/// way an arbitrarily short RSA modulus is.
+const MIN_RSA_MODULUS_BITS: usize = 2048;
+
+fn jwk_meets_minimum_strength(jwk: &jsonwebtoken::jwk::Jwk) -> bool {
+    match &jwk.algorithm {
+        AlgorithmParameters::RSA(params) => base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&params.n)
+            .is_ok_and(|modulus| modulus.len() * 8 >= MIN_RSA_MODULUS_BITS),
+        _ => true,
     }
 }
 
@@ -467,6 +524,50 @@ pub(crate) fn access_token_extra(
     extra
 }
 
+/// Builds the `extra` claim map for a `client_credentials` (M2M) access token (#534, ADR-0030) --
+/// a deliberate SIBLING of [`access_token_extra`], not an extension of it: a `client_credentials`
+/// token carries no [`KeyOwner`] (no human ever authenticated), no `sid`, no `api_key_id`, and no
+/// tenant context (`project_id`/`account_id`) at all, so threading it through `access_token_extra`'s
+/// existing many-`Option`-parameter signature would either force fake values through it or grow
+/// that function's arity further for a shape it otherwise has almost nothing in common with.
+///
+/// Stamps `jti` (this repo's own `lgbr:`-prefixed CUID2, the same `extra["jti"]` override
+/// mechanism `access_token_extra` uses and for the same ADR-0039 reason), `typ: "Bearer"` (so
+/// `/oauth2/introspect`'s `typ == "Bearer"` gate recognizes this token the same way it recognizes a
+/// token-exchange access token), `azp` (the authenticated client's own `client_id` -- never the
+/// `svc:`-prefixed `sub` the `client_credentials` token endpoint (`token_exchange.rs`) mints this
+/// token under), and `lightbridge_caller_kind: "service"`
+/// (`lightbridge_authz_bearer::SERVICE_CALLER_KIND`) -- the RBAC-visible signal a machine token
+/// carries no roster/roles claim, so `lightbridge_authz_bearer::TokenInfo::permissions` resolves
+/// empty for it regardless of this value (see `auth_provider::FederatedSubjectResolver`'s own doc
+/// comment for the `svc:`-prefixed `sub` this claim set rides alongside).
+///
+/// `scope` is accepted for observability only and deliberately NOT stamped into `extra["scope"]`:
+/// `authkestra_engine::token::Claims` already carries `scope` as its OWN top-level, flattened
+/// field (the caller passes the same value straight to
+/// `TokenManager::issue_client_token_with_extra`'s own `scope` parameter), so mirroring it into
+/// `extra` would reproduce the exact duplicate-flattened-key hazard [`access_token_extra`]'s own
+/// `jti` doc comment describes for `jti` before `authkestra-engine` 0.5.0.
+pub(crate) fn service_token_extra(client_id: &str, scope: &str) -> HashMap<String, Value> {
+    let mut extra = HashMap::new();
+    extra.insert(
+        "jti".to_string(),
+        Value::String(format!("lgbr:{}", cuid2())),
+    );
+    extra.insert("typ".to_string(), Value::String(TOKEN_TYP.to_string()));
+    extra.insert("azp".to_string(), Value::String(client_id.to_string()));
+    extra.insert(
+        "lightbridge_caller_kind".to_string(),
+        Value::String(lightbridge_authz_bearer::SERVICE_CALLER_KIND.to_string()),
+    );
+    tracing::debug!(
+        client_id = %client_id,
+        scope = %scope,
+        "built client_credentials extra claims"
+    );
+    extra
+}
+
 /// Builds the `extra` claim map every derived `id_token` carries (ADR-0011, Decision 7):
 /// `email`/`email_verified`/`name`/`preferred_username` upstream snapshots, `auth_time`
 /// propagated only when the upstream token carried one (never defaulted to "now"), `azp` naming
@@ -734,10 +835,21 @@ fn discovery_document(
         .flatten()
         .map(<[String]>::to_vec)
         .unwrap_or_default();
+    // `client_credentials` (#534, ADR-0030) is pushed here UNCONDITIONALLY, like
+    // `TOKEN_EXCHANGE_GRANT`/`REFRESH_TOKEN_GRANT` above it and NOT like
+    // `DEVICE_CODE_GRANT`/`"authorization_code"` below (both additionally gated on their own
+    // route-mount flags): the client_credentials grant is handled entirely inside the always-
+    // mounted `/oauth2/token` route (`token_exchange::client_credentials_token_endpoint`), with no
+    // separate route of its own to gate on. ADR-0023's rule applies exactly as it does to every
+    // other route this server mounts unconditionally: mounted unconditionally means advertised
+    // unconditionally, regardless of whether any `oauth2.clients` entry is actually configured for
+    // it yet (see #473's lesson -- "optional" and "half-broken" must never be the same state for a
+    // capability this document claims).
     let mut grant_types_supported = if token_endpoint_mounted {
         vec![
             crate::token_exchange::TOKEN_EXCHANGE_GRANT.to_string(),
             crate::token_exchange::REFRESH_TOKEN_GRANT.to_string(),
+            crate::token_exchange::CLIENT_CREDENTIALS_GRANT.to_string(),
         ]
     } else {
         Vec::new()

@@ -2533,6 +2533,11 @@ fn build_token_exchange_state(
                 .to_string(),
         ));
     }
+    if cfg.client_credentials_ttl_seconds <= 0 {
+        return Err(Error::Server(
+            "token_exchange client_credentials_ttl_seconds must be positive".to_string(),
+        ));
+    }
     let device_verification_uri =
         reqwest::Url::parse(&cfg.device_verification_uri).map_err(|_| {
             Error::Server(
@@ -2552,6 +2557,7 @@ fn build_token_exchange_state(
         ));
     }
     validate_authorization_code_clients(&oauth2.clients, signing.audience.as_deref())?;
+    validate_client_credentials_and_service_clients(&oauth2.clients)?;
     let signer = signing::ApiKeyJwtSigner::from_config(signing, repo.clone())?;
 
     // ADR-0025 Stage 1/2: `start_idp_server` (this function's sole production caller) already
@@ -2600,6 +2606,7 @@ fn build_token_exchange_state(
             token_exchange::TOKEN_EXCHANGE_GRANT.to_string(),
             token_exchange::REFRESH_TOKEN_GRANT.to_string(),
             token_exchange::DEVICE_CODE_GRANT.to_string(),
+            token_exchange::CLIENT_CREDENTIALS_GRANT.to_string(),
         ],
         id_token_signing_alg: "RS256".to_string(),
         authorization_code_ttl_secs: cfg.authorization_code_ttl_seconds,
@@ -2617,7 +2624,8 @@ fn build_token_exchange_state(
             cfg.device_code_ttl_seconds as u64,
             cfg.device_poll_interval_seconds as u64,
         )
-        .with_cors_origins(cors_origins),
+        .with_cors_origins(cors_origins)
+        .with_client_credentials_ttl_seconds(cfg.client_credentials_ttl_seconds),
     ))
 }
 
@@ -2681,6 +2689,81 @@ fn validate_authorization_code_clients(
                  introspectable as token-exchange access tokens",
                 client.client_id
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Startup guard for `client_credentials`-capable and `confidential`/`service` clients (#534,
+/// ADR-0030), called from [`build_token_exchange_state`] -- `start_idp_server`'s sole production
+/// caller of that function, so this runs unconditionally at `authz-idp` startup exactly like
+/// [`validate_authorization_code_clients`] above it. Two independent, previously-latent footguns:
+///
+/// 1. **A `public` client listing `client_credentials` would mint a machine token with NO
+///    credential at all.** `oauth2_op::client_store::to_registration` maps `public` to `NoAuth`.
+///    This check is the SOLE control against that combination, not a second line of defense behind
+///    the pre-dispatch intercept: `token_exchange::client_credentials_token_endpoint`'s own
+///    `authenticate_presented_client` has, as its first match arm, `(Some(NoAuth), NoCredential) =>
+///    Ok(())` -- the same rule every other grant relies on for public clients -- so a `public`
+///    client that somehow reached this endpoint with `client_credentials` in its `grant_types`
+///    would authenticate with `Ok(())` and then pass the `allows_grant_type` check, reproducing the
+///    exact footgun the intercept might otherwise be assumed to guard against. This startup check
+///    is the only thing that stops that combination from ever minting a token.
+/// 2. **A `confidential`/`service` client whose `jwks` does not actually parse to a usable key**
+///    would previously start successfully: `find_client` would keep answering
+///    `token_endpoint_auth_method: Some(PrivateKeyJwt)` for it, while
+///    `signing::ClientAuthenticationMetadata::from_oauth2` silently dropped it from
+///    `token_endpoint_auth_methods_supported` in discovery -- the client store and the discovery
+///    document disagreeing about whether the client can ever actually authenticate. Refusing to
+///    start closes that gap for `confidential` AND `service` clients alike. This check uses
+///    [`signing::client_has_a_parseable_jwk`]; `from_oauth2` keeps its own inline filter chain
+///    rather than calling that same function (it needs to walk every key to collect signing
+///    algorithms, not just answer "is there at least one"), but both bottom out in the same
+///    `parse_public_jwk` call, so a JWK either function accepts/rejects is judged identically.
+///    `ConfigClientStore::has_confidential_client`/
+///    `TokenExchangeOpStore::has_confidential_client` -- the aggregate "is there at least one"
+///    query this per-client check replaces -- are removed as part of this fix; neither could have
+///    driven a check this specific, and both were otherwise unused outside their own tests.
+///
+/// `client_credentials` clients additionally may not register `redirect_uris`: RFC 6749 §4.4 is a
+/// non-browser, non-redirect grant by construction, so a client combining the two is either a
+/// config mistake or two client roles smuggled into one registration.
+fn validate_client_credentials_and_service_clients(clients: &[OauthClient]) -> Result<()> {
+    for client in clients {
+        if matches!(
+            client.client_type,
+            OauthClientType::Confidential | OauthClientType::Service
+        ) && !signing::client_has_a_parseable_jwk(client.jwks.as_ref())
+        {
+            return Err(Error::Server(format!(
+                "oauth2.clients client_id {:?} is {:?} (bound to private_key_jwt) but its jwks \
+                 does not contain at least one parseable JWK -- it could never actually \
+                 authenticate",
+                client.client_id, client.client_type
+            )));
+        }
+        if client
+            .grant_types
+            .iter()
+            .any(|grant| grant == token_exchange::CLIENT_CREDENTIALS_GRANT)
+        {
+            if client.client_type == OauthClientType::Public {
+                return Err(Error::Server(format!(
+                    "oauth2.clients client_id {:?} is type: public but lists the \
+                     client_credentials grant -- a public client authenticates with no credential \
+                     at all, so this would mint a machine token nobody has to prove they own; use \
+                     type: service with a private_key_jwt keypair instead",
+                    client.client_id
+                )));
+            }
+            if !client.redirect_uris.is_empty() {
+                return Err(Error::Server(format!(
+                    "oauth2.clients client_id {:?} lists the client_credentials grant but also \
+                     registers redirect_uris -- client_credentials is a non-browser, \
+                     non-redirect grant (RFC 6749 §4.4)",
+                    client.client_id
+                )));
+            }
         }
     }
     Ok(())
@@ -3771,6 +3854,7 @@ mod tests {
             device_code_ttl_seconds: 600,
             device_poll_interval_seconds: 5,
             device_verification_uri: "https://authz.example.test/device/verify".to_string(),
+            client_credentials_ttl_seconds: 900,
         }
     }
 
@@ -4031,6 +4115,244 @@ mod tests {
             post_logout_redirect_uris: Vec::new(),
             require_pkce: false,
         }];
+        oauth2.token_exchange = Some(exchange_cfg());
+        let result = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        )
+        .unwrap();
+        assert!(result.is_some());
+    }
+
+    fn service_client_with_grant_types(client_id: &str, grant_types: Vec<String>) -> OauthClient {
+        let key = signing::generate_rs256_key().expect("rsa keypair generation");
+        OauthClient {
+            client_id: client_id.to_string(),
+            client_type: OauthClientType::Service,
+            scopes: vec!["read:usage".to_string()],
+            grant_types,
+            allowed_audiences: vec![client_id.to_string()],
+            jwks: Some(serde_json::json!({ "keys": [key.public_jwk] })),
+            redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
+            require_pkce: false,
+        }
+    }
+
+    /// Test 8 (DECISIVE, #534/ADR-0030): a `public` client (`NoAuth` at the token endpoint) listing
+    /// the `client_credentials` grant must be refused at startup -- a public client mints a machine
+    /// token with NO credential proving who asked for it. Prove-fail-first (recorded verbatim in
+    /// the PR body): deleting the `client_type == OauthClientType::Public` branch inside
+    /// `validate_client_credentials_and_service_clients` turns this test green-to-red -- restored
+    /// immediately after.
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_a_public_client_credentials_client() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        oauth2.clients = vec![OauthClient {
+            client_id: "public-machine".to_string(),
+            client_type: OauthClientType::Public,
+            scopes: vec!["read:usage".to_string()],
+            grant_types: vec!["client_credentials".to_string()],
+            allowed_audiences: vec!["public-machine".to_string()],
+            jwks: None,
+            redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
+            require_pkce: false,
+        }];
+        oauth2.token_exchange = Some(exchange_cfg());
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        ) else {
+            panic!(
+                "expected an error for a public client listing the client_credentials grant -- \
+                 it would mint a machine token with no credential at all"
+            );
+        };
+        let message = format!("{err}");
+        assert!(message.contains("public-machine"));
+        assert!(message.contains("client_credentials"));
+    }
+
+    /// Test 9: a `Service`/`Confidential` client whose `jwks` does not contain at least one
+    /// parseable JWK must be refused at startup -- before this fix, `find_client` would keep
+    /// answering `token_endpoint_auth_method: Some(PrivateKeyJwt)` for it while discovery silently
+    /// dropped it from `token_endpoint_auth_methods_supported`, and nothing ever caught the
+    /// disagreement.
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_a_service_client_with_unparseable_jwks() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        oauth2.clients = vec![OauthClient {
+            client_id: "no-jwks-machine".to_string(),
+            client_type: OauthClientType::Service,
+            scopes: vec!["read:usage".to_string()],
+            grant_types: vec!["client_credentials".to_string()],
+            allowed_audiences: vec!["no-jwks-machine".to_string()],
+            jwks: None,
+            redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
+            require_pkce: false,
+        }];
+        oauth2.token_exchange = Some(exchange_cfg());
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        ) else {
+            panic!("expected an error for a service client with no jwks at all");
+        };
+        let message = format!("{err}");
+        assert!(message.contains("no-jwks-machine"));
+        assert!(message.contains("parseable"));
+    }
+
+    /// The same check (9), but for a `jwks` present yet genuinely unparseable (an empty `keys`
+    /// array) rather than absent entirely -- both must be refused identically.
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_a_confidential_client_with_an_empty_jwks_array() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        oauth2.clients = vec![OauthClient {
+            client_id: "empty-jwks-client".to_string(),
+            client_type: OauthClientType::Confidential,
+            scopes: vec!["openid".to_string()],
+            grant_types: vec!["urn:ietf:params:oauth:grant-type:token-exchange".to_string()],
+            allowed_audiences: vec!["empty-jwks-client".to_string()],
+            jwks: Some(serde_json::json!({ "keys": [] })),
+            redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
+            require_pkce: false,
+        }];
+        oauth2.token_exchange = Some(exchange_cfg());
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        ) else {
+            panic!("expected an error for a confidential client with an empty jwks key set");
+        };
+        assert!(format!("{err}").contains("empty-jwks-client"));
+    }
+
+    /// Fail-first-proven RSA-strength floor: a well-formed, parseable, but only 1024-bit RSA JWK
+    /// must be refused at startup exactly like an unparseable one -- `parse_public_jwk` validates
+    /// shape, not strength, so without `signing::jwk_meets_minimum_strength` this JWK would pass
+    /// the same gate a genuinely unusable key fails, defeating the "could never actually
+    /// authenticate" promise that gate's own error text makes. `n` here is a fabricated,
+    /// mathematically-meaningless 128-byte (1024-bit) value -- `parse_public_jwk` never checks that
+    /// `n`/`e` form an invertible keypair, only that they parse, so this is sufficient to exercise
+    /// the size check without a real weak keypair. Prove-fail-first, actually run: reverted
+    /// `client_has_a_parseable_jwk` to its pre-floor body (`parse_public_jwk(jwk).is_ok()` alone,
+    /// no `jwk_meets_minimum_strength` call), reran just this test, and it went red for the
+    /// predicted reason (no error at all -- the weak key was accepted). Restored immediately after.
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_a_1024_bit_rsa_service_client() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        let weak_modulus_b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xAAu8; 128])
+        };
+        oauth2.clients = vec![OauthClient {
+            client_id: "weak-key-machine".to_string(),
+            client_type: OauthClientType::Service,
+            scopes: vec!["read:usage".to_string()],
+            grant_types: vec!["client_credentials".to_string()],
+            allowed_audiences: vec!["weak-key-machine".to_string()],
+            jwks: Some(serde_json::json!({
+                "keys": [{
+                    "kty": "RSA",
+                    "use": "sig",
+                    "alg": "RS256",
+                    "kid": "weak-key-2026",
+                    "n": weak_modulus_b64,
+                    "e": "AQAB",
+                }]
+            })),
+            redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
+            require_pkce: false,
+        }];
+        oauth2.token_exchange = Some(exchange_cfg());
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        ) else {
+            panic!(
+                "expected an error for a service client whose only RSA key is 1024 bits -- \
+                 parseable is not the same bar as usable"
+            );
+        };
+        let message = format!("{err}");
+        assert!(message.contains("weak-key-machine"));
+        assert!(message.contains("parseable"));
+    }
+
+    /// A `client_credentials` client may not also register `redirect_uris` -- RFC 6749 §4.4 is a
+    /// non-browser, non-redirect grant by construction.
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_a_client_credentials_client_with_redirect_uris() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        let mut client = service_client_with_grant_types(
+            "machine-with-redirect",
+            vec!["client_credentials".to_string()],
+        );
+        client.redirect_uris = vec!["https://cb.example.test/callback".to_string()];
+        oauth2.clients = vec![client];
+        oauth2.token_exchange = Some(exchange_cfg());
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        ) else {
+            panic!("expected an error for a client_credentials client registering redirect_uris");
+        };
+        let message = format!("{err}");
+        assert!(message.contains("machine-with-redirect"));
+        assert!(message.contains("redirect_uris"));
+    }
+
+    /// Control: a well-formed `Service` client with a real, parseable `jwks`, the
+    /// `client_credentials` grant, and no `redirect_uris` starts cleanly -- the checks above must
+    /// not be a blanket refusal of every service client.
+    #[tokio::test]
+    async fn build_token_exchange_state_allows_a_well_formed_service_client() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        oauth2.clients = vec![service_client_with_grant_types(
+            "it-machine",
+            vec!["client_credentials".to_string()],
+        )];
         oauth2.token_exchange = Some(exchange_cfg());
         let result = build_token_exchange_state(
             &oauth2,

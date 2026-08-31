@@ -142,6 +142,7 @@ fn exchange_cfg() -> Oauth2TokenExchange {
         device_code_ttl_seconds: 600,
         device_poll_interval_seconds: 5,
         device_verification_uri: "https://authz.example.test/device/verify".to_string(),
+        client_credentials_ttl_seconds: 900,
     }
 }
 

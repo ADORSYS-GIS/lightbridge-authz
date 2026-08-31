@@ -188,6 +188,12 @@ just a connection string with nothing to validate offline beyond "is it well-for
 
 ### Neutral / follow-ups
 
+- **Amendment (2026-08-31, ADR-0030, #534):** `client_credentials` (RFC 6749 §4.4, M2M) joins the
+  unconditional token surface this Decision already covers — it is handled entirely inside the
+  already-unconditionally-mounted `/oauth2/token` route (no separate route of its own to gate on),
+  so `signing::discovery_document` advertises it in `grant_types_supported` unconditionally, the
+  same rule this ADR already applies to `authorization_code`/`device_code`. See ADR-0030 Decision 8
+  for the full reasoning.
 - `DiscoveryCapabilities`'s other named constructors (`token_surface`, `with_device_authorization`,
   `with_authorization_code`) stay in place — `well_known_router` remains a generic function other
   future callers could still use with a narrower capability set. This ADR does not change that
