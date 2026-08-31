@@ -3085,14 +3085,17 @@ pub async fn start_opa_server(
 /// own API-welcome-JSON `root_handler` (from `probe_router`, merged above) while `GET /index.html`
 /// or `GET /login` served the SPA — same build, two different personalities depending on the
 /// exact path. Scoping the static build under `/ui` removes the ambiguity outright: `GET /` is
-/// unconditionally the API route, `GET /ui`, `GET /ui/`, and every `GET /ui/<anything>` are
-/// unconditionally the SPA (client-side routing falls back to `index.html`), and a path outside
-/// `/ui` that matches no protocol route is a normal `404` — the SPA is no longer a catch-all for
-/// the whole server. This also makes the safety property strictly path-scoping rather than
-/// mount-order: static assets and protocol routes now occupy disjoint path spaces, so they cannot
-/// collide regardless of merge order, whereas the old fallback-based mount was safe only because
-/// a real route always beats a fallback. See `static_assets::static_assets_fallback`'s own doc
-/// comment for the caching/CSP posture applied to everything served from `static_dir`.
+/// unconditionally the API route, `GET /ui` and `GET /ui/` are the SPA's `index.html`, and a path
+/// outside `/ui` that matches no protocol route is a normal `404` — the SPA is no longer a
+/// catch-all for the whole server. **Since lightbridge-authz#598, `/ui` is not a catch-all for its
+/// own subtree either** — `GET /ui/<anything>` only serves `index.html` when `<anything>` is one
+/// of the artifact's own `dist/routes.json` entries; every other `/ui/<anything>` is a plain `404`
+/// too (`static_assets::load_route_manifest`'s own doc comment has the fail-closed reasoning).
+/// This also makes the safety property strictly path-scoping rather than mount-order: static
+/// assets and protocol routes now occupy disjoint path spaces, so they cannot collide regardless
+/// of merge order, whereas the old fallback-based mount was safe only because a real route always
+/// beats a fallback. See `static_assets::static_assets_fallback`'s own doc comment for the
+/// caching/CSP posture applied to everything served from `static_dir`.
 ///
 /// ## Every parameter here is a pre-validated product of `start_idp_server`'s checks
 ///
