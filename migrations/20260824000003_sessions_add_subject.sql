@@ -1,0 +1,28 @@
+-- Code-review follow-up to #463/#466/#467 (ADR-0006 identity, ADR-0014/ADR-0017 claims):
+-- `sessions.subject` is the raw authenticated IdP subject (Keycloak ID-token `sub`) for a
+-- `kind = 'browser'` session, distinct from `sessions.account_id`.
+--
+-- `resolve_context` (`crates/lightbridge-authz-api-key/src/repo.rs`) always returns the
+-- project's OWNING account -- including when the caller only matched via a `project_members`
+-- roster row, not ownership. Before this column existed, `KeycloakRelyingParty::complete`'s
+-- `PendingFlow::Browser` arm discarded the real `claims.sub` once it had called
+-- `resolve_context`, so the only identity `authorize.rs::issue_code` had left to mint the
+-- authorization-code's eventual JWT `sub` claim from was `session.account_id` -- misattributing
+-- every non-owner project member's browser-SSO actions to the project OWNER's account. Every
+-- other grant (device-code, token-exchange, refresh) already threads the real authenticated
+-- subject through `KeyOwner`/`Identity` (see `identity_for` in
+-- `crates/lightbridge-authz-rest/src/signing.rs`), keeping `account_id` as a separate `extra`
+-- claim; this column lets the browser-SSO session-reuse path in `authorize.rs` do the same when
+-- a later `/authorize` hit reuses an already-established session instead of running the full
+-- Keycloak round trip again.
+--
+-- Nullable, deliberately: existing `sessions` rows have no recoverable value here (`kind =
+-- 'token'` rows never needed one; any `kind = 'browser'` row that predates this migration was
+-- minted by the buggy code path this follow-up replaces). New browser-session inserts
+-- (`StoreRepo::create_session` from `PendingFlow::Browser`) always populate it going forward;
+-- `authorize.rs` treats a NULL `subject` on an otherwise-active browser session as unusable and
+-- fails closed (forces a fresh Keycloak login) rather than falling back to the account-id
+-- substitution this migration exists to eliminate. `TEXT`, not validated by shape -- this is an
+-- externally-issued IdP subject, stored exactly as issued, per this repo's CUID2/id-opacity rule
+-- (`AGENTS.md`, "Identifier Format (CUID2)").
+ALTER TABLE sessions ADD COLUMN subject TEXT;

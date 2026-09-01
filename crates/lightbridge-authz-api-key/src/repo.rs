@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_core::error::{Error, Result};
+use lightbridge_authz_core::identity::AccountId;
 use lightbridge_authz_core::{
     Account, ApiKey, ApiKeyStatus, ApiKeyValidation, CreateAccount, CreateProject, DefaultLimits,
-    Project, ProjectMember, ResolvedContext, ResourceStatus, UpdateAccount, UpdateApiKey,
-    UpdateProject,
+    ModelPolicy, Project, ProjectMember, ResolvedContext, ResourceStatus, UpdateAccount,
+    UpdateApiKey, UpdateProject,
 };
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -15,15 +17,42 @@ use tracing::instrument;
 use crate::entities::account_row::AccountRow;
 use crate::entities::api_key_row::{ApiKeyChangeset, ApiKeyRow};
 use crate::entities::api_key_validation_row::ApiKeyValidationRow;
+use crate::entities::authorization_code_row::{AuthorizationCodeRow, NewAuthorizationCode};
+use crate::entities::device_authorization_row::{DeviceAuthorizationRow, NewDeviceAuthorization};
 use crate::entities::exchange_refresh_token_row::{
     ExchangeRefreshTokenRow, NewExchangeRefreshToken,
 };
+use crate::entities::federated_identity_row::{FederatedIdentityRow, UpsertFederatedIdentity};
 use crate::entities::new_account_row::NewAccountRow;
 use crate::entities::new_api_key_row::NewApiKeyRow;
 use crate::entities::new_project_row::NewProjectRow;
 use crate::entities::project_member_row::ProjectMemberRow;
 use crate::entities::project_row::{ProjectChangeset, ProjectRow};
+use crate::entities::session_row::{
+    BrowserSessionContextRow, NewSession, SessionRow, SessionStatusRow,
+};
 use crate::entities::signing_key_row::{NewSigningKey, SigningKeyRow};
+
+/// Fine-grained outcome of [`StoreRepo::resolve_account_for_federated_subject_detailed`]
+/// (ADR-0025 Correction, "the Stage 2..5 bootstrap window"). The two refusal variants exist ONLY
+/// so `FederatedSubjectResolver::resolve` (`lightbridge-authz-rest::auth_provider`) can decide
+/// whether the temporary grandfather-issuer bootstrap fallback applies -- every OTHER caller must
+/// keep using [`StoreRepo::resolve_account_for_federated_subject`], whose `Result<String>`
+/// collapses both variants to the identical `Error::Forbidden("no federated identity for this
+/// subject")` so no ingress becomes an account-existence oracle. Do not match on this enum
+/// anywhere else without re-reading that ADR section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FederatedResolution {
+    /// A `federated_identities` row already existed, or the grandfather-issuer subject was just
+    /// adopted -- the resolved acting account id.
+    Resolved(String),
+    /// The presented issuer is not the grandfather issuer, and no `federated_identities` row
+    /// exists either. Refuse unconditionally -- never eligible for the bootstrap fallback.
+    RogueIssuer,
+    /// The grandfather issuer presented a subject with no `federated_identities` row AND no
+    /// matching `accounts` row. Eligible for the temporary bootstrap fallback.
+    NoAccount,
+}
 
 #[derive(Debug, Clone)]
 pub struct StoreRepo {
@@ -37,6 +66,142 @@ impl StoreRepo {
 
     fn pool(&self) -> &PgPool {
         self.pool.pool()
+    }
+
+    pub async fn create_authorization_code(&self, input: NewAuthorizationCode) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO authorization_codes
+              (id, code_hash, client_id, redirect_uri, scope, code_challenge, code_challenge_method, nonce, identity, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            "#,
+        )
+        .bind(input.id)
+        .bind(input.code_hash)
+        .bind(input.client_id)
+        .bind(input.redirect_uri)
+        .bind(input.scope)
+        .bind(input.code_challenge)
+        .bind(input.code_challenge_method)
+        .bind(input.nonce)
+        .bind(input.identity)
+        .bind(input.expires_at)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn consume_authorization_code(
+        &self,
+        code_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<AuthorizationCodeRow>> {
+        let row = sqlx::query_as(
+            r#"
+            UPDATE authorization_codes
+            SET consumed_at = $2
+            WHERE code_hash = $1
+              AND consumed_at IS NULL
+              AND expires_at > $2
+            RETURNING id, code_hash, client_id, redirect_uri, scope, code_challenge,
+                      code_challenge_method, nonce, identity, created_at, expires_at, consumed_at
+            "#,
+        )
+        .bind(code_hash)
+        .bind(now)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// Stores a sealed, single-use secret claim (GHSA-9pc6-965v-2c44, #538). ADR-0038
+    /// persistence exception, same class as `authorization_codes`: see the migration's own
+    /// comment and `consume_secret_claim` below for why redemption cannot be generated CRUD.
+    pub async fn create_secret_claim(
+        &self,
+        id: &str,
+        token_hash: &str,
+        subject: &str,
+        sealed_secret: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO secret_claims (id, token_hash, subject, sealed_secret, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(id)
+        .bind(token_hash)
+        .bind(subject)
+        .bind(sealed_secret)
+        .bind(expires_at)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Claims a secret exactly once, for `subject` only, returning the sealed envelope.
+    ///
+    /// `subject` is in the `WHERE` clause, not checked afterwards, and that placement is the
+    /// whole point: a wrong-subject attempt matches no row, so `consumed_at` is never written and
+    /// the legitimate owner's claim survives. Consuming first and comparing second would let
+    /// anyone holding the token -- including the model it travelled through -- burn the owner's
+    /// one chance to collect their key.
+    ///
+    /// Single-statement CAS, mirroring `consume_authorization_code`: concurrent redemptions by
+    /// the same subject cannot both win, because only the first sees `consumed_at IS NULL`.
+    pub async fn consume_secret_claim(
+        &self,
+        token_hash: &str,
+        subject: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<String>> {
+        let sealed = sqlx::query_scalar(
+            r#"
+            UPDATE secret_claims
+            SET consumed_at = $3
+            WHERE token_hash = $1
+              AND subject = $2
+              AND consumed_at IS NULL
+              AND expires_at > $3
+            RETURNING sealed_secret
+            "#,
+        )
+        .bind(token_hash)
+        .bind(subject)
+        .bind(now)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(sealed)
+    }
+
+    pub async fn authorization_code_matches(
+        &self,
+        code_hash: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let matches = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM authorization_codes
+                WHERE code_hash = $1
+                  AND client_id = $2
+                  AND redirect_uri = $3
+                  AND consumed_at IS NULL
+                  AND expires_at > $4
+            )
+            "#,
+        )
+        .bind(code_hash)
+        .bind(client_id)
+        .bind(redirect_uri)
+        .bind(now)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(matches)
     }
 
     /// Map an optional model list to the value stored in `projects.allowed_models`. `None` maps to
@@ -82,6 +247,8 @@ impl StoreRepo {
             id: row.id,
             default_quota: row.default_quota,
             status: ResourceStatus::from(row.status),
+            name: row.name,
+            user_id: row.user_id,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -110,12 +277,22 @@ impl StoreRepo {
     /// the project's account owner -- callers that need to treat the owner as implicitly authorized
     /// (every lead-gated procedure does) go through `authorize_project_lead` instead, which layers
     /// that check on top of this one.
-    async fn project_member_role(&self, project_id: &str, subject: &str) -> Result<Option<String>> {
+    ///
+    /// `pub`: also read by `authz-opa`'s introspection handler (`OpaRepoTrait::project_member_role`)
+    /// to resolve the `role` claim for a native RFC 8693 exchange session at introspection time,
+    /// the human/OIDC-plane mirror of `project_member_quota_tier` below (ADR-0017's same
+    /// reasoning applies here).
+    #[instrument(skip(self, account_id))]
+    pub async fn project_member_role(
+        &self,
+        project_id: &str,
+        account_id: &AccountId,
+    ) -> Result<Option<String>> {
         let role: Option<String> = sqlx::query_scalar(
             r#"SELECT role FROM project_members WHERE project_id = $1 AND account_id = $2"#,
         )
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         Ok(role)
@@ -134,20 +311,41 @@ impl StoreRepo {
     /// visibility into the project at all (not the owner, not on the roster in any role) gets
     /// `NotFound` so project existence isn't leaked; a subject who can see the project as a plain
     /// `member` but lacks lead standing gets `Forbidden`.
-    async fn authorize_project_lead(&self, project_id: &str, subject: &str) -> Result<()> {
-        let project_account_id: Option<String> =
-            sqlx::query_scalar(r#"SELECT account_id FROM projects WHERE id = $1"#)
-                .bind(project_id)
-                .fetch_optional(self.pool())
-                .await?;
-        let Some(project_account_id) = project_account_id else {
+    async fn authorize_project_lead(&self, project_id: &str, account_id: &AccountId) -> Result<()> {
+        // COALESCE is load-bearing, not defensive noise: an actor with no `accounts` row at all
+        // (a bootstrapping identity) makes the inner subquery NULL, so the comparison is NULL
+        // rather than false, and decoding NULL into `bool` fails -- turning a clean `NotFound`
+        // into a database error. Caught by `access_control_allows_project_members_and_rejects_
+        // non_members`, which asserts the exact error VARIANT an outsider gets.
+        //
+        // ADR-0026: "the project's account owner" is no longer "the project's account IS me" --
+        // one person may own several accounts, and a project inside a secondary account is just as
+        // much theirs. Compare by OWNER, not by account identity, or the owner gets `NotFound` on
+        // their own project. The member branch below deliberately still compares `auth().id`
+        // directly (ADR-0026 D5: a roster may only ever name an anchor account).
+        let owns_project: Option<bool> = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(
+                a.user_id = (SELECT user_id FROM accounts WHERE id = $2),
+                false
+            )
+            FROM projects p
+            JOIN accounts a ON a.id = p.account_id
+            WHERE p.id = $1
+            "#,
+        )
+        .bind(project_id)
+        .bind(account_id.as_str())
+        .fetch_optional(self.pool())
+        .await?;
+        let Some(owns_project) = owns_project else {
             return Err(Error::NotFound);
         };
-        if project_account_id == subject {
+        if owns_project {
             return Ok(());
         }
         match self
-            .project_member_role(project_id, subject)
+            .project_member_role(project_id, account_id)
             .await?
             .as_deref()
         {
@@ -159,15 +357,10 @@ impl StoreRepo {
         }
     }
 
-    async fn load_account_row(&self, account_id: &str) -> Result<AccountRow> {
-        let row = self.load_account_row_optional(account_id).await?;
-        row.ok_or(Error::NotFound)
-    }
-
     async fn load_account_row_optional(&self, account_id: &str) -> Result<Option<AccountRow>> {
         let row = sqlx::query_as::<_, AccountRow>(
             r#"
-            SELECT id, default_quota, status, created_at, updated_at
+            SELECT id, default_quota, status, name, user_id, created_at, updated_at
             FROM accounts
             WHERE id = $1
             "#,
@@ -190,6 +383,7 @@ impl StoreRepo {
             project_quota: row.project_quota,
             status: ResourceStatus::from(row.status),
             is_default: row.is_default,
+            model_policy: ModelPolicy::from(row.model_policy),
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -213,68 +407,149 @@ impl StoreRepo {
         }
     }
 
-    /// `id` **is** `subject` per ADR-0006 -- there is no more server-generated or caller-supplied
-    /// account id, and no membership row to insert alongside it (one account = one person, no
-    /// account-level membership of any kind). A second call for the same subject hits the `accounts`
-    /// primary key and is surfaced as `Conflict`, matching the cstack schema doc's stated contract
-    /// ("a second call for the same subject is `Error::Conflict`, not an upsert").
+    /// Creates an account owned by the caller. ADR-0026: an identity may hold SEVERAL, so this is
+    /// no longer "the account IS the subject" and a second call is no longer a `Conflict`.
+    ///
+    /// Which id the new account gets is decided here, and the rule is not arbitrary:
+    ///
+    /// * **The identity's FIRST account keeps `id = subject`.** That account is the identity's
+    ///   ANCHOR -- `federated_identities` adopts an account by matching `accounts.id == subject`
+    ///   (`resolve_account_for_federated_subject_detailed`), and it is the only account
+    ///   `auth().id` is ever set to. Minting a CUID2 here instead would break adoption for every
+    ///   brand-new signup: the grandfather lookup would find nothing, the resolver would fall
+    ///   through to ADR-0025's `NoAccount` bootstrap arm forever, and the person's own account
+    ///   would be invisible to them. ADR-0025 Stage 5 anticipated this and required
+    ///   `createAccount` to write the adopting `federated_identities` row itself; keeping
+    ///   `id = subject` for the anchor achieves the same end without this method needing the
+    ///   issuer, and without a second account ever being able to adopt the identity (which
+    ///   `federated_identities_account_uidx` forbids, ADR-0026 D6).
+    /// * **Every subsequent account gets a minted CUID2** (ADR-0039, via the one chokepoint) and
+    ///   INHERITS the owner's existing `user_id`. It anchors no identity; it is a pure owned
+    ///   tenant.
+    ///
+    /// The consequence both branches preserve, and which the `@@allow` clauses in
+    /// `authz.cstack` depend on: **`accounts.user_id` is always the owner's home-account id**,
+    /// i.e. always `auth().id`. See that file's "LOAD-BEARING INVARIANT" block on `Account.userId`.
+    ///
+    /// One transaction, because the owner lookup and the insert must not interleave with a
+    /// concurrent first-account bootstrap for the same identity.
     #[instrument(skip(self))]
-    pub async fn create_account(&self, subject: &str, input: CreateAccount) -> Result<Account> {
+    pub async fn create_account(
+        &self,
+        acting_account_id: &AccountId,
+        input: CreateAccount,
+    ) -> Result<Account> {
         let now = Utc::now();
+        let mut tx = self.pool().begin().await?;
+
+        // The acting account is the caller's home account (or nothing at all, if this identity is
+        // bootstrapping its very first one). `FOR UPDATE` serializes two concurrent creates by the
+        // same person so they cannot both read "no owner yet" and both try to claim the anchor.
+        let existing_owner: Option<(String,)> =
+            sqlx::query_as("SELECT user_id FROM accounts WHERE id = $1 FOR UPDATE")
+                .bind(acting_account_id.as_str())
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        let (new_id, owner_user_id) = match existing_owner {
+            // Bootstrap: the anchor. `user_id` stays NULL so the `accounts_set_user` trigger
+            // provisions it (and the `users` row) exactly as it always has.
+            None => (acting_account_id.as_str().to_string(), None),
+            // Second and subsequent: minted id, inherited owner.
+            Some((user_id,)) => (cuid2(), Some(user_id)),
+        };
+
         let new_account = NewAccountRow {
-            id: subject.to_string(),
+            id: new_id,
             default_quota: input.default_quota,
+            name: input.name,
             created_at: now,
             updated_at: now,
         };
 
         sqlx::query(
             r#"
-            INSERT INTO accounts (id, default_quota, created_at, updated_at)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO accounts (id, user_id, default_quota, name, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
             "#,
         )
         .bind(new_account.id.clone())
+        .bind(owner_user_id)
         .bind(new_account.default_quota.clone())
+        .bind(new_account.name.clone())
         .bind(new_account.created_at)
         .bind(new_account.updated_at)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
-            if let sqlx::Error::Database(db_err) = &e
-                && db_err.code().as_deref() == Some("23505")
-            {
-                return Error::Conflict(format!("account already exists for subject '{subject}'"));
+            if let sqlx::Error::Database(db_err) = &e {
+                match db_err.code().as_deref() {
+                    // Two concurrent bootstraps for the same identity raced for the anchor id.
+                    // Still a `Conflict`, and still the ONLY way this method produces one -- an
+                    // ordinary second account can no longer collide, since its id is minted.
+                    Some("23505") => {
+                        return Error::Conflict(
+                            "account already exists for this subject".to_string(),
+                        );
+                    }
+                    // `user_id` referenced a `users` row that vanished, i.e. the acting account was
+                    // deleted between this transaction's own SELECT and this INSERT. Same meaning,
+                    // and the same error, as `upsert_federated_identity`'s 23503 arm: "this subject
+                    // has no lightbridge account right now."
+                    Some("23503") => {
+                        return Error::Forbidden("acting account no longer exists".to_string());
+                    }
+                    _ => {}
+                }
             }
             Error::from(e)
         })?;
 
-        let account = self.load_account_row(&new_account.id).await?;
+        let account: AccountRow = sqlx::query_as(
+            r#"
+            SELECT id, default_quota, status, name, user_id, created_at, updated_at
+            FROM accounts
+            WHERE id = $1
+            "#,
+        )
+        .bind(&new_account.id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
         Ok(Self::to_account(account))
     }
 
-    /// Lists accounts visible to `subject`. Per ADR-0006 `accounts.id` IS the subject, so this
-    /// returns at most the caller's own single account (there is no membership fan-out left to
-    /// enumerate); kept as a list for API-shape compatibility with the generic `model.Account.list`
-    /// verb it backs.
+    /// Lists every account the caller OWNS (ADR-0026), not just the one that IS them.
+    ///
+    /// The owner is derived rather than passed: `accounts.user_id` is always the owner's
+    /// home-account id, and `acting_account_id` is always that home account, so the correlated
+    /// subquery is an indexed PK lookup that reads "everyone owned by the same person as me".
+    /// Deriving it here rather than threading a `UserId` down from the ingress keeps the seam in
+    /// one place and means an acting account that does not exist (a bootstrapping identity)
+    /// yields `user_id = NULL`, which matches no row -- fail-closed, an empty list, never a
+    /// wildcard.
+    ///
+    /// `ORDER BY created_at` (never by id -- ADR-0039: CUID2 has no ordering) is covered by
+    /// `idx_accounts_user_id_created_at`.
     #[instrument(skip(self))]
     pub async fn list_accounts(
         &self,
-        subject: &str,
+        acting_account_id: &AccountId,
         offset: u32,
         limit: u32,
     ) -> Result<Vec<Account>> {
         let rows: Vec<AccountRow> = sqlx::query_as(
             r#"
-            SELECT id, default_quota, status, created_at, updated_at
+            SELECT id, default_quota, status, name, user_id, created_at, updated_at
             FROM accounts
-            WHERE id = $1
+            WHERE user_id = (SELECT user_id FROM accounts WHERE id = $1)
             ORDER BY created_at ASC
             LIMIT $2
             OFFSET $3
             "#,
         )
-        .bind(subject)
+        .bind(acting_account_id.as_str())
         .bind(i64::from(limit))
         .bind(i64::from(offset))
         .fetch_all(self.pool())
@@ -282,17 +557,27 @@ impl StoreRepo {
         Ok(rows.into_iter().map(Self::to_account).collect())
     }
 
+    /// Reads one account the caller OWNS. Was `WHERE id = $1 AND id = $2` ("the target must BE
+    /// me"); ADR-0026 makes it "the target must be owned by the same person as me", via the same
+    /// derived-owner subquery as [`Self::list_accounts`]. A target the caller does not own is
+    /// `None`, exactly as before -- not an error, and indistinguishable from a target that does
+    /// not exist, so this never becomes an account-existence oracle.
     #[instrument(skip(self))]
-    pub async fn get_account(&self, subject: &str, account_id: &str) -> Result<Option<Account>> {
+    pub async fn get_account(
+        &self,
+        acting_account_id: &AccountId,
+        account_id: &str,
+    ) -> Result<Option<Account>> {
         let row = sqlx::query_as::<_, AccountRow>(
             r#"
-            SELECT id, default_quota, status, created_at, updated_at
+            SELECT id, default_quota, status, name, user_id, created_at, updated_at
             FROM accounts
-            WHERE id = $1 AND id = $2
+            WHERE id = $1
+              AND user_id = (SELECT user_id FROM accounts WHERE id = $2)
             "#,
         )
         .bind(account_id)
-        .bind(subject)
+        .bind(acting_account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(Self::to_account))
@@ -307,7 +592,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn update_account(
         &self,
-        subject: &str,
+        acting_account_id: &AccountId,
         account_id: &str,
         input: UpdateAccount,
     ) -> Result<Account> {
@@ -316,14 +601,15 @@ impl StoreRepo {
             r#"
             UPDATE accounts
             SET default_quota = COALESCE($1, default_quota), updated_at = $2
-            WHERE id = $3 AND id = $4
-            RETURNING id, default_quota, status, created_at, updated_at
+            WHERE id = $3
+              AND user_id = (SELECT user_id FROM accounts WHERE id = $4)
+            RETURNING id, default_quota, status, name, user_id, created_at, updated_at
             "#,
         )
         .bind(input.default_quota)
         .bind(now)
         .bind(account_id)
-        .bind(subject)
+        .bind(acting_account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
@@ -340,19 +626,70 @@ impl StoreRepo {
     /// `projects.is_default` (default-*project*) survives, and it is enforced on `Project`, not
     /// here.
     #[instrument(skip(self))]
-    pub async fn delete_account(&self, subject: &str, account_id: &str) -> Result<Account> {
-        let row: Option<AccountRow> = sqlx::query_as(
+    pub async fn delete_account(
+        &self,
+        acting_account_id: &AccountId,
+        account_id: &str,
+    ) -> Result<Account> {
+        let mut tx = self.pool().begin().await?;
+
+        // Ownership, plus one thing the WHERE clause alone must not decide silently. ADR-0026 lets
+        // a person own several accounts, and exactly one of them is the HOME account -- the
+        // identity's anchor, the row `federated_identities` adopted by matching
+        // `accounts.id == subject`, and the only id `auth().id` is ever set to.
+        //
+        // Deleting the anchor while other accounts are still owned would ORPHAN them: the
+        // `federated_identities` row cascades away with it, the next login resolves through
+        // ADR-0025's bootstrap fallback to a subject with no `accounts` row, and
+        // `user_id = (SELECT user_id FROM accounts WHERE id = $subject)` then yields NULL -- so the
+        // surviving accounts match nothing and become permanently unreachable, with their projects
+        // and keys still live. Refuse it explicitly; a `WHERE` clause that just failed to match
+        // would surface as `NotFound` and read like the account did not exist.
+        //
+        // Deleting the home account when it is the ONLY one is untouched, pre-ADR-0026 behaviour.
+        let target: Option<(bool, bool)> = sqlx::query_as(
             r#"
-            DELETE FROM accounts
-            WHERE id = $1 AND id = $2
-            RETURNING id, default_quota, status, created_at, updated_at
+            SELECT
+                (a.id = a.user_id) AS is_home,
+                EXISTS (
+                    SELECT 1 FROM accounts o
+                    WHERE o.user_id = a.user_id AND o.id <> a.id
+                ) AS has_siblings
+            FROM accounts a
+            WHERE a.id = $1
+              AND a.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+            FOR UPDATE
             "#,
         )
         .bind(account_id)
-        .bind(subject)
-        .fetch_optional(self.pool())
+        .bind(acting_account_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        match target {
+            None => return Err(Error::NotFound),
+            Some((true, true)) => {
+                return Err(Error::BadRequest(
+                    "cannot delete your primary account while you still own others; delete or \
+                     transfer them first"
+                        .to_string(),
+                ));
+            }
+            Some(_) => {}
+        }
+
+        let row: Option<AccountRow> = sqlx::query_as(
+            r#"
+            DELETE FROM accounts
+            WHERE id = $1
+            RETURNING id, default_quota, status, name, user_id, created_at, updated_at
+            "#,
+        )
+        .bind(account_id)
+        .fetch_optional(&mut *tx)
         .await?;
         let row = row.ok_or(Error::NotFound)?;
+        tx.commit().await?;
         Ok(Self::to_account(row))
     }
 
@@ -364,14 +701,47 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn add_project_member(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         target_account_id: &str,
         role: Option<&str>,
     ) -> Result<Project> {
         let role = role.unwrap_or("member");
         Self::validate_project_role(role)?;
-        self.authorize_project_lead(project_id, subject).await?;
+        self.authorize_project_lead(project_id, account_id).await?;
+
+        // ADR-0026 D5: the roster names an ACCOUNT ("a project member IS an account",
+        // 20260727000001), and the `Project`/`ApiKey` membership policies compare that account
+        // against `auth().id` -- which is only ever a person's HOME account. Once one person can
+        // own several accounts, adding a NON-home account to a roster is a silent dead end: the
+        // row exists, the member is listed, and they never gain access, because they will never
+        // act as that account. Refuse it at the point of insert instead of shipping a roster entry
+        // that cannot work.
+        //
+        // A home account is one that owns itself (`id = user_id`) -- see the LOAD-BEARING
+        // INVARIANT block on `Account.userId` in authz.cstack. Checked against `accounts` rather
+        // than `federated_identities` deliberately: equivalent under that invariant, and it keeps
+        // the credential-bearing table out of an ordinary CRUD path.
+        //
+        // `BadRequest`, not `NotFound`: the lead is already authorized on this project (the check
+        // above passed), so there is no existence to leak here -- and a silent no-op would be the
+        // worst outcome of the three.
+        let target_is_home_account: Option<(bool,)> =
+            sqlx::query_as("SELECT (user_id = id) FROM accounts WHERE id = $1")
+                .bind(target_account_id)
+                .fetch_optional(self.pool())
+                .await?;
+        match target_is_home_account {
+            Some((true,)) => {}
+            Some((false,)) => {
+                return Err(Error::BadRequest(
+                    "target account is a secondary account and cannot hold project membership; \
+                     use the owner's primary account"
+                        .to_string(),
+                ));
+            }
+            None => return Err(Error::NotFound),
+        }
 
         sqlx::query(
             r#"
@@ -407,7 +777,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn list_project_roster(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
     ) -> Result<Vec<ProjectMember>> {
         let project_account_id: Option<String> =
@@ -418,9 +788,9 @@ impl StoreRepo {
         let Some(project_account_id) = project_account_id else {
             return Err(Error::NotFound);
         };
-        if project_account_id != subject
+        if project_account_id != account_id.as_str()
             && self
-                .project_member_role(project_id, subject)
+                .project_member_role(project_id, account_id)
                 .await?
                 .is_none()
         {
@@ -451,11 +821,11 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn remove_project_member(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         target_account_id: &str,
     ) -> Result<Project> {
-        self.authorize_project_lead(project_id, subject).await?;
+        self.authorize_project_lead(project_id, account_id).await?;
 
         sqlx::query(r#"DELETE FROM project_members WHERE project_id = $1 AND account_id = $2"#)
             .bind(project_id)
@@ -476,13 +846,13 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn set_project_member_role(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         target_account_id: &str,
         role: &str,
     ) -> Result<Project> {
         Self::validate_project_role(role)?;
-        self.authorize_project_lead(project_id, subject).await?;
+        self.authorize_project_lead(project_id, account_id).await?;
 
         let result = sqlx::query(
             r#"UPDATE project_members SET role = $1 WHERE project_id = $2 AND account_id = $3"#,
@@ -514,12 +884,12 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn set_project_member_quota_tier(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         target_account_id: &str,
         quota_tier: Option<&str>,
     ) -> Result<Project> {
-        self.authorize_project_lead(project_id, subject).await?;
+        self.authorize_project_lead(project_id, account_id).await?;
 
         let result = sqlx::query(
             r#"UPDATE project_members SET quota_tier = $1 WHERE project_id = $2 AND account_id = $3"#,
@@ -547,7 +917,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn create_project(
         &self,
-        subject: &str,
+        acting_account_id: &AccountId,
         account_id: &str,
         input: CreateProject,
         id: String,
@@ -571,7 +941,7 @@ impl StoreRepo {
                 SELECT id AS account_id
                 FROM accounts
                 WHERE id = $1
-                  AND id = $2
+                  AND user_id = (SELECT user_id FROM accounts WHERE id = $2)
             )
             INSERT INTO projects (
               id, account_id, name, allowed_models, default_limits, billing_plan, billing_identity,
@@ -580,11 +950,12 @@ impl StoreRepo {
             SELECT $3, account_auth.account_id, $4, $5, $6, $7, $8, $9, $10, $11
             FROM account_auth
             RETURNING id, account_id, name, allowed_models, default_limits, billing_plan,
-              billing_identity, project_quota, status, is_default, created_at, updated_at
+              billing_identity, project_quota, status, is_default, model_policy, created_at,
+              updated_at
             "#,
         )
         .bind(account_id)
-        .bind(subject)
+        .bind(acting_account_id.as_str())
         .bind(new_project.id)
         .bind(new_project.name)
         .bind(new_project.allowed_models)
@@ -622,8 +993,8 @@ impl StoreRepo {
     /// and the bootstrap "ensure default project" flow are two separate calls) -- callers must
     /// treat that identically to `resolve_context`'s own `NotFound`, not as a distinct error class,
     /// to preserve the same non-leaking behavior.
-    #[instrument(skip(self, subject))]
-    pub async fn find_default_project_id(&self, subject: &str) -> Result<Option<String>> {
+    #[instrument(skip(self, account_id))]
+    pub async fn find_default_project_id(&self, account_id: &AccountId) -> Result<Option<String>> {
         let row: Option<(String,)> = sqlx::query_as(
             r#"
             SELECT id
@@ -632,23 +1003,23 @@ impl StoreRepo {
               AND is_default = true
             "#,
         )
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(|(id,)| id))
     }
 
-    /// Resolves the `{account_id, project_id}` context for a subject + project on behalf of the
-    /// `lightbridge-keycloak-spi` token-exchange adapter. Authorized when `subject` is the
-    /// project's account owner OR holds ANY `project_members` row on it (not lead-gated -- this is
-    /// a read, same visibility boundary as `Project`'s `@@allow("read", ...)`). Deliberately a
-    /// single query with one `NotFound` branch: "unknown project" and "known project the subject
-    /// can't see" must resolve identically so this endpoint never leaks project existence to a
-    /// non-member -- do not split these cases.
-    #[instrument(skip(self, subject))]
+    /// Resolves the `{account_id, project_id}` context for an (already-translated, ADR-0025) acting
+    /// account id + project on behalf of the `lightbridge-keycloak-spi` token-exchange adapter.
+    /// Authorized when `account_id` is the project's account owner OR holds ANY `project_members`
+    /// row on it (not lead-gated -- this is a read, same visibility boundary as `Project`'s
+    /// `@@allow("read", ...)`). Deliberately a single query with one `NotFound` branch: "unknown
+    /// project" and "known project the caller can't see" must resolve identically so this endpoint
+    /// never leaks project existence to a non-member -- do not split these cases.
+    #[instrument(skip(self, account_id))]
     pub async fn resolve_context(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
     ) -> Result<ResolvedContext> {
         let row: Option<(String, String)> = sqlx::query_as(
@@ -657,7 +1028,10 @@ impl StoreRepo {
             FROM projects
             WHERE projects.id = $1
               AND (
-                projects.account_id = $2
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $2
@@ -666,7 +1040,7 @@ impl StoreRepo {
             "#,
         )
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let (account_id, project_id) = row.ok_or(Error::NotFound)?;
@@ -676,10 +1050,132 @@ impl StoreRepo {
         })
     }
 
-    /// Resolves the acting `subject`'s per-member `quota_tier` on `project_id` (ADR-0017), the
+    /// Backs `authz-opa`'s `POST /idp/v1/authorize-usage-scope` (#570): does the already-ADR-0025-
+    /// resolved `account_id` own `scope_id` under `scope`? `lightbridge-authz-usage`'s query
+    /// listener has no database of its own to answer "does this end user own this account/
+    /// project" -- this is the one place that predicate is evaluated, mirroring `resolve_context`'s
+    /// own ownership semantics exactly rather than inventing a second one:
+    ///
+    /// - `scope == "account"`: `account_id` owns `scope_id` when they share the same ADR-0026
+    ///   identity anchor (`accounts.user_id`), the identical `owned.user_id = (SELECT user_id FROM
+    ///   accounts WHERE id = $2)` join `resolve_context`'s ownership branch uses.
+    /// - `scope == "project"`: identical predicate to `resolve_context` itself -- owns the
+    ///   project's account (by the same anchor join) OR holds a `project_members` row on it.
+    /// - anything else (including `"user"`/`"api_key"`, which have no resolvable authority) is an
+    ///   immediate `NotFound`, with no query at all -- there is no ownership predicate to evaluate
+    ///   for them, so refusing here also can never leak whether `scope_id` exists.
+    ///
+    /// One query per scope, one `NotFound` branch each: "unknown scope_id" and "known scope_id the
+    /// caller doesn't own" must resolve identically, exactly like `resolve_context`'s own
+    /// non-leaking-oracle contract.
+    #[instrument(skip(self, account_id))]
+    pub async fn authorize_usage_scope(
+        &self,
+        account_id: &AccountId,
+        scope: &str,
+        scope_id: &str,
+    ) -> Result<()> {
+        match scope {
+            "account" => {
+                let row: Option<(String,)> = sqlx::query_as(
+                    r#"
+                    SELECT owned.id
+                    FROM accounts owned
+                    WHERE owned.id = $1
+                      AND owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                    "#,
+                )
+                .bind(scope_id)
+                .bind(account_id.as_str())
+                .fetch_optional(self.pool())
+                .await?;
+                row.ok_or(Error::NotFound)?;
+                Ok(())
+            }
+            "project" => {
+                let row: Option<(String,)> = sqlx::query_as(
+                    r#"
+                    SELECT projects.id
+                    FROM projects
+                    WHERE projects.id = $1
+                      AND (
+                        projects.account_id IN (
+                          SELECT owned.id FROM accounts owned
+                          WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM project_members pm
+                          WHERE pm.project_id = projects.id AND pm.account_id = $2
+                        )
+                      )
+                    "#,
+                )
+                .bind(scope_id)
+                .bind(account_id.as_str())
+                .fetch_optional(self.pool())
+                .await?;
+                row.ok_or(Error::NotFound)?;
+                Ok(())
+            }
+            _ => Err(Error::NotFound),
+        }
+    }
+
+    /// Enforces the Active-status gate `resolve_context` itself deliberately does not apply (that
+    /// function only checks ownership/membership). Single source of truth for every grant/session
+    /// path that must refuse a suspended account or an inactive project rather than silently
+    /// admitting it: browser SSO (`KeycloakRelyingParty::complete`/`resolve_authorized_context`),
+    /// the device-code grant (`issue_device_tokens`), the refresh grant (`handle_refresh_token`),
+    /// and the RFC 8693 token-exchange grant (`handle_token_exchange`) all route through this (or
+    /// through [`Self::resolve_active_context`] below, which also resolves the context). Returns
+    /// the fetched [`Project`] because two of those four callers (`issue_device_tokens`,
+    /// `handle_refresh_token`) need `allowed_models`/`model_policy` off the SAME row right after
+    /// this check and would otherwise pay for a second, redundant query to get it.
+    ///
+    /// Fail-closed, unconditionally: a lookup ERROR refuses (`Error::Server`), never falls through
+    /// to permit. An inactive project or a suspended account refuses (`Error::Forbidden`). This is
+    /// the exact asymmetry that let `handle_token_exchange` silently admit a suspended account
+    /// through the RFC 8693 grant while `issue_device_tokens`/`handle_refresh_token` already
+    /// refused it -- callers translate the `Result` into their own OAuth error shape (some grants
+    /// use a specific `access_denied`, the refresh grant deliberately uses a uniform
+    /// `invalid_grant` for both "inactive" and "not authorized" so as not to reveal which applied),
+    /// but the underlying check must never drift between them again.
+    pub async fn require_active_project_and_account(
+        &self,
+        project_id: &str,
+        account_id: &str,
+    ) -> Result<Project> {
+        let project = match self.get_project_by_id(project_id).await {
+            Ok(Some(project)) if project.status == ResourceStatus::Active => project,
+            Ok(_) => return Err(Error::Forbidden("project is not active".to_string())),
+            Err(_) => return Err(Error::Server("project lookup failed".to_string())),
+        };
+        match self.get_account_by_id(account_id).await {
+            Ok(Some(account)) if account.status == ResourceStatus::Active => {}
+            Ok(_) => return Err(Error::Forbidden("account is suspended".to_string())),
+            Err(_) => return Err(Error::Server("account lookup failed".to_string())),
+        }
+        Ok(project)
+    }
+
+    /// `resolve_context` followed immediately by [`Self::require_active_project_and_account`], for
+    /// the callers (browser SSO's session creation and cross-project re-resolution) that only need
+    /// the resolved ids, not the fetched `Project` value itself.
+    pub async fn resolve_active_context(
+        &self,
+        account_id: &AccountId,
+        project_id: &str,
+    ) -> Result<ResolvedContext> {
+        let context = self.resolve_context(account_id, project_id).await?;
+        self.require_active_project_and_account(&context.project_id, &context.account_id)
+            .await?;
+        Ok(context)
+    }
+
+    /// Resolves the acting account's per-member `quota_tier` on `project_id` (ADR-0017), the
     /// human/OIDC-plane mirror of the API-key plane's `owner_quota_tier`
     /// (`api_key_validation` view, `migrations/20260731000001_api_keys_owner_account.sql`).
-    /// Deliberately keyed on `subject` (the acting person), not the project's owning account --
+    /// Deliberately keyed on `account_id` (the acting person), not the project's owning account --
     /// same reasoning as that view's `pm.account_id = k.owner_account_id` join: a lead acting on a
     /// project someone else owns is governed by their OWN roster row, not the owner's.
     ///
@@ -695,17 +1191,17 @@ impl StoreRepo {
     /// availability failure becomes a quota bypass. See `TokenExchangeOpStore::resolve_quota_tier`
     /// for how the token-exchange/refresh call sites act on that distinction (refuse the mint
     /// rather than omit the claim).
-    #[instrument(skip(self, subject))]
+    #[instrument(skip(self, account_id))]
     pub async fn project_member_quota_tier(
         &self,
         project_id: &str,
-        subject: &str,
+        account_id: &AccountId,
     ) -> Result<Option<String>> {
         let quota_tier: Option<Option<String>> = sqlx::query_scalar(
             r#"SELECT quota_tier FROM project_members WHERE project_id = $1 AND account_id = $2"#,
         )
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         Ok(quota_tier.flatten())
@@ -718,9 +1214,9 @@ impl StoreRepo {
         let row: ExchangeRefreshTokenRow = sqlx::query_as(
             r#"
             INSERT INTO exchange_refresh_tokens
-              (id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, chain_id, chain_expires_at, created_at, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, $10, $11, $12, $13, $14)
-            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, chain_id, chain_expires_at, created_at, expires_at, last_used_at
+              (id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at, rotated_at, successor_id
             "#,
         )
         .bind(input.id)
@@ -733,8 +1229,11 @@ impl StoreRepo {
         .bind(input.email)
         .bind(input.email_verified)
         .bind(input.auth_time)
+        .bind(input.preferred_username)
+        .bind(input.name)
         .bind(input.chain_id)
         .bind(input.chain_expires_at)
+        .bind(input.session_id)
         .bind(input.created_at)
         .bind(input.expires_at)
         .fetch_one(self.pool())
@@ -749,7 +1248,7 @@ impl StoreRepo {
     ) -> Result<Option<ExchangeRefreshTokenRow>> {
         let row = sqlx::query_as(
             r#"
-            SELECT id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, chain_id, chain_expires_at, created_at, expires_at, last_used_at
+            SELECT id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at, rotated_at, successor_id
             FROM exchange_refresh_tokens
             WHERE token_hash = $1
               AND status = 'active'
@@ -776,7 +1275,7 @@ impl StoreRepo {
     ) -> Result<Option<ExchangeRefreshTokenRow>> {
         let row = sqlx::query_as(
             r#"
-            SELECT id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, chain_id, chain_expires_at, created_at, expires_at, last_used_at
+            SELECT id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at, rotated_at, successor_id
             FROM exchange_refresh_tokens
             WHERE token_hash = $1
             "#,
@@ -819,23 +1318,35 @@ impl StoreRepo {
     /// (`create_exchange_refresh_token`, driving `RefreshTokenStore::store_token`) -- the trait
     /// splits "atomically revoke" from "store a new one" into two methods, so this mirrors that
     /// shape rather than reintroducing the old single-transaction combo.
+    ///
+    /// Also stamps `rotated_at = $2` and `successor_id = $3` in the SAME statement (refresh-reuse
+    /// grace window, migration `20260830000004_exchange_refresh_tokens_add_reuse_grace.sql`, added
+    /// after the 2026-08-30 console-401s incident -- see that migration's doc comment). `successor
+    /// _id` is the id of the row about to be minted by the caller's own follow-up
+    /// `create_exchange_refresh_token` call; the caller generates it BEFORE calling this method
+    /// specifically so it can be recorded here atomically, rather than only existing after a
+    /// second, separate `INSERT` this method has no transaction spanning into. Pass `None` when
+    /// the caller has no successor to record (e.g. the generic `RefreshTokenStore::consume_token`
+    /// path, which only ever consumes -- it never mints a replacement row itself).
     pub async fn consume_exchange_refresh_token(
         &self,
         presented_hash: &str,
         now: DateTime<Utc>,
+        successor_id: Option<&str>,
     ) -> Result<Option<ExchangeRefreshTokenRow>> {
         let row: Option<ExchangeRefreshTokenRow> = sqlx::query_as(
             r#"
             UPDATE exchange_refresh_tokens
-            SET status = 'rotated', last_used_at = $2
+            SET status = 'rotated', last_used_at = $2, rotated_at = $2, successor_id = $3
             WHERE token_hash = $1
               AND status = 'active'
               AND expires_at > $2
-            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, chain_id, chain_expires_at, created_at, expires_at, last_used_at
+            RETURNING id, subject, account_id, project_id, client_id, token_hash, scope, status, email, email_verified, auth_time, preferred_username, name, chain_id, chain_expires_at, session_id, created_at, expires_at, last_used_at, rotated_at, successor_id
             "#,
         )
         .bind(presented_hash)
         .bind(now)
+        .bind(successor_id)
         .fetch_optional(self.pool())
         .await?;
         Ok(row)
@@ -887,28 +1398,509 @@ impl StoreRepo {
         Ok(())
     }
 
-    /// Revokes every currently-active refresh-token session for `subject` in one statement,
-    /// backing both the self-service "log out everywhere" RPC procedure and the admin offboarding
-    /// kill switch (`docs/rbac.md`'s `session:revoke-own`/`session:revoke`) -- previously the only
-    /// way to do this was a manual SQL `UPDATE` against prod. Returns how many rows were actually
-    /// flipped, so the caller gets confirmation the kill switch did something; `0` (not an error)
-    /// when the subject has no active sessions.
-    pub async fn revoke_active_exchange_refresh_tokens_for_subject(
-        &self,
-        subject: &str,
-    ) -> Result<u64> {
-        let result = sqlx::query(
+    /// Inserts a new `sessions` row (ADR-0020 Decision 1). Every call site this PR touches mints
+    /// `kind = "token"` -- see [`NewSession`]'s own doc comment.
+    pub async fn create_session(&self, input: NewSession) -> Result<SessionRow> {
+        let row: SessionRow = sqlx::query_as(
             r#"
-            UPDATE exchange_refresh_tokens
-            SET status = 'revoked'
+            INSERT INTO sessions
+              (id, account_id, project_id, client_id, kind, status, expires_at, subject)
+            VALUES ($1, $2, $3, $4, $5, 'active', $6, $7)
+            RETURNING id, account_id, project_id, client_id, kind, status, created_at, updated_at, last_used_at, expires_at, user_agent, subject
+            "#,
+        )
+        .bind(input.id)
+        .bind(input.account_id)
+        .bind(input.project_id)
+        .bind(input.client_id)
+        .bind(input.kind)
+        .bind(input.expires_at)
+        .bind(input.subject)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// ADR-0024, corrected 2026-08-25: seals-and-persists a login's Keycloak token set for
+    /// `(input.issuer, input.subject)`, inside one transaction (pattern:
+    /// `rotate_api_key_transaction` above). `SELECT ... FOR UPDATE` first, so a second call for the
+    /// same `(issuer, subject)` racing concurrently serializes onto the UPDATE branch rather than
+    /// double-inserting.
+    ///
+    /// On this identity's FIRST login ever (no existing row): adopt-or-REFUSE, decided entirely
+    /// inside this same transaction, before any write. A subject matching a grandfathered
+    /// `accounts` row (a pre-ADR-0024 account, ADR-0006's "id is the stored sub" property) is
+    /// adopted. A subject with no `accounts` row at all has no relationship with this service --
+    /// there is no mint-a-user branch any more -- so the login is REFUSED (`Error::Forbidden`)
+    /// before any row is written; nothing is left behind. Bounded, not a new failure: an
+    /// accountless subject already dead-ended downstream in both flows (browser SSO's
+    /// `find_default_project_id`, device pairing's `issue_device_tokens`) -- this refuses earlier
+    /// and leaves nothing behind. Never rewrites `issuer`/`subject`/`account_id` on an update --
+    /// those are the federation key and its owner, fixed at creation.
+    ///
+    /// `federated_identities_issuer_subject_uidx`/`federated_identities_account_uidx` (the owning
+    /// migration, `20260825000001_users_and_federated_identities.sql`, FK action corrected by
+    /// `20260825000002_federated_identities_link_accounts_not_users.sql`) make a concurrent insert
+    /// racing on either index surface as `Error::Conflict` here, mirroring `create_account`'s own
+    /// 23505 idiom above -- in particular, a second issuer presenting a subject that already
+    /// adopted an account is REFUSED, never silently merged onto that account. A `23503` (the
+    /// adopted account was deleted between this method's own SELECT and its INSERT) maps to the
+    /// same `Error::Forbidden` as the no-account case above -- both are "this subject has no
+    /// lightbridge account right now."
+    /// ADR-0025: `(issuer, subject)` -> the acting person's lightbridge account id. THE ONLY
+    /// translation from a remote IdP subject to an id this service owns -- every repository
+    /// method below this line takes an account id, never a remote sub.
+    ///
+    /// Step 1 is the steady-state path: an already-adopted `federated_identities` row (written
+    /// either by [`Self::upsert_federated_identity`] at login time, or by this method's own
+    /// self-healing insert below the first time a grandfathered subject is ever resolved)
+    /// resolves directly, no write.
+    ///
+    /// Step 2, the grandfather branch, is TEMPORARY and issuer-pinned: it exists only until the
+    /// ADR-0025 residue query (every remaining `accounts` row with no adopting
+    /// `federated_identities` row) reaches steady state, at which point this branch is deleted.
+    /// It is NOT a read-side `accounts.id == subject` fallback -- that shape would re-open
+    /// ADR-0024's cross-issuer merge on every plane that never calls
+    /// [`Self::upsert_federated_identity`]: a subject presented by `grandfather_issuer` (the
+    /// deployment's one configured `oauth2.federation.issuer`) that matches a pre-ADR-0024
+    /// `accounts.id == subject` row is adopted, self-healing a real `federated_identities` row
+    /// into existence right here, under `FOR UPDATE` on the `accounts` row so two concurrent
+    /// resolutions for the same subject serialize rather than double-adopt. A subject presented
+    /// by any OTHER issuer, or with no matching `accounts` row at all, is refused
+    /// (`Error::Forbidden`) with the SAME message in both cases -- never a distinct status that
+    /// would let a caller distinguish "wrong issuer" from "no such account."
+    ///
+    /// `token_envelope` and its sibling columns are left `NULL` on the self-healed row (ADR-0024
+    /// Q2: an absent envelope is read identically to "no stored token" -- the relying-party leg
+    /// re-seals a real token set the next time this subject completes a browser-SSO login).
+    #[instrument(skip(self, subject, grandfather_issuer))]
+    pub async fn resolve_account_for_federated_subject(
+        &self,
+        issuer: &str,
+        subject: &str,
+        grandfather_issuer: &str,
+    ) -> Result<String> {
+        match self
+            .resolve_account_for_federated_subject_detailed(issuer, subject, grandfather_issuer)
+            .await?
+        {
+            FederatedResolution::Resolved(account_id) => Ok(account_id),
+            // Deliberately the SAME variant and message for both refusal cases -- see
+            // `FederatedResolution`'s own doc comment for why, and
+            // `resolve_account_for_federated_subject_detailed` for the one caller allowed to tell
+            // them apart.
+            FederatedResolution::RogueIssuer | FederatedResolution::NoAccount => Err(
+                Error::Forbidden("no federated identity for this subject".to_string()),
+            ),
+        }
+    }
+
+    /// Fine-grained twin of [`Self::resolve_account_for_federated_subject`], which stays the
+    /// externally-uniform `Result<String>` every ingress except one already relies on. This
+    /// method exists ONLY for
+    /// `lightbridge_authz_rest::auth_provider::FederatedSubjectResolver::resolve` (ADR-0025
+    /// Correction, "the Stage 2..5 bootstrap window"): that caller needs to tell "wrong issuer"
+    /// apart from "no account yet" to decide whether the temporary grandfather-issuer bootstrap
+    /// fallback applies, WITHOUT the distinction ever leaking past that one internal seam --
+    /// `resolve_account_for_federated_subject` above still collapses both cases to the identical
+    /// `Error::Forbidden` message no caller can distinguish, so this repo remains exactly as much
+    /// of an account-existence non-oracle as it always was. Do not add a second caller without
+    /// re-reading that ADR section first.
+    #[instrument(skip(self, subject, grandfather_issuer))]
+    pub async fn resolve_account_for_federated_subject_detailed(
+        &self,
+        issuer: &str,
+        subject: &str,
+        grandfather_issuer: &str,
+    ) -> Result<FederatedResolution> {
+        let mut tx = self.pool().begin().await?;
+
+        let existing: Option<(String,)> = sqlx::query_as(
+            r#"SELECT account_id FROM federated_identities WHERE issuer = $1 AND subject = $2"#,
+        )
+        .bind(issuer)
+        .bind(subject)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((account_id,)) = existing {
+            tx.commit().await?;
+            return Ok(FederatedResolution::Resolved(account_id));
+        }
+
+        if issuer != grandfather_issuer {
+            return Ok(FederatedResolution::RogueIssuer);
+        }
+
+        let account: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
+                .bind(subject)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((account_id,)) = account else {
+            return Ok(FederatedResolution::NoAccount);
+        };
+
+        let inserted: Option<(String,)> = sqlx::query_as(
+            r#"
+            INSERT INTO federated_identities (id, issuer, subject, account_id)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (issuer, subject) DO NOTHING
+            RETURNING account_id
+            "#,
+        )
+        .bind(cuid2())
+        .bind(issuer)
+        .bind(subject)
+        .bind(&account_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(db_err) = &e
+                && db_err.code().as_deref() == Some("23505")
+            {
+                // Not the (issuer, subject) target of the ON CONFLICT clause above (that race is
+                // handled by the re-SELECT below) -- this is the OTHER unique index,
+                // `federated_identities_account_uidx`: a different (issuer, subject) pair has
+                // already adopted this same account_id. Refused, never silently merged.
+                return Error::Conflict(
+                    "account already adopted by another federated identity".to_string(),
+                );
+            }
+            if let sqlx::Error::Database(db_err) = &e
+                && db_err.code().as_deref() == Some("23503")
+            {
+                // The account was deleted between this transaction's own FOR UPDATE lookup above
+                // and this INSERT -- the same "no lightbridge account" outcome as the early
+                // refusal above, just discovered a few microseconds later.
+                return Error::Forbidden("no federated identity for this subject".to_string());
+            }
+            Error::from(e)
+        })?;
+
+        let account_id = match inserted {
+            Some((account_id,)) => account_id,
+            None => {
+                // Lost the race to a concurrent resolution for the SAME (issuer, subject): the
+                // other transaction's row already committed between this transaction's own
+                // step-1 SELECT and this INSERT. Re-read it rather than erroring -- this is
+                // exactly the self-healing idempotency this method promises under concurrency,
+                // not a conflict.
+                let (account_id,): (String,) = sqlx::query_as(
+                    r#"SELECT account_id FROM federated_identities WHERE issuer = $1 AND subject = $2"#,
+                )
+                .bind(issuer)
+                .bind(subject)
+                .fetch_one(&mut *tx)
+                .await?;
+                account_id
+            }
+        };
+
+        tx.commit().await?;
+        Ok(FederatedResolution::Resolved(account_id))
+    }
+
+    /// `grandfather_issuer` mirrors `resolve_account_for_federated_subject`'s own parameter of the
+    /// same name (ADR-0025): only a subject presented by the ONE configured grandfather issuer may
+    /// adopt a pre-existing `accounts.id == subject` row. Without this pin, ANY issuer whose token
+    /// happens to carry a `sub` matching an existing account id could adopt it -- first-mover-wins
+    /// across any future second issuer, contradicting the resolver's own issuer-pinned rule. The
+    /// existing-row UPDATE branch below stays un-pinned: the row itself already proves which issuer
+    /// legitimately owns this `(issuer, subject)` pair, so there is nothing left to check.
+    #[instrument(skip(self, input))]
+    pub async fn upsert_federated_identity(
+        &self,
+        input: UpsertFederatedIdentity,
+        grandfather_issuer: &str,
+    ) -> Result<FederatedIdentityRow> {
+        let mut tx = self.pool().begin().await?;
+
+        let existing: Option<(String,)> = sqlx::query_as(
+            r#"
+            SELECT id
+            FROM federated_identities
+            WHERE issuer = $1 AND subject = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(&input.issuer)
+        .bind(&input.subject)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let row: FederatedIdentityRow = if let Some((id,)) = existing {
+            sqlx::query_as(
+                r#"
+                UPDATE federated_identities
+                SET token_envelope = $1,
+                    token_sealed_at = $2,
+                    access_expires_at = $3,
+                    refresh_expires_at = $4,
+                    scope = $5,
+                    email = $6,
+                    email_verified = $7,
+                    preferred_username = $8,
+                    name = $9,
+                    last_authenticated_at = now(),
+                    updated_at = now()
+                WHERE id = $10
+                RETURNING id, issuer, subject, account_id, token_envelope,
+                          token_sealed_at, access_expires_at, refresh_expires_at, scope,
+                          email, email_verified, preferred_username, name,
+                          last_authenticated_at, created_at, updated_at
+                "#,
+            )
+            .bind(&input.token_envelope)
+            .bind(input.token_sealed_at)
+            .bind(input.access_expires_at)
+            .bind(input.refresh_expires_at)
+            .bind(&input.scope)
+            .bind(&input.email)
+            .bind(input.email_verified)
+            .bind(&input.preferred_username)
+            .bind(&input.name)
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await?
+        } else {
+            // ADR-0025: a subject presented by any issuer OTHER than the configured grandfather
+            // issuer may never adopt a pre-existing account, no matter how well the subject
+            // matches -- same message as `resolve_account_for_federated_subject`'s own issuer-pin
+            // refusal (deliberately indistinguishable from "no account", so this never becomes an
+            // account-existence oracle either).
+            if input.issuer != grandfather_issuer {
+                return Err(Error::Forbidden(
+                    "no federated identity for this subject".to_string(),
+                ));
+            }
+            // ADR-0024 Correction (2026-08-25): a Keycloak identity links to an ACCOUNT and to
+            // nothing else. There is no mint-a-user branch: a subject with no accounts row has no
+            // relationship with this service, so the login is refused HERE -- inside the same
+            // transaction that would otherwise insert, so there is no window between the check and
+            // the write -- and federated_identities.account_id NOT NULL is the structural backstop
+            // behind this guard. Bounded, not a new failure: an accountless subject already
+            // dead-ended downstream in both flows (browser SSO's find_default_project_id, device
+            // pairing's issue_device_tokens); this refuses earlier and leaves nothing behind.
+            let account: Option<(String,)> =
+                sqlx::query_as("SELECT id FROM accounts WHERE id = $1")
+                    .bind(&input.subject)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let Some((account_id,)) = account else {
+                return Err(Error::Forbidden(
+                    "federated subject has no lightbridge account".to_string(),
+                ));
+            };
+            sqlx::query_as(
+                r#"
+                INSERT INTO federated_identities
+                  (id, issuer, subject, account_id, token_envelope, token_sealed_at,
+                   access_expires_at, refresh_expires_at, scope,
+                   email, email_verified, preferred_username, name)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                RETURNING id, issuer, subject, account_id, token_envelope,
+                          token_sealed_at, access_expires_at, refresh_expires_at, scope,
+                          email, email_verified, preferred_username, name,
+                          last_authenticated_at, created_at, updated_at
+                "#,
+            )
+            .bind(cuid2())
+            .bind(&input.issuer)
+            .bind(&input.subject)
+            .bind(&account_id)
+            .bind(&input.token_envelope)
+            .bind(input.token_sealed_at)
+            .bind(input.access_expires_at)
+            .bind(input.refresh_expires_at)
+            .bind(&input.scope)
+            .bind(&input.email)
+            .bind(input.email_verified)
+            .bind(&input.preferred_username)
+            .bind(&input.name)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                if let sqlx::Error::Database(db_err) = &e
+                    && db_err.code().as_deref() == Some("23505")
+                {
+                    return Error::Conflict(format!(
+                        "federated identity already exists or account already adopted for \
+                         subject '{}'",
+                        input.subject
+                    ));
+                }
+                if let sqlx::Error::Database(db_err) = &e
+                    && db_err.code().as_deref() == Some("23503")
+                {
+                    // The adopted account was deleted between this method's own SELECT above and
+                    // this INSERT -- the same "no lightbridge account" outcome as the early-return
+                    // refusal above, just discovered a few microseconds later.
+                    return Error::Forbidden(
+                        "federated subject has no lightbridge account".to_string(),
+                    );
+                }
+                Error::from(e)
+            })?
+        };
+
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    /// Read-side counterpart to [`Self::upsert_federated_identity`], and the reason it was
+    /// written ahead of a caller: its consumer arrived as RP-initiated logout's back-channel leg
+    /// (`KeycloakRelyingParty::end_upstream_session`), which needs the sealed token set to
+    /// terminate the upstream Keycloak SSO session. Still not wired to any RPC surface -- nothing
+    /// exposes a federated identity to a client.
+    #[instrument(skip(self, subject))]
+    pub async fn find_federated_identity(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<FederatedIdentityRow>> {
+        let row = sqlx::query_as(
+            r#"
+            SELECT id, issuer, subject, account_id, token_envelope, token_sealed_at,
+                   access_expires_at, refresh_expires_at, scope,
+                   email, email_verified, preferred_username, name,
+                   last_authenticated_at, created_at, updated_at
+            FROM federated_identities
+            WHERE issuer = $1 AND subject = $2
+            "#,
+        )
+        .bind(issuer)
+        .bind(subject)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// The by-`account_id` twin of [`Self::find_federated_identity`] (which looks up by the
+    /// `(issuer, subject)` federation key instead). Exists because several human-plane token-
+    /// minting paths -- `oauth2_op::store::TokenExchangeOpStore::mint_from_authorization_code`
+    /// (the browser flow) and `issue_device_tokens` -- only ever have the ADR-0025-resolved
+    /// ACCOUNT id in hand at mint time, never the raw upstream `(issuer, subject)` pair: the
+    /// authorization code's stored identity carries `external_id = account_id`, not the Keycloak
+    /// subject (see `authorize.rs::issue_code`'s own doc comment). `account_id` is a safe lookup
+    /// key here because `federated_identities_account_uidx` (ADR-0024 Q1) already enforces at
+    /// most one federated identity may ever hold a given `account_id`, so this can never return
+    /// more than one candidate row to begin with.
+    #[instrument(skip(self))]
+    pub async fn find_federated_identity_by_account_id(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<FederatedIdentityRow>> {
+        let row = sqlx::query_as(
+            r#"
+            SELECT id, issuer, subject, account_id, token_envelope, token_sealed_at,
+                   access_expires_at, refresh_expires_at, scope,
+                   email, email_verified, preferred_username, name,
+                   last_authenticated_at, created_at, updated_at
+            FROM federated_identities
+            WHERE account_id = $1
+            "#,
+        )
+        .bind(account_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// ADR-0020 Decision 4 / #437: the current `status`/`expires_at` of the `sessions` row named
+    /// `session_id`, for introspection's fail-closed status check. `Ok(None)` (never an error) for
+    /// an unrecognized `session_id` -- distinguishing "not found" from a real DB error is exactly
+    /// what lets the caller (`resolve_exchange_token_context`) tell "session doesn't exist" (fail
+    /// to `active: false`) apart from "couldn't check" (fail the whole call closed, propagate
+    /// `Err`).
+    pub async fn find_session_status(&self, session_id: &str) -> Result<Option<SessionStatusRow>> {
+        let row = sqlx::query_as(
+            r#"
+            SELECT status, expires_at
+            FROM sessions
+            WHERE id = $1
+            "#,
+        )
+        .bind(session_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn find_active_browser_session(
+        &self,
+        session_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<BrowserSessionContextRow>> {
+        let row = sqlx::query_as(
+            r#"
+            SELECT account_id, project_id, subject
+            FROM sessions
+            WHERE id = $1
+              AND kind = 'browser'
+              AND status = 'active'
+              AND expires_at > $2
+            "#,
+        )
+        .bind(session_id)
+        .bind(now)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// Revokes every currently-active session for `subject` -- of EITHER `kind` (ADR-0021
+    /// Decision 3: the query is deliberately `kind`-blind, which is exactly what makes it cover
+    /// both `kind = 'token'` and `kind = 'browser'` rows in one call) -- and cascades to revoke
+    /// every `exchange_refresh_tokens` row chained under one of those sessions (ADR-0020 Decision
+    /// 9), so a bulk "log out everywhere" cannot leave a live refresh token behind for a session
+    /// it just killed. Backs both the self-service "log out everywhere" RPC procedure and the
+    /// admin offboarding kill switch (`docs/rbac.md`'s `session:revoke-own`/`session:revoke`).
+    /// Returns how many SESSIONS were revoked (not refresh-token rows), so the caller gets
+    /// confirmation the kill switch did something; `0` (not an error) when the subject has no
+    /// active sessions of either kind. Two statements in one transaction, not a single query --
+    /// see the module doc comment on why this repo keeps this operation hand-written rather than
+    /// cratestack-generated (ADR-0020 Decision 9).
+    ///
+    /// Matches on `sessions.subject` (the real authenticated actor), never `sessions.account_id`
+    /// (#492): `account_id` always holds the PROJECT's OWNING account (`resolve_context`'s
+    /// documented behavior), identical for every session ever minted against a given project
+    /// regardless of which real person -- owner or roster member -- minted it. Keying this query
+    /// on `account_id` mixed up "which project" with "which person": a roster member's own
+    /// "log out everywhere" silently no-opped on their own session (it never matched), while the
+    /// project owner's own "log out everywhere" collaterally revoked every OTHER member's session
+    /// on a shared project too (it always matched). `subject` is populated for every session this
+    /// repo creates -- `kind = 'browser'` rows since
+    /// `migrations/20260824000003_sessions_add_subject.sql`, `kind = 'token'` rows since this
+    /// fix's companion change to `oauth2_op::store::TokenExchangeOpStore`'s two `create_session`
+    /// call sites -- so only sessions minted before this fix (`subject IS NULL`) go unmatched
+    /// here; those are TTL-bounded and self-heal on their own expiry, the same trade-off the
+    /// nullable-column migration already made for pre-migration browser rows.
+    pub async fn revoke_sessions_and_cascade(&self, account_id: &AccountId) -> Result<u64> {
+        let mut tx = self.pool().begin().await?;
+        let revoked_sessions = sqlx::query(
+            r#"
+            UPDATE sessions
+            SET status = 'revoked', updated_at = now()
             WHERE subject = $1
               AND status = 'active'
             "#,
         )
-        .bind(subject)
-        .execute(self.pool())
+        .bind(account_id.as_str())
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected())
+        sqlx::query(
+            r#"
+            UPDATE exchange_refresh_tokens
+            SET status = 'revoked'
+            WHERE status = 'active'
+              AND session_id IN (SELECT id FROM sessions WHERE subject = $1)
+            "#,
+        )
+        .bind(account_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(revoked_sessions.rows_affected())
     }
 
     /// Project-scoped rule (see the module-level mechanical rescoping this whole file follows):
@@ -918,7 +1910,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn list_projects(
         &self,
-        subject: &str,
+        acting_account_id: &AccountId,
         account_id: &str,
         offset: u32,
         limit: u32,
@@ -936,12 +1928,16 @@ impl StoreRepo {
               projects.project_quota,
               projects.status,
               projects.is_default,
+              projects.model_policy,
               projects.created_at,
               projects.updated_at
             FROM projects
             WHERE projects.account_id = $1
               AND (
-                projects.account_id = $2
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $2
@@ -953,7 +1949,7 @@ impl StoreRepo {
             "#,
         )
         .bind(account_id)
-        .bind(subject)
+        .bind(acting_account_id.as_str())
         .bind(i64::from(limit))
         .bind(i64::from(offset))
         .fetch_all(self.pool())
@@ -962,7 +1958,11 @@ impl StoreRepo {
     }
 
     #[instrument(skip(self))]
-    pub async fn get_project(&self, subject: &str, project_id: &str) -> Result<Option<Project>> {
+    pub async fn get_project(
+        &self,
+        account_id: &AccountId,
+        project_id: &str,
+    ) -> Result<Option<Project>> {
         let row = sqlx::query_as(
             r#"
             SELECT
@@ -976,12 +1976,16 @@ impl StoreRepo {
               projects.project_quota,
               projects.status,
               projects.is_default,
+              projects.model_policy,
               projects.created_at,
               projects.updated_at
             FROM projects
             WHERE projects.id = $1
               AND (
-                projects.account_id = $2
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $2
@@ -990,7 +1994,7 @@ impl StoreRepo {
             "#,
         )
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(Self::to_project))
@@ -1011,6 +2015,7 @@ impl StoreRepo {
               project_quota,
               status,
               is_default,
+              model_policy,
               created_at,
               updated_at
             FROM projects
@@ -1032,7 +2037,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn update_project(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         input: UpdateProject,
     ) -> Result<Project> {
@@ -1059,7 +2064,10 @@ impl StoreRepo {
               updated_at = $6
             WHERE projects.id = $7
               AND (
-                projects.account_id = $8
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $8)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $8
@@ -1076,6 +2084,7 @@ impl StoreRepo {
               projects.project_quota,
               projects.status,
               projects.is_default,
+              projects.model_policy,
               projects.created_at,
               projects.updated_at
             "#,
@@ -1087,7 +2096,7 @@ impl StoreRepo {
         .bind(changes.billing_plan)
         .bind(changes.updated_at)
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
@@ -1102,13 +2111,16 @@ impl StoreRepo {
     /// account.id == auth().id` schema policy, which is a separate code path this method does not
     /// back).
     #[instrument(skip(self))]
-    pub async fn delete_project(&self, subject: &str, project_id: &str) -> Result<()> {
+    pub async fn delete_project(&self, account_id: &AccountId, project_id: &str) -> Result<()> {
         let result = sqlx::query(
             r#"
             DELETE FROM projects
             WHERE projects.id = $1
               AND (
-                projects.account_id = $2
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $2
@@ -1117,7 +2129,7 @@ impl StoreRepo {
             "#,
         )
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .execute(self.pool())
         .await?;
         if result.rows_affected() == 0 {
@@ -1133,8 +2145,12 @@ impl StoreRepo {
     /// member may NOT create keys. Once authorized, the plain `INSERT` needs no further
     /// project-existence guard (`authorize_project_lead` already confirmed the project exists).
     #[instrument(skip(self))]
-    pub async fn create_api_key(&self, subject: &str, input: NewApiKeyRow) -> Result<ApiKey> {
-        self.authorize_project_lead(&input.project_id, subject)
+    pub async fn create_api_key(
+        &self,
+        account_id: &AccountId,
+        input: NewApiKeyRow,
+    ) -> Result<ApiKey> {
+        self.authorize_project_lead(&input.project_id, account_id)
             .await?;
         let row: ApiKeyRow = sqlx::query_as(
             r#"
@@ -1160,9 +2176,9 @@ impl StoreRepo {
         .bind(input.last_ip)
         .bind(input.revoked_at)
         .bind(input.billing_plan)
-        // The acting subject, not the project's owning account: a lead who is not the owner may
+        // The acting account, not the project's owning account: a lead who is not the owner may
         // mint keys, and it is THEIR per-member ceiling that should bound the key.
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_one(self.pool())
         .await?;
         Ok(Self::to_api_key(row))
@@ -1172,7 +2188,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn list_api_keys(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         offset: u32,
         limit: u32,
@@ -1197,7 +2213,10 @@ impl StoreRepo {
             JOIN projects ON projects.id = api_keys.project_id
             WHERE api_keys.project_id = $1
               AND (
-                projects.account_id = $2
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $2
@@ -1209,7 +2228,7 @@ impl StoreRepo {
             "#,
         )
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .bind(i64::from(limit))
         .bind(i64::from(offset))
         .fetch_all(self.pool())
@@ -1218,7 +2237,11 @@ impl StoreRepo {
     }
 
     #[instrument(skip(self))]
-    pub async fn get_api_key(&self, subject: &str, key_id: &str) -> Result<Option<ApiKey>> {
+    pub async fn get_api_key(
+        &self,
+        account_id: &AccountId,
+        key_id: &str,
+    ) -> Result<Option<ApiKey>> {
         let row = sqlx::query_as(
             r#"
             SELECT
@@ -1239,7 +2262,10 @@ impl StoreRepo {
             JOIN projects ON projects.id = api_keys.project_id
             WHERE api_keys.id = $1
               AND (
-                projects.account_id = $2
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $2
@@ -1248,7 +2274,7 @@ impl StoreRepo {
             "#,
         )
         .bind(key_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(Self::to_api_key))
@@ -1257,7 +2283,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn update_api_key(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         key_id: &str,
         input: UpdateApiKey,
     ) -> Result<ApiKey> {
@@ -1279,7 +2305,10 @@ impl StoreRepo {
             WHERE api_keys.project_id = projects.id
               AND api_keys.id = $3
               AND (
-                projects.account_id = $4
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $4)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $4
@@ -1293,7 +2322,7 @@ impl StoreRepo {
         .bind(changes.name)
         .bind(changes.expires_at)
         .bind(key_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
@@ -1307,7 +2336,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn set_account_status(
         &self,
-        subject: &str,
+        acting_account_id: &AccountId,
         account_id: &str,
         status: ResourceStatus,
     ) -> Result<Account> {
@@ -1315,14 +2344,15 @@ impl StoreRepo {
             r#"
             UPDATE accounts
             SET status = $1, updated_at = $2
-            WHERE id = $3 AND id = $4
-            RETURNING id, default_quota, status, created_at, updated_at
+            WHERE id = $3
+              AND user_id = (SELECT user_id FROM accounts WHERE id = $4)
+            RETURNING id, default_quota, status, name, user_id, created_at, updated_at
             "#,
         )
         .bind(status.to_string())
         .bind(Utc::now())
         .bind(account_id)
-        .bind(subject)
+        .bind(acting_account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
@@ -1335,7 +2365,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn set_project_status(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         status: ResourceStatus,
     ) -> Result<Project> {
@@ -1345,7 +2375,10 @@ impl StoreRepo {
             SET status = $1, updated_at = $2
             WHERE projects.id = $3
               AND (
-                projects.account_id = $4
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $4)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $4
@@ -1362,6 +2395,7 @@ impl StoreRepo {
               projects.project_quota,
               projects.status,
               projects.is_default,
+              projects.model_policy,
               projects.created_at,
               projects.updated_at
             "#,
@@ -1369,7 +2403,7 @@ impl StoreRepo {
         .bind(status.to_string())
         .bind(Utc::now())
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
@@ -1390,7 +2424,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn update_account_default_quota(
         &self,
-        subject: &str,
+        acting_account_id: &AccountId,
         account_id: &str,
         default_quota: Option<&str>,
     ) -> Result<Account> {
@@ -1398,14 +2432,54 @@ impl StoreRepo {
             r#"
             UPDATE accounts
             SET default_quota = $1, updated_at = $2
-            WHERE id = $3 AND id = $4
-            RETURNING id, default_quota, status, created_at, updated_at
+            WHERE id = $3
+              AND user_id = (SELECT user_id FROM accounts WHERE id = $4)
+            RETURNING id, default_quota, status, name, user_id, created_at, updated_at
             "#,
         )
         .bind(default_quota)
         .bind(Utc::now())
         .bind(account_id)
-        .bind(subject)
+        .bind(acting_account_id.as_str())
+        .fetch_optional(self.pool())
+        .await?;
+        let row = row.ok_or(Error::NotFound)?;
+        Ok(Self::to_account(row))
+    }
+
+    /// Sets `Account.name`. Backs `updateAccountName` -- the sole write path for that column, since
+    /// `model.Account.update` does not exist (#398) and the field is `@readonly` in the schema.
+    /// Authorization is identical to [`Self::update_account_default_quota`] directly above: since
+    /// ADR-0006 there is no owner/role concept left, so "the caller is this account"
+    /// (`id = account_id = subject`) is the entire check and it lives in the `WHERE` clause -- a
+    /// mismatched `account_id`/`subject` pair and an unknown account are the same `NotFound`, so
+    /// this cannot be used to probe which accounts exist.
+    ///
+    /// `name` is free text with no catalogue to validate against, but it MUST already be
+    /// normalised (blank/whitespace-only collapsed to `None`) by
+    /// `AuthzStoreImpl::update_account_name` before it reaches here -- same layering as the
+    /// quota-tier checks -- so the DB `CHECK (name IS NULL OR btrim(name) <> '')` never fires from
+    /// this path. Passing `None` clears the name back to unnamed; this is a set, not a PATCH.
+    #[instrument(skip(self))]
+    pub async fn update_account_name(
+        &self,
+        acting_account_id: &AccountId,
+        account_id: &str,
+        name: Option<&str>,
+    ) -> Result<Account> {
+        let row: Option<AccountRow> = sqlx::query_as(
+            r#"
+            UPDATE accounts
+            SET name = $1, updated_at = $2
+            WHERE id = $3
+              AND user_id = (SELECT user_id FROM accounts WHERE id = $4)
+            RETURNING id, default_quota, status, name, user_id, created_at, updated_at
+            "#,
+        )
+        .bind(name)
+        .bind(Utc::now())
+        .bind(account_id)
+        .bind(acting_account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
@@ -1424,7 +2498,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn set_project_quota(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         project_id: &str,
         project_quota: Option<&str>,
     ) -> Result<Project> {
@@ -1434,7 +2508,10 @@ impl StoreRepo {
             SET project_quota = $1, updated_at = $2
             WHERE projects.id = $3
               AND (
-                projects.account_id = $4
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $4)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $4
@@ -1451,6 +2528,7 @@ impl StoreRepo {
               projects.project_quota,
               projects.status,
               projects.is_default,
+              projects.model_policy,
               projects.created_at,
               projects.updated_at
             "#,
@@ -1458,10 +2536,174 @@ impl StoreRepo {
         .bind(project_quota)
         .bind(Utc::now())
         .bind(project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
+        Ok(Self::to_project(row))
+    }
+
+    /// Project-scoped rule, identical to `set_project_quota` immediately above (owner or any
+    /// roster member; a non-authorized subject or unknown project is `NotFound`). Backs
+    /// `AuthzStoreImpl::set_project_allowed_models` (#415, ADR-0018 Decision 5). The catalogue
+    /// check itself does NOT happen here -- same layering as `set_project_quota`: it happens in
+    /// `AuthzStoreImpl::set_project_allowed_models`, before this method is ever called. `None` maps
+    /// to SQL `NULL` (via `Self::vec_to_json`, the same mapping `create_project`/`update_project`
+    /// already use) -- see that helper's own doc comment for why NULL, not jsonb `null`.
+    #[instrument(skip(self))]
+    pub async fn set_project_allowed_models(
+        &self,
+        account_id: &AccountId,
+        project_id: &str,
+        allowed_models: Option<Vec<String>>,
+    ) -> Result<Project> {
+        let allowed_models_json = Self::vec_to_json(&allowed_models);
+        let row: Option<ProjectRow> = sqlx::query_as(
+            r#"
+            UPDATE projects
+            SET allowed_models = $1, updated_at = $2
+            WHERE projects.id = $3
+              AND (
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $4)
+                )
+                OR EXISTS (
+                  SELECT 1 FROM project_members pm
+                  WHERE pm.project_id = projects.id AND pm.account_id = $4
+                )
+              )
+            RETURNING
+              projects.id,
+              projects.account_id,
+              projects.name,
+              projects.allowed_models,
+              projects.default_limits,
+              projects.billing_plan,
+              projects.billing_identity,
+              projects.project_quota,
+              projects.status,
+              projects.is_default,
+              projects.model_policy,
+              projects.created_at,
+              projects.updated_at
+            "#,
+        )
+        .bind(allowed_models_json)
+        .bind(Utc::now())
+        .bind(project_id)
+        .bind(account_id.as_str())
+        .fetch_optional(self.pool())
+        .await?;
+        let row = row.ok_or(Error::NotFound)?;
+        Ok(Self::to_project(row))
+    }
+
+    /// Sets `Project.modelPolicy` (ADR-0018 Decision 5 follow-up, #415's own tracked next step).
+    /// Backs `AuthzStoreImpl::set_project_model_policy` -- `model_policy` is validated to be one of
+    /// the three canonical wire strings there (`ModelPolicy::parse_strict`) before this method is
+    /// ever called, so `model_policy` here is trusted input, same layering as `set_project_quota`/
+    /// `set_project_allowed_models` above.
+    ///
+    /// Runs in a transaction, unlike the two setters immediately above, because this method also
+    /// enforces a business rule this repo's owner decided is a refusal, not a warning or a
+    /// silent allow (see the schema doc comment on `setProjectModelPolicy` for the full
+    /// reasoning): switching to `allowlist` while `allowed_models` is empty/absent would silently
+    /// deny every model -- a lockout by configuration, the same class of footgun ADR-0018 Decision
+    /// 5 already closed for a typo'd model id. That check needs to read the row's *current*
+    /// `allowed_models` under lock (`FOR UPDATE`) so a concurrent `set_project_allowed_models` call
+    /// racing this one cannot slip an empty list past the guard between the check and the write --
+    /// same transactional-invariant shape as `set_default_project` below, just guarding a business
+    /// rule instead of the "at most one default project" structural invariant.
+    #[instrument(skip(self))]
+    pub async fn set_project_model_policy(
+        &self,
+        account_id: &AccountId,
+        project_id: &str,
+        model_policy: &str,
+    ) -> Result<Project> {
+        let mut tx: Transaction<'_, Postgres> = self.pool().begin().await?;
+
+        let current: Option<ProjectRow> = sqlx::query_as(
+            r#"
+            SELECT
+              projects.id,
+              projects.account_id,
+              projects.name,
+              projects.allowed_models,
+              projects.default_limits,
+              projects.billing_plan,
+              projects.billing_identity,
+              projects.project_quota,
+              projects.status,
+              projects.is_default,
+              projects.model_policy,
+              projects.created_at,
+              projects.updated_at
+            FROM projects
+            WHERE projects.id = $1
+              AND (
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                )
+                OR EXISTS (
+                  SELECT 1 FROM project_members pm
+                  WHERE pm.project_id = projects.id AND pm.account_id = $2
+                )
+              )
+            FOR UPDATE
+            "#,
+        )
+        .bind(project_id)
+        .bind(account_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let current = current.ok_or(Error::NotFound)?;
+        let current = Self::to_project(current);
+
+        if model_policy == "allowlist"
+            && current
+                .allowed_models
+                .as_deref()
+                .is_none_or(<[String]>::is_empty)
+        {
+            return Err(Error::BadRequest(
+                "cannot set modelPolicy to 'allowlist' while allowedModels is empty -- this would \
+                 silently deny every model; populate allowedModels via setProjectAllowedModels \
+                 first, or use 'deny_all' if blocking every model is actually intended"
+                    .to_string(),
+            ));
+        }
+
+        let row: ProjectRow = sqlx::query_as(
+            r#"
+            UPDATE projects
+            SET model_policy = $1, updated_at = $2
+            WHERE id = $3
+            RETURNING
+              id,
+              account_id,
+              name,
+              allowed_models,
+              default_limits,
+              billing_plan,
+              billing_identity,
+              project_quota,
+              status,
+              is_default,
+              model_policy,
+              created_at,
+              updated_at
+            "#,
+        )
+        .bind(model_policy)
+        .bind(Utc::now())
+        .bind(project_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
         Ok(Self::to_project(row))
     }
 
@@ -1476,7 +2718,11 @@ impl StoreRepo {
     /// ADR-0006 dropped `accounts.is_default` outright once one subject could only ever have one
     /// account, so "default account" stopped being a meaningful concept.)
     #[instrument(skip(self))]
-    pub async fn set_default_project(&self, subject: &str, project_id: &str) -> Result<Project> {
+    pub async fn set_default_project(
+        &self,
+        acting_account_id: &AccountId,
+        project_id: &str,
+    ) -> Result<Project> {
         let mut tx: Transaction<'_, Postgres> = self.pool().begin().await?;
 
         let account_id: Option<String> = sqlx::query_scalar(
@@ -1485,7 +2731,10 @@ impl StoreRepo {
             FROM projects
             WHERE projects.id = $1
               AND (
-                projects.account_id = $2
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $2
@@ -1494,7 +2743,7 @@ impl StoreRepo {
             "#,
         )
         .bind(project_id)
-        .bind(subject)
+        .bind(acting_account_id.as_str())
         .fetch_optional(&mut *tx)
         .await?;
         let account_id = account_id.ok_or(Error::NotFound)?;
@@ -1517,7 +2766,8 @@ impl StoreRepo {
             UPDATE projects SET is_default = true, updated_at = $1
             WHERE id = $2
             RETURNING id, account_id, name, allowed_models, default_limits, billing_plan,
-              billing_identity, project_quota, status, is_default, created_at, updated_at
+              billing_identity, project_quota, status, is_default, model_policy, created_at,
+              updated_at
             "#,
         )
         .bind(Utc::now())
@@ -1579,7 +2829,7 @@ impl StoreRepo {
     #[instrument(skip(self))]
     pub async fn set_api_key_status(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         key_id: &str,
         status: ApiKeyStatus,
         revoked_at: Option<DateTime<Utc>>,
@@ -1596,7 +2846,10 @@ impl StoreRepo {
             WHERE api_keys.project_id = projects.id
               AND api_keys.id = $4
               AND (
-                projects.account_id = $5
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $5)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $5
@@ -1611,7 +2864,7 @@ impl StoreRepo {
         .bind(revoked_at)
         .bind(expires_at)
         .bind(key_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(self.pool())
         .await?;
         let row = row.ok_or(Error::NotFound)?;
@@ -1619,12 +2872,12 @@ impl StoreRepo {
     }
 
     /// Project-scoped rule for both halves (not lead-gated, unlike `create_api_key`): revoking the
-    /// presented key and minting its successor both require `subject` to own the project's account
-    /// or hold ANY `project_members` row on it.
+    /// presented key and minting its successor both require `account_id` to own the project's
+    /// account or hold ANY `project_members` row on it.
     #[instrument(skip(self))]
     pub async fn rotate_api_key_transaction(
         &self,
-        subject: &str,
+        account_id: &AccountId,
         key_id: &str,
         status: ApiKeyStatus,
         revoked_at: Option<DateTime<Utc>>,
@@ -1643,7 +2896,10 @@ impl StoreRepo {
             WHERE api_keys.project_id = projects.id
               AND api_keys.id = $4
               AND (
-                projects.account_id = $5
+                projects.account_id IN (
+                  SELECT owned.id FROM accounts owned
+                  WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $5)
+                )
                 OR EXISTS (
                   SELECT 1 FROM project_members pm
                   WHERE pm.project_id = projects.id AND pm.account_id = $5
@@ -1658,7 +2914,7 @@ impl StoreRepo {
         .bind(revoked_at)
         .bind(expires_at)
         .bind(key_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .fetch_optional(&mut *tx)
         .await?;
         existing_update.ok_or(Error::NotFound)?;
@@ -1669,7 +2925,10 @@ impl StoreRepo {
                 FROM projects
                 WHERE projects.id = $1
                   AND (
-                    projects.account_id = $2
+                    projects.account_id IN (
+                      SELECT owned.id FROM accounts owned
+                      WHERE owned.user_id = (SELECT user_id FROM accounts WHERE id = $2)
+                    )
                     OR EXISTS (
                       SELECT 1 FROM project_members pm
                       WHERE pm.project_id = projects.id AND pm.account_id = $2
@@ -1691,7 +2950,7 @@ impl StoreRepo {
             "#,
         )
         .bind(new_key.project_id)
-        .bind(subject)
+        .bind(account_id.as_str())
         .bind(new_key.id)
         .bind(new_key.name)
         .bind(new_key.key_prefix)
@@ -1710,33 +2969,18 @@ impl StoreRepo {
         Ok(Self::to_api_key(row))
     }
 
-    /// Project-scoped rule (not lead-gated, unlike `create_api_key`).
-    #[instrument(skip(self))]
-    pub async fn delete_api_key(&self, subject: &str, key_id: &str) -> Result<()> {
-        let result = sqlx::query(
-            r#"
-            DELETE FROM api_keys
-            USING projects
-            WHERE api_keys.project_id = projects.id
-              AND api_keys.id = $1
-              AND (
-                projects.account_id = $2
-                OR EXISTS (
-                  SELECT 1 FROM project_members pm
-                  WHERE pm.project_id = projects.id AND pm.account_id = $2
-                )
-              )
-            "#,
-        )
-        .bind(key_id)
-        .bind(subject)
-        .execute(self.pool())
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(Error::NotFound);
-        }
-        Ok(())
-    }
+    // `delete_api_key` (a hand-written hard `DELETE FROM api_keys`) was removed here (PR #429
+    // follow-up): it had no production caller -- `delete-api-key`'s MCP tool and the RPC
+    // `model.ApiKey.delete` verb both go through cratestack's generated soft-delete
+    // (`deleted_at`), per `migrations/20260721000001_cratestack_soft_delete_audit_defaults.sql`
+    // -- and its semantics were actively unsafe alongside self-issued-token introspection
+    // (`handlers::exchange_token`): a hard delete leaves NO `api_keys` row behind, and
+    // `verify_self_issued_token`'s `azp` check is what keeps a hard-deleted key's
+    // still-cryptographically-valid JWT from being reinterpreted as an active exchange session,
+    // not the row's mere absence (see that function's doc comment). A dead method whose only
+    // effect, if ever wired up again, is to reopen a revocation bypass is worse than no method;
+    // do not reintroduce a hand-written hard delete for `api_keys` without re-reading that
+    // function's doc comment first.
 
     #[instrument(skip(self, key_hash))]
     pub async fn find_api_key_by_hash(&self, key_hash: &str) -> Result<Option<ApiKey>> {
@@ -1890,5 +3134,288 @@ impl StoreRepo {
 
         tx.commit().await?;
         Ok(inserted)
+    }
+
+    /// Inserts a fresh `pending` `device_authorizations` row (ADR-0012 Decision 7 / #423). A
+    /// `user_code` collision (the table's unique index) surfaces as `Error::Conflict`, same
+    /// convention as [`Self::create_account`]'s `23505` handling -- the caller (see
+    /// `oauth2_op::device_store::create_pending_device_authorization`) is expected to regenerate
+    /// the code and retry, per the ticket's own "unique index + retry-on-conflict at insert time,
+    /// not a pre-check-then-insert race" risk mitigation. A `device_code` collision (astronomically
+    /// unlikely given its entropy) surfaces the same way; this method does not attempt to tell the
+    /// two apart, since both are handled identically by the caller (retry with fresh values).
+    #[instrument(skip(self, input))]
+    pub async fn create_device_authorization(
+        &self,
+        input: NewDeviceAuthorization,
+    ) -> Result<DeviceAuthorizationRow> {
+        let row: DeviceAuthorizationRow = sqlx::query_as(
+            r#"
+            INSERT INTO device_authorizations
+              (id, device_code, user_code, client_id, project_id, scope, status, interval_secs, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)
+            RETURNING id, device_code, user_code, client_id, project_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
+            "#,
+        )
+        .bind(input.id)
+        .bind(input.device_code)
+        .bind(input.user_code)
+        .bind(input.client_id)
+        .bind(input.project_id)
+        .bind(input.scope)
+        .bind(input.interval_secs)
+        .bind(input.expires_at)
+        .fetch_one(self.pool())
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(db_err) = &e
+                && db_err.code().as_deref() == Some("23505")
+            {
+                return Error::Conflict(
+                    "device_code or user_code already in use, caller should retry with fresh \
+                     values"
+                        .to_string(),
+                );
+            }
+            Error::from(e)
+        })?;
+        Ok(row)
+    }
+
+    /// Looks up a still-live `device_authorizations` row by `device_code` (backs
+    /// `authkestra_op::device::DeviceCodeStore::get_device_code`/`consume_device_code`'s
+    /// pre-checks). "Live" means not expired AND not already `consumed` -- a consumed row is
+    /// treated as gone for every read path, exactly like an expired one (ADR-0012 Decision 7: "a
+    /// device code must be atomically claimed exactly once"; once claimed, later reads of the same
+    /// code see nothing, matching `find_active_exchange_refresh_token`'s posture on `expires_at`).
+    /// `Ok(None)` covers unknown/expired/consumed uniformly -- callers must not try to distinguish
+    /// them from this call alone.
+    pub async fn find_active_device_authorization_by_device_code(
+        &self,
+        device_code: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DeviceAuthorizationRow>> {
+        let row = sqlx::query_as(
+            r#"
+            SELECT id, device_code, user_code, client_id, project_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
+            FROM device_authorizations
+            WHERE device_code = $1
+              AND status <> 'consumed'
+              AND expires_at > $2
+            "#,
+        )
+        .bind(device_code)
+        .bind(now)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// Reads a device authorization without treating expiry or consumption as absence. The token
+    /// endpoint uses this to return RFC 8628's distinct `expired_token` response while keeping all
+    /// other lookup paths enumeration-safe.
+    pub async fn find_device_authorization_by_device_code(
+        &self,
+        device_code: &str,
+    ) -> Result<Option<DeviceAuthorizationRow>> {
+        let row = sqlx::query_as(
+            r#"
+            SELECT id, device_code, user_code, client_id, project_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
+            FROM device_authorizations
+            WHERE device_code = $1
+            "#,
+        )
+        .bind(device_code)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// Same as [`Self::find_active_device_authorization_by_device_code`], keyed by `user_code`
+    /// instead (the verification-page submission path -- RFC 8628 §6.1). Callers MUST upper-case
+    /// `user_code` before calling (matching `generate_user_code`'s always-upper-case output and
+    /// the migration's case-insensitive-by-convention unique index) -- this method does no
+    /// normalization of its own.
+    pub async fn find_active_device_authorization_by_user_code(
+        &self,
+        user_code: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DeviceAuthorizationRow>> {
+        let row = sqlx::query_as(
+            r#"
+            SELECT id, device_code, user_code, client_id, project_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
+            FROM device_authorizations
+            WHERE user_code = $1
+              AND status <> 'consumed'
+              AND expires_at > $2
+            "#,
+        )
+        .bind(user_code)
+        .bind(now)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// CAS-updates `last_polled_at` on a still-`pending` row (backs
+    /// `authkestra_op::device::DeviceCodeStore::store_device_code`'s re-store-while-polling call
+    /// site -- see `oauth2_op::device_store`'s doc comment for why that trait method is called a
+    /// second time with the same `device_code` during ordinary polling). Deliberately does NOT
+    /// touch `status`/`subject` -- unlike [`Self::approve_device_authorization`]/
+    /// [`Self::deny_device_authorization`], this is not a state transition, just a liveness
+    /// timestamp, so the `WHERE status = 'pending'` guard exists only to make this a safe no-op
+    /// once the row has moved on (never to let a stale "store" call clobber an already-decided
+    /// row). `Ok(None)` (not an error) when the row is gone/expired/already transitioned.
+    pub async fn touch_device_authorization_poll(
+        &self,
+        device_code: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DeviceAuthorizationRow>> {
+        let row: Option<DeviceAuthorizationRow> = sqlx::query_as(
+            r#"
+            UPDATE device_authorizations
+            SET last_polled_at = $2
+            WHERE device_code = $1
+              AND status = 'pending'
+              AND expires_at > $2
+            RETURNING id, device_code, user_code, client_id, project_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
+            "#,
+        )
+        .bind(device_code)
+        .bind(now)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// Atomically transitions a `pending` row to `approved`, stamping `subject` (ADR-0025: the
+    /// resolved acting account id, never the raw Keycloak `sub` directly) in the same statement --
+    /// a single `UPDATE ... WHERE status = 'pending' ... RETURNING` is its own compare-and-swap,
+    /// mirroring [`Self::consume_exchange_refresh_token`] exactly: Postgres holds the row lock for
+    /// the statement's duration, so two concurrent approval attempts (or an approve racing a deny,
+    /// see [`Self::deny_device_authorization`]) can never both observe `status = 'pending'` and
+    /// both succeed. `Ok(None)` when the row is gone/expired/already decided -- the caller (a
+    /// future verification-page ticket) must treat that as "someone already acted on this code",
+    /// not a generic failure.
+    pub async fn approve_device_authorization(
+        &self,
+        device_code: &str,
+        account_id: &AccountId,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DeviceAuthorizationRow>> {
+        let row: Option<DeviceAuthorizationRow> = sqlx::query_as(
+            r#"
+            UPDATE device_authorizations
+            SET status = 'approved', subject = $2
+            WHERE device_code = $1
+              AND status = 'pending'
+              AND expires_at > $3
+            RETURNING id, device_code, user_code, client_id, project_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
+            "#,
+        )
+        .bind(device_code)
+        .bind(account_id.as_str())
+        .bind(now)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// The `deny` mirror of [`Self::approve_device_authorization`] -- same single-statement CAS
+    /// shape, `WHERE status = 'pending'` guard, `Ok(None)` on an already-decided/gone row. Leaves
+    /// `subject` `NULL` (the migration's `device_authorizations_subject_only_when_approved` CHECK
+    /// constraint enforces this at the database level too).
+    pub async fn deny_device_authorization(
+        &self,
+        device_code: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DeviceAuthorizationRow>> {
+        let row: Option<DeviceAuthorizationRow> = sqlx::query_as(
+            r#"
+            UPDATE device_authorizations
+            SET status = 'denied'
+            WHERE device_code = $1
+              AND status = 'pending'
+              AND expires_at > $2
+            RETURNING id, device_code, user_code, client_id, project_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
+            "#,
+        )
+        .bind(device_code)
+        .bind(now)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// Atomically consumes an `approved`/`denied` row exactly once (backs
+    /// `authkestra_op::device::DeviceCodeStore::consume_device_code`, called from the CLI's
+    /// `/oauth2/token` poll once it observes a non-`pending` status). Single-use enforcement, same
+    /// CAS guard as [`Self::consume_exchange_refresh_token`] (`WHERE status IN ('approved',
+    /// 'denied') ...`), so two concurrent polls presenting the same `device_code` can never both
+    /// observe a claimable status and both succeed -- exactly one call ever gets `Some(..)` back;
+    /// every other concurrent or later call gets `Ok(None)`.
+    ///
+    /// Unlike every other CAS method in this file, this one is a `WITH ... FOR UPDATE` CTE feeding
+    /// an `UPDATE ... FROM`, not a plain `UPDATE ... RETURNING` -- deliberately, because the
+    /// caller needs the row's PRE-consume `status`/`subject` (to know whether the device code was
+    /// approved or denied, and by whom) and plain `RETURNING` only ever exposes the POST-update
+    /// row, which would come back as `status = 'consumed'` -- a value
+    /// `oauth2_op::device_store::row_to_session` has no way to map back onto the upstream
+    /// `DeviceCodeStatus` enum (only `Pending`/`Approved`/`Denied` exist there; this was caught by
+    /// this repo's own it-tests, not by inspection -- see #423's PR description). The `FOR UPDATE`
+    /// inside the CTE still holds the row lock for the whole statement's duration -- the second of
+    /// two concurrent callers blocks on it until the first's `UPDATE` commits, then re-evaluates
+    /// the CTE's `WHERE status IN (...)` and finds nothing, so this remains a single atomic
+    /// statement and the CAS property holds exactly as it does everywhere else in this file.
+    ///
+    /// Kept as a `status = 'consumed'` flip rather than a hard `DELETE` -- consistent with this
+    /// codebase's ledger-like convention for CAS-consumed rows (`exchange_refresh_tokens` does the
+    /// same) -- and every read path already treats `consumed` as absent (see
+    /// [`Self::find_active_device_authorization_by_device_code`]), so the row is functionally
+    /// "consumed-and-gone" per ADR-0012 Decision 7 even though the audit trail survives.
+    pub async fn consume_device_authorization(
+        &self,
+        device_code: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DeviceAuthorizationRow>> {
+        let row: Option<DeviceAuthorizationRow> = sqlx::query_as(
+            r#"
+            WITH claimable AS (
+                SELECT id, device_code, user_code, client_id, project_id, scope, status, subject, interval_secs, created_at, expires_at, last_polled_at
+                FROM device_authorizations
+                WHERE device_code = $1
+                  AND status IN ('approved', 'denied')
+                  AND expires_at > $2
+                FOR UPDATE
+            )
+            UPDATE device_authorizations d
+            SET status = 'consumed'
+            FROM claimable
+            WHERE d.id = claimable.id
+            RETURNING claimable.id, claimable.device_code, claimable.user_code, claimable.client_id, claimable.project_id, claimable.scope, claimable.status, claimable.subject, claimable.interval_secs, claimable.created_at, claimable.expires_at, claimable.last_polled_at
+            "#,
+        )
+        .bind(device_code)
+        .bind(now)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// Unconditional hard delete, backing
+    /// `authkestra_op::device::DeviceCodeStore::delete_device_code`. A no-op (not an error) when
+    /// the row is already gone -- deleting something already absent is not a failure, matching
+    /// every other unconditional-delete/revoke convention in this file.
+    pub async fn delete_device_authorization(&self, device_code: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM device_authorizations
+            WHERE device_code = $1
+            "#,
+        )
+        .bind(device_code)
+        .execute(self.pool())
+        .await?;
+        Ok(())
     }
 }

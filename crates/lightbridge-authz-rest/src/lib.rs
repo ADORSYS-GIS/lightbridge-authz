@@ -1,10 +1,11 @@
 use axum::{Json, Router, http::StatusCode, routing::get};
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
+    Account, AccountId, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
     RotateApiKey, async_trait,
     config::{
-        ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetServer, IdpServer, ModelCatalog, Oauth2,
-        OauthClientType, OpaServer, QuotaTiers, Redis, UsageServiceClient,
+        ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetServer, Federation, IdpServer,
+        JwtSigning, ModelCatalog, Oauth2, OauthClient, OauthClientType, OpaServer, QuotaTiers,
+        Redis, UsageServiceClient,
     },
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
@@ -12,19 +13,30 @@ use lightbridge_authz_core::{
 };
 
 pub mod auth_provider;
+pub mod authorize;
+pub mod claim_redeem;
 pub mod codec;
+pub mod end_session;
 pub mod handlers;
+pub mod html_page;
 pub mod middleware;
 pub mod models;
 pub mod oauth2_op;
+pub mod post_logout;
 pub mod ratelimit_redis;
 pub mod redis_tls;
+pub mod relying_party;
 pub mod routers;
 pub mod rpc_authorize;
+pub mod secret_claim;
+pub mod session_cookie;
+pub mod session_management;
 pub mod signing;
+pub mod static_assets;
 pub mod token_exchange;
+pub mod userinfo;
 
-use auth_provider::{ACCESS_TOKEN_CONTEXT_KEY, CALLER_KIND_CONTEXT_KEY, CratestackAuthProvider};
+use auth_provider::{ACCESS_TOKEN_CONTEXT_KEY, CratestackAuthProvider};
 use codec::LenientCborCodec;
 use handlers::AuthzStoreImpl;
 use ratelimit_redis::build_redis_rate_limit_store;
@@ -74,6 +86,22 @@ pub struct OpaState {
     /// Configured billing-plan catalogue, used to resolve a key's plan id into its display name
     /// and limits at introspection time.
     pub billing: Arc<Billing>,
+    /// `oauth2.signing.audience` -- the FIXED `azp` value a self-signed API-key JWT always
+    /// carries (`ApiKeyJwtSigner::sign`). `handlers::exchange_token::verify_self_issued_token`
+    /// uses this to refuse any self-issued token shaped like an API-key JWT before ever treating
+    /// it as an exchange session, independent of whether an `api_keys` row still exists for it --
+    /// see that function's doc comment. `None` when `oauth2.type` is `external` (no self-signing
+    /// at all) or when `oauth2.signing.audience` is left unconfigured under `type: self`.
+    pub api_key_audience: Option<String>,
+    /// ADR-0025 Stage 2: translates `handlers::idp::resolve_context`'s presented
+    /// `(issuer, subject)` into the acting account id -- the real translation seam for that
+    /// endpoint, distinct from [`OpaRepoTrait`]'s own `subject: &str` methods (whose callers
+    /// already hold an ADR-0025-resolved value -- see the `OpaRepoTrait for StoreRepo` impl's own
+    /// doc comment).
+    pub resolver: Arc<dyn auth_provider::SubjectResolver>,
+    /// `oauth2.federation.issuer` -- the default `handlers::idp::resolve_context` uses when the
+    /// request body omits `issuer` (the legacy `lightbridge-keycloak-spi` adapter's shape).
+    pub federation_issuer: String,
 }
 
 #[async_trait]
@@ -96,6 +124,54 @@ pub trait OpaRepoTrait: Send + Sync {
         subject: &str,
         project_id: &str,
     ) -> Result<lightbridge_authz_core::ResolvedContext>;
+    /// Backs `POST /idp/v1/authorize-usage-scope` (#570): does `subject` (already ADR-0025-
+    /// resolved to an account id, exactly like every other `subject: &str` method on this trait)
+    /// own `scope_id` under `scope` (`"account"` or `"project"`)? `Ok(())` when authorized,
+    /// `Err(Error::NotFound)` for every refusal (unowned, unknown scope_id, or an unrecognized
+    /// `scope`) -- see `StoreRepo::authorize_usage_scope`'s doc comment for the full predicate and
+    /// why refusal is uniform.
+    async fn authorize_usage_scope(&self, subject: &str, scope: &str, scope_id: &str)
+    -> Result<()>;
+    /// `subject`'s per-member `quota_tier` on `project_id` (ADR-0017), or `None` for "no
+    /// per-member ceiling" -- see `StoreRepo::project_member_quota_tier`'s doc comment for the
+    /// full `Ok(None)` vs `Err` distinction. Used by introspection to resolve the `quota_tier`
+    /// field for a native RFC 8693 exchange session the same way `owner_quota_tier` already does
+    /// for the API-key plane.
+    async fn project_member_quota_tier(
+        &self,
+        project_id: &str,
+        subject: &str,
+    ) -> Result<Option<String>>;
+    /// `subject`'s roster `role` on `project_id`, or `None` if they hold no `project_members` row.
+    /// Used by introspection to resolve the `role` field for a native RFC 8693 exchange session,
+    /// the human/OIDC-plane mirror of `owner_role` on the API-key plane.
+    async fn project_member_role(&self, project_id: &str, subject: &str) -> Result<Option<String>>;
+    /// Every signing key (active + retired-but-not-yet-expired) this service has minted, as raw
+    /// JWK JSON -- the same rows `signing::well_known_router`'s `/.well-known/jwks.json` handler
+    /// serves. Introspection uses this to verify a presented token was signed by one of THIS
+    /// service's own keys (a *different* trust root than `oauth2.jwks_url`, the external IdP)
+    /// before trusting any tenant claim on it -- see
+    /// `handlers::exchange_token::verify_self_issued_token`.
+    async fn list_verification_jwks(&self) -> Result<Vec<serde_json::Value>>;
+    /// ADR-0020 Decision 4 / #437: the current `status`/`expires_at` of the `sessions` row named
+    /// by a token-exchange access token's `sid` claim -- `Ok(None)` when no such row exists (a
+    /// pre-ADR-0020 token, or an unrecognized `sid`), `Err` when the lookup itself fails (DB
+    /// unreachable). See `handlers::exchange_token::resolve_exchange_token_context`'s own doc
+    /// comment for why the `Err` case must never be read as "session is fine" -- it is the one
+    /// fail-closed branch this whole ADR exists to add.
+    async fn find_session_status(&self, session_id: &str) -> Result<Option<SessionStatusRow>>;
+}
+
+/// The two session-row fields introspection needs to decide `active`/`revoked`/`expired`
+/// (ADR-0020 Decision 6) -- deliberately narrower than the full `sessions` row (no `account_id`/
+/// `project_id`/`client_id`/`kind`/etc, none of which `resolve_exchange_token_context` needs).
+#[derive(Debug, Clone)]
+pub struct SessionStatusRow {
+    /// `"active"` / `"revoked"` -- plain `String`, parsed fail-closed on the read side (an
+    /// unrecognized value is never treated as `"active"`), matching this schema's established
+    /// convention for closed-set string columns (`Project.modelPolicy`, `AugmentationRequest.status`).
+    pub status: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[async_trait]
@@ -115,12 +191,31 @@ impl OpaRepoTrait for StoreRepo {
         StoreRepo::find_api_key_validation_by_hash(self, key_hash).await
     }
 
+    // ADR-0025: `OpaRepoTrait`'s own `subject: &str` contract is UNCHANGED here on purpose --
+    // every caller of this trait (OPA/Authorino introspection, `handlers::opa`/
+    // `handlers::exchange_token`) already holds a value read straight off an `accounts.id`-anchored
+    // column (`owner_account_id`, a resolved exchange session's `account_id`, ...), never a raw
+    // bearer claim that has not passed through `StoreRepo::resolve_account_for_federated_subject`.
+    // Wrapping via `AccountId::assert_already_resolved` here is exactly the "already-legitimate account id,
+    // just not yet typed" case that constructor's own doc comment describes -- this trait is
+    // deliberately outside the ingress list ADR-0025 Stage 2 translates (auth_provider.rs,
+    // bearer, mcp.rs, handlers/idp.rs, relying_party.rs, oauth2_op/store.rs).
     async fn get_project(&self, subject: &str, project_id: &str) -> Result<Option<Project>> {
-        StoreRepo::get_project(self, subject, project_id).await
+        StoreRepo::get_project(
+            self,
+            &AccountId::assert_already_resolved(subject),
+            project_id,
+        )
+        .await
     }
 
     async fn get_account(&self, subject: &str, account_id: &str) -> Result<Option<Account>> {
-        StoreRepo::get_account(self, subject, account_id).await
+        StoreRepo::get_account(
+            self,
+            &AccountId::assert_already_resolved(subject),
+            account_id,
+        )
+        .await
     }
 
     async fn get_project_by_id(&self, project_id: &str) -> Result<Option<Project>> {
@@ -136,7 +231,64 @@ impl OpaRepoTrait for StoreRepo {
         subject: &str,
         project_id: &str,
     ) -> Result<lightbridge_authz_core::ResolvedContext> {
-        StoreRepo::resolve_context(self, subject, project_id).await
+        StoreRepo::resolve_context(
+            self,
+            &AccountId::assert_already_resolved(subject),
+            project_id,
+        )
+        .await
+    }
+
+    async fn authorize_usage_scope(
+        &self,
+        subject: &str,
+        scope: &str,
+        scope_id: &str,
+    ) -> Result<()> {
+        StoreRepo::authorize_usage_scope(
+            self,
+            &AccountId::assert_already_resolved(subject),
+            scope,
+            scope_id,
+        )
+        .await
+    }
+
+    async fn project_member_quota_tier(
+        &self,
+        project_id: &str,
+        subject: &str,
+    ) -> Result<Option<String>> {
+        StoreRepo::project_member_quota_tier(
+            self,
+            project_id,
+            &AccountId::assert_already_resolved(subject),
+        )
+        .await
+    }
+
+    async fn project_member_role(&self, project_id: &str, subject: &str) -> Result<Option<String>> {
+        StoreRepo::project_member_role(
+            self,
+            project_id,
+            &AccountId::assert_already_resolved(subject),
+        )
+        .await
+    }
+
+    async fn list_verification_jwks(&self) -> Result<Vec<serde_json::Value>> {
+        StoreRepo::list_verification_jwks(self).await
+    }
+
+    async fn find_session_status(&self, session_id: &str) -> Result<Option<SessionStatusRow>> {
+        StoreRepo::find_session_status(self, session_id)
+            .await
+            .map(|opt| {
+                opt.map(|row| SessionStatusRow {
+                    status: row.status,
+                    expires_at: row.expires_at,
+                })
+            })
     }
 }
 
@@ -313,7 +465,7 @@ fn to_schema_budget_balance(
 /// Maps a domain [`lightbridge_authz_budget::RefillStatus`] into the schema's wire
 /// `MyBudgetRefillLadder` shape (see `authz.cstack`'s `type MyBudgetRefillLadder` doc comment).
 /// `budget_account_id`/`period` are threaded through from the call site rather than carried on
-/// `RefillStatus` itself -- the domain type only needs to answer "which tier, what ladder", not
+/// `RefillStatus` itself -- the domain type only needs to answer "what amounts are offered", not
 /// echo back the request that produced it.
 fn to_schema_my_budget_refill_ladder(
     budget_account_id: String,
@@ -323,18 +475,6 @@ fn to_schema_my_budget_refill_ladder(
     schema::MyBudgetRefillLadder {
         budgetAccountId: budget_account_id,
         period,
-        currentTier: status.current_tier.to_string(),
-        currentTierAmountMicros: status.current_tier.amount().get().to_string(),
-        nextTier: status.next_tier.map(|tier| tier.to_string()),
-        nextTierAmountMicros: status.next_tier.map(|tier| tier.amount().get().to_string()),
-        ladder: status
-            .ladder
-            .into_iter()
-            .map(|rung| schema::BudgetLadderRung {
-                tier: rung.tier.to_string(),
-                amountMicros: rung.amount_micros.to_string(),
-            })
-            .collect(),
         allowedAmountsMicros: status
             .allowed_amounts_micros
             .into_iter()
@@ -386,6 +526,34 @@ fn resolve_budget_grants_page_size(limit: Option<i64>) -> i64 {
     }
 }
 
+/// `listMyExpiringApiKeys`'s default "soon" window when a caller omits `withinDays`
+/// (lightbridge-authz#436). Matches `apps/self-service/src/lib/api-key-expiry.ts`'s
+/// `EXPIRING_SOON_WINDOW_DAYS` in converse-frontends so the two surfaces agree on what "soon"
+/// means rather than silently diverging -- see `docs/api-key-expiry-visibility.md`.
+const DEFAULT_EXPIRING_SOON_WINDOW_DAYS: i64 = 14;
+/// Ceiling a caller-supplied `withinDays` clamps to. Mirrors the documented default of the
+/// operator-configured `ApiKeyExpiry` ceiling (`api_key_expiry`,
+/// `lightbridge_authz_core::config::ApiKeyExpiry::max_lifetime_days`) -- a window wider than the
+/// maximum possible key lifetime cannot surface anything a plain `model.ApiKey.list` call could
+/// not already return, so there is no security reason to allow (or need to reject) more.
+const MAX_EXPIRING_SOON_WINDOW_DAYS: i64 = 90;
+/// Hard cap on rows `listMyExpiringApiKeys` returns (soonest-expiring first). Comfortably above
+/// the estate-wide count of keys expiring within 30 days at the time of lightbridge-authz#436's
+/// own investigation (11) -- this bounds the query rather than expecting that count to hold
+/// forever.
+const MAX_EXPIRING_API_KEYS_RESULTS: i64 = 500;
+
+/// Resolves a caller-supplied, optional `withinDays` into a window clamped to
+/// `[1, MAX_EXPIRING_SOON_WINDOW_DAYS]`, defaulting to [`DEFAULT_EXPIRING_SOON_WINDOW_DAYS`] when
+/// omitted -- the same "clamp, don't reject" convention [`resolve_budget_grants_page_size`] above
+/// already uses for a read-side convenience parameter, not the fail-closed "reject, never clamp"
+/// rule `validate_expires_at` (`handlers/mod.rs`) uses for the write-time expiry gate.
+fn clamp_expiring_soon_window_days(requested: Option<i64>) -> i64 {
+    requested
+        .unwrap_or(DEFAULT_EXPIRING_SOON_WINDOW_DAYS)
+        .clamp(1, MAX_EXPIRING_SOON_WINDOW_DAYS)
+}
+
 /// The validated caller's subject, projected as `auth().id` by [`CratestackAuthProvider`].
 fn subject_from_ctx(ctx: &CratestackContext) -> Option<String> {
     match ctx.auth_field("id") {
@@ -398,16 +566,6 @@ fn subject_from_ctx(ctx: &CratestackContext) -> Option<String> {
 /// rotate procedure's downstream secret issuance can reuse it (email profile / token exchange).
 fn access_token_from_ctx(ctx: &CratestackContext) -> Option<String> {
     match ctx.extensions.get(ACCESS_TOKEN_CONTEXT_KEY) {
-        Some(Value::String(s)) => Some(s.clone()),
-        _ => None,
-    }
-}
-
-/// The caller-kind signal stashed into the context by [`CratestackAuthProvider`], when the
-/// validated token carried [`lightbridge_authz_bearer::CALLER_KIND_CLAIM`]. `None` means the claim
-/// was absent, which must be treated as "unknown" -- see that constant's docs.
-fn caller_kind_from_ctx(ctx: &CratestackContext) -> Option<String> {
-    match ctx.extensions.get(CALLER_KIND_CONTEXT_KEY) {
         Some(Value::String(s)) => Some(s.clone()),
         _ => None,
     }
@@ -439,6 +597,8 @@ fn to_schema_account(a: Account) -> schema::Account {
         id: a.id,
         defaultQuota: a.default_quota,
         status: a.status.to_string(),
+        name: a.name,
+        userId: a.user_id,
     }
 }
 
@@ -465,6 +625,64 @@ fn json_to_cratestack_value(value: serde_json::Value) -> Value {
     }
 }
 
+/// The inverse of `json_to_cratestack_value` above: lowers cratestack's own `Value` enum back into
+/// the `serde_json::Value` shape the core repo speaks. Needed by `set_project_allowed_models`
+/// (#415) to read a `Json?` procedure argument (`Option<cratestack::Json<Value>>`) back into
+/// `Option<Vec<String>>` before handing it to `AuthzStoreImpl`.
+fn cratestack_value_to_json(value: Value) -> serde_json::Value {
+    match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(b) => serde_json::Value::Bool(b),
+        Value::Int(i) => serde_json::Value::Number(i.into()),
+        Value::Float(f) => serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::String(s) => serde_json::Value::String(s),
+        Value::List(items) => {
+            serde_json::Value::Array(items.into_iter().map(cratestack_value_to_json).collect())
+        }
+        Value::Map(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, cratestack_value_to_json(v)))
+                .collect(),
+        ),
+        // `Bytes` has no `serde_json::Value` counterpart and no forward `json_to_cratestack_value`
+        // arm ever produces it (the core repo never stores binary blobs in `Json` columns) -- not
+        // reachable from `Project.allowedModels`'s own DB round-trip, so `Null` here just means
+        // "not a shape this converter's only caller understands", same tolerance
+        // `allowed_models_from_json_arg` already applies to any other unexpected whole-argument
+        // shape.
+        Value::Bytes(_) => serde_json::Value::Null,
+    }
+}
+
+/// Reads a `Project.allowedModels`-shaped `Json?` procedure argument
+/// (`Option<cratestack::Json<Value>>`) into the core domain's `Option<Vec<String>>`: an absent
+/// argument or an explicit `null` both mean "leave/set to all models allowed" (`None`); a JSON
+/// array is read element-by-element, silently dropping any non-string entry (mirrors
+/// `StoreRepo::json_to_vec`'s existing tolerance for the same shape read back from the DB); any
+/// other JSON shape (a bare string/number/object) is not a valid `allowedModels` value and is
+/// treated the same as `null` rather than panicking -- the catalogue check downstream only ever
+/// rejects known-bad *entries*, so a malformed whole-argument shape fails the same permissive way
+/// `Project.allowedModels`'s own DB decode already does for legacy rows (see that field's schema
+/// doc comment).
+fn allowed_models_from_json_arg(value: Option<cratestack::Json<Value>>) -> Option<Vec<String>> {
+    let json = cratestack_value_to_json(value?.0);
+    match json {
+        serde_json::Value::Null => None,
+        serde_json::Value::Array(items) => Some(
+            items
+                .into_iter()
+                .filter_map(|item| match item {
+                    serde_json::Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 fn to_schema_project(p: Project) -> schema::Project {
     let allowed_models = p
         .allowed_models
@@ -485,6 +703,7 @@ fn to_schema_project(p: Project) -> schema::Project {
         projectQuota: p.project_quota,
         status: p.status.to_string(),
         isDefault: p.is_default,
+        modelPolicy: p.model_policy.to_string(),
     }
 }
 
@@ -626,11 +845,18 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         let issuer = self.issuer.clone();
         let subject = subject_from_ctx(ctx);
         let default_quota = args.args.defaultQuota;
+        let name = args.args.name;
         async move {
             let subject = subject
                 .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let account = issuer
-                .create_account(&subject, CreateAccount { default_quota })
+                .create_account(
+                    &subject,
+                    CreateAccount {
+                        default_quota,
+                        name,
+                    },
+                )
                 .await
                 .map_err(to_cratestack_error)?;
             Ok(to_schema_account(account))
@@ -658,6 +884,33 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
             let account = issuer
                 .update_account_default_quota(&subject, &account_id, default_quota.as_deref())
+                .await
+                .map_err(to_cratestack_error)?;
+            Ok(to_schema_account(account))
+        }
+    }
+
+    fn update_account_name(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::update_account_name::Args,
+        _authorized: schema::procedures::update_account_name::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::update_account_name::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let account_id = args.args.accountId;
+        let name = args.args.name;
+        async move {
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            let account = issuer
+                .update_account_name(&subject, &account_id, name.as_deref())
                 .await
                 .map_err(to_cratestack_error)?;
             Ok(to_schema_account(account))
@@ -924,6 +1177,60 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         }
     }
 
+    fn set_project_allowed_models(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::set_project_allowed_models::Args,
+        _authorized: schema::procedures::set_project_allowed_models::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::set_project_allowed_models::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let project_id = args.args.projectId;
+        let allowed_models = allowed_models_from_json_arg(args.args.allowedModels);
+        async move {
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            let project = issuer
+                .set_project_allowed_models(&subject, &project_id, allowed_models)
+                .await
+                .map_err(to_cratestack_error)?;
+            Ok(to_schema_project(project))
+        }
+    }
+
+    fn set_project_model_policy(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::set_project_model_policy::Args,
+        _authorized: schema::procedures::set_project_model_policy::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::set_project_model_policy::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let subject = subject_from_ctx(ctx);
+        let project_id = args.args.projectId;
+        let model_policy = args.args.modelPolicy;
+        async move {
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            let project = issuer
+                .set_project_model_policy(&subject, &project_id, &model_policy)
+                .await
+                .map_err(to_cratestack_error)?;
+            Ok(to_schema_project(project))
+        }
+    }
+
     fn revoke_api_key(
         &self,
         _db: &schema::Cratestack,
@@ -944,6 +1251,52 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 .await
                 .map_err(to_cratestack_error)?;
             Ok(to_schema_api_key(key))
+        }
+    }
+
+    /// Self-scoped, cross-project "expiring soon" aggregate (lightbridge-authz#436). Unlike every
+    /// other procedure in this impl, this one DOES use `db` -- see the schema doc comment on
+    /// `listMyExpiringApiKeys` for why: calling the generated `db.api_key()` delegate means this
+    /// procedure's tenant isolation is enforced by the exact same compiled `@@allow("read", ...)`
+    /// clause `model.ApiKey.list`/`get` already go through (`push_scoped_conditions` in
+    /// cratestack-pg folds it into the query unconditionally, with no bypass), rather than a
+    /// second, hand-written ownership join that could drift from the model's own policy.
+    /// Soft-deleted rows are excluded the same way (the model's `@@soft_delete` filter, also
+    /// applied unconditionally by the generated delegate) -- no explicit `deletedAt` check needed
+    /// here.
+    fn list_my_expiring_api_keys(
+        &self,
+        db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::list_my_expiring_api_keys::Args,
+        _authorized: schema::procedures::list_my_expiring_api_keys::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::list_my_expiring_api_keys::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let within_days = args.args.withinDays;
+        async move {
+            let within_days = clamp_expiring_soon_window_days(within_days);
+            let now = chrono::Utc::now();
+            let cutoff = now + chrono::Duration::days(within_days);
+            // Three separate `.where_(...)` calls, not one `.and()`-chained expression:
+            // `FindMany`/`ScopedFindMany` combine every entry in its `filters: Vec<FilterExpr>`
+            // with `AND` when building the query (`push_filter_query`,
+            // cratestack-sqlx/src/query/support/filter.rs), so this is equivalent to (and simpler
+            // than) chaining `.and()` on the `Filter` values `eq`/`gt`/`lte` return.
+            let keys = db
+                .api_key()
+                .find_many()
+                .where_(schema::api_key::status().eq("active".to_string()))
+                .where_(schema::api_key::expiresAt().gt(now))
+                .where_(schema::api_key::expiresAt().lte(cutoff))
+                .order_by(schema::api_key::expiresAt().asc())
+                .limit(MAX_EXPIRING_API_KEYS_RESULTS)
+                .run(ctx)
+                .await?;
+            Ok(keys)
         }
     }
 
@@ -1292,25 +1645,29 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     /// request handling (not a pure, unit-testable domain function -- `RefillRequest.as_of` is a
     /// caller-supplied parameter for exactly this reason, per that struct's own doc comment).
     ///
-    /// ## Internal/API-key-client refusal (#191/#216)
+    /// ## Authorization is `budget:self-refill` alone (#419)
     ///
-    /// #191's own acceptance criteria require this operation to be refused for an internal or
-    /// API-key-derived caller -- "refills are OIDC users only". This is enforced by refusing
-    /// whenever the validated token carries [`lightbridge_authz_bearer::CALLER_KIND_CLAIM`] equal
-    /// to [`lightbridge_authz_bearer::API_KEY_CALLER_KIND`] (projected into the context by
-    /// [`CratestackAuthProvider`] as [`auth_provider::CALLER_KIND_CONTEXT_KEY`]).
-    ///
-    /// **Coverage differs by `oauth2.type`** (see #216's investigation for the full analysis of
-    /// why no existing claim -- `aud` included -- reliably distinguished the two caller kinds):
-    /// - `oauth2.type: self`: fully closed. `lightbridge_authz_rest::signing::ApiKeyJwtSigner`
-    ///   stamps this claim on every self-signed API-key JWT it mints, unconditionally, so it is
-    ///   present precisely when the caller is API-key-derived. This is the mode this repo ships by
-    ///   default (`config/default.yaml`, `.docker/authz/container.yaml`).
-    /// - `oauth2.type: external`: **not yet closed**. Tokens minted by the upstream IdP's own
-    ///   API-key token-exchange flow do not carry this claim until that flow (outside this repo --
-    ///   see `docs/rbac.md`) is updated to stamp it. Until then, an API-key-derived caller
-    ///   authenticated under `external` is indistinguishable from a human one at this layer, and
-    ///   is not refused. Tracked as the remaining scope of #216.
+    /// This procedure used to *additionally* refuse any caller whose validated token carried
+    /// [`lightbridge_authz_bearer::CALLER_KIND_CLAIM`] equal to
+    /// [`lightbridge_authz_bearer::API_KEY_CALLER_KIND`] (#191/#216) -- intended to keep a service
+    /// account from self-refilling ("refills are OIDC users only"). #419 deleted that check: it
+    /// fired on humans, not service accounts. `signing.rs`'s `access_token_extra` -- shared by
+    /// both `ApiKeyJwtSigner::sign` (API keys) *and* `oauth2_op::store::TokenExchangeOpStore`'s
+    /// `handle_token_exchange`/`handle_refresh_token` (the human-plane RFC 8693 exchange) --
+    /// stamps this claim on every access token it mints, unconditionally, with no parameter to
+    /// vary it by caller. So every human-plane token carried it too, and got refused by a message
+    /// asserting the opposite of what was happening. It was also never load-bearing: under
+    /// `oauth2.type: self` (this repo's shipped default) an API-key JWT carries no roles claim at
+    /// all, so `rpc_authorize`/`CratestackAuthProvider` already refuses it for lacking
+    /// `budget:self-refill` before this procedure ever runs; under `external`, tokens from the
+    /// upstream IdP's own API-key exchange never carried the claim to begin with (`docs/rbac.md`).
+    /// The service-account exclusion this was written for is already correctly expressed by the
+    /// permission gate alone: a service account never performs an OIDC dashboard login, so it
+    /// never holds a role granting `budget:self-refill` in the first place. See
+    /// `crates/lightbridge-authz-rest/tests/token_exchange_tests.rs`'s
+    /// `request_refill_accepts_a_real_human_plane_token_that_still_carries_the_stale_api_key_signal`
+    /// for the regression coverage minted through the real signing path (not a hand-built
+    /// context) that would have caught this before it shipped.
     fn request_budget_refill(
         &self,
         _db: &schema::Cratestack,
@@ -1325,33 +1682,22 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     > + Send {
         let refill_service = self.refill_service.clone();
         let subject = subject_from_ctx(ctx);
-        let caller_kind = caller_kind_from_ctx(ctx);
         let input = args.args;
         async move {
             let _subject = subject
                 .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
-            if caller_kind.as_deref() == Some(lightbridge_authz_bearer::API_KEY_CALLER_KIND) {
-                return Err(CratestackError::Forbidden(
-                    "self-service budget refills are for OIDC human callers only".to_owned(),
-                ));
-            }
 
             let period = lightbridge_authz_budget::Period::parse(&input.period)
                 .map_err(budget_error_to_cratestack_error)?;
 
-            // ADR-0015: optional and additive -- `None` when the caller omits the field
-            // preserves the pre-ADR-0015 wire shape exactly (`RefillRequest::
-            // requested_amount_micros`'s own doc comment covers why).
-            let requested_amount_micros = input
-                .requestedAmountMicros
-                .map(|raw| {
-                    raw.trim().parse::<i64>().map_err(|_| {
-                        CratestackError::BadRequest(format!(
-                            "requestedAmountMicros must be a valid integer, got '{raw}'"
-                        ))
-                    })
-                })
-                .transpose()?;
+            // ADR-0015: required -- checked against the active policy's offered set
+            // (`allowed_amounts_micros`) inside `RefillService::request_refill` itself.
+            let requested_amount_raw = input.requestedAmountMicros.trim();
+            let requested_amount_micros: i64 = requested_amount_raw.parse().map_err(|_| {
+                CratestackError::BadRequest(format!(
+                    "requestedAmountMicros must be a valid integer, got '{requested_amount_raw}'"
+                ))
+            })?;
 
             let request = lightbridge_authz_budget::RefillRequest {
                 budget_account_id: input.budgetAccountId,
@@ -1372,15 +1718,15 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         }
     }
 
-    /// Read-only companion to [`Self::request_budget_refill`]: where the caller currently sits on
-    /// the ADR-0008 ladder for `period`, and what the next refill would grant if approved --
-    /// delegating to [`lightbridge_authz_budget::RefillService::refill_status`], which calls no
-    /// policy engine and mutates nothing. `budgetAccountId` is derived from the authenticated
-    /// subject exactly like [`Self::get_my_budget_balance`] (never a caller-supplied field, the
-    /// same structural self-scoping guarantee), which is why `GetMyBudgetRefillLadderInput` has no
-    /// target field either. No caller-kind refusal here -- unlike the mutation above, this is a
-    /// pure read with no OIDC-human-only business rule of its own; the shared
-    /// `budget:self-refill` RBAC gate is the entire authorization story for this op-id.
+    /// Read-only companion to [`Self::request_budget_refill`]: the self-service refill amounts
+    /// currently offered by the active policy for `period` -- delegating to
+    /// [`lightbridge_authz_budget::RefillService::refill_status`], which calls no policy engine
+    /// and mutates nothing. `budgetAccountId` is derived from the authenticated subject exactly
+    /// like [`Self::get_my_budget_balance`] (never a caller-supplied field, the same structural
+    /// self-scoping guarantee), which is why `GetMyBudgetRefillLadderInput` has no target field
+    /// either. No caller-kind refusal here -- unlike the mutation above, this is a pure read with
+    /// no OIDC-human-only business rule of its own; the shared `budget:self-refill` RBAC gate is
+    /// the entire authorization story for this op-id.
     fn get_my_budget_refill_ladder(
         &self,
         _db: &schema::Cratestack,
@@ -1399,11 +1745,11 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         async move {
             let subject = subject
                 .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
-            let period = lightbridge_authz_budget::Period::parse(&period_str)
+            lightbridge_authz_budget::Period::parse(&period_str)
                 .map_err(budget_error_to_cratestack_error)?;
 
             let status = refill_service
-                .refill_status(&subject, &period)
+                .refill_status()
                 .await
                 .map_err(budget_error_to_cratestack_error)?;
 
@@ -1975,24 +2321,22 @@ where
         )
 }
 
-/// Derives the two `well_known_router` mount parameters (`token_exchange_scopes`,
-/// `private_key_jwt_supported`) from `oauth2`. Used by `build_idp_router` — `authz-idp` is now the
+/// Derives the token-surface `well_known_router` parameters from the successfully assembled
+/// state, rather than configuration intent. Used by `build_idp_router` — `authz-idp` is now the
 /// only server that mounts `well_known_router` at all; `authz-api` stopped serving OIDC
 /// discovery/JWKS once the `auth.ai.camer.digital` ingress was repointed at `authz-idp` (see
-/// `build_api_router`'s doc comment). Kept as its own function rather than inlined into
-/// `build_idp_router` so a future second self-signed-JWKS server can reuse it the same way
-/// `build_api_router` used to.
-fn well_known_mount_params(oauth2: &Oauth2) -> (Option<Vec<String>>, bool) {
-    let token_exchange_scopes = oauth2
-        .token_exchange
-        .as_ref()
-        .filter(|t| t.enabled)
-        .map(|t| t.allowed_scopes.clone());
-    let private_key_jwt_supported = oauth2
-        .clients
-        .iter()
-        .any(|c| c.client_type == OauthClientType::Confidential);
-    (token_exchange_scopes, private_key_jwt_supported)
+/// `build_api_router`'s doc comment). `token_exchange` is unconditionally assembled by
+/// `start_idp_server` (ADR-0023: `oauth2.token_exchange` is mandatory for `authz-idp`, no longer
+/// optional), so this always reports the real scope/client-authentication metadata — there is no
+/// "token exchange absent" case left to fall back from.
+fn well_known_mount_params(
+    oauth2: &Oauth2,
+    token_exchange: &token_exchange::TokenExchangeState,
+) -> (Option<Vec<String>>, signing::ClientAuthenticationMetadata) {
+    (
+        Some(token_exchange.op_config().scopes_supported.clone()),
+        signing::ClientAuthenticationMetadata::from_oauth2(oauth2),
+    )
 }
 
 /// Assembles the API server router: public probes plus the generated cratestack RPC CRUD surface
@@ -2013,6 +2357,7 @@ fn well_known_mount_params(oauth2: &Oauth2) -> (Option<Vec<String>>, bool) {
 #[allow(clippy::too_many_arguments)]
 pub fn build_api_router(
     bearer: Arc<dyn BearerTokenServiceTrait>,
+    resolver: Arc<dyn auth_provider::SubjectResolver>,
     issuer: Arc<AuthzStoreImpl>,
     policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
     refill_service: Arc<lightbridge_authz_budget::RefillService>,
@@ -2051,8 +2396,12 @@ pub fn build_api_router(
             review_service,
             budget_repo,
         ),
+        // cratestack 0.8.11 (@computed) added this parameter to every generated router fn.
+        // `authz.cstack` declares no `@computed` field, so `()` (the generated
+        // `impl ComputedFieldResolver for ()`) is the correct, zero-behavior-change value here.
+        (),
         LenientCborCodec::default(),
-        CratestackAuthProvider::new(bearer.clone(), RpcScope::Crud),
+        CratestackAuthProvider::new(bearer.clone(), RpcScope::Crud, resolver),
         // cratestack 0.7.12 (#413) made this request-body-size bound an explicit parameter instead
         // of an axum implementation detail. `DEFAULT_BODY_LIMIT_BYTES` (2 MiB) is the value the
         // changelog documents as reproducing the pre-0.7.12 runtime behavior exactly — this call
@@ -2110,7 +2459,11 @@ const CLIENT_ASSERTION_JTI_KEY_PREFIX: &str = "authz-api:client-assertion-jti:";
 
 /// Builds the native token-exchange state. Enabled only when `token_exchange.enabled` is set, and
 /// it REQUIRES `oauth2.type: self` (the exchanged access token is a self-signed JWT). Returns
-/// `Ok(None)` when the feature is off; errors on invalid config so startup fails fast.
+/// `Ok(None)` when the feature is off; errors on invalid config so startup fails fast. This
+/// function's `Result<Option<...>>` contract is unchanged by ADR-0023, and its own unit tests
+/// still exercise the `None`/disabled path directly -- but its sole production caller,
+/// `start_idp_server`, now treats a `None` result as fatal (`oauth2.token_exchange` is mandatory
+/// for authz-idp), so `build_token_exchange_state` itself has exactly ONE production caller.
 ///
 /// ADR-0011 phase 2: builds the config-defined `ClientStore` (Decision 5) and the Redis-backed
 /// `ClientAssertionStore` (Decision 6) that together let `oauth2_op::store::TokenExchangeOpStore`
@@ -2151,9 +2504,13 @@ fn build_token_exchange_state(
     let signing = oauth2.signing.as_ref().ok_or_else(|| {
         Error::Server("oauth2.token_exchange requires oauth2.signing (type: self)".to_string())
     })?;
-    if cfg.access_ttl_seconds <= 0 || cfg.refresh_ttl_seconds <= 0 {
+    if cfg.access_ttl_seconds <= 0
+        || cfg.authorization_code_ttl_seconds <= 0
+        || cfg.refresh_ttl_seconds <= 0
+    {
         return Err(Error::Server(
-            "token_exchange access_ttl_seconds and refresh_ttl_seconds must be positive"
+            "token_exchange access_ttl_seconds, authorization_code_ttl_seconds, and \
+             refresh_ttl_seconds must be positive"
                 .to_string(),
         ));
     }
@@ -2170,7 +2527,55 @@ fn build_token_exchange_state(
                 .to_string(),
         ));
     }
+    if cfg.device_code_ttl_seconds <= 0 || cfg.device_poll_interval_seconds <= 0 {
+        return Err(Error::Server(
+            "token_exchange device_code_ttl_seconds and device_poll_interval_seconds must be positive"
+                .to_string(),
+        ));
+    }
+    if cfg.client_credentials_ttl_seconds <= 0 {
+        return Err(Error::Server(
+            "token_exchange client_credentials_ttl_seconds must be positive".to_string(),
+        ));
+    }
+    let device_verification_uri =
+        reqwest::Url::parse(&cfg.device_verification_uri).map_err(|_| {
+            Error::Server(
+                "token_exchange device_verification_uri must be an absolute URL".to_string(),
+            )
+        })?;
+    if device_verification_uri.scheme() != "https"
+        || device_verification_uri.path() != "/device/verify"
+        || !device_verification_uri.username().is_empty()
+        || device_verification_uri.password().is_some()
+        || device_verification_uri.query().is_some()
+        || device_verification_uri.fragment().is_some()
+    {
+        return Err(Error::Server(
+            "token_exchange device_verification_uri must be a credential-free, query-free HTTPS /device/verify URL"
+                .to_string(),
+        ));
+    }
+    validate_authorization_code_clients(&oauth2.clients, signing.audience.as_deref())?;
+    validate_client_credentials_and_service_clients(&oauth2.clients)?;
     let signer = signing::ApiKeyJwtSigner::from_config(signing, repo.clone())?;
+
+    // ADR-0025 Stage 1/2: `start_idp_server` (this function's sole production caller) already
+    // enforces `oauth2.federation` via `require_federation` before this function ever runs; this
+    // check exists so a *test* fixture that forgets `federation` fails loudly here rather than
+    // the store silently grandfathering against an empty issuer string.
+    let grandfather_issuer = oauth2
+        .federation
+        .as_ref()
+        .ok_or_else(|| {
+            Error::Server(
+                "oauth2.federation.issuer is required to build the token-exchange store \
+                 (ADR-0025)"
+                    .to_string(),
+            )
+        })?
+        .issuer
+        .clone();
 
     let client_store = oauth2_op::client_store::ConfigClientStore::from_config(&oauth2.clients);
     let assertions = oauth2_op::client_assertion_store::RedisClientAssertionStore::connect(
@@ -2186,25 +2591,217 @@ fn build_token_exchange_state(
         budget_repo,
         policy_engine,
         bearer,
+        // Declared in `oauth2.signing.claim_mappers`, evaluated at mint time against data this
+        // deployment owns -- see `TokenExchangeOpStore::resolve_mapped_claims`.
+        Arc::new(signing.claim_mappers.clone()),
         cfg.clone(),
+        grandfather_issuer,
     ));
     let op_config = authkestra_op::config::OpConfig {
         issuer: signing.issuer.clone(),
         scopes_supported: cfg.allowed_scopes.clone(),
-        response_types_supported: vec!["token".to_string()],
+        response_types_supported: vec!["code".to_string()],
         grant_types_supported: vec![
+            "authorization_code".to_string(),
             token_exchange::TOKEN_EXCHANGE_GRANT.to_string(),
             token_exchange::REFRESH_TOKEN_GRANT.to_string(),
+            token_exchange::DEVICE_CODE_GRANT.to_string(),
+            token_exchange::CLIENT_CREDENTIALS_GRANT.to_string(),
         ],
         id_token_signing_alg: "RS256".to_string(),
-        authorization_code_ttl_secs: 0,
+        authorization_code_ttl_secs: cfg.authorization_code_ttl_seconds,
         access_token_ttl_secs: cfg.access_ttl_seconds.max(0) as u64,
-        device_code_ttl_secs: 0,
+        device_code_ttl_secs: cfg.device_code_ttl_seconds as u64,
         token_exchange_enabled: cfg.enabled,
     };
-    Ok(Some(token_exchange::TokenExchangeState::new(
-        signer, op_config, op_store,
-    )))
+    let cors_origins = token_endpoint_cors_origins(&oauth2.clients)?;
+    Ok(Some(
+        token_exchange::TokenExchangeState::new(
+            signer,
+            op_config,
+            op_store,
+            cfg.device_verification_uri.clone(),
+            cfg.device_code_ttl_seconds as u64,
+            cfg.device_poll_interval_seconds as u64,
+        )
+        .with_cors_origins(cors_origins)
+        .with_client_credentials_ttl_seconds(cfg.client_credentials_ttl_seconds),
+    ))
+}
+
+fn token_endpoint_cors_origins(clients: &[OauthClient]) -> Result<Vec<String>> {
+    clients
+        .iter()
+        .filter(|client| {
+            client.client_type == OauthClientType::Public
+                && client.require_pkce
+                && client
+                    .grant_types
+                    .iter()
+                    .any(|grant| grant == "authorization_code")
+        })
+        .flat_map(|client| client.redirect_uris.iter())
+        .map(|redirect_uri| redirect_origin(redirect_uri))
+        .collect::<Result<std::collections::BTreeSet<_>>>()
+        .map(|origins| origins.into_iter().collect())
+}
+
+/// OAuth 2.1 and RFC 9700 (OAuth Security Best Current Practice) recommend PKCE for every client
+/// type, not only public ones, specifically to close authorization-code-injection attacks -- a
+/// confidential client's client-authentication step at the token endpoint proves who is redeeming
+/// the code, not that the code being redeemed is the one THIS session actually requested. This
+/// gate therefore applies to every `authorization_code` client regardless of `client_type`; do not
+/// reintroduce a `client_type == Public` condition here.
+///
+/// Also enforces an invariant the introspection endpoint's module doc comment
+/// (`token_exchange.rs`) relies on but nothing previously checked: no registered client's
+/// `client_id` may equal `oauth2.signing.audience`. That equality is exactly the condition under
+/// which a self-signed API-key JWT's `azp` (always the fixed `oauth2.signing.audience` value)
+/// would collide with a real OAuth2 client id, making an API-key JWT pass
+/// `introspect_endpoint`'s `azp == caller's client_id` gate and introspect as a live token-
+/// exchange access token -- defeating the "API keys are structurally not introspectable" claim
+/// that doc comment makes. Refusing to start is preferable to a config that silently invalidates
+/// that claim.
+fn validate_authorization_code_clients(
+    clients: &[OauthClient],
+    signing_audience: Option<&str>,
+) -> Result<()> {
+    for client in clients {
+        for redirect_uri in &client.redirect_uris {
+            redirect_origin(redirect_uri)?;
+        }
+        if client
+            .grant_types
+            .iter()
+            .any(|grant| grant == "authorization_code")
+            && (!client.require_pkce || client.redirect_uris.is_empty())
+        {
+            return Err(Error::Server(
+                "authorization_code clients require PKCE and at least one redirect_uri".to_string(),
+            ));
+        }
+        if let Some(audience) = signing_audience
+            && client.client_id == audience
+        {
+            return Err(Error::Server(format!(
+                "oauth2.clients client_id {:?} equals oauth2.signing.audience -- a self-signed \
+                 API-key JWT's azp would collide with this client id, making API keys \
+                 introspectable as token-exchange access tokens",
+                client.client_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Startup guard for `client_credentials`-capable and `confidential`/`service` clients (#534,
+/// ADR-0030), called from [`build_token_exchange_state`] -- `start_idp_server`'s sole production
+/// caller of that function, so this runs unconditionally at `authz-idp` startup exactly like
+/// [`validate_authorization_code_clients`] above it. Two independent, previously-latent footguns:
+///
+/// 1. **A `public` client listing `client_credentials` would mint a machine token with NO
+///    credential at all.** `oauth2_op::client_store::to_registration` maps `public` to `NoAuth`.
+///    This check is the SOLE control against that combination, not a second line of defense behind
+///    the pre-dispatch intercept: `token_exchange::client_credentials_token_endpoint`'s own
+///    `authenticate_presented_client` has, as its first match arm, `(Some(NoAuth), NoCredential) =>
+///    Ok(())` -- the same rule every other grant relies on for public clients -- so a `public`
+///    client that somehow reached this endpoint with `client_credentials` in its `grant_types`
+///    would authenticate with `Ok(())` and then pass the `allows_grant_type` check, reproducing the
+///    exact footgun the intercept might otherwise be assumed to guard against. This startup check
+///    is the only thing that stops that combination from ever minting a token.
+/// 2. **A `confidential`/`service` client whose `jwks` does not actually parse to a usable key**
+///    would previously start successfully: `find_client` would keep answering
+///    `token_endpoint_auth_method: Some(PrivateKeyJwt)` for it, while
+///    `signing::ClientAuthenticationMetadata::from_oauth2` silently dropped it from
+///    `token_endpoint_auth_methods_supported` in discovery -- the client store and the discovery
+///    document disagreeing about whether the client can ever actually authenticate. Refusing to
+///    start closes that gap for `confidential` AND `service` clients alike. This check uses
+///    [`signing::client_has_a_parseable_jwk`]; `from_oauth2` keeps its own inline filter chain
+///    rather than calling that same function (it needs to walk every key to collect signing
+///    algorithms, not just answer "is there at least one"), but both bottom out in the same
+///    `parse_public_jwk` call, so a JWK either function accepts/rejects is judged identically.
+///    `ConfigClientStore::has_confidential_client`/
+///    `TokenExchangeOpStore::has_confidential_client` -- the aggregate "is there at least one"
+///    query this per-client check replaces -- are removed as part of this fix; neither could have
+///    driven a check this specific, and both were otherwise unused outside their own tests.
+///
+/// `client_credentials` clients additionally may not register `redirect_uris`: RFC 6749 §4.4 is a
+/// non-browser, non-redirect grant by construction, so a client combining the two is either a
+/// config mistake or two client roles smuggled into one registration.
+fn validate_client_credentials_and_service_clients(clients: &[OauthClient]) -> Result<()> {
+    for client in clients {
+        if matches!(
+            client.client_type,
+            OauthClientType::Confidential | OauthClientType::Service
+        ) && !signing::client_has_a_parseable_jwk(client.jwks.as_ref())
+        {
+            return Err(Error::Server(format!(
+                "oauth2.clients client_id {:?} is {:?} (bound to private_key_jwt) but its jwks \
+                 does not contain at least one parseable JWK -- it could never actually \
+                 authenticate",
+                client.client_id, client.client_type
+            )));
+        }
+        if client
+            .grant_types
+            .iter()
+            .any(|grant| grant == token_exchange::CLIENT_CREDENTIALS_GRANT)
+        {
+            if client.client_type == OauthClientType::Public {
+                return Err(Error::Server(format!(
+                    "oauth2.clients client_id {:?} is type: public but lists the \
+                     client_credentials grant -- a public client authenticates with no credential \
+                     at all, so this would mint a machine token nobody has to prove they own; use \
+                     type: service with a private_key_jwt keypair instead",
+                    client.client_id
+                )));
+            }
+            if !client.redirect_uris.is_empty() {
+                return Err(Error::Server(format!(
+                    "oauth2.clients client_id {:?} lists the client_credentials grant but also \
+                     registers redirect_uris -- client_credentials is a non-browser, \
+                     non-redirect grant (RFC 6749 §4.4)",
+                    client.client_id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn redirect_origin(redirect_uri: &str) -> Result<String> {
+    let url = reqwest::Url::parse(redirect_uri).map_err(|_| {
+        Error::Server("authorization-code redirect_uri must be an absolute URL".to_string())
+    })?;
+    if !matches!(url.scheme(), "https" | "http")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none_or(|host| host.contains('*'))
+    {
+        return Err(Error::Server(
+            "authorization-code redirect_uri must have an HTTP(S) origin without credentials"
+                .to_string(),
+        ));
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+/// ADR-0025 Stage 1: every serving component -- `authz-api`, `authz-idp`, `authz-opa`,
+/// `authz-budget`, `lightbridge-mcp` -- refuses to start without `oauth2.federation.issuer`,
+/// loudly, naming both the missing field and the component (the same shape AGENTS.md's "Redis is
+/// a mandatory dependency" house rule documents for a different dependency). Presence PLUS
+/// [`Federation::validate`]'s offline shape check -- never a live reachability probe against the
+/// issuer, matching `oauth2.relying_party`'s own startup-validation posture.
+fn require_federation<'a>(oauth2: &'a Oauth2, component: &str) -> Result<&'a Federation> {
+    let federation = oauth2.federation.as_ref().ok_or_else(|| {
+        Error::Server(format!(
+            "oauth2.federation.issuer is required for {component} (ADR-0025) -- set the \
+             oauth2.federation block naming the one issuer this deployment trusts for \
+             remote-subject-to-account-id translation"
+        ))
+    })?;
+    federation.validate()?;
+    Ok(federation)
 }
 
 #[expect(
@@ -2228,6 +2825,7 @@ pub async fn start_api_server(
     billing.validate()?;
     api_key_expiry.validate()?;
     oauth2.rbac.validate()?;
+    let federation = require_federation(oauth2, "authz-api")?;
 
     // ADR-0007: load whatever is genuinely active in the DB right now, so a fresh startup always
     // agrees with the last successful activation -- this is what proves "no restart needed to see
@@ -2332,6 +2930,13 @@ pub async fn start_api_server(
     )?);
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
+    // ADR-0025 Stage 2: `federation` above is already `require_federation`'s validated value.
+    let resolver: Arc<dyn auth_provider::SubjectResolver> =
+        Arc::new(auth_provider::FederatedSubjectResolver::new(
+            Arc::new(StoreRepo::new(pool.clone())),
+            oauth2.signing.as_ref().map(|s| s.issuer.clone()),
+            federation.issuer.clone(),
+        ));
 
     // Redis is required unconditionally for authz-api rate limiting.
     let redis = redis.as_ref().ok_or_else(|| {
@@ -2375,6 +2980,7 @@ pub async fn start_api_server(
     let dev_cors = dev_cors_enabled();
     let app = build_api_router(
         bearer_service,
+        resolver,
         issuer,
         policy_store,
         refill_service,
@@ -2421,13 +3027,29 @@ pub async fn start_opa_server(
     opa: &OpaServer,
     pool: Arc<dyn DbPoolTrait>,
     billing: &Billing,
+    oauth2: &Oauth2,
 ) -> Result<()> {
+    let federation = require_federation(oauth2, "authz-opa")?;
     let readiness_pool = pool.clone();
+    // ADR-0025 Stage 2: `federation` above is already `require_federation`'s validated value.
+    let resolver: Arc<dyn auth_provider::SubjectResolver> =
+        Arc::new(auth_provider::FederatedSubjectResolver::new(
+            Arc::new(StoreRepo::new(pool.clone())),
+            oauth2.signing.as_ref().map(|s| s.issuer.clone()),
+            federation.issuer.clone(),
+        ));
     let repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
+    let api_key_audience = oauth2
+        .signing
+        .as_ref()
+        .and_then(|signing| signing.audience.clone());
     let state = Arc::new(OpaState {
         repo,
         basic_auth: opa.basic_auth.clone(),
         billing: Arc::new(billing.clone()),
+        api_key_audience,
+        resolver,
+        federation_issuer: federation.issuer.clone(),
     });
 
     let app = build_opa_router(state, readiness_pool);
@@ -2453,38 +3075,110 @@ pub async fn start_opa_server(
 /// `/.well-known`, `/oauth2/token`, and `/oauth2/revoke` to `authz-api`. That ingress has since
 /// been repointed at `authz-idp` and `authz-api`'s copy of this surface removed (see
 /// `build_api_router`'s doc comment) — `authz-idp` is now the sole owner.
+///
+/// ## Static asset serving under `/ui` (ADR-0021 Decisions 1 + 10, #442, and the follow-up that
+/// moved this from a root-level fallback to a path-scoped mount)
+///
+/// `static_dir` is mounted at `/ui`, via `.nest_service("/ui", ..)`, not as a root-level
+/// `.fallback_service(..)`. Mounting it as a root fallback made `GET /` split-brained in
+/// production: a real route always wins over a fallback, so `GET /` kept answering this server's
+/// own API-welcome-JSON `root_handler` (from `probe_router`, merged above) while `GET /index.html`
+/// or `GET /login` served the SPA — same build, two different personalities depending on the
+/// exact path. Scoping the static build under `/ui` removes the ambiguity outright: `GET /` is
+/// unconditionally the API route, `GET /ui` and `GET /ui/` are the SPA's `index.html`, and a path
+/// outside `/ui` that matches no protocol route is a normal `404` — the SPA is no longer a
+/// catch-all for the whole server. **Since lightbridge-authz#598, `/ui` is not a catch-all for its
+/// own subtree either** — `GET /ui/<anything>` only serves `index.html` when `<anything>` is one
+/// of the artifact's own `dist/routes.json` entries; every other `/ui/<anything>` is a plain `404`
+/// too (`static_assets::load_route_manifest`'s own doc comment has the fail-closed reasoning).
+/// This also makes the safety property strictly path-scoping rather than mount-order: static
+/// assets and protocol routes now occupy disjoint path spaces, so they cannot collide regardless
+/// of merge order, whereas the old fallback-based mount was safe only because a real route always
+/// beats a fallback. See `static_assets::static_assets_fallback`'s own doc comment for the
+/// caching/CSP posture applied to everything served from `static_dir`.
+///
+/// ## Every parameter here is a pre-validated product of `start_idp_server`'s checks
+///
+/// ADR-0023 reverses PR #473 (468084a) on purpose: `oauth2.relying_party` and
+/// `oauth2.token_exchange` are no longer optional inputs this function branches on -- they are
+/// mandatory for `authz-idp`, enforced once, up front, in `start_idp_server`, exactly the same
+/// shape as the "Redis is a mandatory dependency" house rule in `AGENTS.md`. By the time this
+/// function runs, `signing`, `token_exchange`, and `relying_party` are all known-good: `signing`
+/// and `relying_party` come from `start_idp_server`'s own construction (`KeycloakRelyingParty::new`
+/// validates its config offline -- no Keycloak discovery fetch at startup, the same
+/// presence-PLUS-offline-validation posture, not presence-only, that AGENTS.md documents for this
+/// exact field), and `token_exchange` is the `Some` arm of `build_token_exchange_state`'s result
+/// (`start_idp_server` now treats `None` as fatal). So every flow route below -- well-known/JWKS,
+/// `/authorize`, `/oauth2/token` + `/oauth2/revoke` + `/oauth2/device_authorization`,
+/// `/device/verify`, `/idp/callback` -- is mounted unconditionally, and `DiscoveryCapabilities::
+/// full_idp()` describes that unconditionally too. #473's OTHER half is kept and strengthened
+/// here: `relying_party` was already threaded through as a pre-validated `Arc` instead of being
+/// rebuilt inside this function; only the `Option` wrapper (and the mount-conditional branching it
+/// enabled) is removed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every parameter is a distinct mandatory dependency of the IdP surface (ADR-0023 \
+              mounts all routes unconditionally, so none can be folded away as optional); \
+              bundling them into a struct would only move the same arity behind a constructor"
+)]
 pub fn build_idp_router(
     oauth2: &Oauth2,
+    signing: &JwtSigning,
     signing_repo: Arc<StoreRepo>,
-    token_exchange: Option<token_exchange::TokenExchangeState>,
+    token_exchange: token_exchange::TokenExchangeState,
     readiness_pool: Arc<dyn DbPoolTrait>,
+    static_dir: impl AsRef<std::path::Path>,
+    relying_party: Arc<relying_party::KeycloakRelyingParty>,
+    claim_redeem: claim_redeem::ClaimRedeemState,
 ) -> Router {
     let mut router = probe_router(readiness_pool);
-
-    let (token_exchange_scopes, private_key_jwt_supported) = well_known_mount_params(oauth2);
-    if oauth2.is_self_signed()
-        && let Some(signing) = oauth2.signing.as_ref()
-    {
-        router = router.merge(signing::well_known_router(
-            &signing.issuer,
-            signing_repo,
-            token_exchange_scopes,
-            private_key_jwt_supported,
-        ));
-    }
-
-    if let Some(te_state) = token_exchange {
-        router = router.merge(token_exchange::token_exchange_router(te_state));
-    }
-
-    router
+    let claim_redeem_repo = Arc::clone(&claim_redeem.repo);
+    // GHSA-9pc6-965v-2c44: mounted unconditionally, like every other authz-idp route (ADR-0023).
+    // A deployment where this 404s while lightbridge-mcp still issues claim URLs would hand users
+    // links they cannot use -- the exact advertised-but-unmounted failure ADR-0023 exists to stop.
+    router = router.merge(claim_redeem::router(claim_redeem));
+    let (token_exchange_scopes, client_authentication) =
+        well_known_mount_params(oauth2, &token_exchange);
+    router = router.merge(signing::well_known_router(
+        &signing.issuer,
+        signing_repo,
+        token_exchange_scopes,
+        client_authentication,
+        signing::DiscoveryCapabilities::full_idp(),
+    ));
+    router = router.merge(authorize::router(authorize::AuthorizeState::new(
+        Arc::clone(&relying_party),
+        token_exchange.clone(),
+    )));
+    router = router.merge(userinfo::router(token_exchange.clone()));
+    // OIDC RP-Initiated Logout. Mounted unconditionally beside every other authz-idp route
+    // (ADR-0023): discovery advertises it whenever `/authorize` is mounted, and the two must not
+    // be able to disagree.
+    router = router.merge(end_session::router(end_session::EndSessionState::new(
+        Arc::clone(&claim_redeem_repo),
+        token_exchange.clone(),
+        &oauth2.clients,
+        Arc::clone(&relying_party),
+    )));
+    router = router.merge(token_exchange::token_exchange_router(token_exchange));
+    router = router.merge(session_management::router());
+    router = router.merge(relying_party::router(relying_party));
+    router.nest_service("/ui", static_assets::static_assets_fallback(static_dir))
 }
 
-/// Starts `authz-idp` (ADR-0012): the OIDC broker service carrying `/oauth2/token`,
-/// `/oauth2/revoke`, and `.well-known/*`. Deliberately thin next to `start_api_server` — no RPC
-/// CRUD surface, no budget domain, no idempotency/rate-limit layers — because
+/// Starts `authz-idp` (ADR-0012, ADR-0023): the OIDC broker service carrying `/oauth2/token`,
+/// `/oauth2/revoke`, `/oauth2/device_authorization`, `.well-known/*`, `/authorize`,
+/// `/device/verify`, and `/idp/callback`. Since ADR-0023 the full surface is unconditional — every
+/// authz-idp deployment must supply `oauth2.relying_party` and an enabled
+/// `oauth2.token_exchange`, or this function refuses to start. Deliberately thin next to
+/// `start_api_server` — no RPC CRUD surface, no budget domain, no per-route
+/// idempotency/rate-limit tower layers — because
 /// `well_known_router`/`token_exchange_router` need none of that; every route this server mounts
-/// is public (see [`config::IdpServer`]'s doc comment).
+/// is public (see [`config::IdpServer`]'s doc comment). The one exception: the Keycloak RP-leg's
+/// public, unauthenticated `user_code` lookups (`relying_party::verify_submit`/`verify_continue`)
+/// go through the SAME Redis-backed [`RateLimitStore`] `start_api_server`/`start_budget_server`
+/// build for their tower `RateLimitLayer`, just consulted directly by
+/// `device_store::get_by_user_code_rate_limited` rather than via a layer.
 ///
 /// **The sole owner of this surface, not a duplicate.** ADR-0012 Phase 1 ran this alongside
 /// `authz-api`'s own copy of the same routes while `auth.ai.camer.digital` still routed here via
@@ -2507,6 +3201,7 @@ pub async fn start_idp_server(
     pool: Arc<dyn DbPoolTrait>,
     oauth2: &Oauth2,
     redis: &Option<Redis>,
+    secret_claim: &Option<lightbridge_authz_core::config::SecretClaim>,
 ) -> Result<()> {
     if !oauth2.is_self_signed() {
         return Err(Error::Server(
@@ -2518,6 +3213,76 @@ pub async fn start_idp_server(
     let signing = oauth2.signing.as_ref().ok_or_else(|| {
         Error::Server("oauth2.type is 'self' but oauth2.signing is missing".to_string())
     })?;
+    let federation = require_federation(oauth2, "authz-idp")?;
+
+    // Redis is required unconditionally for authz-idp -- every lightbridge-authz serving role
+    // that isn't explicitly freed from it (authz-opa, lightbridge-mcp) needs Redis-backed caching,
+    // not only when `oauth2.token_exchange` happens to be enabled today (that used to be the only
+    // gate; it no longer is -- see AGENTS.md's "Redis is a mandatory dependency" house rule).
+    // Mirrors start_api_server's/start_budget_server's identical unconditional check. Resolved
+    // here (rather than just before `build_token_exchange_state`, its original spot) so the
+    // Redis-backed rate limit store built from it is available to the `KeycloakRelyingParty::new`
+    // validation below. `build_token_exchange_state` itself still no-ops to `Ok(None)` when
+    // token_exchange is disabled (see its own doc comment), so this changes only whether a
+    // *missing* redis config is tolerated, never whether token exchange itself is attempted.
+    let redis = redis.as_ref().ok_or_else(|| {
+        Error::Server(
+            "redis config is required for authz-idp (set `redis.url`) -- mandatory for every \
+             authz-idp deployment, not only when oauth2.token_exchange is enabled"
+                .to_string(),
+        )
+    })?;
+    let device_verify_rate_limit_store =
+        build_redis_rate_limit_store(&redis.url, redis.ca_bundle_path.as_deref(), "authz-idp")?;
+
+    // `oauth2.relying_party` is now MANDATORY for authz-idp -- the same house-rule shape as the
+    // "Redis is a mandatory dependency" rule above: `Config.oauth2.relying_party` stays an
+    // `Option` at the type level (other components -- authz-api/authz-opa/authz-budget/
+    // lightbridge-mcp -- load the same `Config` type and never set this block at all), but
+    // enforcement is unconditional here, inside `start_idp_server`, not a config-driven mount
+    // decision. This is a DELIBERATE REVERSAL of PR #473 (468084a), which made `relying_party`
+    // optional to fix PR #463 (9e0ef4d)'s over-eager unconditional requirement. #463 was reverted
+    // for the wrong reason, not a wrong one: the repo owner's own words, verbatim: "Let's not make
+    // something from the IdP optional anymore. It's a full IDP now." Do not reintroduce #473's
+    // mount-conditional gate -- the defect it left behind was live in production: discovery
+    // advertised `device_code` (the device-authorization routes are gated on `token_exchange`,
+    // not on `relying_party`) while `/device/verify` 404'd, because the RP-leg silently wasn't
+    // mounted. "Optional" and "half-broken" were the same state for this field. Unlike the Redis
+    // rule, enforcement here is presence PLUS the existing offline validation, not presence-only:
+    // `KeycloakRelyingParty::new` is fully synchronous and offline (it validates the config
+    // shape, e.g. `state_encryption_key`, it does not dial Keycloak), so validating it at startup
+    // costs no startup-ordering dependency on a third party -- this deliberately does NOT fetch
+    // Keycloak discovery at startup, which would be the same mistake the Redis rule's own
+    // "presence-only, not a PING" reasoning warns against, aimed at an external IdP instead of an
+    // in-cluster Redis. Constructed once here (not re-derived inside `build_idp_router`) and
+    // threaded through as an already-validated `Arc`, so there is exactly one
+    // `KeycloakRelyingParty::new` call site -- #473's OTHER half (pre-validated `Arc` threading,
+    // not config re-derivation inside `build_idp_router`) is kept and strengthened, not reversed.
+    let rp_config = oauth2.relying_party.clone().ok_or_else(|| {
+        Error::Server(
+            "oauth2.relying_party is required for authz-idp -- it is a full IdP: /authorize, \
+             /device/verify and /idp/callback are always mounted and discovery always advertises \
+             authorization_endpoint. Set the oauth2.relying_party block (client_id, callback_url, \
+             state_encryption_key)."
+                .to_string(),
+        )
+    })?;
+    // ADR-0025 Stage 1: `authz-idp` seals `federated_identities` rows under, and validates ID
+    // tokens against, `oauth2.federation.issuer` -- the ONE issuer field this deployment trusts
+    // (there is no longer a separate `oauth2.relying_party.issuer` for it to drift from; that
+    // field was deleted, closing the config trap where the two had to be kept byte-equal by
+    // hand). `oauth2.federation.discovery_url` is a distinct, optional LOCATION override for
+    // where `authz-idp` dials OIDC discovery from inside this deployment's own network -- see
+    // `KeycloakRelyingParty::discover`'s doc comment for why that dial target and the identity
+    // issuer are kept separate.
+    let relying_party = Arc::new(relying_party::KeycloakRelyingParty::new(
+        rp_config,
+        federation.issuer.clone(),
+        federation.effective_discovery_url().to_string(),
+        oauth2.jwks_url.clone(),
+        Arc::new(StoreRepo::new(pool.clone())),
+        device_verify_rate_limit_store,
+    )?);
 
     let readiness_pool = pool.clone();
     // ADR-0014: the budget ledger is read here (not called over the network) because
@@ -2547,22 +3312,14 @@ pub async fn start_idp_server(
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
 
-    // Redis is required unconditionally for authz-idp -- every lightbridge-authz serving role
-    // that isn't explicitly freed from it (authz-opa, lightbridge-mcp) needs Redis-backed caching,
-    // not only when `oauth2.token_exchange` happens to be enabled today (that used to be the only
-    // gate; it no longer is -- see AGENTS.md's "Redis is a mandatory dependency" house rule).
-    // Mirrors start_api_server's/start_budget_server's identical unconditional check.
-    // `build_token_exchange_state` itself still no-ops to `Ok(None)` when token_exchange is
-    // disabled (see its own doc comment), so this changes only whether a *missing* redis config
-    // is tolerated, never whether token exchange itself is attempted.
-    let redis = redis.as_ref().ok_or_else(|| {
-        Error::Server(
-            "redis config is required for authz-idp (set `redis.url`) -- mandatory for every \
-             authz-idp deployment, not only when oauth2.token_exchange is enabled"
-                .to_string(),
-        )
-    })?;
-
+    // `oauth2.token_exchange` is now MANDATORY for authz-idp, the same reversal as
+    // `relying_party` above: without it there is no `/oauth2/token`, no
+    // `/oauth2/device_authorization`, and the `authorization_code` grant `authorize::router`
+    // mounts unconditionally cannot issue a redeemable token (`build_token_exchange_state`'s sole
+    // production caller is this function -- see its own doc comment). `build_token_exchange_state`
+    // keeps its `Result<Option<...>>` contract (its unit tests still exercise the `None`/disabled
+    // path directly), so the "disabled is fatal for authz-idp" decision lives here, at the one
+    // production call site, not inside that function.
     let token_exchange_state = build_token_exchange_state(
         oauth2,
         signing_repo.clone(),
@@ -2571,16 +3328,73 @@ pub async fn start_idp_server(
         bearer_service,
         &redis.url,
         redis.ca_bundle_path.as_deref(),
-    )?;
-    let token_exchange_enabled = token_exchange_state.is_some();
+    )?
+    .ok_or_else(|| {
+        Error::Server(
+            "oauth2.token_exchange is required and must be enabled for authz-idp (set \
+             oauth2.token_exchange.enabled: true) -- /oauth2/token, /oauth2/revoke and \
+             /oauth2/device_authorization are always mounted, and the authorization_code grant \
+             cannot issue a redeemable token without them"
+                .to_string(),
+        )
+    })?;
 
-    let app = build_idp_router(oauth2, signing_repo, token_exchange_state, readiness_pool);
+    // OIDC Discovery 1.0 §3: an OpenID Provider's `scopes_supported` MUST include `openid` --
+    // absent it, this is a bare OAuth2 authorization server, not the OIDC provider the mounted
+    // `/authorize` browser-SSO flow and discovery document both advertise being. Checked here
+    // (Q2), not inside `build_token_exchange_state`, for the same reason the `None` check above
+    // lives here: this is an authz-idp-specific requirement, not a general token-exchange
+    // constraint on every caller of that function.
+    if !token_exchange_state
+        .op_config()
+        .scopes_supported
+        .iter()
+        .any(|scope| scope == "openid")
+    {
+        return Err(Error::Server(
+            "oauth2.token_exchange.allowed_scopes must include \"openid\" for authz-idp -- it is \
+             an OpenID Provider, and OIDC Discovery 1.0 §3 requires scopes_supported to advertise \
+             openid"
+                .to_string(),
+        ));
+    }
+
+    // GHSA-9pc6-965v-2c44. Deliberately NOT a startup mandate, unlike the redis/relying_party/
+    // token_exchange checks above: authz-idp is the sole server of this deployment's issuer, and
+    // every in-circulation API-key JWT names it in `iss`. Refusing to boot over a missing
+    // claim-redemption key would take the whole issuer down to disable one page. An absent block
+    // instead makes /api-keys/claim answer an explicit 503.
+    //
+    // A PRESENT but malformed block is still a hard startup failure -- `from_config` validates
+    // offline. The tolerated case is "absent", never "wrong".
+    //
+    // Same repo the signing bootstrap already built over this pool -- one StoreRepo per pool, not
+    // a second connection path for the same database.
+    let claim_repo = signing_repo.clone();
+    let claim_redeem = claim_redeem::ClaimRedeemState {
+        claims: secret_claim
+            .as_ref()
+            .map(|cfg| secret_claim::SecretClaimStore::from_config(claim_repo.clone(), cfg))
+            .transpose()?
+            .map(Arc::new),
+        repo: claim_repo,
+    };
+
+    let app = build_idp_router(
+        oauth2,
+        signing,
+        signing_repo,
+        token_exchange_state,
+        readiness_pool,
+        &idp.static_dir,
+        relying_party,
+        claim_redeem,
+    );
 
     tracing::info!(
         server = "authz-idp",
         address = %idp.address,
         port = idp.port,
-        token_exchange_enabled,
         "starting idp server"
     );
 
@@ -2621,6 +3435,7 @@ pub fn build_budget_router(
     cratestack_db: schema::Cratestack,
     readiness_pool: Arc<dyn DbPoolTrait>,
     bearer: Arc<dyn BearerTokenServiceTrait>,
+    resolver: Arc<dyn auth_provider::SubjectResolver>,
     idempotency_store: Arc<SqlxIdempotencyStore>,
     rate_limit_store: Arc<dyn RateLimitStore>,
     dev_cors: bool,
@@ -2636,8 +3451,12 @@ pub fn build_budget_router(
             review_service,
             budget_repo,
         ),
+        // cratestack 0.8.11 (@computed) added this parameter to every generated router fn.
+        // `authz.cstack` declares no `@computed` field, so `()` (the generated
+        // `impl ComputedFieldResolver for ()`) is the correct, zero-behavior-change value here.
+        (),
         LenientCborCodec::default(),
-        CratestackAuthProvider::new(bearer.clone(), RpcScope::Budget),
+        CratestackAuthProvider::new(bearer.clone(), RpcScope::Budget, resolver),
         DEFAULT_BODY_LIMIT_BYTES,
     )
     .layer(IdempotencyLayer::new(idempotency_store, IDEMPOTENCY_TTL))
@@ -2690,6 +3509,7 @@ pub async fn start_budget_server(
     billing.validate()?;
     api_key_expiry.validate()?;
     oauth2.rbac.validate()?;
+    let federation = require_federation(oauth2, "authz-budget")?;
 
     // ADR-0007: load whatever is genuinely active in the DB right now, so a fresh startup always
     // agrees with the last successful activation, exactly like `start_api_server`'s identical load
@@ -2763,6 +3583,13 @@ pub async fn start_budget_server(
     )?);
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
+    // ADR-0025 Stage 2: `federation` above is already `require_federation`'s validated value.
+    let resolver: Arc<dyn auth_provider::SubjectResolver> =
+        Arc::new(auth_provider::FederatedSubjectResolver::new(
+            Arc::new(StoreRepo::new(pool.clone())),
+            oauth2.signing.as_ref().map(|s| s.issuer.clone()),
+            federation.issuer.clone(),
+        ));
 
     // Redis is required unconditionally for authz-budget rate limiting, mirroring authz-api's own
     // hard requirement (see `start_api_server`'s identical check).
@@ -2808,6 +3635,7 @@ pub async fn start_budget_server(
         cratestack_db,
         readiness_pool,
         bearer_service,
+        resolver,
         idempotency_store,
         rate_limit_store,
         dev_cors,
@@ -2855,7 +3683,8 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
 #[openapi(
     paths(
         crate::handlers::introspect::introspect_api_key,
-        crate::handlers::idp::resolve_context
+        crate::handlers::idp::resolve_context,
+        crate::handlers::idp::authorize_usage_scope
     ),
     components(
         schemas(
@@ -2865,7 +3694,8 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
             lightbridge_authz_core::Project,
             lightbridge_authz_core::Account,
             lightbridge_authz_core::ResolveContextRequest,
-            lightbridge_authz_core::ResolvedContext
+            lightbridge_authz_core::ResolvedContext,
+            lightbridge_authz_core::AuthorizeUsageScopeRequest
         )
     ),
     tags(
@@ -3001,8 +3831,13 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
+            relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
+            federation: Some(lightbridge_authz_core::config::Federation {
+                issuer: "https://keycloak.example.test/realms/dev".to_string(),
+                discovery_url: None,
+            }),
         }
     }
 
@@ -3014,9 +3849,15 @@ mod tests {
         Oauth2TokenExchange {
             enabled: true,
             access_ttl_seconds: 900,
+            authorization_code_ttl_seconds: 300,
             refresh_ttl_seconds: 2_592_000,
             allowed_scopes: vec!["openid".to_string()],
             refresh_absolute_ttl_seconds: 7_776_000,
+            refresh_reuse_grace_seconds: 30,
+            device_code_ttl_seconds: 600,
+            device_poll_interval_seconds: 5,
+            device_verification_uri: "https://authz.example.test/device/verify".to_string(),
+            client_credentials_ttl_seconds: 900,
         }
     }
 
@@ -3026,9 +3867,13 @@ mod tests {
             audience: None,
             ttl_seconds: 7_776_000,
             max_key_age_days: 30,
+            claim_mappers: Vec::new(),
         }
     }
 
+    // This function's own `Result<Option<...>>` contract is unchanged by ADR-0023 -- only its
+    // sole production caller, `start_idp_server`, now treats this `None` result as fatal (see
+    // `build_token_exchange_state`'s doc comment).
     #[tokio::test]
     async fn build_token_exchange_state_is_none_when_disabled() {
         let oauth2 = base_oauth2(Oauth2Type::SelfSigned);
@@ -3100,6 +3945,29 @@ mod tests {
             panic!("expected an error for a non-positive ttl");
         };
         assert!(format!("{err}").contains("must be positive"));
+    }
+
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_unsafe_device_verification_uri() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        let mut cfg = exchange_cfg();
+        cfg.device_verification_uri =
+            "https://user:password@authz.example.test/device/verify?unexpected=1#fragment"
+                .to_string();
+        oauth2.token_exchange = Some(cfg);
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        ) else {
+            panic!("expected an error for an unsafe device verification URI");
+        };
+        assert!(format!("{err}").contains("credential-free"));
     }
 
     #[tokio::test]
@@ -3192,6 +4060,316 @@ mod tests {
         assert!(result.is_some());
     }
 
+    /// F4 (adversarial-review follow-up): nothing previously stopped a registered client's
+    /// `client_id` from equaling `oauth2.signing.audience` -- the value a self-signed API-key
+    /// JWT's `azp` always carries. That equality is exactly the condition under which
+    /// `token_exchange::introspect_endpoint`'s `azp == caller's client_id` gate would admit an
+    /// API-key JWT as a live token-exchange access token, defeating the "API keys are
+    /// structurally not introspectable" invariant that module documents.
+    /// `validate_authorization_code_clients` must refuse to start in this configuration.
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_a_client_id_colliding_with_the_signing_audience() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        let mut signing = signing_cfg();
+        signing.audience = Some("shared-audience".to_string());
+        oauth2.signing = Some(signing);
+        oauth2.clients = vec![OauthClient {
+            client_id: "shared-audience".to_string(),
+            client_type: OauthClientType::Public,
+            scopes: vec!["openid".to_string()],
+            grant_types: vec!["refresh_token".to_string()],
+            allowed_audiences: vec!["shared-audience".to_string()],
+            jwks: None,
+            redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
+            require_pkce: false,
+        }];
+        oauth2.token_exchange = Some(exchange_cfg());
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        ) else {
+            panic!("expected an error when a client_id equals oauth2.signing.audience");
+        };
+        assert!(format!("{err}").contains("equals oauth2.signing.audience"));
+    }
+
+    /// Control: distinct client ids and a distinct signing audience must still start cleanly --
+    /// the new check above must not be a blanket refusal of every configured client.
+    #[tokio::test]
+    async fn build_token_exchange_state_allows_a_client_id_distinct_from_the_signing_audience() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        let mut signing = signing_cfg();
+        signing.audience = Some("api-key-audience".to_string());
+        oauth2.signing = Some(signing);
+        oauth2.clients = vec![OauthClient {
+            client_id: "a-real-oauth-client".to_string(),
+            client_type: OauthClientType::Public,
+            scopes: vec!["openid".to_string()],
+            grant_types: vec!["refresh_token".to_string()],
+            allowed_audiences: vec!["a-real-oauth-client".to_string()],
+            jwks: None,
+            redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
+            require_pkce: false,
+        }];
+        oauth2.token_exchange = Some(exchange_cfg());
+        let result = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        )
+        .unwrap();
+        assert!(result.is_some());
+    }
+
+    fn service_client_with_grant_types(client_id: &str, grant_types: Vec<String>) -> OauthClient {
+        let key = signing::generate_rs256_key().expect("rsa keypair generation");
+        OauthClient {
+            client_id: client_id.to_string(),
+            client_type: OauthClientType::Service,
+            scopes: vec!["read:usage".to_string()],
+            grant_types,
+            allowed_audiences: vec![client_id.to_string()],
+            jwks: Some(serde_json::json!({ "keys": [key.public_jwk] })),
+            redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
+            require_pkce: false,
+        }
+    }
+
+    /// Test 8 (DECISIVE, #534/ADR-0030): a `public` client (`NoAuth` at the token endpoint) listing
+    /// the `client_credentials` grant must be refused at startup -- a public client mints a machine
+    /// token with NO credential proving who asked for it. Prove-fail-first (recorded verbatim in
+    /// the PR body): deleting the `client_type == OauthClientType::Public` branch inside
+    /// `validate_client_credentials_and_service_clients` turns this test green-to-red -- restored
+    /// immediately after.
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_a_public_client_credentials_client() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        oauth2.clients = vec![OauthClient {
+            client_id: "public-machine".to_string(),
+            client_type: OauthClientType::Public,
+            scopes: vec!["read:usage".to_string()],
+            grant_types: vec!["client_credentials".to_string()],
+            allowed_audiences: vec!["public-machine".to_string()],
+            jwks: None,
+            redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
+            require_pkce: false,
+        }];
+        oauth2.token_exchange = Some(exchange_cfg());
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        ) else {
+            panic!(
+                "expected an error for a public client listing the client_credentials grant -- \
+                 it would mint a machine token with no credential at all"
+            );
+        };
+        let message = format!("{err}");
+        assert!(message.contains("public-machine"));
+        assert!(message.contains("client_credentials"));
+    }
+
+    /// Test 9: a `Service`/`Confidential` client whose `jwks` does not contain at least one
+    /// parseable JWK must be refused at startup -- before this fix, `find_client` would keep
+    /// answering `token_endpoint_auth_method: Some(PrivateKeyJwt)` for it while discovery silently
+    /// dropped it from `token_endpoint_auth_methods_supported`, and nothing ever caught the
+    /// disagreement.
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_a_service_client_with_unparseable_jwks() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        oauth2.clients = vec![OauthClient {
+            client_id: "no-jwks-machine".to_string(),
+            client_type: OauthClientType::Service,
+            scopes: vec!["read:usage".to_string()],
+            grant_types: vec!["client_credentials".to_string()],
+            allowed_audiences: vec!["no-jwks-machine".to_string()],
+            jwks: None,
+            redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
+            require_pkce: false,
+        }];
+        oauth2.token_exchange = Some(exchange_cfg());
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        ) else {
+            panic!("expected an error for a service client with no jwks at all");
+        };
+        let message = format!("{err}");
+        assert!(message.contains("no-jwks-machine"));
+        assert!(message.contains("parseable"));
+    }
+
+    /// The same check (9), but for a `jwks` present yet genuinely unparseable (an empty `keys`
+    /// array) rather than absent entirely -- both must be refused identically.
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_a_confidential_client_with_an_empty_jwks_array() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        oauth2.clients = vec![OauthClient {
+            client_id: "empty-jwks-client".to_string(),
+            client_type: OauthClientType::Confidential,
+            scopes: vec!["openid".to_string()],
+            grant_types: vec!["urn:ietf:params:oauth:grant-type:token-exchange".to_string()],
+            allowed_audiences: vec!["empty-jwks-client".to_string()],
+            jwks: Some(serde_json::json!({ "keys": [] })),
+            redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
+            require_pkce: false,
+        }];
+        oauth2.token_exchange = Some(exchange_cfg());
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        ) else {
+            panic!("expected an error for a confidential client with an empty jwks key set");
+        };
+        assert!(format!("{err}").contains("empty-jwks-client"));
+    }
+
+    /// Fail-first-proven RSA-strength floor: a well-formed, parseable, but only 1024-bit RSA JWK
+    /// must be refused at startup exactly like an unparseable one -- `parse_public_jwk` validates
+    /// shape, not strength, so without `signing::jwk_meets_minimum_strength` this JWK would pass
+    /// the same gate a genuinely unusable key fails, defeating the "could never actually
+    /// authenticate" promise that gate's own error text makes. `n` here is a fabricated,
+    /// mathematically-meaningless 128-byte (1024-bit) value -- `parse_public_jwk` never checks that
+    /// `n`/`e` form an invertible keypair, only that they parse, so this is sufficient to exercise
+    /// the size check without a real weak keypair. Prove-fail-first, actually run: reverted
+    /// `client_has_a_parseable_jwk` to its pre-floor body (`parse_public_jwk(jwk).is_ok()` alone,
+    /// no `jwk_meets_minimum_strength` call), reran just this test, and it went red for the
+    /// predicted reason (no error at all -- the weak key was accepted). Restored immediately after.
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_a_1024_bit_rsa_service_client() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        let weak_modulus_b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xAAu8; 128])
+        };
+        oauth2.clients = vec![OauthClient {
+            client_id: "weak-key-machine".to_string(),
+            client_type: OauthClientType::Service,
+            scopes: vec!["read:usage".to_string()],
+            grant_types: vec!["client_credentials".to_string()],
+            allowed_audiences: vec!["weak-key-machine".to_string()],
+            jwks: Some(serde_json::json!({
+                "keys": [{
+                    "kty": "RSA",
+                    "use": "sig",
+                    "alg": "RS256",
+                    "kid": "weak-key-2026",
+                    "n": weak_modulus_b64,
+                    "e": "AQAB",
+                }]
+            })),
+            redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
+            require_pkce: false,
+        }];
+        oauth2.token_exchange = Some(exchange_cfg());
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        ) else {
+            panic!(
+                "expected an error for a service client whose only RSA key is 1024 bits -- \
+                 parseable is not the same bar as usable"
+            );
+        };
+        let message = format!("{err}");
+        assert!(message.contains("weak-key-machine"));
+        assert!(message.contains("parseable"));
+    }
+
+    /// A `client_credentials` client may not also register `redirect_uris` -- RFC 6749 §4.4 is a
+    /// non-browser, non-redirect grant by construction.
+    #[tokio::test]
+    async fn build_token_exchange_state_rejects_a_client_credentials_client_with_redirect_uris() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        let mut client = service_client_with_grant_types(
+            "machine-with-redirect",
+            vec!["client_credentials".to_string()],
+        );
+        client.redirect_uris = vec!["https://cb.example.test/callback".to_string()];
+        oauth2.clients = vec![client];
+        oauth2.token_exchange = Some(exchange_cfg());
+        let Err(err) = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        ) else {
+            panic!("expected an error for a client_credentials client registering redirect_uris");
+        };
+        let message = format!("{err}");
+        assert!(message.contains("machine-with-redirect"));
+        assert!(message.contains("redirect_uris"));
+    }
+
+    /// Control: a well-formed `Service` client with a real, parseable `jwks`, the
+    /// `client_credentials` grant, and no `redirect_uris` starts cleanly -- the checks above must
+    /// not be a blanket refusal of every service client.
+    #[tokio::test]
+    async fn build_token_exchange_state_allows_a_well_formed_service_client() {
+        let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
+        oauth2.signing = Some(signing_cfg());
+        oauth2.clients = vec![service_client_with_grant_types(
+            "it-machine",
+            vec!["client_credentials".to_string()],
+        )];
+        oauth2.token_exchange = Some(exchange_cfg());
+        let result = build_token_exchange_state(
+            &oauth2,
+            lazy_signing_repo(),
+            lazy_budget_repo(),
+            lazy_policy_engine(),
+            noop_bearer(),
+            UNREACHABLE_REDIS_URL,
+            None,
+        )
+        .unwrap();
+        assert!(result.is_some());
+    }
+
     fn opa_openapi() -> Value {
         serde_json::to_value(OpaDoc::openapi()).expect("openapi should serialize")
     }
@@ -3227,6 +4405,22 @@ mod tests {
         assert!(
             paths.contains_key("/idp/v1/resolve-context"),
             "expected the OPA server to expose the identity resolve-context endpoint"
+        );
+    }
+
+    /// #570: pins `POST /idp/v1/authorize-usage-scope` (the ownership authority
+    /// `lightbridge-authz-usage`'s query listener calls) in the published OPA OpenAPI contract,
+    /// mirroring `resolve_context_endpoint_should_exist_in_opa_openapi` above.
+    #[test]
+    fn authorize_usage_scope_endpoint_should_exist_in_opa_openapi() {
+        let doc = opa_openapi();
+        let paths = doc["paths"]
+            .as_object()
+            .expect("openapi paths should be an object");
+
+        assert!(
+            paths.contains_key("/idp/v1/authorize-usage-scope"),
+            "expected the OPA server to expose the usage-scope ownership authority endpoint"
         );
     }
 
@@ -3286,5 +4480,49 @@ mod tests {
             readiness_handler(pool).await,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // `clamp_expiring_soon_window_days` (lightbridge-authz#436, `listMyExpiringApiKeys`'s
+    // `withinDays` resolution) -- boundary cases only; the query's own "which keys actually come
+    // back" boundary (exactly-at-threshold expiry timestamps, already-expired exclusion,
+    // cross-tenant isolation) is covered by the live-database `rpc_it_tests.rs` suite, which can
+    // exercise the real generated `db.api_key()` policy-scoped query this function's result feeds
+    // into -- this unit test only proves the pure clamp arithmetic in isolation.
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn expiring_soon_window_defaults_to_fourteen_days_when_omitted() {
+        assert_eq!(
+            clamp_expiring_soon_window_days(None),
+            DEFAULT_EXPIRING_SOON_WINDOW_DAYS
+        );
+        assert_eq!(DEFAULT_EXPIRING_SOON_WINDOW_DAYS, 14);
+    }
+
+    #[test]
+    fn expiring_soon_window_passes_through_an_in_range_value_unchanged() {
+        assert_eq!(clamp_expiring_soon_window_days(Some(1)), 1);
+        assert_eq!(clamp_expiring_soon_window_days(Some(7)), 7);
+        assert_eq!(clamp_expiring_soon_window_days(Some(90)), 90);
+    }
+
+    #[test]
+    fn expiring_soon_window_clamps_a_non_positive_request_up_to_one() {
+        assert_eq!(clamp_expiring_soon_window_days(Some(0)), 1);
+        assert_eq!(clamp_expiring_soon_window_days(Some(-30)), 1);
+    }
+
+    #[test]
+    fn expiring_soon_window_clamps_an_oversized_request_down_to_the_ceiling() {
+        assert_eq!(
+            clamp_expiring_soon_window_days(Some(91)),
+            MAX_EXPIRING_SOON_WINDOW_DAYS
+        );
+        assert_eq!(
+            clamp_expiring_soon_window_days(Some(36_500)),
+            MAX_EXPIRING_SOON_WINDOW_DAYS
+        );
+        assert_eq!(MAX_EXPIRING_SOON_WINDOW_DAYS, 90);
     }
 }

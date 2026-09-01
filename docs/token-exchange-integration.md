@@ -152,8 +152,11 @@ on `store.rs`).
 ```
 
 `id_token` is present only when `openid` was granted; `refresh_token` only when `offline_access` was
-granted. `issued_token_type` is always present and always the access-token URN (this endpoint never
-issues any other primary token type — `crates/lightbridge-authz-rest/src/oauth2_op/mod.rs:25-28`).
+granted. `issued_token_type` is present only on a `urn:ietf:params:oauth:grant-type:token-exchange`
+response, per RFC 8693 §2.2.1 — it is omitted (not present in the JSON body at all) on a
+`refresh_token` grant response, since that grant is not a token exchange and must not claim to be
+one. When present, it is always the access-token URN (this endpoint never issues any other primary
+token type — `crates/lightbridge-authz-rest/src/oauth2_op/mod.rs:25-28`).
 
 The full claim-by-claim table for both tokens (source, minted-vs-propagated, exact `file:line`) is
 [`docs/auth-reference.md` §3](https://github.com/ADORSYS-GIS/lightbridge-authz/blob/main/docs/auth-reference.md#3-token-claims--source) —

@@ -27,7 +27,10 @@
           "value": "test"
         }
       ],
-      "realmRoles": ["offline_access", "lightbridge-admin"]
+      "realmRoles": [
+        "offline_access",
+        "lightbridge-admin"
+      ]
     },
     {
       "email": "test@editor",
@@ -43,7 +46,10 @@
           "value": "test"
         }
       ],
-      "realmRoles": ["offline_access", "lightbridge-editor"]
+      "realmRoles": [
+        "offline_access",
+        "lightbridge-editor"
+      ]
     },
     {
       "email": "test@viewer",
@@ -59,7 +65,10 @@
           "value": "test"
         }
       ],
-      "realmRoles": ["offline_access", "lightbridge-viewer"]
+      "realmRoles": [
+        "offline_access",
+        "lightbridge-viewer"
+      ]
     }
   ],
   "roles": {
@@ -93,7 +102,9 @@
       "redirectUris": [
         "http://localhost:8081",
         "http://localhost:8081/*",
-        "http://localhost:8081/auth"
+        "http://localhost:8081/auth",
+        "http://localhost:3000/*",
+        "http://localhost:12999/*"
       ],
       "webOrigins": [
         "+"
@@ -144,6 +155,17 @@
             "id.token.claim": "false",
             "userinfo.token.claim": "false"
           }
+        },
+        {
+          "name": "it-exchange-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "it-exchange",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
         }
       ],
       "attributes": {
@@ -153,7 +175,8 @@
         "standard.token.exchange.enabled": "true",
         "oauth2.device.authorization.grant.enabled": "false",
         "backchannel.logout.revoke.offline.tokens": "false",
-        "use.offline.access.token.by.default": "true"
+        "use.offline.access.token.by.default": "true",
+        "post.logout.redirect.uris": "http://localhost:3000/*##http://localhost:12999/*"
       },
       "authenticationFlowBindingOverrides": {},
       "fullScopeAllowed": true,
@@ -170,6 +193,45 @@
         "address",
         "phone",
         "organization",
+        "offline_access",
+        "microprofile-jwt"
+      ]
+    },
+    {
+      "clientId": "authz-idp-rp",
+      "name": "Authz IDP browser broker",
+      "description": "Public PKCE client used by authz-idp to broker browser login to Keycloak.",
+      "rootUrl": "",
+      "adminUrl": "",
+      "baseUrl": "",
+      "enabled": true,
+      "redirectUris": [
+        "https://localhost:13004/idp/callback"
+      ],
+      "webOrigins": [],
+      "bearerOnly": false,
+      "consentRequired": false,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "publicClient": true,
+      "protocol": "openid-connect",
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "fullScopeAllowed": true,
+      "defaultClientScopes": [
+        "web-origins",
+        "acr",
+        "profile",
+        "roles",
+        "basic",
+        "email"
+      ],
+      "optionalClientScopes": [
+        "address",
+        "phone",
         "offline_access",
         "microprofile-jwt"
       ]

@@ -3,8 +3,7 @@ use std::sync::Arc;
 
 use authkestra_engine::auth::state::Identity;
 use authkestra_engine::token::TokenManager;
-use authkestra_op::config::OpConfig;
-use authkestra_op::handlers::discovery::OidcDiscovery;
+use authkestra_op::attestation::parse_public_jwk;
 use authkestra_op::handlers::jwks::JwksResponse;
 use axum::{
     Json, Router,
@@ -13,15 +12,17 @@ use axum::{
 };
 use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
+use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve};
 use lightbridge_authz_api_key::entities::signing_key_row::NewSigningKey;
 use lightbridge_authz_api_key::repo::StoreRepo;
-use lightbridge_authz_core::config::JwtSigning;
+use lightbridge_authz_core::config::{JwtSigning, Oauth2, OauthClientType};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::error::{Error, Result};
 use rand_core::OsRng;
 use rsa::pkcs8::EncodePrivateKey;
 use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tower_http::cors::{Any, CorsLayer};
@@ -35,6 +36,192 @@ const TOKEN_SCOPE: &str = "profile email";
 /// never authenticates anyone itself (ADR-0011, Context) -- every identity here is a snapshot of
 /// an upstream Keycloak login, so the provider is always Keycloak regardless of `oauth2.type`.
 const IDENTITY_PROVIDER_ID: &str = "keycloak";
+
+/// Client-authentication capabilities actually accepted by the mounted token and revocation
+/// endpoints. This is derived from the static client registry so metadata cannot advertise a
+/// method for which no configured client can authenticate.
+#[derive(Debug, Clone, Default)]
+pub struct ClientAuthenticationMetadata {
+    methods: Vec<String>,
+    signing_algorithms: Vec<String>,
+}
+
+/// Protocol routes mounted alongside the discovery document.
+///
+/// Discovery is a statement about the router assembled for this process, not about every grant a
+/// configured client could theoretically request. Keeping these route facts separate from the
+/// client registry prevents a configuration-only change from advertising an unmounted endpoint.
+/// authz-idp's production call site always passes [`DiscoveryCapabilities::full_idp`] -- it is a
+/// full IdP, so every flow route `build_idp_router` mounts is unconditional, and its discovery
+/// document describes all of them unconditionally too. The other named constructors remain because
+/// `well_known_router` stays generic over callers that mount less.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DiscoveryCapabilities {
+    token_endpoint: bool,
+    device_authorization_endpoint: bool,
+    authorization_endpoint: bool,
+}
+
+impl DiscoveryCapabilities {
+    /// The token and revocation routes are mounted, with no browser-facing flow routes.
+    pub const fn token_surface() -> Self {
+        Self {
+            token_endpoint: true,
+            device_authorization_endpoint: false,
+            authorization_endpoint: false,
+        }
+    }
+
+    /// The RFC 8628 device-authorization route is mounted with the token surface.
+    pub const fn with_device_authorization(mut self) -> Self {
+        self.device_authorization_endpoint = true;
+        self
+    }
+
+    /// The browser-facing authorization-code route is mounted with the token surface.
+    pub const fn with_authorization_code(mut self) -> Self {
+        self.authorization_endpoint = true;
+        self
+    }
+
+    /// Every flow route build_idp_router mounts. authz-idp is a full IdP: the token,
+    /// revocation, device-authorization and browser /authorize routes are all mounted
+    /// unconditionally, so its discovery document describes all of them unconditionally too.
+    /// Kept as a named constructor rather than deleting DiscoveryCapabilities outright: this
+    /// type is what keeps the document a statement about the assembled route table instead of
+    /// about configuration intent (see the struct's own doc comment), and well_known_router
+    /// remains generic over callers that mount less.
+    pub const fn full_idp() -> Self {
+        Self::token_surface()
+            .with_device_authorization()
+            .with_authorization_code()
+    }
+}
+
+impl ClientAuthenticationMetadata {
+    /// Derives supported client-authentication methods from the configured client registry.
+    /// `Confidential` and `Service` (#534, ADR-0030: `client_credentials`/M2M clients) are both
+    /// bound to `private_key_jwt` (`oauth2_op::client_store::to_registration`), so both contribute
+    /// to the advertised signing algorithms here. This function's own inline filter chain and
+    /// [`client_has_a_parseable_jwk`] (used by `start_idp_server`'s startup validation) are two
+    /// separate call sites, not a single shared predicate, but both bottom out in the same
+    /// `parse_public_jwk` call -- see that function's own doc comment for why a JWK either one
+    /// accepts/rejects is judged identically.
+    pub fn from_oauth2(oauth2: &Oauth2) -> Self {
+        let public_client_registered = oauth2
+            .clients
+            .iter()
+            .any(|client| client.client_type == OauthClientType::Public);
+        let mut seen_algorithms = std::collections::HashSet::new();
+        let signing_algorithms: Vec<String> = oauth2
+            .clients
+            .iter()
+            .filter(|client| {
+                matches!(
+                    client.client_type,
+                    OauthClientType::Confidential | OauthClientType::Service
+                )
+            })
+            .filter_map(|client| client.jwks.as_ref())
+            .filter_map(|jwks| jwks.get("keys").and_then(Value::as_array))
+            .flat_map(|keys| keys.iter())
+            .filter_map(|jwk| parse_public_jwk(jwk).ok())
+            .flat_map(|jwk| client_assertion_algorithms(&jwk.algorithm))
+            .map(str::to_string)
+            .filter(|algorithm| seen_algorithms.insert(algorithm.clone()))
+            .collect();
+
+        let mut methods = Vec::new();
+        if public_client_registered {
+            methods.push("none".to_string());
+        }
+        if !signing_algorithms.is_empty() {
+            methods.push("private_key_jwt".to_string());
+        }
+
+        Self {
+            methods,
+            signing_algorithms,
+        }
+    }
+
+    /// Public-client metadata for route-level discovery tests.
+    pub fn public_client() -> Self {
+        Self {
+            methods: vec!["none".to_string()],
+            signing_algorithms: Vec::new(),
+        }
+    }
+
+    /// Confidential-client metadata for route-level discovery tests.
+    pub fn private_key_jwt(signing_algorithms: Vec<String>) -> Self {
+        Self {
+            methods: vec!["private_key_jwt".to_string()],
+            signing_algorithms,
+        }
+    }
+}
+
+/// True if `jwks` (a client's configured `{"keys": [...]}`, or `None`) contains at least one JWK
+/// [`parse_public_jwk`] can actually use for `private_key_jwt` verification.
+///
+/// Used directly by `start_idp_server`'s startup validation (which confidential/service clients
+/// are actually usable, #534/ADR-0030). [`ClientAuthenticationMetadata::from_oauth2`] (which
+/// JWK-derived signing algorithms to advertise in discovery) does NOT call this function -- it
+/// keeps its own inline filter chain, since it needs to walk every key to collect algorithms
+/// rather than answer a single yes/no -- but both bottom out in the same `parse_public_jwk` call,
+/// so a JWK either one accepts/rejects is judged identically. Before this ADR, nothing enforced
+/// even that weaker guarantee: `ConfigClientStore::to_registration` mapped ANY `confidential`/
+/// `service` client to `TokenEndpointAuthMethod::PrivateKeyJwt` regardless of whether its `jwks`
+/// parsed to anything at all, while `from_oauth2` silently dropped an unparseable one from
+/// `token_endpoint_auth_methods_supported` -- the store kept answering "this client authenticates
+/// via private_key_jwt" while discovery said the deployment supported no such method, and nothing
+/// caught the disagreement at startup. This function's introduction, plus the startup guard that
+/// calls it, closes that gap; it does not make `from_oauth2` and the guard share literal code.
+pub(crate) fn client_has_a_parseable_jwk(jwks: Option<&Value>) -> bool {
+    jwks.and_then(|jwks| jwks.get("keys"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|jwk| parse_public_jwk(jwk).is_ok_and(|jwk| jwk_meets_minimum_strength(&jwk)))
+}
+
+/// RFC 7518 §6.3.1 places no minimum RSA modulus size on a JWK, and `parse_public_jwk` validates
+/// shape only (a well-formed-but-tiny key parses fine) -- so without this, a 512-bit RSA key would
+/// pass [`client_has_a_parseable_jwk`]'s gate, whose whole point (and whose error text, "could
+/// never actually authenticate") is "this client can genuinely use `private_key_jwt`." A key this
+/// weak genuinely CAN authenticate -- just not safely -- so "parseable" alone is the wrong bar.
+/// 2048 bits matches this repo's own generated keys (`generate_rs256_key`, `RSA_KEY_BITS`) and
+/// NIST SP 800-131A's floor for RSA signing keys. EC/OKP keys are unconditionally accepted here:
+/// every curve `client_assertion_algorithms` recognizes (P-256, P-384, Ed25519) is already at or
+/// above an equivalent strength, so there is no weak-but-parseable variant of those key types the
+/// way an arbitrarily short RSA modulus is.
+const MIN_RSA_MODULUS_BITS: usize = 2048;
+
+fn jwk_meets_minimum_strength(jwk: &jsonwebtoken::jwk::Jwk) -> bool {
+    match &jwk.algorithm {
+        AlgorithmParameters::RSA(params) => base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&params.n)
+            .is_ok_and(|modulus| modulus.len() * 8 >= MIN_RSA_MODULUS_BITS),
+        _ => true,
+    }
+}
+
+fn client_assertion_algorithms(algorithm: &AlgorithmParameters) -> Vec<&'static str> {
+    match algorithm {
+        AlgorithmParameters::RSA(_) => vec!["RS256", "RS384", "RS512", "PS256", "PS384", "PS512"],
+        AlgorithmParameters::EllipticCurve(params) => match params.curve {
+            EllipticCurve::P256 => vec!["ES256"],
+            EllipticCurve::P384 => vec!["ES384"],
+            _ => Vec::new(),
+        },
+        AlgorithmParameters::OctetKeyPair(params) => match params.curve {
+            EllipticCurve::Ed25519 => vec!["EdDSA"],
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
 
 /// A freshly generated RS256 signing key: PKCS#8 private PEM + the public JWK to publish.
 pub struct GeneratedKey {
@@ -163,11 +350,33 @@ impl std::fmt::Debug for ApiKeyJwtSigner {
 /// Identity of the human who created or rotated the key, snapshotted into the issued JWT so the
 /// token mirrors a Keycloak access token. Captured at issuance from the creator's bearer token;
 /// frozen for the token's TTL and refreshed on rotation.
+///
+/// ADR-0025 Stage 3: `subject` and `account_id` are deliberately BOTH carried, and deliberately
+/// NOT the same field -- `subject` is the raw upstream claim, kept only as a log/email-resolution
+/// surface (it is never minted into the token itself any more); `account_id` is the already
+/// ADR-0025-resolved acting account id, and [`identity_for`] mints the token's `sub` from THAT,
+/// never from `subject`. For every existing (grandfathered) account the two are byte-identical
+/// today, which is exactly the wire-invariance property Stage 1-3 promises -- see
+/// `minted_sub_is_the_acting_account_id_not_the_upstream_subject` and
+/// `sub_and_account_id_differ_when_a_roster_member_acts_on_someone_elses_project` in
+/// `crates/lightbridge-authz-rest/tests/signing_tests.rs` for both halves proven directly.
 #[derive(Debug, Clone, Default)]
 pub struct KeyOwner {
     pub subject: String,
+    pub account_id: String,
     pub email: Option<String>,
     pub email_verified: Option<bool>,
+    /// The upstream `preferred_username` claim, mirrored as-is -- never derived, never
+    /// defaulted to `email`/`subject` when absent. Minted as [`identity_for`]'s
+    /// `Identity::username` and, at the wire level, `access_token_extra`/`id_token_extra`'s
+    /// `preferred_username` claim -- present only when the upstream login actually carried one
+    /// (the same "omit, never mint an empty string" contract `email` already follows).
+    pub preferred_username: Option<String>,
+    /// The upstream `name` claim, mirrored as-is. `authkestra_engine::auth::state::Identity` has
+    /// no dedicated `name` field (only `email`/`username`), so [`identity_for`] carries this
+    /// through `Identity::attributes` instead; the wire claim itself is minted directly by
+    /// `access_token_extra`/`id_token_extra`, which do not read `Identity` at all.
+    pub name: Option<String>,
 }
 
 /// A freshly signed API-key JWT and the expiry stamped into it.
@@ -192,19 +401,38 @@ pub fn capped_expiry(
     }
 }
 
-/// Builds the `Identity` every derived token (access or id) is minted for. `sub`/`email` are
-/// upstream snapshots -- never re-minted (ADR-0011, Context and Decision 7). `attributes` starts
-/// empty here; `oauth2_op`'s refresh-token store uses it as the only extension point
-/// `authkestra_op::refresh::RefreshToken` offers to round-trip `account_id`/`project_id` (which
-/// have no dedicated field on `Identity`) through the `RefreshTokenStore` trait boundary -- see
-/// that module for the full round trip.
+/// Builds the `Identity` every derived token (access or id) is minted for. `email` is an upstream
+/// snapshot -- never re-minted. `sub` (`external_id`) is DIFFERENT since ADR-0025 Stage 3: it is
+/// minted from `owner.account_id` -- the already-resolved acting account id -- never from
+/// `owner.subject` (the raw upstream claim, amending ADR-0011's Context/Decision 7 "sub copied
+/// from upstream, never re-minted": the upstream-validation posture survives verbatim, but the
+/// *value* placed on `sub` is now this service's own resolved account id, not a bare copy of the
+/// presented claim). For a grandfathered account (`accounts.id == subject`) this is byte-identical
+/// to the pre-Stage-3 behavior -- see [`KeyOwner`]'s own doc comment. `attributes` starts empty
+/// here except for `name` (see below); `oauth2_op`'s refresh-token store uses it as the only
+/// extension point `authkestra_op::refresh::RefreshToken` offers to round-trip
+/// `account_id`/`project_id` (which have no dedicated field on `Identity`) through the
+/// `RefreshTokenStore` trait boundary -- see that module for the full round trip. `username` is
+/// minted from `owner.preferred_username` -- `Identity`'s own field for exactly this claim.
+/// `name` has no dedicated field on `Identity` at all (only `email`/`username`), so it rides
+/// `attributes["name"]` instead, the same "extension point for whatever `Identity` has no field
+/// for" role `attributes` already plays for `account_id`/`project_id` elsewhere. None of this
+/// nested `Identity` is what actually reaches the wire as `name`/`preferred_username` claims --
+/// `TokenManager` embeds it verbatim under the token's own `identity` claim (informational,
+/// mirroring `sub`/`email`); the real wire claims are minted directly by
+/// `access_token_extra`/`id_token_extra` below, which read `owner` directly and never this
+/// `Identity`.
 pub(crate) fn identity_for(owner: &KeyOwner) -> Identity {
+    let mut attributes = HashMap::new();
+    if let Some(name) = owner.name.as_deref() {
+        attributes.insert("name".to_string(), name.to_string());
+    }
     Identity {
         provider_id: IDENTITY_PROVIDER_ID.to_string(),
-        external_id: owner.subject.clone(),
+        external_id: owner.account_id.clone(),
         email: owner.email.clone(),
-        username: None,
-        attributes: HashMap::new(),
+        username: owner.preferred_username.clone(),
+        attributes,
     }
 }
 
@@ -215,6 +443,22 @@ pub(crate) fn identity_for(owner: &KeyOwner) -> Identity {
 /// values each supplies. See [`ApiKeyJwtSigner::sign`]'s doc comment for the full claim-by-claim
 /// provenance; this is that same set, factored out so it is defined exactly once.
 ///
+/// **`sid` (ADR-0020 Decision 2, #437's scoped-down interpretation):** the caller now supplies
+/// `sid` explicitly rather than this function minting one inline. For a token-exchange access
+/// token (`oauth2_op::store`), `sid` and `api_key_id` are the SAME real, persisted `sessions.id`
+/// (see `oauth2_op::store::TokenExchangeOpStore::handle_token_exchange`/`handle_refresh_token`) --
+/// a deliberate, documented narrowing of ADR-0020 Decision 2's full scope: that Decision's own
+/// text anticipates `sid`/`api_key_id` eventually being fully separated (tracked by #421,
+/// deliberately NOT done in this PR), but Authorino's `"lightbridgeintrospect"` metadata step is
+/// gated on `auth.identity.api_key_id != ""` (ADR-0020 Context point 6) -- emptying or
+/// repurposing `api_key_id` here would silently stop the gateway from ever calling introspection
+/// at all for these tokens, a regression far worse than what this PR fixes. Both claims carrying
+/// the same value already fixes the practical symptom #421 describes (a token-exchange session id
+/// changing identity on every refresh), even though it does not rename/separate the claims the
+/// way #421's full scope eventually will. For the plain self-signed API-key JWT path
+/// (`ApiKeyJwtSigner::sign`), `sid` stays an independent, freshly-minted `cuid2()` per call --
+/// completely unchanged behavior, since this PR does not touch API-key-JWT session semantics.
+///
 /// Stamps `extra["jti"]` with this repo's own `lgbr:`-prefixed CUID2 (ADR-0039: every id this
 /// service mints is a CUID2). `TokenManager` (authkestra-engine 0.5.0, PR #215) removes a
 /// string-valued `extra["jti"]` and uses it verbatim as the token's `jti` claim instead of
@@ -223,6 +467,7 @@ pub(crate) fn identity_for(owner: &KeyOwner) -> Identity {
 /// key, producing an undecodable duplicate-key JWT.
 pub(crate) fn access_token_extra(
     owner: &KeyOwner,
+    sid: &str,
     api_key_id: &str,
     project_id: &str,
     account_id: &str,
@@ -242,7 +487,7 @@ pub(crate) fn access_token_extra(
         "lightbridge_caller_kind".to_string(),
         Value::String(lightbridge_authz_bearer::API_KEY_CALLER_KIND.to_string()),
     );
-    extra.insert("sid".to_string(), Value::String(cuid2()));
+    extra.insert("sid".to_string(), Value::String(sid.to_string()));
     extra.insert(
         "api_key_id".to_string(),
         Value::String(api_key_id.to_string()),
@@ -261,6 +506,15 @@ pub(crate) fn access_token_extra(
     if let Some(verified) = owner.email_verified {
         extra.insert("email_verified".to_string(), Value::Bool(verified));
     }
+    if let Some(name) = owner.name.as_deref() {
+        extra.insert("name".to_string(), Value::String(name.to_string()));
+    }
+    if let Some(preferred_username) = owner.preferred_username.as_deref() {
+        extra.insert(
+            "preferred_username".to_string(),
+            Value::String(preferred_username.to_string()),
+        );
+    }
     if let Some(models) = allowed_models {
         extra.insert(
             "allowed_models".to_string(),
@@ -270,13 +524,64 @@ pub(crate) fn access_token_extra(
     extra
 }
 
+/// Builds the `extra` claim map for a `client_credentials` (M2M) access token (#534, ADR-0030) --
+/// a deliberate SIBLING of [`access_token_extra`], not an extension of it: a `client_credentials`
+/// token carries no [`KeyOwner`] (no human ever authenticated), no `sid`, no `api_key_id`, and no
+/// tenant context (`project_id`/`account_id`) at all, so threading it through `access_token_extra`'s
+/// existing many-`Option`-parameter signature would either force fake values through it or grow
+/// that function's arity further for a shape it otherwise has almost nothing in common with.
+///
+/// Stamps `jti` (this repo's own `lgbr:`-prefixed CUID2, the same `extra["jti"]` override
+/// mechanism `access_token_extra` uses and for the same ADR-0039 reason), `typ: "Bearer"` (so
+/// `/oauth2/introspect`'s `typ == "Bearer"` gate recognizes this token the same way it recognizes a
+/// token-exchange access token), `azp` (the authenticated client's own `client_id` -- never the
+/// `svc:`-prefixed `sub` the `client_credentials` token endpoint (`token_exchange.rs`) mints this
+/// token under), and `lightbridge_caller_kind: "service"`
+/// (`lightbridge_authz_bearer::SERVICE_CALLER_KIND`) -- the RBAC-visible signal a machine token
+/// carries no roster/roles claim, so `lightbridge_authz_bearer::TokenInfo::permissions` resolves
+/// empty for it regardless of this value (see `auth_provider::FederatedSubjectResolver`'s own doc
+/// comment for the `svc:`-prefixed `sub` this claim set rides alongside).
+///
+/// `scope` is accepted for observability only and deliberately NOT stamped into `extra["scope"]`:
+/// `authkestra_engine::token::Claims` already carries `scope` as its OWN top-level, flattened
+/// field (the caller passes the same value straight to
+/// `TokenManager::issue_client_token_with_extra`'s own `scope` parameter), so mirroring it into
+/// `extra` would reproduce the exact duplicate-flattened-key hazard [`access_token_extra`]'s own
+/// `jti` doc comment describes for `jti` before `authkestra-engine` 0.5.0.
+pub(crate) fn service_token_extra(client_id: &str, scope: &str) -> HashMap<String, Value> {
+    let mut extra = HashMap::new();
+    extra.insert(
+        "jti".to_string(),
+        Value::String(format!("lgbr:{}", cuid2())),
+    );
+    extra.insert("typ".to_string(), Value::String(TOKEN_TYP.to_string()));
+    extra.insert("azp".to_string(), Value::String(client_id.to_string()));
+    extra.insert(
+        "lightbridge_caller_kind".to_string(),
+        Value::String(lightbridge_authz_bearer::SERVICE_CALLER_KIND.to_string()),
+    );
+    tracing::debug!(
+        client_id = %client_id,
+        scope = %scope,
+        "built client_credentials extra claims"
+    );
+    extra
+}
+
 /// Builds the `extra` claim map every derived `id_token` carries (ADR-0011, Decision 7):
-/// `email`/`email_verified` upstream snapshots, `auth_time` propagated only when the upstream
-/// token carried one (never defaulted to "now"), `azp` naming the client the tokens were issued
-/// to, and `at_hash` binding this `id_token` to the `access_token` minted alongside it in the same
-/// response. Tenant context (`api_key_id`/`project_id`/`account_id`) and role/quota data never
-/// appear here -- see [`compute_at_hash`]. `jti` is stamped as this repo's own `lgbr:`-prefixed
-/// CUID2, same as [`access_token_extra`] and for the same ADR-0039 reason.
+/// `email`/`email_verified`/`name`/`preferred_username` upstream snapshots, `auth_time`
+/// propagated only when the upstream token carried one (never defaulted to "now"), `azp` naming
+/// the client the tokens were issued to, and `at_hash` binding this `id_token` to the
+/// `access_token` minted alongside it in the same response. Tenant context
+/// (`api_key_id`/`project_id`/`account_id`) and role/quota data never appear here -- see
+/// [`compute_at_hash`]. `jti` is stamped as this repo's own `lgbr:`-prefixed CUID2, same as
+/// [`access_token_extra`] and for the same ADR-0039 reason.
+///
+/// Every claim here is inserted unconditionally when `owner` carries a value for it -- minting
+/// never gates on the granted `scope` (an id_token is only ever minted when `openid` was granted
+/// in the first place; `mint_human_plane_tokens` checks that before calling this). Scope-gating
+/// `profile`/`email` claims is `userinfo`'s job alone, at read time, over an access token's own
+/// claim set -- not this function's.
 pub(crate) fn id_token_extra(
     owner: &KeyOwner,
     access_token: &str,
@@ -293,6 +598,15 @@ pub(crate) fn id_token_extra(
     }
     if let Some(verified) = owner.email_verified {
         extra.insert("email_verified".to_string(), Value::Bool(verified));
+    }
+    if let Some(name) = owner.name.as_deref() {
+        extra.insert("name".to_string(), Value::String(name.to_string()));
+    }
+    if let Some(preferred_username) = owner.preferred_username.as_deref() {
+        extra.insert(
+            "preferred_username".to_string(),
+            Value::String(preferred_username.to_string()),
+        );
     }
     if let Some(auth_time) = auth_time {
         extra.insert("auth_time".to_string(), Value::from(auth_time));
@@ -396,8 +710,12 @@ impl ApiKeyJwtSigner {
         // single-`now`-for-everything implementation.
         let expires_in_secs = (expires_at - now).num_seconds().max(0) as u64;
 
+        // Unchanged behavior: this path has no `sessions` table concept, so `sid` stays an
+        // independent, freshly-minted `cuid2()` per call -- see `access_token_extra`'s doc
+        // comment.
         let extra = access_token_extra(
             owner,
+            &cuid2(),
             api_key_id,
             project_id,
             account_id,
@@ -436,186 +754,285 @@ fn to_jwks(raw: Vec<Value>) -> Vec<authkestra_engine::token::jwk::Jwk> {
         .collect()
 }
 
-/// Builds the OIDC discovery document via `authkestra_op::handlers::discovery::OidcDiscovery`
-/// (ADR-0011, Decision 9) rather than the previous hand-built `serde_json::json!`. `OidcDiscovery`
-/// models a full OP (authorization_code + device flows included), which this service structurally
-/// never runs (ADR-0011, Context -- no user store, no login flow). `userinfo_endpoint` is
-/// genuinely optional on the type and is nulled out below, since this service does not serve one.
+/// The common, currently truthful subset of OIDC Discovery and RFC 8414 metadata.
 ///
-/// The document is built from three **independent** gates, not one flag driving everything --
-/// this function used to conflate them, which is how `response_types_supported` ended up
-/// advertising `["token", "id_token", "id_token token"]` in production the moment
-/// `oauth2.token_exchange.enabled` flipped to `true`, even though nothing about enabling
-/// token-exchange stood up an authorization endpoint:
+/// Authkestra's `OidcDiscovery` cannot represent RFC 8414's revocation metadata and serializes
+/// several unsupported endpoints and client-authentication defaults. This explicit, small model
+/// makes omission the default: a field appears only when this process mounts the corresponding
+/// route. `/authorize` and device authorization are represented by independent route facts;
+/// introspection (`/oauth2/introspect`, RFC 7662) and the OIDC Session Management check-session
+/// iframe are advertised alongside the surfaces that mount them; UserInfo and logout remain
+/// absent until their handlers exist. `claims_parameter_supported` is advertised explicitly as
+/// `false` (OIDC Discovery 1.0 §3 -- the `claims` request parameter is not supported) rather
+/// than left to the spec's implicit default, so RPs need not guess.
 ///
-/// 1. **Issuer identity** -- true whenever this function is even called, i.e. whenever
-///    `well_known_router` is mounted (`oauth2.type: self` + `oauth2.signing` configured, see the
-///    call site in `lib.rs`). `ApiKeyJwtSigner` mints self-signed API-key JWTs through that path
-///    regardless of token-exchange, so `issuer`, `jwks_uri`, `subject_types_supported`,
-///    `id_token_signing_alg_values_supported`, `token_endpoint_auth_methods_supported`, and
-///    `claims_supported` are set unconditionally below and never touch `enabled`.
-/// 2. **Grant surface** -- what `/oauth2/token` actually accepts, which is nothing at all unless
-///    `oauth2.token_exchange.enabled` mounts it (`build_token_exchange_state`). So
-///    `grant_types_supported` and `token_endpoint` are gated on `enabled`, dropping to
-///    empty/absent when it's off. `scopes_supported` is gated the same way, deliberately: the
-///    plain API-key-issuance path (`ApiKeyJwtSigner::sign`) stamps a fixed, non-negotiable
-///    `scope: "profile email"` claim (`TOKEN_SCOPE`) and never mints an `id_token` -- there is no
-///    client-facing scope *request* to describe outside the token-exchange grant, where
-///    `openid`/`offline_access` genuinely gate id_token/refresh-token issuance
-///    (`oauth2.token_exchange.allowed_scopes`). Advertising scopes with no grant that honours them
-///    would invent a capability this deployment does not have, same reasoning as `grant_types_supported`.
-/// 3. **Authorization endpoint** -- never advertised, in either state. This service has no
-///    `/authorize` route, no `AuthorizationCodeStore` beyond a permanent no-op stub, and never
-///    redirects a user-agent (token-exchange is a direct machine-to-machine POST/response, not a
-///    redirect flow) -- see ADR-0011, Context. So `authorization_endpoint`,
-///    `response_types_supported`, and `response_modes_supported` are all unconditionally
-///    empty/absent below, independent of `enabled`. Per OIDC Discovery 1.0 §3,
-///    `response_types_supported` is REQUIRED to be present as a JSON array, but the "MUST support
-///    code/id_token/id_token token" clause binds only "Dynamic OpenID Providers" (ones that also
-///    advertise a `registration_endpoint` for dynamic client registration); this deployment
-///    registers clients from static YAML only (ADR-0011, Decision 5) and serves no
-///    `registration_endpoint`, so an empty array here is spec-compliant, not merely tidy.
-///    `response_modes_supported` is OPTIONAL per the same section, so empty is unambiguously fine.
-///    `authorization_endpoint` itself is dropped from the serialized document entirely:
-///    `OidcDiscovery`'s field is a required `String` with no way to omit it via the type itself, so
-///    the value is removed post-serialization below (`obj.remove`), same pattern PR #301 used for
-///    `token_endpoint`.
-///
-/// **`revocation_endpoint` is absent, on purpose, not an oversight -- it cannot be added here.**
-/// `POST /oauth2/revoke` (RFC 7009) is real, mounted, and live
-/// (`crate::token_exchange::token_exchange_router`), but `authkestra_op::handlers::discovery::
-/// OidcDiscovery` (0.5.0) has no `revocation_endpoint` field to populate, and RFC 8414 §2 defines
-/// it as a standard authorization-server metadata field this document should otherwise carry.
-/// Filed upstream: <https://github.com/marcjazz/authkestra/issues/220>. Once that field exists,
-/// wire it in here the same way `token_endpoint` is set below, gated on `enabled` (revocation only
-/// makes sense once the token-exchange grant surface -- the only source of revocable refresh
-/// tokens -- is actually mounted). A previous round of confusion over silently-empty discovery
-/// fields cost real debugging time (see `response_types_supported` in the paragraph above), which
-/// is why this omission gets its own explicit callout rather than just not appearing.
+/// RFC 8414 requires zero-element arrays to be omitted from an authorization-server metadata
+/// response. The shared narrow document applies the same omission discipline to OIDC discovery:
+/// the disabled token surface advertises only the issuer and JWKS, not empty grant, scope,
+/// response, or client-authentication capabilities.
+#[derive(Serialize)]
+struct DiscoveryDocument {
+    issuer: String,
+    jwks_uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revocation_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_authorization_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorization_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    scopes_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    grant_types_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    response_types_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    response_modes_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    code_challenge_methods_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    token_endpoint_auth_methods_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    token_endpoint_auth_signing_alg_values_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    revocation_endpoint_auth_methods_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    revocation_endpoint_auth_signing_alg_values_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    introspection_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    introspection_endpoint_auth_methods_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    introspection_endpoint_auth_signing_alg_values_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    check_session_iframe: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_session_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    userinfo_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claims_parameter_supported: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    subject_types_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    id_token_signing_alg_values_supported: Vec<String>,
+}
+
 fn discovery_document(
     issuer: &str,
     token_exchange_scopes: Option<&[String]>,
-    private_key_jwt_supported: bool,
-) -> serde_json::Value {
-    let enabled = token_exchange_scopes.is_some();
-    let scopes_supported = token_exchange_scopes
+    client_authentication: &ClientAuthenticationMetadata,
+    capabilities: DiscoveryCapabilities,
+) -> DiscoveryDocument {
+    let token_endpoint_mounted = capabilities.token_endpoint && token_exchange_scopes.is_some();
+    let device_authorization_mounted =
+        token_endpoint_mounted && capabilities.device_authorization_endpoint;
+    let authorization_code_mounted = token_endpoint_mounted && capabilities.authorization_endpoint;
+    let scopes_supported = token_endpoint_mounted
+        .then_some(token_exchange_scopes)
+        .flatten()
         .map(<[String]>::to_vec)
         .unwrap_or_default();
-    let grant_types_supported = if enabled {
+    // `client_credentials` (#534, ADR-0030) is pushed here UNCONDITIONALLY, like
+    // `TOKEN_EXCHANGE_GRANT`/`REFRESH_TOKEN_GRANT` above it and NOT like
+    // `DEVICE_CODE_GRANT`/`"authorization_code"` below (both additionally gated on their own
+    // route-mount flags): the client_credentials grant is handled entirely inside the always-
+    // mounted `/oauth2/token` route (`token_exchange::client_credentials_token_endpoint`), with no
+    // separate route of its own to gate on. ADR-0023's rule applies exactly as it does to every
+    // other route this server mounts unconditionally: mounted unconditionally means advertised
+    // unconditionally, regardless of whether any `oauth2.clients` entry is actually configured for
+    // it yet (see #473's lesson -- "optional" and "half-broken" must never be the same state for a
+    // capability this document claims).
+    let mut grant_types_supported = if token_endpoint_mounted {
         vec![
             crate::token_exchange::TOKEN_EXCHANGE_GRANT.to_string(),
             crate::token_exchange::REFRESH_TOKEN_GRANT.to_string(),
+            crate::token_exchange::CLIENT_CREDENTIALS_GRANT.to_string(),
         ]
     } else {
         Vec::new()
     };
-
-    let op_config = OpConfig {
-        issuer: issuer.to_string(),
-        scopes_supported,
-        response_types_supported: Vec::new(),
-        grant_types_supported,
-        id_token_signing_alg: ALGORITHM.to_string(),
-        authorization_code_ttl_secs: 0,
-        access_token_ttl_secs: 0,
-        device_code_ttl_secs: 0,
-        token_exchange_enabled: enabled,
-    };
-
-    let mut doc = OidcDiscovery::from_config(&op_config);
-    doc.jwks_uri = format!("{issuer}/.well-known/jwks.json");
-    doc.token_endpoint = format!("{issuer}/oauth2/token");
-    doc.userinfo_endpoint = None;
-    // `response_modes_supported` is unconditionally empty regardless of `enabled`: response modes
-    // (`query`/`fragment`/`form_post`) describe how an authorization *response* is delivered back
-    // to a browser redirect URI. This service never redirects a user-agent at all -- the
-    // token-exchange grant is a direct machine-to-machine POST/response, not a redirect flow -- so
-    // no response mode ever applies, on or off. `from_config` defaults this to `["query"]`
-    // (appropriate for the authorization_code flow it also models), which would misrepresent a
-    // capability this service never had regardless of token-exchange config.
-    doc.response_modes_supported = Vec::new();
-    doc.token_endpoint_auth_methods_supported = if private_key_jwt_supported {
-        vec!["none".to_string(), "private_key_jwt".to_string()]
-    } else {
-        vec!["none".to_string()]
-    };
-    doc.claims_supported = [
-        "iss",
-        "sub",
-        "aud",
-        "exp",
-        "iat",
-        "nbf",
-        "jti",
-        "typ",
-        "azp",
-        "lightbridge_caller_kind",
-        "sid",
-        "scope",
-        "api_key_id",
-        "project_id",
-        "account_id",
-        "budget_tier",
-        "quota_tier",
-        "email",
-        "email_verified",
-        "allowed_models",
-        "identity",
-        "nonce",
-        "auth_time",
-        "at_hash",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
-
-    let mut value =
-        serde_json::to_value(&doc).unwrap_or_else(|_| serde_json::json!({ "issuer": issuer }));
-    if let Some(obj) = value.as_object_mut() {
-        obj.remove("authorization_endpoint");
-        if !enabled {
-            obj.remove("token_endpoint");
-        }
+    if device_authorization_mounted {
+        grant_types_supported.push(crate::token_exchange::DEVICE_CODE_GRANT.to_string());
     }
-    value
+    if authorization_code_mounted {
+        grant_types_supported.push("authorization_code".to_string());
+    }
+    let oidc_tokens_supported =
+        token_endpoint_mounted && scopes_supported.iter().any(|scope| scope == "openid");
+    let endpoint_base = issuer_origin(issuer);
+    let client_auth_methods = if token_endpoint_mounted {
+        client_authentication.methods.clone()
+    } else {
+        Vec::new()
+    };
+    let client_auth_signing_algorithms = if token_endpoint_mounted {
+        client_authentication.signing_algorithms.clone()
+    } else {
+        Vec::new()
+    };
+    let subject_types_supported = if oidc_tokens_supported {
+        vec!["public".to_string()]
+    } else {
+        Vec::new()
+    };
+    let id_token_signing_alg_values_supported = if oidc_tokens_supported {
+        vec![ALGORITHM.to_string()]
+    } else {
+        Vec::new()
+    };
+
+    DiscoveryDocument {
+        issuer: issuer.to_string(),
+        jwks_uri: format!("{endpoint_base}/.well-known/jwks.json"),
+        token_endpoint: token_endpoint_mounted.then(|| format!("{endpoint_base}/oauth2/token")),
+        revocation_endpoint: token_endpoint_mounted
+            .then(|| format!("{endpoint_base}/oauth2/revoke")),
+        device_authorization_endpoint: device_authorization_mounted
+            .then(|| format!("{endpoint_base}/oauth2/device_authorization")),
+        authorization_endpoint: authorization_code_mounted
+            .then(|| format!("{endpoint_base}/authorize")),
+        scopes_supported,
+        grant_types_supported,
+        response_types_supported: if authorization_code_mounted {
+            vec!["code".to_string()]
+        } else {
+            Vec::new()
+        },
+        response_modes_supported: if authorization_code_mounted {
+            vec!["query".to_string()]
+        } else {
+            Vec::new()
+        },
+        code_challenge_methods_supported: if authorization_code_mounted {
+            vec!["S256".to_string()]
+        } else {
+            Vec::new()
+        },
+        token_endpoint_auth_methods_supported: client_auth_methods.clone(),
+        token_endpoint_auth_signing_alg_values_supported: client_auth_signing_algorithms.clone(),
+        revocation_endpoint_auth_methods_supported: client_auth_methods.clone(),
+        revocation_endpoint_auth_signing_alg_values_supported: client_auth_signing_algorithms
+            .clone(),
+        introspection_endpoint: token_endpoint_mounted
+            .then(|| format!("{endpoint_base}/oauth2/introspect")),
+        introspection_endpoint_auth_methods_supported: client_auth_methods,
+        introspection_endpoint_auth_signing_alg_values_supported: client_auth_signing_algorithms,
+        check_session_iframe: authorization_code_mounted
+            .then(|| format!("{endpoint_base}/oauth2/check_session_iframe")),
+        // OIDC RP-Initiated Logout 1.0 §3. Gated on the authorization-code surface, not on the
+        // token surface: logout ends the BROWSER session, and the browser session only exists
+        // where `/authorize` is mounted. `frontchannel_logout_supported`/
+        // `backchannel_logout_supported` stay absent -- this OP implements neither, and the
+        // omission discipline this document follows means never advertising a capability whose
+        // handler does not exist (ADR-0023's whole lesson).
+        end_session_endpoint: authorization_code_mounted
+            .then(|| format!("{endpoint_base}/oauth2/end_session")),
+        // OIDC Core §5.3. Gated on `oidc_tokens_supported` rather than the route table alone: the
+        // endpoint refuses any token lacking the `openid` scope, so where `openid` is not an
+        // issuable scope it would answer nothing but `insufficient_scope`.
+        userinfo_endpoint: oidc_tokens_supported
+            .then(|| format!("{endpoint_base}/oauth2/userinfo")),
+        claims_parameter_supported: oidc_tokens_supported.then_some(false),
+        subject_types_supported,
+        id_token_signing_alg_values_supported,
+    }
 }
 
-/// Public OIDC discovery + JWKS routes for Authorino's `jwt` identity. JWKS is served live from
-/// the DB (active + stale keys) so tokens signed by a rotated-out key keep verifying until they
-/// expire. Stateless w.r.t. axum state, so it merges into any router. CORS is wide-open (any
-/// origin, GET) because these are public, non-secret discovery documents — browser-based OIDC
-/// clients must be able to fetch them cross-origin, as any standard OIDC provider allows.
+fn issuer_origin(issuer: &str) -> String {
+    reqwest::Url::parse(issuer)
+        .ok()
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|| issuer.trim_end_matches('/').to_string())
+}
+
+fn well_known_paths(issuer: &str) -> (String, String) {
+    let parsed = reqwest::Url::parse(issuer);
+    let path = parsed
+        .as_ref()
+        .ok()
+        .map_or("", |url| url.path().trim_end_matches('/'));
+    let oidc = if path.is_empty() || path == "/" {
+        "/.well-known/openid-configuration".to_string()
+    } else {
+        format!("{path}/.well-known/openid-configuration")
+    };
+    let oauth = if path.is_empty() || path == "/" {
+        "/.well-known/oauth-authorization-server".to_string()
+    } else {
+        format!("/.well-known/oauth-authorization-server{path}")
+    };
+    (oidc, oauth)
+}
+
+/// Public OIDC discovery, RFC 8414 authorization-server metadata, and JWKS routes. JWKS is
+/// served live from the DB (active + stale keys) so tokens signed by a rotated-out key keep
+/// verifying until they expire. Stateless w.r.t. axum state, so it merges into any router. CORS
+/// is wide-open (any origin, GET) because these are public, non-secret discovery documents.
 ///
-/// `token_exchange_scopes` is `Some(allowed_scopes)` when the token-exchange grant is enabled
-/// (`oauth2.token_exchange.enabled`), `None` when it is off (including when the whole
-/// `oauth2.token_exchange` block is absent from config, which deserializes to `None` the same
-/// way). `discovery_document` drops `token_endpoint` from the disabled document entirely, matching
-/// the previous hand-built document -- see its doc comment for the full rationale.
+/// `token_exchange_scopes` is populated only when the token surface was successfully assembled;
+/// `capabilities` separately records which optional flow routes the enclosing router mounted.
+/// `discovery_document` drops every endpoint from the disabled document entirely, matching the
+/// actual route table rather than config intent alone.
 pub fn well_known_router<S>(
     issuer: &str,
     repo: Arc<StoreRepo>,
     token_exchange_scopes: Option<Vec<String>>,
-    private_key_jwt_supported: bool,
+    client_authentication: ClientAuthenticationMetadata,
+    capabilities: DiscoveryCapabilities,
 ) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    let discovery_issuer = issuer.to_string();
+    let issuer: Arc<str> = Arc::from(issuer);
+    let (openid_configuration_path, authorization_server_metadata_path) = well_known_paths(&issuer);
+    let token_exchange_scopes = Arc::new(token_exchange_scopes);
+    let client_authentication = Arc::new(client_authentication);
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET]);
     Router::new()
         .route(
-            "/.well-known/openid-configuration",
-            get(move || {
-                let issuer = discovery_issuer.clone();
-                let scopes = token_exchange_scopes.clone();
-                async move {
-                    Json(discovery_document(
-                        &issuer,
-                        scopes.as_deref(),
-                        private_key_jwt_supported,
-                    ))
+            &openid_configuration_path,
+            get({
+                let issuer = Arc::clone(&issuer);
+                let scopes = Arc::clone(&token_exchange_scopes);
+                let client_authentication = Arc::clone(&client_authentication);
+                move || {
+                    let issuer = Arc::clone(&issuer);
+                    let scopes = Arc::clone(&scopes);
+                    let client_authentication = Arc::clone(&client_authentication);
+                    async move {
+                        Json(discovery_document(
+                            &issuer,
+                            scopes.as_deref(),
+                            &client_authentication,
+                            capabilities,
+                        ))
+                    }
+                }
+            }),
+        )
+        .route(
+            &authorization_server_metadata_path,
+            get({
+                let issuer = Arc::clone(&issuer);
+                let scopes = Arc::clone(&token_exchange_scopes);
+                let client_authentication = Arc::clone(&client_authentication);
+                move || {
+                    let issuer = Arc::clone(&issuer);
+                    let scopes = Arc::clone(&scopes);
+                    let client_authentication = Arc::clone(&client_authentication);
+                    async move {
+                        Json(discovery_document(
+                            &issuer,
+                            scopes.as_deref(),
+                            &client_authentication,
+                            capabilities,
+                        ))
+                    }
                 }
             }),
         )
@@ -641,4 +1058,48 @@ where
             }),
         )
         .layer(cors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::jwk::{OctetKeyPairParameters, OctetKeyPairType};
+
+    #[test]
+    fn client_assertion_algorithms_reports_eddsa_only_for_the_ed25519_okp_curve() {
+        let params = OctetKeyPairParameters {
+            key_type: OctetKeyPairType::OctetKeyPair,
+            curve: EllipticCurve::Ed25519,
+            x: String::new(),
+        };
+        assert_eq!(
+            client_assertion_algorithms(&AlgorithmParameters::OctetKeyPair(params)),
+            vec!["EdDSA"]
+        );
+    }
+
+    #[test]
+    fn client_assertion_algorithms_reports_no_algorithm_for_non_ed25519_okp_curves() {
+        // `jsonwebtoken`'s `OctetKeyPairParameters::curve` reuses the very same `EllipticCurve`
+        // enum as EC keys, so a non-Ed25519 curve value (a malformed key, or the real-world
+        // equivalent of an X25519 key-agreement JWK once that variant exists) can legitimately
+        // reach this arm. Before this fix, `AlgorithmParameters::OctetKeyPair(_) => vec!["EdDSA"]`
+        // matched unconditionally and reported every OKP key as EdDSA-capable regardless of curve.
+        for curve in [
+            EllipticCurve::P256,
+            EllipticCurve::P384,
+            EllipticCurve::P521,
+        ] {
+            let params = OctetKeyPairParameters {
+                key_type: OctetKeyPairType::OctetKeyPair,
+                curve: curve.clone(),
+                x: String::new(),
+            };
+            assert_eq!(
+                client_assertion_algorithms(&AlgorithmParameters::OctetKeyPair(params)),
+                Vec::<&'static str>::new(),
+                "non-Ed25519 OKP curve {curve:?} must not be reported as EdDSA-capable"
+            );
+        }
+    }
 }

@@ -6,13 +6,39 @@ This repository provides API key management plus usage analytics:
 - `authz-budget`: OAuth2/JWT-protected RPC API for the budget domain (policy lifecycle,
   self-service refill, the admin review queue, and direct balance/ledger reads/writes) — carried
   off `authz-api` as a hard cutover (ADR-0010, #351).
-- `authz-opa`: Basic-auth protected validation API intended to be called by Authorino (or similar external auth components). It validates API keys and returns rich context plus dynamic metadata.
-- `authz-idp`: OIDC broker server (ADR-0012 Phase 1) exposing `.well-known/openid-configuration`,
-  `.well-known/jwks.json`, `/oauth2/token`, and `/oauth2/revoke` — every route is public, the
-  presented token/assertion is itself the credential. Transitional: `authz-api` keeps serving the
-  identical surface until the public issuer is repointed at `authz-idp` in a later PR.
+- `authz-opa`: Basic-auth protected validation API intended to be called by Authorino (or similar external auth components). It validates API keys and returns rich context plus dynamic metadata, and is also the ownership authority for the usage query API (`POST /idp/v1/authorize-usage-scope`, #570).
+- `authz-idp`: OIDC broker server (ADR-0012, ADR-0019, ADR-0023) exposing
+  `.well-known/openid-configuration`, `.well-known/jwks.json`, `/oauth2/token`, `/oauth2/revoke`,
+  `/oauth2/device_authorization`, `/oauth2/userinfo`, `/oauth2/end_session`, `/authorize`,
+  `/device/verify`, `/device/verify/context`, and `/idp/callback` — every route is public, the
+  presented token/assertion (or completed Keycloak login) is itself the credential. **`authz-idp`
+  renders no HTML on the RP/device leg** (ADR-0029, lightbridge-authz#607): `GET /device/verify`
+  is a pure 303 handoff into the SPA's `/ui/device` route (the `verification_uri` RFC 8628 names,
+  so the path itself cannot move); `POST /device/verify` and `POST /device/verify/continue` decide
+  and 303 onward (`/ui/device/confirm`, `/ui/device/invalid`, `/ui/error`); `GET
+  /device/verify/context` is a cookie-bound JSON endpoint (uniform `404`/`503`, never `200` with a
+  body the cookie doesn't authorize) feeding the SPA's confirmation page. The pages themselves are
+  a React SPA (`apps/authz-ui` in the `converse-frontends` monorepo) served under `/ui` — see the
+  `web/`-directory bullet under Top-Level Layout below, and ADR-0029. `/oauth2/end_session` (OIDC
+  RP-Initiated Logout 1.0) takes its subject from the `__Host-authz_session` cookie, never from
+  `id_token_hint`, and cascades to every session that subject holds plus their refresh chains;
+  `/oauth2/userinfo` (OIDC Core §5.3) returns identity claims only and never authorization data.
+  It is a full IdP: `oauth2.relying_party` and an enabled `oauth2.token_exchange` are both
+  MANDATORY, and every route above is mounted unconditionally — see "The authz-idp surface is
+  mandatory" below. `/oauth2/token` also serves a machine plane: RFC 6749 §4.4 `client_credentials`
+  (M2M, ADR-0030, #534), `private_key_jwt`-only (a new `OauthClientType::Service` config variant,
+  behaviorally identical to `Confidential`), intercepted before upstream dispatch the same way the
+  device-code grant is. Discovery advertises `client_credentials` unconditionally, in the same
+  always-mounted block as the token-exchange/refresh grants (`signing.rs:838-848`) — never gated on
+  whether any `oauth2.clients` entry actually lists it. A `client_credentials` token mints
+  `sub = "svc:<client_id>"`, carries no `roles` claim, and therefore holds zero permissions against
+  every RPC op-id.
 - `lightbridge-mcp`: OAuth2/JWT-protected MCP server exposing the authz surface as MCP tools over streamable HTTP (`/mcp`).
-- `lightbridge-authz-usage`: unprotected OTLP/HTTP ingest API (`/v1/otel/traces`, `/v1/otel/metrics`) plus a single usage query API (`/usage/v1/usage/query`) backed by Timescale/Postgres.
+- `lightbridge-authz-usage`: split across two listeners (#347) — an unprotected OTLP/HTTP ingest
+  API (`/v1/otel/traces`, `/v1/otel/metrics`, `/v1/otel/logs`) and an mTLS-required query listener
+  serving the usage query API (`/usage/v1/usage/query`, which since #570 also requires an end-user
+  bearer token plus an ownership check — see "Security Notes" below) and the budget domain's
+  service-to-service spend read (`/usage/v1/spend/query`, mTLS-only) — backed by Timescale/Postgres.
 
 The authz services (`authz-api`, `authz-budget`, `authz-opa`, `authz-idp`):
 
@@ -322,10 +348,17 @@ use crate::repo::StoreRepo;
   - `crates/lightbridge-authz-proto/`: proto-related exports (currently minimal).
 - `migrations/`: SQLx migrations.
 - `migrations-usage/`: SQLx migrations for usage events storage (Timescale-compatible schema).
+- There is **no `web/` directory and no JavaScript in this repository.** `authz-idp` renders no
+  HTML on the RP/device leg (see the `authz-idp` bullet above) — its pages are a React SPA built in
+  `converse-frontends` as `apps/authz-ui`, on the estate's `ui-web` design system, and consumed here
+  as a digest-pinned, assets-only OCI image (`ghcr.io/adorsys-gis/converse-frontends/authz-ui`,
+  bundle at `/dist` including `dist/routes.json`, the `/ui` route allowlist `static_assets.rs`
+  reads at startup). See ADR-0029.
 - `config/`: local default config (non-container paths).
 - `.docker/`: docker assets (service config, Keycloak realm import, Envoy example, IT scripts).
 - `compose.yaml`: local dev stack (Postgres, Keycloak, API/OPA, migrations, TLS generator).
-- `compose.it.yaml`: integration-test overlay (adds `it-authorino` and `it-servers` test runners).
+- `compose.it.yaml`: integration-test overlay (adds `it-authorino`, `it-servers`, `it-idp`, and
+  `it-machine-keygen` — the last a one-shot fixture generator, not a test runner itself).
 - `docs/`: human docs (manual protocol, Authorino usage).
 - `.github/actions/`: composite helpers that encapsulate Rust setup, cargo tooling, docker build/publish, and Helm publishing so workflows stay short.
 - `.github/workflows/`: main CI/CD pipeline (`ci.yml`) plus the Helm charts publish workflow (`helm-oci.yml`), both kept lean by calling the shared actions.
@@ -337,13 +370,18 @@ Primary local stack is in `compose.yaml`:
 - `authz-tls`: generates self-signed certs into `authz_tls` volume.
 - `postgresql`: Postgres backing store.
 - `timescaledb`: usage events backing store.
+- `redis`: rate limiting + replay protection for `authz-api`/`authz-idp`/`authz-budget`.
 - `keycloak`: OAuth2 provider (imports `dev` realm from `.docker/keycloak_config/realm.json`).
-- `authz-migrate`: runs migrations once at startup.
+- `authz-migrate`: runs authz migrations once at startup.
+- `authz-usage-migrate`: runs usage-store migrations once at startup.
 - `authz-api`: runs the CRUD API.
 - `authz-opa`: runs validation endpoints for OPA/Authorino.
+- `authz-idp`: runs the OIDC broker (discovery, JWKS, token exchange, device grant).
+- `authz-budget`: runs the budget-domain RPC surface.
 - `authz-mcp`: runs the MCP streamable HTTP endpoint.
 - `mcp-inspector`: optional MCP Inspector UI/proxy container for MCP debugging.
 - `authz-usage`: runs OTEL ingest + usage query endpoints.
+- `jaeger`: OTLP trace collector/UI.
 - `adminer`: optional DB UI.
 
 ## Architecture Overview
@@ -352,16 +390,48 @@ Primary local stack is in `compose.yaml`:
 
 Tables (see `migrations/`):
 
-- `accounts`: **`id` is the caller's JWT `sub`** — one account is one person (ADR-0006). Carries
-  `default_quota` (the governance tier for work in the account's own default project).
+- `accounts`: **`id` is the caller's JWT `sub` for an identity's FIRST (anchor) account, and a
+  minted CUID2 for every account after that** (ADR-0006; amended by ADR-0024, then by ADR-0026 —
+  see `users` below). Since ADR-0026 one identity may own several accounts; the anchor keeps the
+  subject as its id because `federated_identities` adopts by matching `accounts.id == subject`.
+  Carries `default_quota` (the governance tier for work in the account's own default project) and
+  `user_id` (`NOT NULL`, `BEFORE INSERT`-trigger-provisioned when not supplied — see `users`).
+  **`accounts.user_id` is always the owner's anchor-account id**, i.e. always `auth().id`; the
+  ownership `@@allow` clauses depend on this and it is pinned by
+  `accounts_user_id_is_always_a_home_account_id`. Two id populations coexist permanently — never
+  branch on an id's shape (see "Identifier Format").
+- `users` (ADR-0024; corrected 2026-08-25): the actual defining identity — "one account = one
+  federated identity; a person may hold several." Reached only THROUGH an account:
+  `federated_identities.account_id -> accounts.user_id -> users.id`. `id` is always the
+  backfilled/trigger-provisioned account's own id verbatim (an id-reuse, not a new mint — ADR-0039
+  bans minting, not storing) — the fresh-`cuid2()`-for-a-brand-new-person case no longer arises,
+  since a federated identity can no longer exist without an adopted account.
+- `federated_identities` (ADR-0024, corrected 2026-08-25; deliberately absent from `authz.cstack`
+  — see "Persistence" below): keyed by `(issuer, subject)`, the login federation key. Carries the
+  sealed Keycloak token set (`token_envelope`, AES-256-GCM, `lightbridge_authz_core::crypto`) —
+  refresh token plus a non-access-token ID-token claims snapshot, never the access token.
+  `account_id` is `NOT NULL` (no `user_id` column — the user is always derived) and adopted by AT
+  MOST ONE federated identity ever (a partial unique index enforces this): a subject with no
+  pre-existing `accounts` row is refused (`Error::Forbidden`, no mint-a-user branch), and a second
+  issuer presenting a subject that already adopted an account is refused (`Error::Conflict`), never
+  silently merged. `ON DELETE CASCADE` on `account_id`: deleting an account removes its adopted
+  federated identity too (the person's `users` row itself is unaffected — it survives via any
+  other account, or with none).
 - `projects` (belongs to `accounts`): includes `billing_identity` (unique — "who is paying" moved
   here from `accounts`, so one person can bill projects to different parties), `project_quota` (the
-  pooled ceiling), and `is_default` (the auto-provisioned, roster-less project; server-computed by a
-  `BEFORE INSERT` trigger, undeletable).
+  pooled ceiling), `is_default` (the auto-provisioned, roster-less project; server-computed by a
+  `BEFORE INSERT` trigger, undeletable), `allowed_models` (list of permitted models — `NULL` or
+  `[]` (empty list) are interpreted as "all models allowed" when `model_policy = allow_all`, and
+  mean "nothing" when `model_policy = allowlist`; ignored entirely under `deny_all`), and
+  `model_policy` (ADR-0018): `allow_all` (default — the sole pre-existing behavior, and what every
+  row backfills to on migration), `allowlist` (only `allowed_models` entries), or `deny_all`
+  (nothing). Not yet settable through the RPC surface (`@readonly` in `authz.cstack` — see that
+  field's own comment for why); returned by introspection and stamped as an access-token claim
+  (`crates/lightbridge-authz-rest/src/oauth2_op/store.rs`) alongside `allowed_models`.
 - `project_members` (`{project_id, account_id, role: lead|member, quota_tier}`): the project roster.
   Default projects have none by construction. Replaces `account_memberships`, which was dropped
   entirely — there is no account-level membership of any kind.
-- `api_keys` (belongs to `projects`): includes `allowed_models`.
+- `api_keys` (belongs to `projects`).
 
 API keys are stored as:
 
@@ -369,7 +439,6 @@ API keys are stored as:
 - `key_prefix`: derived from the secret for identification/useful listing.
 - `status`: `active` or `revoked`.
 - `expires_at`: optional expiration.
-- `allowed_models`: list of permitted models. `NULL` or `[]` (empty list) are interpreted as "all models allowed".
 - usage telemetry: `last_used_at`, `last_ip`.
 - `owner_account_id`: the member the key belongs to, set from the acting subject on create/rotate.
   Distinct from the project's owning account -- a lead who is not the owner may mint keys. This is
@@ -433,6 +502,7 @@ read, never rewritten, never regenerated into our own format.
   - Rejects revoked/expired keys.
   - Records usage telemetry (last used timestamp).
   - Returns key/project/account context via RFC 7662 introspection.
+  - Is also the ownership authority for the usage query API — see "Identity context resolution" below.
 
 - MCP API (`lightbridge-mcp`)
   - Exposes authz CRUD and validation operations as MCP tools under `/mcp`.
@@ -464,6 +534,7 @@ lookup lives in `crates/lightbridge-authz-rest/src/handlers/opa.rs`).
 Backs the `lightbridge-keycloak-spi` IdP adapter, which seals `account_id`/`project_id` into JWTs at token-exchange time. The adapter reads the authenticated `subject` and a `project_id` form param on the exchange, resolves the context, and a dumb protocol mapper copies it into claims. Stateless — no store.
 
 - Resolve — `POST /idp/v1/resolve-context` on the OPA/validation server, **Basic-auth protected** (the adapter presents the OPA credentials; the endpoint returns tenant context so it must not be publicly reachable). Body `{subject, project_id}` → `{account_id, project_id}`. Since ADR-0006 a project resolves when the subject owns its account (`projects.account_id = $2`, the account id being the subject itself) **or** holds a `project_members` row for it; a non-member or unknown project is a uniform `404` — deliberately indistinguishable, so the endpoint never leaks which projects exist. Handler: `crates/lightbridge-authz-rest/src/handlers/idp.rs`; repo method `resolve_context` in `crates/lightbridge-authz-api-key/src/repo.rs`.
+- Authorize usage scope — `POST /idp/v1/authorize-usage-scope` on the OPA/validation server, **Basic-auth protected**, added by #570 as the ownership authority `lightbridge-authz-usage`'s query listener calls for `account`/`project` usage-query scopes (D14 of ADR-0028: no service reads another service's tables, so the usage side never grows an authz-DB pool). Body `{issuer, subject, scope, scope_id}` → `200` on ownership, uniform `404` on any miss (unknown `scope_id`, non-member `subject`) — the same non-oracle convention `resolve-context` uses. Handler: `crates/lightbridge-authz-rest/src/handlers/idp.rs`'s `authorize_usage_scope`; repo method `StoreRepo::authorize_usage_scope` in `crates/lightbridge-authz-api-key/src/repo.rs`. Tests: `crates/lightbridge-authz-rest/tests/opa_tests.rs`, `crates/lightbridge-authz-api-key/tests/authorize_usage_scope_tests.rs`.
 
 This exchange (the legacy `lightbridge-keycloak-spi` + protocol-mapper path above) seals only `account_id`/`project_id` into the JWT — never `role`/`quota_tier`/`project_quota`. The consequence is that switching project means requesting a new token, not sending a different header on this path.
 
@@ -537,10 +608,37 @@ Key config fields:
 
 - `server.api`: address/port/tls paths — carries no codec key; see below.
 - `server.opa`: address/port/tls paths + basic auth credentials
-- `server.usage`: address/port/tls paths for usage service
+- `server.usage`: address/port/tls paths for `lightbridge-authz-usage`'s unauthenticated ingest
+  listener.
+- `server.query` (`lightbridge-authz-usage` only, mandatory, non-`Option`): address/port/tls paths
+  for the mTLS-required query listener (`/usage/v1/usage/query` + `/usage/v1/spend/query`, #347),
+  plus `tls.client_ca_bundle_path` — what actually turns mTLS on. Source: `config.rs:7-52` in
+  `crates/lightbridge-authz-usage`.
+- `oauth2` (`lightbridge-authz-usage` only, mandatory, non-`Option`): validates the end-user bearer
+  token `/usage/v1/usage/query` now requires (#570) — reuses the shared `Oauth2` type but only ever
+  reads `jwks_url`.
+- `scope_authority` (`lightbridge-authz-usage` only, mandatory, non-`Option`): HTTP client config
+  (`base_url`/`username`/`password` required; `insecure_skip_verify`/`ca_bundle_path`/
+  `client_cert_path`/`client_key_path`/`timeout_ms` defaulted) for calling `authz-opa`'s
+  `POST /idp/v1/authorize-usage-scope` — the ownership authority `/usage/v1/usage/query` calls for
+  `account`/`project` scopes (#570).
 - `database.url`: Postgres connection string
 - `oauth2.jwks_url`: JWKS endpoint (Keycloak in local compose)
 - `redis.url`: mandatory for `authz-api`, `authz-idp`, `authz-budget` — see below.
+- `oauth2.relying_party`, `oauth2.token_exchange` (with `enabled: true` and `openid` in
+  `allowed_scopes`): both mandatory for `authz-idp` (ADR-0023) — see "The authz-idp surface is
+  mandatory" below.
+- `oauth2.relying_party.token_encryption_key` (ADR-0024): mandatory, base64url-encoded 32 bytes,
+  MUST differ from `oauth2.relying_party.state_encryption_key` — `KeycloakRelyingParty::new`
+  refuses to start otherwise. Seals the Keycloak token set at rest; rotating it makes every
+  previously-sealed row permanently unopenable (treated as "no stored token", never deleted).
+- `oauth2.federation.issuer` (ADR-0025) is the ONE issuer field — the `iss` claim value, what the
+  browser is sent to, what tokens validate against. `oauth2.relying_party.issuer` was REMOVED (it
+  used to have to be kept byte-equal to this by hand). `oauth2.federation.discovery_url` (optional,
+  defaults to `issuer`) is a separate LOCATION override for where `authz-idp` dials OIDC discovery
+  from inside this deployment's own network — see `docs/auth-reference.md`'s "Identity vs.
+  location" section and ADR-0025's amendment for the full story, and
+  `.docker/authz/container.yaml` for the local-Compose example where the two diverge.
 
 ### CBOR is the only transport codec for the RPC/CRUD surface (ADR-0013)
 
@@ -591,6 +689,41 @@ Redis."* Concretely:
   with `redis` entirely absent from their YAML. Enforcement lives per-component inside
   `start_api_server`/`start_idp_server`/`start_budget_server`
   (`crates/lightbridge-authz-rest/src/lib.rs`), not on the shared config struct.
+
+### The authz-idp surface is mandatory — every route, every deployment (ADR-0023)
+
+**House rule, from the repo owner:** *"Let's not make something from the IdP optional anymore.
+It's a full IDP now."* The same shape as the Redis rule above, applied to `authz-idp`'s two other
+dependencies:
+
+- `oauth2.relying_party` and `oauth2.token_exchange` **refuse to start** `authz-idp` when either is
+  absent, or when `token_exchange.enabled` is `false`, or when `token_exchange.allowed_scopes`
+  omits `openid` — loudly, at startup, never a silent degradation. `Config.oauth2.relying_party`/
+  `Config.oauth2.token_exchange` stay `Option` at the type level (`authz-api`/`authz-opa`/
+  `authz-budget`/`lightbridge-mcp` load the same `Oauth2` type and never set either), but
+  enforcement is unconditional inside `start_idp_server`
+  (`crates/lightbridge-authz-rest/src/lib.rs`), not a config-driven mount decision.
+- **There is no neutralisation escape hatch and no mount-conditional gate.** `build_idp_router`
+  takes `relying_party`/`token_exchange` as owned, non-`Option` parameters — `/authorize`,
+  `/device/verify`, `/idp/callback`, `/oauth2/token`, `/oauth2/revoke`, `/oauth2/userinfo`,
+  `/oauth2/end_session`, and
+  `/oauth2/device_authorization` are all mounted unconditionally, and discovery
+  (`DiscoveryCapabilities::full_idp()`) always advertises all of them.
+- **Enforcement for `relying_party` is presence PLUS the existing offline validation** — unlike the
+  Redis rule's presence-only posture. `KeycloakRelyingParty::new` is fully synchronous and offline
+  (validates shape: timeout, TTL, base64url 32-byte state key, exact callback URL/path — never
+  dials Keycloak), so validating it at startup costs no ordering dependency on a live third party.
+  This deliberately does **not** fetch Keycloak discovery at startup — that would be the same
+  mistake the Redis rule's "presence-only, not a `PING`" reasoning warns against, aimed at an
+  external IdP instead of an in-cluster Redis.
+- **Do not reintroduce PR #473's mount-conditional gate.** #473 (`468084a`) made `relying_party`
+  optional again after #463 (`9e0ef4d`) made it (wrongly, unconditionally) required — but #473's fix
+  left a live defect: discovery advertised `device_code` (gated only on `token_exchange`) while
+  `/device/verify` 404'd, because the RP-leg silently wasn't mounted. "Optional" and "half-broken"
+  were the same state for that field. ADR-0023 closes this for good; see that ADR for the full
+  chain and the regression test
+  (`build_idp_router_mounts_authorize_device_verify_and_callback_unconditionally`,
+  `crates/lightbridge-authz-rest/tests/idp_server_tests.rs`) that would have caught it.
 
 ### Environment Variable Interpolation
 
@@ -683,9 +816,9 @@ These tests include:
 
 ### Persistence tests (it-tests)
 
-The Postgres-backed `lightbridge-authz-api-key` tests (rotate/limits) and `lightbridge-authz-budget` tests (ledger writes, replay, policy store, refill/review services) are guarded by the `it-tests` feature so they only compile/run when requested. This keeps the default `cargo test` free of database setup, and lets us treat these as Docker-backed integration tests.
+The Postgres-backed `lightbridge-authz-api-key` tests (rotate/limits), `lightbridge-authz-budget` tests (ledger writes, replay, policy store, refill/review services), and `lightbridge-authz-usage-rest` tests (`repo_it_tests`, `spend_query_it_tests`, `scope_ownership_it_tests`) are guarded by the `it-tests` feature so they only compile/run when requested. This keeps the default `cargo test` free of database setup, and lets us treat these as Docker-backed integration tests.
 
-Run them with `just it-tests`, which brings up the `postgresql`/`redis` services, waits a moment, then sets `DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"` before invoking `lightbridge-authz-api-key`, `lightbridge-authz-budget`, and `lightbridge-authz-rest` with `--features it-tests`. These tests exercise the migrations under `sqlx::test`.
+Run them with `just it-tests`, which brings up the `postgresql`/`redis` services, waits a moment, then sets `DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"` before invoking `lightbridge-authz-api-key`, `lightbridge-authz-budget`, `lightbridge-authz-rest`, and `lightbridge-authz-usage-rest` with `--features it-tests`. These tests exercise the migrations under `sqlx::test` — `lightbridge-authz-usage-rest`'s own migrations under `migrations-usage/` are deliberately written to run against this same plain Postgres, not a dedicated TimescaleDB (production runs plain Postgres today; Timescale-shaped CI is deferred to a later phase of #581, gated on that epic's storage-image decision).
 
 ### Load Tests
 
@@ -745,11 +878,27 @@ Traces capture the full lifecycle of a validation request, including database lo
 - Keep secrets out of logs and persisted storage:
   - only store `key_hash` in DB
   - return plaintext `secret` only on create/rotate responses
+  - the Keycloak refresh token is sealed AES-256-GCM at rest (`federated_identities.token_envelope`,
+    ADR-0024) under `oauth2.relying_party.token_encryption_key`; the access token is never stored
+    at all, and every struct carrying a credential-bearing field (`TokenResponse`,
+    `KeycloakTokenSet`) gets a hand-written, redacting `Debug` impl — never `#[derive(Debug)]`
 - Treat validation endpoints as security-sensitive:
   - do constant-time comparisons where relevant (currently Basic auth is direct string compare; acceptable for local/dev but may be upgraded)
   - avoid leaking details in error responses (validation returns generic `unauthorized`)
 - Maintain stable API contracts:
   - changes should update OpenAPI and docs together
+- **The `authz-ui` pin is a deploy, not a dependency.** `Dockerfile`'s `ARG AUTHZ_UI_REF=` is the
+  single place this repo records which login-page bundle ships, and it is pinned by **digest**,
+  never by tag and never by `latest`. Bumping it changes what real users see at the authentication
+  boundary, so it is reviewed like a code change: dependency automation is explicitly configured
+  not to touch it (`.github/dependabot.yml`'s `docker` `ignore:` block), and the bump procedure is
+  documented at the ARG itself. The UI ships first and stays backward-compatible; the pin bump is
+  what makes it live (ADR-0029). **Since lightbridge-authz#607, the pin is no longer independently
+  revertible** (ADR-0029's Update): the RP leg `303`s into SPA routes (`/ui/device`,
+  `/ui/device/confirm`, `/ui/device/invalid`, `/ui/device/success`, `/ui/error`) that only exist in
+  artifacts carrying `dist/routes.json`, so reverting the pin alone can leave Rust redirecting into
+  paths an older bundle has no manifest for — a 404 at the authentication boundary. The rollback
+  unit is the whole cutover PR (pin + handoff + allowlist), not the pin alone.
 
 ## Security Notes
 
@@ -764,12 +913,29 @@ Traces capture the full lifecycle of a validation request, including database lo
   that **requires and verifies a client certificate (mTLS)**. `authz-api`/`authz-budget` present
   their own TLS cert as that client identity (`Config.usage_service.client_cert_path`/
   `client_key_path`), since the deployed `authz-tls` cert already carries both `serverAuth` and
-  `clientAuth` in its `extendedKeyUsage`. This authenticates "a legitimate lightbridge workload
-  holding a CA-signed cert", not a specific caller identity -- see
-  `crates/lightbridge-authz-core/src/server.rs`'s `build_mtls_config` and
+  `clientAuth` in its `extendedKeyUsage`. mTLS alone authenticates "a legitimate lightbridge
+  workload holding a CA-signed cert", not a specific caller identity or what it's entitled to see
+  -- see `crates/lightbridge-authz-core/src/server.rs`'s `build_mtls_config` and
   `crates/lightbridge-authz-budget/src/spend.rs`'s `UsageServiceSpendReader` doc comments for the
   full posture and the fail-closed contract (a rejected/missing/expired client cert resolves to
   `Spend::Unavailable`, never a silent bypass).
+  - **`/usage/v1/usage/query` now ALSO requires an end-user bearer token plus an ownership check
+    (#570/#603/#605), closing the cross-tenant gap mTLS alone left open.** On top of mTLS, the
+    handler (`crates/lightbridge-authz-usage/src/handlers/query.rs`) requires
+    `Authorization: Bearer <token>` (JWKS-validated via `lightbridge-authz-bearer`) and, for
+    `scope=account`/`scope=project`, calls `authz-opa`'s `POST /idp/v1/authorize-usage-scope` to
+    confirm the token's subject owns the requested scope. `scope=user` is allowed only when
+    `scope_id` equals the caller's own subject (no remote call). `scope=all` (estate-wide) instead
+    requires the `usage:read-all` permission (`Permission::UsageReadAll`, ADR granted to
+    `lightbridge-admin` by default, #605). `scope=api_key` has no resolvable ownership authority
+    and is refused unconditionally. Missing/invalid bearer -> `401`; unauthorized, or the
+    authority being unreachable/erroring -> `403`, fail-closed, never treated as authorized.
+  - **`/usage/v1/spend/query` stays mTLS-only** -- it is `authz-budget`'s legitimate cross-account
+    service-to-service reader with no per-caller ownership check by design -- but now REFUSES any
+    request carrying an `Authorization` header (#603), closing a "console catch-all-proxy" hole
+    where a misrouted browser bearer token could otherwise reach this ownerless cross-account read.
+  - See `docs/lightbridge-query-api.md` and `docs/usage-api.md` for the full contract; this section
+    is cited as authoritative by `docs/local-testing.md`.
 
 ## Migrations
 
@@ -783,6 +949,32 @@ In Compose, `authz-migrate` runs before API/OPA start.
 This is a documented ADR-0038 exception (see "Persistence" below), not the target state — new
 schema goes through `crates/lightbridge-authz-api/schema/authz.cstack` and cratestack's migration
 generator where it can.
+
+**Before adding a migration, check that its version prefix is free — including on `main`:**
+
+```bash
+git fetch origin && git ls-tree --name-only origin/main migrations/ | sed 's#.*/##; s/_.*//' | sort | uniq -d
+```
+
+SQLx keys `_sqlx_migrations` by the numeric **version**, not the filename, so two files sharing a
+prefix collide on that table's primary key: the second to apply fails `23505` and aborts the whole
+run. Locally that is every `sqlx::test` in the workspace dying at setup; in a deployment it is
+`authz-migrate` failing at startup, so nothing comes up at all.
+
+**Neither PR's CI can catch this** — each branch contains only its own migration, so the collision
+exists solely in the merge result. Two green PRs turned `main` red exactly this way on 2026-08-30
+(#564 × #565, healed by #568). A same-day pair is the common case, since everyone reaches for
+today's date as the prefix.
+
+Two rules once a collision has happened:
+
+- **A version any environment has durably applied cannot be reassigned** — `_sqlx_migrations` is
+  the record of what actually ran there. The file that moves is the one that has *not* been applied
+  anywhere durable. If both have, renumbering is not available and the fix is a new forward
+  migration.
+- **An applied migration's bytes are frozen.** SQLx stores a checksum per migration and validates
+  it on every run, so editing one — *even to add a comment* — aborts the next migrate with a
+  version mismatch. Corrections go in the owning ADR, not in the file.
 
 ## Persistence: cratestack is the only sanctioned database API (ADR-0038)
 
@@ -810,14 +1002,52 @@ hand-written SQL and direct `sqlx` dependencies.
     `crates/lightbridge-authz-api/schema/authz.cstack`).
   - `exchange_refresh_tokens`: CAS rotation via `SELECT ... FOR UPDATE`
     (`rotate_exchange_refresh_token` in `crates/lightbridge-authz-api-key/src/repo.rs`).
+  - `device_authorizations`: CAS rotation via `SELECT ... FOR UPDATE`, mirroring
+    `rotate_exchange_refresh_token`'s single-use-consume pattern -- a device code must be
+    atomically claimed exactly once across concurrent poll requests (ADR-0012 Decision 7, #423;
+    `consume_device_authorization`/`approve_device_authorization`/`deny_device_authorization` in
+    `crates/lightbridge-authz-api-key/src/repo.rs`).
+  - `authorization_codes`: a short-lived opaque code must be claimed exactly once across
+    concurrent token redemptions with `UPDATE ... WHERE consumed_at IS NULL ... RETURNING`; the
+    code/client/redirect binding is an authentication boundary that generated CRUD cannot express
+    (ADR-0019, #425; `consume_authorization_code` in
+    `crates/lightbridge-authz-api-key/src/repo.rs`).
   - `lightbridge-authz-usage`: dynamic `QueryBuilder` aggregates against the Timescale-backed
     `usage_events` table (`query_usage` in `crates/lightbridge-authz-usage/src/repo.rs`).
-- This repo runs cratestack (`cratestack-pg`) `=0.8.0` (pinned exactly in the root `Cargo.toml`,
+  - `federated_identities`: deliberately ABSENT from `authz.cstack` entirely, not merely
+    `@@allow`-less -- it carries the sealed Keycloak token envelope, so a credential-bearing table
+    must be unreachable from any generated read path, not just gated behind the coarse-RBAC check
+    a present-but-unallowed model would still have (ADR-0024 Q4; created by
+    `migrations/20260825000001_users_and_federated_identities.sql`; justified in the `User` model
+    comment in `crates/lightbridge-authz-api/schema/authz.cstack`).
+  - `secret_claims`: single-use, subject-bound claims for handing an API key secret to a human
+    without routing it through a model's context (GHSA-9pc6-965v-2c44, #538); redemption needs a
+    single-statement CAS so concurrent requests can never both obtain the same secret, which
+    generated CRUD cannot express -- the same exception class as `authorization_codes`
+    (`migrations/20260827000001_secret_claims.sql`; `consume_secret_claim` in
+    `crates/lightbridge-authz-api-key/src/repo.rs`).
+- This repo runs cratestack (`cratestack-pg`) `=0.10.0` (pinned exactly in the root `Cargo.toml`,
   which also documents why the pin cannot float past it -- see that file's `cratestack-core =
-  "=0.8.0"` block); ADR-0038's capability findings were verified against 0.7.8. Re-verify any
-  capability claim against `0.8.0` here before relying on it -- "0.5.1" was stale as of #379
-  (2026-08-20), which also corrected #375's own PR description, which had already found the pin
-  was 0.7.16 at authoring time and out of date by the time #379 landed.
+  "=0.10.0"` block); ADR-0038's capability findings were verified against 0.7.8. Re-verify any
+  capability claim against `0.10.0` here before relying on it -- this line has gone stale at every
+  single bump so far ("0.5.1" as of #379 on 2026-08-20, which also corrected #375's own PR
+  description, itself already out of date at authoring time; then "0.8.12", which survived the
+  0.9.4 bump unnoticed). **Treat it as part of the pin, not as prose:** whoever moves
+  `cratestack-core` in `Cargo.toml` moves this line in the same commit.
+- **The cratestack version must move in lockstep with the `converse-frontends` monorepo**, which
+  consumes the same schema through `@cratestack/*` and regenerates its TypeScript client with the
+  matching `@cratestack/cli`. A generated client carries version bounds derived from the generator's
+  own release line (cratestack#838), so a one-sided bump leaves the two repos resolving different
+  major-equivalent lines. Bump `Cargo.toml` here and, over there, `apps/console/package.json`,
+  `packages/authz-rpc/package.json`, and every `@cratestack/*` entry in `pnpm-workspace.yaml`'s
+  `minimumReleaseAgeExclude` (that last one is what lets a same-day release install at all).
+- **cratestack's MSRV is 1.98.0** (unchanged across the 0.9.4 -> 0.10.0 bump; it was already
+  1.98.0 at 0.9.4). CI installs `stable` via `.github/actions/rust-setup`, so it is satisfied
+  there automatically. A local toolchain older than 1.98 fails the whole workspace at resolution
+  time with `rustc 1.x is not supported by the following packages`, listing every `cratestack-*`
+  crate -- that is a stale local `rustup` default, **not** a regression introduced by the bump.
+  Fix it with `rustup update stable`, or run a one-off gate as
+  `RUSTUP_TOOLCHAIN=1.98.0 just all-checks`.
 
 ## Troubleshooting and Gotchas
 
@@ -834,10 +1064,18 @@ hand-written SQL and direct `sqlx` dependencies.
 ## Docs Index
 
 - Overview and quickstart: `README.md`
+- Run the whole platform locally (backend + frontend console) and test it end to end — issuer vs
+  discovery split, seeded Keycloak users, RBAC gating, honest usage-chart limitations, automated
+  suites, troubleshooting table: `docs/local-testing.md`
+- Code size baseline and the 200-LoC burn-down plan — measured counts, split order, what is
+  deliberately *not* achievable in the current window, and the rules for a behaviour-preserving
+  split: `docs/code-size-baseline.md`
 - Manual end-to-end protocol (OAuth2 + OPA): `docs/test-protocol.md`
 - Authorino endpoint usage + integration test: `docs/authorino-usage.md`
 - Usage ingest/query API: `docs/usage-api.md`
 - RBAC (JWT claim → permission mapping): `docs/rbac.md`
+- API key approaching-expiry visibility (`listMyExpiringApiKeys`, window/threshold rationale, why
+  there is no cross-tenant admin surface): `docs/api-key-expiry-visibility.md`
 - Governance data model + how quotas/allowlists are actually enforced at the gateway (accounts,
   projects, roster, keys; introspection, Authorino claim extraction, BackendTrafficPolicy rule
   families; worked scenarios and the gaps that remain): `docs/governance-model-and-enforcement.md`
@@ -857,6 +1095,33 @@ hand-written SQL and direct `sqlx` dependencies.
   (`docs/adr/0010-budget-domain-uses-procedures-not-cratestack-models.md`).
 - Operational runbooks (budget tier re-key cutover, a stuck refill request, rolling back a bad
   policy revision): `docs/runbooks/README.md`
+- System-level architecture front door — service/caller topology, containers, crate layering, and
+  where the rest of the picture lives: `docs/architecture/README.md`, plus
+  `docs/architecture/{services,deployment,data-model,budget,auth-flows}.md` and the overview at
+  `docs/architecture.md`.
+- Usage query API field-by-field reference (request/response shapes, the #570 ownership gate,
+  latency semantics): `docs/lightbridge-query-api.md`.
+- Auth/token reference dictionary — config key → effect, JWT claim shapes (including the
+  `client_credentials`/`service_token_extra` claim set), discovery-document fields:
+  `docs/auth-reference.md`.
+- Per-platform Helm install/config/deploy commands: `docs/platform-guides.md`.
+- OAuth/OIDC standards gap and delivery roadmap: `docs/oauth-oidc-standards-roadmap.md`.
+- Task guide for integrating a client against native token exchange:
+  `docs/token-exchange-integration.md`.
+- Usage-store ADRs: one store partitioned by grain, source is a dimension
+  (`docs/adr/0027-one-usage-store-partitioned-by-grain.md`, amended by
+  `docs/adr/0028-finops-first-settles-the-usage-store-conventions.md`); the `authz-idp` login UI as
+  a pinned external artifact (`docs/adr/0029-the-authz-idp-login-ui-is-a-pinned-external-artifact.md`);
+  `client_credentials` as a first-class `authz-idp` grant
+  (`docs/adr/0030-client-credentials-is-a-first-class-authz-idp-grant.md`).
+- Multi-source usage epic plan of work (decision register D1-D23):
+  `docs/plans/0581-multi-source-usage-plan-of-work.md`.
+- The F1-F6 genai usage-ingestion audit the usage-store ADRs keep citing:
+  `docs/research/2026-08-25-genai-usage-ingestion.md`.
+- RFC index: `docs/rfc/README.md`.
+
+There is no `docs/adr/README.md` — this Docs Index is the only ADR index in this repo; browse
+`docs/adr/` directly for the full numbered list.
 
 ## Helm / deployment notes
 
@@ -872,8 +1137,42 @@ hand-written SQL and direct `sqlx` dependencies.
 
 - Deployments now hardcode `containerPort: 3000` for both controllers so Kubernetes records the exposed port, aligning with service target ports.
 
-- A brand-new `lightbridge-migrate` chart (aliased `migration` under `charts/lightbridge-authz-stack`) runs `lightbridge-authz migrate --config-path /tmp/lightbridge-config/config.yaml` as a `pre-install/pre-upgrade` job so schema migrations happen before the API/OPA controllers become active. It reuses the ambient `lightbridge-authz-config` config map, shares the same image artifacts, and exposes TTL/backoff knobs to keep the job brief.
-- That migration chart is now built on the `bjw-s/common v4` app-template library, so the job/configmap/secret skeletal resources are rendered by the shared loader instead of bespoke templates, keeping the chart plumbing consistent with the rest of the stack.
+- **Correction:** there is no separate `lightbridge-migrate` chart and no `migration` alias.
+  `charts/lightbridge-authz-stack`'s six dependencies are `api`/`opa`/`idp`/`budget` (all the same
+  `charts/lightbridge-authz` chart, different aliases), `usage`, and `mcp` — see that chart's
+  `Chart.yaml`. Schema migrations instead run as `controllers.migrate` INSIDE the shared
+  `charts/lightbridge-authz` chart (and, separately, inside `charts/lightbridge-authz-usage` for
+  usage-store migrations): `lightbridge-authz migrate --config-path /etc/lightbridge/config.yaml`,
+  reusing the ambient config map and the same image. Per ADR-0016 (`docs/adr/0016-migrate-job-sync-
+  wave-not-hook.md`) this is deliberately NOT a Helm hook — a `post-install,post-upgrade` hook is an
+  ArgoCD PostSync hook that only fires once every non-hook resource (including the main Deployment)
+  is already Healthy, which deadlocks the moment a migration is itself a precondition for the new
+  pods' readiness probe (hit in prod 2026-08-19). Instead it is an ordinary, ArgoCD-tracked `Job`
+  annotated `argocd.argoproj.io/sync-wave: "1"`, one wave earlier than the main Deployment's `"2"`,
+  regardless of whether the Deployment's pods are, or will ever be, ready. Its `suffix` folds both
+  the image tag AND the rendered config data into the Job name (bjw-s stamps a config-checksum
+  annotation into the pod template, so a config-only change would otherwise re-render the SAME Job
+  name with a DIFFERENT, immutable `spec.template` and fail the whole app's sync — hit twice in
+  prod 2026-08-24, #480); `ttlSecondsAfterFinished: 604800` (7 days) keeps a completed Job
+  inspectable via the native Kubernetes Job-controller GC path, not a Helm hook-delete policy.
+- Both migrate Jobs (`charts/lightbridge-authz`, `charts/lightbridge-authz-usage`) are built on the
+  `bjw-s/common v4` app-template library, so the job/configmap/secret skeletal resources are
+  rendered by the shared loader instead of bespoke templates, keeping the chart plumbing consistent
+  with the rest of the stack.
+- `charts/lightbridge-authz-usage` (#593/#570/#603): `configMaps.config.data."config.yaml"` renders
+  BOTH the `server.usage` (ingest) and `server.query` (mTLS) listeners — `UsageServerGroup::query`
+  is a non-`Option` field, so a config omitting it fails to load. mTLS is default-ON:
+  `config.query.tls.clientCaBundlePath` defaults to `/etc/lightbridge/tls/ca.crt`; setting it to
+  `""` explicitly drops BOTH the query listener's containerPort and its Service port entirely
+  (`templates/common.yaml`), trading "query endpoint unreachable" for "config still loads," never
+  "reachable and unauthenticated." Ports: ingest `3000` (this chart's pre-existing port, left
+  unchanged — deliberately NOT full parity with Compose's ingest `3002`) / query `3006` (matching
+  every other reference to this listener in the repo). `config.oauth2.jwksUrl` and every
+  `config.scopeAuthority.*` field (`baseUrl`/`username`/`password`/`caBundlePath`) are likewise
+  mandatory (`UsageConfig::oauth2`/`UsageConfig::scope_authority` are non-`Option`) and MUST be
+  supplied correctly in the SAME ROLLOUT that enables this version of the chart — a bad value fails
+  the `migrate` Job first (earlier sync-wave), failing the whole ArgoCD app sync, not just this
+  chart's own rollout.
 
 <!-- ai-governance:stanza -->
 <!-- BEGIN: AI Governance stanza (managed by ADORSYS-GIS/ai-governance) -->

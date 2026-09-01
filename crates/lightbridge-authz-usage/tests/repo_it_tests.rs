@@ -1,5 +1,8 @@
 #![cfg(feature = "it-tests")]
 
+#[path = "support/mod.rs"]
+mod support;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::{Duration, Utc};
@@ -37,7 +40,20 @@ fn sample_event(observed_at: chrono::DateTime<Utc>) -> UsageEvent {
         completion_tokens: Some(4),
         total_tokens: Some(10),
         total_cost: Some(0.05),
+        latency_ms: Some(410.0),
         attributes: json!({"k": "v"}),
+    }
+}
+
+fn event_with_latency(
+    observed_at: chrono::DateTime<Utc>,
+    model: &str,
+    latency_ms: Option<f64>,
+) -> UsageEvent {
+    UsageEvent {
+        model: Some(model.to_string()),
+        latency_ms,
+        ..sample_event(observed_at)
     }
 }
 
@@ -93,7 +109,7 @@ async fn query_usage_aggregates_inserted_events_by_group(pool: PgPool) {
         ..base_query(now)
     };
 
-    let points = repo
+    let (points, _truncated) = repo
         .query_usage(&request)
         .await
         .expect("query should succeed");
@@ -119,7 +135,7 @@ async fn query_usage_without_group_by_collapses_into_a_single_bucket(pool: PgPoo
         .await
         .expect("insert should succeed");
 
-    let points = repo
+    let (points, _truncated) = repo
         .query_usage(&base_query(now))
         .await
         .expect("query should succeed");
@@ -149,7 +165,7 @@ async fn query_usage_scopes_by_account_project_api_key_and_user(pool: PgPool) {
             ..base_query(now)
         };
 
-        let points = repo
+        let (points, _truncated) = repo
             .query_usage(&request)
             .await
             .expect("query should succeed");
@@ -160,6 +176,49 @@ async fn query_usage_scopes_by_account_project_api_key_and_user(pool: PgPool) {
             "scope_id {scope_id} should match the seeded event"
         );
     }
+}
+
+/// `scope=all` adds no entity filter at all (`repo::push_scope_filters`'s `All` arm is a no-op
+/// beyond the time range) -- proved here by seeding events under TWO different `account_id`s and
+/// asserting a single `scope=all` query sums requests across BOTH of them, not just one.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn query_usage_scope_all_spans_multiple_accounts(pool: PgPool) {
+    let repo = build_repo(pool);
+    let now = Utc::now();
+    let event_a = UsageEvent {
+        account_id: Some("acct_a".to_string()),
+        project_id: Some("proj_a".to_string()),
+        ..sample_event(now)
+    };
+    let event_b = UsageEvent {
+        account_id: Some("acct_b".to_string()),
+        project_id: Some("proj_b".to_string()),
+        ..sample_event(now)
+    };
+    repo.insert_usage_events(&[event_a, event_b])
+        .await
+        .expect("insert should succeed");
+
+    let request = UsageQueryRequest {
+        scope: UsageScope::All,
+        scope_id: String::new(),
+        ..base_query(now)
+    };
+
+    let (points, _truncated) = repo
+        .query_usage(&request)
+        .await
+        .expect("query should succeed");
+
+    assert_eq!(
+        points.len(),
+        1,
+        "both accounts' events land in the same bucket with no group_by"
+    );
+    assert_eq!(
+        points[0].requests, 2,
+        "scope=all must sum requests across both acct_a and acct_b"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations-usage")]
@@ -175,7 +234,7 @@ async fn query_usage_returns_empty_when_scope_id_does_not_match(pool: PgPool) {
         ..base_query(now)
     };
 
-    let points = repo
+    let (points, _truncated) = repo
         .query_usage(&request)
         .await
         .expect("query should succeed");
@@ -197,7 +256,7 @@ async fn query_usage_returns_empty_when_time_window_excludes_events(pool: PgPool
         ..base_query(now)
     };
 
-    let points = repo
+    let (points, _truncated) = repo
         .query_usage(&request)
         .await
         .expect("query should succeed");
@@ -227,7 +286,7 @@ async fn query_usage_applies_every_optional_filter(pool: PgPool) {
         ..base_query(now)
     };
 
-    let points = repo
+    let (points, _truncated) = repo
         .query_usage(&request)
         .await
         .expect("query should succeed");
@@ -251,7 +310,7 @@ async fn query_usage_filters_exclude_non_matching_events(pool: PgPool) {
         ..base_query(now)
     };
 
-    let points = repo
+    let (points, _truncated) = repo
         .query_usage(&request)
         .await
         .expect("query should succeed");
@@ -281,7 +340,11 @@ async fn query_usage_rejects_an_unsupported_bucket_interval(pool: PgPool) {
 async fn healthz_ready_reports_ok_against_a_live_database(pool: PgPool) {
     let readiness_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
     let repo = Arc::new(build_repo(pool));
-    let state = Arc::new(UsageState { repo });
+    let state = Arc::new(UsageState {
+        repo,
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
+    });
     let app = build_ingest_router(state, readiness_pool, false);
 
     let response = app
@@ -295,4 +358,424 @@ async fn healthz_ready_reports_ok_against_a_live_database(pool: PgPool) {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// `percentile_cont` is an interpolating ordered-set aggregate, so for the 100 values 1..=100 the
+/// answers are exact and hand-checkable: Postgres indexes at `p * (n - 1)` and interpolates
+/// linearly between neighbours, giving 0.5 -> 49.5 -> 50.5, 0.95 -> 94.05 -> 95.05, and
+/// 0.99 -> 98.01 -> 99.01. Asserting those exact numbers -- rather than a range -- is what makes
+/// this test able to catch a wrong percentile argument, a `percentile_disc` swap, or a unit slip.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn query_usage_reports_percentiles_over_recorded_latency(pool: PgPool) {
+    let repo = build_repo(pool);
+    let now = Utc::now();
+    let events: Vec<UsageEvent> = (1..=100)
+        .map(|ms| event_with_latency(now, "gpt-4.1", Some(f64::from(ms))))
+        .collect();
+
+    repo.insert_usage_events(&events)
+        .await
+        .expect("insert should succeed");
+
+    let (points, _truncated) = repo
+        .query_usage(&base_query(now))
+        .await
+        .expect("query should succeed");
+
+    assert_eq!(points.len(), 1);
+    let point = &points[0];
+    assert_eq!(point.latency_samples, 100);
+    assert_eq!(point.latency_p50_ms, Some(50.5));
+    assert_eq!(point.latency_p95_ms, Some(95.05));
+    assert_eq!(point.latency_p99_ms, Some(99.01));
+}
+
+/// The honest-absence case, and the reason the percentile fields are `Option<f64>` rather than
+/// `f64`. An aggregate metric signal (OTLP histogram/summary) records no per-request duration at
+/// all, so a bucket made only of those rows must come back as "no samples, no percentiles" --
+/// never as `0.0`, which the console would draw as a chart of instantaneous responses.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn query_usage_reports_no_percentiles_when_nothing_recorded_a_latency(pool: PgPool) {
+    let repo = build_repo(pool);
+    let now = Utc::now();
+    let events = vec![
+        event_with_latency(now, "gpt-4.1", None),
+        event_with_latency(now, "gpt-4.1", None),
+    ];
+
+    repo.insert_usage_events(&events)
+        .await
+        .expect("insert should succeed");
+
+    let (points, _truncated) = repo
+        .query_usage(&base_query(now))
+        .await
+        .expect("query should succeed");
+
+    assert_eq!(points.len(), 1);
+    let point = &points[0];
+    assert_eq!(point.requests, 2);
+    assert_eq!(point.latency_samples, 0);
+    assert_eq!(point.latency_p50_ms, None);
+    assert_eq!(point.latency_p95_ms, None);
+    assert_eq!(point.latency_p99_ms, None);
+}
+
+/// Mixed bucket: rows without a latency must not participate as zeros. If they did, the median of
+/// (100, 200, 300) plus two NULL rows would come out at 200 -> 100 rather than staying 200.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn query_usage_percentiles_ignore_rows_that_reported_no_latency(pool: PgPool) {
+    let repo = build_repo(pool);
+    let now = Utc::now();
+    let events = vec![
+        event_with_latency(now, "gpt-4.1", Some(100.0)),
+        event_with_latency(now, "gpt-4.1", Some(200.0)),
+        event_with_latency(now, "gpt-4.1", Some(300.0)),
+        event_with_latency(now, "gpt-4.1", None),
+        event_with_latency(now, "gpt-4.1", None),
+    ];
+
+    repo.insert_usage_events(&events)
+        .await
+        .expect("insert should succeed");
+
+    let (points, _truncated) = repo
+        .query_usage(&base_query(now))
+        .await
+        .expect("query should succeed");
+
+    let point = &points[0];
+    assert_eq!(point.requests, 5);
+    assert_eq!(point.latency_samples, 3);
+    assert_eq!(point.latency_p50_ms, Some(200.0));
+}
+
+/// Per-series honesty end to end: grouping by model, one model reports latency and the other does
+/// not. The console needs to be able to name exactly which series is missing data, which is only
+/// possible if `latency_samples` is carried per group rather than collapsed across the bucket.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn query_usage_reports_latency_per_group_so_one_silent_model_does_not_blank_the_rest(
+    pool: PgPool,
+) {
+    let repo = build_repo(pool);
+    let now = Utc::now();
+    let events = vec![
+        event_with_latency(now, "gpt-4.1", Some(410.0)),
+        event_with_latency(now, "gpt-4.1", Some(430.0)),
+        event_with_latency(now, "embed-3", None),
+    ];
+
+    repo.insert_usage_events(&events)
+        .await
+        .expect("insert should succeed");
+
+    let mut query = base_query(now);
+    query.group_by = vec![UsageGroupBy::Model];
+
+    let (points, _truncated) = repo
+        .query_usage(&query)
+        .await
+        .expect("query should succeed");
+
+    assert_eq!(points.len(), 2);
+
+    let chat = points
+        .iter()
+        .find(|point| point.model.as_deref() == Some("gpt-4.1"))
+        .expect("gpt-4.1 series should be present");
+    assert_eq!(chat.latency_samples, 2);
+    assert_eq!(chat.latency_p50_ms, Some(420.0));
+
+    let embed = points
+        .iter()
+        .find(|point| point.model.as_deref() == Some("embed-3"))
+        .expect("embed-3 series should be present, not dropped");
+    assert_eq!(embed.latency_samples, 0);
+    assert_eq!(embed.latency_p95_ms, None);
+}
+
+/// The sparse case the console has to render honestly. One request in the bucket means every
+/// percentile collapses onto that single observation -- `percentile_cont` cannot say anything
+/// else. `latency_samples` is what lets the UI mark it unstable instead of drawing a confident
+/// p99.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn query_usage_collapses_every_percentile_onto_a_lone_sample(pool: PgPool) {
+    let repo = build_repo(pool);
+    let now = Utc::now();
+
+    repo.insert_usage_events(&[event_with_latency(now, "gpt-4.1", Some(777.0))])
+        .await
+        .expect("insert should succeed");
+
+    let (points, _truncated) = repo
+        .query_usage(&base_query(now))
+        .await
+        .expect("query should succeed");
+
+    let point = &points[0];
+    assert_eq!(point.latency_samples, 1);
+    assert_eq!(point.latency_p50_ms, Some(777.0));
+    assert_eq!(point.latency_p95_ms, Some(777.0));
+    assert_eq!(point.latency_p99_ms, Some(777.0));
+}
+
+fn event_at_hour(base: chrono::DateTime<Utc>, hour_offset: i64, usage_value: f64) -> UsageEvent {
+    UsageEvent {
+        usage_value,
+        ..sample_event(base + Duration::hours(hour_offset))
+    }
+}
+
+/// #578 regression (fail-first proved separately -- see the PR/commit description for the
+/// before/after run against the pre-fix `ORDER BY bucket_start ASC LIMIT $n` query): N + 1 hourly
+/// buckets, `limit = N`, must return the NEWEST N buckets (dropping the oldest), still in
+/// ascending order, with `truncated: true`. The pre-fix query kept the OLDEST N buckets instead --
+/// this test's `usage_value` assertions (0.0 was the oldest, dropped; 1.0/2.0/3.0 survive) are
+/// exactly what would fail under that behavior.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn query_usage_truncation_drops_the_oldest_bucket_and_sets_truncated_true(pool: PgPool) {
+    let repo = build_repo(pool);
+    let base = Utc::now();
+    let events = vec![
+        event_at_hour(base, 0, 0.0),
+        event_at_hour(base, 1, 1.0),
+        event_at_hour(base, 2, 2.0),
+        event_at_hour(base, 3, 3.0),
+    ];
+    repo.insert_usage_events(&events)
+        .await
+        .expect("insert should succeed");
+
+    let request = UsageQueryRequest {
+        start_time: base - Duration::hours(1),
+        end_time: base + Duration::hours(4),
+        bucket: "1 hour".to_string(),
+        limit: 3,
+        ..base_query(base)
+    };
+
+    let (points, truncated) = repo
+        .query_usage(&request)
+        .await
+        .expect("query should succeed");
+
+    assert!(
+        truncated,
+        "4 buckets with limit 3 must report truncated: true"
+    );
+    assert_eq!(points.len(), 3, "exactly `limit` buckets must be returned");
+
+    let usage_values: Vec<f64> = points.iter().map(|p| p.usage_value).collect();
+    assert_eq!(
+        usage_values,
+        vec![1.0, 2.0, 3.0],
+        "the OLDEST bucket (usage_value 0.0) must be dropped, newest 3 kept in ascending order"
+    );
+    // Response order is ascending, unchanged from before this fix.
+    for window in points.windows(2) {
+        assert!(window[0].bucket_start < window[1].bucket_start);
+    }
+}
+
+/// #578: exactly `limit` buckets must report `truncated: false` -- the boundary case that proves
+/// the fetch-`limit + 1` logic doesn't off-by-one into reporting truncation when there was none.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn query_usage_reports_truncated_false_when_bucket_count_equals_limit(pool: PgPool) {
+    let repo = build_repo(pool);
+    let base = Utc::now();
+    let events = vec![
+        event_at_hour(base, 0, 0.0),
+        event_at_hour(base, 1, 1.0),
+        event_at_hour(base, 2, 2.0),
+    ];
+    repo.insert_usage_events(&events)
+        .await
+        .expect("insert should succeed");
+
+    let request = UsageQueryRequest {
+        start_time: base - Duration::hours(1),
+        end_time: base + Duration::hours(4),
+        bucket: "1 hour".to_string(),
+        limit: 3,
+        ..base_query(base)
+    };
+
+    let (points, truncated) = repo
+        .query_usage(&request)
+        .await
+        .expect("query should succeed");
+
+    assert!(
+        !truncated,
+        "exactly 3 buckets with limit 3 must not be truncated"
+    );
+    assert_eq!(points.len(), 3);
+    let usage_values: Vec<f64> = points.iter().map(|p| p.usage_value).collect();
+    assert_eq!(usage_values, vec![0.0, 1.0, 2.0]);
+}
+
+fn event_at_hour_with_model(
+    base: chrono::DateTime<Utc>,
+    hour_offset: i64,
+    model: &str,
+    usage_value: f64,
+) -> UsageEvent {
+    UsageEvent {
+        model: Some(model.to_string()),
+        usage_value,
+        ..sample_event(base + Duration::hours(hour_offset))
+    }
+}
+
+fn group_by_model_query(base: chrono::DateTime<Utc>, limit: u32) -> UsageQueryRequest {
+    UsageQueryRequest {
+        start_time: base - Duration::hours(1),
+        end_time: base + Duration::hours(10),
+        bucket: "1 hour".to_string(),
+        limit,
+        group_by: vec![UsageGroupBy::Model],
+        ..base_query(base)
+    }
+}
+
+/// #578 bucket-scoping correction, case (a): multiple series per bucket, but the DISTINCT bucket
+/// count is within `limit` -- `truncated` must be `false` and every row for every series in every
+/// bucket must come back, even though the ROW count (2 buckets x 3 models = 6) is well above a
+/// row-scoped reading of the same `limit`.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn query_usage_multi_series_within_bucket_limit_is_not_truncated(pool: PgPool) {
+    let repo = build_repo(pool);
+    let base = Utc::now();
+    let events = vec![
+        event_at_hour_with_model(base, 0, "gpt-4.1", 1.0),
+        event_at_hour_with_model(base, 0, "embed-3", 2.0),
+        event_at_hour_with_model(base, 1, "gpt-4.1", 3.0),
+        event_at_hour_with_model(base, 1, "embed-3", 4.0),
+    ];
+    repo.insert_usage_events(&events)
+        .await
+        .expect("insert should succeed");
+
+    // 2 DISTINCT buckets, limit 2 buckets -- must NOT be truncated, despite 4 rows.
+    let (points, truncated) = repo
+        .query_usage(&group_by_model_query(base, 2))
+        .await
+        .expect("query should succeed");
+
+    assert!(
+        !truncated,
+        "2 distinct buckets with a bucket limit of 2 must not be truncated, regardless of row count"
+    );
+    assert_eq!(
+        points.len(),
+        4,
+        "every series in every bucket must be present"
+    );
+}
+
+/// #578 bucket-scoping correction, case (b) -- THE decisive case the row-scoped bug could not
+/// pass: 3 buckets x 2 series each (6 rows), bucket limit 2. Truncation must drop the OLDEST
+/// bucket WHOLE (both its series, not an arbitrary subset), and BOTH kept buckets must retain
+/// their FULL series set -- never a partially-represented bucket.
+///
+/// FAIL-FIRST EVIDENCE: against the prior row-scoped fix (`ORDER BY bucket_start DESC LIMIT
+/// $n+1` applied to ROWS, i.e. reverting `select_kept_buckets`/the `= ANY(kept_buckets)` filter
+/// and going back to fetching `limit + 1` ROWS directly), this test fails: `limit + 1` = 3 rows
+/// fetched, oldest 1 row dropped -- but 3 rows is not even a whole number of 2-row buckets, so the
+/// surviving 2 buckets can each have anywhere from 0 to 2 of their 2 series present, and running
+/// this test against that code confirms `points.len()` comes back as something other than 4
+/// (observed: 3, one series short in the boundary bucket) rather than every kept bucket's full
+/// series set. See this crate's git history for the exact revert/run/restore used to prove this.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn query_usage_truncation_drops_the_oldest_bucket_whole_with_group_by(pool: PgPool) {
+    let repo = build_repo(pool);
+    let base = Utc::now();
+    let events = vec![
+        event_at_hour_with_model(base, 0, "gpt-4.1", 1.0),
+        event_at_hour_with_model(base, 0, "embed-3", 2.0),
+        event_at_hour_with_model(base, 1, "gpt-4.1", 3.0),
+        event_at_hour_with_model(base, 1, "embed-3", 4.0),
+        event_at_hour_with_model(base, 2, "gpt-4.1", 5.0),
+        event_at_hour_with_model(base, 2, "embed-3", 6.0),
+    ];
+    repo.insert_usage_events(&events)
+        .await
+        .expect("insert should succeed");
+
+    // 3 DISTINCT buckets, limit 2 buckets -- the oldest bucket (hour 0) must be dropped WHOLE.
+    let (points, truncated) = repo
+        .query_usage(&group_by_model_query(base, 2))
+        .await
+        .expect("query should succeed");
+
+    assert!(
+        truncated,
+        "3 buckets with a bucket limit of 2 must be truncated"
+    );
+    assert_eq!(
+        points.len(),
+        4,
+        "both kept buckets must retain their FULL series set (2 buckets x 2 series), never a \
+         partial subset from either bucket"
+    );
+
+    let mut buckets_seen: Vec<chrono::DateTime<Utc>> =
+        points.iter().map(|p| p.bucket_start).collect();
+    buckets_seen.sort();
+    buckets_seen.dedup();
+    assert_eq!(
+        buckets_seen.len(),
+        2,
+        "exactly the 2 newest buckets must survive"
+    );
+    for bucket in &buckets_seen {
+        let series_in_bucket = points.iter().filter(|p| p.bucket_start == *bucket).count();
+        assert_eq!(
+            series_in_bucket, 2,
+            "bucket {bucket} must retain both of its series, not a subset"
+        );
+    }
+
+    // The dropped bucket's usage_value pair (1.0, 2.0) must not appear at all.
+    let usage_values: Vec<f64> = points.iter().map(|p| p.usage_value).collect();
+    assert!(
+        !usage_values.contains(&1.0) && !usage_values.contains(&2.0),
+        "the oldest bucket's series must be dropped entirely, not partially: {usage_values:?}"
+    );
+}
+
+/// #578 bucket-scoping correction, case (c) -- the exact spurious-truncation scenario named in
+/// review: 3 models x 2 buckets (6 rows), bucket limit 5. A row-scoped reading of `limit` would
+/// flag this `truncated: true` (6 rows > 5) and arbitrarily drop one row; bucket-scoped, this must
+/// stay `truncated: false` because there are only 2 distinct buckets, well within a limit of 5.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn query_usage_three_models_two_buckets_limit_five_is_not_truncated(pool: PgPool) {
+    let repo = build_repo(pool);
+    let base = Utc::now();
+    let events = vec![
+        event_at_hour_with_model(base, 0, "gpt-4.1", 1.0),
+        event_at_hour_with_model(base, 0, "embed-3", 2.0),
+        event_at_hour_with_model(base, 0, "claude-x", 3.0),
+        event_at_hour_with_model(base, 1, "gpt-4.1", 4.0),
+        event_at_hour_with_model(base, 1, "embed-3", 5.0),
+        event_at_hour_with_model(base, 1, "claude-x", 6.0),
+    ];
+    repo.insert_usage_events(&events)
+        .await
+        .expect("insert should succeed");
+
+    let (points, truncated) = repo
+        .query_usage(&group_by_model_query(base, 5))
+        .await
+        .expect("query should succeed");
+
+    assert!(
+        !truncated,
+        "6 rows across only 2 distinct buckets must not trip truncation at a bucket limit of 5"
+    );
+    assert_eq!(
+        points.len(),
+        6,
+        "every row across both buckets must be present"
+    );
 }

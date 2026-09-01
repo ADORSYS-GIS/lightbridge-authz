@@ -66,8 +66,13 @@ fn oauth2_config(jwks_url: String, audience: Option<Vec<String>>, rbac: Rbac) ->
         audience,
         signing: None,
         token_exchange: None,
+        relying_party: None,
         rbac,
         clients: Vec::new(),
+        federation: Some(lightbridge_authz_core::config::Federation {
+            issuer: "https://keycloak.example.test/realms/dev".to_string(),
+            discovery_url: None,
+        }),
     }
 }
 
@@ -81,6 +86,13 @@ fn default_rbac() -> Rbac {
 
 fn far_future_exp() -> u64 {
     4_102_444_800
+}
+
+/// The `iss` claim value used by every fixture in this file that needs one -- matches
+/// `oauth2_config`'s own `federation.issuer`, though nothing in this crate enforces `iss` against
+/// it today (deliberately -- see [`lightbridge_authz_bearer::TokenInfo::iss`]'s doc comment).
+fn test_issuer() -> &'static str {
+    "https://keycloak.example.test/realms/dev"
 }
 
 #[tokio::test]
@@ -209,6 +221,35 @@ async fn expired_token_is_rejected() {
     assert_eq!(err.to_string(), "unauthorized");
 }
 
+/// ADR-0025 Stage 2 / Finding 4 (test review): `Claims.iss` is required, not `Option<String>` --
+/// a token that carries no `iss` claim at all must be rejected outright, not silently accepted
+/// with the field defaulted to empty. This is now load-bearing behavior (the resolver seam
+/// downstream trusts `TokenInfo::iss`), so it gets its own dedicated regression test rather than
+/// relying on the five other tests' fixtures happening to include the claim. Prove-fail: making
+/// `Claims.iss`/`TokenInfo::iss` `Option<String>` (or `#[serde(default)]`) makes this test red,
+/// since the token would then deserialize successfully instead of being refused.
+#[tokio::test]
+async fn missing_iss_is_rejected() {
+    let server = MockServer::start();
+    let key = generate_test_key("no-iss-kid");
+    server.mock(|when, then| {
+        when.method(GET).path("/jwks");
+        then.header("content-type", "application/json")
+            .status(200)
+            .body(jwks_body(&[&key.jwk]));
+    });
+
+    let token = sign(
+        &key,
+        &json!({"sub": "user-no-iss", "exp": far_future_exp()}),
+    );
+
+    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()));
+
+    let err = service.validate_bearer_token(&token).await.unwrap_err();
+    assert_eq!(err.to_string(), "unauthorized");
+}
+
 #[tokio::test]
 async fn successful_validation_without_audience_config_grants_admin_permissions() {
     let server = MockServer::start();
@@ -224,6 +265,7 @@ async fn successful_validation_without_audience_config_grants_admin_permissions(
         &key,
         &json!({
             "sub": "user-admin",
+            "iss": test_issuer(),
             "exp": far_future_exp(),
             "roles": ["lightbridge-admin"],
         }),
@@ -253,7 +295,7 @@ async fn caller_without_matching_role_is_denied_by_require() {
 
     let token = sign(
         &key,
-        &json!({"sub": "user-norole", "exp": far_future_exp()}),
+        &json!({"sub": "user-norole", "iss": test_issuer(), "exp": far_future_exp()}),
     );
 
     let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()));
@@ -280,6 +322,7 @@ async fn successful_validation_with_single_string_audience() {
         &key,
         &json!({
             "sub": "user-aud",
+            "iss": test_issuer(),
             "exp": far_future_exp(),
             "aud": "expected-aud",
         }),
@@ -310,6 +353,7 @@ async fn successful_validation_with_array_audience() {
         &key,
         &json!({
             "sub": "user-aud-array",
+            "iss": test_issuer(),
             "exp": far_future_exp(),
             "aud": ["other-aud", "expected-aud"],
         }),
@@ -422,6 +466,7 @@ async fn custom_roles_claim_is_honored() {
         &key,
         &json!({
             "sub": "user-custom",
+            "iss": test_issuer(),
             "exp": far_future_exp(),
             "roles": ["lightbridge-admin"],
             "lightbridge_api_roles": "lightbridge-viewer",
@@ -439,6 +484,74 @@ async fn custom_roles_claim_is_honored() {
     assert_eq!(info.roles, vec!["lightbridge-viewer".to_string()]);
     assert!(info.has_permission(Permission::AccountRead));
     assert!(!info.has_permission(Permission::AccountDelete));
+}
+
+/// #534/ADR-0030, test 17: a `client_credentials` (M2M) access token carries the exact claim
+/// shape `lightbridge_authz_rest::signing::service_token_extra` mints -- `sub = "svc:<client_id>"`,
+/// `azp`, `typ: "Bearer"`, `lightbridge_caller_kind: "service"`, and deliberately NO `roles` claim
+/// at all (or any tenant claim a roster/roles mapping could otherwise ride in on). Fed through the
+/// SAME `BearerTokenService::validate_bearer_token` every RPC call site
+/// (`auth_provider::CratestackAuthProvider::authenticate`) actually calls, this proves the
+/// mechanism that makes "no roster row" become "zero permissions" for EVERY `Permission` this
+/// service defines -- the exact thing that makes every `@allow`/`@@allow` clause on the RPC surface
+/// deny a machine token, since `build_context` bakes `info.has_permission(permission)` into every
+/// `perm*` context field cratestack's generated policy checks read.
+///
+/// This is a stronger, more general version of `caller_without_matching_role_is_denied_by_require`
+/// above (which checks one permission): here every `Permission::ALL` member is asserted denied,
+/// and the token's claim shape is pinned to the real client_credentials contract rather than a
+/// bare no-`roles`-claim token.
+#[tokio::test]
+async fn client_credentials_style_token_has_no_roles_and_zero_permissions_for_every_permission() {
+    let server = MockServer::start();
+    let key = generate_test_key("service-kid");
+    server.mock(|when, then| {
+        when.method(GET).path("/jwks");
+        then.header("content-type", "application/json")
+            .status(200)
+            .body(jwks_body(&[&key.jwk]));
+    });
+
+    // Mirrors `service_token_extra`'s exact claim set (`crates/lightbridge-authz-rest/src/signing.rs`)
+    // plus the `sub`/`exp`/`iss`/`aud` this crate's own `Claims` type requires -- no `roles` claim
+    // anywhere, matching what that function actually stamps.
+    let token = sign(
+        &key,
+        &json!({
+            "sub": "svc:it-machine",
+            "iss": test_issuer(),
+            "exp": far_future_exp(),
+            "aud": "it-machine",
+            "azp": "it-machine",
+            "typ": "Bearer",
+            "jti": "lgbr:abc123",
+            "lightbridge_caller_kind": "service",
+            "scope": "read:usage write:usage",
+        }),
+    );
+
+    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()));
+
+    let info: TokenInfo = service.validate_bearer_token(&token).await.unwrap();
+    assert!(info.active);
+    assert_eq!(info.sub, "svc:it-machine");
+    assert!(
+        info.roles.is_empty(),
+        "a client_credentials token stamps no roles claim at all: {:?}",
+        info.roles
+    );
+    for permission in Permission::ALL {
+        assert!(
+            !info.has_permission(permission),
+            "a machine token must hold ZERO permissions -- {permission:?} was unexpectedly \
+             granted, which would let this token pass an @allow clause on the RPC surface"
+        );
+        assert!(
+            info.require(permission).is_err(),
+            "require({permission:?}) must refuse a machine token exactly like it refuses any \
+             other zero-permission caller"
+        );
+    }
 }
 
 #[tokio::test]

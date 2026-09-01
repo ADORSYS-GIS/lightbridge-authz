@@ -17,6 +17,26 @@ fn lazy_pool() -> Arc<dyn DbPoolTrait> {
     Arc::new(DbPool::from_pool(pool))
 }
 
+/// A trust-everything [`lightbridge_authz_rest::auth_provider::SubjectResolver`] test double
+/// (ADR-0025): resolves any `(iss, sub)` to `AccountId::assert_already_resolved(sub)` unconditionally,
+/// never touching a database.
+struct TrustEverythingResolver;
+
+#[lightbridge_authz_core::async_trait]
+impl lightbridge_authz_rest::auth_provider::SubjectResolver for TrustEverythingResolver {
+    async fn resolve(
+        &self,
+        _iss: &str,
+        sub: &str,
+    ) -> lightbridge_authz_core::error::Result<lightbridge_authz_core::identity::AccountId> {
+        Ok(lightbridge_authz_core::identity::AccountId::assert_already_resolved(sub))
+    }
+}
+
+fn test_resolver() -> Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver> {
+    Arc::new(TrustEverythingResolver)
+}
+
 fn sample_redis() -> Option<Redis> {
     Some(Redis {
         url: "redis://127.0.0.1:6379".to_string(),
@@ -79,8 +99,13 @@ fn external_oauth2() -> Oauth2 {
         audience: None,
         signing: None,
         token_exchange: None,
+        relying_party: None,
         rbac: Default::default(),
         clients: Vec::new(),
+        federation: Some(lightbridge_authz_core::config::Federation {
+            issuer: "https://keycloak.example.test/realms/dev".to_string(),
+            discovery_url: None,
+        }),
     }
 }
 
@@ -127,8 +152,13 @@ async fn start_opa_server_fails_fast_when_tls_certs_are_missing() {
             password: "change-me".to_string(),
         },
     };
-    let result =
-        lightbridge_authz_rest::start_opa_server(&opa, lazy_pool(), &sample_billing()).await;
+    let result = lightbridge_authz_rest::start_opa_server(
+        &opa,
+        lazy_pool(),
+        &sample_billing(),
+        &external_oauth2(),
+    )
+    .await;
     assert!(
         result.is_err(),
         "missing TLS cert paths must surface as an error"
@@ -152,8 +182,13 @@ async fn start_opa_server_starts_fine_with_no_redis_configured() {
             password: "change-me".to_string(),
         },
     };
-    let result =
-        lightbridge_authz_rest::start_opa_server(&opa, lazy_pool(), &sample_billing()).await;
+    let result = lightbridge_authz_rest::start_opa_server(
+        &opa,
+        lazy_pool(),
+        &sample_billing(),
+        &external_oauth2(),
+    )
+    .await;
     let err = result.expect_err("missing TLS cert paths must surface as an error");
     assert!(
         !format!("{err}").to_lowercase().contains("redis"),
@@ -319,6 +354,7 @@ mod db {
             audience: None,
             ttl_seconds: 7_776_000,
             max_key_age_days: 30,
+            claim_mappers: Vec::new(),
         }
     }
 
@@ -544,6 +580,7 @@ mod db {
         ));
         let router = lightbridge_authz_rest::build_api_router(
             bearer,
+            test_resolver(),
             issuer,
             policy_store,
             refill_service,
@@ -588,13 +625,14 @@ mod db {
                 subject,
                 CreateAccount {
                     default_quota: None,
+                    name: None,
                 },
             )
             .await
             .unwrap();
         let project = seed
             .create_project(
-                subject,
+                &lightbridge_authz_core::identity::AccountId::assert_already_resolved(subject),
                 &account.id,
                 CreateProject {
                     name: "opa-trait-project".to_string(),

@@ -13,6 +13,17 @@ WORKDIR /app
 COPY dist/lightbridge-authz /usr/local/bin/lightbridge-authz
 COPY dist/lightbridge-authz-healthcheck /usr/local/bin/lightbridge-authz-healthcheck
 
+# Hosted login page static build (ADR-0021 Decisions 1 + 10, amended by ADR-0029) -- staged into
+# dist/static by the `stage-authz-ui` composite action, which pulls it out of the digest-pinned
+# assets-only image named by ./Dockerfile's `ARG AUTHZ_UI_REF=` (the one pin location) and rides
+# the same dist-binaries.tar.gz as the prebuilt binaries above. This file needs no pin of its own,
+# deliberately: two pins would drift, and a Dockerfile.dist image serving a different UI than a
+# compose-built Dockerfile image is exactly the kind of divergence nobody notices until they diff
+# two running containers. authz-idp serves this from `server.idp.static_dir`, which
+# .docker/authz/container.yaml points at this exact path. Harmless on the other runtime stages
+# below, which never mount the static fallback.
+COPY dist/static /app/static
+
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=1s --retries=3 \

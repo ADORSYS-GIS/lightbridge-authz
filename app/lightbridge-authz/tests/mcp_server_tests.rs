@@ -53,8 +53,13 @@ fn external_oauth2() -> Oauth2 {
         audience: None,
         signing: None,
         token_exchange: None,
+        relying_party: None,
         rbac: Default::default(),
         clients: Vec::new(),
+        federation: Some(lightbridge_authz_core::config::Federation {
+            issuer: "https://keycloak.example.test/realms/dev".to_string(),
+            discovery_url: None,
+        }),
     }
 }
 
@@ -94,6 +99,12 @@ async fn start_mcp_server_runs_without_redis_and_never_fails_on_it() {
         &QuotaTiers::default(),
         &ModelCatalog::default(),
         &ApiKeyExpiry::default(),
+        Some(&lightbridge_authz_core::config::SecretClaim {
+            // base64url of 32 bytes of 0x07 -- a literal so this test crate needs no base64 dep.
+            encryption_key: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".to_string(),
+            ttl_seconds: 300,
+            redeem_base_url: "https://auth.example.test".to_string(),
+        }),
         lazy_pool(),
     )
     .await;

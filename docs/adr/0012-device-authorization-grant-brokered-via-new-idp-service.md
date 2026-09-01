@@ -1,5 +1,13 @@
 # ADR-0012: authz brokers the OAuth 2.0 Device Authorization Grant (RFC 8628) to Keycloak, from a new microservice that takes over the OIDC surface
 
+> **Superseded in part by ADR-0019** (`docs/adr/0019-authz-idp-brokers-authorization-code-alongside-device-grant.md`,
+> 2026-08-22): Decision 3's `AuthorizationCodeStore` half ("remains a permanent no-op stub") and
+> Decision 4 in full (`redirect_uris` deliberately empty) no longer hold — `/authorize` and a real
+> `redirect_uris` registry are now in scope, to serve browser clients the device grant was never
+> meant to cover. Decision 3's `DeviceCodeStore` half and every other decision below are
+> unaffected. See ADR-0019 for the full argument, including why the `redirect_uris` trade this ADR
+> avoided is now accepted deliberately, not by accident.
+
 - Status: Accepted
 - Date: 2026-08-16
 - Decision owners: @stephane-segning
@@ -400,6 +408,9 @@ alongside `signing_keys`, `project_members`, and `exchange_refresh_tokens`, in t
 
 ## Related
 
+- Amended by ADR-0023 (`docs/adr/0023-the-authz-idp-surface-is-mandatory-not-composable.md`):
+  `oauth2.relying_party` and `oauth2.token_exchange` are no longer optional for `authz-idp` — every
+  flow route this ADR and ADR-0019 describe is mounted unconditionally.
 - ADR-0006 (project membership supersedes account roles) — establishes `accounts.id` as the
   caller's JWT `sub`, which Decision 5 depends on.
 - ADR-0011 (authz issues a derived OIDC token object via token-exchange) — the token-exchange grant

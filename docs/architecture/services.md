@@ -89,17 +89,27 @@ comment for why this is not a real dependency on the CRUD domain.
 
 ## `authz-idp`
 
-**Responsibility:** OIDC broker server (ADR-0012) — the sole owner of the discovery/JWKS/token-
-exchange surface, carried off `authz-api` as a hard cutover (see `authz-api` above). Requires
-`oauth2.type: self`; refuses to start otherwise (`start_idp_server` rejects the external-issuance
-path outright — this server only ever serves the self-signed-JWT surface).
+**Responsibility:** OIDC broker server (ADR-0012, ADR-0019, ADR-0023) — the sole owner of the
+discovery/JWKS/token-exchange/browser-SSO surface, carried off `authz-api` as a hard cutover (see
+`authz-api` above). Requires `oauth2.type: self`; refuses to start otherwise (`start_idp_server`
+rejects the external-issuance path outright — this server only ever serves the self-signed-JWT
+surface). **It is a full IdP (ADR-0023): every route below is mounted unconditionally, on every
+deployment — there is no reduced-surface configuration.**
 **Owns:** nothing of its own — reads/writes the same `signing_keys` table as `authz-api` and
 `lightbridge-mcp` via `StoreRepo`, and is a third concurrent bootstrapper against it
-(`signing::bootstrap_signing_key`); plus Redis, mandatory unconditionally (not only when
-`oauth2.token_exchange.enabled`) — see AGENTS.md's "Redis is a mandatory dependency" house rule.
-`start_idp_server` refuses to start with no `redis.url` configured, regardless of whether token
-exchange is enabled; when it is enabled, that same Redis instance also backs the `private_key_jwt`
-client-assertion replay-protection store (ADR-0011, Decision 6).
+(`signing::bootstrap_signing_key`). Three dependencies are hard startup requirements, checked in
+this order (①→⑤, `start_idp_server`):
+
+1. `oauth2.type: self` + `oauth2.signing` present.
+2. `redis.url` present (mandatory unconditionally — see AGENTS.md's "Redis is a mandatory
+   dependency" house rule; presence-only, no startup-time `PING`). Backs the Keycloak RP-leg's
+   `user_code` rate limiting and, when token exchange runs, the `private_key_jwt` client-assertion
+   replay-protection store (ADR-0011, Decision 6).
+3. `oauth2.relying_party` present and valid (ADR-0023) — `KeycloakRelyingParty::new` validates its
+   shape offline (timeout, TTL, base64url 32-byte state key, exact callback URL/path); never dials
+   Keycloak at startup.
+4. `oauth2.token_exchange` present, `enabled: true`, and `openid` ∈ `allowed_scopes` (ADR-0023,
+   OIDC Discovery 1.0 §3).
 
 **The sole owner of this surface, not a duplicate.** ADR-0012 Phase 1 ran this router alongside
 `authz-api`'s own (now-removed) copy of the same routes while the public issuer
@@ -111,19 +121,112 @@ through `authz-api`. That ingress has since been repointed directly at `authz-id
 `auth.ai.camer.digital` is now load-bearing on its own, no same-surface fallback on `authz-api`.
 
 Router assembly: `build_idp_router`/`start_idp_server` in `crates/lightbridge-authz-rest/src/lib.rs`.
+Unlike the prior revision of this doc, the surface below is no longer narrower than the accepted
+ADR-0019/ADR-0021 browser roadmap: `/authorize` (Authorization Code + PKCE), the Keycloak
+browser-session brokering routes, and the device-authorization endpoints are all implemented and,
+since ADR-0023, always mounted. See
+[`docs/oauth-oidc-standards-roadmap.md`](../oauth-oidc-standards-roadmap.md) for the canonical
+conformance-sequence status of each grant.
+
+**Human plane, plus a disjoint machine plane on the same `/oauth2/token` route (ADR-0030, #534).**
+`authz-idp` is the OIDC broker for people — browser SSO, RFC 8628 device pairing, and the token
+exchange those flows land in — but `/oauth2/token` also serves RFC 6749 §4.4 `client_credentials`
+(M2M): intercepted before upstream dispatch (mirroring the pre-existing device-code intercept),
+`private_key_jwt`-only (`OauthClientType::Service`, behaviorally identical to `Confidential`),
+minting `sub = "svc:<client_id>"` with no `roles` claim — so a machine token holds zero permissions
+against every RPC op-id by the same "no roles claim -> empty `PermissionSet`" mechanism every other
+zero-role caller already goes through. There is no separate route or enable flag for this grant: it
+rides the always-mounted `/oauth2/token` handler and is advertised in discovery unconditionally,
+in the same block as the token-exchange/refresh grants (`signing.rs:838-848`), never gated on
+whether any `oauth2.clients` entry actually lists it.
+
+Since lightbridge-authz#607 the human-plane browser/device leg renders
+no HTML at all: the pages are a React SPA, `apps/authz-ui` in the `converse-frontends`
+monorepo, built on the estate's `ui-web` design system and served same-origin under `/ui` as a
+digest-pinned, assets-only OCI artifact (ADR-0029) — the pin is the single `ARG AUTHZ_UI_REF=` at
+the top of `./Dockerfile`, and pin + Rust handoff + `/ui` allowlist are one rollback unit, not
+three independently revertible pieces. `GET /device/verify` is a pure `303` handoff into the SPA's
+entry route; every decision downstream (`POST /device/verify`, `POST /device/verify/continue`) also
+`303`s, never renders; `GET /device/verify/context` is the one JSON escape hatch, feeding the SPA's
+confirmation screen exactly the two values (`user_code`, `client_id`) the deleted server-rendered
+page used to print. `/ui` itself is a route ALLOWLIST, not a catch-all — see that row below. Three
+surfaces still render HTML server-side (`check_session_iframe`, `claim_redeem`, `end_session`) —
+each for a reason specific to it (a protocol artifact, a script-free CSP as the actual security
+property, and a not-yet-migrated legacy page respectively), tracked for eventual migration rather
+than an oversight. All protocol decisions — every redirect, `Set-Cookie`, and ID-token verification
+— stay in this Rust codebase regardless (ADR-0029 Decision 5); the SPA is presentation only.
+
+The whole device pairing, end to end — every human-facing response from Rust is a `303`; the SPA
+renders, Rust decides:
+
+```mermaid
+sequenceDiagram
+    participant CLI as Device client (CLI)
+    participant Browser
+    participant SPA as apps/authz-ui<br/>(served at /ui, allowlisted)
+    participant Rust as authz-idp (Rust)<br/>relying_party.rs
+    participant KC as Keycloak
+
+    CLI->>Rust: POST /oauth2/device_authorization
+    Rust-->>CLI: user_code + verification_uri (/device/verify)
+    Note over CLI: prints the URL; starts polling POST /oauth2/token
+
+    Browser->>Rust: GET /device/verify?user_code=X
+    Rust-->>Browser: 303 /ui/device?user_code=X (sanitised, percent-encoded)
+    Browser->>SPA: GET /ui/device → entry form (native <form>)
+    Browser->>Rust: POST /device/verify {user_code}
+    alt code unknown / expired / consumed (uniform)
+        Rust-->>Browser: 303 /ui/device/invalid
+    else code pending
+        Rust-->>Browser: 303 /ui/device/confirm<br/>Set-Cookie: __Host-authz_device_confirm
+    end
+    Browser->>SPA: GET /ui/device/confirm
+    SPA->>Rust: fetch GET /device/verify/context (cookie-bound)
+    Rust-->>SPA: 200 {user_code, client_id} — or uniform 404 without the cookie
+    Browser->>Rust: POST /device/verify/continue (cookie cross-checked)
+    Rust-->>Browser: 303 Keycloak authorization URL
+    Browser->>KC: login
+    KC-->>Browser: 302 /idp/callback?code=…
+    Browser->>Rust: GET /idp/callback (verify, mark code approved)
+    Rust-->>Browser: 303 /ui/device/success (cookie cleared)
+    CLI->>Rust: POST /oauth2/token (poll)
+    Rust-->>CLI: tokens
+```
+
+And how a `GET /ui/<path>` is answered since #598 — allowlist first, real files always, never a
+catch-all (`static_assets.rs`):
+
+```mermaid
+flowchart TD
+    REQ["GET /ui/&lt;path&gt;"] --> STRIP["nest_service strips /ui"]
+    STRIP --> ALLOW{"path in routes.json's<br/>validated allowlist<br/>(and not shadowing a real file)?"}
+    ALLOW -- yes --> INDEX["index.html<br/>Cache-Control: no-cache + CSP"]
+    ALLOW -- no --> FILE{"real file in the bundle?<br/>(ServeDir)"}
+    FILE -- "yes (assets/*-hash.*)" --> ASSET["file bytes<br/>immutable, max-age=1y"]
+    FILE -- yes --> RAW["file bytes (e.g. sw.js, routes.json)<br/>no-cache"]
+    FILE -- no --> NF["404"]
+    MANIFEST["dist/routes.json<br/>(from the artifact)"] -. "validated at startup:<br/>version==1, basename==/ui,<br/>route syntax, dedup —<br/>any failure ⇒ fail closed to { / }" .-> ALLOW
+```
 
 | Route | Method | Protection | Notes |
 | --- | --- | --- | --- |
 | `/`, `/healthz`, `/healthz/startup`, `/healthz/ready` | GET | none | Same probe wiring as every other server (`probe_router`), `/healthz/ready` checks DB reachability. |
-| `/.well-known/openid-configuration` | GET | none | Only mounted when `oauth2.type: self` (`signing::well_known_router`), reading the same `signing_keys` rows `authz-api` bootstraps/reads for its own (unrelated) API-key JWT signer. |
-| `/.well-known/jwks.json` | GET | none | Same gate as above. |
-| `/oauth2/token` | POST | none (credential is the presented token/assertion) | RFC 8693 token exchange + `refresh_token` grant. Only mounted when `oauth2.token_exchange.enabled` — but `redis.url` is required for this server to start at all regardless of that flag (`start_idp_server` errors at startup otherwise). `project_id` is an optional form param. |
-| `/oauth2/revoke` | POST | none (credential is the presented token) | RFC 7009. Absent from `/.well-known/openid-configuration` pending an upstream `authkestra-op` `OidcDiscovery` field. |
+| `/.well-known/openid-configuration`, `/.well-known/oauth-authorization-server` | GET | none | `signing::well_known_router`, unconditional. `DiscoveryCapabilities::full_idp()` (ADR-0023): `grant_types_supported` always advertises token-exchange, `refresh_token`, `client_credentials` (ADR-0030, #534 — unconditional, same block as token-exchange/refresh, never gated on a route mount), `device_code`, and `authorization_code`; `authorization_endpoint`, `response_types_supported: ["code"]`, `response_modes_supported: ["query"]`, and `code_challenge_methods_supported: ["S256"]` are always present (#471). |
+| `/.well-known/jwks.json` | GET | none | Same router, reads the shared `signing_keys` table. |
+| `/authorize` | GET | none (redirects to Keycloak login) | ADR-0019 Authorization Code + PKCE. Mandatory PKCE for every client type (#471), exact-match `redirect_uris` only. |
+| `/device/verify`, `/device/verify/continue` | GET, POST | none (rate-limited by caller IP, not authenticated) | `/device/verify` hands off to the SPA (lightbridge-authz#598: a 303 to `/ui/device`, RFC 8628 `verification_uri_complete`'s `user_code` prefill forwarded and sanitised) rather than rendering a page itself; `/device/verify/continue` still redirects on to Keycloak. |
+| `/device/verify/context` | GET | none (bound to the `__Host-authz_device_confirm` cookie `/device/verify` sets — see below) | Added by #598: what the SPA's `/ui/device/confirm` route fetches to render the confirmation the deleted server-rendered page used to print (`user_code`, `client_id`, never `device_code`). Uniform `404` for every absence (no cookie, wrong code, wrong `provider_id`); `503` only for a store outage. |
+| `/idp/callback` | GET | none | The fixed Keycloak OAuth2 redirect target both `/authorize` and `/device/verify` route through. |
+| `/oauth2/token` | POST | none (credential is the presented token/assertion) | RFC 8693 token exchange + `authorization_code` + `refresh_token` + RFC 8628 device-code grants, all unconditional (ADR-0023), plus RFC 6749 §4.4 `client_credentials` (M2M, ADR-0030, #534): `private_key_jwt`-only, intercepted before upstream dispatch via `client_credentials_token_endpoint`, mints `sub = "svc:<client_id>"` with no `roles` claim (zero RBAC permissions), never a refresh or ID token. `project_id` is an optional form param. |
+| `/oauth2/device_authorization` | POST | none | RFC 8628 device-authorization endpoint, unconditional. |
+| `/oauth2/revoke` | POST | none (credential is the presented token) | RFC 7009. |
+| `/ui/*` | GET | none | The hosted-login SPA build, path-scoped under `/ui` (ADR-0021 Decision 10 follow-up). Since lightbridge-authz#598, `/ui` is a route ALLOWLIST sourced from the artifact's own `dist/routes.json`, not a whole-subtree catch-all: only the manifest's listed paths resolve to `index.html`, a real file under `assets/` still serves regardless, and every other `/ui/*` path (like any path outside `/ui` matching no protocol route above) is a plain `404`. The bundle is built in `converse-frontends` (`apps/authz-ui`) and consumed here as a digest-pinned OCI artifact, not built in this repo (ADR-0029). |
 
 Deliberately thin next to `authz-api`: no RPC CRUD surface, no budget domain, no idempotency/rate-
-limit layers — `well_known_router`/`token_exchange_router` need none of that, and every route this
-server mounts is public by design (`config::IdpServer`'s doc comment; no `basic_auth` block, unlike
-`OpaServer`).
+limit tower layers on the protocol routes — every route this server mounts is public by design
+(`config::IdpServer`'s doc comment; no `basic_auth` block, unlike `OpaServer`). The one exception is
+the Keycloak RP-leg's `user_code` lookups, which consult the same Redis-backed rate-limit store
+`authz-api`/`authz-budget` use for their tower layer, just called directly rather than layered.
 
 ## `authz-opa`
 
@@ -142,6 +245,7 @@ in `crates/lightbridge-authz-rest/src/routers/mod.rs::opa_router`.
 | `/v1/opa/docs`, `/v1/opa/openapi.json` | GET | none | The one server in this repo that still publishes Swagger UI/OpenAPI — see `AGENTS.md`. |
 | `/v1/authorino/validate/introspect` | POST | Basic auth | Form-encoded, RFC 7662-shaped. Hashes the presented secret, loads `api_keys` by hash, rejects unknown/revoked/expired/suspended (account or project) as `{"active": false}`, updates telemetry, returns enriched context. |
 | `/idp/v1/resolve-context` | POST | Basic auth | `{subject, project_id} -> {account_id, project_id}`. A project resolves when the subject owns its account or holds a `project_members` row for it (ADR-0006); non-member and unknown-project are the same uniform `404`, deliberately, so the endpoint never leaks which projects exist. |
+| `/idp/v1/authorize-usage-scope` | POST | Basic auth | `{issuer, subject, scope, scope_id} -> 200` or uniform `404` (#570). The ownership authority `lightbridge-authz-usage`'s query listener calls for `account`/`project` usage-query scopes — same non-oracle convention and same real, Postgres-backed predicate as `resolve-context`. |
 
 **Correction to prior docs:** `AGENTS.md` and the pre-existing `docs/architecture.md` describe a
 `POST /v1/opa/validate` "minimal validation endpoint." No such route exists in
@@ -192,16 +296,18 @@ health probes, plus whatever routes are theirs below.
 | `/v1/otel/traces` | POST | `usage` (ingest) | **none** | OTLP trace ingest; caller is an AI Envoy/OpenTelemetry exporter outside this repo's deploy surface. |
 | `/v1/otel/metrics` | POST | `usage` (ingest) | **none** | OTLP metric ingest. |
 | `/v1/otel/logs` | POST | `usage` (ingest) | **none** | OTLP log ingest. |
-| `/usage/v1/usage/query` | POST | `query` | **mTLS (#347)** | Scoped, date-bin-aggregated usage query; TLS-layer client-cert requirement, no `scope_id` ownership check. |
-| `/usage/v1/spend/query` | POST | `query` | **mTLS (#347)** | Summed spend for an account/period, called by `lightbridge-authz-budget`'s `UsageServiceSpendReader`. |
+| `/usage/v1/usage/query` | POST | `query` | **mTLS (#347) + Bearer JWT + ownership (#570/#603/#605)** | Scoped, date-bin-aggregated usage query. On top of the TLS-layer client-cert requirement, the handler requires `Authorization: Bearer <end-user token>` (JWKS-validated) and, for `scope=account`/`scope=project`, checks the token's subject owns the scope via `authz-opa`'s `POST /idp/v1/authorize-usage-scope`; `scope=user` is self-ownership from the token, `scope=all` requires `usage:read-all`, `scope=api_key` is always refused. |
+| `/usage/v1/spend/query` | POST | `query` | **mTLS (#347)** | Summed spend for an account/period, called by `lightbridge-authz-budget`'s `UsageServiceSpendReader`; refuses any request carrying an `Authorization` header (#603). |
 
-This service has no application-level authentication anywhere on its data-plane routes — mTLS on
-the `query` listener authenticates the caller (any workload holding a CA-signed cert), not which
-`scope_id`/`account_id` it's entitled to see, and the `usage` (ingest) listener has none at all.
-That ownership gap is a known, accepted one today — see [`README.md`](./README.md)'s
-context-diagram notes and [`deployment.md`](./deployment.md) for why it is currently safe (network
-topology, not application auth) and what would need to change before it could be routed
-externally.
+This service's ingest listener (`usage`) has no application-level authentication at all — its
+caller is an AI Envoy/OpenTelemetry exporter outside this repo's deploy surface. The `query`
+listener's mTLS authenticates the caller (any workload holding a CA-signed cert), not by itself
+which `scope_id`/`account_id` it's entitled to see — but `/usage/v1/usage/query` now closes that
+gap with the bearer/ownership check in the row above; `/usage/v1/spend/query` remains a
+service-to-service route with no per-caller ownership check by design (its only legitimate caller,
+`authz-budget`, asks about any account). See [`README.md`](./README.md)'s context-diagram notes and
+[`deployment.md`](./deployment.md) for the network-topology posture (`ClusterIP`-only, no ingress)
+that remains the primary containment for the ingest listener and for `/usage/v1/spend/query`.
 
 ## Crate layering behind `authz-api` / `authz-opa`
 

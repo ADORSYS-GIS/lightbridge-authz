@@ -42,6 +42,7 @@ flowchart LR
     KcAdapter -->|"Basic auth: resolve-context"| OPA
     McpClient -->|"Bearer JWT"| MCP
     OtelExporters -->|"OTLP/HTTP, unauthenticated"| Usage
+    Frontend -->|"mTLS + Bearer JWT + ownership"| Usage
 
     API -->|"validate via JWKS"| Keycloak
     Budget -->|"validate via JWKS"| Keycloak
@@ -75,24 +76,34 @@ Notes grounded in code, not intent:
   against the same Keycloak JWKS, reads/writes the same `authz` Postgres database, has its own
   Redis-backed rate limiting, and calls `lightbridge-authz-usage`'s spend-query endpoint over HTTP
   the same way `authz-api` used to before the move.
-- **`authz-idp` carries the OIDC discovery/JWKS/token-exchange surface off `authz-api`, but as a
-  transitional duplication, not a cutover** (ADR-0012 Phase 1; see
-  [`services.md`](./services.md#authz-idp)) — `authz-api` keeps serving the byte-identical surface
-  until the public issuer is repointed at `authz-idp` in a later PR. Every route it mounts is
-  public (the presented token/assertion is itself the credential); it validates the `subject_token`
-  presented during an RFC 8693 exchange against Keycloak's JWKS the same way `authz-api` does.
-- **Redis is `authz-api`/`authz-budget`/`authz-idp`-only** today: RPC rate-limiting, the idempotency
-  store, and the `private_key_jwt` replay-tracking store for token exchange
-  (`crates/lightbridge-authz-rest/src/lib.rs`) — `authz-idp` only reaches Redis when
-  `oauth2.token_exchange.enabled`. `authz-opa`, `lightbridge-mcp`, and `lightbridge-authz-usage`
-  have no Redis dependency.
+- **`authz-idp` is the sole owner of the OIDC discovery/JWKS/token-exchange surface.** The public
+  issuer has been cut over to it and `authz-api` no longer mounts the same routes (see
+  [`services.md`](./services.md#authz-idp)). Every route it mounts is public because the presented
+  token/assertion is itself the credential; it validates an RFC 8693 `subject_token` against
+  Keycloak's JWKS. **The browser/device roadmap is a deployed grant surface, unconditionally
+  mounted (ADR-0023)** — `/authorize`, `/device/verify`, and the Keycloak RP leg are all
+  implemented and live, not merely accepted design; since lightbridge-authz#607 that leg renders no
+  HTML itself and hands off to a React SPA served under `/ui` (ADR-0029) — see
+  [`../oauth-oidc-standards-roadmap.md`](../oauth-oidc-standards-roadmap.md) for the per-grant
+  conformance status.
+- **Redis is `authz-api`/`authz-budget`/`authz-idp`-only** today: `authz-idp` requires it at
+  startup even if token exchange is disabled; when exchange is enabled it backs the
+  `private_key_jwt` replay-tracking store (`crates/lightbridge-authz-rest/src/lib.rs`).
+  `authz-opa`, `lightbridge-mcp`, and `lightbridge-authz-usage` have no Redis dependency.
 - **`lightbridge-authz-usage` splits ingest and query auth (#347)** — `/v1/otel/{traces,metrics,logs}`
   stays unprotected (its caller is an AI Envoy/OpenTelemetry exporter outside this repo's deploy
   surface); `/usage/v1/usage/query` and `/usage/v1/spend/query` moved to a separate listener that
   requires and verifies a client certificate (mTLS) — see `UsageServerGroup` in
-  `crates/lightbridge-authz-usage/src/config.rs`. Neither route has an ownership check on
-  `scope_id`/`account_id` — mTLS authenticates the caller, not what it's entitled to see. Safe
-  only because the service is not externally routable in the deployed topology regardless; see
+  `crates/lightbridge-authz-usage/src/config.rs`. **The two routes diverge above the TLS layer
+  (#570/#603/#605):** `/usage/v1/usage/query` additionally requires an end-user
+  `Authorization: Bearer` token (JWKS-validated) and, for `scope=account`/`scope=project`, checks
+  the token's subject actually owns the requested scope via `authz-opa`'s
+  `POST /idp/v1/authorize-usage-scope`; `scope=user` is self-ownership answered from the token
+  directly, `scope=all` requires the `usage:read-all` permission, and `scope=api_key` has no
+  resolvable ownership authority and is always refused. `/usage/v1/spend/query` stays mTLS-only —
+  it is `authz-budget`'s legitimate cross-account service reader with no per-caller ownership check
+  by design — but now REFUSES any request carrying an `Authorization` header. Safe only because the
+  service is not externally routable in the deployed topology regardless; see
   `docs/architecture/deployment.md`.
 
 ## Containers: the six deployables
@@ -111,7 +122,7 @@ flowchart TB
     Budget["authz-budget\nport 3005"]
     Idp["authz-idp\nport 3004"]
     MCP["lightbridge-mcp\nport 3000"]
-    Usage["lightbridge-authz-usage\nport 3002"]
+    Usage["lightbridge-authz-usage\nport 3002 (ingest) / 3006 (query, mTLS)\n(the umbrella chart uses 3000 ingest instead)"]
 
     AuthzDB[("Postgres - authz db\n(shared)")]
     UsageDB[("Timescale/Postgres - usage db")]
@@ -121,7 +132,8 @@ flowchart TB
     C1 -->|"Bearer JWT"| MCP
     C2 -->|"Basic auth"| OPA
     C3 -->|"unprotected"| Usage
-    C4 -->|"transitional: same surface authz-api still serves"| Idp
+    C1 -->|"mTLS + Bearer JWT + ownership"| Usage
+    C4 -->|"public discovery/JWKS + RFC 8693 exchange"| Idp
 
     API --> AuthzDB
     OPA --> AuthzDB
@@ -152,6 +164,7 @@ in-container ports shown above.
 | [`data-model.md`](./data-model.md) | Entity relationships, the account/project/membership model, identifier format (CUID2). |
 | [`budget.md`](./budget.md) | The budget domain: ledger, policy engine, self-service refill/review — distinct from the Envoy-side rate limiting `governance-model-and-enforcement.md` describes. |
 | [`auth-flows.md`](./auth-flows.md) | Credential lifecycle, introspection, `resolve-context`, native RFC 8693 token exchange (including today's refresh-token hardening and RFC 7009 revocation), MCP auth. |
+| [`../oauth-oidc-standards-roadmap.md`](../oauth-oidc-standards-roadmap.md) | Implemented OAuth/OIDC surface, standards gaps, and the ordered Authorization Code + PKCE, device-flow, lifecycle, and hardening roadmap. |
 | [`../rbac.md`](../rbac.md) | JWT claim → permission mapping; which permission gates which operation. |
 | [`../governance-model-and-enforcement.md`](../governance-model-and-enforcement.md) | The Envoy/Authorino data plane: how a request actually gets rate-limited or refused at the gateway. |
 | [`../auth-reference.md`](../auth-reference.md) | Field-by-field dictionary for JWT claims, config keys, and RPC/HTTP shapes. |

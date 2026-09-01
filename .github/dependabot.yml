@@ -28,3 +28,10 @@ updates:
     interval: weekly
     time: "08:00"
   open-pull-requests-limit: 5
+  ignore:
+    # ADR-0029 Decision 3. `Dockerfile`'s `ARG AUTHZ_UI_REF=` is not a dependency, it is a DEPLOY:
+    # it is the single place this repo records which hosted-login bundle real users get at the
+    # authentication boundary. An automated digest bump would ship a UI change to that boundary as
+    # a "chore(deps)" PR with no owner having looked at the page. The bump is done by hand,
+    # reviewed as a change, with the procedure documented at the ARG itself.
+    - dependency-name: "ghcr.io/adorsys-gis/converse-frontends/authz-ui"

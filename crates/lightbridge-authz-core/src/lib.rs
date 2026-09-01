@@ -5,6 +5,7 @@ pub mod crypto;
 pub mod db;
 pub mod dto;
 pub mod error;
+pub mod identity;
 pub mod migrate;
 #[cfg(feature = "axum")]
 pub mod server;
@@ -17,10 +18,12 @@ pub use crate::authz::{Permission, PermissionSet, Rbac};
 pub use crate::config::{Config, load_from_path};
 pub use crate::crypto::hash_api_key;
 pub use crate::dto::{
-    Account, ApiKeyValidation, CreateAccount, CreateProject, DefaultLimits, Project, ProjectMember,
-    ResolveContextRequest, ResolvedContext, ResourceStatus, UpdateAccount, UpdateProject,
+    Account, ApiKeyValidation, AuthorizeUsageScopeRequest, CreateAccount, CreateProject,
+    DefaultLimits, ModelPolicy, Project, ProjectMember, ResolveContextRequest, ResolvedContext,
+    ResourceStatus, UpdateAccount, UpdateProject,
 };
 pub use crate::error::{Error, Result};
+pub use crate::identity::AccountId;
 
 pub use anyhow;
 pub use async_trait::async_trait;

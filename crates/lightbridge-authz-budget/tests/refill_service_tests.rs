@@ -38,7 +38,24 @@ async fn count_budget_grants(pool: &PgPool, account_id: &str) -> i64 {
         .expect("count query must succeed")
 }
 
-fn base_request(account_id: &str, idempotency_key: Option<String>) -> RefillRequest {
+async fn count_augmentation_requests(pool: &PgPool, account_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM budget_augmentation_requests WHERE budget_account_id = $1",
+    )
+    .bind(account_id)
+    .fetch_one(pool)
+    .await
+    .expect("count query must succeed")
+}
+
+/// ADR-0015: `requested_amount_micros` is required -- #387 removed the pre-ADR-0015 optional wire
+/// shape (an absent value deriving `current_tier.next()`). Every test in this file now names an
+/// amount explicitly.
+fn base_request(
+    account_id: &str,
+    idempotency_key: Option<String>,
+    requested_amount_micros: i64,
+) -> RefillRequest {
     RefillRequest {
         budget_account_id: account_id.to_string(),
         account_id: account_id.to_string(),
@@ -46,10 +63,7 @@ fn base_request(account_id: &str, idempotency_key: Option<String>) -> RefillRequ
         period: Period::parse(PERIOD).expect("valid period"),
         idempotency_key,
         as_of: Utc::now(),
-        // Deliberately `None` -- these tests exercise the pre-ADR-0015, `current_tier.next()`
-        // wire shape (still the live behavior for a caller that omits the field). ADR-0015's
-        // amount-based path has its own dedicated tests below.
-        requested_amount_micros: None,
+        requested_amount_micros,
     }
 }
 
@@ -111,7 +125,7 @@ fn known_zero_spend_reader() -> Arc<dyn SpendReader> {
     })
 }
 
-/// Proves "no policy engine call happened" for the already-at-top-rung case: a real
+/// Proves "no policy engine call happened" for the not-offered-amount case: a real
 /// [`RuleDataEngine`] would just silently not care that it was skipped, so only a double that
 /// hard-fails on `evaluate` makes that property a real test failure if violated.
 #[derive(Debug)]
@@ -132,9 +146,7 @@ impl PolicyEngine for PanicIfCalledPolicyEngine {
         _facts: &Facts,
         _requested_amount_micros: i64,
     ) -> Result<Decision, BudgetError> {
-        panic!(
-            "PolicyEngine::evaluate must not be called when the account is already at the top rung"
-        );
+        panic!("PolicyEngine::evaluate must not be called when the amount was never offered");
     }
 
     fn allowed_amounts_micros(&self) -> Vec<i64> {
@@ -230,24 +242,24 @@ impl PolicyEngine for CountingAutoApprovePolicyEngine {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn first_refill_grants_the_next_tier_and_records_auto_approved(pool: PgPool) {
+async fn first_refill_with_a_named_amount_auto_approves_and_writes_a_grant(pool: PgPool) {
     let account_id = cuid2();
     insert_account(&pool, &account_id).await;
 
     let service = refill_service(&pool, default_policy_engine(), known_zero_spend_reader());
 
     let result = service
-        .request_refill(base_request(&account_id, None))
+        .request_refill(base_request(&account_id, None, 15_000_000))
         .await
-        .expect("a fresh account's first refill must succeed");
+        .expect("a fresh account's first refill for an offered amount must succeed");
 
     assert_eq!(result.status, AugmentationStatus::AutoApproved);
     assert_eq!(
         result.requested_tier,
-        BudgetTier::B30,
-        "default-tier B15 -> next() is B30"
+        BudgetTier::B15,
+        "15_000_000 is an exact BudgetTier label match"
     );
-    assert_eq!(result.approved_amount_micros, Some(30_000_000));
+    assert_eq!(result.approved_amount_micros, Some(15_000_000));
     let grant_id = result
         .grant_id
         .clone()
@@ -260,38 +272,43 @@ async fn first_refill_grants_the_next_tier_and_records_auto_approved(pool: PgPoo
             .await
             .expect("the grant row referenced by the augmentation request must exist");
 
-    assert_eq!(amount_micros, 30_000_000);
+    assert_eq!(amount_micros, 15_000_000);
     assert_eq!(source, "self_service");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn second_refill_same_period_grants_the_tier_after_that(pool: PgPool) {
+async fn second_refill_same_period_with_a_different_named_amount_also_auto_approves(pool: PgPool) {
     let account_id = cuid2();
     insert_account(&pool, &account_id).await;
 
     let service = refill_service(&pool, default_policy_engine(), known_zero_spend_reader());
 
     let first = service
-        .request_refill(base_request(&account_id, None))
+        .request_refill(base_request(&account_id, None, 6_000_000))
         .await
         .expect("first refill must succeed");
-    assert_eq!(first.requested_tier, BudgetTier::B30);
+    assert_eq!(
+        first.requested_tier,
+        BudgetTier::B15,
+        "6M has no exact tier label, falls back to B15"
+    );
     assert_eq!(first.status, AugmentationStatus::AutoApproved);
+    assert_eq!(first.approved_amount_micros, Some(6_000_000));
 
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let second = service
-        .request_refill(base_request(&account_id, None))
+        .request_refill(base_request(&account_id, None, 30_000_000))
         .await
         .expect("second refill must succeed");
 
     assert_eq!(
         second.requested_tier,
-        BudgetTier::B60,
-        "tier progression must read back what was actually granted (B30), not always start from B15"
+        BudgetTier::B30,
+        "ADR-0015: the caller names the amount directly -- unrelated to the first refill's amount"
     );
     assert_eq!(second.status, AugmentationStatus::AutoApproved);
-    assert_eq!(second.approved_amount_micros, Some(60_000_000));
+    assert_eq!(second.approved_amount_micros, Some(30_000_000));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -329,15 +346,15 @@ async fn exhausting_unaided_allowance_routes_to_pending_review(pool: PgPool) {
     let before_count = count_budget_grants(&pool, &account_id).await;
 
     let result = service
-        .request_refill(base_request(&account_id, None))
+        .request_refill(base_request(&account_id, None, 30_000_000))
         .await
         .expect("an exhausted-allowance refill must still succeed (queued, not erroring)");
 
     assert_eq!(result.status, AugmentationStatus::PendingReview);
     assert_eq!(
         result.requested_tier,
-        BudgetTier::B60,
-        "resolves from the latest tier grant (B30) -> next is B60"
+        BudgetTier::B30,
+        "requested_tier is a label for the amount actually requested, not derived from history"
     );
     assert_eq!(result.grant_id, None);
 
@@ -348,41 +365,41 @@ async fn exhausting_unaided_allowance_routes_to_pending_review(pool: PgPool) {
     );
 }
 
+/// ADR-0015's structural rejection: an amount that is not a member of the active policy's
+/// `allowed_amounts_micros` must be refused before a `budget_augmentation_requests` row is ever
+/// created or the policy engine is ever consulted -- distinct from a policy `Deny`/`ManualReview`
+/// decision, which only exists for amounts that were legitimately offered. Uses
+/// [`PanicIfCalledPolicyEngine`] so a regression that started calling the engine anyway would fail
+/// loudly (a panic), not just return the "wrong" `Ok`.
 #[sqlx::test(migrations = "../../migrations")]
-async fn already_at_top_rung_is_refused_without_a_failed_grant(pool: PgPool) {
+async fn request_refill_with_an_amount_not_offered_is_rejected_before_any_row_is_created(
+    pool: PgPool,
+) {
     let account_id = cuid2();
     insert_account(&pool, &account_id).await;
 
-    let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
-    let budget_repo = BudgetRepo::new(Arc::clone(&db_pool));
-
-    budget_repo
-        .grant(seed_grant_request(
-            &account_id,
-            GrantSource::Admin,
-            BudgetTier::B1000.amount().get(),
-        ))
-        .await
-        .expect("seeding the top-rung grant must succeed");
-
-    let service = RefillService::new(
-        Arc::new(budget_repo),
-        Arc::new(AugmentationRepo::new(Arc::clone(&db_pool))),
+    let service = refill_service(
+        &pool,
         Arc::new(PanicIfCalledPolicyEngine),
         known_zero_spend_reader(),
     );
 
+    // $17 is not one of the seeded $6/$15/$30 offered amounts.
     let result = service
-        .request_refill(base_request(&account_id, None))
-        .await
-        .expect("a top-rung refill must still succeed (denied, not erroring)");
+        .request_refill(base_request(&account_id, None, 17_000_000))
+        .await;
 
-    assert_eq!(result.status, AugmentationStatus::Denied);
-    assert_eq!(
-        result.policy_reason_codes,
-        Some(vec!["already_at_top_rung".to_string()])
+    let err = result.expect_err("an amount outside the offered set must be refused, not granted");
+    assert!(
+        matches!(err, BudgetError::AmountNotOffered(17_000_000)),
+        "expected AmountNotOffered(17000000), got {err:?}"
     );
-    assert_eq!(result.grant_id, None);
+
+    let request_count = count_augmentation_requests(&pool, &account_id).await;
+    assert_eq!(
+        request_count, 0,
+        "a not-offered amount must never create a budget_augmentation_requests row"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -397,7 +414,7 @@ async fn policy_engine_unavailable_queues_rather_than_denies_or_grants(pool: PgP
     );
 
     let result = service
-        .request_refill(base_request(&account_id, None))
+        .request_refill(base_request(&account_id, None, 15_000_000))
         .await
         .expect("an unavailable policy engine must not propagate as a caller-facing error");
 
@@ -425,11 +442,15 @@ async fn duplicate_idempotency_key_returns_the_same_outcome_without_re_evaluatin
     let idempotency_key = cuid2();
 
     let first = service
-        .request_refill(base_request(&account_id, Some(idempotency_key.clone())))
+        .request_refill(base_request(
+            &account_id,
+            Some(idempotency_key.clone()),
+            15_000_000,
+        ))
         .await
         .expect("first call must succeed");
     let second = service
-        .request_refill(base_request(&account_id, Some(idempotency_key)))
+        .request_refill(base_request(&account_id, Some(idempotency_key), 15_000_000))
         .await
         .expect("second (duplicate) call must succeed");
 
@@ -473,7 +494,7 @@ async fn manual_review_decision_records_reason_codes_and_matched_rule_ids_from_t
     let service = refill_service(&pool, engine, known_zero_spend_reader());
 
     let result = service
-        .request_refill(base_request(&account_id, None))
+        .request_refill(base_request(&account_id, None, 15_000_000))
         .await
         .expect("refill must succeed");
 
@@ -496,106 +517,20 @@ async fn manual_review_decision_records_reason_codes_and_matched_rule_ids_from_t
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn refill_status_for_a_fresh_account_starts_at_b15_with_b30_next(pool: PgPool) {
+async fn refill_status_returns_the_active_policys_offered_amounts(pool: PgPool) {
     let account_id = cuid2();
     insert_account(&pool, &account_id).await;
 
-    let service = refill_service(
-        &pool,
-        Arc::new(PanicIfCalledPolicyEngine),
-        known_zero_spend_reader(),
-    );
+    let service = refill_service(&pool, default_policy_engine(), known_zero_spend_reader());
 
     let status = service
-        .refill_status(&account_id, &Period::parse(PERIOD).expect("valid period"))
+        .refill_status()
         .await
-        .expect("a fresh account's status must succeed");
+        .expect("refill_status must succeed");
 
     assert_eq!(
-        status.current_tier,
-        BudgetTier::B15,
-        "no grants yet this period -> the same B15 default request_refill itself falls back to"
-    );
-    assert_eq!(status.next_tier, Some(BudgetTier::B30));
-    assert_eq!(
-        status.ladder.len(),
-        7,
-        "the full static ADR-0008 ladder, not just current/next"
-    );
-    assert_eq!(status.ladder[0].tier, BudgetTier::B15);
-    assert_eq!(status.ladder[0].amount_micros, 15_000_000);
-    assert_eq!(status.ladder[6].tier, BudgetTier::B1000);
-    assert_eq!(status.ladder[6].amount_micros, 1_000_000_000);
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-async fn refill_status_resolves_current_tier_from_the_latest_tier_grant(pool: PgPool) {
-    let account_id = cuid2();
-    insert_account(&pool, &account_id).await;
-
-    let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
-    let budget_repo = BudgetRepo::new(Arc::clone(&db_pool));
-    budget_repo
-        .grant(seed_grant_request(
-            &account_id,
-            GrantSource::SelfService,
-            BudgetTier::B30.amount().get(),
-        ))
-        .await
-        .expect("seed grant must succeed");
-
-    let service = RefillService::new(
-        Arc::new(budget_repo),
-        Arc::new(AugmentationRepo::new(Arc::clone(&db_pool))),
-        Arc::new(PanicIfCalledPolicyEngine),
-        known_zero_spend_reader(),
-    );
-
-    let status = service
-        .refill_status(&account_id, &Period::parse(PERIOD).expect("valid period"))
-        .await
-        .expect("status must succeed");
-
-    assert_eq!(
-        status.current_tier,
-        BudgetTier::B30,
-        "must read back the latest tier grant (B30), not always default to B15"
-    );
-    assert_eq!(status.next_tier, Some(BudgetTier::B60));
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-async fn refill_status_at_top_rung_has_no_next_tier(pool: PgPool) {
-    let account_id = cuid2();
-    insert_account(&pool, &account_id).await;
-
-    let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
-    let budget_repo = BudgetRepo::new(Arc::clone(&db_pool));
-    budget_repo
-        .grant(seed_grant_request(
-            &account_id,
-            GrantSource::Admin,
-            BudgetTier::B1000.amount().get(),
-        ))
-        .await
-        .expect("seeding the top-rung grant must succeed");
-
-    let service = RefillService::new(
-        Arc::new(budget_repo),
-        Arc::new(AugmentationRepo::new(Arc::clone(&db_pool))),
-        Arc::new(PanicIfCalledPolicyEngine),
-        known_zero_spend_reader(),
-    );
-
-    let status = service
-        .refill_status(&account_id, &Period::parse(PERIOD).expect("valid period"))
-        .await
-        .expect("status must succeed even at the top rung");
-
-    assert_eq!(status.current_tier, BudgetTier::B1000);
-    assert_eq!(
-        status.next_tier, None,
-        "top rung has nothing further, mirroring request_refill's already_at_top_rung case"
+        status.allowed_amounts_micros,
+        default_allowed_amounts_micros()
     );
 }
 
@@ -613,36 +548,41 @@ async fn refill_status_never_calls_the_policy_engine(pool: PgPool) {
     );
 
     let status = service
-        .refill_status(&account_id, &Period::parse(PERIOD).expect("valid period"))
+        .refill_status()
         .await
         .expect("status must succeed without ever calling the policy engine");
 
-    assert_eq!(status.current_tier, BudgetTier::B15);
+    assert_eq!(
+        status.allowed_amounts_micros,
+        default_allowed_amounts_micros()
+    );
 }
 
+/// Cross-checks [`RefillService::refill_status`] against [`RefillService::request_refill`]: every
+/// amount the read-only preview reports as offered must actually be accepted (never
+/// `AmountNotOffered`) by a real submission for that same amount.
 #[sqlx::test(migrations = "../../migrations")]
-async fn refill_status_next_tier_agrees_with_what_request_refill_would_actually_request(
-    pool: PgPool,
-) {
+async fn request_refill_accepts_every_amount_refill_status_reports_as_offered(pool: PgPool) {
     let account_id = cuid2();
     insert_account(&pool, &account_id).await;
 
     let service = refill_service(&pool, default_policy_engine(), known_zero_spend_reader());
-    let period = Period::parse(PERIOD).expect("valid period");
 
-    let status_before = service
-        .refill_status(&account_id, &period)
-        .await
-        .expect("status before any refill must succeed");
-
-    let request_result = service
-        .request_refill(base_request(&account_id, None))
-        .await
-        .expect("refill must succeed");
-
-    assert_eq!(
-        status_before.next_tier,
-        Some(request_result.requested_tier),
-        "the ladder preview must never promise a rung that the real request path disagrees with"
+    let status = service.refill_status().await.expect("status must succeed");
+    assert!(
+        !status.allowed_amounts_micros.is_empty(),
+        "the seeded default policy must offer at least one amount"
     );
+
+    for amount in status.allowed_amounts_micros {
+        let idempotency_key = cuid2();
+        let result = service
+            .request_refill(base_request(&account_id, Some(idempotency_key), amount))
+            .await;
+        assert!(
+            result.is_ok(),
+            "an amount refill_status reports as offered ({amount}) must never be refused as \
+             not-offered: {result:?}"
+        );
+    }
 }

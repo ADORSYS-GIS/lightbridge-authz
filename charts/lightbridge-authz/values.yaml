@@ -157,7 +157,19 @@ controllers:
     # "inspectable" half of this same ADR; (3) `generateName` -- ArgoCD tracks/diffs managed
     # resources by exact name, so a random per-apply suffix cannot be reconciled against the
     # desired manifest and is a documented ArgoCD anti-pattern.
-    suffix: '{{ printf "%s:%s" .Values.global.authz.image.repository .Values.global.authz.image.version | sha256sum | trunc 10 }}'
+    # 2026-08-25 (#480, amending the paragraph above): the image alone is NOT the Job template's
+    # full identity -- bjw-s stamps a checksum/config annotation over the mounted ConfigMap into
+    # the pod template, so a CONFIG-only values change re-rendered the SAME Job name with a
+    # DIFFERENT template. Kubernetes rejects that (completed Jobs have an immutable spec.template)
+    # and, worse, ArgoCD's serverSideDiff dry-runs the apply, so the whole app's diff failed and
+    # NOTHING synced -- hit twice on 2026-08-24 during config-only rollouts. Folding the config
+    # content into the name hash restores the invariant the paragraph above intended: same
+    # inputs -> same name -> identical spec (true no-op); ANY changed input -> new name -> new Job.
+    # This is deliberately NOT the values-wide checksum rejected above: only the config data this
+    # Job actually mounts participates. Known residual: a change scoped purely to
+    # controllers.migrate's own env/values still collides (cannot self-reference the hash);
+    # remedy stays `kubectl delete job <name>` -- see #480.
+    suffix: '{{ printf "%s:%s:%s" .Values.global.authz.image.repository .Values.global.authz.image.version (.Values.configMaps.config.data | toYaml | sha256sum) | sha256sum | trunc 10 }}'
     job:
       backoffLimit: 3
       # Bounded retention, not the old hook-delete-policy's job of "clean up so the next deploy's
@@ -229,6 +241,61 @@ configMaps:
           # For local development with multiple audiences:
           #   audience: ["lightbridge-api-key", "lightbridge-token-issuer"]
           audience: []
+          # ADR-0025 Stage 1: the ONE issuer this deployment trusts for
+          # remote-subject-to-account-id translation. REQUIRED for every alias (api/opa/idp/
+          # budget) and for lightbridge-mcp -- each refuses to start without it. This is the ONLY
+          # issuer field -- `relying_party.issuer` below was removed (it used to have to be kept
+          # byte-equal to this one by hand; that config trap is gone). Real deployments MUST
+          # override this from their own values repo alongside relying_party. `discovery_url` is
+          # left unset here (defaults to `issuer`): this chart's placeholder value already points
+          # at the in-cluster `keycloak` service for both identity and discovery-dial purposes. A
+          # deployment where the externally-reachable issuer differs from the in-cluster dial
+          # target (e.g. local Compose's `localhost` vs `keycloak` split -- see
+          # `.docker/authz/container.yaml`) should set `discovery_url` explicitly to the
+          # in-cluster address.
+          federation:
+            issuer: "http://keycloak:9100/realms/dev"
+          # REQUIRED for the `idp` alias only (ADR-0023: authz-idp is a full IdP — both this block
+          # and `token_exchange` below are mandatory, `start_idp_server` refuses to start without
+          # them). `authz-api`/`authz-opa`/`authz-budget` never read this block; it is harmless
+          # dead config for their subcommands, kept in the same shared config.yaml because all
+          # four aliases mount it identically (see this subchart's persistence.config). Real
+          # deployments MUST override every value here from their own values repo (callback_url,
+          # and above all state_encryption_key) — these are local-dev-shaped placeholders, not
+          # production values, mirroring config/default.yaml's own precedent for this exact block.
+          # The identity issuer now lives solely on `oauth2.federation.issuer` above.
+          relying_party:
+            client_id: "authz-idp-rp"
+            callback_url: "https://authz-idp:3000/idp/callback"
+            # Development-only fixed key. Production MUST override with a unique base64url-encoded
+            # 32-byte key (config/default.yaml's KEYCLOAK_RP_STATE_ENCRYPTION_KEY precedent).
+            state_encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            # ADR-0024: separate AES-256-GCM key sealing the Keycloak token set at rest.
+            # Development-only fixed key, deliberately different from state_encryption_key above
+            # (KeycloakRelyingParty::new refuses a config where the two are equal). Production
+            # MUST supply this via a secretKeyRef env (e.g. KEYCLOAK_RP_TOKEN_ENCRYPTION_KEY),
+            # never inline in this ConfigMap-rendered values file.
+            token_encryption_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI"
+            timeout_ms: 5000
+            browser_session_ttl_seconds: 28800
+          # REQUIRED for the `idp` alias (ADR-0023) — see the comment on `relying_party` above.
+          # `enabled: true` and `openid` present in `allowed_scopes` are both hard startup
+          # requirements for authz-idp specifically.
+          token_exchange:
+            enabled: true
+            access_ttl_seconds: 900
+            authorization_code_ttl_seconds: 300
+            refresh_ttl_seconds: 2592000
+            refresh_absolute_ttl_seconds: 7776000
+            refresh_reuse_grace_seconds: 30
+            allowed_scopes:
+              - openid
+              - profile
+              - email
+              - offline_access
+            device_code_ttl_seconds: 600
+            device_poll_interval_seconds: 5
+            device_verification_uri: "https://authz-idp:3000/device/verify"
         server:
           api:
             address: 0.0.0.0

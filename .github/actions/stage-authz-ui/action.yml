@@ -1,0 +1,120 @@
+name: Stage authz-ui bundle
+description: >
+  Pull the pinned, externally-built authz-ui bundle out of its assets-only GHCR image and stage it
+  into dist/static for Dockerfile.dist. Replaces the deleted `build-frontend` composite action
+  (ADORSYS-GIS/lightbridge-authz#591): the bundle's source home is converse-frontends'
+  `apps/authz-ui` (ADR-0029), so this repo runs no npm, no Vite, and no Node at all.
+runs:
+  using: composite
+  steps:
+    # THE PIN IS READ, NEVER RESTATED. There is exactly one place in this repository that says
+    # which bundle ships: the `ARG AUTHZ_UI_REF=` line in ./Dockerfile. Copying it here would be
+    # a second source of truth that silently drifts -- Dockerfile.dist images would then serve a
+    # different UI than compose's source-built Dockerfile images, and nothing would notice until
+    # someone diffed two running containers.
+    - name: Resolve the pinned authz-ui reference from ./Dockerfile
+      id: pin
+      shell: bash
+      run: |
+        set -euo pipefail
+        ref="$(sed -n 's/^ARG AUTHZ_UI_REF=//p' Dockerfile | head -n1)"
+        if [ -z "${ref}" ]; then
+          echo "::error file=Dockerfile::no 'ARG AUTHZ_UI_REF=' line found -- the authz-ui pin is the single source of truth for the login bundle and this action cannot proceed without it"
+          exit 1
+        fi
+        case "${ref}" in
+          *@sha256:*) : ;;
+          *) echo "::error file=Dockerfile::AUTHZ_UI_REF must be digest-pinned (…@sha256:…), got '${ref}'. A mutable tag is not an artifact; see ADR-0029's pin policy."; exit 1 ;;
+        esac
+        case "${ref}" in
+          *:latest*|*@sha256:REPLACE_ME*) echo "::error file=Dockerfile::AUTHZ_UI_REF is a placeholder or 'latest'"; exit 1 ;;
+        esac
+        echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+        echo "resolved authz-ui pin: ${ref}"
+
+    # GHCR auth. The package is expected to be PUBLIC (its sibling
+    # ghcr.io/adorsys-gis/converse-frontends/console is), in which case this login is a no-op that
+    # costs nothing. If it is ever made private, note that THIS repo's GITHUB_TOKEN cannot read a
+    # private package owned by converse-frontends -- repository-scoped tokens do not cross repos.
+    # The fix in that case is on the producing side (make the package public, or grant this
+    # repository read access to it in the package's Actions-access settings), NOT a PAT here.
+    - name: Log in to GHCR (best effort)
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || {
+          echo "::warning::docker login to ghcr.io failed; continuing on the assumption the authz-ui package is public"
+        }
+
+    # `docker create` + `docker cp`, not `docker run`: the image is FROM scratch and has no shell,
+    # no entrypoint and nothing to execute. A created-but-never-started container is enough for
+    # `docker cp` to read its filesystem. The `/nonexistent` argument satisfies docker's "a command
+    # is required" check and is never executed.
+    #
+    # Every call site of this action (ci.yml's authz-ui-bundle job, build-release, integration-test)
+    # runs on ubuntu-latest, which has a Docker daemon; integration-test already depends on it for
+    # `docker compose`. A daemonless alternative using skopeo is in this action's git history /
+    # ADR-0029 if a runner ever loses the daemon.
+    - name: Pull and stage the bundle into dist/static
+      shell: bash
+      env:
+        AUTHZ_UI_REF: ${{ steps.pin.outputs.ref }}
+      run: |
+        set -euo pipefail
+        ctr="authz-ui-stage-$$"
+        docker pull --platform linux/amd64 "${AUTHZ_UI_REF}"
+        docker create --name "${ctr}" "${AUTHZ_UI_REF}" /nonexistent >/dev/null
+        trap 'docker rm -f "${ctr}" >/dev/null 2>&1 || true' EXIT
+        mkdir -p dist/static
+        docker cp "${ctr}:/dist/." dist/static/
+        ls -lash dist/static/
+
+    # The SAME two assertions the deleted `build-frontend` action made, now made against the
+    # artifact instead of against a directory this repo just built. They are kept on the consuming
+    # side even though converse-frontends asserts them on the producing side, because they are
+    # cheap and because the failure they catch here is different: not "the build regressed" but
+    # "the pin points at something that is not the bundle we think it is". Decision 10's
+    # immutable/no-cache split in static_assets.rs is only correct if the filenames really are
+    # content-hashed.
+    - name: Assert the staged bundle is content-hashed and complete
+      shell: bash
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        hashed=(dist/static/assets/*-*.js)
+        if [ ${#hashed[@]} -eq 0 ]; then
+          echo "::error::expected at least one content-hashed JS asset under dist/static/assets/, found none"
+          exit 1
+        fi
+        if [ ! -f dist/static/index.html ]; then
+          echo "::error::dist/static/index.html is missing -- authz-idp's /ui would 404"
+          exit 1
+        fi
+        if ! grep -q '/ui/assets/' dist/static/index.html; then
+          echo "::error::dist/static/index.html does not reference /ui/-prefixed assets -- the bundle was not built with Vite base '/ui/' and will 404 fetching its own JS under authz-idp's /ui mount"
+          exit 1
+        fi
+        # lightbridge-authz#598 / ADR-0029's Update: `dist/routes.json` is now a REQUIRED bundle
+        # member, not optional. A hard error, not a warning -- once the Rust RP leg redirects into
+        # SPA routes, a manifest-less artifact is a broken login page, and ADR-0029 Decision 4's
+        # "the pin bump is the deploy" means this is exactly where a bad deploy should be stopped.
+        if [ ! -f dist/static/routes.json ]; then
+          echo "::error::dist/static/routes.json is missing -- this pin predates the /ui route allowlist (lightbridge-authz#598). static_assets.rs would fail closed to '/' alone and every device page would 404. Bump AUTHZ_UI_REF to an artifact built after converse-frontends#409's route work."
+          exit 1
+        fi
+        if ! grep -q '"basename": *"/ui"' dist/static/routes.json; then
+          echo "::error::dist/static/routes.json does not declare basename '/ui' -- the bundle and this server disagree about the mount prefix"
+          exit 1
+        fi
+        # R4: check the REAL, pinned artifact's route set, not just a fixture on the Rust side.
+        # These five are the RP leg's own redirect targets (relying_party.rs's UI_* constants) --
+        # a bundle missing one turns a successful pairing (or a genuine error) into a 404 at the
+        # authentication boundary, not a rendered page.
+        for route in /device /device/invalid /device/confirm /device/success /error; do
+          if ! grep -q "\"${route}\"" dist/static/routes.json; then
+            echo "::error::dist/static/routes.json is missing route \"${route}\" -- relying_party.rs redirects into this path and static_assets.rs will 404 it"
+            exit 1
+          fi
+        done
+        echo "staged bundle OK:"
+        printf '  %s\n' "${hashed[@]}"

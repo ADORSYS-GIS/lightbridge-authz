@@ -17,15 +17,19 @@
 //! the full router was added on top of this as a stretch goal.
 #![cfg(feature = "it-tests")]
 
+mod common;
+
 use std::sync::Arc;
 
-use cratestack::{CratestackContext, CratestackError, Value};
+use cratestack::{CratestackContext, CratestackError};
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api::schema::procedures::ProcedureRegistry;
 use lightbridge_authz_budget::PolicyStore;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::Procedures;
+use lightbridge_authz_rest::auth_provider::build_context;
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
+use lightbridge_authz_rest::rpc_authorize::RpcScope;
 use sqlx::PgPool;
 
 const SEEDED_POLICY_SET_ID: &str = "budget-refill";
@@ -130,8 +134,20 @@ async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, Cratest
         review_service,
         budget_repo,
     );
-    let ctx =
-        CratestackContext::authenticated([("id".to_owned(), Value::String(subject.to_owned()))]);
+    // Issue #383 follow-up: a bare `authenticated([("id", ...)])` context satisfied the schema's
+    // old `@allow(auth() != null)` but silently fails the `auth().rpcScope`/`auth().perm*` clauses
+    // #383 added to every mapped op-id (including these two budget procedures) -- this file's own
+    // doc comment already says permission DENIAL is not what's under test here, so this grants the
+    // full permission set via the SAME shared helper `CratestackAuthProvider`/MCP use
+    // (`build_context`), scoped `RpcScope::Budget` (these are budget:*-gated procedures), rather
+    // than hand-rolling a second, out-of-sync context shape.
+    let ctx = build_context(
+        &common::token_info(subject, common::admin_perms()),
+        RpcScope::Budget,
+        common::test_resolver().as_ref(),
+    )
+    .await
+    .expect("the trust-everything test resolver never refuses");
     (procedures, ctx)
 }
 

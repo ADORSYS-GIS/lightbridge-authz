@@ -35,6 +35,7 @@ EXPECTED_MCP_TOOLS = {
     "list-accounts",
     "get-account",
     "update-account",
+    "update-account-name",
     "delete-account",
     "disable-account",
     "enable-account",
@@ -52,6 +53,8 @@ EXPECTED_MCP_TOOLS = {
     "enable-project",
     "set-default-project",
     "set-project-quota",
+    "set-project-allowed-models",
+    "set-project-model-policy",
     "create-api-key",
     "list-api-keys",
     "get-api-key",
@@ -296,15 +299,15 @@ def wait_until_ready() -> None:
             time.sleep(2)
 
 
-def fetch_token() -> str:
+def fetch_token(username: str = USERNAME, password: str = PASSWORD) -> str:
     token_url = f"{KEYCLOAK_URL}/realms/dev/protocol/openid-connect/token"
     status, payload = post_form(
         token_url,
         {
             "grant_type": "password",
             "client_id": CLIENT_ID,
-            "username": USERNAME,
-            "password": PASSWORD,
+            "username": username,
+            "password": password,
         },
     )
     if status != 200 or "access_token" not in payload:
@@ -323,30 +326,53 @@ def account_id_from_token(token: str) -> str:
 
 
 def ensure_account(authz_headers: dict, token: str) -> str:
-    """Create the caller's account, tolerating the one that already exists.
+    """Provision the caller's ANCHOR account, idempotently.
 
-    `createAccount` is once-per-subject since ADR-0006 -- a second call is a 409, not a second
-    row. This suite hits that routinely rather than exceptionally: it shares a compose stack (and
-    therefore a database) with the authorino suite, both authenticate as the same Keycloak user,
-    and the CI runner retries a suite up to three times. So a 409 here means "already
-    provisioned", and the id is the subject.
+    ADR-0026 changed the mechanism this used to rely on. `createAccount` was once-per-subject, so
+    a replay returned 409 and the 409 itself WAS the "already provisioned" signal. One identity may
+    now own several accounts, so a replay returns 200 and a genuinely NEW account -- catching 409
+    would never fire again, and every re-run would silently mint another account instead of reusing
+    the one it wants. That matters here rather than theoretically: this suite shares a compose stack
+    (and therefore a database) with the other IT suites, all authenticate as the same Keycloak user,
+    and the CI runner retries a suite up to three times.
+
+    So provisioning is now keyed on the ANCHOR account instead of on an error code. An identity's
+    first account keeps `id = subject` (ADR-0026 D3) precisely because it anchors the identity, so
+    the subject read off the token IS the id to look for. Read it first; only create when it is
+    genuinely absent, and assert the created id matches -- which also keeps this suite exercising
+    the anchor path rather than drifting onto the secondary-account one.
     """
+    anchor_id = account_id_from_token(token)
+    # A read policy FILTERS rather than rejects, so an absent (or unreadable) account is a 404,
+    # which `urlopen` raises. Absent is the expected first-run case, not an error.
     try:
-        status, account, _ = request_rpc(
+        status, existing, _ = request_rpc(
             "POST",
-            f"{API_URL}/rpc/procedure.createAccount",
-            {"args": {}},
+            f"{API_URL}/rpc/model.Account.get",
+            {"id": anchor_id},
             headers=authz_headers,
             insecure_tls=True,
         )
-        assert status == 200, f"create account failed: status={status}, body={account}"
-        return account["id"]
+        if status == 200 and isinstance(existing, dict) and existing.get("id") == anchor_id:
+            log(f"anchor account already provisioned; reusing {anchor_id}")
+            return anchor_id
     except urllib.error.HTTPError as err:
-        if err.code != 409:
+        if err.code != 404:
             raise
-        account_id = account_id_from_token(token)
-        log(f"account already exists for this subject; reusing {account_id}")
-        return account_id
+
+    status, account, _ = request_rpc(
+        "POST",
+        f"{API_URL}/rpc/procedure.createAccount",
+        {"args": {}},
+        headers=authz_headers,
+        insecure_tls=True,
+    )
+    assert status == 200, f"create account failed: status={status}, body={account}"
+    assert account["id"] == anchor_id, (
+        "the first account for a subject must be the anchor, keyed by the subject itself "
+        f"(ADR-0026 D3): got {account['id']}, expected {anchor_id}"
+    )
+    return anchor_id
 
 
 def assert_mcp_oauth_metadata() -> None:
@@ -539,8 +565,13 @@ def main() -> int:
             pass
         log("usage query listener rejects a connection with no client certificate")
 
-        # #347, acceptance criterion 2: authz-api's configured client certificate -> succeeds
-        # (reaches the router; the invalid time window still gets its ordinary 400/500).
+        # #347, acceptance criterion 2: authz-api's configured client certificate -> reaches the
+        # router (TLS-layer mTLS is satisfied). #570 review remediation: authentication now runs
+        # BEFORE body validation in the handler (crates/lightbridge-authz-usage/src/handlers/
+        # query.rs), specifically so an unauthenticated caller can never distinguish a malformed
+        # request from a well-formed one via a differentiated 400 -- this request carries a
+        # trusted client certificate but NO Authorization header, so it must be refused with 401,
+        # never the invalid-time-window 400 it used to get before that reordering.
         usage_status = None
         usage_error_body = ""
         try:
@@ -555,13 +586,46 @@ def main() -> int:
             usage_status = err.code
             usage_error_body = err.read().decode("utf-8")
 
+        if usage_status != 401:
+            raise AssertionError(
+                f"a trusted-mTLS request with no bearer token must be refused with 401 "
+                f"(auth runs before body validation), got {usage_status}: {usage_error_body}"
+            )
+        log(
+            "usage query listener accepts a trusted client certificate but refuses a request "
+            "with no bearer token (401, auth-before-validation)"
+        )
+
+        # Bearer-carrying variant of the same malformed body, so the invalid-time-window
+        # validation itself stays covered even though the unauthenticated variant above no longer
+        # reaches it: with a valid bearer token, the SAME malformed request must now get the
+        # ordinary 400 "start_time must be before end_time" the pre-#570 assertion checked for.
+        usage_status = None
+        usage_error_body = ""
+        try:
+            request_raw(
+                "POST",
+                f"{USAGE_QUERY_URL}/usage/v1/usage/query",
+                body=usage_query_body,
+                headers={"Authorization": f"Bearer {token}"},
+                ssl_context=MTLS_CLIENT_TLS,
+            )
+            raise AssertionError("usage query unexpectedly succeeded")
+        except urllib.error.HTTPError as err:
+            usage_status = err.code
+            usage_error_body = err.read().decode("utf-8")
+
         if usage_status not in (400, 500):
             raise AssertionError(
-                f"usage query should reject invalid time window, got {usage_status}: {usage_error_body}"
+                f"an authenticated usage query should reject an invalid time window, got "
+                f"{usage_status}: {usage_error_body}"
             )
         if "start_time must be before end_time" not in usage_error_body:
             raise AssertionError(f"unexpected usage error body: {usage_error_body}")
-        log("usage query listener accepts a trusted client certificate and rejects invalid request")
+        log(
+            "usage query listener accepts a trusted client certificate and a valid bearer "
+            "token, and rejects an invalid request (400)"
+        )
 
         # #347 covers both routes named in its acceptance criteria -- prove /usage/v1/spend/query
         # is reachable with the trusted client certificate too (no client cert -> same TLS-layer
@@ -579,6 +643,95 @@ def main() -> int:
         assert spend_status == 200, f"spend query failed: status={spend_status}, body={spend_body}"
         assert "total_cost" in spend_body, f"unexpected spend query body: {spend_body}"
         log("spend query listener accepts a trusted client certificate")
+
+        # #570: two-tenant end-to-end proof that `/usage/v1/usage/query` enforces ownership, not
+        # just mTLS. `test@admin` (this suite's primary tenant, `token`/`account_id` above) and
+        # `test@editor` (a second, distinct Keycloak subject seeded by the same realm import --
+        # `.docker/keycloak_config/realm.json` -- and therefore a distinct `accounts.id` anchor
+        # per ADR-0006/ADR-0026) each query their OWN account scope (200) and each other's (403).
+        other_token = fetch_token(username="test@editor", password="test")
+        other_headers = {"Authorization": f"Bearer {other_token}"}
+        other_account_id = ensure_account(other_headers, other_token)
+        assert other_account_id != account_id, (
+            "the second tenant must resolve to a DIFFERENT account than the primary tenant, or "
+            "this test proves nothing"
+        )
+
+        def usage_query_status(bearer_token: str, scope_id: str) -> tuple:
+            body = {
+                "scope": "account",
+                "scope_id": scope_id,
+                "start_time": "2026-03-01T00:00:00Z",
+                "end_time": "2026-03-02T00:00:00Z",
+                "bucket": "1 day",
+                "group_by": [],
+                "filters": {},
+                "limit": 10,
+            }
+            try:
+                status, payload, _ = request_raw(
+                    "POST",
+                    f"{USAGE_QUERY_URL}/usage/v1/usage/query",
+                    body=body,
+                    headers={"Authorization": f"Bearer {bearer_token}"},
+                    ssl_context=MTLS_CLIENT_TLS,
+                )
+                return status, payload
+            except urllib.error.HTTPError as err:
+                return err.code, err.read().decode("utf-8")
+
+        status, payload = usage_query_status(token, account_id)
+        assert status == 200, (
+            f"tenant A must be authorized for their own account scope: status={status}, "
+            f"body={payload}"
+        )
+        log("usage query: tenant A authorized for their own account scope")
+
+        status, payload = usage_query_status(other_token, other_account_id)
+        assert status == 200, (
+            f"tenant B must be authorized for their own account scope: status={status}, "
+            f"body={payload}"
+        )
+        log("usage query: tenant B authorized for their own account scope")
+
+        status, payload = usage_query_status(other_token, account_id)
+        assert status == 403, (
+            f"tenant B must be refused for tenant A's account scope: status={status}, "
+            f"body={payload}"
+        )
+        assert not payload or "points" not in payload, (
+            f"a refused cross-tenant query must never leak tenant A's data: {payload}"
+        )
+        log("usage query: tenant B refused for tenant A's account scope (#570)")
+
+        status, payload = usage_query_status(token, other_account_id)
+        assert status == 403, (
+            f"tenant A must be refused for tenant B's account scope: status={status}, "
+            f"body={payload}"
+        )
+        log("usage query: tenant A refused for tenant B's account scope (#570)")
+
+        status, payload = None, None
+        try:
+            request_raw(
+                "POST",
+                f"{USAGE_QUERY_URL}/usage/v1/usage/query",
+                body={
+                    "scope": "account",
+                    "scope_id": account_id,
+                    "start_time": "2026-03-01T00:00:00Z",
+                    "end_time": "2026-03-02T00:00:00Z",
+                    "bucket": "1 day",
+                    "group_by": [],
+                    "filters": {},
+                    "limit": 10,
+                },
+                ssl_context=MTLS_CLIENT_TLS,
+            )
+            raise AssertionError("usage query succeeded with no bearer token")
+        except urllib.error.HTTPError as err:
+            assert err.code == 401, f"expected 401 with no bearer token, got {err.code}"
+        log("usage query: missing bearer token refused with 401 (#570)")
 
         expect_http_error(
             401,

@@ -62,6 +62,19 @@ pub struct Account {
     pub default_quota: Option<String>,
     #[serde(default)]
     pub status: ResourceStatus,
+    /// Human-facing display label, so a console has something to render other than `id` (which,
+    /// per ADR-0006, IS the caller's opaque JWT subject). `None` means "not named yet" -- a real
+    /// state every account predating this field is in, never a placeholder to be invented here;
+    /// see `migrations/20260829000001_accounts_add_name.sql`. Not an identifier: not unique, and
+    /// no lookup path resolves an account by it.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The owning person (`accounts.user_id`). ADR-0026: one identity may own several accounts,
+    /// and this is what groups them. Always the owner's HOME-account id, which is what makes the
+    /// `userId == auth().id` read policy sound -- see the LOAD-BEARING INVARIANT block on
+    /// `Account.userId` in `crates/lightbridge-authz-api/schema/authz.cstack`.
+    #[serde(default)]
+    pub user_id: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -74,6 +87,11 @@ pub struct Account {
 pub struct CreateAccount {
     #[serde(default)]
     pub default_quota: Option<String>,
+    /// Optional display label. Blank/whitespace-only input is normalised to `None` by
+    /// `AuthzStoreImpl::create_account` rather than rejected, keeping `NULL` the single
+    /// representation of "unnamed" all the way down to the DB `CHECK`.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -81,9 +99,165 @@ pub struct UpdateAccount {
     pub default_quota: Option<String>,
 }
 
+/// ADR-0018's three-value access-control policy for which models a project's keys may reach.
+/// `AllowAll` is the default -- today's only behavior, and what every pre-existing row backfills
+/// to (`migrations/20260821000001_projects_model_policy.sql`). `Allowlist` consults
+/// `Project.allowed_models` (an empty list now genuinely means "nothing", unlike the NULL/[] ==
+/// "everything" collapse `allowed_models` has on its own). `DenyAll` allows nothing, ignoring
+/// `allowed_models` entirely.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPolicy {
+    #[default]
+    AllowAll,
+    Allowlist,
+    DenyAll,
+}
+
+const MODEL_POLICY_ALLOW_ALL: &str = "allow_all";
+const MODEL_POLICY_ALLOWLIST: &str = "allowlist";
+const MODEL_POLICY_DENY_ALL: &str = "deny_all";
+
+impl Display for ModelPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let r = match self {
+            ModelPolicy::AllowAll => MODEL_POLICY_ALLOW_ALL,
+            ModelPolicy::Allowlist => MODEL_POLICY_ALLOWLIST,
+            ModelPolicy::DenyAll => MODEL_POLICY_DENY_ALL,
+        };
+        write!(f, "{}", r)
+    }
+}
+
+impl From<String> for ModelPolicy {
+    /// Fails CLOSED, not open: only the exact `allow_all`/`allowlist` strings map to their
+    /// permissive/conditional variants. Anything else -- an unrecognized value, a future variant
+    /// this build does not know about yet, corrupted data -- maps to `DenyAll`, the strictest
+    /// state. This is the opposite direction from `ResourceStatus::from`'s fail-safe default
+    /// (which also fails to the restrictive branch, `Suspended`) but for the same reason: an
+    /// unparseable/unknown `model_policy` value must never silently become the *permissive*
+    /// `AllowAll`, or corrupted/unexpected DB state would widen access instead of narrowing it.
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            MODEL_POLICY_ALLOW_ALL => ModelPolicy::AllowAll,
+            MODEL_POLICY_ALLOWLIST => ModelPolicy::Allowlist,
+            _ => ModelPolicy::DenyAll,
+        }
+    }
+}
+
+impl ModelPolicy {
+    /// Strictly parses `s` as one of the three canonical wire values, refusing (returning `None`
+    /// for) anything else -- the opposite failure mode from `From<String>` above. `From<String>`
+    /// exists to read back already-persisted DB state, where there is no caller left to hand an
+    /// error to, so it deliberately coerces an unrecognized value to the strictest `DenyAll`
+    /// rather than panicking. A *write* has a caller, and the house rule for this procedure
+    /// (`setProjectModelPolicy`, ADR-0018 Decision 5 follow-up) is fail-closed in the other
+    /// direction: an unrecognized value on the wire must be refused outright, never silently
+    /// coerced into a value the caller did not ask for -- `DenyAll` would silently narrow, and
+    /// `AllowAll` would (per `From<String>`'s own doc comment) silently widen access. Used by
+    /// `AuthzStoreImpl::set_project_model_policy`
+    /// (`crates/lightbridge-authz-rest/src/handlers/mod.rs`) to validate `setProjectModelPolicy`'s
+    /// wire input before any DB write.
+    pub fn parse_strict(s: &str) -> Option<Self> {
+        match s {
+            MODEL_POLICY_ALLOW_ALL => Some(ModelPolicy::AllowAll),
+            MODEL_POLICY_ALLOWLIST => Some(ModelPolicy::Allowlist),
+            MODEL_POLICY_DENY_ALL => Some(ModelPolicy::DenyAll),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_policy_tests {
+    use super::ModelPolicy;
+
+    #[test]
+    fn from_string_round_trips_known_values() {
+        assert_eq!(
+            ModelPolicy::from("allow_all".to_string()),
+            ModelPolicy::AllowAll
+        );
+        assert_eq!(
+            ModelPolicy::from("allowlist".to_string()),
+            ModelPolicy::Allowlist
+        );
+        assert_eq!(
+            ModelPolicy::from("deny_all".to_string()),
+            ModelPolicy::DenyAll
+        );
+    }
+
+    #[test]
+    fn from_string_fails_closed_on_unknown_values() {
+        assert_eq!(ModelPolicy::from("bogus".to_string()), ModelPolicy::DenyAll);
+        assert_eq!(ModelPolicy::from(String::new()), ModelPolicy::DenyAll);
+        assert_eq!(
+            ModelPolicy::from("ALLOW_ALL".to_string()),
+            ModelPolicy::DenyAll,
+            "must not case-fold into the permissive variant"
+        );
+        assert_eq!(
+            ModelPolicy::from("allow-all".to_string()),
+            ModelPolicy::DenyAll,
+            "a near-miss spelling must not silently become allow_all"
+        );
+    }
+
+    #[test]
+    fn default_is_allow_all() {
+        assert_eq!(ModelPolicy::default(), ModelPolicy::AllowAll);
+    }
+
+    #[test]
+    fn display_matches_the_wire_strings_from_from_round_trips_back() {
+        for policy in [
+            ModelPolicy::AllowAll,
+            ModelPolicy::Allowlist,
+            ModelPolicy::DenyAll,
+        ] {
+            assert_eq!(ModelPolicy::from(policy.to_string()), policy);
+        }
+    }
+
+    #[test]
+    fn parse_strict_accepts_known_values() {
+        assert_eq!(
+            ModelPolicy::parse_strict("allow_all"),
+            Some(ModelPolicy::AllowAll)
+        );
+        assert_eq!(
+            ModelPolicy::parse_strict("allowlist"),
+            Some(ModelPolicy::Allowlist)
+        );
+        assert_eq!(
+            ModelPolicy::parse_strict("deny_all"),
+            Some(ModelPolicy::DenyAll)
+        );
+    }
+
+    #[test]
+    fn parse_strict_refuses_unknown_values_instead_of_coercing() {
+        assert_eq!(ModelPolicy::parse_strict("bogus"), None);
+        assert_eq!(ModelPolicy::parse_strict(""), None);
+        assert_eq!(
+            ModelPolicy::parse_strict("ALLOW_ALL"),
+            None,
+            "must not case-fold into a valid variant"
+        );
+        assert_eq!(
+            ModelPolicy::parse_strict("allow-all"),
+            None,
+            "a near-miss spelling must not silently become allow_all"
+        );
+    }
+}
+
 /// Per ADR-0006, `Project` gains `billing_identity` (moved from `Account` -- one project, one
 /// billing identity, so a single account can bill several projects to different parties) and
 /// `project_quota` (the pooled, tier-catalog-validated ceiling shared by everyone on the project).
+/// Per ADR-0018, `Project` also gains `model_policy` -- see `ModelPolicy`'s own doc comment.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Project {
     pub id: String,
@@ -101,6 +275,8 @@ pub struct Project {
     pub status: ResourceStatus,
     #[serde(default)]
     pub is_default: bool,
+    #[serde(default)]
+    pub model_policy: ModelPolicy,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -236,6 +412,45 @@ pub struct ResolveContextRequest {
     /// account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// ADR-0025 Stage 2: the issuer `subject` was authenticated by. `None` (the legacy
+    /// `lightbridge-keycloak-spi` adapter's body shape -- it never sends this field) defaults to
+    /// `oauth2.federation.issuer` at the handler, the deployment's one configured issuer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+}
+
+/// Request body for the Basic-auth-protected `POST /idp/v1/authorize-usage-scope` endpoint
+/// (#570): answers "does the authenticated end user (`issuer`, `subject`) own `scope_id` under
+/// `scope`?" for `lightbridge-authz-usage`'s query listener, which has no database of its own to
+/// answer that question directly.
+///
+/// Every field is optional so a malformed/partial body resolves to the SAME uniform `404` the
+/// not-authorized branch returns, mirroring [`ResolveContextRequest`]'s own reasoning: this
+/// endpoint must never let a caller distinguish "bad request" from "not authorized" for what is,
+/// from the outside, an authorization boundary. `scope` is a plain `String` rather than a schema
+/// enum for the identical reason -- an unrecognized value (including the `user`/`api_key` scopes
+/// `lightbridge-authz-usage` never actually sends here, since those have no resolvable authority
+/// and are refused unconditionally before this endpoint is ever called) falls through to the same
+/// `NotFound` branch [`crate`]'s callers already produce for "not authorized", not a distinct
+/// `400`/`422`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AuthorizeUsageScopeRequest {
+    /// Issuer that authenticated `subject` -- the end user's bearer token `iss` claim, exactly as
+    /// `lightbridge-authz-usage`'s query listener validated it via JWKS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// Authenticated subject the usage query is being answered for -- the end user's bearer token
+    /// `sub` claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// `"account"` or `"project"` -- the two scopes that have a resolvable ownership predicate.
+    /// Any other value (including `"user"`/`"api_key"`) is refused with the same uniform `404`
+    /// as a failed ownership check -- see this type's own doc comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// The account id or project id being queried, depending on `scope`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<String>,
 }
 
 #[cfg(test)]

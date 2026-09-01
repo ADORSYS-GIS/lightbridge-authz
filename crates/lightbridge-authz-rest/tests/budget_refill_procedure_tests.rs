@@ -33,6 +33,8 @@
 //! is nothing for a direct-call test here to usefully assert about permission denial.
 #![cfg(feature = "it-tests")]
 
+mod common;
+
 use std::sync::Arc;
 
 use cratestack::{CratestackContext, CratestackError, Value};
@@ -51,7 +53,9 @@ use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::Procedures;
 use lightbridge_authz_rest::auth_provider;
+use lightbridge_authz_rest::auth_provider::build_context;
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
+use lightbridge_authz_rest::rpc_authorize::RpcScope;
 use sqlx::PgPool;
 
 const SEEDED_POLICY_SET_ID: &str = "budget-refill";
@@ -78,16 +82,32 @@ async fn insert_account(pool: &PgPool, account_id: &str) {
         .expect("inserting a test account must succeed");
 }
 
-fn ctx_for(subject: &str) -> CratestackContext {
-    CratestackContext::authenticated([("id".to_owned(), Value::String(subject.to_owned()))])
+// Issue #383 follow-up: a bare `authenticated([("id", ...)])` context satisfied the schema's old
+// `@allow(auth() != null)` but silently fails the `auth().rpcScope`/`auth().perm*` clauses #383
+// added to every mapped op-id (including these four budget procedures) -- this file's own module
+// doc already says permission DENIAL is not what's under test here, so this grants the full
+// permission set via the SAME shared helper `CratestackAuthProvider`/MCP use (`build_context`),
+// scoped `RpcScope::Budget`, rather than hand-rolling a second, out-of-sync context shape.
+async fn ctx_for(subject: &str) -> CratestackContext {
+    build_context(
+        &common::token_info(subject, common::admin_perms()),
+        RpcScope::Budget,
+        common::test_resolver().as_ref(),
+    )
+    .await
+    .expect("the trust-everything test resolver never refuses")
 }
 
 /// Like [`ctx_for`], but stamped with [`auth_provider::CALLER_KIND_CONTEXT_KEY`] as
 /// [`lightbridge_authz_rest::auth_provider::CratestackAuthProvider::authenticate`] would for a
 /// token carrying `lightbridge_authz_bearer::API_KEY_CALLER_KIND` -- i.e. an `oauth2.type: self`
-/// self-signed API-key JWT (#191/#216).
-fn ctx_for_api_key_caller(subject: &str) -> CratestackContext {
-    let mut ctx = ctx_for(subject);
+/// self-signed API-key JWT, or (per #419) the RFC 8693-exchanged token every human dashboard
+/// caller presents too, since `signing.rs`'s `access_token_extra` stamps this claim
+/// unconditionally regardless of caller. Kept after #419 deleted `request_budget_refill`'s own
+/// `caller_kind` gate specifically to prove the claim is now irrelevant to that procedure's
+/// outcome -- see `request_refill_accepts_api_key_shaped_caller_holding_the_permission` below.
+async fn ctx_for_api_key_caller(subject: &str) -> CratestackContext {
+    let mut ctx = ctx_for(subject).await;
     ctx.extensions.insert(
         auth_provider::CALLER_KIND_CONTEXT_KEY.to_owned(),
         Value::String(lightbridge_authz_bearer::API_KEY_CALLER_KIND.to_owned()),
@@ -128,7 +148,7 @@ async fn procedures_and_ctx(
         review_service,
         budget_repo.clone(),
     );
-    let ctx = ctx_for(subject);
+    let ctx = ctx_for(subject).await;
     (procedures, ctx, budget_repo)
 }
 
@@ -237,22 +257,13 @@ async fn reject(
     .await
 }
 
+/// ADR-0015: `requestedAmountMicros` is required -- #387 removed the pre-ADR-0015 optional wire
+/// shape (an absent value deriving `current_tier.next()`). `amount` is checked against the active
+/// policy's `allowed_amounts_micros` before the policy engine is ever called.
 fn refill_args(
     budget_account_id: &str,
     idempotency_key: Option<String>,
-) -> schema::procedures::request_budget_refill::Args {
-    refill_args_with_amount(budget_account_id, idempotency_key, None)
-}
-
-/// ADR-0015: the amount-based wire shape. `requested_amount_micros: None` (used by every
-/// pre-existing test in this file via [`refill_args`]) exercises the pre-ADR-0015
-/// `current_tier.next()` derivation; `Some(amount)` exercises the new path, which validates
-/// `amount` against the active policy's `allowed_amounts_micros` before ever calling the policy
-/// engine.
-fn refill_args_with_amount(
-    budget_account_id: &str,
-    idempotency_key: Option<String>,
-    requested_amount_micros: Option<&str>,
+    requested_amount_micros: &str,
 ) -> schema::procedures::request_budget_refill::Args {
     schema::procedures::request_budget_refill::Args {
         args: schema::RequestBudgetRefillInput {
@@ -261,7 +272,7 @@ fn refill_args_with_amount(
             projectId: None,
             period: PERIOD.to_string(),
             idempotencyKey: idempotency_key,
-            requestedAmountMicros: requested_amount_micros.map(str::to_string),
+            requestedAmountMicros: requested_amount_micros.to_string(),
         },
     }
 }
@@ -375,9 +386,14 @@ async fn request_refill_auto_approves_and_the_response_reflects_it(pool: PgPool)
     let (procedures, ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
     let db = lazy_cratestack_db();
 
-    let output = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
-        .await
-        .expect("a fresh account's first refill must be auto-approved");
+    let output = request_refill(
+        &procedures,
+        &db,
+        &ctx,
+        refill_args(&account_id, None, "15000000"),
+    )
+    .await
+    .expect("a fresh account's first refill must be auto-approved");
 
     assert_eq!(
         output.status, "auto_approved",
@@ -387,11 +403,10 @@ async fn request_refill_auto_approves_and_the_response_reflects_it(pool: PgPool)
         output.grantId.is_some(),
         "an auto-approved request must carry the grant it produced"
     );
-    // A fresh account with no grant history this period is treated as currently on the lowest
-    // rung (`BudgetTier::B15`, see `RefillService::current_tier`'s own doc comment for why that
-    // default is deliberate), so the first refill requests the NEXT rung up, `B30`.
-    assert_eq!(output.requestedTier, "b-30");
-    assert_eq!(output.approvedAmountMicros.as_deref(), Some("30000000"));
+    // ADR-0015: `requestedTier` is a best-effort `BudgetTier` label for the requested amount, not
+    // a server-chosen "next rung" -- `15000000` maps exactly to `b-15`.
+    assert_eq!(output.requestedTier, "b-15");
+    assert_eq!(output.approvedAmountMicros.as_deref(), Some("15000000"));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -407,9 +422,14 @@ async fn request_refill_exhausting_allowance_returns_pending_review(pool: PgPool
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
 
-    let output = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
-        .await
-        .expect("an exhausted-allowance refill must still succeed (queued, not erroring)");
+    let output = request_refill(
+        &procedures,
+        &db,
+        &ctx,
+        refill_args(&account_id, None, "30000000"),
+    )
+    .await
+    .expect("an exhausted-allowance refill must still succeed (queued, not erroring)");
 
     assert_eq!(output.status, "pending_review");
     assert_eq!(
@@ -417,17 +437,14 @@ async fn request_refill_exhausting_allowance_returns_pending_review(pool: PgPool
         "a pending_review outcome must not carry a grant"
     );
     assert_eq!(
-        output.requestedTier, "b-60",
-        "resolves from the latest tier grant (B30) -> next is B60"
+        output.requestedTier, "b-30",
+        "requestedTier labels the amount actually requested, not derived from grant history"
     );
 }
 
 /// ADR-0015: the caller names the amount directly, checked against the active policy's
-/// `allowed_amounts_micros` ($6/$15/$30 in the ADR-0015 seed migration) rather than derived via
-/// `current_tier.next()`. `$6` is the new floor -- unreachable through the pre-ADR-0015
-/// `refill_args(None)` path at all, since `current_tier.next()` starting from a fresh account's
-/// implicit `B15` can only ever request `B30` next. This is the test that actually exercises the
-/// new floor being requestable.
+/// `allowed_amounts_micros` ($6/$15/$30 in the ADR-0015 seed migration). `$6` is the new floor,
+/// below any `BudgetTier` variant.
 #[sqlx::test(migrations = "../../migrations")]
 async fn request_refill_with_a_named_amount_in_the_offered_set_auto_approves(pool: PgPool) {
     let account_id = cuid2();
@@ -439,13 +456,17 @@ async fn request_refill_with_a_named_amount_in_the_offered_set_auto_approves(poo
         &procedures,
         &db,
         &ctx,
-        refill_args_with_amount(&account_id, None, Some("6000000")),
+        refill_args(&account_id, None, "6000000"),
     )
     .await
     .expect("an amount in the offered set must succeed");
 
     assert_eq!(output.status, "auto_approved");
     assert_eq!(output.approvedAmountMicros.as_deref(), Some("6000000"));
+    assert_eq!(
+        output.requestedTier, "b-15",
+        "$6 has no exact BudgetTier label, falls back to b-15"
+    );
 }
 
 /// ADR-0015's structural rejection: an amount that is not a member of the active policy's
@@ -464,7 +485,7 @@ async fn request_refill_with_an_amount_not_offered_is_rejected(pool: PgPool) {
         &procedures,
         &db,
         &ctx,
-        refill_args_with_amount(&account_id, None, Some("17000000")),
+        refill_args(&account_id, None, "17000000"),
     )
     .await;
 
@@ -475,33 +496,43 @@ async fn request_refill_with_an_amount_not_offered_is_rejected(pool: PgPool) {
     );
 }
 
-/// #191/#216: an `oauth2.type: self` self-signed API-key JWT carries
-/// `lightbridge_authz_bearer::API_KEY_CALLER_KIND`, which `CratestackAuthProvider` projects into
-/// the context as `auth_provider::CALLER_KIND_CONTEXT_KEY` -- `request_budget_refill` must refuse
-/// it before ever reaching `RefillService`, regardless of whether the request would otherwise have
-/// been auto-approved.
+/// #419: before this fix, an `oauth2.type: self` self-signed API-key JWT's
+/// `lightbridge_authz_bearer::API_KEY_CALLER_KIND` claim -- projected into the context as
+/// `auth_provider::CALLER_KIND_CONTEXT_KEY` -- caused `request_budget_refill` to refuse the
+/// caller outright, *even though the same signal is stamped on every human-plane RFC 8693
+/// exchange token too* (see `token_exchange_tests.rs`'s
+/// `request_refill_accepts_a_real_human_plane_token_that_still_carries_the_stale_api_key_signal`
+/// for the real-signer proof). Authorization is `budget:self-refill` alone now: a caller stamped
+/// with this signal, who holds the permission, must be served exactly like any other caller.
 #[sqlx::test(migrations = "../../migrations")]
-async fn request_refill_refuses_api_key_derived_caller(pool: PgPool) {
+async fn request_refill_accepts_api_key_shaped_caller_holding_the_permission(pool: PgPool) {
     let account_id = cuid2();
     insert_account(&pool, &account_id).await;
     let (procedures, _human_ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
-    let ctx = ctx_for_api_key_caller(&account_id);
+    let ctx = ctx_for_api_key_caller(&account_id).await;
     let db = lazy_cratestack_db();
 
-    let err = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
-        .await
-        .expect_err("an API-key-derived caller must be refused, not served");
-
-    assert!(
-        matches!(err, CratestackError::Forbidden(_)),
-        "expected Forbidden, got {err:?}"
+    let output = request_refill(
+        &procedures,
+        &db,
+        &ctx,
+        refill_args(&account_id, None, "15000000"),
+    )
+    .await
+    .expect(
+        "a caller stamped with the API-key caller-kind signal, holding budget:self-refill, must \
+         be served -- the permission is the only gate now",
     );
+
+    assert_eq!(output.status, "auto_approved");
 }
 
-/// Regression guard for the refusal added above: a caller whose token carries no caller-kind
-/// signal at all (the ordinary case for a human OIDC login, and for every caller before this
-/// PR) must still be served normally -- absence of the claim must never be treated as "is an
-/// API key" (see `TokenInfo::caller_kind`'s doc comment).
+/// Regression guard: a caller whose token carries no caller-kind signal at all (the ordinary case
+/// for most callers) must still be served normally -- absence of the claim must never be treated
+/// as "is an API key" (see `TokenInfo::caller_kind`'s doc comment). Since #419 this is no longer
+/// distinguishing behavior (every caller is served the same way regardless of the signal -- see
+/// the test above), but it remains a useful pin on `TokenInfo::caller_kind`'s absence-is-unknown
+/// contract.
 #[sqlx::test(migrations = "../../migrations")]
 async fn request_refill_still_serves_caller_with_no_caller_kind_signal(pool: PgPool) {
     let account_id = cuid2();
@@ -509,9 +540,14 @@ async fn request_refill_still_serves_caller_with_no_caller_kind_signal(pool: PgP
     let (procedures, ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
     let db = lazy_cratestack_db();
 
-    let output = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
-        .await
-        .expect("a caller with no caller-kind signal must not be refused");
+    let output = request_refill(
+        &procedures,
+        &db,
+        &ctx,
+        refill_args(&account_id, None, "15000000"),
+    )
+    .await
+    .expect("a caller with no caller-kind signal must not be refused");
 
     assert_eq!(output.status, "auto_approved");
 }
@@ -526,9 +562,14 @@ async fn list_pending_returns_queued_requests(pool: PgPool) {
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
 
-    let queued = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
-        .await
-        .expect("exhausted-allowance refill must queue");
+    let queued = request_refill(
+        &procedures,
+        &db,
+        &ctx,
+        refill_args(&account_id, None, "30000000"),
+    )
+    .await
+    .expect("exhausted-allowance refill must queue");
     assert_eq!(queued.status, "pending_review");
 
     let pending = list_pending(&procedures, &db, &ctx, list_pending_args(Some(&account_id)))
@@ -559,15 +600,20 @@ async fn approve_grants_and_updates_status(pool: PgPool) {
     let reviewer_id = cuid2();
     insert_account(&pool, &reviewer_id).await;
     let (procedures, ctx, budget_repo) = procedures_and_ctx(pool, &account_id).await;
-    let reviewer_ctx = ctx_for(&reviewer_id);
+    let reviewer_ctx = ctx_for(&reviewer_id).await;
     let db = lazy_cratestack_db();
 
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
 
-    let queued = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
-        .await
-        .expect("exhausted-allowance refill must queue");
+    let queued = request_refill(
+        &procedures,
+        &db,
+        &ctx,
+        refill_args(&account_id, None, "30000000"),
+    )
+    .await
+    .expect("exhausted-allowance refill must queue");
     assert_eq!(queued.status, "pending_review");
 
     let approved = approve(&procedures, &db, &reviewer_ctx, approve_args(&queued.id))
@@ -589,15 +635,20 @@ async fn reject_without_a_reason_is_rejected_at_the_schema_or_procedure_layer(po
     let reviewer_id = cuid2();
     insert_account(&pool, &reviewer_id).await;
     let (procedures, ctx, budget_repo) = procedures_and_ctx(pool, &account_id).await;
-    let reviewer_ctx = ctx_for(&reviewer_id);
+    let reviewer_ctx = ctx_for(&reviewer_id).await;
     let db = lazy_cratestack_db();
 
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
 
-    let queued = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
-        .await
-        .expect("exhausted-allowance refill must queue");
+    let queued = request_refill(
+        &procedures,
+        &db,
+        &ctx,
+        refill_args(&account_id, None, "30000000"),
+    )
+    .await
+    .expect("exhausted-allowance refill must queue");
 
     // The schema's `reason` field is non-optional, so a caller cannot omit it entirely through
     // the typed `Args` this direct-call test constructs -- a caller who did (e.g. a raw JSON
@@ -629,15 +680,20 @@ async fn reject_with_a_reason_succeeds_and_records_it(pool: PgPool) {
     let reviewer_id = cuid2();
     insert_account(&pool, &reviewer_id).await;
     let (procedures, ctx, budget_repo) = procedures_and_ctx(pool, &account_id).await;
-    let reviewer_ctx = ctx_for(&reviewer_id);
+    let reviewer_ctx = ctx_for(&reviewer_id).await;
     let db = lazy_cratestack_db();
 
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
     seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
 
-    let queued = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
-        .await
-        .expect("exhausted-allowance refill must queue");
+    let queued = request_refill(
+        &procedures,
+        &db,
+        &ctx,
+        refill_args(&account_id, None, "30000000"),
+    )
+    .await
+    .expect("exhausted-allowance refill must queue");
 
     let reason = "over the account's approved discretionary ceiling for this quarter";
     let rejected = reject(
@@ -676,9 +732,14 @@ async fn list_pending_augmentation_requests_paginates_oldest_first(pool: PgPool)
 
     let mut queued_ids = Vec::new();
     for _ in 0..3 {
-        let queued = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
-            .await
-            .expect("an exhausted-allowance refill must still queue, not error");
+        let queued = request_refill(
+            &procedures,
+            &db,
+            &ctx,
+            refill_args(&account_id, None, "30000000"),
+        )
+        .await
+        .expect("an exhausted-allowance refill must still queue, not error");
         assert_eq!(queued.status, "pending_review");
         queued_ids.push(queued.id);
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -744,9 +805,14 @@ async fn list_my_augmentation_requests_returns_own_history_across_statuses_newes
     // statuses without any direct repo access.
     let mut submitted = Vec::new();
     for _ in 0..3 {
-        let created = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
-            .await
-            .expect("request must succeed (auto-approved or queued, never erroring)");
+        let created = request_refill(
+            &procedures,
+            &db,
+            &ctx,
+            refill_args(&account_id, None, "15000000"),
+        )
+        .await
+        .expect("request must succeed (auto-approved or queued, never erroring)");
         submitted.push(created);
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -794,12 +860,17 @@ async fn list_my_augmentation_requests_does_not_leak_another_callers_requests(po
     insert_account(&pool, &owner_id).await;
     insert_account(&pool, &bystander_id).await;
     let (procedures, owner_ctx, _budget_repo) = procedures_and_ctx(pool, &owner_id).await;
-    let bystander_ctx = ctx_for(&bystander_id);
+    let bystander_ctx = ctx_for(&bystander_id).await;
     let db = lazy_cratestack_db();
 
-    let created = request_refill(&procedures, &db, &owner_ctx, refill_args(&owner_id, None))
-        .await
-        .expect("owner's own refill request must succeed");
+    let created = request_refill(
+        &procedures,
+        &db,
+        &owner_ctx,
+        refill_args(&owner_id, None, "15000000"),
+    )
+    .await
+    .expect("owner's own refill request must succeed");
 
     let owner_history = list_my(&procedures, &db, &owner_ctx, list_my_args(None, None))
         .await
@@ -819,13 +890,12 @@ async fn list_my_augmentation_requests_does_not_leak_another_callers_requests(po
     );
 }
 
-/// The read-only ladder-visibility companion (see `refill.rs`'s `RefillService::refill_status`
-/// doc comment): a fresh account with no grants this period sees `currentTier: "b-15"`,
-/// `nextTier: "b-30"`, and the full seven-rung ladder -- and this preview must agree with what a
-/// real `requestBudgetRefill` call would actually request, proven here by calling both against
-/// the same account.
+/// The read-only amount-picker companion (see `refill.rs`'s `RefillService::refill_status` doc
+/// comment): a fresh account sees the active policy's offered amounts, and this preview must
+/// agree with what a real `requestBudgetRefill` call actually accepts -- proven here by calling
+/// both against the same account.
 #[sqlx::test(migrations = "../../migrations")]
-async fn get_my_budget_refill_ladder_matches_what_a_real_refill_would_request(pool: PgPool) {
+async fn get_my_budget_refill_ladder_returns_the_active_policys_offered_amounts(pool: PgPool) {
     let account_id = cuid2();
     insert_account(&pool, &account_id).await;
     let (procedures, ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
@@ -837,32 +907,32 @@ async fn get_my_budget_refill_ladder_matches_what_a_real_refill_would_request(po
 
     assert_eq!(status.budgetAccountId, account_id);
     assert_eq!(status.period, PERIOD);
-    assert_eq!(status.currentTier, "b-15");
-    assert_eq!(status.currentTierAmountMicros, "15000000");
-    assert_eq!(status.nextTier.as_deref(), Some("b-30"));
-    assert_eq!(status.nextTierAmountMicros.as_deref(), Some("30000000"));
-    assert_eq!(status.ladder.len(), 7, "the full static ADR-0008 ladder");
-    assert_eq!(status.ladder[0].tier, "b-15");
-    assert_eq!(status.ladder[0].amountMicros, "15000000");
-    assert_eq!(status.ladder[6].tier, "b-1000");
-    assert_eq!(status.ladder[6].amountMicros, "1000000000");
-
-    let refill = request_refill(&procedures, &db, &ctx, refill_args(&account_id, None))
-        .await
-        .expect("the actual refill this preview described must succeed the same way");
     assert_eq!(
-        refill.requestedTier, "b-30",
-        "the preview's nextTier must match what request_refill actually requests, not drift from it"
+        status.allowedAmountsMicros,
+        vec!["6000000", "15000000", "30000000"]
     );
+
+    let refill = request_refill(
+        &procedures,
+        &db,
+        &ctx,
+        refill_args(&account_id, None, "30000000"),
+    )
+    .await
+    .expect("an amount the preview reported as offered must be accepted by a real submission");
+    assert_eq!(refill.requestedTier, "b-30");
 }
 
-/// ADR-0015: `allowedAmountsMicros` must be present ALONGSIDE the untouched pre-ADR-0015 fields,
-/// not instead of them -- proves the additive contract the coordinator required: converse-
-/// frontends#185 is live in production reading `currentTier`/`ladder`/etc., so a backend deploy
-/// that dropped or reshaped those fields would break it the instant it shipped. This test would
-/// catch that regression by construction: it asserts both halves of the response in one place.
+/// #387's own regression guard: the pre-ADR-0015 `currentTier`/`currentTierAmountMicros`/
+/// `nextTier`/`nextTierAmountMicros`/`ladder` fields (and the `BudgetLadderRung` type) must be
+/// genuinely absent from the wire response, not merely unused in Rust -- serializes the real,
+/// procedure-produced `Output` the same way the RPC codec would and inspects the actual bytes, so
+/// a future re-introduction of any of these fields on the schema type would be caught even though
+/// nothing in this test file references them by name as a struct field.
 #[sqlx::test(migrations = "../../migrations")]
-async fn get_my_budget_refill_ladder_is_additive_both_legacy_and_new_fields_present(pool: PgPool) {
+async fn get_my_budget_refill_ladder_response_never_serializes_the_removed_legacy_fields(
+    pool: PgPool,
+) {
     let account_id = cuid2();
     insert_account(&pool, &account_id).await;
     let (procedures, ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
@@ -872,64 +942,51 @@ async fn get_my_budget_refill_ladder_is_additive_both_legacy_and_new_fields_pres
         .await
         .expect("a fresh account's ladder status must succeed");
 
-    // Pre-ADR-0015, unchanged -- the live frontend's existing contract.
-    assert_eq!(status.currentTier, "b-15");
-    assert_eq!(status.ladder.len(), 7);
+    let wire = serde_json::to_string(&status).expect("the response type must serialize");
 
-    // ADR-0015, new -- what `allowed_amounts_micros` for `requestBudgetRefill` looks like.
-    assert_eq!(
-        status.allowedAmountsMicros,
-        vec!["6000000", "15000000", "30000000"]
+    for legacy_field in [
+        "currentTier",
+        "currentTierAmountMicros",
+        "nextTier",
+        "nextTierAmountMicros",
+        "ladder",
+        "amountMicros",
+    ] {
+        assert!(
+            !wire.contains(legacy_field),
+            "the wire response must never contain the removed field `{legacy_field}`: {wire}"
+        );
+    }
+    assert!(
+        wire.contains("allowedAmountsMicros"),
+        "the wire response must still carry allowedAmountsMicros: {wire}"
     );
 }
 
-/// Once an account is already on the top rung, the ladder preview must say so up front
-/// (`nextTier: null`) rather than only revealing it after a failed submission.
+/// The self-scoping guarantee `getMyBudgetRefillLadder`'s schema doc comment claims: `budgetAccountId`
+/// always reflects the authenticated caller, never a caller-supplied or shared value -- there is
+/// no target field on the input to even attempt otherwise.
 #[sqlx::test(migrations = "../../migrations")]
-async fn get_my_budget_refill_ladder_has_no_next_tier_at_the_top_rung(pool: PgPool) {
-    let account_id = cuid2();
-    insert_account(&pool, &account_id).await;
-    let (procedures, ctx, budget_repo) = procedures_and_ctx(pool, &account_id).await;
-    let db = lazy_cratestack_db();
-
-    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B1000).await;
-
-    let status = get_ladder(&procedures, &db, &ctx, ladder_args())
-        .await
-        .expect("status at the top rung must still succeed");
-
-    assert_eq!(status.currentTier, "b-1000");
-    assert_eq!(status.nextTier, None);
-    assert_eq!(status.nextTierAmountMicros, None);
-}
-
-/// The self-scoping guarantee `getMyBudgetRefillLadder`'s schema doc comment claims: the caller
-/// always sees THEIR OWN ladder position, derived from the authenticated subject, never another
-/// account's -- there is no target field on the input to even attempt otherwise.
-#[sqlx::test(migrations = "../../migrations")]
-async fn get_my_budget_refill_ladder_is_scoped_to_the_caller_not_another_account(pool: PgPool) {
+async fn get_my_budget_refill_ladder_is_scoped_to_the_callers_own_budget_account_id(pool: PgPool) {
     let owner_id = cuid2();
     let bystander_id = cuid2();
     insert_account(&pool, &owner_id).await;
     insert_account(&pool, &bystander_id).await;
-    let (procedures, owner_ctx, budget_repo) = procedures_and_ctx(pool, &owner_id).await;
-    let bystander_ctx = ctx_for(&bystander_id);
+    let (procedures, owner_ctx, _budget_repo) = procedures_and_ctx(pool, &owner_id).await;
+    let bystander_ctx = ctx_for(&bystander_id).await;
     let db = lazy_cratestack_db();
-
-    seed_self_service_grant(&budget_repo, &owner_id, BudgetTier::B250).await;
 
     let owner_status = get_ladder(&procedures, &db, &owner_ctx, ladder_args())
         .await
         .expect("owner's own status must succeed");
     assert_eq!(owner_status.budgetAccountId, owner_id);
-    assert_eq!(owner_status.currentTier, "b-250");
 
     let bystander_status = get_ladder(&procedures, &db, &bystander_ctx, ladder_args())
         .await
-        .expect("bystander's own (fresh) status must succeed");
+        .expect("bystander's own status must succeed");
     assert_eq!(bystander_status.budgetAccountId, bystander_id);
-    assert_eq!(
-        bystander_status.currentTier, "b-15",
-        "a caller must never see another account's tier progress"
+    assert_ne!(
+        owner_status.budgetAccountId, bystander_status.budgetAccountId,
+        "budgetAccountId must always reflect the authenticated caller, never a shared value"
     );
 }

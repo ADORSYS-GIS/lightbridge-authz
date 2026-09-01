@@ -32,6 +32,7 @@ use lightbridge_authz_core::config::{QuotaTier, QuotaTiers};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_core::error::Error;
+use lightbridge_authz_core::identity::AccountId;
 use lightbridge_authz_core::{CreateAccount, CreateProject};
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
 use sqlx::PgPool;
@@ -70,6 +71,7 @@ async fn create_account_accepts_a_configured_default_quota(pool: PgPool) {
             &subject,
             CreateAccount {
                 default_quota: Some("gold".to_string()),
+                name: None,
             },
         )
         .await
@@ -89,6 +91,7 @@ async fn create_account_rejects_an_unconfigured_default_quota(pool: PgPool) {
             &subject,
             CreateAccount {
                 default_quota: Some("medim".to_string()),
+                name: None,
             },
         )
         .await
@@ -121,6 +124,7 @@ async fn create_account_accepts_missing_default_quota(pool: PgPool) {
             &subject,
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
@@ -141,6 +145,7 @@ async fn create_account_accepts_anything_when_catalogue_is_empty(pool: PgPool) {
             &subject,
             CreateAccount {
                 default_quota: Some("anything-goes".to_string()),
+                name: None,
             },
         )
         .await
@@ -161,9 +166,10 @@ async fn update_account_default_quota_accepts_a_configured_tier(pool: PgPool) {
     let subject = format!("subj-{}", cuid2());
     StoreRepo::new(core)
         .create_account(
-            &subject,
+            &AccountId::assert_already_resolved(subject.clone()),
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
@@ -184,9 +190,10 @@ async fn update_account_default_quota_rejects_an_unconfigured_tier(pool: PgPool)
     let subject = format!("subj-{}", cuid2());
     let repo = StoreRepo::new(core.clone());
     repo.create_account(
-        &subject,
+        &AccountId::assert_already_resolved(subject.clone()),
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -217,9 +224,10 @@ async fn update_account_default_quota_accepts_none_to_clear(pool: PgPool) {
     let subject = format!("subj-{}", cuid2());
     StoreRepo::new(core)
         .create_account(
-            &subject,
+            &AccountId::assert_already_resolved(subject.clone()),
             CreateAccount {
                 default_quota: Some("gold".to_string()),
+                name: None,
             },
         )
         .await
@@ -241,9 +249,10 @@ async fn update_account_default_quota_accepts_anything_when_catalogue_is_empty(p
     let subject = format!("subj-{}", cuid2());
     StoreRepo::new(core)
         .create_account(
-            &subject,
+            &AccountId::assert_already_resolved(subject.clone()),
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
@@ -272,17 +281,19 @@ async fn seed_lead_and_target(core: Arc<dyn DbPoolTrait>) -> (String, String, St
 
     let lead_account = repo
         .create_account(
-            &lead_subject,
+            &AccountId::assert_already_resolved(lead_subject.clone()),
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
         .expect("lead account creation");
     repo.create_account(
-        &target_subject,
+        &AccountId::assert_already_resolved(target_subject.clone()),
         CreateAccount {
             default_quota: None,
+            name: None,
         },
     )
     .await
@@ -290,7 +301,7 @@ async fn seed_lead_and_target(core: Arc<dyn DbPoolTrait>) -> (String, String, St
 
     let project = repo
         .create_project(
-            &lead_subject,
+            &AccountId::assert_already_resolved(lead_subject.clone()),
             &lead_account.id,
             CreateProject {
                 name: "proj".to_string(),
@@ -305,9 +316,14 @@ async fn seed_lead_and_target(core: Arc<dyn DbPoolTrait>) -> (String, String, St
         .await
         .expect("project creation");
 
-    repo.add_project_member(&lead_subject, &project.id, &target_subject, Some("member"))
-        .await
-        .expect("add target as a project member");
+    repo.add_project_member(
+        &AccountId::assert_already_resolved(lead_subject.clone()),
+        &project.id,
+        &target_subject,
+        Some("member"),
+    )
+    .await
+    .expect("add target as a project member");
 
     (lead_subject, project.id, target_subject)
 }
@@ -319,7 +335,10 @@ async fn roster_quota_tier(
 ) -> Option<String> {
     let repo = StoreRepo::new(core);
     let roster = repo
-        .list_project_roster(target_subject, project_id)
+        .list_project_roster(
+            &AccountId::assert_already_resolved(target_subject),
+            project_id,
+        )
         .await
         .expect("roster read should succeed");
     roster
@@ -428,9 +447,10 @@ async fn seed_owner_and_project(core: Arc<dyn DbPoolTrait>) -> (String, String) 
 
     let owner_account = repo
         .create_account(
-            &owner_subject,
+            &AccountId::assert_already_resolved(owner_subject.clone()),
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
@@ -438,7 +458,7 @@ async fn seed_owner_and_project(core: Arc<dyn DbPoolTrait>) -> (String, String) 
 
     let project = repo
         .create_project(
-            &owner_subject,
+            &AccountId::assert_already_resolved(owner_subject.clone()),
             &owner_account.id,
             CreateProject {
                 name: "proj".to_string(),

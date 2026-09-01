@@ -22,15 +22,19 @@
 //! and cratestack's own dispatch.
 #![cfg(feature = "it-tests")]
 
+mod common;
+
 use std::sync::Arc;
 
-use cratestack::{CratestackContext, CratestackError, Value};
+use cratestack::{CratestackContext, CratestackError};
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api::schema::procedures::ProcedureRegistry;
 use lightbridge_authz_budget::PolicyStore;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::Procedures;
+use lightbridge_authz_rest::auth_provider::build_context;
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
+use lightbridge_authz_rest::rpc_authorize::RpcScope;
 use sqlx::PgPool;
 
 const SEEDED_POLICY_SET_ID: &str = "budget-refill";
@@ -151,8 +155,17 @@ async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, Cratest
         review_service,
         budget_repo,
     );
-    let ctx =
-        CratestackContext::authenticated([("id".to_owned(), Value::String(subject.to_owned()))]);
+    // Issue #383 follow-up: see the identical comment in `budget_policy_procedure_tests.rs` --
+    // grants the full permission set via the shared `build_context` helper, `RpcScope::Budget`,
+    // rather than a bare `authenticated([("id", ...)])` context that would now fail the schema's
+    // `auth().rpcScope`/`auth().perm*` clauses.
+    let ctx = build_context(
+        &common::token_info(subject, common::admin_perms()),
+        RpcScope::Budget,
+        common::test_resolver().as_ref(),
+    )
+    .await
+    .expect("the trust-everything test resolver never refuses");
     (procedures, ctx)
 }
 

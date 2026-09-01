@@ -33,6 +33,16 @@ server:
     tls:
       cert_path: "./config/tls/idp.crt"
       key_path: "./config/tls/idp.key"
+    # ADR-0021 Decisions 1 + 10, amended by ADR-0029 (#591): the hosted login page's Vite
+    # production build. This repo no longer builds it -- its source home is converse-frontends'
+    # `apps/authz-ui` -- so there is no in-repo path to point at any more. `./dist/static` is the
+    # same staging location CI uses (`.github/actions/stage-authz-ui` -> `Dockerfile.dist`'s
+    # `COPY dist/static /app/static`), so `just stage-authz-ui` populates it for a bare
+    # `cargo run`. To iterate against a live local UI checkout instead, override it:
+    #   IDP_STATIC_DIR=../converse-frontends/apps/authz-ui/dist cargo run -- idp
+    # An empty/absent directory is not fatal: /ui/* 404s until the assets exist (see
+    # `IdpServer::static_dir`'s doc comment and `missing_static_dir_degrades_to_404_without_panicking`).
+    static_dir: "${IDP_STATIC_DIR:-./dist/static}"
   # authz-budget: the budget-domain microservice carrying every budget:*-gated RPC procedure off
   # authz-api (hard cutover, not a transitional duplication like idp above -- see
   # docs/architecture/budget.md). Its RPC surface is mounted under a fixed /budget prefix
@@ -46,7 +56,14 @@ server:
 logging:
   level: "info"
 database:
-  url: "postgres://postgres:postgres@localhost:5432/lightbridge_authz"
+  # Honors DATABASE_URL when set (and non-empty), falling back to the checked-in local default
+  # otherwise -- see AGENTS.md's "Environment Variable Interpolation" (`:-` also falls back on
+  # set-but-empty, unlike `-`). Before this, this key was a bare literal, so `cargo run -p
+  # lightbridge-authz -- migrate --config-path config/default.yaml` silently ignored an exported
+  # DATABASE_URL and always connected to localhost:5432 -- the dangerous part being that it
+  # connected *successfully* to the wrong database rather than erroring, so the migration looked
+  # like it ran when it actually ran somewhere else (found via PR #447 / #440-#441-#437).
+  url: "${DATABASE_URL:-postgres://postgres:postgres@localhost:5432/lightbridge_authz}"
   pool_size: 10
 # Mandatory for authz-api, authz-idp, and authz-budget -- each refuses to start without it (see
 # AGENTS.md's "Redis is a mandatory dependency" house rule). Used for Redis-backed rate limiting
@@ -99,6 +116,14 @@ oauth2:
   #   self     → this service mints self-signed JWT API keys (uses `signing` below).
   #   external → API keys are exchanged at the upstream IdP/Keycloak (uses `issuance` below).
   type: self
+  # ⚠️ LOCAL-STACK DIVERGENCE, do not generalize: this points at Keycloak directly, but the
+  # platform rule (owner, 2026-08-31) is that ALL authz resource servers validate against
+  # AUTHZ-IDP's JWKS -- which prod does (ai-helm-values `lightbridge-app.yaml`: the api/mcp/budget
+  # components all set oauth2.jwks_url to https://auth.ai.camer.digital/.well-known/jwks.json;
+  # only the idp component itself validates the Keycloak leg, as the broker). This local config
+  # predates ADR-0023's full-IdP cutover and stays on Keycloak ONLY because every IT suite still
+  # mints raw Keycloak tokens directly -- migrating the local trust root to authz-idp is a tracked
+  # follow-up (ADR-0030 Decision 6/Neutral-follow-ups) and means converting those suites too.
   jwks_url: "http://localhost:9100/realms/dev/protocol/openid-connect/certs"
   oauth2_url: "http://localhost:9100/realms/dev/protocol/openid-connect/token"
   # Expected audience claim(s) in JWT tokens. If set, tokens must contain at least one of these values.
@@ -119,6 +144,34 @@ oauth2:
     client_secret: "${KEYCLOAK_TOKEN_CLIENT_SECRET:-lightbridge-token-issuer-secret}"
     subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
     requested_token_type: "urn:ietf:params:oauth:token-type:access_token"
+  # ADR-0025 Stage 1: the ONE issuer this deployment trusts for remote-subject-to-account-id
+  # translation (StoreRepo::resolve_account_for_federated_subject). Mandatory for authz-api,
+  # authz-idp, authz-opa, authz-budget, and lightbridge-mcp -- each refuses to start without it.
+  # This is now the ONLY issuer field: `relying_party.issuer` was removed (it used to have to be
+  # kept byte-equal to this one by hand -- that config trap is gone). `discovery_url` is left
+  # unset here and defaults to `issuer`: this file runs binaries directly on the host (see
+  # "Running Locally (Without Compose)" in AGENTS.md), so the same `localhost:9100` address is
+  # reachable both for the browser/host tooling AND for the process's own discovery dial -- there
+  # is no internal-vs-external network split to express here (contrast
+  # `.docker/authz/container.yaml`, which sets `discovery_url` to the in-network Keycloak address).
+  federation:
+    issuer: "http://localhost:9100/realms/dev"
+  # Outbound Keycloak OIDC RP used by /device/verify. This is deliberately distinct from
+  # `issuance`: it is an interactive PKCE client, not a token-exchange service account. The
+  # identity issuer now lives solely on `oauth2.federation.issuer` above.
+  relying_party:
+    client_id: "authz-idp-rp"
+    callback_url: "https://localhost:13004/idp/callback"
+    # Development-only fixed key. Production MUST set a unique base64url-encoded 32-byte key.
+    state_encryption_key: "${KEYCLOAK_RP_STATE_ENCRYPTION_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA}"
+    # ADR-0024: separate AES-256-GCM key sealing the Keycloak token set (refresh token + ID-token
+    # claims snapshot) persisted on federated_identities.token_envelope. Development-only fixed
+    # key, deliberately different from state_encryption_key above (KeycloakRelyingParty::new
+    # refuses a config where the two are equal). Production MUST set a unique base64url-encoded
+    # 32-byte key.
+    token_encryption_key: "${KEYCLOAK_RP_TOKEN_ENCRYPTION_KEY:-QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI}"
+    timeout_ms: ${KEYCLOAK_RP_TIMEOUT_MS:-5000}
+    browser_session_ttl_seconds: ${BROWSER_SESSION_TTL_SECONDS:-28800}
   # Self-signed API-key JWTs (enterprise: the credential must be a JWT). When enabled, issued
   # keys are RS256 JWTs signed by this service, carrying api_key_id/project_id/account_id/
   # allowed_models claims. The signing keypair is generated on first startup and stored in the
@@ -133,36 +186,86 @@ oauth2:
     audience: "${JWT_SIGNING_AUDIENCE:-lightbridge-api-key}"
     ttl_seconds: ${JWT_SIGNING_TTL_SECONDS:-7776000}
     max_key_age_days: ${JWT_SIGNING_MAX_KEY_AGE_DAYS:-30}
-  # Native RFC 8693 token-exchange (POST /oauth2/token). Requires `signing`. Exchanges an upstream
-  # IdP access token (+ project_id) for a short-lived project-scoped self-signed JWT, plus a
-  # revocable refresh token when `offline_access` is requested. Independent of `issuance`.
+
+    # GHSA/#538-adjacent but separate: claims this deployment stamps on tokens it signs, declared
+    # rather than hard-coded.
+    #
+    # This is what lets `authz-idp` be the sole issuer for the human plane. The RBAC roles claim
+    # below is derived from `project_members` -- data this service owns -- not copied out of a
+    # Keycloak token we happened to broker. `authz-api` reads whatever `oauth2.rbac.roles_claim`
+    # names, so the `claim` here MUST match that setting.
+    #
+    # `source: project_role` resolves to `owner` (the subject owns the project's account and
+    # normally holds no roster row -- the same implicit authorization `authorize_project_lead`
+    # applies), or the subject's `project_members.role` (`lead` / `member`).
+    #
+    # A source value absent from `map` falls through to `default`, which is EMPTY here: no roles,
+    # therefore no permissions. That is the default-deny direction. A lookup FAILURE is different --
+    # it refuses the mint outright rather than stamping an empty claim, so a database blip can never
+    # masquerade as a legitimately unprivileged user.
+    claim_mappers:
+      - claim: lightbridge_api_roles
+        source: project_role
+        map:
+          owner: ["lightbridge-admin"]
+          lead: ["lightbridge-editor"]
+          member: ["lightbridge-viewer"]
+        default: []
+  # Native RFC 8693 token-exchange and RFC 8628 device grant. Requires `signing`. Token exchange
+  # exchanges an upstream IdP access token (+ project_id) for a short-lived project-scoped JWT;
+  # the device flow delegates approval to the Keycloak relying-party verification page.
   token_exchange:
-    enabled: ${TOKEN_EXCHANGE_ENABLED:-false}
+    enabled: ${TOKEN_EXCHANGE_ENABLED:-true}
     access_ttl_seconds: ${TOKEN_EXCHANGE_ACCESS_TTL_SECONDS:-900}
+    authorization_code_ttl_seconds: ${AUTHORIZATION_CODE_TTL_SECONDS:-300}
     refresh_ttl_seconds: ${TOKEN_EXCHANGE_REFRESH_TTL_SECONDS:-2592000}
     # Absolute cap on a refresh-token chain's lifetime, independent of the per-rotation TTL above
     # -- see Oauth2TokenExchange::refresh_absolute_ttl_seconds's doc comment for why this exists.
     refresh_absolute_ttl_seconds: ${TOKEN_EXCHANGE_REFRESH_ABSOLUTE_TTL_SECONDS:-7776000}
+    # Bounded idempotent-replay grace window for a refresh token presented just after it was
+    # rotated -- added after the 2026-08-30 console-401s incident (two replicas raced their own
+    # refresh single-flight and one replayed the other's already-rotated token, triggering the
+    # strict RFC 6819 §5.2.2.3 cascade on a benign race). See
+    # Oauth2TokenExchange::refresh_reuse_grace_seconds's doc comment. 0 disables the grace window
+    # (strict cascade on every post-rotation replay, the pre-incident behavior).
+    refresh_reuse_grace_seconds: ${TOKEN_EXCHANGE_REFRESH_REUSE_GRACE_SECONDS:-30}
     allowed_scopes:
       - openid
       - profile
       - email
       - offline_access
-  # Real, config-sourced OAuth2/OIDC clients permitted to use the token-exchange endpoint above
+    device_code_ttl_seconds: ${DEVICE_CODE_TTL_SECONDS:-600}
+    device_poll_interval_seconds: ${DEVICE_POLL_INTERVAL_SECONDS:-5}
+    device_verification_uri: "${DEVICE_VERIFICATION_URI:-https://localhost:13004/device/verify}"
+  # Real, config-sourced OAuth2/OIDC clients. Authorization-code clients must register exact
+  # redirect_uris and set require_pkce: true; S256 is the only accepted PKCE method. No concrete
+  # lightbridge-ss callback is configured in this repository, so it is intentionally not enabled.
   # (ADR-0011, Decision 5). Empty here by default -- with no clients registered, every exchange
   # fails client authentication (invalid_client), it is not left unprotected. Uncomment/adapt when
   # enabling token_exchange for a real client. `public` clients present no credential beyond
   # client_id; `confidential` clients authenticate via `private_key_jwt` only (ADR-0011, Decision
   # 6 -- never client_secret_basic/client_secret_post) and need their public key inline as `jwks`
-  # (a JWK Set: `{"keys": [...]}`) -- there is deliberately no `jwks_uri`.
-  # clients:
-  #   - client_id: lightbridge-ss
-  #     type: public
+  # (a JWK Set: `{"keys": [...]}`) -- there is deliberately no `jwks_uri`. `service` clients (#534,
+  # ADR-0030: the `client_credentials`/M2M grant) authenticate identically to `confidential`
+  # (`private_key_jwt` only) but are a separate config-level type name so a reviewer can see at a
+  # glance which registered clients are machines rather than browser/native RP legs -- see
+  # `start_idp_server`'s startup validation for why `type: public` + `client_credentials` is
+  # refused outright, and why every `confidential`/`service` client needs a real, parseable `jwks`
+  # or startup itself refuses.
+  clients:
+    - client_id: opencode-cli
+      type: public
+      scopes: [openid, offline_access]
+      grant_types:
+        - "urn:ietf:params:oauth:grant-type:device_code"
+        - refresh_token
   #     scopes: [openid, profile, email, offline_access]
   #     grant_types:
   #       - "urn:ietf:params:oauth:grant-type:token-exchange"
   #       - refresh_token
   #     allowed_audiences: [lightbridge-ss]
+  #     redirect_uris: ["https://dashboard.example.invalid/oauth/callback"]
+  #     require_pkce: true
   #   - client_id: lightbridge-mcp
   #     type: confidential
   #     scopes: [openid, profile, email, offline_access]
@@ -176,6 +279,29 @@ oauth2:
   #           kid: "lightbridge-mcp-2026-08"
   #           alg: RS256
   #           n: "<base64url-encoded RSA modulus of lightbridge-mcp's public key>"
+  #           e: "AQAB"
+  #   # A client_credentials (M2M) client -- #534, ADR-0030. `scopes` here is its OWN namespace,
+  #   # checked independently of oauth2.token_exchange.allowed_scopes (the human-plane ceiling).
+  #   # `redirect_uris` MUST stay empty/absent -- this is a non-browser, non-redirect grant.
+  #   # NOTE: in THIS LOCAL config, a token minted from this example is not accepted by authz-api --
+  #   # this file's own oauth2.jwks_url (above) still points at Keycloak directly, a local-dev drift
+  #   # never migrated when ADR-0023 made authz-idp the full IdP (tracked separately, see
+  #   # docs/local-testing.md). Deployed environments validate against authz-idp's own JWKS (the
+  #   # platform rule -- every authz resource server validates against authz-idp), where a token
+  #   # like this one DOES pass signature validation and is refused by its empty permission set
+  #   # instead -- see ADR-0030 Decision 6.
+  #   - client_id: acme-usage-exporter
+  #     type: service
+  #     scopes: [read:usage]
+  #     grant_types:
+  #       - client_credentials
+  #     allowed_audiences: [lightbridge-api-key]
+  #     jwks:
+  #       keys:
+  #         - kty: RSA
+  #           kid: "acme-usage-exporter-2026-08"
+  #           alg: RS256
+  #           n: "<base64url-encoded RSA modulus of acme-usage-exporter's public key>"
   #           e: "AQAB"
   # Role-based access control. Roles arrive on the JWT in a single, flat, top-level claim
   # (`roles_claim`, configurable). Each role maps to the permissions it grants; a grant is `*`
@@ -256,3 +382,25 @@ models:
 # api_key_expiry:
 #   max_lifetime_days: 90
 
+# GHSA-9pc6-965v-2c44 / #538: API key secrets created through lightbridge-mcp are NEVER returned
+# in the tool result -- an MCP result goes straight into the calling model's context. The secret is
+# sealed here and handed over as a single-use claim URL the requesting human redeems once, in a
+# browser, against authz-idp.
+#
+# Deliberately NOT a startup mandate. An ABSENT block degrades safely: lightbridge-mcp REFUSES
+# create-api-key/rotate-api-key (it never falls back to returning the secret), and authz-idp
+# answers 503 on /api-keys/claim. A PRESENT but malformed block IS a hard startup failure --
+# tolerated case is "absent", never "wrong".
+#
+# The mandate was softened deliberately: authz-idp is the sole server of its issuer, and every
+# in-circulation API-key JWT names it in `iss`, so refusing to boot over a missing claim key would
+# take the issuer down to disable one page. authz-api/-opa/-budget ignore this section.
+secret_claim:
+  # Dev-only fixed key: base64url, exactly 32 bytes. Distinct from BOTH relying-party keys above --
+  # different data, different lifetime, different rotation posture. Production MUST override.
+  # Rotating it makes un-redeemed claims unopenable, which is cheap here: claims live ~5 minutes.
+  encryption_key: "${SECRET_CLAIM_ENCRYPTION_KEY:-Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M}"
+  ttl_seconds: 300
+  # Where the human collects it. The authz-idp origin, NOT authz-api/-mcp -- authz-idp is the only
+  # service holding browser sessions, which is what makes a claim URL useless to a model.
+  redeem_base_url: "${SECRET_CLAIM_REDEEM_BASE_URL:-https://localhost:13004}"

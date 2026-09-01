@@ -27,6 +27,12 @@ serde_json = "1.0"
 sha2 = "0.11"
 hex = "0.4"
 base64 = "0.23"
+# Already present in Cargo.lock as a transitive dependency of authkestra-engine (PKCE/state
+# encryption); promoted to a direct workspace dependency here because
+# `lightbridge-authz-core::crypto::{seal,open}` (ADR-0024) now calls it directly for the
+# Keycloak-token-set-at-rest envelope. Pinning the same 0.10 line authkestra-engine already
+# resolves to avoids carrying two `aes-gcm` majors in the lockfile.
+aes-gcm = "0.10"
 # ⚠️ THIS VERSION IS COUPLED TO `authkestra-resource` BELOW. Bump them together or not at all.
 #
 # `lightbridge-authz-bearer` passes `Validation`/`Algorithm` values straight into authkestra's
@@ -92,9 +98,116 @@ jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
 # so all three lines below MUST move together on any future bump, exactly like the cratestack
 # lockstep block further down — a partial bump within this trio reproduces the exact failure mode
 # the old git-pin comment (see git history) documented for jsonwebtoken majors.
-authkestra-resource = "0.5.0"
-authkestra-op = "0.5.0"
-authkestra-engine = "0.5.0"
+#
+# DRIFT OCCURRED (2026-08-21, #404/#406): Dependabot opened one PR per crate — #406
+# (`authkestra-resource` 0.5.0 -> 0.5.1) and #404 (`authkestra-op` 0.5.0 -> 0.5.1) — same as the
+# cratestack family's recurring failure mode documented in the block below. #406 merged first,
+# touching only `Cargo.lock` (the caret range `"0.5.0"` already permitted 0.5.1, so there was
+# nothing for it to change in this manifest); `authkestra-engine` incidentally floated to 0.5.1 in
+# the same lockfile resolution even though nothing bumped it directly, because the resolver picks
+# the newest version satisfying the shared caret range for every crate, not just the one Dependabot
+# targeted. That left `authkestra-op` alone at 0.5.0 in `Cargo.lock` until #404 merged separately —
+# exactly the "two of three moved, one didn't" shape, caught only because `jsonwebtoken` happened to
+# stay at a single 11.0.0 entry throughout (re-verify with the grep two paragraphs up any time this
+# recurs; it is what actually would have failed the build).
+#
+# Per the cratestack block's own "FOURTH OCCURRENCE" finding below: a caret requirement string is
+# not durable against this, because Dependabot's scheduled `cargo update` can silently move a
+# `Cargo.lock` entry within an already-permitted range without ever touching `Cargo.toml` — there is
+# no diff to notice in review. Applying that same fix here: every line below is now an exact `=`
+# pin, so a future single-crate Dependabot bump either edits the requirement string itself (a visible,
+# reviewable `Cargo.toml` diff) or fails to resolve — it cannot land as a silent lockfile-only float
+# again. This repo has no downstream consumers of its own `Cargo.toml` (it produces binaries, not a
+# published library), so exact-pinning carries none of the "raises the floor for consumers" cost an
+# exact pin would have in a published crate.
+# BUMPED (2026-08-24, authkestra 0.5.1 -> 0.5.4): all three move together per the lockstep rule
+# above -- upstream still shares one `version.workspace = true`, and 0.5.2/0.5.3/0.5.4 each
+# re-released every crate in the workspace (the `authkestra-v0.5.x` release notes list all of
+# `-engine`/`-providers`/`-resource`/`-op`/`-axum`/`-oidc`/`-actix` as "updated local packages"),
+# so a partial bump here reproduces exactly the #404/#406 drift documented above.
+#
+# What actually changed for THIS repo across 0.5.2..0.5.4, from upstream's per-crate changelogs:
+#
+# - 0.5.3, `authkestra-op` PR #226 -- `OidcDiscovery` gains a `revocation_endpoint` field.
+#   This resolves <https://github.com/marcjazz/authkestra/issues/220>, which THIS repo filed.
+#   `crates/lightbridge-authz-rest/src/signing.rs` currently carries an explicit
+#   "`revocation_endpoint` is absent, on purpose, not an oversight -- it cannot be added here"
+#   callout justified solely by the field not existing. That justification dies with this bump:
+#   `POST /oauth2/revoke` (RFC 7009) is real, mounted and live, and RFC 8414 §2 says the document
+#   should carry it. Wiring it in is deliberately NOT done here -- PRs #460 and #467 are both
+#   rewriting `signing.rs`'s discovery construction right now, and doing it in this bump would
+#   conflict with them for no benefit. Whichever of those lands last owns the wiring; until then
+#   the `signing.rs` comment is stale and says so only by pointing at an issue now closed.
+#
+# - 0.5.3, `authkestra-op` PR #230 -- requested `audience` is now validated against the client's
+#   `allowed_audiences` in the client_credentials grant. No effect here: this workspace registers
+#   no client for `client_credentials` (the only references are `client_store.rs`'s exhaustive
+#   `GrantType` match arm and a `token_exchange_tests.rs` case that asserts an UNREGISTERED
+#   grant is rejected with `unauthorized_client` -- both unaffected by tighter validation inside
+#   a grant nothing reaches). `app/lightbridge-authz/src/mcp.rs`'s hand-built metadata advertises
+#   the grant but is a separate JSON document that never touches authkestra.
+#
+# - 0.5.4, `authkestra-op`/`-resource` PR #231 -- RFC 8705 certificate-bound access tokens for
+#   client_credentials. Additive, same grant, same reasoning: unreachable from here.
+#
+# - 0.5.3 `authkestra-engine` PR #229 (private_key_jwt on ClientCredentialsFlow) and 0.5.4
+#   `authkestra-oidc` PR #228 (ID-token `Validation` derived from discovery) -- the former is
+#   again client_credentials-only; the latter is in `authkestra-oidc`, which this workspace
+#   deliberately does not depend on (ADR-0021 Decision 5 uses `authkestra-resource`'s
+#   `JwksCache`/`validate_jwt_generic` for the RP leg instead).
+#
+# - 0.5.2, `authkestra-op` PR #211 -- `RedisClientAssertionStore`. This repo already constructs
+#   its own `RedisClientAssertionStore`; verify at review time that the constructor signature is
+#   unchanged (it compiled clean on `cargo check --workspace`, which is the actual proof).
+#
+# BUMPED (2026-08-25, authkestra 0.5.4 -> 0.5.5): same lockstep rule -- verified via GitHub's
+# compare API (`gh api repos/marcjazz/authkestra/compare/<crate>-v0.5.4...<crate>-v0.5.5`) rather
+# than trusting the per-crate changelog text alone, because the changelog for this release listed
+# PR #241 ("add SD-JWT runnable example, doctests, and book/README docs") under `authkestra-op`,
+# `authkestra-providers`, and `authkestra` too -- a release-plz artifact of the shared workspace
+# version, not evidence those crates' source changed. The compare API's file list is the ground
+# truth and is what the verdicts below are based on:
+#
+# - `authkestra-resource` 0.5.4..0.5.5: EMPTY diff outside `Cargo.lock`/`Cargo.toml`/CHANGELOGs --
+#   no `crates/authkestra-resource/**` file appears in the compare. `Pkce`/`OAuth2State`/
+#   `validate_jwt_generic`/`JwksCache` (the RP leg this repo's ADR-0021 Decision 5 depends on) are
+#   byte-for-byte unchanged. Not reachable, because there is nothing to reach.
+# - `authkestra-op` 0.5.4..0.5.5: same -- only `crates/authkestra-op/CHANGELOG.md` changed, no
+#   source file. `OpStore::handle_token_exchange` (overridden in
+#   `crates/lightbridge-authz-rest/src/oauth2_op/store.rs`), `TokenManager` issuance call sites,
+#   `RedisClientAssertionStore`, and `OidcDiscovery` are all unchanged -- confirmed by the empty
+#   diff, not merely inferred from the changelog.
+# - `authkestra-engine` 0.5.4..0.5.5: the one crate with a real source diff -- upstream PR #238
+#   (SD-JWT selective-disclosure issuance/verification) adds `crates/authkestra-engine/src/
+#   token/sd_jwt.rs` as a wholly new module, wired in via a single additive line in
+#   `token/mod.rs` (`pub mod sd_jwt;`), plus new examples/tests/docs. `token::TokenManager`'s
+#   existing issuance API (the surface `signing.rs` calls for jti-override access/id-token
+#   minting) is untouched by this diff -- confirmed via the compare API's file-level patch, not
+#   just the changelog. `authkestra-engine`'s own `Cargo.toml`/lockfile deps are unchanged (no new
+#   crate entries -- SD-JWT reuses the crate's existing `base64`/`serde` deps already in the
+#   graph), so nothing here should perturb dependency resolution.
+# - `authkestra-oidc` 0.5.4..0.5.5 (PR #228, ID-token `Validation` derived from discovery instead
+#   of `Validation::default()`): this workspace still deliberately does not depend on
+#   `authkestra-oidc` (ADR-0021 Decision 5 uses `authkestra-resource` for the RP leg instead), so
+#   unreachable regardless of the crate's own content.
+#
+# Net: this bump is functionally a no-op for every seam this repo touches (`TokenManager`
+# issuance, `OpStore::handle_token_exchange`, `RedisClientAssertionStore`,
+# `validate_jwt_generic`/`JwksCache`, `Pkce`/`OAuth2State`, `OidcDiscovery`) -- verified by
+# GitHub's compare API per crate above, not assumed from the shared changelog text.
+#
+# Exact `=` pins retained deliberately -- see the drift paragraphs above; a caret range here is
+# not durable against a lockfile-only Dependabot float.
+# Bumped past the 0.6.1/0.6.2 window where most public store types were `#[non_exhaustive]`
+# without constructors, making the store traits unimplementable downstream
+# (marcjazz/authkestra#268, fixed by #271). 0.6.2 was tagged one commit BEFORE that fix landed, so
+# it was unusable; 0.6.3 is the first release carrying it.
+#
+# ⚠️ These three move in LOCKSTEP -- they share one `[workspace.package] version` upstream, and a
+# partial bump has broken this workspace before via a `jsonwebtoken` major mismatch.
+authkestra-resource = "=0.6.3"
+authkestra-op = "=0.6.3"
+authkestra-engine = "=0.6.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "tracing", "net", "time"] }
 thiserror = "2"
 anyhow = "1"
@@ -108,6 +221,33 @@ opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 prost = "0.14"
 axum = { version = "0.8", features = ["macros", "tracing"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
+# ADR-0021 Decision 4 / #443: the `__Host-` browser-session cookie. `0.12` is the axum-extra line
+# whose own manifest pins `axum = "0.8.9"` (verified: `axum-extra-0.12.6`'s registry Cargo.toml,
+# `[dependencies.axum] version = "0.8.9"`), matching the `axum` pin above -- `axum-extra` 0.10.x
+# targets axum 0.7 and will not resolve here.
+#
+# Verified against the exact `cookie-0.18.2` source this pulls in (axum-extra re-exports
+# `cookie::{Cookie, Expiration, SameSite}` verbatim) rather than trusting the crate description,
+# per this repo's capability-verification house rule (same standard as the `jsonwebtoken` 10.x
+# pin below and ADR-0021 Decision 5's `authkestra-oidc` trace):
+#   - `Cookie::build()` exposes typed builder methods for every Decision-4 attribute:
+#     `.secure(bool)`, `.http_only(bool)`, `.same_site(SameSite)`, `.path(&str)`,
+#     `.max_age(time::Duration)`, `.expires(Expiration)` (cookie-0.18.2/src/builder.rs:88-183).
+#   - `Cookie`'s `Display` impl renders `HttpOnly`, `SameSite=`, `Secure`, `Path=`, `Domain=`
+#     (only if set), `Max-Age=`, `Expires=` as real `Set-Cookie` attribute tokens, omitting
+#     `Domain` entirely when unset (cookie-0.18.2/src/lib.rs:1198-1236) -- confirmed by this
+#     ticket's own unit tests asserting the exact rendered header string.
+#   - The crate ships a dedicated `__Host-`/`__Secure-` prefix module (`cookie::prefix::Host`,
+#     cookie-0.18.2/src/prefix.rs) that *forcibly conforms* a cookie added through a
+#     `CookieJar::prefixed_mut(Host)` jar (forces `Secure`, `Path=/`, strips `Domain`) -- but this
+#     enforcement lives on the low-level `cookie::CookieJar`, which axum-extra's own `CookieJar`
+#     extractor wrapper does NOT re-expose (`extract::cookie::CookieJar` has no `prefixed`/
+#     `prefixed_mut`, axum-extra-0.12.6/src/extract/cookie/mod.rs:89-206). The plain
+#     `Cookie::build()` path this workspace uses does **not** guard against setting `Domain`
+#     alongside a `__Host-`-prefixed name -- confirmed by
+#     `lightbridge-authz-rest::session_cookie`'s own negative test. The calling code must never
+#     call `.domain(...)` on this cookie; it deliberately never does.
+axum-extra = { version = "0.12", features = ["cookie"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
@@ -130,18 +270,26 @@ rcgen = { version = "0.14", features = ["pem"] }
 # `OffsetDateTime::now_utc()` itself.
 time = { version = "0.3", features = ["std"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.7", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors", "fs"] }
+# Already resolved transitively at 2.3.2 via axum itself; declared directly so
+# `static_assets.rs` can percent-decode the request path for its reserved-namespace comparison
+# without hand-rolling a `%XX` decoder.
+percent-encoding = "2.3"
 rsa = { version = "0.9", features = ["pem", "std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.13", features = ["json", "form"] }
+# Already resolved transitively at 2.5.8 via reqwest itself; declared directly so
+# `Federation::validate` (ADR-0025) can do a cheap offline "does this parse as a URL" check on
+# `oauth2.federation.issuer` without pulling reqwest itself into the dependency-light `core` crate.
+url = "2.5"
 sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "chrono", "json", "macros"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 utoipa = { version = "5", features = ["macros", "chrono"] }
 utoipa-swagger-ui = { version = "9", features = ["axum", "reqwest"] }
-regex = "1.10"
+regex = "1.13"
 flate2 = "1.1.9"
 
-rmcp = { version = "3.0.1", features = ["transport-streamable-http-server"] }
+rmcp = { version = "3.1", features = ["transport-streamable-http-server"] }
 
 mimalloc = "0"
 
@@ -213,7 +361,9 @@ mimalloc = "0"
 # been the one left behind — if this recurs on the next bump, that is strong enough signal to stop
 # trusting Dependabot with this line at all and script a post-PR CI check that fails when it drifts
 # from its five siblings, rather than relying on a human noticing during review.
-# DO NOT widen any line below off `=0.8.0` (not even to a caret `"0.8.0"`) without first re-running
+# (Historical, superseded by the RESOLVED note above: this pin block used to say DO NOT widen off
+# `=0.8.0` at all. That constraint is what #383 existed to lift — the pin is now `=0.8.4`.) Still
+# true regardless of target version: never widen any line below without first re-running
 # `just it-tests` and specifically watching `batch_rpc_frames_enforce_permission_per_frame` /
 # `batch_rpc_frames_succeed_and_fail_independently` /
 # `budget_gated_op_ids_are_unreachable_on_authz_api_even_for_an_admin` in
@@ -244,33 +394,238 @@ mimalloc = "0"
 # critical surgery, not a version bump, and deliberately out of scope for the 0.7.16->0.8.0 dependency
 # upgrade this pin block's history otherwise documents. See the tracking issue filed alongside this
 # exact pin for the reconciliation work itself.
-cratestack-core = "=0.8.0"
-cratestack-axum = "=0.8.0"
-cratestack-redis = "=0.8.0"
+#
+# RESOLVED (#383, 2026-08-20): the family is unpinned to `=0.8.4` — confirmed against cratestack's
+# own `origin/main` to be the newest published release; the ~10 unreleased commits past it (up to
+# and including a breaking `remove protobuf/gRPC support entirely`, #655) carry no workspace version
+# bump (`Cargo.toml` `version` is still `0.8.4` at that tip) and are therefore not resolvable from
+# crates.io at all, not merely "not yet needed" — nothing to re-check here until cratestack cuts an
+# actual next release.
+#
+# The fix does NOT touch `AuthProvider`/`CachedAuthProvider` at all — that seam is structurally
+# unusable for this: `CachedAuthProvider` (`cratestack-core::context`) is a sealed, non-generic
+# wrapper that unconditionally discards the `RequestContext` it's asked to authenticate and returns
+# one pre-computed context, so `CratestackAuthProvider::authenticate` is invoked exactly ONCE per
+# `/rpc/batch` envelope now (`request.path` always the literal `/rpc/batch`), never once per frame —
+# confirmed by tracing `crates/cratestack-macros/src/include/server/rpc_module/batch.rs`.
+#
+# Instead, the coarse per-op-id RBAC gate moved from that (now-broken-for-batch) auth hook into
+# `crates/lightbridge-authz-api/schema/authz.cstack`'s `@allow`/`@@allow` policy clauses — cratestack's
+# OWN per-frame extension point, proven still correct post-0.8.4 by tracing `invoke_with_db` ->
+# `authorize_with_db` -> `::cratestack::authorize_procedure` inside `#dispatch_ident`
+# (`crates/cratestack-macros/src/procedure/instrument.rs`), which batch dispatch re-enters once per
+# frame exactly like a unary call, untouched by the `CachedAuthProvider` change (that only touches
+# `AuthProvider::authenticate`, a separate call site) — and by cratestack's own upstream test
+# `rpc_batch_error_frames_carry_lowercase_grpc_codes`
+# (`crates/cratestack-pg/tests/include_schema.rs`), which the 0.8.4 release itself reports green and
+# which proves a policy-driven per-frame denial produces THAT FRAME's own error, not a wholesale
+# envelope failure. `CratestackAuthProvider::authenticate` now populates every `Permission::ALL`
+# variant's real, computed grant as an `auth().perm<Permission>` boolean (plus `auth().rpcScope`,
+# restoring the `RpcScope` authz-api/authz-budget cutover) once per envelope for batch — same as it
+# always did per request for unary — and each op-id's schema clause reads back the ONE boolean it
+# needs, per frame. Generated, not hand-transcribed, from `rpc_authorize::MAPPED_OP_ID_PERMISSIONS`
+# by `crates/lightbridge-authz-rest/tests/schema_policy_sync_tests.rs`, which also stays as a
+# permanent CI drift-check (`cargo test -p lightbridge-authz-rest --test schema_policy_sync_tests`)
+# so a future op-id/permission change can't silently desync the schema from the Rust-side map again.
+# Full mechanism, the options considered (including two rejected: a `/rpc/batch` reimplementation
+# downstream, and an upstream cratestack opt-in per-frame-auth flag), and the two accepted, batch-
+# path-only behavior differences -- (1) an out-of-scope op-id is `403` not `404` (unary unaffected,
+# still `404`) and (2) `model.*` `list`/`get` verbs filter to empty/not-found rather than
+# `permission_denied` for a caller lacking read permission, an upstream cratestack row-filter-vs-
+# hard-gate property this fix did not create -- are recorded in `auth_provider.rs`'s own module doc
+# (search "Two accepted, documented behavior differences") and in the PR that resolved this issue.
+#
+# BUMPED (2026-08-21, cratestack 0.8.4 -> 0.8.6): 0.8.5 was never independently published to
+# crates.io (its workspace-version bump landed as part of the 0.8.6 tag, per cratestack's own
+# release notes -- `crates.io/api/v1/crates/cratestack-pg` lists no 0.8.5), so this is a single
+# jump, not two. Verified no-op for this repo: 0.8.5 dropped protobuf/gRPC entirely (its own
+# breaking-change ADR 0017) -- this workspace has no `transport grpc`, `@pb(`, or dependency on
+# `cratestack-grpc`/`cratestack-proto`, confirmed by grep, so nothing here was reachable by that
+# removal. 0.8.6 also adds If-Match/ETag on generated update/delete and "omit untouched
+# update-input fields from the wire" (cratestack/cratestack#673) -- neither is used by any
+# hand-written call site in this repo today, so both are inert here, not exercised.
+#
+# The bump's actual payload for this repo: cratestack commit 2c0f4676 (PR
+# https://github.com/cratestack/cratestack/pull/675, cratestack/cratestack#657) makes
+# `cratestack_codec_cbor::CborCodec::encode` itself enable
+# `minicbor_serde::Serializer::serialize_unit_as_null`, which is verbatim the same fix
+# `crates/lightbridge-authz-rest/src/codec.rs`'s `LenientCborCodec::encode` override was hand-
+# rolling locally (confirmed by reading upstream's actual 0.8.6 `cratestack-codec-cbor` source,
+# not just its changelog prose -- `minicbor_serde::Serializer::new` + `serialize_unit_as_null(true)`
+# + the identical `serde_json::Value::Null` root-cause comment). That override is REMOVED --
+# `LenientCborCodec::encode` now delegates straight to the wrapped `CborCodec::encode`. The
+# DECODE-side half of `LenientCborCodec` (wire-level `undefined` -> `null` normalization, `cborg`'s
+# encoding of a JS `undefined` property) is untouched by 0.8.6 -- upstream `CborCodec::decode` is
+# still a bare `minicbor_serde::from_slice`, no `undefined` handling -- so `LenientCborCodec` stays,
+# narrowed to decode-only. `codec.rs`'s own module doc comment carries the full mechanism and the
+# byte-level (`0xf6` vs `0x80`) regression tests that pin this down independent of who implements
+# the encode fix. Also checked and confirmed orthogonal: cratestack#676 (0.8.6, required-enum-field
+# literal comparisons in read policies) only extends the SAME SQL-predicate-compilation mechanism
+# lightbridge-authz#401 is about to a new field type -- it does not add a pre-dispatch permission
+# gate, so it changes nothing about #401's "filter, not refuse" read-policy question.
+# BUMPED (2026-08-23, cratestack 0.8.6 -> 0.8.10): 0.8.8 was never independently published to
+# crates.io for any of the six packages here (confirmed via `crates.io/api/v1/crates/<pkg>/versions`
+# for all of `cratestack-core`/`-axum`/`-redis`/`-pg`/`-codec-cbor`/`-codec-json` -- each jumps
+# 0.8.7 -> 0.8.9 with no 0.8.8 row), so this is a single jump, not two -- the same shape as the
+# 0.8.4 -> 0.8.6 gap above. Per cratestack's own CHANGELOG.md: 0.8.9's release step re-versioned
+# three Dart packages (`cratestack_cbor`/`cratestack_annotations`/`cratestack_builder`) that pub.dev
+# rejected for a tag/pubspec mismatch *after* crates.io and npm had already published, so 0.8.9
+# absorbed what would otherwise have been 0.8.8's crates.io content; 0.8.10 fixed the underlying
+# bump-tooling bug (`just bump`'s dart-pubspec rewrite matched against the *old* workspace version,
+# so it silently skipped any package that had already diverged) and brought those Dart packages back
+# in line. None of this touches the Rust crates this workspace depends on.
+#
+# The only Rust-facing change across 0.8.7-0.8.10 (0.8.9/0.8.10 are entirely internal to
+# cratestack's own release/changelog tooling -- no `cratestack-core`/`-axum`/`-redis`/`-pg`/
+# `-codec-cbor`/`-codec-json` change at all): 0.8.7 makes field-level `@allow`/`@deny` (a bare `@`
+# attached directly to a field inside `model`/`view`/`mixin`/`type`/`auth`) a parse-time error
+# instead of a silently-unenforced no-op (cratestack#679 -- it previously parsed, reported
+# `schema OK`, and was read by nothing). Breaking only for a schema that used that exact field-
+# position form; procedure-level `@allow`/`@deny` and model/view-level `@@allow`/`@@deny` -- the only
+# forms this schema uses -- are untouched. Checked before bumping:
+# `grep -nE '^\s*[A-Za-z_][A-Za-z0-9_]*\s+[A-Za-z_].*@(allow|deny)\('
+# crates/lightbridge-authz-api/schema/authz.cstack` returns zero matches, so this is a no-op here.
+# (0.8.7 also ships `cratestack_cbor` platform artifacts for the Dart package and a changelog-seed
+# fix -- both internal to cratestack's own tooling, not reachable from this repo.)
+# BUMPED (2026-08-25, cratestack 0.8.10 -> 0.8.12): both intermediate releases published cleanly (no
+# 0.8.8-style gap) -- `crates.io/api/v1/crates/<pkg>/versions` lists 0.8.11 and 0.8.12 for all six
+# packages here.
+#
+# 0.8.11's real payload is `@computed` -- resolver-backed, response-time-derived fields on `type`/
+# `model` declarations, replacing the inert `@custom` attribute (cratestack's CHANGELOG.md, "@computed
+# -- resolver-backed response-time fields, replacing @custom"). Two BREAKING changes ship with it:
+# (1) a schema still using `@custom` now fails to parse -- checked before bumping:
+# `grep -n '@custom' crates/lightbridge-authz-api/schema/authz.cstack` returns zero matches, so this
+# is a no-op here; (2) the generated `router()`/`rpc_router()`/`model_router()`/`procedure_router()`
+# functions gain a new `resolvers` parameter (`router(db, registry, resolvers, codec, auth_provider,
+# body_limit_bytes)`), with `()` as the value for any schema with no computed fields (a generated
+# `impl ComputedFieldResolver for ()` covers that case). `authz.cstack` declares no `@computed` field
+# (checked: `grep -n '@computed' crates/lightbridge-authz-api/schema/authz.cstack` returns zero
+# matches), so this is NOT a no-op mechanically -- both `schema::axum::rpc_router(...)` call sites in
+# `crates/lightbridge-authz-rest/src/lib.rs` needed a `()` argument inserted (see that file's own
+# history for the exact diff) -- but it is a no-op behaviorally: no response shape, DDL, or dispatch
+# semantics change for a schema with zero computed fields. Verified by `cargo check --workspace` and
+# the RPC-batch/schema-policy-sync it-tests passing unchanged (see this commit's own message).
+#
+# The rest of 0.8.11 is CI/tooling/Flutter-glue only (TypeScript smoke-test hang fix, iOS log-capture
+# probe corrections, flutter_rust_bridge 2.12.0 -> 2.13.0, changelog-seed tooling) -- none of it
+# reachable from this repo, which has no Dart/Flutter/TypeScript client generation in its build.
+#
+# 0.8.12 (cratestack#729) is RPC `get` gaining REST's `fields`/`include`/`include_fields`/
+# `computedParams` selection parity, plus a typestate builder for `<Model>ComputedParams`. Confirmed
+# additive-only for this repo: every new `RpcGetInput`/`RpcListInput` field is `#[serde(default)]`, an
+# old `{"id": ...}` frame decodes unchanged (no RPC snapshot-version bump, per the PR's own wire-
+# compat claim), and the builder only exists for models with parameterized computed fields -- which,
+# per the 0.8.11 grep above, this schema has none of. No further `router()`/`rpc_router()` signature
+# change past what 0.8.11 already required. Checked specifically against this repo's sensitive seams
+# (per AGENTS.md): no touch to `@@allow`/`@allow` policy evaluation, `LenientCborCodec`/the
+# `undefined`-vs-`null` normalization, the migration generator, or `push_scoped_conditions` --
+# confirmed by grepping cratestack's own CHANGELOG.md for those terms across the 0.8.11-0.8.12 range
+# (zero matches) in addition to reading both features' full changelog prose.
+#
+# BUMPED (2026-08-30, cratestack 0.8.12 -> 0.9.4). Verified against crates.io that all six package
+# names below actually publish 0.9.4 (`curl -s https://crates.io/api/v1/crates/<pkg>/versions`) --
+# this is a real Rust-family release, not just an npm/codegen-toolchain version. Note 0.9.0 does NOT
+# exist on crates.io: per cratestack's own CHANGELOG.md ("Released as 0.9.1, not 0.9.0"), v0.9.0 was
+# tagged and its GitHub Release cut, but a publish pre-flight gate (added the same cycle) caught that
+# nothing had actually reached any registry and blocked it; 0.9.1 is the real first 0.9.x publish, so
+# crates.io jumps 0.8.15 -> 0.9.1 directly, same shape as the earlier 0.8.7->0.8.9 gap.
+#
+# Read cratestack's full CHANGELOG.md for every entry between 0.8.12 and 0.9.4 (0.8.13/0.8.14/0.8.15
+# have real per-version headers; 0.9.1-0.9.4's entries are all still squashed under that changelog's
+# own "Unreleased" heading as of this bump, ungrouped by version -- upstream's changelog-splitting
+# lags its actual crates.io publishes). Every Rust/backend-facing breaking entry in that range was
+# checked against this repo and is a no-op here, confirmed by grep returning zero matches unless
+# noted:
+#   - #742 `@@unique`/`@@index` gain `where: "<sql predicate>"` (partial index DDL), breaking for
+#     `cratestack_core::schema::composite_unique::parse_composite_unique_attribute` callers -- this
+#     repo never calls that function directly (grep for `@@unique`/`@@index` and the function name:
+#     zero matches).
+#   - #741 `ConflictTarget` gains a partial-index variant, breaking for exhaustive external matches --
+#     grep for `ConflictTarget`: zero matches, nothing here pattern-matches it.
+#   - #745 `.upsert(..).run(..)` no longer reports `Created` for an update it lost a race on -- grep
+#     for `.upsert(`: zero matches, this repo doesn't use cratestack's upsert builder.
+#   - #743 `@@internal("action")` route suppression -- new opt-in attribute; `authz.cstack` has no
+#     `@@internal` (zero matches), so nothing is newly suppressed.
+#   - #747 `CRATESTACK_REQUIRE_DB` now fails when no DB backend is configured -- this repo always
+#     configures a Postgres backend, so the new failure mode is unreachable.
+#   - #666 read policies gain `in`/`not in` set-membership comparisons -- purely additive new syntax,
+#     `authz.cstack` doesn't use it and doesn't need to.
+# Everything else in the range (0.9.x's own "Dependency and toolchain audit" -- sqlx 0.8.6->0.9.0,
+# minicbor 2.3, sha2 0.11, tower-http 0.7, etc.) is internal to cratestack's own build, not
+# API-surface-facing: this workspace already pins `sqlx = "0.9"` and `minicbor = "2.3"` directly
+# above, so nothing here forces a change to either. No touch found (grepping the same terms as the
+# 0.8.11-0.8.12 check above) to `@@allow`/`@allow` policy evaluation, `LenientCborCodec`/the
+# `undefined`-vs-`null` CBOR normalization, the migration generator, `push_scoped_conditions`,
+# `AuthProvider`/`CachedAuthProvider`, or `/rpc/batch` dispatch -- the RPC-batch-auth seam this pin
+# block's FOURTH OCCURRENCE/RESOLVED history is about is untouched between 0.8.12 and 0.9.4.
+#
+# BUMPED (2026-08-31, cratestack 0.9.4 -> 0.10.0). Verified against crates.io that all six package
+# names below actually publish 0.10.0 (`curl -H 'User-Agent: <contact>'
+# https://crates.io/api/v1/crates/<pkg>/versions`) -- unlike the 0.8.7->0.8.9, 0.8.4->0.8.6 and
+# 0.9.0 gaps this block records, 0.10.0 published cleanly across the whole family with no skipped
+# version, so there is nothing to route around here. NOTE the UA: crates.io answers a bare
+# `curl -s` with a rate-limit/403 body that `jq`/`python -c json.load` then dies on, which reads as
+# "package has no such version" if you don't look at the raw body. Send a User-Agent.
+#
+# 0.10.0 is a MINOR bump and, pre-1.0, therefore a semver-breaking one. cratestack's CHANGELOG.md
+# calls out exactly three breaking changes; all three are no-ops for this workspace, each confirmed
+# by grep returning zero matches across `--include=*.rs --include=*.cstack --include=*.toml`:
+#   - #842 **the geospatial query surface moved behind a `postgis` Cargo feature**. `SpatialFilter`,
+#     `SpatialPoint`, `point()`, `FilterExpr::Spatial` and `FieldRef::covers_geography`/
+#     `dwithin_geography` shipped unconditionally from 0.6 and are now feature-gated (off by
+#     default). Zero matches for every one of those names, plus `Geography`/`Geometry`/`postgis`/
+#     `pgvector` -- this workspace declares no spatial column and issues no spatial filter, so
+#     there is NO feature to enable here. Do not add `features = ["postgis"]` to the
+#     `cratestack-pg` line below "to be safe": it is an API-surface gate on code nothing calls.
+#   - #843 **`cratestack_sqlx::Migration` gains an `up_pre: Option<String>` field**, breaking any
+#     struct-literal construction. Zero matches for `cratestack_sqlx` or `up_pre`. This repo does
+#     not use cratestack's migration runner at all -- migrations are SQLx embedded migrations under
+#     `migrations/`, run by `app/lightbridge-authz/src/migrate.rs` via the `authz-migrate` container
+#     (see "Migrations" in CLAUDE.md, and ADR-0003 which explicitly defers cratestack-owned
+#     migrations until `migrate diff --backend postgres` can read a live database).
+#   - the same #843 also makes `migrate diff` stop emitting `ALTER COLUMN ... DROP DEFAULT` when a
+#     column moves to or from `@default(dbgenerated())`. This is the ONE 0.10.0 change that names
+#     something `authz.cstack` actually contains -- the `AuditFields` mixin's `createdAt`/
+#     `updatedAt` are both `@default(dbgenerated())` (schema/authz.cstack:124-125). It is still
+#     inert here, but for a reason worth stating rather than assuming: the change is in DDL
+#     *emission*, and this repo never runs the emitter. If cratestack-owned migrations are ever
+#     adopted (ADR-0003's "Revisit"), re-read this entry first -- under 0.9.4 the generator would
+#     have silently dropped the trigger-supplied defaults on those two columns.
+# The rest of 0.10.0 is codegen- and client-facing, not Rust-runtime-facing: #838 makes the emitted
+# npm/Dart client version floors release-line-derived ranges rather than carets, the #845 revert
+# restores a hand-written floor literal inside cratestack's own test suite, and `cratestack-cli` now
+# enables `pgvector`/`postgis` on its `cratestack-migrate` edge so `migrate diff` stops panicking on
+# a `pgvector` schema. #838 DOES land downstream -- it changes what
+# `cratestack generate-typescript` writes into the generated client's `package.json` -- but that
+# output lives in the converse-frontends monorepo (`packages/authz-rpc/generated/`), not here. The
+# two repos' cratestack versions must move together; see that repo's `pnpm-workspace.yaml`.
+# Re-checked and untouched between 0.9.4 and 0.10.0, same terms as the 0.8.12->0.9.4 sweep above:
+# `@@allow`/`@allow` policy evaluation, `LenientCborCodec`/the `undefined`-vs-`null` CBOR
+# normalization, `push_scoped_conditions`, `AuthProvider`/`CachedAuthProvider`, and `/rpc/batch`
+# dispatch -- the RPC-batch-auth seam remains untouched.
+cratestack-core = "=0.10.0"
+cratestack-axum = "=0.10.0"
+cratestack-redis = "=0.10.0"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
 # `include_server_schema!` macro emits `::cratestack::*` paths (see cratestack-pg lib docs). The
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
 # it to build the RPC router (ADR-0003).
-cratestack = { package = "cratestack-pg", version = "=0.8.0" }
-cratestack-codec-cbor = "=0.8.0"
-cratestack-codec-json = "=0.8.0"
+cratestack = { package = "cratestack-pg", version = "=0.10.0" }
+cratestack-codec-cbor = "=0.10.0"
+cratestack-codec-json = "=0.10.0"
 # Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
 # feature). See that module for why.
-minicbor = { version = "2.2", features = ["std", "half"] }
-# Direct dep (also pulled in transitively via cratestack-codec-cbor) so `LenientCborCodec::encode`
-# can construct its own `minicbor_serde::Serializer` with `serialize_unit_as_null(true)` instead of
-# going through `cratestack_codec_cbor::CborCodec::encode`'s hardcoded `minicbor_serde::to_vec`
-# (which leaves that flag at its default `false`). See `codec.rs` for the full mechanism this
-# works around: `serde_json::Value::Null`'s `Serialize` impl calls `serializer.serialize_unit()`,
-# not `serialize_none()`, and minicbor-serde's own `serialize_unit()` encodes `()` as CBOR's empty
-# array (`0x80`) rather than null (`0xf6`) unless this flag is set — confirmed directly against
-# `cratestack-codec-cbor`'s own source and test comments, which document this exact pitfall for
-# `serde_json::Value::Null` but only guard the model-projection decode path, not the
-# `/rpc/batch` handler's `RpcRequest.input: serde_json::Value` re-encode step (cratestack-axum's
-# `rpc_batch_dispatch`/`encode_rpc_value`).
-minicbor-serde = "0.6"
+minicbor = { version = "2.3", features = ["std", "half"] }
+# No direct `minicbor-serde` dependency here (2026-08-21 cratestack 0.8.6 bump removed it, see the
+# cratestack pin block's "BUMPED" note above). It still exists in the dependency graph -- pulled in
+# transitively via `cratestack-codec-cbor` -- but nothing in this workspace names it directly any
+# more now that `LenientCborCodec::encode` was deleted (upstream's own `CborCodec::encode` does the
+# `serialize_unit_as_null(true)` fix itself as of 0.8.6). The `#405`-rejection comment that used to
+# live on a direct `minicbor-serde = "0.6"` line here is gone with the dependency it explained --
+# that pin no longer exists to have an opinion about.
 # lightbridge-authz#363: `tokio-rustls-comp` is a superset of the previous `tokio-comp` (it
 # enables `tls-rustls` + `tokio-comp` together — see docs.rs/crate/redis/1.5.0/features), so
 # `rediss://` URLs now build a rustls-backed TLS connection via `redis::Client::build_with_tls`

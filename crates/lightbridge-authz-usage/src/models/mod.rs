@@ -35,6 +35,14 @@ pub enum UsageScope {
     ApiKey,
     Project,
     Account,
+    /// Estate-wide query: no `account_id`/`project_id`/`user_id`/`api_key_id` filter is added at
+    /// all (`repo::push_scope_filters`'s `All` arm), so the query spans every account. Requires
+    /// the caller's validated bearer token to hold `Permission::UsageReadAll`
+    /// (`handlers::query::query_usage`) -- there is no per-row ownership predicate for "all", by
+    /// definition, so this is gated on a coarse RBAC permission instead of `ScopeAuthority`.
+    /// `scope_id` is still a required wire field (see `UsageQueryRequest::scope_id`) but is
+    /// ignored for this scope; callers should send `""`.
+    All,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema, PartialEq, Eq, Hash)]
@@ -62,12 +70,22 @@ pub struct UsageQueryFilters {
     pub signal_type: Option<String>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UsageQueryResponse {
     pub points: Vec<UsageSeriesPoint>,
+    /// #578: `true` when more than `limit` DISTINCT `bucket_start` values matched the query and
+    /// the OLDEST one was dropped WHOLE to fit. `limit` bounds bucket count, not `points.len()`
+    /// (a row count) -- with a non-empty `group_by`, `points` can hold more entries than `limit`
+    /// (one per series per surviving bucket), still in the same ascending `bucket_start` order as
+    /// before this field existed, and every surviving bucket keeps its FULL series set, never an
+    /// arbitrary subset while a sibling bucket keeps all of its own. `false` means every matching
+    /// bucket is present. See `StoreRepo::query_usage`'s doc comment for why truncation drops the
+    /// oldest bucket, not the newest, why it must be bucket-scoped rather than row-scoped, and for
+    /// the known mid-bucket-cut caveat tracked as #586.
+    pub truncated: bool,
 }
 
-#[derive(Debug, Serialize, ToSchema, Clone)]
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
 pub struct UsageSeriesPoint {
     pub bucket_start: DateTime<Utc>,
     pub account_id: Option<String>,
@@ -84,6 +102,23 @@ pub struct UsageSeriesPoint {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    /// How many rows in this bucket actually carried a latency measurement. A percentile computed
+    /// over a handful of samples is noise, and `p99` needs ~100 samples before it means anything,
+    /// so this count is returned alongside the percentiles rather than left for the caller to
+    /// guess. `0` means no row in this bucket reported latency at all -- which is a legitimate,
+    /// per-series outcome (see `UsageEvent::latency_ms`), not an error.
+    pub latency_samples: i64,
+    /// Median request latency in milliseconds, `percentile_cont(0.5)` over the bucket's
+    /// `latency_ms` values. `None` exactly when `latency_samples == 0` -- never collapsed to `0.0`,
+    /// because "no latency was reported" and "every request took 0 ms" are different facts and the
+    /// console has to be able to say which one it is.
+    pub latency_p50_ms: Option<f64>,
+    /// 95th-percentile request latency in milliseconds. `None` when `latency_samples == 0`.
+    pub latency_p95_ms: Option<f64>,
+    /// 99th-percentile request latency in milliseconds. `None` when `latency_samples == 0`.
+    /// Meaningful only once `latency_samples` is large (~100+); below that it degenerates towards
+    /// the bucket maximum.
+    pub latency_p99_ms: Option<f64>,
 }
 
 fn default_bucket() -> String {
@@ -94,7 +129,9 @@ fn default_limit() -> u32 {
     1_000
 }
 
-/// Request body for the internal, Basic-auth-protected `/usage/v1/spend/query` endpoint. Answers
+/// Request body for the internal, mTLS-protected `/usage/v1/spend/query` endpoint (the query
+/// listener requires and verifies a client certificate -- see `UsageServerGroup::query`'s doc
+/// comment; this route carries no Basic-auth or bearer check of its own). Answers
 /// exactly the question `lightbridge-authz-budget`'s `SpendReader` asks: the summed
 /// `usage_events.total_cost` for one account over a half-open `[start, end)` interval. Deliberately
 /// takes explicit `start`/`end` bounds rather than a `Period` -- period-to-bounds conversion

@@ -18,6 +18,7 @@ pub struct ProjectRow {
     pub project_quota: Option<String>,
     pub status: String,
     pub is_default: bool,
+    pub model_policy: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

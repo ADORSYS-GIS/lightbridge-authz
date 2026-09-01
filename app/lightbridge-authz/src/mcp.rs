@@ -21,10 +21,11 @@ use lightbridge_authz_core::{
 };
 use lightbridge_authz_rest::{
     OpaRepoTrait, OpaState,
-    auth_provider::{ACCESS_TOKEN_CONTEXT_KEY, ROLES_CONTEXT_KEY},
     handlers::{AuthzStoreImpl, opa::validate_api_key_context},
     middleware::bearer_auth,
     models::authorino::AuthorinoMetadata,
+    rpc_authorize::RpcScope,
+    secret_claim::SecretClaimStore,
 };
 use reqwest::Client;
 use rmcp::{
@@ -119,6 +120,23 @@ pub struct LightbridgeMcpHandler {
     issuer: Arc<AuthzStoreImpl>,
     opa_state: Arc<OpaState>,
     billing: Arc<Billing>,
+    /// ADR-0025 Stage 2: translates a validated bearer token's `(iss, sub)` into the acting
+    /// account id -- see `lightbridge_authz_rest::auth_provider::SubjectResolver`'s own doc
+    /// comment for the self-signed-vs-external issuer cases this handles.
+    resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver>,
+    /// Stashes a freshly minted API key secret so it is handed to the human out of band instead
+    /// of returned in a tool result (GHSA-9pc6-965v-2c44).
+    ///
+    /// `None` when `secret_claim` is unconfigured. That does NOT re-enable returning the secret --
+    /// `create-api-key`/`rotate-api-key` REFUSE outright in that state. The alternative, failing at
+    /// startup, would take this service down on any deployment that upgrades the image before
+    /// provisioning the key, so the refusal was moved from process start to the affected operation.
+    /// Every other tool keeps working.
+    claim_store: Option<Arc<SecretClaimStore>>,
+    /// Origin of the `authz-idp` that redeems claims, from `secret_claim.redeem_base_url`.
+    /// Configured, never derived from a request header, which would be attacker-influenced.
+    /// `Some` exactly when `claim_store` is.
+    redeem_base_url: Option<Arc<String>>,
 }
 
 impl std::fmt::Debug for LightbridgeMcpHandler {
@@ -130,18 +148,35 @@ impl std::fmt::Debug for LightbridgeMcpHandler {
 }
 
 impl LightbridgeMcpHandler {
+    /// `api_key_audience` (`oauth2.signing.audience`) is threaded onto the `OpaState` this
+    /// handler builds purely for construction-site consistency with `authz-opa`'s own
+    /// `start_opa_server` -- MCP's own tools only ever call
+    /// `handlers::opa::validate_api_key_context` (the API-key hash path), never
+    /// `handlers::exchange_token::verify_self_issued_token`, so this value is currently inert
+    /// here. Kept correct anyway rather than hardcoding `None`, so a future MCP tool that does
+    /// reach the exchange-token path inherits the same `azp` gate by construction instead of
+    /// silently getting a `None` that would fail closed on every `azp`-bearing token.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cratestack_db: schema::Cratestack,
         issuer: Arc<AuthzStoreImpl>,
         opa_repo: Arc<dyn OpaRepoTrait>,
         basic_auth: BasicAuth,
         billing: &Billing,
+        api_key_audience: Option<String>,
+        resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver>,
+        federation_issuer: String,
+        claim_store: Option<Arc<SecretClaimStore>>,
+        redeem_base_url: Option<Arc<String>>,
     ) -> Self {
         let billing = Arc::new(billing.clone());
         let opa_state = Arc::new(OpaState {
             repo: opa_repo,
             basic_auth,
             billing: billing.clone(),
+            api_key_audience,
+            resolver: resolver.clone(),
+            federation_issuer,
         });
 
         Self {
@@ -150,6 +185,9 @@ impl LightbridgeMcpHandler {
             issuer,
             opa_state,
             billing,
+            resolver,
+            claim_store,
+            redeem_base_url,
         }
     }
 
@@ -294,35 +332,35 @@ fn cratestack_error_to_tool_error(error: CratestackError) -> ErrorData {
     }
 }
 
-/// Build a cratestack [`CratestackContext`] for the authenticated MCP caller, mirroring
-/// `lightbridge_authz_rest::auth_provider::CratestackAuthProvider::authenticate`: the validated
-/// subject is projected as `auth().id` (what the schema's `@@allow` membership predicates resolve
-/// against) and the raw access token + roles are stashed as context extensions, so a CRUD tool
-/// invoking the generated client is scoped to exactly the caller's tenants — the same second-gate
-/// policy path the RPC surface applies. The extension keys are the public constants exported by
-/// that module, so the two surfaces stay in lockstep.
-fn cratestack_context_from_token_info(info: &TokenInfo) -> CratestackContext {
-    let mut ctx = CratestackContext::authenticated([(
-        "id".to_owned(),
-        CratestackValue::String(info.sub.clone()),
-    )]);
-    ctx.extensions.insert(
-        ACCESS_TOKEN_CONTEXT_KEY.to_owned(),
-        CratestackValue::String(info.access_token.clone()),
-    );
-    if !info.roles.is_empty() {
-        ctx.extensions.insert(
-            ROLES_CONTEXT_KEY.to_owned(),
-            CratestackValue::List(
-                info.roles
-                    .iter()
-                    .cloned()
-                    .map(CratestackValue::String)
-                    .collect(),
-            ),
-        );
-    }
-    ctx
+/// Build a cratestack [`CratestackContext`] for the authenticated MCP caller by delegating to
+/// [`lightbridge_authz_rest::auth_provider::build_context`] — the SAME function
+/// `CratestackAuthProvider::authenticate` uses for the RPC surface, not a second, independently
+/// maintained copy of "how a context gets its permission fields".
+///
+/// This is load-bearing, not stylistic (issue #383 follow-up): both MCP and the RPC surface hand
+/// their built context to the SAME generated cratestack client, which evaluates the SAME
+/// `authz.cstack` `@allow`/`@@allow` clauses regardless of which surface reached it. Before this
+/// was unified, MCP's own copy set only `auth().id`, which satisfied the schema's old
+/// `@allow(auth() != null)` clauses but silently failed every clause #383 added (`auth().rpcScope`,
+/// `auth().perm<Permission>`) — found by CI's `integration-test` (`it-servers`) failing the very
+/// first MCP tool call after that PR merged, not by any local test, because nothing exercised this
+/// second entry point at all. `RpcScope::Crud` because the MCP surface only ever exposes the CRUD
+/// tool set (accounts/projects/api-keys) — confirmed against `app/lightbridge-authz/src/bin/
+/// lightbridge-mcp.rs` (a dedicated binary, entirely separate from `authz-budget`'s `command:
+/// budget` subcommand on the main `lightbridge-authz` binary) and `compose.yaml`'s `authz-mcp`
+/// service (own image/port, no budget-scoped env or command, same `DATABASE_URL` as `authz-api`)
+/// — `mcp.rs` has no `RpcScope`/budget-procedure concept anywhere in it.
+///
+/// See `cratestack_context_from_token_info_matches_the_shared_helper` below for the regression
+/// test pinning this delegation — it fails immediately if a future edit reintroduces a
+/// hand-rolled, out-of-sync copy here.
+async fn cratestack_context_from_token_info(
+    info: &TokenInfo,
+    resolver: &dyn lightbridge_authz_rest::auth_provider::SubjectResolver,
+) -> std::result::Result<CratestackContext, ErrorData> {
+    lightbridge_authz_rest::auth_provider::build_context(info, RpcScope::Crud, resolver)
+        .await
+        .map_err(cratestack_error_to_tool_error)
 }
 
 /// A `find_unique` that returned `None` (row absent, or hidden by the membership read policy) is a
@@ -360,6 +398,31 @@ fn cratestack_json(value: Value) -> cratestack::Json<CratestackValue> {
     cratestack::Json(json_to_cratestack_value(value))
 }
 
+/// Builds the tool result for a created or rotated API key.
+///
+/// GHSA-9pc6-965v-2c44: this function **cannot** leak the secret, because it is never given one.
+/// That is deliberate and is the guarantee -- a runtime assertion that some field is absent can be
+/// defeated by a later edit, whereas a builder that has no access to the secret cannot emit it no
+/// matter what anyone adds to it. Both `create-api-key` and `rotate-api-key` return through here.
+fn api_key_claim_response(
+    api_key: &lightbridge_authz_core::ApiKey,
+    oauth2_url: Option<&str>,
+    redeem_base_url: &str,
+    claim_token: &str,
+    expires_in_seconds: i64,
+) -> Value {
+    serde_json::json!({
+        "api_key": api_key,
+        "oauth2_url": oauth2_url,
+        "claim_url": format!(
+            "{}/api-keys/claim/{}",
+            redeem_base_url.trim_end_matches('/'),
+            claim_token
+        ),
+        "expires_in_seconds": expires_in_seconds,
+    })
+}
+
 fn to_json_value<T: Serialize>(value: T) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
     serde_json::to_value(value)
         .map(|result| Json(EndpointResponse { result }))
@@ -379,10 +442,22 @@ fn normalize_list_pagination(offset: u32, limit: u32) -> (u32, u32) {
     (offset, limit.clamp(1, MAX_LIST_LIMIT))
 }
 
-fn subject_from_request_context(
+/// ADR-0025 Stage 2: resolves the request's bearer token into the acting account id -- never the
+/// raw `TokenInfo::sub` directly. Every `AuthzStoreImpl` method this feeds treats its `subject`
+/// parameter as already-resolved (see `handlers::AuthzStoreImpl`'s own call sites into
+/// `StoreRepo`), so this is the one place on the MCP surface that translation must happen.
+async fn subject_from_request_context(
     context: &RequestContext<RoleServer>,
+    resolver: &dyn lightbridge_authz_rest::auth_provider::SubjectResolver,
 ) -> std::result::Result<String, ErrorData> {
-    Ok(token_info_from_request_context(context)?.sub)
+    let info = token_info_from_request_context(context)?;
+    resolver
+        .resolve(&info.iss, &info.sub)
+        .await
+        .map(String::from)
+        .map_err(|_| {
+            ErrorData::invalid_request("unable to resolve caller identity".to_string(), None)
+        })
 }
 
 /// The permission a tool requires, keyed by tool name. Single source of truth for RBAC on the MCP
@@ -392,7 +467,7 @@ fn required_tool_permission(tool: &str) -> Option<Permission> {
     Some(match tool {
         "create-account" => Permission::AccountCreate,
         "list-accounts" | "get-account" => Permission::AccountRead,
-        "update-account" => Permission::AccountUpdate,
+        "update-account" | "update-account-name" => Permission::AccountUpdate,
         "delete-account" => Permission::AccountDelete,
         "disable-account" | "enable-account" => Permission::AccountDisable,
         // Roster management (ADR-0006). The capability moved with the concept: `project:member`,
@@ -405,7 +480,10 @@ fn required_tool_permission(tool: &str) -> Option<Permission> {
         | "set-project-member-quota-tier" => Permission::ProjectMember,
         "create-project" => Permission::ProjectCreate,
         "list-projects" | "get-project" => Permission::ProjectRead,
-        "update-project" | "set-project-quota" => Permission::ProjectUpdate,
+        "update-project"
+        | "set-project-quota"
+        | "set-project-allowed-models"
+        | "set-project-model-policy" => Permission::ProjectUpdate,
         "delete-project" => Permission::ProjectDelete,
         "disable-project" | "enable-project" => Permission::ProjectDisable,
         "set-default-project" => Permission::ProjectUpdate,
@@ -634,6 +712,11 @@ struct CreateAccountParams {
     /// account's id is taken from the caller's JWT subject rather than any input field.
     #[serde(default)]
     default_quota: Option<String>,
+    /// Optional human-facing display label for the account. Blank/whitespace-only is treated as
+    /// "no name" rather than rejected. Purely a label: it is never unique and nothing resolves an
+    /// account by it -- `account_id` (the caller's JWT subject) remains the only handle.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -658,6 +741,16 @@ struct UpdateAccountParams {
     /// `SetProjectMemberQuotaTierParams::quota_tier` below.
     #[serde(default)]
     default_quota: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct UpdateAccountNameParams {
+    account_id: String,
+    /// The new display label, or omitted/`null`/blank to clear it back to unnamed. Like
+    /// `UpdateAccountParams::default_quota` above this always writes -- there is no PATCH
+    /// "leave untouched" state.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -703,8 +796,6 @@ struct CreateProjectParams {
     account_id: String,
     name: String,
     #[serde(default)]
-    allowed_models: Option<Vec<String>>,
-    #[serde(default)]
     default_limits: Option<DefaultLimitsInput>,
     billing_plan: String,
     /// Who is paying for this project. Moved here from `Account` by ADR-0006 so one account can
@@ -719,6 +810,28 @@ struct SetProjectQuotaParams {
     /// the operator-configured catalogue, or omitted/`null` to clear it.
     #[serde(default)]
     project_quota: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetProjectAllowedModelsParams {
+    project_id: String,
+    /// Model ids drawn from the operator-configured catalogue (`list-model-catalog`), or omitted/
+    /// `null` for "all models allowed". Rejected (#415, ADR-0018 Decision 5) if any entry is
+    /// absent from a non-empty catalogue.
+    #[serde(default)]
+    allowed_models: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetProjectModelPolicyParams {
+    project_id: String,
+    /// One of `"allow_all"` (every model, present and future -- the default), `"allowlist"`
+    /// (only `allowed_models` entries), or `"deny_all"` (no models). Any other value is refused
+    /// (ADR-0018 Decision 5 follow-up). Switching to `"allowlist"` while the project's current
+    /// `allowed_models` is empty/absent is refused -- populate it via `set-project-allowed-models`
+    /// first. `allowed_models` itself is never touched by this tool; it is preserved across a
+    /// policy change in either direction.
+    model_policy: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -740,8 +853,6 @@ struct UpdateProjectParams {
     project_id: String,
     #[serde(default)]
     name: Option<String>,
-    #[serde(default)]
-    allowed_models: Option<Option<Vec<String>>>,
     #[serde(default)]
     default_limits: Option<DefaultLimitsInput>,
     #[serde(default)]
@@ -824,13 +935,14 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<CreateAccountParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
         let account = self
             .issuer
             .create_account(
                 &subject,
                 CreateAccount {
                     default_quota: params.default_quota,
+                    name: params.name,
                 },
             )
             .await
@@ -850,9 +962,9 @@ impl LightbridgeMcpHandler {
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
         let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
-        let bound = self
-            .cratestack_db
-            .bind_context(cratestack_context_from_token_info(&token_info));
+        let bound = self.cratestack_db.bind_context(
+            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
+        );
         let accounts = bound
             .account()
             .find_many()
@@ -875,9 +987,9 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<AccountByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
-        let bound = self
-            .cratestack_db
-            .bind_context(cratestack_context_from_token_info(&token_info));
+        let bound = self.cratestack_db.bind_context(
+            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
+        );
         let account = bound
             .account()
             .find_unique(params.account_id)
@@ -902,7 +1014,7 @@ impl LightbridgeMcpHandler {
         // quota-tier catalogue check), so this now calls the `updateAccountDefaultQuota` procedure
         // instead, same as the RPC surface -- mirrors how `delete-account` was already repointed
         // from `model.Account.delete` to `deleteAccountPermanently`.
-        let subject = subject_from_request_context(&context)?;
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
         let account = self
             .issuer
             .update_account_default_quota(
@@ -910,6 +1022,29 @@ impl LightbridgeMcpHandler {
                 &params.account_id,
                 params.default_quota.as_deref(),
             )
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(account)
+    }
+
+    #[tool(
+        name = "update-account-name",
+        description = "Set or clear an account's human-facing display name (RPC procedure.updateAccountName); the name is a label, never an identifier"
+    )]
+    async fn update_account_name_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<UpdateAccountNameParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        // Separate from `update-account` rather than another optional field on it: that tool is a
+        // single-field write onto `updateAccountDefaultQuota`, and folding a second column into it
+        // would resurrect exactly the "which fields did the caller mean to leave alone" ambiguity
+        // #379 removed from the account surface. Same `account:update` permission either way.
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
+        let account = self
+            .issuer
+            .update_account_name(&subject, &params.account_id, params.name.as_deref())
             .await
             .map_err(to_tool_error)?;
 
@@ -929,7 +1064,7 @@ impl LightbridgeMcpHandler {
         // unconditionally (membership-role gating -- owner-only -- can't be expressed as an
         // `@@allow` policy, see the schema's comment on `Account`), so this now calls the
         // `deleteAccountPermanently` procedure instead, same as the RPC surface.
-        let subject = subject_from_request_context(&context)?;
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
         let account = self
             .issuer
             .delete_account(&subject, &params.account_id)
@@ -948,7 +1083,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<AccountByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
         let account = self
             .issuer
             .disable_account(&subject, &params.account_id)
@@ -967,7 +1102,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<AccountByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
         let account = self
             .issuer
             .enable_account(&subject, &params.account_id)
@@ -986,7 +1121,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ListProjectRosterParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
         let members = self
             .issuer
             .list_project_roster(&subject, &params.project_id)
@@ -1005,7 +1140,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<AddProjectMemberParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
         let project = self
             .issuer
             .add_project_member(
@@ -1029,7 +1164,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<RemoveProjectMemberParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
         let project = self
             .issuer
             .remove_project_member(&subject, &params.project_id, &params.account_id)
@@ -1048,7 +1183,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<SetProjectMemberRoleParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
         let project = self
             .issuer
             .set_project_member_role(
@@ -1072,7 +1207,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<SetProjectMemberQuotaTierParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
         let project = self
             .issuer
             .set_project_member_quota_tier(
@@ -1096,7 +1231,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<SetProjectQuotaParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
         let project = self
             .issuer
             .set_project_quota(
@@ -1111,8 +1246,46 @@ impl LightbridgeMcpHandler {
     }
 
     #[tool(
+        name = "set-project-allowed-models",
+        description = "Set a project's AI-model allowlist (RPC procedure.setProjectAllowedModels); owner or any roster member, every entry validated against the operator-configured model catalogue (#415, ADR-0018 Decision 5)"
+    )]
+    async fn set_project_allowed_models_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SetProjectAllowedModelsParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
+        let project = self
+            .issuer
+            .set_project_allowed_models(&subject, &params.project_id, params.allowed_models)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(project)
+    }
+
+    #[tool(
+        name = "set-project-model-policy",
+        description = "Set a project's model access policy to allow_all/allowlist/deny_all (RPC procedure.setProjectModelPolicy); owner or any roster member. Refuses switching to allowlist while allowedModels is empty; never touches allowedModels itself (ADR-0018 Decision 5 follow-up)"
+    )]
+    async fn set_project_model_policy_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SetProjectModelPolicyParams>,
+    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
+        let project = self
+            .issuer
+            .set_project_model_policy(&subject, &params.project_id, &params.model_policy)
+            .await
+            .map_err(to_tool_error)?;
+
+        to_json_value(project)
+    }
+
+    #[tool(
         name = "create-project",
-        description = "Create a project (RPC model.Project.create); projectQuota is set afterward via set-project-quota"
+        description = "Create a project (RPC model.Project.create); allowedModels is set afterward via set-project-allowed-models, projectQuota via set-project-quota"
     )]
     async fn create_project_tool(
         &self,
@@ -1120,26 +1293,24 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<CreateProjectParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
-        let bound = self
-            .cratestack_db
-            .bind_context(cratestack_context_from_token_info(&token_info));
+        let bound = self.cratestack_db.bind_context(
+            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
+        );
         let default_limits = params
             .default_limits
             .map(DefaultLimits::from)
             .unwrap_or_default();
         let default_limits_json =
             serde_json::to_value(default_limits).unwrap_or_else(|_| json!({}));
-        // `projectQuota` is `@readonly` on this generated input since #379 (no hook for the
-        // runtime-configured quota-tier catalogue check on the generic verb) -- a brand-new project
-        // always starts with `projectQuota = NULL` (always valid), settable afterward via the
-        // `set-project-quota` tool below.
+        // `projectQuota`/`allowedModels` are both `@readonly` on this generated input (#379 and
+        // #415 respectively -- neither has a hook for a runtime-configured catalogue check on the
+        // generic verb) -- a brand-new project always starts with `projectQuota = NULL`/
+        // `allowedModels = NULL` (both always valid), settable afterward via the
+        // `set-project-quota`/`set-project-allowed-models` tools below.
         let input = schema::inputs::CreateProjectInput {
             id: cuid2(),
             accountId: params.account_id,
             name: params.name,
-            allowedModels: params
-                .allowed_models
-                .map(|models| cratestack_json(json!(models))),
             defaultLimits: cratestack_json(default_limits_json),
             billingPlan: params.billing_plan,
             billingIdentity: params.billing_identity,
@@ -1165,9 +1336,9 @@ impl LightbridgeMcpHandler {
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
         let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
-        let bound = self
-            .cratestack_db
-            .bind_context(cratestack_context_from_token_info(&token_info));
+        let bound = self.cratestack_db.bind_context(
+            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
+        );
         let projects = bound
             .project()
             .find_many()
@@ -1191,9 +1362,9 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<ProjectByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
-        let bound = self
-            .cratestack_db
-            .bind_context(cratestack_context_from_token_info(&token_info));
+        let bound = self.cratestack_db.bind_context(
+            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
+        );
         let project = bound
             .project()
             .find_unique(params.project_id)
@@ -1206,7 +1377,7 @@ impl LightbridgeMcpHandler {
 
     #[tool(
         name = "update-project",
-        description = "Update a project (RPC model.Project.update)"
+        description = "Update a project (RPC model.Project.update); allowedModels is set via set-project-allowed-models, not this tool (#415, ADR-0018 Decision 5)"
     )]
     async fn update_project_tool(
         &self,
@@ -1214,18 +1385,15 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<UpdateProjectParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
-        let bound = self
-            .cratestack_db
-            .bind_context(cratestack_context_from_token_info(&token_info));
+        let bound = self.cratestack_db.bind_context(
+            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
+        );
         let mut input = schema::inputs::UpdateProjectInput::default();
         if let Some(name) = params.name {
             input.name = Some(name);
         }
         if let Some(billing_plan) = params.billing_plan {
             input.billingPlan = Some(billing_plan);
-        }
-        if let Some(allowed_models) = params.allowed_models {
-            input.allowedModels = Some(allowed_models.map(|models| cratestack_json(json!(models))));
         }
         if let Some(default_limits) = params.default_limits {
             let value = serde_json::to_value(DefaultLimits::from(default_limits))
@@ -1253,9 +1421,9 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<ProjectByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
-        let bound = self
-            .cratestack_db
-            .bind_context(cratestack_context_from_token_info(&token_info));
+        let bound = self.cratestack_db.bind_context(
+            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
+        );
         let project = bound
             .project()
             .delete(params.project_id)
@@ -1275,7 +1443,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ProjectByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
         let project = self
             .issuer
             .disable_project(&subject, &params.project_id)
@@ -1294,7 +1462,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ProjectByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
         let project = self
             .issuer
             .enable_project(&subject, &params.project_id)
@@ -1313,7 +1481,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ProjectByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
         let project = self
             .issuer
             .set_default_project(&subject, &params.project_id)
@@ -1333,12 +1501,13 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<CreateApiKeyParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
         let expires_at = parse_required_datetime(params.expires_at, "expires_at")?;
 
         let api_key_secret = self
             .issuer
             .create_api_key(
-                &token_info.sub,
+                &subject,
                 Some(&token_info.access_token),
                 &params.project_id,
                 CreateApiKey {
@@ -1350,7 +1519,37 @@ impl LightbridgeMcpHandler {
             .await
             .map_err(to_tool_error)?;
 
-        to_json_value(api_key_secret)
+        // GHSA-9pc6-965v-2c44: an MCP tool result is returned into the calling model's context,
+        // so it must never carry the secret. Stash it and hand back a claim only the requesting
+        // human, in a browser, can redeem. A failure to stash REFUSES the call -- there is no
+        // fallback that returns the secret inline.
+        // Fail closed when unconfigured. The secret exists at this point and the key row is
+        // written, but there is nowhere safe to put the secret -- and a tool result is not it.
+        // Refusing is the only correct answer; returning it would reintroduce the exposure this
+        // whole mechanism exists to remove.
+        let (Some(claim_store), Some(redeem_base_url)) =
+            (self.claim_store.as_ref(), self.redeem_base_url.as_ref())
+        else {
+            return Err(ErrorData::internal_error(
+                "secret_claim is not configured on this deployment, so an API key secret cannot \
+                 be delivered safely. An MCP tool result is read by the model, so the secret is \
+                 never returned here. Configure secret_claim (encryption_key, redeem_base_url) \
+                 and retry."
+                    .to_string(),
+                None,
+            ));
+        };
+        let claim = claim_store
+            .issue(&api_key_secret.secret, &subject)
+            .await
+            .map_err(to_tool_error)?;
+        to_json_value(api_key_claim_response(
+            &api_key_secret.api_key,
+            api_key_secret.oauth2_url.as_deref(),
+            redeem_base_url,
+            &claim.token,
+            claim.expires_in_seconds,
+        ))
     }
 
     #[tool(
@@ -1364,9 +1563,9 @@ impl LightbridgeMcpHandler {
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
         let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
-        let bound = self
-            .cratestack_db
-            .bind_context(cratestack_context_from_token_info(&token_info));
+        let bound = self.cratestack_db.bind_context(
+            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
+        );
         let api_keys = bound
             .api_key()
             .find_many()
@@ -1390,9 +1589,9 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<ApiKeyByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
-        let bound = self
-            .cratestack_db
-            .bind_context(cratestack_context_from_token_info(&token_info));
+        let bound = self.cratestack_db.bind_context(
+            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
+        );
         let api_key = bound
             .api_key()
             .find_unique(params.key_id)
@@ -1413,9 +1612,9 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<UpdateApiKeyParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
-        let bound = self
-            .cratestack_db
-            .bind_context(cratestack_context_from_token_info(&token_info));
+        let bound = self.cratestack_db.bind_context(
+            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
+        );
         let mut input = schema::inputs::UpdateApiKeyInput::default();
         if let Some(name) = params.name {
             input.name = Some(name);
@@ -1441,9 +1640,9 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<ApiKeyByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
-        let bound = self
-            .cratestack_db
-            .bind_context(cratestack_context_from_token_info(&token_info));
+        let bound = self.cratestack_db.bind_context(
+            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
+        );
         let api_key = bound
             .api_key()
             .delete(params.key_id)
@@ -1463,7 +1662,7 @@ impl LightbridgeMcpHandler {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ApiKeyByIdParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context)?;
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
         let api_key = self
             .issuer
             .revoke_api_key(&subject, &params.key_id)
@@ -1483,12 +1682,13 @@ impl LightbridgeMcpHandler {
         Parameters(params): Parameters<RotateApiKeyParams>,
     ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
         let token_info = token_info_from_request_context(&context)?;
+        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
         let expires_at = parse_optional_datetime(params.expires_at, "expires_at")?;
 
         let api_key_secret = self
             .issuer
             .rotate_api_key(
-                &token_info.sub,
+                &subject,
                 Some(&token_info.access_token),
                 &params.key_id,
                 RotateApiKey {
@@ -1500,7 +1700,37 @@ impl LightbridgeMcpHandler {
             .await
             .map_err(to_tool_error)?;
 
-        to_json_value(api_key_secret)
+        // GHSA-9pc6-965v-2c44: an MCP tool result is returned into the calling model's context,
+        // so it must never carry the secret. Stash it and hand back a claim only the requesting
+        // human, in a browser, can redeem. A failure to stash REFUSES the call -- there is no
+        // fallback that returns the secret inline.
+        // Fail closed when unconfigured. The secret exists at this point and the key row is
+        // written, but there is nowhere safe to put the secret -- and a tool result is not it.
+        // Refusing is the only correct answer; returning it would reintroduce the exposure this
+        // whole mechanism exists to remove.
+        let (Some(claim_store), Some(redeem_base_url)) =
+            (self.claim_store.as_ref(), self.redeem_base_url.as_ref())
+        else {
+            return Err(ErrorData::internal_error(
+                "secret_claim is not configured on this deployment, so an API key secret cannot \
+                 be delivered safely. An MCP tool result is read by the model, so the secret is \
+                 never returned here. Configure secret_claim (encryption_key, redeem_base_url) \
+                 and retry."
+                    .to_string(),
+                None,
+            ));
+        };
+        let claim = claim_store
+            .issue(&api_key_secret.secret, &subject)
+            .await
+            .map_err(to_tool_error)?;
+        to_json_value(api_key_claim_response(
+            &api_key_secret.api_key,
+            api_key_secret.oauth2_url.as_deref(),
+            redeem_base_url,
+            &claim.token,
+            claim.expires_in_seconds,
+        ))
     }
 
     #[tool(
@@ -1627,13 +1857,32 @@ fn build_mcp_router(
     issuer: Arc<AuthzStoreImpl>,
     opa_repo: Arc<dyn OpaRepoTrait>,
     bearer_service: Arc<dyn BearerTokenServiceTrait>,
+    resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver>,
+    federation_issuer: String,
     readiness_pool: Arc<dyn DbPoolTrait>,
+    claim_store: Option<Arc<SecretClaimStore>>,
+    redeem_base_url: Option<Arc<String>>,
 ) -> Router {
     let app_state = Arc::new(lightbridge_authz_api::AppState {
         bearer: bearer_service,
     });
 
-    let handler = LightbridgeMcpHandler::new(cratestack_db, issuer, opa_repo, basic_auth, billing);
+    let api_key_audience = oauth2
+        .signing
+        .as_ref()
+        .and_then(|signing| signing.audience.clone());
+    let handler = LightbridgeMcpHandler::new(
+        cratestack_db,
+        issuer,
+        opa_repo,
+        basic_auth,
+        billing,
+        api_key_audience,
+        resolver,
+        federation_issuer,
+        claim_store,
+        redeem_base_url,
+    );
     let oauth_proxy_state = Arc::new(OauthProxyState {
         client: Client::new(),
         endpoints: resolve_oauth2_endpoints(oauth2),
@@ -1716,11 +1965,26 @@ pub async fn start_mcp_server(
     quota_tiers: &QuotaTiers,
     models: &ModelCatalog,
     api_key_expiry: &ApiKeyExpiry,
+    secret_claim: Option<&lightbridge_authz_core::config::SecretClaim>,
     pool: Arc<dyn DbPoolTrait>,
 ) -> Result<()> {
     billing.validate()?;
     api_key_expiry.validate()?;
     oauth2.rbac.validate()?;
+    // ADR-0025 Stage 1: `lightbridge-mcp` is one of the five components mandated to carry
+    // `oauth2.federation.issuer` -- see `lightbridge_authz_rest`'s `require_federation` for the
+    // identical shape applied to `authz-api`/`authz-idp`/`authz-opa`/`authz-budget`. `mcp.rs`
+    // lives in a separate crate from `lightbridge-authz-rest`, so this is its own inline check
+    // rather than a shared helper call.
+    let federation = oauth2.federation.as_ref().ok_or_else(|| {
+        Error::Server(
+            "oauth2.federation.issuer is required for lightbridge-mcp (ADR-0025) -- set the \
+             oauth2.federation block naming the one issuer this deployment trusts for \
+             remote-subject-to-account-id translation"
+                .to_string(),
+        )
+    })?;
+    federation.validate()?;
     let readiness_pool = pool.clone();
     if oauth2.is_self_signed() {
         let signing = oauth2.signing.as_ref().ok_or_else(|| {
@@ -1740,6 +2004,25 @@ pub async fn start_mcp_server(
         models,
         api_key_expiry,
     )?);
+    // ADR-0025 Stage 2: `federation` above is already the validated `oauth2.federation` block.
+    let resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver> = Arc::new(
+        lightbridge_authz_rest::auth_provider::FederatedSubjectResolver::new(
+            Arc::new(StoreRepo::new(pool.clone())),
+            oauth2.signing.as_ref().map(|s| s.issuer.clone()),
+            federation.issuer.clone(),
+        ),
+    );
+    // Validated offline here (base64url, exactly 32 bytes, positive TTL) so a malformed key is a
+    // startup failure rather than a first-request failure -- the same posture
+    // `KeycloakRelyingParty::new` takes, and for the same reason.
+    // Still validated OFFLINE when present (base64url, exactly 32 bytes, positive TTL), so a
+    // malformed key is a startup failure -- only an ABSENT block is tolerated, and it degrades to
+    // refusing key creation rather than to returning secrets unsafely.
+    let claim_store = secret_claim
+        .map(|cfg| {
+            SecretClaimStore::from_config(Arc::new(StoreRepo::new(pool.clone())), cfg).map(Arc::new)
+        })
+        .transpose()?;
     let opa_repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
     let bearer_service: Arc<dyn BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));
@@ -1769,7 +2052,11 @@ pub async fn start_mcp_server(
         issuer,
         opa_repo,
         bearer_service,
+        resolver,
+        federation.issuer.clone(),
         readiness_pool,
+        claim_store,
+        secret_claim.map(|cfg| Arc::new(cfg.redeem_base_url.clone())),
     );
 
     let signing_enabled = oauth2.is_self_signed();
@@ -1790,6 +2077,10 @@ pub async fn start_mcp_server(
 pub async fn start_mcp_server_from_config(config: &Config) -> Result<()> {
     let pool: Arc<dyn DbPoolTrait> =
         Arc::new(lightbridge_authz_core::db::DbPool::new(&config.database).await?);
+    // GHSA-9pc6-965v-2c44. Deliberately NOT a startup mandate: an absent block degrades to
+    // refusing create-api-key/rotate-api-key, never to returning a secret in a tool result. The
+    // startup-mandate version would take this service down on any deployment that ships the image
+    // before provisioning the key, which is a worse failure than one tool refusing.
     start_mcp_server(
         &config.server.api,
         &config.oauth2,
@@ -1798,6 +2089,7 @@ pub async fn start_mcp_server_from_config(config: &Config) -> Result<()> {
         &config.quota_tiers,
         &config.models,
         &config.api_key_expiry,
+        config.secret_claim.as_ref(),
         pool,
     )
     .await
@@ -1836,6 +2128,95 @@ mod tests {
     use chrono::Utc;
     use lightbridge_authz_core::{Account, ApiKey, ApiKeyStatus, Project, async_trait};
     use sqlx::postgres::PgPoolOptions;
+
+    /// GHSA-9pc6-965v-2c44 regression. The strong guarantee is structural -- `api_key_claim_response`
+    /// takes no secret parameter, so it cannot emit one. This asserts the resulting shape as well,
+    /// so a future edit that adds a secret-bearing field is caught rather than merely improbable.
+    #[test]
+    fn the_api_key_tool_response_carries_a_claim_url_and_no_secret() {
+        let api_key = ApiKey {
+            id: "key_1".to_string(),
+            project_id: "proj_1".to_string(),
+            name: "n".to_string(),
+            key_prefix: "lbk_abc".to_string(),
+            key_hash: "hash-must-not-be-serialized".to_string(),
+            created_at: Utc::now(),
+            expires_at: None,
+            status: ApiKeyStatus::Active,
+            last_used_at: None,
+            last_ip: None,
+            revoked_at: None,
+            billing_plan: "free".to_string(),
+            updated_at: Utc::now(),
+        };
+        let value = api_key_claim_response(
+            &api_key,
+            Some("https://idp.example.test/token"),
+            "https://auth.example.test/",
+            "claimtoken123",
+            300,
+        );
+        let rendered = serde_json::to_string(&value).expect("serialize");
+        assert!(
+            !rendered.contains("\"secret\""),
+            "the MCP tool result must never carry a secret field: {rendered}"
+        );
+        assert_eq!(
+            value["claim_url"],
+            serde_json::json!("https://auth.example.test/api-keys/claim/claimtoken123"),
+            "a trailing slash on redeem_base_url must not produce a doubled separator"
+        );
+        assert_eq!(value["expires_in_seconds"], serde_json::json!(300));
+        assert!(
+            !rendered.contains("hash-must-not-be-serialized"),
+            "ApiKey::key_hash is #[serde(skip_serializing)] and must stay that way: {rendered}"
+        );
+    }
+
+    /// GHSA-9pc6-965v-2c44 softening contract: the service must come up with `secret_claim`
+    /// absent, with every tool still advertised. The refusal happens at `create-api-key`, not at
+    /// process start -- see that tool's early return. Booting is what makes this safe to deploy
+    /// ahead of provisioning the key.
+    #[tokio::test]
+    async fn the_handler_builds_and_advertises_every_tool_without_a_claim_store() {
+        let with_claims = LightbridgeMcpHandler::new(
+            lazy_cratestack_db(),
+            lazy_issuer(),
+            sample_repo(),
+            basic_auth(),
+            &sample_billing(),
+            None,
+            test_resolver(),
+            "https://keycloak.example.test/realms/dev".to_string(),
+            test_claim_store(),
+            test_redeem_base_url(),
+        );
+        let without_claims = LightbridgeMcpHandler::new(
+            lazy_cratestack_db(),
+            lazy_issuer(),
+            sample_repo(),
+            basic_auth(),
+            &sample_billing(),
+            None,
+            test_resolver(),
+            "https://keycloak.example.test/realms/dev".to_string(),
+            None,
+            None,
+        );
+        assert_eq!(
+            without_claims.advertised_tools().len(),
+            with_claims.advertised_tools().len(),
+            "an unconfigured secret_claim must not remove tools -- it must refuse the two that \
+             hand over a secret, at call time"
+        );
+        assert!(
+            without_claims
+                .advertised_tools()
+                .iter()
+                .any(|t| t.name == "create-api-key"),
+            "create-api-key stays advertised; it refuses when called"
+        );
+    }
 
     #[test]
     fn streamable_http_config_is_stateless_for_multi_replica() {
@@ -1919,6 +2300,15 @@ mod tests {
             Err(lightbridge_authz_core::error::Error::NotFound)
         }
 
+        async fn authorize_usage_scope(
+            &self,
+            _subject: &str,
+            _scope: &str,
+            _scope_id: &str,
+        ) -> Result<()> {
+            Err(lightbridge_authz_core::error::Error::NotFound)
+        }
+
         async fn get_project_by_id(&self, project_id: &str) -> Result<Option<Project>> {
             if project_id == self.project.id {
                 return Ok(Some(self.project.clone()));
@@ -1930,6 +2320,33 @@ mod tests {
             if account_id == self.account.id {
                 return Ok(Some(self.account.clone()));
             }
+            Ok(None)
+        }
+
+        async fn project_member_quota_tier(
+            &self,
+            _project_id: &str,
+            _subject: &str,
+        ) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn project_member_role(
+            &self,
+            _project_id: &str,
+            _subject: &str,
+        ) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn list_verification_jwks(&self) -> Result<Vec<serde_json::Value>> {
+            Ok(Vec::new())
+        }
+
+        async fn find_session_status(
+            &self,
+            _session_id: &str,
+        ) -> Result<Option<lightbridge_authz_rest::SessionStatusRow>> {
             Ok(None)
         }
     }
@@ -1964,6 +2381,7 @@ mod tests {
             project_quota: None,
             status: lightbridge_authz_core::ResourceStatus::Active,
             is_default: false,
+            model_policy: lightbridge_authz_core::ModelPolicy::AllowAll,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -1972,8 +2390,12 @@ mod tests {
     fn fixture_account() -> Account {
         Account {
             id: "acct_1".to_string(),
+            // A home account owns itself (`user_id == id`) -- the ADR-0026 invariant the
+            // `userId == auth().id` read policy rests on.
+            user_id: "acct_1".to_string(),
             default_quota: None,
             status: lightbridge_authz_core::ResourceStatus::Active,
+            name: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -2019,11 +2441,47 @@ mod tests {
             Err(Error::NotFound)
         }
 
+        async fn authorize_usage_scope(
+            &self,
+            _subject: &str,
+            _scope: &str,
+            _scope_id: &str,
+        ) -> Result<()> {
+            Err(Error::NotFound)
+        }
+
         async fn get_project_by_id(&self, _project_id: &str) -> Result<Option<Project>> {
             Ok(None)
         }
 
         async fn get_account_by_id(&self, _account_id: &str) -> Result<Option<Account>> {
+            Ok(None)
+        }
+
+        async fn project_member_quota_tier(
+            &self,
+            _project_id: &str,
+            _subject: &str,
+        ) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn project_member_role(
+            &self,
+            _project_id: &str,
+            _subject: &str,
+        ) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn list_verification_jwks(&self) -> Result<Vec<serde_json::Value>> {
+            Ok(Vec::new())
+        }
+
+        async fn find_session_status(
+            &self,
+            _session_id: &str,
+        ) -> Result<Option<lightbridge_authz_rest::SessionStatusRow>> {
             Ok(None)
         }
     }
@@ -2045,6 +2503,7 @@ mod tests {
         TokenInfo {
             active: true,
             sub: "mcp-tester".to_string(),
+            iss: "https://keycloak.example.test/realms/dev".to_string(),
             exp: 0,
             aud: vec![],
             roles: vec![],
@@ -2058,6 +2517,129 @@ mod tests {
         token_info_with_permissions(Permission::ALL.into_iter().collect())
     }
 
+    /// Issue #383 follow-up regression: MCP's `cratestack_context_from_token_info` must build the
+    /// context by delegating to the SAME `lightbridge_authz_rest::auth_provider::build_context`
+    /// the RPC surface uses (`RpcScope::Crud` — MCP only ever exposes the CRUD tool set, see that
+    /// function's own doc comment for what was confirmed and where). This is the test that fails
+    /// immediately if a future edit reintroduces a hand-rolled, independently-drifting copy here
+    /// instead of updating (or continuing to call) the shared helper — exactly the failure mode
+    /// that shipped once already: MCP's pre-fix copy set only `auth().id`, satisfied the schema's
+    /// OLD `@allow(auth() != null)` clauses, and silently failed every #383-added
+    /// `auth().rpcScope`/`auth().perm<Permission>` clause with no local test catching it (found by
+    /// CI's `integration-test` failing the first live MCP tool call instead).
+    ///
+    /// Covers both a full-access and a zero-permission token so the comparison can't pass merely
+    /// because both sides happen to agree on an all-`true` or all-`false` context.
+    #[tokio::test]
+    async fn cratestack_context_from_token_info_matches_the_shared_helper() {
+        for info in [
+            full_access_token_info(),
+            token_info_with_permissions(lightbridge_authz_core::authz::PermissionSet::new()),
+        ] {
+            let mcp_ctx = cratestack_context_from_token_info(&info, test_resolver().as_ref())
+                .await
+                .expect("the trust-everything test resolver never refuses");
+            let shared_ctx = lightbridge_authz_rest::auth_provider::build_context(
+                &info,
+                RpcScope::Crud,
+                test_resolver().as_ref(),
+            )
+            .await
+            .expect("the trust-everything test resolver never refuses");
+            assert_eq!(
+                mcp_ctx, shared_ctx,
+                "MCP's context-builder has drifted from the shared helper for subject {:?} — it \
+                 must delegate to lightbridge_authz_rest::auth_provider::build_context, not \
+                 maintain its own copy of the permission-field population logic",
+                info.sub,
+            );
+        }
+    }
+
+    /// Companion to the delegation test above: independently pins down the actual field SHAPE a
+    /// real `authz.cstack` `@allow`/`@@allow` clause reads — `auth().rpcScope == "crud"` and
+    /// `auth().perm<Permission>` reflecting the caller's real, computed grant — so a change that
+    /// broke both `build_context` AND this MCP delegation identically (which the equality test
+    /// above alone would not catch) still fails here.
+    #[tokio::test]
+    async fn cratestack_context_from_token_info_carries_the_real_permission_set_and_crud_scope() {
+        let viewer_perms: lightbridge_authz_core::authz::PermissionSet =
+            [lightbridge_authz_core::authz::Permission::AccountRead]
+                .into_iter()
+                .collect();
+        let ctx = cratestack_context_from_token_info(
+            &token_info_with_permissions(viewer_perms),
+            test_resolver().as_ref(),
+        )
+        .await
+        .expect("the trust-everything test resolver never refuses");
+
+        assert_eq!(
+            ctx.auth_field("rpcScope"),
+            Some(&cratestack::Value::String("crud".to_owned())),
+            "MCP must scope its context to RpcScope::Crud (it never dispatches budget:* op-ids)"
+        );
+        assert_eq!(
+            ctx.auth_field("permAccountRead"),
+            Some(&cratestack::Value::Bool(true)),
+            "a permission the caller actually holds must read back true"
+        );
+        assert_eq!(
+            ctx.auth_field("permAccountCreate"),
+            Some(&cratestack::Value::Bool(false)),
+            "a permission the caller does NOT hold must read back false, never absent (absent \
+             would make the schema's auth().permAccountCreate == true comparison fail closed for \
+             the wrong reason — this pins it explicitly false instead)"
+        );
+    }
+
+    /// A trust-everything [`lightbridge_authz_rest::auth_provider::SubjectResolver`] test double:
+    /// resolves any `(iss, sub)` to `AccountId::assert_already_resolved(sub)` unconditionally, never
+    /// touching a database. Correct for every test in this module that is not itself about
+    /// resolver behavior -- those get their own dedicated fixtures instead.
+    struct TrustEverythingResolver;
+
+    #[lightbridge_authz_core::async_trait]
+    impl lightbridge_authz_rest::auth_provider::SubjectResolver for TrustEverythingResolver {
+        async fn resolve(
+            &self,
+            _iss: &str,
+            sub: &str,
+        ) -> lightbridge_authz_core::error::Result<lightbridge_authz_core::identity::AccountId>
+        {
+            Ok(lightbridge_authz_core::identity::AccountId::assert_already_resolved(sub))
+        }
+    }
+
+    fn test_resolver() -> Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver> {
+        Arc::new(TrustEverythingResolver)
+    }
+
+    /// A resolver double that ALWAYS refuses (`Error::Forbidden`) -- used to prove Finding 1's fix
+    /// (lightbridge-authz#PR review, ADR-0025 Stage 2): `create-api-key`/`rotate-api-key` must route
+    /// the acting subject through `subject_from_request_context` (and therefore through this
+    /// resolver) exactly like their 17 siblings, rather than reading `TokenInfo::sub` directly and
+    /// only failing later at the database. With the resolver wired in, a refusal here must surface
+    /// as `subject_from_request_context`'s own "unable to resolve caller identity" error -- if a
+    /// tool body instead uses `TokenInfo::sub` raw, this resolver is never called at all, and the
+    /// call proceeds straight to `AuthzStoreImpl` over the tests' deliberately-unreachable lazy
+    /// pool, producing a different (database) error instead.
+    struct RefusingResolver;
+
+    #[lightbridge_authz_core::async_trait]
+    impl lightbridge_authz_rest::auth_provider::SubjectResolver for RefusingResolver {
+        async fn resolve(
+            &self,
+            _iss: &str,
+            _sub: &str,
+        ) -> lightbridge_authz_core::error::Result<lightbridge_authz_core::identity::AccountId>
+        {
+            Err(lightbridge_authz_core::error::Error::Forbidden(
+                "test: refusing resolution".to_string(),
+            ))
+        }
+    }
+
     fn lazy_pool() -> Arc<dyn DbPoolTrait> {
         let pool = PgPoolOptions::new()
             // Bounded so a deliberately-dead pool fails fast: sqlx's default
@@ -2066,6 +2648,20 @@ mod tests {
             .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/lightbridge_authz")
             .expect("lazy pool should be constructible");
         Arc::new(lightbridge_authz_core::db::DbPool::from_pool(pool))
+    }
+
+    /// Claim store for handler-shape tests. The pool is lazy, so nothing dials a database unless a
+    /// test actually issues a claim.
+    fn test_claim_store() -> Option<Arc<SecretClaimStore>> {
+        Some(Arc::new(SecretClaimStore::new(
+            Arc::new(lightbridge_authz_api_key::repo::StoreRepo::new(lazy_pool())),
+            [7u8; 32],
+            300,
+        )))
+    }
+
+    fn test_redeem_base_url() -> Option<Arc<String>> {
+        Some(Arc::new("https://auth.example.test".to_string()))
     }
 
     /// The generated cratestack CRUD client over a lazily-connected pool pointed at an unreachable
@@ -2102,6 +2698,11 @@ mod tests {
             sample_repo(),
             basic_auth(),
             &sample_billing(),
+            None,
+            test_resolver(),
+            "https://keycloak.example.test/realms/dev".to_string(),
+            test_claim_store(),
+            test_redeem_base_url(),
         )
     }
 
@@ -2120,6 +2721,14 @@ mod tests {
     }
 
     fn test_router(opa_repo: Arc<dyn OpaRepoTrait>, token_info: TokenInfo) -> Router {
+        test_router_with_resolver(opa_repo, token_info, test_resolver())
+    }
+
+    fn test_router_with_resolver(
+        opa_repo: Arc<dyn OpaRepoTrait>,
+        token_info: TokenInfo,
+        resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver>,
+    ) -> Router {
         build_mcp_router(
             &test_api_server(),
             &sample_oauth2(),
@@ -2129,7 +2738,11 @@ mod tests {
             lazy_issuer(),
             opa_repo,
             Arc::new(MockBearer { token_info }),
+            resolver,
+            "https://keycloak.example.test/realms/dev".to_string(),
             lazy_pool(),
+            test_claim_store(),
+            test_redeem_base_url(),
         )
     }
 
@@ -2190,6 +2803,10 @@ mod tests {
                 "update-account",
                 json!({ "account_id": "acct_1", "default_quota": "medium" }),
             ),
+            (
+                "update-account-name",
+                json!({ "account_id": "acct_1", "name": "Acme Corp" }),
+            ),
             ("disable-account", json!({ "account_id": "acct_1" })),
             ("enable-account", json!({ "account_id": "acct_1" })),
             ("list-project-roster", json!({ "project_id": "proj_1" })),
@@ -2216,6 +2833,14 @@ mod tests {
             (
                 "set-project-quota",
                 json!({ "project_id": "proj_1", "project_quota": "small" }),
+            ),
+            (
+                "set-project-allowed-models",
+                json!({ "project_id": "proj_1", "allowed_models": ["gpt-4.1-mini"] }),
+            ),
+            (
+                "set-project-model-policy",
+                json!({ "project_id": "proj_1", "model_policy": "deny_all" }),
             ),
             ("list-projects", json!({ "account_id": "acct_1" })),
             ("get-project", json!({ "project_id": "proj_1" })),
@@ -2303,8 +2928,13 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
+            relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
+            federation: Some(lightbridge_authz_core::config::Federation {
+                issuer: "https://keycloak.example.test/realms/dev".to_string(),
+                discovery_url: None,
+            }),
         }
     }
 
@@ -2450,10 +3080,13 @@ mod tests {
             "revoke-api-key",
             "rotate-api-key",
             "set-default-project",
+            "set-project-allowed-models",
             "set-project-member-quota-tier",
             "set-project-member-role",
+            "set-project-model-policy",
             "set-project-quota",
             "update-account",
+            "update-account-name",
             "update-api-key",
             "update-project",
             "validate-authorino-api-key",
@@ -2501,6 +3134,11 @@ mod tests {
             sample_repo(),
             basic_auth(),
             &Billing::default(),
+            None,
+            test_resolver(),
+            "https://keycloak.example.test/realms/dev".to_string(),
+            test_claim_store(),
+            test_redeem_base_url(),
         );
         let tools = handler.advertised_tools();
         let create = tools
@@ -2696,6 +3334,9 @@ mod tests {
             repo: Arc::new(NotFoundOpaRepo),
             basic_auth: basic_auth(),
             billing: Arc::new(sample_billing()),
+            api_key_audience: None,
+            resolver: test_resolver(),
+            federation_issuer: "https://keycloak.example.test/realms/dev".to_string(),
         });
 
         let result = run_validate_api_key(
@@ -2719,6 +3360,9 @@ mod tests {
             repo: Arc::new(NotFoundOpaRepo),
             basic_auth: basic_auth(),
             billing: Arc::new(sample_billing()),
+            api_key_audience: None,
+            resolver: test_resolver(),
+            federation_issuer: "https://keycloak.example.test/realms/dev".to_string(),
         });
 
         let result = run_validate_authorino(
@@ -2797,6 +3441,66 @@ mod tests {
         assert!(
             payload.get("error").is_some(),
             "an invalid RFC3339 expires_at should be rejected: {payload}"
+        );
+    }
+
+    /// Finding 1 (ADR-0025 Stage 2 gap): `create-api-key` must resolve the acting subject via
+    /// `subject_from_request_context` (the same seam its 17 siblings use), not
+    /// `TokenInfo::sub` directly -- otherwise a federated identity whose `account_id != sub` would
+    /// mint a key owned by the wrong account. Proven here by wiring a resolver that always refuses:
+    /// the fixed tool body must fail with `subject_from_request_context`'s own error BEFORE ever
+    /// reaching `AuthzStoreImpl` (over this test's deliberately-unreachable lazy pool). Prove-fail:
+    /// reverting `create_api_key_tool` to read `&token_info.sub` directly makes this resolver
+    /// unreachable, so the call instead fails later with a database error and this assertion reds.
+    #[tokio::test]
+    async fn create_api_key_tool_routes_the_acting_subject_through_the_resolver_seam() {
+        let router = test_router_with_resolver(
+            sample_repo(),
+            full_access_token_info(),
+            Arc::new(RefusingResolver),
+        );
+        let (status, payload) = call_tool(
+            router,
+            "create-api-key",
+            json!({ "project_id": "proj_1", "name": "key", "expires_at": near_future_expiry(), "billing_plan": "free" }),
+            Some("good"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let message = payload["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("unable to resolve caller identity"),
+            "create-api-key must route the acting subject through subject_from_request_context \
+             (ADR-0025 Stage 2), not TokenInfo::sub directly -- a resolver refusal must surface as \
+             this specific error, not a dead-pool database error from AuthzStoreImpl: {payload}"
+        );
+    }
+
+    /// Same proof as `create_api_key_tool_routes_the_acting_subject_through_the_resolver_seam`,
+    /// for `rotate-api-key` (Finding 1's other affected tool).
+    #[tokio::test]
+    async fn rotate_api_key_tool_routes_the_acting_subject_through_the_resolver_seam() {
+        let router = test_router_with_resolver(
+            sample_repo(),
+            full_access_token_info(),
+            Arc::new(RefusingResolver),
+        );
+        let (status, payload) = call_tool(
+            router,
+            "rotate-api-key",
+            json!({ "key_id": "key_1", "grace_period_seconds": 60 }),
+            Some("good"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let message = payload["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("unable to resolve caller identity"),
+            "rotate-api-key must route the acting subject through subject_from_request_context \
+             (ADR-0025 Stage 2), not TokenInfo::sub directly -- a resolver refusal must surface as \
+             this specific error, not a dead-pool database error from AuthzStoreImpl: {payload}"
         );
     }
 

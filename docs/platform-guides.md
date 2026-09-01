@@ -15,7 +15,7 @@ This document collects the concrete commands that worked when we tested the Helm
     --set auth.database=lightbridge_authz \
     --set primary.persistence.enabled=false \
     --wait --timeout 5m
-  docker build -t lightbridge-authz:0.8.1 .
+  docker build -t lightbridge-authz:<image-tag> .
   ```
 - Generate the TLS secrets manually (optional unless you prefer full control or the built-in job/tag fails):
   ```bash
@@ -117,9 +117,54 @@ With this file you have a repeatable recipe per platform: macOS for installing c
 
 ## Migration job
 
-The umbrella also wires a `migration` dependency (`charts/lightbridge-migrate`, aliased as `migration`) that renders a pre-install/pre-upgrade job running `lightbridge-authz migrate --config-path /tmp/lightbridge-config/config.yaml`. That job reuses the same config map and handshake secrets that the API/OPA subcharts consume, so schema migrations always run before new controllers spin up. `migration.enabled`, `migration.backoffLimit`, `migration.ttlSecondsAfterFinished`, and the image knobs under `migration.image` let you tune retries or run a different build, while the `bjw-s/common v4` loader takes care of creating the supporting config map/secret/job resources with the familiar naming helpers.
+**Correction:** there is no separate `charts/lightbridge-migrate` chart and no `migration` alias.
+`charts/lightbridge-authz-stack`'s dependencies are `api`/`opa`/`idp`/`budget` (all the same
+`charts/lightbridge-authz` chart under different aliases), `usage` (`charts/lightbridge-authz-usage`),
+and `mcp` (`charts/lightbridge-mcp`) — see that chart's `Chart.yaml`.
 
-Check `kubectl get jobs` or `kubectl logs` on the job whose name follows the migration subchart's fullname to confirm completion; if you ever disable the job (e.g., for manual migrations), rerun the migration binary yourself and re-enable the hook before the next upgrade so the database and API/OPA workloads stay in sync.
+Schema migrations instead run as `controllers.migrate` INSIDE `charts/lightbridge-authz` itself
+(and, separately, inside `charts/lightbridge-authz-usage` for usage-store migrations):
+`lightbridge-authz migrate --config-path /etc/lightbridge/config.yaml`, reusing the ambient config
+map and the same image the `api`/`opa` controllers use. Per ADR-0016
+(`docs/adr/0016-migrate-job-sync-wave-not-hook.md`) this is deliberately **not** a Helm hook — a
+`post-install,post-upgrade` hook is an ArgoCD PostSync hook that only fires once every non-hook
+resource (including the main Deployment) is already Healthy, which deadlocks the moment a migration
+is itself a precondition for the new pods' own readiness probe. Instead it is an ordinary,
+ArgoCD-tracked `Job` annotated `argocd.argoproj.io/sync-wave: "1"` — one wave earlier than the main
+Deployment's `"2"` — so it runs regardless of whether the Deployment's pods are, or will ever be,
+ready. Its `suffix` folds both the image tag and the rendered config data into the Job name (a
+config-only change would otherwise re-render the same Job name with a different, immutable
+`spec.template` and fail the whole app's sync); `ttlSecondsAfterFinished: 604800` (7 days) keeps a
+completed Job inspectable via the native Kubernetes Job-controller GC path.
+
+Check `kubectl get jobs` or `kubectl logs` on the rendered migrate Job (its name embeds the image
+tag and a config hash, so it changes on either input) to confirm completion; if you ever disable
+`controllers.migrate` (e.g., for manual migrations), rerun the migration binary yourself and
+re-enable it before the next upgrade so the database and API/OPA workloads stay in sync.
+
+## `charts/lightbridge-authz-usage` (the `usage` alias)
+
+Deploying the usage service (`lightbridge-authz-usage`) through the umbrella chart's `usage` alias
+needs three things set correctly, all mandatory since #593/#570/#603 — a config omitting any of
+them fails to load, taking down BOTH the ingest and query listeners at once (and failing the
+`migrate` Job first, since it loads the same config on an earlier sync-wave):
+
+- **`server.query` renders unconditionally** alongside `server.usage` — `UsageServerGroup::query`
+  is a non-`Option` field. mTLS is default-ON: `config.query.tls.clientCaBundlePath` defaults to
+  `/etc/lightbridge/tls/ca.crt`; set it to `""` explicitly to run without mTLS (this drops the
+  query listener's containerPort and Service port entirely rather than leaving it reachable and
+  unauthenticated).
+- **Ports:** ingest `3000` (this chart's pre-existing port, kept for compatibility — NOT full
+  parity with Compose's ingest `3002`) and query `3006` (matching every other reference to this
+  listener in the repo).
+- **`config.oauth2.jwksUrl`** (the JWKS endpoint validating the end-user bearer token
+  `/usage/v1/usage/query` requires) and **`config.scopeAuthority.{baseUrl,username,password}`**
+  (the Basic-auth credential and address for `authz-opa`'s `POST /idp/v1/authorize-usage-scope`,
+  plus the optional `caBundlePath`) are mandatory `UsageConfig` fields. `username`/`password` MUST
+  match whatever `server.opa.basic_auth` resolves to on the `lightbridge-authz` release (`opa`
+  alias) being deployed against — it is the SAME credential Authorino itself presents, sourced from
+  the same `opa-secret` Secret/key. These MUST be supplied correctly in the SAME ROLLOUT that
+  enables this version of the chart, not as a follow-up — see `charts/lightbridge-authz-usage/values.yaml`'s own comments on `config.query.tls`/`config.oauth2`/`config.scopeAuthority` for the full deploy-ordering consequence chain.
 
 ## TLS certificate generation paths
 

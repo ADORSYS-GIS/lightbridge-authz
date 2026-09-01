@@ -6,6 +6,22 @@ runs:
     - uses: ./.github/actions/rust-setup
     - uses: ./.github/actions/build-binaries
 
+    # ADR-0021 Decisions 1 + 10, amended by ADR-0029 (#591): compose.ci.yaml builds the `runtime`
+    # target (authz-migrate, authz-api) from Dockerfile.dist, which COPYs dist/static. Without
+    # this, `docker compose build` fails with "/dist/static": not found (#446 introduced the COPY;
+    # the populating step was once missing and the break was masked for 3 merges because the runs
+    # that would have caught it were cancelled, not failed).
+    #
+    # This is also the step that makes `run_suite it-idp` below meaningful: .docker/it/idp_it.py's
+    # `section_root_and_spa` asserts GET /ui/, /ui/device, /ui/device/invalid, /ui/device/confirm,
+    # /ui/device/success, and /ui/error all return 200 with an HTML content-type -- every route
+    # dist/routes.json lists -- while GET /ui/login 404s (there is no such route; #598 made /ui a
+    # route ALLOWLIST, not a catch-all, so a stray path must fail closed instead of quietly serving
+    # the SPA shell). That assertion is now the live, end-to-end proof that the digest-pinned
+    # external bundle really lands at /app/static in a running authz-idp -- the single most
+    # valuable gate on this whole cutover.
+    - uses: ./.github/actions/stage-authz-ui
+
     - name: Integration tests (docker compose)
       shell: bash
       run: |
@@ -106,13 +122,37 @@ runs:
         run_migration authz-migrate
         run_migration authz-usage-migrate
 
+        # #534/ADR-0030 (PR #604): authz-idp's compose.it.yaml override mounts a generated,
+        # IT-only config (container.it.yaml) that this one-shot service renders -- it does not
+        # exist on disk until this runs. `--no-deps` throughout this script means compose's own
+        # `depends_on: it-machine-keygen: condition: service_completed_successfully` on authz-idp
+        # is never consulted here, so this step is not optional/redundant with that dependency --
+        # it is the ONLY thing that runs it in this CI job.
+        echo "== generating it-machine client_credentials test fixtures =="
+        $compose up -d --no-deps it-machine-keygen
+        wait_completed it-machine-keygen
+
         echo "== starting app services =="
-        $compose up -d --no-deps authz-api authz-opa authz-mcp authz-usage
+        # authz-idp joins the set for it-idp below. It is the only app service here that is NOT
+        # exercised by it-authorino/it-servers, so before it-idp ran in CI there was no reason to
+        # start it -- and no reason to notice it had drifted.
+        $compose up -d --no-deps authz-api authz-opa authz-mcp authz-usage authz-idp
         wait_ready_hc authz-api 3000
         wait_ready_hc authz-opa 3001
         wait_ready_hc authz-mcp 3000
         wait_ready_hc authz-usage 3002
+        wait_ready_hc authz-idp 3004
 
         echo "== running IT suites =="
         run_suite it-authorino
         run_suite it-servers
+        # it-idp was authored but never wired in here, so `just it-idp` was the only thing that
+        # ever ran it -- and nothing forced anyone to. Two merged PRs changed behaviour the suite
+        # asserts and left it red without anyone noticing: #569's refresh-reuse grace window, and
+        # #565's profile claims (which fired a tripwire #545 had planted for exactly that moment,
+        # into an empty room). Running it here is what makes those tripwires mean something.
+        #
+        # Sequential, like the two above -- every suite provisions against the same Keycloak user,
+        # so running them concurrently would race on that account (the same collision
+        # `compose.it.yaml`'s `it` profile exists to prevent).
+        run_suite it-idp

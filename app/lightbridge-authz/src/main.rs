@@ -66,6 +66,7 @@ async fn main() -> Result<()> {
             let api = config.clone().server.api;
             let opa = config.clone().server.opa;
             let opa_billing = config.billing.clone();
+            let opa_oauth2 = config.oauth2.clone();
 
             let config_clone = config.clone();
             let tx_clone = tx.clone();
@@ -93,7 +94,8 @@ async fn main() -> Result<()> {
             let tx_clone = tx.clone();
             let pool_clone = pool.clone();
             tokio::spawn(async move {
-                if let Err(e) = start_opa_server(&opa, pool_clone, &opa_billing).await {
+                if let Err(e) = start_opa_server(&opa, pool_clone, &opa_billing, &opa_oauth2).await
+                {
                     let _ = tx_clone
                         .send(format!("OPA server failed to start: {}", e))
                         .await;
@@ -133,7 +135,7 @@ async fn main() -> Result<()> {
             info!("Connecting to DB...");
             let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(&config.database).await?);
 
-            start_opa_server(&config.server.opa, pool, &config.billing).await?;
+            start_opa_server(&config.server.opa, pool, &config.billing, &config.oauth2).await?;
             Ok(())
         }
         Some(Commands::Idp { config_path }) => {
@@ -149,7 +151,14 @@ async fn main() -> Result<()> {
                     "server.idp config is required to run the idp command".to_string(),
                 )
             })?;
-            start_idp_server(idp, pool, &config.oauth2, &config.redis).await?;
+            start_idp_server(
+                idp,
+                pool,
+                &config.oauth2,
+                &config.redis,
+                &config.secret_claim,
+            )
+            .await?;
             Ok(())
         }
         Some(Commands::Budget { config_path }) => {

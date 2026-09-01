@@ -30,6 +30,7 @@
 
 mod common;
 
+use lightbridge_authz_core::identity::AccountId;
 use std::sync::Arc;
 
 use axum::Router;
@@ -43,7 +44,7 @@ use cratestack_codec_cbor::CborCodec;
 use cratestack_core::CratestackCodec;
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
-use lightbridge_authz_bearer::BearerTokenServiceTrait;
+use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
 use lightbridge_authz_core::authz::Permission;
 use lightbridge_authz_core::config::{BasicAuth, Billing, BillingPlan};
 use lightbridge_authz_core::cuid::cuid2;
@@ -138,6 +139,19 @@ static IDEMPOTENCY_SCHEMA_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCe
 /// Build the full `build_api_router` for `bearer`, connecting the cratestack CRUD client,
 /// Postgres-backed idempotency store, and Redis rate-limit store to the live backends.
 async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
+    setup_with_resolver(bearer, common::test_resolver()).await
+}
+
+/// Like [`setup`], but with a caller-supplied [`SubjectResolver`] instead of the trust-everything
+/// default -- for `crud_authorizes_via_the_federated_account_not_the_raw_subject` below, which
+/// needs a REAL `FederatedSubjectResolver` against this test's own live Postgres to prove
+/// translation actually happens, not merely that a trust-everything stub passes the raw subject
+/// through unchanged (which every other test in this file relies on, deliberately, so bearer
+/// subjects can double as account ids without seeding a federated_identities row each time).
+async fn setup_with_resolver(
+    bearer: Arc<dyn BearerTokenServiceTrait>,
+    resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver>,
+) -> Ctx {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -199,6 +213,7 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
 
     let router = lightbridge_authz_rest::build_api_router(
         bearer,
+        resolver,
         issuer.clone(),
         policy_store.clone(),
         refill_service.clone(),
@@ -263,28 +278,18 @@ async fn create_account(router: &Router, token: &str, _unused: &str) -> String {
         .to_string()
 }
 
-/// Build a typed `CreateProjectInput`. The `Json` columns (`defaultLimits`, `allowedModels`) carry
-/// cratestack's own `Value` enum, which serializes *externally tagged* (`{}` → `{"Map":{}}`), so a
-/// hand-built `serde_json` body would be rejected as an invalid payload — encoding the generated
-/// input type is the only correct wire shape for both JSON and CBOR.
-fn project_input(
-    id: &str,
-    account_id: &str,
-    name: &str,
-    allowed_models: Option<Vec<&str>>,
-) -> schema::inputs::CreateProjectInput {
+/// Build a typed `CreateProjectInput`. `defaultLimits` carries cratestack's own `Value` enum,
+/// which serializes *externally tagged* (`{}` → `{"Map":{}}`), so a hand-built `serde_json` body
+/// would be rejected as an invalid payload — encoding the generated input type is the only correct
+/// wire shape for both JSON and CBOR. `allowedModels` is NOT a field here (#415, ADR-0018 Decision
+/// 5): it is `@readonly` on the generic verb now, so a fresh project always starts with
+/// `allowedModels = NULL` — see `set_project_allowed_models_over_cbor` below for setting it
+/// afterward via `procedure.setProjectAllowedModels`.
+fn project_input(id: &str, account_id: &str, name: &str) -> schema::inputs::CreateProjectInput {
     schema::inputs::CreateProjectInput {
         id: id.to_string(),
         accountId: account_id.to_string(),
         name: name.to_string(),
-        allowedModels: allowed_models.map(|models| {
-            Json(CValue::List(
-                models
-                    .into_iter()
-                    .map(|m| CValue::String(m.to_string()))
-                    .collect(),
-            ))
-        }),
         defaultLimits: Json(CValue::Map(std::collections::BTreeMap::new())),
         billingPlan: "free".to_string(),
         billingIdentity: format!("bill-{}", cuid2()),
@@ -294,7 +299,7 @@ fn project_input(
 /// Create a project over RPC and return its id, asserting 200.
 async fn create_project(router: &Router, token: &str, account_id: &str, name: &str) -> String {
     let project_id = cuid2();
-    let input = project_input(&project_id, account_id, name, None);
+    let input = project_input(&project_id, account_id, name);
     let (status, body) = rpc_call(
         router.clone(),
         "model.Project.create",
@@ -335,6 +340,37 @@ async fn create_api_key(
         "procedure.createApiKey",
         Wire::Cbor,
         &json!({ "args": { "projectId": project_id, "name": name, "billingPlan": "free", "expiresAt": near_future_expiry() } }),
+        Some(token),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "createApiKey: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = json_body(&body);
+    (
+        v["apiKey"]["id"].as_str().expect("key id").to_string(),
+        v["secret"].as_str().expect("secret").to_string(),
+    )
+}
+
+/// Like [`create_api_key`], but with a caller-supplied `expires_at` instead of the fixed
+/// `near_future_expiry()` -- used by the `listMyExpiringApiKeys` boundary tests
+/// (lightbridge-authz#436) to seed keys at precise offsets from "now", exactly at, just inside,
+/// and just outside the expiry window under test.
+async fn create_api_key_with_expiry(
+    router: &Router,
+    token: &str,
+    project_id: &str,
+    name: &str,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> (String, String) {
+    let (status, body) = rpc_call(
+        router.clone(),
+        "procedure.createApiKey",
+        Wire::Cbor,
+        &json!({ "args": { "projectId": project_id, "name": name, "billingPlan": "free", "expiresAt": expires_at.to_rfc3339() } }),
         Some(token),
     )
     .await;
@@ -398,9 +434,8 @@ async fn crud_lifecycle_for_all_resources() {
     assert!(accounts["totalCount"].as_i64().unwrap() >= 1);
 
     // `Account.defaultQuota` is `@readonly` on the generic verb since #379 -- updated via the
-    // dedicated `updateAccountDefaultQuota` procedure instead (`model.Account.update` still exists
-    // for whatever fields remain generically writable; there are none left on `Account` today, see
-    // that procedure's own doc comment).
+    // dedicated `updateAccountDefaultQuota` procedure instead. `model.Account.update` itself was
+    // removed entirely by #398, since #379 had left it with zero generically-writable fields.
     let new_quota = format!("tenant2-{}", cuid2());
     let (status, body) = rpc_call(
         r.clone(),
@@ -565,6 +600,197 @@ async fn crud_lifecycle_for_all_resources() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// ADR-0025 Stage 2: `auth().id` (set by `auth_provider::build_context` via
+/// `SubjectResolver::resolve`) must be the FEDERATED account id a `federated_identities` row
+/// resolves the presented bearer subject to -- never the raw subject claim itself. Deliberately
+/// seeds a `federated_identities` row where `subject != account_id` (a real Keycloak subject
+/// linked to a lightbridge account under a different id) via raw SQL, since none of this repo's
+/// own write paths in Stage 1-3 produce that shape yet (the self-healing grandfather branch
+/// always adopts `subject == account_id`) -- this test proves the GENERAL translation mechanism
+/// (`resolve_account_for_federated_subject`'s "existing row" fast path), not only the
+/// grandfathered special case every other test in this file relies on via the trust-everything
+/// resolver.
+#[tokio::test]
+async fn crud_authorizes_via_the_federated_account_not_the_raw_subject() {
+    const ISSUER: &str = "https://keycloak.example.test/realms/dev";
+    let account_id = format!("real-account-{}", cuid2());
+    let raw_kc_subject = format!("kc-raw-sub-{}", cuid2());
+
+    let core = core_pool().await;
+    let repo = StoreRepo::new(core.clone());
+    repo.create_account(
+        &AccountId::assert_already_resolved(account_id.clone()),
+        lightbridge_authz_core::CreateAccount {
+            default_quota: None,
+            name: None,
+        },
+    )
+    .await
+    .expect("account creation must succeed");
+    sqlx::query(
+        "INSERT INTO federated_identities (id, issuer, subject, account_id) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(cuid2())
+    .bind(ISSUER)
+    .bind(&raw_kc_subject)
+    .bind(&account_id)
+    .execute(core.pool())
+    .await
+    .expect("seeding the federated_identities row must succeed");
+
+    let resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver> = Arc::new(
+        lightbridge_authz_rest::auth_provider::FederatedSubjectResolver::new(
+            Arc::new(repo),
+            None,
+            ISSUER.to_string(),
+        ),
+    );
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&raw_kc_subject, admin_perms())));
+    let ctx = setup_with_resolver(bearer, resolver).await;
+
+    // `@@allow("read", account.id == auth().id)` on `Account` -- succeeds only if `auth().id`
+    // resolved to `account_id`, the federated target, not `raw_kc_subject`, the presented claim.
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "model.Account.get",
+        Wire::Cbor,
+        &json!({ "id": account_id }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a bearer subject with a federated_identities row must authorize as its target account: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(json_body(&body)["id"], account_id);
+}
+
+/// ADR-0025 Correction: the Stage 2..5 bootstrap window. With Stage 2 live (every ingress
+/// translates `(iss, sub)` to an account id BEFORE any procedure runs) and Stage 5 NOT YET
+/// IMPLEMENTED (a minted `accounts.id` for brand-new accounts, written by `createAccount` itself
+/// in the same transaction as the adopting `federated_identities` row), a subject the deployment
+/// has genuinely never seen before -- no `accounts` row, no `federated_identities` row -- has no
+/// way to bootstrap: `createAccount` is the ONLY procedure that could ever create the account
+/// resolution needs, and Stage 2's own translation seam was refusing it before it could run.
+/// Every other test in this file seeds an account first (directly or via `create_account`'s own
+/// helper against a resolver that already trusts the subject), so none of them exercised a
+/// truly-fresh subject; this is what a real compose e2e run (`just it-authorino`) hits the moment
+/// a genuinely new identity shows up, and unit/it coverage missed it entirely until then.
+///
+/// Proves the full bootstrap end-to-end: `createAccount` succeeds via the TEMPORARY
+/// grandfather-issuer fallback (`FederatedSubjectResolver::resolve`'s `NoAccount` arm, which
+/// resolves to the subject's own pre-Stage-5 identity), then `createProject` and `createApiKey`
+/// for the SAME subject succeed too -- by then `accounts.id == subject` exists, so those two
+/// calls go through the ORDINARY, pre-existing self-healing grandfather adoption path
+/// (`resolve_account_for_federated_subject`'s steady-state branch, unchanged by this fix), not
+/// the bootstrap fallback itself. Prove-fail: reverting the fallback (making `NoAccount` refuse,
+/// like `RogueIssuer`) reds this test's very first assertion with the 401/Unauthorized shape
+/// `build_context` maps every resolver refusal to.
+#[tokio::test]
+async fn a_brand_new_subject_bootstraps_create_account_then_project_then_key_end_to_end() {
+    const ISSUER: &str = "https://keycloak.example.test/realms/dev";
+    let subject = format!("brand-new-subject-{}", cuid2());
+
+    let core = core_pool().await;
+    let repo = StoreRepo::new(core.clone());
+    let resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver> = Arc::new(
+        lightbridge_authz_rest::auth_provider::FederatedSubjectResolver::new(
+            Arc::new(repo),
+            None,
+            ISSUER.to_string(),
+        ),
+    );
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&subject, admin_perms())));
+    let ctx = setup_with_resolver(bearer, resolver).await;
+
+    let account_id = create_account(&ctx.router, "admin", &subject).await;
+    assert_eq!(
+        account_id, subject,
+        "the bootstrap fallback must mint the account under the subject's own pre-Stage-5 \
+         identity (accounts.id == subject), matching the grandfather branch it stands in for"
+    );
+
+    let project_id = create_project(&ctx.router, "admin", &account_id, "bootstrap-project").await;
+    let (_key_id, secret) =
+        create_api_key(&ctx.router, "admin", &project_id, "bootstrap-key").await;
+    assert!(
+        !secret.is_empty(),
+        "createApiKey must succeed once the bootstrapped account/project exist"
+    );
+
+    let fi_row_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM federated_identities WHERE issuer = $1 AND subject = $2)",
+    )
+    .bind(ISSUER)
+    .bind(&subject)
+    .fetch_one(&ctx.verify)
+    .await
+    .expect("checking federated_identities must succeed");
+    assert!(
+        fi_row_exists,
+        "createProject's resolution must have self-healed a federated_identities row via the \
+         ordinary grandfather adoption path, now that the account exists"
+    );
+}
+
+/// Security twin of the bootstrap test above: a brand-new subject presented by a NON-grandfather
+/// issuer must still be refused outright, never bootstrapped -- the fallback is issuer-pinned
+/// exactly like the steady-state adoption path it temporarily stands in for
+/// (`FederatedResolution::RogueIssuer`, not `NoAccount`). Proves the fix did not widen the trust
+/// boundary: only the ONE configured `oauth2.federation.issuer` can bootstrap; every other issuer
+/// dead-ends exactly as it did before this fix.
+#[tokio::test]
+async fn a_brand_new_subject_from_a_rogue_issuer_cannot_bootstrap() {
+    const GRANDFATHER_ISSUER: &str = "https://keycloak.example.test/realms/dev";
+    const ROGUE_ISSUER: &str = "https://rogue-issuer.example/realms/evil";
+    let subject = format!("rogue-brand-new-subject-{}", cuid2());
+
+    let core = core_pool().await;
+    let repo = StoreRepo::new(core.clone());
+    let resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver> = Arc::new(
+        lightbridge_authz_rest::auth_provider::FederatedSubjectResolver::new(
+            Arc::new(repo),
+            None,
+            GRANDFATHER_ISSUER.to_string(),
+        ),
+    );
+    let info = TokenInfo {
+        iss: ROGUE_ISSUER.to_string(),
+        ..token_info(&subject, admin_perms())
+    };
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with("admin", info));
+    let ctx = setup_with_resolver(bearer, resolver).await;
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "procedure.createAccount",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a brand-new subject from a non-grandfather issuer must be refused, never bootstrapped: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1)")
+        .bind(&subject)
+        .fetch_one(&ctx.verify)
+        .await
+        .expect("checking accounts must succeed");
+    assert!(
+        !exists,
+        "a refused bootstrap attempt must leave no accounts row behind"
+    );
 }
 
 /// Regression for the legacy jsonb-`null` `allowed_models` decode failure (migration
@@ -915,14 +1141,13 @@ async fn crud_lifecycle_over_cbor() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(Wire::Cbor.decode::<Value>(&body)["id"], account_id);
 
-    // A project create+get over CBOR too (allowedModels carried as a real list).
+    // A project create+get over CBOR too. `allowedModels` is `@readonly` on the generic verb since
+    // #415 (ADR-0018 Decision 5), so it starts NULL and is set afterward via
+    // `procedure.setProjectAllowedModels` -- see that call below (carried as a real list, not
+    // `None`, to exercise the same `Json` tagged-value encoding this comment used to describe on
+    // create).
     let project_id = cuid2();
-    let input = project_input(
-        &project_id,
-        &account_id,
-        "p-cbor",
-        Some(vec!["gpt-4.1-mini"]),
-    );
+    let input = project_input(&project_id, &account_id, "p-cbor");
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.create",
@@ -938,6 +1163,24 @@ async fn crud_lifecycle_over_cbor() {
     );
     assert_eq!(Wire::Cbor.decode::<Value>(&body)["id"], project_id);
 
+    let allowed_models_value = serde_json::to_value(Json(CValue::List(vec![CValue::String(
+        "gpt-4.1-mini".to_string(),
+    )])))
+    .expect("Json<Value> serializes");
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.setProjectAllowedModels",
+        Wire::Cbor,
+        &json!({ "args": { "projectId": project_id, "allowedModels": allowed_models_value } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "cbor setProjectAllowedModels: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.get",
@@ -947,7 +1190,9 @@ async fn crud_lifecycle_over_cbor() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(Wire::Cbor.decode::<Value>(&body)["name"], "p-cbor");
+    let decoded = Wire::Cbor.decode::<Value>(&body);
+    assert_eq!(decoded["name"], "p-cbor");
+    assert_eq!(decoded["allowedModels"], json!(["gpt-4.1-mini"]));
 
     // Account deletion is owner-only and no longer the generic `model.Account.delete` verb
     // (ADR-0005) -- the account's creator ("admin", the token subject used throughout this test)
@@ -972,36 +1217,23 @@ async fn crud_lifecycle_over_cbor() {
 /// field as CBOR `null` (0xf6) — Rust has no way to emit CBOR's distinct `undefined` (0xf7). The
 /// regression below needs the literal `undefined` wire byte the frontend's `cborg` encoder
 /// actually sends for a JS `undefined` property value, so this builds the raw frame by hand
-/// instead of going through the typed `CreateProjectInput`.
-fn raw_cbor_create_project_with_undefined_allowed_models(
-    id: &str,
-    account_id: &str,
-    name: &str,
-) -> Vec<u8> {
+/// instead of going through the typed `SetProjectAllowedModelsInput`.
+///
+/// Targets `procedure.setProjectAllowedModels`, not `model.Project.create` (the original #341
+/// production incident this regression documents): #415 (ADR-0018 Decision 5) made `allowedModels`
+/// `@readonly` on the generic create/update verbs, moving its only write path onto this procedure
+/// -- a picker that clears its selection is exactly the shape that would send `allowedModels:
+/// undefined` again, so this keeps covering the real risk rather than a structurally-closed one.
+fn raw_cbor_set_project_allowed_models_with_undefined(project_id: &str) -> Vec<u8> {
     let mut out = Vec::new();
     let mut e = minicbor::Encoder::new(&mut out);
-    // Seven fields, not six: ADR-0006 moved `billingIdentity` from `Account` onto `Project` and
-    // it is non-optional there (matches `codec_undefined_regression_tests.rs`'s
-    // `frontend_frame_with_undefined_allowed_models`, the real frontend's own wire shape) -- an
-    // omitted `billingIdentity` fails decode with the same generic "invalid request payload" this
-    // test is trying to prove is fixed for `allowedModels`, masking the real regression.
-    e.map(7).unwrap();
-    e.str("id").unwrap();
-    e.str(id).unwrap();
-    e.str("accountId").unwrap();
-    e.str(account_id).unwrap();
-    e.str("name").unwrap();
-    e.str(name).unwrap();
+    e.map(1).unwrap();
+    e.str("args").unwrap();
+    e.map(2).unwrap();
+    e.str("projectId").unwrap();
+    e.str(project_id).unwrap();
     e.str("allowedModels").unwrap();
     e.undefined().unwrap();
-    e.str("defaultLimits").unwrap();
-    e.map(1).unwrap();
-    e.str("Map").unwrap();
-    e.map(0).unwrap();
-    e.str("billingPlan").unwrap();
-    e.str("free").unwrap();
-    e.str("billingIdentity").unwrap();
-    e.str(&format!("bill-{}", cuid2())).unwrap();
     out
 }
 
@@ -1035,33 +1267,36 @@ async fn rpc_call_raw(
 }
 
 #[tokio::test]
-async fn cbor_project_create_accepts_the_frontends_undefined_allowed_models() {
+async fn cbor_set_project_allowed_models_accepts_undefined_allowed_models() {
     // Regression test for the prod-only "invalid_argument" / "invalid request payload" bug: the
     // TS client's `cborg` CBOR encoder (`converse-frontends/packages/authz-rpc/src/codec.ts`)
     // encodes a JS `undefined` property value as the CBOR `undefined` simple value instead of
-    // omitting the key. The create-project screen never collects `allowedModels`, so every real
-    // `createProject` call on the CBOR path (`authz-api`'s production default) sent exactly this
-    // frame and 400'd — `crud_lifecycle_over_cbor` above sidesteps it entirely (its comment notes
-    // "allowedModels carried as a real list", never `None`). `codec_undefined_regression_tests.rs`
-    // covers `LenientCborCodec` in isolation; this exercises the same frame through the real
-    // router + a live DB.
+    // omitting the key. Originally reproduced on `model.Project.create`'s `allowedModels` (the
+    // create-project screen never collected it); #415 (ADR-0018 Decision 5) moved that field's
+    // only write path onto `procedure.setProjectAllowedModels`, so this test moved with it -- see
+    // `raw_cbor_set_project_allowed_models_with_undefined`'s own doc comment.
+    // `codec_undefined_regression_tests.rs` covers `LenientCborCodec` in isolation; this exercises
+    // the same frame through the real router + a live DB.
     let subject = format!("owner-cbor-undefined-{}", cuid2());
     let ctx = setup(admin_bearer(&subject)).await;
     let r = &ctx.router;
 
     let billing_id = format!("tenant-cbor-undefined-{}", cuid2());
     let account_id = create_account(r, "admin", &billing_id).await;
+    let project_id = create_project(r, "admin", &account_id, "p-cbor-undefined").await;
 
-    let project_id = cuid2();
-    let raw = raw_cbor_create_project_with_undefined_allowed_models(
-        &project_id,
-        &account_id,
-        "p-cbor-undefined",
-    );
-    let (status, body) = rpc_call_raw(r, "model.Project.create", Wire::Cbor, raw, "admin").await;
+    let raw = raw_cbor_set_project_allowed_models_with_undefined(&project_id);
+    let (status, body) = rpc_call_raw(
+        r,
+        "procedure.setProjectAllowedModels",
+        Wire::Cbor,
+        raw,
+        "admin",
+    )
+    .await;
     assert!(
         status.is_success(),
-        "cbor project create with undefined allowedModels: {status} {}",
+        "cbor setProjectAllowedModels with undefined allowedModels: {status} {}",
         String::from_utf8_lossy(&body)
     );
     let decoded = Wire::Cbor.decode::<Value>(&body);
@@ -1165,11 +1400,10 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
 
     // Viewer is blocked by the coarse RBAC gate (403) on every mutating op — even though membership
     // would otherwise permit it. This is the privilege-escalation regression under test.
+    // `model.Account.update` is deliberately absent from this loop: since #398 it is unmapped
+    // (denied unconditionally, see below), not merely permission-gated, so a viewer 403 on it
+    // would prove nothing about *this* regression specifically.
     for (op, input) in [
-        (
-            "model.Account.update",
-            json!({ "id": account_id, "patch": { "defaultQuota": "x" } }),
-        ),
         ("model.Account.delete", json!({ "id": account_id })),
         (
             "model.Project.create",
@@ -1188,6 +1422,10 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
             "procedure.disableAccount",
             json!({ "args": { "accountId": account_id } }),
         ),
+        (
+            "procedure.setProjectModelPolicy",
+            json!({ "args": { "projectId": project_id, "modelPolicy": "deny_all" } }),
+        ),
     ] {
         let (status, _) = rpc_call(r.clone(), op, Wire::Cbor, &input, Some("viewer")).await;
         assert_eq!(
@@ -1197,13 +1435,30 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
         );
     }
 
-    // Admin succeeds on a representative mutating op the viewer was denied. Uses
-    // `procedure.updateAccountDefaultQuota`, not `model.Account.update` (the op the loop above
-    // exercises for the *viewer-denied* half): since #379 marked `Account.defaultQuota`
-    // `@readonly`, `model.Account.update`'s generated input has zero settable fields left, so
-    // every call to it -- including an authorized admin's -- now 422s with cratestack's own
-    // "update input must contain at least one changed column" before ever reaching the RBAC
-    // question this assertion is about. The procedure is the real write path post-#379.
+    // `model.Account.update` (#398, completing #379): #379 marked `Account.defaultQuota`, the
+    // verb's only settable field, `@readonly`, leaving it with zero writable fields, so it 422ed
+    // unconditionally for every caller -- a live endpoint that could only ever fail. #398 removed
+    // the schema's `@@allow("update")` and its `rpc_authorize.rs` permission mapping, so it is now
+    // unreachable at both layers. Proven here against the real DB-backed dispatch pipeline, with a
+    // fully-privileged admin, specifically to rule out the old 422: if this ever regressed back to
+    // a mapped-but-empty verb, this assertion would catch the reappearing 422, not just a 403.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Account.update",
+        Wire::Cbor,
+        &json!({ "id": account_id, "patch": { "defaultQuota": "x" } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "model.Account.update must be unreachable (403), not the old unconditional 422: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Admin succeeds on a representative mutating op the viewer was denied.
+    // `procedure.updateAccountDefaultQuota` is the real write path post-#379/#398.
     let (status, body) = rpc_call(
         r.clone(),
         "procedure.updateAccountDefaultQuota",
@@ -1216,6 +1471,22 @@ async fn rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write() {
         status,
         StatusCode::OK,
         "admin update must succeed: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Admin also succeeds on `setProjectModelPolicy`, the op the viewer was 403'd on above.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.setProjectModelPolicy",
+        Wire::Cbor,
+        &json!({ "args": { "projectId": project_id, "modelPolicy": "deny_all" } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "admin setProjectModelPolicy must succeed: {}",
         String::from_utf8_lossy(&body)
     );
 }
@@ -1236,6 +1507,9 @@ fn opa_state(core: Arc<dyn DbPoolTrait>) -> Arc<OpaState> {
             password: "secret".to_string(),
         },
         billing: Arc::new(billing()),
+        api_key_audience: None,
+        resolver: common::test_resolver(),
+        federation_issuer: "https://keycloak.example.test/realms/dev".to_string(),
     })
 }
 
@@ -1629,8 +1903,15 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
             ctx.review_service.clone(),
             ctx.budget_repo.clone(),
         ),
+        // cratestack 0.8.11 (@computed) added this parameter; `()` is a no-op since
+        // `authz.cstack` declares no `@computed` field (see src/lib.rs's own call sites).
+        (),
         CborCodec,
-        CratestackAuthProvider::new(admin_bearer(&subject), RpcScope::Crud),
+        CratestackAuthProvider::new(
+            admin_bearer(&subject),
+            RpcScope::Crud,
+            common::test_resolver(),
+        ),
         DEFAULT_BODY_LIMIT_BYTES,
     );
 
@@ -1773,6 +2054,224 @@ async fn batch_rpc_frames_enforce_permission_per_frame() {
     );
 }
 
+/// Issue #383's fail-closed obligation, stated explicitly: the `"batch"` special case in
+/// `CratestackAuthProvider::authenticate` (see that module's doc comment) is the single most
+/// dangerous line in the fix, because it is the one place that authenticates-and-attaches a
+/// context instead of denying outright. It must attach the caller's REAL, computed permission set
+/// -- never a blanket-permissive one -- so a caller holding a valid, active token but genuinely
+/// ZERO permissions must have EVERY bundled frame refused, not silently let through because the
+/// envelope-level check only required "some valid caller". This is the negative-space complement
+/// to `batch_rpc_frames_enforce_permission_per_frame` above (which proves a MIXED-permission
+/// caller gets a MIXED result) -- this test proves a ZERO-permission caller gets an ALL-denied
+/// result, which a bug that granted broad access on successful envelope authentication (the
+/// "naive fix" #383's own Risks section warns against) would NOT catch, since a mixed-result test
+/// alone can pass even if the envelope-level context is wrongly permissive for every op the
+/// caller genuinely lacks.
+///
+/// Scoped to `procedure.*` and `model.*` write verbs (`create`/`update`/`delete`) deliberately --
+/// NOT `model.*` `list`/`get`. Those two verb families are enforced through genuinely different
+/// cratestack mechanisms: a write verb's policy denial is an explicit `CratestackError::Forbidden`
+/// (`cratestack-sqlx/src/query/support/create.rs`'s `evaluate_create_policy_expr`; `update.rs`'s
+/// existence-probe-then-`Forbidden`), matching `authorize_procedure`'s all-or-nothing behavior for
+/// procedures. A `list`/`get` verb's `@@allow("read", ...)` is compiled into the SQL `WHERE`
+/// clause itself (`cratestack-sqlx/src/render/policy.rs`) -- a caller whose permission field is
+/// `false` simply matches zero rows, the same as any other caller-scoping predicate (e.g. "only
+/// rows this account owns"). That is a pre-existing, upstream cratestack property of read
+/// policies, not something this fix changed or could change without a much larger rewrite (there
+/// is no schema-level way to make a `@@allow("read", ...)` clause reject instead of filter) -- see
+/// `batch_rpc_read_verbs_filter_to_empty_not_an_error_for_a_caller_lacking_read_permission` below
+/// for the read-verb half of this same fail-closed obligation, and `auth_provider.rs`'s module doc
+/// for where this is recorded as the second accepted, documented behavior difference (alongside
+/// the 403-vs-404 scope one).
+#[tokio::test]
+async fn batch_rpc_frames_all_deny_for_a_caller_with_zero_permissions() {
+    let subject = format!("zero-perm-batch-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with(
+        "zero",
+        token_info(
+            &subject,
+            lightbridge_authz_core::authz::PermissionSet::new(),
+        ),
+    ));
+    let ctx = setup(bearer).await;
+
+    let create_project_input = serde_json::to_value(project_input(&cuid2(), &subject, "x"))
+        .expect("CreateProjectInput serializes");
+    let batch = json!([
+        { "id": 1, "op": "procedure.listBillingPlans", "input": { "args": {} } },
+        { "id": 2, "op": "model.Project.create", "input": create_project_input },
+        { "id": 3, "op": "procedure.createAccount", "input": { "args": {} } }
+    ]);
+
+    let response = ctx
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/rpc/batch")
+                .header("content-type", Wire::Cbor.content_type())
+                .header("accept", Wire::Cbor.content_type())
+                .header("authorization", "Bearer zero")
+                .body(Body::from(Wire::Cbor.encode(&batch)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the envelope itself is 200 -- the caller IS validly authenticated, just permission-less; \
+         per-frame denial happens deeper, in schema policy"
+    );
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let frames: Vec<Value> = Wire::Cbor.decode(&bytes);
+    assert_eq!(frames.len(), 3);
+    for frame in &frames {
+        let error = frame.get("error").unwrap_or_else(|| {
+            panic!("zero-permission caller's frame must be refused, not succeed: {frame}")
+        });
+        assert_eq!(
+            error["code"], "permission_denied",
+            "every frame must be denied with permission_denied for a zero-permission caller: {frame}"
+        );
+    }
+}
+
+/// The read-verb half of the fail-closed obligation the test above documents: a caller lacking
+/// `account:read` must never see another account's row (or, here, their OWN not-yet-visible
+/// permission state) through `model.Account.list`/`.get` inside a batch call. Per that test's own
+/// doc comment, cratestack compiles `@@allow("read", ...)` into the SQL `WHERE` clause rather than
+/// a hard pre-check, so the OBSERVABLE shape is "zero rows" / "not found", not `permission_denied`
+/// -- verified here so that shape is pinned down explicitly rather than assumed. The
+/// security-relevant assertion is the same either way: no row this caller cannot read is ever
+/// returned. Unary calls never exercise this path at all (the outer `rpc_authorize` gate already
+/// rejects a `model.Account.list` call from a caller lacking `account:read` with a clean `403`
+/// before cratestack's dispatch/query layer ever runs) -- this divergence is therefore scoped to
+/// `POST /rpc/batch` specifically, same as the 403-vs-404 scope trade-off.
+#[tokio::test]
+async fn batch_rpc_read_verbs_filter_to_empty_not_an_error_for_a_caller_lacking_read_permission() {
+    let owner = format!("owner-readfilter-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("owner", token_info(&owner, admin_perms()))
+            .with(
+                "zero",
+                token_info(&owner, lightbridge_authz_core::authz::PermissionSet::new()),
+            ),
+    );
+    let ctx = setup(bearer).await;
+    let account_id = create_account(&ctx.router, "owner", "unused").await;
+    assert_eq!(account_id, owner, "account id is the subject per ADR-0006");
+
+    // Same subject as the account owner, but the `"zero"` token carries no permissions at all --
+    // `model.Account.get`/`.list` for their OWN account must not return it.
+    let batch = json!([
+        { "id": 1, "op": "model.Account.get", "input": { "id": account_id } },
+        { "id": 2, "op": "model.Account.list", "input": {} }
+    ]);
+    let response = ctx
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/rpc/batch")
+                .header("content-type", Wire::Cbor.content_type())
+                .header("accept", Wire::Cbor.content_type())
+                .header("authorization", "Bearer zero")
+                .body(Body::from(Wire::Cbor.encode(&batch)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "batch envelope is 200");
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let frames: Vec<Value> = Wire::Cbor.decode(&bytes);
+    assert_eq!(frames.len(), 2);
+
+    let get_frame = frames.iter().find(|f| f["id"] == 1).expect("frame 1");
+    assert!(
+        get_frame.get("output").is_none() || get_frame["output"].is_null(),
+        "get must not return the caller's own account row when they lack account:read: {get_frame}"
+    );
+
+    let list_frame = frames.iter().find(|f| f["id"] == 2).expect("frame 2");
+    if let Some(output) = list_frame.get("output") {
+        let items = output["items"]
+            .as_array()
+            .expect("list output has an items array");
+        assert!(
+            items.is_empty(),
+            "list must not return the caller's own account row when they lack account:read: \
+             {list_frame}"
+        );
+    }
+}
+
+/// The unary counterpart to the batch test above (#401) -- pins the OTHER half of the asymmetry
+/// that test's own doc comment claims but does not itself exercise: a UNARY `model.Account.get`/
+/// `.list` call from a caller lacking `account:read` never reaches cratestack's dispatch/query
+/// layer at all. Both `rpc_authorize` (the outer Axum middleware) and
+/// `CratestackAuthProvider::authenticate`'s unary branch (`auth_provider.rs`) hard-gate on the
+/// *coarse* `op_id` -> permission map from `rpc_authorize::required_permission` BEFORE dispatch, so
+/// the caller gets a clean `403`, never the SQL-filtered empty/not-found shape
+/// `batch_rpc_read_verbs_filter_to_empty_not_an_error_for_a_caller_lacking_read_permission` proves
+/// for the batch path. Together the two tests pin the full, decided contract #401 asked for: read
+/// verbs hard-refuse on the unary surface and filter only inside `/rpc/batch`, where cratestack's
+/// per-frame `CachedAuthProvider` change (0.8.4) leaves no pre-dispatch hook to hard-gate a read
+/// verb -- see `docs/rbac.md`'s "Read verbs filter, they do not refuse" section for the decision
+/// this documents and why routing these three models' reads through hand-written procedures (the
+/// only structural fix) was rejected as disproportionate to a diagnosability-only risk.
+#[tokio::test]
+async fn unary_read_verb_hard_refuses_a_caller_lacking_read_permission() {
+    let owner = format!("owner-unary-readfilter-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("owner", token_info(&owner, admin_perms()))
+            .with(
+                "zero",
+                token_info(&owner, lightbridge_authz_core::authz::PermissionSet::new()),
+            ),
+    );
+    let ctx = setup(bearer).await;
+    let account_id = create_account(&ctx.router, "owner", "unused").await;
+    assert_eq!(account_id, owner, "account id is the subject per ADR-0006");
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "model.Account.get",
+        Wire::Cbor,
+        &json!({ "id": account_id }),
+        Some("zero"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "unary get for a caller lacking account:read must hard-refuse before dispatch, not \
+         filter to not-found: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "model.Account.list",
+        Wire::Cbor,
+        &json!({}),
+        Some("zero"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "unary list for a caller lacking account:read must hard-refuse before dispatch, not \
+         filter to empty: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Section 3: createAccount seeds the creator's membership, enabling a subsequent project create;
 // a non-member is refused.
@@ -1797,7 +2296,7 @@ async fn create_account_seeds_membership_enabling_project_create() {
 
     // A stranger (holds every RBAC permission, so passes the coarse gate, but is NOT a member of
     // this account) is refused by the membership policy — a non-member cannot create under it.
-    let stranger_input = project_input(&cuid2(), &account_id, "nope", None);
+    let stranger_input = project_input(&cuid2(), &account_id, "nope");
     let (status, body) = rpc_call(
         r.clone(),
         "model.Project.create",
@@ -2071,16 +2570,125 @@ async fn promoting_a_second_project_to_default_frees_the_old_default_for_deletio
     );
 }
 
+/// `Account.name` end-to-end over the real CBOR RPC dispatch pipeline: settable at creation,
+/// renameable afterwards through `procedure.updateAccountName` (the only write path -- the field
+/// is `@readonly` and `model.Account.update` was removed by #398), and gated on the SAME
+/// `account:update` permission `updateAccountDefaultQuota` already required, not a new one.
+///
+/// The rename path is not a nicety: every account that predates
+/// `migrations/20260829000001_accounts_add_name.sql` reads back `name = null`, so without this
+/// procedure they would all be permanently unnamed.
 #[tokio::test]
-async fn a_second_account_for_the_same_subject_is_refused() {
-    // Replaces the old `promoting_a_second_account_to_default_frees_the_old_default_for_deletion`.
-    // Since ADR-0006 the account id IS the caller's subject, so there is no second account to
-    // promote and no default-account concept to reassign — a repeat createAccount conflicts.
+async fn account_name_is_settable_at_creation_and_renameable_afterwards() {
+    let admin_subject = format!("owner-name-{}", cuid2());
+    let viewer_subject = format!("viewer-name-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("admin", token_info(&admin_subject, admin_perms()))
+            .with("viewer", token_info(&viewer_subject, viewer_perms())),
+    );
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.createAccount",
+        Wire::Cbor,
+        &json!({ "args": { "name": "Acme Corp" } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "createAccount with a name: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let created = json_body(&body);
+    let account_id = created["id"].as_str().expect("account id").to_string();
+    assert_eq!(
+        created["name"], "Acme Corp",
+        "the created account must carry the name back on the wire"
+    );
+
+    // Reading it back through the generic read verb -- what a console actually calls -- must also
+    // carry `name`, not just the procedure's own response.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Account.get",
+        Wire::Cbor,
+        &json!({ "id": account_id }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json_body(&body)["name"], "Acme Corp");
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.updateAccountName",
+        Wire::Cbor,
+        &json!({ "args": { "accountId": account_id, "name": "Acme Holdings" } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "updateAccountName: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(json_body(&body)["name"], "Acme Holdings");
+
+    // A read-only caller holds `account:read` but not `account:update`, so the rename is refused
+    // by the same coarse gate the quota update already sits behind -- the new procedure did not
+    // widen anything.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.updateAccountName",
+        Wire::Cbor,
+        &json!({ "args": { "accountId": account_id, "name": "Hijacked" } }),
+        Some("viewer"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a caller without account:update must be refused the rename: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.Account.get",
+        Wire::Cbor,
+        &json!({ "id": account_id }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json_body(&body)["name"],
+        "Acme Holdings",
+        "the refused rename must not have landed"
+    );
+}
+
+#[tokio::test]
+async fn a_second_account_for_the_same_subject_is_a_second_account() {
+    // ADR-0026 reverses this test's original assertion. Under ADR-0006 the account id WAS the
+    // caller's subject, so a repeat createAccount collided on the primary key and returned 409;
+    // one identity may now own several accounts, so it returns 200 and a genuinely new row. The
+    // anchor keeps `id = subject`; the second gets a minted id and inherits the anchor's owner.
     let subject = format!("owner-single-acct-{}", cuid2());
     let ctx = setup(admin_bearer(&subject)).await;
     let r = &ctx.router;
 
     let account_id = create_account(r, "admin", "unused").await;
+    assert_eq!(
+        account_id, subject,
+        "the identity's anchor account is keyed by the subject"
+    );
 
     let (status, body) = rpc_call(
         r.clone(),
@@ -2092,8 +2700,51 @@ async fn a_second_account_for_the_same_subject_is_refused() {
     .await;
     assert_eq!(
         status,
-        StatusCode::CONFLICT,
-        "a subject's second createAccount must conflict, not mint a second account: {}",
+        StatusCode::OK,
+        "a subject's second createAccount now mints a second account: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let second = json_body(&body);
+    assert_ne!(second["id"], json!(account_id), "a distinct row");
+    assert_ne!(
+        second["id"],
+        json!(subject),
+        "only the anchor is keyed by the subject"
+    );
+    assert_eq!(
+        second["userId"],
+        json!(subject),
+        "the second account inherits the anchor's owner -- this is what `userId == auth().id` \
+         matches on"
+    );
+
+    // The anchor cannot be deleted while the secondary is still owned (it would strand it).
+    let (status, _) = rpc_call(
+        r.clone(),
+        "procedure.deleteAccountPermanently",
+        Wire::Cbor,
+        &json!({ "args": { "accountId": account_id } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "deleting the anchor while another account is owned must be refused"
+    );
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.deleteAccountPermanently",
+        Wire::Cbor,
+        &json!({ "args": { "accountId": second["id"].as_str().unwrap() } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a secondary account is deletable by its owner: {}",
         String::from_utf8_lossy(&body)
     );
 
@@ -2144,6 +2795,454 @@ async fn set_default_project_rejects_a_project_the_caller_is_not_a_member_of() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// `ApiKey`'s ownership disjunction (`authz.cstack` `@@allow("read"|"update"|"delete", ...)`):
+//   (project.account.id == auth().id || project.members.some.accountId == auth().id)
+//   && auth().rpcScope == "crud" && auth().permApikey<Verb> == true
+//
+// Every other `model.ApiKey.*` call site in this file uses `"admin"`, the same subject that
+// created the key -- so the ownership half of the disjunction has never been exercised failing.
+// `rbac_gate_admin_succeeds_and_member_viewer_reads_but_cannot_write` above proves only the
+// coarse RBAC-gate half (a legitimate *member*, refused by permission). This proves the
+// complementary half: a caller who holds every permission (passes the gate) but is neither the
+// project's owning account nor a project member must still be refused. Restores the coverage
+// `StoreRepo::delete_api_key`'s test used to carry before it was removed as dead/unsafe code
+// (PR #429 follow-up) -- see the comment in
+// `crates/lightbridge-authz-api-key/tests/access_control_scenarios_tests.rs` this test backs.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn api_key_ownership_boundary_refuses_a_non_member_stranger() {
+    let owner = format!("owner-apikey-boundary-{}", cuid2());
+    let stranger = format!("stranger-apikey-boundary-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("owner", token_info(&owner, admin_perms()))
+            .with("stranger", token_info(&stranger, admin_perms())),
+    );
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let account_id =
+        create_account(r, "owner", &format!("tenant-apikey-boundary-{}", cuid2())).await;
+    let project_id = create_project(r, "owner", &account_id, "proj-apikey-boundary").await;
+    let (key_id, _secret) = create_api_key(r, "owner", &project_id, "k-boundary").await;
+
+    // Stranger holds every RBAC permission (`admin_perms()`), so the coarse gate passes; only the
+    // model policy's ownership disjunction stands between them and someone else's key. Observed
+    // (not assumed) via a temporary prove-fail-first run: a filtered read comes back 404 (the
+    // policy's uniform not-found), while update/delete come back 403 -- the two verb families are
+    // NOT interchangeable here, so each gets its own exact assertion rather than a shared loose
+    // one.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.ApiKey.get",
+        Wire::Cbor,
+        &json!({ "id": key_id }),
+        Some("stranger"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a non-member must be refused reading someone else's api key: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.ApiKey.update",
+        Wire::Cbor,
+        &json!({ "id": key_id, "patch": { "name": "hijacked" } }),
+        Some("stranger"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a non-member must be refused updating someone else's api key: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.ApiKey.delete",
+        Wire::Cbor,
+        &json!({ "id": key_id }),
+        Some("stranger"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a non-member must be refused deleting someone else's api key: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // The key must still be intact for its rightful owner -- proves the stranger's attempts had
+    // no effect, not merely that they returned an error status.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "model.ApiKey.get",
+        Wire::Cbor,
+        &json!({ "id": key_id }),
+        Some("owner"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "owner get after stranger's refused attempts: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        json_body(&body)["name"],
+        "k-boundary",
+        "stranger's update must not have applied"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// `procedure.listMyExpiringApiKeys` (lightbridge-authz#436) -- the self-scoped, cross-project
+// "expiring soon" aggregate. Two concerns:
+//   1. the boundary predicate (`status = active AND expiresAt > now AND expiresAt <= cutoff`) --
+//      already-expired excluded, comfortably-outside-the-window excluded, comfortably-inside
+//      included, and the two window edges tested with enough slack to absorb real HTTP/DB
+//      round-trip latency (see `boundary_slack` below for why exact single-second precision
+//      against the window edge is not attempted here);
+//   2. cross-tenant isolation -- this procedure calls the generated `db.api_key()` delegate
+//      precisely so it inherits `ApiKey`'s own compiled `@@allow("read", ...)` policy rather than
+//      a second, hand-written ownership join (see the schema doc comment on
+//      `listMyExpiringApiKeys`), so this test also stands as a regression test for that policy
+//      actually firing when invoked this way, not just when invoked via `model.ApiKey.list`.
+// ---------------------------------------------------------------------------------------------
+
+/// A little slack around a window boundary so "just inside"/"just outside" seeding survives the
+/// real network+DB round trip between this test computing its own reference clock and the
+/// procedure computing its own `Utc::now()` server-side moments later -- chasing literal
+/// single-second precision against a live HTTP call would make this test flaky, not more
+/// rigorous. The comparison operators themselves (`>`/`<=`) are cratestack's own, already
+/// covered by its own test suite; what this test verifies is that THIS procedure wires the right
+/// fields/operators/window to them.
+const BOUNDARY_SLACK_SECONDS: i64 = 5;
+
+async fn call_list_my_expiring_api_keys(
+    router: &Router,
+    token: &str,
+    within_days: i64,
+) -> (StatusCode, Vec<u8>) {
+    rpc_call(
+        router.clone(),
+        "procedure.listMyExpiringApiKeys",
+        Wire::Cbor,
+        &json!({ "args": { "withinDays": within_days } }),
+        Some(token),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn list_my_expiring_api_keys_applies_the_window_boundary_and_excludes_already_expired() {
+    let owner = format!("owner-expiring-boundary-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("owner", token_info(&owner, admin_perms())));
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let account_id =
+        create_account(r, "owner", &format!("tenant-expiring-boundary-{}", cuid2())).await;
+    let project_id = create_project(r, "owner", &account_id, "proj-expiring-boundary").await;
+
+    let now = chrono::Utc::now();
+    let within_days = 7;
+    let cutoff = now + chrono::Duration::days(within_days);
+
+    // Comfortably inside the 7-day window.
+    let (comfortably_inside_id, _) = create_api_key_with_expiry(
+        r,
+        "owner",
+        &project_id,
+        "k-comfortably-inside",
+        now + chrono::Duration::days(1),
+    )
+    .await;
+    // Just inside the window edge (within slack of the cutoff, but before it).
+    let (just_inside_id, _) = create_api_key_with_expiry(
+        r,
+        "owner",
+        &project_id,
+        "k-just-inside",
+        cutoff - chrono::Duration::seconds(BOUNDARY_SLACK_SECONDS),
+    )
+    .await;
+    // Just outside the window edge (within slack of the cutoff, but after it).
+    let (just_outside_id, _) = create_api_key_with_expiry(
+        r,
+        "owner",
+        &project_id,
+        "k-just-outside",
+        cutoff + chrono::Duration::seconds(BOUNDARY_SLACK_SECONDS),
+    )
+    .await;
+    // Comfortably outside the window (30 days out, well beyond the 7-day ask).
+    let (comfortably_outside_id, _) = create_api_key_with_expiry(
+        r,
+        "owner",
+        &project_id,
+        "k-comfortably-outside",
+        now + chrono::Duration::days(30),
+    )
+    .await;
+    // Already expired: created with a valid future expiry (write-time validation requires it),
+    // then pushed into the past directly via the verify pool -- `createApiKey` itself refuses a
+    // past `expiresAt` (lightbridge-authz#395's `validate_expires_at`), so this is the only way
+    // to get an expired row seeded through the real create path rather than hand-inserting one.
+    let (expired_id, _) = create_api_key_with_expiry(
+        r,
+        "owner",
+        &project_id,
+        "k-already-expired",
+        now + chrono::Duration::days(1),
+    )
+    .await;
+    sqlx::query("UPDATE api_keys SET expires_at = $1 WHERE id = $2")
+        .bind(now - chrono::Duration::days(1))
+        .bind(&expired_id)
+        .execute(&ctx.verify)
+        .await
+        .expect("push key into the past");
+
+    let (status, body) = call_list_my_expiring_api_keys(r, "owner", within_days).await;
+    assert!(
+        status.is_success(),
+        "listMyExpiringApiKeys: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let returned_ids: std::collections::HashSet<String> = json_body(&body)
+        .as_array()
+        .expect("array response")
+        .iter()
+        .map(|k| k["id"].as_str().expect("id").to_string())
+        .collect();
+
+    assert!(
+        returned_ids.contains(&comfortably_inside_id),
+        "a key expiring well inside the window must be returned"
+    );
+    assert!(
+        returned_ids.contains(&just_inside_id),
+        "a key expiring just inside the window edge must be returned"
+    );
+    assert!(
+        !returned_ids.contains(&just_outside_id),
+        "a key expiring just outside the window edge must NOT be returned"
+    );
+    assert!(
+        !returned_ids.contains(&comfortably_outside_id),
+        "a key expiring well outside the window must NOT be returned"
+    );
+    assert!(
+        !returned_ids.contains(&expired_id),
+        "an already-expired key must NOT be returned -- that is a separate, existing concern \
+         from \"about to expire\""
+    );
+}
+
+#[tokio::test]
+async fn list_my_expiring_api_keys_does_not_leak_another_tenants_keys() {
+    let owner = format!("owner-expiring-tenant-{}", cuid2());
+    let stranger = format!("stranger-expiring-tenant-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("owner", token_info(&owner, admin_perms()))
+            .with("stranger", token_info(&stranger, admin_perms())),
+    );
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let owner_account =
+        create_account(r, "owner", &format!("tenant-expiring-owner-{}", cuid2())).await;
+    let owner_project = create_project(r, "owner", &owner_account, "proj-expiring-owner").await;
+    let now = chrono::Utc::now();
+    let (owner_key_id, _) = create_api_key_with_expiry(
+        r,
+        "owner",
+        &owner_project,
+        "k-owner-expiring",
+        now + chrono::Duration::days(1),
+    )
+    .await;
+
+    let stranger_account = create_account(
+        r,
+        "stranger",
+        &format!("tenant-expiring-stranger-{}", cuid2()),
+    )
+    .await;
+    let stranger_project =
+        create_project(r, "stranger", &stranger_account, "proj-expiring-stranger").await;
+    let (stranger_key_id, _) = create_api_key_with_expiry(
+        r,
+        "stranger",
+        &stranger_project,
+        "k-stranger-expiring",
+        now + chrono::Duration::days(1),
+    )
+    .await;
+
+    let (status, body) = call_list_my_expiring_api_keys(r, "owner", 7).await;
+    assert!(
+        status.is_success(),
+        "{status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let owner_view: std::collections::HashSet<String> = json_body(&body)
+        .as_array()
+        .expect("array response")
+        .iter()
+        .map(|k| k["id"].as_str().expect("id").to_string())
+        .collect();
+    assert!(
+        owner_view.contains(&owner_key_id),
+        "owner must see their own expiring key"
+    );
+    assert!(
+        !owner_view.contains(&stranger_key_id),
+        "owner must NOT see the stranger's expiring key"
+    );
+
+    let (status, body) = call_list_my_expiring_api_keys(r, "stranger", 7).await;
+    assert!(
+        status.is_success(),
+        "{status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let stranger_view: std::collections::HashSet<String> = json_body(&body)
+        .as_array()
+        .expect("array response")
+        .iter()
+        .map(|k| k["id"].as_str().expect("id").to_string())
+        .collect();
+    assert!(
+        stranger_view.contains(&stranger_key_id),
+        "stranger must see their own expiring key"
+    );
+    assert!(
+        !stranger_view.contains(&owner_key_id),
+        "stranger must NOT see the owner's expiring key"
+    );
+}
+
+#[tokio::test]
+async fn list_my_expiring_api_keys_aggregates_across_every_project_the_caller_can_see() {
+    // The whole point of this procedure (lightbridge-authz#436): the self-service UI's
+    // `listApiKeys` is scoped to one project at a time, so nobody aggregates across projects
+    // without opening each one. This proves a single call surfaces expiring keys from BOTH an
+    // owned project AND a project the caller is merely a MEMBER of (not the owning account) --
+    // the exact ownership disjunction `ApiKey`'s `@@allow("read", ...)` compiles
+    // (`project.account.id == auth().id || project.members.some.accountId == auth().id`).
+    let owner = format!("owner-expiring-aggregate-{}", cuid2());
+    let member = format!("member-expiring-aggregate-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("owner", token_info(&owner, admin_perms()))
+            .with("member", token_info(&member, admin_perms())),
+    );
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let owner_account = create_account(
+        r,
+        "owner",
+        &format!("tenant-expiring-aggregate-owner-{}", cuid2()),
+    )
+    .await;
+    let _member_account = create_account(
+        r,
+        "member",
+        &format!("tenant-expiring-aggregate-member-{}", cuid2()),
+    )
+    .await;
+
+    let project_a = create_project(r, "owner", &owner_account, "proj-expiring-aggregate-a").await;
+    let project_b = create_project(r, "owner", &owner_account, "proj-expiring-aggregate-b").await;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.addProjectMember",
+        Wire::Cbor,
+        &json!({ "args": { "projectId": project_b, "accountId": member, "role": "member" } }),
+        Some("owner"),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "addProjectMember: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let now = chrono::Utc::now();
+    let (key_a_id, _) = create_api_key_with_expiry(
+        r,
+        "owner",
+        &project_a,
+        "k-project-a-expiring",
+        now + chrono::Duration::days(1),
+    )
+    .await;
+    let (key_b_id, _) = create_api_key_with_expiry(
+        r,
+        "owner",
+        &project_b,
+        "k-project-b-expiring",
+        now + chrono::Duration::days(1),
+    )
+    .await;
+
+    // The member calls it as themselves -- they hold no account-owner relationship to either
+    // project, only a `project_members` row on project B.
+    let (status, body) = call_list_my_expiring_api_keys(r, "member", 7).await;
+    assert!(
+        status.is_success(),
+        "{status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let member_view: std::collections::HashSet<String> = json_body(&body)
+        .as_array()
+        .expect("array response")
+        .iter()
+        .map(|k| k["id"].as_str().expect("id").to_string())
+        .collect();
+    assert!(
+        member_view.contains(&key_b_id),
+        "a project member must see that project's expiring keys"
+    );
+    assert!(
+        !member_view.contains(&key_a_id),
+        "a project member must NOT see another project's expiring keys just because its owner \
+         happens to also own the project they ARE a member of"
+    );
+
+    // The owner calls it as themselves -- one call, both projects' expiring keys.
+    let (status, body) = call_list_my_expiring_api_keys(r, "owner", 7).await;
+    assert!(
+        status.is_success(),
+        "{status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let owner_view: std::collections::HashSet<String> = json_body(&body)
+        .as_array()
+        .expect("array response")
+        .iter()
+        .map(|k| k["id"].as_str().expect("id").to_string())
+        .collect();
+    assert!(
+        owner_view.contains(&key_a_id) && owner_view.contains(&key_b_id),
+        "the owner's single call must aggregate expiring keys across BOTH of their projects, \
+         not just whichever one a UI happens to have open"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // Refresh-token session revocation RPC (`revokeOwnSessions` / `revokeSubjectSessions`).
 // `exchange_refresh_tokens` carries no foreign keys to accounts/projects, so these tests seed rows
 // directly against `ctx.verify` rather than driving a real token-exchange grant (this file's
@@ -2151,38 +3250,90 @@ async fn set_default_project_rejects_a_project_the_caller_is_not_a_member_of() {
 // function's doc comment).
 // ---------------------------------------------------------------------------------------------
 
-/// Inserts one active `exchange_refresh_tokens` row for `subject` and returns its `id`, so a test
-/// can assert on which specific rows a revocation touched.
+/// Inserts one active `sessions` row (`kind = 'token'`) for `subject`, plus one active
+/// `exchange_refresh_tokens` row chained under it (`session_id` set), and returns the SESSION's
+/// `id` -- so a test can assert on which specific sessions a revocation touched, and (via
+/// [`refresh_token_status_for_session`]) that the cascade reaches the chained refresh token too.
 async fn seed_active_session(pool: &sqlx::PgPool, subject: &str) -> String {
+    seed_session_with_refresh_token(pool, subject, "token").await
+}
+
+/// Inserts one active `sessions` row of the given `kind` (`"token"` or `"browser"`) for `subject`.
+/// `kind = "browser"` rows get no `exchange_refresh_tokens` row chained under them (ADR-0021
+/// Decision 3: a browser session is never presented as a bearer token, so it structurally cannot
+/// have a refresh-token chain) and no `client_id` (`sessions_kind_client_id_check`).
+///
+/// Sets BOTH `account_id` and `subject` to `subject` -- these tests each model a single caller
+/// acting on their own session, never the owner/roster-member split #492 is about (see
+/// `token_exchange_tests.rs`'s `seed_owner_and_member_sessions` for that scenario), so the two
+/// legitimately coincide here. `revoke_sessions_and_cascade` matches on `subject` (#492), so a
+/// row this helper leaves with `subject IS NULL` would never be reachable by any of these tests'
+/// revoke calls.
+async fn seed_session(pool: &sqlx::PgPool, subject: &str, kind: &str) -> String {
     let id = cuid2();
-    // `chain_id`/`chain_expires_at` (migration `20260815000001_exchange_refresh_tokens_add_chain`)
-    // are `NOT NULL` with no default -- mirrors that migration's own backfill convention for a
-    // pre-existing row: a single-member chain (`chain_id = id`) with a cap far enough out that
-    // none of these tests' assertions ever race it.
+    let client_id: Option<String> = (kind == "token").then(|| "test-client".to_string());
     sqlx::query(
         r#"
-        INSERT INTO exchange_refresh_tokens
-          (id, subject, account_id, project_id, client_id, token_hash, status, chain_id, chain_expires_at, created_at, expires_at)
-        VALUES ($1, $2, $2, $3, 'test-client', $4, 'active', $1, now() + interval '90 days', now(), now() + interval '30 days')
+        INSERT INTO sessions (id, account_id, project_id, client_id, kind, status, expires_at, subject)
+        VALUES ($1, $2, $3, $4, $5, 'active', now() + interval '1 hour', $2)
         "#,
     )
     .bind(&id)
     .bind(subject)
     .bind(cuid2())
-    .bind(cuid2())
+    .bind(client_id)
+    .bind(kind)
     .execute(pool)
     .await
-    .expect("seed active session");
+    .expect("seed session row");
     id
 }
 
-/// The `status` of the `exchange_refresh_tokens` row with `id`.
+/// [`seed_session`] plus one active `exchange_refresh_tokens` row chained under it via
+/// `session_id` -- only meaningful for `kind = "token"` (a browser session has no refresh-token
+/// chain, see [`seed_session`]'s doc comment). Returns the session's `id`.
+async fn seed_session_with_refresh_token(pool: &sqlx::PgPool, subject: &str, kind: &str) -> String {
+    let session_id = seed_session(pool, subject, kind).await;
+    // `chain_id`/`chain_expires_at` (migration `20260815000001_exchange_refresh_tokens_add_chain`)
+    // are `NOT NULL` with no default -- a single-member chain (`chain_id` = the refresh token's
+    // own fresh id) with a cap far enough out that none of these tests' assertions ever race it.
+    let refresh_id = cuid2();
+    sqlx::query(
+        r#"
+        INSERT INTO exchange_refresh_tokens
+          (id, subject, account_id, project_id, client_id, token_hash, status, chain_id, chain_expires_at, session_id, created_at, expires_at)
+        VALUES ($1, $2, $2, $3, 'test-client', $4, 'active', $1, now() + interval '90 days', $5, now(), now() + interval '30 days')
+        "#,
+    )
+    .bind(&refresh_id)
+    .bind(subject)
+    .bind(cuid2())
+    .bind(cuid2())
+    .bind(&session_id)
+    .execute(pool)
+    .await
+    .expect("seed active refresh token chained under the session");
+    session_id
+}
+
+/// The `status` of the `sessions` row with `id`.
 async fn session_status(pool: &sqlx::PgPool, id: &str) -> String {
-    sqlx::query_scalar("SELECT status FROM exchange_refresh_tokens WHERE id = $1")
+    sqlx::query_scalar("SELECT status FROM sessions WHERE id = $1")
         .bind(id)
         .fetch_one(pool)
         .await
         .expect("session row exists")
+}
+
+/// The `status` of the `exchange_refresh_tokens` row chained under `session_id` (ADR-0020
+/// Decision 9's cascade requirement: bulk-revoking a session must also revoke the refresh token
+/// rows chained under it, not leave a live one behind).
+async fn refresh_token_status_for_session(pool: &sqlx::PgPool, session_id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM exchange_refresh_tokens WHERE session_id = $1")
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .expect("chained refresh token row exists")
 }
 
 /// Test 6 (task list): the self-service procedure revokes only the caller's own sessions, and
@@ -2242,6 +3393,14 @@ async fn revoke_own_sessions_revokes_only_the_callers_sessions() {
         session_status(&ctx.verify, &bystander_session).await,
         "active",
         "a bystander's session must never be touched by another subject's self-service call"
+    );
+    // ADR-0020 Decision 9's cascade requirement: bulk-revoking a session must also revoke the
+    // exchange_refresh_tokens row chained under it, not leave a live refresh token behind for a
+    // session that was just killed. Self-service parity with the admin path (task 6e).
+    assert_eq!(
+        refresh_token_status_for_session(&ctx.verify, &caller_session_a).await,
+        "revoked",
+        "revokeOwnSessions must cascade to the refresh token chained under the caller's session"
     );
 }
 
@@ -2374,6 +3533,98 @@ async fn revoke_subject_sessions_reports_zero_when_nothing_is_active() {
     assert_eq!(parsed["revokedCount"], 0);
 }
 
+/// #441's own required regression test: `revokeSubjectSessions`'s underlying query must cover
+/// BOTH `kind`s, proven by seeding a `kind = 'browser'` row directly (no RP-leg caller exists yet
+/// to create one for real -- ADR-0021 Follow-up 6/#441's own scope note; this is fine and expected
+/// per that ticket's own acceptance criteria) alongside a normal `kind = 'token'` one, and
+/// asserting the bulk cascade reaches BOTH in the same call -- not just asserted by code review,
+/// per ADR-0021 Decision 3's own explicit "must be proven, not assumed" requirement.
+#[tokio::test]
+async fn revoke_subject_sessions_reaches_a_browser_kind_session_too() {
+    let admin_subject = format!("session-admin-kind-{}", cuid2());
+    let target = format!("kind-mixed-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let token_session = seed_session(&ctx.verify, &target, "token").await;
+    let browser_session = seed_session(&ctx.verify, &target, "browser").await;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.revokeSubjectSessions",
+        Wire::Cbor,
+        &json!({ "args": { "accountId": target } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let parsed = as_json(Wire::Cbor, &body);
+    assert_eq!(
+        parsed["revokedCount"], 2,
+        "must revoke both sessions, of either kind, in one call: {parsed}"
+    );
+
+    assert_eq!(session_status(&ctx.verify, &token_session).await, "revoked");
+    assert_eq!(
+        session_status(&ctx.verify, &browser_session).await,
+        "revoked",
+        "a kind='browser' row must be reached by the same bulk cascade as a kind='token' one -- \
+         a kind-blind-in-the-wrong-direction bug here would leave this row silently active"
+    );
+}
+
+/// #441's cross-subject isolation criterion: revoking one subject's sessions must not touch a
+/// different subject's rows, of EITHER kind. Seeds both kinds for both a target and a bystander,
+/// revokes only the target, and asserts the bystander's rows (both kinds) are untouched.
+#[tokio::test]
+async fn revoke_subject_sessions_does_not_touch_a_different_subjects_sessions_of_either_kind() {
+    let admin_subject = format!("session-admin-cross-{}", cuid2());
+    let target = format!("cross-target-{}", cuid2());
+    let bystander = format!("cross-bystander-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let target_token = seed_session(&ctx.verify, &target, "token").await;
+    let target_browser = seed_session(&ctx.verify, &target, "browser").await;
+    let bystander_token = seed_session(&ctx.verify, &bystander, "token").await;
+    let bystander_browser = seed_session(&ctx.verify, &bystander, "browser").await;
+
+    let (status, _) = rpc_call(
+        r.clone(),
+        "procedure.revokeSubjectSessions",
+        Wire::Cbor,
+        &json!({ "args": { "accountId": target } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(session_status(&ctx.verify, &target_token).await, "revoked");
+    assert_eq!(
+        session_status(&ctx.verify, &target_browser).await,
+        "revoked"
+    );
+    assert_eq!(
+        session_status(&ctx.verify, &bystander_token).await,
+        "active",
+        "a bystander's token-kind session must never be touched by another subject's revoke call"
+    );
+    assert_eq!(
+        session_status(&ctx.verify, &bystander_browser).await,
+        "active",
+        "a bystander's browser-kind session must never be touched by another subject's revoke call"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Section: self-provisioning -- lightbridge-viewer/lightbridge-editor must be able to create their
 // own account (#219: the account row must exist before `project_members.account_id`'s FK to
@@ -2434,7 +3685,8 @@ async fn viewer_and_editor_can_self_provision_their_own_account() {
         let created = json_body(&body);
         assert_eq!(
             created["id"], subject,
-            "{role}'s created account id must equal their own JWT subject"
+            "{role}'s ANCHOR account id must equal their own JWT subject -- \
+             `federated_identities` adopts by matching exactly this"
         );
 
         let (status, body) = rpc_call(
@@ -2447,10 +3699,16 @@ async fn viewer_and_editor_can_self_provision_their_own_account() {
         .await;
         assert_eq!(
             status,
-            StatusCode::CONFLICT,
-            "{role}'s second createAccount for the same subject must conflict, not mint a \
-             second account: {}",
+            StatusCode::OK,
+            "{role}'s second createAccount now mints a second account (ADR-0026); it used to \
+             conflict on the accounts primary key: {}",
             String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            json_body(&body)["userId"],
+            created["id"],
+            "{role}'s second account must join the person the anchor already established, not \
+             mint a new one"
         );
     }
 }
@@ -2705,9 +3963,12 @@ async fn update_api_key_cannot_clear_expiry_with_real_cborg_null_bytes() {
 /// `invalid_argument` / "invalid request payload" the production report described -- a CBOR empty
 /// array has no mapping onto `Option<DateTime<Utc>>` any more than it did onto a plain `DateTime`.
 ///
-/// Fixed in `LenientCborCodec::encode` (`codec.rs`) by constructing a `minicbor_serde::Serializer`
-/// with `serialize_unit_as_null(true)` instead of delegating to
-/// `cratestack_codec_cbor::CborCodec::encode`'s hardcoded default. This test was the end-to-end
+/// Originally fixed in `LenientCborCodec::encode` (`codec.rs`) by constructing a
+/// `minicbor_serde::Serializer` with `serialize_unit_as_null(true)` instead of delegating to
+/// `cratestack_codec_cbor::CborCodec::encode`'s hardcoded default. As of cratestack 0.8.6
+/// (cratestack/cratestack#675, closing #657) the raw `CborCodec::encode` does this itself, so
+/// `LenientCborCodec::encode` now just delegates straight through -- see `codec.rs`'s module doc
+/// comment for the full mechanism and the upstream commit link. This test was the end-to-end
 /// proof, byte-for-byte, that the frontend's `createBatchLink()` + `cborg` output for a batched
 /// `createApiKey` call with `expiresAt: null` decoded correctly and *succeeded*.
 ///

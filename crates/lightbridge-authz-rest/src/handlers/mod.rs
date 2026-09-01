@@ -1,3 +1,4 @@
+pub mod exchange_token;
 pub mod idp;
 pub mod introspect;
 pub mod opa;
@@ -13,8 +14,8 @@ use lightbridge_authz_core::config::{
 };
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::{
-    Account, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey, Project,
-    ProjectMember, ResourceStatus, RotateApiKey, hash_api_key,
+    Account, AccountId, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey,
+    ModelPolicy, Project, ProjectMember, ResourceStatus, RotateApiKey, hash_api_key,
 };
 use lightbridge_authz_core::{
     db::DbPoolTrait,
@@ -135,16 +136,21 @@ impl AuthzStoreImpl {
         requested_expires_at: Option<DateTime<Utc>>,
     ) -> Result<IssuedSecret> {
         if let Some(signer) = &self.jwt_signer {
+            let account_id = AccountId::assert_already_resolved(subject);
             let project = self
                 .repo
-                .get_project(subject, project_id)
+                .get_project(&account_id, project_id)
                 .await?
                 .ok_or(Error::NotFound)?;
-            let (email, email_verified) = decode_bearer_profile(bearer_token);
+            let (email, email_verified, preferred_username, name) =
+                decode_bearer_profile(bearer_token);
             let owner = crate::signing::KeyOwner {
                 subject: subject.to_string(),
+                account_id: account_id.into(),
                 email,
                 email_verified,
+                preferred_username,
+                name,
             };
             let signed = signer
                 .sign(
@@ -329,15 +335,17 @@ impl OAuth2TokenIssuer {
     }
 }
 
-fn decode_bearer_profile(bearer_token: Option<&str>) -> (Option<String>, Option<bool>) {
+fn decode_bearer_profile(
+    bearer_token: Option<&str>,
+) -> (Option<String>, Option<bool>, Option<String>, Option<String>) {
     let Some(payload) = bearer_token.and_then(|token| token.split('.').nth(1)) else {
-        return (None, None);
+        return (None, None, None, None);
     };
     let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
-        return (None, None);
+        return (None, None, None, None);
     };
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return (None, None);
+        return (None, None, None, None);
     };
     let email = value
         .get("email")
@@ -346,7 +354,15 @@ fn decode_bearer_profile(bearer_token: Option<&str>) -> (Option<String>, Option<
     let email_verified = value
         .get("email_verified")
         .and_then(serde_json::Value::as_bool);
-    (email, email_verified)
+    let preferred_username = value
+        .get("preferred_username")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let name = value
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    (email, email_verified, preferred_username, name)
 }
 
 fn resolve_rotated_expires_at(
@@ -433,7 +449,14 @@ impl AuthzStoreImpl {
                 self.quota_tiers.tier_ids().join(", ")
             )));
         }
-        let account = self.repo.create_account(subject, input).await?;
+        let input = CreateAccount {
+            name: Self::normalize_account_name(input.name.as_deref()).map(str::to_owned),
+            ..input
+        };
+        let account = self
+            .repo
+            .create_account(&AccountId::assert_already_resolved(subject), input)
+            .await?;
         tracing::info!(
             operation = "create_account",
             subject = %subject,
@@ -464,13 +487,64 @@ impl AuthzStoreImpl {
         }
         let account = self
             .repo
-            .update_account_default_quota(subject, account_id, default_quota)
+            .update_account_default_quota(
+                &AccountId::assert_already_resolved(subject),
+                account_id,
+                default_quota,
+            )
             .await?;
         tracing::info!(
             operation = "update_account_default_quota",
             subject = %subject,
             account_id = %account.id,
             "account defaultQuota updated"
+        );
+        Ok(account)
+    }
+
+    /// Collapses a blank or whitespace-only account name to "no name". `NULL` is the single
+    /// representation of unnamed everywhere below this point -- in the DTO, in the column, and in
+    /// what a console reads back -- so an empty string must never survive as a *set* name; if it
+    /// did, a console could no longer distinguish "named" from "not named yet" and could not
+    /// offer a name-me affordance. Trimming is normalisation, not validation: a name is free text
+    /// with no catalogue behind it, so surrounding whitespace is silently dropped rather than
+    /// rejected, and anything non-blank is stored verbatim. The DB
+    /// `CHECK (name IS NULL OR btrim(name) <> '')`
+    /// (`migrations/20260829000001_accounts_add_name.sql`) is the backstop that keeps this true
+    /// for any future write path, not the primary enforcement.
+    fn normalize_account_name(name: Option<&str>) -> Option<&str> {
+        name.map(str::trim).filter(|trimmed| !trimmed.is_empty())
+    }
+
+    /// Sets `Account.name` post-creation. Backs `updateAccountName` -- the sole write path for that
+    /// field: it is `@readonly` in the schema and `model.Account.update` was removed outright by
+    /// #398, so there is no generic verb it could ride. Shaped like
+    /// `update_account_default_quota` above, minus the catalogue check: a name is free text with
+    /// nothing to validate it against. `None` (and, via [`Self::normalize_account_name`], a blank
+    /// string) clears it back to unnamed; this always writes, it is not a PATCH.
+    ///
+    /// The name itself is deliberately NOT logged. It is user-supplied free text on a tenant row,
+    /// and the account id already identifies the row for any audit purpose.
+    pub async fn update_account_name(
+        &self,
+        subject: &str,
+        account_id: &str,
+        name: Option<&str>,
+    ) -> Result<Account> {
+        let account = self
+            .repo
+            .update_account_name(
+                &AccountId::assert_already_resolved(subject),
+                account_id,
+                Self::normalize_account_name(name),
+            )
+            .await?;
+        tracing::info!(
+            operation = "update_account_name",
+            subject = %subject,
+            account_id = %account.id,
+            cleared = account.name.is_none(),
+            "account name updated"
         );
         Ok(account)
     }
@@ -526,7 +600,10 @@ impl AuthzStoreImpl {
             revoked_at: None,
             billing_plan: input.billing_plan,
         };
-        let api_key = self.repo.create_api_key(subject, row).await?;
+        let api_key = self
+            .repo
+            .create_api_key(&AccountId::assert_already_resolved(subject), row)
+            .await?;
         tracing::info!(
             operation = "create_api_key",
             subject = %subject,
@@ -560,14 +637,22 @@ impl AuthzStoreImpl {
     /// `StoreRepo::set_account_status` (membership enforced in SQL).
     pub async fn disable_account(&self, subject: &str, account_id: &str) -> Result<Account> {
         self.repo
-            .set_account_status(subject, account_id, ResourceStatus::Suspended)
+            .set_account_status(
+                &AccountId::assert_already_resolved(subject),
+                account_id,
+                ResourceStatus::Suspended,
+            )
             .await
     }
 
     /// Reactivate a suspended account (`status = 'active'`). Backs `enableAccount`.
     pub async fn enable_account(&self, subject: &str, account_id: &str) -> Result<Account> {
         self.repo
-            .set_account_status(subject, account_id, ResourceStatus::Active)
+            .set_account_status(
+                &AccountId::assert_already_resolved(subject),
+                account_id,
+                ResourceStatus::Active,
+            )
             .await
     }
 
@@ -575,26 +660,36 @@ impl AuthzStoreImpl {
     /// `StoreRepo::set_project_status` (membership enforced in SQL).
     pub async fn disable_project(&self, subject: &str, project_id: &str) -> Result<Project> {
         self.repo
-            .set_project_status(subject, project_id, ResourceStatus::Suspended)
+            .set_project_status(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                ResourceStatus::Suspended,
+            )
             .await
     }
 
     /// Reactivate a suspended project (`status = 'active'`). Backs `enableProject`.
     pub async fn enable_project(&self, subject: &str, project_id: &str) -> Result<Project> {
         self.repo
-            .set_project_status(subject, project_id, ResourceStatus::Active)
+            .set_project_status(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                ResourceStatus::Active,
+            )
             .await
     }
 
-    /// Revokes every active refresh-token session for `subject`, returning how many were
-    /// revoked. Backs both `revokeOwnSessions` (`subject` is the caller's own, from
-    /// `auth().id`) and `revokeSubjectSessions` (`subject` is an operator-supplied target) --
-    /// the operation is identical either way; only which `subject` reaches this method differs,
-    /// and that choice is made entirely by the two procedures' own RBAC gates
-    /// (`session:revoke-own` vs `session:revoke`, `docs/rbac.md`), not by anything in this method.
+    /// Revokes every active session (of either `kind`, ADR-0021 Decision 3) for `subject`,
+    /// cascading to every `exchange_refresh_tokens` row chained under one of them (ADR-0020
+    /// Decision 9), and returns how many SESSIONS were revoked. Backs both `revokeOwnSessions`
+    /// (`subject` is the caller's own, from `auth().id`) and `revokeSubjectSessions` (`subject`
+    /// is an operator-supplied target) -- the operation is identical either way; only which
+    /// `subject` reaches this method differs, and that choice is made entirely by the two
+    /// procedures' own RBAC gates (`session:revoke-own` vs `session:revoke`, `docs/rbac.md`), not
+    /// by anything in this method.
     pub async fn revoke_sessions(&self, subject: &str) -> Result<u64> {
         self.repo
-            .revoke_active_exchange_refresh_tokens_for_subject(subject)
+            .revoke_sessions_and_cascade(&AccountId::assert_already_resolved(subject))
             .await
     }
 
@@ -602,7 +697,9 @@ impl AuthzStoreImpl {
     /// Thin wrapper over `StoreRepo::set_default_project` (ownership + atomic unset/set enforced
     /// in SQL).
     pub async fn set_default_project(&self, subject: &str, project_id: &str) -> Result<Project> {
-        self.repo.set_default_project(subject, project_id).await
+        self.repo
+            .set_default_project(&AccountId::assert_already_resolved(subject), project_id)
+            .await
     }
 
     /// Sets `Project.projectQuota` post-creation. Backs `setProjectQuota` (#379, completing
@@ -626,7 +723,88 @@ impl AuthzStoreImpl {
             )));
         }
         self.repo
-            .set_project_quota(subject, project_id, project_quota)
+            .set_project_quota(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                project_quota,
+            )
+            .await
+    }
+
+    /// Sets `Project.allowedModels` post-creation/update. Backs `setProjectAllowedModels` (#415,
+    /// ADR-0018 Decision 5): `Project.allowedModels` is now `@readonly` on both generic
+    /// `model.Project.create`/`.update` verbs (same "no runtime-catalogue-check hook" gap #379
+    /// closed for `projectQuota`), so this procedure is the only write path left. Every entry in
+    /// `allowed_models` is validated against the operator-configured AI-model catalogue here,
+    /// before the ownership-gated SQL write (`StoreRepo::set_project_allowed_models`) -- same
+    /// pattern/error shape as `set_project_quota`'s `project_quota` check above, except the
+    /// catalogue check here names every invalid entry (`ModelCatalog::invalid_ids`) rather than
+    /// accept/reject a single scalar. `None` always passes (unchanged "all models allowed"
+    /// meaning); an empty/absent catalogue accepts anything (see `ModelCatalog::invalid_ids`'s own
+    /// doc comment).
+    pub async fn set_project_allowed_models(
+        &self,
+        subject: &str,
+        project_id: &str,
+        allowed_models: Option<Vec<String>>,
+    ) -> Result<Project> {
+        let invalid = self.models.invalid_ids(allowed_models.as_deref());
+        if !invalid.is_empty() {
+            return Err(Error::BadRequest(format!(
+                "unknown allowedModels entr{} [{}]: must each be one of the configured models [{}]",
+                if invalid.len() == 1 { "y" } else { "ies" },
+                invalid.join(", "),
+                self.models.model_ids().join(", ")
+            )));
+        }
+        self.repo
+            .set_project_allowed_models(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                allowed_models,
+            )
+            .await
+    }
+
+    /// Sets `Project.modelPolicy` (ADR-0018 Decision 5 follow-up). Backs `setProjectModelPolicy`:
+    /// `Project.modelPolicy` is `@readonly` on both generic `model.Project.create`/`.update` verbs
+    /// (it needed a precondition -- `allowedModels` catalogue validation, #415 -- before a write
+    /// path could safely exist at all; see that field's own schema doc comment), so this procedure
+    /// is the only write path.
+    ///
+    /// `model_policy` is validated to be one of the three canonical wire values here
+    /// (`ModelPolicy::parse_strict`), fail-closed: an unrecognized value is refused outright with
+    /// `BadRequest`, never silently coerced to a default -- the opposite of `ModelPolicy::from`'s
+    /// read-path coercion to `DenyAll`, which exists only because a DB read has no caller left to
+    /// return an error to (see that type's own doc comment). The other business rule this
+    /// procedure enforces -- refusing a transition to `allowlist` while `allowedModels` is empty,
+    /// because that would silently deny every model rather than the caller's evident intent -- is
+    /// NOT checked here: it needs the row's current `allowed_models` read under lock, so it lives
+    /// in `StoreRepo::set_project_model_policy`'s single transaction instead (see that method's
+    /// own doc comment for the full reasoning, including why this is a refusal rather than a
+    /// warning or a silent allow).
+    ///
+    /// `allowedModels` itself is never touched by this procedure -- switching to `allow_all` (or
+    /// back to `allowlist`) preserves whatever list was already there, so toggling `allow_all` off
+    /// and back on restores the previous selection instead of forcing the caller to re-enter it.
+    /// The list is simply inert while `model_policy` is not `allowlist` (ADR-0018 Decision 2).
+    pub async fn set_project_model_policy(
+        &self,
+        subject: &str,
+        project_id: &str,
+        model_policy: &str,
+    ) -> Result<Project> {
+        let parsed = ModelPolicy::parse_strict(model_policy).ok_or_else(|| {
+            Error::BadRequest(format!(
+                "unknown modelPolicy '{model_policy}': must be one of allow_all, allowlist, deny_all"
+            ))
+        })?;
+        self.repo
+            .set_project_model_policy(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                &parsed.to_string(),
+            )
             .await
     }
 
@@ -635,7 +813,7 @@ impl AuthzStoreImpl {
         let api_key = self
             .repo
             .set_api_key_status(
-                subject,
+                &AccountId::assert_already_resolved(subject),
                 key_id,
                 ApiKeyStatus::Revoked,
                 Some(Utc::now()),
@@ -662,7 +840,12 @@ impl AuthzStoreImpl {
         role: Option<&str>,
     ) -> Result<Project> {
         self.repo
-            .add_project_member(subject, project_id, target_account_id, role)
+            .add_project_member(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                target_account_id,
+                role,
+            )
             .await
     }
 
@@ -677,7 +860,11 @@ impl AuthzStoreImpl {
         target_account_id: &str,
     ) -> Result<Project> {
         self.repo
-            .remove_project_member(subject, project_id, target_account_id)
+            .remove_project_member(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                target_account_id,
+            )
             .await
     }
 
@@ -691,7 +878,12 @@ impl AuthzStoreImpl {
         role: &str,
     ) -> Result<Project> {
         self.repo
-            .set_project_member_role(subject, project_id, target_account_id, role)
+            .set_project_member_role(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                target_account_id,
+                role,
+            )
             .await
     }
 
@@ -716,7 +908,12 @@ impl AuthzStoreImpl {
             )));
         }
         self.repo
-            .set_project_member_quota_tier(subject, project_id, target_account_id, quota_tier)
+            .set_project_member_quota_tier(
+                &AccountId::assert_already_resolved(subject),
+                project_id,
+                target_account_id,
+                quota_tier,
+            )
             .await
     }
 
@@ -728,14 +925,18 @@ impl AuthzStoreImpl {
         subject: &str,
         project_id: &str,
     ) -> Result<Vec<ProjectMember>> {
-        self.repo.list_project_roster(subject, project_id).await
+        self.repo
+            .list_project_roster(&AccountId::assert_already_resolved(subject), project_id)
+            .await
     }
 
     /// Permanently delete an account, cascading to its projects and api-keys. Backs
     /// `deleteAccountPermanently`. Since ADR-0006 the authorization is simply "the caller is this
     /// account" — there is no role concept left to gate on.
     pub async fn delete_account(&self, subject: &str, account_id: &str) -> Result<Account> {
-        self.repo.delete_account(subject, account_id).await
+        self.repo
+            .delete_account(&AccountId::assert_already_resolved(subject), account_id)
+            .await
     }
 
     /// Rotate an API key: issue a fresh secret (generation/hashing unchanged from before the
@@ -753,9 +954,10 @@ impl AuthzStoreImpl {
         key_id: &str,
         input: RotateApiKey,
     ) -> Result<ApiKeySecret> {
+        let account_id = AccountId::assert_already_resolved(subject);
         let existing = self
             .repo
-            .get_api_key(subject, key_id)
+            .get_api_key(&account_id, key_id)
             .await?
             .ok_or_else(|| lightbridge_authz_core::error::Error::NotFound)?;
 
@@ -805,7 +1007,14 @@ impl AuthzStoreImpl {
         };
         let api_key = self
             .repo
-            .rotate_api_key_transaction(subject, key_id, status, revoked_at, old_expires_at, row)
+            .rotate_api_key_transaction(
+                &account_id,
+                key_id,
+                status,
+                revoked_at,
+                old_expires_at,
+                row,
+            )
             .await?;
         tracing::info!(
             operation = "rotate_api_key",
@@ -851,9 +1060,14 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
+            relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
             issuance: None,
+            federation: Some(lightbridge_authz_core::config::Federation {
+                issuer: "https://keycloak.example.test/realms/dev".to_string(),
+                discovery_url: None,
+            }),
         }
     }
 
@@ -958,6 +1172,7 @@ mod tests {
                     "subject",
                     CreateAccount {
                         default_quota: Some(tier.to_string()),
+                        name: None,
                     },
                 )
                 .await
@@ -991,6 +1206,7 @@ mod tests {
                 "subject",
                 CreateAccount {
                     default_quota: None,
+                    name: None,
                 },
             )
             .await
@@ -1151,6 +1367,75 @@ mod tests {
         );
     }
 
+    // #415 (ADR-0018 Decision 5): `allowedModels` validation on `setProjectAllowedModels`, same
+    // shape/reasoning as `setProjectQuota` above -- this write path used to be the generic,
+    // entirely-unvalidated `model.Project.create`/`model.Project.update` verbs before #415 marked
+    // `Project.allowedModels` `@readonly` and moved the write behind this procedure.
+    #[tokio::test]
+    async fn set_project_allowed_models_rejects_models_not_in_configured_set() {
+        use lightbridge_authz_core::config::ModelCatalogEntry;
+
+        let store = AuthzStoreImpl::with_pool(lazy_pool()).with_model_catalog(ModelCatalog {
+            models: vec![ModelCatalogEntry {
+                id: "gpt-4.1-mini".to_string(),
+                name: "GPT-4.1 Mini".to_string(),
+            }],
+        });
+
+        let err = store
+            .set_project_allowed_models(
+                "subject",
+                "proj",
+                Some(vec!["gpt-4.1-mini".to_string(), "gtp-4.1-typo".to_string()]),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, lightbridge_authz_core::error::Error::BadRequest(ref m) if m.contains("unknown allowedModels") && m.contains("gtp-4.1-typo")),
+            "an entry absent from the catalogue should be rejected by name before any DB access, got: {err}"
+        );
+    }
+
+    /// Mirrors `set_project_quota_allows_none_against_a_configured_catalogue`: `None` must pass the
+    /// catalogue check and reach the (dead) DB connection, never `BadRequest`.
+    #[tokio::test]
+    async fn set_project_allowed_models_allows_none_against_a_configured_catalogue() {
+        use lightbridge_authz_core::config::ModelCatalogEntry;
+
+        let store = AuthzStoreImpl::with_pool(lazy_pool()).with_model_catalog(ModelCatalog {
+            models: vec![ModelCatalogEntry {
+                id: "gpt-4.1-mini".to_string(),
+                name: "GPT-4.1 Mini".to_string(),
+            }],
+        });
+
+        let err = store
+            .set_project_allowed_models("subject", "proj", None)
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(err, lightbridge_authz_core::error::Error::BadRequest(_)),
+            "None must not be rejected by the catalogue check, got: {err}"
+        );
+    }
+
+    /// #415: proves the "empty/absent catalogue accepts anything" default is real, not merely
+    /// documented -- an entry that matches nothing configured must still pass when `models` is
+    /// never set (`AuthzStoreImpl::with_pool` defaults to `ModelCatalog::default()`).
+    #[tokio::test]
+    async fn set_project_allowed_models_accepts_anything_when_catalogue_is_empty() {
+        let store = AuthzStoreImpl::with_pool(lazy_pool());
+
+        let err = store
+            .set_project_allowed_models("subject", "proj", Some(vec!["anything-goes".to_string()]))
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(err, lightbridge_authz_core::error::Error::BadRequest(_)),
+            "an empty/absent catalogue must accept any value, got: {err}"
+        );
+    }
+
     // Backs `listBillingPlans`: proves `billing_plans()` hands back the exact catalogue the store
     // was constructed with (same plans, in order, `limits` intact including a plan with no limits
     // at all) rather than e.g. a default-constructed `Billing` or a stale clone from before
@@ -1288,8 +1573,10 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
+            relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
+            federation: None,
             issuance: Some(Oauth2Issuance {
                 grant_type: Some("urn:ietf:params:oauth:grant-type:token-exchange".to_string()),
                 client_id: "test-client".to_string(),
@@ -1329,8 +1616,10 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
+            relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
+            federation: None,
             issuance: Some(Oauth2Issuance {
                 grant_type: None,
                 client_id: client_id.to_string(),
@@ -1357,8 +1646,10 @@ mod tests {
             audience: None,
             signing: None,
             token_exchange: None,
+            relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
+            federation: None,
             issuance: None,
         };
         let err = OAuth2TokenIssuer::from_config(&cfg).unwrap_err();

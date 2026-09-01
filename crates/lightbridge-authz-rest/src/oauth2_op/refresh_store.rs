@@ -47,6 +47,11 @@ const ATTR_ACCOUNT_ID: &str = "account_id";
 const ATTR_PROJECT_ID: &str = "project_id";
 const ATTR_EMAIL_VERIFIED: &str = "email_verified";
 const ATTR_AUTH_TIME: &str = "auth_time";
+/// Round-trips `exchange_refresh_tokens.name` through `Identity.attributes` -- `Identity` has no
+/// dedicated `name` field (only `email`/`username`), so this follows the same convention as
+/// `ATTR_EMAIL_VERIFIED`/`ATTR_AUTH_TIME` above. `preferred_username` needs no attribute constant:
+/// it round-trips through `Identity.username`, which IS a dedicated field.
+const ATTR_NAME: &str = "name";
 /// Round-trips `exchange_refresh_tokens.chain_id`/`chain_expires_at` (the rotation-family and its
 /// absolute cap -- see that table's migration) through `Identity.attributes`, same convention as
 /// `account_id`/`project_id` above. Only exercised by `store_token`, since this store's own
@@ -55,6 +60,10 @@ const ATTR_AUTH_TIME: &str = "auth_time";
 /// these attributes through correctly for any other `RefreshTokenStore` caller.
 const ATTR_CHAIN_ID: &str = "chain_id";
 const ATTR_CHAIN_EXPIRES_AT: &str = "chain_expires_at";
+/// ADR-0020: round-trips `exchange_refresh_tokens.session_id` (the `sessions` row this refresh
+/// token is chained under -- see that entity's own doc comment) through `Identity.attributes`,
+/// same convention as `chain_id`/`chain_expires_at` above.
+const ATTR_SESSION_ID: &str = "session_id";
 
 pub struct DbRefreshTokenStore {
     repo: Arc<StoreRepo>,
@@ -76,26 +85,30 @@ fn row_to_refresh_token(row: ExchangeRefreshTokenRow) -> RefreshToken {
     if let Some(auth_time) = row.auth_time {
         attributes.insert(ATTR_AUTH_TIME.to_string(), auth_time.to_string());
     }
+    if let Some(name) = row.name {
+        attributes.insert(ATTR_NAME.to_string(), name);
+    }
     attributes.insert(ATTR_CHAIN_ID.to_string(), row.chain_id);
     attributes.insert(
         ATTR_CHAIN_EXPIRES_AT.to_string(),
         row.chain_expires_at.to_rfc3339(),
     );
-    RefreshToken {
-        // See this module's doc comment: the plaintext was never stored, so this is the hash --
-        // never read back as a real secret by anything in this codebase.
-        token: row.token_hash,
-        client_id: row.client_id,
-        identity: Identity {
+    attributes.insert(ATTR_SESSION_ID.to_string(), row.session_id);
+    // See this module's doc comment: the plaintext was never stored, so `token` here is the
+    // hash -- never read back as a real secret by anything in this codebase.
+    RefreshToken::new(
+        row.token_hash,
+        row.client_id,
+        Identity {
             provider_id: IDENTITY_PROVIDER_ID.to_string(),
             external_id: row.subject,
             email: row.email,
-            username: None,
+            username: row.preferred_username,
             attributes,
         },
-        scope: row.scope.unwrap_or_default(),
-        expires_at: row.expires_at,
-    }
+        row.scope.unwrap_or_default(),
+        row.expires_at,
+    )
 }
 
 #[async_trait]
@@ -123,6 +136,7 @@ impl RefreshTokenStore for DbRefreshTokenStore {
             .attributes
             .get(ATTR_AUTH_TIME)
             .and_then(|v| v.parse::<i64>().ok());
+        let name = token.identity.attributes.get(ATTR_NAME).cloned();
         // Fail closed, unlike account_id/project_id above: a chain with no id or no cap is not a
         // meaningful "unknown" to default away -- every caller of `store_token` in this codebase
         // (`TokenExchangeOpStore::handle_token_exchange`) always sets both, so a missing/
@@ -141,6 +155,16 @@ impl RefreshTokenStore for DbRefreshTokenStore {
             .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
             .map(|dt| dt.with_timezone(&Utc))
             .ok_or(OpError::Storage)?;
+        // Fail closed, same reasoning as chain_id/chain_expires_at above: every caller of
+        // `store_token` in this codebase (`TokenExchangeOpStore::handle_token_exchange`) always
+        // sets this, so a missing value means a caller bug, and persisting a session-less row
+        // would violate the `session_id` FK/NOT NULL constraint anyway.
+        let session_id = token
+            .identity
+            .attributes
+            .get(ATTR_SESSION_ID)
+            .cloned()
+            .ok_or(OpError::Storage)?;
         let new = NewExchangeRefreshToken {
             id: cuid2(),
             subject: token.identity.external_id,
@@ -156,8 +180,11 @@ impl RefreshTokenStore for DbRefreshTokenStore {
             email: token.identity.email,
             email_verified,
             auth_time,
+            preferred_username: token.identity.username,
+            name,
             chain_id,
             chain_expires_at,
+            session_id,
             created_at: Utc::now(),
             expires_at: token.expires_at,
         };
@@ -197,9 +224,13 @@ impl RefreshTokenStore for DbRefreshTokenStore {
 
     async fn consume_token(&self, token: &str) -> Result<Option<RefreshToken>, OpError> {
         let hash = hash_api_key(token);
+        // No successor to record: this generic `RefreshTokenStore::consume_token` path only ever
+        // consumes -- it never mints a replacement row itself (see this module's own doc comment:
+        // `TokenExchangeOpStore::handle_refresh_token` bypasses this trait entirely and calls
+        // `consume_exchange_refresh_token` directly with a pre-generated successor id instead).
         let row = self
             .repo
-            .consume_exchange_refresh_token(&hash, Utc::now())
+            .consume_exchange_refresh_token(&hash, Utc::now(), None)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to consume refresh token");

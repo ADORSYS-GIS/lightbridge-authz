@@ -6,6 +6,7 @@ use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::DbPool;
 use lightbridge_authz_core::error::Error;
+use lightbridge_authz_core::identity::AccountId;
 use lightbridge_authz_core::{ApiKeyStatus, CreateAccount, CreateProject};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -19,9 +20,10 @@ async fn rotate_rolls_back_on_create_failure(pool: PgPool) {
 
     let account = repo
         .create_account(
-            subject,
+            &AccountId::assert_already_resolved(subject),
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
@@ -29,7 +31,7 @@ async fn rotate_rolls_back_on_create_failure(pool: PgPool) {
 
     let project = repo
         .create_project(
-            subject,
+            &AccountId::assert_already_resolved(subject),
             &account.id,
             CreateProject {
                 name: "rollback-project".to_string(),
@@ -63,7 +65,10 @@ async fn rotate_rolls_back_on_create_failure(pool: PgPool) {
         billing_plan: "starter".to_string(),
     };
 
-    let api_key = repo.create_api_key(subject, initial_row).await.unwrap();
+    let api_key = repo
+        .create_api_key(&AccountId::assert_already_resolved(subject), initial_row)
+        .await
+        .unwrap();
 
     let failure_row = NewApiKeyRow {
         id: cuid2(),
@@ -82,7 +87,7 @@ async fn rotate_rolls_back_on_create_failure(pool: PgPool) {
 
     let err = repo
         .rotate_api_key_transaction(
-            subject,
+            &AccountId::assert_already_resolved(subject),
             &api_key.id,
             ApiKeyStatus::Revoked,
             Some(Utc::now()),
@@ -95,7 +100,7 @@ async fn rotate_rolls_back_on_create_failure(pool: PgPool) {
     assert!(matches!(err, Error::NotFound));
 
     let reloaded = repo
-        .get_api_key(subject, &api_key.id)
+        .get_api_key(&AccountId::assert_already_resolved(subject), &api_key.id)
         .await
         .unwrap()
         .unwrap();

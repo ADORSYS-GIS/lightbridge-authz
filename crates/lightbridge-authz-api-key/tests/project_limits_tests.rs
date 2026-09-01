@@ -3,6 +3,7 @@
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::DbPool;
+use lightbridge_authz_core::identity::AccountId;
 use lightbridge_authz_core::{CreateAccount, CreateProject, DefaultLimits, UpdateProject};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -13,13 +14,15 @@ async fn test_project_limits_persistence(pool: PgPool) {
     let repo = StoreRepo::new(db_pool);
 
     let subject = "test-subject";
+    let account_id = AccountId::assert_already_resolved(subject);
 
     // 1. Create Account
     let account = repo
         .create_account(
-            subject,
+            &AccountId::assert_already_resolved(subject),
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
@@ -34,7 +37,7 @@ async fn test_project_limits_persistence(pool: PgPool) {
 
     let project = repo
         .create_project(
-            subject,
+            &account_id,
             &account.id,
             CreateProject {
                 name: "test-project".to_string(),
@@ -53,7 +56,7 @@ async fn test_project_limits_persistence(pool: PgPool) {
 
     // 3. Retrieve and verify
     let retrieved = repo
-        .get_project(subject, &project.id)
+        .get_project(&account_id, &project.id)
         .await
         .unwrap()
         .unwrap();
@@ -68,7 +71,7 @@ async fn test_project_limits_persistence(pool: PgPool) {
 
     let updated = repo
         .update_project(
-            subject,
+            &account_id,
             &project.id,
             UpdateProject {
                 name: None,
@@ -84,7 +87,7 @@ async fn test_project_limits_persistence(pool: PgPool) {
 
     // 5. Verify persistence of update
     let retrieved_updated = repo
-        .get_project(subject, &project.id)
+        .get_project(&account_id, &project.id)
         .await
         .unwrap()
         .unwrap();
@@ -97,12 +100,14 @@ async fn test_create_project_without_limits_uses_default(pool: PgPool) {
     let repo = StoreRepo::new(db_pool);
 
     let subject = "test-subject-default-limits";
+    let account_id = AccountId::assert_already_resolved(subject);
 
     let account = repo
         .create_account(
-            subject,
+            &AccountId::assert_already_resolved(subject),
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
@@ -110,7 +115,7 @@ async fn test_create_project_without_limits_uses_default(pool: PgPool) {
 
     let project = repo
         .create_project(
-            subject,
+            &account_id,
             &account.id,
             CreateProject {
                 name: "project-default-limits".to_string(),
@@ -134,12 +139,14 @@ async fn test_update_project_clears_allowed_models(pool: PgPool) {
     let repo = StoreRepo::new(db_pool);
 
     let subject = "test-subject-clear-models";
+    let account_id = AccountId::assert_already_resolved(subject);
 
     let account = repo
         .create_account(
-            subject,
+            &AccountId::assert_already_resolved(subject),
             CreateAccount {
                 default_quota: None,
+                name: None,
             },
         )
         .await
@@ -149,7 +156,7 @@ async fn test_update_project_clears_allowed_models(pool: PgPool) {
 
     let project = repo
         .create_project(
-            subject,
+            &account_id,
             &account.id,
             CreateProject {
                 name: "project-clear-models".to_string(),
@@ -168,7 +175,7 @@ async fn test_update_project_clears_allowed_models(pool: PgPool) {
 
     let updated = repo
         .update_project(
-            subject,
+            &account_id,
             &project.id,
             UpdateProject {
                 name: None,
@@ -183,7 +190,7 @@ async fn test_update_project_clears_allowed_models(pool: PgPool) {
     assert!(updated.allowed_models.is_none());
 
     let reloaded = repo
-        .get_project(subject, &project.id)
+        .get_project(&account_id, &project.id)
         .await
         .unwrap()
         .unwrap();

@@ -31,9 +31,12 @@ Enforcement is centralized, so the handlers/tools themselves contain no authoriz
   "Batch RPC: per-frame RBAC" below.
 - **CratestackAuthProvider** (`crates/lightbridge-authz-rest/src/auth_provider.rs`) enforces the
   *same* `op_id` → permission map a second time, from inside cratestack's own dispatch. Redundant for
-  a unary call (already checked by `rpc_authorize` above), but this is what actually authorizes a
-  `POST /rpc/batch` request: cratestack calls this provider once per frame, each time with that
-  frame's own canonical `/rpc/<op_id>` path, so every frame in a batch is authorized independently.
+  a unary call (already checked by `rpc_authorize` above — `request.path` is that call's own
+  canonical path both before and after cratestack 0.8.4). For `POST /rpc/batch`, cratestack 0.8.4
+  changed this: the provider is now invoked exactly **once per envelope**, not once per frame (a new
+  `CachedAuthProvider` caches the one resulting context and reuses it for every frame's dispatch), so
+  it can no longer see an individual frame's op-id to authorize it here at all. See "Batch RPC:
+  per-frame RBAC" below for where per-frame enforcement actually happens post-0.8.4.
 - **MCP** — `call_tool` maps the tool name to the required permission and checks it before
   dispatching. It likewise fails closed (an unmapped tool name is rejected).
 
@@ -65,22 +68,44 @@ auth, outside RBAC) — is unchanged, and the MCP enforcement above is unaffecte
 `POST /rpc/batch` bundles multiple ops in one JSON array of frames (`{id, op, input}`), each
 carrying its own `op` (op-id). `rpc_authorize` is a URL-derived, whole-HTTP-request gate — it has no
 visibility into the frames inside the body, so it cannot check a single permission for the batch call
-the way it does for `POST /rpc/{op_id}`. Instead:
+the way it does for `POST /rpc/{op_id}`, and neither can `CratestackAuthProvider::authenticate`
+(cratestack 0.8.4 authenticates a batch envelope exactly once, before it is even split into frames —
+see the bullet above). Since #383/#400, per-frame enforcement instead moves into the schema itself:
 
 1. **`rpc_authorize`** requires only that the caller present *some* valid, active bearer token, then
    forwards the request — a wholly unauthenticated batch call still gets a clean top-level `401`
    rather than a `200` envelope full of per-frame `unauthenticated` errors.
-2. **`CratestackAuthProvider::authenticate`** does the actual permission check, once per frame:
-   cratestack's batch dispatch calls it once for every frame, each time with that frame's own
-   canonical `/rpc/<op_id>` path, and it looks that op-id up in the *same* map `rpc_authorize` uses
-   for unary calls. A frame whose op the caller lacks permission for fails independently with
-   `{"error": {"code": "permission_denied", ...}}` in its own slot — the rest of the batch, and the
-   overall `200`, are unaffected.
+2. **`CratestackAuthProvider::authenticate`** builds ONE `CratestackContext` for the whole envelope,
+   carrying the caller's `id`, which server (`authz-api` vs `authz-budget`) is asking (`rpcScope`),
+   and one boolean field per `Permission` (`permAccountRead`, `permProjectCreate`, …) — the caller's
+   real, already-computed `TokenInfo::has_permission` verdicts, never a blanket `true`
+   (`build_context` in `auth_provider.rs`).
+3. **cratestack's own per-frame policy evaluation** — re-entered once per batch frame from inside
+   `#dispatch_ident`, unaffected by the envelope-level auth caching — reads that ONE context back out
+   per frame via `@allow`/`@@allow` clauses in `crates/lightbridge-authz-api/schema/authz.cstack`.
+   Those clauses are **generated**, not hand-transcribed, from the exact `op_id` → `Permission` map
+   `rpc_authorize::MAPPED_OP_ID_PERMISSIONS` defines (see
+   `crates/lightbridge-authz-rest/tests/schema_policy_sync_tests.rs`, which fails CI on drift) — so a
+   batch frame is authorized against the *same* permission every unary call to that op-id would need.
+
+For `create`/`update`/`delete` verbs and every `procedure.*`, this schema-level check is a genuine
+hard gate — cratestack's create/update SQL executors evaluate the policy expression as an
+application-level pre-check and return `Forbidden` on denial, and `authorize_procedure` does the
+same for procedures — so a frame whose op the caller lacks permission for fails independently with
+`{"error": {"code": "permission_denied", ...}}` in its own slot, exactly like a unary call would.
+
+**`model.*` `list`/`get` verbs are the one exception — see "Read verbs filter, they do not refuse"
+below.** `@@allow("read", …)` compiles into the SQL `WHERE` clause itself
+(`cratestack-sqlx/src/render/policy.rs`), not an application-level pre-check, so there is nothing for
+that boolean permission field to short-circuit against before the query runs. A batch frame calling
+`model.Account.list`/`.get` (or the `Project`/`ApiKey` equivalents) for a caller lacking the read
+permission does not fail at all — it returns `200` with an empty list / a `null` get, the SAME shape
+as a caller who holds the permission but owns none of the matching rows.
 
 One token authorizes every frame in a batch (there's one `Authorization` header per HTTP request, not
 per frame) — so a batch mixing a permitted read and a forbidden write for the *same* caller returns
 `200` with the read's `output` in one frame and a `permission_denied` `error` in the other. Membership
-(`@@allow`) is still the second gate per frame, exactly as for unary calls.
+(`@@allow`) is still the second gate per frame for both shapes, exactly as for unary calls.
 
 The `op_id` → permission and tool → permission maps are the single sources of truth and must stay in
 sync with the tables below. The claim is read at request time; the role→permission map is compiled
@@ -194,31 +219,43 @@ delete`) for generated model CRUD and `procedure.<name>` for the hand-written pr
 This table is the source of truth for `rpc_authorize::required_permission`. **Any RPC `op_id` not
 listed here is denied unconditionally (fail closed).**
 
+**`users` (ADR-0024) has no RPC surface or permission in this pass** — the `User` model in
+`authz.cstack` carries no `@@allow` clause at all (same precedent as `Session`), so every generic
+`model.User.*` verb is denied unconditionally by the rule above; no new entry was needed here or
+in `rpc_authorize.rs`. `federated_identities` has no RPC surface either, and never will through the
+generated CRUD path — it is deliberately absent from `authz.cstack` entirely (see
+[`docs/architecture/data-model.md`](./architecture/data-model.md#users-and-federated-identities-adr-0024)).
+
 **Every `budget:*` row below is served at `POST /budget/rpc/{op_id}` on the separate
 `authz-budget` service, not `POST /rpc/{op_id}` on `authz-api`** (hard cutover — see
 [`docs/architecture/budget.md`](./architecture/budget.md#service-boundary-authz-budget-hard-cutover)).
 The permission each op-id requires is unchanged by that move; only the host and path prefix
 differ. A third gate, `RpcScope` (`rpc_authorize.rs`), sits ahead of the RBAC/membership pair
 described above and enforces this split: `authz-api` 404s every `budget:*` op-id before the RBAC
-gate even runs, and `authz-budget` 404s everything else the same way — including per-frame inside
-a `/rpc/batch` call, via the same `CratestackAuthProvider::authenticate` mechanism "Batch RPC:
-per-frame RBAC" above describes for the permission check.
+gate even runs, and `authz-budget` 404s everything else the same way, for a **unary** call. Inside
+`POST /rpc/batch` the scope check moves with everything else described in "Read verbs filter, they
+do not refuse" above: `rpcScope` is baked into the one envelope-level context as `auth().rpcScope`,
+and every mapped op-id's generated schema clause checks it, so an out-of-scope batch frame still
+gets refused — but as `403 permission_denied` (cratestack's policy layer can only ever return
+`Forbidden` on denial, never `NotFound`), not the clean `404` a unary call to the same op-id gets.
+That 403-vs-404 divergence is a separate, deliberate accepted trade-off recorded in PR #400 — out of
+scope for #401.
 
 | Permission        | RPC `op_id`                                          | MCP tool                            |
 | ----------------- | ---------------------------------------------------- | ----------------------------------- |
 | `account:create`  | `procedure.createAccount`                            | `create-account`                    |
 | `account:read`    | `model.Account.list`, `model.Account.get`, `model.AccountSummary.list`, `model.AccountSummary.get` | `list-accounts`, `get-account` |
-| `account:update`  | `model.Account.update`, `procedure.updateAccountDefaultQuota` | `update-account`          |
+| `account:update`  | `procedure.updateAccountDefaultQuota`, `procedure.updateAccountName` | `update-account`, `update-account-name` |
 | `account:delete`  | `procedure.deleteAccountPermanently`                 | `delete-account`                    |
 | `account:disable` | `procedure.disableAccount`, `procedure.enableAccount`| `disable-account`, `enable-account` |
 | `project:create`  | `model.Project.create`                               | `create-project`                    |
 | `project:read`    | `model.Project.list`, `model.Project.get`            | `list-projects`, `get-project`      |
-| `project:update`  | `model.Project.update`, `procedure.setDefaultProject`, `procedure.listModelCatalog`, `procedure.setProjectQuota` | `update-project`, `set-default-project`, `set-project-quota` |
+| `project:update`  | `model.Project.update`, `procedure.setDefaultProject`, `procedure.listModelCatalog`, `procedure.setProjectQuota`, `procedure.setProjectAllowedModels`, `procedure.setProjectModelPolicy` | `update-project`, `set-default-project`, `set-project-quota`, `set-project-allowed-models`, `set-project-model-policy` |
 | `project:delete`  | `model.Project.delete`                               | `delete-project`                    |
 | `project:disable` | `procedure.disableProject`, `procedure.enableProject`| `disable-project`, `enable-project` |
 | `project:member`  | `procedure.listProjectRoster`, `procedure.addProjectMember`, `procedure.removeProjectMember`, `procedure.setProjectMemberRole`, `procedure.setProjectMemberQuotaTier` | `list-project-roster`, `add-project-member`, `remove-project-member`, `set-project-member-role`, `set-project-member-quota-tier` |
 | `apikey:create`   | `procedure.createApiKey`, `procedure.listBillingPlans` | `create-api-key`                  |
-| `apikey:read`     | `model.ApiKey.list`, `model.ApiKey.get`              | `list-api-keys`, `get-api-key`      |
+| `apikey:read`     | `model.ApiKey.list`, `model.ApiKey.get`, `procedure.listMyExpiringApiKeys` | `list-api-keys`, `get-api-key` |
 | `apikey:update`   | `model.ApiKey.update`                                | `update-api-key`                    |
 | `apikey:delete`   | `model.ApiKey.delete`                                | `delete-api-key`                    |
 | `apikey:revoke`   | `procedure.revokeApiKey`                             | `revoke-api-key`                    |
@@ -237,8 +274,77 @@ per-frame RBAC" above describes for the permission check.
 | `budget:policy-write`    | `procedure.createBudgetPolicyRevision`          | — (no MCP tool yet)                 |
 | `session:revoke-own`     | `procedure.revokeOwnSessions`                        | — (no MCP tool yet)                 |
 | `session:revoke`         | `procedure.revokeSubjectSessions`                    | — (no MCP tool yet)                 |
+| `usage:read-all`         | — (not an RPC op-id; see note below)                 | — (no MCP tool)                     |
 
 `read` covers both the list and get operations for a resource.
+
+`usage:read-all` is the one permission in this table that never gates a `POST /rpc/{op_id}` call on
+`authz-api`/`authz-budget` at all — it exists purely for `lightbridge-authz-usage`'s own
+`/usage/v1/usage/query` endpoint (`crates/lightbridge-authz-usage/src/handlers/query.rs`), which
+reads `TokenInfo::has_permission(Permission::UsageReadAll)` directly off the already-JWKS-validated
+bearer token to gate `scope=all` (estate-wide usage with no `account_id`/`project_id` filter). It
+still needs a `permUsageReadAll Boolean` field in `authz.cstack`'s `auth Principal` block (every
+`Permission::ALL` variant gets one, unconditionally — see `auth_provider.rs::build_context`'s doc
+comment) even though no `@allow`/`@@allow` clause reads it. Granted to `lightbridge-admin` via that
+role's default `*` grant; an operator restricting `role_permissions` explicitly must add
+`usage:read-all` (or `usage:*`) back to whichever role should keep estate-wide usage access.
+
+### Read verbs filter, they do not refuse (`POST /rpc/batch` only) — #401
+
+**Contract:** an empty `model.Account.list`/`model.Project.list`/`model.ApiKey.list` result, or a
+`null`/not-found `model.Account.get`/`model.Project.get`/`model.ApiKey.get`, is not proof the
+underlying data is empty. It can equally mean the caller lacks the corresponding `*:read`
+permission entirely. Operators and the frontend must not treat "list came back empty" as "there is
+nothing to show" without also checking the caller's granted permissions — this is deliberately
+indistinguishable from ordinary per-tenant scoping (a member seeing zero rows because they belong
+to no matching account/project), the same way `/idp/v1/resolve-context` deliberately returns a
+uniform `404` for "not a member" and "doesn't exist."
+
+This is **not a data-leak** — the filtering is fail-closed, and an unauthorized caller never sees a
+row it should not — but it is a **diagnosability gap**: a misconfigured read permission looks
+exactly like an empty table, so it can go unnoticed indefinitely (the same silent-inertness class as
+the `allowed_models` allowlist that was inert for months, #282/#283).
+
+**Where this applies, precisely — it is narrower than "read verbs":**
+
+- **Unary `POST /rpc/{op_id}`** calls to `model.*.list`/`.get` hard-refuse a caller lacking the
+  permission with a clean `403`, exactly like a write verb — `rpc_authorize` and
+  `CratestackAuthProvider::authenticate`'s unary branch both check the coarse `op_id` → permission
+  map (this page's own table above) *before* cratestack's dispatch/query layer ever runs. Proven by
+  `unary_read_verb_hard_refuses_a_caller_lacking_read_permission` in `rpc_it_tests.rs`.
+- **`POST /rpc/batch`** frames are where the filtering contract actually bites. Since cratestack
+  0.8.4 (#383/#400 — see "Batch RPC: per-frame RBAC" above), `CratestackAuthProvider::authenticate`
+  runs once per envelope, not once per frame, so there is no pre-dispatch point left that could see
+  an individual frame's op-id and hard-refuse it before cratestack's own per-frame policy evaluation
+  runs. For `create`/`update`/`delete` verbs and every `procedure.*`, that per-frame policy
+  evaluation is still a hard gate (cratestack's create/update SQL executors and
+  `authorize_procedure` both evaluate the policy as an application-level pre-check and return
+  `Forbidden`). For `model.*` `list`/`get` verbs it is not: `@@allow("read", …)` compiles directly
+  into the query's SQL `WHERE` clause (`cratestack-sqlx/src/render/policy.rs`), so a caller whose
+  read-permission field is `false` simply matches zero rows — indistinguishable, at the SQL level,
+  from a legitimate per-tenant scoping predicate. Proven by
+  `batch_rpc_read_verbs_filter_to_empty_not_an_error_for_a_caller_lacking_read_permission` in
+  `rpc_it_tests.rs`.
+
+**Decision (issue #401): keep the semantic, documented here, rather than build a pre-dispatch gate
+for batch reads.** The alternative would need one of two things, both investigated and rejected as
+disproportionate to a diagnosability-only risk:
+
+1. An upstream cratestack change adding an application-level pre-check hook for `list`/`get`
+   dispatch, mirroring the one `create.rs`/`update.rs` already has (`evaluate_create_policy_expr` /
+   the existence-probe-then-`Forbidden` pattern) — not something this repo controls, and cratestack's
+   own `render/policy.rs` module doc states plainly that read policies compile to SQL, by design.
+2. Routing `Account`/`Project`/`ApiKey` reads through hand-written procedures instead of cratestack's
+   generated `model.*.list`/`.get` verbs, so they could hard-gate exactly like `authorize_procedure`
+   does — the same structural move #379 made for the three write paths cratestack's policy layer
+   could not fully cover. Unlike #379's write paths, this would mean abandoning the
+   ADR-0003 cratestack-CRUD-migration for the read side of exactly the three generic models it was
+   built for, to close a gap that produces an empty result, not a policy bypass — a much larger
+   rewrite than the risk (diagnosability, not disclosure) justifies.
+
+If cratestack ever adds a pre-dispatch hook for read policies, revisit option 1 — the two tests named
+above will start failing the moment the underlying compiled-to-SQL behavior changes, since both
+assert the *current* shape (empty/not-found) rather than merely "the caller sees no data."
 
 ### Refresh-token session revocation
 
@@ -293,12 +399,15 @@ capped), or by queuing the request for a human (`pending_review`) — without an
 policy config. Gated at `budget:self-refill`.
 
 `procedure.getMyBudgetRefillLadder` is the read-only companion over
-`RefillService::refill_status`, gated at the same `budget:self-refill` permission: it returns where
-the caller currently sits on the ADR-0008 ladder for `period`, the next rung (`null` at the top
-rung), and the full static ladder — visibility only, no policy evaluation, no reason codes. It
-exists so a UI can show the ladder instead of offering a tier picker; ADR-0008's ladder stays the
-server's decision space (`current_tier.next()` inside `request_refill`), never a caller-supplied
-choice — see converse-frontends#148 for the prior attempt at a picker and why it was rejected.
+`RefillService::refill_status`, gated at the same `budget:self-refill` permission: it returns the
+self-service refill amounts (`allowedAmountsMicros`) currently offered by the active policy —
+visibility only, no policy evaluation, no reason codes. It exists so a UI can render an amount
+picker without hand-maintaining its own copy of the offered set; `requestBudgetRefill`'s
+`requestedAmountMicros` is checked against this same offered set (ADR-0015) — see
+converse-frontends#148 for the prior, pre-ADR-0015 attempt at a tier picker and why it was rejected
+at the time. #387 removed the pre-ADR-0015 `currentTier`/`nextTier`/`ladder` fields this response
+used to also carry, once the frontend that read them switched to `allowedAmountsMicros` and
+deployed.
 
 `procedure.listPendingAugmentationRequests` / `procedure.approveAugmentationRequest` /
 `procedure.rejectAugmentationRequest` are the admin review queue over
@@ -312,31 +421,55 @@ conversation.
 All four procedures are gated only by `@allow(auth() != null)` in the schema, same pattern as the
 rest of the budget domain — the real authorization is entirely the RBAC permission gate.
 
-> **Internal/API-key-client refusal (#191/#216):** `requestBudgetRefill` refuses any caller whose
-> validated token carries the `lightbridge_caller_kind` claim set to `api_key`
-> (`lightbridge_authz_bearer::CALLER_KIND_CLAIM` / `API_KEY_CALLER_KIND`), projected into the
-> `Procedures` layer by `CratestackAuthProvider` as `auth_provider::CALLER_KIND_CONTEXT_KEY`.
-> Absence of the claim is treated as "unknown, not API-key", so ordinary human callers (who never
-> carry it) are unaffected.
+> **No caller-kind check (#419, superseding #191/#216):** `requestBudgetRefill` used to *also*
+> refuse any caller whose validated token carried the `lightbridge_caller_kind` claim set to
+> `api_key` (`lightbridge_authz_bearer::CALLER_KIND_CLAIM` / `API_KEY_CALLER_KIND`), on the theory
+> that this reliably identified — and could exclude — a service-account/API-key caller ("refills
+> are OIDC users only"). #419 deleted that check: it fired on humans, not service accounts.
+> `signing.rs`'s `access_token_extra` — shared by `ApiKeyJwtSigner::sign` (API keys) *and*
+> `oauth2_op::store::TokenExchangeOpStore`'s `handle_token_exchange`/`handle_refresh_token` (the
+> human-plane RFC 8693 exchange, ADR-0011) — stamps this claim on every access token it mints,
+> unconditionally, with no parameter to vary it by caller. So a human's own exchanged token carried
+> it too, and got refused by a message asserting the opposite of what was happening.
 >
-> Coverage differs by `oauth2.type`, investigated at length in #216:
-> - **`self`** (this repo's shipped default — `config/default.yaml`,
->   `.docker/authz/container.yaml`): fully closed. `ApiKeyJwtSigner`
->   (`crates/lightbridge-authz-rest/src/signing.rs`) stamps this claim on every self-signed
->   API-key JWT it mints, unconditionally, so it is present exactly when the caller is
->   API-key-derived.
-> - **`external`**: **not yet closed**. Tokens minted by the upstream IdP's own API-key
->   token-exchange flow do not carry this claim until that flow — outside this repo — is updated
->   to stamp it. Until then, an `external`-mode API-key-derived caller is indistinguishable from a
->   human one at this layer and is **not** refused. This is why #216 stays open even though this
->   change closes its `self`-mode acceptance criterion.
+> The check was also never load-bearing, in either `oauth2.type` mode:
+> - **`self`** (this repo's shipped default): redundant. An API-key JWT carries no roles claim at
+>   all, so `rpc_authorize`/`CratestackAuthProvider` already refuses it for lacking
+>   `budget:self-refill` before this procedure ever runs.
+> - **`external`**: inert. Tokens minted by the upstream IdP's own API-key token-exchange flow
+>   never carried this claim to begin with — the IdP-side flow that would need to stamp it (#216)
+>   was never built, so there was nothing here to close.
 >
-> See `Procedures::request_budget_refill`'s doc comment (`crates/lightbridge-authz-rest/src/lib.rs`)
-> for the code-level detail, and #216 for the full investigation of why no pre-existing claim
-> (`aud` included — this deployment's own `oauth2.audience` config requires every valid token,
-> human or API-key, to carry `lightbridge-api-key`, which is why that particular claim could never
-> have worked as a distinguishing signal) reliably distinguished the two caller kinds before this
-> dedicated claim was added.
+> The service-account exclusion #191 was actually written for is already correctly expressed by
+> the permission gate alone: a service account never performs an OIDC dashboard login, so it never
+> holds a role granting `budget:self-refill` — see `crates/lightbridge-authz-rest/src/lib.rs`'s
+> `Procedures::request_budget_refill` doc comment for the code-level detail, and
+> `crates/lightbridge-authz-rest/tests/token_exchange_tests.rs`'s
+> `request_refill_accepts_a_real_human_plane_token_that_still_carries_the_stale_api_key_signal`
+> for the regression coverage — minted through the real signing path, not a hand-built context —
+> that would have caught this before it shipped.
+
+**Machine (`client_credentials`) callers hold no permissions at all (ADR-0030, #534).** A THIRD
+`lightbridge_caller_kind` value, `service` (`lightbridge_authz_bearer::SERVICE_CALLER_KIND`), marks
+an `authz-idp` `client_credentials` (M2M) access token — distinct from the absent-claim (human)
+and `api_key` cases the `#419` note above walks through. Unlike the `api_key` case, this is not
+something any procedure needs its own explicit check for: a `client_credentials` token mints NO
+`roles` claim at all (`signing::service_token_extra` never stamps one), so `TokenInfo::permissions`
+resolves to an empty `PermissionSet` the same way any other zero-roles caller's does, and every
+`@allow`/`@@allow` clause on the RPC surface denies it — not only `requestBudgetRefill`. See
+ADR-0030 Decision 6 and
+`crates/lightbridge-authz-bearer/tests/token_validation_tests.rs`'s
+`client_credentials_style_token_has_no_roles_and_zero_permissions_for_every_permission` for the
+direct proof against every `Permission` this service defines. **In deployed environments (prod:
+`ai-helm-values`), the zero-permissions property above is exactly what protects the RPC surface**:
+`authz-api`/`authz-budget` there validate against `authz-idp`'s own JWKS (the owner's platform
+rule -- every authz resource server validates against `authz-idp`, which alone brokers the
+Keycloak login leg), so a real `client_credentials` token DOES reach this RBAC check, and IS
+refused by it. **Only in the LOCAL compose stack** does the token never reach this check at all: it
+is rejected earlier, at signature validation, because `.docker/authz/container.yaml`/
+`config/default.yaml` still point `oauth2.jwks_url` directly at Keycloak -- a local-dev drift never
+migrated when ADR-0023 made `authz-idp` the full IdP, tracked separately (see
+`docs/local-testing.md` and ADR-0030 Decision 6), not the platform's actual posture.
 
 **Role grant (#294):** `lightbridge-editor` holds `budget:self-refill` in the shipped configs
 (`config/default.yaml`, `.docker/authz/container.yaml`) — a caller with any budget role can
@@ -430,6 +563,15 @@ wildcard, exactly as already advised for the existing resources.
 - `model.Account.delete` — the generic delete verb carries no `@@allow` at all and is denied here
   too. Account deletion is `procedure.deleteAccountPermanently` only, whose SQL check is simply "the
   caller is this account".
+- `model.Account.update` (#398, completing #379) — #379 marked `Account.defaultQuota`, the verb's
+  only settable field, `@readonly`, leaving it with zero writable fields; every call 422ed
+  unconditionally, for every caller, regardless of permission — a live endpoint that could only
+  ever fail. The schema's `@@allow("update")` was removed alongside this, so the op-id is now
+  fail-closed at both layers, same as `model.ApiKey.create` above. Account default-quota updates
+  go exclusively through `procedure.updateAccountDefaultQuota`, and account renames through
+  `procedure.updateAccountName`. `Account.name` was added `@readonly` for exactly this reason
+  rather than resurrecting the removed verb to carry it — both procedures sit behind the same
+  `account:update` permission, so nothing was widened to make room for the new field.
 - `model.ProjectMember.*` — that model is policy-locked to read-only with no generated mutation
   verbs; roster changes go through the `addProjectMember` / `removeProjectMember` /
   `setProjectMemberRole` / `setProjectMemberQuotaTier` procedures, which enforce the lead check in
@@ -449,6 +591,13 @@ enforcement; see "Batch RPC: per-frame RBAC" above.
 > API key must now carry an expiry (no more nullable "never expires"), and before this change
 > `model.ApiKey.update` was a live, unvalidated bypass for it — a caller could set `expiresAt` to
 > anything, including explicit `null`, with no cap and no procedure in the path.
+
+> **Approaching-expiry visibility (lightbridge-authz#436).** `procedure.listMyExpiringApiKeys`
+> (`apikey:read`, same permission as the two read verbs above) returns the caller's own active,
+> not-yet-expired keys landing inside a configurable "soon" window, aggregated across every
+> project the caller can already see — not one project at a time the way the self-service UI's
+> list view is. See `docs/api-key-expiry-visibility.md` for the window/threshold and why it has no
+> cross-tenant admin counterpart.
 
 The OPA validation endpoints (introspection / `/idp/v1/resolve-context`) are protected by Basic
 auth, not JWT, so they are outside RBAC; the equivalent MCP validation tools (which run behind JWT)

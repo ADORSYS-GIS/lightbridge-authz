@@ -21,9 +21,33 @@ use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
 use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::authz::{Permission, PermissionSet};
 use lightbridge_authz_core::config::{Oauth2, Oauth2Type};
+use lightbridge_authz_core::identity::AccountId;
+use lightbridge_authz_rest::auth_provider::SubjectResolver;
 use serde::Serialize;
 use serde_json::Value;
+use std::sync::Arc;
 use tower::ServiceExt;
+
+/// A trust-everything [`SubjectResolver`] test double (ADR-0025): resolves any `(iss, sub)` to
+/// `AccountId::assert_already_resolved(sub)` unconditionally, never touching a database. Correct for every
+/// test that is not itself about resolver behavior (those live in `idp_server_tests.rs`'s own
+/// `federated_subject_resolution_tests.rs`-style coverage instead).
+pub struct TrustEverythingResolver;
+
+#[async_trait]
+impl SubjectResolver for TrustEverythingResolver {
+    async fn resolve(
+        &self,
+        _iss: &str,
+        sub: &str,
+    ) -> lightbridge_authz_core::error::Result<AccountId> {
+        Ok(AccountId::assert_already_resolved(sub))
+    }
+}
+
+pub fn test_resolver() -> Arc<dyn SubjectResolver> {
+    Arc::new(TrustEverythingResolver)
+}
 
 /// A bearer service that maps a token *string* to a preconfigured [`TokenInfo`], so a single router
 /// can serve several identities (admin / viewer / editor) just by varying the `Authorization`
@@ -62,6 +86,7 @@ pub fn token_info(subject: &str, perms: PermissionSet) -> TokenInfo {
     TokenInfo {
         active: true,
         sub: subject.to_owned(),
+        iss: "https://keycloak.example.test/realms/dev".to_string(),
         exp: 0,
         aud: vec![],
         roles: vec![],
@@ -72,9 +97,12 @@ pub fn token_info(subject: &str, perms: PermissionSet) -> TokenInfo {
 }
 
 /// Like [`token_info`], but stamped with [`lightbridge_authz_bearer::API_KEY_CALLER_KIND`], as an
-/// `oauth2.type: self` self-signed API-key JWT would be (see `ApiKeyClaims` in
-/// `lightbridge-authz-rest::signing`). Used to exercise the caller-kind refusal in
-/// `requestBudgetRefill` (#191/#216).
+/// `oauth2.type: self` self-signed API-key JWT -- and, per #419, every human-plane RFC 8693
+/// exchange token too -- would be (see `access_token_extra` in `lightbridge-authz-rest::signing`).
+/// `requestBudgetRefill` no longer refuses a caller for carrying this signal (#191/#216's gate
+/// was deleted by #419: it fired on humans, and was never load-bearing for service accounts to
+/// begin with -- see that PR's description). Kept for tests that want to prove a specific caller
+/// is served or refused independent of this signal.
 pub fn api_key_token_info(subject: &str, perms: PermissionSet) -> TokenInfo {
     TokenInfo {
         caller_kind: Some(lightbridge_authz_bearer::API_KEY_CALLER_KIND.to_owned()),
@@ -113,8 +141,13 @@ pub fn external_oauth2() -> Oauth2 {
         audience: None,
         signing: None,
         token_exchange: None,
+        relying_party: None,
         rbac: Default::default(),
         clients: Vec::new(),
+        federation: Some(lightbridge_authz_core::config::Federation {
+            issuer: "https://keycloak.example.test/realms/dev".to_string(),
+            discovery_url: None,
+        }),
     }
 }
 

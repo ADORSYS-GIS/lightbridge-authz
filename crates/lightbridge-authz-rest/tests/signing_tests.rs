@@ -7,7 +7,11 @@
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use lightbridge_authz_core::config::JwtSigning;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
-use lightbridge_authz_rest::signing::{ApiKeyJwtSigner, capped_expiry, generate_rs256_key};
+use lightbridge_authz_core::identity::AccountId;
+use lightbridge_authz_rest::signing::{
+    ApiKeyJwtSigner, ClientAuthenticationMetadata, DiscoveryCapabilities, capped_expiry,
+    generate_rs256_key,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
@@ -20,6 +24,7 @@ fn signing_cfg(ttl: i64) -> JwtSigning {
         audience: Some("lightbridge-api-key".to_string()),
         ttl_seconds: ttl,
         max_key_age_days: 30,
+        claim_mappers: Vec::new(),
     }
 }
 
@@ -108,16 +113,22 @@ async fn well_known_serves_cors_headers() {
     use lightbridge_authz_rest::signing::well_known_router;
     use tower::ServiceExt;
 
-    let response = well_known_router::<()>(ISSUER, lazy_repo(), None, false)
-        .oneshot(
-            Request::builder()
-                .uri("/.well-known/openid-configuration")
-                .header(header::ORIGIN, "https://example.com")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = well_known_router::<()>(
+        ISSUER,
+        lazy_repo(),
+        None,
+        ClientAuthenticationMetadata::default(),
+        DiscoveryCapabilities::default(),
+    )
+    .oneshot(
+        Request::builder()
+            .uri("/.well-known/openid-configuration")
+            .header(header::ORIGIN, "https://example.com")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         response
@@ -136,15 +147,21 @@ async fn jwks_endpoint_returns_server_error_when_repo_is_unreachable() {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    let response = well_known_router::<()>(ISSUER, lazy_repo(), None, false)
-        .oneshot(
-            Request::builder()
-                .uri("/.well-known/jwks.json")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = well_known_router::<()>(
+        ISSUER,
+        lazy_repo(),
+        None,
+        ClientAuthenticationMetadata::default(),
+        DiscoveryCapabilities::default(),
+    )
+    .oneshot(
+        Request::builder()
+            .uri("/.well-known/jwks.json")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -226,10 +243,12 @@ fn at_hash_changes_with_the_access_token() {
 /// values must stay in lockstep with what `token_exchange::TOKEN_EXCHANGE_GRANT`/
 /// `REFRESH_TOKEN_GRANT` and `handle_token`'s real dispatch accept (see `token_exchange.rs`), not
 /// just "non-empty". `response_types_supported` is asserted empty here too, not merely omitted
-/// from this list -- see `discovery_never_advertises_response_types_or_modes` below for why that
-/// must hold regardless of the token-exchange gate, and for the regression this guards (this
-/// service served `["token", "id_token", "id_token token"]` here in production once token-exchange
-/// was enabled, claiming an authorization endpoint that has never existed).
+/// from this list -- see `discovery_advertises_response_types_and_modes_only_for_the_mounted_authorize_route`
+/// below for why that must hold when the `authorization_endpoint` capability isn't part of the
+/// `DiscoveryCapabilities` this test constructs (`token_surface()`, no `with_authorization_code()`),
+/// and for the regression this guards (this service served `["token", "id_token", "id_token
+/// token"]` here in production once token-exchange was enabled, claiming an authorization endpoint
+/// that has never existed).
 #[tokio::test]
 async fn discovery_advertises_exact_token_exchange_metadata_when_enabled() {
     use axum::body::{Body, to_bytes};
@@ -244,15 +263,21 @@ async fn discovery_advertises_exact_token_exchange_metadata_when_enabled() {
         "email".to_string(),
         "offline_access".to_string(),
     ];
-    let discovery = well_known_router::<()>(ISSUER, lazy_repo(), Some(scopes), false)
-        .oneshot(
-            Request::builder()
-                .uri("/.well-known/openid-configuration")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let discovery = well_known_router::<()>(
+        ISSUER,
+        lazy_repo(),
+        Some(scopes),
+        ClientAuthenticationMetadata::public_client(),
+        DiscoveryCapabilities::token_surface(),
+    )
+    .oneshot(
+        Request::builder()
+            .uri("/.well-known/openid-configuration")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(discovery.status(), StatusCode::OK);
     let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
     let payload: Value = serde_json::from_slice(&body).unwrap();
@@ -262,20 +287,23 @@ async fn discovery_advertises_exact_token_exchange_metadata_when_enabled() {
         json!([
             "urn:ietf:params:oauth:grant-type:token-exchange",
             "refresh_token",
+            "client_credentials",
         ]),
-        "grant_types_supported must exactly match what handle_token dispatches: {payload}"
+        "grant_types_supported must exactly match what handle_token dispatches, plus \
+         client_credentials -- advertised unconditionally alongside the token surface since #534 \
+         (ADR-0030), regardless of whether any oauth2.clients entry is configured for it: {payload}"
     );
     assert_eq!(
         payload["scopes_supported"],
         json!(["openid", "profile", "email", "offline_access"]),
         "scopes_supported must exactly match oauth2.token_exchange.allowed_scopes: {payload}"
     );
-    assert_eq!(
-        payload["response_types_supported"],
-        json!([]),
-        "response_types_supported describes the AUTHORIZATION endpoint (OIDC Discovery 1.0 §3), \
-         which this service never serves, on or off -- token-exchange is a direct token-endpoint \
-         grant (RFC 8693), not a redirect-based response_type negotiation: {payload}"
+    assert!(
+        payload.get("response_types_supported").is_none(),
+        "response_types_supported must be omitted when this DiscoveryCapabilities value doesn't \
+         set with_authorization_code() -- authz-idp's own production capabilities \
+         (DiscoveryCapabilities::full_idp()) always sets it, but well_known_router stays generic \
+         over other callers that mount less: {payload}"
     );
     assert_eq!(
         payload["token_endpoint"],
@@ -287,6 +315,121 @@ async fn discovery_advertises_exact_token_exchange_metadata_when_enabled() {
         json!(["none"]),
         "must never advertise client_secret_basic/client_secret_post (ADR-0011 Decision 6): {payload}"
     );
+    assert_eq!(
+        payload["revocation_endpoint"],
+        format!("{ISSUER}/oauth2/revoke"),
+        "RFC 7009 revocation is mounted with the token surface and must be advertised: {payload}"
+    );
+}
+
+#[tokio::test]
+async fn oidc_and_oauth_metadata_use_their_distinct_issuer_path_rules() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use lightbridge_authz_rest::signing::well_known_router;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    let issuer = "https://authz.example.test/issuer/acme/";
+    let router = well_known_router::<()>(
+        issuer,
+        lazy_repo(),
+        Some(vec!["openid".to_string(), "offline_access".to_string()]),
+        ClientAuthenticationMetadata::default(),
+        DiscoveryCapabilities::token_surface()
+            .with_device_authorization()
+            .with_authorization_code(),
+    );
+    let oidc = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/issuer/acme/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let oauth = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/oauth-authorization-server/issuer/acme")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(oidc.status(), StatusCode::OK);
+    assert_eq!(oauth.status(), StatusCode::OK);
+    let oidc: Value =
+        serde_json::from_slice(&to_bytes(oidc.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let oauth: Value =
+        serde_json::from_slice(&to_bytes(oauth.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        oidc, oauth,
+        "both metadata locations describe the same issuer"
+    );
+    assert_eq!(oauth["issuer"], issuer);
+    assert_eq!(
+        oauth["jwks_uri"],
+        "https://authz.example.test/.well-known/jwks.json"
+    );
+    assert_eq!(
+        oauth["token_endpoint"],
+        "https://authz.example.test/oauth2/token"
+    );
+    assert_eq!(
+        oauth["revocation_endpoint"],
+        "https://authz.example.test/oauth2/revoke"
+    );
+    assert_eq!(
+        oauth["device_authorization_endpoint"],
+        "https://authz.example.test/oauth2/device_authorization",
+        "the issuer path selects the metadata path, not an unmounted protocol-route prefix"
+    );
+    assert_eq!(
+        oauth["authorization_endpoint"], "https://authz.example.test/authorize",
+        "the issuer path selects the metadata path, not an unmounted protocol-route prefix"
+    );
+
+    let jwks = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/jwks.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        jwks.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the metadata must advertise the mounted JWKS path; this deliberately offline repo proves routing before the handler reaches its database"
+    );
+
+    let root = well_known_router::<()>(
+        ISSUER,
+        lazy_repo(),
+        Some(vec!["openid".to_string()]),
+        ClientAuthenticationMetadata::default(),
+        DiscoveryCapabilities::token_surface(),
+    )
+    .oneshot(
+        Request::builder()
+            .uri("/.well-known/oauth-authorization-server")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        root.status(),
+        StatusCode::OK,
+        "root issuers use the root RFC 8414 path"
+    );
 }
 
 /// Companion to the "enabled" case above: when token-exchange is off (`token_exchange_scopes` is
@@ -297,13 +440,19 @@ async fn discovery_advertises_exact_token_exchange_metadata_when_enabled() {
 /// see `discovery_document`'s doc comment for why that would be inventing a capability.
 ///
 /// Also proves the other half of the same design point: `well_known_router` is only mounted at all
-/// when `oauth2.type: self` + `oauth2.signing` are configured (see call site in `lib.rs`), which
-/// makes this service an OIDC *issuer* independent of whether the token-exchange grant is enabled
+/// when `oauth2.type: self` + `oauth2.signing` are configured (see call site in `lib.rs`). Since
+/// ADR-0023 that `type:self` gate lives exclusively in `start_idp_server` -- `build_idp_router`
+/// itself no longer branches on it, it merges `well_known_router` unconditionally, so the gate is
+/// a startup-refusal decision, not a router-assembly one. This makes this service an OIDC
+/// *issuer* independent of whether the token-exchange grant is enabled
 /// -- `ApiKeyJwtSigner` mints self-signed API-key JWTs through that path regardless. So the
-/// issuer-identity fields (`issuer`, `jwks_uri`, `subject_types_supported`,
-/// `id_token_signing_alg_values_supported`) must stay populated even with token-exchange disabled;
-/// only the grant-surface fields (`grant_types_supported`, `scopes_supported`, `token_endpoint`)
-/// go empty/absent. Two independent gates, not one flag driving everything.
+/// issuer-identity fields that don't depend on OIDC ID tokens specifically (`issuer`, `jwks_uri`)
+/// stay populated even with token-exchange disabled; the OIDC-specific fields
+/// (`subject_types_supported`, `id_token_signing_alg_values_supported`) are gated on
+/// `oidc_tokens_supported` in `discovery_document` -- token-exchange enabled *and* `openid` present
+/// in the configured scopes -- and go empty/absent here alongside the rest of the grant-surface
+/// fields (`grant_types_supported`, `scopes_supported`, `token_endpoint`) precisely because this
+/// test disables token-exchange entirely. Two independent gates, not one flag driving everything.
 #[tokio::test]
 async fn discovery_advertises_no_grants_when_exchange_disabled() {
     use axum::body::{Body, to_bytes};
@@ -312,40 +461,41 @@ async fn discovery_advertises_no_grants_when_exchange_disabled() {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    let discovery = well_known_router::<()>(ISSUER, lazy_repo(), None, false)
-        .oneshot(
-            Request::builder()
-                .uri("/.well-known/openid-configuration")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let discovery = well_known_router::<()>(
+        ISSUER,
+        lazy_repo(),
+        None,
+        ClientAuthenticationMetadata::default(),
+        DiscoveryCapabilities::default(),
+    )
+    .oneshot(
+        Request::builder()
+            .uri("/.well-known/openid-configuration")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(discovery.status(), StatusCode::OK);
     let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
     let payload: Value = serde_json::from_slice(&body).unwrap();
-    assert!(
-        payload["grant_types_supported"]
-            .as_array()
-            .unwrap()
-            .is_empty(),
-        "no grants must be advertised when token-exchange is disabled: {payload}"
-    );
-    assert!(
-        payload["response_types_supported"]
-            .as_array()
-            .unwrap()
-            .is_empty(),
-        "no response types must be advertised when token-exchange is disabled: {payload}"
-    );
-    assert!(
-        payload["scopes_supported"].as_array().unwrap().is_empty(),
-        "no scopes must be advertised when token-exchange is disabled: {payload}"
-    );
-    assert!(
-        payload.get("token_endpoint").is_none(),
-        "token_endpoint must stay absent when token-exchange is disabled: {payload}"
-    );
+    for field in [
+        "grant_types_supported",
+        "response_types_supported",
+        "response_modes_supported",
+        "scopes_supported",
+        "token_endpoint",
+        "revocation_endpoint",
+        "token_endpoint_auth_methods_supported",
+        "revocation_endpoint_auth_methods_supported",
+        "subject_types_supported",
+        "id_token_signing_alg_values_supported",
+    ] {
+        assert!(
+            payload.get(field).is_none(),
+            "{field} must be omitted when its capability is not mounted: {payload}"
+        );
+    }
 
     assert_eq!(
         payload["issuer"], ISSUER,
@@ -356,17 +506,6 @@ async fn discovery_advertises_no_grants_when_exchange_disabled() {
         format!("{ISSUER}/.well-known/jwks.json"),
         "JWKS is served whenever signing is configured, whether or not token-exchange is enabled \
          -- ApiKeyJwtSigner mints self-signed API-key JWTs through this path regardless: {payload}"
-    );
-    assert_eq!(
-        payload["subject_types_supported"],
-        serde_json::json!(["public"]),
-        "subject type is an issuer property, not a token-exchange one: {payload}"
-    );
-    assert_eq!(
-        payload["id_token_signing_alg_values_supported"],
-        serde_json::json!(["RS256"]),
-        "the signing algorithm is fixed by this deployment's key material, not by whether \
-         token-exchange is enabled: {payload}"
     );
 }
 
@@ -389,15 +528,21 @@ async fn discovery_omits_token_endpoint_when_exchange_disabled() {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    let discovery = well_known_router::<()>(ISSUER, lazy_repo(), None, false)
-        .oneshot(
-            Request::builder()
-                .uri("/.well-known/openid-configuration")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let discovery = well_known_router::<()>(
+        ISSUER,
+        lazy_repo(),
+        None,
+        ClientAuthenticationMetadata::default(),
+        DiscoveryCapabilities::default(),
+    )
+    .oneshot(
+        Request::builder()
+            .uri("/.well-known/openid-configuration")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(discovery.status(), StatusCode::OK);
     let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
     let payload: Value = serde_json::from_slice(&body).unwrap();
@@ -408,7 +553,9 @@ async fn discovery_omits_token_endpoint_when_exchange_disabled() {
     );
     assert!(
         payload.get("authorization_endpoint").is_none(),
-        "authorization_endpoint must always be absent -- this service never serves /authorize: {payload}"
+        "authorization_endpoint must be absent when the capability is not mounted; authz-idp \
+         always mounts it (DiscoveryCapabilities::full_idp()) -- this test's DiscoveryCapabilities \
+         value (::default()) simply doesn't set with_authorization_code(): {payload}"
     );
 }
 
@@ -423,7 +570,127 @@ async fn discovery_advertises_private_key_jwt_only_when_a_confidential_client_is
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
-    let discovery = well_known_router::<()>(ISSUER, lazy_repo(), None, true)
+    let discovery = well_known_router::<()>(
+        ISSUER,
+        lazy_repo(),
+        Some(vec!["openid".to_string()]),
+        ClientAuthenticationMetadata::private_key_jwt(vec!["RS256".to_string()]),
+        DiscoveryCapabilities::token_surface(),
+    )
+    .oneshot(
+        Request::builder()
+            .uri("/.well-known/openid-configuration")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(discovery.status(), StatusCode::OK);
+    let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    let methods = payload["token_endpoint_auth_methods_supported"]
+        .as_array()
+        .unwrap();
+    assert!(methods.contains(&json!("private_key_jwt")));
+    assert!(!methods.contains(&json!("none")));
+    assert_eq!(
+        payload["token_endpoint_auth_signing_alg_values_supported"],
+        json!(["RS256"]),
+        "private_key_jwt requires its supported signing algorithms in metadata: {payload}"
+    );
+    assert!(
+        !methods.contains(&json!("client_secret_basic"))
+            && !methods.contains(&json!("client_secret_post")),
+        "must never advertise secret-based client auth, confidential clients or not: {payload}"
+    );
+}
+
+/// Regression guard for the capability gates in ADR-0019 Decision 5 and #426. This test used to
+/// prove that `response_types_supported` and `response_modes_supported` remained absent because
+/// `/authorize` did not exist. That premise changed when the persisted authorization-code route
+/// shipped; its purpose did not. The document must advertise `code` and `query` only when the
+/// `DiscoveryCapabilities` value passed to `well_known_router` sets `with_authorization_code()`,
+/// never merely because token exchange, a client entry, or the device route exists. The device
+/// grant gets the same independent route gate.
+///
+/// Renamed from `discovery_never_advertises_response_types_or_modes`: since ADR-0023,
+/// `authz-idp`'s own production call site (`build_idp_router`) always passes
+/// `DiscoveryCapabilities::full_idp()`, so it always hits the authorization-code row now -- "never"
+/// stopped being true for that caller. `well_known_router` itself stays generic: the other rows
+/// checked below (disabled/token-only/device-only) still guard its OTHER callers/uses (this test
+/// file's own lower-level unit tests above, which construct narrower `DiscoveryCapabilities`
+/// values directly) -- this is a property of the function, not a claim about what `authz-idp`
+/// itself ships.
+///
+/// Checking disabled, token-only, device-only, and authorization-code-only route combinations is
+/// deliberate. A prior production regression made response types appear when an unrelated
+/// token-exchange flag changed; a one-state test would let that coupling return.
+#[tokio::test]
+async fn discovery_advertises_response_types_and_modes_only_for_the_mounted_authorize_route() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use lightbridge_authz_rest::signing::well_known_router;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    for (label, scopes, capabilities, expected) in [
+        (
+            "disabled",
+            None,
+            DiscoveryCapabilities::default(),
+            serde_json::json!({}),
+        ),
+        (
+            "token-only",
+            Some(vec!["openid".to_string(), "offline_access".to_string()]),
+            DiscoveryCapabilities::token_surface(),
+            serde_json::json!({
+                "grant_types_supported": [
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                    "refresh_token",
+                    "client_credentials"
+                ]
+            }),
+        ),
+        (
+            "device-only",
+            Some(vec!["openid".to_string(), "offline_access".to_string()]),
+            DiscoveryCapabilities::token_surface().with_device_authorization(),
+            serde_json::json!({
+                "device_authorization_endpoint": format!("{ISSUER}/oauth2/device_authorization"),
+                "grant_types_supported": [
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                    "refresh_token",
+                    "client_credentials",
+                    "urn:ietf:params:oauth:grant-type:device_code"
+                ]
+            }),
+        ),
+        (
+            "authorization-code-only",
+            Some(vec!["openid".to_string(), "offline_access".to_string()]),
+            DiscoveryCapabilities::token_surface().with_authorization_code(),
+            serde_json::json!({
+                "authorization_endpoint": format!("{ISSUER}/authorize"),
+                "grant_types_supported": [
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                    "refresh_token",
+                    "client_credentials",
+                    "authorization_code"
+                ],
+                "response_types_supported": ["code"],
+                "response_modes_supported": ["query"],
+                "code_challenge_methods_supported": ["S256"]
+            }),
+        ),
+    ] {
+        let discovery = well_known_router::<()>(
+            ISSUER,
+            lazy_repo(),
+            scopes,
+            ClientAuthenticationMetadata::default(),
+            capabilities,
+        )
         .oneshot(
             Request::builder()
                 .uri("/.well-known/openid-configuration")
@@ -432,85 +699,51 @@ async fn discovery_advertises_private_key_jwt_only_when_a_confidential_client_is
         )
         .await
         .unwrap();
-    assert_eq!(discovery.status(), StatusCode::OK);
-    let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
-    let payload: Value = serde_json::from_slice(&body).unwrap();
-    let methods = payload["token_endpoint_auth_methods_supported"]
-        .as_array()
-        .unwrap();
-    assert!(methods.contains(&json!("none")));
-    assert!(methods.contains(&json!("private_key_jwt")));
-    assert!(
-        !methods.contains(&json!("client_secret_basic"))
-            && !methods.contains(&json!("client_secret_post")),
-        "must never advertise secret-based client auth, confidential clients or not: {payload}"
-    );
-}
-
-/// This service never serves `/authorize` (ADR-0011, Context) regardless of whether
-/// `oauth2.token_exchange.enabled` is on: token-exchange is a direct token-endpoint grant
-/// (RFC 8693), not a redirect-based authorization flow. `response_types_supported` and
-/// `response_modes_supported` describe the authorization endpoint (OIDC Discovery 1.0 §3 --
-/// `response_types_supported` is REQUIRED to be present as a JSON array, but the spec's
-/// "MUST support code/id_token/id_token token" clause binds only "Dynamic OpenID Providers",
-/// meaning ones that also advertise a `registration_endpoint`; this deployment has none, so an
-/// empty array is spec-compliant, not merely tidy). So both must stay empty/absent on *both*
-/// sides of the token-exchange gate -- unlike `grant_types_supported`/`scopes_supported`/
-/// `token_endpoint`, which correctly describe the token-endpoint grant surface and are gated on
-/// it. Checked against both states in one test specifically because the enabled/disabled tests
-/// above each only prove one side; a gate wired to the wrong field (as `response_types_supported`
-/// was before this test was added -- it flipped to `["token", "id_token", "id_token token"]`
-/// purely because `oauth2.token_exchange.enabled` went from `false` to `true` in production) would
-/// still pass a test that only checks one state.
-#[tokio::test]
-async fn discovery_never_advertises_response_types_or_modes() {
-    use axum::body::{Body, to_bytes};
-    use axum::http::{Request, StatusCode};
-    use lightbridge_authz_rest::signing::well_known_router;
-    use serde_json::Value;
-    use tower::ServiceExt;
-
-    for (label, scopes) in [
-        ("disabled", None),
-        (
-            "enabled",
-            Some(vec!["openid".to_string(), "offline_access".to_string()]),
-        ),
-    ] {
-        let discovery = well_known_router::<()>(ISSUER, lazy_repo(), scopes, false)
-            .oneshot(
-                Request::builder()
-                    .uri("/.well-known/openid-configuration")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
         assert_eq!(discovery.status(), StatusCode::OK);
         let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
         let payload: Value = serde_json::from_slice(&body).unwrap();
 
-        assert!(
-            payload["response_types_supported"]
-                .as_array()
-                .unwrap()
-                .is_empty(),
-            "[{label}] no authorization endpoint exists in this deployment -- \
-             response_types_supported must stay empty: {payload}"
-        );
-        assert!(
-            payload["response_modes_supported"]
-                .as_array()
-                .unwrap()
-                .is_empty(),
-            "[{label}] no redirect-based flow is ever served -- response_modes_supported must \
-             stay empty: {payload}"
-        );
-        assert!(
-            payload.get("authorization_endpoint").is_none(),
-            "[{label}] authorization_endpoint must stay absent: {payload}"
-        );
+        for field in [
+            "authorization_endpoint",
+            "device_authorization_endpoint",
+            "grant_types_supported",
+            "response_types_supported",
+            "response_modes_supported",
+            "code_challenge_methods_supported",
+        ] {
+            match expected.get(field) {
+                Some(value) => assert_eq!(
+                    payload.get(field),
+                    Some(value),
+                    "[{label}] {field} must describe the mounted route: {payload}"
+                ),
+                None => assert!(
+                    payload.get(field).is_none(),
+                    "[{label}] {field} must stay absent when its route is not mounted: {payload}"
+                ),
+            }
+        }
     }
+}
+
+/// `DiscoveryCapabilities::full_idp()` (Step 1, ADR-0023) must stay exactly equivalent to chaining
+/// its three named constructors by hand -- it exists as a documented shorthand for that chain, not
+/// a separately-maintained set of flags that could silently drift from it.
+///
+/// Prove-fail-first (recorded verbatim in the PR body): temporarily dropped
+/// `.with_authorization_code()` from `full_idp()` and reran -- this test failed on
+/// `authorization_endpoint` (`true` vs `false`). Restored it.
+#[test]
+fn full_idp_capabilities_match_the_chained_constructors() {
+    assert_eq!(
+        format!("{:?}", DiscoveryCapabilities::full_idp()),
+        format!(
+            "{:?}",
+            DiscoveryCapabilities::token_surface()
+                .with_device_authorization()
+                .with_authorization_code()
+        )
+    );
 }
 
 #[cfg(feature = "it-tests")]
@@ -541,6 +774,8 @@ mod db {
         allowed_models: Option<Vec<String>>,
         email: Option<String>,
         email_verified: Option<bool>,
+        name: Option<String>,
+        preferred_username: Option<String>,
         typ: Option<String>,
         scope: Option<String>,
         #[serde(rename = "lightbridge_caller_kind")]
@@ -679,8 +914,11 @@ mod db {
         let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
         let owner = KeyOwner {
             subject: "kc-user-123".to_string(),
+            account_id: "kc-user-123".to_string(),
             email: Some("dev@example.test".to_string()),
             email_verified: Some(true),
+            preferred_username: Some("dev".to_string()),
+            name: Some("Dev User".to_string()),
         };
         let signed = signer
             .sign(
@@ -703,6 +941,8 @@ mod db {
         assert_eq!(claims.account_id, "acct_1");
         assert_eq!(claims.email.as_deref(), Some("dev@example.test"));
         assert_eq!(claims.email_verified, Some(true));
+        assert_eq!(claims.preferred_username.as_deref(), Some("dev"));
+        assert_eq!(claims.name.as_deref(), Some("Dev User"));
         assert_eq!(claims.typ.as_deref(), Some("Bearer"));
         assert_eq!(claims.scope.as_deref(), Some("profile email"));
         assert_eq!(
@@ -715,6 +955,187 @@ mod db {
         assert_eq!(
             claims.caller_kind.as_deref(),
             Some(lightbridge_authz_bearer::API_KEY_CALLER_KIND)
+        );
+    }
+
+    /// Companion to `signer_signs_verifiable_against_active_jwk`: an owner with no
+    /// `name`/`preferred_username` (the shape of every login before this claim propagation fix,
+    /// and still the shape of any login for a subject Keycloak never gave one) must mint a token
+    /// that OMITS both claims entirely -- never an empty-string placeholder. Asserted against the
+    /// raw wire JSON (`decode_untyped`), not the typed `ApiKeyClaims` struct: a typed
+    /// `Option<String>` field would read back `None` for both "claim absent" and "claim present
+    /// but empty string", so only the untyped claim set actually distinguishes them.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn absent_profile_claims_are_omitted_not_minted_as_empty_strings(pool: PgPool) {
+        let repo = repo(pool);
+        bootstrap_signing_key(&repo, &signing_cfg(3600))
+            .await
+            .unwrap();
+        let active = repo.get_active_signing_key().await.unwrap().unwrap();
+
+        let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
+        let owner = KeyOwner {
+            subject: "kc-user-no-profile".to_string(),
+            account_id: "kc-user-no-profile".to_string(),
+            email: None,
+            email_verified: None,
+            preferred_username: None,
+            name: None,
+        };
+        let signed = signer
+            .sign(&owner, "key_1", "proj_1", "acct_1", None, Utc::now(), None)
+            .await
+            .unwrap();
+
+        let claims = decode_untyped(&active.public_jwk, &signed.token);
+        let body = claims.as_object().unwrap();
+        assert!(
+            !body.contains_key("name"),
+            "name must be omitted, not minted as null/empty, when the owner carries none: {body:?}"
+        );
+        assert!(
+            !body.contains_key("preferred_username"),
+            "preferred_username must be omitted, not minted as null/empty, when the owner \
+             carries none: {body:?}"
+        );
+    }
+
+    /// ADR-0025 Stage 3: the minted `sub` comes from `KeyOwner::account_id` (the resolved acting
+    /// account id), never `KeyOwner::subject` (the raw upstream claim, kept only as a log/email
+    /// surface) -- the two are deliberately DIFFERENT strings here so a signer that still minted
+    /// from `subject` could not pass this test by coincidence.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn minted_sub_is_the_acting_account_id_not_the_upstream_subject(pool: PgPool) {
+        let repo = repo(pool);
+        bootstrap_signing_key(&repo, &signing_cfg(3600))
+            .await
+            .unwrap();
+        let active = repo.get_active_signing_key().await.unwrap().unwrap();
+
+        let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
+        let owner = KeyOwner {
+            subject: "kc-raw-upstream-sub".to_string(),
+            account_id: "resolved-acting-account".to_string(),
+            email: None,
+            email_verified: None,
+            ..Default::default()
+        };
+        let signed = signer
+            .sign(&owner, "key_1", "proj_1", "acct_1", None, Utc::now(), None)
+            .await
+            .unwrap();
+
+        let claims = verify_against(&active.public_jwk, &signed.token);
+        assert_eq!(
+            claims.sub, "resolved-acting-account",
+            "sub must be minted from KeyOwner::account_id"
+        );
+        assert_ne!(
+            claims.sub, "kc-raw-upstream-sub",
+            "sub must NEVER be the raw upstream KeyOwner::subject claim"
+        );
+    }
+
+    /// THE wire-invariance test (ADR-0025 Stages 1-3's central promise): for a grandfathered
+    /// account -- `accounts.id == subject`, the pre-ADR-0024 property every existing account
+    /// still has -- the minted token's `sub` is BYTE-IDENTICAL to what a pre-Stage-3 signer would
+    /// have produced, because `KeyOwner::account_id` (Stage 3's new source for `sub`) is, for a
+    /// grandfathered account, always equal to `KeyOwner::subject` (Stage 3's old source). This is
+    /// not an accident of these two particular test fixtures agreeing -- it is the actual
+    /// invariant `StoreRepo::resolve_account_for_federated_subject`'s grandfather branch
+    /// guarantees for every subject presented by the deployment's one configured
+    /// `oauth2.federation.issuer`. Asserted against `owner.subject` directly (not a hardcoded
+    /// literal) so this test fails if the two fields are ever seeded to differ by mistake, not
+    /// only if the signer's own wiring regresses.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn grandfathered_account_mints_a_byte_identical_sub_to_the_pre_stage_3_signer(
+        pool: PgPool,
+    ) {
+        let repo = repo(pool);
+        bootstrap_signing_key(&repo, &signing_cfg(3600))
+            .await
+            .unwrap();
+        let active = repo.get_active_signing_key().await.unwrap().unwrap();
+
+        let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
+        let grandfathered_id = "grandfathered-acct-42".to_string();
+        let owner = KeyOwner {
+            subject: grandfathered_id.clone(),
+            account_id: grandfathered_id.clone(),
+            email: None,
+            email_verified: None,
+            ..Default::default()
+        };
+        let signed = signer
+            .sign(&owner, "key_1", "proj_1", "acct_1", None, Utc::now(), None)
+            .await
+            .unwrap();
+
+        let claims = verify_against(&active.public_jwk, &signed.token);
+        assert_eq!(
+            claims.sub, owner.subject,
+            "a grandfathered account's minted sub must be byte-identical to its (pre-Stage-3) \
+             upstream subject claim"
+        );
+        assert_eq!(
+            claims.sub, owner.account_id,
+            "and identical to its (Stage-3) resolved account id -- the two are the same value \
+             for every grandfathered account, which is the whole wire-invariance guarantee"
+        );
+    }
+
+    /// ADR-0025 Stage 3 actor-vs-owner split: a roster member (`lead`) minting a key on a
+    /// project someone else's account owns must carry the MEMBER's own account id as `sub` (the
+    /// actor -- who is actually holding this credential), while `account_id` stays the project's
+    /// OWNING account (the context claim, unchanged from before this ADR) -- the two claims must
+    /// differ, and each must independently be correct, not merely "some subject or other".
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn sub_and_account_id_differ_when_a_roster_member_acts_on_someone_elses_project(
+        pool: PgPool,
+    ) {
+        let repo = repo(pool);
+        bootstrap_signing_key(&repo, &signing_cfg(3600))
+            .await
+            .unwrap();
+        let active = repo.get_active_signing_key().await.unwrap().unwrap();
+
+        let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
+        // The acting member: a real, resolved account id, distinct from the project owner below.
+        let owner = KeyOwner {
+            subject: "kc-member-raw-sub".to_string(),
+            account_id: "member-account".to_string(),
+            email: None,
+            email_verified: None,
+            ..Default::default()
+        };
+        let signed = signer
+            .sign(
+                &owner,
+                "key_1",
+                "proj_owned_by_someone_else",
+                // The CONTEXT claim: the project's owning account, a different person entirely.
+                "owner-account",
+                None,
+                Utc::now(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let claims = verify_against(&active.public_jwk, &signed.token);
+        assert_eq!(
+            claims.sub, "member-account",
+            "sub (the actor) must be the acting member's own account id"
+        );
+        assert_eq!(
+            claims.account_id, "owner-account",
+            "the account_id claim (the context) must stay the project's owning account, \
+             unaffected by who actually minted the key"
+        );
+        assert_ne!(
+            claims.sub, claims.account_id,
+            "actor and context must never be conflated -- this is precisely the two-ids \
+             distinction ADR-0025's own module doc comment (authorize.rs:202-211) documents"
         );
     }
 
@@ -818,6 +1239,13 @@ mod db {
     /// so `signing.rs`'s `access_token_extra` supplies this repo's own `lgbr:`-prefixed CUID2
     /// through it -- this test now asserts `jti` is back to matching the old signer's format, not
     /// diverging from it.
+    ///
+    /// ADR-0025 Stage 3 note on `sub`: `owner.subject == owner.account_id` in this fixture
+    /// (`"kc-user-old-vs-new"` for both), so this test's `sub` equality assertion holds
+    /// regardless of whether the signer mints from `KeyOwner::subject` or `KeyOwner::account_id`
+    /// -- it is NOT the test that would catch a Stage-3 regression on which field feeds `sub`.
+    /// That distinction is `minted_sub_is_the_acting_account_id_not_the_upstream_subject` (and
+    /// its actor-vs-owner sibling) above, which deliberately makes the two fields differ.
     #[sqlx::test(migrations = "../../migrations")]
     async fn new_signer_claim_set_is_a_documented_superset_of_the_old_signer(pool: PgPool) {
         let repo = repo(pool);
@@ -828,8 +1256,10 @@ mod db {
 
         let owner = KeyOwner {
             subject: "kc-user-old-vs-new".to_string(),
+            account_id: "kc-user-old-vs-new".to_string(),
             email: Some("dev@example.test".to_string()),
             email_verified: Some(true),
+            ..Default::default()
         };
         let allowed_models = Some(vec!["gpt-4.1-mini".to_string()]);
         let now = Utc::now();
@@ -947,8 +1377,13 @@ mod db {
             audience: None,
             signing: Some(signing_cfg(3600)),
             token_exchange: None,
+            relying_party: None,
             rbac: Default::default(),
             clients: Vec::new(),
+            federation: Some(lightbridge_authz_core::config::Federation {
+                issuer: "https://keycloak.example.test/realms/dev".to_string(),
+                discovery_url: None,
+            }),
         }
     }
 
@@ -983,6 +1418,7 @@ mod db {
                 subject,
                 CreateAccount {
                     default_quota: None,
+                    name: None,
                 },
             )
             .await
@@ -993,7 +1429,7 @@ mod db {
         // this test only needs a project to exist so `create_api_key` can sign against it.
         let project = key_repo
             .create_project(
-                subject,
+                &AccountId::assert_already_resolved(subject),
                 &account.id,
                 CreateProject {
                     name: "p".to_string(),
@@ -1066,15 +1502,21 @@ mod db {
         .await
         .unwrap();
 
-        let jwks = well_known_router::<()>(ISSUER, repo.clone(), None, false)
-            .oneshot(
-                Request::builder()
-                    .uri("/.well-known/jwks.json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let jwks = well_known_router::<()>(
+            ISSUER,
+            repo.clone(),
+            None,
+            ClientAuthenticationMetadata::default(),
+            DiscoveryCapabilities::default(),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/jwks.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(jwks.status(), StatusCode::OK);
         let body = to_bytes(jwks.into_body(), usize::MAX).await.unwrap();
         let payload: Value = serde_json::from_slice(&body).unwrap();
@@ -1086,15 +1528,21 @@ mod db {
         assert_eq!(payload["keys"][0]["alg"], "RS256");
 
         let scopes = vec!["openid".to_string(), "offline_access".to_string()];
-        let discovery = well_known_router::<()>(ISSUER, repo, Some(scopes), false)
-            .oneshot(
-                Request::builder()
-                    .uri("/.well-known/openid-configuration")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let discovery = well_known_router::<()>(
+            ISSUER,
+            repo,
+            Some(scopes),
+            ClientAuthenticationMetadata::default(),
+            DiscoveryCapabilities::token_surface(),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(discovery.status(), StatusCode::OK);
         let body = to_bytes(discovery.into_body(), usize::MAX).await.unwrap();
         let payload: Value = serde_json::from_slice(&body).unwrap();
@@ -1118,21 +1566,15 @@ mod db {
         let scopes_supported = payload["scopes_supported"].as_array().unwrap();
         assert!(scopes_supported.iter().any(|s| s == "openid"));
         assert!(scopes_supported.iter().any(|s| s == "offline_access"));
-        let auth_methods = payload["token_endpoint_auth_methods_supported"]
-            .as_array()
-            .unwrap();
-        assert_eq!(
-            auth_methods,
-            &[Value::String("none".to_string())],
-            "must never advertise client_secret_basic/client_secret_post -- \
-             this service never accepts secret-based client auth"
+        assert!(
+            payload
+                .get("token_endpoint_auth_methods_supported")
+                .is_none(),
+            "an empty client registry must not advertise a usable client-authentication method"
         );
-        let claims_supported = payload["claims_supported"].as_array().unwrap();
-        for claim in ["sub", "email", "email_verified", "auth_time", "at_hash"] {
-            assert!(
-                claims_supported.iter().any(|c| c == claim),
-                "claims_supported must list {claim}: {claims_supported:?}"
-            );
-        }
+        assert!(
+            payload.get("claims_supported").is_none(),
+            "optional claims metadata must stay absent until it has a dedicated, verified contract"
+        );
     }
 }

@@ -7,7 +7,11 @@
 //! - [`client_assertion_store`]: Redis-backed `ClientAssertionStore` (Decision 6) -- fail-closed
 //!   `private_key_jwt` replay tracking.
 //! - [`refresh_store`]: `RefreshTokenStore` over `exchange_refresh_tokens`.
-//! - [`noop_stores`]: permanent `AuthorizationCodeStore`/`DeviceCodeStore` stubs (Decision 3).
+//! - [`device_store`]: `DeviceCodeStore` over `device_authorizations` (ADR-0012 Decision 7, #423)
+//!   -- real, CAS-consuming storage, replacing the permanent `NoDeviceCodeStore` stub ADR-0011
+//!   Decision 3 originally installed for both OP-side traits.
+//! - [`authorization_code_store`]: persisted, TTL-bound and CAS-consuming authorization codes
+//!   for ADR-0019's browser flow.
 //! - [`store`]: `TokenExchangeOpStore`, the `OpStore` implementation tying all of the above
 //!   together, with hand-rolled `handle_token_exchange`/`handle_refresh_token` overrides (the
 //!   upstream defaults are `pub(crate)` to `authkestra-op` and never stamp `extra` claims -- see
@@ -15,7 +19,7 @@
 
 pub mod client_assertion_store;
 pub mod client_store;
-pub mod noop_stores;
+pub mod device_store;
 pub mod refresh_store;
 pub mod store;
 
@@ -35,10 +39,7 @@ const REFRESH_TOKEN_BYTES: usize = 32;
 /// error type carries no HTTP status; `token_exchange::status_for_oauth_error` maps `error` back
 /// to one at the axum boundary, so error-string choices here are load-bearing, not cosmetic.
 pub(crate) fn oauth_err(error: &str, description: &str) -> TokenErrorResponse {
-    TokenErrorResponse {
-        error: error.to_string(),
-        error_description: description.to_string(),
-    }
+    TokenErrorResponse::new(error.to_string(), description.to_string())
 }
 
 /// Intersects the client's requested scopes with the server-wide allow-list AND the requesting
@@ -83,14 +84,23 @@ pub(crate) fn scope_to_string(scopes: &[String]) -> Option<String> {
     }
 }
 
-pub(crate) fn generate_refresh_secret() -> String {
+/// Fills `bytes` random bytes from the OS CSPRNG and returns them URL-safe-base64-encoded
+/// (no padding). Shared by every call site in this crate that previously duplicated this exact
+/// "`OsRng` fill -> `URL_SAFE_NO_PAD` encode" sequence with its own byte count baked in --
+/// [`generate_refresh_secret`] below, [`device_store::generate_device_code`], and
+/// `relying_party`'s per-request state/nonce generation.
+pub(crate) fn random_urlsafe(bytes: usize) -> String {
     use base64::Engine;
     use rand_core::{OsRng, RngCore};
-    let mut buf = [0u8; REFRESH_TOKEN_BYTES];
+    let mut buf = vec![0u8; bytes];
     OsRng.fill_bytes(&mut buf);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+}
+
+pub(crate) fn generate_refresh_secret() -> String {
     format!(
         "{REFRESH_TOKEN_PREFIX}{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+        random_urlsafe(REFRESH_TOKEN_BYTES)
     )
 }
 
@@ -108,18 +118,41 @@ fn decode_payload(bearer_token: &str) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Snapshots `email`/`email_verified` from the presented upstream token so the exchanged JWT
-/// mirrors a Keycloak access token. Best-effort: a token without these claims yields `None`.
-pub(crate) fn decode_email(bearer_token: &str) -> (Option<String>, Option<bool>) {
+/// Snapshots `email`/`email_verified`/`preferred_username`/`name` from the presented upstream
+/// token so the exchanged JWT mirrors a Keycloak access token. Best-effort: a token without a
+/// given claim yields `None` for it, never an invented default -- same "omit, never mint a lie"
+/// contract every other claim in this codebase follows.
+///
+/// This is the token-exchange grant's own source for these four claims, deliberately NOT a
+/// database lookup: the presented `subject_token` already carries them (once
+/// `BearerTokenServiceTrait::validate_bearer_token` has verified its signature -- both callers run
+/// that first), so decoding it directly is both simpler and fresher than round-tripping through
+/// `federated_identities` -- and a subject_token presented here need not even belong to someone
+/// who ever completed a login through this service's own `KeycloakRelyingParty` (a
+/// `federated_identities` row is not guaranteed to exist for it). Contrast the browser
+/// `authorization_code` grant (`TokenExchangeOpStore::mint_from_authorization_code`), which has no
+/// upstream token in hand at redemption time and reads
+/// `StoreRepo::find_federated_identity_by_account_id` instead.
+pub(crate) fn decode_profile_claims(
+    bearer_token: &str,
+) -> (Option<String>, Option<bool>, Option<String>, Option<String>) {
     let Some(value) = decode_payload(bearer_token) else {
-        return (None, None);
+        return (None, None, None, None);
     };
     let email = value
         .get("email")
         .and_then(Value::as_str)
         .map(str::to_string);
     let email_verified = value.get("email_verified").and_then(Value::as_bool);
-    (email, email_verified)
+    let preferred_username = value
+        .get("preferred_username")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    (email, email_verified, preferred_username, name)
 }
 
 /// Snapshots `auth_time`/`nonce` from the presented upstream token for the derived `id_token`
@@ -138,3 +171,4 @@ pub(crate) fn decode_auth_time_and_nonce(bearer_token: &str) -> (Option<i64>, Op
         .map(str::to_string);
     (auth_time, nonce)
 }
+pub mod authorization_code_store;

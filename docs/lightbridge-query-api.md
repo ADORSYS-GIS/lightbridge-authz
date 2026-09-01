@@ -1,22 +1,37 @@
 # Lightbridge Usage Query API
 
 > [!WARNING]
-> **This endpoint requires mTLS (#347) but still has no ownership check on
-> `scope_id`.** `/usage/v1/usage/query` moved to a dedicated query listener
-> (`UsageServerGroup::query` in
+> **This endpoint requires mTLS (#347) AND, as of #570, an end-user bearer token plus
+> an ownership check on `scope_id`.** `/usage/v1/usage/query` sits on a dedicated
+> query listener (`UsageServerGroup::query` in
 > [`crates/lightbridge-authz-usage/src/config.rs`](../crates/lightbridge-authz-usage/src/config.rs),
 > `routers::query_router()`) that requires and verifies a client certificate before any
-> handler runs. That authenticates "a legitimate lightbridge workload holding a
-> CA-signed cert" — it does **not** bind `scope`/`scope_id` to a caller identity. The
+> handler runs — that authenticates "a legitimate lightbridge workload holding a
+> CA-signed cert", not which `scope_id` a given end user is entitled to see. The
 > handler
 > ([`crates/lightbridge-authz-usage/src/handlers/query.rs`](../crates/lightbridge-authz-usage/src/handlers/query.rs))
-> still validates only the time range, that `scope_id` is non-empty, and `limit`.
-> Concretely: any trusted caller (any workload presenting a cert signed by the
-> configured CA — today, that's `authz-api`/`authz-budget`, sharing one cert) that
-> knows a valid CUID2 `scope_id` can read that tenant's usage data, cross-tenant.
-> `scope_id` values are unguessable (CUID2, 24 chars) and the API offers no
-> enumeration, but ids do leak through other channels (URLs, logs, JWT claims, error
-> messages), so "unguessable" is not a substitute for authorization.
+> closes that gap by ALSO requiring `Authorization: Bearer <end-user access token>`
+> (validated via JWKS, `lightbridge-authz-bearer::BearerTokenService`) and calling
+> `authz-opa`'s `POST /idp/v1/authorize-usage-scope`
+> (`ScopeAuthority`, [`crates/lightbridge-authz-usage/src/scope_authority.rs`](../crates/lightbridge-authz-usage/src/scope_authority.rs))
+> to check the token's subject actually owns the requested `account`/`project` scope
+> before running the query. `scope=api_key` has no resolvable ownership predicate at
+> all and is refused unconditionally (`403`). `scope=user` is allowed ONLY when
+> `scope_id` equals the validated token's own `sub` (self-ownership — the caller
+> reading their own usage; anything else is `403`, and `scope_authority` is never
+> consulted for this scope either way). `scope=all` (estate-wide, no entity filter at
+> all) requires the validated token to hold the `usage:read-all` permission
+> (`Permission::UsageReadAll`, `lightbridge-authz-core::authz`) — granted to
+> `lightbridge-admin` by that role's default `*` grant, configurable like every other
+> permission via `oauth2.rbac.role_permissions`; `scope_authority` is not consulted
+> for this scope either, since there is no per-row ownership predicate for
+> "everything." Missing/invalid bearer → `401`; authenticated but not authorized, or
+> the authority being unreachable/erroring (`account`/`project` only) → `403` with an
+> opaque body (fail-closed — never treated as authorized).
+>
+> **Divergence, stated not hidden:** the backend predicate (account owner, OR project
+> owner/roster member) is deliberately WIDER than the console UI's own client-side
+> guard (owner-only) — see `docs/usage-api.md`'s identical note.
 >
 > The `/v1/otel/traces`, `/v1/otel/metrics`, and `/v1/otel/logs` ingest endpoints stay
 > on a separate, unauthenticated listener (`UsageServerGroup::usage`) — their caller is
@@ -25,10 +40,14 @@
 > scope). An unauthenticated write path there means anyone who can reach it can
 > fabricate usage/billing records for any account or project.
 >
+> `/usage/v1/spend/query` stays mTLS-only, exempt from the bearer requirement above —
+> it is `authz-budget`'s legitimate cross-account service reader — but now REFUSES any
+> request carrying an `Authorization` header, closing a live "console catch-all-proxy"
+> hole where a misrouted browser bearer token could otherwise reach this ownerless
+> cross-account read.
+>
 > `lightbridge-authz-usage` is `ClusterIP`-only in prod today, by design, regardless of
-> mTLS — see the **Service** section below. **Do not add an external route
-> (Ingress/HTTPRoute/Gateway) to this service without first fixing the `scope_id`
-> ownership gap.** See "Recommended direction" below.
+> mTLS — see the **Service** section below.
 
 ## Why?
 
@@ -84,6 +103,38 @@ locally, TLS reusing the same `authz-tls`-derived secret's `tls.crt`/`tls.key` p
 not before (the config would reference a port the old image doesn't serve) and not
 long after (the new image won't start without it).
 
+**#570 adds two MORE mandatory blocks to that same config, ratified as mandatory (not
+optional) exactly like `server.query` above — this is not a new decision, it is the
+same "hard-cutover, not a dormant flag" rule applied twice more.** `UsageConfig::
+oauth2` and `UsageConfig::scope_authority` (`crates/lightbridge-authz-usage/src/
+config.rs`) are also non-`Option` fields: a config omitting `oauth2.jwks_url` or any of
+`scope_authority.{base_url,username,password}` fails to load, exactly
+the same failure mode `server.query`'s own rollout already produced once.
+(`scope_authority.ca_bundle_path` is `#[serde(default)] Option<String>` and does NOT
+gate config load — omitting it against a private-CA-signed `authz-opa` instead fails
+closed at REQUEST time: TLS verification fails on every `scope=account`/`scope=project`
+query, which `RemoteScopeAuthority` treats as "not authorized," i.e. every such query
+gets a `403`, not a startup crash.) The consequence of a genuine config-load failure
+is the same too, just doubled: it kills BOTH listeners
+at once, not just the query one — the ingest listener's OTLP writes are refused
+(usage/billing data loss for every request in the outage window) at the same moment
+the query listener's spend reads for `authz-budget` degrade to `Spend::Unavailable`
+(routing every self-service refill decision that depends on them to `manual_review`,
+never `auto_approve`, until the config is fixed). Because the `migrate` Job runs at an
+earlier ArgoCD sync-wave than the main Deployment (`docs/adr/0016-migrate-job-sync-
+wave-not-hook.md`) and loads this identical config, a bad value here fails the
+`migrate` Job first — which fails the WHOLE app's ArgoCD sync, not merely this
+service's own rollout. **Deploy order, extended:** `ai-helm-values` MUST set
+`oauth2.jwks_url` (the same Keycloak/OIDC JWKS endpoint `authz-api`/`authz-opa`
+already point at) and the three mandatory `scope_authority` fields (`base_url` pointing
+at `authz-opa`'s in-cluster address, `username`/`password` matching `authz-opa`'s own
+`server.opa.basic_auth` credential exactly) — plus the optional-but-effectively-required
+`ca_bundle_path`, pointed at the same CA bundle `server.query.tls.client_ca_bundle_path`
+already uses, or every account/project query fails closed once TLS verification fails —
+**in the same rollout** as this repo's image bump that introduces #570 — the chart's own
+`charts/lightbridge-authz-usage/values.yaml` documents this identically at
+`config.oauth2`/`config.scopeAuthority`.
+
 ### Endpoint
 
 - Method: `POST`
@@ -113,8 +164,8 @@ The request is JSON and matches the `UsageQueryRequest` model.
 
 | Field | Type | Required | Default | Meaning |
 |---|---|---:|---|---|
-| `scope` | enum: `user` \| `api_key` \| `project` \| `account` | yes | none | Primary scoping dimension. Adds a mandatory equality filter based on `scope_id`. |
-| `scope_id` | string | yes | none | The ID value for the chosen `scope`. Must be non-empty. |
+| `scope` | enum: `user` \| `api_key` \| `project` \| `account` \| `all` | yes | none | Primary scoping dimension. Adds a mandatory equality filter based on `scope_id`, except `all` (see below). |
+| `scope_id` | string | yes | none | The ID value for the chosen `scope`. Must be non-empty for every scope except `all`, where it is ignored -- send `""`. |
 | `start_time` | RFC3339 datetime | yes | none | Inclusive start of the time window (`observed_at >= start_time`). |
 | `end_time` | RFC3339 datetime | yes | none | Exclusive end of the time window (`observed_at < end_time`). Must be after `start_time`. |
 | `bucket` | string interval | no | `"1 hour"` | Bucket size for time aggregation. Must match `^\d+\s+(second|seconds|minute|minutes|hour|hours|day|days)$`. Examples: `"5 minutes"`, `"1 hour"`, `"30 days"`. |
@@ -184,11 +235,23 @@ Successful response is HTTP `200` with JSON:
       "total_cost": 12.34,
       "prompt_tokens": 20000,
       "completion_tokens": 14567,
-      "total_tokens": 34567
+      "total_tokens": 34567,
+      "latency_samples": 118,
+      "latency_p50_ms": 412.0,
+      "latency_p95_ms": 1180.5,
+      "latency_p99_ms": 2404.0
     }
-  ]
+  ],
+  "truncated": false
 }
 ```
+
+`truncated` (#578): `true` when more than `limit` DISTINCT buckets matched the query and the
+OLDEST one was dropped WHOLE to fit. `limit` bounds bucket count, not `points.len()` -- with a
+non-empty `group_by`, `points` can hold more entries than `limit` (one per series per surviving
+bucket), and every surviving bucket keeps its FULL series set, never an arbitrary subset. `false`
+means every matching bucket is present. See `docs/usage-api.md`'s "Response shape and truncation"
+for the known mid-bucket-cut caveat (#586).
 
 #### Point fields
 
@@ -216,6 +279,39 @@ Each point is an aggregate across matching `usage_events` rows for:
 | `prompt_tokens` | int64 | yes | `SUM(prompt_tokens)`.
 | `completion_tokens` | int64 | yes | `SUM(completion_tokens)`.
 | `total_tokens` | int64 | yes | `SUM(total_tokens)`.
+| `latency_samples` | int64 | yes | `COUNT(latency_ms)` -- how many of this group's rows actually carried a per-request duration. `0` is a legitimate outcome, not an error (see below).
+| `latency_p50_ms` | float64 or null | yes | `percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms)`. `null` exactly when `latency_samples` is `0`.
+| `latency_p95_ms` | float64 or null | yes | `percentile_cont(0.95) …`. `null` when `latency_samples` is `0`.
+| `latency_p99_ms` | float64 or null | yes | `percentile_cont(0.99) …`. `null` when `latency_samples` is `0`.
+
+#### Latency, and when it is legitimately absent
+
+`latency_ms` is captured per event at ingest, and the percentiles are ordered-set aggregates
+computed at query time -- there is no stored histogram and no stored sample array. Sources, in the
+order they are tried:
+
+| Signal | Source | Notes |
+|---|---|---|
+| trace | the span's own `end_time_unix_nano - start_time_unix_nano` | Authoritative; wins over any duration attribute on the same span. |
+| trace / log / metric | a duration attribute | Millisecond-named keys (`duration`, `x-envoy-upstream-service-time`, `duration_ms`, …) and second-named keys (every OpenTelemetry semantic-convention `*.duration`, which are seconds) are kept in separate lists so the unit is never guessed. |
+| metric (gauge / sum) | the data point's own value, when the metric is *named* as a duration | e.g. `gen_ai.server.request.duration`. |
+| metric (histogram / exponential histogram / summary) | **nothing** | A bucketed distribution is not one observation. `sum / count` is a mean, and feeding a mean into `percentile_cont` would fabricate a percentile out of data that never contained one. These rows deliberately store `NULL`. |
+
+What actually reaches this service in the deployed stack today is the **log** path: the AI gateway
+configures Envoy's OpenTelemetry access-log sink with `duration: "%DURATION%"` and
+`x-envoy-upstream-service-time: "%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%"` (both milliseconds, both
+delivered as OTLP LogRecord attributes on `/v1/otel/logs`). The AI Gateway ExtProc's
+`llmRequestCosts` dynamic metadata -- the channel that produces
+`io.envoy.ai_gateway.llm_custom_total_cost` -- carries token and cost keys only, never a duration.
+
+Consumers must therefore treat `latency_samples == 0` as a **per-series** fact and say so for that
+series, rather than blanking a whole panel. `null` percentiles are never collapsed to `0.0`: "no
+latency was reported" and "every request took 0 ms" are different facts.
+
+`latency_p99_ms` needs roughly 100 samples before it means anything; below that it degenerates
+towards the group's maximum, and at `latency_samples == 1` all three percentiles collapse onto that
+single observation. `latency_samples` is returned precisely so a caller can mark that unstable
+instead of drawing a confident tail.
 
 ### Error behaviour
 
@@ -245,52 +341,95 @@ Database error: start_time must be before end_time
 - Pagination is limited to a simple `limit`; there is no `offset`.
 - Filters are equality filters only.
 
-## Security: recommended fix direction
+## Security: the ownership fix (#570)
 
-This section exists because the warning at the top of this document needs somewhere
-to point. #347 answered "who can call this endpoint at all" with mTLS (client
-certificates, verified at the TLS layer, before this endpoint's own handler runs —
-see the warning above and `docs/architecture/budget.md`'s "Spend dependency" section).
-That is authentication, not authorization: it does not solve cross-tenant reads,
-because a shared client-certificate trust anchor authenticates *a caller* (any
-lightbridge workload holding a CA-signed cert), not which `scope_id` that caller is
-entitled to see. Before this endpoint is given any externally reachable route, it
-still needs an ownership check:
+This section used to describe a recommended fix direction; #570 implements it.
+#347 answered "who can call this endpoint at all" with mTLS (client certificates,
+verified at the TLS layer, before this endpoint's own handler runs — see the warning
+above and `docs/architecture/budget.md`'s "Spend dependency" section). That is
+authentication, not authorization: a shared client-certificate trust anchor
+authenticates *a caller* (any lightbridge workload holding a CA-signed cert), not
+which `scope_id` that caller is entitled to see.
 
-- **Fold the query behind `authz-api`'s JWT middleware, with an ownership check.**
-  Resolve the caller's `account_id`/`project_id` from their JWT (the same claims
-  `/idp/v1/resolve-context` already resolves and seals into tokens — see
-  [`crates/lightbridge-authz-rest/src/handlers/idp.rs`](../crates/lightbridge-authz-rest/src/handlers/idp.rs)),
-  and require the requested `scope`/`scope_id` to match — or be owned by — that
-  identity before running the query. This is the option that actually fixes the
-  remaining gap; mTLS alone does not.
+`/usage/v1/usage/query`'s handler now closes that gap directly, rather than folding
+the query behind `authz-api`'s own JWT middleware (a separate service on a separate
+port, which would have meant either merging the two services or proxying every query
+through `authz-api` first):
+
+1. **Bearer validation.** The request must carry `Authorization: Bearer <token>`, an
+   end-user access token validated via JWKS
+   (`lightbridge_authz_bearer::BearerTokenService`, the same crate `authz-api`/
+   `authz-opa`/`authz-budget` use). Missing or invalid → `401`.
+2. **Ownership check.** For `scope=account`/`scope=project`, the validated token's
+   `(iss, sub)` is sent to `authz-opa`'s new Basic-auth-protected
+   `POST /idp/v1/authorize-usage-scope` endpoint
+   ([`crates/lightbridge-authz-rest/src/handlers/idp.rs`](../crates/lightbridge-authz-rest/src/handlers/idp.rs)),
+   which runs the SAME real, Postgres-backed ownership predicate `resolve_context`
+   already enforces for the OIDC token-exchange path (own the account/project, or hold
+   a `project_members` roster row) — see
+   [`crates/lightbridge-authz-api-key/src/repo.rs`](../crates/lightbridge-authz-api-key/src/repo.rs)'s
+   `authorize_usage_scope`. `scope=api_key` has no resolvable ownership predicate at
+   all (no `accounts`/`projects` row is ever keyed by a raw `api_key_id`) and is
+   refused unconditionally, before ever calling the authority.
+3. **Self-ownership for `scope=user`.** Answered entirely from the already-validated
+   token, no remote call: allowed iff `scope_id` equals the token's own `sub`, refused
+   otherwise. There is still no `accounts`/`projects` row keyed by a raw `user_id`, so
+   there is nothing for `scope_authority` to check even for the caller's own subject —
+   this closes the gap #570 left where the console's own `/settings/overview/user` lens
+   (a caller reading their own usage) was unconditionally `403`.
+4. **Estate-wide `scope=all`.** No entity filter is added at all — the query spans
+   every account. There is no per-row ownership predicate for "everything" by
+   definition, so this is gated on a coarse RBAC permission instead:
+   `Permission::UsageReadAll` (`usage:read-all`,
+   [`crates/lightbridge-authz-core/src/authz.rs`](../crates/lightbridge-authz-core/src/authz.rs)),
+   read directly off `TokenInfo::has_permission` — the same permission-set machinery
+   `authz-api`'s RPC surface uses, reusing the SAME `oauth2.rbac` config this service
+   already loads for JWT validation (`docs/rbac.md`). Granted to `lightbridge-admin` by
+   that role's default `*` grant, so an unconfigured deployment restricts `scope=all`
+   to admins with no extra setup; an operator narrowing `role_permissions` explicitly
+   must grant `usage:read-all` (or `usage:*`) back to whichever role should keep
+   estate-wide access. This answers the repo-owner ruling that operators should not
+   need per-account enumeration to see estate-wide usage — see issue #602.
+5. **Fail-closed on every authority failure mode.** A transport error, timeout,
+   non-`200`/`404` status, or unparseable response from `authz-opa` is treated as "not
+   authorized", never as "authorized" — see
+   [`crates/lightbridge-authz-usage/src/scope_authority.rs`](../crates/lightbridge-authz-usage/src/scope_authority.rs)'s
+   `RemoteScopeAuthority`, mirroring `UsageServiceSpendReader`'s identical posture for
+   the sibling `/usage/v1/spend/query` call. `scope=user` self and `scope=all` never
+   reach this authority at all (steps 3/4 above), so this fail-closed contract only
+   applies to `scope=account`/`scope=project`.
 
 This still needs a corresponding fix on the ingest side (`/v1/otel/traces`,
 `/v1/otel/metrics`, `/v1/otel/logs`) before it is safe to expose externally — those
-stay on a separate, unauthenticated listener even after #347 (see the warning above
-for why: their caller cannot be given a client certificate without a coordinated
-change outside this repo).
+stay on a separate, unauthenticated listener even after #347/#570 (see the warning
+above for why: their caller cannot be given a client certificate without a
+coordinated change outside this repo).
 
 ## Findings
 
 ### Integration notes
 
 - This repository does not include a Lightbridge frontend, so there are no in-repo UI call sites to enumerate.
-- The usage query endpoint is exercised by the integration test runner in [`.docker/it/servers_it.py`](.docker/it/servers_it.py:1).
-- The endpoint is also described at a high level in [`README.md`](README.md:118) and [`docs/usage-api.md`](docs/usage-api.md:1).
+- The usage query endpoint is exercised by the integration test runner in [`.docker/it/servers_it.py`](../.docker/it/servers_it.py).
+- The endpoint is also described at a high level in [`README.md`](../README.md:162) and [`docs/usage-api.md`](usage-api.md).
 
 ### Known quirks and limitations
 
-- Input validation errors currently surface as plain-text errors (often with HTTP 500) due to the shared error-to-response mapping in [`crates/lightbridge-authz-core/src/error.rs`](crates/lightbridge-authz-core/src/error.rs:1).
+- Input validation errors currently surface as plain-text errors (often with HTTP 500) due to the shared error-to-response mapping in [`crates/lightbridge-authz-core/src/error.rs`](../crates/lightbridge-authz-core/src/error.rs).
 - The API is aggregation-first: no raw events, no server-side ranking/top-N, no offset pagination, and fixed ordering by time bucket.
 
 ## How to?
+
+Every example below omits `-H 'Authorization: Bearer <token>'` for brevity — since #570 it is
+REQUIRED (see the warning at the top of this document); every example as written now returns
+`401`, not `200`, without it.
 
 ### Example 1: Total cost for a project over the last 30 days
 
 ```bash
 curl -k https://lightbridge-usage.converse.svc.cluster.local:3000/usage/v1/usage/query \
   -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <end-user access token>' \
   -d '{
     "scope": "project",
     "scope_id": "proj_123",

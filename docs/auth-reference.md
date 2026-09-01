@@ -6,9 +6,14 @@ or a permission string and get a `file:line` citation, not prose. This does **no
 `docs/rbac.md` (the RBAC model in full) or the ADRs (the *why*) — it points at them instead of
 restating them.
 
-Verified against commit `9f095e0` on `origin/main` (2026-08-15). Every row below was checked
-against the code at that commit; anything that could not be confirmed by reading source or a
-passing test was left out rather than guessed.
+For the canonical OAuth/OIDC implementation inventory, standards gaps, and Authorization Code +
+PKCE/device-flow roadmap, see
+[`docs/oauth-oidc-standards-roadmap.md`](oauth-oidc-standards-roadmap.md). In particular, accepted
+ADR-0019/ADR-0021 design work is not evidence that `/authorize` or device endpoints are mounted.
+
+The OAuth/OIDC rows and endpoint inventory were reconciled against the current repository on
+2026-08-24. Other entries retain their source citations; when behavior changes, prefer the linked
+implementation and the canonical roadmap over an old verification date.
 
 ## 1. Config keys → effect
 
@@ -35,18 +40,47 @@ out separately where it differs.
 | `oauth2.issuance.subject_token_type` | `Option<String>` | default `None`, falls back to `"urn:ietf:params:oauth:token-type:access_token"` | RFC 8693 `subject_token_type` sent upstream | — |
 | `oauth2.issuance.requested_token_type` | `Option<String>` | default `None` | RFC 8693 `requested_token_type`, only sent if present | — |
 | `oauth2.issuance.audience` / `.scope` | `Option<String>` | default `None` | Forwarded to the upstream exchange request if present | — |
+| `oauth2.federation` | `Option<Federation>` | **Required by `authz-api`/`authz-idp`/`authz-opa`/`authz-budget`/`lightbridge-mcp` startup** | The identity-vs-location split for the one Keycloak this deployment federates with (see "Identity vs. location: `federation.issuer` vs. `federation.discovery_url`" below) | Missing or malformed `issuer` makes every component above refuse to start (ADR-0025) |
+| `oauth2.federation.issuer` | `String` | required | IDENTITY: the `iss` claim value every ID token must carry, what `authz-idp`'s fetched OIDC discovery document's own `issuer` is checked against, what the browser is ultimately sent to via the discovered `authorization_endpoint`, and the ADR-0025 grandfather-adoption pin. The ONE issuer field — there is no longer a separate `oauth2.relying_party.issuer` this must be kept byte-equal to (removed; see below) | Empty or not a valid URL fails `Federation::validate` at startup |
+| `oauth2.federation.discovery_url` | `Option<String>` | default: falls back to `oauth2.federation.issuer` | LOCATION: where `authz-idp` dials OIDC discovery from inside this deployment's own network. Set only when it diverges from `issuer` — e.g. local Compose, where the browser/host tooling reach Keycloak via `http://localhost:9100/realms/dev` but `authz-idp`'s own container must dial the in-network `http://keycloak:9100/realms/dev` instead (`.docker/authz/container.yaml`) | `KeycloakRelyingParty::discover` dials this URL but still validates the returned document's `issuer` against `oauth2.federation.issuer` — never relaxed to compare against this value instead. Leaving it unset when the issuer is genuinely unreachable from inside the network surfaces as `GET /authorize` returning 502 "sign-in unavailable" |
+| `oauth2.relying_party` | `Option<OidcRelyingParty>` | **Required by `authz-idp` startup** | Keycloak browser-login broker used by `/authorize`, `/device/verify`, and `/idp/callback` | Missing or malformed state encryption key/callback URL makes `authz-idp` refuse startup; this is never treated as an optional unauthenticated fallback — a config that omits this block entirely is ALSO refused, unconditionally, since ADR-0023 reversed PR #473 (`468084a`)'s mount-conditional gate |
+| `oauth2.relying_party.client_id`, `.callback_url` | `String` | required when the RP block is configured | ID-token audience, and the one exact Keycloak callback URL. The issuer used for discovery/ID-token validation is `oauth2.federation.issuer`, not a field on this struct — `oauth2.relying_party.issuer` was REMOVED (it used to have to be kept byte-equal to `oauth2.federation.issuer` by hand; that config trap is gone) | An issuer mismatch, token endpoint error, signature/`kid`/issuer/audience/`iat`/nonce failure, or callback-state failure refuses completion without approving a device code or issuing a browser cookie; multi-audience ID tokens must set `azp` to this client |
+| `oauth2.relying_party.state_encryption_key` | `String` | required; base64url encoding of exactly 32 bytes | AES-256-GCM protection for the short-lived, `HttpOnly`, `Secure`, `SameSite=Lax` RP state cookie | Bad encoding/length makes `authz-idp` refuse startup; production must provide a unique secret |
+| `oauth2.relying_party.token_encryption_key` | `String` | required; base64url encoding of exactly 32 bytes | AES-256-GCM protection (ADR-0024) for the Keycloak token set (refresh token + ID-token claims snapshot, never the access token) persisted at rest on `federated_identities.token_envelope` | Bad encoding/length, or a value equal to `state_encryption_key`, makes `authz-idp` refuse startup; production must provide a unique secret, distinct from `state_encryption_key`; rotating this value makes every previously-sealed token envelope permanently unopenable (treated as "no stored token", never deleted) until that identity's next login re-seals it |
+| `oauth2.relying_party.timeout_ms` | `u64` | `5000` | Bound on Keycloak discovery and authorization-code redemption | Must be positive at startup. A timeout is a refused login; a pending device authorization stays pending |
+| `oauth2.relying_party.browser_session_ttl_seconds` | `i64` | `28800` | Fixed expiry used by the shared browser-session callback primitive | Must be positive at startup; device pairing does not create a browser session |
+
+### Identity vs. location: `federation.issuer` vs. `federation.discovery_url`
+
+`oauth2.relying_party.issuer` used to do four jobs across two network planes — the discovery dial
+target, the expected issuer in the discovery document, the ID-token `iss` check, and the ADR-0025
+grandfather pin — while `oauth2.federation.issuer` had to be kept byte-equal to it by hand
+(`start_idp_server` asserted this at startup; that assertion is now DELETED, since there is only
+one field left to compare). Three of those four jobs are IDENTITY (must be the externally-reachable
+issuer: what tokens validate against, what the browser is redirected to); only the discovery dial
+is LOCATION (must be internally reachable). Conflating them made a deployment where internal ≠
+external unable to start `authz-idp` at all: with the issuer set to the external address, `GET
+/authorize` dialed that same external address from inside the container and got connection-refused,
+surfacing as 502 "sign-in unavailable".
+
+`oauth2.federation.discovery_url` (`crates/lightbridge-authz-core/src/config/mod.rs`) is the fix:
+`authz-idp` dials `discovery_url.unwrap_or(issuer)` (`Federation::effective_discovery_url`,
+`KeycloakRelyingParty::discover` in `crates/lightbridge-authz-rest/src/relying_party.rs`), but
+still validates the returned document's `issuer` against `federation.issuer` — the identity check
+is never relaxed to compare against the dial target. See `.docker/authz/container.yaml` for the
+worked local-Compose example (`localhost:9100` identity, `keycloak:9100` discovery dial).
 | `oauth2.audience` | `Option<Vec<String>>` | default `None` | Expected `aud` values for inbound JWT validation; unset disables audience checking | An unset/empty value means **no audience enforcement** — any `aud` is accepted |
 | `oauth2.signing` | `Option<JwtSigning>` | default `None` | Enables self-signed RS256 API-key JWTs; required alongside `type: self` for both plain key signing and native token-exchange | Absent under `type: self` with `token_exchange.enabled` → startup fails (`lib.rs:1283-1285`) |
 | `oauth2.signing.issuer` | `String` | **Required, non-empty** | `iss` claim + OIDC issuer for JWKS discovery | Empty → `ApiKeyJwtSigner::from_config` fails (`signing.rs:274-278`) |
 | `oauth2.signing.audience` | `Option<String>` | default `None` | `aud`/`azp` stamped on plain (non-exchange) self-signed API-key JWTs | — |
 | `oauth2.signing.ttl_seconds` | `i64` | default `7_776_000` (90 days) | Default lifetime **and hard cap** on any frontend-requested expiry (`signing.rs:145-155`) | `<= 0` → startup fails (`signing.rs:279-284`) |
 | `oauth2.signing.max_key_age_days` | `i64` | default `30` | Auto-rotation interval for the active signing key, checked at startup (`bootstrap_signing_key`, `signing.rs:86-93`) | No hard failure; a very small value just rotates aggressively |
-| `oauth2.token_exchange` | `Option<Oauth2TokenExchange>` | default `None` | Native RFC 8693 token-exchange (`POST /oauth2/token`) | Absent/`enabled: false` → `/oauth2/token` is not mounted and discovery advertises no `token_endpoint` at all |
-| `oauth2.token_exchange.enabled` | `bool` | default `false` | Whether the exchange grant is mounted | **`enabled: true` under `oauth2.type: external` fails server startup hard** — `Error::Server("oauth2.token_exchange is enabled but requires oauth2.type: self")` (`lib.rs:1278-1282`, test `build_token_exchange_state_rejects_external_oauth2` at `lib.rs:1722-1731`) |
+| `oauth2.token_exchange` | `Option<Oauth2TokenExchange>` | default `None`; **required by `authz-idp` startup** (ADR-0023) | Native RFC 8693 token-exchange (`POST /oauth2/token`) plus the `authorization_code`/device/`client_credentials` grants `/oauth2/token` also dispatches | Absent/`enabled: false` → `authz-idp` refuses to start (see `start_idp_server_refuses_to_start_without_token_exchange`/`..._when_token_exchange_is_disabled`, `idp_server_tests.rs`); other callers of `build_token_exchange_state` keep the older "not mounted" behavior for the `None` case, but `authz-idp` is the only production caller and treats it as fatal. **`client_credentials` (ADR-0030, #534) has no separate enable flag of its own** — `signing.rs:838-848` advertises it unconditionally inside the same `token_endpoint_mounted` gate as the token-exchange/refresh grants, not behind `oauth2.token_exchange.enabled` specifically; in practice `token_endpoint_mounted` requires the token surface to have assembled successfully, which for `authz-idp` means this block is present and valid anyway (ADR-0023 makes it mandatory), but the gating mechanism is the route-mount flag, not this field's boolean |
+| `oauth2.token_exchange.enabled` | `bool` | default `false`; **`authz-idp` requires `true`** (ADR-0023) | Whether the exchange grant is mounted | **`enabled: true` under `oauth2.type: external` fails server startup hard** — `Error::Server("oauth2.token_exchange is enabled but requires oauth2.type: self")` (`lib.rs:1278-1282`, test `build_token_exchange_state_rejects_external_oauth2` at `lib.rs:1722-1731`). For `authz-idp` specifically, `enabled: false` (or the block being absent) is itself a startup failure — see the row above |
 | `oauth2.token_exchange.access_ttl_seconds` | `i64` | default `900` (15 min) | Exchanged access-JWT lifetime | `<= 0` → startup fails (`lib.rs:1286-1290`) |
 | `oauth2.token_exchange.refresh_ttl_seconds` | `i64` | default `2_592_000` (30 days) | Per-**token** lifetime, reset on every rotation (`new_row.expires_at = now + refresh_ttl_seconds`, `oauth2_op/store.rs:581`) — this is not a session-level ceiling by itself; see `refresh_absolute_ttl_seconds` immediately below for the field that actually bounds a session | `<= 0` → startup fails, same check as above |
 | `oauth2.token_exchange.refresh_absolute_ttl_seconds` | `i64` | default `7_776_000` (90 days) | Absolute cap on a refresh-token **chain** (every token minted across one rotation lineage), not the individual token above. Set once, at chain birth (the offline-scope exchange grant), to `now + refresh_absolute_ttl_seconds` (`chain_expires_at`, `oauth2_op/store.rs:330-332`), and inherited unchanged by every subsequent rotation (`store.rs:578-579`) — this is what stops a session that keeps refreshing before every individual `expires_at` from living forever. See §4 below for the full chain/status model | **Not startup-validated**, unlike `access_ttl_seconds`/`refresh_ttl_seconds` above (`lib.rs:1754-1758` only checks those two). A `<= 0` value is silently clamped to `0` via `.max(0)`, so every new chain is born already past its cap and the first refresh attempt on it fails `invalid_grant` — not a startup crash |
-| `oauth2.token_exchange.allowed_scopes` | `Vec<String>` | default `["openid","profile","email","offline_access"]` | Server-wide scope ceiling, intersected with each client's own `scopes` at request time (`oauth2_op/mod.rs:44-76`) | A scope omitted here can never be granted regardless of client config |
+| `oauth2.token_exchange.allowed_scopes` | `Vec<String>` | default `["openid","profile","email","offline_access"]`; **`authz-idp` requires `openid` present** (ADR-0023, OIDC Discovery 1.0 §3) | Server-wide scope ceiling, intersected with each client's own `scopes` at request time (`oauth2_op/mod.rs:44-76`) | A scope omitted here can never be granted regardless of client config. For `authz-idp` specifically, omitting `openid` is itself a startup failure (`start_idp_server_requires_openid_in_allowed_scopes`, `idp_server_tests.rs`) — `authz-idp` always mounts `/authorize` and always advertises `authorization_endpoint`, so it is always an OpenID Provider, never a bare OAuth2 authorization server |
 | `oauth2.rbac` | `Rbac` | default: `roles_claim="roles"`, empty maps | RBAC config — see below | — |
 | `oauth2.rbac.roles_claim` | `String` | struct default `"roles"` (`authz.rs:357-359`) when the key is absent; **shipped config sets** `"${RBAC_ROLES_CLAIM:-lightbridge_api_roles}"` (`config/default.yaml:122`) | JWT claim carrying the caller's roles (array or space-delimited string) | Wrong claim name → every caller resolves to zero permissions (no error, just silent 403s) |
 | `oauth2.rbac.role_permissions` | `HashMap<String, Vec<String>>` | default empty → falls back to `default_role_permissions()` (`authz.rs:363-383`) | Role → grant-string mapping | Unknown grant strings are logged and skipped, never widen access (`authz.rs:305-311`) |
@@ -81,6 +115,15 @@ service's separate ingest listener (`/v1/otel/*`) stays unauthenticated, since i
 Envoy/OpenTelemetry exporter outside this repo's deploy surface — see `AGENTS.md`'s Security Notes
 and `docs/architecture/budget.md`'s "Spend dependency" section for the full posture.
 
+**Since #603, the two `query`-listener routes no longer share one auth posture above the TLS
+layer.** `/usage/v1/spend/query` (`UsageServiceSpendReader`'s own call, described here) stays
+mTLS-only, unchanged, and now REFUSES any request carrying an `Authorization` header. But
+`/usage/v1/usage/query` additionally requires an end-user `Authorization: Bearer` token (JWKS-
+validated) plus an ownership check against `authz-opa`'s `POST /idp/v1/authorize-usage-scope`
+(#570) — a bearer token that would get `/usage/v1/spend/query` refused is *required* on
+`/usage/v1/usage/query`. Do not assume the two routes are interchangeable behind the shared mTLS
+gate; see `docs/lightbridge-query-api.md` and `docs/usage-api.md` for the full, separate contracts.
+
 ### Env-var interpolation (`interpolate_env_vars`, `config/mod.rs:607-639`)
 
 | Form | Behavior | Unset/empty var |
@@ -96,20 +139,21 @@ Verified by `config/mod.rs:646-701`.
 ## 2. Discovery document fields → derivation
 
 Covers `GET /.well-known/openid-configuration`, built by `discovery_document`
-in `crates/lightbridge-authz-rest/src/signing.rs:438-529` and served via `well_known_router`
-(`signing.rs:542-592`). **Now served exclusively by `authz-idp`** — `authz-api` mounted this same
+in `crates/lightbridge-authz-rest/src/signing.rs:576-628` and served via `well_known_router`
+(`signing.rs:666-736`). **Now served exclusively by `authz-idp`** — `authz-api` mounted this same
 `well_known_router` call during the ADR-0012 Phase 1 transitional-duplication window, but that copy
 was removed once the public `auth.ai.camer.digital` ingress was repointed directly at `authz-idp`;
-`authz-api` no longer serves `/.well-known/*` at all (see `docs/architecture/services.md`). The
-derivation mechanics below are unchanged, only the serving service's name is.
+`authz-api` no longer serves `/.well-known/*` at all (see `docs/architecture/services.md`).
 
 > **Gating note:** the `token_endpoint` omission logic was fixed in PR #301
 > (`fix(oauth2): drop token_endpoint from OIDC discovery when token-exchange is disabled`,
 > commit `3f00ca6`, merged 2026-08-15) — before that fix, a disabled token-exchange still
-> advertised a live-looking `token_endpoint` URL next to empty `grant_types_supported`. This
-> document was checked against `1c2fc6e` (one commit after that fix). Re-check the current state
-> of `discovery_document` before trusting this section if it looks stale — the doc comment on
-> that function is intentionally dense and updated whenever the gating logic moves.
+> advertised a live-looking `token_endpoint` URL next to empty `grant_types_supported`. The
+> derivation mechanics below were rewritten for the model-replacement PR (`OidcDiscovery` →
+> the explicit `DiscoveryDocument`/`ClientAuthenticationMetadata` structs) and re-checked against
+> that PR's final state. Re-check the current state of `discovery_document` before trusting this
+> section if it looks stale — the doc comment directly above that function is intentionally dense
+> and updated whenever the gating logic moves.
 
 **Whether the document exists at all**: only mounted when `oauth2.type: self` **and**
 `oauth2.signing` is set (`lib.rs:1178-1187`). Under `type: external`, `authz-idp` serves no
@@ -120,21 +164,34 @@ either regardless of `oauth2.type`, since it no longer mounts this router at all
 which is `oauth2.token_exchange.as_ref().filter(|t| t.enabled)` (`lib.rs:1169-1173`) — true only
 when the block is present *and* `enabled: true`.
 
+As of this PR, the document is no longer built from `authkestra_op::handlers::discovery::OidcDiscovery`.
+It is a small, explicit `DiscoveryDocument` struct owned by this crate (`signing.rs:551-574`), built by
+`discovery_document` (`signing.rs:576-628`) from two inputs: `token_exchange_scopes: Option<&[String]>`
+(`None` when the block is absent or `enabled: false`; `Some(allowed_scopes)` otherwise) and a
+`ClientAuthenticationMetadata` describing what the registered `oauth2.clients` can actually do
+(`ClientAuthenticationMetadata::from_oauth2`, `signing.rs:51-82`). Every `Vec`/`Option` field on
+`DiscoveryDocument` carries `#[serde(skip_serializing_if = ...)]`, so "empty" and "absent from the JSON"
+are the same thing here — RFC 8414's "omit, don't emit an empty array" discipline applied uniformly.
+
 | Field | Derivation | Gated by |
 |---|---|---|
 | `issuer` | `oauth2.signing.issuer` verbatim | mount condition above |
-| `jwks_uri` | `{issuer}/.well-known/jwks.json` (`signing.rs:476`) | always present when doc exists |
-| `token_endpoint` | `{issuer}/oauth2/token` | **removed from the JSON entirely** when `enabled` is false (`signing.rs:524-526`) — not a null/empty string, the key is absent |
-| `authorization_endpoint` | n/a | **always removed** (`signing.rs:406,523`) — this service never serves `/authorize` (no authorization_code flow, ADR-0011) |
-| `userinfo_endpoint` | n/a | always `null` (`signing.rs:478`) — no userinfo endpoint served |
-| `response_modes_supported` | n/a | always `[]` regardless of `enabled` (`signing.rs:486`) — no redirect flow ever applies |
-| `token_endpoint_auth_methods_supported` | `["none"]`, or `["none","private_key_jwt"]` | second form iff `oauth2.clients` contains at least one `type: confidential` entry (`private_key_jwt_supported`, computed at `lib.rs:1174-1177`) |
-| `grant_types_supported` | `[]` when disabled; `[token-exchange URN, refresh_token URN]` when enabled | `enabled` |
-| `response_types_supported` | **always `[]`** — literal `Vec::new()` in `op_config` (`signing.rs:466`), never touched afterward on either side of `enabled` | **never gated by `enabled` — always empty.** This service has no `/authorize` endpoint (no authorization_code/implicit flow, ADR-0011), so no response type is ever advertised. This field previously *was* wired to `enabled` in production and briefly advertised `["token","id_token","id_token token"]` the moment token-exchange was turned on, even though nothing about token-exchange stands up an authorization endpoint; pinned by regression test `discovery_never_advertises_response_types_or_modes` in `signing_tests.rs` |
-| `scopes_supported` | `[]` when disabled; `oauth2.token_exchange.allowed_scopes` verbatim when enabled | `enabled` |
-| `id_token_signing_alg_values_supported` | hardcoded `["RS256"]` — `ALGORITHM` const (`signing.rs:30`) fed into `op_config.id_token_signing_alg` (`signing.rs:468`), wrapped into a single-element array by `OidcDiscovery::from_config` (`authkestra_op` 0.5.0) | always |
-| `claims_supported` | hardcoded static list: `iss, sub, aud, exp, iat, nbf, jti, typ, azp, lightbridge_caller_kind, sid, scope, api_key_id, project_id, account_id, email, email_verified, allowed_models, identity, nonce, auth_time, at_hash` (`signing.rs:492-518`) | always, regardless of `enabled` — lists claims that *can* appear, not ones guaranteed on every token |
-| `revocation_endpoint` | **Not emitted — the field does not exist on `OidcDiscovery`.** `POST /oauth2/revoke` (RFC 7009) is real and mounted (see §6), but `authkestra_op::handlers::discovery::OidcDiscovery` (0.5.0) has no field to carry it; RFC 8414 §2 lists it as standard metadata this document should otherwise have. Filed upstream: `marcjazz/authkestra#220`. See the doc comment directly above `discovery_document` in `signing.rs` | n/a — structurally absent, not gated by any config |
+| `jwks_uri` | `{issuer origin}/.well-known/jwks.json` (`signing.rs:616`) | always present when doc exists |
+| `token_endpoint` | `{issuer origin}/oauth2/token` | **omitted entirely** (not null, the key is absent) when `enabled` is false (`signing.rs:581,617`) |
+| `revocation_endpoint` | `{issuer origin}/oauth2/revoke` (RFC 7009, mounted — see §6) | same gate as `token_endpoint` (`signing.rs:618`). **This field now exists and is emitted** — the old `OidcDiscovery`-based model had no field to carry it at all; that gap is closed, not just documented |
+| `scopes_supported` | `oauth2.token_exchange.allowed_scopes` verbatim, else omitted | `enabled` (`signing.rs:582-584,619`) |
+| `grant_types_supported` | `[token-exchange URN, refresh_token URN, client_credentials]` unconditionally within that block (ADR-0030, #534 — same gate as the first two, never a separate flag), **plus** `device_code` when the device-authorization endpoint is mounted and `authorization_code` when `/authorize` is mounted; else omitted entirely | `enabled` for the base three (`signing.rs:585-590,620,838-848`); `device_code`/`authorization_code` gated additionally on their own route-mount flags |
+| `token_endpoint_auth_methods_supported` | from `ClientAuthenticationMetadata`: `"none"` iff at least one `type: public` client is registered, `"private_key_jwt"` iff at least one `type: confidential` client's registered JWKS yields a usable signing algorithm (`signing.rs:73-79`) — this replaces the old single `private_key_jwt_supported` boolean with the actual method list | `enabled` — forced empty/omitted regardless of the client registry when token-exchange is disabled (`signing.rs:593-597,621`) |
+| `token_endpoint_auth_signing_alg_values_supported` | per-JWK algorithms collected across every confidential client's registered JWKS via `client_assertion_algorithms` (`signing.rs:101-115`): RSA keys advertise `RS256/RS384/RS512/PS256/PS384/PS512`; EC keys advertise `ES256`/`ES384` for curves P-256/P-384 only (other curves yield none); OKP keys advertise `EdDSA` only for curve `Ed25519` (any other OKP curve, e.g. X25519, yields none) — deduped via `HashSet` (`signing.rs:56-72`) | same as above (`signing.rs:598-602,622`) |
+| `revocation_endpoint_auth_methods_supported` / `revocation_endpoint_auth_signing_alg_values_supported` | **mirror the token-endpoint auth fields exactly** — the same `ClientAuthenticationMetadata` values are reused for both endpoints (`signing.rs:623-624`), since the same registered clients authenticate against either one | `enabled` |
+| `subject_types_supported` | `["public"]`, else omitted | `enabled` **and** `openid` present in `oauth2.token_exchange.allowed_scopes` (`oidc_tokens_supported`, `signing.rs:591,603-607,625`) |
+| `id_token_signing_alg_values_supported` | `[ALGORITHM]` = `["RS256"]` (`ALGORITHM` const, `signing.rs:31`), else omitted | same gate as `subject_types_supported` (`signing.rs:608-612,626`) |
+| `authorization_endpoint`, `response_types_supported`, `response_modes_supported`, `code_challenge_methods_supported` | ADR-0019/#467: gated on the authorization-code capability (`authorization_code_mounted`) | `enabled` **and** `/authorize` mounted |
+| `end_session_endpoint` | `{issuer origin}/oauth2/end_session` (OIDC RP-Initiated Logout 1.0 §3) | same gate as `authorization_endpoint` — logout ends the BROWSER session, which only exists where `/authorize` is mounted |
+| `userinfo_endpoint` | `{issuer origin}/oauth2/userinfo` (OIDC Core §5.3) | `oidc_tokens_supported` — the endpoint refuses any token without the `openid` scope, so where `openid` is not issuable it would answer nothing but `insufficient_scope` |
+| `frontchannel_logout_supported`, `backchannel_logout_supported`, `claims_supported` | **Never emitted.** Neither logout channel has a handler *as an OP* — this deployment never notifies its own RPs of a logout, which is why `/oauth2/end_session` revokes their refresh chains instead. (Not to be confused with the back-channel logout `authz-idp` performs *as an RP* against Keycloak, which needs no advertisement here.) Advertising a channel without a handler is the exact ADR-0023 failure. `claims_supported` remains genuinely unimplemented. | — |
+
+**Rows 149–154's `enabled` gate is always satisfied on `authz-idp` (ADR-0023).** `oauth2.token_exchange.enabled` is a mandatory `true` for every `authz-idp` deployment (see the `oauth2.token_exchange.enabled` row above), so every field in rows 149–154 gated on `enabled` is unconditionally present on `authz-idp`'s own discovery document — the "else omitted"/"forced empty" branches in this table describe `well_known_router`'s behavior for a hypothetical caller with `token_exchange` disabled, which `authz-idp` itself can no longer be. Only the client-registry-dependent content (which auth methods/algorithms actually appear) still varies. This pass does not chase every other stale line-number citation in this file — see the PR body.
 
 **A second, unrelated discovery surface exists on `lightbridge-mcp`.** `GET
 /.well-known/oauth-authorization-server` and `GET /.well-known/openid-configuration` on the MCP
@@ -167,6 +224,27 @@ by `authkestra_engine::token::TokenManager` itself: `iss`, `sub`, `aud`, `exp`, 
 | `email` / `email_verified` | `owner.email` / `owner.email_verified`, populated via `decode_email(subject_token)` on the exchange path (`oauth2_op/mod.rs:113-123`) — best-effort, unverified re-decode of an already-signature-verified upstream token | **Propagated upstream snapshot**, omitted (not `null`) when absent |
 | `allowed_models` | Project's `allowed_models`, if `Some` | Minted from DB state |
 | `at_hash`, `auth_time`, `nonce` | **Not on the access token** — only on the `id_token` (see below) | — |
+
+### `client_credentials` (M2M) access token — a DIFFERENT, smaller claim set (`service_token_extra`, ADR-0030, #534)
+
+The table above describes the human-plane access token (`access_token_extra`). A `client_credentials`
+grant (RFC 6749 §4.4) mints a deliberately separate, smaller shape via `signing::service_token_extra`
+— do not assume the table above applies to it:
+
+| Claim | Value | Note |
+|---|---|---|
+| `sub` | `"svc:<client_id>"` | Never the bare `client_id` — the `svc:` prefix is the namespace guard `auth_provider::FederatedSubjectResolver`'s own-issuer short-circuit relies on |
+| `azp` | The bare, unprefixed `client_id` | |
+| `typ` | `"Bearer"` | Same constant as the human-plane token, so `/oauth2/introspect`'s `typ == "Bearer"` gate recognizes it with no new branch |
+| `jti` | `"lgbr:<cuid2()>"` | Same ADR-0039 convention, same `extra["jti"]` override mechanism |
+| `lightbridge_caller_kind` | `"service"` (`lightbridge_authz_bearer::SERVICE_CALLER_KIND`) | A third value alongside the absent-claim (human) and `"api_key"` cases — see §5 below |
+| `aud` | Requested `audience` if listed in the client's `allowed_audiences`, else the client's own `client_id` | The ONE grant where `aud` may legitimately differ from `azp` |
+| `scope` | Requested scope narrowed against `client.scopes` (or every configured scope if none requested) | Checked against `client.scopes` ONLY — never `oauth2.token_exchange.allowed_scopes` |
+
+**Absent, by omission:** `account_id`, `project_id`, `api_key_id`, `sid`, `identity`,
+`budget_tier`, `quota_tier`, `allowed_models`, `email`/`email_verified`, `at_hash`/`auth_time`/
+`nonce`. No refresh token, no id_token (RFC 6749 §4.4.3). There is no account, project, API key, or
+human identity behind a machine client for any of these to describe.
 
 ### ID token (`id_token_extra`, only issued when the `openid` scope is granted)
 
@@ -273,6 +351,18 @@ catalogue + RBAC compilation), `app/lightbridge-authz/src/mcp.rs:378-403` (MCP t
 - `requestBudgetRefill` additionally refuses any caller whose token carries
   `lightbridge_caller_kind: api_key` — see `docs/rbac.md`'s "#191/#216" note for the `self` vs
   `external` coverage gap (fully closed under `self`, not yet closed under `external`).
+- A THIRD `lightbridge_caller_kind` value, `service`, marks a `client_credentials` (M2M) access
+  token (ADR-0030, #534). A machine token mints no `roles` claim at all, so it holds ZERO
+  permissions on the RPC surface unconditionally — it is refused by every `@allow`/`@@allow` clause,
+  not only `requestBudgetRefill`'s own explicit `api_key` check. **In deployed environments (prod:
+  `ai-helm-values`) this RBAC outcome IS what stops such a token**: `authz-api`/`authz-budget`
+  there validate against `authz-idp`'s own JWKS (the platform rule — every authz resource server
+  validates against `authz-idp`), so the token's signature checks out and the empty permission set
+  is what refuses it. **Only in the LOCAL compose stack** is the token rejected earlier, at
+  signature validation, before any permission is ever checked — `.docker/authz/container.yaml`/
+  `config/default.yaml` still point `oauth2.jwks_url` directly at Keycloak, a local-dev drift
+  tracked separately (`docs/local-testing.md`), not the platform's actual posture. See
+  `docs/rbac.md`'s "Machine (`client_credentials`) callers" note and ADR-0030 Decision 6.
 
 ### `session:revoke-own` / `session:revoke`
 
@@ -299,6 +389,8 @@ catalogue + RBAC compilation), `app/lightbridge-authz/src/mcp.rs:378-403` (MCP t
 | `authz-idp` | `GET /.well-known/openid-configuration`, `GET /.well-known/jwks.json` | none | OIDC discovery + JWKS; only mounted under `oauth2.type: self` with `signing` set (see §2). The sole owner of this surface (ADR-0012) — moved off `authz-api` as a hard cutover |
 | `authz-idp` | `POST /oauth2/token` | client auth (public `client_id` or `private_key_jwt`), no bearer | RFC 8693 token-exchange + refresh grant; only mounted when `oauth2.token_exchange.enabled` |
 | `authz-idp` | `POST /oauth2/revoke` | client auth, same as `/oauth2/token` (public `client_id` or `private_key_jwt`), no bearer | RFC 7009 token revocation for `exchange_refresh_tokens` rows; mounted alongside `/oauth2/token` by the same `token_exchange_router` (`crates/lightbridge-authz-rest/src/token_exchange.rs`). **Not advertised in discovery** — see §2's `revocation_endpoint` row. §2.2: an unknown/already-revoked/out-of-scope token is `200`, never an error; only client-authentication failure is |
+| `authz-idp` | `GET\|POST /oauth2/userinfo` | **Bearer JWT**, this deployment's own, verified against its live JWKS | OIDC Core §5.3 UserInfo. Returns `sub` always, `email`/`email_verified` under the `email` scope, plus `account_id`/`project_id`. **Never returns authorization data** (`budget_tier`, `quota_tier`, `model_policy`, `allowed_models`, roles) — that stays a per-request resource-server decision, not a cacheable identity response. A token without `openid` (notably a data-plane API-key JWT, which is signed by the same key and so verifies here) gets `403 insufficient_scope`, distinct from `401 invalid_token` (`userinfo.rs`) |
+| `authz-idp` | `GET\|POST /oauth2/end_session` | none — the `__Host-authz_session` cookie is the credential | OIDC RP-Initiated Logout 1.0. Ends EVERY session the cookie's subject holds, browser and token alike, and cascades to their refresh chains (`revoke_sessions_and_cascade`) — the only way logout can terminate RP sessions without a back-channel. **Also ends the upstream Keycloak SSO session**, back-channel: a `POST` of the stored (sealed, ADR-0024) refresh token to Keycloak's discovered `end_session_endpoint`, never a browser redirect — there is no raw ID token stored to use as an `id_token_hint`, and a redirect without one shows an interstitial on every logout (`KeycloakRelyingParty::end_upstream_session`). Every upstream failure — unreachable, refused, no stored/openable refresh token — is logged and swallowed: local revocation, cookie clearing and the redirect all still happen. The hard `500` stays reserved for LOCAL revocation failing. `id_token_hint` is verified but **never selects whose session ends**; it only names the client whose registered `post_logout_redirect_uris` are consulted, and is accepted while expired (§2). An unregistered `post_logout_redirect_uri` is refused and the OP renders its own page. Does NOT invalidate an access token already in flight — nothing consults `sessions` on the resource-server path, so a bearer stays valid to its `exp` (`end_session.rs`) |
 | `authz-opa` | `GET /`, `GET /healthz`, `GET /healthz/startup`, `GET /healthz/ready` | none | probes |
 | `authz-opa` | `GET /v1/opa/docs`, `GET /v1/opa/openapi.json` | none | Swagger UI (`lib.rs:1525`) |
 | `authz-opa` | `POST /v1/authorino/validate/introspect` | **Basic auth** | RFC 7662-shaped API-key introspection; response includes `role`/`quota_tier`/`project_quota` (`routers/mod.rs:14-22`, `introspect.rs`) |
@@ -371,3 +463,5 @@ use `/v1/authorino/validate/introspect`. All three should be updated to match th
   `authkestra_engine::TokenManager` instead of hand-rolled `jsonwebtoken::encode`.
 - `docs/adr/0003-cratestack-crud-migration.md` — why the CRUD surface is `/rpc/*`, not REST.
 - `docs/authorino-usage.md` — the Authorino `AuthConfig` wiring for `/v1/authorino/validate/introspect`.
+- `docs/oauth-oidc-standards-roadmap.md` — current OAuth/OIDC implementation status and standards
+  conformance roadmap.

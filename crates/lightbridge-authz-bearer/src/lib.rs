@@ -23,11 +23,33 @@ pub const CALLER_KIND_CLAIM: &str = "lightbridge_caller_kind";
 /// not carry it until that flow is updated to stamp it.
 pub const API_KEY_CALLER_KIND: &str = "api_key";
 
+/// The [`CALLER_KIND_CLAIM`] value stamped onto a token minted for the `client_credentials` (M2M)
+/// grant (#534, ADR-0030), as opposed to a human OIDC login (no claim at all) or an API-key JWT
+/// ([`API_KEY_CALLER_KIND`]). A machine token also mints no roster/roles claim at all, so
+/// [`TokenInfo::permissions`] resolves empty for it regardless of this value -- RBAC fail-closed
+/// does not depend on this constant being checked anywhere. It exists purely so a caller that
+/// needs to tell "no signal" apart from "this genuinely is a service token" can (e.g. for audit
+/// logging), without inventing a second ad hoc string.
+pub const SERVICE_CALLER_KIND: &str = "service";
+
 /// Token information returned by JWT validation.
 #[derive(Clone, Deserialize)]
 pub struct TokenInfo {
     pub active: bool,
     pub sub: String,
+    /// The token's `iss` claim (ADR-0025 Stage 2). Extraction only, deliberately NOT enforced
+    /// here: `BearerTokenService` is one shared instance per component, validating every bearer
+    /// token that component ever sees regardless of which plane minted it -- a Keycloak-issued
+    /// human OIDC token (`oauth2.type: external`, or the token-exchange grant's `subject_token`
+    /// check under `type: self`) and a self-signed API-key JWT this service minted itself
+    /// (`ApiKeyJwtSigner`, `oauth2.signing.issuer` -- deliberately OUR OWN issuer, not
+    /// `oauth2.federation.issuer`) both flow through the SAME `validate_bearer_token` call site,
+    /// keyed off the SAME `oauth2.jwks_url`. Enforcing `iss == oauth2.federation.issuer` here
+    /// would refuse every self-signed-JWT deployment outright. Scoping enforcement to only the
+    /// Keycloak-validated plane needs a caller-side signal this trait does not carry today (which
+    /// `oauth2.type` produced the config this instance was built with, and/or which call site is
+    /// asking) -- tracked as a follow-up; see ADR-0025's own "amends ADR-0011" section.
+    pub iss: String,
     pub exp: u64,
     /// The audience claim from the JWT, if present.
     #[serde(default)]
@@ -54,6 +76,7 @@ impl std::fmt::Debug for TokenInfo {
         f.debug_struct("TokenInfo")
             .field("active", &self.active)
             .field("sub", &self.sub)
+            .field("iss", &self.iss)
             .field("exp", &self.exp)
             .field("aud", &self.aud)
             .field("roles", &self.roles)
@@ -87,6 +110,16 @@ impl TokenInfo {
 #[derive(Debug, Clone, Deserialize)]
 struct Claims {
     sub: String,
+    /// ADR-0025 Stage 2: extracted so [`TokenInfo::iss`] can carry it -- see that field's doc
+    /// comment for why this codebase does not enforce it inside this service. Deliberately
+    /// required (no `#[serde(default)]`), not `Option<String>`: every real token this service
+    /// ever validates -- Keycloak-issued or self-signed -- carries an `iss` claim, so a token
+    /// missing one is not a legitimate degraded case to tolerate. AGENTS.md's fail-closed rule
+    /// applies here too: a missing claim is "unknown", and unknown routes to the strictest
+    /// branch, which for a required field means deserialization itself fails the whole token,
+    /// not a permissive default. See `missing_iss_is_rejected` in `token_validation_tests.rs` for
+    /// the dedicated regression test.
+    iss: String,
     exp: u64,
     /// Audience claim - can be a single string or array of strings
     #[serde(default)]
@@ -323,6 +356,7 @@ impl BearerTokenServiceTrait for BearerTokenService {
         Ok(TokenInfo {
             active: true,
             sub: claims.sub,
+            iss: claims.iss,
             exp: claims.exp,
             aud: token_audience,
             roles,

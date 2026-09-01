@@ -119,20 +119,24 @@ runs:
         done <<< "$TAGS"
         echo "digest=$(cat "$digest_file")" >> "$GITHUB_OUTPUT"
 
-    - name: Install cosign
-      uses: sigstore/cosign-installer@v3.7.0
-
-    - name: Sign image (keyless, GitHub OIDC)
-      shell: bash
-      env:
-        IMAGE_REF: ${{ steps.docker-setup.outputs.image-ref }}
-        DIGEST: ${{ steps.push.outputs.digest }}
-      run: cosign sign --yes "${IMAGE_REF}@${DIGEST}"
+    # This action deliberately does NOT sign. The cosign signature is what
+    # argocd-image-updater promotes on (`newest-build` resolves over signed images), so it is the
+    # production-promotion token, not a build artifact -- and #499 is what happens when the token
+    # is minted here: signing ran seconds after the push, before `test`/`integration-test` had a
+    # verdict and before Trivy had looked at the image, so a red-main build (bffeaf5) reached prod
+    # while CI was still red. Signing now lives in `ci.yml`'s `container-build` job, after the
+    # Trivy gate and behind `needs: [sast, binaries, test, integration-test]`, where the ordering
+    # is visible in the workflow instead of buried in a composite step.
+    #
+    # `image-ref` is exported for that signing step: cosign signs `ref@digest`, never a tag.
 
 outputs:
   version-tag:
     description: Fully qualified image tag for this application version
     value: ${{ steps.docker-setup.outputs.version-tag }}
+  image-ref:
+    description: Fully qualified image reference WITHOUT a tag, for signing by digest
+    value: ${{ steps.docker-setup.outputs.image-ref }}
   digest:
     description: Digest of the pushed image
     value: ${{ steps.push.outputs.digest }}
