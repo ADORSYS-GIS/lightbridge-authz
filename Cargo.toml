@@ -205,9 +205,9 @@ jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
 #
 # ⚠️ These three move in LOCKSTEP -- they share one `[workspace.package] version` upstream, and a
 # partial bump has broken this workspace before via a `jsonwebtoken` major mismatch.
-authkestra-resource = "=0.6.3"
-authkestra-op = "=0.6.3"
-authkestra-engine = "=0.6.3"
+authkestra-resource = "=0.7.0"
+authkestra-op = "=0.7.0"
+authkestra-engine = "=0.7.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "tracing", "net", "time"] }
 thiserror = "2"
 anyhow = "1"

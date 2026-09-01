@@ -3,6 +3,9 @@
 **Start here:** [`docs/local-testing.md`](docs/local-testing.md) — run the whole platform locally
 (backend + frontend console) and test it end to end.
 
+**Find any document:** [`docs/README.md`](docs/README.md) is the navigation map for this
+repository's documentation — use it to jump straight to the guide, ADR, or runbook you need.
+
 Lightbridge Authz is a multi-service backend for API key management and usage analytics:
 - `authz-api` and `authz-opa` handle key lifecycle and validation.
 - `authz-idp` is the OIDC broker for both the human plane (browser SSO, RFC 8628 device flow, token
