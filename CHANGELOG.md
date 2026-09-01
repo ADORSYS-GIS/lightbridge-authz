@@ -1,5 +1,44 @@
 # Changelog
 
+## [8.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v7.0.0...v8.0.0) (2026-09-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **idp:** the RP leg takes its keys from discovery, not oauth2.jwks_url ([#624](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/624))
+* **idp:** the RP leg hands off to the SPA; /ui becomes a route allowlist ([#607](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/607))
+* **usage:** scope=all estate-wide usage query, scope=user self-ownership ([#605](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/605))
+* **build:** authz-idp serves the pinned external authz-ui bundle; delete web/hosted-login ([#599](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/599))
+
+### Features
+
+* **build:** authz-idp serves the pinned external authz-ui bundle; delete web/hosted-login ([#599](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/599)) ([c4f2411](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/c4f2411f419bc74864807ba7f2ac5f40c04a7dbd))
+* **idp:** first-class client_credentials (M2M) grant, private_key_jwt-only ([#534](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/534)) ([#604](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/604)) ([66ce232](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/66ce232215acf4cb03446ea6338cee897a4755c4))
+* **idp:** the RP leg hands off to the SPA; /ui becomes a route allowlist ([#607](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/607)) ([cbc9bd1](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/cbc9bd198b67fdb030d55a50983e5843a7dfde72))
+* **usage:** scope=all estate-wide usage query, scope=user self-ownership ([#605](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/605)) ([a9bf3ed](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/a9bf3ed3aded5928b46b8ef03d8b63024630e8f5))
+
+
+### Bug Fixes
+
+* **authz-idp:** enforce PKCE unconditionally at the authorization-code token endpoint; migrate authkestra to 0.7.0 ([#616](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/616)) ([4f9e901](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/4f9e901985854683a6a2f7ffcab7f5cdd6b5a89e))
+* **chart:** render the required server.query listener in lightbridge-authz-usage, mTLS on by default ([#593](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/593)) ([6b4f83d](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/6b4f83daa1b2112583bfc3c348e37608f11c32bf))
+* **idp:** the RP leg takes its keys from discovery, not oauth2.jwks_url ([#624](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/624)) ([8f2b7c7](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/8f2b7c70837134906de59b5fa6b5056bcb35f58e))
+
+
+### Continuous Integration
+
+* **loc-gate:** block new or changed non-test Rust files over 200 LoC ([fe66b31](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/fe66b31547902fddc1968bee0da0599fdd228194))
+* **loc-gate:** block new or changed Rust files over 200 LoC (port from lightbridge-governance) ([c42079c](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/c42079c5c758e1f0b8bb1296f14efa4c53f54ee2))
+* **usage:** run lightbridge-authz-usage-rest it-tests in CI and just it-tests ([#592](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/592)) ([6025cf4](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/6025cf4bda301f8514b65c05c114e538e493fa1c))
+
+
+### Documentation
+
+* **adr:** ADR-0028 — FinOps first settles the usage-store conventions ([#581](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/581)) ([#595](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/595)) ([888ac7f](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/888ac7ff69f7bf0882339493b61e468981f1a204))
+* **architecture:** mermaid diagrams for the human plane ([#610](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/610)) ([4da6420](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/4da6420f951453c5cb4424b3c112ba630f5cf2c9))
+* sweep stale claims after the 2026-08-31 merges ([#581](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/581)) ([#612](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/612)) ([69443aa](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/69443aad4cf38d9322415b7c6d5660ef0058fc4a))
+* the human plane — SPA-rendered pages, artifact contract, /ui allowlist ([#609](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/609)) ([43ab30a](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/43ab30a6e69707a1533198000f4ef4920026dfc6))
+
 ## [7.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v6.0.0...v7.0.0) (2026-08-31)
 
 
