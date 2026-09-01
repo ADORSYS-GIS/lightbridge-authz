@@ -108,6 +108,7 @@ fn row_to_refresh_token(row: ExchangeRefreshTokenRow) -> RefreshToken {
         },
         row.scope.unwrap_or_default(),
         row.expires_at,
+        None,
     )
 }
 

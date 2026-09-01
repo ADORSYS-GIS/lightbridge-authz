@@ -697,6 +697,7 @@ impl TokenExchangeOpStore {
             identity,
             input.scope.unwrap_or_default().to_string(),
             now + Duration::seconds(self.cfg.refresh_ttl_seconds),
+            None,
         );
         self.refresh
             .store_token(refresh)
