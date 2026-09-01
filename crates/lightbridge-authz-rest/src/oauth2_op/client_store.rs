@@ -36,6 +36,14 @@ impl ClientStore for ConfigClientStore {
 /// the reviewed config. `Service` (#534, ADR-0030: `client_credentials`/M2M clients) maps to the
 /// SAME `PrivateKeyJwt` method as `Confidential` -- ADR-0011 Decision 6 draws no exception for
 /// machine clients, so the two variants only differ at the config-review layer, never here.
+#[expect(
+    deprecated,
+    reason = "ClientRegistration::require_pkce is deprecated (authkestra#273) because PKCE is \
+              mandatory for every authorization_code client and no longer read by upstream's \
+              handlers. The field is still required and retained for wire/storage compatibility, \
+              so we keep writing it from config; this repo's own PKCE enforcement is the \
+              unconditional /authorize and token-endpoint checks, not this field."
+)]
 fn to_registration(client: &OauthClient) -> ClientRegistration {
     ClientRegistration {
         client_id: client.client_id.clone(),
