@@ -697,6 +697,7 @@ impl TokenExchangeOpStore {
             identity,
             input.scope.unwrap_or_default().to_string(),
             now + Duration::seconds(self.cfg.refresh_ttl_seconds),
+            None,
         );
         self.refresh
             .store_token(refresh)
@@ -1152,7 +1153,8 @@ impl TokenExchangeOpStore {
     /// `authkestra_op::handlers::token::default_handle_authorization_code`.** It cannot be
     /// delegated: that function consumes the code itself, so calling it first would leave nothing
     /// to mint from. Every check it performs is reproduced here in the same order -- expiry,
-    /// client binding, `redirect_uri` equality, PKCE S256, and the `require_pkce` fallback. If
+    /// client binding, `redirect_uri` equality, and PKCE S256 (mandatory for every client,
+    /// per authkestra#273/0.7.0 — `client.require_pkce` no longer gates it). If
     /// upstream changes those semantics, this copy must be updated with them; that is the cost of
     /// the seam and it is why each check carries its own refusal test.
     async fn mint_from_authorization_code(
@@ -1224,11 +1226,16 @@ impl TokenExchangeOpStore {
             if computed != challenge {
                 return Err(oauth_err("invalid_grant", "code_verifier is invalid"));
             }
-        } else if client.require_pkce {
-            return Err(oauth_err(
-                "invalid_grant",
-                "PKCE is required for this client",
-            ));
+        } else {
+            // PKCE is mandatory for every client, per OAuth 2.1 §4.1 (authkestra#273):
+            // since 0.7.0 upstream rejects a stored code with no code_challenge
+            // unconditionally — `client.require_pkce` no longer gates this (it is
+            // deprecated and no longer read). In ordinary operation `authorize.rs`
+            // never stores a code without a challenge, so this only fires for a code
+            // that reached storage by some other path; reject it rather than silently
+            // skip PKCE verification for it. This mirrors upstream 0.7.0's handler
+            // exactly, which this copy must faithfully track.
+            return Err(oauth_err("invalid_grant", "PKCE is required"));
         }
 
         // `authorize.rs` stamps the resolved account/project into the code's identity. The

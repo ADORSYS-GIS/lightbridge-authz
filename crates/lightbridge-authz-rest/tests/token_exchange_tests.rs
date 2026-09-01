@@ -1030,6 +1030,88 @@ async fn authorization_code_token_endpoint_enforces_binding_pkce_and_single_use(
     assert!(body.get("access_token").is_none());
 }
 
+/// Regresses the authkestra 0.7.0 PKCE hardening (authkestra#273): the token endpoint must
+/// refuse a stored authorization code that carries NO `code_challenge`, unconditionally, rather
+/// than gating that refusal on `client.require_pkce`. `/authorize` never stores a codeless code
+/// (it enforces PKCE S256 unconditionally), so this branch only fires for a code that reached
+/// storage by some other path (a legacy pre-#273 code or a downstream `OpStore::store_code`
+/// override). Before this fix `mint_from_authorization_code` mirrored authkestra's *old* logic
+/// (`else if client.require_pkce`), so a `require_pkce: false` client could redeem a codeless
+/// code end to end; upstream 0.7.0 rejects that case unconditionally, and this hand-written copy
+/// must faithfully track upstream. The client here is deliberately a PUBLIC `authorization_code`
+/// client with `require_pkce: false` (a shape whose require_pkce flag would, before authkestra#273,
+/// have allowed a codeless redemption, and which needs no client authentication at the token
+/// endpoint) so the refusal is proven independent of the deprecated flag.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorization_code_token_endpoint_refuses_stored_code_without_pkce_challenge(
+    pool: PgPool,
+) {
+    const CLIENT: &str = "public-browser-client";
+    const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
+
+    let repo = repo(pool);
+    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    seed(&repo).await;
+
+    // A Public authorization_code client with require_pkce: false -- the shape that must still be
+    // refused at the token endpoint now that PKCE is mandatory regardless of the flag.
+    let client = OauthClient {
+        client_id: CLIENT.to_string(),
+        client_type: OauthClientType::Public,
+        scopes: client_scopes(),
+        grant_types: vec![
+            "authorization_code".to_string(),
+            "refresh_token".to_string(),
+        ],
+        allowed_audiences: vec![CLIENT.to_string()],
+        jwks: None,
+        redirect_uris: vec![REDIRECT_URI.to_string()],
+        post_logout_redirect_uris: Vec::new(),
+        require_pkce: false,
+    };
+    DbAuthorizationCodeStore::new(repo.clone())
+        .store_code({
+            let mut attributes = HashMap::new();
+            attributes.insert("account_id".to_string(), ACCOUNT_ID.to_string());
+            attributes.insert("project_id".to_string(), PROJECT_ID.to_string());
+            let authorization_code = AuthorizationCode::new(
+                "codeless-code".to_string(),
+                CLIENT.to_string(),
+                REDIRECT_URI.to_string(),
+                "openid".to_string(),
+                Identity {
+                    provider_id: "keycloak".to_string(),
+                    external_id: SUBJECT.to_string(),
+                    email: Some("user@example.test".to_string()),
+                    username: None,
+                    attributes,
+                },
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                false,
+            );
+            // Deliberately NO code_challenge / code_challenge_method on purpose.
+            authorization_code
+        })
+        .await
+        .unwrap();
+
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![])),
+            vec![client],
+            &redis_url(),
+        ),
+        &format!(
+            "grant_type=authorization_code&client_id={CLIENT}&code=codeless-code&redirect_uri={REDIRECT_URI}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_grant", "body: {body}");
+    assert!(body.get("access_token").is_none(), "body: {body}");
+}
+
 /// The defect this whole claim-propagation change exists to fix: unlike the token-exchange grant
 /// (`exchange_snapshots_email_claims_from_subject_token`), the browser `authorization_code` grant
 /// has no upstream bearer token in hand at redemption time to decode claims from -- the

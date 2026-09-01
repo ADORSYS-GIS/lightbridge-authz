@@ -1,0 +1,14 @@
+{
+	"servers": {
+		"lci-mcp": {
+			"type": "stdio",
+			"command": "npx",
+			"args": [
+				"-y",
+				"@vymalo/lightbridge-code-intelligence-mcp@0.1.0",
+				"--stdio"
+			]
+		}
+	},
+	"inputs": []
+}
