@@ -50,8 +50,11 @@ against `IdP` instead. Do not read this diagram as the platform's general archit
 own JWKS — `authz-idp` alone brokers the Keycloak login leg.** Production already complies:
 `ai-helm-values`' `environments/prod/values/lightbridge-app.yaml` sets the `api`, `mcp`, and
 `budget` components' `oauth2.jwks_url` to `https://auth.ai.camer.digital/.well-known/jwks.json` —
-`authz-idp`'s own discovery JWKS — and Keycloak's JWKS is configured only inside the `idp`
-component itself. `authz-idp` mints its own tokens with a signing keypair generated on first
+`authz-idp`'s own discovery JWKS. **The `idp` component's own `oauth2.jwks_url` belongs to that
+same rule, not to the Keycloak leg**: it validates a `subject_token` presented TO `authz-idp`, and
+`KeycloakRelyingParty` reads the keys that verify Keycloak's ID tokens from the discovery document
+instead. Setting it to Keycloak's JWKS to serve the RP leg is what it looks like it does and is not
+what it does — see `docs/auth-reference.md`'s `oauth2.jwks_url` row for the outage that taught this. `authz-idp` mints its own tokens with a signing keypair generated on first
 startup and stored in the DB (`crates/lightbridge-authz-api-key/src/repo.rs:2601`
 `ensure_active_signing_key`); in prod, that is the ONE trust root every resource server (including
 `authz-api`/`authz-budget`) actually validates against.
@@ -428,7 +431,7 @@ CARGO_BUILD_JOBS=4 cargo check --all-targets
 | `406 Not Acceptable` | Request sent `Accept: application/json` (most JSON HTTP clients default to this) | ADR-0013 made CBOR the only codec and deleted the JSON variant; `Accept` is validated *before* `Content-Type`, so a naive all-JSON client hits `406` here, not `415` (`docs/adr/0013-cbor-is-the-only-transport-codec.md:91-97`) |
 | `415 Unsupported Media Type` | Valid `Accept: application/cbor` but `Content-Type: application/json` body | Send CBOR, not JSON, as the request body |
 | TLS/cert errors from any non-`curl` client | The generated certs' SAN (if present) names the in-network service, never `localhost`; the currently-running dev volume's cert has no SAN at all | Disable certificate verification for local use (`curl -k`, `NODE_TLS_REJECT_UNAUTHORIZED=0`, etc.) — see section 1 (Backend) |
-| `502 sign-in unavailable` on `authz-idp` `/authorize` | The relying party can't reach `oauth2.federation.discovery_url` from inside the Docker network | Confirm `discovery_url` is the in-network Keycloak address (`http://keycloak:9100/realms/dev`), not `localhost` |
+| `502 sign-in unavailable` on `authz-idp` `/authorize` | `begin()`'s first step, `discover()`, failed. Either the relying party can't reach `oauth2.federation.discovery_url` from inside the Docker network, or the fetched document's `issuer` isn't byte-equal to `oauth2.federation.issuer` | Confirm `discovery_url` is the in-network Keycloak address (`http://keycloak:9100/realms/dev`), not `localhost`, and that `issuer` matches the document's own `issuer` exactly. The same failure on the device leg logs `rp leg failure reason="begin_device_failed"` and 303s to `/ui/error` ("Unable to complete sign-in") — one cause, two error strings |
 | `just it-idp` fails at the browser-flow section | The RP's `callback_url` is `https://localhost:13004/...`, unreachable from inside the `it-idp` test container | Expected to be handled automatically — `idp_it.py`'s `to_in_network()` (`.docker/it/idp_it.py:303-320`) rewrites the callback to the in-network `authz-idp` address before following it |
 | Connection refused on 13000–13003, 9100, 5432, 5433 or 6379 — while `docker compose ps` shows every container healthy, and 13004/13005 still answer | You ran a `just it-*` target. `compose.it.yaml` applies `ports: !reset []` to 11 services (`compose.it.yaml:4-34`), un-publishing their host ports so the test runner reaches them over the Docker network instead. `authz-idp` and `authz-budget` are **not** in that list, which is why those two keep working and the failure looks selective rather than total | `just up` re-applies the base compose file and restores every published port. Nothing is broken and no data is lost — the containers were reachable in-network the whole time |
 

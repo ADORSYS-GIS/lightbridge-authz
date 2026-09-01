@@ -142,15 +142,7 @@ fn relying_party(
     discovery_url: String,
     repo: Arc<StoreRepo>,
 ) -> KeycloakRelyingParty {
-    KeycloakRelyingParty::new(
-        config,
-        issuer,
-        discovery_url,
-        "https://keycloak.example.test/jwks".to_string(),
-        repo,
-        rate_limiter(),
-    )
-    .unwrap()
+    KeycloakRelyingParty::new(config, issuer, discovery_url, repo, rate_limiter()).unwrap()
 }
 
 fn token_set(refresh_token: Option<&str>, issuer: &str) -> KeycloakTokenSet {

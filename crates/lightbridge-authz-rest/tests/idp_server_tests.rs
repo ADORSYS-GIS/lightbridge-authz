@@ -656,7 +656,6 @@ fn offline_relying_party(
             working_relying_party(),
             WORKING_ISSUER.to_string(),
             WORKING_ISSUER.to_string(),
-            "https://keycloak.example.test/jwks".to_string(),
             repo,
             Arc::new(cratestack_axum::ratelimit::InMemoryRateLimitStore::new()),
         )

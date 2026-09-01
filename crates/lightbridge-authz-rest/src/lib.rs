@@ -3274,12 +3274,12 @@ pub async fn start_idp_server(
     // hand). `oauth2.federation.discovery_url` is a distinct, optional LOCATION override for
     // where `authz-idp` dials OIDC discovery from inside this deployment's own network -- see
     // `KeycloakRelyingParty::discover`'s doc comment for why that dial target and the identity
-    // issuer are kept separate.
+    // issuer are kept separate. `oauth2.jwks_url` is deliberately NOT passed -- on authz-idp it
+    // is the OPPOSITE trust root; see `KeycloakRelyingParty::jwks` (conflating them broke prod).
     let relying_party = Arc::new(relying_party::KeycloakRelyingParty::new(
         rp_config,
         federation.issuer.clone(),
         federation.effective_discovery_url().to_string(),
-        oauth2.jwks_url.clone(),
         Arc::new(StoreRepo::new(pool.clone())),
         device_verify_rate_limit_store,
     )?);

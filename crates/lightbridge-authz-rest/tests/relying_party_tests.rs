@@ -234,7 +234,6 @@ async fn verify_page_sanitizes_user_code_for_the_handoff(pool: PgPool) {
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo(pool),
             rate_limiter(),
         )
@@ -297,7 +296,6 @@ async fn discover_dials_discovery_url_but_validates_issuer_against_identity(pool
         rp_config(&keycloak),
         identity_issuer,
         keycloak.base_url(),
-        keycloak.url("/jwks"),
         repo,
         rate_limiter(),
     )
@@ -351,7 +349,6 @@ async fn verified_keycloak_callback_transitions_pending_device_code_to_approved(
             config,
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
         )
@@ -446,7 +443,6 @@ async fn keycloak_token_failure_leaves_device_code_pending(pool: PgPool) {
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
         )
@@ -487,7 +483,6 @@ async fn invalid_device_codes_have_one_uniform_response_and_frame_protection(poo
             invalid_callback,
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo(pool.clone()),
             rate_limiter(),
         )
@@ -524,7 +519,6 @@ async fn invalid_device_codes_have_one_uniform_response_and_frame_protection(poo
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo,
             rate_limiter(),
         )
@@ -612,7 +606,6 @@ async fn verify_continue_requires_the_confirmation_cookie_from_verify_submit(poo
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo,
             rate_limiter(),
         )
@@ -714,7 +707,6 @@ async fn verify_context_is_a_uniform_404_without_the_confirm_cookie(pool: PgPool
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo,
             rate_limiter(),
         )
@@ -809,7 +801,6 @@ async fn verify_context_never_returns_the_device_code(pool: PgPool) {
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo,
             rate_limiter(),
         )
@@ -874,7 +865,6 @@ async fn relying_party_rejects_non_positive_runtime_limits(pool: PgPool) {
             zero_timeout,
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo(pool.clone()),
             rate_limiter(),
         )
@@ -888,7 +878,6 @@ async fn relying_party_rejects_non_positive_runtime_limits(pool: PgPool) {
             zero_browser_ttl,
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo(pool),
             rate_limiter(),
         )
@@ -914,7 +903,6 @@ async fn begin_browser_rejects_backslash_open_redirect_variants(pool: PgPool) {
         rp_config(&keycloak),
         keycloak.base_url(),
         keycloak.base_url(),
-        keycloak.url("/jwks"),
         repo(pool),
         rate_limiter(),
     )
@@ -957,7 +945,6 @@ async fn callback_rejects_state_cookie_mismatch_before_contacting_keycloak(pool:
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo(pool),
             rate_limiter(),
         )
@@ -1013,7 +1000,6 @@ async fn invalid_id_token_profiles_fail_closed(pool: PgPool) {
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo(pool),
             rate_limiter(),
         )
@@ -1197,7 +1183,6 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
         )
@@ -1422,7 +1407,6 @@ async fn suspended_account_is_refused_a_browser_session(pool: PgPool) {
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
         )
@@ -1565,7 +1549,6 @@ async fn inactive_project_is_refused_a_browser_session(pool: PgPool) {
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
         )
@@ -1719,7 +1702,6 @@ async fn browser_session_persists_the_real_authenticated_member_subject(pool: Pg
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
         )
@@ -1867,7 +1849,6 @@ async fn browser_session_subject_is_the_acting_account_not_the_keycloak_sub(pool
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
         )
@@ -2083,7 +2064,6 @@ async fn device_pairing_callback_persists_a_federated_identity_for_an_existing_a
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
         )
@@ -2136,6 +2116,117 @@ async fn device_pairing_callback_persists_a_federated_identity_for_an_existing_a
     );
 }
 
+/// Regression, lightbridge-authz production outage 2026-09-01: the RP leg must take its ID-token
+/// verification keys from the DISCOVERY document's own `jwks_uri`, never from `oauth2.jwks_url`.
+///
+/// `oauth2.jwks_url` on `authz-idp` names the keys a `subject_token` presented TO this service is
+/// validated against (`BearerTokenService`, `lib.rs`). It was repointed at this service's own
+/// JWKS -- correct for that consumer, catastrophic for this one: `discover()` used to require
+/// `metadata.jwks_uri == oauth2.jwks_url`, so discovery returned `Err` on every call and 100% of
+/// fresh logins died in `begin()` (browser: `502 sign-in unavailable`; device:
+/// `begin_device_failed` -> `/ui/error`). Refresh-token traffic never touches this leg, so the
+/// service looked healthy.
+///
+/// Every other test here serves discovery from `mock_discovery_and_jwks`, whose `jwks_uri` is the
+/// same `/jwks` path the old signature was handed -- so the whole suite satisfied the equality by
+/// construction and the config trap was invisible. This test breaks that coupling deliberately:
+/// the realm publishes its keys at `/protocol/openid-connect/certs` (what a real Keycloak does),
+/// and NOTHING is served at `/jwks`. A full device pairing must still complete end to end.
+///
+/// Prove-fail-first (done, 2026-09-01): reinstating `discover()`'s
+/// `metadata.jwks_uri != self.jwks_url` check makes this fail UPSTREAM of its own assertions,
+/// inside `begin_pairing` -- `begin_device` returns `Err("Keycloak discovery JWKS URI mismatch")`,
+/// the handler 303s to the relative `/ui/error`, and `state_from_redirect`'s `Url::parse` panics
+/// `RelativeUrlWithoutBase`. That is the production failure reaching the test, one frame earlier
+/// than the assertion (same shape as the note on
+/// `device_pairing_callback_persists_a_federated_identity_for_an_existing_account`). In the same
+/// run that test still PASSED -- its `jwks_uri` is `/jwks`, so it satisfied the old equality by
+/// construction. That is precisely the blind spot this test exists to close.
+#[sqlx::test(migrations = "../../migrations")]
+async fn id_token_keys_come_from_the_discovered_jwks_uri_not_a_configured_one(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let key = generate_rs256_key().unwrap();
+    let certs_path = "/protocol/openid-connect/certs";
+    keycloak
+        .mock_async(|when, then| {
+            when.method(GET).path("/.well-known/openid-configuration");
+            then.status(200).json_body(serde_json::json!({
+                "issuer": keycloak.base_url(),
+                "authorization_endpoint": keycloak.url("/authorize"),
+                "token_endpoint": keycloak.url("/token"),
+                "jwks_uri": keycloak.url(certs_path)
+            }));
+        })
+        .await;
+    keycloak
+        .mock_async(|when, then| {
+            when.method(GET).path(certs_path);
+            then.status(200)
+                .json_body(serde_json::json!({ "keys": [key.public_jwk.clone()] }));
+        })
+        .await;
+    let repo = repo(pool.clone());
+    repo.create_account(
+        &AccountId::assert_already_resolved("keycloak-subject"),
+        CreateAccount {
+            default_quota: None,
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let store = DbDeviceCodeStore::new(repo.clone());
+    store.store_device_code(session()).await.unwrap();
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
+            repo.clone(),
+            rate_limiter(),
+        )
+        .unwrap(),
+    );
+    let (router, state, cookie) = begin_pairing(router(rp)).await;
+    let decoded = OAuth2State::decrypt(&state, &state_key_bytes()).unwrap();
+    let token = sign_id_token(
+        &key,
+        "keycloak-subject",
+        &keycloak.base_url(),
+        decoded.nonce.as_deref().unwrap(),
+    );
+    keycloak
+        .mock_async(|when, then| {
+            when.method(POST).path("/token").body_includes("code=code");
+            then.status(200)
+                .json_body(rich_token_response(&token, "discovered-jwks-refresh"));
+        })
+        .await;
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(callback_uri(&state))
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "a realm publishing its keys anywhere other than /jwks must still complete a login"
+    );
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        "/ui/device/success"
+    );
+    repo.find_federated_identity(&keycloak.base_url(), "keycloak-subject")
+        .await
+        .unwrap()
+        .expect("the ID token must have been verified against the DISCOVERED jwks_uri");
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn device_pairing_callback_is_refused_for_a_subject_with_no_account(pool: PgPool) {
     let keycloak = MockServer::start_async().await;
@@ -2150,7 +2241,6 @@ async fn device_pairing_callback_is_refused_for_a_subject_with_no_account(pool: 
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
         )
@@ -2258,7 +2348,6 @@ async fn browser_sso_callback_persists_the_same_federated_identity(pool: PgPool)
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
         )
@@ -2370,7 +2459,6 @@ async fn federated_identities_persists_the_plaintext_profile_claim_snapshot(pool
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
         )
@@ -2474,7 +2562,6 @@ async fn stored_token_envelope_is_not_plaintext_at_rest(pool: PgPool) {
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
         )
@@ -2561,7 +2648,6 @@ async fn token_envelope_does_not_open_under_the_state_encryption_key(pool: PgPoo
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
         )
@@ -2652,7 +2738,6 @@ async fn a_second_login_updates_the_same_federated_identity_row_and_reseals(pool
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            keycloak.url("/jwks"),
             repo.clone(),
             rate_limiter(),
         )
@@ -2845,7 +2930,6 @@ async fn a_second_issuer_with_a_colliding_subject_is_refused_not_merged(pool: Pg
             rp_config(&keycloak_a),
             keycloak_a.base_url(),
             keycloak_a.base_url(),
-            keycloak_a.url("/jwks"),
             repo.clone(),
             rate_limiter(),
         )
@@ -2856,7 +2940,6 @@ async fn a_second_issuer_with_a_colliding_subject_is_refused_not_merged(pool: Pg
             rp_config(&keycloak_b),
             keycloak_b.base_url(),
             keycloak_b.base_url(),
-            keycloak_b.url("/jwks"),
             repo.clone(),
             rate_limiter(),
         )
