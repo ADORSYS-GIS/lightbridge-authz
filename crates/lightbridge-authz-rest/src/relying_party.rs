@@ -9,7 +9,7 @@ use authkestra_engine::{
     token::Audience,
 };
 use authkestra_op::device::{DeviceCodeSession, DeviceCodeStatus};
-use authkestra_resource::jwt::{JwksCache, ValidationConfig, validate_jwt_generic};
+use authkestra_resource::jwt::{JwksCache, validate_jwt_generic};
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Form, Query, State},
@@ -114,8 +114,19 @@ pub struct KeycloakRelyingParty {
     /// and [`Self::new`] for the startup check that rejects a config where the two are equal.
     token_key: [u8; 32],
     client: reqwest::Client,
-    jwks: Arc<JwksCache>,
-    jwks_url: String,
+    /// Upstream ID-token verification keys, built on first use from the DISCOVERY document's
+    /// own `jwks_uri` -- never from `oauth2.jwks_url`, which on `authz-idp` means the opposite
+    /// trust root (the keys a `subject_token` presented TO this service is validated against;
+    /// `BearerTokenService` in `lib.rs`). Conflating the two took prod down: an ai-helm change
+    /// repointed `oauth2.jwks_url` at this service's OWN JWKS, `discover()`'s
+    /// `jwks_uri`-equality check then failed for every request, and 100% of fresh logins died in
+    /// [`Self::begin`] -- browser as `502 sign-in unavailable`, device as `begin_device_failed`.
+    /// Sourcing this from discovery makes the RP leg independent of that key by construction.
+    /// `OnceLock`, not a plain field, because [`Self::new`] stays synchronous and offline
+    /// (ADR-0023: no Keycloak fetch at startup); the URI is only known once discovery has run.
+    /// One-shot is sound: a changed `jwks_uri` implies a changed realm, which `discover()`'s
+    /// issuer check already refuses.
+    jwks: Arc<std::sync::OnceLock<Arc<JwksCache>>>,
     repo: Arc<StoreRepo>,
     /// Backs [`lookup_pending_session`]'s `get_by_user_code_rate_limited` call -- the SAME
     /// Redis-backed store `authz-api`/`authz-budget` use for HTTP rate limiting in production
@@ -317,7 +328,6 @@ impl KeycloakRelyingParty {
         config: OidcRelyingParty,
         issuer: String,
         discovery_url: String,
-        jwks_url: String,
         repo: Arc<StoreRepo>,
         rate_limiter: Arc<dyn RateLimitStore>,
     ) -> Result<Self> {
@@ -388,23 +398,6 @@ impl KeycloakRelyingParty {
             .timeout(Duration::from_millis(config.timeout_ms))
             .build()
             .map_err(|e| Error::Server(format!("failed to build Keycloak RP HTTP client: {e}")))?;
-        // `.issuer(..)`/`.audience(..)`/`.algorithms(..)` are deliberately NOT set here: real ID
-        // token validation runs through a separately-constructed `Validation` in
-        // `validate_id_token` below (which does set issuer/audience/algorithms on that object),
-        // never through this `ValidationConfig`. Only `jwks_url`/`refresh_interval`/`require_kid`
-        // are read off it (immediately below), so setting the other three would be dead code.
-        let validation_config = ValidationConfig::builder()
-            .jwks_url(jwks_url.clone())
-            .refresh_interval(JWKS_REFRESH_INTERVAL)
-            .require_kid(true)
-            .build();
-        let jwks = Arc::new(
-            JwksCache::new(
-                validation_config.jwks_url,
-                validation_config.refresh_interval,
-            )
-            .require_kid(validation_config.require_kid),
-        );
         Ok(Self {
             config,
             issuer,
@@ -413,8 +406,7 @@ impl KeycloakRelyingParty {
             state_key,
             token_key,
             client,
-            jwks,
-            jwks_url,
+            jwks: Arc::new(std::sync::OnceLock::new()),
             repo,
             rate_limiter,
         })
@@ -514,11 +506,10 @@ impl KeycloakRelyingParty {
                 "Keycloak discovery issuer mismatch".to_string(),
             ));
         }
-        if metadata.jwks_uri != self.jwks_url {
-            return Err(Error::Server(
-                "Keycloak discovery JWKS URI mismatch".to_string(),
-            ));
-        }
+        // There is deliberately NO `jwks_uri` pin here. It bought nothing -- anyone able to forge
+        // this document already controls `authorization_endpoint`/`token_endpoint`, so TLS to
+        // `discovery_url` plus the issuer check above are the real anchors -- and it cost a total
+        // outage by coupling the RP leg to `oauth2.jwks_url` (see [`Self::jwks`]).
         Ok(metadata)
     }
 
@@ -558,7 +549,9 @@ impl KeycloakRelyingParty {
         let token = response.json::<TokenResponse>().await.map_err(|_| {
             Error::Server("Keycloak token endpoint returned invalid response".to_string())
         })?;
-        let claims = self.validate_id_token(&token.id_token).await?;
+        let claims = self
+            .validate_id_token(&token.id_token, &metadata.jwks_uri)
+            .await?;
         if claims.nonce != state.nonce {
             return Err(Error::Forbidden(
                 "Keycloak ID token nonce mismatch".to_string(),
@@ -838,7 +831,14 @@ impl KeycloakRelyingParty {
         })
     }
 
-    async fn validate_id_token(&self, token: &str) -> Result<IdTokenClaims> {
+    /// `jwks_uri` comes from the SAME discovery document whose `issuer` was just checked against
+    /// [`Self::issuer`], so the keys an ID token is verified against are the ones the trusted
+    /// issuer itself publishes -- see [`Self::jwks`] for the config key this deliberately no
+    /// longer reads.
+    async fn validate_id_token(&self, token: &str, jwks_uri: &str) -> Result<IdTokenClaims> {
+        let jwks = self.jwks.get_or_init(|| {
+            Arc::new(JwksCache::new(jwks_uri.to_string(), JWKS_REFRESH_INTERVAL).require_kid(true))
+        });
         let header = decode_header(token)
             .map_err(|_| Error::Forbidden("invalid Keycloak ID token".to_string()))?;
         if header.kid.is_none() {
@@ -850,7 +850,7 @@ impl KeycloakRelyingParty {
         validation.algorithms = ACCEPTED_ALGORITHMS.to_vec();
         validation.set_issuer(&[self.issuer.as_str()]);
         validation.set_audience(&[self.config.client_id.as_str()]);
-        let claims: IdTokenClaims = validate_jwt_generic(token, &self.jwks, &validation)
+        let claims: IdTokenClaims = validate_jwt_generic(token, jwks, &validation)
             .await
             .map_err(|_| Error::Forbidden("invalid Keycloak ID token".to_string()))?;
         if claims.iat <= 0 {

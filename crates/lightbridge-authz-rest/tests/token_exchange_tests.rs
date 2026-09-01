@@ -335,7 +335,6 @@ fn relying_party_with_issuer(repo: Arc<StoreRepo>, issuer: &str) -> Arc<Keycloak
             },
             issuer.to_string(),
             issuer.to_string(),
-            format!("{issuer}/jwks"),
             repo,
             Arc::new(InMemoryRateLimitStore::new()),
         )
