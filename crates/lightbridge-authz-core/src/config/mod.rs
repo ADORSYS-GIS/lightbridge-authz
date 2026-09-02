@@ -1063,6 +1063,26 @@ pub struct OauthClient {
     /// Whether the authorization request must carry an S256 PKCE challenge.
     #[serde(default)]
     pub require_pkce: bool,
+    /// Per-client override of [`Oauth2TokenExchange::refresh_ttl_seconds`] (the lifetime of one
+    /// issued refresh token, in seconds). `None` (the default) falls back to the server-wide
+    /// value -- most clients need no override. Resolved once, at startup
+    /// (`oauth2_op::client_store::ConfigClientStore::from_config`), not re-read per request.
+    /// `start_idp_server` refuses to start when the EFFECTIVE value (this override, or the
+    /// global fallback) is not positive, or exceeds the EFFECTIVE
+    /// [`Self::refresh_absolute_ttl_seconds`] -- see `oauth2_op::refresh_ttl` for why a longer
+    /// per-token TTL than the chain's absolute cap is a config trap, not just a bad value.
+    #[serde(default)]
+    pub refresh_ttl_seconds: Option<i64>,
+    /// Per-client override of [`Oauth2TokenExchange::refresh_absolute_ttl_seconds`] (the hard cap
+    /// on a refresh-token chain's total lifetime, set once when the chain is born and inherited
+    /// unchanged by every rotation). `None` (the default) falls back to the server-wide value.
+    /// Deliberately a SEPARATE override from [`Self::refresh_ttl_seconds`] rather than one
+    /// combined knob: a client configured only for a longer per-token TTL, with no matching
+    /// absolute-cap override, would otherwise have every one of its tokens silently killed by the
+    /// still-global (and likely shorter) chain cap -- `start_idp_server`'s startup validation
+    /// refuses exactly that combination instead of letting it ship half-working.
+    #[serde(default)]
+    pub refresh_absolute_ttl_seconds: Option<i64>,
 }
 
 /// A client's authentication method at the token endpoint (ADR-0011, Decision 6).

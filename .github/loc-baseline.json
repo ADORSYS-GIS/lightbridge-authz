@@ -12,7 +12,7 @@
   "crates/lightbridge-authz-budget/src/spend.rs": 565,
   "crates/lightbridge-authz-budget/src/tier.rs": 210,
   "crates/lightbridge-authz-core/src/authz.rs": 683,
-  "crates/lightbridge-authz-core/src/config/mod.rs": 2173,
+  "crates/lightbridge-authz-core/src/config/mod.rs": 2193,
   "crates/lightbridge-authz-core/src/dto.rs": 513,
   "crates/lightbridge-authz-rest/src/auth_provider.rs": 414,
   "crates/lightbridge-authz-rest/src/authorize.rs": 408,

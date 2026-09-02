@@ -548,7 +548,7 @@ fn offline_token_exchange_state(
         .expect("caller supplies a self-signed oauth2 with token_exchange configured");
     let signer = ApiKeyJwtSigner::from_config(oauth2.signing.as_ref().unwrap(), repo.clone())
         .expect("valid signing config");
-    let client_store = ConfigClientStore::from_config(&oauth2.clients);
+    let client_store = ConfigClientStore::from_config(&oauth2.clients, &cfg);
     let assertions =
         RedisClientAssertionStore::connect("redis://127.0.0.1:1", None, "test:idp-server-tests:")
             .expect("lazy redis connection manager always builds");
@@ -1238,6 +1238,8 @@ fn offline_public_client(client_id: &str) -> lightbridge_authz_core::config::Oau
         redirect_uris: Vec::new(),
         post_logout_redirect_uris: Vec::new(),
         require_pkce: false,
+        refresh_ttl_seconds: None,
+        refresh_absolute_ttl_seconds: None,
     }
 }
 
@@ -2527,6 +2529,8 @@ mod db {
             redirect_uris: vec!["https://cb.example.test/callback".to_string()],
             post_logout_redirect_uris: Vec::new(),
             require_pkce,
+            refresh_ttl_seconds: None,
+            refresh_absolute_ttl_seconds: None,
         }
     }
 

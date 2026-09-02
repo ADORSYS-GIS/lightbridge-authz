@@ -7,20 +7,54 @@ use std::collections::HashMap;
 
 use authkestra_op::{ClientRegistration, ClientStore, GrantType, OpError, TokenEndpointAuthMethod};
 use lightbridge_authz_core::async_trait;
-use lightbridge_authz_core::config::{OauthClient, OauthClientType};
+use lightbridge_authz_core::config::{Oauth2TokenExchange, OauthClient, OauthClientType};
 
-/// In-memory `client_id -> ClientRegistration` lookup built once from `oauth2.clients`.
+use super::refresh_ttl::effective_refresh_ttls;
+
+/// In-memory `client_id -> ClientRegistration` lookup built once from `oauth2.clients`, plus the
+/// per-client refresh-token TTL resolution (repo owner request: "the duration of a refresh token
+/// should be configurable on the client entry in the .yaml config file") -- a parallel map instead
+/// of threading `Oauth2TokenExchange` itself into `TokenExchangeOpStore`'s per-request paths.
 pub struct ConfigClientStore {
     clients: HashMap<String, ClientRegistration>,
+    /// `client_id -> (refresh_ttl_seconds, refresh_absolute_ttl_seconds)`, each pair already
+    /// resolved (client override, or the server-wide `Oauth2TokenExchange` fallback) once here at
+    /// construction time -- see [`Self::refresh_ttls`].
+    refresh_ttls: HashMap<String, (i64, i64)>,
+    /// The server-wide pair, kept for a `client_id` this store has no entry for (never expected
+    /// in production -- every caller of [`Self::refresh_ttls`] already resolved the client via
+    /// [`ClientStore::find_client`] first -- but a lookup miss must still resolve to a sane value
+    /// rather than panic).
+    default_refresh_ttls: (i64, i64),
 }
 
 impl ConfigClientStore {
-    pub fn from_config(clients: &[OauthClient]) -> Self {
+    pub fn from_config(clients: &[OauthClient], global: &Oauth2TokenExchange) -> Self {
+        let refresh_ttls = clients
+            .iter()
+            .map(|c| (c.client_id.clone(), effective_refresh_ttls(c, global)))
+            .collect();
         let clients = clients
             .iter()
             .map(|c| (c.client_id.clone(), to_registration(c)))
             .collect();
-        Self { clients }
+        Self {
+            clients,
+            refresh_ttls,
+            default_refresh_ttls: (
+                global.refresh_ttl_seconds,
+                global.refresh_absolute_ttl_seconds,
+            ),
+        }
+    }
+
+    /// The effective `(refresh_ttl_seconds, refresh_absolute_ttl_seconds)` pair for `client_id`,
+    /// already resolved at construction time (client override, else the server-wide default).
+    pub fn refresh_ttls(&self, client_id: &str) -> (i64, i64) {
+        self.refresh_ttls
+            .get(client_id)
+            .copied()
+            .unwrap_or(self.default_refresh_ttls)
     }
 }
 
@@ -81,67 +115,7 @@ fn parse_grant_type(raw: &str) -> GrantType {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn client(client_id: &str, client_type: OauthClientType) -> OauthClient {
-        OauthClient {
-            client_id: client_id.to_string(),
-            client_type,
-            scopes: vec!["openid".to_string()],
-            grant_types: vec!["urn:ietf:params:oauth:grant-type:token-exchange".to_string()],
-            allowed_audiences: vec![client_id.to_string()],
-            jwks: None,
-            redirect_uris: Vec::new(),
-            post_logout_redirect_uris: Vec::new(),
-            require_pkce: false,
-        }
-    }
-
-    #[tokio::test]
-    async fn finds_a_configured_client() {
-        let store =
-            ConfigClientStore::from_config(&[client("lightbridge-ss", OauthClientType::Public)]);
-        let found = store.find_client("lightbridge-ss").await.unwrap().unwrap();
-        assert_eq!(found.client_id, "lightbridge-ss");
-        assert_eq!(
-            found.token_endpoint_auth_method,
-            Some(TokenEndpointAuthMethod::NoAuth)
-        );
-        assert!(found.redirect_uris.is_empty());
-        assert!(found.client_secret_hash.is_none());
-    }
-
-    #[tokio::test]
-    async fn unknown_client_is_none_not_an_error() {
-        let store = ConfigClientStore::from_config(&[]);
-        assert!(store.find_client("nope").await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn confidential_client_maps_to_private_key_jwt() {
-        let store = ConfigClientStore::from_config(&[client(
-            "lightbridge-mcp",
-            OauthClientType::Confidential,
-        )]);
-        let found = store.find_client("lightbridge-mcp").await.unwrap().unwrap();
-        assert_eq!(
-            found.token_endpoint_auth_method,
-            Some(TokenEndpointAuthMethod::PrivateKeyJwt)
-        );
-    }
-
-    /// #534/ADR-0030: `Service` (`client_credentials`/M2M) clients authenticate identically to
-    /// `Confidential` -- ADR-0011 Decision 6 draws no exception for machine clients.
-    #[tokio::test]
-    async fn service_client_maps_to_private_key_jwt() {
-        let store =
-            ConfigClientStore::from_config(&[client("it-machine", OauthClientType::Service)]);
-        let found = store.find_client("it-machine").await.unwrap().unwrap();
-        assert_eq!(
-            found.token_endpoint_auth_method,
-            Some(TokenEndpointAuthMethod::PrivateKeyJwt)
-        );
-    }
-}
+// Behavior tests for this module live in `tests/client_store_tests.rs` (house rule: new/relocated
+// tests belong in a dedicated `tests/` file, not `src/`) -- moved there to make room for the
+// per-client refresh-TTL fields/lookup added above without pushing this file over the workspace's
+// 200-LoC default ceiling for a file with no `.github/loc-baseline.json` entry.

@@ -2514,19 +2514,11 @@ fn build_token_exchange_state(
                 .to_string(),
         ));
     }
-    if cfg.refresh_absolute_ttl_seconds <= 0 {
-        return Err(Error::Server(
-            "token_exchange refresh_absolute_ttl_seconds must be positive".to_string(),
-        ));
-    }
-    if cfg.refresh_absolute_ttl_seconds <= cfg.refresh_ttl_seconds {
-        return Err(Error::Server(
-            "token_exchange refresh_absolute_ttl_seconds must be greater than \
-             refresh_ttl_seconds, otherwise the chain's absolute cap is reached no later than \
-             every individual token's own expiry and refresh_ttl_seconds never takes effect"
-                .to_string(),
-        ));
-    }
+    // Per-client refresh-TTL overrides (`OauthClient::refresh_ttl_seconds`/
+    // `refresh_absolute_ttl_seconds`): refuses to start when any client's EFFECTIVE per-token TTL
+    // is non-positive or exceeds its EFFECTIVE absolute chain cap -- see that module's doc
+    // comment. Subsumes this function's own former inline global-only check.
+    oauth2_op::refresh_ttl::validate_client_refresh_ttls(&oauth2.clients, cfg)?;
     if cfg.device_code_ttl_seconds <= 0 || cfg.device_poll_interval_seconds <= 0 {
         return Err(Error::Server(
             "token_exchange device_code_ttl_seconds and device_poll_interval_seconds must be positive"
@@ -2577,7 +2569,8 @@ fn build_token_exchange_state(
         .issuer
         .clone();
 
-    let client_store = oauth2_op::client_store::ConfigClientStore::from_config(&oauth2.clients);
+    let client_store =
+        oauth2_op::client_store::ConfigClientStore::from_config(&oauth2.clients, cfg);
     let assertions = oauth2_op::client_assertion_store::RedisClientAssertionStore::connect(
         redis_url,
         redis_ca_bundle_path,
@@ -3871,6 +3864,33 @@ mod tests {
         }
     }
 
+    /// Shared fixture for this module's `build_token_exchange_state` tests: every field this
+    /// crate's own validation cares about, defaulted to the shape every test below needs unless
+    /// it overrides one -- none of these tests exercise `refresh_ttl_seconds`/
+    /// `refresh_absolute_ttl_seconds` overrides, so both stay `None` (falls back to
+    /// `exchange_cfg()`'s global values).
+    fn oauth_client_fixture(
+        client_id: &str,
+        client_type: OauthClientType,
+        scopes: Vec<String>,
+        grant_types: Vec<String>,
+        jwks: Option<serde_json::Value>,
+    ) -> OauthClient {
+        OauthClient {
+            client_id: client_id.to_string(),
+            client_type,
+            scopes,
+            grant_types,
+            allowed_audiences: vec![client_id.to_string()],
+            jwks,
+            redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
+            require_pkce: false,
+            refresh_ttl_seconds: None,
+            refresh_absolute_ttl_seconds: None,
+        }
+    }
+
     // This function's own `Result<Option<...>>` contract is unchanged by ADR-0023 -- only its
     // sole production caller, `start_idp_server`, now treats this `None` result as fatal (see
     // `build_token_exchange_state`'s doc comment).
@@ -4016,13 +4036,18 @@ mod tests {
         assert!(message.contains("must be positive"));
     }
 
+    /// Per `oauth2_op::refresh_ttl::validate_client_refresh_ttls` (the per-client-aware
+    /// replacement for this function's own former inline global-only check): the boundary is
+    /// `refresh_ttl_seconds <= refresh_absolute_ttl_seconds`, not strict `<` -- an EQUAL pair is
+    /// accepted (see that module's own `an_effective_ttl_equal_to_the_absolute_cap_is_accepted`),
+    /// only a `refresh_ttl_seconds` that genuinely EXCEEDS the cap is refused.
     #[tokio::test]
-    async fn build_token_exchange_state_rejects_refresh_absolute_ttl_not_longer_than_refresh_ttl() {
+    async fn build_token_exchange_state_rejects_refresh_ttl_exceeding_refresh_absolute_ttl() {
         let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
         oauth2.signing = Some(signing_cfg());
         let mut cfg = exchange_cfg();
-        cfg.refresh_ttl_seconds = 2_592_000;
         cfg.refresh_absolute_ttl_seconds = 2_592_000;
+        cfg.refresh_ttl_seconds = 2_592_001;
         oauth2.token_exchange = Some(cfg);
         let Err(err) = build_token_exchange_state(
             &oauth2,
@@ -4034,7 +4059,7 @@ mod tests {
             None,
         ) else {
             panic!(
-                "expected an error when refresh_absolute_ttl_seconds does not exceed refresh_ttl_seconds"
+                "expected an error when refresh_ttl_seconds exceeds refresh_absolute_ttl_seconds"
             );
         };
         let message = format!("{err}");
@@ -4073,17 +4098,13 @@ mod tests {
         let mut signing = signing_cfg();
         signing.audience = Some("shared-audience".to_string());
         oauth2.signing = Some(signing);
-        oauth2.clients = vec![OauthClient {
-            client_id: "shared-audience".to_string(),
-            client_type: OauthClientType::Public,
-            scopes: vec!["openid".to_string()],
-            grant_types: vec!["refresh_token".to_string()],
-            allowed_audiences: vec!["shared-audience".to_string()],
-            jwks: None,
-            redirect_uris: Vec::new(),
-            post_logout_redirect_uris: Vec::new(),
-            require_pkce: false,
-        }];
+        oauth2.clients = vec![oauth_client_fixture(
+            "shared-audience",
+            OauthClientType::Public,
+            vec!["openid".to_string()],
+            vec!["refresh_token".to_string()],
+            None,
+        )];
         oauth2.token_exchange = Some(exchange_cfg());
         let Err(err) = build_token_exchange_state(
             &oauth2,
@@ -4107,17 +4128,13 @@ mod tests {
         let mut signing = signing_cfg();
         signing.audience = Some("api-key-audience".to_string());
         oauth2.signing = Some(signing);
-        oauth2.clients = vec![OauthClient {
-            client_id: "a-real-oauth-client".to_string(),
-            client_type: OauthClientType::Public,
-            scopes: vec!["openid".to_string()],
-            grant_types: vec!["refresh_token".to_string()],
-            allowed_audiences: vec!["a-real-oauth-client".to_string()],
-            jwks: None,
-            redirect_uris: Vec::new(),
-            post_logout_redirect_uris: Vec::new(),
-            require_pkce: false,
-        }];
+        oauth2.clients = vec![oauth_client_fixture(
+            "a-real-oauth-client",
+            OauthClientType::Public,
+            vec!["openid".to_string()],
+            vec!["refresh_token".to_string()],
+            None,
+        )];
         oauth2.token_exchange = Some(exchange_cfg());
         let result = build_token_exchange_state(
             &oauth2,
@@ -4134,17 +4151,13 @@ mod tests {
 
     fn service_client_with_grant_types(client_id: &str, grant_types: Vec<String>) -> OauthClient {
         let key = signing::generate_rs256_key().expect("rsa keypair generation");
-        OauthClient {
-            client_id: client_id.to_string(),
-            client_type: OauthClientType::Service,
-            scopes: vec!["read:usage".to_string()],
+        oauth_client_fixture(
+            client_id,
+            OauthClientType::Service,
+            vec!["read:usage".to_string()],
             grant_types,
-            allowed_audiences: vec![client_id.to_string()],
-            jwks: Some(serde_json::json!({ "keys": [key.public_jwk] })),
-            redirect_uris: Vec::new(),
-            post_logout_redirect_uris: Vec::new(),
-            require_pkce: false,
-        }
+            Some(serde_json::json!({ "keys": [key.public_jwk] })),
+        )
     }
 
     /// Test 8 (DECISIVE, #534/ADR-0030): a `public` client (`NoAuth` at the token endpoint) listing
@@ -4157,17 +4170,13 @@ mod tests {
     async fn build_token_exchange_state_rejects_a_public_client_credentials_client() {
         let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
         oauth2.signing = Some(signing_cfg());
-        oauth2.clients = vec![OauthClient {
-            client_id: "public-machine".to_string(),
-            client_type: OauthClientType::Public,
-            scopes: vec!["read:usage".to_string()],
-            grant_types: vec!["client_credentials".to_string()],
-            allowed_audiences: vec!["public-machine".to_string()],
-            jwks: None,
-            redirect_uris: Vec::new(),
-            post_logout_redirect_uris: Vec::new(),
-            require_pkce: false,
-        }];
+        oauth2.clients = vec![oauth_client_fixture(
+            "public-machine",
+            OauthClientType::Public,
+            vec!["read:usage".to_string()],
+            vec!["client_credentials".to_string()],
+            None,
+        )];
         oauth2.token_exchange = Some(exchange_cfg());
         let Err(err) = build_token_exchange_state(
             &oauth2,
@@ -4197,17 +4206,13 @@ mod tests {
     async fn build_token_exchange_state_rejects_a_service_client_with_unparseable_jwks() {
         let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
         oauth2.signing = Some(signing_cfg());
-        oauth2.clients = vec![OauthClient {
-            client_id: "no-jwks-machine".to_string(),
-            client_type: OauthClientType::Service,
-            scopes: vec!["read:usage".to_string()],
-            grant_types: vec!["client_credentials".to_string()],
-            allowed_audiences: vec!["no-jwks-machine".to_string()],
-            jwks: None,
-            redirect_uris: Vec::new(),
-            post_logout_redirect_uris: Vec::new(),
-            require_pkce: false,
-        }];
+        oauth2.clients = vec![oauth_client_fixture(
+            "no-jwks-machine",
+            OauthClientType::Service,
+            vec!["read:usage".to_string()],
+            vec!["client_credentials".to_string()],
+            None,
+        )];
         oauth2.token_exchange = Some(exchange_cfg());
         let Err(err) = build_token_exchange_state(
             &oauth2,
@@ -4231,17 +4236,13 @@ mod tests {
     async fn build_token_exchange_state_rejects_a_confidential_client_with_an_empty_jwks_array() {
         let mut oauth2 = base_oauth2(Oauth2Type::SelfSigned);
         oauth2.signing = Some(signing_cfg());
-        oauth2.clients = vec![OauthClient {
-            client_id: "empty-jwks-client".to_string(),
-            client_type: OauthClientType::Confidential,
-            scopes: vec!["openid".to_string()],
-            grant_types: vec!["urn:ietf:params:oauth:grant-type:token-exchange".to_string()],
-            allowed_audiences: vec!["empty-jwks-client".to_string()],
-            jwks: Some(serde_json::json!({ "keys": [] })),
-            redirect_uris: Vec::new(),
-            post_logout_redirect_uris: Vec::new(),
-            require_pkce: false,
-        }];
+        oauth2.clients = vec![oauth_client_fixture(
+            "empty-jwks-client",
+            OauthClientType::Confidential,
+            vec!["openid".to_string()],
+            vec!["urn:ietf:params:oauth:grant-type:token-exchange".to_string()],
+            Some(serde_json::json!({ "keys": [] })),
+        )];
         oauth2.token_exchange = Some(exchange_cfg());
         let Err(err) = build_token_exchange_state(
             &oauth2,
@@ -4276,13 +4277,12 @@ mod tests {
             use base64::Engine;
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xAAu8; 128])
         };
-        oauth2.clients = vec![OauthClient {
-            client_id: "weak-key-machine".to_string(),
-            client_type: OauthClientType::Service,
-            scopes: vec!["read:usage".to_string()],
-            grant_types: vec!["client_credentials".to_string()],
-            allowed_audiences: vec!["weak-key-machine".to_string()],
-            jwks: Some(serde_json::json!({
+        oauth2.clients = vec![oauth_client_fixture(
+            "weak-key-machine",
+            OauthClientType::Service,
+            vec!["read:usage".to_string()],
+            vec!["client_credentials".to_string()],
+            Some(serde_json::json!({
                 "keys": [{
                     "kty": "RSA",
                     "use": "sig",
@@ -4292,10 +4292,7 @@ mod tests {
                     "e": "AQAB",
                 }]
             })),
-            redirect_uris: Vec::new(),
-            post_logout_redirect_uris: Vec::new(),
-            require_pkce: false,
-        }];
+        )];
         oauth2.token_exchange = Some(exchange_cfg());
         let Err(err) = build_token_exchange_state(
             &oauth2,

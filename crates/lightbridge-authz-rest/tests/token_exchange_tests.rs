@@ -255,6 +255,8 @@ fn public_client(client_id: &str) -> OauthClient {
         redirect_uris: Vec::new(),
         post_logout_redirect_uris: Vec::new(),
         require_pkce: false,
+        refresh_ttl_seconds: None,
+        refresh_absolute_ttl_seconds: None,
     }
 }
 
@@ -272,6 +274,8 @@ fn device_client(client_id: &str) -> OauthClient {
         redirect_uris: Vec::new(),
         post_logout_redirect_uris: Vec::new(),
         require_pkce: false,
+        refresh_ttl_seconds: None,
+        refresh_absolute_ttl_seconds: None,
     }
 }
 
@@ -292,6 +296,8 @@ fn browser_client(client_id: &str, redirect_uri: &str) -> OauthClient {
         redirect_uris: vec![redirect_uri.to_string()],
         post_logout_redirect_uris: Vec::new(),
         require_pkce: true,
+        refresh_ttl_seconds: None,
+        refresh_absolute_ttl_seconds: None,
     }
 }
 
@@ -313,6 +319,8 @@ fn confidential_browser_client_without_pkce(client_id: &str, redirect_uri: &str)
         redirect_uris: vec![redirect_uri.to_string()],
         post_logout_redirect_uris: Vec::new(),
         require_pkce: false,
+        refresh_ttl_seconds: None,
+        refresh_absolute_ttl_seconds: None,
     }
 }
 
@@ -362,6 +370,8 @@ fn confidential_client(client_id: &str) -> ConfidentialClientFixture {
         redirect_uris: Vec::new(),
         post_logout_redirect_uris: Vec::new(),
         require_pkce: false,
+        refresh_ttl_seconds: None,
+        refresh_absolute_ttl_seconds: None,
     };
     ConfidentialClientFixture {
         client,
@@ -392,6 +402,8 @@ fn service_client(
         redirect_uris: Vec::new(),
         post_logout_redirect_uris: Vec::new(),
         require_pkce: false,
+        refresh_ttl_seconds: None,
+        refresh_absolute_ttl_seconds: None,
     };
     ConfidentialClientFixture {
         client,
@@ -559,7 +571,7 @@ fn state_with_cfg_and_budget_repo(
     let device_code_ttl_secs = cfg.device_code_ttl_seconds as u64;
     let device_poll_interval_secs = cfg.device_poll_interval_seconds as u64;
     let signer = ApiKeyJwtSigner::from_config(&signing_cfg(), repo.clone()).unwrap();
-    let client_store = ConfigClientStore::from_config(&clients);
+    let client_store = ConfigClientStore::from_config(&clients, &cfg);
     let assertions =
         RedisClientAssertionStore::connect(redis_url, None, "test:token-exchange-jti:")
             .expect("lazy connection manager always builds");
@@ -1114,6 +1126,8 @@ async fn authorization_code_token_endpoint_refuses_stored_code_without_pkce_chal
         redirect_uris: vec![REDIRECT_URI.to_string()],
         post_logout_redirect_uris: Vec::new(),
         require_pkce: false,
+        refresh_ttl_seconds: None,
+        refresh_absolute_ttl_seconds: None,
     };
     DbAuthorizationCodeStore::new(repo.clone())
         .store_code({
@@ -2832,6 +2846,87 @@ async fn refresh_token_issued_to_client_a_is_rejected_when_presented_by_client_b
         "a refresh token must be rejected when presented by a different client: {body}"
     );
     assert_eq!(body["error"], "invalid_grant");
+}
+
+/// `oauth2_op::refresh_refusal` logs a distinct server-side `reason` per refusal cause, but the
+/// WIRE response must be byte-identical regardless -- distinguishing refusal reasons on the wire
+/// would be an oracle telling an attacker whether a given presented token ever existed. Compares
+/// two genuinely different causes (an unknown/never-issued token vs. a real token presented by
+/// the wrong client) end to end through the real `/oauth2/token` handler.
+#[sqlx::test(migrations = "../../migrations")]
+async fn refresh_refusal_reason_never_leaks_onto_the_wire(pool: PgPool) {
+    let repo = repo(pool);
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
+    seed(&repo).await;
+
+    let client_a = "wire-client-a";
+    let client_b = "wire-client-b";
+    let redis = redis_url();
+    let clients = || vec![public_client(client_a), public_client(client_b)];
+
+    let (status, body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![client_a.to_string()])),
+            clients(),
+            &redis,
+        ),
+        &format!(
+            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={client_a}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}&scope=offline_access"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let refresh_token = body["refresh_token"].as_str().unwrap().to_string();
+
+    // Reason A: an unknown/garbage token that was never issued at all.
+    let (unknown_status, unknown_body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![client_a.to_string()])),
+            clients(),
+            &redis,
+        ),
+        &format!(
+            "grant_type=refresh_token&client_id={client_a}&refresh_token=lgbr_rt_never_issued"
+        ),
+    )
+    .await;
+
+    // Reason B: a genuinely issued token, but presented by a different client than the one it was
+    // bound to.
+    let (wrong_client_status, wrong_client_body) = post_token(
+        state_with(
+            repo.clone(),
+            Arc::new(MockBearer::new(true, vec![client_b.to_string()])),
+            clients(),
+            &redis,
+        ),
+        &format!("grant_type=refresh_token&client_id={client_b}&refresh_token={refresh_token}"),
+    )
+    .await;
+
+    assert_eq!(
+        unknown_status,
+        StatusCode::BAD_REQUEST,
+        "body: {unknown_body}"
+    );
+    assert_eq!(
+        wrong_client_status,
+        StatusCode::BAD_REQUEST,
+        "body: {wrong_client_body}"
+    );
+    assert_eq!(
+        unknown_status, wrong_client_status,
+        "different server-side refusal reasons must not differ in HTTP status"
+    );
+    assert_eq!(
+        unknown_body, wrong_client_body,
+        "different server-side refusal reasons must produce a byte-identical wire response body \
+         -- distinguishing them would be an oracle for whether a token ever existed"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

@@ -160,6 +160,8 @@ fn public_client(client_id: &str) -> OauthClient {
         redirect_uris: Vec::new(),
         post_logout_redirect_uris: Vec::new(),
         require_pkce: false,
+        refresh_ttl_seconds: None,
+        refresh_absolute_ttl_seconds: None,
     }
 }
 
@@ -178,7 +180,7 @@ fn state(repo: Arc<StoreRepo>) -> TokenExchangeState {
     let device_code_ttl_secs = cfg.device_code_ttl_seconds as u64;
     let device_poll_interval_secs = cfg.device_poll_interval_seconds as u64;
     let signer = ApiKeyJwtSigner::from_config(&signing_cfg(), repo.clone()).unwrap();
-    let client_store = ConfigClientStore::from_config(&[public_client(PUBLIC_CLIENT_ID)]);
+    let client_store = ConfigClientStore::from_config(&[public_client(PUBLIC_CLIENT_ID)], &cfg);
     let assertions =
         RedisClientAssertionStore::connect(&redis_url(), None, "test:introspection-failclosed:")
             .expect("lazy connection manager always builds");
