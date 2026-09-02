@@ -119,6 +119,10 @@ auth Principal {
   // /usage/v1/usage/query scope=all gate instead (handlers/query.rs), which reads
   // TokenInfo::has_permission directly and never touches this schema.
   permUsageReadAll Boolean
+  // `permUserRead` (Permission::UserRead, "user:read") DOES have MAPPED_OP_ID_PERMISSIONS
+  // entries -- `resolveUserProfiles`/`resolveActorLabels`/`searchUsers` at the end of this file
+  // read this exact boolean back out of the auth context, once per frame.
+  permUserRead Boolean
 }
 
 mixin AuditFields {
@@ -1198,7 +1202,7 @@ procedure simulateBudgetPolicy(args: SimulateBudgetPolicyInput): Decision
 // `requestedByUserId` (#646) is the token subject that SUBMITTED the request -- `auth().id` inside
 // `requestBudgetRefill` -- as distinct from `reviewedBy`, the admin who decided it. Optional, and
 // permanently so: rows created before
-// `migrations/20260902000002_budget_augmentation_requests_add_requested_by.sql` carry NULL and
+// `migrations/20260902000004_budget_augmentation_requests_add_requested_by.sql` carry NULL and
 // nothing can reconstruct their requester, so a client must render an explicit "unknown" sentinel
 // for absent rather than assuming a value will always arrive. It is an AUDIT field: no `@allow`
 // clause in this schema references it, and none may -- authorization for every procedure below is
@@ -1780,3 +1784,118 @@ type EffectiveResetSchedule {
 // `listBillingPlans` uses -- because this read serves a screen that does NOT also mutate.
 procedure getEffectiveResetSchedule(args: GetEffectiveResetScheduleInput): EffectiveResetSchedule
   @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetRead == true)
+// ---------------------------------------------------------------------------------------------
+// Admin identity resolution (#647). Three read-only procedures that turn opaque ids into human
+// labels for an admin console, gated by ONE dedicated permission, `user:read`
+// (`Permission::UserRead`) -- see that variant's doc comment for why it is not a reuse of
+// `account:read`.
+//
+// ADR-0038 note. All three are backed by hand-written SQL in
+// `crates/lightbridge-authz-api-key/src/identity_resolution.rs`, not by the generated model
+// client, for two independent reasons:
+//   1. `federated_identities` -- the ONLY source of display claims (`name`/`email`/
+//      `preferred_username`; `users` carries no display data at all) -- is deliberately absent
+//      from this schema entirely, because it also carries the sealed Keycloak token envelope
+//      (ADR-0024 Q4). There is no generated read path to reach it through, by design.
+//   2. `Account`/`Project`'s `@@allow("read", ...)` clauses are ownership-scoped
+//      (`userId == auth().id`), and cratestack folds them into the query unconditionally with no
+//      bypass (see `listMyExpiringApiKeys`'s own doc comment). An estate-wide admin label lookup
+//      is precisely the query that policy cannot express, and widening the shared clause to make
+//      it expressible would also widen `model.Account.list`/`model.Project.list` for every other
+//      caller. The `@allow` clauses below are therefore the whole schema-layer story; the
+//      procedures' SQL applies NO ownership filter, which is the point.
+//
+// Nothing here ever fabricates an identity. An id with no row is simply ABSENT from the result --
+// the console owns every "Unknown" sentinel it renders, so the backend needs no placeholder
+// identity concept (#647's own non-negotiable).
+
+// One person's display identity. Every field except `userId` is nullable and independently so: a
+// `users` row with no `federated_identities` row at all (possible -- the row is created by the
+// `accounts_set_user` trigger, the federated identity only by a completed login) resolves to
+// `userId` plus three nulls, never to a synthesised name.
+type UserProfile {
+  userId String
+  displayName String?
+  email String?
+  username String?
+}
+
+// Batch profile lookup. `userIds` is capped at 200 per call and a longer batch is REJECTED
+// (`Error::BadRequest`), never silently truncated -- a truncated result is indistinguishable from
+// "those ids do not exist", which is exactly the confusion this surface must not create.
+type ResolveUserProfilesInput {
+  userIds String[]
+}
+
+type UserProfiles {
+  profiles UserProfile[]
+}
+
+procedure resolveUserProfiles(args: ResolveUserProfilesInput): UserProfiles
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permUserRead == true)
+
+// The multi-kind sibling of `resolveUserProfiles`: one call, one query per kind, no N+1. Users
+// come first in every actor lens, so `users` carries the same name+email pair `resolveUserProfiles`
+// returns; accounts and projects carry only what a label needs plus the edge back to their owner
+// (`ownerUserId`) / account (`accountId`), so a console can chain a lens without a second call.
+//
+// All three lists are REQUIRED and may be empty (cratestack's `TypeArity` has no "optional list"
+// -- a field is exactly one of required/optional/list), so a caller resolving only accounts sends
+// `{ userIds: [], accountIds: [...], projectIds: [] }`. Each list is capped at 200 independently,
+// same reject-don't-truncate contract as above.
+type ActorUserLabel {
+  userId String
+  displayName String?
+  email String?
+}
+
+// `name` is nullable (`accounts.name`, added 20260829000001, has no truthful backfill value);
+// `ownerUserId` is not (`accounts.user_id` is NOT NULL and trigger-provisioned).
+type ActorAccountLabel {
+  accountId String
+  name String?
+  ownerUserId String
+}
+
+// Both `name` and `accountId` are NOT NULL on `projects`, so neither is optional here.
+type ActorProjectLabel {
+  projectId String
+  name String
+  accountId String
+}
+
+type ResolveActorLabelsInput {
+  userIds String[]
+  accountIds String[]
+  projectIds String[]
+}
+
+type ActorLabels {
+  users ActorUserLabel[]
+  accounts ActorAccountLabel[]
+  projects ActorProjectLabel[]
+}
+
+procedure resolveActorLabels(args: ResolveActorLabelsInput): ActorLabels
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permUserRead == true)
+
+// Bounded free-text user search over `federated_identities`' three display columns
+// (`name`, `email`, `preferred_username`), case-insensitively, prefix-or-substring. `query` must
+// be at least 2 characters (a 1-character substring search is a table dump with extra steps) and
+// `limit` defaults to 20 and is CLAMPED -- not rejected -- at 50: unlike the batch caps above, a
+// caller asking for "as many as you have" is not making a correctness claim about a specific set
+// of ids, so clamping loses nothing and the result is bounded either way.
+//
+// Order is deterministic and does not depend on Postgres row order: prefix matches before
+// substring-only matches, then by display name, then by `userId` as the final tiebreak.
+type SearchUsersInput {
+  query String
+  limit Int?
+}
+
+type UserSearchResults {
+  users UserProfile[]
+}
+
+procedure searchUsers(args: SearchUsersInput): UserSearchResults
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permUserRead == true)

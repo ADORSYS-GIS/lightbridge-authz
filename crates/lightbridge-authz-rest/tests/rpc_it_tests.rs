@@ -4211,3 +4211,127 @@ async fn batch_response_null_allowed_models_encodes_as_cbor_null_not_empty_array
     let frames: Vec<Value> = Wire::Cbor.decode(&bytes);
     assert!(frames[0]["output"]["allowedModels"].is_null());
 }
+
+/// #647's positive half, end to end over the real RPC transport: an admin holding `user:read`
+/// resolves user, account and project ids into labels and searches for a user by name — and the
+/// unknown ids in the same batch come back ABSENT, never as fabricated placeholder rows.
+///
+/// The refusal half (a caller holding every permission EXCEPT `user:read`) is
+/// `rbac_gate_denies_identity_resolution_without_user_read` in `rpc_router_tests.rs`, which needs
+/// no database because the gate runs ahead of dispatch.
+#[tokio::test]
+async fn identity_resolution_procedures_resolve_labels_and_omit_unknown_ids() {
+    let owner = format!("owner-identity-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&owner, admin_perms())));
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let account_id = create_account(r, "admin", "tenant-identity").await;
+    let project_id = create_project(r, "admin", &account_id, "identity-proj").await;
+
+    // The profile claims live on `federated_identities`, which no RPC surface writes: seed the row
+    // the way a completed login would.
+    let display_name = format!("Ada Lovelace {}", cuid2());
+    sqlx::query(
+        r#"
+        INSERT INTO federated_identities
+            (id, issuer, subject, account_id, email, email_verified, preferred_username, name,
+             last_authenticated_at, created_at, updated_at)
+        VALUES ($1, 'https://issuer.example', $2, $2, $3, true, $4, $5, now(), now(), now())
+        "#,
+    )
+    .bind(cuid2())
+    .bind(&owner)
+    .bind(format!("{owner}@example.com"))
+    .bind(format!("u{owner}"))
+    .bind(&display_name)
+    .execute(&ctx.verify)
+    .await
+    .unwrap();
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.resolveUserProfiles",
+        Wire::Cbor,
+        &json!({ "args": { "userIds": [owner, "definitely-not-a-user"] } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(status.is_success(), "resolveUserProfiles: {status}");
+    let profiles = json_body(&body)["profiles"].as_array().unwrap().clone();
+    assert_eq!(
+        profiles.len(),
+        1,
+        "the unknown id must be absent: {profiles:?}"
+    );
+    assert_eq!(profiles[0]["userId"].as_str(), Some(owner.as_str()));
+    assert_eq!(
+        profiles[0]["displayName"].as_str(),
+        Some(display_name.as_str())
+    );
+    assert_eq!(
+        profiles[0]["email"].as_str(),
+        Some(format!("{owner}@example.com").as_str())
+    );
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.resolveActorLabels",
+        Wire::Cbor,
+        &json!({ "args": {
+            "userIds": [owner],
+            "accountIds": [account_id, "definitely-not-an-account"],
+            "projectIds": [project_id],
+        } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(status.is_success(), "resolveActorLabels: {status}");
+    let labels = json_body(&body);
+    assert_eq!(labels["users"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        labels["users"][0]["displayName"].as_str(),
+        Some(display_name.as_str())
+    );
+    let accounts = labels["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 1, "the unknown account id must be absent");
+    assert_eq!(accounts[0]["accountId"].as_str(), Some(account_id.as_str()));
+    assert_eq!(accounts[0]["ownerUserId"].as_str(), Some(owner.as_str()));
+    let projects = labels["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0]["projectId"].as_str(), Some(project_id.as_str()));
+    assert_eq!(projects[0]["accountId"].as_str(), Some(account_id.as_str()));
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.searchUsers",
+        Wire::Cbor,
+        &json!({ "args": { "query": "ada lovelace" } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(status.is_success(), "searchUsers: {status}");
+    let users = json_body(&body)["users"].as_array().unwrap().clone();
+    assert!(
+        users
+            .iter()
+            .any(|u| u["userId"].as_str() == Some(owner.as_str())),
+        "case-insensitive name search must find the seeded identity: {users:?}"
+    );
+
+    // A one-character query is refused rather than answered with a bounded table dump.
+    let (status, _) = rpc_call(
+        r.clone(),
+        "procedure.searchUsers",
+        Wire::Cbor,
+        &json!({ "args": { "query": "a" } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a 1-character query must be refused"
+    );
+}

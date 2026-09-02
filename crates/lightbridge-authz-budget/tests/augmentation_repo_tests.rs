@@ -708,7 +708,7 @@ async fn the_requester_is_persisted_at_creation_and_survives_decision_and_review
 
 /// #646's "NULL means unknown, pre-migration" contract: a row that carries no requester -- which
 /// is exactly the shape every row written before
-/// `20260902000002_budget_augmentation_requests_add_requested_by.sql` has -- reads back as `None`
+/// `20260902000004_budget_augmentation_requests_add_requested_by.sql` has -- reads back as `None`
 /// through the normal repository path, with no error and no invented placeholder. Written with
 /// raw SQL that never names the new column, so it reproduces a pre-migration insert faithfully
 /// rather than merely binding `NULL` to it.

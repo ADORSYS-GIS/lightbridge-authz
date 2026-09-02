@@ -109,7 +109,7 @@ pub struct AugmentationRequest {
     pub rejection_reason: Option<String>,
     /// Story #646: the token subject that submitted this request -- `auth().id` at
     /// `requestBudgetRefill`. `None` for rows created before
-    /// `migrations/20260902000002_budget_augmentation_requests_add_requested_by.sql`, which is a
+    /// `migrations/20260902000004_budget_augmentation_requests_add_requested_by.sql`, which is a
     /// permanent, legitimate value: nothing can reconstruct a historical requester (NULL means
     /// unknown, never "nobody" and never a stand-in id).
     ///

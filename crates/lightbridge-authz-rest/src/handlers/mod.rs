@@ -26,7 +26,7 @@ use serde::Deserialize;
 
 #[derive(Clone)]
 pub struct AuthzStoreImpl {
-    repo: Arc<StoreRepo>,
+    pub(crate) repo: Arc<StoreRepo>,
     token_issuer: Option<OAuth2TokenIssuer>,
     jwt_signer: Option<Arc<crate::signing::ApiKeyJwtSigner>>,
     billing: Arc<Billing>,
