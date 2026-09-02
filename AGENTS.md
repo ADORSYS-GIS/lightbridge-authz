@@ -1095,7 +1095,10 @@ hand-written SQL and direct `sqlx` dependencies.
   why the domain is hand-written procedures, not cratestack models
   (`docs/adr/0010-budget-domain-uses-procedures-not-cratestack-models.md`).
 - Operational runbooks (budget tier re-key cutover, a stuck refill request, rolling back a bad
-  policy revision): `docs/runbooks/README.md`
+  policy revision, **signing-key management via `idp jwk`**): `docs/runbooks/README.md`. The
+  signing-key runbook is the one to open when "everyone is suddenly asked to log in again" — it
+  starts from the two-keys-two-purposes distinction (`access` is published in the JWKS, `refresh`
+  deliberately is not) that is the usual cause.
 - System-level architecture front door — service/caller topology, containers, crate layering, and
   where the rest of the picture lives: `docs/architecture/README.md`, plus
   `docs/architecture/{services,deployment,data-model,budget,auth-flows}.md` and the overview at
