@@ -320,8 +320,11 @@ erDiagram
   history of revisions and one active pointer at a time; activation is validated before the
   pointer moves, so a bad revision never displaces a good one.
 - **`budget_augmentation_requests`** is a *separate* ledger from `budget_grants` — decisions about
-  requests (including refusals), not money-granting events. See `budget.md` for the full
-  request lifecycle.
+  requests (including refusals), not money-granting events. It names both ends of the workflow:
+  `requested_by_user_id` (the submitting subject, #646; NULL for pre-migration rows, never
+  backfilled) and `reviewed_by` (the deciding admin). Neither has a foreign key into `users` —
+  they hold token subjects, and an audit column must never become a write barrier. See `budget.md`
+  for the full request lifecycle.
 
 Full behavior — the ledger's replay/correction discipline, the policy engine contract, and what's
 actually live versus merely implemented — is in [`budget.md`](./budget.md).

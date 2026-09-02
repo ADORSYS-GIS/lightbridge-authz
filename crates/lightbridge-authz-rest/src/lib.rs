@@ -402,6 +402,7 @@ fn to_schema_augmentation_request(
         idempotencyKey: request.idempotency_key,
         reviewedBy: request.reviewed_by,
         rejectionReason: request.rejection_reason,
+        requestedByUserId: request.requested_by_user_id,
         createdAt: request.created_at,
         reviewedAt: request.reviewed_at,
     }
@@ -1742,6 +1743,15 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     /// request handling (not a pure, unit-testable domain function -- `RefillRequest.as_of` is a
     /// caller-supplied parameter for exactly this reason, per that struct's own doc comment).
     ///
+    /// ## The requester is persisted (#646)
+    ///
+    /// The authenticated subject is written to `budget_augmentation_requests.requested_by_user_id`
+    /// and surfaced as `AugmentationRequest.requestedByUserId`, so the admin review queue can name
+    /// who asked instead of only which account and which reviewer. There is no "request on behalf
+    /// of" input and there must not be one: the recorded requester is always the caller, which is
+    /// the only claim this field is allowed to make. It is an audit field -- nothing here or
+    /// downstream makes an authorization decision from it.
+    ///
     /// ## Authorization is `budget:self-refill` alone (#419)
     ///
     /// This procedure used to *additionally* refuse any caller whose validated token carried
@@ -1781,7 +1791,13 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         let subject = subject_from_ctx(ctx);
         let input = args.args;
         async move {
-            let _subject = subject
+            // #646: the caller's subject is no longer merely proof that someone is authenticated
+            // -- it is persisted onto the request row as `requested_by_user_id` so a decided
+            // request stays attributable to a person. Still fail-closed and still never trusted
+            // as authorization: `rpc_authorize` has already gated this op-id on
+            // `budget:self-refill` before this procedure runs, and nothing below branches on the
+            // value.
+            let requested_by_user_id = subject
                 .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
 
             let period = lightbridge_authz_budget::Period::parse(&input.period)
@@ -1804,6 +1820,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 idempotency_key: input.idempotencyKey,
                 as_of: chrono::Utc::now(),
                 requested_amount_micros,
+                requested_by_user_id: Some(requested_by_user_id),
             };
 
             let created = refill_service

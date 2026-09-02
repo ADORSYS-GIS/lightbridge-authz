@@ -109,7 +109,7 @@ flowchart TD
     Idem -- yes --> Existing["return existing request\n(no re-evaluation)"]
     Idem -- no --> Offered{"requested_amount_micros\nin allowed_amounts_micros?\n(ADR-0015, active policy)"}
     Offered -- no --> DenyAmount["Err: AmountNotOffered\n(policy engine never called)"]
-    Offered -- yes --> Create["create budget_augmentation_requests row\n(status = created)"]
+    Offered -- yes --> Create["create budget_augmentation_requests row\n(status = created,\nrequested_by_user_id = auth().id)"]
     Create --> Facts["gather Facts:\neffective_balance_micros (BudgetRepo)\nself_service_grant_count (budget_balances)\nspend_this_period, spend_last_period (SpendReader)"]
     Facts --> Engine["PolicyEngine::evaluate(Facts, requested_amount)"]
     Engine -- Err --> EngineDown["pending_review:\npolicy_engine_unavailable"]

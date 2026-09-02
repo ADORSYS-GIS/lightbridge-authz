@@ -58,6 +58,20 @@ pub struct RefillRequest {
     /// for a live frontend still reading the legacy ladder fields; #387 removed both once that
     /// frontend switched to `allowed_amounts_micros` and deployed.
     pub requested_amount_micros: i64,
+    /// Story #646: the token subject asking for the refill -- `auth().id` in the
+    /// `requestBudgetRefill` procedure, which is the only production caller. Persisted onto the
+    /// `budget_augmentation_requests` row so a decided request stays attributable to a person and
+    /// not just to an account and a reviewer.
+    ///
+    /// Caller-supplied rather than read from any ambient context, the same discipline `as_of`
+    /// already follows: this crate has no visibility into authentication by design (see the
+    /// module doc's scope boundary). `None` means "no authenticated caller to attribute this to",
+    /// which the live path never produces -- it is reachable only from a direct
+    /// service/repository call such as a test fixture.
+    ///
+    /// **Audit only.** Nothing in this crate branches on it, and nothing may start to: it is
+    /// written once at creation and never read back by any decision.
+    pub requested_by_user_id: Option<String>,
 }
 
 /// The result of [`RefillService::refill_status`] -- see that method's doc comment for what this
@@ -143,7 +157,12 @@ impl RefillService {
     ///    (`allowed_amounts_micros`, ADR-0015) -- an amount outside that set is refused with
     ///    [`BudgetError::AmountNotOffered`] before a `budget_augmentation_requests` row is ever
     ///    created or the policy engine is ever consulted.
-    /// 3. Create the `budget_augmentation_requests` row.
+    /// 3. Create the `budget_augmentation_requests` row, stamping
+    ///    [`RefillRequest::requested_by_user_id`] onto it (#646). Note the ordering: an
+    ///    idempotent retry short-circuits at step 1 and therefore returns the row as the ORIGINAL
+    ///    submitter created it -- the requester recorded is whoever first submitted that
+    ///    idempotency key, never the caller of the retry. That is the intended audit semantic:
+    ///    the row describes one request, and a retry is the same request.
     /// 4. Load [`Facts`].
     /// 5. Evaluate. Per [`PolicyEngine`]'s own doc comment, an evaluator that can run to
     ///    completion should prefer `Ok(Decision { Deny | ManualReview, .. })` over `Err`; `Err` is
@@ -189,6 +208,7 @@ impl RefillService {
                 requested_tier,
                 requested_amount_micros,
                 idempotency_key: request.idempotency_key.clone(),
+                requested_by_user_id: request.requested_by_user_id.clone(),
             })
             .await?;
 

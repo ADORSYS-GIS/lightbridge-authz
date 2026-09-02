@@ -50,6 +50,7 @@ fn base_new_request(account_id: &str, amount_micros: i64) -> NewAugmentationRequ
         requested_tier: BudgetTier::B30,
         requested_amount_micros: amount_micros,
         idempotency_key: None,
+        requested_by_user_id: None,
     }
 }
 
@@ -641,4 +642,107 @@ async fn list_by_budget_account_does_not_leak_another_accounts_requests(pool: Pg
     assert_eq!(scoped.len(), 1);
     assert_eq!(scoped[0].id, request_a.id);
     assert_eq!(scoped[0].budget_account_id, account_a);
+}
+
+/// #646: the requester is persisted at creation and survives every later write to the row. The
+/// second half matters as much as the first -- `record_decision`/`record_review` name their
+/// columns explicitly (see `REQUEST_UPDATE_DECISION_SQL`/`REQUEST_UPDATE_REVIEW_SQL`), so a
+/// requester that vanished on review would be a silent, invisible regression the queue itself
+/// could never surface.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_requester_is_persisted_at_creation_and_survives_decision_and_review(pool: PgPool) {
+    let account_id = cuid2();
+    let requester_id = cuid2();
+    let reviewer_id = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    let repo = AugmentationRepo::new(Arc::new(DbPool::from_pool(pool)));
+
+    let created = repo
+        .create(NewAugmentationRequest {
+            requested_by_user_id: Some(requester_id.clone()),
+            ..base_new_request(&account_id, 30_000_000)
+        })
+        .await
+        .expect("create must succeed");
+
+    assert_eq!(
+        created.requested_by_user_id.as_deref(),
+        Some(requester_id.as_str())
+    );
+
+    let fetched = repo.get(&created.id).await.expect("get must succeed");
+    assert_eq!(
+        fetched.requested_by_user_id.as_deref(),
+        Some(requester_id.as_str()),
+        "the requester must round-trip through a fresh read, not just the INSERT ... RETURNING"
+    );
+
+    let decided = repo
+        .record_decision(&created.id, pending_review_decision())
+        .await
+        .expect("record_decision must succeed");
+    assert_eq!(
+        decided.requested_by_user_id.as_deref(),
+        Some(requester_id.as_str()),
+        "recording a policy decision must not drop the requester"
+    );
+
+    let reviewed = repo
+        .record_review(
+            &created.id,
+            AugmentationStatus::Denied,
+            &reviewer_id,
+            Some("not this period"),
+            None,
+        )
+        .await
+        .expect("record_review must succeed");
+    assert_eq!(
+        reviewed.requested_by_user_id.as_deref(),
+        Some(requester_id.as_str()),
+        "the requester and the reviewer are two different people and two different columns"
+    );
+    assert_eq!(reviewed.reviewed_by.as_deref(), Some(reviewer_id.as_str()));
+}
+
+/// #646's "NULL means unknown, pre-migration" contract: a row that carries no requester -- which
+/// is exactly the shape every row written before
+/// `20260902000002_budget_augmentation_requests_add_requested_by.sql` has -- reads back as `None`
+/// through the normal repository path, with no error and no invented placeholder. Written with
+/// raw SQL that never names the new column, so it reproduces a pre-migration insert faithfully
+/// rather than merely binding `NULL` to it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_row_written_without_a_requester_reads_back_as_none(pool: PgPool) {
+    let account_id = cuid2();
+    let request_id = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    sqlx::query(
+        "INSERT INTO budget_augmentation_requests \
+         (id, budget_account_id, account_id, period, requested_tier, requested_amount_micros, status) \
+         VALUES ($1, $2, $2, $3, 'b-30', $4, 'pending_review')",
+    )
+    .bind(&request_id)
+    .bind(&account_id)
+    .bind(PERIOD)
+    .bind(30_000_000_i64)
+    .execute(&pool)
+    .await
+    .expect("a pre-migration-shaped insert must still be a legal write");
+
+    let repo = AugmentationRepo::new(Arc::new(DbPool::from_pool(pool)));
+
+    let fetched = repo.get(&request_id).await.expect("get must succeed");
+    assert_eq!(
+        fetched.requested_by_user_id, None,
+        "an unattributed row is unknown, not an error and not a stand-in id"
+    );
+
+    let queued = repo
+        .list_pending_review(Some(&account_id), None, 200)
+        .await
+        .expect("listing the queue over an unattributed row must succeed");
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].requested_by_user_id, None);
 }
