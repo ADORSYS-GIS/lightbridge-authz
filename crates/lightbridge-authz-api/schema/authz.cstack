@@ -123,6 +123,12 @@ auth Principal {
   // entries -- `resolveUserProfiles`/`resolveActorLabels`/`searchUsers` at the end of this file
   // read this exact boolean back out of the auth context, once per frame.
   permUserRead Boolean
+  // `permRbacManage` (Permission::RbacManage, "rbac:manage") gates the three
+  // `platform_role_grants` procedures at the end of this file. `getMyAccess` beside them
+  // deliberately reads NO permission field at all -- it is in
+  // `rpc_permission_map::AUTHENTICATED_ONLY_OP_IDS`, the enumerated exception to the fail-closed
+  // "unmapped op-id is denied" rule; see that constant's own doc comment.
+  permRbacManage Boolean
 }
 
 mixin AuditFields {
@@ -1899,3 +1905,135 @@ type UserSearchResults {
 
 procedure searchUsers(args: SearchUsersInput): UserSearchResults
   @allow((auth() != null) && auth().rpcScope == "crud" && auth().permUserRead == true)
+
+// ---------------------------------------------------------------------------------------------
+// Platform role grants (ADR-0033). `platform_role_grants` is the table that decides who holds a
+// platform role; `ClaimSource::PlatformRoles` stamps its ACTIVE rows into the RBAC roles claim at
+// token mint, unioned with whatever the `project_role` mapper contributes.
+//
+// The problem this closes: prod mapped `owner -> ["lightbridge-admin"]`, and under ADR-0026 every
+// signed-in person owns an account, so EVERY authenticated user was minted `lightbridge-admin`.
+// Admin was the default, not a decision. Post-cutover, account owners default to
+// `lightbridge-viewer` and admin is a row somebody wrote, with a granter, a timestamp and a
+// reason.
+//
+// ADR-0038 note. All four procedures are backed by hand-written SQL in
+// `crates/lightbridge-authz-api-key/src/platform_roles.rs` /`platform_role_lookup.rs`, not by the
+// generated model client, for two independent reasons: the hot read runs on the token-mint path
+// inside `authz-idp`, which builds no cratestack client at all; and `grantPlatformRole`'s
+// idempotency is an `ON CONFLICT ... WHERE revoked_at IS NULL DO NOTHING` against a PARTIAL unique
+// index, the same class of single-statement conditional write as `consume_authorization_code`.
+// The `@allow` clauses below are therefore the whole schema-layer authorization story: there is no
+// per-tenant ownership relation between an admin and an arbitrary target person for a `@@allow` to
+// check, exactly as with `revokeSubjectSessions`.
+
+// One row of `platform_role_grants`, verbatim.
+//
+// `grantedBy` null means CLI BOOTSTRAP (`lightbridge-authz rbac grant`) -- the only way the first
+// admin can exist, since there is no admin to grant it. That is a real, permanent distinction, not
+// a missing value: render it as "CLI bootstrap", never as "unknown".
+//
+// `revokedAt` null means ACTIVE. Revocation is a soft delete on purpose -- "X held admin between
+// these two timestamps, granted by Y, for reason Z" is the audit trail this table exists to
+// produce.
+type PlatformRoleGrant {
+  id String
+  userId String
+  role String
+  grantedBy String?
+  grantedAt DateTime
+  revokedAt DateTime?
+  reason String?
+}
+
+// Filters AND together. `includeRevoked` defaults to false, i.e. ACTIVE grants only -- the "who can
+// do what right now" view; set it for the audit view. `after` is the previous page's last
+// `grantedAt` (rows are newest first); `limit` defaults to 50 and CLAMPS at 200.
+type ListPlatformRoleGrantsInput {
+  userId String?
+  role String?
+  includeRevoked Boolean?
+  after DateTime?
+  limit Int?
+}
+
+// `nextCursor` is the last entry's `grantedAt` when the page came back exactly `limit` long (there
+// may be more) and null when it came back short -- the same rule `listBudgetGrants` uses.
+type PlatformRoleGrantPage {
+  entries PlatformRoleGrant[]
+  nextCursor DateTime?
+}
+
+procedure listPlatformRoleGrants(args: ListPlatformRoleGrantsInput): PlatformRoleGrantPage
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permRbacManage == true)
+
+// `userId` is a `users.id` (the PERSON, ADR-0024/ADR-0026), never an account id -- a platform role
+// follows the human across every account they own. `role` is validated against the configured
+// `oauth2.rbac.role_permissions` catalogue and REFUSED when unknown: an unvalidated typo would
+// write a row that confers nothing while looking exactly like a successful grant.
+type GrantPlatformRoleInput {
+  userId String
+  role String
+  reason String?
+}
+
+// IDEMPOTENT: granting a role the person already actively holds returns the EXISTING grant
+// untouched (including its original `reason` -- a repeat call is not a new decision), rather than
+// minting a duplicate or erroring. The operator asked for "this person holds this role", and after
+// either outcome they do.
+//
+// The new role does not reach the person's token until it is next minted. That delay is bounded by
+// the access-token TTL and is documented as such in `docs/rbac.md` -- the same ADR-0014 property
+// `budget_tier` already has.
+mutation procedure grantPlatformRole(args: GrantPlatformRoleInput): PlatformRoleGrant
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permRbacManage == true)
+
+type RevokePlatformRoleInput {
+  grantId String
+  reason String?
+}
+
+// The revoked grant, plus how many of that person's sessions were closed to make it bite.
+//
+// `revokedSessionCount` is not decoration: a revocation that only stamped `revoked_at` would leave
+// the person holding a still-valid access token carrying the role for up to a full TTL, and a
+// refresh would keep re-minting it from the same live session. So revocation ALSO runs the existing
+// `revokeSubjectSessions` path for every account the person owns (ADR-0026: one person, many
+// accounts, one `sessions.subject` per account), which forces a fresh login rather than a silent
+// re-mint. Grants deliberately do NOT do this -- gaining a capability late is not a security event.
+type PlatformRoleRevocation {
+  grant PlatformRoleGrant
+  revokedSessionCount Int
+}
+
+// Revoking an already-revoked grant is refused rather than silently re-stamped: the original
+// `revoked_at` is the audit fact, and overwriting it with a later timestamp would destroy the one
+// thing the row is for.
+mutation procedure revokePlatformRole(args: RevokePlatformRoleInput): PlatformRoleRevocation
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permRbacManage == true)
+
+type GetMyAccessInput {
+}
+
+// What the CALLER may do, as the server itself computed it.
+//
+// `roles` are the raw role strings off the caller's own validated token (whatever
+// `oauth2.rbac.roles_claim` names). `permissions` are the canonical `resource:action` strings the
+// server resolved those roles into -- read back out of the very auth context every `@allow` clause
+// in this file is evaluated against, NOT re-derived. That is the whole point: a console that
+// re-implemented the role -> permission map would drift from it, and the drift would show up as a
+// screen offering an action the backend then refuses (or, worse, hiding one it would have allowed).
+type MyAccess {
+  userId String
+  roles String[]
+  permissions String[]
+}
+
+// Allowed for ANY authenticated caller -- no permission at all. It is the one procedure in this
+// schema whose `@allow` checks no `auth().perm*` field, and it is listed in
+// `rpc_permission_map::AUTHENTICATED_ONLY_OP_IDS` so both enforcement points (the unary
+// `rpc_authorize` middleware and `CratestackAuthProvider::authenticate`) agree. Gating it would
+// defeat its purpose -- the console calls it to find out what it may render -- and it discloses
+// nothing: every value it returns is already derivable from the token the caller is holding.
+procedure getMyAccess(args: GetMyAccessInput): MyAccess
+  @allow(auth() != null && auth().rpcScope == "crud")

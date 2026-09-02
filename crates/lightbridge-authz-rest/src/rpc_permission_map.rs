@@ -16,6 +16,29 @@
 
 use lightbridge_authz_core::Permission;
 
+/// Op-ids that require ONLY a valid, active bearer token -- no permission at all.
+///
+/// This list is the deliberate, enumerated exception to [`required_permission`]'s fail-closed
+/// `None => denied` rule (`rpc_authorize.rs`), and it is a list rather than a "self-service ops are
+/// exempt" heuristic precisely so that adding one is a conscious edit somebody reviews.
+///
+/// [`required_permission`]: crate::rpc_authorize::required_permission
+///
+/// Its sole member, `getMyAccess` (ADR-0033), returns the caller's OWN already-minted roles and the
+/// permission set the server derives from them. Gating it would defeat its purpose: the console
+/// calls it to find out what it may render, so a permission requirement would make "you may not
+/// ask what you may do" a reachable state, and the natural candidates all make it worse --
+/// `rbac:manage` would restrict it to the admins who need it least, and any permission every role
+/// happens to hold today is an accident of the default map that an operator's own
+/// `role_permissions` can revoke. It discloses nothing new either way: every value it returns is
+/// already derivable from the caller's own token, which they are holding.
+pub const AUTHENTICATED_ONLY_OP_IDS: &[&str] = &["procedure.getMyAccess"];
+
+/// Whether `op_id` is served to any authenticated caller (see [`AUTHENTICATED_ONLY_OP_IDS`]).
+pub fn is_authenticated_only_op_id(op_id: &str) -> bool {
+    AUTHENTICATED_ONLY_OP_IDS.contains(&op_id)
+}
+
 /// Every op-id `required_permission` maps to a `Some`, paired with the expected permission —
 /// the single enumeration both `every_mapped_op_id_maps_to_the_documented_permission` (below) and
 /// `schema_policy_sync`'s codegen/drift-check walk, so there is exactly one hand-maintained list
@@ -148,6 +171,9 @@ pub const MAPPED_OP_ID_PERMISSIONS: &[(&str, Permission)] = &[
     ("procedure.resolveUserProfiles", Permission::UserRead),
     ("procedure.resolveActorLabels", Permission::UserRead),
     ("procedure.searchUsers", Permission::UserRead),
+    ("procedure.listPlatformRoleGrants", Permission::RbacManage),
+    ("procedure.grantPlatformRole", Permission::RbacManage),
+    ("procedure.revokePlatformRole", Permission::RbacManage),
 ];
 
 /// The `auth().<field>` name `CratestackAuthProvider` bakes each [`Permission`]'s boolean grant

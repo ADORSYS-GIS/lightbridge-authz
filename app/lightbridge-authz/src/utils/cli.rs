@@ -34,6 +34,16 @@ pub enum Commands {
         #[arg(long, short, env = "CONFIG_PATH")]
         config_path: String,
     },
+    /// Manage PLATFORM role grants (`platform_role_grants`, ADR-0033) directly against the
+    /// configured database. One-shot, no server -- the `idp jwk` pattern. This is how the FIRST
+    /// admin exists at all: `grantPlatformRole` needs `rbac:manage`, which needs a role, which
+    /// after the cutover nobody is minted by default.
+    Rbac {
+        #[arg(long, short, env = "CONFIG_PATH")]
+        config_path: String,
+        #[command(subcommand)]
+        command: RbacCommand,
+    },
     Config {
         #[arg(long, short, env = "CONFIG_PATH")]
         config_path: String,
@@ -41,6 +51,44 @@ pub enum Commands {
     Migrate {
         #[arg(long, short, env = "CONFIG_PATH")]
         config_path: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RbacCommand {
+    /// Grant a platform role. Idempotent: re-granting a role the person already actively holds
+    /// reports the existing grant instead of minting a second one. `granted_by` is recorded as
+    /// NULL ("CLI bootstrap") on this path, always.
+    Grant {
+        /// A `users.id` or an email. An email matching more than one user is REFUSED, never
+        /// guessed at -- see `rbac_cmd::resolve_user`.
+        #[arg(long)]
+        user: String,
+        /// Must be one of the roles configured in `oauth2.rbac.role_permissions` (or the built-in
+        /// defaults when that is unset). An unknown role is refused: the row would confer nothing
+        /// while looking exactly like a successful grant.
+        #[arg(long)]
+        role: String,
+        /// Recorded on the row. Write down why -- that is most of what this table is for.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Revoke the active grant of `--role` for `--user`, then close that person's sessions so the
+    /// change bites within the access-token TTL instead of the session lifetime.
+    Revoke {
+        #[arg(long)]
+        user: String,
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Print active grants, optionally filtered. Never prints revoked history.
+    List {
+        #[arg(long)]
+        user: Option<String>,
+        #[arg(long)]
+        role: Option<String>,
     },
 }
 

@@ -194,6 +194,9 @@ async fn setup(
         review_service,
         budget_repo,
         reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
         cdb,
         core.clone(),
         bearer,

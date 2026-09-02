@@ -157,12 +157,25 @@ pub enum Permission {
     /// no other default role, so an unconfigured deployment keeps it admin-only out of the box.
     #[serde(rename = "user:read")]
     UserRead,
+
+    /// Grant, revoke and list PLATFORM role grants (`platform_role_grants`, ADR-0033) -- the rows
+    /// `ClaimSource::PlatformRoles` stamps into the roles claim at mint. Its own permission, not a
+    /// reuse of [`Permission::UserRead`] or any `account:*` grant, because it is the one
+    /// capability that can hand out every other capability: a caller who can write this table can
+    /// make themselves `lightbridge-admin`. Included in the default `lightbridge-admin`'s `*`
+    /// grant (see [`default_role_permissions`]) and in no other default role.
+    ///
+    /// Deliberately NOT required by `getMyAccess`, which any authenticated caller may invoke:
+    /// reading back your OWN already-minted roles and the permissions the server derives from them
+    /// discloses nothing the caller's own token does not already carry.
+    #[serde(rename = "rbac:manage")]
+    RbacManage,
 }
 
 impl Permission {
     /// Every permission, in declaration order. The single source of truth for wildcard expansion
     /// and documentation.
-    pub const ALL: [Permission; 34] = [
+    pub const ALL: [Permission; 35] = [
         Permission::AccountCreate,
         Permission::AccountRead,
         Permission::AccountUpdate,
@@ -197,6 +210,7 @@ impl Permission {
         Permission::SessionRevoke,
         Permission::UsageReadAll,
         Permission::UserRead,
+        Permission::RbacManage,
     ];
 
     /// Canonical `resource:action` string.
@@ -236,6 +250,7 @@ impl Permission {
             Permission::SessionRevoke => "session:revoke",
             Permission::UsageReadAll => "usage:read-all",
             Permission::UserRead => "user:read",
+            Permission::RbacManage => "rbac:manage",
         }
     }
 

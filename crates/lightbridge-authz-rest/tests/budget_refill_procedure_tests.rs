@@ -156,6 +156,9 @@ async fn procedures_and_ctx(
         review_service,
         budget_repo.clone(),
         reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
     );
     let ctx = ctx_for(subject).await;
     (procedures, ctx, budget_repo)

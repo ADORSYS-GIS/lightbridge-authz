@@ -202,6 +202,7 @@ fn state(repo: Arc<StoreRepo>) -> TokenExchangeState {
         client_store,
         assertions,
         repo.clone(),
+        repo.clone(),
         repo,
         budget_repo,
         Arc::new(FixedFloorPolicyEngine),

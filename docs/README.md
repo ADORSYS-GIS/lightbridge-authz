@@ -55,7 +55,7 @@ All but the usage service share one Postgres database (`authz`); usage has its o
 
 | Want to… | Open |
 | --- | --- |
-| RBAC — JWT claim → permission mapping | [`rbac.md`](./rbac.md) |
+| RBAC — JWT claim → permission mapping, platform role grants (ADR-0033) and the `rbac` CLI bootstrap runbook | [`rbac.md`](./rbac.md) |
 | Governance model — how quotas/allowlists are enforced at the gateway (introspection, Authorino) | [`governance-model-and-enforcement.md`](./governance-model-and-enforcement.md) |
 | Authorino endpoint usage + integration test | [`authorino-usage.md`](./authorino-usage.md) |
 | Usage ingest/query API | [`usage-api.md`](./usage-api.md) |
@@ -73,7 +73,7 @@ All but the usage service share one Postgres database (`authz`); usage has its o
 
 | Want to… | Open |
 | --- | --- |
-| Architecture Decision Records (30) — why the system is shaped this way | [`adr/`](./adr/) |
+| Architecture Decision Records (33) — why the system is shaped this way | [`adr/`](./adr/) |
 | Budget refill RFC (the original design proposal) | [`rfc/`](./rfc/) |
 | Operational runbooks (tier re-key, stuck refill, policy rollback) | [`runbooks/`](./runbooks/) |
 | Work/analysis plans | [`plans/`](./plans/), [`research/`](./research/) |

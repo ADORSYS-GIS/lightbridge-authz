@@ -596,6 +596,11 @@ fn state_with_cfg_and_budget_repo(
         client_store,
         assertions,
         repo,
+        quota_repo.clone(),
+        // ADR-0033: the `platform_role_grants` seam. Deliberately the SAME handle as `quota_repo`
+        // here, so the existing "point the claim/roster lookup at a dead pool" fixture
+        // (`lazy_repo()`) covers both claim sources at once; the dedicated platform-role
+        // fail-closed coverage lives in `platform_role_claim_tests.rs`, which builds its own store.
         quota_repo,
         budget_repo,
         policy_engine,
@@ -2733,6 +2738,9 @@ async fn request_refill_accepts_a_real_human_plane_token_that_still_carries_the_
         review_service,
         budget_repo,
         reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
     );
 
     // Every field below traces to the real token decoded above, except `permissions` -- see this

@@ -305,13 +305,25 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         "procedure.resolveActorLabels" => UserRead,
         "procedure.searchUsers" => UserRead,
 
+        // Platform role grants (ADR-0033). All three share ONE permission for the same reason the
+        // identity trio above does: a caller who can grant a role can trivially list who holds it
+        // (grant to themselves, read it back), so splitting read from write here would be
+        // granularity theatre. `getMyAccess` is deliberately NOT here -- it is in
+        // `AUTHENTICATED_ONLY_OP_IDS` instead; see that constant's own doc comment.
+        "procedure.listPlatformRoleGrants" => RbacManage,
+        "procedure.grantPlatformRole" => RbacManage,
+        "procedure.revokePlatformRole" => RbacManage,
+
         _ => return None,
     })
 }
 
 /// Re-exported from [`crate::rpc_permission_map`], which holds both items. Split out only to keep
 /// this file inside its LoC-gate baseline; see that module's own doc comment.
-pub use crate::rpc_permission_map::{MAPPED_OP_ID_PERMISSIONS, permission_field_name};
+pub use crate::rpc_permission_map::{
+    AUTHENTICATED_ONLY_OP_IDS, MAPPED_OP_ID_PERMISSIONS, is_authenticated_only_op_id,
+    permission_field_name,
+};
 
 /// Extract a bearer token from the `Authorization` header, tolerating `Bearer`/`bearer` casing and
 /// surrounding whitespace. Mirrors `auth_provider::extract_bearer` (kept local so this module does
@@ -403,9 +415,12 @@ pub async fn rpc_authorize(
         return deny(StatusCode::NOT_FOUND, "unknown RPC op");
     }
 
-    let Some(required) = required_permission(&op_id) else {
+    // Unmapped op-ids are denied unconditionally, EXCEPT the enumerated
+    // `AUTHENTICATED_ONLY_OP_IDS` (see that constant), which need a live token and nothing more.
+    let required = required_permission(&op_id);
+    if required.is_none() && !is_authenticated_only_op_id(&op_id) {
         return deny(StatusCode::FORBIDDEN, "operation not permitted");
-    };
+    }
 
     let Some(token) = extract_bearer(request.headers()) else {
         return deny(StatusCode::UNAUTHORIZED, "missing bearer token");
@@ -413,10 +428,10 @@ pub async fn rpc_authorize(
 
     match state.bearer.validate_bearer_token(&token).await {
         Ok(info) if info.active => {
-            if info.has_permission(required) {
-                next.run(request).await
-            } else {
+            if required.is_some_and(|required| !info.has_permission(required)) {
                 deny(StatusCode::FORBIDDEN, "insufficient permissions")
+            } else {
+                next.run(request).await
             }
         }
         // Invalid/inactive token or validation error -> uniform 401, never leaking which step failed.
