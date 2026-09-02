@@ -172,11 +172,19 @@ async fn setup(
         budget_repo.clone(),
         augmentation_repo.clone(),
         policy_engine,
-        spend_reader,
+        spend_reader.clone(),
     ));
     let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
         budget_repo.clone(),
         augmentation_repo,
+    ));
+    // ADR-0032: the same scheduler the RPC schedule procedures reach, over this test's live pool
+    // and the same spend reader the refill path uses. The interval task is NOT started here -- it
+    // is spawned only by `start_budget_server` -- so nothing fires in the background during a test.
+    let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
+        core.clone(),
+        budget_repo.clone(),
+        spend_reader,
     ));
 
     let router = lightbridge_authz_rest::build_budget_router(
@@ -185,6 +193,7 @@ async fn setup(
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
         cdb,
         core.clone(),
         bearer,

@@ -84,3 +84,8 @@ required-features = ["it-tests"]
 name = "review_service_tests"
 path = "tests/review_service_tests.rs"
 required-features = ["it-tests"]
+
+[[test]]
+name = "reset_schedule_tests"
+path = "tests/reset_schedule_tests.rs"
+required-features = ["it-tests"]

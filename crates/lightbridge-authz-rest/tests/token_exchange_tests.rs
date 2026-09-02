@@ -2713,7 +2713,7 @@ async fn request_refill_accepts_a_real_human_plane_token_that_still_carries_the_
             .expect("migrations seed an active budget-refill revision"),
     );
     let budget_repo = Arc::new(BudgetRepo::new(db_pool.clone()));
-    let augmentation_repo = Arc::new(AugmentationRepo::new(db_pool));
+    let augmentation_repo = Arc::new(AugmentationRepo::new(db_pool.clone()));
     let refill_service = Arc::new(RefillService::new(
         budget_repo.clone(),
         augmentation_repo.clone(),
@@ -2721,12 +2721,18 @@ async fn request_refill_accepts_a_real_human_plane_token_that_still_carries_the_
         Arc::new(UnavailableSpendReader),
     ));
     let review_service = Arc::new(ReviewService::new(budget_repo.clone(), augmentation_repo));
+    let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
+        db_pool,
+        budget_repo.clone(),
+        Arc::new(UnavailableSpendReader),
+    ));
     let procedures = Procedures::new(
         issuer,
         policy_store,
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
     );
 
     // Every field below traces to the real token decoded above, except `permissions` -- see this

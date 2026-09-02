@@ -137,7 +137,9 @@ async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, Cratest
     let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
         db_pool.clone(),
     ));
-    let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(db_pool));
+    let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(
+        db_pool.clone(),
+    ));
     let refill_service = Arc::new(lightbridge_authz_budget::RefillService::new(
         budget_repo.clone(),
         augmentation_repo.clone(),
@@ -148,12 +150,21 @@ async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, Cratest
         budget_repo.clone(),
         augmentation_repo,
     ));
+    // ADR-0032: `Procedures::new` takes the reset scheduler unconditionally, the same type-level
+    // obligation the refill/review services above already carry -- no test in this file reaches a
+    // schedule procedure, and `UnavailableSpendReader` keeps it network-free.
+    let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
+        db_pool,
+        budget_repo.clone(),
+        Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
+    ));
     let procedures = Procedures::new(
         issuer,
         policy_store,
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
     );
     // Issue #383 follow-up: see the identical comment in `budget_policy_procedure_tests.rs` --
     // grants the full permission set via the shared `build_context` helper, `RpcScope::Budget`,

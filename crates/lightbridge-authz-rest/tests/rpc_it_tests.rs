@@ -124,6 +124,7 @@ struct Ctx {
     refill_service: Arc<lightbridge_authz_budget::RefillService>,
     review_service: Arc<lightbridge_authz_budget::ReviewService>,
     budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+    reset_scheduler: Arc<lightbridge_authz_budget::ResetScheduler>,
 }
 
 // `SqlxIdempotencyStore::ensure_schema()` issues its `CREATE TYPE`/`CREATE TABLE` DDL without
@@ -210,6 +211,14 @@ async fn setup_with_resolver(
         budget_repo.clone(),
         augmentation_repo,
     ));
+    // ADR-0032: `build_*_router` takes the reset scheduler unconditionally (see `Procedures`'s own
+    // field doc). Nothing here drives the interval task -- that is spawned only by
+    // `start_budget_server` -- so this is an inert handle over the same lazily-connected pool.
+    let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
+        core.clone(),
+        budget_repo.clone(),
+        Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
+    ));
 
     let router = lightbridge_authz_rest::build_api_router(
         bearer,
@@ -219,6 +228,7 @@ async fn setup_with_resolver(
         refill_service.clone(),
         review_service.clone(),
         budget_repo.clone(),
+        reset_scheduler.clone(),
         cdb,
         core.clone(),
         idempotency,
@@ -243,6 +253,7 @@ async fn setup_with_resolver(
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
     }
 }
 
@@ -1902,6 +1913,7 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
             ctx.refill_service.clone(),
             ctx.review_service.clone(),
             ctx.budget_repo.clone(),
+            ctx.reset_scheduler.clone(),
         ),
         // cratestack 0.8.11 (@computed) added this parameter; `()` is a no-op since
         // `authz.cstack` declares no `@computed` field (see src/lib.rs's own call sites).

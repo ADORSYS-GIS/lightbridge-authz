@@ -267,11 +267,12 @@ scope for #401.
 | `budget:self-refill`     | `procedure.requestBudgetRefill`, `procedure.getMyBudgetRefillLadder` | — (no MCP tool yet)   |
 | `budget:review`          | `procedure.listPendingAugmentationRequests`, `procedure.approveAugmentationRequest`, `procedure.rejectAugmentationRequest` | — (no MCP tool yet) |
 | `budget:read-own`        | `procedure.getMyBudgetBalance`, `procedure.listMyBudgetGrants`, `procedure.listMyAugmentationRequests` | — (no MCP tool yet) |
-| `budget:read`            | `procedure.getBudgetBalance`                    | — (no MCP tool yet)                 |
+| `budget:read`            | `procedure.getBudgetBalance`, `procedure.getEffectiveResetSchedule` | — (no MCP tool yet)     |
 | `budget:audit-read`      | `procedure.listBudgetGrants`                    | — (no MCP tool yet)                 |
 | `budget:grant`           | `procedure.grantBudget`                         | — (no MCP tool yet)                 |
 | `budget:revoke`          | `procedure.revokeBudgetGrant`                   | — (no MCP tool yet)                 |
 | `budget:policy-write`    | `procedure.createBudgetPolicyRevision`          | — (no MCP tool yet)                 |
+| `budget:schedule-manage` | `procedure.listBudgetResetSchedules`, `procedure.createBudgetResetSchedule`, `procedure.updateBudgetResetSchedule`, `procedure.deleteBudgetResetSchedule`, `procedure.runBudgetResetScheduleNow` | — (no MCP tool yet) |
 | `session:revoke-own`     | `procedure.revokeOwnSessions`                        | — (no MCP tool yet)                 |
 | `session:revoke`         | `procedure.revokeSubjectSessions`                    | — (no MCP tool yet)                 |
 | `usage:read-all`         | — (not an RPC op-id; see note below)                 | — (no MCP tool)                     |
@@ -513,6 +514,27 @@ one procedure with an optional/defaulted target:
   `budget:policy-read` vs `budget:policy-write` split rather than the `budget:review` precedent
   (which bundles list + act into one permission). Neither default role holds these; only
   `lightbridge-admin` (via `*`) can read another account's budget.
+
+**Budget reset schedules (ADR-0032) are one permission, with one deliberate exception.**
+`budget:schedule-manage` gates all five management procedures — `listBudgetResetSchedules`,
+`createBudgetResetSchedule`, `updateBudgetResetSchedule`, `deleteBudgetResetSchedule`,
+`runBudgetResetScheduleNow`. Authoring a standing rule, editing it, deleting it and firing it by
+hand are the same capability with the same blast radius (a `global` schedule rewrites every
+account's balance on a timer), so splitting them would be granularity theatre — the same reasoning
+`budget:review` already applies to list-plus-act. `runBudgetResetScheduleNow` is gated there even
+for `dryRun: true`, because the dry run enumerates every matched account and its balance. Kept
+distinct from `budget:grant`, which is one amount to one account that a human typed out. No default
+role holds it; only `lightbridge-admin` (via `*`).
+
+The exception is **`procedure.getEffectiveResetSchedule`**, gated at **`budget:read`** — the
+permission a caller already needs for `getBudgetBalance`. It answers "which schedule governs this
+account, and when does it next fire", which is what a console budget card renders as "next reset:
+`<date>` → $2.00"; reading the standing rule is materially lower-risk than authoring one, and
+requiring schedule-management rights to draw a budget card would be exactly the conflation the
+`budget:read` / `budget:read-own` split above exists to avoid. Both directions are asserted in
+`crates/lightbridge-authz-rest/tests/budget_router_tests.rs`
+(`budget_schedule_manage_alone_reaches_the_five_and_no_other_budget_op`,
+`the_effective_schedule_read_rides_budget_read`).
 
 `listMyBudgetGrants`/`listBudgetGrants`/`listMyAugmentationRequests` paginate strictly by
 `createdAt`, never by id (ADR-0039 — CUID2 has no defined ordering): the response's `nextCursor` is

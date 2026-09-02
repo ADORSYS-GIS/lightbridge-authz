@@ -53,6 +53,14 @@ pub enum BudgetError {
     /// consulted.
     #[error("{0} is not a currently offered refill amount (micro-USD)")]
     AmountNotOffered(i64),
+    /// ADR-0032: a budget reset schedule whose fields do not form a legitimate schedule -- an
+    /// unknown scope kind/cadence/mode read back from storage, a `global` row carrying a
+    /// `scope_id`, a weekly row with no weekday anchor, a `top_up` with a non-positive amount.
+    /// Distinct from `InvalidAmount` (sign only) and from `NotFound` (no such schedule): the row
+    /// is addressable and the amount may be fine, but the combination of fields is not a schedule
+    /// this scheduler could ever execute.
+    #[error("invalid budget reset schedule: {0}")]
+    InvalidSchedule(String),
 }
 
 pub type Result<T> = std::result::Result<T, BudgetError>;
@@ -119,6 +127,10 @@ mod tests {
         assert_eq!(
             BudgetError::AmountNotOffered(17_000_000).to_string(),
             "17000000 is not a currently offered refill amount (micro-USD)"
+        );
+        assert_eq!(
+            BudgetError::InvalidSchedule("unknown cadence 'hourly'".to_string()).to_string(),
+            "invalid budget reset schedule: unknown cadence 'hourly'"
         );
     }
 }
