@@ -7,6 +7,9 @@
 //! - [`client_assertion_store`]: Redis-backed `ClientAssertionStore` (Decision 6) -- fail-closed
 //!   `private_key_jwt` replay tracking.
 //! - [`refresh_store`]: `RefreshTokenStore` over `exchange_refresh_tokens`.
+//! - [`refresh_token`]: mints/verifies the refresh token itself as an RS256 JWT (was: an opaque
+//!   `lgbr_rt_<random>` string) -- a presentation-format change only, `refresh_store`'s DB-backed
+//!   CAS/rotation/revocation stays the single source of truth.
 //! - [`device_store`]: `DeviceCodeStore` over `device_authorizations` (ADR-0012 Decision 7, #423)
 //!   -- real, CAS-consuming storage, replacing the permanent `NoDeviceCodeStore` stub ADR-0011
 //!   Decision 3 originally installed for both OP-side traits.
@@ -21,6 +24,7 @@ pub mod client_assertion_store;
 pub mod client_store;
 pub mod device_store;
 pub mod refresh_store;
+pub mod refresh_token;
 pub mod store;
 
 use authkestra_op::handlers::token::TokenErrorResponse;
@@ -32,8 +36,6 @@ use serde_json::Value;
 pub(crate) const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 pub(crate) const OFFLINE_ACCESS_SCOPE: &str = "offline_access";
 pub(crate) const OPENID_SCOPE: &str = "openid";
-pub(crate) const REFRESH_TOKEN_PREFIX: &str = "lgbr_rt_";
-const REFRESH_TOKEN_BYTES: usize = 32;
 
 /// Builds an RFC 6749 §5.2-shaped `TokenErrorResponse`. `authkestra_op::handlers::token`'s own
 /// error type carries no HTTP status; `token_exchange::status_for_oauth_error` maps `error` back
@@ -87,21 +89,14 @@ pub(crate) fn scope_to_string(scopes: &[String]) -> Option<String> {
 /// Fills `bytes` random bytes from the OS CSPRNG and returns them URL-safe-base64-encoded
 /// (no padding). Shared by every call site in this crate that previously duplicated this exact
 /// "`OsRng` fill -> `URL_SAFE_NO_PAD` encode" sequence with its own byte count baked in --
-/// [`generate_refresh_secret`] below, [`device_store::generate_device_code`], and
-/// `relying_party`'s per-request state/nonce generation.
+/// [`device_store::generate_device_code`] and `relying_party`'s per-request state/nonce
+/// generation.
 pub(crate) fn random_urlsafe(bytes: usize) -> String {
     use base64::Engine;
     use rand_core::{OsRng, RngCore};
     let mut buf = vec![0u8; bytes];
     OsRng.fill_bytes(&mut buf);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
-}
-
-pub(crate) fn generate_refresh_secret() -> String {
-    format!(
-        "{REFRESH_TOKEN_PREFIX}{}",
-        random_urlsafe(REFRESH_TOKEN_BYTES)
-    )
 }
 
 /// Best-effort, unverified decode of a JWT's payload segment into JSON. Used only to snapshot

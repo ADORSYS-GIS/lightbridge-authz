@@ -40,7 +40,6 @@
 
 use std::sync::Arc;
 
-use authkestra_engine::auth::state::Identity;
 use authkestra_engine::token::TokenManager;
 use authkestra_op::client::{ClientRegistration, ClientStore, GrantType, TokenEndpointAuthMethod};
 use authkestra_op::client_assertion::ClientAssertionStore;
@@ -77,9 +76,10 @@ use super::client_assertion_store::RedisClientAssertionStore;
 use super::client_store::ConfigClientStore;
 use super::device_store::{DbDeviceCodeStore, create_pending_device_authorization};
 use super::refresh_store::DbRefreshTokenStore;
+use super::refresh_token;
 use super::{
     ACCESS_TOKEN_TYPE, OFFLINE_ACCESS_SCOPE, OPENID_SCOPE, decode_auth_time_and_nonce,
-    decode_profile_claims, generate_refresh_secret, grant_scopes, oauth_err, scope_to_string,
+    decode_profile_claims, grant_scopes, oauth_err, scope_to_string,
 };
 
 /// The `budget_tier` claim's wire label for an arbitrary amount, in micros. ADR-0008's ladder
@@ -659,6 +659,7 @@ impl TokenExchangeOpStore {
                         session_id: &session.id,
                     },
                     now,
+                    tokens,
                 )
                 .await?,
             )
@@ -677,30 +678,42 @@ impl TokenExchangeOpStore {
         &self,
         input: InitialRefreshToken<'_>,
         now: DateTime<Utc>,
+        tokens: &TokenManager,
     ) -> Result<String, TokenErrorResponse> {
-        let plaintext = generate_refresh_secret();
-        let chain_id = cuid2();
+        // Row id minted up front, same reasoning as `handle_refresh_token`'s own `new_id`: it is
+        // both the DB primary key AND the JWT `jti`, so the two always agree on identity.
+        let row_id = cuid2();
         let chain_expires_at =
             now + Duration::seconds(self.cfg.refresh_absolute_ttl_seconds.max(0));
-        let identity = refresh_identity(
-            input.owner,
+        let expires_at = now + Duration::seconds(self.cfg.refresh_ttl_seconds);
+        let plaintext = refresh_token::mint_refresh_jwt(
+            tokens,
             input.account_id,
-            input.project_id,
-            input.auth_time,
-            &chain_id,
-            chain_expires_at,
             input.session_id,
-        );
-        let refresh = RefreshToken::new(
-            plaintext.clone(),
-            input.client_id.to_string(),
-            identity,
-            input.scope.unwrap_or_default().to_string(),
-            now + Duration::seconds(self.cfg.refresh_ttl_seconds),
-            None,
-        );
-        self.refresh
-            .store_token(refresh)
+            &row_id,
+            self.cfg.refresh_ttl_seconds.max(0) as u64,
+        )
+        .map_err(|_| oauth_err("server_error", "refresh token signing failed"))?;
+        self.repo
+            .create_exchange_refresh_token(NewExchangeRefreshToken {
+                id: row_id,
+                subject: input.owner.account_id.clone(),
+                account_id: input.account_id.to_string(),
+                project_id: input.project_id.to_string(),
+                client_id: input.client_id.to_string(),
+                token_hash: hash_api_key(&plaintext),
+                scope: input.scope.map(str::to_string),
+                email: input.owner.email.clone(),
+                email_verified: input.owner.email_verified,
+                auth_time: input.auth_time,
+                preferred_username: input.owner.preferred_username.clone(),
+                name: input.owner.name.clone(),
+                chain_id: cuid2(),
+                chain_expires_at,
+                session_id: input.session_id.to_string(),
+                created_at: now,
+                expires_at,
+            })
             .await
             .map_err(|_| oauth_err("server_error", "refresh token persistence failed"))?;
         Ok(plaintext)
@@ -1112,6 +1125,7 @@ impl TokenExchangeOpStore {
                         session_id: &session_id,
                     },
                     now,
+                    tokens,
                 )
                 .await?,
             )
@@ -1584,13 +1598,29 @@ impl TokenExchangeOpStore {
         };
 
         let now = Utc::now();
-        let presented_hash = hash_api_key(presented);
         let invalid_grant = || {
             oauth_err(
                 "invalid_grant",
                 "refresh_token is invalid, expired, or already used",
             )
         };
+
+        // JWT verification (signature/exp/aud/typ) gates the DB entirely: a malformed or
+        // foreign-signed presentation is refused here and never reaches the hash/CAS step below.
+        // See `refresh_token`'s doc comment for why this needs `list_verification_jwks` (active +
+        // retired keys) rather than the request's own single-active-key `TokenManager`.
+        match refresh_token::verify_refresh_jwt(&self.repo, presented).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(invalid_grant()),
+            Err(_) => {
+                return Err(oauth_err(
+                    "server_error",
+                    "refresh verification unavailable",
+                ));
+            }
+        }
+
+        let presented_hash = hash_api_key(presented);
 
         // Generated BEFORE the CAS consume, not after, specifically so it can be written as
         // `successor_id` in the SAME `UPDATE` that flips the presented row to `rotated` (see
@@ -1644,8 +1674,9 @@ impl TokenExchangeOpStore {
         // cover. Any failure here refuses the refresh -- no permissive fallback.
         //
         // ADR-0025: `old_row.subject` is already the resolved acting account id (set at the
-        // initial `handle_token_exchange` mint via `refresh_identity`'s `external_id`), never a
-        // raw upstream claim -- no second resolver call needed on the refresh path.
+        // initial `handle_token_exchange` mint via `create_initial_refresh_token`'s
+        // `input.owner.account_id`), never a raw upstream claim -- no second resolver call needed
+        // on the refresh path.
         let old_row_account_id = AccountId::assert_already_resolved(old_row.subject.clone());
         let context = match self
             .repo
@@ -1755,7 +1786,14 @@ impl TokenExchangeOpStore {
             None
         };
 
-        let new_plaintext = generate_refresh_secret();
+        let new_plaintext = refresh_token::mint_refresh_jwt(
+            tokens,
+            &context.account_id,
+            &session_id,
+            &new_id,
+            self.cfg.refresh_ttl_seconds.max(0) as u64,
+        )
+        .map_err(|_| oauth_err("server_error", "refresh token signing failed"))?;
         let new_row = NewExchangeRefreshToken {
             // The SAME id generated above, before the CAS consume -- see `new_id`'s own comment.
             // On the graced-replay path this is the first time it is actually written anywhere;
@@ -1909,58 +1947,6 @@ impl TokenExchangeOpStore {
             );
         }
         None
-    }
-}
-
-/// Builds the `Identity` a refresh-token row round-trips through `RefreshTokenStore` (see
-/// `refresh_store`'s doc comment for why `account_id`/`project_id`/`email_verified`/`auth_time`/
-/// `chain_id`/`chain_expires_at` live in `attributes`). Only used for the initial
-/// offline-scope mint in `handle_token_exchange` -- `handle_refresh_token` mints rotations
-/// directly against `StoreRepo`, reading/writing the typed `ExchangeRefreshTokenRow` columns
-/// instead of round-tripping through this string-keyed map.
-fn refresh_identity(
-    owner: &KeyOwner,
-    account_id: &str,
-    project_id: &str,
-    auth_time: Option<i64>,
-    chain_id: &str,
-    chain_expires_at: DateTime<Utc>,
-    session_id: &str,
-) -> Identity {
-    let mut attributes = std::collections::HashMap::new();
-    attributes.insert("account_id".to_string(), account_id.to_string());
-    attributes.insert("project_id".to_string(), project_id.to_string());
-    if let Some(verified) = owner.email_verified {
-        attributes.insert("email_verified".to_string(), verified.to_string());
-    }
-    if let Some(auth_time) = auth_time {
-        attributes.insert("auth_time".to_string(), auth_time.to_string());
-    }
-    // `name` has no dedicated field on `Identity` (only `email`/`username`), so it rides
-    // `attributes` -- same convention `signing::identity_for` uses, and the same reason
-    // `DbRefreshTokenStore` already round-trips `account_id`/`project_id`/`email_verified`/
-    // `auth_time` through here: `preferred_username` DOES have a dedicated field (`username`,
-    // set below) and does not need this treatment.
-    if let Some(name) = owner.name.as_deref() {
-        attributes.insert("name".to_string(), name.to_string());
-    }
-    attributes.insert("chain_id".to_string(), chain_id.to_string());
-    attributes.insert(
-        "chain_expires_at".to_string(),
-        chain_expires_at.to_rfc3339(),
-    );
-    attributes.insert("session_id".to_string(), session_id.to_string());
-    Identity {
-        provider_id: "keycloak".to_string(),
-        // ADR-0025 Stage 2/#492: `external_id` becomes `exchange_refresh_tokens.subject` via
-        // `DbRefreshTokenStore::store_token` -- the real ACTING person, mirroring
-        // `sessions.subject`'s own #492 fix. Minted from `owner.account_id` (the resolved acting
-        // account id), never `owner.subject` (the raw upstream claim); byte-identical to the
-        // pre-Stage-3 value for every grandfathered account.
-        external_id: owner.account_id.clone(),
-        email: owner.email.clone(),
-        username: owner.preferred_username.clone(),
-        attributes,
     }
 }
 
