@@ -930,10 +930,23 @@ Traces capture the full lifecycle of a validation request, including database lo
     `lightbridge-admin` by default, #605). `scope=api_key` has no resolvable ownership authority
     and is refused unconditionally. Missing/invalid bearer -> `401`; unauthorized, or the
     authority being unreachable/erroring -> `403`, fail-closed, never treated as authorized.
+    **Since #648 a caller holding `usage:read-all` may query `user`/`project`/`account` with ANY
+    `scope_id`** (the ownership round trip is skipped entirely) -- that permission already returns
+    the whole estate via `scope=all`, so a per-account slice of it is not a wider grant. The two
+    edges of that bypass are load-bearing and tested: `scope=api_key` stays refused for permission
+    holders too, and a caller WITHOUT the permission sees the unchanged rules above.
   - **`/usage/v1/spend/query` stays mTLS-only** -- it is `authz-budget`'s legitimate cross-account
     service-to-service reader with no per-caller ownership check by design -- but now REFUSES any
     request carrying an `Authorization` header (#603), closing a "console catch-all-proxy" hole
     where a misrouted browser bearer token could otherwise reach this ownerless cross-account read.
+  - **Usage dimensions (#648):** `usage_events` carries `azp`, `operation` and `billing_plan` as
+    real, indexed, groupable/filterable columns (promoted out of the `attributes` JSONB blob, which
+    is still written unchanged), plus an `operation_in` set-membership filter over the closed
+    vocabulary `chat_completions` | `responses` | `messages` | `embeddings` | `other`. `operation`
+    is derived at ingest by path prefix; NO path key at all stores `NULL`, never `other`. This is
+    an explicitly interim bridge on a table #581 will drop -- see `docs/usage-api.md`'s "Usage
+    dimensions" section and the interim-bridge note in
+    `docs/plans/0581-multi-source-usage-plan-of-work.md`.
   - See `docs/lightbridge-query-api.md` and `docs/usage-api.md` for the full contract; this section
     is cited as authoritative by `docs/local-testing.md`.
 

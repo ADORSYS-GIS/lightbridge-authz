@@ -193,7 +193,9 @@ Split across two listeners since #347 — ingest `:3002` (compose) / query `:300
   scopes) — query listener: requires mTLS (#347) **plus** `Authorization: Bearer <end-user access
   token>` and an ownership check against `authz-opa`'s `authorize-usage-scope` for `account`/
   `project` scopes; `scope=all` instead requires the `usage:read-all` permission (#570/#603/#605).
-  `scope=api_key` has no resolvable ownership authority and is always `403`.
+  `scope=api_key` has no resolvable ownership authority and is always `403`. A caller holding
+  `usage:read-all` may query `user`/`project`/`account` with ANY `scope_id` (#648's admin bypass);
+  `api_key` stays refused for them too, and nothing changes for a caller without the permission.
 - `POST /usage/v1/spend/query` (summed spend for an account/period) — query listener: mTLS-only,
   `authz-budget`'s service-to-service reader; refuses any request carrying an `Authorization`
   header (#603).
@@ -209,13 +211,20 @@ Example query body:
   "start_time": "2026-02-20T00:00:00Z",
   "end_time": "2026-02-23T00:00:00Z",
   "bucket": "1 hour",
-  "group_by": ["model"],
+  "group_by": ["model", "azp"],
   "filters": {
-    "signal_type": "metric"
+    "signal_type": "metric",
+    "operation_in": ["chat_completions", "responses", "messages"]
   },
   "limit": 1000
 }
 ```
+
+`usage_events` also carries the three dimensions #648 promoted out of the `attributes` JSONB blob
+into real indexed columns — `azp` (the OAuth client / channel), `operation` (which API surface,
+from the closed vocabulary `chat_completions` | `responses` | `messages` | `embeddings` | `other`)
+and `billing_plan` — each groupable and filterable, plus the `operation_in` set filter. Interim by
+design: #581's `usage_request_events` rewrite carries them forward and drops `usage_events`.
 
 Run locally:
 
