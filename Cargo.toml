@@ -205,9 +205,15 @@ jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
 #
 # ⚠️ These three move in LOCKSTEP -- they share one `[workspace.package] version` upstream, and a
 # partial bump has broken this workspace before via a `jsonwebtoken` major mismatch.
-authkestra-resource = "=0.7.0"
-authkestra-op = "=0.7.0"
-authkestra-engine = "=0.7.0"
+#
+# 0.7.0 -> 0.7.1 (#625): `authkestra-resource` adds `JwksCache::with_client(reqwest::Client)` and
+# `Jwks::fetch_with`, letting a caller supply its own `reqwest::Client` (private-CA trust roots for
+# an in-cluster JWKS endpoint) instead of always dialling out with `reqwest::Client::new()`. This
+# is the whole reason for the bump; `authkestra-op`/`authkestra-engine` move only to keep the
+# lockstep -- no call site here touches either crate's new surface.
+authkestra-resource = "=0.7.1"
+authkestra-op = "=0.7.1"
+authkestra-engine = "=0.7.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "tracing", "net", "time"] }
 thiserror = "2"
 anyhow = "1"

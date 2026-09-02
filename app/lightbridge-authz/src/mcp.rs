@@ -2024,8 +2024,10 @@ pub async fn start_mcp_server(
         })
         .transpose()?;
     let opa_repo: Arc<dyn OpaRepoTrait> = Arc::new(StoreRepo::new(pool));
-    let bearer_service: Arc<dyn BearerTokenServiceTrait> =
-        Arc::new(BearerTokenService::new(oauth2.clone()));
+    let bearer_service: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        BearerTokenService::new(oauth2.clone())
+            .map_err(|e| Error::Server(format!("failed to build bearer JWKS client: {e}")))?,
+    );
 
     // cratestack CRUD client for the model-backed tools. cratestack runs on its own sqlx major
     // (0.8, vs this workspace's 0.9), so it needs a separate pool built with cratestack's sqlx,
@@ -2919,6 +2921,7 @@ mod tests {
         Oauth2 {
             oauth2_type: lightbridge_authz_core::config::Oauth2Type::External,
             jwks_url: "http://keycloak:9100/realms/dev/protocol/openid-connect/certs".to_string(),
+            jwks_ca_bundle_path: None,
             oauth2_url: None,
             issuer_url: None,
             authorization_endpoint: None,

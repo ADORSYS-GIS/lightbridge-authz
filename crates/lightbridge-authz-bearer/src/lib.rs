@@ -9,6 +9,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::{fmt, sync::Arc, time::Duration};
 
+mod jwks_client;
+pub use jwks_client::trust_ca_bundle;
+
 /// Claim name carrying the caller-kind signal (see [`API_KEY_CALLER_KIND`]). Custom (not a
 /// standard OIDC claim) and namespaced like the existing `lightbridge_api_roles` roles claim, so
 /// it cannot collide with an IdP's own claims.
@@ -226,8 +229,9 @@ impl fmt::Debug for BearerTokenService {
 }
 
 impl BearerTokenService {
-    /// Create a new instance of the BearerTokenService.
-    pub fn new(config: Oauth2) -> Self {
+    /// Create a new instance of the BearerTokenService. Fails when `config.jwks_ca_bundle_path`
+    /// is set but unreadable or not valid PEM -- see [`Oauth2::jwks_ca_bundle_path`].
+    pub fn new(config: Oauth2) -> anyhow::Result<Self> {
         tracing::info!(
             "Initializing BearerTokenService with audience config: {:?}, roles_claim: {:?}",
             config.audience,
@@ -243,18 +247,23 @@ impl BearerTokenService {
             .refresh_interval(DEFAULT_JWKS_CACHE_TTL)
             .algorithms(ACCEPTED_ALGORITHMS.to_vec())
             .build();
-        let cache = Arc::new(JwksCache::new(
+        let ca_bundle_path = config.jwks_ca_bundle_path.as_deref();
+        let client = trust_ca_bundle(reqwest::Client::builder(), ca_bundle_path)?
+            .build()
+            .map_err(|e| anyhow!("failed to build JWKS HTTP client: {e}"))?;
+        let (jwks_url, refresh_interval) = (
             validation_config.jwks_url,
             validation_config.refresh_interval,
-        ));
+        );
+        let cache = Arc::new(JwksCache::new(jwks_url, refresh_interval).with_client(client));
         let roles_claim = config.rbac.roles_claim.clone();
         let role_permissions = config.rbac.compile();
-        BearerTokenService {
+        Ok(BearerTokenService {
             config,
             cache,
             roles_claim,
             role_permissions,
-        }
+        })
     }
 }
 

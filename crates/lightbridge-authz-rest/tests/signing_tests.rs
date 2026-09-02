@@ -1369,6 +1369,7 @@ mod db {
         Oauth2 {
             oauth2_type: lightbridge_authz_core::config::Oauth2Type::SelfSigned,
             jwks_url: "http://unused".to_string(),
+            jwks_ca_bundle_path: None,
             oauth2_url: None,
             issuer_url: None,
             authorization_endpoint: None,

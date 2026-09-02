@@ -2,7 +2,7 @@ use axum::{Json, Router, http::StatusCode, routing::get};
 use chrono::{DateTime, Utc};
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait};
 use lightbridge_authz_core::{
-    Result, async_trait,
+    Error, Result, async_trait,
     config::{Database, Oauth2},
     db::{DbPool, DbPoolTrait, is_database_ready},
     server::{dev_cors_enabled, serve_tls},
@@ -165,8 +165,10 @@ pub async fn start_usage_server(
 ) -> Result<()> {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(database).await?);
     let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool.clone()));
-    let bearer: Arc<dyn BearerTokenServiceTrait> =
-        Arc::new(BearerTokenService::new(oauth2.clone()));
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        BearerTokenService::new(oauth2.clone())
+            .map_err(|e| Error::Server(format!("failed to build bearer JWKS client: {e}")))?,
+    );
     let scope_authority: Arc<dyn ScopeAuthority> =
         Arc::new(RemoteScopeAuthority::new(scope_authority)?);
     let state = Arc::new(UsageState {

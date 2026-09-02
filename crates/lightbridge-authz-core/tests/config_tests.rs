@@ -1,6 +1,6 @@
 use lightbridge_authz_core::Config;
 use lightbridge_authz_core::config::{
-    Federation, IdpServer, JwtSigning, Oauth2TokenExchange, load_from_path,
+    Federation, IdpServer, JwtSigning, Oauth2, Oauth2TokenExchange, load_from_path,
 };
 use std::fs;
 
@@ -59,6 +59,28 @@ fn oauth2_token_exchange_honors_explicit_values() {
     assert_eq!(exchange.refresh_ttl_seconds, 2);
     assert_eq!(exchange.allowed_scopes, vec!["openid"]);
     assert_eq!(exchange.client_credentials_ttl_seconds, 3);
+}
+
+/// lightbridge-authz#625: `jwks_ca_bundle_path` is genuinely optional -- most deployments never
+/// set it, since the platform trust store already covers a publicly-reachable JWKS endpoint.
+#[test]
+fn oauth2_jwks_ca_bundle_path_defaults_to_none_when_unset() {
+    let cfg: Oauth2 = serde_yaml::from_str("type: self\njwks_url: \"http://x\"\n").unwrap();
+    assert_eq!(cfg.jwks_ca_bundle_path, None);
+}
+
+/// The counterpart: an explicit `jwks_ca_bundle_path` (the in-cluster, private-CA deployment
+/// shape #625 exists for) must parse through untouched.
+#[test]
+fn oauth2_jwks_ca_bundle_path_parses_an_explicit_value() {
+    let cfg: Oauth2 = serde_yaml::from_str(
+        "type: self\njwks_url: \"http://x\"\njwks_ca_bundle_path: \"/etc/lightbridge/tls/ca.crt\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.jwks_ca_bundle_path.as_deref(),
+        Some("/etc/lightbridge/tls/ca.crt")
+    );
 }
 
 /// Identity-vs-location split (ADR-0025 amendment): `discovery_url` is optional and, when unset,

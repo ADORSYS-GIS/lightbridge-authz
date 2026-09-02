@@ -90,6 +90,7 @@ fn external_oauth2() -> Oauth2 {
     Oauth2 {
         oauth2_type: Oauth2Type::External,
         jwks_url: "http://jwks".to_string(),
+        jwks_ca_bundle_path: None,
         oauth2_url: None,
         issuer_url: None,
         authorization_endpoint: None,

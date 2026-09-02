@@ -2797,6 +2797,16 @@ fn require_federation<'a>(oauth2: &'a Oauth2, component: &str) -> Result<&'a Fed
     Ok(federation)
 }
 
+/// Shared by `start_api_server`/`start_idp_server`/`start_budget_server`. Fails when
+/// `oauth2.jwks_ca_bundle_path` is unreadable/malformed (lightbridge-authz#625).
+fn build_bearer_service(
+    oauth2: &Oauth2,
+) -> Result<Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait>> {
+    let service = BearerTokenService::new(oauth2.clone())
+        .map_err(|e| Error::Server(format!("failed to build bearer JWKS client: {e}")))?;
+    Ok(Arc::new(service))
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "startup wiring for authz-api -- each parameter is a distinct, independently-loaded \
@@ -2921,8 +2931,7 @@ pub async fn start_api_server(
         models,
         api_key_expiry,
     )?);
-    let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
-        Arc::new(BearerTokenService::new(oauth2.clone()));
+    let bearer_service = build_bearer_service(oauth2)?;
     // ADR-0025 Stage 2: `federation` above is already `require_federation`'s validated value.
     let resolver: Arc<dyn auth_provider::SubjectResolver> =
         Arc::new(auth_provider::FederatedSubjectResolver::new(
@@ -3275,6 +3284,7 @@ pub async fn start_idp_server(
         federation.effective_discovery_url().to_string(),
         Arc::new(StoreRepo::new(pool.clone())),
         device_verify_rate_limit_store,
+        oauth2.jwks_ca_bundle_path.clone(),
     )?);
 
     let readiness_pool = pool.clone();
@@ -3302,8 +3312,7 @@ pub async fn start_idp_server(
     let signing_repo = Arc::new(StoreRepo::new(pool));
     oauth2_op::refresh_signing::bootstrap_idp_signing_keys(&signing_repo, signing).await?;
 
-    let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
-        Arc::new(BearerTokenService::new(oauth2.clone()));
+    let bearer_service = build_bearer_service(oauth2)?;
 
     // `oauth2.token_exchange` is now MANDATORY for authz-idp, the same reversal as
     // `relying_party` above: without it there is no `/oauth2/token`, no
@@ -3574,8 +3583,7 @@ pub async fn start_budget_server(
         models,
         api_key_expiry,
     )?);
-    let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
-        Arc::new(BearerTokenService::new(oauth2.clone()));
+    let bearer_service = build_bearer_service(oauth2)?;
     // ADR-0025 Stage 2: `federation` above is already `require_federation`'s validated value.
     let resolver: Arc<dyn auth_provider::SubjectResolver> =
         Arc::new(auth_provider::FederatedSubjectResolver::new(
@@ -3815,6 +3823,7 @@ mod tests {
         Oauth2 {
             oauth2_type,
             jwks_url: "http://jwks".to_string(),
+            jwks_ca_bundle_path: None,
             oauth2_url: None,
             issuer_url: None,
             authorization_endpoint: None,

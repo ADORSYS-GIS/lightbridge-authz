@@ -330,6 +330,7 @@ impl KeycloakRelyingParty {
         discovery_url: String,
         repo: Arc<StoreRepo>,
         rate_limiter: Arc<dyn RateLimitStore>,
+        jwks_ca_bundle_path: Option<String>,
     ) -> Result<Self> {
         if config.timeout_ms == 0 {
             return Err(Error::Server(
@@ -394,10 +395,14 @@ impl KeycloakRelyingParty {
                 "oauth2.relying_party.callback_url must be the exact fixed HTTPS {CALLBACK_PATH} URL"
             )));
         }
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(config.timeout_ms))
-            .build()
-            .map_err(|e| Error::Server(format!("failed to build Keycloak RP HTTP client: {e}")))?;
+        // lightbridge-authz#625: also trusted here -- reused below for the JWKS fetch (`Self::jwks`).
+        let client = lightbridge_authz_bearer::trust_ca_bundle(
+            reqwest::Client::builder().timeout(Duration::from_millis(config.timeout_ms)),
+            jwks_ca_bundle_path.as_deref(),
+        )
+        .map_err(|e| Error::Server(format!("failed to build Keycloak RP HTTP client: {e}")))?
+        .build()
+        .map_err(|e| Error::Server(format!("failed to build Keycloak RP HTTP client: {e}")))?;
         Ok(Self {
             config,
             issuer,
@@ -837,7 +842,11 @@ impl KeycloakRelyingParty {
     /// longer reads.
     async fn validate_id_token(&self, token: &str, jwks_uri: &str) -> Result<IdTokenClaims> {
         let jwks = self.jwks.get_or_init(|| {
-            Arc::new(JwksCache::new(jwks_uri.to_string(), JWKS_REFRESH_INTERVAL).require_kid(true))
+            Arc::new(
+                JwksCache::new(jwks_uri.to_string(), JWKS_REFRESH_INTERVAL)
+                    .require_kid(true)
+                    .with_client(self.client.clone()),
+            )
         });
         let header = decode_header(token)
             .map_err(|_| Error::Forbidden("invalid Keycloak ID token".to_string()))?;

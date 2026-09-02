@@ -114,6 +114,7 @@ fn external_oauth2() -> Oauth2 {
     Oauth2 {
         oauth2_type: Oauth2Type::External,
         jwks_url: "http://jwks".to_string(),
+        jwks_ca_bundle_path: None,
         oauth2_url: None,
         issuer_url: None,
         authorization_endpoint: None,
@@ -658,6 +659,7 @@ fn offline_relying_party(
             WORKING_ISSUER.to_string(),
             repo,
             Arc::new(cratestack_axum::ratelimit::InMemoryRateLimitStore::new()),
+            None,
         )
         .expect("working_relying_party() is a valid offline config"),
     )
