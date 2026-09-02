@@ -59,6 +59,9 @@ fn sample_event(account_id: &str, project_id: &str, observed_at: DateTime<Utc>) 
         user_name: None,
         model: None,
         metric_name: None,
+        azp: None,
+        operation: None,
+        billing_plan: None,
         usage_value: 1.0,
         request_count: 1,
         prompt_tokens: None,
@@ -445,6 +448,9 @@ fn sample_event_for_user(user_id: &str, observed_at: DateTime<Utc>) -> UsageEven
         user_name: None,
         model: None,
         metric_name: None,
+        azp: None,
+        operation: None,
+        billing_plan: None,
         usage_value: 1.0,
         request_count: 1,
         prompt_tokens: None,
@@ -598,4 +604,159 @@ async fn all_scope_with_permission_returns_200_across_accounts(pool: PgPool) {
         "scope=all must sum requests across BOTH tenant-a's and tenant-b's seeded events -- proof \
          no entity filter was added"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// #648 -- the admin bypass: a `usage:read-all` holder may read ANY scope_id under
+// user|project|account. `api_key` stays refused for everyone, and nothing changes for a caller
+// without the permission (every refusal test above still passes unmodified -- that is the point).
+// ---------------------------------------------------------------------------------------------
+
+/// A `ScopeAuthority` that authorizes NOTHING and records whether it was called at all. The
+/// bypass must not merely succeed -- it must skip the ownership round trip entirely, because the
+/// authority has no predicate that would ever say yes for another tenant's account.
+#[derive(Default)]
+struct CountingRefusal {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[lightbridge_authz_core::async_trait]
+impl lightbridge_authz_usage_rest::scope_authority::ScopeAuthority for CountingRefusal {
+    async fn authorize(
+        &self,
+        _issuer: &str,
+        _subject: &str,
+        _scope: &UsageScope,
+        _scope_id: &str,
+    ) -> lightbridge_authz_core::Result<bool> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(false)
+    }
+}
+
+/// #648: a `usage:read-all` holder reads ANOTHER tenant's `account` and `project` scopes, and
+/// ANOTHER subject's `user` scope -- 200 with that data, and without consulting the ownership
+/// authority at all (it is wired to refuse everything and to count its calls).
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn usage_read_all_holder_may_query_any_scope_id(pool: PgPool) {
+    seed(&pool, "acct-tenant-b", "proj-tenant-b").await;
+    let repo = StoreRepo::new(Arc::new(DbPool::from_pool(pool.clone())));
+    repo.insert_usage_events(&[sample_event_for_user(
+        "sub-someone-else",
+        parse_timestamp("2026-08-15T12:00:00Z"),
+    )])
+    .await
+    .expect("seeding a user-scoped row must succeed");
+
+    for (scope, scope_id) in [
+        ("account", "acct-tenant-b"),
+        ("project", "proj-tenant-b"),
+        ("user", "sub-someone-else"),
+    ] {
+        let authority = Arc::new(CountingRefusal::default());
+        let bearer = support::bearer_with_permissions(
+            "token-admin",
+            ISSUER,
+            "sub-admin",
+            PermissionSet::from_iter([Permission::UsageReadAll]),
+        );
+
+        let (status, body) = query(
+            app(pool.clone(), bearer, authority.clone()),
+            Some("Bearer token-admin"),
+            scope,
+            scope_id,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a usage:read-all holder must be able to query scope '{scope}' for any scope_id"
+        );
+        let response: UsageQueryResponse =
+            serde_json::from_value(body).expect("response must be a UsageQueryResponse");
+        assert_eq!(
+            response.points.len(),
+            1,
+            "scope '{scope}' must return the seeded row, not an empty series"
+        );
+        assert_eq!(
+            authority.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the bypass must skip the ownership round trip for scope '{scope}'"
+        );
+    }
+}
+
+/// #648's negative twin, and the one that matters most: WITHOUT `usage:read-all`, every one of
+/// those same three requests is still refused exactly as before -- the bypass is a permission
+/// gate, not a hole.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn caller_without_usage_read_all_is_still_refused_for_other_scope_ids(pool: PgPool) {
+    seed(&pool, "acct-tenant-b", "proj-tenant-b").await;
+    let repo = StoreRepo::new(Arc::new(DbPool::from_pool(pool.clone())));
+    repo.insert_usage_events(&[sample_event_for_user(
+        "sub-someone-else",
+        parse_timestamp("2026-08-15T12:00:00Z"),
+    )])
+    .await
+    .expect("seeding a user-scoped row must succeed");
+
+    for (scope, scope_id) in [
+        ("account", "acct-tenant-b"),
+        ("project", "proj-tenant-b"),
+        ("user", "sub-someone-else"),
+    ] {
+        let bearer = support::bearer_with("token-plain", ISSUER, "sub-plain");
+
+        let (status, body) = query(
+            app(
+                pool.clone(),
+                bearer,
+                support::refuse_everything_scope_authority(),
+            ),
+            Some("Bearer token-plain"),
+            scope,
+            scope_id,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "scope '{scope}' must stay refused for a caller without usage:read-all"
+        );
+        assert_eq!(
+            body,
+            serde_json::Value::Null,
+            "a refused scope '{scope}' query must never leak data"
+        );
+    }
+}
+
+/// #648: `scope=api_key` is refused even for a `usage:read-all` holder. The bypass grants data
+/// the caller could already reach through `scope=all`; it does not conjure an ownership authority
+/// for a scope that has never had one.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn api_key_scope_stays_refused_even_for_usage_read_all(pool: PgPool) {
+    seed(&pool, "acct-tenant-a", "proj-tenant-a").await;
+
+    let bearer = support::bearer_with_permissions(
+        "token-admin",
+        ISSUER,
+        "sub-admin",
+        PermissionSet::from_iter([Permission::UsageReadAll]),
+    );
+
+    let (status, body) = query(
+        app(pool, bearer, support::refuse_everything_scope_authority()),
+        Some("Bearer token-admin"),
+        "api_key",
+        "key_1",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, serde_json::Value::Null);
 }

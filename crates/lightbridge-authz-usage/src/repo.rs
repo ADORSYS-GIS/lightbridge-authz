@@ -19,6 +19,19 @@ pub struct UsageEvent {
     pub user_name: Option<String>,
     pub model: Option<String>,
     pub metric_name: Option<String>,
+    /// The OAuth client (`azp`) this request arrived on -- "which channel" (#648). Promoted out of
+    /// the `attributes` blob so it can be grouped and filtered; `None` when the signal carried
+    /// none of `AZP_KEYS`.
+    pub azp: Option<String>,
+    /// Which API surface was called, derived from the request path at ingest
+    /// (`handlers::ingest::operation_from_path`) and drawn from the closed
+    /// [`crate::models::USAGE_OPERATIONS`] vocabulary (#648). `None` means the signal carried no
+    /// path key at all -- which is NOT `Some("other")`: "we do not know which surface" and "a
+    /// surface we do not have a name for" are different facts.
+    pub operation: Option<String>,
+    /// The billing plan Authorino stamped on the request (#648). `None` when the signal carried
+    /// none of `BILLING_PLAN_KEYS` -- unknown, never a default plan name.
+    pub billing_plan: Option<String>,
     pub usage_value: f64,
     pub request_count: i64,
     pub prompt_tokens: Option<i64>,
@@ -53,6 +66,9 @@ struct UsageQueryRow {
     model: Option<String>,
     metric_name: Option<String>,
     signal_type: Option<String>,
+    azp: Option<String>,
+    operation: Option<String>,
+    billing_plan: Option<String>,
     requests: Option<i64>,
     usage_value: Option<f64>,
     prompt_tokens: Option<i64>,
@@ -82,7 +98,7 @@ impl StoreRepo {
         }
 
         let mut builder = QueryBuilder::<Postgres>::new(
-            "INSERT INTO usage_events (observed_at, signal_type, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, usage_value, request_count, prompt_tokens, completion_tokens, total_tokens, total_cost, latency_ms, attributes) ",
+            "INSERT INTO usage_events (observed_at, signal_type, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, azp, operation, billing_plan, usage_value, request_count, prompt_tokens, completion_tokens, total_tokens, total_cost, latency_ms, attributes) ",
         );
 
         builder.push_values(events, |mut row, event| {
@@ -96,6 +112,9 @@ impl StoreRepo {
                 .push_bind(&event.user_name)
                 .push_bind(&event.model)
                 .push_bind(&event.metric_name)
+                .push_bind(&event.azp)
+                .push_bind(&event.operation)
+                .push_bind(&event.billing_plan)
                 .push_bind(event.usage_value)
                 .push_bind(event.request_count)
                 .push_bind(event.prompt_tokens)
@@ -265,6 +284,27 @@ impl StoreRepo {
             UsageGroupBy::SignalType,
             "signal_type",
         );
+        append_dimension(
+            &mut builder,
+            &mut grouped_columns,
+            &group_set,
+            UsageGroupBy::Azp,
+            "azp",
+        );
+        append_dimension(
+            &mut builder,
+            &mut grouped_columns,
+            &group_set,
+            UsageGroupBy::Operation,
+            "operation",
+        );
+        append_dimension(
+            &mut builder,
+            &mut grouped_columns,
+            &group_set,
+            UsageGroupBy::BillingPlan,
+            "billing_plan",
+        );
 
         builder.push(", SUM(request_count)::bigint AS requests");
         builder.push(", SUM(usage_value)::double precision AS usage_value");
@@ -307,7 +347,7 @@ impl StoreRepo {
         // it isn't grouped -- but it means the ORDER BY clause's shape never depends on `group_by`
         // and a grouped dimension always gets a real, stable sort key).
         builder.push(
-            " ORDER BY bucket_start ASC, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, signal_type",
+            " ORDER BY bucket_start ASC, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, signal_type, azp, operation, billing_plan",
         );
 
         let rows: Vec<UsageQueryRow> = builder.build_query_as().fetch_all(self.pool()).await?;
@@ -324,6 +364,9 @@ impl StoreRepo {
                 model: row.model,
                 metric_name: row.metric_name,
                 signal_type: row.signal_type,
+                azp: row.azp,
+                operation: row.operation,
+                billing_plan: row.billing_plan,
                 requests: row.requests.unwrap_or(0),
                 usage_value: row.usage_value.unwrap_or(0.0),
                 total_cost: row.total_cost.unwrap_or(0.0),
@@ -448,6 +491,29 @@ fn push_scope_filters(builder: &mut QueryBuilder<Postgres>, input: &UsageQueryRe
     if let Some(signal_type) = &input.filters.signal_type {
         builder.push(" AND signal_type = ");
         builder.push_bind(signal_type);
+    }
+    if let Some(azp) = &input.filters.azp {
+        builder.push(" AND azp = ");
+        builder.push_bind(azp);
+    }
+    if let Some(operation) = &input.filters.operation {
+        builder.push(" AND operation = ");
+        builder.push_bind(operation);
+    }
+    if let Some(billing_plan) = &input.filters.billing_plan {
+        builder.push(" AND billing_plan = ");
+        builder.push_bind(billing_plan);
+    }
+    // #648: set membership, as ONE bound `text[]` parameter -- never an interpolated `IN (...)`
+    // list. The console's "chats" view asks for three operations at once; making it issue three
+    // queries and sum them client-side would both triple the load and let the three disagree
+    // whenever a bucket boundary or the `truncated` limit fell differently between them. Values
+    // are validated against the closed `USAGE_OPERATIONS` vocabulary
+    // (`UsageQueryFilters::validate`) before the request ever reaches this repo.
+    if let Some(operations) = &input.filters.operation_in {
+        builder.push(" AND operation = ANY(");
+        builder.push_bind(operations.as_slice());
+        builder.push(")");
     }
 }
 

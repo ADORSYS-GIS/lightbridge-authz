@@ -153,9 +153,10 @@ The request is JSON and matches the `UsageQueryRequest` model.
   "end_time": "2026-02-23T00:00:00Z",
   "bucket": "1 hour",
   "filters": {
-    "signal_type": "metric"
+    "signal_type": "metric",
+    "operation_in": ["chat_completions", "responses", "messages"]
   },
-  "group_by": ["model"],
+  "group_by": ["model", "azp"],
   "limit": 1000
 }
 ```
@@ -187,12 +188,16 @@ The request is JSON and matches the `UsageQueryRequest` model.
 | `model` | string | no | Adds `AND model = <value>` |
 | `metric_name` | string | no | Adds `AND metric_name = <value>` |
 | `signal_type` | string | no | Adds `AND signal_type = <value>` |
+| `azp` | string | no | Adds `AND azp = <value>` -- the OAuth client / channel (#648). |
+| `operation` | string | no | Adds `AND operation = <value>` (#648). For several operations at once, use `operation_in` -- do not issue one query per value. |
+| `billing_plan` | string | no | Adds `AND billing_plan = <value>` (#648). |
+| `operation_in` | array of strings | no | Adds `AND operation = ANY($n)`, one bound `text[]` parameter (#648). **Closed vocabulary**: every entry must be one of `chat_completions`, `responses`, `messages`, `embeddings`, `other`, and an empty array is refused -- both are `400`, not an empty result set. Rows whose `operation` is `null` never match (SQL `= ANY` is false for `NULL`): "unknown" is not a member of any set of known values. |
 
 Notes:
 
 - `scope` and `filters` are cumulative; they combine with logical AND.
 - If you specify a filter that contradicts `scope` (example: `scope=project, scope_id=proj_1` but `filters.project_id=proj_2`), the query will return an empty result.
-- There is no server-side validation of `signal_type`, `metric_name`, or `model` values; unknown values generally yield empty results.
+- There is no server-side validation of `signal_type`, `metric_name`, or `model` values; unknown values generally yield empty results. `operation_in` is the one exception -- its value space is closed, so an unknown entry is a `400` naming the offending value rather than a blank chart the caller cannot tell apart from "no usage this month".
 
 #### `group_by` values
 
@@ -208,8 +213,18 @@ Supported values:
 - `model`
 - `metric_name`
 - `signal_type`
+- `azp` (#648)
+- `operation` (#648)
+- `billing_plan` (#648)
 
 If a dimension is not in `group_by`, the response will contain that field as `null` for every point.
+
+`azp`, `operation` and `billing_plan` are the three dimensions #648 promoted out of the
+`attributes` JSONB blob into real indexed columns; their source attribute keys and the path-prefix
+table `operation` is derived from live in [`docs/usage-api.md`](usage-api.md)'s "Usage dimensions"
+section, with the ingest/backfill sequence and the `null`-is-not-`other` state machine drawn there.
+That bridge is interim: #581's `usage_request_events` rewrite carries the same three columns and
+the same vocabulary forward, and `usage_events` is dropped.
 
 Implementation detail: the server internally deduplicates group-by entries, so duplicates do not change the output.
 
@@ -273,6 +288,9 @@ Each point is an aggregate across matching `usage_events` rows for:
 | `model` | string or null | yes | Present when `group_by` includes `model`, else null.
 | `metric_name` | string or null | yes | Present when `group_by` includes `metric_name`, else null.
 | `signal_type` | string or null | yes | Present when `group_by` includes `signal_type`, else null.
+| `azp` | string or null | yes | Present when `group_by` includes `azp`, else null (#648).
+| `operation` | string or null | yes | Present when `group_by` includes `operation`, else null. `null` while `operation` IS grouped is a real series: those rows carried no request path at all (#648).
+| `billing_plan` | string or null | yes | Present when `group_by` includes `billing_plan`, else null (#648).
 | `requests` | int64 | yes | `SUM(request_count)`.
 | `usage_value` | float64 | yes | `SUM(usage_value)`.
 | `total_cost` | float64 | yes | `SUM(total_cost)`.
@@ -321,6 +339,7 @@ This handler performs a small set of input validations (see [`crates/lightbridge
 - `scope_id` must be non-empty
 - `limit` must be greater than 0
 - `bucket` must match the supported interval format (see [`crates/lightbridge-authz-usage/src/repo.rs`](crates/lightbridge-authz-usage/src/repo.rs:257))
+- every `filters.operation_in` entry must be a member of the closed `operation` vocabulary, and the array must not be empty (`UsageQueryFilters::validate`, #648)
 
 Current behaviour to be aware of:
 
@@ -339,7 +358,7 @@ Database error: start_time must be before end_time
 - This endpoint is **always aggregated** by `bucket_start` (there is no “raw per-event” mode).
 - Sorting is **always** by `bucket_start ASC` (there is no server-side `order_by` for cost or token totals).
 - Pagination is limited to a simple `limit`; there is no `offset`.
-- Filters are equality filters only.
+- Filters are equality filters only, with exactly one exception: `operation_in` (`#648`), a set-membership filter over the closed `operation` vocabulary.
 
 ## Security: the ownership fix (#570)
 
@@ -398,6 +417,21 @@ through `authz-api` first):
    the sibling `/usage/v1/spend/query` call. `scope=user` self and `scope=all` never
    reach this authority at all (steps 3/4 above), so this fail-closed contract only
    applies to `scope=account`/`scope=project`.
+
+6. **Admin bypass for `user`/`project`/`account` (#648).** A caller whose token holds
+   `Permission::UsageReadAll` may query those three scopes with ANY `scope_id`, skipping
+   both the self-ownership check of step 3 and the `authz-opa` round trip of step 2. This
+   is not a widening of what that permission can read: step 4's `scope=all` already
+   returns every row in the estate to the same holder, so refusing them the same data
+   sliced by one account was a missing feature (it is what blocked the console's
+   per-actor `/admin/usage` pages), not a boundary. Two deliberate limits: `scope=api_key`
+   stays refused for **everyone** — no permission conjures an ownership authority that has
+   never existed for a raw `api_key_id` — and a caller **without** `usage:read-all` sees
+   steps 1-5 exactly as written, unchanged. Coverage:
+   `usage_read_all_holder_may_query_any_scope_id`,
+   `caller_without_usage_read_all_is_still_refused_for_other_scope_ids` and
+   `api_key_scope_stays_refused_even_for_usage_read_all` in
+   [`crates/lightbridge-authz-usage/tests/scope_ownership_it_tests.rs`](../crates/lightbridge-authz-usage/tests/scope_ownership_it_tests.rs).
 
 This still needs a corresponding fix on the ingest side (`/v1/otel/traces`,
 `/v1/otel/metrics`, `/v1/otel/logs`) before it is safe to expose externally — those

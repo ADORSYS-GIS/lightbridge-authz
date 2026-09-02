@@ -76,9 +76,10 @@
   "bucket": "1 hour",
   "filters": {
     "model": "gpt-4.1",
-    "signal_type": "metric"
+    "signal_type": "metric",
+    "operation_in": ["chat_completions", "responses", "messages"]
   },
-  "group_by": ["model", "metric_name"],
+  "group_by": ["model", "metric_name", "azp"],
   "limit": 1000
 }
 ```
@@ -110,11 +111,124 @@ boundary is dropped or kept as a whole bucket, not split (a known caveat tracked
   the `usage:read-all` permission (`Permission::UsageReadAll`); `scope_id` is ignored and
   should be sent as `""`.
 
+**Admin bypass (#648).** A caller whose token holds `usage:read-all` may query
+`scope=user`, `scope=project` or `scope=account` with ANY `scope_id`, with no
+ownership round trip to `authz-opa` at all. This is not a widening: that same
+permission already returns every row in the estate through `scope=all`, so
+refusing the same data sliced by one account was a missing feature (it is what
+blocked the console's per-actor usage pages), not a boundary. Two things are
+deliberately unchanged: `scope=api_key` is still refused for **everyone**,
+`usage:read-all` holders included — no permission conjures an ownership authority
+that has never existed for a raw `api_key_id` — and a caller **without** the
+permission sees exactly today's behaviour, `scope=user` self-only and
+account/project through `ScopeAuthority`.
+
 `filters` also accepts `api_key_id` and `user_name` (in addition to `account_id`,
-`project_id`, `user_id`, `model`, `metric_name`, `signal_type`), and `group_by`
-accepts the same set of dimensions. See
+`project_id`, `user_id`, `model`, `metric_name`, `signal_type`), plus the three
+usage dimensions below (`azp`, `operation`, `billing_plan`) and the set-membership
+filter `operation_in`. `group_by` accepts the same set of dimensions. See
 [`docs/lightbridge-query-api.md`](lightbridge-query-api.md) for the full field
 reference.
+
+## Usage dimensions: `azp`, `operation`, `billing_plan` (#648)
+
+Three dimensions the AI gateway has always emitted are stored as real, indexed,
+groupable columns on `usage_events` rather than only inside the `attributes` JSONB
+blob:
+
+| Column | Source attribute keys, first match wins | Meaning |
+|---|---|---|
+| `azp` | `azp`, `x-oidc-azp`, `oauth.azp`, `client_id` | The OAuth client the request arrived on — "which channel". Gateway: `ai-helm` `charts/core-gateway/templates/envoy-proxy.yaml:257`, from Authorino's `x-oidc-azp`. |
+| `billing_plan` | `billing_plan`, `x-billing-plan` | The plan Authorino stamped on the request (`envoy-proxy.yaml:240`). |
+| `operation` | derived from `x-envoy-origin-path`, `http.route`, `url.path`, `route_name` | Which API surface was called. Closed vocabulary, below. |
+
+`operation` is derived at ingest by **path prefix** (a real request target carries a
+query string, so `/v1/chat/completions?stream=true` must still be
+`chat_completions`):
+
+| Path prefix | `operation` |
+|---|---|
+| `/v1/chat/completions` | `chat_completions` |
+| `/v1/responses` | `responses` |
+| `/v1/messages` | `messages` |
+| `/v1/embeddings` | `embeddings` |
+| anything else | `other` |
+| *no path key present at all* | `null` |
+
+The last two rows are different facts and are stored differently on purpose:
+`other` means "a surface was called and we have no name for it", `null` means "this
+signal never told us which surface". Collapsing the second into the first would
+invent data — the same honesty rule `total_cost` and `latency_ms` already follow.
+`operation_in` is a set-membership filter (`operation = ANY($1)`, one bound
+`text[]`) validated against exactly the five values above, so the console's chat
+view asks one query instead of three that can disagree with each other at a bucket
+boundary.
+
+**This bridge is interim and dies with the table.** #581
+(`docs/plans/0581-multi-source-usage-plan-of-work.md`) replaces `usage_events` with
+the `usage_request_events` hypertable and ends with `DROP TABLE usage_events`;
+PR-1b there carries these three columns and this exact vocabulary forward. Total
+surface here: three columns, one backfill, the query-schema additions.
+
+### How a dimension gets from the gateway to a chart
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant GW as Envoy AI Gateway<br/>(access log)
+    participant IN as POST /v1/otel/logs<br/>handlers/ingest.rs
+    participant DB as usage_events<br/>(Postgres)
+    participant Q as POST /usage/v1/usage/query<br/>handlers/query.rs
+    participant C as Console
+
+    GW->>IN: OTLP LogRecord attributes<br/>azp, billing_plan, x-envoy-origin-path
+    Note over IN: extract_string(&attrs, &AZP_KEYS)<br/>extract_string(&attrs, &BILLING_PLAN_KEYS)<br/>derive_operation(&attrs) -- ingest.rs
+    IN->>DB: INSERT ... (azp, operation, billing_plan, attributes)<br/>repo.rs::insert_usage_events
+    Note over DB: the raw attributes blob is written too,<br/>unchanged -- the columns are a projection,<br/>not a replacement
+    C->>Q: {scope, group_by:["azp"],<br/>filters:{operation_in:[...]}}
+    Q->>Q: filters.validate() -- closed vocabulary, else 400
+    Q->>Q: bearer + ownership, or the usage:read-all bypass (#648)
+    Q->>DB: GROUP BY bucket_start, azp<br/>AND operation = ANY($n) -- repo.rs::push_scope_filters
+    DB-->>Q: rows
+    Q-->>C: points[] echoing azp / operation / billing_plan
+```
+
+### A row's `operation`, and why `null` is not `other`
+
+```mermaid
+stateDiagram-v2
+    [*] --> NoPathKey: signal carries none of PATH_KEYS
+    [*] --> PathPresent: signal carries a path key
+
+    NoPathKey --> OperationNull: derive_operation -> None
+    PathPresent --> KnownSurface: prefix matches OPERATION_PREFIXES
+    PathPresent --> Other: prefix matches nothing
+
+    OperationNull --> BackfilledNull: backfill migration finds<br/>no path key in attributes either
+    BackfilledNull --> OperationNull
+
+    OperationNull --> NeverMatched: operation_in filter<br/>(SQL `= ANY` is false for NULL)
+    KnownSurface --> Matched: operation_in filter
+    Other --> Matched: operation_in only if 'other' was asked for
+
+    note right of OperationNull
+        "we do not know which surface"
+        Never rewritten to 'other'.
+        Groups as a null series, filters out.
+    end note
+    note right of Other
+        "a surface we have no name for"
+        A real, storable, filterable value.
+    end note
+```
+
+Every transition above is exercised by a test:
+`operation_derivation_should_cover_the_whole_table` and
+`extract_log_events_should_promote_azp_billing_plan_and_operation_to_columns`
+(`crates/lightbridge-authz-usage/src/handlers/ingest.rs`),
+`operation_in_never_matches_rows_with_a_null_operation` and
+`backfill_derives_the_new_columns_from_the_attributes_blob`
+(`crates/lightbridge-authz-usage/tests/repo_it_tests.rs`).
 
 ## Latency
 
@@ -139,3 +253,14 @@ Usage storage migrations are separate from authz migrations:
 - migration module: `app/lightbridge-authz-usage/src/migrate.rs`
 
 The primary table is `usage_events` (hypertable when Timescale is available).
+
+#648's bridge is three files, in this order and for this reason: columns added
+nullable first (`20260902000001`, catalog-only, no rewrite), then the backfill
+(`20260902000002`) as a `-- no-transaction` migration whose single `DO` block
+updates by `id` range in batches of **10 000** and `COMMIT`s each one — so
+autovacuum can reclaim as it goes and a killed run resumes instead of rolling
+back — then the indexes (`20260902000003`), built once over final data. The
+backfill reads `attributes` and never rewrites it, and only touches a row whose
+three columns are all still NULL and whose blob actually yields something, which
+is what makes a re-run free. No `EXCEPTION WHEN OTHERS` anywhere: a migration that
+cannot do its job fails loudly.

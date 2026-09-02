@@ -305,6 +305,9 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
                 model: Some("gpt-4.1".to_string()),
                 metric_name: Some("gen_ai.usage.total_tokens".to_string()),
                 signal_type: Some("metric".to_string()),
+                azp: Some("console-web".to_string()),
+                operation: Some("chat_completions".to_string()),
+                billing_plan: Some("pro".to_string()),
                 requests: 3,
                 total_cost: 42.0,
                 usage_value: 120.0,
@@ -340,6 +343,53 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
 }
 
 /// #570: no `Authorization` header at all -- 401, no data.
+/// #648: an `operation_in` value outside the closed vocabulary is a `400` naming the offending
+/// value, not a silently empty series. A blank chart is indistinguishable from "no usage this
+/// month", and the caller who typed `chat` instead of `chat_completions` would never find out.
+#[tokio::test]
+async fn query_usage_returns_bad_request_for_an_unknown_operation_filter() {
+    let req = UsageQueryRequest {
+        filters: UsageQueryFilters {
+            operation_in: Some(vec!["chat".to_string()]),
+            ..Default::default()
+        },
+        ..base_request()
+    };
+
+    let result = query_usage(
+        axum::extract::State(mock_state()),
+        authorized_headers(),
+        Json(req),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(Error::BadRequest(message)) if message.contains("chat") && message.contains("operation_in")
+    ));
+}
+
+/// #648: validation runs AFTER authentication, like every other body check on this handler -- an
+/// unauthenticated caller must not be able to tell a well-formed request from a malformed one.
+#[tokio::test]
+async fn query_usage_refuses_an_unauthenticated_caller_before_validating_filters() {
+    let req = UsageQueryRequest {
+        filters: UsageQueryFilters {
+            operation_in: Some(vec!["chat".to_string()]),
+            ..Default::default()
+        },
+        ..base_request()
+    };
+
+    let response = call_query_usage(mock_state(), HeaderMap::new(), req).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "a bad filter must not turn a 401 into a 400"
+    );
+}
+
 #[tokio::test]
 async fn query_usage_refuses_missing_bearer_with_401() {
     let response = call_query_usage(mock_state(), HeaderMap::new(), base_request()).await;
@@ -395,6 +445,9 @@ async fn query_usage_refuses_when_scope_authority_declines() {
                 model: None,
                 metric_name: None,
                 signal_type: None,
+                azp: None,
+                operation: None,
+                billing_plan: None,
                 requests: 1,
                 total_cost: 1.0,
                 usage_value: 1.0,

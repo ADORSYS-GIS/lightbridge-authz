@@ -170,6 +170,56 @@ const DURATION_METRIC_MS_NAMES: [&str; 4] = [
     "upstream_rq_time",
 ];
 
+/// Attribute names carrying the OAuth client id (`azp`) the request arrived on -- the "channel"
+/// dimension (#648).
+///
+/// First match wins, in this order. `azp` and `x-oidc-azp` are what production actually emits:
+/// the AI gateway's access log stamps `azp` from Authorino's `x-oidc-azp` header
+/// (`ai-helm`, `charts/core-gateway/templates/envoy-proxy.yaml:257`). `oauth.azp` and `client_id`
+/// are conventional names kept so a different emitter is not silently dropped -- the assumption
+/// this list encodes is that a first-match key list is safer than one hard-coded key, because a
+/// renamed attribute would otherwise turn every channel chart blank with no error anywhere.
+const AZP_KEYS: [&str; 4] = ["azp", "x-oidc-azp", "oauth.azp", "client_id"];
+
+/// Attribute names carrying the billing plan Authorino stamped on the request (#648). Production
+/// emits `billing_plan` (`envoy-proxy.yaml:240`); `x-billing-plan` is the header name the same
+/// value travels under at the gateway, kept for emitters that pass the header through verbatim.
+const BILLING_PLAN_KEYS: [&str; 2] = ["billing_plan", "x-billing-plan"];
+
+/// Attribute names carrying the request path, from which `operation` is derived (#648).
+///
+/// `x-envoy-origin-path` leads because it is what the gateway actually emits
+/// (`envoy-proxy.yaml:211`) and it is the ORIGINAL path -- the one the caller asked for, before
+/// any rewrite. `http.route` and `url.path` are the OpenTelemetry HTTP semantic-convention names.
+/// `route_name` is last and is deliberately weakest: it is an Envoy route identifier, not a path,
+/// so it will normally derive `other` rather than a named surface -- which is the honest answer
+/// for it, and still better than `NULL`.
+const PATH_KEYS: [&str; 4] = [
+    "x-envoy-origin-path",
+    "http.route",
+    "url.path",
+    "route_name",
+];
+
+/// The path-prefix -> `operation` table (#648). Prefix, not equality: a real request target
+/// carries a query string and sometimes a suffix, so `/v1/chat/completions?stream=true` must land
+/// on `chat_completions` and not fall through to `other`.
+///
+/// Kept in the same order as the SQL `CASE` in
+/// `migrations-usage/20260902000002_usage_event_dimensions_backfill.sql`, which must derive
+/// bit-identical values: a backfilled row and a freshly-ingested row have to be the same fact, or
+/// every "how many chat completions" chart silently steps at the migration timestamp.
+const OPERATION_PREFIXES: [(&str, &str); 4] = [
+    ("/v1/chat/completions", "chat_completions"),
+    ("/v1/responses", "responses"),
+    ("/v1/messages", "messages"),
+    ("/v1/embeddings", "embeddings"),
+];
+
+/// The catch-all `operation` value: a request path was present and matched no known surface.
+/// Distinct from `None` (no path key at all) on purpose -- see [`derive_operation`].
+const OPERATION_OTHER: &str = "other";
+
 #[utoipa::path(
     post,
     path = "/v1/otel/traces",
@@ -401,6 +451,9 @@ fn extract_log_events(payload: ExportLogsServiceRequest) -> Vec<UsageEvent> {
                     user_id: extract_string(&attrs, &USER_KEYS),
                     user_name: extract_string(&attrs, &USER_NAME_KEYS),
                     model: extract_string(&attrs, &MODEL_KEYS),
+                    azp: extract_string(&attrs, &AZP_KEYS),
+                    operation: derive_operation(&attrs),
+                    billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
                     metric_name: non_empty(Some(log_record.severity_text)),
                     usage_value,
                     latency_ms: extract_latency_ms(&attrs),
@@ -496,6 +549,9 @@ fn extract_trace_events(payload: ExportTraceServiceRequest) -> Vec<UsageEvent> {
                     user_id: extract_string(&attrs, &USER_KEYS),
                     user_name: extract_string(&attrs, &USER_NAME_KEYS),
                     model: extract_string(&attrs, &MODEL_KEYS),
+                    azp: extract_string(&attrs, &AZP_KEYS),
+                    operation: derive_operation(&attrs),
+                    billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
                     metric_name: non_empty(Some(span.name)),
                     usage_value,
                     total_cost,
@@ -612,6 +668,9 @@ fn number_data_point_to_event(
         user_id: extract_string(&attrs, &USER_KEYS),
         user_name: extract_string(&attrs, &USER_NAME_KEYS),
         model: extract_string(&attrs, &MODEL_KEYS),
+        azp: extract_string(&attrs, &AZP_KEYS),
+        operation: derive_operation(&attrs),
+        billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
         latency_ms: extract_latency_ms(&attrs)
             .or_else(|| duration_metric_value_to_ms(metric_name.as_deref(), value)),
         metric_name,
@@ -644,6 +703,9 @@ fn histogram_data_point_to_event(
         user_id: extract_string(&attrs, &USER_KEYS),
         user_name: extract_string(&attrs, &USER_NAME_KEYS),
         model: extract_string(&attrs, &MODEL_KEYS),
+        azp: extract_string(&attrs, &AZP_KEYS),
+        operation: derive_operation(&attrs),
+        billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
         metric_name,
         usage_value,
         total_cost,
@@ -675,6 +737,9 @@ fn exponential_histogram_data_point_to_event(
         user_id: extract_string(&attrs, &USER_KEYS),
         user_name: extract_string(&attrs, &USER_NAME_KEYS),
         model: extract_string(&attrs, &MODEL_KEYS),
+        azp: extract_string(&attrs, &AZP_KEYS),
+        operation: derive_operation(&attrs),
+        billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
         metric_name,
         usage_value,
         total_cost,
@@ -705,6 +770,9 @@ fn summary_data_point_to_event(
         user_id: extract_string(&attrs, &USER_KEYS),
         user_name: extract_string(&attrs, &USER_NAME_KEYS),
         model: extract_string(&attrs, &MODEL_KEYS),
+        azp: extract_string(&attrs, &AZP_KEYS),
+        operation: derive_operation(&attrs),
+        billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
         metric_name,
         total_cost,
         latency_ms: extract_latency_ms(&attrs),
@@ -886,6 +954,28 @@ fn duration_metric_value_to_ms(metric_name: Option<&str>, value: f64) -> Option<
     } else {
         None
     }
+}
+
+/// Derives `operation` from whichever of [`PATH_KEYS`] the payload carries (#648).
+///
+/// `None` when NO path key is present at all, and that is the whole point of returning an
+/// `Option` here rather than defaulting to [`OPERATION_OTHER`]: "this signal never told us which
+/// surface was called" and "this signal named a surface we have no name for" are different facts,
+/// and a dashboard that shows the first as `other` is lying about what it knows. A metric data
+/// point from a token-count exporter is the standing example -- it has no path, and it is not an
+/// `other` operation.
+fn derive_operation(attrs: &HashMap<String, Value>) -> Option<String> {
+    extract_string(attrs, &PATH_KEYS).map(|path| operation_from_path(&path).to_string())
+}
+
+/// Maps one request path onto the closed `operation` vocabulary
+/// ([`crate::models::USAGE_OPERATIONS`]). Every non-empty path maps to something -- unmatched
+/// paths become [`OPERATION_OTHER`].
+fn operation_from_path(path: &str) -> &'static str {
+    OPERATION_PREFIXES
+        .iter()
+        .find_map(|(prefix, operation)| path.starts_with(prefix).then_some(*operation))
+        .unwrap_or(OPERATION_OTHER)
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -1397,6 +1487,268 @@ mod tests {
         assert_eq!(event.model.as_deref(), Some("gpt-4.1"));
     }
 
+    fn attrs_of(pairs: &[(&str, &str)]) -> HashMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), Value::String((*v).to_string())))
+            .collect()
+    }
+
+    /// #648: `AZP_KEYS` is a FIRST-MATCH list, and the order is the contract -- each key on its
+    /// own must resolve, and when several are present the earliest in the list must win. A silent
+    /// reordering here would change which client id a channel chart attributes cost to.
+    #[test]
+    fn azp_extraction_should_honour_every_key_and_its_precedence() {
+        for key in AZP_KEYS {
+            let attrs = attrs_of(&[(key, "console-web")]);
+            assert_eq!(
+                extract_string(&attrs, &AZP_KEYS).as_deref(),
+                Some("console-web"),
+                "`{key}` must populate azp on its own"
+            );
+        }
+
+        let all_present = attrs_of(&[
+            ("azp", "first"),
+            ("x-oidc-azp", "second"),
+            ("oauth.azp", "third"),
+            ("client_id", "fourth"),
+        ]);
+        assert_eq!(
+            extract_string(&all_present, &AZP_KEYS).as_deref(),
+            Some("first"),
+            "the earliest key in AZP_KEYS must win"
+        );
+
+        assert_eq!(
+            extract_string(&attrs_of(&[("azp", "")]), &AZP_KEYS),
+            None,
+            "an empty string is an absent value, not a channel named \"\""
+        );
+        assert_eq!(extract_string(&HashMap::new(), &AZP_KEYS), None);
+    }
+
+    /// #648: the same first-match contract for `BILLING_PLAN_KEYS`.
+    #[test]
+    fn billing_plan_extraction_should_honour_every_key_and_its_precedence() {
+        for key in BILLING_PLAN_KEYS {
+            let attrs = attrs_of(&[(key, "pro")]);
+            assert_eq!(
+                extract_string(&attrs, &BILLING_PLAN_KEYS).as_deref(),
+                Some("pro"),
+                "`{key}` must populate billing_plan on its own"
+            );
+        }
+
+        let both = attrs_of(&[("billing_plan", "first"), ("x-billing-plan", "second")]);
+        assert_eq!(
+            extract_string(&both, &BILLING_PLAN_KEYS).as_deref(),
+            Some("first"),
+            "the earliest key in BILLING_PLAN_KEYS must win"
+        );
+
+        assert_eq!(extract_string(&HashMap::new(), &BILLING_PLAN_KEYS), None);
+    }
+
+    /// #648: every key in `PATH_KEYS` must be able to drive the derivation on its own, and the
+    /// order must hold -- `x-envoy-origin-path` (the path the caller actually asked for) beats a
+    /// rewritten `http.route`, which is the whole reason it leads the list.
+    #[test]
+    fn path_keys_should_drive_operation_derivation_in_order() {
+        for key in PATH_KEYS {
+            let attrs = attrs_of(&[(key, "/v1/embeddings")]);
+            assert_eq!(
+                derive_operation(&attrs).as_deref(),
+                Some("embeddings"),
+                "`{key}` must drive the operation derivation on its own"
+            );
+        }
+
+        let all_present = attrs_of(&[
+            ("x-envoy-origin-path", "/v1/chat/completions"),
+            ("http.route", "/v1/responses"),
+            ("url.path", "/v1/messages"),
+            ("route_name", "/v1/embeddings"),
+        ]);
+        assert_eq!(
+            derive_operation(&all_present).as_deref(),
+            Some("chat_completions"),
+            "the earliest key in PATH_KEYS must win"
+        );
+    }
+
+    /// #648: the derivation table, exhaustively -- including the two cases the whole design turns
+    /// on. A path that matches nothing is `other` (we know a surface was called, we just have no
+    /// name for it); NO path key at all is `None` (we know nothing), and collapsing the second
+    /// into the first would invent data.
+    #[test]
+    fn operation_derivation_should_cover_the_whole_table() {
+        let cases: [(&str, &str); 10] = [
+            ("/v1/chat/completions", "chat_completions"),
+            ("/v1/chat/completions?stream=true", "chat_completions"),
+            ("/v1/responses", "responses"),
+            ("/v1/responses/resp_123", "responses"),
+            ("/v1/messages", "messages"),
+            ("/v1/messages?beta=true", "messages"),
+            ("/v1/embeddings", "embeddings"),
+            ("/v1/models", "other"),
+            ("/healthz", "other"),
+            ("openai-route", "other"),
+        ];
+
+        for (path, expected) in cases {
+            assert_eq!(
+                operation_from_path(path),
+                expected,
+                "path `{path}` must derive `{expected}`"
+            );
+            assert_eq!(
+                derive_operation(&attrs_of(&[("x-envoy-origin-path", path)])).as_deref(),
+                Some(expected)
+            );
+        }
+
+        assert_eq!(
+            derive_operation(&HashMap::new()),
+            None,
+            "no path key at all must derive NULL, never 'other'"
+        );
+        assert_eq!(
+            derive_operation(&attrs_of(&[("x-envoy-origin-path", "")])),
+            None,
+            "an empty path is an absent path, not an 'other' operation"
+        );
+
+        for (_, operation) in OPERATION_PREFIXES {
+            assert!(
+                crate::models::USAGE_OPERATIONS.contains(&operation),
+                "`{operation}` must be part of the published vocabulary"
+            );
+        }
+        assert!(crate::models::USAGE_OPERATIONS.contains(&OPERATION_OTHER));
+    }
+
+    /// #648, end to end over the real wire shape: a gateway access-log record carrying the exact
+    /// attribute names `ai-helm`'s `charts/core-gateway/templates/envoy-proxy.yaml` emits must
+    /// come out of `extract_log_events` with all three dimensions populated as COLUMNS -- not
+    /// merely surviving inside the `attributes` blob, which is what they already did before this
+    /// story and is precisely the state it exists to end.
+    #[test]
+    fn extract_log_events_should_promote_azp_billing_plan_and_operation_to_columns() {
+        let payload: ExportLogsServiceRequest = serde_json::from_value(json!({
+            "resourceLogs": [
+                {
+                    "scopeLogs": [
+                        {
+                            "logRecords": [
+                                {
+                                    "timeUnixNano": "1735689601000000000",
+                                    "attributes": [
+                                        {"key": "azp", "value": {"stringValue": "converse-console"}},
+                                        {"key": "billing_plan", "value": {"stringValue": "pro"}},
+                                        {"key": "x-envoy-origin-path", "value": {"stringValue": "/v1/chat/completions"}},
+                                        {"key": "route_name", "value": {"stringValue": "openai-route"}}
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("valid log payload");
+
+        let events = extract_log_events(payload);
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.azp.as_deref(), Some("converse-console"));
+        assert_eq!(event.billing_plan.as_deref(), Some("pro"));
+        assert_eq!(
+            event.operation.as_deref(),
+            Some("chat_completions"),
+            "x-envoy-origin-path must beat route_name"
+        );
+        assert_eq!(
+            event.attributes.get("azp").and_then(Value::as_str),
+            Some("converse-console"),
+            "promoting a dimension to a column must not strip it from the attributes blob"
+        );
+    }
+
+    /// #648: the same promotion for the trace and metric signal paths -- all three write the
+    /// columns, so a non-gateway emitter is not silently dimensionless.
+    #[test]
+    fn trace_and_metric_paths_should_promote_the_new_dimensions_too() {
+        let traces: ExportTraceServiceRequest = serde_json::from_value(json!({
+            "resourceSpans": [
+                {
+                    "scopeSpans": [
+                        {
+                            "spans": [
+                                {
+                                    "traceId": "00000000000000000000000000000001",
+                                    "spanId": "0000000000000001",
+                                    "name": "chat.completion",
+                                    "startTimeUnixNano": "1735689600000000000",
+                                    "endTimeUnixNano": "1735689601000000000",
+                                    "attributes": [
+                                        {"key": "x-oidc-azp", "value": {"stringValue": "cli"}},
+                                        {"key": "x-billing-plan", "value": {"stringValue": "free"}},
+                                        {"key": "url.path", "value": {"stringValue": "/v1/messages"}}
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("valid trace payload");
+
+        let trace_events = extract_trace_events(traces);
+        assert_eq!(trace_events.len(), 1);
+        assert_eq!(trace_events[0].azp.as_deref(), Some("cli"));
+        assert_eq!(trace_events[0].billing_plan.as_deref(), Some("free"));
+        assert_eq!(trace_events[0].operation.as_deref(), Some("messages"));
+
+        let metrics: ExportMetricsServiceRequest = serde_json::from_value(json!({
+            "resourceMetrics": [
+                {
+                    "scopeMetrics": [
+                        {
+                            "metrics": [
+                                {
+                                    "name": "gen_ai.usage.total_tokens",
+                                    "sum": {
+                                        "dataPoints": [
+                                            {
+                                                "timeUnixNano": "1735689601000000000",
+                                                "asInt": "120",
+                                                "attributes": [
+                                                    {"key": "oauth.azp", "value": {"stringValue": "batch-job"}},
+                                                    {"key": "billing_plan", "value": {"stringValue": "enterprise"}},
+                                                    {"key": "http.route", "value": {"stringValue": "/v1/embeddings"}}
+                                                ]
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("valid metric payload");
+
+        let metric_events = extract_metric_events(metrics);
+        assert_eq!(metric_events.len(), 1);
+        assert_eq!(metric_events[0].azp.as_deref(), Some("batch-job"));
+        assert_eq!(metric_events[0].billing_plan.as_deref(), Some("enterprise"));
+        assert_eq!(metric_events[0].operation.as_deref(), Some("embeddings"));
+    }
+
     fn base_usage_event() -> UsageEvent {
         UsageEvent {
             observed_at: Utc::now(),
@@ -1408,6 +1760,9 @@ mod tests {
             user_id: None,
             user_name: None,
             model: None,
+            azp: None,
+            operation: None,
+            billing_plan: None,
             metric_name: None,
             usage_value: 1.0,
             request_count: 1,

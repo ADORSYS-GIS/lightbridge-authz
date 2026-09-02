@@ -400,6 +400,61 @@ mod tests {
         );
     }
 
+    /// #648: the same console-facing seam as the latency/truncation guards above, for the three
+    /// usage dimensions. `converse-frontends` hand-maintains `openapi/usage.backend.yaml` and
+    /// generates its typed client from it, so these enum values ARE the contract -- a rename here
+    /// that is not mirrored there turns "cost by channel" into a 400 nobody notices until a
+    /// dashboard is blank. Asserting the published document (not just the Rust enum) is what
+    /// makes that drift fail on this side first.
+    #[test]
+    fn usage_openapi_should_publish_the_usage_dimension_contract() {
+        let doc = usage_openapi();
+
+        let group_by: Vec<&str> = doc["components"]["schemas"]["UsageGroupBy"]["enum"]
+            .as_array()
+            .expect("UsageGroupBy should publish an enum")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert_eq!(
+            group_by,
+            vec![
+                "account_id",
+                "project_id",
+                "api_key_id",
+                "user_id",
+                "user_name",
+                "model",
+                "metric_name",
+                "signal_type",
+                "azp",
+                "operation",
+                "billing_plan",
+            ],
+            "UsageGroupBy's published values are the console's client contract"
+        );
+
+        let filters = &doc["components"]["schemas"]["UsageQueryFilters"]["properties"];
+        for field in ["azp", "operation", "billing_plan", "operation_in"] {
+            assert!(
+                filters.get(field).is_some(),
+                "expected UsageQueryFilters.{field} in the published schema"
+            );
+        }
+        assert_eq!(
+            filters["operation_in"]["items"]["type"], "string",
+            "operation_in must publish as an array of strings"
+        );
+
+        let point = &doc["components"]["schemas"]["UsageSeriesPoint"]["properties"];
+        for field in ["azp", "operation", "billing_plan"] {
+            assert!(
+                point.get(field).is_some(),
+                "expected UsageSeriesPoint.{field} in the published schema"
+            );
+        }
+    }
+
     #[test]
     fn usage_openapi_should_be_openapi_3() {
         let doc = usage_openapi();

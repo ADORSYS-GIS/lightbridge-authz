@@ -133,16 +133,36 @@ pub async fn query_usage(
         ));
     }
 
+    // #648: `filters.operation_in` is a CLOSED vocabulary, so an unknown entry is a 400 here and
+    // not an empty result set from the repo -- a caller who typed `chat` instead of
+    // `chat_completions` deserves to be told, not handed a blank chart that looks like "no usage".
+    input.filters.validate()?;
+
+    // #648: the admin bypass. A caller holding `usage:read-all` -- the same coarse RBAC permission
+    // that already unlocks the estate-wide `scope=all` -- may read ANY `scope_id` under
+    // `user`/`project`/`account`. Without it those three scopes are strictly WIDER than `all` is
+    // narrow: `scope=all` already returns every row in the estate to this exact permission
+    // holder, so refusing them the same data sliced by one account is not a security boundary, it
+    // is a missing feature (it is why `/admin/usage`'s per-actor pages cannot be built today).
+    //
+    // What this does NOT do, deliberately: it does not touch `scope=api_key` (still refused for
+    // everyone -- there is no ownership authority for a raw `api_key_id` and an admin bypass would
+    // not create one), and it does not weaken anything for a caller WITHOUT the permission --
+    // `scope=user` stays self-only and `scope=account`/`project` still go through
+    // `scope_authority`, unchanged.
+    let is_usage_admin = token_info.has_permission(Permission::UsageReadAll);
+
     match &input.scope {
-        // Self-ownership: the caller reading their OWN usage. `user_id` is never a row any
-        // `accounts`/`projects` table is keyed by, so there is no `scope_authority` predicate to
-        // call for it (unlike account/project) -- but "is this token's own subject" needs no
+        // Self-ownership (or `usage:read-all`, #648): the caller reading their OWN usage.
+        // `user_id` is never a row any `accounts`/`projects` table is keyed by, so there is no
+        // `scope_authority` predicate to call for it (unlike account/project) -- but "is this token's own subject" needs no
         // remote call at all, it is answered entirely from the already-JWKS-validated
         // `token_info.sub`. Any `scope_id` other than the caller's own subject is refused --
         // there is still no ownership predicate that would let a caller read someone ELSE's
-        // per-user usage.
+        // per-user usage -- unless they hold `usage:read-all`, which already entitles them to
+        // every one of those rows through `scope=all` anyway.
         UsageScope::User => {
-            if input.scope_id != token_info.sub {
+            if !is_usage_admin && input.scope_id != token_info.sub {
                 warn!(
                     scope = ?input.scope,
                     "query_usage: scope=user requested for a subject other than the caller's own; refusing"
@@ -154,6 +174,9 @@ pub async fn query_usage(
         // ever keyed by a raw `api_key_id`) and no caller-subject shortcut either (an API key's
         // bearer token, if one even existed here, is not "the API key itself") -- refused
         // unconditionally, matching the console's own guard, and never reaching `scope_authority`.
+        // #648's admin bypass deliberately stops short of this arm: `usage:read-all` grants a
+        // caller data they are already entitled to under `scope=all`, and no amount of permission
+        // conjures the ownership authority this scope has never had.
         UsageScope::ApiKey => {
             warn!(
                 scope = ?input.scope,
@@ -166,7 +189,7 @@ pub async fn query_usage(
         // check regardless of what (if anything) `scope_id` was set to (already validated above to
         // be the "ignored" empty-or-anything shape `UsageScope::All` documents).
         UsageScope::All => {
-            if !token_info.has_permission(Permission::UsageReadAll) {
+            if !is_usage_admin {
                 warn!(
                     scope = ?input.scope,
                     "query_usage: scope=all requires usage:read-all; refusing"
@@ -175,22 +198,29 @@ pub async fn query_usage(
             }
         }
         UsageScope::Account | UsageScope::Project => {
-            let authorized = state
-                .scope_authority
-                .authorize(
-                    &token_info.iss,
-                    &token_info.sub,
-                    &input.scope,
-                    &input.scope_id,
-                )
-                .await?;
-            if !authorized {
-                warn!(
+            if is_usage_admin {
+                info!(
                     scope = ?input.scope,
-                    scope_id = %input.scope_id,
-                    "query_usage: scope authority refused the requested scope"
+                    "query_usage: usage:read-all holder; skipping the ownership round trip"
                 );
-                return Ok(forbidden());
+            } else {
+                let authorized = state
+                    .scope_authority
+                    .authorize(
+                        &token_info.iss,
+                        &token_info.sub,
+                        &input.scope,
+                        &input.scope_id,
+                    )
+                    .await?;
+                if !authorized {
+                    warn!(
+                        scope = ?input.scope,
+                        scope_id = %input.scope_id,
+                        "query_usage: scope authority refused the requested scope"
+                    );
+                    return Ok(forbidden());
+                }
             }
         }
     }
