@@ -165,6 +165,9 @@ async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, Cratest
         review_service,
         budget_repo,
         reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
     );
     // Issue #383 follow-up: see the identical comment in `budget_policy_procedure_tests.rs` --
     // grants the full permission set via the shared `build_context` helper, `RpcScope::Budget`,

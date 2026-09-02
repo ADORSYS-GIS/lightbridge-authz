@@ -161,6 +161,9 @@ fn build_router(bearer: Arc<dyn BearerTokenServiceTrait>, dev_cors: bool) -> Rou
         review_service,
         budget_repo,
         reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
         lazy_cratestack_db(),
         core,
         lazy_idempotency(),
@@ -190,6 +193,9 @@ fn build_router_with_billing(bearer: Arc<dyn BearerTokenServiceTrait>, billing: 
         review_service,
         budget_repo,
         reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
         lazy_cratestack_db(),
         core,
         lazy_idempotency(),
@@ -219,6 +225,9 @@ fn build_router_with_models(
         review_service,
         budget_repo,
         reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
         lazy_cratestack_db(),
         core,
         lazy_idempotency(),
@@ -248,6 +257,9 @@ fn build_router_at(
         review_service,
         budget_repo,
         reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
         lazy_cratestack_db(),
         core,
         lazy_idempotency(),
@@ -481,6 +493,78 @@ async fn rbac_gate_denies_identity_resolution_without_user_read() {
             "`{op}` must require user:read, and no other permission may stand in for it"
         );
     }
+}
+
+/// ADR-0033's negative half: the three `platform_role_grants` op-ids are refused for a caller
+/// holding EVERY other permission but not `rbac:manage`. Stated as "admin minus one" rather than
+/// "viewer" deliberately — the interesting failure would be `rbac:manage` being implied by some
+/// broader grant (`user:read`, `account:update`), and a viewer token could not tell that apart from
+/// an ordinary read-only denial. This is the single most important refusal in the schema: a caller
+/// who can write this table can make themselves `lightbridge-admin`.
+#[tokio::test]
+async fn rbac_gate_denies_platform_role_management_without_rbac_manage() {
+    let almost_admin: PermissionSet = Permission::ALL
+        .into_iter()
+        .filter(|p| *p != Permission::RbacManage)
+        .collect();
+    for op in [
+        "procedure.listPlatformRoleGrants",
+        "procedure.grantPlatformRole",
+        "procedure.revokePlatformRole",
+    ] {
+        let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+            MapBearer::new().with("almost", token_info("almost-subject", almost_admin.clone())),
+        );
+        let router = build_router(bearer, false);
+        let (status, _) = rpc_call(router, op, Wire::Cbor, &json!({}), Some("almost")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "`{op}` must require rbac:manage, and no other permission may stand in for it"
+        );
+    }
+}
+
+/// The other side of the same coin: `getMyAccess` is the ONE op-id served to any authenticated
+/// caller, so it must NOT be refused for a caller holding zero permissions at all -- otherwise the
+/// console cannot ask what it may render. It reaches dispatch (which then fails on the lazy pool
+/// this router is built over), so the assertion is "not 401/403", not "200".
+///
+/// Still fail-closed for an UNAUTHENTICATED caller: no bearer is a clean 401, not an anonymous
+/// answer.
+#[tokio::test]
+async fn get_my_access_is_served_to_any_authenticated_caller_but_never_to_none() {
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new().with("nobody", token_info("nobody-subject", PermissionSet::new())),
+    );
+    let router = build_router(bearer, false);
+    let (status, body) = rpc_call(
+        router.clone(),
+        "procedure.getMyAccess",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        Some("nobody"),
+    )
+    .await;
+    assert!(
+        status != StatusCode::FORBIDDEN && status != StatusCode::UNAUTHORIZED,
+        "a caller with zero permissions must still be able to ask what they may do; got {status}:          {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, _) = rpc_call(
+        router,
+        "procedure.getMyAccess",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "`authenticated only` still means authenticated"
+    );
 }
 
 /// Deliberately-unmapped and defense-in-depth op-ids are denied unconditionally, even for an admin

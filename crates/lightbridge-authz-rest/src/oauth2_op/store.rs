@@ -60,7 +60,7 @@ use lightbridge_authz_bearer::BearerTokenServiceTrait;
 use lightbridge_authz_budget::repo::BudgetRepo;
 use lightbridge_authz_budget::{BudgetTier, Period, PolicyEngine};
 use lightbridge_authz_core::async_trait;
-use lightbridge_authz_core::config::{ClaimMapper, ClaimSource, Oauth2TokenExchange};
+use lightbridge_authz_core::config::{ClaimMapper, Oauth2TokenExchange};
 use lightbridge_authz_core::crypto::hash_api_key;
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::dto::ModelPolicy;
@@ -146,6 +146,12 @@ pub struct TokenExchangeOpStore {
     /// `quota_tier_lookup_failure_refuses_the_exchange_even_though_context_resolution_succeeds`
     /// and its refresh-grant mirror are exactly that proof.
     quota_repo: Arc<StoreRepo>,
+    /// The `platform_role_grants` handle `ClaimSource::PlatformRoles` reads (ADR-0033). Its own
+    /// field for exactly the reason `quota_repo` above is: production points both at the same
+    /// pool, but a separate injection seam is what lets a test hold `repo` reachable (so
+    /// `resolve_context` succeeds) while pointing THIS one at a dead pool, proving the claim
+    /// mapper's own fail-closed branch fires rather than context resolution failing first.
+    platform_repo: Arc<StoreRepo>,
     budget_repo: Arc<BudgetRepo>,
     /// ADR-0015 Decision 6's fail-closed floor, read live (see [`Self::resolve_budget_tier`]) --
     /// the SAME hot-swappable engine `authz-api`/`authz-budget` already hold via
@@ -178,6 +184,7 @@ impl TokenExchangeOpStore {
         assertions: RedisClientAssertionStore,
         repo: Arc<StoreRepo>,
         quota_repo: Arc<StoreRepo>,
+        platform_repo: Arc<StoreRepo>,
         budget_repo: Arc<BudgetRepo>,
         policy_engine: Arc<dyn PolicyEngine>,
         bearer: Arc<dyn BearerTokenServiceTrait>,
@@ -193,6 +200,7 @@ impl TokenExchangeOpStore {
             assertions,
             repo,
             quota_repo,
+            platform_repo,
             budget_repo,
             policy_engine,
             bearer,
@@ -721,66 +729,25 @@ impl TokenExchangeOpStore {
         Ok(plaintext)
     }
 
-    /// Evaluates `oauth2.signing.claim_mappers` into concrete claims for this token.
-    ///
-    /// Every source reads data this service already owns and has already resolved for this mint --
-    /// no extra hop, and nothing borrowed from the upstream IdP. That is the point: `authz-idp` is
-    /// the issuer for the human plane, so the RBAC roles claim it stamps must come from
-    /// `project_members`, not from a Keycloak token we happened to broker.
-    ///
-    /// Fail-closed, matching [`Self::resolve_quota_tier`] rather than
-    /// [`Self::resolve_budget_tier`]: a lookup failure REFUSES the mint. Omitting the claim
-    /// instead would produce a token whose roles are empty, which `permissions_for_roles` reads as
-    /// "no permissions" -- indistinguishable on the wire from a legitimately unprivileged user,
-    /// and it would turn a database blip into a silent, confusing authorization failure that looks
-    /// like a policy decision. Refusing says what actually happened.
+    /// Evaluates `oauth2.signing.claim_mappers` for this mint. The whole implementation --
+    /// fail-closed contract, the per-claim UNION semantics several mappers on one claim name get
+    /// (ADR-0033), and every source -- lives in [`super::claim_mappers`]; this is the thin,
+    /// field-supplying wrapper the three mint paths call.
     async fn resolve_mapped_claims(
         &self,
         project_id: &str,
         acting_account_id: &AccountId,
         owning_account_id: &str,
     ) -> Result<Vec<(String, Value)>, TokenErrorResponse> {
-        if self.claim_mappers.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut resolved = Vec::with_capacity(self.claim_mappers.len());
-        for mapper in self.claim_mappers.iter() {
-            let source_value = match mapper.source {
-                ClaimSource::ProjectRole => {
-                    // The account owner is implicitly authorized and normally holds no roster row
-                    // -- the same rule `authorize_project_lead` layers on top of
-                    // `project_member_role`. Checked FIRST so an owner is never reported as
-                    // whatever roster row they may additionally hold.
-                    if owning_account_id == acting_account_id.as_str() {
-                        Some("owner".to_string())
-                    } else {
-                        self.quota_repo
-                            .project_member_role(project_id, acting_account_id)
-                            .await
-                            .map_err(|err| {
-                                tracing::error!(
-                                    error = %err,
-                                    project_id = %project_id,
-                                    claim = %mapper.claim,
-                                    "claim mapper source resolution failed; refusing to mint \
-                                     rather than stamping an empty claim, which would be \
-                                     indistinguishable from a legitimately unprivileged user"
-                                );
-                                oauth_err("server_error", "claim resolution failed")
-                            })?
-                    }
-                }
-            };
-            let values = source_value
-                .as_deref()
-                .and_then(|value| mapper.map.get(value))
-                .unwrap_or(&mapper.default_values);
-            resolved.push((
-                mapper.claim.clone(),
-                Value::Array(values.iter().cloned().map(Value::String).collect()),
-            ));
-        }
-        Ok(resolved)
+        super::claim_mappers::resolve_mapped_claims(
+            &self.claim_mappers,
+            &self.quota_repo,
+            &self.platform_repo,
+            project_id,
+            acting_account_id,
+            owning_account_id,
+        )
+        .await
     }
 
     /// Resolves the `budget_tier` claim to stamp on a minted access token (ADR-0014,

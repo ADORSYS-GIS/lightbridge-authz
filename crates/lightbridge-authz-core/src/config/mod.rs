@@ -1151,40 +1151,11 @@ pub struct JwtSigning {
     pub claim_mappers: Vec<ClaimMapper>,
 }
 
-/// One declared claim, its source, and how source values become claim values.
-///
-/// Deliberately data, not code: adding a role tier or renaming the RBAC claim is a values-file
-/// edit, not a release. The evaluation is intentionally trivial -- lookup, map, emit -- because a
-/// claim that feeds an authorization decision is the wrong place for an expression language.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ClaimMapper {
-    /// The claim name to stamp, e.g. `lightbridge_api_roles` (whatever `rbac.roles_claim` names).
-    pub claim: String,
-    /// Where the value comes from. Server-side resolved data only.
-    pub source: ClaimSource,
-    /// Source value -> emitted claim values. A source value absent from this map falls through to
-    /// [`ClaimMapper::default_values`].
-    #[serde(default)]
-    pub map: std::collections::HashMap<String, Vec<String>>,
-    /// Emitted when the source resolves to a value `map` does not cover, or resolves to nothing.
-    ///
-    /// Defaults to EMPTY, which for the RBAC roles claim means "no permissions" -- the
-    /// default-deny direction. An operator wanting a baseline role must say so explicitly.
-    #[serde(default, rename = "default")]
-    pub default_values: Vec<String>,
-}
+pub mod claim_mapper;
 
-/// The server-side facts a [`ClaimMapper`] may read. Closed on purpose: every variant must be
-/// something this service already resolves while minting, so a mapper can never introduce a new
-/// round-trip or read data the token subject does not own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClaimSource {
-    /// The subject's `project_members.role` on the token's project (`lead` / `member`), or
-    /// `owner` when they own the project's account and hold no roster row -- the same
-    /// owner-is-implicitly-authorized rule `authorize_project_lead` applies.
-    ProjectRole,
-}
+/// Re-exported from [`crate::config::claim_mapper`], which holds both types. Split out only to
+/// keep this file inside its LoC-gate baseline; see that module's own doc comment.
+pub use claim_mapper::{ClaimMapper, ClaimSource};
 
 fn default_signing_ttl_seconds() -> i64 {
     7_776_000

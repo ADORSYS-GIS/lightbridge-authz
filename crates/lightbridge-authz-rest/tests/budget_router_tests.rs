@@ -139,6 +139,9 @@ fn build_router(bearer: Arc<dyn BearerTokenServiceTrait>) -> Router {
         review_service,
         budget_repo,
         reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
         lazy_cratestack_db(),
         core,
         bearer,

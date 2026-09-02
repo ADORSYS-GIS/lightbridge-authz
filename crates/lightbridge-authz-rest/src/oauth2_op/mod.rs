@@ -19,6 +19,9 @@
 //!   Decision 3 originally installed for both OP-side traits.
 //! - [`authorization_code_store`]: persisted, TTL-bound and CAS-consuming authorization codes
 //!   for ADR-0019's browser flow.
+//! - [`claim_mappers`]: evaluates `oauth2.signing.claim_mappers` into concrete claims at mint
+//!   time -- fail-closed, and MERGING (union, deduped) when several mappers name one claim, which
+//!   is how `project_role` and `platform_roles` coexist on the RBAC roles claim (ADR-0033).
 //! - [`store`]: `TokenExchangeOpStore`, the `OpStore` implementation tying all of the above
 //!   together, with hand-rolled `handle_token_exchange`/`handle_refresh_token` overrides (the
 //!   upstream defaults are `pub(crate)` to `authkestra-op` and never stamp `extra` claims -- see
@@ -28,6 +31,7 @@
 //! - [`refresh_refusal`]: server-side-only structured logging for why `handle_refresh_token`
 //!   refused a presented refresh token -- the wire response never varies by reason.
 
+pub mod claim_mappers;
 pub mod client_assertion_store;
 pub mod client_store;
 pub mod device_store;

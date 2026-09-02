@@ -27,15 +27,13 @@
 //! pass/fail semantics for `/rpc/batch` without any upstream cratestack change: `authenticate`
 //! still only runs once per envelope, but it now hands every frame's dispatch the caller's FULL,
 //! REAL computed permission set (every [`lightbridge_authz_core::Permission`], via
-//! [`build_context`]) rather than a single, already-narrowed-to-one-op-id verdict — and it is
-//! cratestack's per-frame policy evaluation, not this function, that narrows it back down per
-//! frame.
+//! [`build_context`]) rather than a single, already-narrowed-to-one-op-id verdict — and cratestack's
+//! per-frame policy evaluation, not this function, narrows it back down per frame.
 //!
 //! For a UNARY call, `build_context` populates the exact same fields, but the pre-existing
-//! `required_permission`/`scope.permits`/`has_permission` checks below still run FIRST and are
-//! completely unchanged — the schema clauses are a second, now-redundant-for-unary but harmless
-//! check on that path (unary was never broken by 0.8.4 in the first place: `request.path` for a
-//! unary call was always its own canonical path, both before and after 0.8.4).
+//! `required_permission`/`scope.permits`/`has_permission` checks below still run FIRST — the schema
+//! clauses are a second, now-redundant-for-unary but harmless check on that path (unary was never
+//! broken by 0.8.4: `request.path` for a unary call was always its own canonical path).
 //!
 //! ## Two accepted, documented behavior differences (batch path only — unary is unaffected)
 //!
@@ -83,7 +81,8 @@ use lightbridge_authz_core::Permission;
 use lightbridge_authz_core::identity::AccountId;
 
 use crate::rpc_authorize::{
-    BATCH_OP_ID, RpcScope, op_id_from_path, permission_field_name, required_permission,
+    BATCH_OP_ID, RpcScope, is_authenticated_only_op_id, op_id_from_path, permission_field_name,
+    required_permission,
 };
 
 /// ADR-0025 Stage 2: translates a validated bearer token's `(iss, sub)` into the acting account
@@ -262,9 +261,8 @@ fn extract_bearer(headers: &http::HeaderMap) -> Option<String> {
 /// never anything narrower than the caller's actual grants. This is the single most
 /// security-sensitive function in this crate: every `authz.cstack` `@allow`/`@@allow` clause's
 /// permission gate is only as fail-closed as the values populated here. Looping over
-/// [`Permission::ALL`] rather than 32 hand-written field insertions is deliberate — a variant
-/// added to `Permission` later is picked up automatically, with no separate list to remember to
-/// update here.
+/// [`Permission::ALL`] rather than hand-writing one field insertion per variant is deliberate — a
+/// variant added to `Permission` later is picked up automatically, with no separate list here.
 ///
 /// `pub` and called from TWO independent entry points, deliberately kept as ONE function rather
 /// than two copies of "how a context gets its permission fields": [`CratestackAuthProvider`]
@@ -381,12 +379,14 @@ impl AuthProvider for CratestackAuthProvider {
                 )));
             }
             // Unmapped op-id → 403 unconditionally, mirroring `rpc_authorize`'s fail-closed set
-            // (unknown ops, `model.ProjectMember.*`, `model.ApiKey.create`, ...).
-            let Some(required) = required_permission(&op_id) else {
+            // (unknown ops, `model.ProjectMember.*`, `model.ApiKey.create`, ...) -- except the
+            // enumerated `AUTHENTICATED_ONLY_OP_IDS`, which need a live token and nothing more.
+            let required = required_permission(&op_id);
+            if required.is_none() && !is_authenticated_only_op_id(&op_id) {
                 return Err(CratestackError::Forbidden(
                     "operation not permitted".to_owned(),
                 ));
-            };
+            }
             // No bearer at all → 401, matching the prior middleware's fail-closed posture (rather
             // than an anonymous context, which would surface as a policy-driven empty read).
             let Some(token) = token else {
@@ -396,7 +396,7 @@ impl AuthProvider for CratestackAuthProvider {
             };
             match bearer.validate_bearer_token(&token).await {
                 Ok(info) if info.active => {
-                    if !info.has_permission(required) {
+                    if required.is_some_and(|required| !info.has_permission(required)) {
                         return Err(CratestackError::Forbidden(
                             "insufficient permissions".to_owned(),
                         ));

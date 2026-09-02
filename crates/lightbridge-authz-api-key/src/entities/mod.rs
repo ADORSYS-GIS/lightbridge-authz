@@ -9,6 +9,7 @@ pub mod identity_label_row;
 pub mod new_account_row;
 pub mod new_api_key_row;
 pub mod new_project_row;
+pub mod platform_role_grant_row;
 pub mod project_member_row;
 pub mod project_row;
 pub mod session_row;

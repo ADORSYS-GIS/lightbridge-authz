@@ -367,6 +367,55 @@ claim_mappers:
     );
 }
 
+/// ADR-0033: `source: platform_roles` parses, several mappers may name ONE claim, and a
+/// `platform_roles` mapper legitimately carries no `map` at all (it resolves to role names
+/// already, so an unmapped value contributes itself). Asserted because this exact two-mapper block
+/// is what ai-helm-values deploys to prod -- a parse regression here is a fleet-wide mint outage,
+/// since the claim source is fail-closed.
+#[test]
+fn several_mappers_may_target_one_claim_and_platform_roles_needs_no_map() {
+    let yaml = r#"
+issuer: "https://idp.example.test"
+ttl_seconds: 3600
+max_key_age_days: 30
+claim_mappers:
+  - claim: lightbridge_api_roles
+    source: project_role
+    map:
+      owner: ["lightbridge-viewer"]
+      lead: ["lightbridge-editor"]
+      member: ["lightbridge-viewer"]
+    default: []
+  - claim: lightbridge_api_roles
+    source: platform_roles
+    default: []
+"#;
+    let signing: lightbridge_authz_core::config::JwtSigning =
+        serde_yaml::from_str(yaml).expect("the prod-shaped two-mapper block must parse");
+    assert_eq!(signing.claim_mappers.len(), 2);
+    assert_eq!(
+        signing.claim_mappers[0].source,
+        lightbridge_authz_core::config::ClaimSource::ProjectRole
+    );
+    assert_eq!(
+        signing.claim_mappers[0].map.get("owner").map(Vec::as_slice),
+        Some(["lightbridge-viewer".to_string()].as_slice()),
+        "post-cutover an account owner is a VIEWER -- the owner's binding ruling, and the whole          point of ADR-0033"
+    );
+    assert_eq!(
+        signing.claim_mappers[1].source,
+        lightbridge_authz_core::config::ClaimSource::PlatformRoles
+    );
+    assert!(
+        signing.claim_mappers[1].map.is_empty(),
+        "a platform_roles mapper needs no translation table"
+    );
+    assert_eq!(
+        signing.claim_mappers[0].claim, signing.claim_mappers[1].claim,
+        "both target the same claim; resolve_mapped_claims unions them"
+    );
+}
+
 /// Absent `claim_mappers` must parse to empty, not fail: a deployment that declares none mints
 /// exactly the claims it did before this feature existed.
 #[test]

@@ -2,8 +2,15 @@
 
 Authentication is delegated to Keycloak; **authorization** is decided here. Every request to the
 CRUD API (`authz-api`) and the MCP server (`lightbridge-mcp`) is gated on a **permission**. This
-document describes how the roles Keycloak puts on a JWT become permissions, and which permission
-each operation requires.
+document describes how the roles on a JWT become permissions, which permission each operation
+requires, and — since ADR-0033 — **where those roles come from in the first place**.
+
+> **Roles are not a Keycloak fact.** On the human plane `authz-idp` is the issuer, and it stamps
+> the roles claim itself from data this deployment owns: the `project_members` roster, and
+> `platform_role_grants` (ADR-0033). Nothing is read back from Keycloak, ever, and nothing is
+> written to it — the ADR-0014 pattern. See
+> [Platform roles are a table](#platform-roles-are-a-table-adr-0033), which is the section to read
+> first if your question is "why is this person an admin".
 
 > Ownership still applies. RBAC is a *coarse capability* check (may this caller create projects at
 > all?). Account ownership (`accounts.id = sub`) and the per-row `project_members` roster still
@@ -12,7 +19,9 @@ each operation requires.
 
 ## How it works
 
-1. Keycloak issues a JWT carrying the caller's roles in a single, flat, top-level claim.
+1. The issuer mints a JWT carrying the caller's roles in a single, flat, top-level claim. On the
+   human plane that issuer is **`authz-idp`**, and the claim is assembled at mint time by
+   `oauth2.signing.claim_mappers` (see below) from this deployment's own tables.
 2. `lightbridge-authz-bearer` validates the JWT (JWKS) and reads that claim by name.
 3. Each role string is mapped to a set of permissions via configuration.
 4. The union of those permissions is attached to the request.
@@ -205,9 +214,248 @@ Used when `oauth2.rbac.role_permissions` is not configured
 
 | Role                 | Grants                                | Effective permissions                              |
 | -------------------- | ------------------------------------- | -------------------------------------------------- |
-| `lightbridge-admin`  | `*`                                   | all permissions                                    |
+| `lightbridge-admin`  | `*`                                   | all permissions — including `rbac:manage`, i.e. the ability to grant `lightbridge-admin` to anyone, so this is the role to hand out deliberately and to nobody else by default (ADR-0033) |
 | `lightbridge-editor` | `account:create`, `account:read`, `project:*`, `apikey:*`, `session:revoke-own`, `budget:read-own` | self-provision own account; read accounts; full project + api-key lifecycle; log out own sessions; see own budget |
 | `lightbridge-viewer` | `account:create`, `account:read`, `project:read`, `apikey:read`, `session:revoke-own`, `budget:read-own` | self-provision own account; otherwise read-only, plus log out own sessions and see own budget |
+
+## Platform roles are a table (ADR-0033)
+
+### The problem this closes
+
+Prod configured the roles mapper as `owner → ["lightbridge-admin"]`
+(`ai-helm-values/environments/prod/values/lightbridge-app.yaml:266-273`, repeated at 863 and 1172).
+`owner` is the claim source's value for "the acting subject owns the account this project belongs
+to" — and under [ADR-0026](adr/0026-one-identity-may-own-many-accounts.md) **every signed-in person
+owns an account**. So every authenticated user was minted `lightbridge-admin`, which the default map
+expands to `*`: every permission in the enum.
+
+That was never a bug in a line of code. It was a configuration whose meaning changed underneath it
+when ADR-0026 landed, with no YAML changing. Nothing could have flagged it, because nothing in the
+system knew that "who should be an admin" was a question anybody had answered. That is the real
+content of [#262](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/262) "full RBAC": **admin
+was a default, not a decision.**
+
+### The model
+
+`platform_role_grants` (migration `20260902000006`) makes a platform role a row somebody wrote:
+
+| Column       | Meaning                                                                             |
+| ------------ | ----------------------------------------------------------------------------------- |
+| `id`         | CUID2                                                                                |
+| `user_id`    | the **person** (`users.id`), not an account — a role follows the human across every account they own (ADR-0026) |
+| `role`       | a role name from `oauth2.rbac.role_permissions`; validated on write, not by a `CHECK` |
+| `granted_by` | the granting admin's `users.id`, or **NULL = CLI bootstrap**                          |
+| `granted_at` | database `now()`, never caller-supplied — an audit row cannot be backdated            |
+| `revoked_at` | NULL = active. Revocation is a soft delete: the history *is* the product              |
+| `reason`     | why. Write it down                                                                    |
+
+A **partial** unique index over `(user_id, role) WHERE revoked_at IS NULL` does two jobs: grant →
+revoke → grant is a normal history rather than a conflict, and `grantPlatformRole` is idempotent
+(`ON CONFLICT … DO NOTHING`, then read the existing row back — a repeat grant is not a new decision,
+so the original `reason` and `granted_by` stand).
+
+`role` is free TEXT with no `CHECK` and no enum on purpose: the role catalogue is operator
+configuration, so a database constraint would hard-code one deployment's config into the schema.
+Both writers refuse a role absent from the configured catalogue instead — a row for
+`lightbridge-admn` confers nothing while looking exactly like a successful grant, and the operator
+would find out only when the person it was for could not do anything.
+
+### How a grant becomes a claim
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Person as Person (browser/CLI)
+    participant IdP as authz-idp<br/>(oauth2_op/store.rs)
+    participant Mappers as claim_mappers.rs<br/>resolve_mapped_claims
+    participant DB as Postgres
+    participant API as authz-api<br/>rpc_authorize + auth_provider
+
+    Person->>IdP: POST /oauth2/token (exchange | refresh | authorization_code)
+    IdP->>Mappers: resolve_mapped_claims(project_id, acting_account, owning_account)
+    Mappers->>DB: project_member_role(project, account)  [ClaimSource::ProjectRole]
+    DB-->>Mappers: "owner" | "lead" | "member" | none
+    Mappers->>DB: resolve_user_id_for_account(account)  [ClaimSource::PlatformRoles]
+    DB-->>Mappers: users.id | none
+    Mappers->>DB: active_platform_roles_for_user(user)
+    DB-->>Mappers: ["lightbridge-admin", ...] | []
+    Note over Mappers: map + default per source,<br/>then UNION per claim name, deduped
+    alt any lookup errored
+        Mappers--x IdP: Err
+        IdP--xPerson: 500 server_error (fail-closed: NO token is issued)
+    else resolved (an empty grant set is a normal answer)
+        Mappers-->>IdP: lightbridge_api_roles = [...]
+        IdP-->>Person: access_token (+ refresh_token)
+    end
+
+    Person->>API: POST /rpc/<op_id> (Bearer)
+    API->>API: roles claim -> permissions_for_roles(compiled Rbac)
+    API-->>Person: 403 if the op's permission is absent, else dispatch
+```
+
+Two things in that diagram carry the whole design:
+
+**Fail-closed.** A lookup failure REFUSES the mint. Omitting the claim instead would produce a token
+whose roles are empty, which `permissions_for_roles` reads as "no permissions" — indistinguishable
+on the wire from a legitimately unprivileged user, turning a database blip into a silent
+authorization failure that looks like a policy decision. An **empty grant set is not a failure**: a
+person granted nothing mints normally with whatever the project mapper contributed.
+
+**Union, never overwrite.** Several mappers may name the same claim; their values MERGE,
+deduplicated, in mapper-declaration order. That is the mechanism by which the project-role default
+and the platform grants coexist on `lightbridge_api_roles`. Last-one-wins would make the roles claim
+depend on YAML ordering — a values-file edit must not be able to cause that class of silent
+authorization surprise.
+
+The two sources apply their `map` differently, deliberately:
+
+| Source           | Resolves to                       | Unmapped source value                        |
+| ---------------- | --------------------------------- | -------------------------------------------- |
+| `project_role`   | a roster POSITION (`owner`/`lead`/`member`) — not a role name, so it must be translated | falls through to `default` |
+| `platform_roles` | role NAMES already                | **contributes itself** — no mapping table to keep in sync with the grants you hand out |
+
+### The claim_mappers block to deploy
+
+Post-cutover, `oauth2.signing.claim_mappers` reads:
+
+```yaml
+oauth2:
+  signing:
+    claim_mappers:
+      - claim: lightbridge_api_roles
+        source: project_role
+        map:
+          owner: ["lightbridge-viewer"]
+          lead: ["lightbridge-editor"]
+          member: ["lightbridge-viewer"]
+        default: []
+      - claim: lightbridge_api_roles
+        source: platform_roles
+        default: []
+```
+
+**Account owners default to `lightbridge-viewer`** (owner's binding ruling, 2026-09-02): editor
+(`project:*`, `apikey:*`, `account:create`) is too broad to hand every signed-in human by default.
+An owner who needs more asks, somebody grants it, and there is a row saying who and why.
+
+> **Sequencing is not optional.** A `platform_roles` mapper configured before migration
+> `20260902000006` is live refuses **every** mint — that is the fail-closed contract working exactly
+> as designed, and it takes the whole human plane down. Deploy the image first, bootstrap the first
+> admins (`rbac grant`), *then* change the mapper. The full order is
+> A2 → A5 → B3 → B1 → C9; any other order locks every operator out of `/admin/*`.
+
+### A grant's lifecycle, and how long it takes to bite
+
+```mermaid
+stateDiagram-v2
+    [*] --> NoGrant: person exists in `users`
+
+    NoGrant --> Active: rbac grant (granted_by = NULL)
+    NoGrant --> Active: grantPlatformRole (granted_by = admin's users.id)
+    Active --> Active: repeat grant — idempotent, returns the SAME row,<br/>original reason/granter stand
+
+    Active --> InTokens: next mint (exchange | refresh | authorization_code)
+    InTokens --> InTokens: refresh re-resolves LIVE on every rotation
+
+    Active --> Revoked: revokePlatformRole / rbac revoke<br/>(stamps revoked_at, then revokes the person's sessions)
+    InTokens --> Revoked: same call — sessions closed, so no re-mint
+    Revoked --> Active: re-grant mints a NEW row<br/>(the partial index is over ACTIVE rows only)
+
+    Revoked --> Revoked: second revoke REFUSED —<br/>never re-stamps the original revoked_at
+
+    note right of InTokens
+        The only window: an access token minted
+        BEFORE the revoke keeps the role until it
+        expires. Bounded by oauth2.token_exchange
+        .access_ttl_seconds (900s in prod), not by
+        the session or the refresh chain.
+    end note
+
+    note left of NoGrant
+        There is deliberately NO "granted but inert"
+        state to draw. A role absent from
+        oauth2.rbac.role_permissions is refused at
+        WRITE time, in both writers, so the table can
+        never hold a grant that confers nothing --
+        the failure mode that would otherwise look
+        exactly like a successful grant.
+    end note
+```
+
+**Propagation is bounded by the access-token TTL.** A grant reaches a person's token at the next
+mint, not before — the same ADR-0014 property `budget_tier` already has. For a grant that is fine:
+gaining a capability a few minutes late is not a security event.
+
+For a **revocation** it is not fine on its own, so `revokePlatformRole` (and `rbac revoke`) also run
+the existing `revokeSubjectSessions` path for **every account the person owns**. Without that, the
+still-valid access token keeps carrying the role and — worse — a refresh keeps re-minting it from
+the same live session for as long as the refresh chain lives. With it, the worst case collapses to
+the remaining lifetime of one already-issued access token.
+
+### Bootstrap runbook (the first admin)
+
+`grantPlatformRole` requires `rbac:manage`, which comes from a role, which after the cutover nobody
+is minted by default. There is no admin to grant the first admin. The CLI breaks the cycle by
+writing the row directly:
+
+```bash
+# Inside a pod that already has CONFIG_PATH and database credentials --
+# a k8s Job or `kubectl exec`, exactly like `idp jwk rotate`.
+lightbridge-authz rbac grant \
+  --user selast@example.com \
+  --role lightbridge-admin \
+  --reason "platform owner, bootstrap 2026-09"
+
+lightbridge-authz rbac list --role lightbridge-admin
+# GRANT_ID   USER_ID   ROLE               GRANTED_BY   REASON
+# c1f...     kc-u...   lightbridge-admin  CLI          platform owner, bootstrap 2026-09
+
+lightbridge-authz rbac revoke --user selast@example.com --role lightbridge-admin --reason "offboarded"
+```
+
+- `--user` takes a `users.id` **or** an email. An email matching **more than one person is a hard
+  refusal**, never a pick: `federated_identities` is unique on `(issuer, subject)`, not on `email`,
+  so the same address logged in through two realms is two rows, two accounts, two `users` rows.
+  Choosing one would grant admin to the wrong human, silently. The error lists every candidate id.
+- `granted_by` is **always NULL** on this path. That is what distinguishes a bootstrap from a
+  console grant forever after, and it is the honest value even when the operator has a user id: an
+  operator with database credentials made this decision, not anybody in `users`.
+- Every failure exits non-zero, so a Job that reports success really did write the row.
+- The new role reaches the person's token only at their next mint — tell them to sign out and back
+  in if they cannot wait out the TTL.
+
+### The RPC surface
+
+| Procedure                                                                   | Permission                    |
+| --------------------------------------------------------------------------- | ----------------------------- |
+| `listPlatformRoleGrants({ userId?, role?, includeRevoked?, after?, limit? })` | `rbac:manage`                 |
+| `grantPlatformRole({ userId, role, reason? })`                               | `rbac:manage`                 |
+| `revokePlatformRole({ grantId, reason? })`                                   | `rbac:manage`                 |
+| `getMyAccess() → { userId, roles[], permissions[] }`                          | **none — any authenticated caller** |
+
+The three write/read-all procedures share ONE permission because a caller who can grant a role can
+trivially list who holds it (grant to themselves, read it back); splitting read from write would be
+granularity theatre. `rbac:manage` is its own permission rather than a reuse of `user:read` or any
+`account:*` grant because it is the one capability that can hand out every other capability:
+**whoever can write this table can make themselves `lightbridge-admin`.**
+
+`getMyAccess` is the deliberate opposite. It is the sole entry in
+`rpc_permission_map::AUTHENTICATED_ONLY_OP_IDS`, the enumerated exception to the fail-closed
+"unmapped op-id is denied" rule — a list rather than a heuristic, precisely so that adding another
+is a conscious edit somebody reviews. Gating it would defeat its purpose (the console calls it to
+find out what it may render, so a permission requirement makes "you may not ask what you may do" a
+reachable state), and it discloses nothing: every value it returns is already derivable from the
+token the caller is holding.
+
+Both halves of its answer are **read back out of the auth context**, not re-derived: `roles` from
+the context's roles extension, `permissions` from the `auth().perm*` booleans `build_context`
+populated from the caller's real `TokenInfo::has_permission` verdicts. A console that
+re-implemented the role → permission map would drift from the server's, and the drift shows up as a
+screen offering an action the backend then refuses — or, worse, hiding one it would have allowed.
+
+`listPlatformRoleGrants` defaults to **active grants only**; `includeRevoked: true` is the audit
+view. Pages are newest-first, cursored on `grantedAt` (never on `id` — ADR-0039: CUID2 has no
+defined ordering), `limit` defaults to 50 and clamps at 200.
 
 ## Permissions and the operations they gate
 
@@ -277,6 +525,8 @@ scope for #401.
 | `session:revoke`         | `procedure.revokeSubjectSessions`                    | — (no MCP tool yet)                 |
 | `usage:read-all`         | — (not an RPC op-id; see note below)                 | — (no MCP tool)                     |
 | `user:read`              | `procedure.resolveUserProfiles`, `procedure.resolveActorLabels`, `procedure.searchUsers` | — (no MCP tool yet) |
+| `rbac:manage`            | `procedure.listPlatformRoleGrants`, `procedure.grantPlatformRole`, `procedure.revokePlatformRole` | — (no MCP tool yet) |
+| **none** (any authenticated caller) | `procedure.getMyAccess` — the ONE enumerated exception to "unmapped op-id is denied"; see [Platform roles are a table](#platform-roles-are-a-table-adr-0033) | — (no MCP tool yet) |
 
 `read` covers both the list and get operations for a resource.
 

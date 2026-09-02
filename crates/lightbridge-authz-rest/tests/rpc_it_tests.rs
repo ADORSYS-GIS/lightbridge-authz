@@ -229,6 +229,9 @@ async fn setup_with_resolver(
         review_service.clone(),
         budget_repo.clone(),
         reset_scheduler.clone(),
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
         cdb,
         core.clone(),
         idempotency,
@@ -1914,6 +1917,9 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
             ctx.review_service.clone(),
             ctx.budget_repo.clone(),
             ctx.reset_scheduler.clone(),
+            std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+                &lightbridge_authz_core::authz::Rbac::default(),
+            )),
         ),
         // cratestack 0.8.11 (@computed) added this parameter; `()` is a no-op since
         // `authz.cstack` declares no `@computed` field (see src/lib.rs's own call sites).
@@ -4333,5 +4339,221 @@ async fn identity_resolution_procedures_resolve_labels_and_omit_unknown_ids() {
         status,
         StatusCode::BAD_REQUEST,
         "a 1-character query must be refused"
+    );
+}
+
+/// ADR-0033's positive half over the real RPC transport: an admin grants a platform role, sees it
+/// in the listing, and revokes it — and the revoke CLOSES that person's sessions, which is what
+/// makes the change bite within an access-token TTL instead of a session lifetime.
+///
+/// The refusal half (a caller holding every permission EXCEPT `rbac:manage`) is
+/// `rbac_gate_denies_platform_role_management_without_rbac_manage` in `rpc_router_tests.rs`, which
+/// needs no database because the gate runs ahead of dispatch.
+#[tokio::test]
+async fn platform_role_grants_are_idempotent_listable_and_revoking_closes_sessions() {
+    let admin = format!("rbac-admin-{}", cuid2());
+    let target = format!("rbac-target-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin, admin_perms())));
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    // Both people need `users` rows; `createAccount`'s `accounts_set_user` trigger provisions one
+    // keyed to the same id, which is the grandfathered `users.id == accounts.id` shape.
+    create_account(r, "admin", "admin-tenant").await;
+    sqlx::query("INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING")
+        .bind(&target)
+        .execute(&ctx.verify)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO accounts (id, user_id, created_at, updated_at) VALUES ($1, $1, now(), now())",
+    )
+    .bind(&target)
+    .execute(&ctx.verify)
+    .await
+    .unwrap();
+    let target_session = seed_active_session(&ctx.verify, &target).await;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.grantPlatformRole",
+        Wire::Cbor,
+        &json!({ "args": { "userId": target, "role": "lightbridge-admin", "reason": "on call" } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(status.is_success(), "grantPlatformRole: {status}");
+    let grant = json_body(&body);
+    let grant_id = grant["id"].as_str().unwrap().to_string();
+    assert_eq!(grant["userId"].as_str(), Some(target.as_str()));
+    assert_eq!(
+        grant["grantedBy"].as_str(),
+        Some(admin.as_str()),
+        "the audit row names the granting PERSON, not the account the console was scoped to"
+    );
+    assert!(grant["revokedAt"].is_null());
+
+    // Idempotent: the same call again returns the SAME row, not a second one.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.grantPlatformRole",
+        Wire::Cbor,
+        &json!({ "args": { "userId": target, "role": "lightbridge-admin" } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(status.is_success());
+    assert_eq!(json_body(&body)["id"].as_str(), Some(grant_id.as_str()));
+
+    // An unknown role is refused rather than written: the row would confer nothing.
+    let (status, _) = rpc_call(
+        r.clone(),
+        "procedure.grantPlatformRole",
+        Wire::Cbor,
+        &json!({ "args": { "userId": target, "role": "lightbridge-admn" } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a role absent from the configured catalogue must be refused, not silently written"
+    );
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.listPlatformRoleGrants",
+        Wire::Cbor,
+        &json!({ "args": { "userId": target } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(status.is_success(), "listPlatformRoleGrants: {status}");
+    let entries = json_body(&body)["entries"].as_array().unwrap().clone();
+    assert_eq!(entries.len(), 1, "one active grant, not two: {entries:?}");
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.revokePlatformRole",
+        Wire::Cbor,
+        &json!({ "args": { "grantId": grant_id, "reason": "off call" } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(status.is_success(), "revokePlatformRole: {status}");
+    let revocation = json_body(&body);
+    assert!(!revocation["grant"]["revokedAt"].is_null());
+    assert_eq!(
+        revocation["revokedSessionCount"].as_i64(),
+        Some(1),
+        "revocation must close the person's sessions, or the revoked role keeps being re-minted \
+         from a live refresh chain: {revocation}"
+    );
+    assert_eq!(
+        session_status(&ctx.verify, &target_session).await,
+        "revoked"
+    );
+
+    // Revoking twice is refused rather than re-stamping the audit fact.
+    let (status, _) = rpc_call(
+        r.clone(),
+        "procedure.revokePlatformRole",
+        Wire::Cbor,
+        &json!({ "args": { "grantId": grant_id } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Default listing is active-only; the audit view still has the history.
+    let (_, body) = rpc_call(
+        r.clone(),
+        "procedure.listPlatformRoleGrants",
+        Wire::Cbor,
+        &json!({ "args": { "userId": target } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(json_body(&body)["entries"].as_array().unwrap().is_empty());
+    let (_, body) = rpc_call(
+        r.clone(),
+        "procedure.listPlatformRoleGrants",
+        Wire::Cbor,
+        &json!({ "args": { "userId": target, "includeRevoked": true } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(json_body(&body)["entries"].as_array().unwrap().len(), 1);
+}
+
+/// `getMyAccess` is allowed for ANY authenticated caller and returns the permission set the SERVER
+/// computed — read back out of the same auth context every `@allow` clause is evaluated against,
+/// never re-derived. Asserted with a VIEWER (who cannot call any `rbac:manage` op at all) precisely
+/// because that is the caller the console most needs it for.
+#[tokio::test]
+async fn get_my_access_returns_the_servers_own_permission_set_for_a_viewer() {
+    let viewer = format!("access-viewer-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with(
+        "viewer",
+        TokenInfo {
+            roles: vec!["lightbridge-viewer".to_string()],
+            ..token_info(&viewer, viewer_perms())
+        },
+    ));
+    let ctx = setup(bearer).await;
+
+    sqlx::query("INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING")
+        .bind(&viewer)
+        .execute(&ctx.verify)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO accounts (id, user_id, created_at, updated_at) VALUES ($1, $1, now(), now())",
+    )
+    .bind(&viewer)
+    .execute(&ctx.verify)
+    .await
+    .unwrap();
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "procedure.getMyAccess",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        Some("viewer"),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "getMyAccess must need no permission at all: {status}"
+    );
+    let access = json_body(&body);
+    assert_eq!(access["userId"].as_str(), Some(viewer.as_str()));
+    assert_eq!(
+        access["roles"].as_array().unwrap(),
+        &vec![json!("lightbridge-viewer")],
+        "roles are the caller's own raw claim strings: {access}"
+    );
+    let mut permissions: Vec<String> = access["permissions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_string())
+        .collect();
+    permissions.sort();
+    let mut expected: Vec<String> = viewer_perms()
+        .iter()
+        .map(|permission| permission.as_str().to_string())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        permissions, expected,
+        "the compiled permission set, exactly -- not a client-side re-derivation, and not the \
+         whole enum: {access}"
+    );
+    assert!(
+        !permissions.contains(&"rbac:manage".to_string()),
+        "a viewer must not be told they may manage roles: {access}"
     );
 }

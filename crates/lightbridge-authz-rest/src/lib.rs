@@ -23,11 +23,14 @@ pub mod html_page;
 pub mod identity_directory;
 pub mod middleware;
 pub mod models;
+pub mod my_access;
 pub mod oauth2_op;
+pub mod platform_roles_directory;
 pub mod post_logout;
 pub mod ratelimit_redis;
 pub mod redis_tls;
 pub mod relying_party;
+pub mod reset_schedule_convert;
 pub mod routers;
 pub mod rpc_authorize;
 pub mod rpc_permission_map;
@@ -46,7 +49,12 @@ use budget_convert::{
 };
 use codec::LenientCborCodec;
 use handlers::AuthzStoreImpl;
+use lightbridge_authz_core::platform_role::known_platform_roles;
 use ratelimit_redis::build_redis_rate_limit_store;
+use reset_schedule_convert::{
+    parse_amount_micros, parse_schedule_anchor, to_schema_budget_reset_schedule,
+    to_schema_reset_schedule_run_result,
+};
 use routers::opa_router;
 use rpc_authorize::{RpcAuthorizeState, RpcScope};
 
@@ -418,80 +426,6 @@ fn to_schema_budget_grant_entry(
     }
 }
 
-/// Maps a domain [`lightbridge_authz_budget::BudgetResetSchedule`] into the schema's wire
-/// `BudgetResetSchedule` shape (ADR-0032). `scopeKind`/`cadence`/`mode` carry the exact strings
-/// their Rust enums' `Display` impls render -- the same wire-string-as-`String` choice
-/// `Decision.effect` already documents -- and `amountMicros` is a `String`-carried i64 like every
-/// other micro-USD amount on this surface.
-fn to_schema_budget_reset_schedule(
-    schedule: lightbridge_authz_budget::BudgetResetSchedule,
-) -> schema::BudgetResetSchedule {
-    schema::BudgetResetSchedule {
-        id: schedule.id,
-        name: schedule.name,
-        scopeKind: schedule.scope_kind.to_string(),
-        scopeId: schedule.scope_id,
-        cadence: schedule.cadence.to_string(),
-        anchor: schedule.anchor.map(i64::from),
-        runAtUtc: lightbridge_authz_budget::render_run_at_utc(schedule.run_at_utc),
-        amountMicros: schedule.amount_micros.to_string(),
-        mode: schedule.mode.to_string(),
-        enabled: schedule.enabled,
-        nextRunAt: schedule.next_run_at,
-        lastRunAt: schedule.last_run_at,
-        createdBy: schedule.created_by,
-        createdAt: schedule.created_at,
-        updatedAt: schedule.updated_at,
-    }
-}
-
-/// Parses a wire `amountMicros` (a `String`-carried i64) into `i64`, mirroring `grantBudget`'s
-/// identical parse so a malformed amount is a 400 with the offending value, never a 500.
-fn parse_amount_micros(raw: &str) -> std::result::Result<i64, CratestackError> {
-    raw.trim().parse::<i64>().map_err(|_| {
-        CratestackError::BadRequest(format!("amountMicros must be a valid integer, got '{raw}'"))
-    })
-}
-
-/// Narrows a wire `anchor` (`Int?`, i.e. `i64`) into the `i16` the column stores. Out-of-range is a
-/// 400 rather than a silent truncation -- the DB `CHECK` would reject it anyway, but as an opaque
-/// constraint violation surfaced as a 500.
-fn parse_schedule_anchor(anchor: Option<i64>) -> std::result::Result<Option<i16>, CratestackError> {
-    anchor
-        .map(|value| {
-            i16::try_from(value)
-                .map_err(|_| CratestackError::BadRequest(format!("anchor {value} is out of range")))
-        })
-        .transpose()
-}
-
-/// Maps one [`lightbridge_authz_budget::ScheduleRunOutcome`] into the schema's
-/// `BudgetResetScheduleRunResult`, shared by the dry-run and the real `runBudgetResetScheduleNow`
-/// so the two can never render a different shape.
-fn to_schema_reset_schedule_run_result(
-    schedule_id: String,
-    dry_run: bool,
-    window_start: chrono::DateTime<chrono::Utc>,
-    outcome: lightbridge_authz_budget::ScheduleRunOutcome,
-) -> schema::BudgetResetScheduleRunResult {
-    schema::BudgetResetScheduleRunResult {
-        scheduleId: schedule_id,
-        dryRun: dry_run,
-        windowStart: window_start,
-        entries: outcome
-            .planned
-            .into_iter()
-            .map(|entry| schema::BudgetResetSchedulePlanEntry {
-                budgetAccountId: entry.budget_account_id,
-                remainingMicros: entry.remaining_micros.to_string(),
-                deltaMicros: entry.delta_micros.to_string(),
-            })
-            .collect(),
-        deferredAccountIds: outcome.deferred_account_ids,
-        supersededAccountIds: outcome.superseded_account_ids,
-    }
-}
-
 /// Default/max page size for `listMyBudgetGrants`/`listBudgetGrants`. `BudgetRepo::list_grants`
 /// independently clamps to its own `MAX_LIST_GRANTS_LIMIT` (200) regardless of what this layer
 /// passes -- this constant is this procedure layer's own default when a caller omits `limit`, and
@@ -803,9 +737,17 @@ pub struct Procedures {
     /// procedures reach schedules through `reset_scheduler.schedules()` rather than a separate
     /// field.
     reset_scheduler: Arc<lightbridge_authz_budget::ResetScheduler>,
+    /// This deployment's configured platform-role catalogue (ADR-0033) --
+    /// `oauth2.rbac.role_permissions`' keys, or the built-in defaults when it is unset. The ONLY
+    /// consumer is `grantPlatformRole`, which refuses a role absent from it: an unvalidated typo
+    /// writes a row that confers nothing while looking exactly like a successful grant. Threaded
+    /// in from config rather than read from a global, so a test can drive a deployment whose roles
+    /// are not the built-in three.
+    rbac_roles: Arc<Vec<String>>,
 }
 
 impl Procedures {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         issuer: Arc<AuthzStoreImpl>,
         policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
@@ -813,6 +755,7 @@ impl Procedures {
         review_service: Arc<lightbridge_authz_budget::ReviewService>,
         budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
         reset_scheduler: Arc<lightbridge_authz_budget::ResetScheduler>,
+        rbac_roles: Arc<Vec<String>>,
     ) -> Self {
         Self {
             issuer,
@@ -821,6 +764,7 @@ impl Procedures {
             review_service,
             budget_repo,
             reset_scheduler,
+            rbac_roles,
         }
     }
 }
@@ -2600,6 +2544,86 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         let ctx = ctx.clone();
         async move { identity_directory::search_users(&issuer.repo, &ctx, args.args).await }
     }
+
+    /// Platform role grants (ADR-0033). The three `rbac:manage` bodies live in
+    /// [`crate::platform_roles_directory`] and `getMyAccess`'s in [`crate::my_access`] -- see
+    /// those modules for the authorization story, the revocation session fan-out, and why
+    /// `getMyAccess` reads its answer back out of the auth context instead of re-deriving it.
+    fn list_platform_role_grants(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::list_platform_role_grants::Args,
+        _authorized: schema::procedures::list_platform_role_grants::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::list_platform_role_grants::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let ctx = ctx.clone();
+        async move {
+            platform_roles_directory::list_platform_role_grants(&issuer.repo, &ctx, args.args).await
+        }
+    }
+
+    fn grant_platform_role(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::grant_platform_role::Args,
+        _authorized: schema::procedures::grant_platform_role::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::grant_platform_role::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let rbac_roles = self.rbac_roles.clone();
+        let ctx = ctx.clone();
+        async move {
+            platform_roles_directory::grant_platform_role(
+                &issuer.repo,
+                &ctx,
+                &rbac_roles,
+                args.args,
+            )
+            .await
+        }
+    }
+
+    fn revoke_platform_role(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::revoke_platform_role::Args,
+        _authorized: schema::procedures::revoke_platform_role::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::revoke_platform_role::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let ctx = ctx.clone();
+        async move { platform_roles_directory::revoke_platform_role(&issuer, &ctx, args.args).await }
+    }
+
+    fn get_my_access(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        _args: schema::procedures::get_my_access::Args,
+        _authorized: schema::procedures::get_my_access::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::get_my_access::Output, CratestackError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let ctx = ctx.clone();
+        async move { my_access::get_my_access(&issuer.repo, &ctx).await }
+    }
 }
 
 /// Shared page-fetch for `listMyBudgetGrants`/`listBudgetGrants`: parses the optional `period`,
@@ -2705,6 +2729,9 @@ pub fn build_api_router(
     review_service: Arc<lightbridge_authz_budget::ReviewService>,
     budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
     reset_scheduler: Arc<lightbridge_authz_budget::ResetScheduler>,
+    // ADR-0033: the configured platform-role catalogue `grantPlatformRole` validates against.
+    // Build it with `lightbridge_authz_core::platform_role::known_platform_roles`.
+    rbac_roles: Arc<Vec<String>>,
     cratestack_db: schema::Cratestack,
     readiness_pool: Arc<dyn DbPoolTrait>,
     idempotency_store: Arc<SqlxIdempotencyStore>,
@@ -2738,6 +2765,7 @@ pub fn build_api_router(
             review_service,
             budget_repo,
             reset_scheduler,
+            rbac_roles,
         ),
         // cratestack 0.8.11 (@computed) added this parameter to every generated router fn.
         // `authz.cstack` declares no `@computed` field, so `()` (the generated
@@ -2822,11 +2850,12 @@ const CLIENT_ASSERTION_JTI_KEY_PREFIX: &str = "authz-api:client-assertion-jti:";
 /// `TokenExchangeOpStore::resolve_budget_tier`'s fail-closed fallback reads the live, admin-
 /// configured `fail_closed_floor_micros` instead of a hard-coded rung.
 ///
-/// `TokenExchangeOpStore::new` also takes `repo` a second time as its own `quota_repo` parameter
-/// (ADR-0017): production always passes the same `Arc<StoreRepo>` clone for both, since
-/// `project_members` lives on this exact pool with no operational separation from tenant-context
-/// resolution -- the duplicate parameter exists purely as an independent test-injection seam, see
-/// `TokenExchangeOpStore`'s own `quota_repo` field doc comment for why.
+/// `TokenExchangeOpStore::new` also takes `repo` twice more, as its own `quota_repo` (ADR-0017)
+/// and `platform_repo` (ADR-0033) parameters: production always passes the same `Arc<StoreRepo>`
+/// clone for all three, since `project_members` and `platform_role_grants` live on this exact
+/// pool with no operational separation from tenant-context resolution -- the duplicate parameters
+/// exist purely as independent test-injection seams, see `TokenExchangeOpStore`'s own field doc
+/// comments for why.
 fn build_token_exchange_state(
     oauth2: &Oauth2,
     repo: Arc<StoreRepo>,
@@ -2922,6 +2951,7 @@ fn build_token_exchange_state(
     let op_store = Arc::new(oauth2_op::store::TokenExchangeOpStore::new(
         client_store,
         assertions,
+        repo.clone(),
         repo.clone(),
         repo,
         budget_repo,
@@ -3344,6 +3374,7 @@ pub async fn start_api_server(
         review_service,
         budget_repo,
         reset_scheduler,
+        Arc::new(known_platform_roles(&oauth2.rbac)),
         cratestack_db,
         readiness_pool,
         idempotency_store,
@@ -3791,6 +3822,9 @@ pub fn build_budget_router(
     review_service: Arc<lightbridge_authz_budget::ReviewService>,
     budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
     reset_scheduler: Arc<lightbridge_authz_budget::ResetScheduler>,
+    // See `build_api_router`'s parameter of the same name. `authz-budget` serves none of the
+    // `rbac:manage` op-ids (they are `crud`-scoped), but it builds the same `Procedures`.
+    rbac_roles: Arc<Vec<String>>,
     cratestack_db: schema::Cratestack,
     readiness_pool: Arc<dyn DbPoolTrait>,
     bearer: Arc<dyn BearerTokenServiceTrait>,
@@ -3810,6 +3844,7 @@ pub fn build_budget_router(
             review_service,
             budget_repo,
             reset_scheduler,
+            rbac_roles,
         ),
         // cratestack 0.8.11 (@computed) added this parameter to every generated router fn.
         // `authz.cstack` declares no `@computed` field, so `()` (the generated
@@ -4037,6 +4072,7 @@ pub async fn start_budget_server(
         review_service,
         budget_repo,
         reset_scheduler,
+        Arc::new(known_platform_roles(&oauth2.rbac)),
         cratestack_db,
         readiness_pool,
         bearer_service,

@@ -197,19 +197,44 @@ oauth2:
     #
     # `source: project_role` resolves to `owner` (the subject owns the project's account and
     # normally holds no roster row -- the same implicit authorization `authorize_project_lead`
-    # applies), or the subject's `project_members.role` (`lead` / `member`).
+    # applies), or the subject's `project_members.role` (`lead` / `member`). It resolves to a
+    # roster POSITION, which is not a role name, so `map` must translate it.
+    #
+    # `source: platform_roles` (ADR-0033) resolves to the subject's ACTIVE rows in
+    # `platform_role_grants` -- the table `lightbridge-authz rbac grant` and the
+    # `grantPlatformRole` procedure write. It resolves to role NAMES already, so a value absent
+    # from `map` contributes ITSELF; `map` is left out here entirely because there is nothing to
+    # translate.
+    #
+    # BOTH mappers name the SAME claim, and that is the point: several mappers on one claim MERGE
+    # (union, deduplicated, in declaration order), never overwrite. This is how an account owner's
+    # baseline role and their granted platform roles coexist. Last-one-wins would make the roles
+    # claim depend on YAML ordering.
+    #
+    # `owner: ["lightbridge-viewer"]`, NOT `lightbridge-admin` (ADR-0033, owner's binding ruling
+    # 2026-09-02). Under ADR-0026 every signed-in person owns an account, so mapping `owner` to
+    # admin minted `lightbridge-admin` for EVERYONE -- the defect this claim source exists to fix.
+    # Admin is now a granted row with a granter, a timestamp and a reason; see docs/rbac.md's
+    # bootstrap runbook for how the first one is created.
     #
     # A source value absent from `map` falls through to `default`, which is EMPTY here: no roles,
     # therefore no permissions. That is the default-deny direction. A lookup FAILURE is different --
     # it refuses the mint outright rather than stamping an empty claim, so a database blip can never
-    # masquerade as a legitimately unprivileged user.
+    # masquerade as a legitimately unprivileged user. An EMPTY grant set is NOT a failure: a person
+    # granted nothing mints normally.
+    #
+    # Sequencing: a `platform_roles` mapper configured before migration 20260902000006 is live
+    # refuses EVERY mint (that is the fail-closed contract working). Deploy the image first.
     claim_mappers:
       - claim: lightbridge_api_roles
         source: project_role
         map:
-          owner: ["lightbridge-admin"]
+          owner: ["lightbridge-viewer"]
           lead: ["lightbridge-editor"]
           member: ["lightbridge-viewer"]
+        default: []
+      - claim: lightbridge_api_roles
+        source: platform_roles
         default: []
   # Native RFC 8693 token-exchange and RFC 8628 device grant. Requires `signing`. Token exchange
   # exchanges an upstream IdP access token (+ project_id) for a short-lived project-scoped JWT;

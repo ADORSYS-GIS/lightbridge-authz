@@ -185,19 +185,33 @@ oauth2:
     #
     # `source: project_role` resolves to `owner` (the subject owns the project's account and
     # normally holds no roster row -- the same implicit authorization `authorize_project_lead`
-    # applies), or the subject's `project_members.role` (`lead` / `member`).
+    # applies), or the subject's `project_members.role` (`lead` / `member`) -- a roster POSITION,
+    # which `map` must translate into role names.
+    #
+    # `source: platform_roles` (ADR-0033) resolves to the subject's ACTIVE `platform_role_grants`
+    # rows, which are role names already, so an unmapped value contributes itself.
+    #
+    # Both name the SAME claim: several mappers on one claim MERGE (union, deduplicated), never
+    # overwrite. `owner` maps to `lightbridge-viewer`, NOT admin -- under ADR-0026 every signed-in
+    # person owns an account, so the old `owner -> lightbridge-admin` mapping minted admin for
+    # EVERYONE. Locally, bootstrap yourself with:
+    #   docker compose -p lightbridge-authz exec authz-api \
+    #     lightbridge-authz rbac grant --user <you@example.com> --role lightbridge-admin
     #
     # A source value absent from `map` falls through to `default`, which is EMPTY here: no roles,
     # therefore no permissions. That is the default-deny direction. A lookup FAILURE is different --
     # it refuses the mint outright rather than stamping an empty claim, so a database blip can never
-    # masquerade as a legitimately unprivileged user.
+    # masquerade as a legitimately unprivileged user. An EMPTY grant set is not a failure.
     claim_mappers:
       - claim: lightbridge_api_roles
         source: project_role
         map:
-          owner: ["lightbridge-admin"]
+          owner: ["lightbridge-viewer"]
           lead: ["lightbridge-editor"]
           member: ["lightbridge-viewer"]
+        default: []
+      - claim: lightbridge_api_roles
+        source: platform_roles
         default: []
   # Native RFC 8693 token-exchange and RFC 8628 device grant. Requires signing; token exchange
   # resolves an upstream IdP access token + project_id, and device approval uses the Keycloak

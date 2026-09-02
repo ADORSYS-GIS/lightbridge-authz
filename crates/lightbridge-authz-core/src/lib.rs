@@ -8,6 +8,7 @@ pub mod error;
 pub mod identity;
 pub mod migrate;
 pub mod permission_set;
+pub mod platform_role;
 #[cfg(feature = "axum")]
 pub mod server;
 pub mod tracing;

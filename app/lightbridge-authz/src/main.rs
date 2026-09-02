@@ -9,6 +9,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+mod rbac_dispatch;
+
 use crate::utils::banner::BANNER;
 use crate::utils::cli::{Cli, Commands};
 use lightbridge_authz_core::config::load_from_path;
@@ -33,6 +35,7 @@ async fn main() -> Result<()> {
         Some(Commands::Idp { config_path, .. }) => Some(config_path),
         Some(Commands::Budget { config_path }) => Some(config_path),
         Some(Commands::Migrate { config_path }) => Some(config_path),
+        Some(Commands::Rbac { config_path, .. }) => Some(config_path),
         Some(Commands::Config { config_path }) => Some(config_path),
         None => None,
     };
@@ -168,6 +171,10 @@ async fn main() -> Result<()> {
             .await?;
             Ok(())
         }
+        Some(Commands::Rbac {
+            config_path,
+            command,
+        }) => rbac_dispatch::run(config_path, command).await,
         Some(Commands::Migrate { config_path }) => {
             let config = load_from_path(&config_path)?;
             migrate::migrate(&config.database.url).await?;

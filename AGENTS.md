@@ -406,6 +406,14 @@ Tables (see `migrations/`):
   backfilled/trigger-provisioned account's own id verbatim (an id-reuse, not a new mint — ADR-0039
   bans minting, not storing) — the fresh-`cuid2()`-for-a-brand-new-person case no longer arises,
   since a federated identity can no longer exist without an adopted account.
+- `platform_role_grants` (ADR-0033; deliberately absent from `authz.cstack` — see "Persistence"
+  below): `(id, user_id -> users.id, role, granted_by NULL = CLI bootstrap, granted_at,
+  revoked_at NULL = active, reason)`, with a PARTIAL unique index over active `(user_id, role)`.
+  Keyed on the PERSON, not an account — a platform role follows the human across every account
+  they own (ADR-0026). `ClaimSource::PlatformRoles` reads the active rows at token mint and unions
+  them into the roles claim alongside `ClaimSource::ProjectRole`; `lightbridge-authz rbac grant` is
+  the bootstrap writer (there is no admin to grant the first admin). Before this, prod mapped
+  `owner -> lightbridge-admin`, which under ADR-0026 minted admin for every signed-in person.
 - `federated_identities` (ADR-0024, corrected 2026-08-25; deliberately absent from `authz.cstack`
   — see "Persistence" below): keyed by `(issuer, subject)`, the login federation key. Carries the
   sealed Keycloak token set (`token_envelope`, AES-256-GCM, `lightbridge_authz_core::crypto`) —
@@ -1048,6 +1056,14 @@ hand-written SQL and direct `sqlx` dependencies.
     for every other caller too. Gated instead by the dedicated `user:read` permission at the RPC
     layer; see `docs/admin-identity-resolution.md`. Reads only -- every write to these tables still
     goes through the generated client or the pre-existing exceptions.
+  - `platform_role_grants` (ADR-0033): who holds a platform role, read at token mint by
+    `ClaimSource::PlatformRoles`. Two independent reasons: the hot read runs on the mint path
+    inside `authz-idp`, which builds no cratestack client at all; and the grant's idempotency is an
+    `ON CONFLICT ... WHERE revoked_at IS NULL DO NOTHING` against a PARTIAL unique index, with
+    revocation an `UPDATE ... WHERE revoked_at IS NULL RETURNING` -- the same
+    single-statement-conditional-write class as `authorization_codes`/`secret_claims`
+    (`migrations/20260902000006_platform_role_grants.sql`;
+    `crates/lightbridge-authz-api-key/src/platform_roles.rs` and `platform_role_lookup.rs`).
   - `secret_claims`: single-use, subject-bound claims for handing an API key secret to a human
     without routing it through a model's context (GHSA-9pc6-965v-2c44, #538); redemption needs a
     single-statement CAS so concurrent requests can never both obtain the same secret, which
@@ -1102,7 +1118,10 @@ hand-written SQL and direct `sqlx` dependencies.
 - Manual end-to-end protocol (OAuth2 + OPA): `docs/test-protocol.md`
 - Authorino endpoint usage + integration test: `docs/authorino-usage.md`
 - Usage ingest/query API: `docs/usage-api.md`
-- RBAC (JWT claim → permission mapping): `docs/rbac.md`
+- RBAC (JWT claim → permission mapping; how the roles claim is assembled at mint from
+  `project_members` + `platform_role_grants`, the mapper MERGE semantics, the `lightbridge-viewer`
+  default for account owners, TTL-bounded propagation, and the `rbac` CLI bootstrap runbook):
+  `docs/rbac.md`
 - API key approaching-expiry visibility (`listMyExpiringApiKeys`, window/threshold rationale, why
   there is no cross-tenant admin surface): `docs/api-key-expiry-visibility.md`
 - Admin identity resolution (`resolveUserProfiles`/`resolveActorLabels`/`searchUsers`, the

@@ -144,6 +144,9 @@ async fn procedures_and_ctx(pool: PgPool, subject: &str) -> (Procedures, Cratest
         review_service,
         budget_repo,
         reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
     );
     // Issue #383 follow-up: a bare `authenticated([("id", ...)])` context satisfied the schema's
     // old `@allow(auth() != null)` but silently fails the `auth().rpcScope`/`auth().perm*` clauses
