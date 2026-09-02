@@ -23,13 +23,19 @@
 //!   together, with hand-rolled `handle_token_exchange`/`handle_refresh_token` overrides (the
 //!   upstream defaults are `pub(crate)` to `authkestra-op` and never stamp `extra` claims -- see
 //!   that module's doc comment for exactly how much RFC 8693 logic had to be reimplemented here).
+//! - [`refresh_ttl`]: per-client refresh-token TTL override resolution + the startup validation
+//!   that refuses a client's per-token TTL exceeding its absolute chain cap.
+//! - [`refresh_refusal`]: server-side-only structured logging for why `handle_refresh_token`
+//!   refused a presented refresh token -- the wire response never varies by reason.
 
 pub mod client_assertion_store;
 pub mod client_store;
 pub mod device_store;
+pub mod refresh_refusal;
 pub mod refresh_signing;
 pub mod refresh_store;
 pub mod refresh_token;
+pub mod refresh_ttl;
 pub mod store;
 
 use authkestra_op::handlers::token::TokenErrorResponse;

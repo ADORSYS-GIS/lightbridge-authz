@@ -75,6 +75,9 @@ use super::authorization_code_store::DbAuthorizationCodeStore;
 use super::client_assertion_store::RedisClientAssertionStore;
 use super::client_store::ConfigClientStore;
 use super::device_store::{DbDeviceCodeStore, create_pending_device_authorization};
+use super::refresh_refusal::{
+    cas_miss_reason, invalid_grant_refusal, log_refresh_refusal, server_refusal,
+};
 use super::refresh_store::DbRefreshTokenStore;
 use super::refresh_token;
 use super::{
@@ -562,7 +565,7 @@ impl TokenExchangeOpStore {
             ));
         }
         let session_expires_at = if offline {
-            now + Duration::seconds(self.cfg.refresh_absolute_ttl_seconds.max(0))
+            now + Duration::seconds(self.clients.refresh_ttls(client_id).1.max(0))
         } else {
             now + Duration::seconds(self.cfg.access_ttl_seconds)
         };
@@ -681,15 +684,15 @@ impl TokenExchangeOpStore {
         // Row id minted up front, same reasoning as `handle_refresh_token`'s own `new_id`: it is
         // both the DB primary key AND the JWT `jti`, so the two always agree on identity.
         let row_id = cuid2();
-        let chain_expires_at =
-            now + Duration::seconds(self.cfg.refresh_absolute_ttl_seconds.max(0));
-        let expires_at = now + Duration::seconds(self.cfg.refresh_ttl_seconds);
+        let (refresh_ttl, refresh_absolute_ttl) = self.clients.refresh_ttls(input.client_id);
+        let chain_expires_at = now + Duration::seconds(refresh_absolute_ttl.max(0));
+        let expires_at = now + Duration::seconds(refresh_ttl);
         let plaintext = refresh_token::mint_refresh_jwt(
             &self.repo,
             input.account_id,
             input.session_id,
             &row_id,
-            self.cfg.refresh_ttl_seconds.max(0) as u64,
+            refresh_ttl.max(0) as u64,
         )
         .await
         .map_err(|_| oauth_err("server_error", "refresh token signing failed"))?;
@@ -1028,7 +1031,7 @@ impl TokenExchangeOpStore {
         // below) when this grant has one, so the two agree; for an access-token-only grant there
         // is no chain, so the session's own cap is just the access token's own TTL.
         let session_expires_at = if offline {
-            now + Duration::seconds(self.cfg.refresh_absolute_ttl_seconds.max(0))
+            now + Duration::seconds(self.clients.refresh_ttls(client_id).1.max(0))
         } else {
             now + Duration::seconds(expires_in_secs as i64)
         };
@@ -1582,6 +1585,7 @@ impl TokenExchangeOpStore {
         tokens: &TokenManager,
     ) -> Result<TokenResponse, TokenErrorResponse> {
         if !client.allows_grant_type(&GrantType::RefreshToken) {
+            log_refresh_refusal("grant_type_not_allowed", &client_id, None, None);
             return Err(oauth_err(
                 "unauthorized_client",
                 "Client is not authorized to use refresh_token grant type",
@@ -1602,21 +1606,18 @@ impl TokenExchangeOpStore {
                 "refresh_token is invalid, expired, or already used",
             )
         };
+        let refuse = |reason| invalid_grant_refusal(reason, &client_id, None, None);
+        let unavailable = |reason, description| server_refusal(reason, &client_id, description);
 
         // JWT verification (signature/exp/aud/typ) gates the DB entirely: a malformed or
         // foreign-signed presentation is refused here and never reaches the hash/CAS step below.
         // See `refresh_token`'s doc comment for why this needs `list_verification_jwks` (active +
         // retired keys) rather than the request's own single-active-key `TokenManager`.
         match refresh_token::verify_refresh_jwt(&self.repo, presented).await {
-            Ok(Some(_)) => {}
-            Ok(None) => return Err(invalid_grant()),
-            Err(_) => {
-                return Err(oauth_err(
-                    "server_error",
-                    "refresh verification unavailable",
-                ));
-            }
-        }
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(refuse("jwt_verification_failed")),
+            Err(_) => Err(unavailable("jwks_read", "refresh verification unavailable")),
+        }?;
 
         let presented_hash = hash_api_key(presented);
 
@@ -1629,6 +1630,8 @@ impl TokenExchangeOpStore {
         let new_id = cuid2();
 
         let mut is_graced_replay = false;
+        // `#[rustfmt::skip]`: the `rotate_failed` arm is 61 chars, 1 over rustfmt's fn_call_width.
+        #[rustfmt::skip]
         let old_row = match self
             .repo
             .consume_exchange_refresh_token(&presented_hash, now, Some(&new_id))
@@ -1636,35 +1639,32 @@ impl TokenExchangeOpStore {
         {
             Ok(Some(row)) => row,
             Ok(None) => match self
-                .classify_replayed_refresh_token(&presented_hash, now)
+                .classify_replayed_refresh_token(&client_id, &presented_hash, now)
                 .await
             {
                 Some(row) => {
                     is_graced_replay = true;
                     row
                 }
-                None => return Err(invalid_grant()),
+                None => return Err(invalid_grant()), // already logged deeper, no double log
             },
-            Err(_) => {
-                return Err(oauth_err("server_error", "refresh token rotation failed"));
-            }
+            Err(_) => return Err(unavailable("rotate_failed", "refresh token rotation failed")),
+        };
+        let refuse_with_row = |reason| {
+            invalid_grant_refusal(
+                reason,
+                &client_id,
+                Some(old_row.subject.as_str()),
+                Some(old_row.chain_id.as_str()),
+            )
         };
 
         if old_row.client_id != client_id {
-            tracing::warn!(
-                client_id = %client_id,
-                "refresh token was issued to a different client; burned, not honored"
-            );
-            return Err(invalid_grant());
+            return Err(refuse_with_row("wrong_client"));
         }
 
         if now >= old_row.chain_expires_at {
-            tracing::warn!(
-                subject = %old_row.subject,
-                chain_id = %old_row.chain_id,
-                "refresh token chain past its absolute cap; refusing to rotate"
-            );
-            return Err(invalid_grant());
+            return Err(refuse_with_row("absolute_cap_exceeded"));
         }
 
         // Re-validation (gap 1 above): the same ownership/membership check the exchange grant
@@ -1682,10 +1682,8 @@ impl TokenExchangeOpStore {
             .await
         {
             Ok(context) => context,
-            Err(Error::NotFound) => return Err(invalid_grant()),
-            Err(_) => {
-                return Err(oauth_err("server_error", "context resolution failed"));
-            }
+            Err(Error::NotFound) => return Err(refuse_with_row("context_not_found")),
+            Err(_) => return Err(unavailable("ctx_failed", "context resolution failed")),
         };
         let project = match self
             .repo
@@ -1693,10 +1691,8 @@ impl TokenExchangeOpStore {
             .await
         {
             Ok(project) => project,
-            Err(Error::Forbidden(_)) => return Err(invalid_grant()),
-            Err(_) => {
-                return Err(oauth_err("server_error", "context resolution failed"));
-            }
+            Err(Error::Forbidden(_)) => return Err(refuse_with_row("account_suspended")),
+            Err(_) => return Err(unavailable("status_failed", "suspension check failed")),
         };
 
         let owner = KeyOwner {
@@ -1784,12 +1780,13 @@ impl TokenExchangeOpStore {
             None
         };
 
+        let (refresh_ttl, _) = self.clients.refresh_ttls(&client_id);
         let new_plaintext = refresh_token::mint_refresh_jwt(
             &self.repo,
             &context.account_id,
             &session_id,
             &new_id,
-            self.cfg.refresh_ttl_seconds.max(0) as u64,
+            refresh_ttl.max(0) as u64,
         )
         .await
         .map_err(|_| oauth_err("server_error", "refresh token signing failed"))?;
@@ -1818,7 +1815,7 @@ impl TokenExchangeOpStore {
             // rotation" shape as chain_id immediately above.
             session_id: session_id.clone(),
             created_at: now,
-            expires_at: now + Duration::seconds(self.cfg.refresh_ttl_seconds),
+            expires_at: now + Duration::seconds(refresh_ttl),
         };
         if self
             .repo
@@ -1890,17 +1887,28 @@ impl TokenExchangeOpStore {
     /// this repo's existing rule against logging secret-shaped material.
     async fn classify_replayed_refresh_token(
         &self,
+        client_id: &str,
         presented_hash: &str,
         now: DateTime<Utc>,
     ) -> Option<ExchangeRefreshTokenRow> {
-        let Ok(Some(row)) = self
+        let row = match self
             .repo
             .find_exchange_refresh_token_by_hash(presented_hash)
             .await
-        else {
-            return None;
+        {
+            Ok(Some(row)) => row,
+            _ => {
+                log_refresh_refusal("unknown_token", client_id, None, None);
+                return None;
+            }
         };
         if row.status != "rotated" {
+            log_refresh_refusal(
+                cas_miss_reason(&row.status),
+                client_id,
+                Some(&row.subject),
+                Some(&row.chain_id),
+            );
             return None;
         }
 
