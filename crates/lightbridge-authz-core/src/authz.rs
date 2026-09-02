@@ -123,14 +123,32 @@ pub enum Permission {
     #[serde(rename = "budget:schedule-manage")]
     BudgetScheduleManage,
 
-    /// Revoke all of the caller's own refresh-token sessions ("log out everywhere"). Kept
+    /// Enumerate ANY subject's sessions, estate-wide (`querySessions` with arbitrary filters).
+    /// A sensitive read -- user agents, client ids and last-used times for people the caller has
+    /// no relationship with -- so it is admin-only by default, held solely via
+    /// `lightbridge-admin`'s `*` grant (see [`default_role_permissions`]). It is what WIDENS the
+    /// `Session` model's `@@allow("read", ...)` clause from "my own rows" to "every row"; it is
+    /// not itself the floor to call the procedure (that is [`Permission::SessionReadOwn`]).
+    #[serde(rename = "session:read")]
+    SessionRead,
+    /// See your own sessions and nothing else. The floor capability behind `querySessions`:
+    /// granted to every default non-admin role, because "which devices am I logged in on" is
+    /// self-service, not administration. The row-level scoping is enforced by the `Session`
+    /// model's `@@allow("read", ...)` clause, which cratestack folds into the SQL `WHERE` --
+    /// so a caller holding only this permission cannot reach another subject's row with ANY
+    /// filter combination, rather than relying on a handler remembering to clamp one.
+    #[serde(rename = "session:read-own")]
+    SessionReadOwn,
+    /// Revoke all of the caller's own refresh-token sessions ("log out everywhere"), and one
+    /// specific session of the caller's own by id (`revokeSession`). Kept
     /// distinct from [`Permission::SessionRevoke`] -- same self/admin split as
     /// [`Permission::BudgetSelfRefill`] vs [`Permission::BudgetReview`] -- because acting on your
     /// own sessions is a materially different capability from acting on someone else's.
     #[serde(rename = "session:revoke-own")]
     SessionRevokeOwn,
-    /// Revoke every active refresh-token session for another subject: the offboarding kill switch
-    /// that otherwise requires a manual SQL `UPDATE` against prod.
+    /// Revoke every active refresh-token session for another subject (the offboarding kill
+    /// switch that otherwise requires a manual SQL `UPDATE` against prod), and any single
+    /// session by id regardless of whose it is.
     #[serde(rename = "session:revoke")]
     SessionRevoke,
 
@@ -175,7 +193,7 @@ pub enum Permission {
 impl Permission {
     /// Every permission, in declaration order. The single source of truth for wildcard expansion
     /// and documentation.
-    pub const ALL: [Permission; 35] = [
+    pub const ALL: [Permission; 37] = [
         Permission::AccountCreate,
         Permission::AccountRead,
         Permission::AccountUpdate,
@@ -206,6 +224,8 @@ impl Permission {
         Permission::BudgetPolicySimulate,
         Permission::BudgetPolicyActivate,
         Permission::BudgetScheduleManage,
+        Permission::SessionRead,
+        Permission::SessionReadOwn,
         Permission::SessionRevokeOwn,
         Permission::SessionRevoke,
         Permission::UsageReadAll,
@@ -246,6 +266,8 @@ impl Permission {
             Permission::BudgetPolicySimulate => "budget:policy-simulate",
             Permission::BudgetPolicyActivate => "budget:policy-activate",
             Permission::BudgetScheduleManage => "budget:schedule-manage",
+            Permission::SessionRead => "session:read",
+            Permission::SessionReadOwn => "session:read-own",
             Permission::SessionRevokeOwn => "session:revoke-own",
             Permission::SessionRevoke => "session:revoke",
             Permission::UsageReadAll => "usage:read-all",
@@ -399,35 +421,9 @@ fn default_roles_claim() -> String {
     "roles".to_string()
 }
 
-/// Built-in role → grant mapping used when `oauth2.rbac.role_permissions` is not configured. Keep
-/// this in sync with `docs/rbac.md`.
-pub fn default_role_permissions() -> HashMap<String, Vec<String>> {
-    HashMap::from([
-        ("lightbridge-admin".to_string(), vec!["*".to_string()]),
-        (
-            "lightbridge-editor".to_string(),
-            vec![
-                "account:create".to_string(),
-                "account:read".to_string(),
-                "project:*".to_string(),
-                "apikey:*".to_string(),
-                "session:revoke-own".to_string(),
-                "budget:read-own".to_string(),
-            ],
-        ),
-        (
-            "lightbridge-viewer".to_string(),
-            vec![
-                "account:create".to_string(),
-                "account:read".to_string(),
-                "project:read".to_string(),
-                "apikey:read".to_string(),
-                "session:revoke-own".to_string(),
-                "budget:read-own".to_string(),
-            ],
-        ),
-    ])
-}
+/// Re-exported from [`crate::role_defaults`], which holds the mapping itself. Split out only to
+/// keep this file inside its LoC-gate baseline; see that module's own doc comment.
+pub use crate::role_defaults::default_role_permissions;
 
 /// Resolve the permission set for a caller given the raw role strings extracted from their JWT and
 /// a precompiled [`CompiledRbac`]. Applied per role: a role string matching a configured entry
@@ -534,9 +530,11 @@ mod tests {
     }
 
     #[test]
-    fn session_wildcard_expands_to_both_actions() {
+    fn session_wildcard_expands_to_all_four_actions() {
         let session = expand_grant("session:*");
-        assert_eq!(session.len(), 2);
+        assert_eq!(session.len(), 4);
+        assert!(session.contains(&Permission::SessionRead));
+        assert!(session.contains(&Permission::SessionReadOwn));
         assert!(session.contains(&Permission::SessionRevokeOwn));
         assert!(session.contains(&Permission::SessionRevoke));
     }

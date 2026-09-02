@@ -79,3 +79,36 @@ pub struct BrowserSessionContextRow {
     /// `account_id` -- that fallback is exactly the identity-substitution bug this column fixes.
     pub subject: Option<String>,
 }
+
+/// The two facts a listed session needs that its own row cannot answer, keyed by session id
+/// (`StoreRepo::session_listing_facts`, #649).
+///
+/// Read in ONE batch query over the ids a page already returned, rather than per row: the page is
+/// capped at 100, and an N+1 here would be 100 round trips to render one table.
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+pub struct SessionFactsRow {
+    pub session_id: String,
+    /// `accounts.user_id` for the account named by `sessions.subject` -- the PERSON, not the
+    /// account (ADR-0026: one identity may own many accounts). `None` when `subject` is `None`, or
+    /// when it names no `accounts` row; both are "unknown", and the caller renders its own
+    /// sentinel rather than being handed a fabricated one (#647's contract, kept here).
+    pub subject_user_id: Option<String>,
+    /// Whether this session's refresh chain carries the `offline_access` scope -- the
+    /// owner-confirmed definition of an "offline" (CLI/device) session, as opposed to a browser
+    /// one. Never `NULL`: a session with no chain at all is `false`.
+    pub offline: bool,
+}
+
+/// The narrow slice `revokeSession` needs BEFORE it decides whether the caller may act
+/// (`StoreRepo::find_session_owner`, #649): who the session belongs to, and whether it is already
+/// revoked. Deliberately not the whole [`SessionRow`] -- the ownership decision reads two columns,
+/// and a caller who turns out not to own the session must never have had the rest in hand.
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+pub struct SessionOwnerRow {
+    /// See [`SessionRow::subject`]. `None` for a session minted before the subject column existed;
+    /// such a row is owned by nobody, so only a `session:revoke` holder can act on it.
+    pub subject: Option<String>,
+    /// The STORED status (`"active"` / `"revoked"`), not the computed one -- expiry is irrelevant
+    /// to whether a revoke is allowed, only to whether it changes anything.
+    pub status: String,
+}

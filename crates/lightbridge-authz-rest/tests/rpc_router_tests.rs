@@ -525,6 +525,35 @@ async fn rbac_gate_denies_platform_role_management_without_rbac_manage() {
     }
 }
 
+/// #649's gate half: each new session op-id requires ITS OWN permission and no other, proved
+/// "admin minus one" so a broader grant standing in for it would show up as a pass here. Both are
+/// mapped to the SELF-SERVICE permission on purpose — that is the floor to call them at all; the
+/// widening to someone else's sessions is a per-row decision (the `Session` model's read policy
+/// for `querySessions`, an explicit check in `session_directory::revoke_session` for the revoke),
+/// which needs a database and lives in `rpc_it_tests.rs`.
+#[tokio::test]
+async fn rbac_gate_denies_session_ops_without_their_own_permission() {
+    for (op, required) in [
+        ("procedure.querySessions", Permission::SessionReadOwn),
+        ("procedure.revokeSession", Permission::SessionRevokeOwn),
+    ] {
+        let almost_admin: PermissionSet = Permission::ALL
+            .into_iter()
+            .filter(|p| *p != required)
+            .collect();
+        let bearer: Arc<dyn BearerTokenServiceTrait> =
+            Arc::new(MapBearer::new().with("almost", token_info("almost-subject", almost_admin)));
+        let router = build_router(bearer, false);
+        let (status, _) = rpc_call(router, op, Wire::Cbor, &json!({}), Some("almost")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "`{op}` must require {}, and no other permission may stand in for it",
+            required.as_str()
+        );
+    }
+}
+
 /// The other side of the same coin: `getMyAccess` is the ONE op-id served to any authenticated
 /// caller, so it must NOT be refused for a caller holding zero permissions at all -- otherwise the
 /// console cannot ask what it may render. It reaches dispatch (which then fails on the lazy pool
@@ -582,6 +611,17 @@ async fn rbac_gate_denies_unmapped_and_locked_ops_even_for_admin() {
         "model.ApiKey.create",
         "model.ProjectMember.list",
         "model.ProjectMember.create",
+        // #649 gave `Session` its first `@@allow("read", ...)` clause. That clause exists for the
+        // hand-written `querySessions` procedure's `db.session()` read to be scoped by; it must
+        // NOT have made the generic model verbs reachable. `model.Session.*` stays absent from
+        // `MAPPED_OP_ID_PERMISSIONS`, so every one of them is still denied unconditionally —
+        // including `update`, which would otherwise be a way to flip a revoked session back to
+        // `active`, and `list`, which would bypass the computed-status/`offline` contract.
+        "model.Session.list",
+        "model.Session.get",
+        "model.Session.create",
+        "model.Session.update",
+        "model.Session.delete",
         "model.Account.frobnicate",
         "procedure.unknown",
         "",

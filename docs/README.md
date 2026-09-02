@@ -65,6 +65,7 @@ All but the usage service share one Postgres database (`authz`); usage has its o
 | Manual end-to-end protocol (OAuth2 + OPA) | [`test-protocol.md`](./test-protocol.md) |
 | API key approaching-expiry visibility | [`api-key-expiry-visibility.md`](./api-key-expiry-visibility.md) |
 | Admin identity resolution (`user:read`) | [`admin-identity-resolution.md`](./admin-identity-resolution.md) |
+| Sessions API (`querySessions`, `revokeSession`) | [`sessions-api.md`](./sessions-api.md) |
 | Auth reference (identity vs. location, OIDC details) | [`auth-reference.md`](./auth-reference.md) |
 | OAuth/OIDC standards roadmap | [`oauth-oidc-standards-roadmap.md`](./oauth-oidc-standards-roadmap.md) |
 | OIDC token-exchange integration | [`token-exchange-integration.md`](./token-exchange-integration.md) |

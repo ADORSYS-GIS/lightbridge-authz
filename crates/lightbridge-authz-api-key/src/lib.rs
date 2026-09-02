@@ -4,6 +4,7 @@ pub mod identity_resolution;
 pub mod platform_role_lookup;
 pub mod platform_roles;
 pub mod repo;
+pub mod session_listing;
 pub mod session_revocation;
 pub mod signing_keys_admin;
 pub mod signing_keys_refresh;
