@@ -1115,6 +1115,13 @@ hand-written SQL and direct `sqlx` dependencies.
   a pinned external artifact (`docs/adr/0029-the-authz-idp-login-ui-is-a-pinned-external-artifact.md`);
   `client_credentials` as a first-class `authz-idp` grant
   (`docs/adr/0030-client-credentials-is-a-first-class-authz-idp-grant.md`).
+- **Migrations run in init containers, and are backward-compatible for one release**
+  (`docs/adr/0031-migrations-run-in-init-containers.md`) — SUPERSEDES ADR-0016's sync-wave Job,
+  after three prod incidents in ten days across two failure classes (the Job's immutable pod
+  template under a config-only change, twice; and a subchart with no sync-wave rendering at wave 0,
+  ahead of the migration it depended on). ADR-0016's *reasoning* about Helm hooks stands and is not
+  reversed; only the mechanism changes. Read the expand/contract half too: it is what makes the
+  ordering stop being load-bearing at all.
 - Multi-source usage epic plan of work (decision register D1-D23):
   `docs/plans/0581-multi-source-usage-plan-of-work.md`.
 - The F1-F6 genai usage-ingestion audit the usage-store ADRs keep citing:

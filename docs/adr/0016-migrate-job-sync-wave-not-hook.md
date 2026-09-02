@@ -1,6 +1,6 @@
 # ADR-0016: The migrate Job is an ArgoCD sync-wave, not a Helm hook
 
-- Status: Accepted
+- Status: **Superseded by [ADR-0031](0031-migrations-run-in-init-containers.md)** (2026-09-02)
 - Date: 2026-08-19
 - Decision owners: @stephane-segning
 
