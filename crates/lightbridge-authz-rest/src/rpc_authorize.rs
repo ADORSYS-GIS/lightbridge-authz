@@ -256,6 +256,26 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         "procedure.approveAugmentationRequest" => BudgetReview,
         "procedure.rejectAugmentationRequest" => BudgetReview,
 
+        // Session enumeration (#649 -- named `querySessions`, not `listSessions`: that name
+        // collides with the generated `model.Session.list` handler, see authz.cstack).
+        // Mapped to the NARROWER `session:read-own`, deliberately:
+        // this coarse gate decides who may CALL the procedure, and "list my own sessions" is
+        // self-service (both default non-admin roles hold it). Which ROWS come back is decided one
+        // layer down, by the `Session` model's `@@allow("read", ...)` clause -- `permSessionRead`
+        // (admin-only) widens it from "subject == auth().id" to every row, and cratestack folds
+        // that predicate into the SQL `WHERE` unconditionally. So an own-scope caller passing
+        // `subject: <someone else>` gets an empty page from the database itself, not from a
+        // handler that remembered to clamp the filter. See docs/sessions-api.md.
+        "procedure.querySessions" => SessionReadOwn,
+        // Per-session revoke (#649), same floor-plus-widening shape: `session:revoke-own` is what
+        // lets a caller revoke a session at all, and the handler additionally requires
+        // `session:revoke` when the target session's `subject` is not the caller's own. Unlike
+        // the read above this second check CANNOT live in the schema -- `Session` has no
+        // `@@allow("update", ...)` (and must not gain one: that would light up the generic
+        // `model.Session.update` verb), and a procedure `@allow` clause can only see `auth()`,
+        // never the row a caller-supplied id names. See `session_directory::revoke_session`.
+        "procedure.revokeSession" => SessionRevokeOwn,
+
         // Refresh-token session revocation (the offboarding kill switch). Same self/admin split
         // as the budget refill pair above -- see docs/rbac.md.
         "procedure.revokeOwnSessions" => SessionRevokeOwn,

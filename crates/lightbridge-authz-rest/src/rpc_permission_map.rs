@@ -128,6 +128,8 @@ pub const MAPPED_OP_ID_PERMISSIONS: &[(&str, Permission)] = &[
         "procedure.rejectAugmentationRequest",
         Permission::BudgetReview,
     ),
+    ("procedure.querySessions", Permission::SessionReadOwn),
+    ("procedure.revokeSession", Permission::SessionRevokeOwn),
     ("procedure.revokeOwnSessions", Permission::SessionRevokeOwn),
     ("procedure.revokeSubjectSessions", Permission::SessionRevoke),
     ("procedure.getMyBudgetBalance", Permission::BudgetReadOwn),

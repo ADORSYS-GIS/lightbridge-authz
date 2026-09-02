@@ -1064,6 +1064,18 @@ hand-written SQL and direct `sqlx` dependencies.
     single-statement-conditional-write class as `authorization_codes`/`secret_claims`
     (`migrations/20260902000006_platform_role_grants.sql`;
     `crates/lightbridge-authz-api-key/src/platform_roles.rs` and `platform_role_lookup.rs`).
+  - `sessions`/`exchange_refresh_tokens`, for the sessions read+revoke surface (#649): the
+    per-page enrichment query in `crates/lightbridge-authz-api-key/src/session_listing.rs`
+    (`session_listing_facts` -- the `subject -> accounts.user_id` hop and the `offline_access`
+    scope `EXISTS` over the refresh chain) and the per-session revoke in `session_revocation.rs`
+    (`find_session_owner`/`revoke_session_by_id`, alongside the pre-existing
+    `revoke_sessions_and_cascade`/`revoke_for_logout`). `Session` IS a cratestack model and the
+    listing's ROWS come from the generated client on purpose -- that is what makes its
+    `@@allow("read", ...)` own-scoping unbypassable. The exception is only the annotation and the
+    write: `exchange_refresh_tokens` is already an exception above and absent from the schema, the
+    `accounts` hop is the same ownership-scoped-policy problem as #647's entry, and the revoke is a
+    two-statement transaction the generic `update` verb must never be able to express (it would
+    also be able to flip a revoked session back to `active`). See `docs/sessions-api.md`.
   - `secret_claims`: single-use, subject-bound claims for handing an API key secret to a human
     without routing it through a model's context (GHSA-9pc6-965v-2c44, #538); redemption needs a
     single-statement CAS so concurrent requests can never both obtain the same secret, which

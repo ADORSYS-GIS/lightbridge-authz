@@ -1,0 +1,40 @@
+-- ADR-0020 Follow-up 4 (#649): indexes for the two access paths `listSessions` introduces.
+--
+-- Before this, `sessions` carried exactly one index besides its PK --
+-- `idx_sessions_account_id_status`, added by `20260823000002_sessions.sql` for the bulk-revoke
+-- cascade's `WHERE account_id = ... AND status = ...`. That index serves neither of the new
+-- queries: the listing orders by `created_at` and the own-scope read policy filters on `subject`,
+-- and `account_id` is the leading column of the only index there was.
+--
+-- 1. `idx_sessions_created_at_id` backs the ORDER BY and the cursor. `listSessions` pages with
+--    `ORDER BY created_at DESC, id DESC` and the tuple comparison
+--    `(created_at, id) < ($cursor_created_at, $cursor_id)`; a matching two-column index turns each
+--    page into an index range scan instead of a full sort of the table per page. The DESC
+--    direction is written out rather than left to Postgres's backwards scan so the composite
+--    ordering matches the query exactly (a plain ASC index can be scanned backwards, but only for
+--    an ordering that is the exact reverse of every column -- which this is, so the explicit form
+--    is belt-and-braces documentation of intent more than a hard requirement).
+--
+--    `id` is a TIEBREAK column here, never a sort key: ADR-0039 forbids ordering by a CUID2
+--    because it encodes no time. `created_at` remains the only meaningful ordering; `id` exists so
+--    that two sessions minted in the same microsecond still have a total order and therefore
+--    cannot be skipped or repeated across a page boundary.
+--
+-- 2. `idx_sessions_subject` backs the `subject = auth().id` half of the `Session` model's
+--    `@@allow("read", ...)` clause (`crates/lightbridge-authz-api/schema/authz.cstack`), which
+--    cratestack folds into the WHERE clause of every own-scope caller's listing, and the
+--    `revokeSession` ownership lookup. Deliberately a plain single-column index and NOT partial
+--    (`WHERE subject IS NOT NULL`): rows with a NULL subject are already absent from a btree's
+--    equality scan, so the partial form would save only the pre-#492 rows' entries while adding a
+--    predicate every planner lookup has to match against.
+--
+-- No new index for the `offline` derivation: that EXISTS subquery joins
+-- `exchange_refresh_tokens.session_id`, already covered by `idx_exchange_refresh_tokens_session_id`
+-- from `20260823000002_sessions.sql`. The `scope LIKE '% offline_access %'` test inside it runs
+-- over the handful of rotations belonging to one session, never as a scan.
+--
+-- Additive and index-only: no column, constraint or data changes, so this migration is safe to
+-- apply to a live database and needs no backfill.
+CREATE INDEX idx_sessions_created_at_id ON sessions (created_at DESC, id DESC);
+
+CREATE INDEX idx_sessions_subject ON sessions (subject);

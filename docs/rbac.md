@@ -215,8 +215,16 @@ Used when `oauth2.rbac.role_permissions` is not configured
 | Role                 | Grants                                | Effective permissions                              |
 | -------------------- | ------------------------------------- | -------------------------------------------------- |
 | `lightbridge-admin`  | `*`                                   | all permissions — including `rbac:manage`, i.e. the ability to grant `lightbridge-admin` to anyone, so this is the role to hand out deliberately and to nobody else by default (ADR-0033) |
-| `lightbridge-editor` | `account:create`, `account:read`, `project:*`, `apikey:*`, `session:revoke-own`, `budget:read-own` | self-provision own account; read accounts; full project + api-key lifecycle; log out own sessions; see own budget |
-| `lightbridge-viewer` | `account:create`, `account:read`, `project:read`, `apikey:read`, `session:revoke-own`, `budget:read-own` | self-provision own account; otherwise read-only, plus log out own sessions and see own budget |
+| `lightbridge-editor` | `account:create`, `account:read`, `project:*`, `apikey:*`, `session:read-own`, `session:revoke-own`, `budget:read-own` | self-provision own account; read accounts; full project + api-key lifecycle; list and log out own sessions; see own budget |
+| `lightbridge-viewer` | `account:create`, `account:read`, `project:read`, `apikey:read`, `session:read-own`, `session:revoke-own`, `budget:read-own` | self-provision own account; otherwise read-only, plus list and log out own sessions and see own budget |
+
+> **Divergence worth knowing about, found while adding `session:read-own` (#649):** the shipped
+> `config/default.yaml` and `.docker/authz/container.yaml` set `role_permissions` explicitly, which
+> REPLACES this default table entirely — and those files have never listed `session:revoke-own` for
+> either non-admin role (they do list `budget:self-refill` for the editor, which this table does
+> not). `session:read-own` was added to both files by #649, so listing your own sessions works out
+> of the box; revoking one still does not under the shipped config, and closing that gap is its own
+> change, not a silent widening inside a read story.
 
 ## Platform roles are a table (ADR-0033)
 
@@ -521,8 +529,10 @@ scope for #401.
 | `budget:revoke`          | `procedure.revokeBudgetGrant`                   | — (no MCP tool yet)                 |
 | `budget:policy-write`    | `procedure.createBudgetPolicyRevision`          | — (no MCP tool yet)                 |
 | `budget:schedule-manage` | `procedure.listBudgetResetSchedules`, `procedure.createBudgetResetSchedule`, `procedure.updateBudgetResetSchedule`, `procedure.deleteBudgetResetSchedule`, `procedure.runBudgetResetScheduleNow` | — (no MCP tool yet) |
-| `session:revoke-own`     | `procedure.revokeOwnSessions`                        | — (no MCP tool yet)                 |
-| `session:revoke`         | `procedure.revokeSubjectSessions`                    | — (no MCP tool yet)                 |
+| `session:read-own`       | `procedure.querySessions`                            | — (no MCP tool yet)                 |
+| `session:read`           | — (widens `procedure.querySessions`; see below)      | — (no MCP tool yet)                 |
+| `session:revoke-own`     | `procedure.revokeOwnSessions`, `procedure.revokeSession` | — (no MCP tool yet)             |
+| `session:revoke`         | `procedure.revokeSubjectSessions` (and widens `procedure.revokeSession`; see below) | — (no MCP tool yet) |
 | `usage:read-all`         | — (not an RPC op-id; see note below)                 | — (no MCP tool)                     |
 | `user:read`              | `procedure.resolveUserProfiles`, `procedure.resolveActorLabels`, `procedure.searchUsers` | — (no MCP tool yet) |
 | `rbac:manage`            | `procedure.listPlatformRoleGrants`, `procedure.grantPlatformRole`, `procedure.revokePlatformRole` | — (no MCP tool yet) |
@@ -636,7 +646,40 @@ revocation takes effect on the very next refresh attempt:
 `session:revoke-own` is granted to every default role (including `lightbridge-viewer`) in
 `default_role_permissions` — logging yourself out everywhere is self-protective, not a write
 capability inconsistent with a read-only role, unlike `budget:self-refill` (which spends budget and
-so is withheld from `lightbridge-viewer`).
+so is withheld from `lightbridge-viewer`). `session:read-own` (#649) is granted the same way and
+for the same reason: "which devices am I signed in on" is self-service.
+
+### Reading sessions, and the per-session revoke (#649, ADR-0020 Follow-up 4)
+
+Two op-ids, and both are gated at the SELF-SERVICE permission in `rpc_authorize.rs` — that is the
+floor to call them at all, not the ceiling on what they return. The widening to other people's
+sessions is a **per-row** decision, and the two procedures place it differently on purpose. Full
+contract, with diagrams: `docs/sessions-api.md`.
+
+- **`procedure.querySessions`** (gated `session:read-own`) returns a filtered, cursor-paged list.
+  Which rows it can see is decided by the `Session` model's `@@allow("read", (auth().permSessionRead
+  == true || subject == auth().id) && auth().rpcScope == "crud")` clause, which cratestack compiles
+  into the SQL `WHERE` itself rather than into a pre-check. So `session:read` — admin-only, via
+  `lightbridge-admin`'s `*`, in no other default role — turns "my rows" into "every row", and a
+  caller holding only `session:read-own` gets an EMPTY page for a `subject` naming somebody else,
+  from the database, with no filter combination that gets around it and no handler-side clamp that
+  could be forgotten. This is the one permission pair in this document where the scope narrowing is
+  enforced entirely in the schema.
+- **`procedure.revokeSession`** (gated `session:revoke-own`) closes one session by id and revokes
+  the refresh chain hanging off it. Its own-vs-other check is in the handler
+  (`session_directory::revoke_session`): a session whose `subject` is not the caller's own — which
+  includes a session with a NULL `subject`, since that row belongs to nobody — requires
+  `session:revoke`. That check cannot move into the schema: `Session` carries no
+  `@@allow("update", ...)` and must not gain one (it would light up the generic
+  `model.Session.update` verb, i.e. a way to flip a revoked session back to `active`), and a
+  procedure `@allow` clause can only see `auth()`, never the row a caller-supplied id names.
+  An unknown id is `404`; someone else's session without `session:revoke` is `403`. Keeping those
+  distinct is safe because a session id is an opaque CUID2 nobody can enumerate.
+
+Every generic `model.Session.*` verb stays denied unconditionally — `model.Session.list`/`get`/
+`create`/`update`/`delete` have no entry in `MAPPED_OP_ID_PERMISSIONS`, and an op-id that map does
+not list is refused before dispatch. The `@@allow("read", ...)` clause above exists solely so that
+`querySessions`' internal `db.session()` read is scoped by it.
 
 ### Budget policy lifecycle (ADR-0007)
 

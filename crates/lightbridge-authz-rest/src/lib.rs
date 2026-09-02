@@ -18,6 +18,7 @@ pub mod budget_convert;
 pub mod claim_redeem;
 pub mod codec;
 pub mod end_session;
+pub mod error_convert;
 pub mod handlers;
 pub mod html_page;
 pub mod identity_directory;
@@ -36,7 +37,9 @@ pub mod rpc_authorize;
 pub mod rpc_permission_map;
 pub mod secret_claim;
 pub mod session_cookie;
+pub mod session_directory;
 pub mod session_management;
+pub mod session_query;
 pub mod signing;
 pub mod static_assets;
 pub mod token_exchange;
@@ -320,43 +323,9 @@ impl OpaRepoTrait for StoreRepo {
     }
 }
 
-/// Maps a core repository `Error` (reused hand-written sqlx) into cratestack's `CratestackError` so an RPC
-/// procedure failure surfaces with the right HTTP status through the RPC error envelope.
-fn to_cratestack_error(err: Error) -> CratestackError {
-    match err {
-        Error::NotFound => CratestackError::NotFound("not found".to_owned()),
-        Error::Forbidden(m) => CratestackError::Forbidden(m),
-        Error::Conflict(m) => CratestackError::Conflict(m),
-        Error::BadRequest(m) => CratestackError::BadRequest(m),
-        other => CratestackError::Internal(other.to_string()),
-    }
-}
-
-/// Maps a [`lightbridge_authz_budget::BudgetError`] into cratestack's `CratestackError`, mirroring
-/// [`to_cratestack_error`] above for the (unrelated) core `Error` type. Exhaustive match, no wildcard
-/// arm, so a new `BudgetError` variant fails this crate's build until it is triaged here rather
-/// than silently falling into some default status.
-fn budget_error_to_cratestack_error(err: lightbridge_authz_budget::BudgetError) -> CratestackError {
-    use lightbridge_authz_budget::BudgetError;
-    match err {
-        BudgetError::InvalidRuleData(m) => CratestackError::BadRequest(m),
-        BudgetError::InvalidAmount(_)
-        | BudgetError::InvalidPeriod(_)
-        | BudgetError::UnknownSource(_)
-        | BudgetError::UnknownTier(_)
-        | BudgetError::UnknownStatus(_)
-        | BudgetError::InvalidReviewOutcome(_)
-        | BudgetError::MissingRejectionReason
-        | BudgetError::AmountNotOffered(_)
-        | BudgetError::InvalidSchedule(_) => CratestackError::BadRequest(err.to_string()),
-        BudgetError::AlreadyGranted | BudgetError::AlreadyReviewed(_) => {
-            CratestackError::Conflict(err.to_string())
-        }
-        BudgetError::PolicyDenied(_) => CratestackError::Forbidden(err.to_string()),
-        BudgetError::NotFound(m) => CratestackError::NotFound(m),
-        BudgetError::StorageFailed(m) => CratestackError::Internal(m),
-    }
-}
+/// Re-exported from [`crate::error_convert`], which holds both converters. Split out only to keep
+/// this file inside its LoC-gate baseline; see that module's own doc comment.
+pub(crate) use crate::error_convert::{budget_error_to_cratestack_error, to_cratestack_error};
 
 /// Maps a domain [`lightbridge_authz_budget::repo::BalanceSnapshot`] into the schema's wire
 /// `BudgetBalance` shape (see `authz.cstack`'s `type BudgetBalance` doc comment for the
@@ -2495,6 +2464,35 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     /// [`crate::identity_directory`] -- see that module's doc comment for the authorization story
     /// (the `@allow` clause is the whole of it: no ownership filter, by design) and for why an
     /// unknown id is absent from the result rather than a fabricated placeholder.
+    /// Sessions (#649). Both bodies live in [`crate::session_directory`] -- see that module's doc
+    /// comment for the asymmetric authorization story (the read is scoped by the `Session` model's
+    /// own `@@allow`; the revoke's own-vs-other check has to be in the handler).
+    fn query_sessions(
+        &self,
+        db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::query_sessions::Args,
+        _authorized: schema::procedures::query_sessions::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::query_sessions::Output, CratestackError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        async move { session_directory::query_sessions(db, &issuer.repo, ctx, args.args).await }
+    }
+
+    fn revoke_session(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::revoke_session::Args,
+        _authorized: schema::procedures::revoke_session::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::revoke_session::Output, CratestackError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        async move { session_directory::revoke_session(&issuer.repo, ctx, args.args).await }
+    }
+
     fn resolve_user_profiles(
         &self,
         _db: &schema::Cratestack,

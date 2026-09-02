@@ -293,6 +293,7 @@ oauth2:
         - "account:read"
         - "project:*"
         - "apikey:*"
+        - "session:read-own"
         - "budget:self-refill"
         - "budget:read-own"
       lightbridge-viewer:
@@ -300,6 +301,7 @@ oauth2:
         - "account:read"
         - "project:read"
         - "apikey:read"
+        - "session:read-own"
         - "budget:read-own"
 otel:
   enabled: true

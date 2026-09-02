@@ -31,6 +31,7 @@
 mod common;
 
 use lightbridge_authz_core::identity::AccountId;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Router;
@@ -45,7 +46,7 @@ use cratestack_core::CratestackCodec;
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
-use lightbridge_authz_core::authz::Permission;
+use lightbridge_authz_core::authz::{Permission, PermissionSet};
 use lightbridge_authz_core::config::{BasicAuth, Billing, BillingPlan};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
@@ -3640,6 +3641,852 @@ async fn revoke_subject_sessions_does_not_touch_a_different_subjects_sessions_of
         session_status(&ctx.verify, &bystander_browser).await,
         "active",
         "a bystander's browser-kind session must never be touched by another subject's revoke call"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sessions read + per-session revoke (`procedure.querySessions` / `procedure.revokeSession`,
+// ADR-0020 Follow-up 4, #649).
+//
+// The property under test in most of these is that own-scoping is enforced by the `Session`
+// model's `@@allow("read", ...)` clause -- compiled into the SQL `WHERE` by cratestack -- and not
+// by anything in the handler. That is why the read tests all drive the REAL assembled router with
+// a REAL permission set: a unit test of the procedure body could not observe the policy at all.
+// ---------------------------------------------------------------------------------------------
+
+/// Seeds one session with full control over the columns the listing filters and computes on.
+/// `expires_in_hours` may be negative to produce a stored-`active` row that is already past its
+/// expiry -- the only way an `"expired"` session exists, since that status is never written
+/// (ADR-0020 Decision 6).
+#[allow(clippy::too_many_arguments)]
+async fn seed_session_detailed(
+    pool: &sqlx::PgPool,
+    subject: &str,
+    account_id: &str,
+    kind: &str,
+    status: &str,
+    client_id: Option<&str>,
+    created_minutes_ago: i64,
+    expires_in_hours: i64,
+) -> String {
+    let id = cuid2();
+    sqlx::query(
+        r#"
+        INSERT INTO sessions
+          (id, account_id, project_id, client_id, kind, status, created_at, updated_at,
+           expires_at, subject, user_agent)
+        VALUES ($1, $2, $3, $4, $5, $6,
+                now() - make_interval(mins => $7::int), now(),
+                now() + make_interval(hours => $8::int), $9, 'test-agent/1.0')
+        "#,
+    )
+    .bind(&id)
+    .bind(account_id)
+    .bind(cuid2())
+    .bind(client_id)
+    .bind(kind)
+    .bind(status)
+    .bind(created_minutes_ago as i32)
+    .bind(expires_in_hours as i32)
+    .bind(subject)
+    .execute(pool)
+    .await
+    .expect("seed detailed session row");
+    id
+}
+
+/// [`seed_session_detailed`] with `subject` left NULL -- the shape of a session minted before
+/// `20260824000003_sessions_add_subject.sql` (browser) or before #492's companion fix (token).
+/// Such a row belongs to nobody, which is exactly what both the own-scope read policy and the
+/// per-session revoke's ownership check have to fail closed on.
+async fn seed_session_detailed_null_subject(
+    pool: &sqlx::PgPool,
+    account_id: &str,
+    kind: &str,
+    status: &str,
+    created_minutes_ago: i64,
+    expires_in_hours: i64,
+) -> String {
+    let id = seed_session_detailed(
+        pool,
+        account_id,
+        account_id,
+        kind,
+        status,
+        (kind == "token").then_some("cli"),
+        created_minutes_ago,
+        expires_in_hours,
+    )
+    .await;
+    sqlx::query("UPDATE sessions SET subject = NULL WHERE id = $1")
+        .bind(&id)
+        .execute(pool)
+        .await
+        .expect("clear the seeded session's subject");
+    id
+}
+
+/// Inserts an `accounts` row with a caller-chosen id, so a test can make a session's `subject`
+/// resolve to a real owning user. The `accounts_set_user` trigger (20260830000003) provisions
+/// `user_id` (and the `users` row) from the account id for a first-time account, so the owning
+/// user id IS `account_id` here -- the same anchor #647's identity-resolution tests use.
+async fn seed_account_row(pool: &sqlx::PgPool, account_id: &str) {
+    sqlx::query(
+        r#"
+        INSERT INTO accounts (id, default_quota, name, created_at, updated_at)
+        VALUES ($1, NULL, $2, now(), now())
+        ON CONFLICT (id) DO NOTHING
+        "#,
+    )
+    .bind(account_id)
+    .bind(format!("{account_id} account"))
+    .execute(pool)
+    .await
+    .expect("seed account row");
+}
+
+/// Chains one `exchange_refresh_tokens` row under `session_id` with an explicit `scope` string --
+/// the column `offline` is derived from. `None` seeds a chain with a NULL scope, which must read
+/// as NOT offline rather than as unknown-so-assume-yes.
+async fn seed_chain_with_scope(
+    pool: &sqlx::PgPool,
+    session_id: &str,
+    subject: &str,
+    scope: Option<&str>,
+) {
+    let refresh_id = cuid2();
+    sqlx::query(
+        r#"
+        INSERT INTO exchange_refresh_tokens
+          (id, subject, account_id, project_id, client_id, token_hash, scope, status, chain_id,
+           chain_expires_at, session_id, created_at, expires_at)
+        VALUES ($1, $2, $2, $3, 'test-client', $4, $5, 'active', $1,
+                now() + interval '90 days', $6, now(), now() + interval '30 days')
+        "#,
+    )
+    .bind(&refresh_id)
+    .bind(subject)
+    .bind(cuid2())
+    .bind(cuid2())
+    .bind(scope)
+    .bind(session_id)
+    .execute(pool)
+    .await
+    .expect("seed refresh chain with an explicit scope");
+}
+
+/// The rows of one `querySessions` page, as JSON.
+async fn query_sessions(router: Router, token: &str, args: Value) -> (StatusCode, Value) {
+    let (status, body) = rpc_call(
+        router,
+        "procedure.querySessions",
+        Wire::Cbor,
+        &json!({ "args": args }),
+        Some(token),
+    )
+    .await;
+    let parsed = if status == StatusCode::OK {
+        as_json(Wire::Cbor, &body)
+    } else {
+        json!({ "raw": String::from_utf8_lossy(&body) })
+    };
+    (status, parsed)
+}
+
+fn row_ids(page: &Value) -> Vec<String> {
+    page["rows"]
+        .as_array()
+        .expect("rows array")
+        .iter()
+        .map(|row| row["id"].as_str().expect("row id").to_owned())
+        .collect()
+}
+
+/// An admin (holding `session:read`) sees rows belonging to a subject they have no relationship
+/// with -- the whole point of the estate-wide permission -- and `status: "all"` really does drop
+/// the status predicate rather than defaulting back to active.
+#[tokio::test]
+async fn query_sessions_as_admin_returns_other_subjects_rows() {
+    let admin_subject = format!("qs-admin-{}", cuid2());
+    let stranger = format!("qs-stranger-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
+    let ctx = setup(bearer).await;
+
+    let active = seed_session_detailed(
+        &ctx.verify,
+        &stranger,
+        &stranger,
+        "token",
+        "active",
+        Some("cli"),
+        10,
+        24,
+    )
+    .await;
+    let revoked = seed_session_detailed(
+        &ctx.verify,
+        &stranger,
+        &stranger,
+        "token",
+        "revoked",
+        Some("cli"),
+        20,
+        24,
+    )
+    .await;
+
+    let (status, page) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "all", "subject": stranger }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "page: {page}");
+    let ids = row_ids(&page);
+    assert!(
+        ids.contains(&active) && ids.contains(&revoked),
+        "an admin filtering by another subject must see both rows: {page}"
+    );
+    assert_eq!(
+        page["next"],
+        Value::Null,
+        "two rows is far short of the default limit, so this is the final page: {page}"
+    );
+}
+
+/// #649's headline negative: a caller holding ONLY `session:read-own` cannot reach another
+/// subject's rows with ANY filter -- proven by asking for exactly them by `subject`, the one
+/// filter that would otherwise do it. The empty page comes from the schema policy folded into the
+/// `WHERE`, not from a handler clamp, which is why the same call as an admin (above) succeeds.
+#[tokio::test]
+async fn query_sessions_own_scope_cannot_reach_another_subject_with_any_filter() {
+    let caller = format!("qs-own-{}", cuid2());
+    let stranger = format!("qs-other-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with(
+        "own",
+        token_info(
+            &caller,
+            PermissionSet::from_iter([Permission::SessionReadOwn]),
+        ),
+    ));
+    let ctx = setup(bearer).await;
+
+    let mine = seed_session_detailed(
+        &ctx.verify,
+        &caller,
+        &caller,
+        "token",
+        "active",
+        Some("cli"),
+        5,
+        24,
+    )
+    .await;
+    let theirs = seed_session_detailed(
+        &ctx.verify,
+        &stranger,
+        &stranger,
+        "token",
+        "active",
+        Some("cli"),
+        5,
+        24,
+    )
+    .await;
+    let subjectless =
+        seed_session_detailed_null_subject(&ctx.verify, &caller, "token", "active", 5, 24).await;
+
+    for filters in [
+        json!({ "status": "all", "subject": stranger.clone() }),
+        json!({ "status": "all", "accountId": stranger.clone() }),
+        json!({ "status": "all", "kind": "token", "clientId": "cli", "subject": stranger.clone() }),
+    ] {
+        let (status, page) = query_sessions(ctx.router.clone(), "own", filters.clone()).await;
+        assert_eq!(status, StatusCode::OK, "page: {page}");
+        assert!(
+            !row_ids(&page).contains(&theirs),
+            "own-scope caller reached another subject's session with {filters}: {page}"
+        );
+    }
+
+    let (status, page) =
+        query_sessions(ctx.router.clone(), "own", json!({ "status": "all" })).await;
+    assert_eq!(status, StatusCode::OK, "page: {page}");
+    let ids = row_ids(&page);
+    assert!(
+        ids.contains(&mine),
+        "own-scope caller must see their own rows: {page}"
+    );
+    assert!(!ids.contains(&theirs));
+    assert!(
+        !ids.contains(&subjectless),
+        "a row with a NULL subject belongs to nobody and must stay invisible to an own-scope \
+         caller -- `NULL = $1` is never true, which is the fail-closed direction: {page}"
+    );
+}
+
+/// `"expired"` is computed, never stored (ADR-0020 Decision 6): the same clock rule selects the
+/// row and labels it, and a revoked row that is ALSO past its expiry still reads `"revoked"`.
+#[tokio::test]
+async fn query_sessions_computes_expired_status_and_selects_on_it() {
+    let admin_subject = format!("qs-exp-admin-{}", cuid2());
+    let owner = format!("qs-exp-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
+    let ctx = setup(bearer).await;
+
+    let live = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "token",
+        "active",
+        Some("cli"),
+        5,
+        24,
+    )
+    .await;
+    let stale = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "token",
+        "active",
+        Some("cli"),
+        10,
+        -1,
+    )
+    .await;
+    let revoked_and_stale = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "token",
+        "revoked",
+        Some("cli"),
+        15,
+        -1,
+    )
+    .await;
+
+    let (_, expired_page) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "expired", "subject": owner }),
+    )
+    .await;
+    assert_eq!(
+        row_ids(&expired_page),
+        vec![stale.clone()],
+        "`expired` must select stored-active-and-past-expiry only -- not the live row, and not \
+         the revoked one that happens to also be past its expiry: {expired_page}"
+    );
+    let row = &expired_page["rows"][0];
+    assert_eq!(row["status"], "expired", "computed status: {row}");
+    assert_eq!(row["expired"], true);
+
+    let (_, active_page) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "active", "subject": owner }),
+    )
+    .await;
+    assert_eq!(
+        row_ids(&active_page),
+        vec![live.clone()],
+        "the default `active` filter must exclude the expired row: {active_page}"
+    );
+    assert_eq!(active_page["rows"][0]["status"], "active");
+    assert_eq!(active_page["rows"][0]["expired"], false);
+
+    let (_, revoked_page) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "revoked", "subject": owner }),
+    )
+    .await;
+    assert_eq!(row_ids(&revoked_page), vec![revoked_and_stale.clone()]);
+    assert_eq!(
+        revoked_page["rows"][0]["status"], "revoked",
+        "revocation beats expiry -- an operator revoked this, the clock did not"
+    );
+    assert_eq!(
+        revoked_page["rows"][0]["expired"], true,
+        "`expired` still reports the clock fact independently of the status"
+    );
+
+    let (status, bad) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "acive", "subject": owner }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unrecognised status must be REJECTED, never widened to `all`: {bad}"
+    );
+}
+
+/// Paging is stable and terminal: every row appears exactly once across the pages, in
+/// `created_at DESC` order, and the last page's `next` is null. Seeded with two rows sharing an
+/// identical `created_at` so the `id` tiebreak is actually exercised -- without it a page boundary
+/// landing inside the tie would skip or repeat one of them.
+#[tokio::test]
+async fn query_sessions_pages_deterministically_including_across_a_created_at_tie() {
+    let admin_subject = format!("qs-page-admin-{}", cuid2());
+    let owner = format!("qs-page-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
+    let ctx = setup(bearer).await;
+
+    let mut seeded = Vec::new();
+    for minutes in [50i64, 40, 30, 20, 10] {
+        seeded.push(
+            seed_session_detailed(
+                &ctx.verify,
+                &owner,
+                &owner,
+                "token",
+                "active",
+                Some("cli"),
+                minutes,
+                24,
+            )
+            .await,
+        );
+    }
+    // Two more sharing one exact `created_at` -- the tie the cursor's `id` half exists for.
+    seeded.push(
+        seed_session_detailed(
+            &ctx.verify,
+            &owner,
+            &owner,
+            "token",
+            "active",
+            Some("cli"),
+            25,
+            24,
+        )
+        .await,
+    );
+    seeded.push(
+        seed_session_detailed(
+            &ctx.verify,
+            &owner,
+            &owner,
+            "token",
+            "active",
+            Some("cli"),
+            25,
+            24,
+        )
+        .await,
+    );
+    sqlx::query("UPDATE sessions SET created_at = (SELECT min(created_at) FROM sessions WHERE id = ANY($1)) WHERE id = ANY($1)")
+        .bind(seeded[5..].to_vec())
+        .execute(&ctx.verify)
+        .await
+        .expect("force a created_at tie between the last two seeded rows");
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let mut args = json!({ "status": "all", "subject": owner, "limit": 2 });
+        if let Some(after) = cursor.clone() {
+            args["after"] = json!(after);
+        }
+        let (status, page) = query_sessions(ctx.router.clone(), "admin", args).await;
+        assert_eq!(status, StatusCode::OK, "page: {page}");
+        seen.extend(row_ids(&page));
+        pages += 1;
+        assert!(pages < 20, "pagination did not terminate: {seen:?}");
+        match page["next"].as_str() {
+            Some(next) => cursor = Some(next.to_owned()),
+            None => break,
+        }
+    }
+
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        seen.len(),
+        "a row was served twice across pages: {seen:?}"
+    );
+    let mut expected = seeded.clone();
+    expected.sort();
+    assert_eq!(
+        unique, expected,
+        "every seeded row must appear exactly once"
+    );
+
+    let (_, single) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "all", "subject": owner, "limit": 100 }),
+    )
+    .await;
+    assert_eq!(
+        single["next"],
+        Value::Null,
+        "a page shorter than `limit` is the final page: {single}"
+    );
+    assert_eq!(
+        row_ids(&single).len(),
+        seeded.len(),
+        "one big page must hold everything the paged walk found: {single}"
+    );
+
+    let (status, bad) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "all", "subject": owner, "after": "not-a-cursor" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a malformed cursor must be rejected, not silently ignored back to page 1: {bad}"
+    );
+}
+
+/// `offline` is derived from the chain's stored `offline_access` scope, matched as a whole word:
+/// a chain carrying it is offline, a chain carrying only other scopes is not, a chain with a NULL
+/// scope is not, and a session with no chain at all is not.
+#[tokio::test]
+async fn query_sessions_derives_offline_from_the_refresh_chain_scope() {
+    let admin_subject = format!("qs-off-admin-{}", cuid2());
+    let owner = format!("qs-off-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
+    let ctx = setup(bearer).await;
+
+    let offline = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "token",
+        "active",
+        Some("cli"),
+        40,
+        24,
+    )
+    .await;
+    seed_chain_with_scope(
+        &ctx.verify,
+        &offline,
+        &owner,
+        Some("openid profile offline_access"),
+    )
+    .await;
+    let online = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "token",
+        "active",
+        Some("cli"),
+        30,
+        24,
+    )
+    .await;
+    seed_chain_with_scope(&ctx.verify, &online, &owner, Some("openid profile")).await;
+    let null_scope = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "token",
+        "active",
+        Some("cli"),
+        20,
+        24,
+    )
+    .await;
+    seed_chain_with_scope(&ctx.verify, &null_scope, &owner, None).await;
+    let chainless = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "browser",
+        "active",
+        None,
+        10,
+        24,
+    )
+    .await;
+    let lookalike = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "token",
+        "active",
+        Some("cli"),
+        5,
+        24,
+    )
+    .await;
+    seed_chain_with_scope(
+        &ctx.verify,
+        &lookalike,
+        &owner,
+        Some("openid offline_access_readonly"),
+    )
+    .await;
+
+    let (status, page) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "all", "subject": owner }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "page: {page}");
+    let by_id: HashMap<String, bool> = page["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            (
+                row["id"].as_str().expect("id").to_owned(),
+                row["offline"].as_bool().expect("offline is never null"),
+            )
+        })
+        .collect();
+    assert_eq!(by_id.get(&offline), Some(&true), "page: {page}");
+    assert_eq!(
+        by_id.get(&online),
+        Some(&false),
+        "a chain without offline_access is a browser-lifetime grant, not an offline one: {page}"
+    );
+    assert_eq!(
+        by_id.get(&null_scope),
+        Some(&false),
+        "an unrecorded scope is not evidence of offline access: {page}"
+    );
+    assert_eq!(
+        by_id.get(&chainless),
+        Some(&false),
+        "no refresh chain means nothing to outlive a browser session: {page}"
+    );
+    assert_eq!(
+        by_id.get(&lookalike),
+        Some(&false),
+        "the scope list is matched as whole space-delimited words -- a hypothetical          `offline_access_readonly` scope is a DIFFERENT scope and must not read as offline: {page}"
+    );
+}
+
+/// `subjectUserId` resolves the session's subject (an account id, ADR-0006) to the PERSON who owns
+/// that account (`accounts.user_id`, ADR-0026) -- the id the console feeds to `resolveUserProfiles`
+/// (#647). A subject naming no account row stays null rather than being fabricated.
+#[tokio::test]
+async fn query_sessions_resolves_the_subjects_owning_user() {
+    let admin_subject = format!("qs-user-admin-{}", cuid2());
+    let owner = format!("qs-user-{}", cuid2());
+    let unknown_subject = format!("qs-user-ghost-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
+    let ctx = setup(bearer).await;
+
+    // `accounts_set_user` provisions `accounts.user_id` from the account id for a first-time
+    // account, so the owning user id IS `owner` here (same anchor the #647 tests use).
+    seed_account_row(&ctx.verify, &owner).await;
+    let known = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "token",
+        "active",
+        Some("cli"),
+        10,
+        24,
+    )
+    .await;
+    let ghost = seed_session_detailed(
+        &ctx.verify,
+        &unknown_subject,
+        &unknown_subject,
+        "token",
+        "active",
+        Some("cli"),
+        5,
+        24,
+    )
+    .await;
+
+    let (_, page) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "all", "subject": owner }),
+    )
+    .await;
+    assert_eq!(
+        page["rows"][0]["subjectUserId"], owner,
+        "the session's subject must resolve to the user owning that account: {page}"
+    );
+    assert_eq!(page["rows"][0]["id"], known);
+
+    let (_, ghost_page) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "all", "subject": unknown_subject }),
+    )
+    .await;
+    assert_eq!(ghost_page["rows"][0]["id"], ghost);
+    assert_eq!(
+        ghost_page["rows"][0]["subjectUserId"],
+        Value::Null,
+        "a subject naming no account resolves to null, never to a fabricated id: {ghost_page}"
+    );
+}
+
+/// `revokeSession` closes exactly the session named, cascades to its refresh chain, leaves the
+/// caller's other sessions alone, and is idempotent on a second call.
+#[tokio::test]
+async fn revoke_session_closes_one_session_and_its_chain_idempotently() {
+    let caller = format!("rs-own-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with(
+        "own",
+        token_info(
+            &caller,
+            PermissionSet::from_iter([Permission::SessionRevokeOwn]),
+        ),
+    ));
+    let ctx = setup(bearer).await;
+
+    let target = seed_active_session(&ctx.verify, &caller).await;
+    let keeper = seed_active_session(&ctx.verify, &caller).await;
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "procedure.revokeSession",
+        Wire::Cbor,
+        &json!({ "args": { "id": target, "reason": "lost laptop" } }),
+        Some("own"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(as_json(Wire::Cbor, &body)["revoked"], true);
+
+    assert_eq!(session_status(&ctx.verify, &target).await, "revoked");
+    assert_eq!(
+        refresh_token_status_for_session(&ctx.verify, &target).await,
+        "revoked",
+        "revoking a session without its chain would leave a working refresh token behind -- \
+         ADR-0020 Decision 9's cascade requirement"
+    );
+    assert_eq!(
+        session_status(&ctx.verify, &keeper).await,
+        "active",
+        "a per-session revoke must not behave like the bulk one"
+    );
+    assert_eq!(
+        refresh_token_status_for_session(&ctx.verify, &keeper).await,
+        "active"
+    );
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "procedure.revokeSession",
+        Wire::Cbor,
+        &json!({ "args": { "id": target } }),
+        Some("own"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a second revoke must succeed, not error"
+    );
+    assert_eq!(
+        as_json(Wire::Cbor, &body)["revoked"],
+        false,
+        "`revoked` reports whether THIS call changed state -- the second one did not"
+    );
+}
+
+/// The own-vs-other split on the revoke: a caller holding only `session:revoke-own` is refused a
+/// session that is not theirs (including one with a NULL subject, which belongs to nobody), and an
+/// admin holding `session:revoke` is not. An unknown id is a clean not-found either way.
+#[tokio::test]
+async fn revoke_session_refuses_another_subjects_session_without_session_revoke() {
+    let caller = format!("rs-other-{}", cuid2());
+    let stranger = format!("rs-stranger-{}", cuid2());
+    let admin_subject = format!("rs-admin-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with(
+                "own",
+                token_info(
+                    &caller,
+                    PermissionSet::from_iter([Permission::SessionRevokeOwn]),
+                ),
+            )
+            .with("admin", token_info(&admin_subject, admin_perms())),
+    );
+    let ctx = setup(bearer).await;
+
+    let theirs = seed_active_session(&ctx.verify, &stranger).await;
+    let orphan =
+        seed_session_detailed_null_subject(&ctx.verify, &caller, "token", "active", 5, 24).await;
+
+    for (id, why) in [
+        (theirs.clone(), "another subject's session"),
+        (orphan.clone(), "a session with no recorded subject"),
+    ] {
+        let (status, body) = rpc_call(
+            ctx.router.clone(),
+            "procedure.revokeSession",
+            Wire::Cbor,
+            &json!({ "args": { "id": id } }),
+            Some("own"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{why} must be refused without session:revoke: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(session_status(&ctx.verify, &id).await, "active");
+    }
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "procedure.revokeSession",
+        Wire::Cbor,
+        &json!({ "args": { "id": theirs } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(as_json(Wire::Cbor, &body)["revoked"], true);
+    assert_eq!(session_status(&ctx.verify, &theirs).await, "revoked");
+
+    let (status, _) = rpc_call(
+        ctx.router.clone(),
+        "procedure.revokeSession",
+        Wire::Cbor,
+        &json!({ "args": { "id": format!("does-not-exist-{}", cuid2()) } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an unknown session id is a clean not-found, not an internal error"
     );
 }
 

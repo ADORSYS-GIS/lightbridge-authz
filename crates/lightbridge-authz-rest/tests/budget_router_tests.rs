@@ -256,6 +256,8 @@ async fn non_budget_op_ids_404_on_authz_budget_even_without_a_token() {
         "model.Account.create",
         "procedure.createAccount",
         "procedure.createApiKey",
+        "procedure.querySessions",
+        "procedure.revokeSession",
         "procedure.revokeOwnSessions",
         "procedure.revokeSubjectSessions",
         "procedure.unknown",
