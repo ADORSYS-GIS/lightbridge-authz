@@ -368,7 +368,7 @@ This RPC surface was built across a PR sequence in `lightbridge-authz` implement
 - #215 — admin review queue (`ReviewService`)
 - the PR that added this doc — wires both into the RPC surface described above
 - #646 — persists the requester (`requested_by_user_id`, migration
-  `20260902000002_budget_augmentation_requests_add_requested_by.sql`) and exposes it as
+  `20260902000004_budget_augmentation_requests_add_requested_by.sql`) and exposes it as
   `AugmentationRequest.requestedByUserId`
 
 If this doc doesn't answer a question you have, #191's own body (acceptance criteria,

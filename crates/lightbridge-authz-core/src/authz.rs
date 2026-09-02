@@ -16,7 +16,7 @@
 //! Expansion happens once, at service start, so authorization checks at request time are a plain
 //! set lookup with no wildcard evaluation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -146,12 +146,23 @@ pub enum Permission {
     /// `scope=all` to admins out of the box.
     #[serde(rename = "usage:read-all")]
     UsageReadAll,
+
+    /// Resolve another person's display identity: the estate-wide, ownership-filter-free batch
+    /// reads `resolveUserProfiles`/`resolveActorLabels`/`searchUsers` serve so an admin console
+    /// can render "Stephane Segning - selast@example.com" instead of a bare cuid. Its own
+    /// permission, not a reuse of [`Permission::AccountRead`]: those procedures read
+    /// `federated_identities` profile claims for subjects the caller has no relationship with at
+    /// all, which is a PII surface of a different shape from "list the accounts I own". Included
+    /// in the default `lightbridge-admin`'s `*` grant (see [`default_role_permissions`]) and in
+    /// no other default role, so an unconfigured deployment keeps it admin-only out of the box.
+    #[serde(rename = "user:read")]
+    UserRead,
 }
 
 impl Permission {
     /// Every permission, in declaration order. The single source of truth for wildcard expansion
     /// and documentation.
-    pub const ALL: [Permission; 33] = [
+    pub const ALL: [Permission; 34] = [
         Permission::AccountCreate,
         Permission::AccountRead,
         Permission::AccountUpdate,
@@ -185,6 +196,7 @@ impl Permission {
         Permission::SessionRevokeOwn,
         Permission::SessionRevoke,
         Permission::UsageReadAll,
+        Permission::UserRead,
     ];
 
     /// Canonical `resource:action` string.
@@ -223,6 +235,7 @@ impl Permission {
             Permission::SessionRevokeOwn => "session:revoke-own",
             Permission::SessionRevoke => "session:revoke",
             Permission::UsageReadAll => "usage:read-all",
+            Permission::UserRead => "user:read",
         }
     }
 
@@ -232,55 +245,9 @@ impl Permission {
     }
 }
 
-/// The set of permissions a caller holds. Built once per request from JWT grants; checked with
-/// [`PermissionSet::require`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PermissionSet(HashSet<Permission>);
-
-impl PermissionSet {
-    pub fn new() -> Self {
-        Self(HashSet::new())
-    }
-
-    pub fn contains(&self, permission: Permission) -> bool {
-        self.0.contains(&permission)
-    }
-
-    pub fn insert(&mut self, permission: Permission) {
-        self.0.insert(permission);
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = Permission> + '_ {
-        self.0.iter().copied()
-    }
-
-    /// Returns `Ok(())` when the caller holds `permission`, otherwise a [`Error::Forbidden`]
-    /// carrying the missing permission (mapped to HTTP 403 by the REST layer).
-    pub fn require(&self, permission: Permission) -> Result<(), Error> {
-        if self.contains(permission) {
-            Ok(())
-        } else {
-            Err(Error::Forbidden(format!(
-                "missing required permission: {}",
-                permission.as_str()
-            )))
-        }
-    }
-}
-
-impl FromIterator<Permission> for PermissionSet {
-    fn from_iter<I: IntoIterator<Item = Permission>>(iter: I) -> Self {
-        Self(iter.into_iter().collect())
-    }
-}
+/// Re-exported from [`crate::permission_set`], which holds the type itself. Split out only to
+/// keep this file inside its LoC-gate baseline; see that module's own doc comment.
+pub use crate::permission_set::PermissionSet;
 
 /// Expand a single grant string into the permissions it confers. Unknown grants expand to nothing
 /// (and are logged by [`Rbac::compile`]); they never widen access.

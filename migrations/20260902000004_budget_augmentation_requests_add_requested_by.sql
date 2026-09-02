@@ -1,3 +1,15 @@
+-- RENUMBERED 20260902000002 -> 20260902000004 (#647). #653 (budget reset schedules) and #654
+-- (this file) merged within minutes of each other and both claimed version `20260902000002`.
+-- sqlx keys `_sqlx_migrations` on the numeric prefix alone, so the pair made `sqlx migrate run`
+-- abort against ANY database with
+-- `duplicate key value violates unique constraint "_sqlx_migrations_pkey"` after applying the
+-- first of the two -- i.e. every fresh deploy's migrate init container (ADR-0031) would fail, and
+-- with it every service behind it. Renumbering THIS file (rather than #653's) is the safe half of
+-- the pair: a partially-migrated environment has `20260902000002` already recorded against
+-- #653's checksum, so moving that one would trip sqlx's "previously applied but has been
+-- modified" check instead. This file has never been successfully recorded anywhere, so a new
+-- version number is a clean first application. Contents unchanged from #654.
+
 -- Story #646 (epic #645): persist WHO asked for a refill.
 --
 -- `budget_augmentation_requests` already records the *reviewer* (`reviewed_by`) and the *account*

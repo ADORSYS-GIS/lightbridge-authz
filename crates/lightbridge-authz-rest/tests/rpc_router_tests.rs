@@ -40,6 +40,7 @@ use cratestack::SqlxIdempotencyStore;
 use cratestack::ratelimit::RateLimitStore;
 use lightbridge_authz_api::schema;
 use lightbridge_authz_bearer::BearerTokenServiceTrait;
+use lightbridge_authz_core::authz::{Permission, PermissionSet};
 use lightbridge_authz_core::config::{Billing, ModelCatalog};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
@@ -448,6 +449,36 @@ async fn rbac_gate_denies_viewer_on_every_mutating_op() {
             status,
             StatusCode::FORBIDDEN,
             "viewer must be denied `{op}` by the RBAC gate"
+        );
+    }
+}
+
+/// #647's negative half: the three estate-wide identity-resolution op-ids are refused for a caller
+/// holding EVERY other permission but not `user:read`. Stated as "admin minus one" rather than
+/// "viewer" deliberately — the interesting failure would be `user:read` being implied by some
+/// broader grant (`account:read`, say), and a viewer token could not tell that apart from an
+/// ordinary read-only denial. The gate runs before dispatch, so this needs no DB: nothing is
+/// returned, not even an empty result set.
+#[tokio::test]
+async fn rbac_gate_denies_identity_resolution_without_user_read() {
+    let almost_admin: PermissionSet = Permission::ALL
+        .into_iter()
+        .filter(|p| *p != Permission::UserRead)
+        .collect();
+    for op in [
+        "procedure.resolveUserProfiles",
+        "procedure.resolveActorLabels",
+        "procedure.searchUsers",
+    ] {
+        let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+            MapBearer::new().with("almost", token_info("almost-subject", almost_admin.clone())),
+        );
+        let router = build_router(bearer, false);
+        let (status, _) = rpc_call(router, op, Wire::Cbor, &json!({}), Some("almost")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "`{op}` must require user:read, and no other permission may stand in for it"
         );
     }
 }

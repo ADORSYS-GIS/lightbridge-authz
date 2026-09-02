@@ -14,11 +14,13 @@ use lightbridge_authz_core::{
 
 pub mod auth_provider;
 pub mod authorize;
+pub mod budget_convert;
 pub mod claim_redeem;
 pub mod codec;
 pub mod end_session;
 pub mod handlers;
 pub mod html_page;
+pub mod identity_directory;
 pub mod middleware;
 pub mod models;
 pub mod oauth2_op;
@@ -28,6 +30,7 @@ pub mod redis_tls;
 pub mod relying_party;
 pub mod routers;
 pub mod rpc_authorize;
+pub mod rpc_permission_map;
 pub mod secret_claim;
 pub mod session_cookie;
 pub mod session_management;
@@ -37,6 +40,10 @@ pub mod token_exchange;
 pub mod userinfo;
 
 use auth_provider::{ACCESS_TOKEN_CONTEXT_KEY, CratestackAuthProvider};
+use budget_convert::{
+    resolve_augmentation_requests_page_size, to_schema_augmentation_request,
+    to_schema_augmentation_request_page, to_schema_decision,
+};
 use codec::LenientCborCodec;
 use handlers::AuthzStoreImpl;
 use ratelimit_redis::build_redis_rate_limit_store;
@@ -340,118 +347,6 @@ fn budget_error_to_cratestack_error(err: lightbridge_authz_budget::BudgetError) 
         BudgetError::PolicyDenied(_) => CratestackError::Forbidden(err.to_string()),
         BudgetError::NotFound(m) => CratestackError::NotFound(m),
         BudgetError::StorageFailed(m) => CratestackError::Internal(m),
-    }
-}
-
-/// Renders a [`lightbridge_authz_budget::Effect`] as the exact snake_case wire value its own
-/// `Serialize` impl (`#[serde(rename_all = "snake_case")]`) produces, e.g. `"auto_approve"` /
-/// `"manual_review"`. Used to fill the schema `Decision.effect` `String` field (see the schema's
-/// doc comment on `type Decision` for why that field is a `String` rather than a schema-level
-/// enum) without a second, hand-maintained mapping that could drift from `Effect`'s own derive.
-fn effect_to_wire_string(effect: lightbridge_authz_budget::Effect) -> String {
-    serde_json::to_string(&effect)
-        .expect("Effect always serializes to a JSON string")
-        .trim_matches('"')
-        .to_owned()
-}
-
-/// Maps a domain [`lightbridge_authz_budget::Decision`] into the schema's wire `Decision` shape
-/// (ADR-0007's decision contract, mirrored field-for-field in `authz.cstack`'s `type Decision`).
-/// The two `i64` micro-USD amounts are stringified per that type's documented 64-bit-safety
-/// rationale (matching `ruleDataJson`'s existing string-encoding precedent).
-fn to_schema_decision(
-    decision: lightbridge_authz_budget::Decision,
-) -> schema::procedures::simulate_budget_policy::Output {
-    schema::procedures::simulate_budget_policy::Output {
-        effect: effect_to_wire_string(decision.effect),
-        approvedAmountMicros: decision.approved_amount_micros.to_string(),
-        maximumAmountMicros: decision.maximum_amount_micros.to_string(),
-        reasonCodes: decision.reason_codes,
-        matchedRuleIds: decision.matched_rule_ids,
-        policyRevision: decision.policy_revision,
-        obligations: schema::Obligations {
-            requiredApproverRole: decision.obligations.required_approver_role,
-        },
-    }
-}
-
-/// Maps a domain [`lightbridge_authz_budget::AugmentationRequest`] into the schema's wire
-/// `AugmentationRequest` shape (see `authz.cstack`'s `type AugmentationRequest` doc comment for
-/// the field-by-field reasoning, in particular why `policyReasonCodes`/`matchedRuleIds` are
-/// required `String[]` rather than the `Option<Vec<String>>` the domain type carries -- both
-/// `unwrap_or_default()` calls below are the "never actually `None` by the time a procedure
-/// returns a value" case that comment documents, not a silent-loss compromise).
-fn to_schema_augmentation_request(
-    request: lightbridge_authz_budget::AugmentationRequest,
-) -> schema::AugmentationRequest {
-    schema::AugmentationRequest {
-        id: request.id,
-        budgetAccountId: request.budget_account_id,
-        accountId: request.account_id,
-        projectId: request.project_id,
-        period: request.period.to_string(),
-        requestedTier: request.requested_tier.to_string(),
-        requestedAmountMicros: request.requested_amount_micros.to_string(),
-        status: request.status.to_string(),
-        policyEffect: request.policy_effect.map(effect_to_wire_string),
-        policyReasonCodes: request.policy_reason_codes.unwrap_or_default(),
-        matchedRuleIds: request.matched_rule_ids.unwrap_or_default(),
-        policyRevision: request.policy_revision,
-        approvedAmountMicros: request.approved_amount_micros.map(|a| a.to_string()),
-        grantId: request.grant_id,
-        idempotencyKey: request.idempotency_key,
-        reviewedBy: request.reviewed_by,
-        rejectionReason: request.rejection_reason,
-        requestedByUserId: request.requested_by_user_id,
-        createdAt: request.created_at,
-        reviewedAt: request.reviewed_at,
-    }
-}
-
-/// Default/max page size for `listPendingAugmentationRequests`/`listMyAugmentationRequests`
-/// (#296/#295). Mirrors [`DEFAULT_BUDGET_GRANTS_PAGE_SIZE`]/[`MAX_BUDGET_GRANTS_PAGE_SIZE`]
-/// exactly -- same reasoning: this procedure layer's own default when a caller omits `limit`,
-/// and its own tighter ceiling when a caller supplies one, independent of whatever
-/// `AugmentationRepo` additionally clamps to.
-const DEFAULT_AUGMENTATION_REQUESTS_PAGE_SIZE: i64 = 20;
-const MAX_AUGMENTATION_REQUESTS_PAGE_SIZE: i64 = 50;
-
-/// Resolves a caller-supplied, optional `limit` into a page size clamped to
-/// `[1, MAX_AUGMENTATION_REQUESTS_PAGE_SIZE]`, defaulting to
-/// [`DEFAULT_AUGMENTATION_REQUESTS_PAGE_SIZE`] when omitted. Shared by
-/// `listPendingAugmentationRequests` and `listMyAugmentationRequests` -- both page the same
-/// `AugmentationRequest` entity, just in opposite directions (see each procedure's own doc
-/// comment).
-fn resolve_augmentation_requests_page_size(limit: Option<i64>) -> i64 {
-    match limit {
-        Some(requested) => requested.clamp(1, MAX_AUGMENTATION_REQUESTS_PAGE_SIZE),
-        None => DEFAULT_AUGMENTATION_REQUESTS_PAGE_SIZE,
-    }
-}
-
-/// Maps one page of domain [`lightbridge_authz_budget::AugmentationRequest`] rows into the
-/// schema's `AugmentationRequestPage` (#296/#295), mirroring `list_budget_grants_page`'s own
-/// `nextCursor` rule: the last entry's `createdAt` when the page came back exactly `page_size`
-/// long (there may be more), `None` when it came back short (nothing further). This works
-/// identically regardless of which direction the underlying query walked (ASC for
-/// `listPendingAugmentationRequests`, DESC for `listMyAugmentationRequests`) -- "the last entry
-/// in this page" is always the correct cursor to continue that same walk, whichever way it goes.
-fn to_schema_augmentation_request_page(
-    requests: Vec<lightbridge_authz_budget::AugmentationRequest>,
-    page_size: i64,
-) -> schema::AugmentationRequestPage {
-    let next_cursor = if requests.len() == usize::try_from(page_size).unwrap_or(usize::MAX) {
-        requests.last().map(|r| r.created_at)
-    } else {
-        None
-    };
-
-    schema::AugmentationRequestPage {
-        entries: requests
-            .into_iter()
-            .map(to_schema_augmentation_request)
-            .collect(),
-        nextCursor: next_cursor,
     }
 }
 
@@ -2650,6 +2545,60 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 },
             })
         }
+    }
+
+    /// Admin identity resolution (#647). All three bodies live in
+    /// [`crate::identity_directory`] -- see that module's doc comment for the authorization story
+    /// (the `@allow` clause is the whole of it: no ownership filter, by design) and for why an
+    /// unknown id is absent from the result rather than a fabricated placeholder.
+    fn resolve_user_profiles(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::resolve_user_profiles::Args,
+        _authorized: schema::procedures::resolve_user_profiles::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::resolve_user_profiles::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let ctx = ctx.clone();
+        async move {
+            identity_directory::resolve_user_profiles(&issuer.repo, &ctx, args.args.userIds).await
+        }
+    }
+
+    fn resolve_actor_labels(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::resolve_actor_labels::Args,
+        _authorized: schema::procedures::resolve_actor_labels::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::resolve_actor_labels::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let ctx = ctx.clone();
+        async move { identity_directory::resolve_actor_labels(&issuer.repo, &ctx, args.args).await }
+    }
+
+    fn search_users(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::search_users::Args,
+        _authorized: schema::procedures::search_users::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::search_users::Output, CratestackError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let ctx = ctx.clone();
+        async move { identity_directory::search_users(&issuer.repo, &ctx, args.args).await }
     }
 }
 

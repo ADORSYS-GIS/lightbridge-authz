@@ -276,6 +276,7 @@ scope for #401.
 | `session:revoke-own`     | `procedure.revokeOwnSessions`                        | — (no MCP tool yet)                 |
 | `session:revoke`         | `procedure.revokeSubjectSessions`                    | — (no MCP tool yet)                 |
 | `usage:read-all`         | — (not an RPC op-id; see note below)                 | — (no MCP tool)                     |
+| `user:read`              | `procedure.resolveUserProfiles`, `procedure.resolveActorLabels`, `procedure.searchUsers` | — (no MCP tool yet) |
 
 `read` covers both the list and get operations for a resource.
 
@@ -289,6 +290,18 @@ still needs a `permUsageReadAll Boolean` field in `authz.cstack`'s `auth Princip
 comment) even though no `@allow`/`@@allow` clause reads it. Granted to `lightbridge-admin` via that
 role's default `*` grant; an operator restricting `role_permissions` explicitly must add
 `usage:read-all` (or `usage:*`) back to whichever role should keep estate-wide usage access.
+
+`user:read` (#647) is the estate-wide identity-resolution permission: it gates the three admin
+procedures that turn opaque `users.id`/`accounts.id`/`projects.id` values into human labels
+(`resolveUserProfiles`, `resolveActorLabels`, `searchUsers`). Those procedures apply **no ownership
+filter at all** — that is their purpose, and it is why this is its own permission rather than a
+reuse of `account:read`: they read `federated_identities` profile claims for subjects the caller
+has no relationship with. It is deliberately admin-only by default, granted to `lightbridge-admin`
+via that role's `*` and to neither `lightbridge-editor` nor `lightbridge-viewer`. The surface is
+bounded by design: batches are capped at 200 ids per kind and an over-cap batch is **rejected**
+rather than truncated, and free-text search requires a 2-character minimum query and returns at
+most 50 rows (20 by default). An unresolvable id is simply absent from the result — no procedure
+here ever fabricates a placeholder identity; the console renders its own sentinel.
 
 ### Read verbs filter, they do not refuse (`POST /rpc/batch` only) — #401
 

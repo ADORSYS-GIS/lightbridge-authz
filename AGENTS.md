@@ -463,7 +463,7 @@ API keys are stored as:
   reviewed." "Who asked" is `requested_by_user_id` (the caller's token subject, stamped at
   `requestBudgetRefill`, #646) and "who reviewed" is `reviewed_by`; they are different columns and
   usually different people. `requested_by_user_id` is NULL for rows predating
-  `migrations/20260902000002_budget_augmentation_requests_add_requested_by.sql` and is never
+  `migrations/20260902000004_budget_augmentation_requests_add_requested_by.sql` and is never
   backfilled — NULL means unknown. It is an audit column: no authorization path reads it.
 
 ### Identifier Format (CUID2)
@@ -1037,6 +1037,17 @@ hand-written SQL and direct `sqlx` dependencies.
     a present-but-unallowed model would still have (ADR-0024 Q4; created by
     `migrations/20260825000001_users_and_federated_identities.sql`; justified in the `User` model
     comment in `crates/lightbridge-authz-api/schema/authz.cstack`).
+  - `accounts`/`projects`, READ-ONLY, for admin identity resolution only (#647): the estate-wide
+    label lookups in `crates/lightbridge-authz-api-key/src/identity_resolution.rs`
+    (`resolve_account_labels`/`resolve_project_labels`, and the `accounts` hop
+    `resolve_user_profiles`/`search_user_profiles` join through). These two models ARE in
+    `authz.cstack`, but their `@@allow("read", ...)` clauses are ownership-scoped
+    (`userId == auth().id`) and cratestack folds them into every generated query unconditionally
+    with no bypass -- an estate-wide admin label lookup is exactly the query that policy cannot
+    express, and widening the shared clause would widen `model.Account.list`/`model.Project.list`
+    for every other caller too. Gated instead by the dedicated `user:read` permission at the RPC
+    layer; see `docs/admin-identity-resolution.md`. Reads only -- every write to these tables still
+    goes through the generated client or the pre-existing exceptions.
   - `secret_claims`: single-use, subject-bound claims for handing an API key secret to a human
     without routing it through a model's context (GHSA-9pc6-965v-2c44, #538); redemption needs a
     single-statement CAS so concurrent requests can never both obtain the same secret, which
@@ -1094,6 +1105,9 @@ hand-written SQL and direct `sqlx` dependencies.
 - RBAC (JWT claim → permission mapping): `docs/rbac.md`
 - API key approaching-expiry visibility (`listMyExpiringApiKeys`, window/threshold rationale, why
   there is no cross-tenant admin surface): `docs/api-key-expiry-visibility.md`
+- Admin identity resolution (`resolveUserProfiles`/`resolveActorLabels`/`searchUsers`, the
+  `user:read` permission, the never-fabricate-an-identity and reject-don't-truncate rules, and the
+  search index's honest limits): `docs/admin-identity-resolution.md`
 - Governance data model + how quotas/allowlists are actually enforced at the gateway (accounts,
   projects, roster, keys; introspection, Authorino claim extraction, BackendTrafficPolicy rule
   families; worked scenarios and the gaps that remain): `docs/governance-model-and-enforcement.md`
