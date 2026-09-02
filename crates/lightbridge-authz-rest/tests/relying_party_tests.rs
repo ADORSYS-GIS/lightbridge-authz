@@ -236,6 +236,7 @@ async fn verify_page_sanitizes_user_code_for_the_handoff(pool: PgPool) {
             keycloak.base_url(),
             repo(pool),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -298,6 +299,7 @@ async fn discover_dials_discovery_url_but_validates_issuer_against_identity(pool
         keycloak.base_url(),
         repo,
         rate_limiter(),
+        None,
     )
     .unwrap();
     let err = rp.begin_device("device-code".to_string()).await.expect_err(
@@ -351,6 +353,7 @@ async fn verified_keycloak_callback_transitions_pending_device_code_to_approved(
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -445,6 +448,7 @@ async fn keycloak_token_failure_leaves_device_code_pending(pool: PgPool) {
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -485,6 +489,7 @@ async fn invalid_device_codes_have_one_uniform_response_and_frame_protection(poo
             keycloak.base_url(),
             repo(pool.clone()),
             rate_limiter(),
+            None,
         )
         .is_err()
     );
@@ -521,6 +526,7 @@ async fn invalid_device_codes_have_one_uniform_response_and_frame_protection(poo
             keycloak.base_url(),
             repo,
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -608,6 +614,7 @@ async fn verify_continue_requires_the_confirmation_cookie_from_verify_submit(poo
             keycloak.base_url(),
             repo,
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -709,6 +716,7 @@ async fn verify_context_is_a_uniform_404_without_the_confirm_cookie(pool: PgPool
             keycloak.base_url(),
             repo,
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -803,6 +811,7 @@ async fn verify_context_never_returns_the_device_code(pool: PgPool) {
             keycloak.base_url(),
             repo,
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -867,6 +876,7 @@ async fn relying_party_rejects_non_positive_runtime_limits(pool: PgPool) {
             keycloak.base_url(),
             repo(pool.clone()),
             rate_limiter(),
+            None,
         )
         .is_err()
     );
@@ -880,6 +890,7 @@ async fn relying_party_rejects_non_positive_runtime_limits(pool: PgPool) {
             keycloak.base_url(),
             repo(pool),
             rate_limiter(),
+            None,
         )
         .is_err()
     );
@@ -905,6 +916,7 @@ async fn begin_browser_rejects_backslash_open_redirect_variants(pool: PgPool) {
         keycloak.base_url(),
         repo(pool),
         rate_limiter(),
+        None,
     )
     .unwrap();
 
@@ -947,6 +959,7 @@ async fn callback_rejects_state_cookie_mismatch_before_contacting_keycloak(pool:
             keycloak.base_url(),
             repo(pool),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -1002,6 +1015,7 @@ async fn invalid_id_token_profiles_fail_closed(pool: PgPool) {
             keycloak.base_url(),
             repo(pool),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -1185,6 +1199,7 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -1409,6 +1424,7 @@ async fn suspended_account_is_refused_a_browser_session(pool: PgPool) {
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -1551,6 +1567,7 @@ async fn inactive_project_is_refused_a_browser_session(pool: PgPool) {
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -1704,6 +1721,7 @@ async fn browser_session_persists_the_real_authenticated_member_subject(pool: Pg
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -1851,6 +1869,7 @@ async fn browser_session_subject_is_the_acting_account_not_the_keycloak_sub(pool
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -2066,6 +2085,7 @@ async fn device_pairing_callback_persists_a_federated_identity_for_an_existing_a
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -2184,6 +2204,7 @@ async fn id_token_keys_come_from_the_discovered_jwks_uri_not_a_configured_one(po
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -2243,6 +2264,7 @@ async fn device_pairing_callback_is_refused_for_a_subject_with_no_account(pool: 
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -2350,6 +2372,7 @@ async fn browser_sso_callback_persists_the_same_federated_identity(pool: PgPool)
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -2461,6 +2484,7 @@ async fn federated_identities_persists_the_plaintext_profile_claim_snapshot(pool
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -2564,6 +2588,7 @@ async fn stored_token_envelope_is_not_plaintext_at_rest(pool: PgPool) {
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -2650,6 +2675,7 @@ async fn token_envelope_does_not_open_under_the_state_encryption_key(pool: PgPoo
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -2740,6 +2766,7 @@ async fn a_second_login_updates_the_same_federated_identity_row_and_reseals(pool
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -2932,6 +2959,7 @@ async fn a_second_issuer_with_a_colliding_subject_is_refused_not_merged(pool: Pg
             keycloak_a.base_url(),
             repo.clone(),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );
@@ -2942,6 +2970,7 @@ async fn a_second_issuer_with_a_colliding_subject_is_refused_not_merged(pool: Pg
             keycloak_b.base_url(),
             repo.clone(),
             rate_limiter(),
+            None,
         )
         .unwrap(),
     );

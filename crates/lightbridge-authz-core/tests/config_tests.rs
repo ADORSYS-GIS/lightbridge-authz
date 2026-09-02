@@ -1,6 +1,6 @@
 use lightbridge_authz_core::Config;
 use lightbridge_authz_core::config::{
-    Federation, IdpServer, JwtSigning, Oauth2TokenExchange, load_from_path,
+    Federation, IdpServer, JwtSigning, Oauth2, Oauth2TokenExchange, load_from_path,
 };
 use std::fs;
 
@@ -59,6 +59,35 @@ fn oauth2_token_exchange_honors_explicit_values() {
     assert_eq!(exchange.refresh_ttl_seconds, 2);
     assert_eq!(exchange.allowed_scopes, vec!["openid"]);
     assert_eq!(exchange.client_credentials_ttl_seconds, 3);
+}
+
+/// lightbridge-authz#625: `jwks_ca_bundle_path` is genuinely optional -- most deployments never
+/// set it, since the platform trust store already covers a publicly-reachable JWKS endpoint.
+#[test]
+fn oauth2_jwks_ca_bundle_path_defaults_to_none_when_unset() {
+    // NOT a regression guard for `#[serde(default)]`, and deliberately labelled so: serde treats
+    // an `Option<T>` field as implicitly defaulted whether or not that attribute is present, so
+    // removing it does NOT make this fail (verified by mutation). The attribute is kept for
+    // consistency with the sibling `ca_bundle_path` fields, not because this test pins it.
+    // What this DOES pin is the observable contract -- an absent key parses, and the default is
+    // `None` rather than an empty string -- which a change to the field type would break. Its
+    // counterpart below IS mutation-proof (verified via a `rename`).
+    let cfg: Oauth2 = serde_yaml::from_str("type: self\njwks_url: \"http://x\"\n").unwrap();
+    assert_eq!(cfg.jwks_ca_bundle_path, None);
+}
+
+/// The counterpart: an explicit `jwks_ca_bundle_path` (the in-cluster, private-CA deployment
+/// shape #625 exists for) must parse through untouched.
+#[test]
+fn oauth2_jwks_ca_bundle_path_parses_an_explicit_value() {
+    let cfg: Oauth2 = serde_yaml::from_str(
+        "type: self\njwks_url: \"http://x\"\njwks_ca_bundle_path: \"/etc/lightbridge/tls/ca.crt\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.jwks_ca_bundle_path.as_deref(),
+        Some("/etc/lightbridge/tls/ca.crt")
+    );
 }
 
 /// Identity-vs-location split (ADR-0025 amendment): `discovery_url` is optional and, when unset,

@@ -889,6 +889,20 @@ pub struct Oauth2 {
     #[serde(rename = "type")]
     pub oauth2_type: Oauth2Type,
     pub jwks_url: String,
+    /// Path to a PEM-encoded CA bundle trusted for `jwks_url`, when it resolves to a private,
+    /// in-cluster endpoint whose certificate chains to the cluster's own CA rather than a
+    /// publicly-trusted one (lightbridge-authz#625) -- e.g. dialling `authz-idp`'s own in-cluster
+    /// Service DNS name for JWKS instead of hairpinning back out through the public ingress.
+    /// Scoped to ONLY the JWKS HTTP client (`reqwest::ClientBuilder::add_root_certificate`),
+    /// never `SSL_CERT_FILE`, which replaces the trust store for every outbound connection this
+    /// process makes, Keycloak discovery included. Optional -- unset (the default, and today's
+    /// universal case) is byte-identical to before this field existed: the default client,
+    /// platform roots only. An unreadable path or a bundle with no parseable PEM certificate is a
+    /// hard construction-time failure naming the path, never a silent fallback to the default
+    /// client -- the same fail-closed convention as `Redis::ca_bundle_path` and
+    /// `UsageServiceClient::ca_bundle_path` above.
+    #[serde(default)]
+    pub jwks_ca_bundle_path: Option<String>,
     #[serde(default)]
     pub oauth2_url: Option<String>,
     #[serde(default)]

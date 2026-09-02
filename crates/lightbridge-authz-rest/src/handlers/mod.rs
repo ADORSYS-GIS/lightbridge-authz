@@ -1052,6 +1052,7 @@ mod tests {
         Oauth2 {
             oauth2_type,
             jwks_url: "http://x".to_string(),
+            jwks_ca_bundle_path: None,
             oauth2_url: None,
             issuer_url: None,
             authorization_endpoint: None,
@@ -1565,6 +1566,7 @@ mod tests {
         let issuer = OAuth2TokenIssuer::from_config(&Oauth2 {
             oauth2_type: lightbridge_authz_core::config::Oauth2Type::External,
             jwks_url: server.url("/jwks"),
+            jwks_ca_bundle_path: None,
             oauth2_url: Some(oauth2_url.clone()),
             issuer_url: None,
             authorization_endpoint: None,
@@ -1608,6 +1610,7 @@ mod tests {
         OAuth2TokenIssuer::from_config(&Oauth2 {
             oauth2_type: lightbridge_authz_core::config::Oauth2Type::External,
             jwks_url: "http://jwks".to_string(),
+            jwks_ca_bundle_path: None,
             oauth2_url: Some(oauth2_url),
             issuer_url: None,
             authorization_endpoint: None,
@@ -1638,6 +1641,7 @@ mod tests {
         let cfg = Oauth2 {
             oauth2_type: lightbridge_authz_core::config::Oauth2Type::External,
             jwks_url: "http://jwks".to_string(),
+            jwks_ca_bundle_path: None,
             oauth2_url: Some("http://token".to_string()),
             issuer_url: None,
             authorization_endpoint: None,

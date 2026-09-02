@@ -340,9 +340,9 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "authkestra-crypto-util"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "938b09ad2aba5f03fffc7a0dc531fc82fe297b701696dcb6350ae074dc6fb822"
+checksum = "2cefd1c6589795e71e9f773fb616eba7029f6547c62a3b1a4905b7ee8b3408f9"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -352,9 +352,9 @@ dependencies = [
 
 [[package]]
 name = "authkestra-engine"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33122b5dd8d92c5f5d5774c9daba390bcfaf28a7de8b2f23774a4823690e0fc3"
+checksum = "4e9b8041b3314ba012d156328885643fd9d0735e292b9da92af967c0fb6a1697"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -379,9 +379,9 @@ dependencies = [
 
 [[package]]
 name = "authkestra-op"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "350badc3bc5b182f57106754d5f10dd9e7cd7bbf9790fe57d72ec5cf1907286b"
+checksum = "94728078ec11531474e706c04c808a313e3dbbb4d58cb57f2c7ffe05d446cae9"
 dependencies = [
  "argon2",
  "async-trait",
@@ -404,9 +404,9 @@ dependencies = [
 
 [[package]]
 name = "authkestra-resource"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86fa2c038762048096c1f58d42cd26f07c623f727c2e724ea48550193bf97153"
+checksum = "28965829977a62ac7e8301128f442ae672c9c0ff61553c3f69ba5026e4b88bed"
 dependencies = [
  "async-trait",
  "authkestra-engine",
@@ -2726,14 +2726,20 @@ version = "0.8.1"
 dependencies = [
  "anyhow",
  "authkestra-resource",
+ "axum",
+ "axum-server",
  "base64 0.23.1",
  "httpmock",
  "jsonwebtoken",
  "lightbridge-authz-core",
  "rand_core 0.6.4",
+ "rcgen",
+ "reqwest 0.13.4",
  "rsa",
+ "rustls",
  "serde",
  "serde_json",
+ "time",
  "tokio",
  "tracing",
 ]
@@ -5142,7 +5148,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

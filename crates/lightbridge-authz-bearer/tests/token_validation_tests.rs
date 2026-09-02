@@ -57,6 +57,7 @@ fn oauth2_config(jwks_url: String, audience: Option<Vec<String>>, rbac: Rbac) ->
     Oauth2 {
         oauth2_type: Oauth2Type::External,
         jwks_url,
+        jwks_ca_bundle_path: None,
         oauth2_url: None,
         issuer_url: None,
         authorization_endpoint: None,
@@ -101,7 +102,8 @@ async fn empty_token_is_rejected() {
         "http://unused.invalid/jwks".to_string(),
         None,
         default_rbac(),
-    ));
+    ))
+    .expect("valid oauth2 config must build a BearerTokenService");
 
     assert!(service.validate_bearer_token("").await.is_err());
     assert!(service.validate_bearer_token("   ").await.is_err());
@@ -113,7 +115,8 @@ async fn malformed_token_is_rejected() {
         "http://unused.invalid/jwks".to_string(),
         None,
         default_rbac(),
-    ));
+    ))
+    .expect("valid oauth2 config must build a BearerTokenService");
 
     let err = service
         .validate_bearer_token("not-a-jwt")
@@ -128,7 +131,8 @@ async fn token_without_kid_is_rejected() {
         "http://unused.invalid/jwks".to_string(),
         None,
         default_rbac(),
-    ));
+    ))
+    .expect("valid oauth2 config must build a BearerTokenService");
 
     let header = Header::new(Algorithm::HS256);
     let token = encode(
@@ -156,7 +160,8 @@ async fn unknown_kid_is_rejected() {
     let signer = generate_test_key("other-kid");
     let token = sign(&signer, &json!({"sub": "user-1", "exp": far_future_exp()}));
 
-    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()));
+    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()))
+        .expect("valid oauth2 config must build a BearerTokenService");
 
     let err = service.validate_bearer_token(&token).await.unwrap_err();
     assert_eq!(err.to_string(), "unauthorized");
@@ -173,7 +178,8 @@ async fn jwks_fetch_failure_is_rejected() {
     let signer = generate_test_key("some-kid");
     let token = sign(&signer, &json!({"sub": "user-1", "exp": far_future_exp()}));
 
-    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()));
+    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()))
+        .expect("valid oauth2 config must build a BearerTokenService");
 
     let err = service.validate_bearer_token(&token).await.unwrap_err();
     assert_eq!(err.to_string(), "unauthorized");
@@ -196,7 +202,8 @@ async fn invalid_signature_is_rejected() {
         &json!({"sub": "user-1", "exp": far_future_exp()}),
     );
 
-    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()));
+    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()))
+        .expect("valid oauth2 config must build a BearerTokenService");
 
     let err = service.validate_bearer_token(&token).await.unwrap_err();
     assert_eq!(err.to_string(), "unauthorized");
@@ -215,7 +222,8 @@ async fn expired_token_is_rejected() {
 
     let token = sign(&key, &json!({"sub": "user-1", "exp": 1}));
 
-    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()));
+    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()))
+        .expect("valid oauth2 config must build a BearerTokenService");
 
     let err = service.validate_bearer_token(&token).await.unwrap_err();
     assert_eq!(err.to_string(), "unauthorized");
@@ -244,7 +252,8 @@ async fn missing_iss_is_rejected() {
         &json!({"sub": "user-no-iss", "exp": far_future_exp()}),
     );
 
-    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()));
+    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()))
+        .expect("valid oauth2 config must build a BearerTokenService");
 
     let err = service.validate_bearer_token(&token).await.unwrap_err();
     assert_eq!(err.to_string(), "unauthorized");
@@ -271,7 +280,8 @@ async fn successful_validation_without_audience_config_grants_admin_permissions(
         }),
     );
 
-    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()));
+    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()))
+        .expect("valid oauth2 config must build a BearerTokenService");
 
     let info: TokenInfo = service.validate_bearer_token(&token).await.unwrap();
     assert!(info.active);
@@ -298,7 +308,8 @@ async fn caller_without_matching_role_is_denied_by_require() {
         &json!({"sub": "user-norole", "iss": test_issuer(), "exp": far_future_exp()}),
     );
 
-    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()));
+    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()))
+        .expect("valid oauth2 config must build a BearerTokenService");
 
     let info = service.validate_bearer_token(&token).await.unwrap();
     assert!(info.roles.is_empty());
@@ -332,7 +343,8 @@ async fn successful_validation_with_single_string_audience() {
         server.url("/jwks"),
         Some(vec!["expected-aud".to_string()]),
         default_rbac(),
-    ));
+    ))
+    .expect("valid oauth2 config must build a BearerTokenService");
 
     let info = service.validate_bearer_token(&token).await.unwrap();
     assert_eq!(info.aud, vec!["expected-aud".to_string()]);
@@ -363,7 +375,8 @@ async fn successful_validation_with_array_audience() {
         server.url("/jwks"),
         Some(vec!["expected-aud".to_string()]),
         default_rbac(),
-    ));
+    ))
+    .expect("valid oauth2 config must build a BearerTokenService");
 
     let info = service.validate_bearer_token(&token).await.unwrap();
     assert_eq!(
@@ -389,7 +402,8 @@ async fn audience_configured_but_token_missing_aud_is_rejected() {
         server.url("/jwks"),
         Some(vec!["expected-aud".to_string()]),
         default_rbac(),
-    ));
+    ))
+    .expect("valid oauth2 config must build a BearerTokenService");
 
     let err = service.validate_bearer_token(&token).await.unwrap_err();
     assert_eq!(err.to_string(), "unauthorized");
@@ -419,7 +433,8 @@ async fn audience_mismatch_is_rejected() {
         server.url("/jwks"),
         Some(vec!["expected-aud".to_string()]),
         default_rbac(),
-    ));
+    ))
+    .expect("valid oauth2 config must build a BearerTokenService");
 
     let err = service.validate_bearer_token(&token).await.unwrap_err();
     assert_eq!(err.to_string(), "unauthorized");
@@ -445,7 +460,8 @@ async fn empty_audience_list_skips_jsonwebtoken_aud_check_but_still_rejects_on_n
         server.url("/jwks"),
         Some(vec![]),
         default_rbac(),
-    ));
+    ))
+    .expect("valid oauth2 config must build a BearerTokenService");
 
     let err = service.validate_bearer_token(&token).await.unwrap_err();
     assert_eq!(err.to_string(), "unauthorized");
@@ -478,7 +494,8 @@ async fn custom_roles_claim_is_honored() {
         role_permissions: HashMap::new(),
         default_grants: Vec::new(),
     };
-    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, rbac));
+    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, rbac))
+        .expect("valid oauth2 config must build a BearerTokenService");
 
     let info = service.validate_bearer_token(&token).await.unwrap();
     assert_eq!(info.roles, vec!["lightbridge-viewer".to_string()]);
@@ -530,7 +547,8 @@ async fn client_credentials_style_token_has_no_roles_and_zero_permissions_for_ev
         }),
     );
 
-    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()));
+    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()))
+        .expect("valid oauth2 config must build a BearerTokenService");
 
     let info: TokenInfo = service.validate_bearer_token(&token).await.unwrap();
     assert!(info.active);
@@ -583,7 +601,8 @@ async fn refresh_token_typ_claim_is_rejected_as_a_bearer_token() {
         }),
     );
 
-    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()));
+    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()))
+        .expect("valid oauth2 config must build a BearerTokenService");
 
     let err = service.validate_bearer_token(&token).await.unwrap_err();
     assert_eq!(err.to_string(), "unauthorized");
@@ -595,7 +614,8 @@ async fn service_debug_output_exposes_jwks_url_and_roles_claim_only() {
         "http://unused.invalid/jwks".to_string(),
         None,
         default_rbac(),
-    ));
+    ))
+    .expect("valid oauth2 config must build a BearerTokenService");
 
     let rendered = format!("{service:?}");
     assert!(rendered.contains("unused.invalid"));
