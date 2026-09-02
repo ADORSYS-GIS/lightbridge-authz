@@ -856,6 +856,32 @@ async fn verify_access_token(repo: &StoreRepo, token: &str, client_id: &str) -> 
         .claims
 }
 
+/// The refresh-token-specific claims `oauth2_op::refresh_token::mint_refresh_jwt` stamps.
+/// Re-declared rather than imported (mirroring `AccessClaims` above, for the same reason: this
+/// test file verifies the ACTUAL wire shape independently of the minting module's own types).
+#[derive(Debug, Deserialize)]
+struct RefreshClaims {
+    sub: String,
+    aud: String,
+    jti: String,
+    sid: String,
+    typ: String,
+}
+
+/// Verifies a minted refresh-token JWT against the active signing key -- the same claim
+/// shape/audience/typ `BearerTokenService`'s replay guard and `handle_refresh_token`'s own
+/// verification check, so a test asserting against this proves the token is genuinely well-formed
+/// rather than merely opaque-looking.
+async fn verify_refresh_token(repo: &StoreRepo, token: &str) -> RefreshClaims {
+    let jwks = repo.list_verification_jwks().await.unwrap();
+    let jwk = jwks.first().expect("an active signing key");
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_audience(&["lightbridge-refresh"]);
+    decode::<RefreshClaims>(token, &decoding_key(jwk), &validation)
+        .expect("refresh token verifies against the active jwk")
+        .claims
+}
+
 /// Decodes an access token's full, untyped claim set -- for assertions the typed `AccessClaims`
 /// has no field for (`aud`, absence of `role`/`quota_tier`/`project_quota`).
 async fn decode_access_token_claims(repo: &StoreRepo, token: &str, client_id: &str) -> Value {
@@ -2750,12 +2776,9 @@ async fn both_public_and_confidential_clients_can_obtain_a_refresh_token(pool: P
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert!(
-        body["refresh_token"]
-            .as_str()
-            .unwrap()
-            .starts_with("lgbr_rt_")
-    );
+    let refresh_claims = verify_refresh_token(&repo, body["refresh_token"].as_str().unwrap()).await;
+    assert_eq!(refresh_claims.aud, "lightbridge-refresh");
+    assert_eq!(refresh_claims.typ, "Refresh");
 
     // Confidential.
     let fixture = confidential_client(CONFIDENTIAL_CLIENT_ID);
@@ -2784,12 +2807,9 @@ async fn both_public_and_confidential_clients_can_obtain_a_refresh_token(pool: P
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert!(
-        body["refresh_token"]
-            .as_str()
-            .unwrap()
-            .starts_with("lgbr_rt_")
-    );
+    let refresh_claims = verify_refresh_token(&repo, body["refresh_token"].as_str().unwrap()).await;
+    assert_eq!(refresh_claims.aud, "lightbridge-refresh");
+    assert_eq!(refresh_claims.typ, "Refresh");
 }
 
 // ============================================================================================
@@ -2822,7 +2842,25 @@ async fn exchange_mints_project_scoped_jwt_with_refresh(pool: PgPool) {
     let refresh = body["refresh_token"]
         .as_str()
         .expect("offline_access must yield a refresh token");
-    assert!(refresh.starts_with("lgbr_rt_"));
+    // The refresh token is now an RS256 JWT (was: an opaque `lgbr_rt_<random>` string) --
+    // signed with the same active key the access token above verifies against, carrying the
+    // exact claim set `oauth2_op::refresh_token::mint_refresh_jwt` stamps.
+    let refresh_claims = verify_refresh_token(&repo, refresh).await;
+    assert_eq!(refresh_claims.sub, ACCOUNT_ID);
+    assert_eq!(refresh_claims.aud, "lightbridge-refresh");
+    assert_eq!(refresh_claims.typ, "Refresh");
+    assert!(!refresh_claims.jti.is_empty());
+    assert!(!refresh_claims.sid.is_empty());
+    // `jti` must be the ACTUAL `exchange_refresh_tokens` row id, not merely non-empty -- this is
+    // what lets the DB row and the JWT agree on identity (spec requirement, `refresh_token.rs`'s
+    // doc comment).
+    let row = repo
+        .find_exchange_refresh_token_by_hash(&hash_api_key(refresh))
+        .await
+        .unwrap()
+        .expect("refresh token row exists");
+    assert_eq!(refresh_claims.jti, row.id);
+    assert_eq!(refresh_claims.sid, row.session_id);
 
     let claims = verify_access_token(
         &repo,
@@ -3311,6 +3349,11 @@ async fn missing_refresh_token_is_invalid_request(pool: PgPool) {
     assert_eq!(body["error_description"], "refresh_token is required");
 }
 
+/// `state.signer.token_manager()` (which every grant type dispatches through, `token_exchange.rs`
+/// lines 260/425/551 -- built once per request before `handle_refresh_token` or any of this
+/// module's JWT verification ever runs) itself hits the unreachable repo first, fetching the
+/// active signing key. So this proves fail-closed behavior at that earlier gate, unaffected by
+/// the refresh-token JWT change: the presented value below is never even parsed.
 #[tokio::test]
 async fn totally_unreachable_repo_fails_the_refresh_grant_closed_as_server_error() {
     let state = state_with(
@@ -3762,6 +3805,16 @@ async fn refresh_succeeds_and_rotates_the_refresh_token(pool: PgPool) {
     .await;
     assert_eq!(claims.project_id, PROJECT_ID);
     assert_eq!(claims.account_id, ACCOUNT_ID);
+
+    // The rotated (second) refresh token is itself a well-formed, correctly-claimed JWT, not
+    // just "some different string" -- proves the full mint -> present -> verify -> rotate round
+    // trip end to end on the new refresh-token format, not only that the CAS/rotation bookkeeping
+    // still works.
+    let second_claims = verify_refresh_token(&repo, &second).await;
+    assert_eq!(second_claims.sub, ACCOUNT_ID);
+    assert_eq!(second_claims.aud, "lightbridge-refresh");
+    assert_eq!(second_claims.typ, "Refresh");
+    assert!(!second_claims.jti.is_empty());
 }
 
 /// Gap 2 (absolute cap): a refresh presented after `chain_expires_at` is refused even though the
@@ -7491,6 +7544,7 @@ async fn client_credentials_absent_scope_grants_every_configured_client_scope(po
         "an absent scope parameter must grant every scope the client is configured for: {body}"
     );
 }
+
 /// A browser logout must not revoke a DIFFERENT client's `offline_access` refresh chain.
 ///
 /// The production defect (`/oauth2/end_session` -> `revoke_sessions_and_cascade`, which matches on

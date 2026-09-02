@@ -554,6 +554,41 @@ async fn client_credentials_style_token_has_no_roles_and_zero_permissions_for_ev
     }
 }
 
+/// The replay guard `oauth2_op::refresh_token` (`lightbridge-authz-rest`) depends on: a refresh
+/// token is signed with the SAME key an access token would be, so signature verification alone
+/// cannot tell the two apart -- only the `typ` BODY claim does. Prove-fail: removing the `typ`
+/// check from `BearerTokenService::validate_bearer_token` makes this red, since the token below
+/// is otherwise a perfectly valid, signature-checked, unexpired, correctly-audienced JWT.
+#[tokio::test]
+async fn refresh_token_typ_claim_is_rejected_as_a_bearer_token() {
+    let server = MockServer::start();
+    let key = generate_test_key("refresh-typ-kid");
+    server.mock(|when, then| {
+        when.method(GET).path("/jwks");
+        then.header("content-type", "application/json")
+            .status(200)
+            .body(jwks_body(&[&key.jwk]));
+    });
+
+    let token = sign(
+        &key,
+        &json!({
+            "sub": "acc_1",
+            "iss": test_issuer(),
+            "exp": far_future_exp(),
+            "aud": "lightbridge-refresh",
+            "typ": "Refresh",
+            "jti": "row-id-1",
+            "sid": "session-1",
+        }),
+    );
+
+    let service = BearerTokenService::new(oauth2_config(server.url("/jwks"), None, default_rbac()));
+
+    let err = service.validate_bearer_token(&token).await.unwrap_err();
+    assert_eq!(err.to_string(), "unauthorized");
+}
+
 #[tokio::test]
 async fn service_debug_output_exposes_jwks_url_and_roles_claim_only() {
     let service = BearerTokenService::new(oauth2_config(

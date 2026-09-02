@@ -32,6 +32,14 @@ pub const API_KEY_CALLER_KIND: &str = "api_key";
 /// logging), without inventing a second ad hoc string.
 pub const SERVICE_CALLER_KIND: &str = "service";
 
+/// The `typ` BODY claim (not the JWT header's own `typ`) a refresh-token JWT carries
+/// (`oauth2_op::refresh_token`, `lightbridge-authz-rest`). Checked in
+/// [`BearerTokenServiceTrait::validate_bearer_token`] below: this service signs refresh and
+/// access/API-key tokens with the same key, so signature verification alone cannot tell a
+/// refresh token apart from a Bearer access token or an RFC 8693 `subject_token` -- this claim is
+/// what does, closing the replay this crate would otherwise leave open.
+pub const REFRESH_TOKEN_TYP_CLAIM: &str = "Refresh";
+
 /// Token information returned by JWT validation.
 #[derive(Clone, Deserialize)]
 pub struct TokenInfo {
@@ -276,19 +284,10 @@ impl BearerTokenServiceTrait for BearerTokenService {
 
         let mut validation = Validation::new(ACCEPTED_ALGORITHMS[0]);
         validation.algorithms = ACCEPTED_ALGORITHMS.to_vec();
-        if let Some(expected_audiences) = &self.config.audience {
-            tracing::debug!(
-                "Validating JWT with expected audiences: {:?}",
-                expected_audiences
-            );
-            if !expected_audiences.is_empty() {
-                validation.set_audience(expected_audiences);
-                validation.validate_aud = true;
-            } else {
-                validation.validate_aud = false;
-            }
-        } else {
-            validation.validate_aud = false;
+        let expected_audiences = self.config.audience.as_deref().unwrap_or_default();
+        validation.validate_aud = !expected_audiences.is_empty();
+        if validation.validate_aud {
+            validation.set_audience(expected_audiences);
         }
 
         // JWKS fetch/cache + kid lookup + signature/exp verification, delegated to
@@ -302,39 +301,30 @@ impl BearerTokenServiceTrait for BearerTokenService {
                 anyhow!("unauthorized")
             })?;
 
-        // Extract audience from claims
         let token_audience: Vec<String> = claims.aud.map(|a| a.to_vec()).unwrap_or_default();
 
-        // Explicit check: If we have expected audiences, verify that the token actually has one.
-        // Some JWT libraries might allow a missing 'aud' claim even when validate_aud=true if no required audiences are set.
-        if let Some(expected) = &self.config.audience {
-            if !expected.is_empty() && token_audience.is_empty() {
-                tracing::error!("JWT validation failed: missing mandatory 'aud' claim");
-                return Err(anyhow!("unauthorized"));
-            }
-
-            // Check that at least one of the configured expected audiences is present in the token.
-            // This ensures tokens are explicitly issued for this service.
-            let has_matching_audience = token_audience.iter().any(|token_aud| {
-                expected
-                    .iter()
-                    .any(|expected_aud| token_aud == expected_aud)
-            });
-
-            if !has_matching_audience {
-                tracing::error!(
-                    "JWT validation failed: no matching audience found. Expected one of {:?}, got {:?}",
-                    expected,
-                    token_audience
-                );
-                return Err(anyhow!("unauthorized"));
-            }
-
-            tracing::debug!(
-                "JWT audience validation passed. Expected: {:?}, Token: {:?}",
+        // Explicit re-check on top of `validate_jwt_generic`'s own `validate_aud`: that check
+        // skips entirely when the token carries no `aud` claim at all, even with `validate_aud =
+        // true` -- this catches that case too, via the same "does any token audience match"
+        // test, and correctly rejects EVERY token when `oauth2.audience` is configured as an
+        // explicit empty list (`Some(&[])`, distinct from unconfigured/`None`): there is then no
+        // audience value a token could ever match.
+        if let Some(expected) = &self.config.audience
+            && !token_audience.iter().any(|aud| expected.contains(aud))
+        {
+            tracing::error!(
+                "JWT validation failed: no matching audience. expected one of {:?}, got {:?}",
                 expected,
                 token_audience
             );
+            return Err(anyhow!("unauthorized"));
+        }
+
+        // Replay guard: a refresh-token JWT must never validate as a Bearer access token or an
+        // RFC 8693 `subject_token` -- see `REFRESH_TOKEN_TYP_CLAIM`'s own doc comment.
+        if claims.extra.get("typ").and_then(Value::as_str) == Some(REFRESH_TOKEN_TYP_CLAIM) {
+            tracing::debug!("rejecting a refresh-token JWT presented as a bearer token");
+            return Err(anyhow!("unauthorized"));
         }
 
         let roles = roles_from_claim(claims.extra.get(&self.roles_claim));
