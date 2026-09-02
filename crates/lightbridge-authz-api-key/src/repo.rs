@@ -64,7 +64,7 @@ impl StoreRepo {
         Self { pool }
     }
 
-    fn pool(&self) -> &PgPool {
+    pub(crate) fn pool(&self) -> &PgPool {
         self.pool.pool()
     }
 

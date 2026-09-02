@@ -300,7 +300,7 @@ async fn logout_ends_the_upstream_keycloak_sso_session(pool: PgPool) {
         repo.clone(),
     );
 
-    let ended = revoke_sessions_for_cookie(&repo, &rp, &cookie_headers(&session_id)).await;
+    let ended = revoke_sessions_for_cookie(&repo, &rp, &cookie_headers(&session_id), None).await;
 
     assert_eq!(ended, Ok(true));
     logout.assert_calls_async(1).await;
@@ -345,7 +345,7 @@ async fn a_confidential_client_authenticates_its_back_channel_logout(pool: PgPoo
     );
 
     assert_eq!(
-        revoke_sessions_for_cookie(&repo, &rp, &cookie_headers(&session_id)).await,
+        revoke_sessions_for_cookie(&repo, &rp, &cookie_headers(&session_id), None).await,
         Ok(true)
     );
     logout.assert_calls_async(1).await;
@@ -374,7 +374,7 @@ async fn an_unreachable_keycloak_does_not_block_local_logout(pool: PgPool) {
     );
 
     assert_eq!(
-        revoke_sessions_for_cookie(&repo, &rp, &cookie_headers(&session_id)).await,
+        revoke_sessions_for_cookie(&repo, &rp, &cookie_headers(&session_id), None).await,
         Ok(true),
         "an unreachable Keycloak must never surface as logout's hard 500"
     );
@@ -410,7 +410,7 @@ async fn a_keycloak_that_refuses_the_logout_does_not_block_local_logout(pool: Pg
     );
 
     assert_eq!(
-        revoke_sessions_for_cookie(&repo, &rp, &cookie_headers(&session_id)).await,
+        revoke_sessions_for_cookie(&repo, &rp, &cookie_headers(&session_id), None).await,
         Ok(true),
         "a refused back-channel logout must never surface as logout's hard 500"
     );
@@ -447,7 +447,7 @@ async fn an_absent_refresh_token_means_no_upstream_call_at_all(pool: PgPool) {
     );
 
     assert_eq!(
-        revoke_sessions_for_cookie(&repo, &rp, &cookie_headers(&session_id)).await,
+        revoke_sessions_for_cookie(&repo, &rp, &cookie_headers(&session_id), None).await,
         Ok(true)
     );
     assert_eq!(
@@ -493,7 +493,7 @@ async fn an_envelope_under_a_rotated_key_is_treated_as_no_stored_credential(pool
     );
 
     assert_eq!(
-        revoke_sessions_for_cookie(&repo, &rp, &cookie_headers(&session_id)).await,
+        revoke_sessions_for_cookie(&repo, &rp, &cookie_headers(&session_id), None).await,
         Ok(true)
     );
     assert_eq!(logout.calls_async().await, 0);
@@ -537,7 +537,7 @@ async fn a_subject_with_no_federated_identity_still_logs_out(pool: PgPool) {
     );
 
     assert_eq!(
-        revoke_sessions_for_cookie(&repo, &rp, &cookie_headers(&session_id)).await,
+        revoke_sessions_for_cookie(&repo, &rp, &cookie_headers(&session_id), None).await,
         Ok(true)
     );
     assert_eq!(logout.calls_async().await, 0);
