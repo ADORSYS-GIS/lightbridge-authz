@@ -53,7 +53,8 @@ impl KeyPurpose {
 pub enum JwkAction {
     List,
     New(KeyPurpose),
-    Rotate(KeyPurpose),
+    /// The `bool` is `--yes`; see [`rotate_key`] for why rotation alone requires it.
+    Rotate(KeyPurpose, bool),
 }
 
 /// Entry point: loads config, connects to Postgres (no Redis -- signing keys are DB-only), and
@@ -72,7 +73,7 @@ pub async fn dispatch(repo: &StoreRepo, action: JwkAction) -> Result<()> {
     match action {
         JwkAction::List => list(repo).await,
         JwkAction::New(purpose) => new_key(repo, purpose).await,
-        JwkAction::Rotate(purpose) => rotate_key(repo, purpose).await,
+        JwkAction::Rotate(purpose, confirmed) => rotate_key(repo, purpose, confirmed).await,
     }
 }
 
@@ -148,7 +149,19 @@ async fn new_key(repo: &StoreRepo, purpose: KeyPurpose) -> Result<()> {
 /// one, via the same advisory-lock `ensure_active_signing_key` path the age-based auto-rotation
 /// uses -- passing `now` as the cutoff means any existing active key (necessarily created before
 /// `now`) is always due for rotation.
-async fn rotate_key(repo: &StoreRepo, purpose: KeyPurpose) -> Result<()> {
+/// `confirmed` is `--yes`. Refused without it: `list` and `new` are safe to fat-finger, this is
+/// not -- it retires the key currently signing tokens. Already-issued tokens keep validating
+/// (retired keys stay in the verification set), so the blast radius is bounded, but an accidental
+/// rotation is still a real event and there is no interactive prompt available in the `kubectl
+/// exec`/init-container contexts this command exists for.
+async fn rotate_key(repo: &StoreRepo, purpose: KeyPurpose, confirmed: bool) -> Result<()> {
+    if !confirmed {
+        return Err(Error::Conflict(format!(
+            "refusing to rotate the {} signing key without --yes: this retires the key currently \
+             signing tokens",
+            purpose.as_str()
+        )));
+    }
     let old = active_for(repo, purpose).await?;
     let now = Utc::now();
     let new = repo

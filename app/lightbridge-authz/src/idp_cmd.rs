@@ -26,7 +26,7 @@ pub async fn run(config_path: String, command: Option<IdpSubcommand>) -> Result<
             let action = match command {
                 JwkCommand::List => JwkAction::List,
                 JwkCommand::New { r#type } => JwkAction::New(r#type),
-                JwkCommand::Rotate { r#type } => JwkAction::Rotate(r#type),
+                JwkCommand::Rotate { r#type, yes } => JwkAction::Rotate(r#type, yes),
             };
             jwk_cmd::run(&config_path, action).await
         }

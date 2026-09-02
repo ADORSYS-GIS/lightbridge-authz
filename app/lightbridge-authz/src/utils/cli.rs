@@ -66,9 +66,14 @@ pub enum JwkCommand {
         r#type: KeyPurpose,
     },
     /// Force-rotate the active key for `--type`: retires the current one and activates a fresh
-    /// one.
+    /// one. Requires `--yes`: unlike `list` and `new`, this changes live signing state, and the
+    /// operator typing it is the only confirmation an `exec`/init-container context can offer.
     Rotate {
         #[arg(long, value_enum)]
         r#type: KeyPurpose,
+        /// Required. Rotation retires the currently active key; without this flag the command
+        /// refuses and exits non-zero, so a mistyped or scripted invocation cannot rotate.
+        #[arg(long)]
+        yes: bool,
     },
 }

@@ -141,7 +141,7 @@ mod db {
                 .is_none()
         );
 
-        dispatch(&repo, JwkAction::Rotate(KeyPurpose::Refresh))
+        dispatch(&repo, JwkAction::Rotate(KeyPurpose::Refresh, true))
             .await
             .expect("rotate must succeed even with no prior key");
 
@@ -163,7 +163,7 @@ mod db {
             .expect("seed an active access key");
         let old = repo.get_active_signing_key().await.unwrap().unwrap();
 
-        dispatch(&repo, JwkAction::Rotate(KeyPurpose::Access))
+        dispatch(&repo, JwkAction::Rotate(KeyPurpose::Access, true))
             .await
             .expect("rotate must succeed against an existing active key");
 
@@ -197,7 +197,7 @@ mod db {
         dispatch(&repo, JwkAction::New(KeyPurpose::Refresh))
             .await
             .unwrap();
-        dispatch(&repo, JwkAction::Rotate(KeyPurpose::Access))
+        dispatch(&repo, JwkAction::Rotate(KeyPurpose::Access, true))
             .await
             .unwrap();
 
@@ -215,5 +215,40 @@ mod db {
         // Also drive it through jwk_cmd's own formatter, the same output the CLI prints.
         let rendered = format_signing_keys(&keys);
         assert!(!rendered.to_uppercase().contains("PRIVATE KEY"));
+    }
+
+    /// `rotate` without `--yes` must refuse and must NOT rotate.
+    ///
+    /// The guard exists because `rotate` is the only one of the three verbs that changes live signing
+    /// state, and the contexts this command is built for (`kubectl exec`, an init container) offer no
+    /// interactive confirmation. A refusal that still rotated, or that rotated on a later retry, would
+    /// make the flag decorative.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn rotate_without_yes_refuses_and_leaves_the_key_untouched(pool: PgPool) {
+        let repo = repo(pool);
+        dispatch(&repo, JwkAction::New(KeyPurpose::Access))
+            .await
+            .expect("seeding an access key");
+        let before = repo
+            .get_active_signing_key()
+            .await
+            .expect("read back")
+            .expect("an active key");
+
+        let refused = dispatch(&repo, JwkAction::Rotate(KeyPurpose::Access, false)).await;
+        assert!(
+            refused.is_err(),
+            "rotate without --yes must refuse, got: {refused:?}"
+        );
+
+        let after = repo
+            .get_active_signing_key()
+            .await
+            .expect("read back")
+            .expect("an active key");
+        assert_eq!(
+            before.kid, after.kid,
+            "a refused rotation must leave the active key untouched, not rotate anyway"
+        );
     }
 }
