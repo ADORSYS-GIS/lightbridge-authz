@@ -1,5 +1,22 @@
 # Changelog
 
+## [9.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v8.0.0...v9.0.0) (2026-09-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* **idp:** refresh tokens are RS256 JWTs, with a replay guard ([#628](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/628))
+
+### Features
+
+* **idp:** refresh tokens are RS256 JWTs, with a replay guard ([#628](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/628)) ([e878631](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/e878631121dd89e111d7dc3a904200ded6edd1b0))
+* **idp:** refresh tokens get their own signing key, kept out of the JWKS ([#631](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/631)) ([7f7ca4b](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/7f7ca4b3436e04f1255ed980dacd0ccbb057556d))
+
+
+### Bug Fixes
+
+* **idp:** browser logout must not revoke other clients' offline_access ([#627](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/627)) ([c500fcf](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/c500fcfca27f8df85c95263ae276f6e8f72f1168))
+
 ## [8.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v7.0.0...v8.0.0) (2026-09-01)
 
 
