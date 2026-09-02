@@ -65,6 +65,13 @@ fn oauth2_token_exchange_honors_explicit_values() {
 /// set it, since the platform trust store already covers a publicly-reachable JWKS endpoint.
 #[test]
 fn oauth2_jwks_ca_bundle_path_defaults_to_none_when_unset() {
+    // NOT a regression guard for `#[serde(default)]`, and deliberately labelled so: serde treats
+    // an `Option<T>` field as implicitly defaulted whether or not that attribute is present, so
+    // removing it does NOT make this fail (verified by mutation). The attribute is kept for
+    // consistency with the sibling `ca_bundle_path` fields, not because this test pins it.
+    // What this DOES pin is the observable contract -- an absent key parses, and the default is
+    // `None` rather than an empty string -- which a change to the field type would break. Its
+    // counterpart below IS mutation-proof (verified via a `rename`).
     let cfg: Oauth2 = serde_yaml::from_str("type: self\njwks_url: \"http://x\"\n").unwrap();
     assert_eq!(cfg.jwks_ca_bundle_path, None);
 }
