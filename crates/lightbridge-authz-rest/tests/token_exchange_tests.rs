@@ -7491,3 +7491,121 @@ async fn client_credentials_absent_scope_grants_every_configured_client_scope(po
         "an absent scope parameter must grant every scope the client is configured for: {body}"
     );
 }
+/// A browser logout must not revoke a DIFFERENT client's `offline_access` refresh chain.
+///
+/// The production defect (`/oauth2/end_session` -> `revoke_sessions_and_cascade`, which matches on
+/// `subject` alone): every CLI grant persists a `kind = "token"` session, so signing out of the
+/// console silently killed the refresh chain of every other client that person had authorised.
+/// Their `opencode-cli` -- working fine moments earlier -- answered `400 invalid_grant` on its next
+/// refresh and demanded a fresh device-code login, at no fixed interval, because the trigger was a
+/// browser action in another client rather than anything time-based (refresh TTLs are 30/90 days).
+/// Nothing was logged: `handle_refresh_token`'s plain `invalid_grant` arm is silent.
+///
+/// `revoke_for_logout` scopes the blast radius to the browser session plus the RP that asked for
+/// the logout, so the console's own tokens still die (asserted below -- the fix must not become a
+/// licence for a logout that logs nothing out) while other clients' `offline_access` survives, per
+/// OIDC Core §11's definition of that scope as access outliving the browser session.
+///
+/// Prove-fail-first (run, 2026-09-02): swapping `revoke_for_logout(.., Some(CONSOLE))` for
+/// `revoke_sessions_and_cascade(..)` panics at the `cli_id` session assertion --
+/// `assertion left == right failed: another client's session must survive a browser logout it had
+/// no part in / left: "revoked" / right: "active"`. That is the first of the two `opencode`
+/// assertions; the refresh-chain one below it never runs, since the session check panics first.
+#[sqlx::test(migrations = "../../migrations")]
+async fn browser_logout_spares_another_clients_offline_refresh_chain(pool: PgPool) {
+    const CONSOLE: &str = "lightbridge-console";
+    const CLI: &str = "opencode-cli";
+    let repo = repo(pool.clone());
+    seed_member_project(&repo).await;
+    let now = chrono::Utc::now();
+
+    let session = |kind: &str, client: Option<&str>| {
+        let id = cuid2();
+        let row = NewSession {
+            id: id.clone(),
+            account_id: OWNER_ACCOUNT.to_string(),
+            project_id: MEMBER_PROJECT_ID.to_string(),
+            client_id: client.map(str::to_string),
+            kind: kind.to_string(),
+            expires_at: now + chrono::Duration::days(90),
+            subject: Some(SUBJECT.to_string()),
+        };
+        (id, row)
+    };
+    let (browser_id, browser_row) = session("browser", None);
+    let (console_id, console_row) = session("token", Some(CONSOLE));
+    let (cli_id, cli_row) = session("token", Some(CLI));
+    for row in [browser_row, console_row, cli_row] {
+        repo.create_session(row).await.expect("session persists");
+    }
+
+    let chain = |session_id: &str, client: &str| {
+        let id = cuid2();
+        let row = NewExchangeRefreshToken {
+            id: id.clone(),
+            subject: SUBJECT.to_string(),
+            account_id: OWNER_ACCOUNT.to_string(),
+            project_id: MEMBER_PROJECT_ID.to_string(),
+            client_id: client.to_string(),
+            token_hash: format!("hash-{id}"),
+            scope: Some("offline_access".to_string()),
+            email: None,
+            email_verified: None,
+            auth_time: None,
+            preferred_username: None,
+            name: None,
+            chain_id: cuid2(),
+            chain_expires_at: now + chrono::Duration::days(90),
+            session_id: session_id.to_string(),
+            created_at: now,
+            expires_at: now + chrono::Duration::days(30),
+        };
+        (id, row)
+    };
+    let (console_refresh_id, console_refresh) = chain(&console_id, CONSOLE);
+    let (cli_refresh_id, cli_refresh) = chain(&cli_id, CLI);
+    for row in [console_refresh, cli_refresh] {
+        repo.create_exchange_refresh_token(row)
+            .await
+            .expect("refresh token persists");
+    }
+
+    repo.revoke_for_logout(&AccountId::assert_already_resolved(SUBJECT), Some(CONSOLE))
+        .await
+        .expect("browser logout should succeed");
+
+    async fn refresh_status(pool: &PgPool, id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM exchange_refresh_tokens WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("refresh row exists")
+    }
+
+    assert_eq!(
+        session_status(&pool, &browser_id).await,
+        "revoked",
+        "the browser SSO session is what logout exists to end"
+    );
+    assert_eq!(
+        session_status(&pool, &console_id).await,
+        "revoked",
+        "the RP that asked for the logout must lose its own session"
+    );
+    assert_eq!(
+        refresh_status(&pool, &console_refresh_id).await,
+        "revoked",
+        "signing out of the console must still invalidate the console's own refresh token"
+    );
+
+    assert_eq!(
+        session_status(&pool, &cli_id).await,
+        "active",
+        "another client's session must survive a browser logout it had no part in"
+    );
+    assert_eq!(
+        refresh_status(&pool, &cli_refresh_id).await,
+        "active",
+        "the reported bug: opencode's offline_access chain must survive a console logout"
+    );
+}

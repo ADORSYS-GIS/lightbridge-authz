@@ -128,6 +128,7 @@ pub async fn revoke_sessions_for_cookie(
     repo: &StoreRepo,
     relying_party: &KeycloakRelyingParty,
     headers: &HeaderMap,
+    client_id: Option<&str>,
 ) -> Result<bool, LocalRevocationFailed> {
     let Some(session_id) = read_session_cookie(headers) else {
         return Ok(false);
@@ -143,17 +144,15 @@ pub async fn revoke_sessions_for_cookie(
             return Err(LocalRevocationFailed);
         }
     };
-    // `None` only for a row predating `migrations/20260824000003_sessions_add_subject.sql`. There
-    // is no safe fallback -- `account_id` is the project's OWNING account, so revoking on it would
-    // log out every member of a shared project (`revoke_sessions_and_cascade`'s own comment
-    // records that incident). Such rows are TTL-bounded and self-heal; clearing the cookie below
-    // still ends this browser's use of it.
+    // `None` only for a row predating `migrations/20260824000003_sessions_add_subject.sql`. No
+    // safe fallback: `account_id` is the project's OWNING account, so revoking on it would log out
+    // every member of a shared project. TTL-bounded and self-healing; the cookie is still cleared.
     let Some(subject) = session.subject else {
         tracing::warn!("logout: session row predates the subject column; clearing cookie only");
         return Ok(false);
     };
     match repo
-        .revoke_sessions_and_cascade(&AccountId::assert_already_resolved(&subject))
+        .revoke_for_logout(&AccountId::assert_already_resolved(&subject), client_id)
         .await
     {
         Ok(revoked) => {
@@ -206,7 +205,15 @@ async fn end_session(
     headers: HeaderMap,
     request: EndSessionRequest,
 ) -> Response {
-    if revoke_sessions_for_cookie(&state.repo, &state.relying_party, &headers)
+    // Verified for `azp` only, and with expiry ignored -- see `verify_own_token`'s doc comment for
+    // why an expired hint at logout is the normal case; resolved BEFORE the scoped revocation.
+    let hint = match request.id_token_hint.as_deref() {
+        Some(hint) => verify_own_token(&state.token, hint, false).await,
+        None => None,
+    };
+    let client_id = resolve_client_id(&request, hint.as_ref());
+    let logout_client = client_id.as_deref();
+    if revoke_sessions_for_cookie(&state.repo, &state.relying_party, &headers, logout_client)
         .await
         .is_err()
     {
@@ -224,13 +231,6 @@ async fn end_session(
             .into_response();
     }
 
-    // Verified for `azp` only, and with expiry ignored -- see `verify_own_token`'s doc comment for
-    // why an expired hint at logout is the normal case rather than an error.
-    let hint = match request.id_token_hint.as_deref() {
-        Some(hint) => verify_own_token(&state.token, hint, false).await,
-        None => None,
-    };
-    let client_id = resolve_client_id(&request, hint.as_ref());
     let redirect = resolve_post_logout_redirect(
         &state.post_logout_redirect_uris,
         client_id.as_deref(),
