@@ -263,6 +263,7 @@ impl GeneratedKey {
             algorithm: ALGORITHM.to_string(),
             private_key_pem: self.private_key_pem,
             public_jwk: self.public_jwk,
+            purpose: "access".to_string(),
             created_at,
         }
     }
@@ -291,8 +292,7 @@ impl GeneratedKey {
 /// the just-inserted row as `active`, decides `needs_rotation == false`, and returns it unchanged.
 /// This holds identically for two callers or three (or more) — the lock, not the caller count, is
 /// what guarantees exactly one active key. See
-/// `concurrent_bootstraps_from_multiple_services_produce_exactly_one_active_key`
-/// (`tests/signing_tests.rs`) for the proof against a real database with three concurrent callers.
+/// `concurrent_bootstraps_from_multiple_services_produce_exactly_one_active_key` (`tests/signing_tests.rs`) for the proof against three concurrent callers.
 ///
 /// **What happens if services disagree on `max_key_age_days`.** Each caller computes its own
 /// rotation cutoff from its own `cfg.max_key_age_days` before taking the lock (see this

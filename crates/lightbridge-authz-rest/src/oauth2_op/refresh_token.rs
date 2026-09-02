@@ -9,23 +9,30 @@
 //! like, and that this module verifies it (signature/`exp`/`aud`/`typ`) before that hash/CAS step
 //! ever runs -- a malformed or foreign-signed presentation never reaches the database at all.
 //!
-//! **Minting** goes through the SAME `TokenManager` (`authkestra_engine::token`) the access token
-//! minted alongside it uses -- literally the same call's `tokens: &TokenManager`, so it is signed
-//! with the same active key/`kid` and stamps the same `iss` with no extra plumbing.
+//! **A dedicated refresh signing key, not the access-token key.** Earlier revisions of this
+//! module minted over the SAME `TokenManager` the access token minted alongside it used, and
+//! relied on the `typ` claim below as the only guard against a refresh JWT being replayed as an
+//! access token. Cross-use is now prevented BY CONSTRUCTION instead: [`mint_refresh_jwt`] builds
+//! its own `TokenManager` from [`StoreRepo::get_active_refresh_signing_key`] (`purpose =
+//! 'refresh'`), a key that never appears in `/.well-known/jwks.json`
+//! ([`StoreRepo::list_verification_jwks`] serves `purpose = 'access'` only) -- no resource server
+//! ever holds a key that can verify a refresh token, so there is no key for a forged/replayed one
+//! to validate against even if the `typ` check below were somehow bypassed. See
+//! `migrations/20260902000001_signing_keys_add_purpose.sql` and
+//! `oauth2_op::refresh_signing::bootstrap_idp_signing_keys` for how that key is provisioned.
 //!
-//! **Verification**, unlike minting, cannot reuse that single-key `TokenManager`: an individual
-//! refresh token's own `refresh_ttl_seconds` (default 30 days) can outlive one signing-key
-//! rotation cycle (`max_key_age_days`, also default 30 days) before it is ever redeemed, so a
-//! `TokenManager` rebuilt from "the currently active key" at redemption time may not be the key
-//! that signed it. [`StoreRepo::list_verification_jwks`] (active + retired) is used here instead
-//! -- the same key set `/.well-known/jwks.json` serves.
+//! **Verification** reads [`StoreRepo::list_refresh_verification_jwks`] (active + retired refresh
+//! keys) rather than a single freshly-built `TokenManager`: an individual refresh token's own
+//! `refresh_ttl_seconds` (default 30 days) can outlive one signing-key rotation cycle
+//! (`max_key_age_days`, also default 30 days) before it is ever redeemed, so "the currently active
+//! refresh key" at redemption time may not be the key that signed it.
 //!
 //! `aud` is fixed to [`REFRESH_TOKEN_AUDIENCE`], a value no resource server (nor this service's
 //! own bearer/`subject_token` validators) is configured to accept. The `typ` claim
-//! ([`lightbridge_authz_bearer::REFRESH_TOKEN_TYP_CLAIM`]) is the other half of the replay guard:
-//! `BearerTokenService::validate_bearer_token` refuses any token carrying it outright, so a
-//! refresh JWT can never be replayed as a Bearer access token or an RFC 8693 `subject_token` --
-//! see that constant's own doc comment.
+//! ([`lightbridge_authz_bearer::REFRESH_TOKEN_TYP_CLAIM`]) is a second, independent guard on top
+//! of the dedicated key: `BearerTokenService::validate_bearer_token` refuses any token carrying it
+//! outright, so a refresh JWT can never be replayed as a Bearer access token or an RFC 8693
+//! `subject_token` -- see that constant's own doc comment.
 
 use std::collections::HashMap;
 
@@ -57,16 +64,31 @@ pub struct RefreshTokenClaims {
 }
 
 /// Mints a refresh-token JWT for `account_id`/`session_id`, stamping `row_id` (the
-/// `exchange_refresh_tokens` row this plaintext will be hashed into) as `jti`, over `tokens` --
-/// the same `TokenManager` the access token minted alongside it uses, so `iss`/signing key/`kid`
-/// are identical between the two without this function needing to know either.
-pub fn mint_refresh_jwt(
-    tokens: &TokenManager,
+/// `exchange_refresh_tokens` row this plaintext will be hashed into) as `jti`. Signed with the
+/// dedicated refresh signing key (`repo.get_active_refresh_signing_key()`), never the access-token
+/// key an access/id token in the same response might be signed with -- see this module's doc
+/// comment for why that is what makes cross-use impossible by construction rather than by policy.
+pub async fn mint_refresh_jwt(
+    repo: &StoreRepo,
     account_id: &str,
     session_id: &str,
     row_id: &str,
     expires_in_secs: u64,
 ) -> Result<String> {
+    // Self-healing rather than a hard error: see `ensure_refresh_signing_key`'s doc comment for
+    // why startup bootstrap alone is not enough, and why this can create but never rotate.
+    let key = match repo.get_active_refresh_signing_key().await? {
+        Some(key) => key,
+        None => {
+            super::refresh_signing::ensure_refresh_signing_key(
+                repo,
+                super::refresh_signing::mint_path_cutoff(),
+            )
+            .await?
+        }
+    };
+    let tokens = TokenManager::new_asymmetric(key.private_key_pem.as_bytes(), None, Some(key.kid))
+        .map_err(|e| Error::Server(format!("invalid stored refresh signing key: {e}")))?;
     let mut extra: HashMap<String, Value> = HashMap::new();
     extra.insert("jti".to_string(), Value::String(row_id.to_string()));
     extra.insert("sid".to_string(), Value::String(session_id.to_string()));
@@ -85,8 +107,8 @@ pub fn mint_refresh_jwt(
         .map_err(|e| Error::Server(format!("refresh token signing failed: {e}")))
 }
 
-/// Verifies a presented refresh-token JWT: signature (against every key this service has ever
-/// signed with, active or retired -- see this module's doc comment for why), `exp`, `aud ==
+/// Verifies a presented refresh-token JWT: signature (against every REFRESH key this service has
+/// ever signed with, active or retired -- see this module's doc comment for why), `exp`, `aud ==
 /// `[`REFRESH_TOKEN_AUDIENCE`], and `typ == `[`REFRESH_TOKEN_TYP_CLAIM`]. Returns `None` on ANY
 /// failure (malformed token, unknown `kid`, bad signature, expired, wrong audience, wrong `typ`)
 /// -- `oauth2_op::store::TokenExchangeOpStore::handle_refresh_token` maps every `Ok(None)` to the
@@ -103,7 +125,7 @@ pub async fn verify_refresh_jwt(
     repo: &StoreRepo,
     presented: &str,
 ) -> Result<Option<RefreshTokenClaims>> {
-    let jwks = repo.list_verification_jwks().await?;
+    let jwks = repo.list_refresh_verification_jwks().await?;
     Ok(verify_against_jwks(&jwks, presented))
 }
 

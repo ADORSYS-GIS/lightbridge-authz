@@ -3039,7 +3039,7 @@ impl StoreRepo {
             r#"
             SELECT kid, algorithm, private_key_pem, public_jwk, status, created_at, retired_at
             FROM signing_keys
-            WHERE status = 'active'
+            WHERE status = 'active' AND purpose = 'access'
             LIMIT 1
             "#,
         )
@@ -3053,7 +3053,7 @@ impl StoreRepo {
         let rows: Vec<(Value,)> = sqlx::query_as(
             r#"
             SELECT public_jwk
-            FROM signing_keys
+            FROM signing_keys WHERE purpose = 'access'
             ORDER BY status = 'active' DESC, created_at DESC
             "#,
         )
@@ -3062,12 +3062,10 @@ impl StoreRepo {
         Ok(rows.into_iter().map(|(jwk,)| jwk).collect())
     }
 
-    /// Idempotently ensures there is an active signing key, rotating (marking the current
-    /// active stale + activating `candidate`) when it is missing or older than `max_age_cutoff`.
-    /// A transaction-scoped advisory lock serializes this across replicas so only one key wins --
-    /// this is the chokepoint every bootstrapping caller shares (`authz-api`, `lightbridge-mcp`,
-    /// and, since ADR-0012, `authz-idp`; see `lightbridge_authz_rest::signing::bootstrap_signing_key`'s
-    /// doc comment for the full concurrent-bootstrap and `max_key_age_days`-disagreement analysis).
+    /// Idempotently ensures an active signing key of `candidate.purpose` (`'access'`/`'refresh'`),
+    /// rotating within that purpose alone when missing/stale -- the `(status, purpose) WHERE
+    /// status = 'active'` index is what lets an access key and a refresh key both be active. One
+    /// advisory lock still serializes every purpose/caller; see `lightbridge_authz_rest::signing::bootstrap_signing_key`'s doc comment for the concurrent-bootstrap analysis.
     #[instrument(skip(self, candidate))]
     pub async fn ensure_active_signing_key(
         &self,
@@ -3085,10 +3083,11 @@ impl StoreRepo {
             r#"
             SELECT kid, algorithm, private_key_pem, public_jwk, status, created_at, retired_at
             FROM signing_keys
-            WHERE status = 'active'
+            WHERE status = 'active' AND purpose = $1
             LIMIT 1
             "#,
         )
+        .bind(&candidate.purpose)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -3119,8 +3118,8 @@ impl StoreRepo {
 
         let inserted: SigningKeyRow = sqlx::query_as(
             r#"
-            INSERT INTO signing_keys (kid, algorithm, private_key_pem, public_jwk, status, created_at)
-            VALUES ($1, $2, $3, $4, 'active', $5)
+            INSERT INTO signing_keys (kid, algorithm, private_key_pem, public_jwk, status, purpose, created_at)
+            VALUES ($1, $2, $3, $4, 'active', $5, $6)
             RETURNING kid, algorithm, private_key_pem, public_jwk, status, created_at, retired_at
             "#,
         )
@@ -3128,6 +3127,7 @@ impl StoreRepo {
         .bind(candidate.algorithm)
         .bind(candidate.private_key_pem)
         .bind(candidate.public_jwk)
+        .bind(candidate.purpose)
         .bind(candidate.created_at)
         .fetch_one(&mut *tx)
         .await?;

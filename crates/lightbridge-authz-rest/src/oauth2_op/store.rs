@@ -659,7 +659,6 @@ impl TokenExchangeOpStore {
                         session_id: &session.id,
                     },
                     now,
-                    tokens,
                 )
                 .await?,
             )
@@ -678,7 +677,6 @@ impl TokenExchangeOpStore {
         &self,
         input: InitialRefreshToken<'_>,
         now: DateTime<Utc>,
-        tokens: &TokenManager,
     ) -> Result<String, TokenErrorResponse> {
         // Row id minted up front, same reasoning as `handle_refresh_token`'s own `new_id`: it is
         // both the DB primary key AND the JWT `jti`, so the two always agree on identity.
@@ -687,12 +685,13 @@ impl TokenExchangeOpStore {
             now + Duration::seconds(self.cfg.refresh_absolute_ttl_seconds.max(0));
         let expires_at = now + Duration::seconds(self.cfg.refresh_ttl_seconds);
         let plaintext = refresh_token::mint_refresh_jwt(
-            tokens,
+            &self.repo,
             input.account_id,
             input.session_id,
             &row_id,
             self.cfg.refresh_ttl_seconds.max(0) as u64,
         )
+        .await
         .map_err(|_| oauth_err("server_error", "refresh token signing failed"))?;
         self.repo
             .create_exchange_refresh_token(NewExchangeRefreshToken {
@@ -1125,7 +1124,6 @@ impl TokenExchangeOpStore {
                         session_id: &session_id,
                     },
                     now,
-                    tokens,
                 )
                 .await?,
             )
@@ -1787,12 +1785,13 @@ impl TokenExchangeOpStore {
         };
 
         let new_plaintext = refresh_token::mint_refresh_jwt(
-            tokens,
+            &self.repo,
             &context.account_id,
             &session_id,
             &new_id,
             self.cfg.refresh_ttl_seconds.max(0) as u64,
         )
+        .await
         .map_err(|_| oauth_err("server_error", "refresh token signing failed"))?;
         let new_row = NewExchangeRefreshToken {
             // The SAME id generated above, before the CAS consume -- see `new_id`'s own comment.

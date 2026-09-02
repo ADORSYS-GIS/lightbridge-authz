@@ -3191,11 +3191,11 @@ pub fn build_idp_router(
 ///
 /// ## Signing-key ownership decision (ADR-0012, "signing-key bootstrap")
 ///
-/// `authz-idp` calls [`signing::bootstrap_signing_key`] on startup, exactly as `authz-api`
-/// (`start_api_server`) and `lightbridge-mcp` already do — making this the *third* concurrent
-/// bootstrapper against the shared `signing_keys` table, not a new kind of participant. See
-/// [`signing::bootstrap_signing_key`]'s own doc comment for why a third caller is exactly as safe
-/// as the two that already exist, and for the `max_key_age_days`-disagreement analysis.
+/// `authz-idp` calls [`oauth2_op::refresh_signing::bootstrap_idp_signing_keys`] on startup: the
+/// access key via [`signing::bootstrap_signing_key`], exactly as `authz-api` (`start_api_server`)
+/// and `lightbridge-mcp` already do (the *third* concurrent bootstrapper of that key, not a new
+/// kind of participant) -- AND, only here, the dedicated refresh-token signing key. See both
+/// functions' own doc comments for the concurrent-bootstrap and `max_key_age_days` analysis.
 pub async fn start_idp_server(
     idp: &IdpServer,
     pool: Arc<dyn DbPoolTrait>,
@@ -3307,7 +3307,7 @@ pub async fn start_idp_server(
     );
     let policy_engine: Arc<dyn lightbridge_authz_budget::PolicyEngine> = policy_store.engine();
     let signing_repo = Arc::new(StoreRepo::new(pool));
-    signing::bootstrap_signing_key(&signing_repo, signing).await?;
+    oauth2_op::refresh_signing::bootstrap_idp_signing_keys(&signing_repo, signing).await?;
 
     let bearer_service: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> =
         Arc::new(BearerTokenService::new(oauth2.clone()));

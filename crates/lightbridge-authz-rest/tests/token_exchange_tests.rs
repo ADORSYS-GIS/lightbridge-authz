@@ -71,12 +71,11 @@ use lightbridge_authz_rest::models::IntrospectRequest;
 use lightbridge_authz_rest::oauth2_op::authorization_code_store::DbAuthorizationCodeStore;
 use lightbridge_authz_rest::oauth2_op::client_assertion_store::RedisClientAssertionStore;
 use lightbridge_authz_rest::oauth2_op::client_store::ConfigClientStore;
+use lightbridge_authz_rest::oauth2_op::refresh_signing::bootstrap_idp_signing_keys;
 use lightbridge_authz_rest::oauth2_op::store::TokenExchangeOpStore;
 use lightbridge_authz_rest::relying_party::KeycloakRelyingParty;
 use lightbridge_authz_rest::rpc_authorize::RpcScope;
-use lightbridge_authz_rest::signing::{
-    ApiKeyJwtSigner, KeyOwner, bootstrap_signing_key, generate_rs256_key,
-};
+use lightbridge_authz_rest::signing::{ApiKeyJwtSigner, KeyOwner, generate_rs256_key};
 use lightbridge_authz_rest::token_exchange::{TokenExchangeState, token_exchange_router};
 use serde::Deserialize;
 use serde_json::Value;
@@ -872,13 +871,29 @@ struct RefreshClaims {
 /// shape/audience/typ `BearerTokenService`'s replay guard and `handle_refresh_token`'s own
 /// verification check, so a test asserting against this proves the token is genuinely well-formed
 /// rather than merely opaque-looking.
+/// Verifies a refresh token against the REFRESH key set, and asserts in passing that it does NOT
+/// verify against the published access JWKS.
+///
+/// That second assertion is the security property #629 exists to establish: the refresh signing
+/// key is excluded from `/.well-known/jwks.json`, so no resource server holds a key capable of
+/// verifying a refresh token, and cross-use is impossible by construction rather than prevented by
+/// the `typ` denylist alone. Before #629 this helper verified against `list_verification_jwks`
+/// (the published set) and passed -- that it now CANNOT is the change.
 async fn verify_refresh_token(repo: &StoreRepo, token: &str) -> RefreshClaims {
-    let jwks = repo.list_verification_jwks().await.unwrap();
-    let jwk = jwks.first().expect("an active signing key");
     let mut validation = Validation::new(Algorithm::RS256);
     validation.set_audience(&["lightbridge-refresh"]);
+
+    for published in repo.list_verification_jwks().await.unwrap() {
+        assert!(
+            decode::<RefreshClaims>(token, &decoding_key(&published), &validation).is_err(),
+            "a refresh token must NOT be verifiable against any key in the published JWKS: {published}"
+        );
+    }
+
+    let refresh_jwks = repo.list_refresh_verification_jwks().await.unwrap();
+    let jwk = refresh_jwks.first().expect("an active refresh signing key");
     decode::<RefreshClaims>(token, &decoding_key(jwk), &validation)
-        .expect("refresh token verifies against the active jwk")
+        .expect("refresh token verifies against the refresh jwk")
         .claims
 }
 
@@ -925,7 +940,9 @@ fn subject_token_with_claims(claims: &Value) -> String {
 #[sqlx::test(migrations = "../../migrations")]
 async fn public_client_with_no_credential_authenticates(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -948,7 +965,9 @@ async fn authorization_code_token_endpoint_enforces_binding_pkce_and_single_use(
     const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
 
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
     let clients = vec![
         browser_client(CLIENT, REDIRECT_URI),
@@ -1075,7 +1094,9 @@ async fn authorization_code_token_endpoint_refuses_stored_code_without_pkce_chal
     const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
 
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     // A Public authorization_code client with require_pkce: false -- the shape that must still be
@@ -1159,7 +1180,9 @@ async fn browser_authorization_code_grant_mints_profile_claims_from_federated_id
     const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
 
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
     repo.upsert_federated_identity(
         UpsertFederatedIdentity {
@@ -1222,7 +1245,9 @@ async fn browser_authorization_code_grant_omits_profile_claims_with_no_federated
     const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
 
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
     // Deliberately no `upsert_federated_identity` call -- no federated_identities row exists.
 
@@ -1266,7 +1291,9 @@ async fn token_endpoint_cors_is_exact_and_never_wildcarded(pool: PgPool) {
     const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
 
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     let state = state_with(
         repo,
         Arc::new(MockBearer::new(true, vec![])),
@@ -1328,7 +1355,9 @@ async fn authorize_rejects_unregistered_redirects_and_pkce_before_relying_party(
     const CLIENT: &str = "browser-client";
     const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     let router = authorize_router(AuthorizeState::new(
         relying_party(repo.clone()),
         state_with(
@@ -1395,7 +1424,9 @@ async fn authorize_requires_pkce_for_confidential_clients_regardless_of_require_
     const CLIENT: &str = "confidential-browser-client";
     const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     let router = authorize_router(AuthorizeState::new(
         relying_party(repo.clone()),
         state_with(
@@ -1432,7 +1463,9 @@ async fn active_browser_session_authorizes_without_keycloak(pool: PgPool) {
     const CLIENT: &str = "browser-client";
     const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
     let session_id = cuid2();
     repo.create_session(NewSession {
@@ -1505,7 +1538,9 @@ async fn authorize_appends_session_state_when_op_browser_state_cookie_present(po
     const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
     const OPBS: &str = "opbs-test-value-not-a-secret";
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
     let session_id = cuid2();
     repo.create_session(NewSession {
@@ -1585,7 +1620,9 @@ async fn authorize_with_existing_session_mints_the_real_subject_not_the_owner_ac
     const REDIRECT_URI: &str = "https://dashboard.example.test/oauth/callback";
     const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed_member_project(&repo).await;
     let session_id = cuid2();
     repo.create_session(NewSession {
@@ -1686,7 +1723,9 @@ async fn authorize_reresolves_context_when_request_project_differs_from_session(
     const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
     const SECOND_PROJECT_ID: &str = "proj_second";
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
     repo.create_project(
         &AccountId::assert_already_resolved(SUBJECT),
@@ -1789,7 +1828,9 @@ async fn authorize_refuses_when_requested_project_is_not_authorized_for_the_sess
     const UNRELATED_ACCOUNT: &str = "unrelated-account-e";
     const UNRELATED_PROJECT: &str = "unrelated-project-e";
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
     repo.create_account(
         &AccountId::assert_already_resolved(UNRELATED_ACCOUNT),
@@ -1887,7 +1928,9 @@ async fn missing_browser_session_falls_back_to_relying_party_login(pool: PgPool)
         })
         .await;
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     let router = authorize_router(AuthorizeState::new(
         relying_party_with_issuer(repo.clone(), &keycloak.base_url()),
         state_with(
@@ -1923,7 +1966,9 @@ async fn missing_browser_session_falls_back_to_relying_party_login(pool: PgPool)
 #[sqlx::test(migrations = "../../migrations")]
 async fn unknown_client_id_is_rejected(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -1941,7 +1986,9 @@ async fn unknown_client_id_is_rejected(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn confidential_client_with_valid_assertion_authenticates(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let fixture = confidential_client(CONFIDENTIAL_CLIENT_ID);
@@ -1973,7 +2020,9 @@ async fn confidential_client_with_valid_assertion_authenticates(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn confidential_client_with_missing_assertion_is_refused(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let fixture = confidential_client(CONFIDENTIAL_CLIENT_ID);
@@ -1999,7 +2048,9 @@ async fn confidential_client_with_missing_assertion_is_refused(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn confidential_client_with_bad_assertion_is_refused(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let fixture = confidential_client(CONFIDENTIAL_CLIENT_ID);
@@ -2037,7 +2088,9 @@ async fn confidential_client_with_bad_assertion_is_refused(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn replayed_client_assertion_jti_is_refused(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let fixture = confidential_client(CONFIDENTIAL_CLIENT_ID);
@@ -2085,7 +2138,9 @@ async fn replayed_client_assertion_jti_is_refused(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn redis_unreachable_refuses_confidential_client_rather_than_admitting(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let fixture = confidential_client(CONFIDENTIAL_CLIENT_ID);
@@ -2131,7 +2186,9 @@ async fn redis_unreachable_refuses_confidential_client_rather_than_admitting(poo
 #[sqlx::test(migrations = "../../migrations")]
 async fn aud_is_the_requesting_client_id_and_varies_between_clients(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let client_a = "client-a";
@@ -2209,7 +2266,9 @@ async fn azp_reliably_distinguishes_a_real_api_key_jwt_from_a_real_exchange_sess
 ) {
     const API_KEY_AUDIENCE: &str = "lightbridge-api-key";
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     // Real self-signed API-key JWT, minted through the actual `ApiKeyJwtSigner::sign` production
@@ -2302,7 +2361,9 @@ async fn azp_reliably_distinguishes_a_real_api_key_jwt_from_a_real_exchange_sess
 #[sqlx::test(migrations = "../../migrations")]
 async fn subject_token_aud_array_containing_client_id_among_others_is_accepted(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let state = state_with(
@@ -2332,7 +2393,9 @@ async fn subject_token_aud_array_containing_client_id_among_others_is_accepted(p
 #[sqlx::test(migrations = "../../migrations")]
 async fn subject_token_aud_not_naming_the_requesting_client_is_invalid_grant(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     // MockBearer reports the subject_token's aud as some OTHER client -- the requesting client is
@@ -2369,7 +2432,9 @@ async fn subject_token_aud_not_naming_the_requesting_client_is_invalid_grant(poo
 #[sqlx::test(migrations = "../../migrations")]
 async fn exchange_refuses_when_the_subject_has_no_federated_identity(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let state = state_with(
@@ -2411,7 +2476,9 @@ async fn an_unfederated_subject_and_a_non_member_produce_byte_identical_error_re
     pool: PgPool,
 ) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
     // A second, unrelated project SUBJECT holds no standing on at all.
     let other_owner = format!("other-owner-{}", cuid2());
@@ -2491,7 +2558,9 @@ async fn an_unfederated_subject_and_a_non_member_produce_byte_identical_error_re
 #[sqlx::test(migrations = "../../migrations")]
 async fn tenant_claims_on_access_token_role_and_quota_absent_from_both(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -2583,7 +2652,9 @@ async fn request_refill_accepts_a_real_human_plane_token_that_still_carries_the_
     pool: PgPool,
 ) {
     let repo = repo(pool.clone());
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -2716,7 +2787,9 @@ async fn call_request_budget_refill(
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_token_issued_to_client_a_is_rejected_when_presented_by_client_b(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let client_a = "client-a";
@@ -2764,7 +2837,9 @@ async fn refresh_token_issued_to_client_a_is_rejected_when_presented_by_client_b
 #[sqlx::test(migrations = "../../migrations")]
 async fn both_public_and_confidential_clients_can_obtain_a_refresh_token(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     // Public.
@@ -2820,7 +2895,9 @@ async fn both_public_and_confidential_clients_can_obtain_a_refresh_token(pool: P
 #[sqlx::test(migrations = "../../migrations")]
 async fn exchange_mints_project_scoped_jwt_with_refresh(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -2882,7 +2959,9 @@ async fn exchange_mints_project_scoped_jwt_with_refresh(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn token_endpoint_responses_are_never_stored(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, headers, body) = post_token_response(
@@ -2915,7 +2994,9 @@ async fn token_endpoint_responses_are_never_stored(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn exchange_without_offline_scope_has_no_refresh_token(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -2936,7 +3017,9 @@ async fn exchange_without_offline_scope_has_no_refresh_token(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn exchange_with_absent_scope_grants_no_refresh_token(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -2962,7 +3045,9 @@ async fn exchange_with_absent_scope_grants_no_refresh_token(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn exchange_for_non_member_project_is_denied(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -2989,7 +3074,9 @@ async fn exchange_for_non_member_project_is_denied(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn exchange_after_project_suspended_is_access_denied(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     repo.set_project_status(
@@ -3025,7 +3112,9 @@ async fn exchange_after_project_suspended_is_access_denied(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn exchange_after_account_suspended_is_access_denied(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     repo.set_account_status(
@@ -3056,7 +3145,9 @@ async fn exchange_after_account_suspended_is_access_denied(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn exchange_with_inactive_subject_token_is_invalid_request(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -3079,7 +3170,9 @@ async fn exchange_with_inactive_subject_token_is_invalid_request(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn missing_project_id_resolves_caller_default_project(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -3108,7 +3201,9 @@ async fn missing_project_id_resolves_caller_default_project(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn missing_project_id_with_no_projects_is_denied(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     // Deliberately account-only: create_account never provisions a project by itself (that is a
     // separate "ensure default project" bootstrap call), so this subject legitimately has zero
     // projects and therefore no default to fall back to.
@@ -3140,7 +3235,9 @@ async fn missing_project_id_with_no_projects_is_denied(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_rotates_and_rejects_replay(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -3199,7 +3296,9 @@ async fn refresh_rotates_and_rejects_replay(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn registered_client_with_unpermitted_grant_type_is_unauthorized_client(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -3215,7 +3314,9 @@ async fn registered_client_with_unpermitted_grant_type_is_unauthorized_client(po
 #[sqlx::test(migrations = "../../migrations")]
 async fn missing_subject_token_is_invalid_request(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -3236,7 +3337,9 @@ async fn missing_subject_token_is_invalid_request(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn missing_subject_token_type_is_invalid_request(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -3259,7 +3362,9 @@ async fn missing_subject_token_type_is_invalid_request(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn unsupported_subject_token_type_is_invalid_request(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -3282,7 +3387,9 @@ async fn unsupported_subject_token_type_is_invalid_request(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn bearer_validation_error_is_invalid_request(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let state = state_with(
@@ -3336,7 +3443,9 @@ async fn totally_unreachable_repo_fails_the_exchange_grant_closed_as_server_erro
 #[sqlx::test(migrations = "../../migrations")]
 async fn missing_refresh_token_is_invalid_request(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
 
     let (status, body) = post_token(
         state(repo.clone(), true),
@@ -3394,7 +3503,9 @@ async fn exchange_fails_when_no_signing_key_is_bootstrapped(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn exchange_with_unrecognized_scope_omits_scope_from_response(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -3419,7 +3530,9 @@ async fn exchange_snapshots_email_claims_from_subject_token(pool: PgPool) {
     use base64::Engine;
 
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -3454,7 +3567,9 @@ async fn exchange_snapshots_email_claims_from_subject_token(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn exchange_snapshots_name_and_preferred_username_claims_from_subject_token(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let subject_token = subject_token_with_claims(&serde_json::json!({
@@ -3492,7 +3607,9 @@ async fn exchange_snapshots_name_and_preferred_username_claims_from_subject_toke
 #[sqlx::test(migrations = "../../migrations")]
 async fn exchange_tolerates_a_subject_token_with_an_unparsable_payload_segment(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -3519,7 +3636,9 @@ async fn exchange_tolerates_a_subject_token_with_a_non_json_payload_segment(pool
     use base64::Engine;
 
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json");
@@ -3552,7 +3671,9 @@ async fn exchange_tolerates_a_subject_token_with_a_non_json_payload_segment(pool
 #[sqlx::test(migrations = "../../migrations")]
 async fn exchange_issues_id_token_when_openid_granted(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -3588,7 +3709,9 @@ async fn exchange_issues_id_token_when_openid_granted(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn exchange_omits_id_token_when_openid_not_granted(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -3609,7 +3732,9 @@ async fn exchange_omits_id_token_when_openid_not_granted(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn exchange_id_token_propagates_auth_time_and_nonce_when_present(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let subject_token = subject_token_with_claims(&serde_json::json!({
@@ -3635,7 +3760,9 @@ async fn exchange_id_token_propagates_auth_time_and_nonce_when_present(pool: PgP
 #[sqlx::test(migrations = "../../migrations")]
 async fn exchange_id_token_omits_auth_time_and_nonce_when_absent(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -3675,7 +3802,9 @@ async fn exchange_id_token_omits_auth_time_and_nonce_when_absent(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_reissues_id_token_and_preserves_email(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let subject_token = subject_token_with_claims(&serde_json::json!({
@@ -3766,7 +3895,9 @@ async fn refresh_reissues_id_token_and_preserves_email(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_succeeds_and_rotates_the_refresh_token(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -3824,7 +3955,9 @@ async fn refresh_succeeds_and_rotates_the_refresh_token(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_after_absolute_cap_is_invalid_grant(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let cfg = Oauth2TokenExchange {
@@ -3882,7 +4015,9 @@ async fn refresh_after_absolute_cap_is_invalid_grant(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn chain_id_and_absolute_cap_survive_multiple_rotations(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -3940,7 +4075,9 @@ async fn chain_id_and_absolute_cap_survive_multiple_rotations(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_after_member_removed_from_project_is_invalid_grant(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed_member_project(&repo).await;
 
     let (status, body) = post_token(
@@ -3984,7 +4121,9 @@ async fn refresh_after_member_removed_from_project_is_invalid_grant(pool: PgPool
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_after_project_deleted_is_invalid_grant_not_fail_open(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -4023,7 +4162,9 @@ async fn refresh_after_project_deleted_is_invalid_grant_not_fail_open(pool: PgPo
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_after_project_suspended_is_invalid_grant(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -4065,7 +4206,9 @@ async fn refresh_after_project_suspended_is_invalid_grant(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_after_account_suspended_is_invalid_grant(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -4111,7 +4254,9 @@ async fn refresh_after_account_suspended_is_invalid_grant(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn replaying_a_rotated_refresh_token_revokes_the_whole_chain(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -4165,7 +4310,9 @@ async fn replaying_a_rotated_refresh_token_revokes_the_whole_chain(pool: PgPool)
 #[sqlx::test(migrations = "../../migrations")]
 async fn unknown_refresh_token_is_invalid_grant_without_cascading(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -4215,7 +4362,9 @@ async fn unknown_refresh_token_is_invalid_grant_without_cascading(pool: PgPool) 
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_reuse_within_grace_window_mints_a_fresh_pair_without_cascading(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -4287,7 +4436,9 @@ async fn refresh_reuse_within_grace_window_mints_a_fresh_pair_without_cascading(
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_reuse_outside_grace_window_still_cascades(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let cfg = Oauth2TokenExchange {
@@ -4359,7 +4510,9 @@ async fn refresh_reuse_outside_grace_window_still_cascades(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_reuse_grace_disabled_cascades_on_immediate_replay(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -4400,7 +4553,9 @@ async fn refresh_reuse_grace_disabled_cascades_on_immediate_replay(pool: PgPool)
 #[sqlx::test(migrations = "../../migrations")]
 async fn two_sequential_graced_replays_of_the_same_token_each_succeed(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -4663,7 +4818,9 @@ async fn sessions_migration_backfills_session_id_and_status_from_existing_chains
 #[sqlx::test(migrations = "../../migrations")]
 async fn revoking_a_subjects_sessions_makes_a_live_access_token_introspect_inactive(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -4712,7 +4869,9 @@ async fn revoking_own_sessions_makes_the_callers_own_live_access_token_introspec
     pool: PgPool,
 ) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -5016,7 +5175,9 @@ async fn issue_refresh_token(state: TokenExchangeState, client_id: &str) -> Stri
 #[sqlx::test(migrations = "../../migrations")]
 async fn revoking_a_valid_refresh_token_blocks_the_next_refresh(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let refresh_token = issue_refresh_token(state(repo.clone(), true), PUBLIC_CLIENT_ID).await;
@@ -5048,7 +5209,9 @@ async fn revoking_a_valid_refresh_token_blocks_the_next_refresh(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn revoking_an_unknown_token_returns_200(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_revoke(
@@ -5065,7 +5228,9 @@ async fn revoking_an_unknown_token_returns_200(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn revoking_an_already_revoked_token_is_idempotent(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let refresh_token = issue_refresh_token(state(repo.clone(), true), PUBLIC_CLIENT_ID).await;
@@ -5096,7 +5261,9 @@ async fn revoking_an_already_revoked_token_is_idempotent(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn client_a_cannot_revoke_client_bs_token(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let client_a = "client-a";
@@ -5150,7 +5317,9 @@ async fn client_a_cannot_revoke_client_bs_token(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn revoke_with_unknown_client_is_rejected(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_revoke(
@@ -5169,7 +5338,9 @@ async fn revoke_with_unknown_client_is_rejected(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn revoke_confidential_client_with_missing_assertion_is_rejected(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let fixture = confidential_client(CONFIDENTIAL_CLIENT_ID);
@@ -5195,7 +5366,9 @@ async fn revoke_confidential_client_with_missing_assertion_is_rejected(pool: PgP
 #[sqlx::test(migrations = "../../migrations")]
 async fn revoke_with_missing_token_field_is_invalid_request(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_revoke(
@@ -5215,7 +5388,9 @@ async fn revoke_with_missing_token_field_is_invalid_request(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn revoke_confidential_client_with_valid_assertion_succeeds(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let fixture = confidential_client(CONFIDENTIAL_CLIENT_ID);
@@ -5317,7 +5492,9 @@ async fn introspecting_a_refresh_token_as_its_owning_client_is_active_with_corre
     pool: PgPool,
 ) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let refresh_token = issue_refresh_token(state(repo.clone(), true), PUBLIC_CLIENT_ID).await;
@@ -5350,7 +5527,9 @@ async fn introspecting_a_refresh_token_as_its_owning_client_is_active_with_corre
 #[sqlx::test(migrations = "../../migrations")]
 async fn introspecting_a_refresh_token_as_a_different_client_is_inactive(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let owner_client = "introspect-owner";
@@ -5389,7 +5568,9 @@ async fn introspecting_a_refresh_token_as_a_different_client_is_inactive(pool: P
 #[sqlx::test(migrations = "../../migrations")]
 async fn introspecting_a_revoked_refresh_token_is_inactive(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let refresh_token = issue_refresh_token(state(repo.clone(), true), PUBLIC_CLIENT_ID).await;
@@ -5419,7 +5600,9 @@ async fn introspecting_a_revoked_refresh_token_is_inactive(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn introspecting_a_garbage_token_returns_inactive(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_introspect(
@@ -5440,7 +5623,9 @@ async fn introspecting_a_garbage_token_returns_inactive(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn introspecting_a_self_signed_access_token_with_matching_azp_is_active(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -5475,7 +5660,9 @@ async fn introspecting_a_self_signed_access_token_with_matching_azp_is_active(po
 #[sqlx::test(migrations = "../../migrations")]
 async fn introspecting_a_self_signed_access_token_with_azp_mismatch_is_inactive(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let minting_client = "introspect-azp-owner";
@@ -5534,7 +5721,9 @@ async fn introspecting_a_self_signed_access_token_with_azp_mismatch_is_inactive(
 #[sqlx::test(migrations = "../../migrations")]
 async fn reuse_cascade_is_a_clean_noop_on_a_chain_already_drained_by_explicit_revoke(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let token1 =
@@ -5585,7 +5774,9 @@ async fn reuse_cascade_is_a_clean_noop_on_a_chain_already_drained_by_explicit_re
 #[sqlx::test(migrations = "../../migrations")]
 async fn replaying_an_explicitly_revoked_token_does_not_trigger_the_reuse_cascade(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let revoked = issue_refresh_token(state(repo.clone(), true), PUBLIC_CLIENT_ID).await;
@@ -5738,7 +5929,9 @@ fn current_period_string() -> String {
 #[sqlx::test(migrations = "../../migrations")]
 async fn token_exchange_stamps_the_lowest_rung_when_the_account_has_no_grant_yet(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -5769,7 +5962,9 @@ async fn token_exchange_stamps_the_lowest_rung_when_the_account_has_no_grant_yet
 #[sqlx::test(migrations = "../../migrations")]
 async fn token_exchange_stamps_the_accounts_real_current_tier(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
     let budget_repo = BudgetRepo::new(repo.pool.clone());
     seed_budget_grant(
@@ -5805,7 +6000,9 @@ async fn token_exchange_stamps_the_accounts_real_current_tier(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_re_resolves_the_budget_tier_live_rather_than_copying_the_old_claim(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
     let budget_repo = BudgetRepo::new(repo.pool.clone());
     let period = current_period_string();
@@ -5873,7 +6070,9 @@ async fn refresh_re_resolves_the_budget_tier_live_rather_than_copying_the_old_cl
 #[sqlx::test(migrations = "../../migrations")]
 async fn budget_tier_claim_survives_a_budget_ledger_outage_on_exchange(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let state = state_with_cfg_and_budget_repo(
@@ -5927,7 +6126,9 @@ async fn budget_tier_claim_survives_a_budget_ledger_outage_on_exchange(pool: PgP
 #[sqlx::test(migrations = "../../migrations")]
 async fn budget_tier_claim_survives_a_budget_ledger_outage_on_refresh(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
     let budget_repo = BudgetRepo::new(repo.pool.clone());
     seed_budget_grant(
@@ -6013,7 +6214,9 @@ async fn budget_tier_claim_survives_a_budget_ledger_outage_on_refresh(pool: PgPo
 #[sqlx::test(migrations = "../../migrations")]
 async fn token_exchange_stamps_the_real_quota_tier_when_the_subject_has_one(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed_member_project(&repo).await;
     repo.set_project_member_quota_tier(
         &AccountId::assert_already_resolved(OWNER_ACCOUNT),
@@ -6050,7 +6253,9 @@ async fn token_exchange_stamps_the_real_quota_tier_when_the_subject_has_one(pool
 #[sqlx::test(migrations = "../../migrations")]
 async fn token_exchange_omits_quota_tier_when_the_members_row_has_a_null_tier(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed_member_project(&repo).await;
 
     let (status, body) = post_token(
@@ -6084,7 +6289,9 @@ async fn token_exchange_omits_quota_tier_when_the_members_row_has_a_null_tier(po
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_re_resolves_the_quota_tier_live_rather_than_copying_the_old_claim(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed_member_project(&repo).await;
 
     let (status, body) = post_token(
@@ -6160,7 +6367,9 @@ async fn set_project_model_policy(repo: &StoreRepo, project_id: &str, policy: &s
 #[sqlx::test(migrations = "../../migrations")]
 async fn token_exchange_stamps_the_projects_model_policy_allow_all_by_default(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -6186,7 +6395,9 @@ async fn token_exchange_stamps_the_projects_model_policy_allow_all_by_default(po
 #[sqlx::test(migrations = "../../migrations")]
 async fn token_exchange_stamps_each_model_policy_value(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     for wire_value in ["allow_all", "allowlist", "deny_all"] {
@@ -6224,7 +6435,9 @@ async fn token_exchange_stamps_each_model_policy_value(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_re_resolves_the_model_policy_live_rather_than_copying_the_old_claim(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let (status, body) = post_token(
@@ -6354,7 +6567,9 @@ async fn quota_tier_lookup_failure_refuses_the_exchange_even_though_context_reso
     pool: PgPool,
 ) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed_member_project(&repo).await;
     repo.set_project_member_quota_tier(
         &AccountId::assert_already_resolved(OWNER_ACCOUNT),
@@ -6410,7 +6625,9 @@ async fn quota_tier_lookup_failure_refuses_the_refresh_even_though_context_resol
     pool: PgPool,
 ) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed_member_project(&repo).await;
     repo.set_project_member_quota_tier(
         &AccountId::assert_already_resolved(OWNER_ACCOUNT),
@@ -6468,7 +6685,9 @@ async fn quota_tier_lookup_failure_refuses_the_refresh_even_though_context_resol
 #[sqlx::test(migrations = "../../migrations")]
 async fn device_grant_persists_pending_state_enforces_polling_and_consumes_once(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let client_id = "opencode-cli";
@@ -6559,7 +6778,9 @@ async fn device_grant_persists_pending_state_enforces_polling_and_consumes_once(
 #[sqlx::test(migrations = "../../migrations")]
 async fn device_grant_omits_refresh_without_offline_access(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let client_id = "opencode-cli";
@@ -6591,7 +6812,9 @@ async fn device_grant_omits_refresh_without_offline_access(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn device_grant_rejects_denied_expired_wrong_client_and_invalid_scope(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
 
     let client_id = "opencode-cli";
@@ -6699,7 +6922,9 @@ async fn device_grant_rejects_denied_expired_wrong_client_and_invalid_scope(pool
 #[sqlx::test(migrations = "../../migrations")]
 async fn approved_device_code_is_one_shot_when_context_resolution_refuses(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     let client_id = "opencode-cli";
     let (status, body) = post_device_authorization(
         state_with(
@@ -6765,7 +6990,9 @@ async fn authorization_code_grant_stamps_the_same_enforcement_claims_as_the_othe
     const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
 
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
     store_browser_code(repo.clone(), "claims-code", CLIENT, REDIRECT_URI, VERIFIER).await;
 
@@ -6833,7 +7060,9 @@ async fn authorization_code_grant_issues_a_rotating_refresh_token(pool: PgPool) 
     const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
 
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
     store_browser_code_with_scope(
         repo.clone(),
@@ -6912,7 +7141,9 @@ async fn authorization_code_grant_omits_refresh_without_offline_access(pool: PgP
     const VERIFIER: &str = "this-is-a-sufficiently-long-pkce-verifier-value-123456789";
 
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
     seed(&repo).await;
     store_browser_code(repo.clone(), "no-offline", CLIENT, REDIRECT_URI, VERIFIER).await;
 
@@ -6966,7 +7197,9 @@ fn client_credentials_state(
 #[sqlx::test(migrations = "../../migrations")]
 async fn client_credentials_with_no_credential_is_refused(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
 
     let fixture = service_client(
         "it-machine",
@@ -6989,7 +7222,9 @@ async fn client_credentials_with_no_credential_is_refused(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn client_credentials_signed_by_wrong_key_is_refused(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
 
     let fixture = service_client(
         "it-machine",
@@ -7024,7 +7259,9 @@ async fn client_credentials_signed_by_wrong_key_is_refused(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn client_credentials_replayed_assertion_jti_is_refused(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
 
     let fixture = service_client(
         "it-machine",
@@ -7076,7 +7313,9 @@ async fn client_credentials_replayed_assertion_jti_is_refused(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn client_credentials_redis_unreachable_is_server_error_never_a_mint(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
 
     let fixture = service_client(
         "it-machine",
@@ -7118,7 +7357,9 @@ async fn client_credentials_redis_unreachable_is_server_error_never_a_mint(pool:
 #[sqlx::test(migrations = "../../migrations")]
 async fn client_credentials_absent_from_client_grant_types_is_unauthorized_client(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
 
     let mut fixture = service_client(
         "it-machine",
@@ -7153,7 +7394,9 @@ async fn client_credentials_absent_from_client_grant_types_is_unauthorized_clien
 #[sqlx::test(migrations = "../../migrations")]
 async fn client_credentials_disallowed_audience_is_invalid_target(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
 
     let fixture = service_client(
         "it-machine",
@@ -7188,7 +7431,9 @@ async fn client_credentials_disallowed_audience_is_invalid_target(pool: PgPool) 
 #[sqlx::test(migrations = "../../migrations")]
 async fn client_credentials_scope_outside_client_scopes_is_invalid_scope(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
 
     let fixture = service_client(
         "it-machine",
@@ -7221,7 +7466,9 @@ async fn client_credentials_scope_outside_client_scopes_is_invalid_scope(pool: P
 #[sqlx::test(migrations = "../../migrations")]
 async fn client_credentials_unknown_client_id_is_rejected(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
 
     let state = client_credentials_state(repo, Vec::new(), &redis_url());
 
@@ -7240,7 +7487,9 @@ async fn client_credentials_unknown_client_id_is_rejected(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn client_credentials_happy_path_has_no_refresh_token_and_no_id_token(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
 
     let fixture = service_client(
         "it-machine",
@@ -7290,7 +7539,9 @@ async fn client_credentials_happy_path_has_no_refresh_token_and_no_id_token(pool
 #[sqlx::test(migrations = "../../migrations")]
 async fn client_credentials_claim_shape_matches_the_service_token_contract(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
 
     let fixture = service_client(
         "it-machine",
@@ -7357,7 +7608,9 @@ async fn client_credentials_claim_shape_matches_the_service_token_contract(pool:
 #[sqlx::test(migrations = "../../migrations")]
 async fn client_credentials_audience_defaults_to_client_id_or_honors_an_allowed_one(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
 
     let fixture = service_client(
         "it-machine",
@@ -7421,7 +7674,9 @@ async fn client_credentials_audience_defaults_to_client_id_or_honors_an_allowed_
 #[sqlx::test(migrations = "../../migrations")]
 async fn client_credentials_introspects_as_active(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
 
     let fixture = service_client(
         "it-machine",
@@ -7475,7 +7730,9 @@ async fn client_credentials_introspects_as_active(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn client_credentials_scope_narrows_to_the_requested_subset(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
 
     let fixture = service_client(
         "it-machine",
@@ -7511,7 +7768,9 @@ async fn client_credentials_scope_narrows_to_the_requested_subset(pool: PgPool) 
 #[sqlx::test(migrations = "../../migrations")]
 async fn client_credentials_absent_scope_grants_every_configured_client_scope(pool: PgPool) {
     let repo = repo(pool);
-    bootstrap_signing_key(&repo, &signing_cfg()).await.unwrap();
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
 
     let fixture = service_client(
         "it-machine",
