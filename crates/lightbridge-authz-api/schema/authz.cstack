@@ -1193,6 +1193,18 @@ procedure simulateBudgetPolicy(args: SimulateBudgetPolicyInput): Decision
 // empty, never absent). The conversion in `lightbridge-authz-rest` maps that `None` case (which a
 // caller of this RPC surface can never actually observe) to an empty list defensively rather than
 // treating it as reachable.
+//
+// `requestedByUserId` (#646) is the token subject that SUBMITTED the request -- `auth().id` inside
+// `requestBudgetRefill` -- as distinct from `reviewedBy`, the admin who decided it. Optional, and
+// permanently so: rows created before
+// `migrations/20260902000002_budget_augmentation_requests_add_requested_by.sql` carry NULL and
+// nothing can reconstruct their requester, so a client must render an explicit "unknown" sentinel
+// for absent rather than assuming a value will always arrive. It is an AUDIT field: no `@allow`
+// clause in this schema references it, and none may -- authorization for every procedure below is
+// the coarse RBAC permission on the caller's own token, never a value read back off a stored row.
+// Resolving it to a display name/email is deliberately NOT this type's job (story A2's
+// `resolveUserProfiles` does that against `federated_identities`, which is absent from this schema
+// on purpose -- see the `User` model comment).
 type AugmentationRequest {
   id String
   budgetAccountId String
@@ -1211,6 +1223,7 @@ type AugmentationRequest {
   idempotencyKey String?
   reviewedBy String?
   rejectionReason String?
+  requestedByUserId String?
   createdAt DateTime
   reviewedAt DateTime?
 }

@@ -56,6 +56,8 @@ mutation requestBudgetRefill(args: {
   original outcome instead of being evaluated twice. Use a fresh UUID/cuid per logical user action
   (one click = one key), not a fixed constant.
 - Returns an `AugmentationRequest` — see "Response shape" below for what to render from it.
+- The authenticated caller is recorded on the row as `requestedByUserId` — see "The requester"
+  below.
 
 Requires the caller to hold `budget:self-refill`. A caller who lacks it gets a `403`; the UI should
 not normally let a user reach this action if their role doesn't carry it, but should still handle a
@@ -191,7 +193,87 @@ The fields a UI actually needs to render, in plain terms (the schema has the exh
 | `policyReasonCodes` | Machine-readable reason codes (e.g. `"within_unaided_allowance"`, `"unaided_allowance_exhausted"`, `"policy_engine_unavailable"`). Useful for debugging/support tooling; not designed to be shown to an end user verbatim — write your own copy per code, or fall back to a generic message for codes you don't have copy for yet. An amount outside `allowedAmountsMicros` never reaches this field at all — it is refused as a request-level `BadRequest` before any `AugmentationRequest` row exists. |
 | `rejectionReason` | Present only when `status == "denied"` **and a human rejected it** (as opposed to a policy denial — see below). Always show this verbatim when present; see "Rejection reasons" below. |
 | `grantId` | Present when a grant was actually issued. Not usually shown directly, but its presence/absence is a reliable way to tell "did this produce money" apart from `status` alone if you want a belt-and-suspenders check. |
+| `requestedByUserId` | **Who asked.** The token subject of the caller that submitted the request — the counterpart to `reviewedBy` (who decided it). Nullable, permanently: see "The requester" below before rendering it. |
 | `createdAt` / `reviewedAt` | Timestamps for queue/history views. |
+
+## The requester (`requestedByUserId`)
+
+`AugmentationRequest.requestedByUserId` is the subject of the authenticated caller at the moment
+`requestBudgetRefill` ran. It is stamped server-side from the token; there is no client-supplied
+requester field and there will not be one, so the value always means "this person asked", never
+"this person was named as the asker".
+
+Three rules for rendering it:
+
+1. **`null` means unknown, not "nobody" and not the account.** Requests created before this field
+   existed carry `null` and nothing can reconstruct them. Render an explicit sentinel
+   ("Unknown — requested before this was recorded") rather than a blank cell, and never fall back
+   to the account id: showing the account in a "Requester" column is exactly the confusion the
+   earlier console column was removed for.
+2. **It is a raw subject id, not a display name.** Resolving it to a name/email is a separate
+   admin-only batch RPC (`resolveUserProfiles`, story A2) reading `federated_identities`; until a
+   screen calls it, show the id truncated or nothing at all — not a fabricated label.
+3. **It is not `reviewedBy`.** The requester is set at creation and never changes; the reviewer is
+   set only when a human decides a `pending_review` request. Both can be present on the same row,
+   and they are usually different people. An auto-approved request has a requester and no reviewer.
+
+An idempotent retry (same `idempotencyKey`) returns the original row, so the requester recorded is
+whoever submitted first — a retry never rewrites it.
+
+It is an **audit** field. No authorization decision reads it: who may request, review, or read is
+decided from the caller's own token (`budget:self-refill` / `budget:review` / `budget:read-own`),
+never from a value stored on the row. Do not build client-side gating on it either.
+
+### Where the requester comes from
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Requester (OIDC user)
+    participant Console as Console (converse-frontends)
+    participant RPC as authz-budget · requestBudgetRefill
+    participant Svc as RefillService::request_refill
+    participant Repo as AugmentationRepo
+    participant DB as budget_augmentation_requests
+    actor Admin as Admin reviewer
+
+    User->>Console: pick an offered amount, submit
+    Console->>RPC: POST /budget/rpc/requestBudgetRefill (bearer token)
+    Note over RPC: rpc_authorize has already gated on budget:self-refill<br/>using the token alone — the row is never consulted
+    RPC->>RPC: subject_from_ctx(ctx) → auth().id (401 if absent)
+    RPC->>Svc: RefillRequest { …, requested_by_user_id: Some(subject) }
+    Svc->>Repo: create(NewAugmentationRequest { …, requested_by_user_id })
+    Repo->>DB: INSERT … requested_by_user_id
+    DB-->>Repo: row
+    Repo-->>Svc: AugmentationRequest
+    Svc-->>RPC: AugmentationRequest (after policy evaluation)
+    RPC-->>Console: requestedByUserId = subject
+    Admin->>RPC: listPendingAugmentationRequests
+    RPC-->>Admin: entries[].requestedByUserId (null for pre-#646 rows)
+```
+
+### What the field looks like over a request's lifetime
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unattributed: row written before #646<br/>(requested_by_user_id NULL)
+    [*] --> Attributed: requestBudgetRefill<br/>(requested_by_user_id = auth().id)
+
+    Unattributed --> Unattributed: record_decision / record_review<br/>(stays NULL — never backfilled)
+    Attributed --> Attributed: record_decision / record_review<br/>(reviewed_by is written; requester untouched)
+
+    note right of Unattributed
+        Terminal by design. No source can
+        reconstruct a historical requester,
+        so NULL is permanent, not a to-do.
+    end note
+    note right of Attributed
+        Write-once. There is no transition
+        that changes the requester — an
+        idempotent retry returns this row
+        rather than re-stamping it.
+    end note
+```
 
 ### Why amounts are strings
 
@@ -285,6 +367,9 @@ This RPC surface was built across a PR sequence in `lightbridge-authz` implement
 - #214 — self-service refill orchestration (`RefillService`)
 - #215 — admin review queue (`ReviewService`)
 - the PR that added this doc — wires both into the RPC surface described above
+- #646 — persists the requester (`requested_by_user_id`, migration
+  `20260902000002_budget_augmentation_requests_add_requested_by.sql`) and exposes it as
+  `AugmentationRequest.requestedByUserId`
 
 If this doc doesn't answer a question you have, #191's own body (acceptance criteria,
 implementation notes, the two "will look like bugs" behaviors) and the PRs above are the next place

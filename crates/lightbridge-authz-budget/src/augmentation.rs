@@ -107,6 +107,16 @@ pub struct AugmentationRequest {
     pub idempotency_key: Option<String>,
     pub reviewed_by: Option<String>,
     pub rejection_reason: Option<String>,
+    /// Story #646: the token subject that submitted this request -- `auth().id` at
+    /// `requestBudgetRefill`. `None` for rows created before
+    /// `migrations/20260902000002_budget_augmentation_requests_add_requested_by.sql`, which is a
+    /// permanent, legitimate value: nothing can reconstruct a historical requester (NULL means
+    /// unknown, never "nobody" and never a stand-in id).
+    ///
+    /// Audit only. No authorization decision anywhere reads this field, and none may start to --
+    /// who may ask, review, or read is decided from the caller's token by `rpc_authorize`, never
+    /// from a stored row.
+    pub requested_by_user_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub reviewed_at: Option<DateTime<Utc>>,
 }
@@ -123,6 +133,10 @@ pub struct NewAugmentationRequest {
     pub requested_tier: BudgetTier,
     pub requested_amount_micros: i64,
     pub idempotency_key: Option<String>,
+    /// Story #646: the token subject submitting this request. `None` only where no authenticated
+    /// caller exists to attribute it to -- a direct repository/test write, never the live
+    /// `requestBudgetRefill` path, which always has `auth().id`.
+    pub requested_by_user_id: Option<String>,
 }
 
 /// The policy-outcome fields common to a decision that resulted in an (auto-)approval: some
@@ -254,18 +268,18 @@ fn storage_failed(err: sqlx::Error) -> BudgetError {
 // column list dynamically at call time.
 const REQUEST_INSERT_SQL: &str = "INSERT INTO budget_augmentation_requests \
      (id, budget_account_id, account_id, project_id, period, requested_tier, \
-      requested_amount_micros, status, idempotency_key) \
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+      requested_amount_micros, status, idempotency_key, requested_by_user_id) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
      ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING \
      RETURNING id, budget_account_id, account_id, project_id, period, requested_tier, \
      requested_amount_micros, status, policy_effect, policy_reason_codes, matched_rule_ids, \
      policy_revision, approved_amount_micros, grant_id, idempotency_key, reviewed_by, \
-     rejection_reason, created_at, reviewed_at";
+     rejection_reason, requested_by_user_id, created_at, reviewed_at";
 
 const REQUEST_SELECT_BY_IDEMPOTENCY_KEY_SQL: &str = "SELECT id, budget_account_id, account_id, \
      project_id, period, requested_tier, requested_amount_micros, status, policy_effect, \
      policy_reason_codes, matched_rule_ids, policy_revision, approved_amount_micros, grant_id, \
-     idempotency_key, reviewed_by, rejection_reason, created_at, reviewed_at \
+     idempotency_key, reviewed_by, rejection_reason, requested_by_user_id, created_at, reviewed_at \
      FROM budget_augmentation_requests WHERE idempotency_key = $1";
 
 const REQUEST_UPDATE_DECISION_SQL: &str = "UPDATE budget_augmentation_requests SET \
@@ -275,7 +289,7 @@ const REQUEST_UPDATE_DECISION_SQL: &str = "UPDATE budget_augmentation_requests S
      RETURNING id, budget_account_id, account_id, project_id, period, requested_tier, \
      requested_amount_micros, status, policy_effect, policy_reason_codes, matched_rule_ids, \
      policy_revision, approved_amount_micros, grant_id, idempotency_key, reviewed_by, \
-     rejection_reason, created_at, reviewed_at";
+     rejection_reason, requested_by_user_id, created_at, reviewed_at";
 
 // The `AND status = 'pending_review'` guard is the fix for a real concurrency gap (PR 3.3,
 // #191): without it, two concurrent review actions on the same row -- two admins racing an
@@ -294,12 +308,12 @@ const REQUEST_UPDATE_REVIEW_SQL: &str = "UPDATE budget_augmentation_requests SET
      RETURNING id, budget_account_id, account_id, project_id, period, requested_tier, \
      requested_amount_micros, status, policy_effect, policy_reason_codes, matched_rule_ids, \
      policy_revision, approved_amount_micros, grant_id, idempotency_key, reviewed_by, \
-     rejection_reason, created_at, reviewed_at";
+     rejection_reason, requested_by_user_id, created_at, reviewed_at";
 
 const REQUEST_SELECT_BY_ID_SQL: &str = "SELECT id, budget_account_id, account_id, project_id, \
      period, requested_tier, requested_amount_micros, status, policy_effect, \
      policy_reason_codes, matched_rule_ids, policy_revision, approved_amount_micros, grant_id, \
-     idempotency_key, reviewed_by, rejection_reason, created_at, reviewed_at \
+     idempotency_key, reviewed_by, rejection_reason, requested_by_user_id, created_at, reviewed_at \
      FROM budget_augmentation_requests WHERE id = $1";
 
 // `after: $2::timestamptz` makes the cursor exclusive on the low side (`created_at > $2`) --
@@ -313,7 +327,7 @@ const REQUEST_SELECT_BY_ID_SQL: &str = "SELECT id, budget_account_id, account_id
 const REQUEST_LIST_PENDING_REVIEW_SQL: &str = "SELECT id, budget_account_id, account_id, \
      project_id, period, requested_tier, requested_amount_micros, status, policy_effect, \
      policy_reason_codes, matched_rule_ids, policy_revision, approved_amount_micros, grant_id, \
-     idempotency_key, reviewed_by, rejection_reason, created_at, reviewed_at \
+     idempotency_key, reviewed_by, rejection_reason, requested_by_user_id, created_at, reviewed_at \
      FROM budget_augmentation_requests \
      WHERE status = 'pending_review' AND ($1::text IS NULL OR budget_account_id = $1) \
        AND ($2::timestamptz IS NULL OR created_at > $2) \
@@ -330,7 +344,7 @@ const REQUEST_LIST_PENDING_REVIEW_SQL: &str = "SELECT id, budget_account_id, acc
 const REQUEST_LIST_BY_BUDGET_ACCOUNT_SQL: &str = "SELECT id, budget_account_id, account_id, \
      project_id, period, requested_tier, requested_amount_micros, status, policy_effect, \
      policy_reason_codes, matched_rule_ids, policy_revision, approved_amount_micros, grant_id, \
-     idempotency_key, reviewed_by, rejection_reason, created_at, reviewed_at \
+     idempotency_key, reviewed_by, rejection_reason, requested_by_user_id, created_at, reviewed_at \
      FROM budget_augmentation_requests \
      WHERE budget_account_id = $1 \
        AND ($2::timestamptz IS NULL OR created_at < $2) \
@@ -363,6 +377,7 @@ struct AugmentationRequestRow {
     idempotency_key: Option<String>,
     reviewed_by: Option<String>,
     rejection_reason: Option<String>,
+    requested_by_user_id: Option<String>,
     created_at: DateTime<Utc>,
     reviewed_at: Option<DateTime<Utc>>,
 }
@@ -410,6 +425,7 @@ impl TryFrom<AugmentationRequestRow> for AugmentationRequest {
             idempotency_key: row.idempotency_key,
             reviewed_by: row.reviewed_by,
             rejection_reason: row.rejection_reason,
+            requested_by_user_id: row.requested_by_user_id,
             created_at: row.created_at,
             reviewed_at: row.reviewed_at,
         })
@@ -464,6 +480,7 @@ impl AugmentationRepo {
             .bind(request.requested_amount_micros)
             .bind(status_str)
             .bind(&request.idempotency_key)
+            .bind(&request.requested_by_user_id)
             .fetch_optional(self.pool())
             .await
             .map_err(storage_failed)?;

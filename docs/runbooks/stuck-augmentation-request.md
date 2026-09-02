@@ -14,13 +14,15 @@ They look identical to the user:
 ```sql
 SELECT id, status, requested_amount_micros, approved_amount_micros,
        policy_effect, policy_reason_codes, matched_rule_ids, policy_revision,
-       created_at, reviewed_at
+       requested_by_user_id, reviewed_by, created_at, reviewed_at
 FROM budget_augmentation_requests
 WHERE account_id = :account AND period = :period
 ORDER BY created_at DESC LIMIT 5;
 ```
 
 `policy_effect` and `reason_codes` say exactly which rule decided, and under which revision.
+`requested_by_user_id` is the subject that submitted it (#646) and `reviewed_by` the admin that
+decided it — a NULL requester means the row predates that column, not that nobody asked.
 
 ## 1. If it is (3) — approved but not effective
 

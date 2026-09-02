@@ -990,3 +990,103 @@ async fn get_my_budget_refill_ladder_is_scoped_to_the_callers_own_budget_account
         "budgetAccountId must always reflect the authenticated caller, never a shared value"
     );
 }
+
+/// #646: `requestBudgetRefill` records the AUTHENTICATED CALLER as the requester -- not the
+/// `budgetAccountId` the caller named, and not any client-supplied field (there is none, by
+/// design). The context's subject is deliberately a different id from the account here, which is
+/// the whole reason the field exists: the console's earlier "Requester" column was removed
+/// precisely because it only ever duplicated the account.
+#[sqlx::test(migrations = "../../migrations")]
+async fn request_refill_records_the_caller_subject_as_the_requester(pool: PgPool) {
+    let account_id = cuid2();
+    let requester_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let (procedures, _account_ctx, _budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let requester_ctx = ctx_for(&requester_id).await;
+    let db = lazy_cratestack_db();
+
+    let output = request_refill(
+        &procedures,
+        &db,
+        &requester_ctx,
+        refill_args(&account_id, None, "15000000"),
+    )
+    .await
+    .expect("a fresh account's first refill must succeed");
+
+    assert_eq!(
+        output.requestedByUserId.as_deref(),
+        Some(requester_id.as_str()),
+        "the requester is the token subject, never the budget account"
+    );
+    assert_ne!(
+        output.requestedByUserId.as_deref(),
+        Some(account_id.as_str())
+    );
+    assert_eq!(
+        output.reviewedBy, None,
+        "requester and reviewer are separate fields: nothing has reviewed this yet"
+    );
+}
+
+/// The field must survive the wire, not just the direct mutation response: both listings the
+/// console renders (`listPendingAugmentationRequests`, the admin queue; and
+/// `listMyAugmentationRequests`, the caller's own history) must carry it. Subject and
+/// `budgetAccountId` coincide here because `listMyAugmentationRequests` derives its target from
+/// the subject alone (#295's IDOR guard) -- the "requester is not the account" property is proven
+/// by `request_refill_records_the_caller_subject_as_the_requester` above instead.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_requester_round_trips_through_both_augmentation_request_listings(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    let (procedures, ctx, budget_repo) = procedures_and_ctx(pool, &account_id).await;
+    let db = lazy_cratestack_db();
+
+    // The seeded policy auto-approves only the first two self-service refills per period; seed
+    // both so the request below lands in `pending_review` and therefore appears in the admin
+    // queue as well as in the caller's own history.
+    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B15).await;
+    seed_self_service_grant(&budget_repo, &account_id, BudgetTier::B30).await;
+
+    let queued = request_refill(
+        &procedures,
+        &db,
+        &ctx,
+        refill_args(&account_id, None, "30000000"),
+    )
+    .await
+    .expect("an exhausted-allowance refill must still succeed (queued)");
+    assert_eq!(queued.status, "pending_review");
+
+    let pending = list_pending(&procedures, &db, &ctx, list_pending_args(Some(&account_id)))
+        .await
+        .expect("the admin queue read must succeed");
+    let queued_entry = pending
+        .entries
+        .iter()
+        .find(|r| r.id == queued.id)
+        .expect("the queued request must be in the admin queue");
+    assert_eq!(
+        queued_entry.requestedByUserId.as_deref(),
+        Some(account_id.as_str())
+    );
+
+    let history = list_my(&procedures, &db, &ctx, list_my_args(None, None))
+        .await
+        .expect("the caller's own history read must succeed");
+    let history_entry = history
+        .entries
+        .iter()
+        .find(|r| r.id == queued.id)
+        .expect("the queued request must be in the caller's own history");
+    assert_eq!(
+        history_entry.requestedByUserId.as_deref(),
+        Some(account_id.as_str())
+    );
+
+    let wire = serde_json::to_string(&queued).expect("the response type must serialize");
+    assert!(
+        wire.contains("requestedByUserId"),
+        "the field must be present on the actual wire bytes the console decodes: {wire}"
+    );
+}

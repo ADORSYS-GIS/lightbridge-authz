@@ -460,7 +460,11 @@ API keys are stored as:
   never displaces a good one (`PolicyStore`).
 - `budget_augmentation_requests`: one row per self-service refill request, from creation through
   auto-approval or admin approve/reject — the audit trail for "who asked, what decided, who
-  reviewed."
+  reviewed." "Who asked" is `requested_by_user_id` (the caller's token subject, stamped at
+  `requestBudgetRefill`, #646) and "who reviewed" is `reviewed_by`; they are different columns and
+  usually different people. `requested_by_user_id` is NULL for rows predating
+  `migrations/20260902000002_budget_augmentation_requests_add_requested_by.sql` and is never
+  backfilled — NULL means unknown. It is an audit column: no authorization path reads it.
 
 ### Identifier Format (CUID2)
 

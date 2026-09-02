@@ -64,6 +64,22 @@ fn base_request(
         idempotency_key,
         as_of: Utc::now(),
         requested_amount_micros,
+        requested_by_user_id: None,
+    }
+}
+
+/// #646 variant of [`base_request`]: the same request, attributed to `requested_by_user_id`.
+/// Kept as its own constructor so every pre-existing test body stays byte-identical -- only the
+/// shared fixture gained the field.
+fn base_request_by(
+    account_id: &str,
+    idempotency_key: Option<String>,
+    requested_amount_micros: i64,
+    requested_by_user_id: &str,
+) -> RefillRequest {
+    RefillRequest {
+        requested_by_user_id: Some(requested_by_user_id.to_string()),
+        ..base_request(account_id, idempotency_key, requested_amount_micros)
     }
 }
 
@@ -585,4 +601,104 @@ async fn request_refill_accepts_every_amount_refill_status_reports_as_offered(po
              not-offered: {result:?}"
         );
     }
+}
+
+/// #646: `request_refill` stamps the caller's subject onto the row it creates. The requester is
+/// deliberately a different id from the budget account -- the whole point of the field is that it
+/// is NOT derivable from `budget_account_id`/`account_id`, which is why the console's earlier
+/// "Requester" column (which only re-rendered the account) was removed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn request_refill_persists_the_requester_from_the_request(pool: PgPool) {
+    let account_id = cuid2();
+    let requester_id = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    let service = refill_service(&pool, default_policy_engine(), known_zero_spend_reader());
+
+    let result = service
+        .request_refill(base_request_by(
+            &account_id,
+            None,
+            15_000_000,
+            &requester_id,
+        ))
+        .await
+        .expect("a fresh account's first refill must succeed");
+
+    assert_eq!(
+        result.requested_by_user_id.as_deref(),
+        Some(requester_id.as_str()),
+        "the returned request must carry the submitter, not the budget account"
+    );
+    assert_ne!(
+        result.requested_by_user_id.as_deref(),
+        Some(account_id.as_str())
+    );
+
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT requested_by_user_id FROM budget_augmentation_requests WHERE id = $1",
+    )
+    .bind(&result.id)
+    .fetch_one(&pool)
+    .await
+    .expect("the request row must exist");
+
+    assert_eq!(
+        stored.as_deref(),
+        Some(requester_id.as_str()),
+        "the requester must be in the database, not merely in the returned value"
+    );
+
+    let history = service
+        .list_own_history(&account_id, None, 50)
+        .await
+        .expect("history read must succeed");
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].requested_by_user_id.as_deref(),
+        Some(requester_id.as_str()),
+        "the requester must round-trip through the history read the console renders"
+    );
+}
+
+/// The idempotency short-circuit runs BEFORE the row is created, so a retry returns the request
+/// as the ORIGINAL submitter created it. Recording the retrying caller instead would quietly
+/// rewrite history on a network hiccup -- one request, one requester, whoever asked first.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_idempotent_retry_keeps_the_original_requester(pool: PgPool) {
+    let account_id = cuid2();
+    let first_requester = cuid2();
+    let retrying_caller = cuid2();
+    let idempotency_key = cuid2();
+    insert_account(&pool, &account_id).await;
+
+    let service = refill_service(&pool, default_policy_engine(), known_zero_spend_reader());
+
+    let first = service
+        .request_refill(base_request_by(
+            &account_id,
+            Some(idempotency_key.clone()),
+            15_000_000,
+            &first_requester,
+        ))
+        .await
+        .expect("the first submission must succeed");
+
+    let retry = service
+        .request_refill(base_request_by(
+            &account_id,
+            Some(idempotency_key),
+            15_000_000,
+            &retrying_caller,
+        ))
+        .await
+        .expect("the retry must return the same request, not a new one");
+
+    assert_eq!(retry.id, first.id, "the retry must be the same row");
+    assert_eq!(
+        retry.requested_by_user_id.as_deref(),
+        Some(first_requester.as_str()),
+        "a retry must never rewrite the recorded requester"
+    );
+    assert_eq!(count_augmentation_requests(&pool, &account_id).await, 1);
 }
