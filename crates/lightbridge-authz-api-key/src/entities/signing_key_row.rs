@@ -13,6 +13,22 @@ pub struct SigningKeyRow {
     pub retired_at: Option<DateTime<Utc>>,
 }
 
+/// Listing-only projection over `signing_keys` -- deliberately carries NEITHER
+/// `private_key_pem` NOR `public_jwk`, unlike [`SigningKeyRow`]. This is the type
+/// `StoreRepo::list_signing_keys` (`crate::signing_keys_admin`) returns for the `idp jwk list`
+/// operator command: the private key must never reach stdout/logs, so the query behind this type
+/// does not even select that column -- there is no code path through which it could leak, rather
+/// than relying on a formatter to omit it.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct SigningKeyMeta {
+    pub kid: String,
+    /// `'access'` or `'refresh'` -- see [`NewSigningKey::purpose`].
+    pub purpose: String,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub retired_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewSigningKey {
     pub kid: String,

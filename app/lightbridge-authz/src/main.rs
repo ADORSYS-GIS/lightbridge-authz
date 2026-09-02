@@ -1,11 +1,10 @@
+mod idp_cmd;
 mod migrate;
 mod utils;
 
 use clap::Parser;
 use lightbridge_authz_core::Result;
-use lightbridge_authz_rest::{
-    start_api_server, start_budget_server, start_idp_server, start_opa_server,
-};
+use lightbridge_authz_rest::{start_api_server, start_budget_server, start_opa_server};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
@@ -31,7 +30,7 @@ async fn main() -> Result<()> {
         Some(Commands::Serve { config_path }) => Some(config_path),
         Some(Commands::Api { config_path }) => Some(config_path),
         Some(Commands::Opa { config_path }) => Some(config_path),
-        Some(Commands::Idp { config_path }) => Some(config_path),
+        Some(Commands::Idp { config_path, .. }) => Some(config_path),
         Some(Commands::Budget { config_path }) => Some(config_path),
         Some(Commands::Migrate { config_path }) => Some(config_path),
         Some(Commands::Config { config_path }) => Some(config_path),
@@ -138,29 +137,10 @@ async fn main() -> Result<()> {
             start_opa_server(&config.server.opa, pool, &config.billing, &config.oauth2).await?;
             Ok(())
         }
-        Some(Commands::Idp { config_path }) => {
-            info!("{}", BANNER);
-
-            let config = load_from_path(&config_path)?;
-
-            info!("Connecting to DB...");
-            let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(&config.database).await?);
-
-            let idp = config.server.idp.as_ref().ok_or_else(|| {
-                lightbridge_authz_core::Error::Server(
-                    "server.idp config is required to run the idp command".to_string(),
-                )
-            })?;
-            start_idp_server(
-                idp,
-                pool,
-                &config.oauth2,
-                &config.redis,
-                &config.secret_claim,
-            )
-            .await?;
-            Ok(())
-        }
+        Some(Commands::Idp {
+            config_path,
+            command,
+        }) => idp_cmd::run(config_path, command).await,
         Some(Commands::Budget { config_path }) => {
             info!("{}", BANNER);
 
