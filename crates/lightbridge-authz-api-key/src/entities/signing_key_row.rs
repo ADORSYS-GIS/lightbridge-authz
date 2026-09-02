@@ -19,5 +19,10 @@ pub struct NewSigningKey {
     pub algorithm: String,
     pub private_key_pem: String,
     pub public_jwk: serde_json::Value,
+    /// `'access'` or `'refresh'` -- see `migrations/20260902000001_signing_keys_add_purpose.sql`.
+    /// Scopes [`crate::repo::StoreRepo::ensure_active_signing_key`]'s single-active-key rotation
+    /// to keys of the SAME purpose, so an access key and a refresh key can be active at once (the
+    /// `(status, purpose) WHERE status = 'active'` unique index is what makes this legal).
+    pub purpose: String,
     pub created_at: DateTime<Utc>,
 }

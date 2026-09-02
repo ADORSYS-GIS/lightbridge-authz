@@ -9,7 +9,11 @@
 //! - [`refresh_store`]: `RefreshTokenStore` over `exchange_refresh_tokens`.
 //! - [`refresh_token`]: mints/verifies the refresh token itself as an RS256 JWT (was: an opaque
 //!   `lgbr_rt_<random>` string) -- a presentation-format change only, `refresh_store`'s DB-backed
-//!   CAS/rotation/revocation stays the single source of truth.
+//!   CAS/rotation/revocation stays the single source of truth. Signed with its OWN dedicated
+//!   signing key/`kid`, absent from the public JWKS by construction (never merely by a `typ`
+//!   denylist) -- see [`refresh_signing`] for how that key is bootstrapped.
+//! - [`refresh_signing`]: bootstraps the dedicated refresh-token signing key at `authz-idp`
+//!   startup, alongside the access-key bootstrap `authz-api`/`lightbridge-mcp` also run.
 //! - [`device_store`]: `DeviceCodeStore` over `device_authorizations` (ADR-0012 Decision 7, #423)
 //!   -- real, CAS-consuming storage, replacing the permanent `NoDeviceCodeStore` stub ADR-0011
 //!   Decision 3 originally installed for both OP-side traits.
@@ -23,6 +27,7 @@
 pub mod client_assertion_store;
 pub mod client_store;
 pub mod device_store;
+pub mod refresh_signing;
 pub mod refresh_store;
 pub mod refresh_token;
 pub mod store;

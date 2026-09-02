@@ -886,6 +886,7 @@ mod db {
                     algorithm: "RS256".to_string(),
                     private_key_pem: candidate.private_key_pem,
                     public_jwk: candidate.public_jwk,
+                    purpose: "access".to_string(),
                     created_at: Utc::now(),
                 },
                 Utc::now() + Duration::minutes(1),
@@ -1495,6 +1496,7 @@ mod db {
                 algorithm: "RS256".to_string(),
                 private_key_pem: candidate.private_key_pem,
                 public_jwk: candidate.public_jwk,
+                purpose: "access".to_string(),
                 created_at: Utc::now(),
             },
             Utc::now() + Duration::minutes(1),
@@ -1576,5 +1578,111 @@ mod db {
             payload.get("claims_supported").is_none(),
             "optional claims metadata must stay absent until it has a dedicated, verified contract"
         );
+    }
+
+    /// The whole point of giving refresh tokens their own signing key (dedicated-refresh-signing-
+    /// key work): the published JWKS must NEVER carry the refresh key's `kid`. Before this, cross-
+    /// use of a refresh JWT as a Bearer access token was prevented only by an application-level
+    /// `typ` denylist; with the refresh key absent from `/.well-known/jwks.json`
+    /// (`StoreRepo::list_verification_jwks`, scoped to `purpose = 'access'`), no resource server
+    /// ever holds a key that could verify one in the first place, so cross-use is impossible BY
+    /// CONSTRUCTION rather than by policy alone.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn refresh_signing_key_never_appears_in_the_access_jwks(pool: PgPool) {
+        let repo = repo(pool);
+        lightbridge_authz_rest::oauth2_op::refresh_signing::bootstrap_idp_signing_keys(
+            &repo,
+            &signing_cfg(3600),
+        )
+        .await
+        .unwrap();
+
+        let refresh_key = repo
+            .get_active_refresh_signing_key()
+            .await
+            .unwrap()
+            .expect("refresh key must be bootstrapped alongside the access key");
+
+        let published_kids: Vec<String> = repo
+            .list_verification_jwks()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|jwk| jwk.get("kid").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+
+        assert!(
+            !published_kids.contains(&refresh_key.kid),
+            "the public JWKS must never publish the refresh signing key's kid ({}); published: \
+             {published_kids:?}",
+            refresh_key.kid
+        );
+        assert_eq!(
+            published_kids.len(),
+            1,
+            "exactly the access key must be published, never the refresh key too"
+        );
+    }
+
+    /// End-to-end mint -> verify round trip for the refresh JWT itself, now signed by the
+    /// dedicated refresh key rather than whichever key the access token alongside it used.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn refresh_jwt_round_trips_through_mint_and_verify(pool: PgPool) {
+        use lightbridge_authz_rest::oauth2_op::refresh_token::{
+            mint_refresh_jwt, verify_refresh_jwt,
+        };
+
+        let repo = repo(pool);
+        lightbridge_authz_rest::oauth2_op::refresh_signing::bootstrap_idp_signing_keys(
+            &repo,
+            &signing_cfg(3600),
+        )
+        .await
+        .unwrap();
+
+        let token = mint_refresh_jwt(&repo, "acct_1", "sess_1", "row_1", 3600)
+            .await
+            .unwrap();
+
+        let claims = verify_refresh_jwt(&repo, &token)
+            .await
+            .unwrap()
+            .expect("a freshly minted refresh JWT must verify against the refresh JWKS");
+        assert_eq!(claims.sub, "acct_1");
+        assert_eq!(claims.sid, "sess_1");
+        assert_eq!(claims.jti, "row_1");
+    }
+
+    /// Proves the migration's `(status, purpose) WHERE status = 'active'` unique index (replacing
+    /// the old `(status) WHERE status = 'active'` one) is what lets an access key and a refresh
+    /// key be active at the same time -- without it, bootstrapping the refresh key while an
+    /// access key is already active would violate the old single-column unique index at INSERT
+    /// time and this bootstrap would fail outright.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn access_and_refresh_signing_keys_can_both_be_active_at_once(pool: PgPool) {
+        let repo = repo(pool);
+        lightbridge_authz_rest::oauth2_op::refresh_signing::bootstrap_idp_signing_keys(
+            &repo,
+            &signing_cfg(3600),
+        )
+        .await
+        .unwrap();
+
+        let access = repo
+            .get_active_signing_key()
+            .await
+            .unwrap()
+            .expect("access key must be active");
+        let refresh = repo
+            .get_active_refresh_signing_key()
+            .await
+            .unwrap()
+            .expect("refresh key must be active");
+        assert_ne!(
+            access.kid, refresh.kid,
+            "the two purposes must mint distinct keys"
+        );
+        assert_eq!(access.status, "active");
+        assert_eq!(refresh.status, "active");
     }
 }
