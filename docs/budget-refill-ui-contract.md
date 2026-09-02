@@ -300,3 +300,101 @@ landing — see the PR description for the investigation and the tracking follow
 doesn't change anything about how the UI should call these RPCs (a real end-user session token
 works exactly as described above); it's called out here so nobody building against this contract
 assumes that acceptance criterion is already enforced server-side.
+
+---
+
+## Budget reset schedules (ADR-0032, story #651)
+
+Six more procedures on the same `authz-budget` service and the same `/budget/rpc/{op_id}` prefix.
+A **reset schedule** is a standing, operator-authored rule — *"reset remaining to $2.00 every day at
+00:00 UTC for every account on the `free` plan"* — that a background task in `authz-budget`
+executes, writing one grant per matching budget account per window into the same append-only ledger
+every other grant goes to.
+
+Source of truth is again `crates/lightbridge-authz-api/schema/authz.cstack` (search for
+`BudgetResetSchedule`, `listBudgetResetSchedules`, `createBudgetResetSchedule`,
+`updateBudgetResetSchedule`, `deleteBudgetResetSchedule`, `runBudgetResetScheduleNow`,
+`getEffectiveResetSchedule`); the decisions behind them are
+[`docs/adr/0032-budget-reset-schedules.md`](./adr/0032-budget-reset-schedules.md).
+
+### The procedures
+
+| Procedure | Permission | Notes |
+| --- | --- | --- |
+| `listBudgetResetSchedules({})` → `BudgetResetSchedule[]` | `budget:schedule-manage` | Every schedule, enabled or not, oldest first. Unpaginated — this is configuration, not a ledger. |
+| `createBudgetResetSchedule({ name, scopeKind, scopeId?, cadence, anchor?, runAtUtc?, amountMicros, mode })` → `BudgetResetSchedule` | `budget:schedule-manage` | **Always created disabled.** There is no `enabled` input field to set. |
+| `updateBudgetResetSchedule({ id, …all optional… , enabled? })` → `BudgetResetSchedule` | `budget:schedule-manage` | Partial. The only way to flip `enabled`. |
+| `deleteBudgetResetSchedule({ id })` → `{ id, deleted }` | `budget:schedule-manage` | Removes the future; grants already written stay in the ledger forever. |
+| `runBudgetResetScheduleNow({ id, dryRun })` → `BudgetResetScheduleRunResult` | `budget:schedule-manage` | `dryRun: true` writes **nothing**: no grant, no `nextRunAt` advance, no `lastRunAt`. |
+| `getEffectiveResetSchedule({ budgetAccountId })` → `{ schedule?, nextRunAt? }` | **`budget:read`** | Deliberately NOT `budget:schedule-manage` — this is what a budget card calls. |
+
+### `BudgetResetSchedule`
+
+```
+{
+  id: string
+  name: string
+  scopeKind: "global" | "billing_plan" | "account"
+  scopeId?: string        // null for global; a billing-plan name, or an account id
+  cadence: "daily" | "weekly" | "monthly"
+  anchor?: number         // ISO weekday 1..7 (weekly), day of month 1..28 (monthly), null (daily)
+  runAtUtc: string        // "HH:MM", always UTC
+  amountMicros: string    // integer micro-USD as a string — see "Why amounts are strings" above
+  mode: "reset" | "top_up"
+  enabled: boolean
+  nextRunAt: string       // ISO-8601
+  lastRunAt?: string
+  createdBy?: string
+  createdAt: string
+  updatedAt: string
+}
+```
+
+`scopeKind`/`cadence`/`mode` are plain strings carrying the exact wire values above, the same
+convention `Decision.effect` already uses. A cadence sentence renders straight off these fields:
+*"Reset remaining to $2.00 every day at 00:00 UTC"*.
+
+### The three behaviors that need explicit copy
+
+**1. `reset` clamps BOTH ways.** `delta = amount − (effectiveBudget − spendToDate)`. When an
+account has MORE remaining than the target, the schedule writes a **negative** row — `source:
+"correction"`, the compensating entry the append-only ledger defines — and remaining lands exactly
+on the target. A reset is not only a top-up with a ceiling; it can take budget away, and the UI
+copy must say so before anyone enables a global one. An account already exactly on target gets no
+row at all.
+
+**2. Only the most specific schedule fires.** Precedence is `account` > `billing_plan` > `global`;
+at equal specificity the oldest wins; disabled schedules are invisible to precedence. So an account
+covered by all three sees exactly one grant, from the account-scoped one — and disabling that
+override silently hands the account back to the plan schedule. A list view should say which
+schedule actually governs which accounts rather than implying all matching ones apply.
+
+**3. Preview before enabling, and mean it.** `runBudgetResetScheduleNow({ id, dryRun: true })`
+returns `entries: [{ budgetAccountId, remainingMicros, deltaMicros }]` — the exact rows a real run
+would write, from the exact same code path — plus `deferredAccountIds` (accounts whose spend could
+not be read; they would get nothing) and `supersededAccountIds` (accounts a more specific schedule
+covers). Show the first ~25 entries and the two id counts. `deltaMicros` is never zero.
+
+`runBudgetResetScheduleNow` with `dryRun: false` fires the schedule's **pending window** — the same
+`triggerKey` the scheduled tick would have used — so a manual fire followed by the tick catching up
+cannot double-grant.
+
+### The honest caption (required)
+
+> Schedules change the ledger balance and the minted budget tier; gateway rate limits still follow
+> the plan buckets until lightbridge-authz Phase 6a lands.
+
+This is the same gap ["Today, a refill has no gateway effect at all"](#2-today-a-refill-has-no-gateway-effect-at-all--not-until-the-next-token-refresh-none)
+above documents, and it applies identically to reset schedules. A fired schedule changes
+`budget_balances` and the `budget_tier` claim minted at token exchange; it does not change what a
+request experiences at the Envoy gateway. Do not ship a schedules screen without this line.
+
+### Auditing what fired
+
+Every scheduled grant is visible through `listBudgetGrants` with no new procedure:
+
+- `source: "automatic"` for a top-up or a reset-up, `source: "correction"` for a reset-down.
+- `triggerKey` is `"<scheduleId>:<windowStartIso>:<budgetAccountId>"` — filter or group on the
+  leading segment to see everything one schedule ever did.
+- `reason` carries the schedule's name and the window, e.g.
+  `budget reset schedule 'free plan daily' (reset) for window 2026-09-03T00:00:00+00:00`.

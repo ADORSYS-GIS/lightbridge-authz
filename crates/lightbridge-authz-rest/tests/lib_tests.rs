@@ -579,6 +579,11 @@ mod db {
             budget_repo.clone(),
             augmentation_repo,
         ));
+        let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
+            db_pool.clone(),
+            budget_repo.clone(),
+            Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
+        ));
         let router = lightbridge_authz_rest::build_api_router(
             bearer,
             test_resolver(),
@@ -587,6 +592,7 @@ mod db {
             refill_service,
             review_service,
             budget_repo,
+            reset_scheduler,
             lazy_cratestack_db(),
             db_pool.clone(),
             lazy_idempotency_store(),

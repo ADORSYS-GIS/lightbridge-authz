@@ -241,6 +241,16 @@ see "Service boundary" above.
   `listBudgetGrants` (`budget:audit-read`) (both admin, arbitrary-target).
 - Direct admin grant/revoke: `grantBudget` (`budget:grant`), `revokeBudgetGrant`
   (`budget:revoke`).
+- Budget reset schedules (ADR-0032): `listBudgetResetSchedules` / `createBudgetResetSchedule` /
+  `updateBudgetResetSchedule` / `deleteBudgetResetSchedule` / `runBudgetResetScheduleNow` (all
+  `budget:schedule-manage`), plus `getEffectiveResetSchedule` (`budget:read`, deliberately NOT the
+  manage permission — it is what a per-account budget card reads). These are the RPC face of the
+  one background job this process runs: `start_budget_server` spawns a 60-second
+  `tokio::time::interval` task driving `ResetScheduler::tick`, which claims due
+  `budget_reset_schedules` rows with `FOR UPDATE SKIP LOCKED` (replica-safe) and writes one grant
+  per matching account per window. A `reset` clamps remaining BOTH ways: a negative delta is booked
+  as the `source = 'correction'` compensating row, never a mutation. See
+  [`docs/adr/0032-budget-reset-schedules.md`](../adr/0032-budget-reset-schedules.md).
 
 See [`docs/rbac.md`](../rbac.md) for the authoritative permission table and the full self-vs-admin
 reasoning; the list here is derived from `rpc_authorize.rs`'s `required_permission` map, not

@@ -112,11 +112,14 @@ fn lazy_refill_and_review_services(
     Arc<lightbridge_authz_budget::RefillService>,
     Arc<lightbridge_authz_budget::ReviewService>,
     Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+    Arc<lightbridge_authz_budget::ResetScheduler>,
 ) {
     let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
         core.clone(),
     ));
-    let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(core));
+    let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(
+        core.clone(),
+    ));
     let refill_service = Arc::new(lightbridge_authz_budget::RefillService::new(
         budget_repo.clone(),
         augmentation_repo.clone(),
@@ -127,7 +130,15 @@ fn lazy_refill_and_review_services(
         budget_repo.clone(),
         augmentation_repo,
     ));
-    (refill_service, review_service, budget_repo)
+    // ADR-0032: `build_api_router` takes the reset scheduler unconditionally (see `Procedures`'s
+    // own field doc). Inert here -- the interval task is spawned only by `start_budget_server`,
+    // and `RpcScope::Crud` refuses every schedule op-id on this router anyway.
+    let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
+        core,
+        budget_repo.clone(),
+        Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
+    ));
+    (refill_service, review_service, budget_repo, reset_scheduler)
 }
 
 /// Assemble the full API router with a caller-supplied bearer, everything else lazily wired to
@@ -138,7 +149,7 @@ fn build_router(bearer: Arc<dyn BearerTokenServiceTrait>, dev_cors: bool) -> Rou
     let core = lazy_core_pool();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()));
     let policy_store = lazy_policy_store(core.clone());
-    let (refill_service, review_service, budget_repo) =
+    let (refill_service, review_service, budget_repo, reset_scheduler) =
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
         bearer,
@@ -148,6 +159,7 @@ fn build_router(bearer: Arc<dyn BearerTokenServiceTrait>, dev_cors: bool) -> Rou
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
         lazy_cratestack_db(),
         core,
         lazy_idempotency(),
@@ -166,7 +178,7 @@ fn build_router_with_billing(bearer: Arc<dyn BearerTokenServiceTrait>, billing: 
     let core = lazy_core_pool();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()).with_billing(billing));
     let policy_store = lazy_policy_store(core.clone());
-    let (refill_service, review_service, budget_repo) =
+    let (refill_service, review_service, budget_repo, reset_scheduler) =
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
         bearer,
@@ -176,6 +188,7 @@ fn build_router_with_billing(bearer: Arc<dyn BearerTokenServiceTrait>, billing: 
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
         lazy_cratestack_db(),
         core,
         lazy_idempotency(),
@@ -194,7 +207,7 @@ fn build_router_with_models(
     let core = lazy_core_pool();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()).with_model_catalog(models));
     let policy_store = lazy_policy_store(core.clone());
-    let (refill_service, review_service, budget_repo) =
+    let (refill_service, review_service, budget_repo, reset_scheduler) =
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
         bearer,
@@ -204,6 +217,7 @@ fn build_router_with_models(
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
         lazy_cratestack_db(),
         core,
         lazy_idempotency(),
@@ -222,7 +236,7 @@ fn build_router_at(
     let core = lazy_core_pool();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()));
     let policy_store = lazy_policy_store(core.clone());
-    let (refill_service, review_service, budget_repo) =
+    let (refill_service, review_service, budget_repo, reset_scheduler) =
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
         bearer,
@@ -232,6 +246,7 @@ fn build_router_at(
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
         lazy_cratestack_db(),
         core,
         lazy_idempotency(),

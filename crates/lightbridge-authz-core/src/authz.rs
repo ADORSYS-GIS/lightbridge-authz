@@ -112,6 +112,16 @@ pub enum Permission {
     /// see that variant's doc comment.
     #[serde(rename = "budget:policy-activate")]
     BudgetPolicyActivate,
+    /// Author, edit, delete and manually fire budget reset schedules (ADR-0032). Kept distinct
+    /// from [`Permission::BudgetGrant`] even though a firing schedule ultimately writes grants: a
+    /// direct grant is one amount to one account that an admin typed out, whereas a schedule is a
+    /// standing rule that can, at `global` scope, rewrite every account's balance on a timer
+    /// without anyone in the loop. Reading which schedule currently governs an account
+    /// (`getEffectiveResetSchedule`) is deliberately NOT gated here -- it rides
+    /// [`Permission::BudgetRead`], so a console budget card can render "next reset: <date>"
+    /// without the caller also being able to author schedules.
+    #[serde(rename = "budget:schedule-manage")]
+    BudgetScheduleManage,
 
     /// Revoke all of the caller's own refresh-token sessions ("log out everywhere"). Kept
     /// distinct from [`Permission::SessionRevoke`] -- same self/admin split as
@@ -141,7 +151,7 @@ pub enum Permission {
 impl Permission {
     /// Every permission, in declaration order. The single source of truth for wildcard expansion
     /// and documentation.
-    pub const ALL: [Permission; 32] = [
+    pub const ALL: [Permission; 33] = [
         Permission::AccountCreate,
         Permission::AccountRead,
         Permission::AccountUpdate,
@@ -171,6 +181,7 @@ impl Permission {
         Permission::BudgetPolicyWrite,
         Permission::BudgetPolicySimulate,
         Permission::BudgetPolicyActivate,
+        Permission::BudgetScheduleManage,
         Permission::SessionRevokeOwn,
         Permission::SessionRevoke,
         Permission::UsageReadAll,
@@ -208,6 +219,7 @@ impl Permission {
             Permission::BudgetPolicyWrite => "budget:policy-write",
             Permission::BudgetPolicySimulate => "budget:policy-simulate",
             Permission::BudgetPolicyActivate => "budget:policy-activate",
+            Permission::BudgetScheduleManage => "budget:schedule-manage",
             Permission::SessionRevokeOwn => "session:revoke-own",
             Permission::SessionRevoke => "session:revoke",
             Permission::UsageReadAll => "usage:read-all",

@@ -150,6 +150,15 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
         augmentation_repo,
     ));
 
+    // ADR-0032: `Procedures`/`build_*_router` take the reset scheduler unconditionally (see
+    // `Procedures`'s own field doc). The interval task is spawned only by `start_budget_server`,
+    // so this is an inert handle over the same pool.
+    let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
+        core.clone(),
+        budget_repo.clone(),
+        Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
+    ));
+
     let router = lightbridge_authz_rest::build_api_router(
         bearer,
         common::test_resolver(),
@@ -158,6 +167,7 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
         cdb,
         core,
         idempotency,

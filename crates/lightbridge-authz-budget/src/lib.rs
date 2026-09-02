@@ -18,6 +18,8 @@ pub mod period;
 pub mod policy_store;
 pub mod refill;
 pub mod repo;
+pub mod reset_schedule;
+pub mod reset_scheduler;
 pub mod review;
 pub mod rule_data;
 pub mod source;
@@ -35,6 +37,14 @@ pub use facts::Facts;
 pub use period::Period;
 pub use policy_store::PolicyStore;
 pub use refill::{RefillRequest, RefillService, RefillStatus};
+pub use reset_schedule::{
+    BudgetResetSchedule, BudgetResetScheduleUpdate, Cadence, NewBudgetResetSchedule, ResetMode,
+    ResetScheduleRepo, ScheduleScopeKind, first_window_after, next_window_after, parse_run_at_utc,
+    render_run_at_utc,
+};
+pub use reset_scheduler::{
+    EffectiveSchedule, PlannedGrant, ResetScheduler, ScheduleRunOutcome, TickReport,
+};
 pub use review::ReviewService;
 pub use rule_data::{
     Condition, Field, Operator, Rule, RuleDataEngine, RuleSet, default_rule_set_json,

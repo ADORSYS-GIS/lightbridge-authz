@@ -109,6 +109,7 @@ auth Principal {
   permBudgetPolicyWrite Boolean
   permBudgetPolicySimulate Boolean
   permBudgetPolicyActivate Boolean
+  permBudgetScheduleManage Boolean
   permSessionRevokeOwn Boolean
   permSessionRevoke Boolean
   // `permUsageReadAll` (Permission::UsageReadAll, "usage:read-all") has no MAPPED_OP_ID_PERMISSIONS
@@ -1614,3 +1615,155 @@ type BudgetPolicyRevisionRef {
 
 mutation procedure createBudgetPolicyRevision(args: CreateBudgetPolicyRevisionInput): BudgetPolicyRevisionRef
   @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetPolicyWrite == true)
+
+// Budget reset schedules (ADR-0032). A schedule is a standing policy -- "reset remaining to $2.00
+// every day at 00:00 UTC for every account on the `free` plan" -- that a background task in the
+// authz-budget process executes, writing ONE grant per matching account per window into the
+// append-only `budget_grants` ledger. `scopeKind`/`cadence`/`mode` carry the exact wire strings
+// their Rust enums (`ScheduleScopeKind`/`Cadence`/`ResetMode`) render, as plain `String` fields --
+// the same choice, for the same reason, `Decision.effect` above already documents.
+// `amountMicros` is a `String`-carried i64, matching every other micro-USD amount in this schema.
+// `runAtUtc` is `HH:MM`, always UTC. `anchor` is the ISO weekday (1..7) for a weekly cadence, the
+// day of month (1..28) for a monthly one, and null for a daily one.
+type BudgetResetSchedule {
+  id String
+  name String
+  scopeKind String
+  scopeId String?
+  cadence String
+  anchor Int?
+  runAtUtc String
+  amountMicros String
+  mode String
+  enabled Boolean
+  nextRunAt DateTime
+  lastRunAt DateTime?
+  createdBy String?
+  createdAt DateTime
+  updatedAt DateTime
+}
+
+type ListBudgetResetSchedulesInput {
+}
+
+// Every schedule, enabled or not, oldest first (ordered by `createdAt` -- per ADR-0039 ids are
+// opaque CUID2 strings with no defined ordering, so they are never an ordering key). Unpaginated
+// on purpose: this is operator-authored configuration measured in tens of rows, not a ledger.
+procedure listBudgetResetSchedules(args: ListBudgetResetSchedulesInput): BudgetResetSchedule[]
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetScheduleManage == true)
+
+// Authors a schedule. It is ALWAYS created disabled -- `enabled` is deliberately absent from this
+// input, not merely defaulted -- because a misconfigured `global` schedule would rewrite every
+// account's balance on its first window. The intended flow is create -> `runBudgetResetScheduleNow
+// { dryRun: true }` -> `updateBudgetResetSchedule { enabled: true }`. `nextRunAt` is likewise
+// server-computed from the cadence, never caller-supplied, so nobody can backdate a window into
+// firing immediately.
+type CreateBudgetResetScheduleInput {
+  name String
+  scopeKind String
+  scopeId String?
+  cadence String
+  anchor Int?
+  runAtUtc String?
+  amountMicros String
+  mode String
+}
+
+mutation procedure createBudgetResetSchedule(args: CreateBudgetResetScheduleInput): BudgetResetSchedule
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetScheduleManage == true)
+
+// A partial update: every field except `id` is optional and an omitted one leaves its column
+// alone. `scopeId` is read only when `scopeKind` is also supplied -- a scope change always moves
+// both halves together, since a `global` schedule must carry no `scopeId` and a scoped one must.
+// Changing `cadence`, `anchor` or `runAtUtc` re-seeds `nextRunAt` from the NEW cadence, so a
+// schedule that becomes weekly does not keep firing on yesterday's daily window. This is also the
+// only way to flip `enabled`.
+type UpdateBudgetResetScheduleInput {
+  id String
+  name String?
+  scopeKind String?
+  scopeId String?
+  cadence String?
+  anchor Int?
+  runAtUtc String?
+  amountMicros String?
+  mode String?
+  enabled Boolean?
+}
+
+mutation procedure updateBudgetResetSchedule(args: UpdateBudgetResetScheduleInput): BudgetResetSchedule
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetScheduleManage == true)
+
+type DeleteBudgetResetScheduleInput {
+  id String
+}
+
+type DeleteBudgetResetScheduleResult {
+  id String
+  deleted Boolean
+}
+
+// Deletes a schedule. Grants it already wrote stay in `budget_grants` forever (ADR-0009 -- the
+// ledger is append-only and nothing here touches it); this removes the future, never the past.
+mutation procedure deleteBudgetResetSchedule(args: DeleteBudgetResetScheduleInput): DeleteBudgetResetScheduleResult
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetScheduleManage == true)
+
+// One account's would-be grant for a window: what "Preview" renders, and exactly what a non-dry
+// run writes. `remainingMicros` is `effectiveBudget - spendToDate` at plan time (it can be
+// negative, for an account that overspent its grants); `deltaMicros` is the ledger row -- positive
+// is a `source = "automatic"` grant, negative is the `source = "correction"` compensating row that
+// clamps an over-funded account back down (the owner's binding "reset clamps both ways" ruling).
+// It is never zero: an account already exactly on target is dropped from the plan rather than
+// booked as an auditless no-op row.
+type BudgetResetSchedulePlanEntry {
+  budgetAccountId String
+  remainingMicros String
+  deltaMicros String
+}
+
+// `deferredAccountIds` are accounts whose spend came back Unavailable -- no grant was written for
+// them and the window stays due so the next tick retries them (never grant on unknown spend).
+// `supersededAccountIds` are accounts this schedule matches but a MORE SPECIFIC enabled schedule
+// covers (account > billing_plan > global), so only that one fires.
+type BudgetResetScheduleRunResult {
+  scheduleId String
+  dryRun Boolean
+  windowStart DateTime
+  entries BudgetResetSchedulePlanEntry[]
+  deferredAccountIds String[]
+  supersededAccountIds String[]
+}
+
+type RunBudgetResetScheduleNowInput {
+  id String
+  dryRun Boolean
+}
+
+// Fires the schedule's CURRENT pending window immediately, whether or not it is due yet -- so the
+// `triggerKey` is the one the scheduled tick would have used, and running now then letting the
+// tick catch up cannot double-grant. With `dryRun: true` it computes the plan and writes NOTHING
+// at all: no grant, no `nextRunAt` advance, no `lastRunAt` stamp. Dry run and the real tick are
+// literally the same code path with one boolean flipped, so a preview can never disagree with what
+// the scheduler goes on to do.
+mutation procedure runBudgetResetScheduleNow(args: RunBudgetResetScheduleNowInput): BudgetResetScheduleRunResult
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetScheduleManage == true)
+
+type GetEffectiveResetScheduleInput {
+  budgetAccountId String
+}
+
+// The winning schedule for one budget account and when it next fires, or nulls when no enabled
+// schedule covers it.
+type EffectiveResetSchedule {
+  schedule BudgetResetSchedule?
+  nextRunAt DateTime?
+}
+
+// Deliberately gated at `budget:read` (`Permission::BudgetRead`), NOT at `budget:schedule-manage`
+// like the five procedures above: this is what a console budget card calls to render "next reset:
+// <date> -> $2.00", and reading which standing rule governs an account is a materially lower-risk
+// capability than authoring one. Same "read-only companion at the read permission" shape as
+// `getBudgetBalance`, not the "read-only companion at the mutation's permission" shape
+// `listBillingPlans` uses -- because this read serves a screen that does NOT also mutate.
+procedure getEffectiveResetSchedule(args: GetEffectiveResetScheduleInput): EffectiveResetSchedule
+  @allow((auth() != null) && auth().rpcScope == "budget" && auth().permBudgetRead == true)

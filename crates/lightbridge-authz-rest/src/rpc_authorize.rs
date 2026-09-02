@@ -280,6 +280,23 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         // Authoring a new policy revision, kept distinct from `budget:policy-activate` (ADR-0007).
         "procedure.createBudgetPolicyRevision" => BudgetPolicyWrite,
 
+        // Budget reset schedules (ADR-0032). The four CRUD procedures and the manual fire share
+        // one permission: authoring a standing rule, editing it, deleting it and firing it by hand
+        // are the same capability with the same blast radius (a `global` schedule rewrites every
+        // account's balance), so splitting them would be granularity theatre. `runBudgetResetScheduleNow`
+        // is gated here even for `dryRun: true` -- the dry run enumerates the whole estate's
+        // accounts and their balances, which is not a read a non-manager should be able to make.
+        "procedure.listBudgetResetSchedules" => BudgetScheduleManage,
+        "procedure.createBudgetResetSchedule" => BudgetScheduleManage,
+        "procedure.updateBudgetResetSchedule" => BudgetScheduleManage,
+        "procedure.deleteBudgetResetSchedule" => BudgetScheduleManage,
+        "procedure.runBudgetResetScheduleNow" => BudgetScheduleManage,
+        // The one schedule procedure that is NOT `budget:schedule-manage`: reading which schedule
+        // governs one account (for a budget card's "next reset: <date>") is a read of that
+        // account's budget, gated exactly like `getBudgetBalance` beside it. See the schema doc
+        // comment on `getEffectiveResetSchedule`.
+        "procedure.getEffectiveResetSchedule" => BudgetRead,
+
         _ => return None,
     })
 }
@@ -388,6 +405,30 @@ pub const MAPPED_OP_ID_PERMISSIONS: &[(&str, Permission)] = &[
     (
         "procedure.createBudgetPolicyRevision",
         Permission::BudgetPolicyWrite,
+    ),
+    (
+        "procedure.listBudgetResetSchedules",
+        Permission::BudgetScheduleManage,
+    ),
+    (
+        "procedure.createBudgetResetSchedule",
+        Permission::BudgetScheduleManage,
+    ),
+    (
+        "procedure.updateBudgetResetSchedule",
+        Permission::BudgetScheduleManage,
+    ),
+    (
+        "procedure.deleteBudgetResetSchedule",
+        Permission::BudgetScheduleManage,
+    ),
+    (
+        "procedure.runBudgetResetScheduleNow",
+        Permission::BudgetScheduleManage,
+    ),
+    (
+        "procedure.getEffectiveResetSchedule",
+        Permission::BudgetRead,
     ),
 ];
 

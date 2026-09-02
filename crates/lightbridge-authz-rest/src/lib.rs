@@ -73,6 +73,19 @@ const BUDGET_POLICY_EVALUATION_BUDGET: usize = 10_000;
 /// server startup). See `migrations/20260804000001_budget_policy_sets_and_revisions.sql`.
 const BUDGET_POLICY_SET_ID: &str = "budget-refill";
 
+/// How often `authz-budget` wakes to claim due budget reset schedules (ADR-0032). 60 seconds is
+/// comfortably fine-grained for a domain whose finest cadence is daily, and coarse enough that an
+/// idle deployment's scheduler costs one indexed `SELECT` a minute.
+const RESET_SCHEDULER_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The time of day a reset schedule fires when `createBudgetResetSchedule` omits `runAtUtc`,
+/// matching the column's own `DEFAULT '00:00'`. Always UTC.
+const DEFAULT_RESET_SCHEDULE_RUN_AT_UTC: chrono::NaiveTime =
+    match chrono::NaiveTime::from_hms_opt(0, 0, 0) {
+        Some(time) => time,
+        None => unreachable!(),
+    };
+
 #[derive(Serialize, Deserialize)]
 struct RootResponse {
     status: String,
@@ -319,7 +332,8 @@ fn budget_error_to_cratestack_error(err: lightbridge_authz_budget::BudgetError) 
         | BudgetError::UnknownStatus(_)
         | BudgetError::InvalidReviewOutcome(_)
         | BudgetError::MissingRejectionReason
-        | BudgetError::AmountNotOffered(_) => CratestackError::BadRequest(err.to_string()),
+        | BudgetError::AmountNotOffered(_)
+        | BudgetError::InvalidSchedule(_) => CratestackError::BadRequest(err.to_string()),
         BudgetError::AlreadyGranted | BudgetError::AlreadyReviewed(_) => {
             CratestackError::Conflict(err.to_string())
         }
@@ -505,6 +519,80 @@ fn to_schema_budget_grant_entry(
         createdAt: grant.created_at,
         expiresAt: grant.expires_at,
         revokedAt: grant.revoked_at,
+    }
+}
+
+/// Maps a domain [`lightbridge_authz_budget::BudgetResetSchedule`] into the schema's wire
+/// `BudgetResetSchedule` shape (ADR-0032). `scopeKind`/`cadence`/`mode` carry the exact strings
+/// their Rust enums' `Display` impls render -- the same wire-string-as-`String` choice
+/// `Decision.effect` already documents -- and `amountMicros` is a `String`-carried i64 like every
+/// other micro-USD amount on this surface.
+fn to_schema_budget_reset_schedule(
+    schedule: lightbridge_authz_budget::BudgetResetSchedule,
+) -> schema::BudgetResetSchedule {
+    schema::BudgetResetSchedule {
+        id: schedule.id,
+        name: schedule.name,
+        scopeKind: schedule.scope_kind.to_string(),
+        scopeId: schedule.scope_id,
+        cadence: schedule.cadence.to_string(),
+        anchor: schedule.anchor.map(i64::from),
+        runAtUtc: lightbridge_authz_budget::render_run_at_utc(schedule.run_at_utc),
+        amountMicros: schedule.amount_micros.to_string(),
+        mode: schedule.mode.to_string(),
+        enabled: schedule.enabled,
+        nextRunAt: schedule.next_run_at,
+        lastRunAt: schedule.last_run_at,
+        createdBy: schedule.created_by,
+        createdAt: schedule.created_at,
+        updatedAt: schedule.updated_at,
+    }
+}
+
+/// Parses a wire `amountMicros` (a `String`-carried i64) into `i64`, mirroring `grantBudget`'s
+/// identical parse so a malformed amount is a 400 with the offending value, never a 500.
+fn parse_amount_micros(raw: &str) -> std::result::Result<i64, CratestackError> {
+    raw.trim().parse::<i64>().map_err(|_| {
+        CratestackError::BadRequest(format!("amountMicros must be a valid integer, got '{raw}'"))
+    })
+}
+
+/// Narrows a wire `anchor` (`Int?`, i.e. `i64`) into the `i16` the column stores. Out-of-range is a
+/// 400 rather than a silent truncation -- the DB `CHECK` would reject it anyway, but as an opaque
+/// constraint violation surfaced as a 500.
+fn parse_schedule_anchor(anchor: Option<i64>) -> std::result::Result<Option<i16>, CratestackError> {
+    anchor
+        .map(|value| {
+            i16::try_from(value)
+                .map_err(|_| CratestackError::BadRequest(format!("anchor {value} is out of range")))
+        })
+        .transpose()
+}
+
+/// Maps one [`lightbridge_authz_budget::ScheduleRunOutcome`] into the schema's
+/// `BudgetResetScheduleRunResult`, shared by the dry-run and the real `runBudgetResetScheduleNow`
+/// so the two can never render a different shape.
+fn to_schema_reset_schedule_run_result(
+    schedule_id: String,
+    dry_run: bool,
+    window_start: chrono::DateTime<chrono::Utc>,
+    outcome: lightbridge_authz_budget::ScheduleRunOutcome,
+) -> schema::BudgetResetScheduleRunResult {
+    schema::BudgetResetScheduleRunResult {
+        scheduleId: schedule_id,
+        dryRun: dry_run,
+        windowStart: window_start,
+        entries: outcome
+            .planned
+            .into_iter()
+            .map(|entry| schema::BudgetResetSchedulePlanEntry {
+                budgetAccountId: entry.budget_account_id,
+                remainingMicros: entry.remaining_micros.to_string(),
+                deltaMicros: entry.delta_micros.to_string(),
+            })
+            .collect(),
+        deferredAccountIds: outcome.deferred_account_ids,
+        supersededAccountIds: outcome.superseded_account_ids,
     }
 }
 
@@ -812,6 +900,13 @@ pub struct Procedures {
     /// independent handle against the SAME underlying database (constructed once at server
     /// startup, see `start_api_server`).
     budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+    /// The budget reset scheduler (ADR-0032). The SAME instance the `authz-budget` interval task
+    /// drives (see `start_budget_server`), not a second one built for the RPC surface: a dry run
+    /// and a real tick must be the same code over the same state, or a preview could disagree with
+    /// what the scheduler goes on to do. It owns its own `ResetScheduleRepo`, so the four CRUD
+    /// procedures reach schedules through `reset_scheduler.schedules()` rather than a separate
+    /// field.
+    reset_scheduler: Arc<lightbridge_authz_budget::ResetScheduler>,
 }
 
 impl Procedures {
@@ -821,6 +916,7 @@ impl Procedures {
         refill_service: Arc<lightbridge_authz_budget::RefillService>,
         review_service: Arc<lightbridge_authz_budget::ReviewService>,
         budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+        reset_scheduler: Arc<lightbridge_authz_budget::ResetScheduler>,
     ) -> Self {
         Self {
             issuer,
@@ -828,6 +924,7 @@ impl Procedures {
             refill_service,
             review_service,
             budget_repo,
+            reset_scheduler,
         }
     }
 }
@@ -2259,6 +2356,284 @@ impl schema::procedures::ProcedureRegistry for Procedures {
             })
         }
     }
+
+    /// Every reset schedule, oldest first. Gated at `budget:schedule-manage`.
+    fn list_budget_reset_schedules(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        _args: schema::procedures::list_budget_reset_schedules::Args,
+        _authorized: schema::procedures::list_budget_reset_schedules::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::list_budget_reset_schedules::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let reset_scheduler = self.reset_scheduler.clone();
+        let subject = subject_from_ctx(ctx);
+        async move {
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            let schedules = reset_scheduler
+                .schedules()
+                .list()
+                .await
+                .map_err(budget_error_to_cratestack_error)?;
+            Ok(schedules
+                .into_iter()
+                .map(to_schema_budget_reset_schedule)
+                .collect())
+        }
+    }
+
+    /// Authors a schedule, ALWAYS disabled (ADR-0032) -- there is no input field a caller could set
+    /// to create an already-live global schedule. `nextRunAt` is derived server-side from the
+    /// cadence, so a caller cannot backdate a window into firing immediately either. Gated at
+    /// `budget:schedule-manage`.
+    fn create_budget_reset_schedule(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::create_budget_reset_schedule::Args,
+        _authorized: schema::procedures::create_budget_reset_schedule::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::create_budget_reset_schedule::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let reset_scheduler = self.reset_scheduler.clone();
+        let subject = subject_from_ctx(ctx);
+        let input = args.args;
+        async move {
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+
+            let run_at_utc = match input.runAtUtc.as_deref() {
+                Some(raw) => lightbridge_authz_budget::parse_run_at_utc(raw)
+                    .map_err(budget_error_to_cratestack_error)?,
+                None => DEFAULT_RESET_SCHEDULE_RUN_AT_UTC,
+            };
+
+            let schedule = reset_scheduler
+                .schedules()
+                .create(
+                    lightbridge_authz_budget::NewBudgetResetSchedule {
+                        name: input.name,
+                        scope_kind: input
+                            .scopeKind
+                            .parse()
+                            .map_err(budget_error_to_cratestack_error)?,
+                        scope_id: input.scopeId,
+                        cadence: input
+                            .cadence
+                            .parse()
+                            .map_err(budget_error_to_cratestack_error)?,
+                        anchor: parse_schedule_anchor(input.anchor)?,
+                        run_at_utc,
+                        amount_micros: parse_amount_micros(&input.amountMicros)?,
+                        mode: input
+                            .mode
+                            .parse()
+                            .map_err(budget_error_to_cratestack_error)?,
+                    },
+                    Some(&subject),
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(budget_error_to_cratestack_error)?;
+
+            Ok(to_schema_budget_reset_schedule(schedule))
+        }
+    }
+
+    /// A partial update; an omitted field leaves its column alone. This is also the only way to
+    /// flip `enabled`, which is what makes "create -> dry run -> enable" the enforced flow rather
+    /// than a convention. Gated at `budget:schedule-manage`.
+    fn update_budget_reset_schedule(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::update_budget_reset_schedule::Args,
+        _authorized: schema::procedures::update_budget_reset_schedule::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::update_budget_reset_schedule::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let reset_scheduler = self.reset_scheduler.clone();
+        let subject = subject_from_ctx(ctx);
+        let input = args.args;
+        async move {
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+
+            // `scopeId` is read only alongside `scopeKind`: the two move together, since the DB
+            // CHECK requires `global` to carry no scopeId and every other kind to carry one.
+            let scope = input
+                .scopeKind
+                .map(|kind| {
+                    kind.parse::<lightbridge_authz_budget::ScheduleScopeKind>()
+                        .map(|kind| (kind, input.scopeId.clone()))
+                })
+                .transpose()
+                .map_err(budget_error_to_cratestack_error)?;
+
+            let update = lightbridge_authz_budget::BudgetResetScheduleUpdate {
+                name: input.name,
+                scope,
+                cadence: input
+                    .cadence
+                    .map(|c| c.parse())
+                    .transpose()
+                    .map_err(budget_error_to_cratestack_error)?,
+                // `Some(None)` (clear the anchor) is unreachable over this wire shape -- an absent
+                // `anchor` and an explicit null are the same value here -- so an omitted anchor
+                // keeps the stored one, EXCEPT when the cadence becomes daily, where the repo
+                // clears it (see `ResetScheduleRepo::update`).
+                anchor: parse_schedule_anchor(input.anchor)?.map(Some),
+                run_at_utc: input
+                    .runAtUtc
+                    .as_deref()
+                    .map(lightbridge_authz_budget::parse_run_at_utc)
+                    .transpose()
+                    .map_err(budget_error_to_cratestack_error)?,
+                amount_micros: input
+                    .amountMicros
+                    .as_deref()
+                    .map(parse_amount_micros)
+                    .transpose()?,
+                mode: input
+                    .mode
+                    .map(|m| m.parse())
+                    .transpose()
+                    .map_err(budget_error_to_cratestack_error)?,
+                enabled: input.enabled,
+            };
+
+            let schedule = reset_scheduler
+                .schedules()
+                .update(&input.id, update, chrono::Utc::now())
+                .await
+                .map_err(budget_error_to_cratestack_error)?;
+
+            Ok(to_schema_budget_reset_schedule(schedule))
+        }
+    }
+
+    /// Deletes a schedule. The grants it already wrote stay in the append-only ledger (ADR-0009);
+    /// this removes the future, never the past. Gated at `budget:schedule-manage`.
+    fn delete_budget_reset_schedule(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::delete_budget_reset_schedule::Args,
+        _authorized: schema::procedures::delete_budget_reset_schedule::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::delete_budget_reset_schedule::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let reset_scheduler = self.reset_scheduler.clone();
+        let subject = subject_from_ctx(ctx);
+        let id = args.args.id;
+        async move {
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            reset_scheduler
+                .schedules()
+                .delete(&id)
+                .await
+                .map_err(budget_error_to_cratestack_error)?;
+            Ok(schema::procedures::delete_budget_reset_schedule::Output { id, deleted: true })
+        }
+    }
+
+    /// Fires the schedule's pending window immediately, or (with `dryRun`) computes the plan and
+    /// writes nothing at all. Same code path either way -- see `ResetScheduler::run_now`. Gated at
+    /// `budget:schedule-manage` even for a dry run: the preview enumerates the estate's accounts
+    /// and their balances.
+    fn run_budget_reset_schedule_now(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::run_budget_reset_schedule_now::Args,
+        _authorized: schema::procedures::run_budget_reset_schedule_now::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::run_budget_reset_schedule_now::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let reset_scheduler = self.reset_scheduler.clone();
+        let subject = subject_from_ctx(ctx);
+        let input = args.args;
+        async move {
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+
+            let schedule = reset_scheduler
+                .schedules()
+                .get(&input.id)
+                .await
+                .map_err(budget_error_to_cratestack_error)?;
+            let window_start = schedule.next_run_at;
+
+            let outcome = reset_scheduler
+                .run_now(&input.id, chrono::Utc::now(), input.dryRun)
+                .await
+                .map_err(budget_error_to_cratestack_error)?;
+
+            Ok(to_schema_reset_schedule_run_result(
+                input.id,
+                input.dryRun,
+                window_start,
+                outcome,
+            ))
+        }
+    }
+
+    /// The winning schedule for one budget account and when it next fires. Gated at `budget:read`,
+    /// NOT `budget:schedule-manage` -- see the schema doc comment on this procedure.
+    fn get_effective_reset_schedule(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::get_effective_reset_schedule::Args,
+        _authorized: schema::procedures::get_effective_reset_schedule::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::get_effective_reset_schedule::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let reset_scheduler = self.reset_scheduler.clone();
+        let subject = subject_from_ctx(ctx);
+        let budget_account_id = args.args.budgetAccountId;
+        async move {
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+
+            let effective = reset_scheduler
+                .effective_schedule(&budget_account_id)
+                .await
+                .map_err(budget_error_to_cratestack_error)?;
+
+            Ok(match effective {
+                Some(effective) => schema::procedures::get_effective_reset_schedule::Output {
+                    nextRunAt: Some(effective.next_run_at),
+                    schedule: Some(to_schema_budget_reset_schedule(effective.schedule)),
+                },
+                None => schema::procedures::get_effective_reset_schedule::Output {
+                    schedule: None,
+                    nextRunAt: None,
+                },
+            })
+        }
+    }
 }
 
 /// Shared page-fetch for `listMyBudgetGrants`/`listBudgetGrants`: parses the optional `period`,
@@ -2363,6 +2738,7 @@ pub fn build_api_router(
     refill_service: Arc<lightbridge_authz_budget::RefillService>,
     review_service: Arc<lightbridge_authz_budget::ReviewService>,
     budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+    reset_scheduler: Arc<lightbridge_authz_budget::ResetScheduler>,
     cratestack_db: schema::Cratestack,
     readiness_pool: Arc<dyn DbPoolTrait>,
     idempotency_store: Arc<SqlxIdempotencyStore>,
@@ -2395,6 +2771,7 @@ pub fn build_api_router(
             refill_service,
             review_service,
             budget_repo,
+            reset_scheduler,
         ),
         // cratestack 0.8.11 (@computed) added this parameter to every generated router fn.
         // `authz.cstack` declares no `@computed` field, so `()` (the generated
@@ -2902,11 +3279,23 @@ pub async fn start_api_server(
         budget_repo.clone(),
         augmentation_repo.clone(),
         policy_engine,
-        spend_reader,
+        spend_reader.clone(),
     ));
     let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
         budget_repo.clone(),
         augmentation_repo,
+    ));
+    // ADR-0032. Constructed on BOTH servers because `Procedures::new` takes it unconditionally
+    // (the same type-level obligation `build_budget_router`'s `issuer` argument already documents)
+    // -- but only `start_budget_server` spawns the interval task that drives it, so `authz-api`
+    // holds an idle scheduler it can never reach: `RpcScope::Crud` refuses every `budget:*` op-id
+    // before dispatch. It shares the SAME fail-closed `spend_reader` the refill path uses, so an
+    // unreachable usage service degrades a reset the same way it degrades a refill: never a grant
+    // on unknown spend.
+    let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
+        pool.clone(),
+        budget_repo.clone(),
+        spend_reader,
     ));
 
     let readiness_pool = pool.clone();
@@ -2988,6 +3377,7 @@ pub async fn start_api_server(
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
         cratestack_db,
         readiness_pool,
         idempotency_store,
@@ -3434,6 +3824,7 @@ pub fn build_budget_router(
     refill_service: Arc<lightbridge_authz_budget::RefillService>,
     review_service: Arc<lightbridge_authz_budget::ReviewService>,
     budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+    reset_scheduler: Arc<lightbridge_authz_budget::ResetScheduler>,
     cratestack_db: schema::Cratestack,
     readiness_pool: Arc<dyn DbPoolTrait>,
     bearer: Arc<dyn BearerTokenServiceTrait>,
@@ -3452,6 +3843,7 @@ pub fn build_budget_router(
             refill_service,
             review_service,
             budget_repo,
+            reset_scheduler,
         ),
         // cratestack 0.8.11 (@computed) added this parameter to every generated router fn.
         // `authz.cstack` declares no `@computed` field, so `()` (the generated
@@ -3564,11 +3956,23 @@ pub async fn start_budget_server(
         budget_repo.clone(),
         augmentation_repo.clone(),
         policy_engine,
-        spend_reader,
+        spend_reader.clone(),
     ));
     let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
         budget_repo.clone(),
         augmentation_repo,
+    ));
+    // ADR-0032. Constructed on BOTH servers because `Procedures::new` takes it unconditionally
+    // (the same type-level obligation `build_budget_router`'s `issuer` argument already documents)
+    // -- but only `start_budget_server` spawns the interval task that drives it, so `authz-api`
+    // holds an idle scheduler it can never reach: `RpcScope::Crud` refuses every `budget:*` op-id
+    // before dispatch. It shares the SAME fail-closed `spend_reader` the refill path uses, so an
+    // unreachable usage service degrades a reset the same way it degrades a refill: never a grant
+    // on unknown spend.
+    let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
+        pool.clone(),
+        budget_repo.clone(),
+        spend_reader,
     ));
 
     let readiness_pool = pool.clone();
@@ -3626,6 +4030,39 @@ pub async fn start_budget_server(
     let rate_limit_store =
         build_redis_rate_limit_store(&redis.url, redis.ca_bundle_path.as_deref(), "authz-budget")?;
 
+    // ADR-0032: the budget reset scheduler's own tick loop, started HERE and only here -- one
+    // `tokio::interval` alongside the three existing listener tasks, on the process that owns the
+    // budget domain. Running several `authz-budget` replicas is safe by construction: each tick
+    // claims due rows with `FOR UPDATE SKIP LOCKED`, so a schedule another replica already holds
+    // is skipped rather than fired twice.
+    //
+    // `spawn`ed, not awaited: a scheduler failure must never stop the RPC surface from serving. A
+    // failing tick is logged and the next one retries 60 seconds later -- and because the tick's
+    // claim transaction only commits the `next_run_at` advance on success, a failed window stays
+    // due rather than being silently skipped.
+    let scheduler_task = reset_scheduler.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(RESET_SCHEDULER_TICK_INTERVAL);
+        // `Delay`, not the default `Burst`: a tick that overruns 60 seconds (a global schedule
+        // over a large estate) must not queue up a backlog of immediate catch-up ticks behind it.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match scheduler_task.tick(chrono::Utc::now()).await {
+                Ok(report) if report.claimed_schedule_ids.is_empty() => {}
+                Ok(report) => tracing::info!(
+                    claimed = report.claimed_schedule_ids.len(),
+                    grants_written = report.grants_written,
+                    "budget reset scheduler tick"
+                ),
+                Err(err) => tracing::error!(
+                    error = %err,
+                    "budget reset scheduler tick failed; retrying on the next interval"
+                ),
+            }
+        }
+    });
+
     let dev_cors = dev_cors_enabled();
     let app = build_budget_router(
         issuer,
@@ -3633,6 +4070,7 @@ pub async fn start_budget_server(
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
         cratestack_db,
         readiness_pool,
         bearer_service,
