@@ -275,6 +275,66 @@ sequenceDiagram
     end
 ```
 
+## 3a. A refresh token's lifecycle, as a state machine
+
+§2 and §3 above show how a chain is born and how one rotation proceeds. This is the same thing
+viewed as states rather than steps, because **every way a refresh token dies is a transition into
+a terminal state, and all of them return the identical wire response**. That is the single most
+important operational fact about this subsystem and it is invisible in a sequence diagram.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active: offline_access exchange grant\nchain_id + chain_expires_at born here\n(store.rs:684, store.rs:710)
+    Active --> Rotated: CAS consume succeeds\n(store.rs:1634)
+    Rotated --> Active: successor row inserted\nchain_expires_at INHERITED, never reset\n(store.rs:1815-1816)
+    Active --> Expired: now > row.expires_at\nrefresh_ttl_seconds, default 30d\n(store.rs:1821)
+    Active --> ChainCapped: now >= chain_expires_at\nrefresh_absolute_ttl_seconds, default 90d\n(store.rs:303)
+    Rotated --> Revoked: replayed after rotation -> reuse cascade\nkills the WHOLE chain (repo.rs:1295)
+    Active --> Revoked: cascade from a sibling's reuse\n(same chain_id)
+    Active --> Revoked: browser logout, requesting client only\n(session_revocation.rs:40)
+    Active --> Revoked: revokeOwnSessions / revokeSubjectSessions\n(repo.rs:1878)
+    Expired --> [*]: 400 invalid_grant
+    ChainCapped --> [*]: 400 invalid_grant
+    Revoked --> [*]: 400 invalid_grant
+```
+
+### Why this view matters more than it looks
+
+**Five distinct causes collapse into one indistinguishable response.** `Expired`, `ChainCapped`,
+`Revoked`-by-reuse, `Revoked`-by-logout and "no such token at all" are all
+`400 invalid_grant`, and the wire deliberately cannot tell them apart — an oracle here would leak
+whether a given token ever existed. The cost is paid at debugging time. The
+"Which failure means what" table at the end of this document maps each response back to its
+causes; this diagram is the same information keyed by *state* rather than by response.
+
+**Unreachable by design**, stated explicitly per this repo's "draw the state machine, don't just
+describe it" rule (see ADR-0020's own state diagram for the sessions equivalent): there is no
+transition out of `Expired`, `ChainCapped` or `Revoked`. Nothing anywhere un-revokes a chain or
+extends a cap — `Rotated -> Active` is the ONLY edge that continues a lineage, and it inherits
+`chain_expires_at` rather than recomputing it.
+
+**Only ONE of those transitions logs anything.** The reuse cascade warns
+(`refresh token reuse detected ...`), and the graced-replay path warns. Every other death is
+silent: `handle_refresh_token`'s plain `invalid_grant` arm emits no log line at all. So a user
+reporting "my CLI suddenly asks me to log in again" produces, server-side, *the absence of
+evidence*. When diagnosing, reason from the state machine and the row's `status` column, not from
+the logs.
+
+**`Rotated -> Active` is where the 90-day cap lives.** A chain that keeps refreshing before every
+individual `expires_at` would otherwise live forever; `chain_expires_at` is set once at birth and
+inherited unchanged (never recomputed) precisely so that rotation cannot extend it.
+
+**`Rotated -> Revoked` deliberately kills more than the replayed token.** The successor — which was
+never itself replayed — dies too. That is the point: RFC 6819 §5.2.2.3 treats a replay as evidence
+the family is compromised, so the family dies, not just the member. A 30-second grace window
+(`refresh_reuse_grace_seconds`) exempts a client racing itself; see §4.
+
+**Not shown here, because it is not a chain state at all:** since #631 a refresh token is verified
+(signature/`aud`/`typ`) *before* the database is consulted, against `purpose = 'refresh'` signing
+keys only. A token that fails that check never reaches any state above — it is refused with the
+same `400 invalid_grant`, which is why a signing-key cutover looks identical to a revoked chain
+from the client's side.
+
 ## 4. Reuse detection / theft cascade
 
 RFC 6819 §5.2.2.3: a refresh token being presented a *second* time, after it was already
@@ -467,6 +527,7 @@ read per request.
 | §2 exchange | `400 invalid_grant` | `"Client is not authorized to exchange this token"` | subject token valid, but `client_id` absent from its own `aud` claim (CHECK 2) | no |
 | §2 exchange | `403 access_denied` | `"subject is not a member of the requested project"` | no `project_id` given and no default project yet, or the resolved project is unknown/non-member | no |
 | §3 refresh | `400 invalid_grant` | `"refresh_token is invalid, expired, or already used"` | unknown hash, genuinely expired, wrong client, past the 90-day cap, or project/account resolution/suspension failure | no, unless the row's prior status was `rotated` — see §4 |
+| §3 refresh | `400 invalid_grant` | `"refresh_token is invalid, expired, or already used"` | **Since #631:** the presented JWT failed signature/`aud`/`typ` verification against the `purpose = 'refresh'` signing keys — checked BEFORE the database, so no chain state is involved at all. Indistinguishable on the wire from every row above | no |
 | §4 reuse | `400 invalid_grant` (attacker's replay) | same message as above | CAS found the row already `rotated` — a token already exchanged for a successor was replayed | **yes — entire chain revoked**, including the live successor |
 | §5a revoke | `200 OK`, empty body | — | ALWAYS, for a live token, unknown token, already-revoked token, or wrong-client token (RFC 7009 §2.2) | flips one row, no cascade |
 | §5a revoke | `401 invalid_client` | `"Client authentication failed"` | unknown `client_id`, or missing/invalid/replayed client assertion | no |
