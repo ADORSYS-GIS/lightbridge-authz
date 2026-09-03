@@ -304,8 +304,9 @@ for its op-id, or when a tool claims an op-id the REST surface fail-closes.
 **Responsibility:** ingests OTLP/HTTP traces, metrics, and logs (JSON or protobuf, optional gzip),
 normalizes attributes across compatibility aliases, and serves a single aggregated usage-query
 endpoint.
-**Owns:** the usage database — a Timescale hypertable when the extension is available, plain
-Postgres table otherwise, independent of the `authz` database.
+**Owns:** the usage database — a plain Postgres table in production (no Timescale extension; the
+`create_hypertable` block in the init migration no-ops). Retention/rollup is a background job that
+moves rows older than 90 days into `usage_events_daily` (#549). Independent of the `authz` database.
 
 Router assembly: `crates/lightbridge-authz-usage/src/{lib.rs,routers/mod.rs}`. Split across two
 listeners since #347 (`UsageServerGroup` in `crates/lightbridge-authz-usage/src/config.rs`): the

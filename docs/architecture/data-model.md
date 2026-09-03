@@ -332,8 +332,9 @@ actually live versus merely implemented — is in [`budget.md`](./budget.md).
 ## The usage side: a separate database
 
 `usage_events` (`migrations-usage/`) is **not** in the schema above — it lives in its own
-Timescale-compatible database (`lightbridge-authz-usage`'s own `DATABASE_URL`, provisioned
-independently from the authz Postgres instance), ingested via unprotected OTLP/HTTP
+Postgres database (`lightbridge-authz-usage`'s own `DATABASE_URL`, provisioned
+independently from the authz Postgres instance; plain Postgres in production, no Timescale
+extension), ingested via unprotected OTLP/HTTP
 (`/v1/otel/traces`, `/v1/otel/metrics`, `/v1/otel/logs`) and queried via
 `/usage/v1/usage/query` (mTLS + Bearer JWT + ownership since #570/#603). It carries
 `account_id`/`project_id` as plain `TEXT` columns with no foreign key back into `accounts`/
@@ -394,7 +395,7 @@ scratch:
 | `project_members` | Composite primary key `(project_id, account_id)`; cratestack's schema only models it as a relation target with a synthetic `id`, explicitly barred from the migration generator. |
 | `exchange_refresh_tokens` | Refresh-token rotation is a compare-and-swap (`SELECT ... FOR UPDATE`), not a plain CRUD write. |
 | `federated_identities` (ADR-0024) | Carries a sealed credential (`token_envelope`); must be structurally unreachable from any generated read path, same class as `signing_keys` — modelling it, even `@@allow`-less, would still leave it reachable as a relation target. |
-| `lightbridge-authz-usage`'s `usage_events` queries | Dynamic `QueryBuilder`-assembled aggregates against the Timescale-backed table, driven by caller-selected dimensions/filters. |
+| `lightbridge-authz-usage`'s `usage_events` queries | Dynamic `QueryBuilder`-assembled aggregates against the plain-Postgres table (plus the `usage_events_daily` rollup for spend, #549), driven by caller-selected dimensions/filters. |
 
 This repo runs `cratestack-pg` 0.5.1; ADR-0038's own capability findings were verified against
 0.7.8 — re-verify any capability claim against 0.5.1 before relying on it here. The two-major

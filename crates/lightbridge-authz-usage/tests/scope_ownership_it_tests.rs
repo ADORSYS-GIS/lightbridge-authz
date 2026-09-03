@@ -69,7 +69,6 @@ fn sample_event(account_id: &str, project_id: &str, observed_at: DateTime<Utc>) 
         total_tokens: None,
         total_cost: Some(1.0),
         latency_ms: None,
-        attributes: json!({}),
     }
 }
 
@@ -458,7 +457,6 @@ fn sample_event_for_user(user_id: &str, observed_at: DateTime<Utc>) -> UsageEven
         total_tokens: None,
         total_cost: Some(1.0),
         latency_ms: None,
-        attributes: json!({}),
     }
 }
 

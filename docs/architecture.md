@@ -301,8 +301,10 @@ flowchart LR
     OTLP --> Decode --> Normalize --> Events --> DB --> Query
 ```
 
-The usage schema becomes a Timescale hypertable when the extension is available and requests a
-thirty-day retention policy. The query endpoint always aggregates by time bucket and can group by
+The usage schema is plain Postgres in production (no Timescale extension — the `create_hypertable`
+block in `20260223000001` no-ops). Retention is a background rollup job that moves rows older than
+90 days out of `usage_events` into the `usage_events_daily` aggregate (#549). The query endpoint
+always aggregates by time bucket and can group by
 tenant, user, model, metric, and signal dimensions. Since #570/#603, `Query` above sits behind mTLS
 plus an end-user bearer token and an ownership check (`/usage/v1/usage/query`) or mTLS-only with no
 per-caller ownership check (`/usage/v1/spend/query`) — see

@@ -299,8 +299,8 @@ sequenceDiagram
 
     GW->>IN: OTLP LogRecord attributes<br/>azp, billing_plan, x-envoy-origin-path
     Note over IN: extract_string(&attrs, &AZP_KEYS)<br/>extract_string(&attrs, &BILLING_PLAN_KEYS)<br/>derive_operation(&attrs) -- ingest.rs
-    IN->>DB: INSERT ... (azp, operation, billing_plan, attributes)<br/>repo.rs::insert_usage_events
-    Note over DB: the raw attributes blob is written too,<br/>unchanged -- the columns are a projection,<br/>not a replacement
+    IN->>DB: INSERT ... (azp, operation, billing_plan)<br/>repo.rs::insert_usage_events
+    Note over DB: the raw attributes blob is dropped at ingest (#549 AC1);<br/>the columns are the only place these dimensions live
     C->>Q: {scope, group_by:["azp"],<br/>filters:{operation_in:[...]}}
     Q->>Q: filters.validate() -- closed vocabulary, else 400
     Q->>Q: bearer + ownership, or the usage:read-all bypass (#648)
@@ -342,8 +342,7 @@ Every transition above is exercised by a test:
 `operation_derivation_should_cover_the_whole_table` and
 `extract_log_events_should_promote_azp_billing_plan_and_operation_to_columns`
 (`crates/lightbridge-authz-usage/src/handlers/ingest.rs`),
-`operation_in_never_matches_rows_with_a_null_operation` and
-`backfill_derives_the_new_columns_from_the_attributes_blob`
+`operation_in_never_matches_rows_with_a_null_operation`
 (`crates/lightbridge-authz-usage/tests/repo_it_tests.rs`).
 
 ## Latency
@@ -384,6 +383,13 @@ the extension being available and no-ops.
 [Query cost](#query-cost-2026-09-03) for the measurements that justify it and for the BRIN
 alternative that was measured and rejected.
 
+`20260903000003_drop_usage_event_attributes.sql` drops the write-only `attributes` column (#549
+AC1). It was 60% of the table and nothing ever read it; ingest no longer writes it. The drop is a
+catalog-only change (no rewrite); the ~900 MB of existing rows are reclaimed separately by a
+scheduled `VACUUM FULL` / `pg_repack` (#549 AC5). The #648 backfill (`20260902000002`) that read
+the blob already ran in production and, on a fresh database, runs before this migration in the
+sequence.
+
 #648's bridge is three files, in this order and for this reason: columns added
 nullable first (`20260902000001`, catalog-only, no rewrite), then the backfill
 (`20260902000002`) as a `-- no-transaction` migration whose single `DO` block
@@ -394,3 +400,30 @@ backfill reads `attributes` and never rewrites it, and only touches a row whose
 three columns are all still NULL and whose blob actually yields something, which
 is what makes a re-run free. No `EXCEPTION WHEN OTHERS` anywhere: a migration that
 cannot do its job fails loudly.
+
+`20260903000004_usage_event_rollup.sql` creates `usage_events_daily`, the retention/rollup target
+(#549 AC2) — see [Retention](#retention-549-ac2) below.
+
+## Retention (#549 AC2)
+
+`usage_events` grows ~100 MB/day with no retention. A background job in the usage service
+(`crates/lightbridge-authz-usage/src/retention.rs`, driven by the `retention` config block)
+periodically rolls rows older than `retention.raw_days` (default **90**) out of `usage_events` into
+the `usage_events_daily` aggregate table, then deletes them — in one transaction.
+
+- **The dashboard's 90-day window is always served from raw.** The cutoff is rounded down to the
+  day boundary, so raw keeps slightly more than `raw_days`, and the console's 7d/30d/90d ranges
+  stay exact — including latency percentiles, which the rollup deliberately does not carry (an
+  ordered-set aggregate cannot be exactly rolled up from daily sums).
+- **Budget spend is never truncated.** `spend_for_account` reads `usage_events` UNION ALL
+  `usage_events_daily`, so a spend query is correct whether its rows are still raw or have aged
+  into the rollup. The current billing period is always within the raw window, so budget decisions
+  do not shift as data ages (AC3).
+- **Money semantics are preserved.** `usage_events_daily.total_cost` is nullable, exactly like the
+  raw column: `SUM` over all-NULL rows is NULL ("unknown"), never 0, so the `Spend::Known` /
+  `Spend::Unavailable` split is unchanged across the boundary.
+- **Only complete days are rolled up**, so the rollup is a plain `INSERT` with no `ON CONFLICT` and
+  a re-run is idempotent.
+
+The `retention` config block is optional with safe defaults (`enabled: true`, `raw_days: 90`,
+`interval_seconds: 3600`). `raw_days` MUST stay >= 90 to keep the full dashboard window in raw.

@@ -20,10 +20,11 @@ pub mod handlers;
 pub mod instrumentation;
 pub mod models;
 pub mod repo;
+pub mod retention;
 pub mod routers;
 pub mod scope_authority;
 
-pub use config::{ScopeAuthorityConfig, UsageConfig, UsageServer, load_from_path};
+pub use config::{RetentionConfig, ScopeAuthorityConfig, UsageConfig, UsageServer, load_from_path};
 use models::{UsageQueryRequest, UsageSeriesPoint};
 use repo::{StoreRepo, UsageEvent};
 use scope_authority::{RemoteScopeAuthority, ScopeAuthority};
@@ -186,6 +187,7 @@ pub async fn start_usage_server(
     database: &Database,
     oauth2: &Oauth2,
     scope_authority: &ScopeAuthorityConfig,
+    retention: &RetentionConfig,
 ) -> Result<()> {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(database).await?);
     let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool.clone()));
@@ -200,6 +202,14 @@ pub async fn start_usage_server(
         bearer,
         scope_authority,
     });
+
+    // #549 AC2: the retention/rollup background job. It owns its own `PgPool` clone (the shared
+    // pool is behind a `dyn DbPoolTrait`), and runs independently of both listeners -- a retention
+    // failure is logged and retried, never fatal.
+    tokio::spawn(retention::run_retention_loop(
+        Arc::new(pool.pool().clone()),
+        retention.clone(),
+    ));
 
     let dev_cors = dev_cors_enabled();
     if dev_cors {

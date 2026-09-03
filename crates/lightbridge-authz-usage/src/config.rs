@@ -22,6 +22,55 @@ pub struct UsageConfig {
     /// `oauth2` above is: this is the one thing that turns "we validated a bearer token" into "and
     /// this user actually owns what they're asking about."
     pub scope_authority: ScopeAuthorityConfig,
+    /// Retention/rollup for `usage_events` (#549 AC2). Optional with safe defaults: the background
+    /// job is on by default, keeps 90 days of raw events, and rolls older rows into
+    /// `usage_events_daily` hourly. See [`RetentionConfig`].
+    #[serde(default)]
+    pub retention: RetentionConfig,
+}
+
+/// Retention/rollup configuration for `usage_events` (#549 AC2).
+///
+/// `usage_events` grows ~100 MB/day with no retention. This config drives a background job in the
+/// usage service that rolls rows older than `raw_days` into the `usage_events_daily` aggregate and
+/// deletes them from the raw table, in one transaction. The dashboard's max range is 90 days, so
+/// `raw_days` MUST be >= 90 to keep the full dashboard window queryable from raw (which is what
+/// keeps latency percentiles exact -- the rollup does not carry them). Budget spend reads the
+/// current billing period, which is always within the raw window, so it is never truncated.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetentionConfig {
+    /// Whether the retention/rollup background job runs. Default `true`.
+    #[serde(default = "default_retention_enabled")]
+    pub enabled: bool,
+    /// Days of raw `usage_events` to keep before rolling up + deleting. Must be >= the dashboard's
+    /// max range (90 days). Default `90`.
+    #[serde(default = "default_retention_raw_days")]
+    pub raw_days: i64,
+    /// How often the retention/rollup job runs, in seconds. Default `3600` (hourly).
+    #[serde(default = "default_retention_interval_seconds")]
+    pub interval_seconds: u64,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_retention_enabled(),
+            raw_days: default_retention_raw_days(),
+            interval_seconds: default_retention_interval_seconds(),
+        }
+    }
+}
+
+fn default_retention_enabled() -> bool {
+    true
+}
+
+fn default_retention_raw_days() -> i64 {
+    90
+}
+
+fn default_retention_interval_seconds() -> u64 {
+    3600
 }
 
 /// HTTP client config for calling `authz-opa`'s `POST /idp/v1/authorize-usage-scope` (#570).
@@ -274,6 +323,33 @@ otel:
         assert!(
             result.is_err(),
             "a config omitting scope_authority must fail to load, not silently degrade"
+        );
+    }
+
+    /// #549 AC2: `retention` is optional with safe defaults -- a config that omits it must load
+    /// with the retention job enabled, 90 raw days, and an hourly interval, so retention is on by
+    /// default rather than silently absent.
+    #[test]
+    fn config_omitting_retention_gets_safe_defaults() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("usage-config-no-retention-{unique}.yaml"));
+        let content = format!(
+            "{}\noauth2:\n  type: external\n  jwks_url: \"http://keycloak:9100/realms/dev/protocol/openid-connect/certs\"\nscope_authority:\n  base_url: \"https://authz-opa:3001\"\n  username: \"authorino\"\n  password: \"change-me\"\n",
+            valid_server_and_logging_block()
+        );
+        fs::write(&path, content).expect("temp config should be written");
+
+        let cfg = load_from_path(&path).expect("config should load");
+        fs::remove_file(&path).expect("temp config should be removed");
+
+        assert!(cfg.retention.enabled, "retention must default to enabled");
+        assert_eq!(cfg.retention.raw_days, 90, "raw_days must default to 90");
+        assert_eq!(
+            cfg.retention.interval_seconds, 3600,
+            "interval_seconds must default to 3600"
         );
     }
 }
