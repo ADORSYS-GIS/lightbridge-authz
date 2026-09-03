@@ -81,7 +81,27 @@ pub struct BudgetInternalState {
 /// Every failure mode ends as a `503` carrying `budget_unavailable`, never a `200` with a
 /// fabricated `0` — see this module's doc comment for why that distinction is the whole point of
 /// the endpoint.
+///
+/// **The span is the SLO.** ADR-0034 §9 makes this route's p99 a *hard* shadow-mode exit criterion
+/// — Authorino v0.24.0 has no `metadata.http.timeout`, so nothing else bounds the tail — and until
+/// this attribute nothing emitted a span for it, so that criterion had no data source. The exit
+/// query filters on `http.route`; `http.response.status_code` separates p99 from the 503 rate.
+#[tracing::instrument(
+    name = "GET /budget/v1/remaining", skip_all,
+    fields(otel.kind = "server", http.request.method = "GET", http.route = BUDGET_REMAINING_PATH,
+        budget_account_id = tracing::field::Empty, period = tracing::field::Empty,
+        http.response.status_code = tracing::field::Empty)
+)]
 pub async fn budget_remaining(
+    state: State<Arc<BudgetInternalState>>,
+    query: Query<RemainingQuery>,
+) -> Response {
+    let response = remaining_response(state, query).await;
+    tracing::Span::current().record("http.response.status_code", response.status().as_u16());
+    response
+}
+
+async fn remaining_response(
     State(state): State<Arc<BudgetInternalState>>,
     Query(query): Query<RemainingQuery>,
 ) -> Response {
@@ -108,6 +128,10 @@ pub async fn budget_remaining(
             }
         },
     };
+
+    let span = tracing::Span::current();
+    span.record("budget_account_id", account_id);
+    span.record("period", tracing::field::display(&period));
 
     match state
         .remaining
