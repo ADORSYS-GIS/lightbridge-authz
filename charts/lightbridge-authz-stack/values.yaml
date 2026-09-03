@@ -2,6 +2,24 @@ nameOverride: lightbridge
 
 global:
   tlsSecretName: lightbridge-authz-tls
+  # ── ONE config for every component ──────────────────────────────────────────────────
+  # `global` is the ONLY channel Helm gives an umbrella chart for a value that every ALIAS
+  # (api/opa/idp/budget, all four the same subchart) plus lightbridge-mcp can read. Set
+  # `global.lightbridge.sharedConfig` to a YAML OBJECT (never a string) and it becomes the
+  # single source of truth for every component's /etc/lightbridge/config.yaml — oauth2
+  # signing + claim_mappers, rbac role_permissions, database, federation, otel, the lot.
+  # Per-component identity (listeners, otel.service_name, client certs) goes in that
+  # component's own `configOverrides`; blocks a component must NOT see go in its
+  # `configOmit`. See charts/lightbridge-authz/templates/_config.tpl for the full contract
+  # and docs/single-source-config.md for the diagrams.
+  #
+  # Left empty here on purpose: empty means "each subchart falls back to its own
+  # dev-shaped `sharedConfig` default", which is what makes `helm install` of this umbrella
+  # chart still produce a working local-dev stack. A non-empty value REPLACES those
+  # defaults outright — it is never deep-merged into them, so no local-dev placeholder can
+  # survive into a production render through a key the operator did not restate.
+  lightbridge:
+    sharedConfig: {}
   authz:
     image:
       version: "0.8.1"
