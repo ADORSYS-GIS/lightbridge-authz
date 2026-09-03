@@ -11,7 +11,7 @@
 //! That migration also seeds `"budget-refill"` with ADR-0008's real policy already active, so
 //! there is never a "nothing is active yet" state for [`PolicyStore::load_active_from_db`] to
 //! special-case in production -- only in a hand-rolled test database that skips the seed, which
-//! this module still treats as a real, loud error rather than assuming it can't happen.
+//! this module still treats as a loud error. Its SQL lives in `policy_store_sql`.
 
 use std::sync::Arc;
 
@@ -19,6 +19,10 @@ use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::DbPoolTrait;
 
 use crate::error::BudgetError;
+use crate::policy_store_sql::{
+    ACTIVATE_REVISION_SQL, INSERT_REVISION_RETURNING_ID_SQL, INSERT_REVISION_SQL,
+    LOAD_ACTIVE_REVISION_SQL, SELECT_REVISION_BY_ID_SQL,
+};
 use crate::rule_data::{RuleDataEngine, validate_rule_data};
 
 fn storage_failed(err: sqlx::Error) -> BudgetError {
@@ -35,26 +39,6 @@ pub struct NewRevision {
     pub policy_revision: String,
 }
 
-const LOAD_ACTIVE_REVISION_SQL: &str = "SELECT r.rule_data_json::text AS rule_data_json \
-     FROM budget_policy_sets s \
-     JOIN budget_policy_revisions r ON r.id = s.active_revision_id \
-     WHERE s.id = $1";
-
-const INSERT_REVISION_SQL: &str = "INSERT INTO budget_policy_revisions \
-     (id, policy_set_id, policy_revision, rule_data_json, created_by) \
-     VALUES ($1, $2, $3, $4::jsonb, $5)";
-
-const ACTIVATE_REVISION_SQL: &str =
-    "UPDATE budget_policy_sets SET active_revision_id = $1 WHERE id = $2";
-
-const SELECT_REVISION_BY_ID_SQL: &str = "SELECT policy_revision, rule_data_json::text \
-     FROM budget_policy_revisions WHERE id = $1 AND policy_set_id = $2";
-
-const INSERT_REVISION_RETURNING_ID_SQL: &str = "INSERT INTO budget_policy_revisions \
-     (id, policy_set_id, policy_revision, rule_data_json, created_by) \
-     VALUES ($1, $2, $3, $4::jsonb, $5) \
-     RETURNING id";
-
 /// Ties one DB-persisted policy set (identified by `policy_set_id`) to one live
 /// [`RuleDataEngine`]. Cheaply `Clone` -- `pool` and `engine` are both `Arc`s, so cloning a
 /// `PolicyStore` shares the same live engine rather than constructing a second, independent one.
@@ -66,6 +50,22 @@ pub struct PolicyStore {
 }
 
 impl PolicyStore {
+    /// Ties an ALREADY-CONSTRUCTED [`RuleDataEngine`] to `policy_set_id` without reading the DB.
+    /// [`Self::load_active_from_db`] stays the only way a server learns what is *actually* active;
+    /// this serves callers already holding it (`lightbridge-mcp`'s handler-shape tests).
+    pub fn with_engine(
+        pool: Arc<dyn DbPoolTrait>,
+        policy_set_id: impl Into<String>,
+        engine: Arc<RuleDataEngine>,
+    ) -> Self {
+        let policy_set_id = policy_set_id.into();
+        Self {
+            pool,
+            policy_set_id,
+            engine,
+        }
+    }
+
     /// Loads the currently active revision for `policy_set_id` from the database and constructs
     /// a fresh [`RuleDataEngine`] from it. This is what server startup (and, in tests, "simulate a
     /// restart") calls -- it is the read path that proves persistence and the in-memory engine

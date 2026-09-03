@@ -15,6 +15,7 @@ use lightbridge_authz_core::{
 pub mod auth_provider;
 pub mod authorize;
 pub mod budget_convert;
+pub mod budget_services;
 pub mod claim_redeem;
 pub mod codec;
 pub mod end_session;
@@ -82,14 +83,10 @@ const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 3600);
 /// limiting (Redis-backed)"). Generous burst with steady refill; tune via deployment as needed.
 const RATE_LIMIT_BURST: u32 = 120;
 const RATE_LIMIT_REFILL_PER_SECOND: f64 = 60.0;
-/// The node-count evaluation budget passed to the [`lightbridge_authz_budget::RuleDataEngine`]
-/// this server's [`lightbridge_authz_budget::PolicyStore`] wraps. See
-/// [`lightbridge_authz_budget::RuleDataEngine`]'s own doc comment for why this is a deterministic
-/// node-count budget rather than a wall-clock request timeout.
-const BUDGET_POLICY_EVALUATION_BUDGET: usize = 10_000;
-/// The one budget policy set this epic needs (ADR-0007; `PolicyStore` is bound to it once at
-/// server startup). See `migrations/20260804000001_budget_policy_sets_and_revisions.sql`.
-const BUDGET_POLICY_SET_ID: &str = "budget-refill";
+// The evaluation budget and the one policy set id both moved to `budget_services`, beside the
+// `PolicyStore::load_active_from_db` call that is their only real consumer -- `lightbridge-mcp`
+// needs the same two values now that it builds the same service graph (lightbridge-authz#645).
+use crate::budget_services::{BUDGET_POLICY_EVALUATION_BUDGET, BUDGET_POLICY_SET_ID};
 
 /// How often `authz-budget` wakes to claim due budget reset schedules (ADR-0032). 60 seconds is
 /// comfortably fine-grained for a domain whose finest cadence is daily, and coarse enough that an
@@ -3271,96 +3268,18 @@ pub async fn start_api_server(
     oauth2.rbac.validate()?;
     let federation = require_federation(oauth2, "authz-api")?;
 
-    // ADR-0007: load whatever is genuinely active in the DB right now, so a fresh startup always
-    // agrees with the last successful activation -- this is what proves "no restart needed to see
-    // a policy change AND still correct if you do restart" holds for the real running server, not
-    // just at the `PolicyStore` unit level.
-    let policy_store = Arc::new(
-        lightbridge_authz_budget::PolicyStore::load_active_from_db(
-            pool.clone(),
-            BUDGET_POLICY_SET_ID,
-            BUDGET_POLICY_EVALUATION_BUDGET,
-        )
-        .await
-        .map_err(|e| Error::Server(format!("failed to load active budget policy: {e}")))?,
-    );
-
-    // Self-service refill and the admin review queue (#191, PR 3.4). `budget_repo`/
-    // `augmentation_repo` are fresh handles against the same `pool` every other hand-written
-    // repository on this server uses; `policy_store.engine()` is the SAME live, hot-swappable
-    // engine `activateBudgetPolicy`/`getBudgetPolicyStatus` above read/write, so a policy
-    // activated at runtime takes effect for refills immediately, with no restart, exactly as it
-    // already does for `simulateBudgetPolicy`'s sibling procedures.
-    //
-    // `usage_service` (`Config.usage_service`) is optional -- see that field's own doc comment.
-    // When it is not configured, this degrades to `UnavailableSpendReader` rather than failing
-    // server startup: every spend-dependent policy fact then reads `Spend::Unavailable`, which
-    // the rule-data evaluator already treats as a fail-closed signal (routes to `manual_review`,
-    // never `auto_approve` -- see `UnavailableSpendReader`'s own doc comment for the full
-    // reasoning). Choosing to degrade rather than hard-fail (unlike `policy_store` above, which
-    // DOES fail startup loudly on a bad load) is deliberate: a missing `usage_service` narrows
-    // what self-service refill can decide automatically, it does not make the RPC surface
-    // unsafe to serve -- so a deployment that has not wired up the usage service yet can still
-    // start, just with every refill routing to manual review until it does. When it IS
-    // configured, `UsageServiceSpendReader` calls the usage service's `/usage/v1/spend/query`
-    // over HTTP instead of opening a second database connection (see
-    // `crates/lightbridge-authz-budget/src/spend.rs`'s module doc comment for why); every way
-    // that HTTP call can fail -- unreachable, timeout, non-2xx, unparseable body -- also resolves
-    // to `Spend::Unavailable`, never a hard error, so a flaky or down usage service degrades
-    // refill decisions the same way a missing config does, rather than failing this server's own
-    // requests.
-    let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
-        pool.clone(),
-    ));
-    let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(
-        pool.clone(),
-    ));
-    let policy_engine: Arc<dyn lightbridge_authz_budget::PolicyEngine> = policy_store.engine();
-    let spend_reader: Arc<dyn lightbridge_authz_budget::SpendReader> = match usage_service {
-        Some(usage_service) => Arc::new(
-            lightbridge_authz_budget::UsageServiceSpendReader::new(
-                usage_service.base_url.clone(),
-                usage_service.insecure_skip_verify,
-                usage_service.ca_bundle_path.as_deref(),
-                usage_service.client_cert_path.as_deref(),
-                usage_service.client_key_path.as_deref(),
-                std::time::Duration::from_millis(usage_service.timeout_ms),
-            )
-            .map_err(|e| {
-                Error::Server(format!("failed to build usage-service spend reader: {e}"))
-            })?,
-        ),
-        None => {
-            tracing::warn!(
-                "usage_service is not configured -- budget refill spend facts will report \
-                 Unavailable, and self-service refill decisions that depend on them will fail \
-                 closed to manual review"
-            );
-            Arc::new(lightbridge_authz_budget::UnavailableSpendReader)
-        }
-    };
-    let refill_service = Arc::new(lightbridge_authz_budget::RefillService::new(
-        budget_repo.clone(),
-        augmentation_repo.clone(),
-        policy_engine,
-        spend_reader.clone(),
-    ));
-    let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
-        budget_repo.clone(),
-        augmentation_repo,
-    ));
-    // ADR-0032. Constructed on BOTH servers because `Procedures::new` takes it unconditionally
-    // (the same type-level obligation `build_budget_router`'s `issuer` argument already documents)
-    // -- but only `start_budget_server` spawns the interval task that drives it, so `authz-api`
-    // holds an idle scheduler it can never reach: `RpcScope::Crud` refuses every `budget:*` op-id
-    // before dispatch. It shares the SAME fail-closed `spend_reader` the refill path uses, so an
-    // unreachable usage service degrades a reset the same way it degrades a refill: never a grant
-    // on unknown spend.
-    let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
-        pool.clone(),
-        budget_repo.clone(),
-        spend_reader,
-    ));
+    // ADR-0007 / ADR-0032, one shared builder (`budget_services`) rather than a copy per server:
+    // `authz-api`, `authz-budget` and `lightbridge-mcp` all need the identical graph, including
+    // the fail-closed spend-reader degrade. `authz-api` holds an inert `reset_scheduler` -- only
+    // `start_budget_server` spawns the interval task that drives it, and `RpcScope::Crud` refuses
+    // every `budget:*` op-id here before dispatch.
+    let budget_services::BudgetServices {
+        policy_store,
+        refill_service,
+        review_service,
+        budget_repo,
+        reset_scheduler,
+    } = budget_services::build_budget_services(pool.clone(), usage_service).await?;
 
     let readiness_pool = pool.clone();
     // Bootstraps (or observes) the active self-signed-JWT signing key so `AuthzStoreImpl`'s own
@@ -3978,75 +3897,16 @@ pub async fn start_budget_server(
     oauth2.rbac.validate()?;
     let federation = require_federation(oauth2, "authz-budget")?;
 
-    // ADR-0007: load whatever is genuinely active in the DB right now, so a fresh startup always
-    // agrees with the last successful activation, exactly like `start_api_server`'s identical load
-    // did before the cutover.
-    let policy_store = Arc::new(
-        lightbridge_authz_budget::PolicyStore::load_active_from_db(
-            pool.clone(),
-            BUDGET_POLICY_SET_ID,
-            BUDGET_POLICY_EVALUATION_BUDGET,
-        )
-        .await
-        .map_err(|e| Error::Server(format!("failed to load active budget policy: {e}")))?,
-    );
-
-    // Self-service refill and the admin review queue (#191, PR 3.4) -- see `start_api_server`'s
-    // identical construction for the full spend-reader degrade-not-fail reasoning
-    // (`UnavailableSpendReader` on a missing/unreachable `usage_service`, never a hard startup
-    // failure or an auto-approve).
-    let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
-        pool.clone(),
-    ));
-    let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(
-        pool.clone(),
-    ));
-    let policy_engine: Arc<dyn lightbridge_authz_budget::PolicyEngine> = policy_store.engine();
-    let spend_reader: Arc<dyn lightbridge_authz_budget::SpendReader> = match usage_service {
-        Some(usage_service) => Arc::new(
-            lightbridge_authz_budget::UsageServiceSpendReader::new(
-                usage_service.base_url.clone(),
-                usage_service.insecure_skip_verify,
-                usage_service.ca_bundle_path.as_deref(),
-                usage_service.client_cert_path.as_deref(),
-                usage_service.client_key_path.as_deref(),
-                std::time::Duration::from_millis(usage_service.timeout_ms),
-            )
-            .map_err(|e| {
-                Error::Server(format!("failed to build usage-service spend reader: {e}"))
-            })?,
-        ),
-        None => {
-            tracing::warn!(
-                "usage_service is not configured -- budget refill spend facts will report \
-                 Unavailable, and self-service refill decisions that depend on them will fail \
-                 closed to manual review"
-            );
-            Arc::new(lightbridge_authz_budget::UnavailableSpendReader)
-        }
-    };
-    let refill_service = Arc::new(lightbridge_authz_budget::RefillService::new(
-        budget_repo.clone(),
-        augmentation_repo.clone(),
-        policy_engine,
-        spend_reader.clone(),
-    ));
-    let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
-        budget_repo.clone(),
-        augmentation_repo,
-    ));
-    // ADR-0032. Constructed on BOTH servers because `Procedures::new` takes it unconditionally
-    // (the same type-level obligation `build_budget_router`'s `issuer` argument already documents)
-    // -- but only `start_budget_server` spawns the interval task that drives it, so `authz-api`
-    // holds an idle scheduler it can never reach: `RpcScope::Crud` refuses every `budget:*` op-id
-    // before dispatch. It shares the SAME fail-closed `spend_reader` the refill path uses, so an
-    // unreachable usage service degrades a reset the same way it degrades a refill: never a grant
-    // on unknown spend.
-    let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
-        pool.clone(),
-        budget_repo.clone(),
-        spend_reader,
-    ));
+    // The same shared `budget_services` graph `start_api_server` builds -- this server owns the
+    // half of it that is actually reachable (`RpcScope::Budget`) and is the only one that spawns
+    // the reset scheduler's interval task, below.
+    let budget_services::BudgetServices {
+        policy_store,
+        refill_service,
+        review_service,
+        budget_repo,
+        reset_scheduler,
+    } = budget_services::build_budget_services(pool.clone(), usage_service).await?;
 
     let readiness_pool = pool.clone();
     // Hand-written sqlx on the core `DbPool` (sqlx 0.9), same as `start_api_server` -- required to

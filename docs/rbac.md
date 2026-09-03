@@ -46,8 +46,15 @@ Enforcement is centralized, so the handlers/tools themselves contain no authoriz
   `CachedAuthProvider` caches the one resulting context and reuses it for every frame's dispatch), so
   it can no longer see an individual frame's op-id to authorize it here at all. See "Batch RPC:
   per-frame RBAC" below for where per-frame enforcement actually happens post-0.8.4.
-- **MCP** — `call_tool` maps the tool name to the required permission and checks it before
-  dispatching. It likewise fails closed (an unmapped tool name is rejected).
+- **MCP** (`lightbridge-mcp`) — `call_tool` resolves the tool name to its RPC `op_id` and asks
+  **the same `rpc_authorize::required_permission` map** the two gates above use
+  (`app/lightbridge-authz/src/mcp_rbac.rs`, lightbridge-authz#122 / #645). It is not a mirror of
+  that map and no longer a copy of it: the MCP surface holds only a `tool -> op_id` table, and the
+  permission comes from one place. It fails closed the same way — an unmapped tool name, or a tool
+  whose op-id the map denies unconditionally, is rejected — and honours the same
+  `AUTHENTICATED_ONLY_OP_IDS` exception (`get-my-access`, `get-build-info` need a live token and
+  nothing more). `app/lightbridge-authz/tests/mcp_parity_tests.rs` fails the build if any reachable
+  RPC op-id has no MCP tool, or if a tool's gate differs from its op-id's REST permission.
 
 ### Two gates on the CRUD surface, in order
 
@@ -507,39 +514,120 @@ scope for #401.
 | `account:disable` | `procedure.disableAccount`, `procedure.enableAccount`| `disable-account`, `enable-account` |
 | `project:create`  | `model.Project.create`                               | `create-project`                    |
 | `project:read`    | `model.Project.list`, `model.Project.get`            | `list-projects`, `get-project`      |
-| `project:update`  | `model.Project.update`, `procedure.setDefaultProject`, `procedure.listModelCatalog`, `procedure.setProjectQuota`, `procedure.setProjectAllowedModels`, `procedure.setProjectModelPolicy` | `update-project`, `set-default-project`, `set-project-quota`, `set-project-allowed-models`, `set-project-model-policy` |
+| `project:update`  | `model.Project.update`, `procedure.setDefaultProject`, `procedure.listModelCatalog`, `procedure.setProjectQuota`, `procedure.setProjectAllowedModels`, `procedure.setProjectModelPolicy` | `update-project`, `set-default-project`, `list-model-catalog`, `set-project-quota`, `set-project-allowed-models`, `set-project-model-policy` |
 | `project:delete`  | `model.Project.delete`                               | `delete-project`                    |
 | `project:disable` | `procedure.disableProject`, `procedure.enableProject`| `disable-project`, `enable-project` |
 | `project:member`  | `procedure.listProjectRoster`, `procedure.addProjectMember`, `procedure.removeProjectMember`, `procedure.setProjectMemberRole`, `procedure.setProjectMemberQuotaTier` | `list-project-roster`, `add-project-member`, `remove-project-member`, `set-project-member-role`, `set-project-member-quota-tier` |
-| `apikey:create`   | `procedure.createApiKey`, `procedure.listBillingPlans` | `create-api-key`                  |
-| `apikey:read`     | `model.ApiKey.list`, `model.ApiKey.get`, `procedure.listMyExpiringApiKeys` | `list-api-keys`, `get-api-key` |
+| `apikey:create`   | `procedure.createApiKey`, `procedure.listBillingPlans` | `create-api-key`, `list-billing-plans` |
+| `apikey:read`     | `model.ApiKey.list`, `model.ApiKey.get`, `procedure.listMyExpiringApiKeys` | `list-api-keys`, `get-api-key`, `list-my-expiring-api-keys` |
 | `apikey:update`   | `model.ApiKey.update`                                | `update-api-key`                    |
 | `apikey:delete`   | `model.ApiKey.delete`                                | `delete-api-key`                    |
 | `apikey:revoke`   | `procedure.revokeApiKey`                             | `revoke-api-key`                    |
 | `apikey:rotate`   | `procedure.rotateApiKey`                             | `rotate-api-key`                    |
 | `apikey:validate` | — (OPA server, Basic-auth)                           | `validate-api-key`, `validate-authorino-api-key` |
-| `budget:policy-activate` | `procedure.activateBudgetPolicy`                | — (no MCP tool yet)                 |
-| `budget:policy-read`     | `procedure.getBudgetPolicyStatus`               | — (no MCP tool yet)                 |
-| `budget:policy-simulate` | `procedure.simulateBudgetPolicy`                | — (no MCP tool yet)                 |
-| `budget:self-refill`     | `procedure.requestBudgetRefill`, `procedure.getMyBudgetRefillLadder` | — (no MCP tool yet)   |
-| `budget:review`          | `procedure.listPendingAugmentationRequests`, `procedure.approveAugmentationRequest`, `procedure.rejectAugmentationRequest` | — (no MCP tool yet) |
-| `budget:read-own`        | `procedure.getMyBudgetBalance`, `procedure.listMyBudgetGrants`, `procedure.listMyAugmentationRequests` | — (no MCP tool yet) |
-| `budget:read`            | `procedure.getBudgetBalance`, `procedure.getEffectiveResetSchedule` | — (no MCP tool yet)     |
-| `budget:audit-read`      | `procedure.listBudgetGrants`                    | — (no MCP tool yet)                 |
-| `budget:grant`           | `procedure.grantBudget`                         | — (no MCP tool yet)                 |
-| `budget:revoke`          | `procedure.revokeBudgetGrant`                   | — (no MCP tool yet)                 |
-| `budget:policy-write`    | `procedure.createBudgetPolicyRevision`          | — (no MCP tool yet)                 |
-| `budget:schedule-manage` | `procedure.listBudgetResetSchedules`, `procedure.createBudgetResetSchedule`, `procedure.updateBudgetResetSchedule`, `procedure.deleteBudgetResetSchedule`, `procedure.runBudgetResetScheduleNow` | — (no MCP tool yet) |
-| `session:read-own`       | `procedure.querySessions`                            | — (no MCP tool yet)                 |
-| `session:read`           | — (widens `procedure.querySessions`; see below)      | — (no MCP tool yet)                 |
-| `session:revoke-own`     | `procedure.revokeOwnSessions`, `procedure.revokeSession` | — (no MCP tool yet)             |
-| `session:revoke`         | `procedure.revokeSubjectSessions` (and widens `procedure.revokeSession`; see below) | — (no MCP tool yet) |
+| `budget:policy-activate` | `procedure.activateBudgetPolicy`                | `activate-budget-policy`            |
+| `budget:policy-read`     | `procedure.getBudgetPolicyStatus`               | `get-budget-policy-status`          |
+| `budget:policy-simulate` | `procedure.simulateBudgetPolicy`                | `simulate-budget-policy`            |
+| `budget:self-refill`     | `procedure.requestBudgetRefill`, `procedure.getMyBudgetRefillLadder` | `request-budget-refill`, `get-my-budget-refill-ladder` |
+| `budget:review`          | `procedure.listPendingAugmentationRequests`, `procedure.approveAugmentationRequest`, `procedure.rejectAugmentationRequest` | `list-pending-augmentation-requests`, `approve-augmentation-request`, `reject-augmentation-request` |
+| `budget:read-own`        | `procedure.getMyBudgetBalance`, `procedure.listMyBudgetGrants`, `procedure.listMyAugmentationRequests` | `get-my-budget-balance`, `list-my-budget-grants`, `list-my-augmentation-requests` |
+| `budget:read`            | `procedure.getBudgetBalance`, `procedure.getEffectiveResetSchedule` | `get-budget-balance`, `get-effective-reset-schedule` |
+| `budget:audit-read`      | `procedure.listBudgetGrants`                    | `list-budget-grants`                |
+| `budget:grant`           | `procedure.grantBudget`                         | `grant-budget`                      |
+| `budget:revoke`          | `procedure.revokeBudgetGrant`                   | `revoke-budget-grant`               |
+| `budget:policy-write`    | `procedure.createBudgetPolicyRevision`          | `create-budget-policy-revision`     |
+| `budget:schedule-manage` | `procedure.listBudgetResetSchedules`, `procedure.createBudgetResetSchedule`, `procedure.updateBudgetResetSchedule`, `procedure.deleteBudgetResetSchedule`, `procedure.runBudgetResetScheduleNow` | `list-budget-reset-schedules`, `create-budget-reset-schedule`, `update-budget-reset-schedule`, `delete-budget-reset-schedule`, `run-budget-reset-schedule-now` |
+| `session:read-own`       | `procedure.querySessions`                            | `query-sessions`                    |
+| `session:read`           | — (widens `procedure.querySessions`; see below)      | — (widens `query-sessions` the same way) |
+| `session:revoke-own`     | `procedure.revokeOwnSessions`, `procedure.revokeSession` | `revoke-own-sessions`, `revoke-session` |
+| `session:revoke`         | `procedure.revokeSubjectSessions` (and widens `procedure.revokeSession`; see below) | `revoke-subject-sessions` |
 | `usage:read-all`         | — (not an RPC op-id; see note below)                 | — (no MCP tool)                     |
-| `user:read`              | `procedure.resolveUserProfiles`, `procedure.resolveActorLabels`, `procedure.searchUsers` | — (no MCP tool yet) |
-| `rbac:manage`            | `procedure.listPlatformRoleGrants`, `procedure.grantPlatformRole`, `procedure.revokePlatformRole` | — (no MCP tool yet) |
-| **none** (any authenticated caller) | `procedure.getMyAccess`, `procedure.getBuildInfo` — the two enumerated exceptions to "unmapped op-id is denied"; see [Platform roles are a table](#platform-roles-are-a-table-adr-0033) and [docs/build-info.md](build-info.md) | — (no MCP tool yet) |
+| `user:read`              | `procedure.resolveUserProfiles`, `procedure.resolveActorLabels`, `procedure.searchUsers` | `resolve-user-profiles`, `resolve-actor-labels`, `search-users` |
+| `rbac:manage`            | `procedure.listPlatformRoleGrants`, `procedure.grantPlatformRole`, `procedure.revokePlatformRole` | `list-platform-role-grants`, `grant-platform-role`, `revoke-platform-role` |
+| **none** (any authenticated caller) | `procedure.getMyAccess`, `procedure.getBuildInfo` — the two enumerated exceptions to "unmapped op-id is denied"; see [Platform roles are a table](#platform-roles-are-a-table-adr-0033) and [docs/build-info.md](build-info.md) | `get-my-access`, `get-build-info` |
 
 `read` covers both the list and get operations for a resource.
+
+### The MCP surface serves both halves, one scope per tool
+
+`lightbridge-mcp` is the one listener that serves the `crud` and `budget` op-id sets together. That
+is not a hole in the hard `authz-api`/`authz-budget` cutover described above — that split is about
+which *HTTP listener* answers `POST /rpc/{op_id}`, and MCP is not an RPC listener. What MCP must
+preserve is the `auth().rpcScope` clause every mapped op-id's schema policy checks, and it does:
+`LightbridgeMcpHandler::procedure_context` derives the scope **per tool** from
+`rpc_authorize::is_budget_op_id` — the identical predicate `RpcScope::permits` uses to split the two
+routers — so a budget tool's context carries `rpcScope == "budget"` and a crud tool's carries
+`"crud"`, and neither can satisfy the other's clause.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as MCP client
+    participant B as bearer_auth<br/>(middleware/mod.rs)
+    participant T as call_tool<br/>(mcp.rs)
+    participant G as tool_gate<br/>(mcp_rbac.rs)
+    participant M as required_permission<br/>(rpc_authorize.rs)
+    participant P as procedures::&lt;name&gt;::invoke_with_db<br/>(generated)
+    participant R as Procedures<br/>(lightbridge-authz-rest/src/lib.rs)
+
+    C->>B: POST /mcp tools/call {name, arguments}
+    B->>B: validate bearer -> TokenInfo
+    B->>T: request + TokenInfo extension
+    T->>G: tool_gate("get-my-budget-balance")
+    G->>G: op_id_for_tool -> "procedure.getMyBudgetBalance"
+    G->>M: required_permission(op_id)
+    M-->>G: Some(budget:read-own)
+    G-->>T: ToolGate::Permission(budget:read-own)
+    alt token lacks the permission
+        T-->>C: JSON-RPC error (invalid_request), body never runs
+    else token holds it
+        T->>T: procedure_context(op_id) -> RpcScope::Budget
+        T->>P: invoke_with_db(db, Args, ctx)
+        P->>P: @allow: auth().rpcScope == "budget" && auth().permBudgetReadOwn
+        P->>R: registry.get_my_budget_balance(db, ctx, args, Authorized)
+        R-->>P: Output
+        P-->>T: Output
+        T-->>C: {"result": Output} as structuredContent
+    end
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unauthenticated
+    Unauthenticated --> Rejected401: no / invalid bearer (bearer_auth)
+    Unauthenticated --> Authenticated: valid, active token
+
+    Authenticated --> UnknownTool: tool_gate -> None (name not in the table)
+    Authenticated --> FailClosed: tool_gate -> None (op-id unmapped in the REST map)
+    Authenticated --> Gated: tool_gate -> Permission(p)
+    Authenticated --> Admitted: tool_gate -> AuthenticatedOnly
+
+    Gated --> PermissionDenied: token lacks p
+    Gated --> Admitted: token holds p
+
+    Admitted --> ScopedCrud: is_budget_op_id == false
+    Admitted --> ScopedBudget: is_budget_op_id == true
+
+    ScopedCrud --> PolicyDenied: @allow fails (wrong scope / no membership)
+    ScopedBudget --> PolicyDenied: @allow fails (wrong scope / no membership)
+    ScopedCrud --> Dispatched: @allow passes
+    ScopedBudget --> Dispatched: @allow passes
+
+    Dispatched --> [*]: {"result": Output}
+    UnknownTool --> [*]
+    FailClosed --> [*]
+    PermissionDenied --> [*]
+    PolicyDenied --> [*]
+    Rejected401 --> [*]
+
+    note right of FailClosed
+        Unreachable from a registered tool: mcp_parity_tests
+        forbids a tool whose op-id the REST map denies.
+        Kept in the diagram because it is the state a
+        future drift would land in, not a dead branch.
+    end note
+```
+
 
 `usage:read-all` is the one permission in this table that never gates a `POST /rpc/{op_id}` call on
 `authz-api`/`authz-budget` at all — it exists purely for `lightbridge-authz-usage`'s own

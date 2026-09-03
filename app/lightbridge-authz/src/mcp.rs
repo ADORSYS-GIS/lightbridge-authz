@@ -2,9 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     Json as AxumJson, Router,
-    body::Body,
-    http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{IntoResponse, Response},
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
@@ -13,19 +11,32 @@ use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait, TokenInfo};
 use lightbridge_authz_core::{
-    Config, CreateAccount, CreateApiKey, DefaultLimits, Error, Permission, Result, RotateApiKey,
+    Config, CreateAccount, CreateApiKey, DefaultLimits, Error, Result, RotateApiKey,
     config::{ApiKeyExpiry, ApiServer, BasicAuth, Billing, ModelCatalog, Oauth2, QuotaTiers},
     cuid::cuid2,
     db::{DbPoolTrait, is_database_ready},
     server::serve_tls,
 };
 use lightbridge_authz_rest::{
-    OpaRepoTrait, OpaState,
+    OpaRepoTrait, OpaState, Procedures,
     handlers::{AuthzStoreImpl, opa::validate_api_key_context},
     middleware::bearer_auth,
     models::authorino::AuthorinoMetadata,
     rpc_authorize::RpcScope,
     secret_claim::SecretClaimStore,
+};
+
+use crate::mcp_rbac::ToolGate;
+// Moved out of this file when the MCP surface reached api/budget parity (lightbridge-authz#645):
+// `mcp.rs` sits on its LoC-gate baseline and may be touched but not grown. Re-exported here rather
+// than referenced by path at every call site so this module's own `#[cfg(test)] mod tests`, which
+// reaches them through `use super::*`, still resolves them.
+use crate::mcp_oauth_metadata::{
+    OauthProxyState, fallback_registration_endpoint, resolve_oauth2_endpoints,
+};
+use crate::mcp_oauth_proxy::{
+    oauth_authorization_server_metadata_handler, oauth_register_handler,
+    openid_configuration_handler,
 };
 use reqwest::Client;
 use rmcp::{
@@ -66,22 +77,6 @@ fn json_value_without_boolean_schema(_: &mut schemars::SchemaGenerator) -> schem
     schemars::json_schema!({
         "type": ["object", "array", "string", "number", "boolean", "null"]
     })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Oauth2ResolvedEndpoints {
-    issuer: String,
-    authorization_endpoint: String,
-    token_endpoint: String,
-    registration_endpoint: String,
-    jwks_uri: String,
-}
-
-#[derive(Clone)]
-struct OauthProxyState {
-    client: Client,
-    endpoints: Option<Oauth2ResolvedEndpoints>,
-    fallback_registration_endpoint: String,
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
@@ -140,6 +135,12 @@ pub struct LightbridgeMcpHandler {
     /// Configured, never derived from a request header, which would be attacker-influenced.
     /// `Some` exactly when `claim_store` is.
     redeem_base_url: Option<Arc<String>>,
+    /// The SAME `ProcedureRegistry` implementation `authz-api` and `authz-budget` mount on their
+    /// RPC routers (lightbridge-authz#645), constructed here with `SERVICE_MCP` so `getBuildInfo`
+    /// reports the process a caller actually reached. Every procedure-backed tool in
+    /// `mcp_procedure_tools` dispatches through it -- not through a second, MCP-local
+    /// reimplementation of the same SQL.
+    procedures: Arc<Procedures>,
 }
 
 impl std::fmt::Debug for LightbridgeMcpHandler {
@@ -171,6 +172,7 @@ impl LightbridgeMcpHandler {
         federation_issuer: String,
         claim_store: Option<Arc<SecretClaimStore>>,
         redeem_base_url: Option<Arc<String>>,
+        procedures: Arc<Procedures>,
     ) -> Self {
         let billing = Arc::new(billing.clone());
         let opa_state = Arc::new(OpaState {
@@ -182,8 +184,13 @@ impl LightbridgeMcpHandler {
             federation_issuer,
         });
 
+        let mut tool_router = Self::tool_router();
+        for route in crate::mcp_procedure_tools::procedure_tool_routes() {
+            tool_router.add_route(route);
+        }
+
         Self {
-            tool_router: Self::tool_router(),
+            tool_router,
             cratestack_db,
             issuer,
             opa_state,
@@ -191,7 +198,41 @@ impl LightbridgeMcpHandler {
             resolver,
             claim_store,
             redeem_base_url,
+            procedures,
         }
+    }
+
+    /// The cratestack client the procedure tools hand to `invoke_with_db`.
+    pub(crate) fn cratestack_db(&self) -> &schema::Cratestack {
+        &self.cratestack_db
+    }
+
+    /// The shared `ProcedureRegistry` the procedure tools dispatch through.
+    pub(crate) fn procedures(&self) -> &Procedures {
+        &self.procedures
+    }
+
+    /// Build the caller's cratestack context for one op-id, at that op-id's OWN `RpcScope`.
+    ///
+    /// `is_budget_op_id` is the same predicate `RpcScope::permits` uses to split the two REST
+    /// routers, so a `budget:*` procedure gets `auth().rpcScope == "budget"` here exactly when it
+    /// would on `authz-budget`, and a crud procedure never does. Deriving it per call rather than
+    /// per process is what lets one MCP listener serve both halves without widening either one's
+    /// `@allow` clause.
+    pub(crate) async fn procedure_context(
+        &self,
+        context: &RequestContext<RoleServer>,
+        op_id: &str,
+    ) -> std::result::Result<CratestackContext, ErrorData> {
+        let info = token_info_from_request_context(context)?;
+        let scope = if lightbridge_authz_rest::rpc_authorize::is_budget_op_id(op_id) {
+            RpcScope::Budget
+        } else {
+            RpcScope::Crud
+        };
+        lightbridge_authz_rest::auth_provider::build_context(&info, scope, self.resolver.as_ref())
+            .await
+            .map_err(cratestack_error_to_tool_error)
     }
 
     /// The tool list advertised to clients: the router's tools, with the `create-api-key`
@@ -244,8 +285,15 @@ impl ServerHandler for LightbridgeMcpHandler {
 
         let token_info = token_info_from_request_context(&context)?;
         let subject = token_info.sub.clone();
-        match required_tool_permission(&tool) {
-            Some(required) => token_info.require(required).map_err(to_tool_error)?,
+        // One gate, one source of truth: `mcp_rbac::tool_gate` resolves the tool to its RPC op-id
+        // and asks `rpc_authorize::required_permission` -- the SAME map the REST middleware uses.
+        match crate::mcp_rbac::tool_gate(&tool) {
+            Some(ToolGate::Permission(required)) => {
+                token_info.require(required).map_err(to_tool_error)?
+            }
+            // The bearer middleware in front of the `/mcp` nest already proved the token is valid
+            // and active, which is the entire requirement for these two op-ids.
+            Some(ToolGate::AuthenticatedOnly) => {}
             None => {
                 return Err(ErrorData::invalid_request(
                     format!("unknown tool: {tool}"),
@@ -319,7 +367,7 @@ fn to_tool_error(error: Error) -> ErrorData {
 /// Map a cratestack `CratestackError` (returned by the generated CRUD client) onto an MCP `ErrorData`,
 /// mirroring [`to_tool_error`]'s status mapping for the hand-written `Error`. Internal/database
 /// variants collapse to a generic internal error so operator detail never leaks to the client.
-fn cratestack_error_to_tool_error(error: CratestackError) -> ErrorData {
+pub(crate) fn cratestack_error_to_tool_error(error: CratestackError) -> ErrorData {
     match error {
         CratestackError::NotFound(_) => ErrorData::resource_not_found("not found", None),
         CratestackError::Forbidden(msg) | CratestackError::Unauthorized(msg) => {
@@ -347,12 +395,12 @@ fn cratestack_error_to_tool_error(error: CratestackError) -> ErrorData {
 /// `@allow(auth() != null)` clauses but silently failed every clause #383 added (`auth().rpcScope`,
 /// `auth().perm<Permission>`) — found by CI's `integration-test` (`it-servers`) failing the very
 /// first MCP tool call after that PR merged, not by any local test, because nothing exercised this
-/// second entry point at all. `RpcScope::Crud` because the MCP surface only ever exposes the CRUD
-/// tool set (accounts/projects/api-keys) — confirmed against `app/lightbridge-authz/src/bin/
-/// lightbridge-mcp.rs` (a dedicated binary, entirely separate from `authz-budget`'s `command:
-/// budget` subcommand on the main `lightbridge-authz` binary) and `compose.yaml`'s `authz-mcp`
-/// service (own image/port, no budget-scoped env or command, same `DATABASE_URL` as `authz-api`)
-/// — `mcp.rs` has no `RpcScope`/budget-procedure concept anywhere in it.
+/// second entry point at all. `RpcScope::Crud` here because THIS helper serves only the
+/// hand-written CRUD tools (accounts/projects/api-keys), every one of which is a crud op-id.
+/// Since lightbridge-authz#645 the MCP surface also serves the budget half: those tools go through
+/// [`LightbridgeMcpHandler::procedure_context`] instead, which derives the scope from the op-id
+/// via `rpc_authorize::is_budget_op_id` rather than hardcoding one. Both call the same
+/// `build_context`; only the scope argument differs, and neither picks it by hand.
 ///
 /// See `cratestack_context_from_token_info_matches_the_shared_helper` below for the regression
 /// test pinning this delegation — it fails immediately if a future edit reintroduces a
@@ -463,44 +511,6 @@ async fn subject_from_request_context(
         })
 }
 
-/// The permission a tool requires, keyed by tool name. Single source of truth for RBAC on the MCP
-/// surface; mirrors `required_permission` on the REST server and `docs/rbac.md`. Enforced centrally
-/// in `call_tool`, so the tool bodies stay free of authorization code.
-fn required_tool_permission(tool: &str) -> Option<Permission> {
-    Some(match tool {
-        "create-account" => Permission::AccountCreate,
-        "list-accounts" | "get-account" => Permission::AccountRead,
-        "update-account" | "update-account-name" => Permission::AccountUpdate,
-        "delete-account" => Permission::AccountDelete,
-        "disable-account" | "enable-account" => Permission::AccountDisable,
-        // Roster management (ADR-0006). The capability moved with the concept: `project:member`,
-        // not `account:member`. This is only the coarse gate — the lead check lives in the
-        // procedures' hand-written SQL, as cratestack's policy layer cannot express it.
-        "list-project-roster"
-        | "add-project-member"
-        | "remove-project-member"
-        | "set-project-member-role"
-        | "set-project-member-quota-tier" => Permission::ProjectMember,
-        "create-project" => Permission::ProjectCreate,
-        "list-projects" | "get-project" => Permission::ProjectRead,
-        "update-project"
-        | "set-project-quota"
-        | "set-project-allowed-models"
-        | "set-project-model-policy" => Permission::ProjectUpdate,
-        "delete-project" => Permission::ProjectDelete,
-        "disable-project" | "enable-project" => Permission::ProjectDisable,
-        "set-default-project" => Permission::ProjectUpdate,
-        "create-api-key" => Permission::ApiKeyCreate,
-        "list-api-keys" | "get-api-key" => Permission::ApiKeyRead,
-        "update-api-key" => Permission::ApiKeyUpdate,
-        "delete-api-key" => Permission::ApiKeyDelete,
-        "revoke-api-key" => Permission::ApiKeyRevoke,
-        "rotate-api-key" => Permission::ApiKeyRotate,
-        "validate-api-key" | "validate-authorino-api-key" => Permission::ApiKeyValidate,
-        _ => return None,
-    })
-}
-
 fn token_info_from_request_context(
     context: &RequestContext<RoleServer>,
 ) -> std::result::Result<TokenInfo, ErrorData> {
@@ -515,197 +525,6 @@ fn token_info_from_request_context(
         .ok_or_else(|| ErrorData::internal_error("missing bearer token context", None))?;
 
     Ok(token_info.clone())
-}
-
-fn issuer_from_jwks_url(jwks_url: &str) -> Option<String> {
-    let parsed = reqwest::Url::parse(jwks_url).ok()?;
-    let host = parsed.host_str()?;
-    let path = parsed.path();
-    let realm_path = path.strip_suffix("/protocol/openid-connect/certs")?;
-    let mut issuer = format!("{}://{}", parsed.scheme(), host);
-    if let Some(port) = parsed.port() {
-        issuer.push(':');
-        issuer.push_str(&port.to_string());
-    }
-    issuer.push_str(realm_path);
-    Some(issuer)
-}
-
-fn join_issuer_path(issuer: &str, path: &str) -> String {
-    format!(
-        "{}/{}",
-        issuer.trim_end_matches('/'),
-        path.trim_start_matches('/')
-    )
-}
-
-fn resolve_oauth2_endpoints(oauth2: &Oauth2) -> Option<Oauth2ResolvedEndpoints> {
-    let issuer = oauth2
-        .issuer_url
-        .clone()
-        .or_else(|| issuer_from_jwks_url(&oauth2.jwks_url))?;
-
-    let authorization_endpoint = oauth2
-        .authorization_endpoint
-        .clone()
-        .unwrap_or_else(|| join_issuer_path(&issuer, "protocol/openid-connect/auth"));
-    let token_endpoint = oauth2
-        .token_endpoint
-        .clone()
-        .or_else(|| oauth2.oauth2_url.clone())
-        .unwrap_or_else(|| join_issuer_path(&issuer, "protocol/openid-connect/token"));
-    let registration_endpoint = oauth2
-        .registration_endpoint
-        .clone()
-        .unwrap_or_else(|| join_issuer_path(&issuer, "clients-registrations/openid-connect"));
-
-    Some(Oauth2ResolvedEndpoints {
-        issuer,
-        authorization_endpoint,
-        token_endpoint,
-        registration_endpoint,
-        jwks_uri: oauth2.jwks_url.clone(),
-    })
-}
-
-fn oauth_metadata_response(
-    endpoints: &Oauth2ResolvedEndpoints,
-    registration_endpoint: &str,
-) -> Value {
-    json!({
-        "issuer": endpoints.issuer,
-        "authorization_endpoint": endpoints.authorization_endpoint,
-        "token_endpoint": endpoints.token_endpoint,
-        "jwks_uri": endpoints.jwks_uri,
-        "registration_endpoint": registration_endpoint,
-        "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code", "refresh_token", "client_credentials"],
-        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
-        "code_challenge_methods_supported": ["S256"],
-    })
-}
-
-fn request_origin(headers: &HeaderMap) -> Option<String> {
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get(header::HOST))
-        .and_then(|value| value.to_str().ok())?;
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("https");
-    Some(format!("{proto}://{}", host.trim()))
-}
-
-fn registration_endpoint_for_request(headers: &HeaderMap, fallback: &str) -> String {
-    request_origin(headers)
-        .map(|origin| format!("{}/oauth/register", origin.trim_end_matches('/')))
-        .unwrap_or_else(|| fallback.to_string())
-}
-
-fn fallback_registration_endpoint(api: &ApiServer) -> String {
-    format!("https://{}:{}/oauth/register", api.address, api.port)
-}
-
-async fn oauth_authorization_server_metadata_handler(
-    state: Arc<OauthProxyState>,
-    headers: HeaderMap,
-) -> Response {
-    let Some(endpoints) = state.endpoints.as_ref() else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            AxumJson(json!({
-                "error": "server_error",
-                "error_description": "OAuth2 issuer URL could not be derived from configuration"
-            })),
-        )
-            .into_response();
-    };
-
-    let registration_endpoint =
-        registration_endpoint_for_request(&headers, &state.fallback_registration_endpoint);
-    let metadata = oauth_metadata_response(endpoints, &registration_endpoint);
-    (StatusCode::OK, AxumJson(metadata)).into_response()
-}
-
-async fn openid_configuration_handler(state: Arc<OauthProxyState>, headers: HeaderMap) -> Response {
-    oauth_authorization_server_metadata_handler(state, headers).await
-}
-
-async fn oauth_register_handler(
-    state: Arc<OauthProxyState>,
-    headers: HeaderMap,
-    AxumJson(payload): AxumJson<Value>,
-) -> Response {
-    let Some(endpoints) = state.endpoints.as_ref() else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            AxumJson(json!({
-                "error": "server_error",
-                "error_description": "OAuth2 registration endpoint could not be derived from configuration"
-            })),
-        )
-            .into_response();
-    };
-
-    let mut request = state
-        .client
-        .post(&endpoints.registration_endpoint)
-        .json(&payload);
-    if let Some(auth) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-    {
-        request = request.header(header::AUTHORIZATION, auth);
-    }
-
-    let upstream = match request.send().await {
-        Ok(response) => response,
-        Err(error) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                AxumJson(json!({
-                    "error": "bad_gateway",
-                    "error_description": format!("failed to reach upstream registration endpoint: {error}")
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    let status =
-        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = upstream
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned);
-
-    let body = match upstream.bytes().await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                AxumJson(json!({
-                    "error": "bad_gateway",
-                    "error_description": format!("failed to read upstream registration response: {error}")
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    let mut response = Response::new(Body::from(body.to_vec()));
-    *response.status_mut() = status;
-    if let Some(content_type) = content_type
-        && let Ok(header_value) = HeaderValue::from_str(&content_type)
-    {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_TYPE, header_value);
-    }
-    response
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1851,7 +1670,10 @@ fn build_streamable_http_config(allowed_hosts: &Option<Vec<String>>) -> Streamab
 /// binding a TLS socket, mirroring `build_api_router`/`build_opa_router` in
 /// `lightbridge-authz-rest`.
 #[allow(clippy::too_many_arguments)]
-fn build_mcp_router(
+/// Assemble the MCP listener's router. `pub` so `tests/mcp_tool_it_tests.rs` can drive the REAL
+/// transport (JSON-RPC over `/mcp`, bearer middleware, permission gate, cratestack policy, SQL)
+/// against a migrated database rather than asserting on an in-process handler.
+pub fn build_mcp_router(
     api: &ApiServer,
     oauth2: &Oauth2,
     basic_auth: BasicAuth,
@@ -1865,6 +1687,7 @@ fn build_mcp_router(
     readiness_pool: Arc<dyn DbPoolTrait>,
     claim_store: Option<Arc<SecretClaimStore>>,
     redeem_base_url: Option<Arc<String>>,
+    procedures: Arc<Procedures>,
 ) -> Router {
     let app_state = Arc::new(lightbridge_authz_api::AppState {
         bearer: bearer_service,
@@ -1885,6 +1708,7 @@ fn build_mcp_router(
         federation_issuer,
         claim_store,
         redeem_base_url,
+        procedures,
     );
     let oauth_proxy_state = Arc::new(OauthProxyState {
         client: Client::new(),
@@ -1970,6 +1794,7 @@ pub async fn start_mcp_server(
     models: &ModelCatalog,
     api_key_expiry: &ApiKeyExpiry,
     secret_claim: Option<&lightbridge_authz_core::config::SecretClaim>,
+    usage_service: &Option<lightbridge_authz_core::config::UsageServiceClient>,
     pool: Arc<dyn DbPoolTrait>,
 ) -> Result<()> {
     billing.validate()?;
@@ -1990,6 +1815,7 @@ pub async fn start_mcp_server(
     })?;
     federation.validate()?;
     let readiness_pool = pool.clone();
+    let pool_for_budget = pool.clone();
     if oauth2.is_self_signed() {
         let signing = oauth2.signing.as_ref().ok_or_else(|| {
             Error::Server("oauth2.type is 'self' but oauth2.signing is missing".to_string())
@@ -2049,6 +1875,29 @@ pub async fn start_mcp_server(
         .map_err(|e| Error::Server(format!("failed to open cratestack Postgres pool: {e}")))?;
     let cratestack_db = schema::Cratestack::builder(cratestack_pool).build();
 
+    // The budget-domain service graph, from the SAME builder `authz-api`/`authz-budget` use --
+    // including the fail-closed `UnavailableSpendReader` degrade when `usage_service` is unset.
+    // The reset scheduler this returns is inert here: only `start_budget_server` spawns the
+    // interval task that drives it, and `lightbridge-mcp` reaches schedules exclusively through
+    // the five `*BudgetResetSchedule*` tools, which are ordinary caller-initiated RPC procedures.
+    let budget = lightbridge_authz_rest::budget_services::build_budget_services(
+        pool_for_budget,
+        usage_service,
+    )
+    .await?;
+    let procedures = Arc::new(Procedures::new(
+        SERVICE_MCP,
+        issuer.clone(),
+        budget.policy_store,
+        budget.refill_service,
+        budget.review_service,
+        budget.budget_repo,
+        budget.reset_scheduler,
+        Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &oauth2.rbac,
+        )),
+    ));
+
     let app = build_mcp_router(
         api,
         oauth2,
@@ -2063,6 +1912,7 @@ pub async fn start_mcp_server(
         readiness_pool,
         claim_store,
         secret_claim.map(|cfg| Arc::new(cfg.redeem_base_url.clone())),
+        procedures,
     );
 
     let signing_enabled = oauth2.is_self_signed();
@@ -2097,6 +1947,7 @@ pub async fn start_mcp_server_from_config(config: &Config) -> Result<()> {
         &config.models,
         &config.api_key_expiry,
         config.secret_claim.as_ref(),
+        &config.usage_service,
         pool,
     )
     .await
@@ -2138,8 +1989,13 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp_oauth_metadata::{oauth_metadata_response, registration_endpoint_for_request};
+    use crate::mcp_rbac::tool_gate;
+    use axum::body::Body;
     use axum::body::to_bytes;
+    use axum::http::{HeaderValue, header};
     use chrono::Utc;
+    use lightbridge_authz_core::Permission;
     use lightbridge_authz_core::{Account, ApiKey, ApiKeyStatus, Project, async_trait};
     use sqlx::postgres::PgPoolOptions;
 
@@ -2204,6 +2060,7 @@ mod tests {
             "https://keycloak.example.test/realms/dev".to_string(),
             test_claim_store(),
             test_redeem_base_url(),
+            lazy_procedures(),
         );
         let without_claims = LightbridgeMcpHandler::new(
             lazy_cratestack_db(),
@@ -2216,6 +2073,7 @@ mod tests {
             "https://keycloak.example.test/realms/dev".to_string(),
             None,
             None,
+            lazy_procedures(),
         );
         assert_eq!(
             without_claims.advertised_tools().len(),
@@ -2702,6 +2560,75 @@ mod tests {
         Arc::new(AuthzStoreImpl::with_pool(lazy_pool()).with_billing(sample_billing()))
     }
 
+    /// A minimal but genuinely valid rule set, so `RuleDataEngine::new` accepts it without a
+    /// database round trip. Nothing in this module's tests evaluates a policy -- these tests
+    /// exercise tool listing/shape and the permission gate, both of which run before any procedure
+    /// body -- so the rules themselves only have to parse.
+    const LAZY_RULE_DATA: &str = r#"{
+      "policy_revision": "mcp-test-policy",
+      "rules": [
+        {
+          "id": "always-review",
+          "condition": { "type": "threshold", "field": "requested_amount_micros", "operator": "gte", "value": 0 },
+          "effect": "manual_review",
+          "reason_code": "test_only"
+        }
+      ],
+      "default_effect": "manual_review",
+      "default_reason_code": "test_only",
+      "allowed_amounts_micros": [6000000],
+      "starting_amount_micros": 6000000,
+      "fail_closed_floor_micros": 6000000
+    }"#;
+
+    /// The shared `Procedures` registry every procedure-backed tool dispatches through, built over
+    /// the same unreachable lazy pool as `lazy_issuer` -- a procedure tool invoked against this
+    /// handler fails at its first query, exactly like the model-backed tools already do.
+    fn lazy_procedures() -> Arc<Procedures> {
+        let pool = lazy_pool();
+        let engine = Arc::new(
+            lightbridge_authz_budget::RuleDataEngine::new(LAZY_RULE_DATA, 10_000)
+                .expect("the fixture rule data above is valid"),
+        );
+        let policy_store = Arc::new(lightbridge_authz_budget::PolicyStore::with_engine(
+            pool.clone(),
+            "budget-refill",
+            engine,
+        ));
+        let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
+            pool.clone(),
+        ));
+        let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(
+            pool.clone(),
+        ));
+        let spend: Arc<dyn lightbridge_authz_budget::SpendReader> =
+            Arc::new(lightbridge_authz_budget::UnavailableSpendReader);
+        Arc::new(Procedures::new(
+            SERVICE_MCP,
+            lazy_issuer(),
+            policy_store.clone(),
+            Arc::new(lightbridge_authz_budget::RefillService::new(
+                budget_repo.clone(),
+                augmentation_repo.clone(),
+                policy_store.engine(),
+                spend.clone(),
+            )),
+            Arc::new(lightbridge_authz_budget::ReviewService::new(
+                budget_repo.clone(),
+                augmentation_repo,
+            )),
+            budget_repo.clone(),
+            Arc::new(lightbridge_authz_budget::ResetScheduler::new(
+                pool,
+                budget_repo,
+                spend,
+            )),
+            Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+                &lightbridge_authz_core::authz::Rbac::default(),
+            )),
+        ))
+    }
+
     /// Build a handler over the lazy (unreachable) cratestack client + issuer. Sufficient for the
     /// non-DB tests (tool listing, schema shape, billing advertisement, permission mapping) and for
     /// the dead-pool dispatch/error-mapping test; DB-touching tool bodies error at first query.
@@ -2717,6 +2644,7 @@ mod tests {
             "https://keycloak.example.test/realms/dev".to_string(),
             test_claim_store(),
             test_redeem_base_url(),
+            lazy_procedures(),
         )
     }
 
@@ -2757,6 +2685,7 @@ mod tests {
             lazy_pool(),
             test_claim_store(),
             test_redeem_base_url(),
+            lazy_procedures(),
         )
     }
 
@@ -3072,44 +3001,24 @@ mod tests {
             .collect::<Vec<_>>();
         tool_names.sort();
 
-        let mut expected = vec![
-            "add-project-member",
-            "create-account",
-            "create-api-key",
-            "create-project",
-            "delete-account",
-            "delete-api-key",
-            "delete-project",
-            "disable-account",
-            "disable-project",
-            "enable-account",
-            "enable-project",
-            "get-account",
-            "get-api-key",
-            "get-project",
-            "list-accounts",
-            "list-api-keys",
-            "list-project-roster",
-            "list-projects",
-            "remove-project-member",
-            "revoke-api-key",
-            "rotate-api-key",
-            "set-default-project",
-            "set-project-allowed-models",
-            "set-project-member-quota-tier",
-            "set-project-member-role",
-            "set-project-model-policy",
-            "set-project-quota",
-            "update-account",
-            "update-account-name",
-            "update-api-key",
-            "update-project",
-            "validate-authorino-api-key",
-            "validate-api-key",
-        ];
+        // Asserted against `mcp_rbac::gated_tools()` rather than a second literal list: that
+        // table is what `call_tool` consults for the permission gate, so "every registered route
+        // is gated" and "every gated tool is registered" become the SAME assertion. A hand-typed
+        // expectation here would be a third list to update, and it is exactly the list that went
+        // stale for 37 procedures before lightbridge-authz#645.
+        let mut expected = crate::mcp_rbac::gated_tools()
+            .into_iter()
+            .map(|(tool, _)| tool)
+            .collect::<Vec<_>>();
         expected.sort();
 
         assert_eq!(tool_names, expected);
+        assert_eq!(
+            tool_names.len(),
+            70,
+            "the MCP surface should advertise 33 hand-written tools plus 37 procedure tools; \
+             update this count deliberately when the RPC surface grows"
+        );
     }
 
     #[tokio::test]
@@ -3154,6 +3063,7 @@ mod tests {
             "https://keycloak.example.test/realms/dev".to_string(),
             test_claim_store(),
             test_redeem_base_url(),
+            lazy_procedures(),
         );
         let tools = handler.advertised_tools();
         let create = tools
@@ -3180,8 +3090,8 @@ mod tests {
             "set-project-member-quota-tier",
         ] {
             assert_eq!(
-                required_tool_permission(tool),
-                Some(Permission::ProjectMember),
+                tool_gate(tool),
+                Some(ToolGate::Permission(Permission::ProjectMember)),
                 "tool `{tool}` should require project:member"
             );
         }
@@ -3199,7 +3109,7 @@ mod tests {
             "set-default-account",
         ] {
             assert_eq!(
-                required_tool_permission(tool),
+                tool_gate(tool),
                 None,
                 "removed tool `{tool}` must be unmapped (fail closed)"
             );
@@ -3211,7 +3121,7 @@ mod tests {
         let handler = lazy_handler();
         for tool in handler.tool_router.list_all() {
             assert!(
-                required_tool_permission(&tool.name).is_some(),
+                tool_gate(&tool.name).is_some(),
                 "tool `{}` is registered but has no permission mapping (would fail closed in call_tool)",
                 tool.name
             );

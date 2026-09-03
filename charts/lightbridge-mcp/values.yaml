@@ -152,6 +152,15 @@ sharedConfig:
     enabled: true
     otlp_endpoint: "http://localhost:4317"
     service_name: "lightbridge-authz"
+  # `usage_service` is OPTIONAL here, exactly as it is for the budget alias in
+  # charts/lightbridge-authz/values.yaml, and is deliberately not set. Since
+  # lightbridge-authz#645 lightbridge-mcp serves the budget procedures too, so it builds the same
+  # `budget_services` graph the budget listener builds -- and, like that listener, an unset
+  # `usage_service` degrades every spend fact to `Spend::Unavailable` rather than failing startup.
+  # Refill decisions that depend on spend then fail closed to manual review, never auto-approve.
+  # NO new key is required for the pod to start; wiring a real `usage_service.base_url` here is the
+  # same follow-up already noted on the budget alias, and belongs in `global.lightbridge.sharedConfig`
+  # so both components get it in one edit.
   # Billing plans a caller may attach to an API key at creation. Operator-defined catalogue
   # (no plan table/entity): each plan has a stable id, UI name, and optional limits. A
   # CreateApiKey must name one of these ids or it is rejected (400); introspection resolves
