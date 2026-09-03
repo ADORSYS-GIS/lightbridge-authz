@@ -274,7 +274,9 @@ mod db {
     use lightbridge_authz_api::schema;
     use lightbridge_authz_api_key::repo::StoreRepo;
     use lightbridge_authz_bearer::BearerTokenServiceTrait;
-    use lightbridge_authz_core::config::{BudgetServer, JwtSigning, Oauth2Issuance};
+    use lightbridge_authz_core::config::{
+        BudgetInternalServer, BudgetServer, JwtSigning, Oauth2Issuance,
+    };
     use lightbridge_authz_core::cuid::cuid2;
     use lightbridge_authz_core::{CreateAccount, CreateApiKey, CreateProject};
     use lightbridge_authz_rest::OpaRepoTrait;
@@ -484,6 +486,7 @@ mod db {
         let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
         let err = lightbridge_authz_rest::start_budget_server(
             &budget_server(),
+            None,
             db_pool,
             &external_oauth2_with_issuance(),
             &sample_billing(),
@@ -507,6 +510,7 @@ mod db {
         let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
         let result = lightbridge_authz_rest::start_budget_server(
             &budget_server(),
+            None,
             db_pool,
             &external_oauth2_with_issuance(),
             &sample_billing(),
@@ -522,6 +526,51 @@ mod db {
             !format!("{err}").to_lowercase().contains("redis"),
             "an unreachable-but-well-formed redis.url must not fail the mandatory-redis check: \
              got {err}"
+        );
+    }
+
+    /// ADR-0034: `server.budget_internal` is optional, but a configured internal listener without
+    /// a client-CA trust anchor is a hard startup failure, never a listener served without mTLS.
+    /// `GET /budget/v1/remaining` answers a cross-account balance question with no per-caller
+    /// ownership check of any kind; the client-certificate requirement is the only thing in front
+    /// of it, and forgetting it must be loud rather than silently permissive.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_budget_server_refuses_an_internal_listener_without_mtls(pool: PgPool) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let internal = BudgetInternalServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+            remaining_grace_seconds: 120,
+        };
+        assert!(
+            internal.tls.client_ca_bundle_path.is_none(),
+            "this test's premise is an internal listener with no client CA bundle"
+        );
+
+        let err = lightbridge_authz_rest::start_budget_server(
+            &budget_server(),
+            Some(&internal),
+            db_pool,
+            &external_oauth2_with_issuance(),
+            &sample_billing(),
+            &sample_quota_tiers(),
+            &sample_models(),
+            &sample_api_key_expiry(),
+            &unreachable_redis(),
+            &None,
+        )
+        .await
+        .expect_err("a budget_internal listener without client_ca_bundle_path must not start");
+
+        let message = format!("{err}");
+        assert!(
+            message.contains("client_ca_bundle_path"),
+            "the error must name the missing trust anchor: got {message}"
+        );
+        assert!(
+            message.contains("/budget/v1/remaining"),
+            "the error must name the route it protects: got {message}"
         );
     }
 

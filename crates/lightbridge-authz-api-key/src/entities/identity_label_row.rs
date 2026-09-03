@@ -47,8 +47,23 @@ pub struct ProjectLabelRow {
     pub account_id: String,
 }
 
+/// An API key's label plus both edges up the tree (`api_keys` -> `projects` -> `accounts`).
+///
+/// `name` is `NOT NULL` on `api_keys`, so it is a plain `String`: an id nothing matched is ABSENT
+/// from the result, never present with a null name. `revoked` is DERIVED in SQL
+/// (`revoked_at IS NOT NULL OR status <> 'active'`), not a column — a spend row for a key that no
+/// longer works reads as a live cost centre unless the label says otherwise.
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+pub struct ApiKeyLabelRow {
+    pub api_key_id: String,
+    pub name: String,
+    pub project_id: String,
+    pub account_id: String,
+    pub revoked: bool,
+}
+
 /// Rejects an over-cap batch (see [`MAX_IDENTITY_BATCH`]).
-pub(crate) fn check_batch(kind: &str, ids: &[String]) -> Result<()> {
+pub fn check_batch(kind: &str, ids: &[String]) -> Result<()> {
     if ids.len() > MAX_IDENTITY_BATCH {
         return Err(Error::BadRequest(format!(
             "{kind}: {} ids requested, maximum is {MAX_IDENTITY_BATCH} per call",

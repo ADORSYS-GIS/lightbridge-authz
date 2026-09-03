@@ -5137,6 +5137,7 @@ async fn identity_resolution_procedures_resolve_labels_and_omit_unknown_ids() {
             "userIds": [owner],
             "accountIds": [account_id, "definitely-not-an-account"],
             "projectIds": [project_id],
+            "apiKeyIds": [],
         } }),
         Some("admin"),
     )
@@ -5188,6 +5189,228 @@ async fn identity_resolution_procedures_resolve_labels_and_omit_unknown_ids() {
         StatusCode::BAD_REQUEST,
         "a 1-character query must be refused"
     );
+}
+
+/// `resolveActorLabels`' fourth kind, end to end (#647, owner feedback 2026-09-03: "can we use
+/// names on the 'Spend by API key' panel? API keys do have names").
+///
+/// This is the whole point of moving the op-id out of `user:read` and into the handler, so it
+/// pins all four halves of that move in one place, over the real RPC transport:
+///
+///  1. an ADMIN (`user:read`) resolves a FOREIGN key — one in an account they have no relationship
+///     with — because that is the same estate-wide reach they already have over users/accounts;
+///  2. a MEMBER holding every permission EXCEPT `user:read` resolves the keys of a project they are
+///     merely a `project_members` row on, and NOT the ones they are not — the exact ownership
+///     disjunction `ApiKey`'s own `@@allow("read", …)` compiles, reached through `db.api_key()`;
+///  3. a STRANGER gets `{ apiKeys: [] }` and a 200, never a 403: refusing would confirm the key
+///     exists, and would take their own resolvable keys down with it in the same batch;
+///  4. the three ESTATE-WIDE kinds still refuse a caller without `user:read` — that gate moved into
+///     the handler, it did not disappear — and the refusal is a 403, not a silent empty list.
+///
+/// Plus the `revoked` flag, which is what lets the console render "name (revoked)" instead of
+/// letting a dead key read as a live cost centre.
+#[tokio::test]
+async fn resolve_actor_labels_names_api_keys_row_scoped_without_user_read() {
+    let owner = format!("owner-keylabels-{}", cuid2());
+    let member = format!("member-keylabels-{}", cuid2());
+    let stranger = format!("stranger-keylabels-{}", cuid2());
+    // "Admin minus one": everything a person needs to run their own tenant, and NOT `user:read`.
+    // Stated as a subtraction rather than as `viewer_perms()` because the member has to CREATE the
+    // account/project/key this test scopes them to, and because the interesting failure would be
+    // `user:read` being implied by some broader grant.
+    let no_user_read: PermissionSet = Permission::ALL
+        .into_iter()
+        .filter(|permission| *permission != Permission::UserRead)
+        .collect();
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("admin", token_info(&owner, admin_perms()))
+            .with("member", token_info(&member, no_user_read.clone()))
+            .with("stranger", token_info(&stranger, no_user_read)),
+    );
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let owner_account = create_account(r, "admin", "tenant-keylabels-owner").await;
+    let owned_project = create_project(r, "admin", &owner_account, "proj-keylabels-owned").await;
+    let shared_project = create_project(r, "admin", &owner_account, "proj-keylabels-shared").await;
+    let (owned_key, _) = create_api_key(r, "admin", &owned_project, "Owned ingest").await;
+    let (shared_key, _) = create_api_key(r, "admin", &shared_project, "Shared ingest").await;
+
+    let _member_account = create_account(r, "member", "tenant-keylabels-member").await;
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.addProjectMember",
+        Wire::Cbor,
+        &json!({ "args": { "projectId": shared_project, "accountId": member, "role": "member" } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "addProjectMember: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let stranger_account = create_account(r, "stranger", "tenant-keylabels-stranger").await;
+    let stranger_project =
+        create_project(r, "stranger", &stranger_account, "proj-keylabels-stranger").await;
+    let (stranger_key, _) =
+        create_api_key(r, "stranger", &stranger_project, "Stranger ingest").await;
+
+    let call = |token: &'static str, ids: Vec<String>| {
+        let router = r.clone();
+        async move {
+            rpc_call(
+                router,
+                "procedure.resolveActorLabels",
+                Wire::Cbor,
+                &json!({ "args": {
+                    "userIds": [],
+                    "accountIds": [],
+                    "projectIds": [],
+                    "apiKeyIds": ids,
+                } }),
+                Some(token),
+            )
+            .await
+        }
+    };
+    let key_labels = |body: &[u8]| -> HashMap<String, Value> {
+        json_body(body)["apiKeys"]
+            .as_array()
+            .expect("apiKeys array")
+            .iter()
+            .map(|label| {
+                (
+                    label["apiKeyId"].as_str().expect("apiKeyId").to_string(),
+                    label.clone(),
+                )
+            })
+            .collect()
+    };
+
+    // (1) The admin resolves every key, INCLUDING the stranger's, and each label carries the
+    // account edge the `ApiKey` model itself has no relation path for.
+    let all_ids = vec![
+        owned_key.clone(),
+        shared_key.clone(),
+        stranger_key.clone(),
+        "definitely-not-a-key".to_string(),
+    ];
+    let (status, body) = call("admin", all_ids.clone()).await;
+    assert!(
+        status.is_success(),
+        "admin resolveActorLabels: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let admin_view = key_labels(&body);
+    assert_eq!(
+        admin_view.len(),
+        3,
+        "the unknown id must be absent, never fabricated: {admin_view:?}"
+    );
+    assert_eq!(
+        admin_view[&owned_key]["name"].as_str(),
+        Some("Owned ingest")
+    );
+    assert_eq!(
+        admin_view[&owned_key]["projectId"].as_str(),
+        Some(owned_project.as_str())
+    );
+    assert_eq!(
+        admin_view[&owned_key]["accountId"].as_str(),
+        Some(owner_account.as_str())
+    );
+    assert_eq!(admin_view[&owned_key]["revoked"].as_bool(), Some(false));
+    assert_eq!(
+        admin_view[&stranger_key]["accountId"].as_str(),
+        Some(stranger_account.as_str()),
+        "user:read resolves a key in an account the caller has no relationship with — that is the \
+         same estate-wide reach the other three kinds already grant"
+    );
+
+    // (2) The member holds NO `user:read` and still gets a name for the shared project's key --
+    // and only that one.
+    let (status, body) = call("member", all_ids.clone()).await;
+    assert!(
+        status.is_success(),
+        "member resolveActorLabels: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let member_view = key_labels(&body);
+    assert_eq!(
+        member_view.keys().cloned().collect::<Vec<_>>(),
+        vec![shared_key.clone()],
+        "a project member sees that project's keys and nothing else: {member_view:?}"
+    );
+    assert_eq!(
+        member_view[&shared_key]["name"].as_str(),
+        Some("Shared ingest"),
+        "this is the panel label the whole change exists for"
+    );
+
+    // (3) A stranger to every one of those keys gets an EMPTY list and a 200 -- never a 403, which
+    // would confirm the ids exist.
+    let (status, body) = call("stranger", vec![owned_key.clone(), shared_key.clone()]).await;
+    assert!(
+        status.is_success(),
+        "a stranger must get an empty list, not a refusal: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        key_labels(&body).is_empty(),
+        "an id the caller may not see is ABSENT, exactly like an id that does not exist"
+    );
+
+    // (4) The `user:read` gate did not disappear with the op-id mapping -- it moved into the
+    // handler, and it still refuses rather than answering empty.
+    let (status, _) = rpc_call(
+        r.clone(),
+        "procedure.resolveActorLabels",
+        Wire::Cbor,
+        &json!({ "args": {
+            "userIds": [owner],
+            "accountIds": [],
+            "projectIds": [],
+            "apiKeyIds": [shared_key],
+        } }),
+        Some("member"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "asking for an estate-wide kind without user:read must be REFUSED, not silently emptied"
+    );
+
+    // (5) A revoked key keeps its name and says so, so a spend row for a dead key does not read as
+    // a live cost centre.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.revokeApiKey",
+        Wire::Cbor,
+        &json!({ "args": { "keyId": owned_key } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "revokeApiKey: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let (status, body) = call("admin", vec![owned_key.clone()]).await;
+    assert!(
+        status.is_success(),
+        "resolveActorLabels after revoke: {status}"
+    );
+    let after = key_labels(&body);
+    assert_eq!(
+        after[&owned_key]["name"].as_str(),
+        Some("Owned ingest"),
+        "a revoked key keeps its name -- the console renders name + \"(revoked)\", not a sentinel"
+    );
+    assert_eq!(after[&owned_key]["revoked"].as_bool(), Some(true));
 }
 
 /// ADR-0033's positive half over the real RPC transport: an admin grants a platform role, sees it

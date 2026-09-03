@@ -1,0 +1,1 @@
+../../.claude/skills/governance-pr/SKILL.md

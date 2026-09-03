@@ -18,6 +18,9 @@ pub mod period;
 pub mod policy_store;
 mod policy_store_sql;
 pub mod refill;
+pub mod remaining;
+mod remaining_cache;
+pub mod remaining_service;
 pub mod repo;
 pub mod reset_schedule;
 pub mod reset_schedule_validate;
@@ -26,6 +29,7 @@ pub mod review;
 pub mod rule_data;
 pub mod source;
 pub mod spend;
+mod spend_units;
 pub mod tier;
 
 pub use amount::AmountMicros;
@@ -39,6 +43,7 @@ pub use facts::Facts;
 pub use period::Period;
 pub use policy_store::PolicyStore;
 pub use refill::{RefillRequest, RefillService, RefillStatus};
+pub use remaining::{BudgetRemaining, Remaining, RemainingReader, RemainingService};
 pub use reset_schedule::{
     BudgetResetSchedule, BudgetResetScheduleUpdate, Cadence, NewBudgetResetSchedule, ResetMode,
     ResetScheduleRepo, ScheduleScopeKind, first_window_after, next_window_after, parse_run_at_utc,
@@ -53,5 +58,7 @@ pub use rule_data::{
     validate_rule_data,
 };
 pub use source::GrantSource;
-pub use spend::{Spend, SpendReader, UnavailableSpendReader, UsageServiceSpendReader};
+pub use spend::{
+    Spend, SpendObservation, SpendReader, UnavailableSpendReader, UsageServiceSpendReader,
+};
 pub use tier::BudgetTier;

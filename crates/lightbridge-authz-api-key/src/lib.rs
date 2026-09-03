@@ -1,3 +1,4 @@
+pub mod api_key_labels;
 pub mod db;
 pub mod entities;
 pub mod identity_resolution;

@@ -62,7 +62,11 @@ The following must-have path is implemented for a standards-based browser client
    never create a session or issue a code.
 3. Implement `GET /authorize` with registered-client lookup, exact byte-for-byte
    `redirect_uri` matching, requested-scope validation, `state` round-trip, and a redirect only
-   after all validation succeeds. Do not accept wildcard, prefix, or inferred redirect URIs.
+   after all validation succeeds. Do not accept wildcard, prefix, or inferred redirect URIs. The
+   one sanctioned relaxation is RFC 8252 §7.3's loopback rule for public native-app clients, where
+   the **port alone** may differ from a registered loopback IP-literal URI — scheme, host, path and
+   query still match exactly, and `localhost` is refused per §8.3. See
+   [`docs/rfc-8252-loopback-redirects.md`](rfc-8252-loopback-redirects.md).
 4. Replace `NoAuthorizationCodeStore` with a persisted, short-lived, opaque, single-use,
    CAS-consumed code bound to `client_id`, exact `redirect_uri`, granted scope, authenticated
    subject/context, and PKCE challenge/method. Expired, replayed, cross-client, or

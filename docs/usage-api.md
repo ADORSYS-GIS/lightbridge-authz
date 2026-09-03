@@ -113,104 +113,26 @@ boundary is dropped or kept as a whole bucket, not split (a known caveat tracked
 ## Query cost (2026-09-03)
 
 The owner reported the query backend as "very slow". It was: the console's estate-wide 30-day
-overview took **~35 s** end to end on production. Measured read-only on the production replica
-(`lightbridge-main-db-2`, database `usage`, PostgreSQL 18.4, 933,494 rows / 3,267 MB heap,
-`shared_buffers = 128MB`, `work_mem = 4MB`), estate-wide, 30 days, 1-day buckets, no `group_by`:
+overview took **34.8 s** on production. Three independent causes, all fixed in #665, and the
+biggest one is not the one the question assumed:
 
-| step                                                     | time      | pages touched        |
-|----------------------------------------------------------|-----------|----------------------|
-| `SELECT DISTINCT date_bin(...) ... LIMIT n+1` (bucket pick) | 2,993 ms  | 35,094 (274 MB)      |
-| the grouped aggregation                                  | 31,806 ms | 418,280 (3,268 MB)   |
+1. **The table was scanned twice** — #578's bucket-scoped truncation was two statements over the
+   same `WHERE`. `StoreRepo::query_usage` is now one statement.
+2. **87% of the heap is `attributes`, a column no query reads** — it averages 1,445 B and stays
+   inline, so a page holds ~4 rows instead of ~35.
+   `migrations-usage/20260903000002_usage_event_query_covering_index.sql` adds a covering index over
+   the eighteen columns the query actually reads: 279,627 → 13,436 pages on a production-width
+   fixture, 20.8x fewer.
+3. **`percentile_cont` cannot be hash-aggregated** — asking for latency percentiles changes the
+   plan, not just its cost. That is what the `metrics` request field above turns off: send
+   `"metrics": ["totals"]` when the caller does not render percentiles.
 
-Three separate problems, and their fixes:
+**The measurements, the query shape before/after, the rejected alternatives (BRIN, a CTE), the
+log-noise fix and how to re-measure on the read-only replica live in
+[`docs/usage-performance.md`](./usage-performance.md)** — they are not repeated here. The related
+question *"would Timescale hypertables fix this?"* is answered against the same numbers in
+[`docs/plans/0581-multi-source-usage-plan-of-work.md` §0a](./plans/0581-multi-source-usage-plan-of-work.md).
 
-1. **The table was scanned twice.** #578 implemented bucket-scoped truncation as two queries
-   carrying the same `WHERE` clause. `StoreRepo::query_usage` is now ONE statement: the
-   aggregation runs once and a `dense_rank()` over its own (tens of rows) output does the bucket
-   ranking. The `SELECT DISTINCT ... ORDER BY ... LIMIT` shape it replaces also made Postgres sort
-   every matching row -- 933,494 of them, spilling to disk -- to learn that 21 distinct days
-   existed.
-2. **The heap is 87% a column no query reads.** `attributes` averages 1,445 bytes/row and peaks
-   just under the ~2 KB TOAST threshold, so it stays INLINE: a heap page holds ~4 rows instead of
-   ~35, and an aggregation over eighteen narrow columns reads 3.27 GB.
-   `migrations-usage/20260903000002_usage_event_query_covering_index.sql` adds a covering index
-   carrying exactly those eighteen columns keyed on `observed_at`. Measured on a 2M-row fixture
-   built to production's width (`.docker/it/seed-usage-perf-fixture.sql`):
-
-   | shape                       | before               | after (index-only scan) |
-   |-----------------------------|----------------------|-------------------------|
-   | estate-wide, 30 days        | 279,627 pg (2,185 MB) | 13,436 pg (105 MB)      |
-   | estate-wide, 7 days         |  57,951 pg (  453 MB) |  2,785 pg ( 22 MB)      |
-
-   A BRIN index on `observed_at` was measured as the alternative and left exactly as many pages to
-   read (279,627) -- it narrows which heap pages are visited, not how wide they are.
-3. **`percentile_cont` cannot be hash-aggregated.** Asking for latency percentiles forces the
-   planner out of a `HashAggregate` over a handful of groups and into a `GroupAggregate` fed by a
-   full `Sort`, which at `work_mem = 4MB` spills to disk. On the same fixture, with the covering
-   index, the identical query measured 222 ms with percentiles (`GroupAggregate` <- `Sort`,
-   32 MB to disk) and 130 ms without (`HashAggregate`, no sort at all). That is what the `metrics`
-   request field turns off.
-
-### The query, before and after
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as console
-    participant H as handlers::query
-    participant R as StoreRepo
-    participant PG as Postgres (usage_events)
-
-    rect rgb(245, 235, 235)
-    note over C,PG: BEFORE -- two statements, same WHERE, same rows
-    C->>H: POST /usage/v1/usage/query {scope:all, 30d, bucket:1 day}
-    H->>R: query_usage(input)
-    R->>PG: SELECT DISTINCT date_bin(...) ORDER BY ... DESC LIMIT n+1
-    PG-->>R: 21 bucket_start values (2,993 ms, 274 MB scanned + sort spill)
-    R->>PG: SELECT ... GROUP BY bucket_start WHERE date_bin(...) = ANY($kept)
-    PG-->>R: 21 rows (31,806 ms, 3,268 MB scanned + 60 MB sort spill)
-    R-->>H: (points, truncated)
-    end
-
-    rect rgb(235, 245, 235)
-    note over C,PG: AFTER -- one statement, one scan, index-only
-    C->>H: POST /usage/v1/usage/query {..., metrics:["totals"]}
-    H->>R: query_usage(input)
-    R->>PG: SELECT ... FROM (dense_rank() OVER (...) FROM (GROUP BY bucket_start) agg) ...
-    PG-->>R: 21 rows + truncated, one Index Only Scan over idx_usage_events_query_cover
-    R-->>H: (points, truncated)
-    H-->>C: {points, truncated, metrics:["totals"]}
-    end
-```
-
-A bucket's lifecycle through that single statement -- which is where the `truncated` contract
-lives, and where the states that used to be reachable only across two round trips now are not:
-
-```mermaid
-stateDiagram-v2
-    [*] --> Matched: row passes observed_at range + scope + filters
-    Matched --> Aggregated: GROUP BY bucket_start (+ grouped dimensions)
-    Aggregated --> Ranked: dense_rank() OVER (ORDER BY bucket_start DESC)
-    Ranked --> Kept: bucket_rank <= limit
-    Ranked --> Dropped: bucket_rank > limit
-    Dropped --> [*]: sets truncated = true (max(bucket_rank) OVER () > limit)
-    Kept --> Returned: every series in the bucket, never a subset
-    Returned --> [*]
-
-    note right of Ranked
-        dense_rank(), not row_number():
-        every series row in a bucket shares
-        one rank, so a bucket is kept or
-        dropped WHOLE (#578).
-    end note
-    note right of Dropped
-        UNREACHABLE by design: a bucket that is
-        partially returned. There is no transition
-        from Ranked to "some rows kept, some dropped"
-        -- the filter is on the bucket's rank, not
-        on the row.
-    end note
-```
 
 ## Scope semantics
 
