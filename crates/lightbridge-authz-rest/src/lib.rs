@@ -15,6 +15,7 @@ use lightbridge_authz_core::{
 pub mod actor_api_key_labels;
 pub mod auth_provider;
 pub mod authorize;
+pub mod authorize_session_state;
 pub mod budget_convert;
 pub mod budget_services;
 pub mod claim_redeem;
@@ -24,6 +25,7 @@ pub mod error_convert;
 pub mod handlers;
 pub mod html_page;
 pub mod identity_directory;
+pub mod loopback;
 pub mod middleware;
 pub mod models;
 pub mod my_access;
