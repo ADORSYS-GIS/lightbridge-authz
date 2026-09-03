@@ -1708,9 +1708,16 @@ procedure listBudgetResetSchedules(args: ListBudgetResetSchedulesInput): BudgetR
 // Authors a schedule. It is ALWAYS created disabled -- `enabled` is deliberately absent from this
 // input, not merely defaulted -- because a misconfigured `global` schedule would rewrite every
 // account's balance on its first window. The intended flow is create -> `runBudgetResetScheduleNow
-// { dryRun: true }` -> `updateBudgetResetSchedule { enabled: true }`. `nextRunAt` is likewise
-// server-computed from the cadence, never caller-supplied, so nobody can backdate a window into
-// firing immediately.
+// { dryRun: true }` -> `updateBudgetResetSchedule { enabled: true }`.
+//
+// `nextRunAt` is the one lever over that derivation: OMIT it and the first window is computed from
+// the cadence as before; SET it and the operator has forced the first execution onto a specific
+// instant, stored verbatim. It must be strictly in the FUTURE (a past one is a 400) -- a backdated
+// window would fire on the very next 60-second tick, across the whole estate, before anyone had
+// dry-run it. Forcing a date does not bypass create-disabled: a human still has to enable the row.
+// Once a forced window has fired, the schedule returns to its OWN cadence grid at its own
+// `runAtUtc` -- a daily schedule forced onto 2026-09-15T09:30Z next fires 2026-09-16 at `runAtUtc`,
+// not at 09:30.
 type CreateBudgetResetScheduleInput {
   name String
   scopeKind String
@@ -1720,6 +1727,7 @@ type CreateBudgetResetScheduleInput {
   runAtUtc String?
   amountMicros String
   mode String
+  nextRunAt DateTime?
 }
 
 mutation procedure createBudgetResetSchedule(args: CreateBudgetResetScheduleInput): BudgetResetSchedule
@@ -1731,6 +1739,11 @@ mutation procedure createBudgetResetSchedule(args: CreateBudgetResetScheduleInpu
 // Changing `cadence`, `anchor` or `runAtUtc` re-seeds `nextRunAt` from the NEW cadence, so a
 // schedule that becomes weekly does not keep firing on yesterday's daily window. This is also the
 // only way to flip `enabled`.
+//
+// An explicit `nextRunAt` forces the next execution onto that instant and OUTRANKS the re-seed
+// above; it must be strictly in the future, same rule as on create. Omitting it leaves the column
+// alone (unless the cadence/anchor/run time changed, where it is re-seeded as before), so a forced
+// window survives a rename, a re-price and an enable.
 type UpdateBudgetResetScheduleInput {
   id String
   name String?
@@ -1742,6 +1755,7 @@ type UpdateBudgetResetScheduleInput {
   amountMicros String?
   mode String?
   enabled Boolean?
+  nextRunAt DateTime?
 }
 
 mutation procedure updateBudgetResetSchedule(args: UpdateBudgetResetScheduleInput): BudgetResetSchedule

@@ -103,6 +103,10 @@ the advance first would silently lose a window on a crash.
 
 ### D7 — `next_run_at` advances from the schedule, never from `now()`
 
+**Amended 2026-09-03 — the advance is now stated as "the first instant on the schedule's own grid
+strictly after both the fired window and `now`", which is the same rule for an on-grid window and
+the correct one for a forced, off-grid window. See the amendment below.**
+
 Anti-drift and catch-up are the same rule: the next window is `previous next_run_at + one cadence
 step`, stepped until it is strictly in the future. A tick that wakes 47 seconds late still lands on
 midnight; a schedule six windows stale lands on the next future window in ONE advance, not six
@@ -110,6 +114,9 @@ fires. All arithmetic is UTC, where a calendar day is always 24 hours, so there 
 discontinuity to absorb. The monthly anchor is capped at 28 so no month silently skips.
 
 ### D8 — `enabled` defaults to false, and no RPC can override that on create
+
+**Amended 2026-09-03 — see "Amendment: forcing the next execution onto a date" below. `next_run_at`
+IS now optionally caller-supplied; `enabled` still is not.**
 
 `CreateBudgetResetScheduleInput` has no `enabled` field at all, and `next_run_at` is derived
 server-side. A misconfigured `global` schedule cannot rewrite every balance before a human has
@@ -229,3 +236,129 @@ stateDiagram-v2
   `MAPPED_OP_ID_PERMISSIONS` table follow mechanically (`schema_policy_sync_tests`).
 - The honest caption in D10 is now load-bearing UI copy, not a footnote. It comes down when Phase
   6a lands, and not before.
+
+## Amendment (2026-09-03): forcing the next execution onto a date
+
+- Date: 2026-09-03
+- Driver: owner directive — *"/admin/budget-schedules misses a next execution date; so as to force
+  the next execution on a specific date."*
+- Amends: **D7** and **D8**.
+
+### A8 — `nextRunAt` is an optional input on create AND update
+
+`CreateBudgetResetScheduleInput` and `UpdateBudgetResetScheduleInput` both gain
+`nextRunAt: DateTime?`.
+
+- **Absent** — unchanged behaviour. On create, the cadence computes the first window
+  (`first_window_after`). On update, the column is left alone unless `cadence`/`anchor`/`runAtUtc`
+  changed, where it is re-seeded from the new cadence exactly as before.
+- **Present** — that instant becomes `next_run_at` verbatim. It is the operator saying *"whatever
+  the cadence thinks, run this one on the 15th."* On update it **outranks** the cadence re-seed: an
+  operator who widens the cadence and names a date in the same call means the date.
+
+D8's original reasoning — a caller-supplied window is dangerous because a backdated one fires on the
+very next 60-second tick, across the whole estate — is preserved by one guard rather than by
+refusing the field: **a forced `nextRunAt` must be strictly in the future**
+(`validate_forced_next_run`, `crates/lightbridge-authz-budget/src/reset_schedule_validate.rs`). A
+past instant, or exactly `now`, is `BudgetError::InvalidSchedule` → HTTP 400 with a message naming
+the rule. Everything else D8 protects is untouched: the row is still created **disabled**, there is
+still no `enabled` input on create, and a human still has to enable it after a dry run.
+
+### A7 — a forced window is a ONE-OFF; the advance returns to the schedule's own grid
+
+D7 said "the next window is `previous next_run_at + one cadence step`". With an off-grid `previous`
+that rule drags the whole schedule off its grid forever: a daily schedule forced onto
+`2026-09-15T09:30Z` would fire at 09:30 every day after, silently abandoning its `run_at_utc`, and a
+Wednesday-anchored weekly one forced onto a Tuesday would stay on Tuesdays.
+
+The advance is therefore restated — same answer for every on-grid case D7 already covered, correct
+for the forced one:
+
+> `next_run_at` becomes the earliest instant on the schedule's **own** grid (its `cadence`, `anchor`
+> and `run_at_utc`) that is strictly after **both** the window just fired and `now`.
+
+`BudgetResetSchedule::advance_from_next_run` is one line of that:
+`first_window_after(self.next_run_at.max(now), cadence, anchor, run_at_utc)`. Anti-drift and
+catch-up are unchanged and still fall straight out of it — a tick 47 seconds late still lands on
+midnight; six stale windows collapse into ONE advance — because taking `max(previous, now)` is
+exactly D7's "step until strictly in the future", and the grid, not the elapsed time, decides where
+it lands. So a daily schedule forced onto `2026-09-15T09:30Z` fires there once and next fires
+`2026-09-16T00:00Z`, at `run_at_utc`.
+
+A consequence the console must carry: a `nextRunAt` can legitimately sit **off** the cadence grid.
+That row is a forced one, and a schedules list should say so rather than let the reader infer a
+cadence that does not exist.
+
+### The amended process, as diagrams
+
+Authoring a forced window, and the one tick that consumes it:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant O as Operator<br/>/admin/budget-schedules
+    participant R as createBudgetResetSchedule<br/>lib.rs:2238
+    participant V as validate_forced_next_run<br/>reset_schedule_validate.rs
+    participant DB as budget_reset_schedules
+    participant S as ResetScheduler::tick<br/>reset_scheduler.rs:250
+
+    O->>R: { name, cadence: daily, runAtUtc: "00:00",<br/>nextRunAt: 2026-09-15T09:30Z }
+    R->>V: validate_forced_next_run(forced, now)
+    alt forced <= now
+        V-->>R: InvalidSchedule("nextRunAt must be in the future: …")
+        R-->>O: 400 — nothing written
+    else forced > now
+        V-->>R: ok
+        R->>DB: INSERT … enabled = FALSE, next_run_at = forced
+        DB-->>O: BudgetResetSchedule { enabled: false, nextRunAt: forced }
+        Note over O,DB: still disabled — dry run, then<br/>updateBudgetResetSchedule { enabled: true }
+    end
+
+    Note over S: 2026-09-15T09:30:10Z — the tick after the forced instant
+    S->>DB: claim WHERE enabled AND next_run_at <= now
+    DB-->>S: the forced schedule
+    S->>S: execute the window (grants as usual, D2/D4/D5 unchanged)
+    S->>S: advance_from_next_run(now) =<br/>first_window_after(max(forced, now), daily, NULL, 00:00)
+    S->>DB: UPDATE next_run_at = 2026-09-16T00:00Z,<br/>last_run_at = now
+    Note over S,DB: back on the schedule's OWN grid,<br/>at run_at_utc — not 09:30
+```
+
+Where a forced window sits in the lifecycle (only the new states and edges are called out; every
+other transition is D6/D5's, unchanged):
+
+```mermaid
+stateDiagram-v2
+    [*] --> Disabled: createBudgetResetSchedule<br/>(enabled is never an input)
+    Disabled --> Rejected: nextRunAt <= now<br/>400 InvalidSchedule
+    Rejected --> [*]: nothing written
+    Disabled --> Forced: nextRunAt supplied and in the future<br/>(stored verbatim, still disabled)
+    Disabled --> Pending: nextRunAt omitted<br/>(first_window_after from the cadence)
+    Forced --> Forced: updateBudgetResetSchedule without nextRunAt<br/>(rename / re-price / enable — window untouched)
+    Forced --> Pending: updateBudgetResetSchedule changed<br/>cadence / anchor / runAtUtc<br/>(re-seeded from the NEW cadence)
+    Pending --> Forced: updateBudgetResetSchedule { nextRunAt }<br/>(outranks the re-seed)
+    Forced --> Claimed: enabled AND next_run_at <= now
+    Pending --> Claimed: enabled AND next_run_at <= now
+    Claimed --> Fired: window executed (D2/D4/D5 unchanged)
+    Claimed --> Deferred: spend Unavailable for some account
+    Deferred --> Claimed: same window reclaimed next tick
+    Fired --> Pending: first_window_after(max(fired_window, now),<br/>cadence, anchor, run_at_utc)
+
+    note right of Fired
+        A forced window can only ever be
+        consumed ONCE: the advance lands on
+        the schedule's own grid, so there is
+        no state a forced instant can re-enter.
+    end note
+```
+
+### Amendment consequences
+
+- No migration. `budget_reset_schedules.next_run_at` already exists, is already `TIMESTAMPTZ NOT
+  NULL`, and `last_run_at` was already on the wire as `BudgetResetSchedule.lastRunAt`.
+- `validate_shape` moved verbatim from `reset_schedule.rs` into the new
+  `reset_schedule_validate.rs`, which is where `validate_forced_next_run` lives. Behaviour is
+  unchanged; the split exists because `reset_schedule.rs` sits on its LoC-gate baseline.
+- One behaviour genuinely changed for schedules that were never forced: `advance_from_next_run` now
+  pins the time of day to `run_at_utc` instead of inheriting it from the previous window. For every
+  row the old code could produce these are the same instant (`next_run_at` was only ever seeded from
+  `run_at_utc`), so this is a tightening, not a migration.
