@@ -3,9 +3,9 @@ use lightbridge_authz_core::{
     Account, AccountId, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
     RotateApiKey, async_trait,
     config::{
-        ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetServer, Federation, IdpServer,
-        JwtSigning, ModelCatalog, Oauth2, OauthClient, OauthClientType, OpaServer, QuotaTiers,
-        Redis, UsageServiceClient,
+        ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetInternalServer, BudgetServer,
+        Federation, IdpServer, JwtSigning, ModelCatalog, Oauth2, OauthClient, OauthClientType,
+        OpaServer, QuotaTiers, Redis, UsageServiceClient,
     },
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
@@ -16,6 +16,8 @@ pub mod actor_api_key_labels;
 pub mod auth_provider;
 pub mod authorize;
 pub mod budget_convert;
+pub mod budget_remaining;
+pub mod budget_remaining_wire;
 pub mod budget_services;
 pub mod claim_redeem;
 pub mod codec;
@@ -46,6 +48,8 @@ pub mod signing;
 pub mod static_assets;
 pub mod token_exchange;
 pub mod userinfo;
+
+use crate::budget_remaining::BUDGET_REMAINING_PATH;
 
 use auth_provider::{ACCESS_TOKEN_CONTEXT_KEY, CratestackAuthProvider};
 use budget_convert::{
@@ -108,6 +112,11 @@ pub const SERVICE_OPA: &str = "authz-opa";
 pub const SERVICE_IDP: &str = "authz-idp";
 /// See [`SERVICE_API`].
 pub const SERVICE_BUDGET: &str = "authz-budget";
+/// See [`SERVICE_API`]. `authz-budget`'s second, mTLS-only listener (ADR-0034) reports as its own
+/// service for the same reason `lightbridge-authz-usage` splits `authz-usage`/`authz-usage-query`
+/// (#347): the two ports have different auth postures, and "which one am I hitting?" must have an
+/// answer.
+pub const SERVICE_BUDGET_INTERNAL: &str = "authz-budget-internal";
 
 #[derive(Serialize, Deserialize)]
 struct RootResponse {
@@ -3290,6 +3299,9 @@ pub async fn start_api_server(
         review_service,
         budget_repo,
         reset_scheduler,
+        // ADR-0034's remaining reader is assembled and mounted only by `start_budget_server`, on
+        // its mTLS-only internal listener. `authz-api` shares the graph and drops this handle.
+        spend_reader: _,
     } = budget_services::build_budget_services(pool.clone(), usage_service).await?;
 
     let readiness_pool = pool.clone();
@@ -3894,6 +3906,7 @@ pub fn build_budget_router(
 )]
 pub async fn start_budget_server(
     budget: &BudgetServer,
+    budget_internal: Option<&BudgetInternalServer>,
     pool: Arc<dyn DbPoolTrait>,
     oauth2: &Oauth2,
     billing: &Billing,
@@ -3917,6 +3930,7 @@ pub async fn start_budget_server(
         review_service,
         budget_repo,
         reset_scheduler,
+        spend_reader,
     } = budget_services::build_budget_services(pool.clone(), usage_service).await?;
 
     let readiness_pool = pool.clone();
@@ -4008,6 +4022,10 @@ pub async fn start_budget_server(
     });
 
     let dev_cors = dev_cors_enabled();
+    // Cloned before `build_budget_router` consumes them: ADR-0034's reader must be the SAME repo
+    // and the SAME scheduler the RPC surface serves from, not a second graph over the same pool.
+    let budget_repo_for_remaining = budget_repo.clone();
+    let reset_scheduler_for_remaining = reset_scheduler.clone();
     let app = build_budget_router(
         issuer,
         policy_store,
@@ -4037,7 +4055,76 @@ pub async fn start_budget_server(
         "starting budget server"
     );
 
-    serve_tls("BUDGET", &budget.address, budget.port, &budget.tls, app).await
+    let rpc_listener = serve_tls("BUDGET", &budget.address, budget.port, &budget.tls, app);
+
+    // ADR-0034: the mTLS-only internal listener, when configured. `tokio::try_join!` runs the two
+    // concurrently rather than sequentially (the same shape `start_usage_server` uses for its own
+    // two listeners) so neither listener's lifetime blocks the other's, and either one failing
+    // fails this function.
+    let Some(internal) = budget_internal else {
+        tracing::info!(
+            server = SERVICE_BUDGET_INTERNAL,
+            "server.budget_internal is not configured; the gateway's budget-remaining read \
+             ({BUDGET_REMAINING_PATH}) is not served by this process"
+        );
+        return rpc_listener.await;
+    };
+
+    // Fail-closed, and loudly: this listener answers a cross-account balance question with NO
+    // per-caller ownership check of any kind, and the client-certificate requirement is the only
+    // thing standing in front of it. Serving it because someone configured the port and forgot the
+    // trust anchor is precisely the silent degrade `Tls::client_ca_bundle_path` exists to prevent.
+    if internal.tls.client_ca_bundle_path.is_none() {
+        return Err(Error::Server(format!(
+            "server.budget_internal.tls.client_ca_bundle_path is required: {BUDGET_REMAINING_PATH} \
+             is a cross-account service read gated ONLY by mTLS"
+        )));
+    }
+
+    // The grace window is this listener's own config, which is why `build_budget_services` hands
+    // back the shared `spend_reader` rather than a pre-assembled reader: `authz-api` and
+    // `lightbridge-mcp` share the graph but have no `budget_internal` block to read a grace from.
+    let grace = chrono::Duration::seconds(
+        i64::try_from(internal.remaining_grace_seconds).map_err(|_| {
+            Error::Server(format!(
+                "server.budget_internal.remaining_grace_seconds is out of range: {}",
+                internal.remaining_grace_seconds
+            ))
+        })?,
+    );
+    let remaining_service = Arc::new(lightbridge_authz_budget::RemainingService::with_grace(
+        budget_repo_for_remaining,
+        spend_reader,
+        reset_scheduler_for_remaining,
+        grace,
+    ));
+
+    let internal_app = budget_remaining::budget_remaining_router().with_state(Arc::new(
+        budget_remaining::BudgetInternalState {
+            remaining: remaining_service,
+        },
+    ));
+
+    lightbridge_authz_core::log_build_info(SERVICE_BUDGET_INTERNAL);
+    tracing::info!(
+        server = SERVICE_BUDGET_INTERNAL,
+        address = %internal.address,
+        port = internal.port,
+        path = BUDGET_REMAINING_PATH,
+        grace_seconds = internal.remaining_grace_seconds,
+        "starting budget internal (mTLS) server"
+    );
+
+    let internal_listener = serve_tls(
+        "BUDGET_INTERNAL",
+        &internal.address,
+        internal.port,
+        &internal.tls,
+        internal_app,
+    );
+
+    tokio::try_join!(rpc_listener, internal_listener)?;
+    Ok(())
 }
 
 async fn root_handler() -> (StatusCode, Json<RootResponse>) {

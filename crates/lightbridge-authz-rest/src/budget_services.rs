@@ -38,6 +38,14 @@ pub struct BudgetServices {
     pub review_service: Arc<lightbridge_authz_budget::ReviewService>,
     pub budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
     pub reset_scheduler: Arc<lightbridge_authz_budget::ResetScheduler>,
+    /// The same fail-closed spend reader `refill_service`/`reset_scheduler` above were built
+    /// with, handed back so `start_budget_server` can assemble ADR-0034's `RemainingService` over
+    /// it with that server's configured grace window. Exposed rather than pre-assembled here
+    /// because the grace window is `server.budget_internal` config that only `authz-budget` reads
+    /// -- and because sharing this exact reader is the point: the number the gateway enforces on
+    /// can never disagree with the number a refill decision or a reset tick would compute from
+    /// identical state.
+    pub spend_reader: Arc<dyn lightbridge_authz_budget::SpendReader>,
 }
 
 /// The spend reader for `usage_service`, or the fail-closed stand-in when it is unconfigured.
@@ -129,6 +137,7 @@ pub async fn build_budget_services(
     // ADR-0032. Shares the SAME fail-closed `spend_reader` the refill path uses, so an unreachable
     // usage service degrades a reset the same way it degrades a refill: never a grant on unknown
     // spend.
+    let spend_reader_for_remaining = spend_reader.clone();
     let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
         pool.clone(),
         budget_repo.clone(),
@@ -141,5 +150,6 @@ pub async fn build_budget_services(
         review_service,
         budget_repo,
         reset_scheduler,
+        spend_reader: spend_reader_for_remaining,
     })
 }

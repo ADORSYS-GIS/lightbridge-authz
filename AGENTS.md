@@ -5,7 +5,13 @@ This repository provides API key management plus usage analytics:
 - `authz-api`: OAuth2/JWT-protected CRUD API for Accounts, Projects, and API keys.
 - `authz-budget`: OAuth2/JWT-protected RPC API for the budget domain (policy lifecycle,
   self-service refill, the admin review queue, and direct balance/ledger reads/writes) — carried
-  off `authz-api` as a hard cutover (ADR-0010, #351).
+  off `authz-api` as a hard cutover (ADR-0010, #351). Since ADR-0034 it also binds a **second,
+  mTLS-only listener** (`server.budget_internal`) serving one route, `GET /budget/v1/remaining` —
+  the live `ceiling − spend` read the gateway's Dynamic Budget Limiter makes through Authorino, so
+  a refill counts at the gateway without any claim or token refresh. Separate listener for the same
+  reason `lightbridge-authz-usage` has one (#347): client-certificate verification is per listener,
+  not per route. `client_ca_bundle_path` is mandatory there — the server refuses to start without
+  it. `503 budget_unavailable` is never a zero balance; see `docs/architecture/budget.md`.
 - `authz-opa`: Basic-auth protected validation API intended to be called by Authorino (or similar external auth components). It validates API keys and returns rich context plus dynamic metadata, and is also the ownership authority for the usage query API (`POST /idp/v1/authorize-usage-scope`, #570).
 - `authz-idp`: OIDC broker server (ADR-0012, ADR-0019, ADR-0023) exposing
   `.well-known/openid-configuration`, `.well-known/jwks.json`, `/oauth2/token`, `/oauth2/revoke`,

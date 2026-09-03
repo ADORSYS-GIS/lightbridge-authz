@@ -16,7 +16,9 @@
 
 use httpmock::Method::POST;
 use httpmock::MockServer;
-use lightbridge_authz_budget::{Period, Spend, SpendReader, UsageServiceSpendReader};
+use lightbridge_authz_budget::{
+    Period, Spend, SpendObservation, SpendReader, UsageServiceSpendReader,
+};
 use std::time::Duration;
 
 fn reader_for(base_url: &str) -> UsageServiceSpendReader {
@@ -223,4 +225,127 @@ async fn usage_service_returns_negative_total_cost_yields_spend_unavailable() {
         .expect("an unusable total_cost must not surface as Err");
 
     assert_eq!(spend, Spend::Unavailable);
+}
+
+// ── ADR-0034: `observe_spend_for_account` splits the two halves `Spend::Unavailable` merges ──
+//
+// `spend_for_account` above must keep its contract exactly: a `NULL` sum and an unreachable
+// service are both `Unavailable`, because a refill must never be decided on unverified spend.
+// The gateway's remaining-budget read is the one caller that needs them apart -- an account with
+// no rows this period is the ordinary state of EVERY account until its first request completes,
+// and collapsing it into "unknown" would fail-close the whole fleet at every month boundary.
+
+/// The distinguishing case. `spend_for_account` says `Unavailable` (asserted above);
+/// `observe_spend_for_account` says `Empty`, which the remaining endpoint reads as zero spend.
+#[tokio::test]
+async fn null_total_cost_observes_as_empty_not_unreachable() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/usage/v1/spend/query");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(serde_json::json!({ "total_cost": null }));
+    });
+
+    let reader = reader_for(&server.base_url());
+    let observation = reader
+        .observe_spend_for_account("acct_1", &period())
+        .await
+        .expect("reader never returns Err");
+
+    assert_eq!(observation, SpendObservation::Empty);
+}
+
+/// The case that must NOT be confused with the one above: nothing answered at all.
+#[tokio::test]
+async fn an_unreachable_usage_service_observes_as_unreachable_never_empty() {
+    // Port 1 is reserved and nothing listens on it: a connection refusal, not a timeout.
+    let reader = reader_for("http://127.0.0.1:1");
+    let observation = reader
+        .observe_spend_for_account("acct_1", &period())
+        .await
+        .expect("reader never returns Err");
+
+    assert_eq!(observation, SpendObservation::Unreachable);
+}
+
+#[tokio::test]
+async fn a_non_success_status_observes_as_unreachable_never_empty() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/usage/v1/spend/query");
+        then.status(500);
+    });
+
+    let reader = reader_for(&server.base_url());
+    let observation = reader
+        .observe_spend_for_account("acct_1", &period())
+        .await
+        .expect("reader never returns Err");
+
+    assert_eq!(observation, SpendObservation::Unreachable);
+}
+
+/// A real, non-null total is reported as itself on both methods -- the split changed nothing for
+/// the ordinary path.
+#[tokio::test]
+async fn a_known_total_observes_as_answered_with_the_same_micros() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/usage/v1/spend/query");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(serde_json::json!({ "total_cost": 1234.0 }));
+    });
+
+    let reader = reader_for(&server.base_url());
+    assert_eq!(
+        reader
+            .observe_spend_for_account("acct_1", &period())
+            .await
+            .expect("reader never returns Err"),
+        SpendObservation::Answered(1_234)
+    );
+    assert_eq!(
+        reader
+            .spend_for_account("acct_1", &period())
+            .await
+            .expect("reader never returns Err"),
+        Spend::Known(1_234)
+    );
+}
+
+/// A genuine zero-cost total is `Answered(0)`, NOT `Empty`: the usage store has rows for this
+/// account and they summed to nothing. The two are different facts and the enum keeps them apart.
+#[tokio::test]
+async fn a_genuine_zero_total_observes_as_answered_zero_not_empty() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/usage/v1/spend/query");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(serde_json::json!({ "total_cost": 0.0 }));
+    });
+
+    let reader = reader_for(&server.base_url());
+    let observation = reader
+        .observe_spend_for_account("acct_1", &period())
+        .await
+        .expect("reader never returns Err");
+
+    assert_eq!(observation, SpendObservation::Answered(0));
+}
+
+/// The default trait method collapses conservatively: a reader that cannot see the transport
+/// boundary reports `Unreachable`, never a permissive `Empty`.
+#[tokio::test]
+async fn the_default_observation_for_a_reader_without_a_transport_is_unreachable() {
+    use lightbridge_authz_budget::UnavailableSpendReader;
+
+    let observation = UnavailableSpendReader
+        .observe_spend_for_account("acct_1", &period())
+        .await
+        .expect("reader never returns Err");
+
+    assert_eq!(observation, SpendObservation::Unreachable);
 }
