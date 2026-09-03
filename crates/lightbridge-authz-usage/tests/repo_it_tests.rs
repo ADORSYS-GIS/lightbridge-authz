@@ -11,7 +11,7 @@ use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_usage_rest::UsageState;
 use lightbridge_authz_usage_rest::build_ingest_router;
 use lightbridge_authz_usage_rest::models::{
-    UsageGroupBy, UsageQueryFilters, UsageQueryRequest, UsageScope,
+    UsageGroupBy, UsageMetric, UsageQueryFilters, UsageQueryRequest, UsageScope,
 };
 use lightbridge_authz_usage_rest::repo::{StoreRepo, UsageEvent};
 use serde_json::{Value, json};
@@ -70,6 +70,7 @@ fn base_query(now: chrono::DateTime<Utc>) -> UsageQueryRequest {
         filters: UsageQueryFilters::default(),
         group_by: vec![],
         limit: 100,
+        metrics: None,
     }
 }
 
@@ -1240,4 +1241,328 @@ async fn migration_creates_the_three_dimension_indexes(pool: PgPool) {
         .expect("index lookup should succeed");
         assert!(exists, "expected index {index} to exist after migration");
     }
+}
+
+/// The 2026-09-03 query-cost work: `metrics` omitting `latency_percentiles` must remove the
+/// `percentile_cont` computation (which is what changes the PLAN from a sort-fed `GroupAggregate`
+/// to a `HashAggregate`) WITHOUT changing anything else about the answer. Same rows, same sums,
+/// same `latency_samples` -- only the three percentile fields go null.
+///
+/// The percentile values asserted here are the same exact numbers
+/// `query_usage_reports_percentiles_over_recorded_latency` pins, so the two tests together say
+/// "this is what the lever turns off, and this is what it must not touch".
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn query_usage_should_skip_percentiles_when_metrics_omits_them(pool: PgPool) {
+    let repo = build_repo(pool);
+    let now = Utc::now();
+    let events: Vec<UsageEvent> = (1..=100)
+        .map(|ms| event_with_latency(now, "gpt-4.1", Some(f64::from(ms))))
+        .collect();
+
+    repo.insert_usage_events(&events)
+        .await
+        .expect("insert should succeed");
+
+    let with_percentiles = repo
+        .query_usage(&base_query(now))
+        .await
+        .expect("query should succeed")
+        .0;
+    let without_percentiles = repo
+        .query_usage(&UsageQueryRequest {
+            metrics: Some(vec![UsageMetric::Totals]),
+            ..base_query(now)
+        })
+        .await
+        .expect("query should succeed")
+        .0;
+
+    assert_eq!(with_percentiles.len(), 1);
+    assert_eq!(without_percentiles.len(), 1);
+    let with = &with_percentiles[0];
+    let without = &without_percentiles[0];
+
+    assert_eq!(with.latency_p50_ms, Some(50.5));
+    assert_eq!(without.latency_p50_ms, None);
+    assert_eq!(without.latency_p95_ms, None);
+    assert_eq!(without.latency_p99_ms, None);
+
+    // `latency_samples` is part of `Totals`: a plain COUNT in the same pass, so it stays a true
+    // count rather than being zeroed to make the response look like "no data".
+    assert_eq!(without.latency_samples, 100);
+    assert_eq!(without.latency_samples, with.latency_samples);
+    assert_eq!(without.requests, with.requests);
+    assert_eq!(without.total_tokens, with.total_tokens);
+    assert_eq!(without.total_cost, with.total_cost);
+    assert_eq!(without.bucket_start, with.bucket_start);
+}
+
+/// `metrics: None` is the wire shape every caller written before the field existed sends, and it
+/// must keep meaning "everything". A regression here silently blanks latency on the console.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn absent_metrics_should_still_compute_percentiles(pool: PgPool) {
+    let repo = build_repo(pool);
+    let now = Utc::now();
+
+    repo.insert_usage_events(&[event_with_latency(now, "gpt-4.1", Some(42.0))])
+        .await
+        .expect("insert should succeed");
+
+    let request: UsageQueryRequest = serde_json::from_value(json!({
+        "scope": "project",
+        "scope_id": "proj_1",
+        "start_time": (now - Duration::hours(1)).to_rfc3339(),
+        "end_time": (now + Duration::hours(1)).to_rfc3339(),
+        "bucket": "1 hour",
+    }))
+    .expect("a request without `metrics` must still deserialize");
+    assert!(request.metrics.is_none());
+    assert!(request.wants_latency_percentiles());
+
+    let (points, _truncated) = repo
+        .query_usage(&request)
+        .await
+        .expect("query should succeed");
+    assert_eq!(points[0].latency_p50_ms, Some(42.0));
+}
+
+/// #578's truncation contract, re-asserted against the single-statement rewrite. The flag now
+/// comes from a `max(dense_rank()) OVER ()` inside the same query rather than from a separate
+/// bucket-selection round trip, so it needs pinning again: `limit` bounds DISTINCT buckets, the
+/// NEWEST ones survive, and every surviving bucket keeps its full series set.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn truncation_should_keep_the_newest_whole_buckets(pool: PgPool) {
+    let repo = build_repo(pool);
+    let now = Utc::now();
+
+    // Five hourly buckets, two models in each -- ten rows, five distinct buckets.
+    let mut events = Vec::new();
+    for hour in 0..5 {
+        for model in ["gpt-4.1", "claude-4"] {
+            events.push(event_with_latency(
+                now - Duration::hours(i64::from(hour)),
+                model,
+                Some(10.0),
+            ));
+        }
+    }
+    repo.insert_usage_events(&events)
+        .await
+        .expect("insert should succeed");
+
+    let request = UsageQueryRequest {
+        start_time: now - Duration::hours(24),
+        end_time: now + Duration::hours(1),
+        group_by: vec![UsageGroupBy::Model],
+        limit: 3,
+        ..base_query(now)
+    };
+    let (points, truncated) = repo
+        .query_usage(&request)
+        .await
+        .expect("query should succeed");
+
+    assert!(
+        truncated,
+        "5 distinct buckets against limit 3 is a truncation"
+    );
+
+    let mut buckets: Vec<_> = points.iter().map(|point| point.bucket_start).collect();
+    buckets.dedup();
+    assert_eq!(buckets.len(), 3, "limit bounds DISTINCT buckets, not rows");
+    assert_eq!(points.len(), 6, "each surviving bucket keeps BOTH series");
+    assert!(
+        buckets.windows(2).all(|pair| pair[0] < pair[1]),
+        "points come back in ascending bucket order"
+    );
+    // The newest bucket survives; the oldest (now - 4h) does not.
+    let oldest_kept = buckets[0];
+    assert!(
+        oldest_kept > now - Duration::hours(3),
+        "truncation must drop the OLDEST buckets, kept {oldest_kept}"
+    );
+
+    // Under the limit, nothing is truncated and every bucket is present.
+    let (points, truncated) = repo
+        .query_usage(&UsageQueryRequest {
+            limit: 10,
+            ..request
+        })
+        .await
+        .expect("query should succeed");
+    assert!(!truncated);
+    assert_eq!(points.len(), 10);
+}
+
+/// Owner report, 2026-09-03: every OTLP export was logging a line shaped like
+/// `INFO ingest_logs{body=b"\x1f\x8b..."}: ... accepted 4 log events`.
+///
+/// Two separate defects in one line, and this test pins both:
+///
+/// 1. `#[instrument]` records every non-skipped ARGUMENT into the span at entry, so an unskipped
+///    `body: Bytes` stamped the whole compressed protobuf payload into the span -- unreadable at
+///    this endpoint's volume, and an OTLP body carries whatever the exporter put in it (prompts,
+///    user names, request bodies), which has no business in a log sink. The span must carry
+///    `bytes` and nothing else derived from the payload.
+/// 2. "accepted N events" is per-request bookkeeping, not an operational event, so it belongs at
+///    `DEBUG`. Rejects stay at `WARN` -- a refused export is worth waking up for.
+///
+/// Asserted against a real `tracing` subscriber driving the real handler, not by grepping the
+/// source: the failure mode here is an attribute macro's behaviour, which source text does not
+/// show.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn ingest_must_not_log_the_request_body_and_must_not_log_at_info(pool: PgPool) {
+    use std::sync::Mutex;
+    use tracing::field::{Field, Visit};
+    use tracing::{Level, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
+
+    #[derive(Default)]
+    struct Captured {
+        span_fields: Vec<(String, String)>,
+        span_names: Vec<String>,
+        events: Vec<(Level, String)>,
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor(Vec<(String, String)>);
+
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+    }
+
+    struct CaptureLayer(Arc<Mutex<Captured>>);
+
+    impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for CaptureLayer {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: Context<'_, S>,
+        ) {
+            let mut visitor = FieldVisitor::default();
+            attrs.record(&mut visitor);
+            let mut captured = self.0.lock().expect("capture mutex");
+            captured
+                .span_names
+                .push(attrs.metadata().name().to_string());
+            captured.span_fields.extend(visitor.0);
+        }
+
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            let message = visitor
+                .0
+                .iter()
+                .find(|(name, _)| name == "message")
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default();
+            self.0
+                .lock()
+                .expect("capture mutex")
+                .events
+                .push((*event.metadata().level(), message));
+        }
+    }
+
+    let captured = Arc::new(Mutex::new(Captured::default()));
+    let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&captured)));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let readiness_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
+    let state = Arc::new(UsageState {
+        repo: Arc::new(build_repo(pool)),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
+    });
+    let app = build_ingest_router(state, readiness_pool, false);
+
+    // A minimal, valid OTLP/JSON logs export carrying one record.
+    let body = json!({
+        "resourceLogs": [{
+            "scopeLogs": [{
+                "logRecords": [{
+                    "timeUnixNano": "1756800000000000000",
+                    "attributes": [
+                        {"key": "account_id", "value": {"stringValue": "acct_1"}},
+                        {"key": "model", "value": {"stringValue": "gpt-4.1"}}
+                    ]
+                }]
+            }]
+        }]
+    })
+    .to_string();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/otel/logs")
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let captured = captured.lock().expect("capture mutex");
+
+    assert!(
+        captured.span_names.iter().any(|name| name == "ingest_logs"),
+        "expected an `ingest_logs` span, saw {:?}",
+        captured.span_names
+    );
+
+    let field_names: Vec<&str> = captured
+        .span_fields
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert!(
+        field_names.contains(&"bytes"),
+        "the span must record the payload SIZE, saw {field_names:?}"
+    );
+    assert!(
+        !field_names.contains(&"body"),
+        "the span must never record the payload itself, saw {field_names:?}"
+    );
+    assert!(
+        !captured
+            .span_fields
+            .iter()
+            .any(|(_, value)| value.contains("acct_1")),
+        "no span field may echo the export's contents, saw {:?}",
+        captured.span_fields
+    );
+
+    let accepted: Vec<&(Level, String)> = captured
+        .events
+        .iter()
+        .filter(|(_, message)| message.contains("accepted") && message.contains("log events"))
+        .collect();
+    assert_eq!(
+        accepted.len(),
+        1,
+        "expected exactly one accept line, saw {:?}",
+        captured.events
+    );
+    assert_eq!(
+        accepted[0].0,
+        Level::DEBUG,
+        "the accept line must be DEBUG, not INFO"
+    );
+    assert!(
+        !captured
+            .events
+            .iter()
+            .any(|(level, _)| *level == Level::INFO),
+        "a successful ingest must log nothing at INFO, saw {:?}",
+        captured.events
+    );
 }

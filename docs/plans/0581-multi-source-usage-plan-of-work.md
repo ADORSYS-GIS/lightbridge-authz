@@ -37,6 +37,38 @@ issue corpus, the ADRs, and the governance repo — so none gets settled by acci
 
 ---
 
+## 0a. "Would Timescale hypertables fix the slow queries?" — measured 2026-09-03
+
+The owner asked this directly. The answer, with the numbers behind it, is **partly — and not the
+expensive part**. Everything here was measured read-only on the production replica
+(`lightbridge-main-db-2`, database `usage`, PostgreSQL 18.4, 933,494 rows / 3,267 MB heap /
+625 MB indexes, `shared_buffers = 128MB`, `work_mem = 4MB`) plus a 2M-row local fixture built to
+production's row width (`.docker/it/seed-usage-perf-fixture.sql`). The console's estate-wide
+30-day overview query took **34.8 s** on production (2,993 ms picking buckets + 31,806 ms
+aggregating).
+
+Where that 34.8 s actually goes, and who fixes each part:
+
+| cost | share | what fixes it |
+|------|-------|---------------|
+| Reading 3,268 MB of heap for eighteen narrow columns, because inline `attributes` (avg 1,445 B, 87% of the row) makes a page hold ~4 rows instead of ~35 | ~27 s of 31.8 s in the aggregation, plus most of the bucket-pick step | **Shipped today**: the covering index (`migrations-usage/20260903000002`) — 279,627 → 13,436 pages on the fixture, 20.8× fewer. Timescale's **columnar compression** would attack the same cost from the other side and go further (`attributes` is a compressible blob nobody reads), but it is not the only way to get there, and PR-1b's `usage_request_events` split — which moves `attributes` out of the hot table entirely — is the real structural fix. |
+| Scanning the same rows a second time for the bucket list | 2,993 ms (8.6%) | **Shipped today**: one statement instead of two. Nothing to do with Timescale. |
+| `percentile_cont` forcing `GroupAggregate` + a disk-spilling `Sort` instead of `HashAggregate` | 222 ms vs 130 ms on the fixture with the index; 34,387 ms vs 31,500 ms on production without it | **Partly shipped today**: one multi-quantile call instead of three, and a `metrics` request field so a caller that does not need percentiles does not pay for them. **Continuous aggregates (#587) are the real fix** — they make the percentile a lookup instead of a computation — and they need `timescaledb_toolkit` (D1). |
+| Chunk exclusion (only reading the chunks a time range touches) | **~0 for the shapes the console actually issues** | Hypertables. But the console asks for 7d/30d/90d/mtd against a table with a **30-day retention window** — a 30-day query IS the whole table, so there are no chunks to exclude. Chunk exclusion earns its keep only once retention is longer than the typical query range (#582/#583's day/seat facts). |
+
+**Residual after this PR, before any Timescale work:** the estate-wide 30-day query should land
+around 1–2 s on production (13,436 pages of index instead of 418,280 of heap, extrapolating the
+fixture's 20.8× at production's shape), dominated by the aggregate itself rather than by I/O. That
+is the number #587's continuous aggregates would then take further, and the number PR-1a/1b should
+be judged against — not the 34.8 s it replaced.
+
+**So: no, hypertables are not the fix for this.** Compression and continuous aggregates are the
+two Timescale features that would help, chunk exclusion is not, and both remain gated on D1–D7.
+Nothing in this PR introduces or presumes Timescale; it is deliberately confined to plain-Postgres
+changes that hold whichever way D1 goes.
+
+---
+
 ## 1. Decision register — reserved for the maintainer
 
 Nothing below gets decided by an implementer. Gate decisions block Phase 1 DDL; the rest block

@@ -23,7 +23,7 @@ use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
-use tracing::{info, instrument, warn};
+use tracing::{debug, instrument, warn};
 
 const ACCOUNT_KEYS: [&str; 5] = [
     "account_id",
@@ -230,7 +230,16 @@ const OPERATION_OTHER: &str = "other";
     ),
     tag = "ingest"
 )]
-#[instrument(skip(state, headers))]
+// `skip_all` + an explicit `bytes` field, deliberately (owner report, 2026-09-03). The previous
+// `#[instrument(skip(state, headers))]` left `body` UNSKIPPED, and `#[instrument]` records every
+// non-skipped argument into the span with its `Debug` representation -- so every OTLP export
+// stamped the entire compressed protobuf payload into the span name, producing log lines like
+// `ingest_logs{body=b"\x1f\x8b\x08\x00..."}` on EVERY request. That is two problems, not one:
+// it is unreadable noise at the volume this endpoint runs at, and an OTLP log/trace body carries
+// whatever the exporter put in it -- prompts, user names, request bodies -- so the raw bytes have
+// no business in a log sink at all. `bytes = body.len()` keeps the one thing the field was ever
+// useful for (how big was this export) and drops the payload.
+#[instrument(skip_all, fields(bytes = body.len()))]
 pub async fn ingest_traces(
     State(state): State<Arc<UsageState>>,
     headers: HeaderMap,
@@ -240,7 +249,7 @@ pub async fn ingest_traces(
     let events = extract_trace_events(payload);
     let accepted_events = persist_events(&state, "trace", &events).await?;
 
-    info!("accepted {} trace events", accepted_events);
+    debug!("accepted {} trace events", accepted_events);
 
     Ok((
         StatusCode::ACCEPTED,
@@ -258,7 +267,7 @@ pub async fn ingest_traces(
     ),
     tag = "ingest"
 )]
-#[instrument(skip(state, headers))]
+#[instrument(skip_all, fields(bytes = body.len()))]
 pub async fn ingest_metrics(
     State(state): State<Arc<UsageState>>,
     headers: HeaderMap,
@@ -268,7 +277,7 @@ pub async fn ingest_metrics(
     let events = extract_metric_events(payload);
     let accepted_events = persist_events(&state, "metric", &events).await?;
 
-    info!("accepted {} metric events", accepted_events);
+    debug!("accepted {} metric events", accepted_events);
 
     Ok((
         StatusCode::ACCEPTED,
@@ -286,7 +295,7 @@ pub async fn ingest_metrics(
     ),
     tag = "ingest"
 )]
-#[instrument(skip(state, headers))]
+#[instrument(skip_all, fields(bytes = body.len()))]
 pub async fn ingest_logs(
     State(state): State<Arc<UsageState>>,
     headers: HeaderMap,
@@ -296,7 +305,7 @@ pub async fn ingest_logs(
     let events = extract_log_events(payload);
     let accepted_events = persist_events(&state, "log", &events).await?;
 
-    info!("accepted {} log events", accepted_events);
+    debug!("accepted {} log events", accepted_events);
 
     Ok((
         StatusCode::ACCEPTED,

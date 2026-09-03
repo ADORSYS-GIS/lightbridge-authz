@@ -80,13 +80,27 @@
     "operation_in": ["chat_completions", "responses", "messages"]
   },
   "group_by": ["model", "metric_name", "azp"],
-  "limit": 1000
+  "limit": 1000,
+  "metrics": ["totals"]
 }
 ```
 
+`metrics` (optional; **omit it and you get everything**, which is what every caller written before
+2026-09-03 does) selects which metric FAMILIES the query computes:
+
+| value                  | fields                                                                                            | cost |
+|------------------------|---------------------------------------------------------------------------------------------------|------|
+| `totals`               | `requests`, `usage_value`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `total_cost`, `latency_samples` | free -- plain `SUM`/`COUNT` in the pass that already reads the row. Always computed; listing it is a documented no-op. |
+| `latency_percentiles`  | `latency_p50_ms`, `latency_p95_ms`, `latency_p99_ms`                                              | changes the PLAN. See [Query cost](#query-cost-2026-09-03). |
+
+Omitting `latency_percentiles` returns the three percentile fields as `null`, and the response
+echoes back a `metrics` array saying so -- which is what keeps that `null` unambiguous. A point
+with `latency_samples > 0` and `latency_p50_ms: null` means "percentiles were not requested";
+`latency_samples: 0` still means "no row in this bucket reported a latency at all".
+
 ## Response shape and truncation (#578)
 
-The response is `{ "points": [...], "truncated": bool }`. `limit` bounds the number of DISTINCT
+The response is `{ "points": [...], "truncated": bool, "metrics": [...] }`. `limit` bounds the number of DISTINCT
 `bucket_start` values returned, not the number of `points` entries (rows) -- with a non-empty
 `group_by`, each bucket can contribute multiple `points` (one per series), so `points.len()` can
 exceed `limit` even when `truncated` is `false`. `truncated: true` means more than `limit`
@@ -95,6 +109,108 @@ every series for exactly the newest `limit` buckets, in ascending `bucket_start`
 always drops a bucket WHOLE — every series that bucket had, together, never an arbitrary subset of
 one bucket's series while its sibling buckets keep theirs; a bucket that straddles the truncation
 boundary is dropped or kept as a whole bucket, not split (a known caveat tracked as #586).
+
+## Query cost (2026-09-03)
+
+The owner reported the query backend as "very slow". It was: the console's estate-wide 30-day
+overview took **~35 s** end to end on production. Measured read-only on the production replica
+(`lightbridge-main-db-2`, database `usage`, PostgreSQL 18.4, 933,494 rows / 3,267 MB heap,
+`shared_buffers = 128MB`, `work_mem = 4MB`), estate-wide, 30 days, 1-day buckets, no `group_by`:
+
+| step                                                     | time      | pages touched        |
+|----------------------------------------------------------|-----------|----------------------|
+| `SELECT DISTINCT date_bin(...) ... LIMIT n+1` (bucket pick) | 2,993 ms  | 35,094 (274 MB)      |
+| the grouped aggregation                                  | 31,806 ms | 418,280 (3,268 MB)   |
+
+Three separate problems, and their fixes:
+
+1. **The table was scanned twice.** #578 implemented bucket-scoped truncation as two queries
+   carrying the same `WHERE` clause. `StoreRepo::query_usage` is now ONE statement: the
+   aggregation runs once and a `dense_rank()` over its own (tens of rows) output does the bucket
+   ranking. The `SELECT DISTINCT ... ORDER BY ... LIMIT` shape it replaces also made Postgres sort
+   every matching row -- 933,494 of them, spilling to disk -- to learn that 21 distinct days
+   existed.
+2. **The heap is 87% a column no query reads.** `attributes` averages 1,445 bytes/row and peaks
+   just under the ~2 KB TOAST threshold, so it stays INLINE: a heap page holds ~4 rows instead of
+   ~35, and an aggregation over eighteen narrow columns reads 3.27 GB.
+   `migrations-usage/20260903000002_usage_event_query_covering_index.sql` adds a covering index
+   carrying exactly those eighteen columns keyed on `observed_at`. Measured on a 2M-row fixture
+   built to production's width (`.docker/it/seed-usage-perf-fixture.sql`):
+
+   | shape                       | before               | after (index-only scan) |
+   |-----------------------------|----------------------|-------------------------|
+   | estate-wide, 30 days        | 279,627 pg (2,185 MB) | 13,436 pg (105 MB)      |
+   | estate-wide, 7 days         |  57,951 pg (  453 MB) |  2,785 pg ( 22 MB)      |
+
+   A BRIN index on `observed_at` was measured as the alternative and left exactly as many pages to
+   read (279,627) -- it narrows which heap pages are visited, not how wide they are.
+3. **`percentile_cont` cannot be hash-aggregated.** Asking for latency percentiles forces the
+   planner out of a `HashAggregate` over a handful of groups and into a `GroupAggregate` fed by a
+   full `Sort`, which at `work_mem = 4MB` spills to disk. On the same fixture, with the covering
+   index, the identical query measured 222 ms with percentiles (`GroupAggregate` <- `Sort`,
+   32 MB to disk) and 130 ms without (`HashAggregate`, no sort at all). That is what the `metrics`
+   request field turns off.
+
+### The query, before and after
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as console
+    participant H as handlers::query
+    participant R as StoreRepo
+    participant PG as Postgres (usage_events)
+
+    rect rgb(245, 235, 235)
+    note over C,PG: BEFORE -- two statements, same WHERE, same rows
+    C->>H: POST /usage/v1/usage/query {scope:all, 30d, bucket:1 day}
+    H->>R: query_usage(input)
+    R->>PG: SELECT DISTINCT date_bin(...) ORDER BY ... DESC LIMIT n+1
+    PG-->>R: 21 bucket_start values (2,993 ms, 274 MB scanned + sort spill)
+    R->>PG: SELECT ... GROUP BY bucket_start WHERE date_bin(...) = ANY($kept)
+    PG-->>R: 21 rows (31,806 ms, 3,268 MB scanned + 60 MB sort spill)
+    R-->>H: (points, truncated)
+    end
+
+    rect rgb(235, 245, 235)
+    note over C,PG: AFTER -- one statement, one scan, index-only
+    C->>H: POST /usage/v1/usage/query {..., metrics:["totals"]}
+    H->>R: query_usage(input)
+    R->>PG: SELECT ... FROM (dense_rank() OVER (...) FROM (GROUP BY bucket_start) agg) ...
+    PG-->>R: 21 rows + truncated, one Index Only Scan over idx_usage_events_query_cover
+    R-->>H: (points, truncated)
+    H-->>C: {points, truncated, metrics:["totals"]}
+    end
+```
+
+A bucket's lifecycle through that single statement -- which is where the `truncated` contract
+lives, and where the states that used to be reachable only across two round trips now are not:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Matched: row passes observed_at range + scope + filters
+    Matched --> Aggregated: GROUP BY bucket_start (+ grouped dimensions)
+    Aggregated --> Ranked: dense_rank() OVER (ORDER BY bucket_start DESC)
+    Ranked --> Kept: bucket_rank <= limit
+    Ranked --> Dropped: bucket_rank > limit
+    Dropped --> [*]: sets truncated = true (max(bucket_rank) OVER () > limit)
+    Kept --> Returned: every series in the bucket, never a subset
+    Returned --> [*]
+
+    note right of Ranked
+        dense_rank(), not row_number():
+        every series row in a bucket shares
+        one rank, so a bucket is kept or
+        dropped WHOLE (#578).
+    end note
+    note right of Dropped
+        UNREACHABLE by design: a bucket that is
+        partially returned. There is no transition
+        from Ranked to "some rows kept, some dropped"
+        -- the filter is on the bucket's rank, not
+        on the row.
+    end note
+```
 
 ## Scope semantics
 
@@ -245,6 +361,12 @@ percentiles rather than a zero. See
 [`docs/lightbridge-query-api.md`](lightbridge-query-api.md)'s "Latency, and when it is legitimately
 absent" for the full source table and the honesty contract consumers are expected to honour.
 
+Since 2026-09-03 the three percentiles are computed by ONE multi-quantile
+`percentile_cont(ARRAY[0.5, 0.95, 0.99])` call rather than three separate ones (each ordered-set
+aggregate builds its own tuplesort, so the old form sorted the same latencies three times), and a
+caller that does not need them can say so with `"metrics": ["totals"]` -- see
+[Query cost](#query-cost-2026-09-03).
+
 ## Migrations
 
 Usage storage migrations are separate from authz migrations:
@@ -252,7 +374,15 @@ Usage storage migrations are separate from authz migrations:
 - `migrations-usage/`
 - migration module: `app/lightbridge-authz-usage/src/migrate.rs`
 
-The primary table is `usage_events` (hypertable when Timescale is available).
+The primary table is `usage_events`. Production is PLAIN POSTGRES: `SELECT count(*) FROM
+pg_extension WHERE extname = 'timescaledb'` is `0` on `lightbridge-main-db` (re-confirmed
+2026-09-03), so `usage_events` is an ordinary table there and nothing may depend on hypertable
+functions or continuous aggregates. `20260223000001`'s `create_hypertable` block is conditional on
+the extension being available and no-ops.
+
+`20260903000002_usage_event_query_covering_index.sql` adds `idx_usage_events_query_cover` -- see
+[Query cost](#query-cost-2026-09-03) for the measurements that justify it and for the BRIN
+alternative that was measured and rejected.
 
 #648's bridge is three files, in this order and for this reason: columns added
 nullable first (`20260902000001`, catalog-only, no rewrite), then the backfill

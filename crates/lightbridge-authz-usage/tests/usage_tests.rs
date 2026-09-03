@@ -76,6 +76,7 @@ fn base_request() -> UsageQueryRequest {
         filters: UsageQueryFilters::default(),
         group_by: vec![UsageGroupBy::Model],
         limit: 100,
+        metrics: None,
     }
 }
 

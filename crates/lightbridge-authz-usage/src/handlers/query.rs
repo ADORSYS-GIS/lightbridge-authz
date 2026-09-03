@@ -225,11 +225,18 @@ pub async fn query_usage(
         }
     }
 
+    // Captured BEFORE the query so the echo describes what was ASKED for, not what came back --
+    // a response with zero points still has to say whether percentiles were computed.
+    let metrics = input.effective_metrics();
     let (points, truncated) = state.repo.query_usage(&input).await?;
 
     Ok((
         StatusCode::OK,
-        Json(UsageQueryResponse { points, truncated }),
+        Json(UsageQueryResponse {
+            points,
+            truncated,
+            metrics,
+        }),
     )
         .into_response())
 }
