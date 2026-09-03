@@ -38,6 +38,11 @@ opentelemetry-otlp.workspace = true
 tracing-opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 
+[build-dependencies]
+# `build.rs` renders `SOURCE_DATE_EPOCH` as RFC 3339 (see `build_probe.rs`). Already in the
+# dependency graph as a normal dependency below, so this adds no new entry to `Cargo.lock`.
+chrono.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "sync"] }
 reqwest.workspace = true

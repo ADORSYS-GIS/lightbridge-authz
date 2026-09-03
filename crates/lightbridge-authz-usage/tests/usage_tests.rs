@@ -160,6 +160,49 @@ async fn build_query_router_serves_probes() {
     );
 }
 
+/// `GET /version` (#573) on BOTH usage listeners, each naming itself.
+///
+/// The two listeners are one process on two ports with different auth postures (#347), so they
+/// report as two distinct services: `authz-usage` (ingest) and `authz-usage-query` (mTLS query).
+/// A support engineer who has curl'd a port needs to know which one answered, and the compiled-in
+/// stamp is identical for both — only the `service` field distinguishes them.
+#[tokio::test]
+async fn both_listeners_serve_version_and_name_themselves() {
+    for (app, expected) in [
+        (usage_app(false), "authz-usage"),
+        (query_app(false), "authz-usage-query"),
+    ] {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "/version on {expected}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(info["service"].as_str(), Some(expected), "{info}");
+        for field in [
+            "version",
+            "gitSha",
+            "gitShortSha",
+            "rustcVersion",
+            "buildTime",
+        ] {
+            assert!(
+                info[field].as_str().is_some_and(|v| !v.is_empty()),
+                "`{field}` must be a non-empty string on {expected}: {info}"
+            );
+        }
+        assert!(info["gitDirty"].is_boolean(), "{info}");
+    }
+}
+
 #[tokio::test]
 async fn build_query_router_with_dev_cors_answers_preflight_with_any_origin() {
     let preflight = query_app(true)

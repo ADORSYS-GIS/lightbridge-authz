@@ -299,6 +299,69 @@ async fn health_probes_report_ok() {
     }
 }
 
+/// `GET /version` (#573) answers unauthenticated, names THIS listener, and carries every field the
+/// console's `/settings/info` screen renders.
+///
+/// Unauthenticated is the assertion that matters: this router is built with a bearer service, and
+/// the request below carries no token at all. `/version` sitting beside `/healthz` rather than
+/// behind the RBAC gate is a deliberate decision (see `probe_router`), so it needs a test that
+/// fails if someone later "tightens" it.
+#[tokio::test]
+async fn version_endpoint_is_unauthenticated_and_reports_the_api_service() {
+    let router = build_router(admin_bearer(), false);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        info["service"].as_str(),
+        Some("authz-api"),
+        "the api router must name itself, not the binary: {info}"
+    );
+    // Every compile-time field is present and non-empty. `build.rs` guarantees a value for each --
+    // the literal string "unknown" when neither git nor the environment could answer -- so an empty
+    // string here means the stamp did not make it into the binary at all.
+    for field in [
+        "version",
+        "gitSha",
+        "gitShortSha",
+        "gitCommitDate",
+        "rustcVersion",
+        "buildTime",
+    ] {
+        let value = info[field].as_str();
+        assert!(
+            value.is_some_and(|v| !v.is_empty()),
+            "`{field}` must be a non-empty string: {info}"
+        );
+    }
+    assert!(info["gitDirty"].is_boolean(), "gitDirty is a bool: {info}");
+    // The image fields are null OUTSIDE a container -- `cargo test` is exactly that case. Null, not
+    // an empty string and not a fabricated value: the console renders "unknown" from the absence.
+    for field in ["imageBuildSha", "imageTag", "imageBuildTime"] {
+        assert!(
+            info[field].is_null() || info[field].is_string(),
+            "`{field}` is nullable, never anything else: {info}"
+        );
+    }
+    assert_eq!(
+        info["gitShortSha"].as_str().unwrap().len().min(7),
+        info["gitShortSha"].as_str().unwrap().len(),
+        "the short sha is at most 7 characters: {info}"
+    );
+}
+
 #[tokio::test]
 async fn dev_cors_preflight_is_answered_with_permissive_headers() {
     let router = build_router(admin_bearer(), true);
@@ -584,6 +647,49 @@ async fn get_my_access_is_served_to_any_authenticated_caller_but_never_to_none()
     let (status, _) = rpc_call(
         router,
         "procedure.getMyAccess",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "`authenticated only` still means authenticated"
+    );
+}
+
+/// `getBuildInfo` (#573) is the second member of `AUTHENTICATED_ONLY_OP_IDS`, and behaves exactly
+/// like `getMyAccess` above: a caller holding zero permissions gets past the gate, an
+/// unauthenticated caller does not.
+///
+/// The asymmetry with `GET /version` — same data, no token needed there — is intentional and NOT a
+/// hole: `/version` is the operator/probe surface, this is the console's, and tightening the RPC
+/// transport to "authenticated" costs the console nothing (it is always signed in) while keeping
+/// the RPC surface's uniform "no token, no dispatch" rule intact.
+#[tokio::test]
+async fn get_build_info_is_served_to_any_authenticated_caller_but_never_to_none() {
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new().with("nobody", token_info("nobody-subject", PermissionSet::new())),
+    );
+    let router = build_router(bearer, false);
+    let (status, body) = rpc_call(
+        router.clone(),
+        "procedure.getBuildInfo",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        Some("nobody"),
+    )
+    .await;
+    assert!(
+        status != StatusCode::FORBIDDEN && status != StatusCode::UNAUTHORIZED,
+        "a caller with zero permissions must still be able to ask what build they are talking to; got {status}: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, _) = rpc_call(
+        router,
+        "procedure.getBuildInfo",
         Wire::Cbor,
         &json!({ "args": {} }),
         None,

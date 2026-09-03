@@ -1912,6 +1912,7 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
     let bare: Router = schema::axum::rpc_router(
         cdb,
         Procedures::new(
+            lightbridge_authz_rest::SERVICE_API,
             ctx.issuer.clone(),
             ctx.policy_store.clone(),
             ctx.refill_service.clone(),
@@ -5332,6 +5333,61 @@ async fn platform_role_grants_are_idempotent_listable_and_revoking_closes_sessio
     )
     .await;
     assert_eq!(json_body(&body)["entries"].as_array().unwrap().len(), 1);
+}
+
+/// `getBuildInfo` (#573) dispatches for a viewer and returns the running build's real stamp.
+///
+/// The hermetic sibling in `rpc_router_tests.rs` only proves the RBAC gate lets a zero-permission
+/// caller past; this one goes all the way through cratestack dispatch and asserts the payload the
+/// console's `/settings/info` screen actually deserializes — including that `service` names
+/// `authz-api` (the router under test here) and that the nullable image fields come back as null
+/// rather than empty strings when nothing is running in a container.
+#[tokio::test]
+async fn get_build_info_returns_the_running_builds_stamp_for_a_viewer() {
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with(
+        "viewer",
+        token_info(&format!("build-info-{}", cuid2()), viewer_perms()),
+    ));
+    let ctx = setup(bearer).await;
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "procedure.getBuildInfo",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        Some("viewer"),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "getBuildInfo must need no permission at all: {status}"
+    );
+    let info = json_body(&body);
+    assert_eq!(
+        info["service"].as_str(),
+        Some("authz-api"),
+        "the RPC answer names the same service `GET /version` does: {info}"
+    );
+    for field in [
+        "version",
+        "gitSha",
+        "gitShortSha",
+        "gitCommitDate",
+        "rustcVersion",
+        "buildTime",
+    ] {
+        assert!(
+            info[field].as_str().is_some_and(|v| !v.is_empty()),
+            "`{field}` must be a non-empty string (\"unknown\" when unresolvable, never blank): {info}"
+        );
+    }
+    assert!(info["gitDirty"].is_boolean(), "{info}");
+    for field in ["imageBuildSha", "imageTag", "imageBuildTime"] {
+        assert!(
+            info[field].is_null() || info[field].is_string(),
+            "`{field}` is nullable and never fabricated: {info}"
+        );
+    }
 }
 
 /// `getMyAccess` is allowed for ANY authenticated caller and returns the permission set the SERVER

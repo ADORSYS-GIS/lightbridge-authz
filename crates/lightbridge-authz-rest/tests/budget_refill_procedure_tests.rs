@@ -150,6 +150,7 @@ async fn procedures_and_ctx(
         Arc::new(UnavailableSpendReader),
     ));
     let procedures = Procedures::new(
+        lightbridge_authz_rest::SERVICE_API,
         issuer,
         policy_store,
         refill_service,

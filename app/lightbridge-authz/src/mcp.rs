@@ -45,6 +45,9 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// Service name reported by `GET /version` and the `service.build` startup log line (#573).
+pub const SERVICE_MCP: &str = "lightbridge-mcp";
+
 #[derive(Debug, Serialize, Deserialize)]
 struct RootResponse {
     status: String,
@@ -1908,6 +1911,7 @@ fn build_mcp_router(
             .route("/", get(root_handler))
             .route("/healthz", get(health_handler))
             .route("/healthz/startup", get(startup_handler))
+            .route("/version", get(|| version_handler(SERVICE_MCP)))
             .route(
                 "/.well-known/oauth-authorization-server",
                 get(move |headers: HeaderMap| {
@@ -2063,8 +2067,9 @@ pub async fn start_mcp_server(
 
     let signing_enabled = oauth2.is_self_signed();
     let issuance_enabled = oauth2.is_external();
+    lightbridge_authz_core::log_build_info(SERVICE_MCP);
     tracing::info!(
-        server = "lightbridge-mcp",
+        server = SERVICE_MCP,
         address = %api.address,
         port = api.port,
         oauth2_type = ?oauth2.oauth2_type,
@@ -2113,6 +2118,13 @@ async fn health_handler() -> StatusCode {
 
 async fn startup_handler() -> StatusCode {
     StatusCode::OK
+}
+
+/// `GET /version` (#573): the build stamp of the process answering, as JSON. Unauthenticated,
+/// sitting with the other public probes and outside the bearer-gated `/mcp` nest — same reasoning
+/// as `lightbridge-authz-rest`'s `probe_router`.
+async fn version_handler(service: &'static str) -> AxumJson<lightbridge_authz_core::BuildInfo> {
+    AxumJson(lightbridge_authz_core::build_info(service))
 }
 
 async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {

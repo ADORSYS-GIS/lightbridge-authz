@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait};
 use lightbridge_authz_core::{
     Error, Result, async_trait,
+    build_info::log_build_info,
     config::{Database, Oauth2},
     db::{DbPool, DbPoolTrait, is_database_ready},
     server::{dev_cors_enabled, serve_tls},
@@ -90,11 +91,34 @@ impl UsageRepoTrait for StoreRepo {
     }
 }
 
-fn health_routes(readiness_pool: Arc<dyn DbPoolTrait>) -> Router<Arc<UsageState>> {
+/// Service names reported by `GET /version` and the `service.build` startup log line (#573).
+///
+/// The usage binary binds TWO listeners on two ports (#347) with different auth postures, so they
+/// report as two distinct services: a support engineer asking "which one am I hitting?" gets an
+/// answer, rather than one ambiguous `authz-usage` for both.
+pub const SERVICE_USAGE_INGEST: &str = "authz-usage";
+/// See [`SERVICE_USAGE_INGEST`]. The mTLS-required query listener.
+pub const SERVICE_USAGE_QUERY: &str = "authz-usage-query";
+
+/// `GET /version` (#573): the build stamp of the process answering, as JSON.
+///
+/// Unauthenticated for the same reason `/healthz` is (see `lightbridge-authz-rest`'s
+/// `probe_router`): it names the running build and nothing else. On the ingest listener that
+/// matters more than elsewhere — that listener has no auth gate at all beyond being ClusterIP-only,
+/// and a version string is exactly the kind of non-secret an operator needs from it.
+async fn version_handler(service: &'static str) -> Json<lightbridge_authz_core::BuildInfo> {
+    Json(lightbridge_authz_core::build_info(service))
+}
+
+fn health_routes(
+    readiness_pool: Arc<dyn DbPoolTrait>,
+    service: &'static str,
+) -> Router<Arc<UsageState>> {
     Router::new()
         .route("/", get(root_handler))
         .route("/healthz", get(health_handler))
         .route("/healthz/startup", get(startup_handler))
+        .route("/version", get(move || version_handler(service)))
         .route(
             "/healthz/ready",
             get(move || {
@@ -115,7 +139,7 @@ pub fn build_ingest_router(
     readiness_pool: Arc<dyn DbPoolTrait>,
     dev_cors: bool,
 ) -> Router {
-    let router = health_routes(readiness_pool)
+    let router = health_routes(readiness_pool, SERVICE_USAGE_INGEST)
         .merge(
             SwaggerUi::new("/usage/v1/usage/docs")
                 .url("/usage/v1/usage/openapi.json", UsageDoc::openapi()),
@@ -140,7 +164,7 @@ pub fn build_query_router(
     readiness_pool: Arc<dyn DbPoolTrait>,
     dev_cors: bool,
 ) -> Router {
-    let router = health_routes(readiness_pool)
+    let router = health_routes(readiness_pool, SERVICE_USAGE_QUERY)
         .merge(routers::query_router())
         .with_state(state);
 
@@ -185,6 +209,8 @@ pub async fn start_usage_server(
     let ingest_app = build_ingest_router(state.clone(), pool.clone(), dev_cors);
     let query_app = build_query_router(state, pool, dev_cors);
 
+    log_build_info(SERVICE_USAGE_INGEST);
+    log_build_info(SERVICE_USAGE_QUERY);
     info!(
         "starting usage ingest listener on {}:{}",
         &usage.address, usage.port

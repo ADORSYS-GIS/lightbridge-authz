@@ -2069,6 +2069,50 @@ procedure getMyAccess(args: GetMyAccessInput): MyAccess
   @allow(auth() != null && auth().rpcScope == "crud")
 
 // ---------------------------------------------------------------------------------------------
+// getBuildInfo (#573): what backend build the caller is actually talking to.
+//
+// The console's `/settings/info` screen reports its OWN package version and build SHA but, until
+// this landed, could say nothing about the backend on the other end of the wire -- so a "console
+// says X, server does Y" bug had no diagnostic surface at all. Now every service reports the same
+// stamp on two transports: this procedure (over the RPC client the console already holds), and an
+// unauthenticated `GET /version` on every listener (for probes, operators, and anything without a
+// token). Both read `lightbridge_authz_core::build_info`, so they cannot disagree.
+//
+// `imageBuildSha`/`imageTag`/`imageBuildTime` are nullable BECAUSE they are genuinely unknown
+// outside a container built by our pipeline (a local `cargo run`, a test): null is the honest
+// answer, and the console renders it as unknown rather than inventing a value. The non-nullable
+// fields carry the literal string "unknown" in the same situation -- see `build_probe.rs`.
+type GetBuildInfoInput {
+}
+
+type ServerBuildInfo {
+  // Which listener answered: authz-api, authz-idp, authz-opa, authz-budget, authz-usage,
+  // authz-usage-query or lightbridge-mcp. One binary serves several of these, so the router that
+  // handled the call is the only thing that can name it.
+  service String
+  // The workspace crate version (release-please owns this number).
+  version String
+  gitSha String
+  gitShortSha String
+  gitCommitDate String
+  gitDirty Boolean
+  rustcVersion String
+  buildTime String
+  imageBuildSha String?
+  imageTag String?
+  imageBuildTime String?
+}
+
+// Allowed for ANY authenticated caller, exactly like `getMyAccess` above and for the same reason:
+// it is listed in `rpc_permission_map::AUTHENTICATED_ONLY_OP_IDS`, the enumerated exception to the
+// fail-closed "unmapped op-id is denied" rule. Gating it behind a permission would mean the one
+// screen whose whole job is "what am I running and what am I talking to" could not answer its own
+// question for most users -- and there is nothing to gate: the same values are served
+// unauthenticated at `GET /version`. A version string is not a secret.
+procedure getBuildInfo(args: GetBuildInfoInput): ServerBuildInfo
+  @allow(auth() != null && auth().rpcScope == "crud")
+
+// ---------------------------------------------------------------------------------------------
 // Sessions: the read + per-session revoke half of ADR-0020 (Follow-up 4, #649).
 //
 // `sessions` has been a revocable table since #440/#441, but nothing could ENUMERATE it -- only

@@ -37,6 +37,8 @@ async fn main() -> Result<()> {
         Some(Commands::Migrate { config_path }) => Some(config_path),
         Some(Commands::Rbac { config_path, .. }) => Some(config_path),
         Some(Commands::Config { config_path }) => Some(config_path),
+        // `version` reads no config on purpose -- see the subcommand's doc comment.
+        Some(Commands::Version) => None,
         None => None,
     };
 
@@ -182,6 +184,20 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Config { config_path }) => {
             let _ = load_from_path(&config_path)?;
+            Ok(())
+        }
+        Some(Commands::Version) => {
+            // Printed to stdout, not logged: this is the command's OUTPUT, and a caller piping it
+            // into `jq` must not have a tracing prefix or a banner in the way.
+            let info = lightbridge_authz_core::build_info(crate::utils::cli::SERVICE_CLI);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&info).map_err(|e| {
+                    lightbridge_authz_core::Error::Server(format!(
+                        "failed to serialize build info: {e}"
+                    ))
+                })?
+            );
             Ok(())
         }
         None => {
