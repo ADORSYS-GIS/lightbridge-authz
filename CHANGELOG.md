@@ -1,5 +1,37 @@
 # Changelog
 
+## [10.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v9.0.0...v10.0.0) (2026-09-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* **chart:** one sharedConfig object instead of five copies of config.yaml ([#662](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/662))
+
+### Features
+
+* **authz:** admin identity resolution RPCs behind a new `user:read` permission ([#655](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/655)) ([14cc374](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/14cc374931a80a8c4a9c7d3891769da966e6dfb5)), closes [#647](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/647)
+* **authz:** platform roles are a table, stamped at mint ([#650](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/650)) ([#656](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/656)) ([a7b4fbc](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/a7b4fbc4c43b7328a2b00d7a053de3a120a0735c))
+* **authz:** readable, paged sessions plus a per-session revoke ([#649](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/649)) ([#657](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/657)) ([c3a3b6a](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/c3a3b6aaf3422af743cab5eb3013b3fd91be3c93))
+* **bearer:** oauth2.jwks_ca_bundle_path, so JWKS can be fetched in-cluster ([#625](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/625)) ([#642](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/642)) ([1d7623c](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/1d7623ca3a27a90fa0d808ba0d1e90752104dbc9))
+* **budget:** persist the requester on budget refill requests ([#654](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/654)) ([6c0fc32](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/6c0fc323641d31adf5ef5eebb6b70656fe6fcd3c)), closes [#646](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/646)
+* **budget:** reset schedules — table, replica-safe scheduler, dry-run RPCs ([#653](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/653)) ([7addf8e](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/7addf8e8ecb6a5119402b8974dde39b89ed2d1f0)), closes [#651](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/651)
+* **chart:** one sharedConfig object instead of five copies of config.yaml ([#662](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/662)) ([005c634](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/005c634c707544fba4f5d8ac630429266c0842d1)), closes [#661](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/661)
+* **idp:** add jwk {list,new,rotate} signing-key management subcommand ([#634](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/634)) ([2140be0](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/2140be0e2fbae7b1b31ac2d0cdb2e047a869beeb))
+* **idp:** per-client refresh TTLs, refusal-reason logging, global cap validation ([#637](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/637)) ([4a83a58](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/4a83a58fef90200eabcece0502b9cad9a22394f2))
+* **usage:** bridge azp, operation and billing_plan onto usage_events ([#652](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/652)) ([8019375](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/801937553d0bdee91e2084f59b1cb5b1b9015e2c)), closes [#648](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/648)
+
+
+### Bug Fixes
+
+* **authz:** browser sessions record the client that started the login ([#659](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/659)) ([6cb3869](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/6cb38691dadcced6ea6d2ac96fb59c7c0b75e163))
+
+
+### Documentation
+
+* **adr:** ADR-0031 -- migrations run in init containers, backward-compatible for one release ([#632](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/632)) ([23b6144](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/23b61442f4ad5986d8b6e772edddd858f395fea1))
+* **auth-flows:** add the refresh-token lifecycle as a state machine (§3a) ([#635](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/635)) ([c2a71b6](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/c2a71b6cad7655d37e386b5736f394d6055329bd))
+* **runbooks:** signing-key management via `idp jwk` ([#636](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/636)) ([7eb58b6](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/7eb58b6f42025af80a44efcd267872e5d8872f7e))
+
 ## [9.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v8.0.0...v9.0.0) (2026-09-02)
 
 
