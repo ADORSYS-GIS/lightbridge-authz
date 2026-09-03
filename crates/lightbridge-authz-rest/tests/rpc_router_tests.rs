@@ -528,23 +528,22 @@ async fn rbac_gate_denies_viewer_on_every_mutating_op() {
     }
 }
 
-/// #647's negative half: the three estate-wide identity-resolution op-ids are refused for a caller
+/// #647's negative half: the two estate-wide identity-resolution op-ids are refused for a caller
 /// holding EVERY other permission but not `user:read`. Stated as "admin minus one" rather than
 /// "viewer" deliberately — the interesting failure would be `user:read` being implied by some
 /// broader grant (`account:read`, say), and a viewer token could not tell that apart from an
 /// ordinary read-only denial. The gate runs before dispatch, so this needs no DB: nothing is
 /// returned, not even an empty result set.
+///
+/// `resolveActorLabels` is deliberately NOT in this list any more — see
+/// `resolve_actor_labels_passes_the_gate_for_anyone_and_refuses_admin_kinds_in_the_handler` below.
 #[tokio::test]
 async fn rbac_gate_denies_identity_resolution_without_user_read() {
     let almost_admin: PermissionSet = Permission::ALL
         .into_iter()
         .filter(|p| *p != Permission::UserRead)
         .collect();
-    for op in [
-        "procedure.resolveUserProfiles",
-        "procedure.resolveActorLabels",
-        "procedure.searchUsers",
-    ] {
+    for op in ["procedure.resolveUserProfiles", "procedure.searchUsers"] {
         let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
             MapBearer::new().with("almost", token_info("almost-subject", almost_admin.clone())),
         );
@@ -556,6 +555,59 @@ async fn rbac_gate_denies_identity_resolution_without_user_read() {
             "`{op}` must require user:read, and no other permission may stand in for it"
         );
     }
+}
+
+/// `resolveActorLabels` moved from `user:read` to `AUTHENTICATED_ONLY_OP_IDS` (owner feedback
+/// 2026-09-03) so that an ordinary member's "Spend by API key" panel can name its rows. This pins
+/// the two halves of that move at the transport, without a database:
+///
+///  1. the coarse gate no longer refuses a caller who holds NOTHING — the `403` a permission-mapped
+///     op-id produces before dispatch is gone;
+///  2. the `user:read` requirement did not evaporate with it: a call that asks for the three
+///     estate-wide kinds is still refused, now by the handler, with a `403` that names the reason.
+///
+/// The positive half — an `apiKeyIds`-only call actually returning names, row-scoped — needs real
+/// rows and lives in `rpc_it_tests.rs`.
+#[tokio::test]
+async fn resolve_actor_labels_passes_the_gate_for_anyone_and_refuses_admin_kinds_in_the_handler() {
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new().with("nobody", token_info("nobody-subject", PermissionSet::new())),
+    );
+    let router = build_router(bearer, false);
+
+    let (status, body) = rpc_call(
+        router.clone(),
+        "procedure.resolveActorLabels",
+        Wire::Cbor,
+        &json!({ "args": {
+            "userIds": ["some-user"],
+            "accountIds": [],
+            "projectIds": [],
+            "apiKeyIds": [],
+        } }),
+        Some("nobody"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "asking for the estate-wide kinds without user:read must still be refused: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, _) = rpc_call(
+        router,
+        "procedure.resolveActorLabels",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "`authenticated only` still means authenticated"
+    );
 }
 
 /// ADR-0033's negative half: the three `platform_role_grants` op-ids are refused for a caller

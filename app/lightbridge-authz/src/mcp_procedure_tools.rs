@@ -42,8 +42,11 @@ procedure_tools! {
     // --- Identity resolution (#647, crud) ------------------------------------------------------
     "resolve-user-profiles" => resolve_user_profiles,
         "Batch-resolve account ids to display profiles";
+    // Authenticated-only, not `user:read`: its `apiKeyIds` kind is row-scoped through `ApiKey`'s
+    // own read policy, and the other three still refuse a caller without `user:read` in the
+    // handler. `mcp_rbac` derives the gate from `required_permission`, so this needs no entry.
     "resolve-actor-labels" => resolve_actor_labels,
-        "Batch-resolve actor ids to audit-trail display labels";
+        "Batch-resolve user/account/project/API-key ids to display labels";
     "search-users" => search_users,
         "Search the estate's users by name or email";
 

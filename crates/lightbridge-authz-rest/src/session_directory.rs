@@ -44,21 +44,13 @@ use crate::session_query::{
     STATUS_ACTIVE, STATUS_REVOKED, SessionCursor, SessionStatusFilter, decode_cursor,
     encode_cursor, parse_status_filter, resolve_limit, to_schema_session_row,
 };
-use crate::{subject_from_ctx, to_cratestack_error};
+use crate::{has_permission, subject_from_ctx, to_cratestack_error};
 
 /// The caller's own subject, or `Unauthorized`. The `@allow` clause already asserts
 /// `auth() != null`; this is defence in depth against a context carrying no subject, matching
 /// every other procedure in `lib.rs`.
 fn require_subject(ctx: &CratestackContext) -> Result<String, CratestackError> {
     subject_from_ctx(ctx).ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))
-}
-
-/// Whether the caller holds a given permission, read back out of the auth context
-/// `CratestackAuthProvider` populated once at authentication time (one boolean per
-/// `Permission::ALL` variant — see `auth_provider.rs`). Absent or non-boolean reads as `false`:
-/// unknown is not a default, it routes to the strictest branch.
-fn has_permission(ctx: &CratestackContext, field: &str) -> bool {
-    matches!(ctx.auth_field(field), Some(cratestack::Value::Bool(true)))
 }
 
 /// `querySessions`: one policy-scoped page, annotated with the two facts the row cannot answer.

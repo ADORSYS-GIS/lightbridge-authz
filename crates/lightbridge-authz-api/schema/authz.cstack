@@ -1889,10 +1889,22 @@ procedure resolveUserProfiles(args: ResolveUserProfilesInput): UserProfiles
 // returns; accounts and projects carry only what a label needs plus the edge back to their owner
 // (`ownerUserId`) / account (`accountId`), so a console can chain a lens without a second call.
 //
-// All three lists are REQUIRED and may be empty (cratestack's `TypeArity` has no "optional list"
+// All FOUR lists are REQUIRED and may be empty (cratestack's `TypeArity` has no "optional list"
 // -- a field is exactly one of required/optional/list), so a caller resolving only accounts sends
-// `{ userIds: [], accountIds: [...], projectIds: [] }`. Each list is capped at 200 independently,
-// same reject-don't-truncate contract as above.
+// `{ userIds: [], accountIds: [...], projectIds: [], apiKeyIds: [] }`. Each list is capped at 200
+// independently, same reject-don't-truncate contract as above.
+//
+// `apiKeyIds` is the ONE kind that is not admin-only, and it is why this procedure's `@allow` is
+// bare `auth() != null` where its two siblings still carry `permUserRead` (lightbridge-authz#647,
+// owner feedback 2026-09-03: "can we use names on the 'Spend by API key' panel? API keys do have
+// names"). A key's name is not estate-wide PII: it is a label the caller's OWN project already
+// shows them on `/settings/api-keys`, and the panel that needs it is a per-account spend breakdown
+// nobody holding `user:read` is required to read. So the per-kind authorization moved INTO the
+// handler (`identity_directory.rs` + `actor_api_key_labels.rs`): `userIds`/`accountIds`/
+// `projectIds` still REFUSE a caller without `user:read`, and `apiKeyIds` is row-scoped through
+// `ApiKey`'s own `@@allow("read", ...)` clause for everyone else. Do not "simplify" this back to a
+// single coarse gate -- doing so either re-hides key names from ordinary members or hands them the
+// estate-wide identity surface.
 type ActorUserLabel {
   userId String
   displayName String?
@@ -1914,20 +1926,41 @@ type ActorProjectLabel {
   accountId String
 }
 
+// An API key's label plus BOTH edges up the tree, so a spend panel can name the key and still say
+// which project and account it belongs to without a second lookup.
+//
+// `name` is NOT NULL on `api_keys` (since `20260203000001_init_authz.sql`), so it is not optional
+// -- an unresolvable id is ABSENT from the list, never present with a null name.
+//
+// `revoked` is DERIVED, not a column: `revoked_at IS NOT NULL OR status <> 'active'`. A label
+// carries it because a spend row for a key that no longer works reads as a live cost centre
+// otherwise, and the console renders the key's name plus "(revoked)" rather than inventing a
+// second sentinel. It is deliberately coarse -- "this key cannot be used any more", not a
+// four-valued lifecycle -- because that is the only distinction a label needs to draw.
+type ActorApiKeyLabel {
+  apiKeyId String
+  name String
+  projectId String
+  accountId String
+  revoked Boolean
+}
+
 type ResolveActorLabelsInput {
   userIds String[]
   accountIds String[]
   projectIds String[]
+  apiKeyIds String[]
 }
 
 type ActorLabels {
   users ActorUserLabel[]
   accounts ActorAccountLabel[]
   projects ActorProjectLabel[]
+  apiKeys ActorApiKeyLabel[]
 }
 
 procedure resolveActorLabels(args: ResolveActorLabelsInput): ActorLabels
-  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permUserRead == true)
+  @allow(auth() != null && auth().rpcScope == "crud")
 
 // Bounded free-text user search over `federated_identities`' three display columns
 // (`name`, `email`, `preferred_username`), case-insensitively, prefix-or-substring. `query` must

@@ -30,7 +30,7 @@
   "crates/lightbridge-authz-rest/src/oauth2_op/store.rs": 2213,
   "crates/lightbridge-authz-rest/src/relying_party.rs": 1461,
   "crates/lightbridge-authz-rest/src/rpc_authorize.rs": 788,
-  "crates/lightbridge-authz-rest/src/rpc_permission_map.rs": 204,
+  "crates/lightbridge-authz-rest/src/rpc_permission_map.rs": 216,
   "crates/lightbridge-authz-rest/src/signing.rs": 1105,
   "crates/lightbridge-authz-rest/src/static_assets.rs": 269,
   "crates/lightbridge-authz-rest/src/token_exchange.rs": 1284,

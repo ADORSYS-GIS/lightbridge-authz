@@ -9,13 +9,21 @@
 //!
 //! # What the schema policy does and does not do here
 //!
-//! Each procedure's `@allow` in `authz.cstack` is the generated coarse gate —
-//! `auth() != null && auth().rpcScope == "crud" && auth().permUserRead == true` — so a caller
-//! without `user:read` is refused before any of this runs, on the unary path by
+//! `resolveUserProfiles`' and `searchUsers`' `@allow` in `authz.cstack` is the generated coarse
+//! gate — `auth() != null && auth().rpcScope == "crud" && auth().permUserRead == true` — so a
+//! caller without `user:read` is refused before either runs, on the unary path by
 //! `rpc_authorize`'s middleware and on the `/rpc/batch` path by cratestack's own per-frame policy
-//! evaluation. That gate is the WHOLE authorization story for these three: the SQL underneath
+//! evaluation. That gate is the WHOLE authorization story for those two: the SQL underneath
 //! applies no ownership filter whatsoever, which is exactly what "estate-wide admin labels"
 //! means. There is deliberately no per-tenant second check to add.
+//!
+//! `resolveActorLabels` is the exception, and [`require_user_read_for_admin_kinds`] below is why.
+//! Since the owner's 2026-09-03 feedback it also answers `apiKeyIds`, a kind that is NOT
+//! admin-only and is row-scoped through `ApiKey`'s own `@@allow("read", …)` clause
+//! (`actor_api_key_labels.rs`). A coarse op-id/`@allow` gate cannot say "these three lists need a
+//! permission, that one needs a row check", so its clause is bare `auth() != null` and the
+//! `user:read` requirement for the other three kinds is enforced HERE — moved, not dropped. The
+//! op-id moved to `AUTHENTICATED_ONLY_OP_IDS` in the same change; see that constant.
 //!
 //! # Never fabricate an identity
 //!
@@ -27,6 +35,7 @@ use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::entities::identity_label_row::UserProfileRow;
 use lightbridge_authz_api_key::repo::StoreRepo;
 
+use crate::actor_api_key_labels::{resolve_api_key_labels, resolves_labels_estate_wide};
 use crate::{subject_from_ctx, to_cratestack_error};
 
 /// Every procedure here requires an authenticated caller. The `@allow` clause already asserts
@@ -63,18 +72,48 @@ pub(crate) async fn resolve_user_profiles(
     })
 }
 
-/// `resolveActorLabels`: one call, three kinds, one query per kind.
+/// The three ESTATE-WIDE kinds still require `user:read`, and say so rather than answering empty.
 ///
-/// The three queries run sequentially rather than concurrently: they hit the same pool, each is a
-/// single indexed `= ANY($1)` lookup capped at 200 ids, and `join!`-ing them would buy three
-/// round trips' latency at the cost of holding three pool connections per call. Sequential is the
+/// Silently returning `[]` for a caller who may not ask would be the one confusion this whole
+/// surface exists to prevent: an empty list already means "no row for that id", so reusing it for
+/// "you may not ask" would make an unknown id and a forbidden one indistinguishable. `apiKeyIds`
+/// is different and empties on purpose — see `actor_api_key_labels.rs`'s own doc comment: there,
+/// absence is a ROW-level fact about ids the caller has no relationship with, and a refusal would
+/// leak that the id exists.
+///
+/// The check is skipped entirely when all three lists are empty, so an `apiKeyIds`-only call —
+/// which is exactly what an ordinary member's spend panel sends — is served rather than refused.
+fn require_user_read_for_admin_kinds(
+    ctx: &CratestackContext,
+    args: &schema::ResolveActorLabelsInput,
+) -> Result<(), CratestackError> {
+    let asks_admin_kinds =
+        !args.userIds.is_empty() || !args.accountIds.is_empty() || !args.projectIds.is_empty();
+    if asks_admin_kinds && !resolves_labels_estate_wide(ctx) {
+        return Err(CratestackError::Forbidden(
+            "userIds, accountIds and projectIds require the user:read permission; apiKeyIds does              not — send only apiKeyIds"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// `resolveActorLabels`: one call, four kinds, one query per kind (two for `apiKeyIds` on the
+/// row-scoped path).
+///
+/// The queries run sequentially rather than concurrently: they hit the same pool, each is a
+/// single indexed `= ANY($1)` lookup capped at 200 ids, and `join!`-ing them would buy the round
+/// trips' latency at the cost of holding a pool connection per kind per call. Sequential is the
 /// right trade at this size; revisit only with a measurement.
 pub(crate) async fn resolve_actor_labels(
+    db: &schema::Cratestack,
     repo: &StoreRepo,
     ctx: &CratestackContext,
     args: schema::ResolveActorLabelsInput,
 ) -> Result<schema::ActorLabels, CratestackError> {
     require_subject(ctx)?;
+    require_user_read_for_admin_kinds(ctx, &args)?;
+    let api_keys = resolve_api_key_labels(db, repo, ctx, &args.apiKeyIds).await?;
     let users = repo
         .resolve_user_profiles(&args.userIds)
         .await
@@ -116,6 +155,7 @@ pub(crate) async fn resolve_actor_labels(
                 accountId: row.account_id,
             })
             .collect(),
+        apiKeys: api_keys,
     })
 }
 
