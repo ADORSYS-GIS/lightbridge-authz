@@ -19,6 +19,7 @@ pub mod policy_store;
 pub mod refill;
 pub mod repo;
 pub mod reset_schedule;
+pub mod reset_schedule_validate;
 pub mod reset_scheduler;
 pub mod review;
 pub mod rule_data;

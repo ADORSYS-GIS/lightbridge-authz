@@ -775,6 +775,7 @@ async fn create_is_always_disabled_with_a_future_window(pool: PgPool) {
                 run_at_utc: midnight_time(),
                 amount_micros: 2_000_000,
                 mode: ResetMode::Reset,
+                next_run_at: None,
             },
             Some("admin-subject"),
             now,
@@ -831,6 +832,7 @@ async fn create_rejects_a_schedule_the_scheduler_could_never_execute(pool: PgPoo
         run_at_utc: midnight_time(),
         amount_micros: 2_000_000,
         mode: ResetMode::Reset,
+        next_run_at: None,
     };
 
     // A global schedule may not carry a target.
@@ -885,4 +887,219 @@ async fn a_disabled_schedule_is_never_claimed(pool: PgPool) {
     let report = scheduler.tick(at(9, 0, 0)).await.unwrap();
     assert!(report.claimed_schedule_ids.is_empty());
     assert_eq!(grant_count(&pool).await, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Forcing the next execution onto a specific date (the ADR-0032 "forced next execution"
+// amendment). A forced window is a one-off: it fires once, then the schedule is back on its own
+// cadence grid at its own `run_at_utc`.
+// ---------------------------------------------------------------------------------------------
+
+/// A caller-supplied `next_run_at` is stored verbatim instead of the cadence's own first window,
+/// and the row is STILL created disabled — forcing a date does not skip the dry-run gate.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_honours_a_forced_next_run_at(pool: PgPool) {
+    let core: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
+    let repo = ResetScheduleRepo::new(core);
+    let now = at(2, 6, 0);
+    let forced = at(15, 9, 30);
+
+    let created = repo
+        .create(
+            NewBudgetResetSchedule {
+                name: "reset to $2 daily, first run on the 15th".to_string(),
+                scope_kind: ScheduleScopeKind::Global,
+                scope_id: None,
+                cadence: Cadence::Daily,
+                anchor: None,
+                run_at_utc: midnight_time(),
+                amount_micros: 2_000_000,
+                mode: ResetMode::Reset,
+                next_run_at: Some(forced),
+            },
+            Some("admin-subject"),
+            now,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        created.next_run_at, forced,
+        "a forced window is stored verbatim, not rounded onto the cadence grid"
+    );
+    assert!(
+        !created.enabled,
+        "forcing a date must not bypass the create-disabled rule (ADR-0032 D8)"
+    );
+}
+
+/// A backdated window would fire on the very next 60-second tick, across the whole estate, before
+/// anyone had dry-run it. Both `create` and `update` refuse it with a legible message (a 400).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_next_run_at_in_the_past_is_refused(pool: PgPool) {
+    let core: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
+    let repo = ResetScheduleRepo::new(core);
+    let now = at(10, 6, 0);
+
+    let base = NewBudgetResetSchedule {
+        name: "backdated".to_string(),
+        scope_kind: ScheduleScopeKind::Global,
+        scope_id: None,
+        cadence: Cadence::Daily,
+        anchor: None,
+        run_at_utc: midnight_time(),
+        amount_micros: 2_000_000,
+        mode: ResetMode::Reset,
+        next_run_at: Some(at(1, 0, 0)),
+    };
+
+    let err = repo.create(base.clone(), None, now).await.unwrap_err();
+    assert!(
+        matches!(&err, BudgetError::InvalidSchedule(m) if m.contains("must be in the future")),
+        "expected a legible InvalidSchedule, got: {err}"
+    );
+
+    // `now` itself is not the future either.
+    let mut exactly_now = base.clone();
+    exactly_now.next_run_at = Some(now);
+    assert!(matches!(
+        repo.create(exactly_now, None, now).await,
+        Err(BudgetError::InvalidSchedule(_))
+    ));
+
+    // The same guard on the update path.
+    let mut ok = base;
+    ok.next_run_at = None;
+    let created = repo.create(ok, None, now).await.unwrap();
+    let err = repo
+        .update(
+            &created.id,
+            BudgetResetScheduleUpdate {
+                next_run_at: Some(at(1, 0, 0)),
+                ..Default::default()
+            },
+            now,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BudgetError::InvalidSchedule(_)));
+    assert_eq!(
+        repo.get(&created.id).await.unwrap().next_run_at,
+        created.next_run_at,
+        "a refused update must not have moved the window"
+    );
+}
+
+/// An update that omits `next_run_at` leaves the column alone — including a forced one. Only a
+/// cadence/anchor/run-time change re-seeds it, exactly as before this amendment.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_update_without_next_run_at_leaves_a_forced_window_alone(pool: PgPool) {
+    let core: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
+    let repo = ResetScheduleRepo::new(core);
+    let now = at(2, 6, 0);
+    let forced = at(15, 9, 30);
+
+    let created = repo
+        .create(
+            NewBudgetResetSchedule {
+                name: "forced".to_string(),
+                scope_kind: ScheduleScopeKind::Global,
+                scope_id: None,
+                cadence: Cadence::Daily,
+                anchor: None,
+                run_at_utc: midnight_time(),
+                amount_micros: 2_000_000,
+                mode: ResetMode::Reset,
+                next_run_at: Some(forced),
+            },
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+
+    // Renaming, re-pricing and enabling all leave the forced window untouched.
+    let updated = repo
+        .update(
+            &created.id,
+            BudgetResetScheduleUpdate {
+                name: Some("forced, renamed".to_string()),
+                amount_micros: Some(3_000_000),
+                enabled: Some(true),
+                ..Default::default()
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.next_run_at, forced);
+
+    // Changing the cadence DOES re-seed it, per ADR-0032 — a forced daily window must not survive
+    // into a weekly schedule.
+    let reseeded = repo
+        .update(
+            &created.id,
+            BudgetResetScheduleUpdate {
+                cadence: Some(Cadence::Weekly),
+                anchor: Some(Some(1)),
+                ..Default::default()
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    assert_ne!(reseeded.next_run_at, forced);
+    assert_eq!(
+        reseeded.next_run_at,
+        at(7, 0, 0),
+        "the next Monday at 00:00"
+    );
+}
+
+/// The advance-after-a-forced-run contract: a daily schedule forced onto 2026-09-15 fires there
+/// once, then next fires on 09-16 at its own `run_at_utc` (00:00) — NOT 24 hours after the forced
+/// instant's time of day.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_forced_window_fires_once_then_returns_to_the_cadence_grid(pool: PgPool) {
+    let account = cuid2();
+    insert_account(&pool, &account).await;
+    let (_core, _repo, scheduler) = scheduler(&pool, MapSpendReader::default());
+
+    // `seed_schedule` writes a daily/00:00 schedule; force its window onto the 15th at 09:30.
+    let forced = at(15, 9, 30);
+    let schedule_id = seed_schedule(
+        &pool,
+        "daily top-up, forced onto the 15th",
+        ScheduleScopeKind::Account,
+        Some(&account),
+        ResetMode::TopUp,
+        5_000_000,
+        forced,
+        true,
+    )
+    .await;
+
+    // Not due yet: a tick before the forced instant claims nothing.
+    let report = scheduler.tick(at(15, 9, 0)).await.unwrap();
+    assert!(report.claimed_schedule_ids.is_empty());
+    assert_eq!(grant_count(&pool).await, 0);
+
+    // The tick that wakes just after the forced instant fires it once...
+    let report = scheduler
+        .tick(forced + chrono::Duration::seconds(10))
+        .await
+        .unwrap();
+    assert_eq!(report.claimed_schedule_ids, vec![schedule_id.clone()]);
+    assert_eq!(grant_count(&pool).await, 1);
+
+    // ...and the schedule is back on its own grid: 09-16 at 00:00, its `run_at_utc`.
+    let (next_run_at, last_run_at) = schedule_timing(&pool, &schedule_id).await;
+    assert_eq!(next_run_at, at(16, 0, 0));
+    assert!(last_run_at.is_some());
+
+    // And it keeps stepping on the grid from there.
+    let report = scheduler.tick(at(16, 0, 30)).await.unwrap();
+    assert_eq!(report.claimed_schedule_ids, vec![schedule_id.clone()]);
+    let (next_run_at, _) = schedule_timing(&pool, &schedule_id).await;
+    assert_eq!(next_run_at, at(17, 0, 0));
 }

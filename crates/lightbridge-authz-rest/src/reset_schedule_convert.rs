@@ -7,6 +7,8 @@
 use cratestack::CratestackError;
 use lightbridge_authz_api::schema;
 
+use crate::error_convert::budget_error_to_cratestack_error;
+
 /// Maps a domain [`lightbridge_authz_budget::BudgetResetSchedule`] into the schema's wire
 /// `BudgetResetSchedule` shape (ADR-0032). `scopeKind`/`cadence`/`mode` carry the exact strings
 /// their Rust enums' `Display` impls render -- the same wire-string-as-`String` choice
@@ -31,6 +33,26 @@ pub(crate) fn to_schema_budget_reset_schedule(
         createdBy: schedule.created_by,
         createdAt: schedule.created_at,
         updatedAt: schedule.updated_at,
+    }
+}
+
+/// The time of day a reset schedule fires when `createBudgetResetSchedule` omits `runAtUtc`,
+/// matching the column's own `DEFAULT '00:00'`. Always UTC.
+const DEFAULT_RESET_SCHEDULE_RUN_AT_UTC: chrono::NaiveTime =
+    match chrono::NaiveTime::from_hms_opt(0, 0, 0) {
+        Some(time) => time,
+        None => unreachable!(),
+    };
+
+/// Parses the wire `runAtUtc` (`HH:MM`, always UTC), falling back to the column's own default when
+/// the caller omitted it. A malformed value is a 400 naming the offending string, never a 500.
+pub(crate) fn parse_run_at_or_default(
+    raw: Option<&str>,
+) -> std::result::Result<chrono::NaiveTime, CratestackError> {
+    match raw {
+        Some(raw) => lightbridge_authz_budget::parse_run_at_utc(raw)
+            .map_err(budget_error_to_cratestack_error),
+        None => Ok(DEFAULT_RESET_SCHEDULE_RUN_AT_UTC),
     }
 }
 

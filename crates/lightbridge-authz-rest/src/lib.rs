@@ -55,8 +55,8 @@ use handlers::AuthzStoreImpl;
 use lightbridge_authz_core::platform_role::known_platform_roles;
 use ratelimit_redis::build_redis_rate_limit_store;
 use reset_schedule_convert::{
-    parse_amount_micros, parse_schedule_anchor, to_schema_budget_reset_schedule,
-    to_schema_reset_schedule_run_result,
+    parse_amount_micros, parse_run_at_or_default, parse_schedule_anchor,
+    to_schema_budget_reset_schedule, to_schema_reset_schedule_run_result,
 };
 use routers::opa_router;
 use rpc_authorize::{RpcAuthorizeState, RpcScope};
@@ -95,14 +95,6 @@ const BUDGET_POLICY_SET_ID: &str = "budget-refill";
 /// comfortably fine-grained for a domain whose finest cadence is daily, and coarse enough that an
 /// idle deployment's scheduler costs one indexed `SELECT` a minute.
 const RESET_SCHEDULER_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// The time of day a reset schedule fires when `createBudgetResetSchedule` omits `runAtUtc`,
-/// matching the column's own `DEFAULT '00:00'`. Always UTC.
-const DEFAULT_RESET_SCHEDULE_RUN_AT_UTC: chrono::NaiveTime =
-    match chrono::NaiveTime::from_hms_opt(0, 0, 0) {
-        Some(time) => time,
-        None => unreachable!(),
-    };
 
 /// Service names reported by `GET /version` and the `service.build` startup log line (#573).
 ///
@@ -2236,9 +2228,9 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     }
 
     /// Authors a schedule, ALWAYS disabled (ADR-0032) -- there is no input field a caller could set
-    /// to create an already-live global schedule. `nextRunAt` is derived server-side from the
-    /// cadence, so a caller cannot backdate a window into firing immediately either. Gated at
-    /// `budget:schedule-manage`.
+    /// to create an already-live global schedule. An explicit `nextRunAt` forces the first window
+    /// onto a date the operator picks and must be in the future, so nobody can backdate one into
+    /// firing immediately. Gated at `budget:schedule-manage`.
     fn create_budget_reset_schedule(
         &self,
         _db: &schema::Cratestack,
@@ -2258,11 +2250,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
             let subject = subject
                 .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
 
-            let run_at_utc = match input.runAtUtc.as_deref() {
-                Some(raw) => lightbridge_authz_budget::parse_run_at_utc(raw)
-                    .map_err(budget_error_to_cratestack_error)?,
-                None => DEFAULT_RESET_SCHEDULE_RUN_AT_UTC,
-            };
+            let run_at_utc = parse_run_at_or_default(input.runAtUtc.as_deref())?;
 
             let schedule = reset_scheduler
                 .schedules()
@@ -2285,6 +2273,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                             .mode
                             .parse()
                             .map_err(budget_error_to_cratestack_error)?,
+                        next_run_at: input.nextRunAt,
                     },
                     Some(&subject),
                     chrono::Utc::now(),
@@ -2359,6 +2348,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                     .transpose()
                     .map_err(budget_error_to_cratestack_error)?,
                 enabled: input.enabled,
+                next_run_at: input.nextRunAt,
             };
 
             let schedule = reset_scheduler

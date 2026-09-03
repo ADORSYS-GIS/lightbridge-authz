@@ -2,7 +2,8 @@
 //! the ledger, plus the calendar arithmetic that decides when each one is next due.
 //!
 //! This module owns the *data*: the row shape, its closed-value domains, the repository that
-//! reads/writes `budget_reset_schedules`, and the cadence math. What a due schedule actually
+//! reads/writes `budget_reset_schedules`, and the cadence math. Input validation lives one file
+//! over, in [`crate::reset_schedule_validate`]. What a due schedule actually
 //! *does* — enumerate matching budget accounts, read spend, write a grant — lives in
 //! [`crate::reset_scheduler`], so this module has no dependency on the ledger or on spend.
 //!
@@ -23,6 +24,7 @@ use lightbridge_authz_core::db::DbPoolTrait;
 use sqlx::PgPool;
 
 use crate::error::BudgetError;
+use crate::reset_schedule_validate::{validate_forced_next_run, validate_shape};
 
 /// Which budget accounts a schedule targets. Ordered most-general to most-specific so
 /// [`ScheduleScopeKind::specificity`] can be a plain integer comparison.
@@ -181,10 +183,26 @@ pub struct BudgetResetSchedule {
 }
 
 impl BudgetResetSchedule {
-    /// The instant AFTER `self.next_run_at` this schedule is due, given `now`. Delegates to
-    /// [`next_window_after`]; see that function for the catch-up contract.
+    /// The instant this schedule is next due, after the window at `self.next_run_at` has fired.
+    ///
+    /// The answer is the earliest instant on the schedule's OWN grid — its cadence, its anchor and
+    /// its `run_at_utc` — strictly after both the window just fired and `now`. Two properties fall
+    /// out of that single rule:
+    ///
+    /// - **Anti-drift and catch-up (ADR-0032 D7).** A tick that wakes 47 seconds late still lands
+    ///   on midnight, and a schedule six windows stale lands on the next FUTURE window in ONE
+    ///   advance rather than firing six times.
+    /// - **A forced window is a one-off.** An operator-supplied `next_run_at` (the "force the next
+    ///   execution on a specific date" amendment to ADR-0032) fires once and hands the schedule
+    ///   straight back to its own grid: a daily schedule forced to 2026-09-15 fires again on
+    ///   2026-09-16 at `run_at_utc`, never at whatever time of day the forced instant carried.
     pub fn advance_from_next_run(&self, now: DateTime<Utc>) -> Result<DateTime<Utc>, BudgetError> {
-        next_window_after(self.next_run_at, self.cadence, self.anchor, now)
+        first_window_after(
+            self.next_run_at.max(now),
+            self.cadence,
+            self.anchor,
+            self.run_at_utc,
+        )
     }
 }
 
@@ -201,6 +219,11 @@ pub struct NewBudgetResetSchedule {
     pub run_at_utc: NaiveTime,
     pub amount_micros: i64,
     pub mode: ResetMode,
+    /// An operator forcing the FIRST window onto a specific instant, instead of letting the
+    /// cadence pick it. `None` — the ordinary case — keeps ADR-0032's server-side derivation.
+    /// `Some` must be strictly in the future ([`validate_forced_next_run`]); it is stored verbatim
+    /// and, once it has fired, the schedule returns to its own grid.
+    pub next_run_at: Option<DateTime<Utc>>,
 }
 
 /// A partial update. Every field is `Option`: `None` means "leave this column alone".
@@ -219,80 +242,10 @@ pub struct BudgetResetScheduleUpdate {
     pub amount_micros: Option<i64>,
     pub mode: Option<ResetMode>,
     pub enabled: Option<bool>,
-}
-
-/// Validates the closed-domain invariants the DB `CHECK`s also enforce, so a bad create/update is
-/// a legible `InvalidSchedule` (HTTP 400) instead of a raw constraint violation surfaced as a 500.
-/// Deliberately duplicated across both layers rather than trusted to one: the DB is the authority
-/// (nothing bypasses it), this is the error message a human reads.
-fn validate_shape(
-    name: &str,
-    scope_kind: ScheduleScopeKind,
-    scope_id: Option<&str>,
-    cadence: Cadence,
-    anchor: Option<i16>,
-    amount_micros: i64,
-    mode: ResetMode,
-) -> Result<(), BudgetError> {
-    if name.trim().is_empty() {
-        return Err(BudgetError::InvalidSchedule(
-            "name must not be empty".to_string(),
-        ));
-    }
-    match (scope_kind, scope_id) {
-        (ScheduleScopeKind::Global, Some(_)) => {
-            return Err(BudgetError::InvalidSchedule(
-                "a global schedule must not carry a scopeId".to_string(),
-            ));
-        }
-        (ScheduleScopeKind::Global, None) => {}
-        (_, None) | (_, Some("")) => {
-            return Err(BudgetError::InvalidSchedule(format!(
-                "a {scope_kind} schedule requires a non-empty scopeId"
-            )));
-        }
-        (_, Some(id)) if id.trim().is_empty() => {
-            return Err(BudgetError::InvalidSchedule(format!(
-                "a {scope_kind} schedule requires a non-empty scopeId"
-            )));
-        }
-        (_, Some(_)) => {}
-    }
-    match (cadence, anchor) {
-        (Cadence::Daily, None) => {}
-        (Cadence::Daily, Some(_)) => {
-            return Err(BudgetError::InvalidSchedule(
-                "a daily schedule must not carry an anchor".to_string(),
-            ));
-        }
-        (Cadence::Weekly, Some(a)) if (1..=7).contains(&a) => {}
-        (Cadence::Weekly, _) => {
-            return Err(BudgetError::InvalidSchedule(
-                "a weekly schedule requires an anchor in 1..=7 (ISO weekday, Monday = 1)"
-                    .to_string(),
-            ));
-        }
-        (Cadence::Monthly, Some(a)) if (1..=28).contains(&a) => {}
-        (Cadence::Monthly, _) => {
-            return Err(BudgetError::InvalidSchedule(
-                "a monthly schedule requires an anchor in 1..=28 (day of month)".to_string(),
-            ));
-        }
-    }
-    match mode {
-        ResetMode::TopUp if amount_micros <= 0 => {
-            return Err(BudgetError::InvalidSchedule(
-                "a top_up schedule requires a strictly positive amountMicros".to_string(),
-            ));
-        }
-        ResetMode::Reset if amount_micros < 0 => {
-            return Err(BudgetError::InvalidSchedule(
-                "a reset schedule requires a non-negative amountMicros".to_string(),
-            ));
-        }
-        _ => {}
-    }
-    Ok(())
+    /// Forces the NEXT window onto a specific instant. `None` leaves `next_run_at` alone, except
+    /// when `cadence`/`anchor`/`run_at_utc` changed, where it is re-seeded from the new cadence as
+    /// before. `Some` wins over that re-seed and must be strictly in the future.
+    pub next_run_at: Option<DateTime<Utc>>,
 }
 
 /// The first instant a freshly created schedule fires: the earliest instant STRICTLY after `now`
@@ -608,7 +561,16 @@ impl ResetScheduleRepo {
             input.mode,
         )?;
 
-        let next_run_at = first_window_after(now, input.cadence, input.anchor, input.run_at_utc)?;
+        // An operator-forced window is stored verbatim; the cadence only picks the first one
+        // when the caller did not. Either way the row is still created DISABLED (ADR-0032 D8), so a
+        // forced date cannot fire before a human has dry-run it and enabled it.
+        let next_run_at = match input.next_run_at {
+            Some(forced) => {
+                validate_forced_next_run(forced, now)?;
+                forced
+            }
+            None => first_window_after(now, input.cadence, input.anchor, input.run_at_utc)?,
+        };
 
         let row: ScheduleRow = sqlx::query_as(concat!(
             "INSERT INTO budget_reset_schedules ",
@@ -635,7 +597,8 @@ impl ResetScheduleRepo {
         row.try_into()
     }
 
-    /// Applies a partial update. Any change to `cadence`/`anchor`/`run_at_utc` re-seeds
+    /// Applies a partial update. An explicit `next_run_at` is honoured verbatim (it must be in
+    /// the future). Otherwise any change to `cadence`/`anchor`/`run_at_utc` re-seeds
     /// `next_run_at` from the NEW cadence (a schedule that becomes weekly must not keep firing on
     /// yesterday's daily window), so this reads the current row first rather than issuing a blind
     /// `UPDATE`.
@@ -677,10 +640,15 @@ impl ResetScheduleRepo {
         let timing_changed = cadence != current.cadence
             || anchor != current.anchor
             || run_at_utc != current.run_at_utc;
-        let next_run_at = if timing_changed {
-            first_window_after(now, cadence, anchor, run_at_utc)?
-        } else {
-            current.next_run_at
+        // An explicit `nextRunAt` outranks the cadence re-seed: an operator who says "run it on
+        // the 15th" in the same call that widens the cadence means the 15th, not the new grid.
+        let next_run_at = match update.next_run_at {
+            Some(forced) => {
+                validate_forced_next_run(forced, now)?;
+                forced
+            }
+            None if timing_changed => first_window_after(now, cadence, anchor, run_at_utc)?,
+            None => current.next_run_at,
         };
 
         let row: ScheduleRow = sqlx::query_as(concat!(
@@ -740,6 +708,33 @@ mod tests {
 
     fn midnight() -> NaiveTime {
         NaiveTime::from_hms_opt(0, 0, 0).expect("00:00 is a valid time")
+    }
+
+    /// A schedule carrying only the fields [`BudgetResetSchedule::advance_from_next_run`] reads.
+    /// Everything else is filler: this is calendar arithmetic, not a row under test.
+    fn schedule_with(
+        cadence: Cadence,
+        anchor: Option<i16>,
+        run_at_utc: NaiveTime,
+        next_run_at: DateTime<Utc>,
+    ) -> BudgetResetSchedule {
+        BudgetResetSchedule {
+            id: "sched".to_string(),
+            name: "test".to_string(),
+            scope_kind: ScheduleScopeKind::Global,
+            scope_id: None,
+            cadence,
+            anchor,
+            run_at_utc,
+            amount_micros: 2_000_000,
+            mode: ResetMode::Reset,
+            enabled: true,
+            next_run_at,
+            last_run_at: None,
+            created_by: None,
+            created_at: next_run_at,
+            updated_at: next_run_at,
+        }
     }
 
     #[test]
@@ -874,80 +869,61 @@ mod tests {
         assert!(parse_run_at_utc("noon").is_err());
     }
 
+    /// A forced window is a ONE-OFF: after it fires the schedule is back on its own grid, at its
+    /// own `run_at_utc`. The owner's worked example — a daily schedule forced onto 2026-09-15 next
+    /// fires on 09-16 at `run_at_utc`, not 24h after whatever time the forced instant carried.
     #[test]
-    fn validate_shape_rejects_mismatched_scope_and_anchor() {
-        assert!(
-            validate_shape(
-                "s",
-                ScheduleScopeKind::Global,
-                Some("acc"),
-                Cadence::Daily,
-                None,
-                1,
-                ResetMode::TopUp
-            )
-            .is_err()
+    fn a_forced_window_hands_the_schedule_back_to_its_own_grid() {
+        let forced = utc(2026, 9, 15, 14, 30);
+        let schedule = schedule_with(Cadence::Daily, None, midnight(), forced);
+        // The tick fires it ten seconds late, as a real 60-second tick would.
+        let now = forced + chrono::Duration::seconds(10);
+        assert_eq!(
+            schedule.advance_from_next_run(now).unwrap(),
+            utc(2026, 9, 16, 0, 0)
         );
-        assert!(
-            validate_shape(
-                "s",
-                ScheduleScopeKind::Account,
-                None,
-                Cadence::Daily,
-                None,
-                1,
-                ResetMode::TopUp
-            )
-            .is_err()
+    }
+
+    /// The same for a weekly schedule: a forced Tuesday does not permanently move a Wednesday
+    /// schedule to Tuesdays.
+    #[test]
+    fn a_forced_window_does_not_move_a_weekly_anchor() {
+        // 2026-09-15 is a Tuesday; the anchor is Wednesday (ISO 3).
+        let forced = utc(2026, 9, 15, 9, 0);
+        let schedule = schedule_with(Cadence::Weekly, Some(3), midnight(), forced);
+        assert_eq!(
+            schedule.advance_from_next_run(forced).unwrap(),
+            utc(2026, 9, 16, 0, 0)
         );
-        assert!(
-            validate_shape(
-                "s",
-                ScheduleScopeKind::Global,
-                None,
-                Cadence::Weekly,
-                Some(9),
-                1,
-                ResetMode::TopUp
-            )
-            .is_err()
+        assert_eq!(
+            schedule.advance_from_next_run(forced).unwrap().weekday(),
+            chrono::Weekday::Wed
         );
-        assert!(
-            validate_shape(
-                "s",
-                ScheduleScopeKind::Global,
-                None,
-                Cadence::Monthly,
-                Some(31),
-                1,
-                ResetMode::TopUp
-            )
-            .is_err()
+    }
+
+    /// The pre-existing D7 contract, now asserted through the method the scheduler actually calls
+    /// rather than through `next_window_after` alone: an on-grid schedule advances exactly one
+    /// cadence step, a late tick does not drift, and a stale one catches up in a single advance.
+    #[test]
+    fn advancing_an_on_grid_schedule_is_unchanged_by_the_forced_window_support() {
+        let schedule = schedule_with(Cadence::Daily, None, midnight(), utc(2026, 9, 2, 0, 0));
+        assert_eq!(
+            schedule
+                .advance_from_next_run(utc(2026, 9, 2, 0, 0))
+                .unwrap(),
+            utc(2026, 9, 3, 0, 0)
         );
-        assert!(
-            validate_shape(
-                "s",
-                ScheduleScopeKind::Global,
-                None,
-                Cadence::Daily,
-                None,
-                0,
-                ResetMode::TopUp
-            )
-            .is_err()
+        assert_eq!(
+            schedule
+                .advance_from_next_run(utc(2026, 9, 2, 0, 0) + chrono::Duration::seconds(47))
+                .unwrap(),
+            utc(2026, 9, 3, 0, 0)
         );
-        // A `reset` to zero is legitimate: "cut everyone off at midnight".
-        assert!(
-            validate_shape(
-                "s",
-                ScheduleScopeKind::Global,
-                None,
-                Cadence::Daily,
-                None,
-                0,
-                ResetMode::Reset
-            )
-            .is_ok()
+        assert_eq!(
+            schedule
+                .advance_from_next_run(utc(2026, 9, 8, 9, 30))
+                .unwrap(),
+            utc(2026, 9, 9, 0, 0)
         );
     }
 }

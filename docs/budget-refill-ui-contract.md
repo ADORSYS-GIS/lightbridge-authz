@@ -407,8 +407,8 @@ Source of truth is again `crates/lightbridge-authz-api/schema/authz.cstack` (sea
 | Procedure | Permission | Notes |
 | --- | --- | --- |
 | `listBudgetResetSchedules({})` → `BudgetResetSchedule[]` | `budget:schedule-manage` | Every schedule, enabled or not, oldest first. Unpaginated — this is configuration, not a ledger. |
-| `createBudgetResetSchedule({ name, scopeKind, scopeId?, cadence, anchor?, runAtUtc?, amountMicros, mode })` → `BudgetResetSchedule` | `budget:schedule-manage` | **Always created disabled.** There is no `enabled` input field to set. |
-| `updateBudgetResetSchedule({ id, …all optional… , enabled? })` → `BudgetResetSchedule` | `budget:schedule-manage` | Partial. The only way to flip `enabled`. |
+| `createBudgetResetSchedule({ name, scopeKind, scopeId?, cadence, anchor?, runAtUtc?, amountMicros, mode, nextRunAt? })` → `BudgetResetSchedule` | `budget:schedule-manage` | **Always created disabled.** There is no `enabled` input field to set. `nextRunAt` forces the first window onto a specific instant; it must be in the future. |
+| `updateBudgetResetSchedule({ id, …all optional… , enabled?, nextRunAt? })` → `BudgetResetSchedule` | `budget:schedule-manage` | Partial. The only way to flip `enabled`. `nextRunAt` forces the next window and outranks the cadence re-seed. |
 | `deleteBudgetResetSchedule({ id })` → `{ id, deleted }` | `budget:schedule-manage` | Removes the future; grants already written stay in the ledger forever. |
 | `runBudgetResetScheduleNow({ id, dryRun })` → `BudgetResetScheduleRunResult` | `budget:schedule-manage` | `dryRun: true` writes **nothing**: no grant, no `nextRunAt` advance, no `lastRunAt`. |
 | `getEffectiveResetSchedule({ budgetAccountId })` → `{ schedule?, nextRunAt? }` | **`budget:read`** | Deliberately NOT `budget:schedule-manage` — this is what a budget card calls. |
@@ -439,7 +439,7 @@ Source of truth is again `crates/lightbridge-authz-api/schema/authz.cstack` (sea
 convention `Decision.effect` already uses. A cadence sentence renders straight off these fields:
 *"Reset remaining to $2.00 every day at 00:00 UTC"*.
 
-### The three behaviors that need explicit copy
+### The four behaviors that need explicit copy
 
 **1. `reset` clamps BOTH ways.** `delta = amount − (effectiveBudget − spendToDate)`. When an
 account has MORE remaining than the target, the schedule writes a **negative** row — `source:
@@ -463,6 +463,25 @@ covers). Show the first ~25 entries and the two id counts. `deltaMicros` is neve
 `runBudgetResetScheduleNow` with `dryRun: false` fires the schedule's **pending window** — the same
 `triggerKey` the scheduled tick would have used — so a manual fire followed by the tick catching up
 cannot double-grant.
+
+**4. An operator can force the next execution onto a date.** `nextRunAt` is optional on both
+`createBudgetResetSchedule` and `updateBudgetResetSchedule`. Set it and that instant becomes the
+schedule's window verbatim; omit it and the cadence decides, exactly as before. Two rules the UI
+must carry:
+
+- **It must be strictly in the future.** A past (or exactly-now) instant is a `400` whose message
+  names the rule — a backdated window would fire on the very next 60-second tick, across every
+  account the schedule matches, before anyone had dry-run it. Validate client-side too, so the
+  operator sees it before the round trip.
+- **It is a ONE-OFF, not a new grid.** Once the forced window fires, the schedule returns to its own
+  cadence at its own `runAtUtc`. A daily schedule forced onto `2026-09-15T09:30Z` next fires
+  `2026-09-16T00:00Z`, not `2026-09-16T09:30Z`; a Wednesday-anchored weekly schedule forced onto a
+  Tuesday is back on Wednesday afterwards. A list view can therefore render a `nextRunAt` that is
+  **off the cadence grid** — that row is a forced one, and saying so is more honest than letting the
+  reader infer a cadence that does not exist.
+
+Forcing a date does **not** bypass create-disabled: a new schedule is still created disabled and a
+human still has to enable it.
 
 ### The honest caption (required)
 
