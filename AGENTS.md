@@ -15,8 +15,10 @@ This repository provides API key management plus usage analytics:
   references a client certificate, so an mTLS-only listener would be unreachable by its only
   caller (ADR-0034's 2026-09-03 amendment). `shared_secret` is mandatory — the server refuses to
   start without it, and refuses to start WITH a `tls.client_ca_bundle_path`, which would demand a
-  certificate Authorino cannot present. `503 budget_unavailable` is never a zero balance; see
-  `docs/architecture/budget.md`.
+  certificate Authorino cannot present. `503 budget_unavailable` is never a zero balance, and since
+  the 2026-09-03 owner directive (ADR-0034 §3.3) an id matching no `accounts` row is
+  `404 unknown_account` rather than a `200` with `remaining_micros: 0` — a real account with no
+  grants yet stays a `200` with `ceiling_micros: 0`. See `docs/architecture/budget.md`.
 - `authz-opa`: Basic-auth protected validation API intended to be called by Authorino (or similar external auth components). It validates API keys and returns rich context plus dynamic metadata, and is also the ownership authority for the usage query API (`POST /idp/v1/authorize-usage-scope`, #570).
 - `authz-idp`: OIDC broker server (ADR-0012, ADR-0019, ADR-0023) exposing
   `.well-known/openid-configuration`, `.well-known/jwks.json`, `/oauth2/token`, `/oauth2/revoke`,

@@ -1,11 +1,12 @@
 # ADR-0034: The Dynamic Budget Limiter — the gateway reads the live balance, it does not trust the token
 
 - Status: Proposed
-- Date: 2026-09-03 (amended twice the same day — first §3.1/§4.1/§9/§14 re-grounded on the
+- Date: 2026-09-03 (amended three times the same day — first §3.1/§4.1/§9/§14 re-grounded on the
   **deployed** Authorino v0.24.0 CRD rather than upstream source, after `kubectl explain` against
   prod contradicted the upstream Go types on `metadata.http.timeout`; then **§3's transport
   changed from mTLS to a shared secret** during Stage 1, after the same `kubectl explain` showed
-  Authorino cannot present a client certificate at all — see §3.2)
+  Authorino cannot present a client certificate at all — see §3.2; then **an unknown account id
+  became a `404`** rather than a `200` with a zero balance, on the owner's directive — see §3.3)
 - Decision owners: @stephane-segning
 - Story: [lightbridge-authz#658](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/658)
   (Phase 6a decision memo)
@@ -150,10 +151,12 @@ should fail loudly.
 // 400 {"error":"bad_request",…}         malformed account id / period
 // 401 {"error":"unauthorized",…}        the shared secret was missing or wrong
 // 403 {"error":"forbidden",…}           an Authorization header was present
+// 404 {"error":"unknown_account","account_id":"…"}
+//                                       the id names no `accounts` row — see §3.3
 // 503 {"error":"budget_unavailable",…}  the answer is not knowable right now
 ```
 
-Four things about that payload are decisions, not details:
+Five things about that payload are decisions, not details:
 
 - **`ceiling_micros` is `BudgetRepo::effective_balance`**, not the raw
   `budget_balances.effective_budget_micros` projection. The projection counts grants that have
@@ -174,6 +177,10 @@ Four things about that payload are decisions, not details:
   understate §5.4's overspend window, which is computed from exactly this term. Teaching
   `/usage/v1/spend/query` to return `MAX(time)` alongside the sum is the tracked follow-up that
   makes the fresh case a real number too.
+- **A `200` asserts the account exists.** `ceiling_micros: 0` is a statement about an account we
+  know — one between its creation and its first grant, or one whose grants have all expired. An id
+  the ledger has never seen gets a `404`, never a flattering zero. §3.3 is the amendment and its
+  reasoning.
 
 ### 3.2 Amendment (2026-09-03, during Stage 1) — the transport is a shared secret, not mTLS
 
@@ -286,6 +293,152 @@ NetworkPolicy *alone*, with no credential (rejected: it authenticates a network 
 caller, and every pod in `converse-gateway` would be able to read every account's balance). A
 sidecar proxy terminating mTLS in front of `authz-budget` (rejected: it moves the problem into a
 component nobody asked for and still hands Authorino an uncredentialed hop).
+
+### 3.3 Amendment (2026-09-03, owner directive) — an unknown account id is a `404`, not a zero balance
+
+**What changed.** `GET /budget/v1/remaining?account_id=<id>` answers
+`404 {"error":"unknown_account","account_id":"<id>"}` when `<id>` names no account. It previously
+answered `200 {"remaining_micros": 0, …}`, and that is the bug this amendment closes.
+
+**Why it mattered more than it looks.** `BudgetRepo::effective_balance` is
+`COALESCE(SUM(amount_micros), 0)` over `budget_grants`. A **row-less** account and a
+**non-existent** one are indistinguishable to it: both sum to `0`. So under enforcement, a typo in
+an identity mapping — one wrong character in the `account_id` claim, a stale token, a mis-scoped
+service credential — arrived at the gateway as `known=true, remaining_micros=0`, which the Lua
+correctly refuses with `402 budget_exhausted`. The single most expensive way to be wrong: the
+fault wears the costume of a real paying user who really did run out, so the operator sees a
+support ticket about billing rather than an alert about configuration, and no dashboard anywhere
+distinguishes the two.
+
+**The definition of "unknown", stated once so nothing has to guess it.** *Known* = **a row in
+`accounts` whose `user_id` resolves to a row in `users`.**
+
+- The ledger keys on `accounts.id` and on nothing else: `budget_grants.budget_account_id`,
+  `budget_balances.budget_account_id` and `budget_augmentation_requests.budget_account_id` are all
+  `TEXT NOT NULL REFERENCES accounts(id)` (migrations `20260803000001`, `20260803000002`,
+  `20260804000002`). It is **not** `users.id` — §7 and ADR-0026 make one identity own many
+  accounts, so keying the check on the person would let one account's typo pass because a sibling
+  account exists.
+- The `users` join is the ADR-0014 intra-DB read pattern, taken verbatim from the reset
+  scheduler's own account enumeration (`reset_scheduler.rs`'s `matching_accounts`, #653), so
+  "an account this endpoint reports on" and "an account the estate grants to" cannot drift apart.
+  `accounts.user_id` is `NOT NULL` and FK-bound, so today the join filters nothing; it states the
+  rule and stays correct if that column ever becomes nullable.
+
+**Three things are deliberately NOT `unknown`, and each would be a different bug:**
+
+| Condition | Answer | Why not `404` |
+|---|---|---|
+| Real account, **no grants** this period | `200`, `ceiling_micros: 0`, `remaining_micros: -spent_micros` | The state of every account between creation and its first grant, and of every account whose grants have expired. It is knowledge, not ignorance. This is also exactly what the console's Budget card shows for such an account (`BalanceSnapshot::zero`), and the two surfaces must not disagree. |
+| Account **suspended** (`accounts.status`) | `200`, real numbers | Suspension is enforced upstream of the budget entirely (`effective_status`, `20260714000001`). Folding it in here would make one condition wear another's error code and would `404` an account whose balance an operator is legitimately reading. |
+| Ledger or spend source **unreadable** | `503 budget_unavailable` | Unchanged. "We could not ask" is not "it does not exist", for the same reason it is not "you have nothing left". The existence probe's own failure is an `Err` → `503`, never a `false` → `404`. |
+
+**No starting amount is ever fabricated.** The policy's `starting_amount_micros` (ADR-0015
+Decision 5) materialises **only when a grant is actually booked** — `RefillService` writes a
+`budget_grants` row, and nothing about the policy is readable from the ledger until it does. This
+endpoint reports the ledger. A brand-new account therefore reads `ceiling_micros: 0` here until
+its base grant lands, and that is the honest number, not an omission.
+
+**Ordering is load-bearing in one direction.** The existence probe runs *in front of* both the
+ceiling read and the spend read, so an unknown id answers `404` even while the usage service is
+down. The other ordering would let a transient outage mask a permanent configuration fault behind
+`budget_unavailable`, which is precisely the confusion this amendment exists to remove.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant AZ as Authorino<br/>metadata step
+    participant H as budget_remaining<br/>handler
+    participant S as RemainingService
+    participant DB as Postgres<br/>(accounts + budget_grants)
+    participant U as authz-usage<br/>/usage/v1/spend/query
+
+    AZ->>H: GET /budget/v1/remaining?account_id=…
+    H->>S: remaining_for_account(id, period, now)
+    S->>DB: SELECT 1 FROM accounts a JOIN users u ON u.id = a.user_id WHERE a.id = $1
+    alt no row — the id names nothing
+        DB-->>S: ∅
+        S-->>H: Remaining::UnknownAccount
+        H-->>AZ: 404 {"error":"unknown_account","account_id":…}
+        Note over AZ: metadata step FAILS → value absent →<br/>known=false → 503 budget_unavailable (today)<br/>see "What the gateway does with it" below
+    else row exists
+        DB-->>S: 1
+        S->>DB: effective_balance(id, period, as_of)
+        DB-->>S: COALESCE(SUM(...),0) — 0 is a real ceiling here
+        S->>U: spend for (id, period)
+        U-->>S: SUM | empty | unreachable
+        S-->>H: Remaining::Known{ceiling, spent, remaining}
+        H-->>AZ: 200 {…}
+    end
+```
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Asked: (budget_account_id, period)
+
+    Asked --> ProbeFailed: accounts read errored
+    Asked --> Unknown: no accounts row
+    Asked --> Exists: accounts row + owning users row
+
+    ProbeFailed --> Http503: Err(StorageFailed)
+    Unknown --> Http404: Remaining::UnknownAccount
+
+    Exists --> CeilingRead
+    CeilingRead --> Http503: ledger read errored
+    CeilingRead --> SpendRead: ceiling known (0 IS a ceiling)
+
+    SpendRead --> Http200: answered / empty / cached within grace
+    SpendRead --> Http503: unreachable, no cached reading
+
+    Http200 --> [*]
+    Http404 --> [*]
+    Http503 --> [*]
+
+    note right of Http404
+        The edge that did not exist before this amendment.
+        Everything that used to reach Http200 through
+        "no accounts row" now stops here — and note what
+        still has NO edge: nothing reaches Http200 with a
+        fabricated ceiling, and nothing reaches Http404
+        from a failed read.
+    end note
+```
+
+**What the gateway does with a `404` — today, and the proposal.**
+
+Today, nothing distinguishes it. Authorino's `evaluateMetadataConfigs` treats *any* non-2xx (and
+any transport failure) on a `metadata.http` step as a failed fetch: it logs, leaves the value
+**absent**, and continues (§3.1). The Lua then reads `known=false` and refuses with
+`503 budget_unavailable`. That is already fail-closed, already a different status and a different
+runbook from `402 budget_exhausted`, and already a strict improvement — the phantom account no
+longer looks like a real one. But it is indistinguishable at the gateway from "authz-budget is
+down", which is the wrong triage for a fault that will never clear on its own.
+
+**Proposal, NOT implemented here (no `ai-helm` change in this task; the limiter is disabled in
+prod).** Surface it as a distinct deny, `403 unknown_account`, fail-closed — the token names an
+account the ledger has never seen, and that is an authorization fault, not a capacity one. The
+only shape that works with the deployed CRD:
+
+- Authorino's `metadata.http` cannot branch on status, so the distinction cannot come from the
+  existing step. It has to come from an **`authorization.http`** evaluator, where a non-2xx **is**
+  a deny, with `response.unauthorized.message` carrying the reason (CEL is accepted on
+  `body`/`message`/`headers`, not on `code` — §4.1).
+- That evaluator must therefore deny on *exactly* the unknown case and on nothing else, which
+  means a dedicated existence-only route (`GET /budget/v1/account-known?account_id=…`) that
+  answers `200` when the account is known, `404` when it is not, and — critically — **`200` when
+  our own database is unreadable**. Fail-*open* on that one step is correct precisely because the
+  budget metadata step already fails closed on our outage with `503 budget_unavailable`: an
+  outage must never be able to masquerade as "your account does not exist".
+- **Cost, named rather than glossed:** a second HTTP call inside the one ext_authz hop §9 is
+  already worried about. It caches on the same key as the budget step and its TTL can be far
+  longer (account existence changes on the order of account creation, not of spending), which
+  bounds it — but it is not free, and it is the reason this is a proposal and not a shipped
+  change.
+- **Owner decision still open:** whether that second hop is worth a distinct `403` at the gateway,
+  or whether `503 budget_unavailable` plus this endpoint's own `404` in logs, traces and metrics is
+  enough triage. Nothing in the enforcement chain is blocked on it — the `404` is live at the
+  endpoint either way, which is where a probe, a runbook and a human read it.
 
 ### 3.1 The AuthConfig side
 
@@ -472,6 +625,7 @@ billing-period (12) → model-policy (13) → budget-limiter (14).
 |---|---|---|---|
 | Balance known, `remaining > 0` | `200` | `known=true`, `remaining_micros>0` | **pass** |
 | Balance known, `remaining <= 0` | `200` | `known=true`, `remaining_micros<=0` | **402 `budget_exhausted`** |
+| **Account id names no `accounts` row** | **`404 unknown_account`** | value **absent** (Authorino cannot branch on status) | **503 `budget_unavailable`** — fail-closed, and distinct from 402. §3.3 proposes making it a distinct `403 unknown_account`; not implemented. |
 | Usage service down, cached reading inside grace | `200` + `source_lag_seconds` | `known=true` | pass / 402 on the stale figure |
 | Usage service down, no cached reading (or past grace) | `503 budget_unavailable` | value **absent** | **503 `budget_unavailable`** |
 | Ledger unreadable | `503 budget_unavailable` | value **absent** | **503 `budget_unavailable`** |

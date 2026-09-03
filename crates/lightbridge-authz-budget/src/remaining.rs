@@ -76,7 +76,7 @@ pub struct BudgetRemaining {
 
 /// The result of asking for an account's remaining budget.
 ///
-/// There is no third variant for "the ledger failed": that surfaces as `Err(BudgetError)` from
+/// There is no variant for "the ledger failed": that surfaces as `Err(BudgetError)` from
 /// [`RemainingService::remaining_for_account`], because a ledger read failing is a fault, while a
 /// spend source being unreachable is an expected, transient operating condition the gateway is
 /// designed to ride out (ADR-0034's cached-grace window). Both end as a `503` at the HTTP edge;
@@ -86,6 +86,18 @@ pub enum Remaining {
     Known(Box<BudgetRemaining>),
     /// The spend source could not be asked. **Not** `remaining = 0`, and not an error.
     Unavailable,
+    /// The id names no account at all — see the `known_account` module for the exact definition and
+    /// for the two conditions that are deliberately *not* this one (a suspended account, and a
+    /// real account with no grants yet).
+    ///
+    /// A third outcome rather than a `Known` answer with a zero ceiling, because the two are
+    /// opposite facts about the world that happen to share an arithmetic result. A real account
+    /// awaiting its first grant has a ceiling of `0` and must be refused as
+    /// `budget_exhausted`; an id nothing has ever heard of is a **configuration error upstream**
+    /// — a typo in an identity mapping, a stale claim, a mis-scoped token — and refusing it as
+    /// "you have spent everything" hides the fault behind a page telling a phantom user to top
+    /// up. The HTTP edge renders this as `404 unknown_account`.
+    UnknownAccount,
 }
 
 /// Reads an account's remaining budget. A trait, not just the concrete [`RemainingService`], so
