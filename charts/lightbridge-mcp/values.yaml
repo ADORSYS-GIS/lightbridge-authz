@@ -85,108 +85,133 @@ controllers:
                 path: /healthz/startup
                 port: http
 
+# ─────────────────────────────────────────────────────────────────────────────────────
+# Single-source config (see templates/_config.tpl for the full contract — that file is
+# kept BYTE-IDENTICAL with charts/lightbridge-authz/templates/_config.tpl; the chart tests
+# assert it).
+#
+# `sharedConfig` here is the DEV / STANDALONE default. A real deployment supplies
+# `global.lightbridge.sharedConfig`, which this chart reads from the SAME place the
+# api/opa/idp/budget aliases do — that is what makes one edit reach all of them. That object
+# REPLACES this one outright rather than deep-merging into it, so the local-dev placeholders
+# below cannot leak into a production render.
+# ─────────────────────────────────────────────────────────────────────────────────────
+sharedConfig:
+  logging:
+    level: info
+  database:
+    url: "${DATABASE_URL}"
+    pool_size: 10
+  oauth2:
+    # REQUIRED credential-issuance mode — no default. `self` mints self-signed JWT API keys
+    # (uses `signing`); `external` exchanges at the upstream IdP (uses `issuance`). MUST match
+    # the api service so both surfaces mint the same credential format.
+    type: self
+    signing:
+      issuer: "https://authz-api:3000"
+      audience: "lightbridge-api-key"
+      ttl_seconds: 7776000
+      max_key_age_days: 30
+    jwks_url: http://keycloak:9100/realms/dev/protocol/openid-connect/certs
+    # Expected audience claim(s) in JWT tokens. Set to restrict token acceptance.
+    # Tokens must contain at least one matching audience value.
+    #
+    # Valid audience values:
+    #   - lightbridge-api-key: Primary audience for API Key service
+    #   - lightbridge-token-issuer: Audience for token issuer service
+    #
+    # For production, set via Helm values or environment variable:
+    #   OAUTH2__AUDIENCE='["lightbridge-api-key"]'
+    # For local development with multiple audiences:
+    #   audience: ["lightbridge-api-key", "lightbridge-token-issuer"]
+    audience: []
+    # ADR-0025 Stage 1: the ONE issuer this deployment trusts for
+    # remote-subject-to-account-id translation. REQUIRED -- lightbridge-mcp refuses to
+    # start without it, the same as every authz-* component. MUST match the api service's
+    # oauth2.federation.issuer. There is no longer a separate `oauth2.relying_party.issuer`
+    # to also match -- that field was removed.
+    federation:
+      issuer: "http://keycloak:9100/realms/dev"
+  server:
+    api:
+      address: 0.0.0.0
+      port: 3000
+      tls:
+        cert_path: /etc/lightbridge/tls/api.crt
+        key_path: /etc/lightbridge/tls/api.key
+    opa:
+      address: 0.0.0.0
+      port: 3000
+      tls:
+        cert_path: /etc/lightbridge/tls/opa.crt
+        key_path: /etc/lightbridge/tls/opa.key
+      basic_auth:
+        username: authorino
+        password: "${OPA_PASSWORD}"
+  otel:
+    enabled: true
+    otlp_endpoint: "http://localhost:4317"
+    service_name: "lightbridge-authz"
+  # Billing plans a caller may attach to an API key at creation. Operator-defined catalogue
+  # (no plan table/entity): each plan has a stable id, UI name, and optional limits. A
+  # CreateApiKey must name one of these ids or it is rejected (400); introspection resolves
+  # the id to name + limits. `plans` also accepts a single JSON-array string via
+  # "${BILLING_PLANS}".
+  # NOTE: keep this catalogue in sync with charts/lightbridge-authz/values.yaml — API and MCP
+  # share the same DB, so a key created under one must be creatable under the other.
+  billing:
+    plans:
+      - id: free
+        name: Free
+        limits:
+          requests_per_second: 5
+          requests_per_day: 1000
+          concurrent_requests: 2
+      - id: pro
+        name: Pro
+        limits:
+          requests_per_second: 50
+          requests_per_day: 50000
+          requests_per_month: 1000000
+          concurrent_requests: 20
+      # No `limits` block ⇒ unlimited on every dimension.
+      - id: enterprise
+        name: Enterprise
+
+# Merged OVER the effective sharedConfig for THIS component only (maps merge recursively;
+# scalars and lists are replaced wholesale). `server.api.allowed_hosts` lives here rather
+# than in the shared object: it is MCP-only (rmcp streamable-HTTP DNS-rebinding protection)
+# and it is templated per release.
+configOverrides:
+  server:
+    api:
+      # Host authorities MCP clients may present in the inbound Host header when reaching
+      # `/mcp`. Consumed only by the MCP server. Defaults to this release's in-cluster
+      # Service name (short + FQDN, with and without :3000) so pod-to-pod access works out
+      # of the box; `/healthz` probes are never gated by this. Add ingress host(s) for
+      # external access via `mcpAllowedHosts` above.
+      # Each entry is an ordinary list item, so `lightbridge.config.render`'s `tpl` pass
+      # resolves the release-derived names. `mcpAllowedHosts` is APPENDED to whatever this
+      # list ends up being by templates/common.yaml — a structural `{{ range }}` cannot live
+      # in a values file that is now real YAML data rather than a string blob.
+      allowed_hosts:
+        - localhost
+        - 127.0.0.1
+        - '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}'
+        - '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}:3000'
+        - '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}.{{ $.Release.Namespace }}.svc.cluster.local'
+        - '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}.{{ $.Release.Namespace }}.svc.cluster.local:3000'
+
+# Dotted paths removed AFTER the merge — for blocks this component must not see at all.
+configOmit: []
+
 configMaps:
   config:
     enabled: true
     data:
-      config.yaml: |-
-        logging:
-          level: info
-        database:
-          url: "${DATABASE_URL}"
-          pool_size: 10
-        oauth2:
-          # REQUIRED credential-issuance mode — no default. `self` mints self-signed JWT API keys
-          # (uses `signing`); `external` exchanges at the upstream IdP (uses `issuance`). MUST match
-          # the api service so both surfaces mint the same credential format.
-          type: self
-          signing:
-            issuer: "https://authz-api:3000"
-            audience: "lightbridge-api-key"
-            ttl_seconds: 7776000
-            max_key_age_days: 30
-          jwks_url: http://keycloak:9100/realms/dev/protocol/openid-connect/certs
-          # Expected audience claim(s) in JWT tokens. Set to restrict token acceptance.
-          # Tokens must contain at least one matching audience value.
-          #
-          # Valid audience values:
-          #   - lightbridge-api-key: Primary audience for API Key service
-          #   - lightbridge-token-issuer: Audience for token issuer service
-          #
-          # For production, set via Helm values or environment variable:
-          #   OAUTH2__AUDIENCE='["lightbridge-api-key"]'
-          # For local development with multiple audiences:
-          #   audience: ["lightbridge-api-key", "lightbridge-token-issuer"]
-          audience: []
-          # ADR-0025 Stage 1: the ONE issuer this deployment trusts for
-          # remote-subject-to-account-id translation. REQUIRED -- lightbridge-mcp refuses to
-          # start without it, the same as every authz-* component. MUST match the api service's
-          # oauth2.federation.issuer. There is no longer a separate `oauth2.relying_party.issuer`
-          # to also match -- that field was removed.
-          federation:
-            issuer: "http://keycloak:9100/realms/dev"
-        server:
-          api:
-            address: 0.0.0.0
-            port: 3000
-            tls:
-              cert_path: /etc/lightbridge/tls/api.crt
-              key_path: /etc/lightbridge/tls/api.key
-            # Host authorities MCP clients may present in the inbound Host header when reaching
-            # `/mcp` (rmcp streamable-HTTP DNS-rebinding protection). Consumed only by the MCP
-            # server. Defaults to this release's in-cluster Service name (short + FQDN, with and
-            # without :3000) so pod-to-pod access works out of the box; `/healthz` probes are
-            # never gated by this. Add ingress host(s) for external access via `mcpAllowedHosts`
-            # below (e.g. `--set mcpAllowedHosts={mcp.example.com}`).
-            allowed_hosts:
-              - localhost
-              - 127.0.0.1
-              - '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}'
-              - '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}:3000'
-              - '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}.{{ $.Release.Namespace }}.svc.cluster.local'
-              - '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}.{{ $.Release.Namespace }}.svc.cluster.local:3000'
-              {{- range ($.Values.mcpAllowedHosts | default list) }}
-              - {{ . | quote }}
-              {{- end }}
-          opa:
-            address: 0.0.0.0
-            port: 3000
-            tls:
-              cert_path: /etc/lightbridge/tls/opa.crt
-              key_path: /etc/lightbridge/tls/opa.key
-            basic_auth:
-              username: authorino
-              password: "${OPA_PASSWORD}"
-        otel:
-          enabled: true
-          otlp_endpoint: "http://localhost:4317"
-          service_name: "lightbridge-authz"
-        # Billing plans a caller may attach to an API key at creation. Operator-defined catalogue
-        # (no plan table/entity): each plan has a stable id, UI name, and optional limits. A
-        # CreateApiKey must name one of these ids or it is rejected (400); introspection resolves
-        # the id to name + limits. `plans` also accepts a single JSON-array string via
-        # "${BILLING_PLANS}".
-        # NOTE: keep this catalogue in sync with charts/lightbridge-authz/values.yaml — API and MCP
-        # share the same DB, so a key created under one must be creatable under the other.
-        billing:
-          plans:
-            - id: free
-              name: Free
-              limits:
-                requests_per_second: 5
-                requests_per_day: 1000
-                concurrent_requests: 2
-            - id: pro
-              name: Pro
-              limits:
-                requests_per_second: 50
-                requests_per_day: 50000
-                requests_per_month: 1000000
-                concurrent_requests: 20
-            # No `limits` block ⇒ unlimited on every dimension.
-            - id: enterprise
-              name: Enterprise
-
+      # Deliberately one line — see charts/lightbridge-authz/values.yaml's matching comment.
+      config.yaml: |
+        {{ include "lightbridge.config.render" $ | indent 2 | trim }}
 
 service:
   authz:
