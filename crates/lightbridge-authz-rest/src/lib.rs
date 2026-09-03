@@ -64,7 +64,7 @@ use routers::opa_router;
 use rpc_authorize::{RpcAuthorizeState, RpcScope};
 
 use cratestack::idempotency::IdempotencyLayer;
-use cratestack::ratelimit::{RateLimitConfig, RateLimitLayer, RateLimitStore};
+use cratestack::ratelimit::{RateLimitConfig, RateLimitLayer, RateLimitStore, StoreErrorPolicy};
 use cratestack::{
     CratestackContext, CratestackError, DEFAULT_BODY_LIMIT_BYTES, SqlxIdempotencyStore, Value,
 };
@@ -84,6 +84,32 @@ const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 3600);
 /// limiting (Redis-backed)"). Generous burst with steady refill; tune via deployment as needed.
 const RATE_LIMIT_BURST: u32 = 120;
 const RATE_LIMIT_REFILL_PER_SECOND: f64 = 60.0;
+/// Store-failure policy for every `RateLimitLayer` this crate builds.
+///
+/// cratestack 0.11.0 (cratestack/cratestack#869, closing cratestack#846) changed the DEFAULT from
+/// "any store error is a 500" to `StoreErrorPolicy::Allow` -- serve the request *unthrottled* when
+/// the store failure is transport-class (`CratestackError::Unavailable`: socket broken, Redis
+/// unreachable, or the new 500ms `with_store_timeout` budget elapsed). Upstream's argument is a
+/// capacity-control one: an unreachable limiter should degrade to unlimited rather than take every
+/// rate-limited route down with it.
+///
+/// **This repo rejects that default.** Here the limiter is a security control, not a capacity
+/// control: it is the brute-force guard in front of the OAuth/OIDC token, device-verification and
+/// CRUD surfaces, and it sits in a service whose whole reason to exist is authorization. The rule
+/// this repo states everywhere else -- "an unavailable dependency must never become the permissive
+/// branch" -- is already applied by hand at the one direct `RateLimitStore::consume` call site
+/// (`oauth2_op::device_store::get_by_user_code_rate_limited`, which returns `Err` fail-closed on
+/// any limiter error). `Deny` is the same decision, restored for the two tower layers so all three
+/// call sites agree.
+///
+/// Consequence, stated plainly: a Redis outage now refuses rate-limited requests with the store's
+/// own error status (503 for transport-class) instead of serving them unthrottled. That is the
+/// pre-0.11.0 behaviour this repo already shipped, minus the opaque body -- 0.11.0 renders the
+/// refusal through the codec-negotiated error envelope, so generated clients decode a typed code.
+/// `DEFAULT_STORE_TIMEOUT` (500ms) is deliberately left at upstream's default: under `Deny` it
+/// only bounds how long a request waits before being refused, which is a strict improvement over
+/// the unbounded `ConnectionManager` reconnect it replaces.
+const RATE_LIMIT_STORE_ERROR_POLICY: StoreErrorPolicy = StoreErrorPolicy::Deny;
 // The evaluation budget and the one policy set id both moved to `budget_services`, beside the
 // `PolicyStore::load_active_from_db` call that is their only real consumer -- `lightbridge-mcp`
 // needs the same two values now that it builds the same service graph (lightbridge-authz#645).
@@ -2857,10 +2883,14 @@ pub fn build_api_router(
         DEFAULT_BODY_LIMIT_BYTES,
     )
     .layer(IdempotencyLayer::new(idempotency_store, IDEMPOTENCY_TTL))
-    .layer(RateLimitLayer::new(
-        rate_limit_store,
-        RateLimitConfig::new(RATE_LIMIT_BURST, RATE_LIMIT_REFILL_PER_SECOND),
-    ))
+    .layer(
+        RateLimitLayer::new(
+            rate_limit_store,
+            RateLimitConfig::new(RATE_LIMIT_BURST, RATE_LIMIT_REFILL_PER_SECOND),
+        )
+        // Opt out of cratestack 0.11.0's fail-open default -- see `RATE_LIMIT_STORE_ERROR_POLICY`.
+        .with_store_error_policy(RATE_LIMIT_STORE_ERROR_POLICY),
+    )
     .layer(axum::middleware::from_fn_with_state(
         RpcAuthorizeState {
             bearer,
@@ -3857,10 +3887,14 @@ pub fn build_budget_router(
         DEFAULT_BODY_LIMIT_BYTES,
     )
     .layer(IdempotencyLayer::new(idempotency_store, IDEMPOTENCY_TTL))
-    .layer(RateLimitLayer::new(
-        rate_limit_store,
-        RateLimitConfig::new(RATE_LIMIT_BURST, RATE_LIMIT_REFILL_PER_SECOND),
-    ))
+    .layer(
+        RateLimitLayer::new(
+            rate_limit_store,
+            RateLimitConfig::new(RATE_LIMIT_BURST, RATE_LIMIT_REFILL_PER_SECOND),
+        )
+        // Opt out of cratestack 0.11.0's fail-open default -- see `RATE_LIMIT_STORE_ERROR_POLICY`.
+        .with_store_error_policy(RATE_LIMIT_STORE_ERROR_POLICY),
+    )
     .layer(axum::middleware::from_fn_with_state(
         RpcAuthorizeState {
             bearer,

@@ -269,6 +269,125 @@ fn build_router_at(
     )
 }
 
+/// A [`RateLimitStore`] that always fails with the caller-supplied error -- the injectable half of
+/// the fail-closed guard below. Deterministic and network-free, unlike [`DEAD_REDIS`]: whether a
+/// literal `redis://127.0.0.1:6379` is actually dead depends on the developer's machine, and a
+/// security property must not be asserted through a premise that a stray local Redis can falsify.
+struct AlwaysFailingRateLimitStore {
+    error: fn() -> cratestack::CratestackError,
+}
+
+#[lightbridge_authz_core::async_trait]
+impl RateLimitStore for AlwaysFailingRateLimitStore {
+    async fn consume(
+        &self,
+        _key: &str,
+        _config: cratestack::ratelimit::RateLimitConfig,
+    ) -> Result<cratestack::ratelimit::RateLimitDecision, cratestack::CratestackError> {
+        Err((self.error)())
+    }
+}
+
+/// Like [`build_router`], but with a caller-supplied rate-limit store -- for the store-failure
+/// policy guard. Everything else stays lazily wired to unreachable backends, so any request that
+/// gets *past* the rate-limit layer necessarily fails afterwards with something that is NOT the
+/// store's own status; the assertions below key on that distinction.
+fn build_router_with_rate_limit_store(
+    bearer: Arc<dyn BearerTokenServiceTrait>,
+    rate_limit_store: Arc<dyn RateLimitStore>,
+) -> Router {
+    let core = lazy_core_pool();
+    let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()));
+    let policy_store = lazy_policy_store(core.clone());
+    let (refill_service, review_service, budget_repo, reset_scheduler) =
+        lazy_refill_and_review_services(core.clone(), &policy_store);
+    lightbridge_authz_rest::build_api_router(
+        bearer,
+        common::test_resolver(),
+        issuer,
+        policy_store,
+        refill_service,
+        review_service,
+        budget_repo,
+        reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
+        lazy_cratestack_db(),
+        core,
+        lazy_idempotency(),
+        rate_limit_store,
+        false,
+        None,
+    )
+}
+
+/// **The fail-closed guard for cratestack 0.11.0's flipped rate-limit default.**
+///
+/// cratestack/cratestack#869 (closing cratestack#846) changed `RateLimitLayer`'s behaviour on a
+/// *store* failure from "always a 500" to `StoreErrorPolicy::Allow` -- serve the request
+/// **unthrottled** whenever the failure is transport-class (`CratestackError::Unavailable`: the
+/// socket broke, Redis is unreachable, or the new 500ms store-timeout budget elapsed). Upstream's
+/// reasoning is a capacity-control one and is sound for a capacity limiter.
+///
+/// It is the wrong default *here*. This service's limiter is the brute-force guard in front of the
+/// OAuth/OIDC and CRUD surfaces, so `lightbridge-authz-rest` pins
+/// `RATE_LIMIT_STORE_ERROR_POLICY = StoreErrorPolicy::Deny` on every `RateLimitLayer` it builds
+/// (see its doc comment in `lib.rs`, and the identical hand-written decision at
+/// `oauth2_op::device_store::get_by_user_code_rate_limited`). This test is what keeps that opt-out
+/// from being silently dropped by a future bump: it injects a store that fails **transport-class**
+/// -- precisely the class upstream's default serves through -- and asserts the request is refused
+/// with the store's own `503`, never dispatched.
+#[tokio::test]
+async fn a_transport_class_rate_limit_store_failure_is_refused_not_served_unthrottled() {
+    let store = Arc::new(AlwaysFailingRateLimitStore {
+        error: || cratestack::CratestackError::Unavailable("simulated redis outage".to_owned()),
+    });
+    let router = build_router_with_rate_limit_store(admin_bearer(), store);
+    let (status, _) = rpc_call(
+        router,
+        "model.Account.list",
+        Wire::Cbor,
+        &json!({}),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an unreachable rate-limit store must REFUSE (503, the store's own status), not serve the \
+         request through unthrottled -- cratestack 0.11.0's StoreErrorPolicy::Allow default is \
+         opted out of in lib.rs. A 200/500 here means the Deny opt-out was dropped and the \
+         limiter silently stopped limiting during a Redis outage."
+    );
+}
+
+/// The other half of the classification: a store that is *reachable and refusing* stays closed
+/// under every policy upstream ships, so this one would pass even without the `Deny` opt-out. It is
+/// here so a future reader can see both classes asserted side by side and not mistake the test
+/// above for a blanket "all store errors 503" claim -- the two differ only in which upstream
+/// default they survive.
+#[tokio::test]
+async fn a_logical_rate_limit_store_failure_is_refused_too() {
+    let store = Arc::new(AlwaysFailingRateLimitStore {
+        error: || cratestack::CratestackError::Internal("simulated redis OOM".to_owned()),
+    });
+    let router = build_router_with_rate_limit_store(admin_bearer(), store);
+    let (status, _) = rpc_call(
+        router,
+        "model.Account.list",
+        Wire::Cbor,
+        &json!({}),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a reachable-but-refusing rate-limit store must never open the gate"
+    );
+}
+
 /// A single-identity admin bearer, token string `"admin"`.
 fn admin_bearer() -> Arc<dyn BearerTokenServiceTrait> {
     Arc::new(MapBearer::new().with("admin", token_info("admin-subject", admin_perms())))
