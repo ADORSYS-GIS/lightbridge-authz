@@ -771,6 +771,18 @@ Check health:
 - `curl -k https://localhost:13004/healthz` (`authz-idp`)
 - `curl -k https://localhost:13005/healthz` (`authz-budget`)
 
+Check WHICH BUILD is running (#573, `docs/build-info.md`) — `GET /version` is mounted beside the
+probes on every listener and is unauthenticated for the same reason `/healthz` is. It reports the
+crate version, git SHA + commit date, rustc version, build time, and (inside a container) the image
+build SHA/tag. Same struct over RPC as `getBuildInfo` for the console, and the same JSON from
+`lightbridge-authz version` / `lightbridge-authz --version` at a shell:
+
+- `curl -k https://localhost:13000/version` (`authz-api`)
+- `curl -k https://localhost:13001/version` (`authz-opa`)
+- `curl -k https://localhost:13002/version` (`authz-usage`)
+- `curl -k https://localhost:13004/version` (`authz-idp`)
+- `curl -k https://localhost:13005/version` (`authz-budget`)
+
 OpenAPI docs:
 
 - CRUD API: removed. Swagger UI/OpenAPI generation for the CRUD API was dropped as part of the cratestack migration (see `docs/adr/0003-cratestack-crud-migration.md`); the generated cratestack Rust client is now the primary integration contract.

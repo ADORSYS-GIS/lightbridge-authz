@@ -2763,6 +2763,7 @@ async fn request_refill_accepts_a_real_human_plane_token_that_still_carries_the_
         Arc::new(UnavailableSpendReader),
     ));
     let procedures = Procedures::new(
+        lightbridge_authz_rest::SERVICE_API,
         issuer,
         policy_store,
         refill_service,

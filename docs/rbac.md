@@ -447,8 +447,9 @@ granularity theatre. `rbac:manage` is its own permission rather than a reuse of 
 `account:*` grant because it is the one capability that can hand out every other capability:
 **whoever can write this table can make themselves `lightbridge-admin`.**
 
-`getMyAccess` is the deliberate opposite. It is the sole entry in
-`rpc_permission_map::AUTHENTICATED_ONLY_OP_IDS`, the enumerated exception to the fail-closed
+`getMyAccess` is the deliberate opposite. It is one of two entries in
+`rpc_permission_map::AUTHENTICATED_ONLY_OP_IDS` (the other being `getBuildInfo`, #573 — see
+[docs/build-info.md](build-info.md)), the enumerated exception to the fail-closed
 "unmapped op-id is denied" rule — a list rather than a heuristic, precisely so that adding another
 is a conscious edit somebody reviews. Gating it would defeat its purpose (the console calls it to
 find out what it may render, so a permission requirement makes "you may not ask what you may do" a
@@ -536,7 +537,7 @@ scope for #401.
 | `usage:read-all`         | — (not an RPC op-id; see note below)                 | — (no MCP tool)                     |
 | `user:read`              | `procedure.resolveUserProfiles`, `procedure.resolveActorLabels`, `procedure.searchUsers` | — (no MCP tool yet) |
 | `rbac:manage`            | `procedure.listPlatformRoleGrants`, `procedure.grantPlatformRole`, `procedure.revokePlatformRole` | — (no MCP tool yet) |
-| **none** (any authenticated caller) | `procedure.getMyAccess` — the ONE enumerated exception to "unmapped op-id is denied"; see [Platform roles are a table](#platform-roles-are-a-table-adr-0033) | — (no MCP tool yet) |
+| **none** (any authenticated caller) | `procedure.getMyAccess`, `procedure.getBuildInfo` — the two enumerated exceptions to "unmapped op-id is denied"; see [Platform roles are a table](#platform-roles-are-a-table-adr-0033) and [docs/build-info.md](build-info.md) | — (no MCP tool yet) |
 
 `read` covers both the list and get operations for a resource.
 

@@ -2860,6 +2860,7 @@ dependencies = [
  "lightbridge-authz-core",
  "lightbridge-authz-usage-rest",
  "mimalloc",
+ "serde_json",
  "sqlx",
  "tokio",
  "tracing",

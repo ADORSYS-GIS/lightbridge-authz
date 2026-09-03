@@ -104,6 +104,21 @@ const DEFAULT_RESET_SCHEDULE_RUN_AT_UTC: chrono::NaiveTime =
         None => unreachable!(),
     };
 
+/// Service names reported by `GET /version` and the `service.build` startup log line (#573).
+///
+/// One binary (`lightbridge-authz`) serves all four of these routers, so "which service am I
+/// talking to?" cannot be answered by the process name or the crate version — only by which router
+/// handled the request. These constants are that answer, and they are the SAME strings the servers
+/// already use for their `server = ...` tracing field, so a log line and a `/version` response name
+/// the same thing.
+pub const SERVICE_API: &str = "authz-api";
+/// See [`SERVICE_API`].
+pub const SERVICE_OPA: &str = "authz-opa";
+/// See [`SERVICE_API`].
+pub const SERVICE_IDP: &str = "authz-idp";
+/// See [`SERVICE_API`].
+pub const SERVICE_BUDGET: &str = "authz-budget";
+
 #[derive(Serialize, Deserialize)]
 struct RootResponse {
     status: String,
@@ -687,6 +702,12 @@ fn to_schema_session_revocation_result(revoked_count: u64) -> schema::SessionRev
 /// `start_api_server`.
 #[derive(Clone)]
 pub struct Procedures {
+    /// Which listener this registry is mounted behind (`SERVICE_API` or `SERVICE_BUDGET`), for
+    /// `getBuildInfo` (#573). One registry type serves both routers, so the router that built it
+    /// is the only thing that knows which service the caller actually reached -- deriving it at
+    /// call time is impossible, and defaulting it would let `authz-budget` report itself as
+    /// `authz-api` in the one screen built to detect exactly that class of mismatch.
+    service: &'static str,
     issuer: Arc<AuthzStoreImpl>,
     policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
     refill_service: Arc<lightbridge_authz_budget::RefillService>,
@@ -718,6 +739,7 @@ pub struct Procedures {
 impl Procedures {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        service: &'static str,
         issuer: Arc<AuthzStoreImpl>,
         policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
         refill_service: Arc<lightbridge_authz_budget::RefillService>,
@@ -727,6 +749,7 @@ impl Procedures {
         rbac_roles: Arc<Vec<String>>,
     ) -> Self {
         Self {
+            service,
             issuer,
             policy_store,
             refill_service,
@@ -2622,6 +2645,39 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         let ctx = ctx.clone();
         async move { my_access::get_my_access(&issuer.repo, &ctx).await }
     }
+
+    /// `getBuildInfo` (#573): the build stamp of the service that answered.
+    ///
+    /// Reads the exact same `lightbridge_authz_core::build_info` value `GET /version` serves, so
+    /// the authenticated RPC answer and the unauthenticated HTTP answer can never disagree about
+    /// what is running. Touches neither the database nor the caller's identity -- `_db` and `ctx`
+    /// are both unused on purpose; the only per-call input is which router mounted this registry.
+    fn get_build_info(
+        &self,
+        _db: &schema::Cratestack,
+        _ctx: &CratestackContext,
+        _args: schema::procedures::get_build_info::Args,
+        _authorized: schema::procedures::get_build_info::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::get_build_info::Output, CratestackError>,
+    > + Send {
+        let info = lightbridge_authz_core::build_info(self.service);
+        async move {
+            Ok(schema::ServerBuildInfo {
+                service: info.service,
+                version: info.version,
+                gitSha: info.git_sha,
+                gitShortSha: info.git_short_sha,
+                gitCommitDate: info.git_commit_date,
+                gitDirty: info.git_dirty,
+                rustcVersion: info.rustc_version,
+                buildTime: info.build_time,
+                imageBuildSha: info.image_build_sha,
+                imageTag: info.image_tag,
+                imageBuildTime: info.image_build_time,
+            })
+        }
+    }
 }
 
 /// Shared page-fetch for `listMyBudgetGrants`/`listBudgetGrants`: parses the optional `period`,
@@ -2662,12 +2718,24 @@ async fn list_budget_grants_page(
     })
 }
 
-/// Shared `/`, `/healthz`, `/healthz/startup`, `/healthz/ready` mount, reused by every server
-/// router (`build_api_router`/`build_opa_router`/`build_idp_router`) so the probe surface — and
-/// its DB-readiness semantics (`readiness_handler`/`is_database_ready`) — can never drift between
-/// them. Generic over `S` the same way `well_known_router`/`token_exchange_router` are, so it
-/// merges into any router regardless of that router's own state type.
-fn probe_router<S>(readiness_pool: Arc<dyn DbPoolTrait>) -> Router<S>
+/// Shared `/`, `/healthz`, `/healthz/startup`, `/healthz/ready`, `/version` mount, reused by every
+/// server router (`build_api_router`/`build_opa_router`/`build_idp_router`/`build_budget_router`)
+/// so the probe surface — and its DB-readiness semantics (`readiness_handler`/`is_database_ready`)
+/// — can never drift between them. Generic over `S` the same way
+/// `well_known_router`/`token_exchange_router` are, so it merges into any router regardless of that
+/// router's own state type.
+///
+/// `service` names the listener in `GET /version`'s answer (#573). It is a `&'static str` rather
+/// than configuration on purpose: one binary serves four of these routers, and which one a request
+/// reached is a fact of the code path, not something an operator should be able to mislabel.
+///
+/// `/version` sits here, beside the probes, because it is the same KIND of surface: unauthenticated,
+/// side-effect free, and answering "what is this process?" for an operator or a support engineer
+/// who does not hold a credential. It discloses a crate version, a commit id and a toolchain name —
+/// no configuration, no topology, no data. The authenticated equivalent for the console is the
+/// `getBuildInfo` RPC procedure, which returns this same struct over the same client the console
+/// already holds.
+fn probe_router<S>(readiness_pool: Arc<dyn DbPoolTrait>, service: &'static str) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -2675,6 +2743,7 @@ where
         .route("/", get(root_handler))
         .route("/healthz", get(health_handler))
         .route("/healthz/startup", get(startup_handler))
+        .route("/version", get(move || version_handler(service)))
         .route(
             "/healthz/ready",
             get(move || {
@@ -2737,7 +2806,7 @@ pub fn build_api_router(
     dev_cors: bool,
     rpc_base_path: Option<&str>,
 ) -> Router {
-    let public = probe_router(readiness_pool);
+    let public = probe_router(readiness_pool, SERVICE_API);
 
     // Generated RPC CRUD surface. Codec: CBOR is the ONLY wire format this router serves — no JSON
     // fallback (ADR-0013, "CBOR is the only transport codec", reversing ADR-0003's "CBOR in
@@ -2757,6 +2826,7 @@ pub fn build_api_router(
     let rpc = schema::axum::rpc_router(
         cratestack_db,
         Procedures::new(
+            SERVICE_API,
             issuer,
             policy_store,
             refill_service,
@@ -3386,8 +3456,9 @@ pub async fn start_api_server(
     }
     let signing_enabled = oauth2.is_self_signed();
     let issuance_enabled = oauth2.is_external();
+    lightbridge_authz_core::log_build_info(SERVICE_API);
     tracing::info!(
-        server = "authz-api",
+        server = SERVICE_API,
         address = %api.address,
         port = api.port,
         oauth2_type = ?oauth2.oauth2_type,
@@ -3402,7 +3473,7 @@ pub async fn start_api_server(
 /// Assembles the OPA server router (public probes + Basic-auth introspection/resolve routes).
 /// Separated from `start_opa_server` for testability.
 pub fn build_opa_router(state: Arc<OpaState>, readiness_pool: Arc<dyn DbPoolTrait>) -> Router {
-    let public = probe_router(readiness_pool)
+    let public = probe_router(readiness_pool, SERVICE_OPA)
         .merge(SwaggerUi::new("/v1/opa/docs").url("/v1/opa/openapi.json", OpaDoc::openapi()));
 
     let protected = opa_router(state.clone()).with_state(state.clone());
@@ -3441,8 +3512,9 @@ pub async fn start_opa_server(
 
     let app = build_opa_router(state, readiness_pool);
 
+    lightbridge_authz_core::log_build_info(SERVICE_OPA);
     tracing::info!(
-        server = "authz-opa",
+        server = SERVICE_OPA,
         address = %opa.address,
         port = opa.port,
         "starting opa server"
@@ -3518,7 +3590,7 @@ pub fn build_idp_router(
     relying_party: Arc<relying_party::KeycloakRelyingParty>,
     claim_redeem: claim_redeem::ClaimRedeemState,
 ) -> Router {
-    let mut router = probe_router(readiness_pool);
+    let mut router = probe_router(readiness_pool, SERVICE_IDP);
     let claim_redeem_repo = Arc::clone(&claim_redeem.repo);
     // GHSA-9pc6-965v-2c44: mounted unconditionally, like every other authz-idp route (ADR-0023).
     // A deployment where this 404s while lightbridge-mcp still issues claim URLs would hand users
@@ -3778,8 +3850,9 @@ pub async fn start_idp_server(
         claim_redeem,
     );
 
+    lightbridge_authz_core::log_build_info(SERVICE_IDP);
     tracing::info!(
-        server = "authz-idp",
+        server = SERVICE_IDP,
         address = %idp.address,
         port = idp.port,
         "starting idp server"
@@ -3831,11 +3904,12 @@ pub fn build_budget_router(
     rate_limit_store: Arc<dyn RateLimitStore>,
     dev_cors: bool,
 ) -> Router {
-    let public = probe_router(readiness_pool);
+    let public = probe_router(readiness_pool, SERVICE_BUDGET);
 
     let rpc = schema::axum::rpc_router(
         cratestack_db,
         Procedures::new(
+            SERVICE_BUDGET,
             issuer,
             policy_store,
             refill_service,
@@ -4083,8 +4157,9 @@ pub async fn start_budget_server(
     if dev_cors {
         tracing::warn!("AUTHZ_DEV_CORS is set — budget server allows any CORS origin (dev only)");
     }
+    lightbridge_authz_core::log_build_info(SERVICE_BUDGET);
     tracing::info!(
-        server = "authz-budget",
+        server = SERVICE_BUDGET,
         address = %budget.address,
         port = budget.port,
         rpc_base_path = BUDGET_RPC_BASE_PATH,
@@ -4108,6 +4183,15 @@ async fn health_handler() -> StatusCode {
 
 async fn startup_handler() -> StatusCode {
     StatusCode::OK
+}
+
+/// `GET /version` (#573): the build stamp of the process answering, as JSON.
+///
+/// Always `200` — there is no failure mode. The stamp is assembled from compile-time constants
+/// plus three environment reads; nothing here touches the database, the network, or the caller's
+/// identity, which is why it is safe to leave unauthenticated next to `/healthz`.
+async fn version_handler(service: &'static str) -> Json<lightbridge_authz_core::BuildInfo> {
+    Json(lightbridge_authz_core::build_info(service))
 }
 
 async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {

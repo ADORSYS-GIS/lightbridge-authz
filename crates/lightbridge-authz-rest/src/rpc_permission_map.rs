@@ -24,7 +24,7 @@ use lightbridge_authz_core::Permission;
 ///
 /// [`required_permission`]: crate::rpc_authorize::required_permission
 ///
-/// Its sole member, `getMyAccess` (ADR-0033), returns the caller's OWN already-minted roles and the
+/// `getMyAccess` (ADR-0033) returns the caller's OWN already-minted roles and the
 /// permission set the server derives from them. Gating it would defeat its purpose: the console
 /// calls it to find out what it may render, so a permission requirement would make "you may not
 /// ask what you may do" a reachable state, and the natural candidates all make it worse --
@@ -32,7 +32,14 @@ use lightbridge_authz_core::Permission;
 /// happens to hold today is an accident of the default map that an operator's own
 /// `role_permissions` can revoke. It discloses nothing new either way: every value it returns is
 /// already derivable from the caller's own token, which they are holding.
-pub const AUTHENTICATED_ONLY_OP_IDS: &[&str] = &["procedure.getMyAccess"];
+///
+/// `getBuildInfo` (#573) returns the running build's version/commit/image stamp. It is here for a
+/// simpler reason: the SAME values are already served unauthenticated at `GET /version` on every
+/// listener, beside `/healthz`. Requiring a permission on the RPC transport of a value anyone can
+/// curl would be theatre, and it would break the one console screen (`/settings/info`) whose whole
+/// job is to answer "what am I running, and what am I talking to" for every signed-in user, not
+/// just admins.
+pub const AUTHENTICATED_ONLY_OP_IDS: &[&str] = &["procedure.getMyAccess", "procedure.getBuildInfo"];
 
 /// Whether `op_id` is served to any authenticated caller (see [`AUTHENTICATED_ONLY_OP_IDS`]).
 pub fn is_authenticated_only_op_id(op_id: &str) -> bool {

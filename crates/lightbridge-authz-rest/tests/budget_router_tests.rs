@@ -186,6 +186,37 @@ async fn health_probes_report_ok() {
     }
 }
 
+/// `GET /version` (#573) on `authz-budget` names `authz-budget`, not `authz-api`.
+///
+/// This is the assertion the whole "thread a `&'static str` through `probe_router` and
+/// `Procedures`" design exists for: one binary serves both routers, so if the service name were
+/// derived from the process rather than the router, the console's `/settings/info` screen would
+/// show two identical rows and be unable to detect a version skew between the two services — which
+/// is the exact failure mode it was built to catch.
+#[tokio::test]
+async fn version_endpoint_reports_the_budget_service_not_the_api() {
+    let router = build_router(admin_bearer());
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(info["service"].as_str(), Some("authz-budget"), "{info}");
+    assert!(
+        info["gitSha"].as_str().is_some_and(|v| !v.is_empty()),
+        "the same stamp every other listener reports: {info}"
+    );
+}
+
 #[tokio::test]
 async fn readiness_reports_unavailable_when_the_database_is_unreachable() {
     let router = build_router(admin_bearer());
