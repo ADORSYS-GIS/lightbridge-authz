@@ -18,6 +18,7 @@ pub mod authorize;
 pub mod authorize_session_state;
 pub mod budget_convert;
 pub mod budget_remaining;
+pub mod budget_remaining_auth;
 pub mod budget_remaining_wire;
 pub mod budget_services;
 pub mod claim_redeem;
@@ -4106,16 +4107,10 @@ pub async fn start_budget_server(
         return rpc_listener.await;
     };
 
-    // Fail-closed, and loudly: this listener answers a cross-account balance question with NO
-    // per-caller ownership check of any kind, and the client-certificate requirement is the only
-    // thing standing in front of it. Serving it because someone configured the port and forgot the
-    // trust anchor is precisely the silent degrade `Tls::client_ca_bundle_path` exists to prevent.
-    if internal.tls.client_ca_bundle_path.is_none() {
-        return Err(Error::Server(format!(
-            "server.budget_internal.tls.client_ca_bundle_path is required: {BUDGET_REMAINING_PATH} \
-             is a cross-account service read gated ONLY by mTLS"
-        )));
-    }
+    // Fail-closed, and loudly (ADR-0034 §3.2) -- see `budget_remaining_auth`.
+    let shared_secret_header =
+        budget_remaining_auth::validate_budget_internal(internal, BUDGET_REMAINING_PATH)
+            .map_err(Error::Server)?;
 
     // The grace window is this listener's own config, which is why `build_budget_services` hands
     // back the shared `spend_reader` rather than a pre-assembled reader: `authz-api` and
@@ -4135,11 +4130,13 @@ pub async fn start_budget_server(
         grace,
     ));
 
-    let internal_app = budget_remaining::budget_remaining_router().with_state(Arc::new(
-        budget_remaining::BudgetInternalState {
-            remaining: remaining_service,
-        },
-    ));
+    let internal_state = Arc::new(budget_remaining::BudgetInternalState {
+        remaining: remaining_service,
+        shared_secret: internal.shared_secret.clone(),
+        shared_secret_header,
+    });
+    let internal_app = budget_remaining::budget_remaining_router(internal_state.clone())
+        .with_state(internal_state);
 
     lightbridge_authz_core::log_build_info(SERVICE_BUDGET_INTERNAL);
     tracing::info!(
@@ -4148,7 +4145,8 @@ pub async fn start_budget_server(
         port = internal.port,
         path = BUDGET_REMAINING_PATH,
         grace_seconds = internal.remaining_grace_seconds,
-        "starting budget internal (mTLS) server"
+        auth_header = %internal.shared_secret_header,
+        "starting budget internal (shared-secret) server"
     );
 
     let internal_listener = serve_tls(

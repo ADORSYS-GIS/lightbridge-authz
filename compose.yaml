@@ -328,9 +328,9 @@ services:
       DATABASE_URL: "postgres://postgres:postgres@postgresql:5432/lightbridge_authz"
     ports:
       - "13005:3005"
-      # ADR-0034's mTLS-only internal listener. Published so a local client with the compose CA's
-      # client certificate can exercise `GET /budget/v1/remaining`; a plain curl gets a TLS
-      # handshake refusal, which is the point.
+      # ADR-0034's internal listener. Published so a local client can exercise
+      # `GET /budget/v1/remaining`; a curl WITHOUT
+      # `-H "x-lightbridge-budget-token: local-dev-budget-secret"` gets a 401, which is the point.
       - "13007:3007"
     command:
       - budget
