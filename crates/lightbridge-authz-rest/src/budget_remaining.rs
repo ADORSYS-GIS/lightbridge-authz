@@ -1,5 +1,5 @@
-//! `GET /budget/v1/remaining` — the mTLS-only, service-to-service read behind the gateway's
-//! Dynamic Budget Limiter (ADR-0034, lightbridge-authz#658).
+//! `GET /budget/v1/remaining` — the service-to-service read behind the gateway's Dynamic Budget
+//! Limiter (ADR-0034 + its 2026-09-03 amendment, lightbridge-authz#658).
 //!
 //! ## What this is for
 //!
@@ -14,16 +14,15 @@
 //! `authz-budget`'s main listener is a bearer-JWT RPC surface reachable by the console. This
 //! answer must be readable by Authorino, which holds no user token, and must NOT be readable by
 //! anything else — it is a cross-account read with no per-caller ownership check at all, exactly
-//! like `lightbridge-authz-usage`'s `/usage/v1/spend/query` (#347), and it is gated exactly the
-//! same way: a second listener whose `Tls::client_ca_bundle_path` makes a verified client
-//! certificate a precondition of the TLS handshake, before any code in this module runs.
-//! `axum-server`'s rustls integration enforces client-certificate verification per **listener**,
-//! not per route, so this cannot be a route on the existing one without locking out the console.
+//! like `lightbridge-authz-usage`'s `/usage/v1/spend/query` (#347). Keeping it off the RPC
+//! listener means the console's bearer surface stays untouched and this route's own credential
+//! cannot be bypassed by hitting a sibling route.
 //!
-//! Like `/usage/v1/spend/query`, it additionally **refuses** any request carrying an
-//! `Authorization` header: it has no business ever receiving a user's bearer token, and a
-//! misrouted proxy that forwards one should fail loudly rather than quietly answering a
-//! cross-account question.
+//! That credential is a **shared secret in a custom header**, not a client certificate — see
+//! [`crate::budget_remaining_auth`] for the `kubectl explain` output that rules mTLS out, what is
+//! given up by taking the secret instead, and what would bring mTLS back. Like
+//! `/usage/v1/spend/query`, the route additionally **refuses** any request carrying an
+//! `Authorization` header.
 //!
 //! ## The contract, and the one rule that matters
 //!
@@ -31,6 +30,7 @@
 //! 200  {"budget_account_id","period","ceiling_micros","spent_micros","remaining_micros",
 //!       "next_reset_at","source_lag_seconds"}
 //! 400  {"error":"bad_request","message":...}      malformed account id / period
+//! 401  {"error":"unauthorized","message":...}     the shared secret was missing or wrong
 //! 403  {"error":"forbidden","message":...}        an Authorization header was present
 //! 503  {"error":"budget_unavailable","reason":...} the answer is not knowable right now
 //! ```
@@ -46,7 +46,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderName, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -67,6 +67,13 @@ pub const BUDGET_REMAINING_PATH: &str = "/budget/v1/remaining";
 /// so a later addition to this listener does not have to churn every handler signature.
 pub struct BudgetInternalState {
     pub remaining: Arc<dyn RemainingReader>,
+    /// The secret [`crate::budget_remaining_auth::require_shared_secret`] requires, verbatim from
+    /// `server.budget_internal.shared_secret`. Never empty in a running process —
+    /// `start_budget_server` refuses to start on an empty one.
+    pub shared_secret: String,
+    /// The header that secret must arrive in — `server.budget_internal.shared_secret_header`,
+    /// which must equal the AuthConfig's `metadata.http.credentials.customHeader.name`.
+    pub shared_secret_header: HeaderName,
 }
 
 /// Reports `ceiling − spend` for one budget account and period.
@@ -76,21 +83,8 @@ pub struct BudgetInternalState {
 /// the endpoint.
 pub async fn budget_remaining(
     State(state): State<Arc<BudgetInternalState>>,
-    headers: HeaderMap,
     Query(query): Query<RemainingQuery>,
 ) -> Response {
-    if headers.contains_key(header::AUTHORIZATION) {
-        tracing::warn!(
-            "budget_remaining: refusing a request carrying an Authorization header -- this is a \
-             service-to-service route with no per-caller ownership check"
-        );
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "this endpoint does not accept an Authorization header".to_string(),
-        );
-    }
-
     let account_id = query.account_id.trim();
     if account_id.is_empty() {
         return error_response(
@@ -164,12 +158,19 @@ pub async fn budget_remaining(
     }
 }
 
-/// The internal listener's router: the remaining read plus nothing else.
+/// The internal listener's router: the remaining read, behind the shared-secret check.
 ///
-/// No auth middleware, deliberately — the client-certificate requirement is enforced at the TLS
-/// layer by `Tls::client_ca_bundle_path` (`lightbridge_authz_core::server::serve_tls`'s
-/// `build_mtls_config`) before any handler here runs, exactly as on
-/// `lightbridge-authz-usage`'s query listener.
-pub fn budget_remaining_router() -> Router<Arc<BudgetInternalState>> {
-    Router::new().route(BUDGET_REMAINING_PATH, get(budget_remaining))
+/// The credential is a **route-layer** concern here rather than a TLS-handshake one, which is the
+/// one structural difference from `lightbridge-authz-usage`'s query listener — see
+/// [`crate::budget_remaining_auth`] for why Authorino leaves no other option. The layer is
+/// attached here, not at the call site, so no future caller can mount this router unprotected.
+pub fn budget_remaining_router(
+    state: Arc<BudgetInternalState>,
+) -> Router<Arc<BudgetInternalState>> {
+    Router::new()
+        .route(BUDGET_REMAINING_PATH, get(budget_remaining))
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            crate::budget_remaining_auth::require_shared_secret,
+        ))
 }

@@ -11,13 +11,14 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{HeaderName, Request, StatusCode, header};
 use chrono::{DateTime, Utc};
 use lightbridge_authz_budget::error::BudgetError;
 use lightbridge_authz_budget::{BudgetRemaining, Period, Remaining, RemainingReader};
 use lightbridge_authz_rest::budget_remaining::{
     BUDGET_REMAINING_PATH, BudgetInternalState, ERROR_BUDGET_UNAVAILABLE, budget_remaining_router,
 };
+use lightbridge_authz_rest::budget_remaining_auth::ERROR_UNAUTHORIZED;
 use tower::ServiceExt;
 
 /// Drives the REAL handler. `RemainingReader` exists precisely so this can be done: the two
@@ -55,10 +56,19 @@ fn the_route_is_mounted_at_the_documented_path() {
     assert_eq!(BUDGET_REMAINING_PATH, "/budget/v1/remaining");
 }
 
+/// The secret every authorized call below presents, and the header it rides in. Both are values
+/// in `server.budget_internal`; the AuthConfig's `sharedSecretRef` +
+/// `credentials.customHeader.name` are the other end of exactly these two.
+const SECRET: &str = "shared-secret-under-test";
+const SECRET_HEADER: &str = "x-lightbridge-budget-token";
+
 fn app(reader: StubReader) -> Router {
-    budget_remaining_router().with_state(Arc::new(BudgetInternalState {
+    let state = Arc::new(BudgetInternalState {
         remaining: Arc::new(reader),
-    }))
+        shared_secret: SECRET.to_string(),
+        shared_secret_header: HeaderName::from_static(SECRET_HEADER),
+    });
+    budget_remaining_router(state.clone()).with_state(state)
 }
 
 fn known() -> BudgetRemaining {
@@ -75,8 +85,11 @@ fn known() -> BudgetRemaining {
     }
 }
 
+/// Every call presents the shared secret unless a test is specifically about the credential --
+/// the middleware runs in front of the handler, so an unauthenticated call can never reach the
+/// behaviour the other tests are about.
 async fn call(app: Router, uri: &str, auth: bool) -> (StatusCode, serde_json::Value) {
-    let mut builder = Request::builder().uri(uri);
+    let mut builder = Request::builder().uri(uri).header(SECRET_HEADER, SECRET);
     if auth {
         builder = builder.header(header::AUTHORIZATION, "Bearer nope");
     }
@@ -229,4 +242,69 @@ async fn an_overspent_account_reports_a_negative_remaining() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["remaining_micros"], -1_000_000);
+}
+
+/// ADR-0034's 2026-09-03 amendment. The shared secret replaced mTLS because Authorino v0.24.0's
+/// `metadata.http` cannot present a client certificate -- which makes THIS check, and not the TLS
+/// handshake, the only thing standing in front of a cross-account balance read.
+#[tokio::test]
+async fn a_request_without_the_shared_secret_is_refused() {
+    let response = app(StubReader::Known(known()))
+        .oneshot(
+            Request::builder()
+                .uri("/budget/v1/remaining?account_id=acct_1")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("body reads");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+    assert_eq!(body["error"], ERROR_UNAUTHORIZED);
+    assert!(
+        body.get("remaining_micros").is_none(),
+        "an unauthenticated call must never carry a balance: {body}"
+    );
+}
+
+/// A wrong secret and a missing one are the same answer, deliberately: telling them apart would
+/// confirm to a prober that it guessed the header NAME correctly.
+#[tokio::test]
+async fn a_wrong_shared_secret_is_refused_the_same_way() {
+    let response = app(StubReader::Known(known()))
+        .oneshot(
+            Request::builder()
+                .uri("/budget/v1/remaining?account_id=acct_1")
+                .header(SECRET_HEADER, "not-the-secret")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The secret must not be accepted in the `Authorization` header even when it is the right value:
+/// that header is refused before the credential is looked at (403, not 401), so a proxy that
+/// forwards a user's bearer token here fails loudly rather than being silently ignored.
+#[tokio::test]
+async fn the_authorization_header_is_refused_before_the_credential_is_checked() {
+    let response = app(StubReader::Known(known()))
+        .oneshot(
+            Request::builder()
+                .uri("/budget/v1/remaining?account_id=acct_1")
+                .header(SECRET_HEADER, SECRET)
+                .header(header::AUTHORIZATION, format!("Bearer {SECRET}"))
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }

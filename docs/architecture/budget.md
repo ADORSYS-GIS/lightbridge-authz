@@ -55,8 +55,8 @@ call, never what a caller needs to hold to make it.
 
 ## The gateway's remaining-budget read (ADR-0034)
 
-`authz-budget` binds a **second, mTLS-only listener** (`config::BudgetInternalServer`, config key
-`server.budget_internal`) serving exactly one route:
+`authz-budget` binds a **second, shared-secret-gated listener** (`config::BudgetInternalServer`,
+config key `server.budget_internal`) serving exactly one route:
 
 ```
 GET /budget/v1/remaining?account_id=<budget account id>[&period=YYYY-MM]
@@ -71,13 +71,22 @@ budget_exhausted`), and for why the enforcement decision deliberately does **not
 
 Four properties, each of which is a decision:
 
-- **A separate listener, not a route.** `axum-server`'s rustls integration enforces
-  client-certificate verification per listener, not per route — the same constraint that split
-  `lightbridge-authz-usage` into an ingest and a query listener (#347). Adding this to the bearer-JWT
-  RPC listener would lock out the console. `client_ca_bundle_path` is **mandatory** here:
-  `start_budget_server` refuses to start without it, because mTLS is the only access control in
-  front of a cross-account balance read. Like `/usage/v1/spend/query`, the route also refuses any
-  request carrying an `Authorization` header.
+- **A separate listener, not a route.** The console's bearer-JWT RPC surface stays untouched, and
+  this route's credential cannot be bypassed by hitting a sibling route — the same split, for a
+  related reason, as `lightbridge-authz-usage`'s ingest/query listeners (#347).
+- **A shared secret, not mTLS — ADR-0034's 2026-09-03 amendment.** The ADR first specified
+  `Tls::client_ca_bundle_path`, copying #347. That was checked against the deployed CRD and does
+  not work: Authorino **v0.24.0**'s `AuthConfig.spec.metadata.http` exposes `body`,
+  `bodyParameters`, `contentType`, `credentials`, `headers`, `method`, `oauth2`, `sharedSecretRef`,
+  `url` and `urlExpression` — nothing that references a client key/certificate — and the deployed
+  pod mounts only `ca.crt`. An mTLS-only listener would fail every metadata handshake, leaving the
+  value absent and 503-ing every model request. So the route takes the credential Authorino *can*
+  send: a `sharedSecretRef` value in a custom header (`credentials.customHeader`). `shared_secret`
+  is **mandatory** — `start_budget_server` refuses to start without it — and
+  `tls.client_ca_bundle_path` must stay unset, which startup also enforces. A NetworkPolicy
+  restricting the port to the gateway namespace is the second layer. Like `/usage/v1/spend/query`,
+  the route additionally refuses any request carrying an `Authorization` header (`403`), before the
+  credential is even looked at.
 - **It reports, it does not decide.** The body is `ceiling_micros` (the expiry/revocation-aware
   `BudgetRepo::effective_balance`, not the raw `budget_balances` projection — an expired grant must
   not buy gateway traffic), `spent_micros`, their signed difference, `next_reset_at`, and

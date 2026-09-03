@@ -1,9 +1,11 @@
 # ADR-0034: The Dynamic Budget Limiter — the gateway reads the live balance, it does not trust the token
 
 - Status: Proposed
-- Date: 2026-09-03 (amended the same day — §3.1/§4.1/§9/§14 re-grounded on the
+- Date: 2026-09-03 (amended twice the same day — first §3.1/§4.1/§9/§14 re-grounded on the
   **deployed** Authorino v0.24.0 CRD rather than upstream source, after `kubectl explain` against
-  prod contradicted the upstream Go types on `metadata.http.timeout`)
+  prod contradicted the upstream Go types on `metadata.http.timeout`; then **§3's transport
+  changed from mTLS to a shared secret** during Stage 1, after the same `kubectl explain` showed
+  Authorino cannot present a client certificate at all — see §3.2)
 - Decision owners: @stephane-segning
 - Story: [lightbridge-authz#658](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/658)
   (Phase 6a decision memo)
@@ -85,7 +87,7 @@ step — and keep the enforcement *decision* out of the token entirely.
 ```
 JWKS identity (unchanged)
   → OPA / CEL authorization (unchanged)
-    → AuthConfig `metadata` → GET /budget/v1/remaining   [NEW, mTLS-only, authz-budget]
+    → AuthConfig `metadata` → GET /budget/v1/remaining   [NEW, shared-secret, authz-budget]
       → response.success.dynamicMetadata  (NOT a header)
         → Envoy Lua EnvoyExtensionPolicy: remaining_micros <= 0 ⇒ 402 budget_exhausted
 ```
@@ -126,14 +128,13 @@ rules, no plan-derived money. §6 states what the `BackendTrafficPolicy` becomes
 
 `GET /budget/v1/remaining?account_id=<budget account id>[&period=YYYY-MM]`
 
-Served by `authz-budget` on a **second listener** whose `Tls::client_ca_bundle_path` requires and
-verifies a client certificate at the TLS handshake, before any application code runs — the same
-posture, and the same reasoning, as `lightbridge-authz-usage`'s `/usage/v1/spend/query` (#347).
-Client-certificate verification is enforced per *listener*, not per route, so this cannot be a
-route on the bearer-JWT RPC listener without locking out the console. It additionally **refuses**
-any request carrying an `Authorization` header: it is a cross-account read with no per-caller
-ownership check at all, and a proxy misconfigured to forward a user's token here should fail
-loudly.
+Served by `authz-budget` on a **second listener**, gated by a **shared secret in a custom header**
+— *not* mTLS, which is what this ADR originally specified; §3.2 is the amendment and its evidence.
+A second listener rather than a route on the bearer-JWT RPC surface, so the console's plane is
+untouched and this route's credential cannot be bypassed by hitting a sibling route. It
+additionally **refuses** any request carrying an `Authorization` header: it is a cross-account read
+with no per-caller ownership check at all, and a proxy misconfigured to forward a user's token here
+should fail loudly.
 
 ```jsonc
 // 200
@@ -147,6 +148,7 @@ loudly.
   "source_lag_seconds": null      // null = no cache age to report; NOT "zero staleness"
 }
 // 400 {"error":"bad_request",…}         malformed account id / period
+// 401 {"error":"unauthorized",…}        the shared secret was missing or wrong
 // 403 {"error":"forbidden",…}           an Authorization header was present
 // 503 {"error":"budget_unavailable",…}  the answer is not knowable right now
 ```
@@ -172,6 +174,118 @@ Four things about that payload are decisions, not details:
   understate §5.4's overspend window, which is computed from exactly this term. Teaching
   `/usage/v1/spend/query` to return `MAX(time)` alongside the sum is the tracked follow-up that
   makes the fresh case a real number too.
+
+### 3.2 Amendment (2026-09-03, during Stage 1) — the transport is a shared secret, not mTLS
+
+**What changed.** `GET /budget/v1/remaining` is gated by a shared secret in a custom header
+(`server.budget_internal.shared_secret` / `.shared_secret_header`, default
+`x-lightbridge-budget-token`), delivered by the AuthConfig's `metadata.http.sharedSecretRef` +
+`credentials.customHeader`. `Tls::client_ca_bundle_path` is not merely optional on this listener —
+`start_budget_server` **refuses to start** when it is set, because setting it makes the endpoint
+unreachable.
+
+**Why, and it is checkable rather than arguable.** The original text copied #347's posture without
+checking that the *caller* could hold up its end. Authorino is not one of our Rust services; it is
+the only caller, and the deployed CRD gives it no way to attach a client key/certificate to a
+`metadata` call:
+
+```console
+$ kubectl --context hetzner-prod explain authconfigs.spec.metadata.http \
+    --api-version=authorino.kuadrant.io/v1beta3
+FIELDS:
+  body, bodyParameters, contentType, credentials, headers, method, oauth2,
+  sharedSecretRef, url, urlExpression
+```
+
+No `tls`, no `clientCert`, no `clientCertificateRef`. And the deployed pod
+(`quay.io/kuadrant/authorino:v0.24.0`, `kuadrant-policies-main` in `converse-gateway`) mounts
+exactly one file — `authz-tls`'s `ca.crt`, projected to
+`/etc/pki/tls/certs/lightbridge-ca.crt` — which lets it *verify our server certificate* and nothing
+more.
+
+So the mTLS shape does not fail loudly at review time; it fails at 100 % of requests in production.
+Every metadata fetch would be refused at the handshake, Authorino would leave the value absent (it
+logs and continues — §3.1), and the Lua would read absence on a metered model request as
+`budget_unavailable`. Shadow mode would have "worked" and measured nothing but our own
+misconfiguration.
+
+**What the substitute keeps, and what it gives up.** Kept: the channel is still TLS verified
+against the internal CA, so the secret is never in clear on the wire and the caller still
+authenticates *us*; both ends read the same Kubernetes Secret (this listener through the config's
+`${VAR}` interpolation, Authorino through `sharedSecretRef`), so they cannot silently drift; the
+`Authorization`-header refusal is unchanged and still runs first, with `403` rather than `401`, so
+a misrouted proxy fails loudly instead of being invited to retry with a different token; and a
+NetworkPolicy restricts port 3007 to the gateway namespace, so a leaked secret alone does not
+reach the listener from an arbitrary pod.
+
+Given up, and worth naming rather than glossing: a bearer secret is **replayable** by anything that
+can read it, where a private key is not; and rotation becomes a two-sided values change rather than
+a certificate renewal. That is the price of the field not existing. The day Authorino grows a
+client-certificate reference on `metadata.http`, this amendment is reverted — the code to delete is
+one module (`crates/lightbridge-authz-rest/src/budget_remaining_auth.rs`) and the startup check
+that currently *rejects* `client_ca_bundle_path`.
+
+**The admission path, before and after.**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant AZ as Authorino v0.24.0<br/>metadata step
+    participant L as authz-budget :3007
+    participant H as budget_remaining<br/>handler
+
+    rect rgb(250, 235, 235)
+        Note over AZ,L: BEFORE — as ADR-0034 first specified it
+        AZ->>L: TLS ClientHello (no client certificate — the CRD has no field for one)
+        L--xAZ: handshake refused (WebPkiClientVerifier)
+        Note over AZ: value left ABSENT → gateway reads budget_unavailable<br/>on 100% of requests
+    end
+
+    rect rgb(235, 245, 235)
+        Note over AZ,H: AFTER — this amendment
+        AZ->>L: GET /budget/v1/remaining?account_id=…<br/>x-lightbridge-budget-token: <sharedSecretRef>
+        L->>L: TLS: server cert only, verified by Authorino against lightbridge-ca.crt
+        L->>H: middleware: no Authorization header, secret matches
+        H-->>AZ: 200 {ceiling, spent, remaining, next_reset_at}
+    end
+```
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Arrived: request on :3007
+
+    Arrived --> Forbidden403: an Authorization header is present
+    Arrived --> CredentialChecked: no Authorization header
+
+    CredentialChecked --> Unauthorized401: header missing OR secret mismatch
+    CredentialChecked --> Handler: constant-time match
+
+    Handler --> Ok200: balance known
+    Handler --> BadRequest400: malformed account_id / period
+    Handler --> Unavailable503: ledger unreadable or spend unknowable
+
+    Forbidden403 --> [*]
+    Unauthorized401 --> [*]
+    Ok200 --> [*]
+    BadRequest400 --> [*]
+    Unavailable503 --> [*]
+
+    note right of Unauthorized401
+        A missing header and a wrong value are the SAME state on
+        purpose: separating them would confirm to a prober that it
+        guessed the header name. And note what has no edge here —
+        no path reaches Ok200 with remaining_micros fabricated as 0.
+    end note
+```
+
+**Rejected alternatives, briefly.** `oauth2` client-credentials on the metadata step (real, but it
+puts `authz-idp` on the ext_authz path to mint a token for a call whose whole purpose is to stay
+cheap — a second network dependency inside the one hop §9 is already worried about). A
+NetworkPolicy *alone*, with no credential (rejected: it authenticates a network location, not a
+caller, and every pod in `converse-gateway` would be able to read every account's balance). A
+sidecar proxy terminating mTLS in front of `authz-budget` (rejected: it moves the problem into a
+component nobody asked for and still hands Authorino an uncredentialed hop).
 
 ### 3.1 The AuthConfig side
 
@@ -574,8 +688,11 @@ is configured. Prod does not configure it yet, so `authz-budget` logs that the r
 and behaves exactly as before. Nothing at the gateway references it.
 
 **Stage 1 — plumbing.** The `authz-budget` chart gains the container/Service port and the
-`budget_internal` config block (owner action; see the runbook). Verify by hand from inside the
-cluster, with and without a client certificate — the without case must fail the TLS handshake.
+`budget_internal` config block, the shared-secret Secret, and the NetworkPolicy that restricts the
+port to the gateway namespace (owner action; see the runbook). Verify by hand from inside the
+cluster, **with and without the shared-secret header** — the without case must be a `401`, not an
+answer. (Before §3.2's amendment this read "with and without a client certificate"; there is no
+client certificate any more.)
 
 **Stage 2 — shadow.** `budgetLimiter.enabled: true`, `shadowMode: true`. The AuthConfig metadata
 step and the dynamic-metadata export go live; the Lua computes and logs decisions and refuses
@@ -611,7 +728,7 @@ sequenceDiagram
     participant C as Client
     participant EG as Envoy (core-gateway)
     participant AZ as Authorino<br/>ext_authz, filter 5
-    participant B as authz-budget<br/>:3007 mTLS
+    participant B as authz-budget<br/>:3007 shared secret
     participant U as authz-usage<br/>/usage/v1/spend/query
     participant LUA as Lua budget-limiter<br/>filter 14
     participant M as model backend
@@ -623,7 +740,7 @@ sequenceDiagram
     alt metadata cache HIT (within ttl, keyed on account_id)
         AZ-->>AZ: reuse cached budget answer — no hop
     else cache MISS
-        AZ->>B: GET /budget/v1/remaining?account_id=… (mTLS, timeout 300ms)
+        AZ->>B: GET /budget/v1/remaining?account_id=…<br/>(TLS + x-lightbridge-budget-token)
         B->>B: effective_balance(account, period) — expiry-aware SUM(budget_grants)
         B->>U: POST /usage/v1/spend/query (mTLS)
         alt spend answered (incl. empty SUM ⇒ 0)
