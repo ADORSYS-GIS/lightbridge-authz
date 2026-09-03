@@ -4,6 +4,15 @@
 - Date: 2026-08-14
 - Decision owners: @stephane-segning
 
+> **Decision 7 RESTORED IN FULL, 2026-09-03 (#430, PR #454).** Three later ADRs each carved a
+> claim out of Decision 7's "role/quota data stays out of both JWTs": ADR-0017 (`quota_tier`),
+> ADR-0018/#418 (`model_policy`, `allowed_models`). All three carve-outs are now closed --
+> `authz-opa` introspection resolves every one of them live for the human plane as well as the
+> API-key plane (PR #429), so none of them ride a JWT any more. A minted access token carries
+> identity/tenant context (`sub`, `account_id`, `project_id`, `api_key_id`/`sid`/`jti`/`azp`/
+> `lightbridge_caller_kind`), the ADR-0033 mapped role claims, and `budget_tier` -- which stays as
+> the single documented exception (ADR-0014, re-evaluated; ADR-0034 §12).
+
 ## Context
 
 **Hard constraint, stated first because it reframes everything below: this system owns no

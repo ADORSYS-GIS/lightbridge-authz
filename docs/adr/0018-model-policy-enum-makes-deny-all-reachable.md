@@ -4,6 +4,14 @@
 - Date: 2026-08-21
 - Decision owners: Stephane Segning Lambou
 
+> **Partially superseded, 2026-09-03 (#430, PR #454).** The `model_policy` (and `allowed_models`)
+> **claim** is gone from every minted token; `authz-opa` introspection is the sole source of both
+> for every caller shape. Everything else in this ADR stands: the `projects.model_policy` enum, the
+> `ModelPolicy::from` fail-closed parse to `DenyAll`, `setProjectModelPolicy`'s allowlist guard,
+> and the gateway's ADR-0018 semantics (`allow_all` / `allowlist` / `deny_all` / unrecognised ->
+> deny) are unchanged -- the policy is enforced from the same values, read live rather than frozen
+> at mint. See `ADORSYS-GIS/ai-helm-values#296` for the CEL arms this makes dead.
+
 ## Context
 
 **Most of the per-model access control story here is already built and running in production.**

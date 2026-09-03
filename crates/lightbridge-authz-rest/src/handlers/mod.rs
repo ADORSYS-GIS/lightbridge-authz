@@ -158,7 +158,6 @@ impl AuthzStoreImpl {
                     api_key_id,
                     project_id,
                     &project.account_id,
-                    project.allowed_models.clone(),
                     Utc::now(),
                     requested_expires_at,
                 )
