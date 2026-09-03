@@ -13,9 +13,15 @@ pub struct SessionRow {
     pub id: String,
     pub account_id: String,
     pub project_id: String,
-    /// `NULL` for a `kind = 'browser'` row (ADR-0021 Decision 3) -- always set for `kind =
-    /// 'token'` (ADR-0020's original scope), enforced by the `sessions_kind_client_id_check` DB
-    /// constraint.
+    /// The OAuth client this session belongs to -- the `azp` `/admin/sessions` lists.
+    ///
+    /// Always set for `kind = 'token'` (ADR-0020's original scope), and enforced as such by the
+    /// `sessions_kind_client_id_check` DB constraint. For `kind = 'browser'` it is the client
+    /// whose `/authorize` request STARTED the login (provenance, not scope -- ADR-0021 Decision
+    /// 3's "a browser session is not scoped to any one client" still holds; nothing gates session
+    /// reuse or logout on this value). `None` on a browser row minted before
+    /// `migrations/20260903000001_sessions_browser_client_id.sql`, which no backfill can recover:
+    /// the authorization code that carried the client id is single-use and long consumed.
     pub client_id: Option<String>,
     /// `"token"` (ADR-0020) or `"browser"` (ADR-0021 Decision 3) -- plain `String`, this schema's
     /// established convention for closed-set values.
@@ -49,6 +55,9 @@ pub struct NewSession {
     pub id: String,
     pub account_id: String,
     pub project_id: String,
+    /// See [`SessionRow::client_id`]. `Some` for every path that mints a session today -- the
+    /// token-exchange and device grants pass the redeeming client, and the browser-SSO callback
+    /// passes the client that started the login (`BrowserLoginTarget::client_id`).
     pub client_id: Option<String>,
     pub kind: String,
     pub expires_at: DateTime<Utc>,

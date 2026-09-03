@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use authkestra_engine::auth::state::Identity;
+use authkestra_engine::auth::state::{Identity, OAuth2State};
 use authkestra_op::code::{AuthorizationCode, AuthorizationCodeStore};
 use axum::Form;
 use axum::body::{Body, to_bytes};
@@ -1974,13 +1974,44 @@ async fn missing_browser_session_falls_back_to_relying_party_login(pool: PgPool)
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-    assert!(
-        response.headers()[header::LOCATION]
-            .to_str()
-            .unwrap()
-            .starts_with(&keycloak.url("/authorize"))
-    );
+    let location = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(location.starts_with(&keycloak.url("/authorize")));
     assert!(response.headers().get(header::SET_COOKIE).is_some());
+
+    // The requesting client rides the encrypted `state` into Keycloak and back, so the RP-leg
+    // callback can stamp it onto the `kind = 'browser'` session it mints -- which is the whole
+    // reason `/admin/sessions` can name the app behind a browser login
+    // (`migrations/20260903000001_sessions_browser_client_id.sql`). Reverting `authorize.rs` to
+    // build a `BrowserLoginTarget` without `client_id` fails HERE, at the only place the
+    // *requesting* client is still in scope; `relying_party_tests.rs`' own browser-login test
+    // covers the other half (that the callback persists whatever this carries).
+    let state_param = reqwest::Url::parse(location)
+        .unwrap()
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .expect("the Keycloak redirect carries an encrypted state parameter");
+    let decoded = OAuth2State::decrypt(
+        &state_param,
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    )
+    .expect("state decrypts with the RP's own state_encryption_key");
+    let pending: serde_json::Value = serde_json::from_str(
+        decoded
+            .success_url
+            .as_deref()
+            .expect("pending flow payload"),
+    )
+    .expect("the pending flow is JSON");
+    assert_eq!(
+        pending["Browser"]["client_id"],
+        serde_json::json!(CLIENT),
+        "the browser login must carry the REQUESTING client, not the RP's own \
+         `oauth2.relying_party.client_id`: {pending}"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

@@ -196,6 +196,12 @@ async fn authorize(
     let target = BrowserLoginTarget {
         project_id,
         resume_path: path_and_query.as_str().to_owned(),
+        // Every refusal above has already run, including the client-registry lookup that produced
+        // `client` -- so this is a REGISTERED client id, never an arbitrary query-string value,
+        // by the time it can reach a `sessions` row. It travels in the encrypted `state` payload
+        // and is stamped onto the browser session the RP-leg callback mints, which is how
+        // `/admin/sessions` can finally name the app behind a browser login.
+        client_id: request.client_id.clone(),
     };
     match state.rp.begin_browser(target).await {
         Ok((location, cookie)) => {

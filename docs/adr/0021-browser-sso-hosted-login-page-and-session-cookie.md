@@ -261,7 +261,7 @@ row carries that a token-originated one does not:
 
 | Field | `kind = 'token'` (ADR-0020) | `kind = 'browser'` (this ADR) |
 |---|---|---|
-| `client_id` | always set — the registered OAuth client this grant was issued to | always `NULL` — a browser session is not scoped to any one client; that is the entire point of SSO |
+| `client_id` | always set — the registered OAuth client this grant was issued to | the client whose `/authorize` request *started* this login — provenance, never scope (see the amendment below); `NULL` only for a row minted before `migrations/20260903000001_sessions_browser_client_id.sql` |
 | Created by | `handle_token_exchange`/the future `/oauth2/token` `authorization_code` redemption (#425) | the RP-leg callback (#424), on a *verified* Keycloak authentication — never by `/authorize` itself, never speculatively |
 | Referenced by | a minted access token's `sid` claim (ADR-0020 Decision 2) | a `__Host-` cookie value only — never appears inside any JWT |
 | Cardinality per login | one row per grant/refresh chain — a user authorizing 3 client apps in one browser session produces 3 separate `kind='token'` rows | one row per Keycloak login — that single row is what lets all 3 of those client authorizations skip Keycloak |
@@ -272,6 +272,77 @@ Multiplicity follows directly from this: one `kind='browser'` row can outlive an
 (`listMySessions`) and independently revocable (`revokeOwnSession`) — revoking one downstream token
 session (e.g., "log out this one app") never touches the browser session that spawned it, and vice
 versa unless the bulk cascade (below) is used.
+
+#### Amendment, 2026-09-03: a browser row records its *initiating* client (provenance, not scope)
+
+As originally decided, `client_id` was `NULL` for every `kind='browser'` row, and
+`migrations/20260823000002_sessions.sql` enforced that with
+`sessions_kind_client_id_check`. `/admin/sessions` (converse-frontends#450) then shipped a Client
+column that was empty for exactly the rows an operator looks at most, and the owner's report was
+blunt: *"doesn't expose azp"*. The console was correct — there was nothing to expose.
+
+The `NULL` reasoning above conflates two different facts, and only one of them was ever about SSO:
+
+- **Scope** — *which clients may reuse this session*. Unchanged, and still every client: the reuse
+  branch in `crates/lightbridge-authz-rest/src/authorize.rs` reads `BrowserSessionContextRow`
+  (`account_id`, `project_id`, `subject`), which deliberately does not carry `client_id` and must
+  not gain it. A second client's `/authorize` still skips Keycloak exactly as this ADR designed.
+- **Provenance** — *which client caused this login to happen*. A fixed property of the login event,
+  knowable only at `/authorize` time, and precisely what an operator needs in order to tell "signed
+  into the console" apart from "signed into the docs portal".
+
+`migrations/20260903000001_sessions_browser_client_id.sql` therefore relaxes the constraint from
+"browser ⇒ `NULL`" to "token ⇒ `NOT NULL`", and `authorize.rs` threads the already-registry-
+validated `client_id` through `BrowserLoginTarget` (inside the encrypted `state` envelope) so the
+RP-leg callback can stamp it onto the row it mints. Nothing reads a browser row's `client_id` as an
+authorization input: `revoke_for_logout`'s predicate is
+`kind = 'browser' OR (client_id = $2)`, whose left disjunct already matched every browser row
+unconditionally, so which rows a logout revokes is unchanged.
+
+No backfill is possible — the authorization code that carried the initiating client is single-use
+and consumed, and `exchange_refresh_tokens` chains hang off the `kind='token'` rows minted at
+redemption, not off the browser row that preceded them. Pre-migration rows stay `NULL` and the
+console renders them "None recorded"; they clear themselves within the browser session TTL.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as Browser
+    participant A as /authorize<br/>(authorize.rs)
+    participant K as Keycloak
+    participant C as /idp/callback<br/>(relying_party.rs)
+    participant D as sessions
+
+    B->>A: GET /authorize?client_id=console-web&…
+    A->>A: find_client_registration(console-web)<br/>redirect_uri / PKCE / scope checks
+    Note over A: client_id is REGISTERED before it can<br/>reach a row (authorize.rs:89-129)
+    A->>A: BrowserLoginTarget { project_id, resume_path,<br/>client_id: "console-web" }
+    A-->>B: 307 → Keycloak, state = AES-GCM(PendingFlow::Browser{…})
+    B->>K: hosted login
+    K-->>C: GET /idp/callback?code&state
+    C->>C: validate ID token, decode PendingFlow
+    C->>D: INSERT sessions(kind='browser', client_id='console-web', …)
+    D-->>C: session id
+    C-->>B: Set-Cookie __Host-authz_session=<id> → resume_path
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> unrecorded: row minted BEFORE\n20260903000001 -- client_id NULL,\nconsole renders "None recorded"
+    [*] --> recorded: row minted AFTER 20260903000001 --\nclient_id = the /authorize client\nthat started this login
+    unrecorded --> unrecorded: reused by any client's /authorize\n(reuse never reads client_id)
+    recorded --> recorded: reused by ANY client's /authorize --\nclient_id is NOT rewritten:\nit names the login, not the current caller
+    unrecorded --> [*]: revoked / expired
+    recorded --> [*]: revoked / expired
+```
+
+**Unreachable by design:** `unrecorded --> recorded`. There is no backfill and no lazy repair — a
+pre-migration row can never learn which client started its login, because that fact was never
+persisted anywhere and its carrier (the authorization code) is consumed. Equally absent:
+`recorded --> unrecorded`, and any transition that rewrites `client_id` when a *different* client
+reuses the session — recording the most recent caller instead of the originating one would make the
+column mean "whoever asked last", which is not a fact about the session and would silently
+contradict the Client column's own label.
 
 **Bulk revocation must cover both kinds, or "log out everywhere" lies.** ADR-0020 Decision 9
 already specifies that `revokeOwnSessions`/`revokeSubjectSessions` cascade to revoke the
