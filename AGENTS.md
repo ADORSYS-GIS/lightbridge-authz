@@ -58,6 +58,30 @@ today has no effect on, the Envoy/Authorino-side rate limiting
 
 This file documents structure, architecture, workflows, and practices for contributors and agents working on this codebase.
 
+## Skills and agents
+
+**This file is the entry point.** It is read directly by Claude Code (via the `CLAUDE.md` symlink),
+GitHub Copilot in VS Code, OpenCode, Antigravity/Gemini (via the `GEMINI.md` symlink), Cursor and Roo
+(via `.roo/rules/AGENTS.md`). Task-level playbooks live beside it as **skills**, and role definitions
+as **agents** — one copy each, surfaced to every other harness through committed relative symlinks.
+The link map, and what each harness picks up without configuration, is
+[`docs/agent-harnesses.md`](docs/agent-harnesses.md).
+
+**Skills** (`.claude/skills/<name>/SKILL.md`):
+
+| Skill | Read it when |
+| --- | --- |
+| `authz-procedure` | Adding, renaming or re-gating a cratestack RPC procedure or a `Permission` — nine places move together |
+| `authz-migration` | Anything under `migrations/` or `migrations-usage/`: prefix collisions, sqlx transaction semantics, batched backfills, fail-loud |
+| `authz-verify` | Before claiming a Rust change here is verified — private `CARGO_TARGET_DIR`, the DB-backed suites, the LoC gate and its split convention |
+| `authz-release-verify` | After merging — CI concurrency, the cosign gate, the ArgoCD pin, `GET /version` |
+| `governance-pr` | Opening any PR or issue in this repo |
+| `usage-query-perf` | A usage/spend query is slow, or you are about to propose an index or a storage change |
+
+**Agents** (`.claude/agents/<name>.md`): `authz-implementer` (implements one scoped story and ships
+it), `authz-verifier` (**read-only** — runs the checks and reports what is true), `docs-curator`
+(writes and maintains the docs under the citation/diagram/no-duplication rules).
+
 ## Quick Reference - Build/Test Commands
 
 ### Essential Commands
@@ -1133,6 +1157,20 @@ hand-written SQL and direct `sqlx` dependencies.
 
 - **Documentation navigation map (start here to find a doc):** `docs/README.md`
 - Overview and quickstart: `README.md`
+- **Is my merged change live?** — the CI → GHCR → cosign → argocd-image-updater → ArgoCD chain as a
+  procedure, with the `/version` check, the live image list, and the two links in it that are
+  currently broken (#666's chart publishing; ADR-0031 accepted but the chart still shipping the
+  ADR-0016 sync-wave Job): `docs/runbooks/release-and-rollout.md`
+- Why a usage query was 34.8 s and is not any more — the measurements, the covering index, the
+  `metrics` field, the rejected alternatives (BRIN, a CTE), the `#[instrument]` log-noise trap, and
+  how to re-measure on the read-only replica: `docs/usage-performance.md`
+- One `sharedConfig` object instead of five copies of `config.yaml` — the chart contract, the
+  replace-don't-merge rule and the env-placeholder re-quoting: `docs/single-source-config.md`
+- What build a service is running (`GET /version`, `getBuildInfo`, `--version`, the `service.build`
+  startup log, and the git → env → `unknown` fallback ladder): `docs/build-info.md`
+- Release narratives — why a batch of PRs was one thing, what order it had to ship in, and what is
+  live. `CHANGELOG.md` is owned by release-please and is never hand-edited: `docs/releases/`
+- Skills, agents, and how a non-Claude harness picks them up: `docs/agent-harnesses.md`
 - Run the whole platform locally (backend + frontend console) and test it end to end — issuer vs
   discovery split, seeded Keycloak users, RBAC gating, honest usage-chart limitations, automated
   suites, troubleshooting table: `docs/local-testing.md`

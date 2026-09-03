@@ -56,6 +56,15 @@ Enforcement is centralized, so the handlers/tools themselves contain no authoriz
   nothing more). `app/lightbridge-authz/tests/mcp_parity_tests.rs` fails the build if any reachable
   RPC op-id has no MCP tool, or if a tool's gate differs from its op-id's REST permission.
 
+  Since #670 the surface is **70 advertised tools**: all **68** reachable RPC op-ids (it was 31 of
+  68 before) plus the two MCP-only validation tools that have no RPC twin, enumerated in
+  `mcp_rbac::MCP_ONLY_TOOL_PERMISSIONS` (`app/lightbridge-authz/src/mcp_rbac.rs:92`) at
+  `apikey:validate`. `mcp_rbac::gated_tools()` (`:114`) is the one enumeration; three consumers now
+  derive from it rather than restating it, the third having been added by #672 after the *second*
+  hand-typed copy — `EXPECTED_MCP_TOOLS` in `.docker/it/servers_it.py`, a Python file that cannot
+  import the crate — turned `main` red on merge. That guard reads the Python file from the Rust
+  side and fails loudly (not vacuously) if the block is ever renamed or reshaped.
+
 ### Two gates on the CRUD surface, in order
 
 The CRUD surface (`authz-api`) migrated to cratestack-generated RPC routing (see
@@ -480,6 +489,14 @@ API the operation is an RPC `op_id` (`POST /rpc/{op_id}`); the equivalent MCP to
 permission. cratestack's `op_id` scheme is `model.<Model>.<verb>` (verb ∈ `list|get|create|update|
 delete`) for generated model CRUD and `procedure.<name>` for the hand-written procedures.
 
+There are **37** permissions, and the list that decides is
+`Permission::ALL` at `crates/lightbridge-authz-core/src/authz.rs:196` — not this page. Five of them
+arrived on 2026-09-02/03 (32 → 37): `budget:schedule-manage` (#653), `session:read` and
+`session:read-own` (#657), `user:read` (#655), `rbac:manage` (#656). If you are adding one, add the
+variant, its `ALL` entry, its `as_str`, its `perm…` boolean on the schema's `auth Principal` block
+and its op-id row in `rpc_permission_map` — the `.claude/skills/authz-procedure` skill walks the
+whole set, and `schema_policy_sync_tests` fails CI if the schema's `@allow` clauses drift from it.
+
 This table is the source of truth for `rpc_authorize::required_permission`. **Any RPC `op_id` not
 listed here is denied unconditionally (fail closed).**
 
@@ -488,7 +505,7 @@ listed here is denied unconditionally (fail closed).**
 `model.User.*` verb is denied unconditionally by the rule above; no new entry was needed here or
 in `rpc_authorize.rs`. `federated_identities` has no RPC surface either, and never will through the
 generated CRUD path — it is deliberately absent from `authz.cstack` entirely (see
-[`docs/architecture/data-model.md`](./architecture/data-model.md#users-and-federated-identities-adr-0024)).
+[`docs/architecture/data-model.md`](./architecture/data-model.md#users-and-federated-identities-adr-0024-corrected-2026-08-25)).
 
 **Every `budget:*` row below is served at `POST /budget/rpc/{op_id}` on the separate
 `authz-budget` service, not `POST /rpc/{op_id}` on `authz-api`** (hard cutover — see
@@ -567,7 +584,7 @@ sequenceDiagram
     participant T as call_tool<br/>(mcp.rs)
     participant G as tool_gate<br/>(mcp_rbac.rs)
     participant M as required_permission<br/>(rpc_authorize.rs)
-    participant P as procedures::&lt;name&gt;::invoke_with_db<br/>(generated)
+    participant P as procedures::NAME::invoke_with_db<br/>(generated)
     participant R as Procedures<br/>(lightbridge-authz-rest/src/lib.rs)
 
     C->>B: POST /mcp tools/call {name, arguments}
