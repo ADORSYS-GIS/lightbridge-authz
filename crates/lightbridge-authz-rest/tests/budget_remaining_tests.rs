@@ -308,3 +308,183 @@ async fn the_authorization_header_is_refused_before_the_credential_is_checked() 
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// The span. ADR-0034 §9 makes this route's own p99 a HARD shadow-mode exit criterion, and §10
+// watches its 503 rate beside it. Both are read off this span — `authz-budget` exports no metrics
+// and, before the `#[tracing::instrument]` on `budget_remaining`, emitted no span for this route
+// at all, so the criterion had no data source. These tests fail if the span, its name, or either
+// of the two attributes the exit-criterion query selects on ever goes away.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// One recorded span: its name, and the fields that were set on it (`Empty` fields that were
+/// never recorded do not appear, which is exactly what makes the assertions below meaningful).
+#[derive(Debug, Default, Clone)]
+struct CapturedSpan {
+    name: &'static str,
+    fields: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct SpanCapture(Arc<std::sync::Mutex<Vec<CapturedSpan>>>);
+
+impl SpanCapture {
+    fn spans(&self) -> Vec<CapturedSpan> {
+        self.0.lock().expect("capture mutex").clone()
+    }
+}
+
+/// Writes every `key = value` pair a span carries into the map, using the `Debug`/`Display`
+/// rendering `tracing` itself would emit.
+struct FieldVisitor<'a>(&'a mut std::collections::BTreeMap<String, String>);
+
+impl tracing::field::Visit for FieldVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(
+            field.name().to_string(),
+            format!("{value:?}").trim_matches('"').to_string(),
+        );
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for SpanCapture
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = std::collections::BTreeMap::new();
+        attrs.record(&mut FieldVisitor(&mut fields));
+        self.0.lock().expect("capture mutex").push(CapturedSpan {
+            name: attrs.metadata().name(),
+            fields,
+        });
+        let _ = (id, ctx);
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let Some(span) = ctx.span(id) else { return };
+        let name = span.metadata().name();
+        let mut captured = self.0.lock().expect("capture mutex");
+        if let Some(entry) = captured.iter_mut().rev().find(|s| s.name == name) {
+            values.record(&mut FieldVisitor(&mut entry.fields));
+        }
+    }
+}
+
+/// Drives one request with a capturing subscriber installed for this thread, and returns the span
+/// the handler opened. `#[tokio::test]`'s runtime is current-thread, so the thread-local default
+/// set here is in force for the whole await chain.
+async fn captured_span(app: Router, uri: &str) -> CapturedSpan {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let capture = SpanCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(SECRET_HEADER, SECRET)
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    let _ = axum::body::to_bytes(response.into_body(), 64 * 1024).await;
+    drop(guard);
+
+    capture
+        .spans()
+        .into_iter()
+        .find(|s| s.name == "GET /budget/v1/remaining")
+        .expect("the handler must open a span named after the route it serves")
+}
+
+/// The exit-criterion query is `{ span.http.route = "/budget/v1/remaining" }`. That attribute is
+/// the whole contract between this handler and ADR-0034 §9 -- if it stops being recorded, the
+/// p99 panel goes silently empty rather than red.
+#[tokio::test]
+async fn the_span_carries_the_route_the_exit_criterion_selects_on() {
+    let span = captured_span(
+        app(StubReader::Known(known())),
+        "/budget/v1/remaining?account_id=acct_1",
+    )
+    .await;
+
+    assert_eq!(
+        span.fields.get("http.route").map(String::as_str),
+        Some(BUDGET_REMAINING_PATH),
+        "http.route is what the exit-criterion TraceQL filters on: {:?}",
+        span.fields
+    );
+    assert_eq!(
+        span.fields.get("otel.kind").map(String::as_str),
+        Some("server"),
+        "tracing-opentelemetry reads otel.kind to mark this a SERVER span: {:?}",
+        span.fields
+    );
+    assert_eq!(
+        span.fields.get("budget_account_id").map(String::as_str),
+        Some("acct_1"),
+        "the account is what makes one slow span attributable: {:?}",
+        span.fields
+    );
+    assert_eq!(
+        span.fields.get("period").map(String::as_str),
+        Some("2026-09"),
+        "the period disambiguates a backfill read from a live one: {:?}",
+        span.fields
+    );
+}
+
+/// §10 watches the p99 AND the 503 rate. Both come off the same span, so the status code has to
+/// be on it -- including on the failure path, which is the one that matters for the 503 rate and
+/// the one a wrapper that recorded only on success would silently lose.
+#[tokio::test]
+async fn the_span_carries_the_status_code_on_both_paths() {
+    let ok = captured_span(
+        app(StubReader::Known(known())),
+        "/budget/v1/remaining?account_id=acct_1",
+    )
+    .await;
+    assert_eq!(
+        ok.fields
+            .get("http.response.status_code")
+            .map(String::as_str),
+        Some("200"),
+        "{:?}",
+        ok.fields
+    );
+
+    let unavailable = captured_span(
+        app(StubReader::Unavailable),
+        "/budget/v1/remaining?account_id=acct_1",
+    )
+    .await;
+    assert_eq!(
+        unavailable
+            .fields
+            .get("http.response.status_code")
+            .map(String::as_str),
+        Some("503"),
+        "the 503 rate is a Stage 2 exit criterion; it is read off this field: {:?}",
+        unavailable.fields
+    );
+}
