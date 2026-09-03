@@ -9,6 +9,12 @@
 !.vscode/mcp.json
 *.log
 charts/*/charts
+# The umbrella chart's dependencies are all `file://` siblings at `version: '*'`, so its lock
+# pins nothing that can be resolved from a registry, while release-please bumps every leaf
+# Chart.yaml and never the lock — a committed lock goes stale at every release and makes
+# `helm dependency build` fail. CI and the OCI publish action both run `helm dependency
+# update` on it instead, which regenerates this file locally.
+charts/lightbridge-authz-stack/Chart.lock
 
 __pycache__
 tls
