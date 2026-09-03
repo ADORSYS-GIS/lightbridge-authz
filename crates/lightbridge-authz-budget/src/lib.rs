@@ -16,6 +16,7 @@ pub mod error;
 pub mod facts;
 pub mod period;
 pub mod policy_store;
+mod policy_store_sql;
 pub mod refill;
 pub mod repo;
 pub mod reset_schedule;

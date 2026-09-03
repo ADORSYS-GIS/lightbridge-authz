@@ -154,6 +154,10 @@ load-test:
 	@bash -ec 'set -euo pipefail; cmd="docker compose -p lightbridge-authz -f compose.yaml"; ${cmd} up -d authz-tls postgresql authz-migrate authz-opa; trap "${cmd} down authz-tls postgresql authz-migrate authz-opa" EXIT; sleep 5; cargo test -p lightbridge-authz-rest --features load-tests --test load_tests -- --host https://localhost:13001 -u 10 -r 2 -t 30s --accept-invalid-certs'
 
 # Run database-backed integration tests.
+# `lightbridge-authz`'s own `mcp_tool_it_tests` runs here too (lightbridge-authz#645): the MCP
+# procedure tools reach the same database through the same `Procedures` registry the two RPC
+# listeners use, and the per-tool `RpcScope` switch that lets one MCP listener serve both the crud
+# and budget halves is only observable against a real cratestack policy evaluation.
 # Brings up Postgres + Redis (the cratestack RPC surface's rate limiter is Redis-backed, ADR-0003)
 # and runs migrations against the shared DB (the rest crate's RPC integration tests connect the
 # cratestack pool directly to DATABASE_URL, unlike the api-key crate's ephemeral sqlx::test DBs).
@@ -170,7 +174,7 @@ load-test:
 # a nonzero count, the same "a skipped test is not a passing test" failure mode AGENTS.md warns
 # about, just moved one level up from an individual test to an individual binary.
 it-tests:
-	@bash -ec 'set -euo pipefail; cmd="docker compose -p lightbridge-authz -f compose.yaml"; ${cmd} up -d postgresql redis; ${cmd} up authz-migrate --exit-code-from authz-migrate; trap "${cmd} down postgresql redis authz-migrate" EXIT; sleep 2; export DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"; export AUTHZ_REDIS_URL="redis://127.0.0.1:6379"; cargo test -p lightbridge-authz-api-key --features it-tests --tests; cargo test -p lightbridge-authz-budget --features it-tests --tests; cargo test -p lightbridge-authz-rest --features it-tests; check_binary() { log_file=$(mktemp); cargo test -p lightbridge-authz-usage-rest --features it-tests --test "$1" 2>&1 | tee "${log_file}"; passed=$(grep -oE "[0-9]+ passed" "${log_file}" | grep -oE "^[0-9]+" | tail -1 || true); echo "$1 passed: ${passed:-0}"; if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then echo "$1 reported 0 passed tests -- a skip is not a pass"; exit 1; fi; }; check_binary repo_it_tests; check_binary spend_query_it_tests; check_binary scope_ownership_it_tests'
+	@bash -ec 'set -euo pipefail; cmd="docker compose -p lightbridge-authz -f compose.yaml"; ${cmd} up -d postgresql redis; ${cmd} up authz-migrate --exit-code-from authz-migrate; trap "${cmd} down postgresql redis authz-migrate" EXIT; sleep 2; export DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"; export AUTHZ_REDIS_URL="redis://127.0.0.1:6379"; cargo test -p lightbridge-authz-api-key --features it-tests --tests; cargo test -p lightbridge-authz-budget --features it-tests --tests; cargo test -p lightbridge-authz-rest --features it-tests; cargo test -p lightbridge-authz --features it-tests --test mcp_tool_it_tests; check_binary() { log_file=$(mktemp); cargo test -p lightbridge-authz-usage-rest --features it-tests --test "$1" 2>&1 | tee "${log_file}"; passed=$(grep -oE "[0-9]+ passed" "${log_file}" | grep -oE "^[0-9]+" | tail -1 || true); echo "$1 passed: ${passed:-0}"; if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then echo "$1 reported 0 passed tests -- a skip is not a pass"; exit 1; fi; }; check_binary repo_it_tests; check_binary spend_query_it_tests; check_binary scope_ownership_it_tests'
 
 all-checks:
 	@echo "Running Rust formatting, lint, and checks"

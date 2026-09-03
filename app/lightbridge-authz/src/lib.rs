@@ -1,4 +1,9 @@
 pub mod jwk_cmd;
 pub mod mcp;
+pub(crate) mod mcp_oauth_metadata;
+pub(crate) mod mcp_oauth_proxy;
+pub mod mcp_procedure_tool;
+pub mod mcp_procedure_tools;
+pub mod mcp_rbac;
 pub mod rbac_cmd;
 pub mod rbac_lookup;

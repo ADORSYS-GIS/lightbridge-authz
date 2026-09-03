@@ -114,7 +114,7 @@ impl RpcScope {
     /// binary is running is a deployment fact, the same for every frame in one `/rpc/batch` call,
     /// so caching it once per envelope (unlike a per-frame *permission* requirement) is correct,
     /// not a compromise.
-    pub(crate) const fn wire_str(self) -> &'static str {
+    pub const fn wire_str(self) -> &'static str {
         match self {
             RpcScope::Crud => "crud",
             RpcScope::Budget => "budget",
@@ -126,11 +126,11 @@ impl RpcScope {
 /// is built from. `resource()` on [`Permission`] is deliberately private to `authz.rs` (not part
 /// of its public API), so this reads the canonical `"budget:…"` wire string via the already-public
 /// [`Permission::as_str`] instead of exposing a second accessor just for this one caller.
-pub(crate) fn is_budget_op_id(op_id: &str) -> bool {
+pub fn is_budget_op_id(op_id: &str) -> bool {
     required_permission(op_id).is_some_and(|permission| permission.as_str().starts_with("budget:"))
 }
 
-pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
+pub fn required_permission(op_id: &str) -> Option<Permission> {
     use Permission::*;
     Some(match op_id {
         "procedure.createAccount" => AccountCreate,

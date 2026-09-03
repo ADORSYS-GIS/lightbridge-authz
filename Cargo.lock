@@ -2684,6 +2684,7 @@ dependencies = [
  "lightbridge-authz-api",
  "lightbridge-authz-api-key",
  "lightbridge-authz-bearer",
+ "lightbridge-authz-budget",
  "lightbridge-authz-core",
  "lightbridge-authz-rest",
  "mimalloc",

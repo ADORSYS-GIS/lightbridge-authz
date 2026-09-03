@@ -255,13 +255,14 @@ here since AGENTS.md is outside this PR's file scope.
 
 ## `lightbridge-mcp`
 
-**Responsibility:** exposes the CRUD/validation surface as MCP tools over streamable HTTP, plus
-OAuth discovery metadata and dynamic client-registration proxying for MCP clients. Derives caller
-identity from the JWT (no subject in tool input).
-**Owns:** nothing of its own — calls the same `AuthzStoreImpl` the REST handlers use, backed by the
-same `authz` Postgres database, via `crates/lightbridge-authz-rest`.
+**Responsibility:** exposes the **whole** `authz-api` + `authz-budget` RPC surface as MCP tools over
+streamable HTTP, plus OAuth discovery metadata and dynamic client-registration proxying for MCP
+clients. Derives caller identity from the JWT (no subject in tool input).
+**Owns:** nothing of its own — calls the same `AuthzStoreImpl` the REST handlers use and the same
+`Procedures` registry the two RPC routers mount, backed by the same `authz` Postgres database, via
+`crates/lightbridge-authz-rest`.
 
-Router assembly: `app/lightbridge-authz/src/mcp.rs` (search around line 1607).
+Router assembly: `app/lightbridge-authz/src/mcp.rs` (`build_mcp_router`).
 
 | Route | Method | Protection | Notes |
 | --- | --- | --- | --- |
@@ -271,10 +272,32 @@ Router assembly: `app/lightbridge-authz/src/mcp.rs` (search around line 1607).
 | `/oauth/register` | POST | none | Proxies dynamic client registration to a configured upstream registration endpoint. Public registration URLs are derived from forwarded/host headers when present. |
 | `/mcp` | (streamable HTTP) | Bearer JWT (`bearer_auth` middleware, `nest_service`) | The MCP tool surface itself. Stateless (`with_stateful_mode(false)`) so it works safely behind multi-replica round-robin — see the multi-replica gotcha this repo already hit. |
 
-The tool set is generated from `#[tool]`-annotated methods on the MCP handler in `mcp.rs`, not
-duplicated here — the exact set drifts easily and this table would go stale faster than the code;
-read the `#[tool]` annotations directly if you need the current list. The budget domain is **not**
-exposed over MCP today — only over `authz-api`'s `/rpc/*` surface.
+### The tool set (lightbridge-authz#645)
+
+Two families, both registered onto one `ToolRouter` and both gated by the same `call_tool` check:
+
+- **Hand-written tools** — `#[tool]`-annotated methods on the handler in `mcp.rs` (accounts,
+  projects, API keys, roster, the two OPA validation tools). Several do more than their RPC twin
+  (`rotate-api-key` accepts a name/expiry/grace period the `keyId`-only `rotateApiKey` procedure
+  cannot express) or have no RPC twin at all (`validate-api-key`).
+- **Procedure tools** — declared in `app/lightbridge-authz/src/mcp_procedure_tools.rs`, one per RPC
+  procedure the hand-written set does not already cover. Each takes the procedure's OWN generated
+  `Args` struct as its tool arguments (`{"args": {...}}`, byte-identical to the RPC request body)
+  and returns its own `Output`, so input/output shapes match the RPC surface by construction rather
+  than by transcription. They dispatch through the shared `Procedures` registry via the generated
+  `invoke_with_db`, which is what evaluates the schema's `@allow` clauses.
+
+**The budget domain IS exposed over MCP** (this reverses the pre-#645 note here). That does not
+weaken the hard `authz-api`/`authz-budget` listener cutover: MCP is not an RPC listener, and the
+scope every budget procedure's `@allow` clause checks is derived **per tool** from
+`rpc_authorize::is_budget_op_id`, the same predicate `RpcScope::permits` uses to split the two
+routers. See [`docs/rbac.md`](../rbac.md#the-mcp-surface-serves-both-halves-one-scope-per-tool) for
+the sequence/state diagrams and the full tool table.
+
+Permissions are **not** a second table here: `mcp_rbac::tool_gate` maps a tool to its op-id and asks
+`rpc_authorize::required_permission`. `app/lightbridge-authz/tests/mcp_parity_tests.rs` fails the
+build when a reachable RPC op-id has no tool, when a tool's gate differs from the REST permission
+for its op-id, or when a tool claims an op-id the REST surface fail-closes.
 
 ## `lightbridge-authz-usage`
 

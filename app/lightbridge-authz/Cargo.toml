@@ -37,6 +37,13 @@ cratestack.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 tower.workspace = true
+# Handler-shape tests build the same `Procedures` registry the server does (lightbridge-authz#645),
+# which means naming the budget domain's own service types. Production code here never does: it
+# receives them already built from `lightbridge_authz_rest::budget_services`.
+lightbridge-authz-budget.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
 
 [features]
 it-tests = []
