@@ -155,3 +155,62 @@ fn no_mcp_tool_exists_for_a_fail_closed_op_id() {
         );
     }
 }
+
+/// The third copy of the tool list, and the one the Rust-side guards above could not see.
+///
+/// `.docker/it/servers_it.py` asserts the live MCP server's `tools/list` equals a hand-typed
+/// `EXPECTED_MCP_TOOLS` set. It runs inside a container against a running server, so it cannot
+/// import this crate — which is precisely why it went stale the moment #645 added 37 tools, and
+/// broke `main`'s `integration-test` job after the merge was already green everywhere else
+/// (lightbridge-authz#671). Every other list in this chain is derived; that one was not.
+///
+/// So this test reads that file and compares its set to [`gated_tools`]. It is a deliberately dumb
+/// parse — the literals between `EXPECTED_MCP_TOOLS = {` and the closing `}` — because the
+/// alternative (teaching CI to generate the Python from the Rust) buys nothing here: the failure
+/// mode is "somebody added a tool and forgot the other file", and one failing assertion with both
+/// names in it fixes that in a glance. A parse that no longer finds the block fails loudly rather
+/// than silently passing on an empty set.
+#[test]
+fn the_it_servers_expected_tool_set_matches_the_mcp_surface() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.docker/it/servers_it.py")
+        .canonicalize()
+        .expect("`.docker/it/servers_it.py` should exist relative to this crate");
+    let source = std::fs::read_to_string(&path).expect("servers_it.py should be readable");
+
+    let start = source
+        .find("EXPECTED_MCP_TOOLS = {")
+        .expect("servers_it.py should declare EXPECTED_MCP_TOOLS -- did the block get renamed?");
+    let body = &source[start..];
+    let end = body
+        .find("\n}")
+        .expect("EXPECTED_MCP_TOOLS should be closed by a `}` at the start of a line");
+    let block = &body[..end];
+
+    let in_python: BTreeSet<&str> = block
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            // Skip the `EXPECTED_MCP_TOOLS = {` header and the `#` comments between the two groups.
+            let rest = line.strip_prefix('"')?;
+            rest.split('"').next()
+        })
+        .collect();
+    assert!(
+        !in_python.is_empty(),
+        "parsed an EMPTY EXPECTED_MCP_TOOLS out of {}: the block's shape changed and this test \
+         would otherwise pass vacuously",
+        path.display()
+    );
+
+    let advertised: BTreeSet<String> = gated_tools().into_iter().map(|(tool, _)| tool).collect();
+    let in_python: BTreeSet<String> = in_python.into_iter().map(ToOwned::to_owned).collect();
+
+    let missing: Vec<&String> = advertised.difference(&in_python).collect();
+    let extra: Vec<&String> = in_python.difference(&advertised).collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "`.docker/it/servers_it.py`'s EXPECTED_MCP_TOOLS has drifted from the MCP tool surface. \
+         Add to that file: {missing:?}. Remove from it: {extra:?}."
+    );
+}

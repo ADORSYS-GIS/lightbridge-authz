@@ -30,7 +30,15 @@ USERNAME = os.environ.get("USERNAME", "test@admin")
 PASSWORD = os.environ.get("PASSWORD", "test")
 AUTHORINO_BASIC = os.environ.get("AUTHORINO_BASIC", "authorino:change-me")
 MAX_WAIT_SECONDS = int(os.environ.get("MAX_WAIT_SECONDS", "180"))
+# Every tool `lightbridge-mcp` advertises. Kept in sync with the Rust side by hand, because this
+# script runs in a container against a live server and cannot import the crate -- the Rust-side
+# single source is `mcp_rbac::gated_tools()` (`app/lightbridge-authz/src/mcp_rbac.rs`), which
+# `app/lightbridge-authz/tests/mcp_parity_tests.rs` already pins against the generated
+# `schema::axum::OPS`. THAT chain is airtight; this set is the one link outside it, and adding 37
+# tools in lightbridge-authz#645 without touching it is exactly how it broke `main`
+# (lightbridge-authz#671). If you add or rename a tool, grep for the tool name and update BOTH.
 EXPECTED_MCP_TOOLS = {
+    # Hand-written tools (`#[tool]` methods in `app/lightbridge-authz/src/mcp.rs`).
     "create-account",
     "list-accounts",
     "get-account",
@@ -64,6 +72,46 @@ EXPECTED_MCP_TOOLS = {
     "rotate-api-key",
     "validate-api-key",
     "validate-authorino-api-key",
+    # Procedure tools (`app/lightbridge-authz/src/mcp_procedure_tools.rs`, #645) -- one per RPC
+    # procedure the hand-written set above does not already cover, across BOTH the crud and the
+    # budget halves of the RPC surface.
+    "list-billing-plans",
+    "list-model-catalog",
+    "list-my-expiring-api-keys",
+    "query-sessions",
+    "revoke-session",
+    "revoke-own-sessions",
+    "revoke-subject-sessions",
+    "resolve-user-profiles",
+    "resolve-actor-labels",
+    "search-users",
+    "list-platform-role-grants",
+    "grant-platform-role",
+    "revoke-platform-role",
+    "get-my-access",
+    "get-build-info",
+    "activate-budget-policy",
+    "get-budget-policy-status",
+    "simulate-budget-policy",
+    "create-budget-policy-revision",
+    "request-budget-refill",
+    "get-my-budget-refill-ladder",
+    "list-pending-augmentation-requests",
+    "approve-augmentation-request",
+    "reject-augmentation-request",
+    "list-my-augmentation-requests",
+    "get-my-budget-balance",
+    "get-budget-balance",
+    "list-my-budget-grants",
+    "list-budget-grants",
+    "grant-budget",
+    "revoke-budget-grant",
+    "list-budget-reset-schedules",
+    "create-budget-reset-schedule",
+    "update-budget-reset-schedule",
+    "delete-budget-reset-schedule",
+    "run-budget-reset-schedule-now",
+    "get-effective-reset-schedule",
 }
 
 
@@ -761,11 +809,19 @@ def main() -> int:
         tools_result = next((msg for msg in tools_messages if msg.get("id") == 2), None)
         assert tools_result is not None, f"missing tools/list result: body={tools_body}"
         tool_names = [tool["name"] for tool in tools_result["result"]["tools"]]
-        assert len(tool_names) == len(EXPECTED_MCP_TOOLS), (
-            f"unexpected MCP tool count: {tool_names}"
+        # Report the DIFFERENCE, not the whole list. The previous message dumped all 70 names and
+        # left the reader to spot which one moved; #645 broke on exactly this assertion and the
+        # log line was truncated before the interesting part.
+        missing = sorted(EXPECTED_MCP_TOOLS - set(tool_names))
+        unexpected = sorted(set(tool_names) - EXPECTED_MCP_TOOLS)
+        assert not missing and not unexpected, (
+            f"MCP tool set drifted from EXPECTED_MCP_TOOLS: "
+            f"advertised-but-not-expected={unexpected}, expected-but-not-advertised={missing}. "
+            f"Update EXPECTED_MCP_TOOLS in this file AND the Rust side it mirrors "
+            f"(app/lightbridge-authz/src/mcp_rbac.rs)."
         )
-        assert set(tool_names) == EXPECTED_MCP_TOOLS, (
-            f"unexpected MCP tools: {tool_names}"
+        assert len(tool_names) == len(set(tool_names)), (
+            f"the MCP server advertised a duplicate tool name: {tool_names}"
         )
 
         status, account_body, _ = mcp_post(
