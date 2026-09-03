@@ -38,6 +38,11 @@ const STATE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 /// where `token_encryption_key == state_encryption_key` (ADR-0024).
 const TOKEN_KEY: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI";
 
+/// The client whose `/authorize` request starts a browser login in these tests. `authorize.rs`
+/// only ever builds a `BrowserLoginTarget` after the client registry has resolved this id, so a
+/// test that constructs one directly stands in for an already-validated client.
+const BROWSER_CLIENT_ID: &str = "console-web";
+
 fn repo(pool: PgPool) -> Arc<StoreRepo> {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
     Arc::new(StoreRepo::new(pool))
@@ -925,6 +930,7 @@ async fn begin_browser_rejects_backslash_open_redirect_variants(pool: PgPool) {
             rp.begin_browser(BrowserLoginTarget {
                 project_id: Some("some-project".to_string()),
                 resume_path: resume_path.to_string(),
+                client_id: BROWSER_CLIENT_ID.to_string(),
             })
             .await
             .is_err(),
@@ -937,6 +943,7 @@ async fn begin_browser_rejects_backslash_open_redirect_variants(pool: PgPool) {
         rp.begin_browser(BrowserLoginTarget {
             project_id: Some("some-project".to_string()),
             resume_path: "/browser".to_string(),
+            client_id: BROWSER_CLIENT_ID.to_string(),
         })
         .await
         .is_ok()
@@ -1207,6 +1214,7 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
         .begin_browser(BrowserLoginTarget {
             project_id: None,
             resume_path: "/browser".to_string(),
+            client_id: BROWSER_CLIENT_ID.to_string(),
         })
         .await
         .unwrap();
@@ -1283,17 +1291,31 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
         "the OP browser-state cookie must be JS-readable by the check-session iframe, never \
          HttpOnly -- unlike its __Host-authz_session sibling: {op_state_cookie}"
     );
-    let row: (String, String) =
-        sqlx::query_as("SELECT account_id, project_id FROM sessions WHERE kind = 'browser'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(row, ("keycloak-subject".to_string(), default_project_id));
+    // `client_id` is asserted here alongside account/project because it is written by the same
+    // single `create_session` call: a browser session records the client whose `/authorize`
+    // request started the login (`migrations/20260903000001_sessions_browser_client_id.sql`).
+    // Before that migration this column was pinned to NULL by `sessions_kind_client_id_check`,
+    // and `/admin/sessions`' Client column read "None recorded" for every browser row.
+    let row: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT account_id, project_id, client_id FROM sessions WHERE kind = 'browser'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row,
+        (
+            "keycloak-subject".to_string(),
+            default_project_id,
+            Some(BROWSER_CLIENT_ID.to_string())
+        )
+    );
 
     let (location, cookie) = rp
         .begin_browser(BrowserLoginTarget {
             project_id: Some("other-browser-project".to_string()),
             resume_path: "/browser".to_string(),
+            client_id: BROWSER_CLIENT_ID.to_string(),
         })
         .await
         .unwrap();
@@ -1432,6 +1454,7 @@ async fn suspended_account_is_refused_a_browser_session(pool: PgPool) {
         .begin_browser(BrowserLoginTarget {
             project_id: None,
             resume_path: "/browser".to_string(),
+            client_id: BROWSER_CLIENT_ID.to_string(),
         })
         .await
         .unwrap();
@@ -1575,6 +1598,7 @@ async fn inactive_project_is_refused_a_browser_session(pool: PgPool) {
         .begin_browser(BrowserLoginTarget {
             project_id: Some("inactive-project".to_string()),
             resume_path: "/browser".to_string(),
+            client_id: BROWSER_CLIENT_ID.to_string(),
         })
         .await
         .unwrap();
@@ -1729,6 +1753,7 @@ async fn browser_session_persists_the_real_authenticated_member_subject(pool: Pg
         .begin_browser(BrowserLoginTarget {
             project_id: Some("member-scope-project".to_string()),
             resume_path: "/browser".to_string(),
+            client_id: BROWSER_CLIENT_ID.to_string(),
         })
         .await
         .unwrap();
@@ -1877,6 +1902,7 @@ async fn browser_session_subject_is_the_acting_account_not_the_keycloak_sub(pool
         .begin_browser(BrowserLoginTarget {
             project_id: Some("federated-project".to_string()),
             resume_path: "/browser".to_string(),
+            client_id: BROWSER_CLIENT_ID.to_string(),
         })
         .await
         .unwrap();
@@ -2380,6 +2406,7 @@ async fn browser_sso_callback_persists_the_same_federated_identity(pool: PgPool)
         .begin_browser(BrowserLoginTarget {
             project_id: None,
             resume_path: "/browser".to_string(),
+            client_id: BROWSER_CLIENT_ID.to_string(),
         })
         .await
         .unwrap();
@@ -2492,6 +2519,7 @@ async fn federated_identities_persists_the_plaintext_profile_claim_snapshot(pool
         .begin_browser(BrowserLoginTarget {
             project_id: None,
             resume_path: "/browser".to_string(),
+            client_id: BROWSER_CLIENT_ID.to_string(),
         })
         .await
         .unwrap();
@@ -2776,6 +2804,7 @@ async fn a_second_login_updates_the_same_federated_identity_row_and_reseals(pool
         .begin_browser(BrowserLoginTarget {
             project_id: None,
             resume_path: "/browser".to_string(),
+            client_id: BROWSER_CLIENT_ID.to_string(),
         })
         .await
         .unwrap();
@@ -2823,6 +2852,7 @@ async fn a_second_login_updates_the_same_federated_identity_row_and_reseals(pool
         .begin_browser(BrowserLoginTarget {
             project_id: None,
             resume_path: "/browser".to_string(),
+            client_id: BROWSER_CLIENT_ID.to_string(),
         })
         .await
         .unwrap();
@@ -2980,6 +3010,7 @@ async fn a_second_issuer_with_a_colliding_subject_is_refused_not_merged(pool: Pg
         .begin_browser(BrowserLoginTarget {
             project_id: None,
             resume_path: "/browser".to_string(),
+            client_id: BROWSER_CLIENT_ID.to_string(),
         })
         .await
         .unwrap();
@@ -3031,6 +3062,7 @@ async fn a_second_issuer_with_a_colliding_subject_is_refused_not_merged(pool: Pg
         .begin_browser(BrowserLoginTarget {
             project_id: None,
             resume_path: "/browser".to_string(),
+            client_id: BROWSER_CLIENT_ID.to_string(),
         })
         .await
         .unwrap();
