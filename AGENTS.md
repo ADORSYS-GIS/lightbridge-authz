@@ -71,6 +71,9 @@ today has no effect on, the Envoy/Authorino-side rate limiting
 
 This file documents structure, architecture, workflows, and practices for contributors and agents working on this codebase.
 
+**Repository status matrix:** [`docs/ROADMAP.md`](docs/ROADMAP.md) — what is done, missing, broken,
+flaky, not future-proof or waiting on an owner decision; a merged PR updates its row in the same PR.
+
 ## Skills and agents
 
 **This file is the entry point.** It is read directly by Claude Code (via the `CLAUDE.md` symlink),
