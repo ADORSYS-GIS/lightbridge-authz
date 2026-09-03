@@ -582,6 +582,29 @@ pub struct Server {
     /// `app/lightbridge-authz/src/main.rs`).
     #[serde(default)]
     pub budget: Option<BudgetServer>,
+    /// `authz-budget`'s **second**, mTLS-only listener (ADR-0034, lightbridge-authz#658): the
+    /// service-to-service read `GET /budget/v1/remaining` the gateway's Dynamic Budget Limiter
+    /// calls through Authorino. Shaped exactly like `lightbridge-authz-usage`'s
+    /// `UsageServerGroup::query` (#347) and for the identical reason — `axum-server`'s rustls
+    /// integration enforces client-certificate verification per **listener**, not per route, so
+    /// this cannot be a route on the bearer-JWT RPC listener above without locking out the
+    /// console.
+    ///
+    /// `Option`, like `idp`/`budget` above, and for the same operational reason recorded on
+    /// [`IdpServer::static_dir`]: prod's config is a wholesale override living in the separate
+    /// `ai-helm-values` repo, and prod tracks `main` HEAD via argocd-image-updater with no
+    /// release-tag gate — a hard-required field here would crash-loop `authz-budget` on the very
+    /// next promotion, taking the console's whole budget surface down. When it is absent the
+    /// listener is simply not bound and `startup` logs why; the gateway side of ADR-0034 is
+    /// values-gated off in the same state, so the two halves cannot be enabled independently by
+    /// accident.
+    ///
+    /// When it IS present, `tls.client_ca_bundle_path` is **mandatory** and startup fails without
+    /// it (`start_budget_server`). This listener answers a cross-account balance question with no
+    /// per-caller ownership check at all; serving it without mTLS because a key was forgotten is
+    /// exactly the silent-degrade this codebase's fail-closed rule forbids.
+    #[serde(default)]
+    pub budget_internal: Option<BudgetInternalServer>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1151,10 +1174,12 @@ pub struct JwtSigning {
     pub claim_mappers: Vec<ClaimMapper>,
 }
 
+pub mod budget_internal;
 pub mod claim_mapper;
 
 /// Re-exported from [`crate::config::claim_mapper`], which holds both types. Split out only to
 /// keep this file inside its LoC-gate baseline; see that module's own doc comment.
+pub use budget_internal::BudgetInternalServer;
 pub use claim_mapper::{ClaimMapper, ClaimSource};
 
 fn default_signing_ttl_seconds() -> i64 {

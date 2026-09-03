@@ -53,6 +53,51 @@ Authorization is unchanged by the move: every procedure keeps its exact permissi
 else's budget) survives verbatim — the split only changes which host and path prefix serves a
 call, never what a caller needs to hold to make it.
 
+## The gateway's remaining-budget read (ADR-0034)
+
+`authz-budget` binds a **second, mTLS-only listener** (`config::BudgetInternalServer`, config key
+`server.budget_internal`) serving exactly one route:
+
+```
+GET /budget/v1/remaining?account_id=<budget account id>[&period=YYYY-MM]
+```
+
+It is the data-plane half of the budget domain — the read the gateway's Dynamic Budget Limiter
+makes, per identity per Authorino cache TTL, so that a refill takes effect at the gateway without
+any claim, any token refresh, or any tier ladder. See
+[`docs/adr/0034-dynamic-budget-limiter.md`](../adr/0034-dynamic-budget-limiter.md) for the whole
+chain (AuthConfig `metadata` → ext_authz dynamic metadata → an Envoy Lua filter that answers `402
+budget_exhausted`), and for why the enforcement decision deliberately does **not** live here.
+
+Four properties, each of which is a decision:
+
+- **A separate listener, not a route.** `axum-server`'s rustls integration enforces
+  client-certificate verification per listener, not per route — the same constraint that split
+  `lightbridge-authz-usage` into an ingest and a query listener (#347). Adding this to the bearer-JWT
+  RPC listener would lock out the console. `client_ca_bundle_path` is **mandatory** here:
+  `start_budget_server` refuses to start without it, because mTLS is the only access control in
+  front of a cross-account balance read. Like `/usage/v1/spend/query`, the route also refuses any
+  request carrying an `Authorization` header.
+- **It reports, it does not decide.** The body is `ceiling_micros` (the expiry/revocation-aware
+  `BudgetRepo::effective_balance`, not the raw `budget_balances` projection — an expired grant must
+  not buy gateway traffic), `spent_micros`, their signed difference, `next_reset_at`, and
+  `source_lag_seconds`. Thresholding is the gateway's job.
+- **Unknown is never zero.** An unreadable ledger or an unreachable usage service is
+  `503 {"error":"budget_unavailable"}`, never a `200` with `remaining_micros: 0` — those two produce
+  opposite correct behaviours at the gateway, and conflating them would bill a user's
+  exhausted-budget page for our own outage.
+- **A bounded grace window.** `RemainingService` keeps the last known `spent_micros` per
+  `(account, period)` and serves it for up to `remaining_grace_seconds` (default 120) while the
+  usage service is unreachable, stamping the reading's age into `source_lag_seconds`. Only the
+  spend half is cached: the ceiling is re-read every time, so a refill that lands *during* an
+  outage takes effect immediately. This lives here because neither component downstream can express
+  it — Envoy's Lua filter has no cross-request state, and Authorino's metadata cache drops an entry
+  on a failed fetch rather than serving it stale.
+
+The service is built over the SAME `BudgetRepo`, the SAME fail-closed `SpendReader` and the SAME
+`ResetScheduler` the RPC surface uses (`budget_services::BudgetServices`), so the number the gateway
+enforces on can never disagree with the number a refill decision or a reset tick would compute.
+
 ## Augmentation request lifecycle
 
 `budget_augmentation_requests` carries the exact state machine from the RFC's "Domain (ADR-0009)"

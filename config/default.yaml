@@ -53,6 +53,22 @@ server:
     tls:
       cert_path: "./config/tls/budget.crt"
       key_path: "./config/tls/budget.key"
+  # authz-budget's SECOND listener (ADR-0034, lightbridge-authz#658): the mTLS-only internal read
+  # `GET /budget/v1/remaining` the gateway's Dynamic Budget Limiter calls through Authorino. A
+  # separate port, not a route on `budget` above, because client-certificate verification is
+  # enforced per LISTENER, not per route -- gating the RPC surface would lock out the console.
+  # `client_ca_bundle_path` is mandatory here: the server refuses to start without it, because
+  # mTLS is the ONLY access control in front of a cross-account balance read.
+  budget_internal:
+    address: "0.0.0.0"
+    port: 3007
+    tls:
+      cert_path: "./config/tls/budget.crt"
+      key_path: "./config/tls/budget.key"
+      client_ca_bundle_path: "./config/tls/ca.crt"
+    # Seconds the last known spend reading may still be served after the usage service stops
+    # answering, before the balance is reported as unknowable (503 budget_unavailable).
+    remaining_grace_seconds: 120
 logging:
   level: "info"
 database:

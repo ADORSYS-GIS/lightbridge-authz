@@ -3,7 +3,7 @@ mod migrate;
 mod utils;
 
 use clap::Parser;
-use lightbridge_authz_core::Result;
+use lightbridge_authz_core::{Error, Result};
 use lightbridge_authz_rest::{start_api_server, start_budget_server, start_opa_server};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -155,12 +155,11 @@ async fn main() -> Result<()> {
             let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(&config.database).await?);
 
             let budget = config.server.budget.as_ref().ok_or_else(|| {
-                lightbridge_authz_core::Error::Server(
-                    "server.budget config is required to run the budget command".to_string(),
-                )
+                Error::Server("server.budget config is required to run the budget command".into())
             })?;
             start_budget_server(
                 budget,
+                config.server.budget_internal.as_ref(),
                 pool,
                 &config.oauth2,
                 &config.billing,
