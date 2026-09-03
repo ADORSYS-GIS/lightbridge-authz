@@ -776,7 +776,10 @@ owns. The two ids diverging is therefore not a migration; it is the design.
 
 ## 8. What this does *not* change
 
-- **`budget_tier` keeps being minted** (ADR-0014). Nothing here reads it, but it is a useful
+- **`budget_tier` keeps being minted** (ADR-0014, re-evaluated and reaffirmed by #430 --
+  it is the ONE claim that survived that ticket's removal of `quota_tier`/`model_policy`/
+  `allowed_models`, because `authz-opa` introspection has no budget-domain dependency to serve it
+  from). Nothing here reads it, but it is a useful
   audit/telemetry signal and removing it is a separate decision with its own blast radius.
   Consequently the memo's defects (a) and (b) — `current_tier` collapsing an off-ladder amount to
   `b-15`, and ADR-0032 `automatic` resets doing so systematically — stop being *enforcement* bugs

@@ -225,7 +225,7 @@ by `authkestra_engine::token::TokenManager` itself: `iss`, `sub`, `aud`, `exp`, 
 | `sid` | Plain `cuid2()`, no prefix (`signing.rs:207`) | Minted, per-issuance session id |
 | `api_key_id`, `project_id`, `account_id` | Passed in by the caller of `sign`/the exchange handler | Minted (tenant context resolved server-side) |
 | `email` / `email_verified` | `owner.email` / `owner.email_verified`, populated via `decode_email(subject_token)` on the exchange path (`oauth2_op/mod.rs:113-123`) — best-effort, unverified re-decode of an already-signature-verified upstream token | **Propagated upstream snapshot**, omitted (not `null`) when absent |
-| `allowed_models` | Project's `allowed_models`, if `Some` | Minted from DB state |
+| `budget_tier` | `TokenExchangeOpStore::resolve_budget_tier` — the live ledger balance mapped to ADR-0008's rung ladder, re-resolved on every mint and refresh | Minted from DB state. **The only authorization-shaped claim left on the token** (ADR-0014, reaffirmed by #430; ADR-0034 §12 made it display-only, since the limiter reads the balance itself) |
 | `at_hash`, `auth_time`, `nonce` | **Not on the access token** — only on the `id_token` (see below) | — |
 
 ### `client_credentials` (M2M) access token — a DIFFERENT, smaller claim set (`service_token_extra`, ADR-0030, #534)
@@ -260,11 +260,13 @@ human identity behind a machine client for any of these to describe.
 | `azp` | The exchange client's `client_id` (`signing.rs:262`) | Minted |
 | `at_hash` | `compute_at_hash(access_token)` — OIDC Core §3.1.3.6: SHA-256 the access token's ASCII octets, take the left half, base64url-encode (`signing.rs:95-104,263-266`) | Computed by this service, binds the id_token to the access_token minted in the same response |
 
-### Deliberately absent from every JWT: `role`, `quota_tier`, `project_quota`
+### Deliberately absent from every JWT: `role`, `quota_tier`, `project_quota`, `model_policy`, `allowed_models`
 
-No code path inserts `role`, `quota_tier`, or `project_quota` into any JWT `extra` map — verified
-by grepping for those three literal keys across `crates/lightbridge-authz-rest/src/` and
-`crates/lightbridge-authz-bearer/src/` (zero hits). They ride instead on the **introspection
+No code path inserts `role`, `quota_tier`, `project_quota`, `model_policy` or `allowed_models`
+into any JWT `extra` map — verified by grepping for those five literal keys across
+`crates/lightbridge-authz-rest/src/` and `crates/lightbridge-authz-bearer/src/` (zero hits).
+(`quota_tier` was minted between ADR-0017 and #430, `model_policy`/`allowed_models` between #418
+and #430; all three were removed once PR #429 let introspection serve them for exchange sessions.) They ride instead on the **introspection
 response** (`IntrospectResponse`, `crates/lightbridge-authz-rest/src/models/mod.rs:18-...`,
 populated at `crates/lightbridge-authz-rest/src/handlers/introspect.rs:52-67`), which Authorino
 calls per request — so a roster/quota change is visible on the *next* request rather than waiting
@@ -332,7 +334,7 @@ catalogue + RBAC compilation), `app/lightbridge-authz/src/mcp.rs:378-403` (MCP t
 
 | Name | What it is | Where it lives | Governs |
 |---|---|---|---|
-| `project_members.quota_tier` | A per-project-member spending ceiling, validated against the operator-configured `QuotaTiers` catalogue (`crates/lightbridge-authz-core/src/config/mod.rs:210-251`) | `project_members` table, set via `procedure.setProjectMemberQuotaTier` | Stamped into the OPA/Authorino `x-quota-tier` header via introspection; matched by ai-helm's per-member rate-limit rules |
+| `project_members.quota_tier` | A per-project-member spending ceiling, validated against the operator-configured `QuotaTiers` catalogue (`crates/lightbridge-authz-core/src/config/mod.rs:210-251`) | `project_members` table, set via `procedure.setProjectMemberQuotaTier` | Stamped into the OPA/Authorino `x-quota-tier` header via introspection **for both planes** (since #429/#430 — never as a JWT claim); matched by ai-helm's per-member rate-limit rules |
 | ADR-0008's budget-tier ladder (`x-budget-tier`, `b-15`…`b-1000`) | A *proposed* (ADR status: `Proposed`) Keycloak-claim-based rate-limit ladder for the gateway's static `BackendTrafficPolicy` rules (`docs/adr/0008-refills-are-discrete-budget-tiers.md`) | Not this repo's runtime code — a design document | Would govern Envoy rate-limit rungs directly, if/when implemented |
 | `self_service_grant_count` rule-data threshold | The **actual, live** ceiling on how many self-service refills an account gets before requests queue for review | `crates/lightbridge-authz-budget/src/rule_data.rs:118` — `{"field": "self_service_grant_count", "operator": "lt", "value": 2}` inside `default_rule_set_json()` | `procedure.requestBudgetRefill` — see below |
 
