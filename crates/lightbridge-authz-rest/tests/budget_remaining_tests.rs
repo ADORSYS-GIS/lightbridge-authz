@@ -16,7 +16,8 @@ use chrono::{DateTime, Utc};
 use lightbridge_authz_budget::error::BudgetError;
 use lightbridge_authz_budget::{BudgetRemaining, Period, Remaining, RemainingReader};
 use lightbridge_authz_rest::budget_remaining::{
-    BUDGET_REMAINING_PATH, BudgetInternalState, ERROR_BUDGET_UNAVAILABLE, budget_remaining_router,
+    BUDGET_REMAINING_PATH, BudgetInternalState, ERROR_BUDGET_UNAVAILABLE, ERROR_UNKNOWN_ACCOUNT,
+    budget_remaining_router,
 };
 use lightbridge_authz_rest::budget_remaining_auth::ERROR_UNAUTHORIZED;
 use tower::ServiceExt;
@@ -30,6 +31,7 @@ enum StubReader {
     Known(BudgetRemaining),
     Unavailable,
     LedgerFailed,
+    UnknownAccount,
 }
 
 #[lightbridge_authz_core::async_trait]
@@ -46,6 +48,7 @@ impl RemainingReader for StubReader {
             Self::LedgerFailed => Err(BudgetError::StorageFailed(
                 "connection pool timed out".to_string(),
             )),
+            Self::UnknownAccount => Ok(Remaining::UnknownAccount),
         }
     }
 }
@@ -486,5 +489,84 @@ async fn the_span_carries_the_status_code_on_both_paths() {
         Some("503"),
         "the 503 rate is a Stage 2 exit criterion; it is read off this field: {:?}",
         unavailable.fields
+    );
+}
+
+/// The owner directive of 2026-09-03. Before this, an id nothing had ever heard of summed to a
+/// zero ceiling and answered `200 {"remaining_micros": 0}` -- so a typo in an identity mapping
+/// reached the gateway as `402 budget_exhausted` for a phantom account, indistinguishable from a
+/// real user who really had run out. A `404` cannot be mistaken for a spending outcome.
+#[tokio::test]
+async fn an_unknown_account_is_404_and_never_a_zero_balance() {
+    let (status, body) = call(
+        app(StubReader::UnknownAccount),
+        "/budget/v1/remaining?account_id=acct_typo",
+        false,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], ERROR_UNKNOWN_ACCOUNT);
+    assert_eq!(body["account_id"], "acct_typo");
+    assert!(
+        body.get("remaining_micros").is_none(),
+        "a 404 must not carry a balance at all: {body}"
+    );
+    assert!(
+        body.get("ceiling_micros").is_none(),
+        "a 404 must not carry a ceiling either: {body}"
+    );
+}
+
+/// `unknown_account` and `budget_unavailable` are different runbooks and must stay different
+/// machine tokens: one is a configuration fault upstream of us that a human has to fix, the other
+/// is a transient outage the gateway rides out on cached grace.
+#[tokio::test]
+async fn unknown_account_is_a_distinct_token_from_budget_unavailable() {
+    assert_ne!(ERROR_UNKNOWN_ACCOUNT, ERROR_BUDGET_UNAVAILABLE);
+    assert_eq!(ERROR_UNKNOWN_ACCOUNT, "unknown_account");
+}
+
+/// The credential still runs first. An unauthenticated prober must not be able to use this
+/// endpoint as an account-existence oracle by reading 404-vs-200 off it.
+#[tokio::test]
+async fn an_unknown_account_without_the_secret_is_401_not_404() {
+    let response = app(StubReader::UnknownAccount)
+        .oneshot(
+            Request::builder()
+                .uri("/budget/v1/remaining?account_id=acct_typo")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The span must carry the `404` too, and name the account. ADR-0034 §10 watches the 503 rate off
+/// this field; an `unknown_account` rate read the same way is what tells an operator a mapping is
+/// wrong rather than a service being down.
+#[tokio::test]
+async fn the_span_carries_the_404_and_the_account_that_caused_it() {
+    let span = captured_span(
+        app(StubReader::UnknownAccount),
+        "/budget/v1/remaining?account_id=acct_typo",
+    )
+    .await;
+
+    assert_eq!(
+        span.fields
+            .get("http.response.status_code")
+            .map(String::as_str),
+        Some("404"),
+        "{:?}",
+        span.fields
+    );
+    assert_eq!(
+        span.fields.get("budget_account_id").map(String::as_str),
+        Some("acct_typo"),
+        "the id that matched nothing is the whole content of this failure: {:?}",
+        span.fields
     );
 }

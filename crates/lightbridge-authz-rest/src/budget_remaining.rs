@@ -32,6 +32,7 @@
 //! 400  {"error":"bad_request","message":...}      malformed account id / period
 //! 401  {"error":"unauthorized","message":...}     the shared secret was missing or wrong
 //! 403  {"error":"forbidden","message":...}        an Authorization header was present
+//! 404  {"error":"unknown_account","account_id":...} the id names no account
 //! 503  {"error":"budget_unavailable","reason":...} the answer is not knowable right now
 //! ```
 //!
@@ -40,41 +41,34 @@
 //! for our own outage. The gateway distinguishes them — it rides a `503` out on the last cached
 //! value for a bounded grace window and then refuses with `budget_unavailable`, which is a
 //! different error, a different status, and a different runbook from `budget_exhausted`.
+//!
+//! **A `404` is never a `0` either** (owner directive, 2026-09-03). An id nothing has ever heard
+//! of used to sum to an ordinary zero ceiling and answer `200 {"remaining_micros": 0}`, so a typo
+//! in an identity mapping reached the gateway as `402 budget_exhausted` for a phantom account. It
+//! is now `404 unknown_account`. What is **not** a `404`: a real account with no grants booked
+//! this period — that is `200`, `ceiling_micros: 0`, `remaining_micros: -spent_micros`, the state
+//! of every account between its creation and its first grant and the figure the console's Budget
+//! card shows for it. The policy's `starting_amount_micros` (ADR-0015 Decision 5) materialises
+//! **only when a grant is booked**; this endpoint reports the ledger, never an unbooked amount.
 
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
+    Json,
     extract::{Query, State},
-    http::{HeaderName, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
 };
 use chrono::Utc;
-use lightbridge_authz_budget::{Period, Remaining, RemainingReader};
+use lightbridge_authz_budget::{Period, Remaining};
 
-pub use crate::budget_remaining_wire::{
-    ERROR_BUDGET_UNAVAILABLE, RemainingErrorResponse, RemainingQuery, RemainingResponse,
-    error_response,
+pub use crate::budget_remaining_router::{
+    BUDGET_REMAINING_PATH, BudgetInternalState, budget_remaining_router,
 };
-
-/// Path the budget-remaining read is served on. Versioned under `/budget/v1` rather than mounted
-/// beside the RPC surface's `/budget/rpc/*`: this is a plain REST read for a non-RPC client
-/// (Authorino speaks HTTP, not cratestack), and it lives on a different listener entirely.
-pub const BUDGET_REMAINING_PATH: &str = "/budget/v1/remaining";
-
-/// State for [`budget_remaining_router`]. A struct rather than a bare `Arc<dyn RemainingReader>`
-/// so a later addition to this listener does not have to churn every handler signature.
-pub struct BudgetInternalState {
-    pub remaining: Arc<dyn RemainingReader>,
-    /// The secret [`crate::budget_remaining_auth::require_shared_secret`] requires, verbatim from
-    /// `server.budget_internal.shared_secret`. Never empty in a running process —
-    /// `start_budget_server` refuses to start on an empty one.
-    pub shared_secret: String,
-    /// The header that secret must arrive in — `server.budget_internal.shared_secret_header`,
-    /// which must equal the AuthConfig's `metadata.http.credentials.customHeader.name`.
-    pub shared_secret_header: HeaderName,
-}
+pub use crate::budget_remaining_wire::{
+    ERROR_BUDGET_UNAVAILABLE, ERROR_UNKNOWN_ACCOUNT, RemainingErrorResponse, RemainingQuery,
+    RemainingResponse, UnknownAccountResponse, error_response, unknown_account_response,
+};
 
 /// Reports `ceiling − spend` for one budget account and period.
 ///
@@ -151,6 +145,17 @@ async fn remaining_response(
             }),
         )
             .into_response(),
+        Ok(Remaining::UnknownAccount) => {
+            // `warn`, not `error`: the fault is upstream of this process and this process handled
+            // it correctly. It is still the loudest thing this endpoint can say, and a sustained
+            // rate of it is the signal that an identity mapping is wrong.
+            tracing::warn!(
+                budget_account_id = %account_id,
+                period = %period,
+                "budget remaining was asked for an account that does not exist"
+            );
+            unknown_account_response(account_id)
+        }
         Ok(Remaining::Unavailable) => {
             // Logged at warn, not error: an unreachable usage service is an expected transient
             // the gateway is designed to ride out, and paging on it would train the team to
@@ -180,21 +185,4 @@ async fn remaining_response(
             )
         }
     }
-}
-
-/// The internal listener's router: the remaining read, behind the shared-secret check.
-///
-/// The credential is a **route-layer** concern here rather than a TLS-handshake one, which is the
-/// one structural difference from `lightbridge-authz-usage`'s query listener — see
-/// [`crate::budget_remaining_auth`] for why Authorino leaves no other option. The layer is
-/// attached here, not at the call site, so no future caller can mount this router unprotected.
-pub fn budget_remaining_router(
-    state: Arc<BudgetInternalState>,
-) -> Router<Arc<BudgetInternalState>> {
-    Router::new()
-        .route(BUDGET_REMAINING_PATH, get(budget_remaining))
-        .layer(axum::middleware::from_fn_with_state(
-            state,
-            crate::budget_remaining_auth::require_shared_secret,
-        ))
 }

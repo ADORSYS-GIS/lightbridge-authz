@@ -19,6 +19,7 @@ pub mod authorize_session_state;
 pub mod budget_convert;
 pub mod budget_remaining;
 pub mod budget_remaining_auth;
+pub mod budget_remaining_router;
 pub mod budget_remaining_wire;
 pub mod budget_services;
 pub mod claim_redeem;

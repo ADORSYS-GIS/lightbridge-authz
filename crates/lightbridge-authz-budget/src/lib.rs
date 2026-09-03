@@ -14,6 +14,7 @@ pub mod augmentation;
 pub mod decision;
 pub mod error;
 pub mod facts;
+mod known_account;
 pub mod period;
 pub mod policy_store;
 mod policy_store_sql;

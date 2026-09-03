@@ -5,8 +5,11 @@
 //! `httpmock` in `usage_service_spend_reader_tests.rs`, and the HTTP contract in
 //! `lightbridge-authz-rest`'s `budget_remaining` module tests. What can only be proved here is the
 //! arithmetic against actual `budget_grants` rows: that the ceiling is the **expiry- and
-//! revocation-aware** sum, that an expired grant cannot buy gateway traffic, and that an account
-//! with no grants at all reports a zero ceiling rather than an error.
+//! revocation-aware** sum, that an expired grant cannot buy gateway traffic, that an account
+//! with no grants at all reports a zero ceiling rather than an error -- and, since the owner
+//! directive of 2026-09-03, the one distinction only a real database can prove: a **row-less**
+//! account and a **non-existent** one both sum to `0` through `COALESCE(SUM(...), 0)`, and must
+//! nevertheless produce different answers.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -99,6 +102,7 @@ fn known(remaining: Remaining) -> lightbridge_authz_budget::BudgetRemaining {
     match remaining {
         Remaining::Known(known) => *known,
         Remaining::Unavailable => panic!("expected a known remaining balance"),
+        Remaining::UnknownAccount => panic!("expected a known account"),
     }
 }
 
@@ -145,6 +149,71 @@ async fn an_account_with_no_grants_reports_a_zero_ceiling_not_an_error(pool: PgP
 
     assert_eq!(answer.ceiling_micros, 0);
     assert_eq!(answer.spent_micros, 0);
+    assert_eq!(answer.remaining_micros, 0);
+    assert_eq!(answer.budget_account_id, account_id);
+}
+
+/// The owner directive of 2026-09-03, and the case only a live ledger can prove. An id no
+/// `accounts` row carries is **unknown**, not broke: `COALESCE(SUM(...), 0)` gives it the exact
+/// same `0` as the test above, and telling the two apart is the entire point of the existence
+/// probe. Under enforcement the difference is a loud fault versus a silent `402
+/// budget_exhausted` billed to a phantom account.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_id_with_no_accounts_row_is_unknown_not_a_zero_balance(pool: PgPool) {
+    // Deliberately NOT inserted -- a well-formed cuid2 that names nothing, exactly what a typo in
+    // an identity mapping produces.
+    let account_id = cuid2();
+
+    let svc = service(pool, StubSpend::Empty);
+    let period = Period::parse(PERIOD).expect("valid period");
+    let answer = svc
+        .remaining_for_account(&account_id, &period, Utc::now())
+        .await
+        .expect("an unknown account is an ANSWER, not a ledger fault");
+
+    assert_eq!(answer, Remaining::UnknownAccount);
+}
+
+/// The existence probe runs in FRONT of the spend read, so an unknown id answers `unknown_account`
+/// even while the usage service is unreachable. The alternative ordering would let a transient
+/// outage mask a permanent configuration fault behind `budget_unavailable`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unknown_account_wins_over_an_unreachable_spend_source(pool: PgPool) {
+    let account_id = cuid2();
+
+    let svc = service(pool, StubSpend::Unreachable);
+    let period = Period::parse(PERIOD).expect("valid period");
+    let answer = svc
+        .remaining_for_account(&account_id, &period, Utc::now())
+        .await
+        .expect("an unknown account is an ANSWER, not a ledger fault");
+
+    assert_eq!(answer, Remaining::UnknownAccount);
+}
+
+/// A **suspended** account is known. Suspension is enforced upstream of the budget entirely
+/// (`effective_status`, migration `20260714000001`); folding it into "unknown" would make one
+/// condition wear another's error code, and would 404 an account whose balance is a real number
+/// an operator may well be looking at.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_suspended_account_is_still_known(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    sqlx::query("UPDATE accounts SET status = 'suspended' WHERE id = $1")
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .expect("suspending the test account must succeed");
+
+    let svc = service(pool, StubSpend::Empty);
+    let period = Period::parse(PERIOD).expect("valid period");
+    let answer = known(
+        svc.remaining_for_account(&account_id, &period, Utc::now())
+            .await
+            .expect("the ledger is readable"),
+    );
+
+    assert_eq!(answer.ceiling_micros, 0);
     assert_eq!(answer.remaining_micros, 0);
 }
 
