@@ -169,7 +169,7 @@ sequenceDiagram
 
     CLI->>Rust: POST /oauth2/device_authorization
     Rust-->>CLI: user_code + verification_uri (/device/verify)
-    Note over CLI: prints the URL; starts polling POST /oauth2/token
+    Note over CLI: prints the URL — starts polling POST /oauth2/token
 
     Browser->>Rust: GET /device/verify?user_code=X
     Rust-->>Browser: 303 /ui/device?user_code=X (sanitised, percent-encoded)
@@ -298,6 +298,20 @@ Permissions are **not** a second table here: `mcp_rbac::tool_gate` maps a tool t
 `rpc_authorize::required_permission`. `app/lightbridge-authz/tests/mcp_parity_tests.rs` fails the
 build when a reachable RPC op-id has no tool, when a tool's gate differs from the REST permission
 for its op-id, or when a tool claims an op-id the REST surface fail-closes.
+
+**The surface is 70 tools** (#670): all **68** reachable RPC op-ids — it was 31 of 68 — plus the two
+MCP-only validation tools (`validate-api-key`, `validate-authorino-api-key`), which have no RPC twin
+and are enumerated at `apikey:validate` in `mcp_rbac::MCP_ONLY_TOOL_PERMISSIONS`
+(`app/lightbridge-authz/src/mcp_rbac.rs:92`). `mcp_rbac::gated_tools()` (`:114`) is the single
+enumeration.
+
+The drift guard covers a **third** copy of that list as of #672: `EXPECTED_MCP_TOOLS` in
+`.docker/it/servers_it.py` asserts set-equality against the live server's `tools/list`, went stale
+the moment #670 merged, and turned `main` red on `integration-test` while every other job stayed
+green — the shape of a list sitting outside the derived chain. That script runs in a container and
+cannot import the crate, so `the_it_servers_expected_tool_set_matches_the_mcp_surface` reads the
+Python file from the Rust side instead, and fails explicitly rather than vacuously if the block is
+renamed or reshaped.
 
 ## `lightbridge-authz-usage`
 

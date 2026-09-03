@@ -5,7 +5,13 @@ This repository provides API key management plus usage analytics:
 - `authz-api`: OAuth2/JWT-protected CRUD API for Accounts, Projects, and API keys.
 - `authz-budget`: OAuth2/JWT-protected RPC API for the budget domain (policy lifecycle,
   self-service refill, the admin review queue, and direct balance/ledger reads/writes) — carried
-  off `authz-api` as a hard cutover (ADR-0010, #351).
+  off `authz-api` as a hard cutover (ADR-0010, #351). Since ADR-0034 it also binds a **second,
+  mTLS-only listener** (`server.budget_internal`) serving one route, `GET /budget/v1/remaining` —
+  the live `ceiling − spend` read the gateway's Dynamic Budget Limiter makes through Authorino, so
+  a refill counts at the gateway without any claim or token refresh. Separate listener for the same
+  reason `lightbridge-authz-usage` has one (#347): client-certificate verification is per listener,
+  not per route. `client_ca_bundle_path` is mandatory there — the server refuses to start without
+  it. `503 budget_unavailable` is never a zero balance; see `docs/architecture/budget.md`.
 - `authz-opa`: Basic-auth protected validation API intended to be called by Authorino (or similar external auth components). It validates API keys and returns rich context plus dynamic metadata, and is also the ownership authority for the usage query API (`POST /idp/v1/authorize-usage-scope`, #570).
 - `authz-idp`: OIDC broker server (ADR-0012, ADR-0019, ADR-0023) exposing
   `.well-known/openid-configuration`, `.well-known/jwks.json`, `/oauth2/token`, `/oauth2/revoke`,
@@ -57,6 +63,30 @@ today has no effect on, the Envoy/Authorino-side rate limiting
 `docs/governance-model-and-enforcement.md` describes.
 
 This file documents structure, architecture, workflows, and practices for contributors and agents working on this codebase.
+
+## Skills and agents
+
+**This file is the entry point.** It is read directly by Claude Code (via the `CLAUDE.md` symlink),
+GitHub Copilot in VS Code, OpenCode, Antigravity/Gemini (via the `GEMINI.md` symlink), Cursor and Roo
+(via `.roo/rules/AGENTS.md`). Task-level playbooks live beside it as **skills**, and role definitions
+as **agents** — one copy each, surfaced to every other harness through committed relative symlinks.
+The link map, and what each harness picks up without configuration, is
+[`docs/agent-harnesses.md`](docs/agent-harnesses.md).
+
+**Skills** (`.claude/skills/<name>/SKILL.md`):
+
+| Skill | Read it when |
+| --- | --- |
+| `authz-procedure` | Adding, renaming or re-gating a cratestack RPC procedure or a `Permission` — nine places move together |
+| `authz-migration` | Anything under `migrations/` or `migrations-usage/`: prefix collisions, sqlx transaction semantics, batched backfills, fail-loud |
+| `authz-verify` | Before claiming a Rust change here is verified — private `CARGO_TARGET_DIR`, the DB-backed suites, the LoC gate and its split convention |
+| `authz-release-verify` | After merging — CI concurrency, the cosign gate, the ArgoCD pin, `GET /version` |
+| `governance-pr` | Opening any PR or issue in this repo |
+| `usage-query-perf` | A usage/spend query is slow, or you are about to propose an index or a storage change |
+
+**Agents** (`.claude/agents/<name>.md`): `authz-implementer` (implements one scoped story and ships
+it), `authz-verifier` (**read-only** — runs the checks and reports what is true), `docs-curator`
+(writes and maintains the docs under the citation/diagram/no-duplication rules).
 
 ## Quick Reference - Build/Test Commands
 
@@ -1133,6 +1163,20 @@ hand-written SQL and direct `sqlx` dependencies.
 
 - **Documentation navigation map (start here to find a doc):** `docs/README.md`
 - Overview and quickstart: `README.md`
+- **Is my merged change live?** — the CI → GHCR → cosign → argocd-image-updater → ArgoCD chain as a
+  procedure, with the `/version` check, the live image list, and the two links in it that are
+  currently broken (#666's chart publishing; ADR-0031 accepted but the chart still shipping the
+  ADR-0016 sync-wave Job): `docs/runbooks/release-and-rollout.md`
+- Why a usage query was 34.8 s and is not any more — the measurements, the covering index, the
+  `metrics` field, the rejected alternatives (BRIN, a CTE), the `#[instrument]` log-noise trap, and
+  how to re-measure on the read-only replica: `docs/usage-performance.md`
+- One `sharedConfig` object instead of five copies of `config.yaml` — the chart contract, the
+  replace-don't-merge rule and the env-placeholder re-quoting: `docs/single-source-config.md`
+- What build a service is running (`GET /version`, `getBuildInfo`, `--version`, the `service.build`
+  startup log, and the git → env → `unknown` fallback ladder): `docs/build-info.md`
+- Release narratives — why a batch of PRs was one thing, what order it had to ship in, and what is
+  live. `CHANGELOG.md` is owned by release-please and is never hand-edited: `docs/releases/`
+- Skills, agents, and how a non-Claude harness picks them up: `docs/agent-harnesses.md`
 - Run the whole platform locally (backend + frontend console) and test it end to end — issuer vs
   discovery split, seeded Keycloak users, RBAC gating, honest usage-chart limitations, automated
   suites, troubleshooting table: `docs/local-testing.md`
@@ -1148,9 +1192,11 @@ hand-written SQL and direct `sqlx` dependencies.
   `docs/rbac.md`
 - API key approaching-expiry visibility (`listMyExpiringApiKeys`, window/threshold rationale, why
   there is no cross-tenant admin surface): `docs/api-key-expiry-visibility.md`
-- Admin identity resolution (`resolveUserProfiles`/`resolveActorLabels`/`searchUsers`, the
-  `user:read` permission, the never-fabricate-an-identity and reject-don't-truncate rules, and the
-  search index's honest limits): `docs/admin-identity-resolution.md`
+- Identity resolution (`resolveUserProfiles`/`resolveActorLabels`/`searchUsers`, the `user:read`
+  permission, why `resolveActorLabels` is gated PER KIND — three estate-wide kinds behind
+  `user:read`, `apiKeyIds` row-scoped through `ApiKey`'s own `@@allow("read", …)` — the
+  never-fabricate-an-identity and reject-don't-truncate rules, and the search index's honest
+  limits): `docs/admin-identity-resolution.md`
 - Governance data model + how quotas/allowlists are actually enforced at the gateway (accounts,
   projects, roster, keys; introspection, Authorino claim extraction, BackendTrafficPolicy rule
   families; worked scenarios and the gaps that remain): `docs/governance-model-and-enforcement.md`

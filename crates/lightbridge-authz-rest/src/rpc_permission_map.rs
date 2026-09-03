@@ -39,7 +39,20 @@ use lightbridge_authz_core::Permission;
 /// curl would be theatre, and it would break the one console screen (`/settings/info`) whose whole
 /// job is to answer "what am I running, and what am I talking to" for every signed-in user, not
 /// just admins.
-pub const AUTHENTICATED_ONLY_OP_IDS: &[&str] = &["procedure.getMyAccess", "procedure.getBuildInfo"];
+///
+/// `resolveActorLabels` (#647, owner feedback 2026-09-03) is the third, and the only one whose
+/// entry here is a MOVE rather than an addition: it used to be mapped to `user:read` beside its two
+/// siblings. It still refuses `userIds`/`accountIds`/`projectIds` to a caller without `user:read` —
+/// that gate did not disappear, it moved from this coarse table into the handler
+/// (`identity_directory.rs`), because the procedure now answers a fourth kind, `apiKeyIds`, that is
+/// NOT admin-only and is row-scoped through `ApiKey`'s own `@@allow("read", …)` clause instead. A
+/// coarse op-id gate cannot express "these three lists need a permission, that one needs a row
+/// check", so the op-id is authenticated-only and the handler is where the four kinds diverge.
+pub const AUTHENTICATED_ONLY_OP_IDS: &[&str] = &[
+    "procedure.getMyAccess",
+    "procedure.getBuildInfo",
+    "procedure.resolveActorLabels",
+];
 
 /// Whether `op_id` is served to any authenticated caller (see [`AUTHENTICATED_ONLY_OP_IDS`]).
 pub fn is_authenticated_only_op_id(op_id: &str) -> bool {
@@ -178,7 +191,6 @@ pub const MAPPED_OP_ID_PERMISSIONS: &[(&str, Permission)] = &[
         Permission::BudgetRead,
     ),
     ("procedure.resolveUserProfiles", Permission::UserRead),
-    ("procedure.resolveActorLabels", Permission::UserRead),
     ("procedure.searchUsers", Permission::UserRead),
     ("procedure.listPlatformRoleGrants", Permission::RbacManage),
     ("procedure.grantPlatformRole", Permission::RbacManage),

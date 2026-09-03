@@ -3,18 +3,22 @@ use lightbridge_authz_core::{
     Account, AccountId, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
     RotateApiKey, async_trait,
     config::{
-        ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetServer, Federation, IdpServer,
-        JwtSigning, ModelCatalog, Oauth2, OauthClient, OauthClientType, OpaServer, QuotaTiers,
-        Redis, UsageServiceClient,
+        ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetInternalServer, BudgetServer,
+        Federation, IdpServer, JwtSigning, ModelCatalog, Oauth2, OauthClient, OauthClientType,
+        OpaServer, QuotaTiers, Redis, UsageServiceClient,
     },
     db::{DbPoolTrait, is_database_ready},
     error::{Error, Result},
     server::{dev_cors_enabled, serve_tls},
 };
 
+pub mod actor_api_key_labels;
 pub mod auth_provider;
 pub mod authorize;
+pub mod authorize_session_state;
 pub mod budget_convert;
+pub mod budget_remaining;
+pub mod budget_remaining_wire;
 pub mod budget_services;
 pub mod claim_redeem;
 pub mod codec;
@@ -23,6 +27,7 @@ pub mod error_convert;
 pub mod handlers;
 pub mod html_page;
 pub mod identity_directory;
+pub mod loopback;
 pub mod middleware;
 pub mod models;
 pub mod my_access;
@@ -46,6 +51,8 @@ pub mod static_assets;
 pub mod token_exchange;
 pub mod userinfo;
 
+use crate::budget_remaining::BUDGET_REMAINING_PATH;
+
 use auth_provider::{ACCESS_TOKEN_CONTEXT_KEY, CratestackAuthProvider};
 use budget_convert::{
     resolve_augmentation_requests_page_size, to_schema_augmentation_request,
@@ -63,7 +70,7 @@ use routers::opa_router;
 use rpc_authorize::{RpcAuthorizeState, RpcScope};
 
 use cratestack::idempotency::IdempotencyLayer;
-use cratestack::ratelimit::{RateLimitConfig, RateLimitLayer, RateLimitStore};
+use cratestack::ratelimit::{RateLimitConfig, RateLimitLayer, RateLimitStore, StoreErrorPolicy};
 use cratestack::{
     CratestackContext, CratestackError, DEFAULT_BODY_LIMIT_BYTES, SqlxIdempotencyStore, Value,
 };
@@ -83,6 +90,32 @@ const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 3600);
 /// limiting (Redis-backed)"). Generous burst with steady refill; tune via deployment as needed.
 const RATE_LIMIT_BURST: u32 = 120;
 const RATE_LIMIT_REFILL_PER_SECOND: f64 = 60.0;
+/// Store-failure policy for every `RateLimitLayer` this crate builds.
+///
+/// cratestack 0.11.0 (cratestack/cratestack#869, closing cratestack#846) changed the DEFAULT from
+/// "any store error is a 500" to `StoreErrorPolicy::Allow` -- serve the request *unthrottled* when
+/// the store failure is transport-class (`CratestackError::Unavailable`: socket broken, Redis
+/// unreachable, or the new 500ms `with_store_timeout` budget elapsed). Upstream's argument is a
+/// capacity-control one: an unreachable limiter should degrade to unlimited rather than take every
+/// rate-limited route down with it.
+///
+/// **This repo rejects that default.** Here the limiter is a security control, not a capacity
+/// control: it is the brute-force guard in front of the OAuth/OIDC token, device-verification and
+/// CRUD surfaces, and it sits in a service whose whole reason to exist is authorization. The rule
+/// this repo states everywhere else -- "an unavailable dependency must never become the permissive
+/// branch" -- is already applied by hand at the one direct `RateLimitStore::consume` call site
+/// (`oauth2_op::device_store::get_by_user_code_rate_limited`, which returns `Err` fail-closed on
+/// any limiter error). `Deny` is the same decision, restored for the two tower layers so all three
+/// call sites agree.
+///
+/// Consequence, stated plainly: a Redis outage now refuses rate-limited requests with the store's
+/// own error status (503 for transport-class) instead of serving them unthrottled. That is the
+/// pre-0.11.0 behaviour this repo already shipped, minus the opaque body -- 0.11.0 renders the
+/// refusal through the codec-negotiated error envelope, so generated clients decode a typed code.
+/// `DEFAULT_STORE_TIMEOUT` (500ms) is deliberately left at upstream's default: under `Deny` it
+/// only bounds how long a request waits before being refused, which is a strict improvement over
+/// the unbounded `ConnectionManager` reconnect it replaces.
+const RATE_LIMIT_STORE_ERROR_POLICY: StoreErrorPolicy = StoreErrorPolicy::Deny;
 // The evaluation budget and the one policy set id both moved to `budget_services`, beside the
 // `PolicyStore::load_active_from_db` call that is their only real consumer -- `lightbridge-mcp`
 // needs the same two values now that it builds the same service graph (lightbridge-authz#645).
@@ -107,6 +140,11 @@ pub const SERVICE_OPA: &str = "authz-opa";
 pub const SERVICE_IDP: &str = "authz-idp";
 /// See [`SERVICE_API`].
 pub const SERVICE_BUDGET: &str = "authz-budget";
+/// See [`SERVICE_API`]. `authz-budget`'s second, mTLS-only listener (ADR-0034) reports as its own
+/// service for the same reason `lightbridge-authz-usage` splits `authz-usage`/`authz-usage-query`
+/// (#347): the two ports have different auth postures, and "which one am I hitting?" must have an
+/// answer.
+pub const SERVICE_BUDGET_INTERNAL: &str = "authz-budget-internal";
 
 #[derive(Serialize, Deserialize)]
 struct RootResponse {
@@ -451,6 +489,19 @@ fn subject_from_ctx(ctx: &CratestackContext) -> Option<String> {
         Some(Value::String(s)) => Some(s.clone()),
         _ => None,
     }
+}
+
+/// Whether the caller holds a given permission, read back out of the auth context
+/// `CratestackAuthProvider` populated once at authentication time (one boolean per
+/// `Permission::ALL` variant -- see `auth_provider.rs`). Absent or non-boolean reads as `false`:
+/// unknown is not a default, it routes to the strictest branch.
+///
+/// One copy, not one per module: it is a security predicate, and a second hand-written copy that
+/// forgot the `Bool(true)` match (or matched `Some(_)`) would fail OPEN. `field` is the
+/// `auth().perm*` name, which callers derive from [`rpc_permission_map::permission_field_name`]
+/// rather than typing.
+pub(crate) fn has_permission(ctx: &CratestackContext, field: &str) -> bool {
+    matches!(ctx.auth_field(field), Some(Value::Bool(true)))
 }
 
 /// The caller's raw access token, stashed into the context by [`CratestackAuthProvider`] so the
@@ -2522,9 +2573,14 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         }
     }
 
+    /// Unlike its two `user:read` siblings, this one DOES use `db`: its `apiKeyIds` kind is
+    /// row-scoped through the generated `db.api_key()` delegate rather than by a permission, the
+    /// same `listMyExpiringApiKeys` idiom and for the same reason (the model's own compiled
+    /// `@@allow("read", ...)` clause, not a second hand-written ownership join). See
+    /// `actor_api_key_labels.rs`.
     fn resolve_actor_labels(
         &self,
-        _db: &schema::Cratestack,
+        db: &schema::Cratestack,
         ctx: &CratestackContext,
         args: schema::procedures::resolve_actor_labels::Args,
         _authorized: schema::procedures::resolve_actor_labels::Authorized,
@@ -2534,9 +2590,11 @@ impl schema::procedures::ProcedureRegistry for Procedures {
             CratestackError,
         >,
     > + Send {
+        // `db`/`ctx` are BORROWED into the future rather than cloned, exactly as
+        // `list_my_expiring_api_keys` above does -- the only other procedure in this impl that
+        // reaches the generated delegate.
         let issuer = self.issuer.clone();
-        let ctx = ctx.clone();
-        async move { identity_directory::resolve_actor_labels(&issuer.repo, &ctx, args.args).await }
+        async move { identity_directory::resolve_actor_labels(db, &issuer.repo, ctx, args.args).await }
     }
 
     fn search_users(
@@ -2836,10 +2894,14 @@ pub fn build_api_router(
         DEFAULT_BODY_LIMIT_BYTES,
     )
     .layer(IdempotencyLayer::new(idempotency_store, IDEMPOTENCY_TTL))
-    .layer(RateLimitLayer::new(
-        rate_limit_store,
-        RateLimitConfig::new(RATE_LIMIT_BURST, RATE_LIMIT_REFILL_PER_SECOND),
-    ))
+    .layer(
+        RateLimitLayer::new(
+            rate_limit_store,
+            RateLimitConfig::new(RATE_LIMIT_BURST, RATE_LIMIT_REFILL_PER_SECOND),
+        )
+        // Opt out of cratestack 0.11.0's fail-open default -- see `RATE_LIMIT_STORE_ERROR_POLICY`.
+        .with_store_error_policy(RATE_LIMIT_STORE_ERROR_POLICY),
+    )
     .layer(axum::middleware::from_fn_with_state(
         RpcAuthorizeState {
             bearer,
@@ -3269,6 +3331,9 @@ pub async fn start_api_server(
         review_service,
         budget_repo,
         reset_scheduler,
+        // ADR-0034's remaining reader is assembled and mounted only by `start_budget_server`, on
+        // its mTLS-only internal listener. `authz-api` shares the graph and drops this handle.
+        spend_reader: _,
     } = budget_services::build_budget_services(pool.clone(), usage_service).await?;
 
     let readiness_pool = pool.clone();
@@ -3836,10 +3901,14 @@ pub fn build_budget_router(
         DEFAULT_BODY_LIMIT_BYTES,
     )
     .layer(IdempotencyLayer::new(idempotency_store, IDEMPOTENCY_TTL))
-    .layer(RateLimitLayer::new(
-        rate_limit_store,
-        RateLimitConfig::new(RATE_LIMIT_BURST, RATE_LIMIT_REFILL_PER_SECOND),
-    ))
+    .layer(
+        RateLimitLayer::new(
+            rate_limit_store,
+            RateLimitConfig::new(RATE_LIMIT_BURST, RATE_LIMIT_REFILL_PER_SECOND),
+        )
+        // Opt out of cratestack 0.11.0's fail-open default -- see `RATE_LIMIT_STORE_ERROR_POLICY`.
+        .with_store_error_policy(RATE_LIMIT_STORE_ERROR_POLICY),
+    )
     .layer(axum::middleware::from_fn_with_state(
         RpcAuthorizeState {
             bearer,
@@ -3873,6 +3942,7 @@ pub fn build_budget_router(
 )]
 pub async fn start_budget_server(
     budget: &BudgetServer,
+    budget_internal: Option<&BudgetInternalServer>,
     pool: Arc<dyn DbPoolTrait>,
     oauth2: &Oauth2,
     billing: &Billing,
@@ -3896,6 +3966,7 @@ pub async fn start_budget_server(
         review_service,
         budget_repo,
         reset_scheduler,
+        spend_reader,
     } = budget_services::build_budget_services(pool.clone(), usage_service).await?;
 
     let readiness_pool = pool.clone();
@@ -3987,6 +4058,10 @@ pub async fn start_budget_server(
     });
 
     let dev_cors = dev_cors_enabled();
+    // Cloned before `build_budget_router` consumes them: ADR-0034's reader must be the SAME repo
+    // and the SAME scheduler the RPC surface serves from, not a second graph over the same pool.
+    let budget_repo_for_remaining = budget_repo.clone();
+    let reset_scheduler_for_remaining = reset_scheduler.clone();
     let app = build_budget_router(
         issuer,
         policy_store,
@@ -4016,7 +4091,76 @@ pub async fn start_budget_server(
         "starting budget server"
     );
 
-    serve_tls("BUDGET", &budget.address, budget.port, &budget.tls, app).await
+    let rpc_listener = serve_tls("BUDGET", &budget.address, budget.port, &budget.tls, app);
+
+    // ADR-0034: the mTLS-only internal listener, when configured. `tokio::try_join!` runs the two
+    // concurrently rather than sequentially (the same shape `start_usage_server` uses for its own
+    // two listeners) so neither listener's lifetime blocks the other's, and either one failing
+    // fails this function.
+    let Some(internal) = budget_internal else {
+        tracing::info!(
+            server = SERVICE_BUDGET_INTERNAL,
+            "server.budget_internal is not configured; the gateway's budget-remaining read \
+             ({BUDGET_REMAINING_PATH}) is not served by this process"
+        );
+        return rpc_listener.await;
+    };
+
+    // Fail-closed, and loudly: this listener answers a cross-account balance question with NO
+    // per-caller ownership check of any kind, and the client-certificate requirement is the only
+    // thing standing in front of it. Serving it because someone configured the port and forgot the
+    // trust anchor is precisely the silent degrade `Tls::client_ca_bundle_path` exists to prevent.
+    if internal.tls.client_ca_bundle_path.is_none() {
+        return Err(Error::Server(format!(
+            "server.budget_internal.tls.client_ca_bundle_path is required: {BUDGET_REMAINING_PATH} \
+             is a cross-account service read gated ONLY by mTLS"
+        )));
+    }
+
+    // The grace window is this listener's own config, which is why `build_budget_services` hands
+    // back the shared `spend_reader` rather than a pre-assembled reader: `authz-api` and
+    // `lightbridge-mcp` share the graph but have no `budget_internal` block to read a grace from.
+    let grace = chrono::Duration::seconds(
+        i64::try_from(internal.remaining_grace_seconds).map_err(|_| {
+            Error::Server(format!(
+                "server.budget_internal.remaining_grace_seconds is out of range: {}",
+                internal.remaining_grace_seconds
+            ))
+        })?,
+    );
+    let remaining_service = Arc::new(lightbridge_authz_budget::RemainingService::with_grace(
+        budget_repo_for_remaining,
+        spend_reader,
+        reset_scheduler_for_remaining,
+        grace,
+    ));
+
+    let internal_app = budget_remaining::budget_remaining_router().with_state(Arc::new(
+        budget_remaining::BudgetInternalState {
+            remaining: remaining_service,
+        },
+    ));
+
+    lightbridge_authz_core::log_build_info(SERVICE_BUDGET_INTERNAL);
+    tracing::info!(
+        server = SERVICE_BUDGET_INTERNAL,
+        address = %internal.address,
+        port = internal.port,
+        path = BUDGET_REMAINING_PATH,
+        grace_seconds = internal.remaining_grace_seconds,
+        "starting budget internal (mTLS) server"
+    );
+
+    let internal_listener = serve_tls(
+        "BUDGET_INTERNAL",
+        &internal.address,
+        internal.port,
+        &internal.tls,
+        internal_app,
+    );
+
+    tokio::try_join!(rpc_listener, internal_listener)?;
+    Ok(())
 }
 
 async fn root_handler() -> (StatusCode, Json<RootResponse>) {

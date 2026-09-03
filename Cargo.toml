@@ -610,16 +610,58 @@ mimalloc = "0"
 # `@@allow`/`@allow` policy evaluation, `LenientCborCodec`/the `undefined`-vs-`null` CBOR
 # normalization, `push_scoped_conditions`, `AuthProvider`/`CachedAuthProvider`, and `/rpc/batch`
 # dispatch -- the RPC-batch-auth seam remains untouched.
-cratestack-core = "=0.10.0"
-cratestack-axum = "=0.10.0"
-cratestack-redis = "=0.10.0"
+# BUMPED (2026-09-03, cratestack 0.10.0 -> 0.11.0). Verified against the crates.io sparse index
+# that all six declared package names publish 0.11.0 (and that `cargo update` moved all TWELVE
+# lockfile crates in lockstep, the transitive `-client-rust`/`-macros`/`-parser`/`-policy`/`-sql`/
+# `-sqlx` included). 0.10.1 sits in between and is inert here: two vscode-extension rename/CI fixes
+# and the workspace version bump, nothing Rust-runtime-facing (cratestack#861/#862/#863).
+#
+# 0.11.0 carries ONE change that reaches this repo's runtime, and it is a security default:
+#   - cratestack#869 (closing cratestack#846), marked breaking upstream: `RateLimitLayer` no longer
+#     turns every `RateLimitStore` failure into a 500. The new `StoreErrorPolicy` defaults to
+#     `Allow`, which serves a request UNTHROTTLED when the store failure is transport-class
+#     (`CratestackError::Unavailable` -- broken socket, unreachable Redis, or the new 500ms
+#     `with_store_timeout` budget elapsing). A store that is reachable but refusing (OOM, NOPERM, a
+#     poisoned mutex) still refuses under every policy. **This repo opts out.** Both
+#     `RateLimitLayer::new` call sites in `lightbridge-authz-rest/src/lib.rs` now chain
+#     `.with_store_error_policy(RATE_LIMIT_STORE_ERROR_POLICY)` = `StoreErrorPolicy::Deny`, because
+#     here the limiter is a brute-force guard (a security control), not a capacity control -- the
+#     same decision `oauth2_op::device_store::get_by_user_code_rate_limited` already made by hand
+#     for the one direct `consume` call site. Guarded by
+#     `rpc_router_tests::a_transport_class_rate_limit_store_failure_is_refused_not_served_unthrottled`,
+#     which fails (200/500 instead of 503) the moment the opt-out is dropped. See
+#     docs/plans/cratestack-0.11.0-migration.md.
+#   - Same PR: every response the `RateLimitLayer` and `IdempotencyLayer` emit THEMSELVES now
+#     carries the codec-negotiated error envelope (`CratestackErrorResponse` for REST,
+#     `RpcErrorBody` for RPC) instead of a bare `text/plain` string, and `CratestackError` gained an
+#     additive `TooManyRequests` variant (`TOO_MANY_REQUESTS` / gRPC `resource_exhausted`). Nothing
+#     in this workspace matches `CratestackError` exhaustively (it is `#[non_exhaustive]` anyway)
+#     and no test asserted on a middleware error body as text, so the Rust side needed no edit --
+#     but this IS wire-visible, so the console's `packages/authz-rpc/src/runtime.ts` error mapping
+#     moves with it in the converse-frontends repo.
+# Checked and confirmed NOT reachable from this repo:
+#   - cratestack#870, the declarative `query <name>(...): Type` block (parser/macros). Additive, and
+#     dispatched only on a top-level line starting `query ` (`cratestack-parser`'s
+#     `src/parse/mod.rs:217`). `authz.cstack:1975`'s `query String` is a FIELD inside a `type` block
+#     -- a different parse context -- so it does not collide; proven by the schema still expanding
+#     and `schema_policy_sync_tests` staying green.
+#   - cratestack#868 (musl napi packages for `@cratestack/cbor-node`) and #866 (an rpc-client
+#     example) are npm/example-side; the first DOES land downstream in converse-frontends'
+#     `apps/console` image staging. #864/#865 are vscode-extension only.
+# Re-checked and untouched between 0.10.0 and 0.11.0, same terms as every sweep above:
+# `@@allow`/`@allow` policy evaluation, `LenientCborCodec`/the `undefined`-vs-`null` CBOR
+# normalization, `push_scoped_conditions`, `AuthProvider`/`CachedAuthProvider`, the `rpc_router`/
+# `model_router` signatures, and `/rpc/batch` dispatch -- the RPC-batch-auth seam remains untouched.
+cratestack-core = "=0.11.0"
+cratestack-axum = "=0.11.0"
+cratestack-redis = "=0.11.0"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
 # `include_server_schema!` macro emits `::cratestack::*` paths (see cratestack-pg lib docs). The
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
 # it to build the RPC router (ADR-0003).
-cratestack = { package = "cratestack-pg", version = "=0.10.0" }
-cratestack-codec-cbor = "=0.10.0"
-cratestack-codec-json = "=0.10.0"
+cratestack = { package = "cratestack-pg", version = "=0.11.0" }
+cratestack-codec-cbor = "=0.11.0"
+cratestack-codec-json = "=0.11.0"
 # Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"

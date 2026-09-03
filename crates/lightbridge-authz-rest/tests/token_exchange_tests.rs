@@ -1370,6 +1370,113 @@ async fn token_endpoint_cors_is_exact_and_never_wildcarded(pool: PgPool) {
     }
 }
 
+/// RFC 8252 §7.3 at the endpoint, end to end through `/authorize`'s own gate
+/// (`docs/rfc-8252-loopback-redirects.md`). The discriminator is the status code: a refused
+/// `redirect_uri` is a direct `400` from the gate, while an admitted one gets past it and fails
+/// later at the Keycloak leg with `502` -- `relying_party()` points at an unreachable issuer, so
+/// reaching `502` at all proves the redirect URI was accepted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorize_admits_only_an_ephemeral_port_on_a_registered_loopback_uri(pool: PgPool) {
+    const CLIENT: &str = "native-app";
+    const REGISTERED: &str = "http://127.0.0.1:17452/callback";
+    let repo = repo(pool);
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
+    let router = authorize_router(AuthorizeState::new(
+        relying_party(repo.clone()),
+        state_with(
+            repo,
+            Arc::new(MockBearer::new(true, vec![])),
+            vec![browser_client(CLIENT, REGISTERED)],
+            &redis_url(),
+        ),
+    ));
+    let authorize = |redirect_uri: String| {
+        let router = router.clone();
+        async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/authorize?client_id={CLIENT}&redirect_uri={redirect_uri}&response_type=code&scope=openid&code_challenge=challenge&code_challenge_method=S256"
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    // Admitted: only the port differs from the registration. The registered URI itself still
+    // matches exactly, as it always did.
+    for redirect_uri in [
+        "http://127.0.0.1:54321/callback",
+        "http://127.0.0.1/callback",
+        REGISTERED,
+    ] {
+        let response = authorize(redirect_uri.to_string()).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "{redirect_uri} must pass the redirect-URI gate and reach the Keycloak leg"
+        );
+    }
+
+    // Refused: `localhost` (RFC 8252 §8.3), a path the registration does not carry, `https`, a
+    // different loopback-range address, and a look-alike hostname.
+    for redirect_uri in [
+        "http://localhost:54321/callback",
+        "http://127.0.0.1:54321/other",
+        "https://127.0.0.1:54321/callback",
+        "http://127.0.0.2:54321/callback",
+        "http://127.0.0.1.evil.example:54321/callback",
+    ] {
+        let response = authorize(redirect_uri.to_string()).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{redirect_uri} must be refused at the redirect-URI gate"
+        );
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+    }
+}
+
+/// A public client that registered no loopback URI does not silently gain one: the carve-out is
+/// opt-in via the registration, not a property of being public.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorize_refuses_a_loopback_redirect_for_a_client_without_one_registered(pool: PgPool) {
+    const CLIENT: &str = "browser-client";
+    const REGISTERED: &str = "https://dashboard.example.test/oauth/callback";
+    let repo = repo(pool);
+    bootstrap_idp_signing_keys(&repo, &signing_cfg())
+        .await
+        .unwrap();
+    let router = authorize_router(AuthorizeState::new(
+        relying_party(repo.clone()),
+        state_with(
+            repo,
+            Arc::new(MockBearer::new(true, vec![])),
+            vec![browser_client(CLIENT, REGISTERED)],
+            &redis_url(),
+        ),
+    ));
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/authorize?client_id={CLIENT}&redirect_uri=http://127.0.0.1:54321/callback&response_type=code&scope=openid&code_challenge=challenge&code_challenge_method=S256"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn authorize_rejects_unregistered_redirects_and_pkce_before_relying_party(pool: PgPool) {
     const CLIENT: &str = "browser-client";

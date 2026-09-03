@@ -56,6 +56,15 @@ Enforcement is centralized, so the handlers/tools themselves contain no authoriz
   nothing more). `app/lightbridge-authz/tests/mcp_parity_tests.rs` fails the build if any reachable
   RPC op-id has no MCP tool, or if a tool's gate differs from its op-id's REST permission.
 
+  Since #670 the surface is **70 advertised tools**: all **68** reachable RPC op-ids (it was 31 of
+  68 before) plus the two MCP-only validation tools that have no RPC twin, enumerated in
+  `mcp_rbac::MCP_ONLY_TOOL_PERMISSIONS` (`app/lightbridge-authz/src/mcp_rbac.rs:92`) at
+  `apikey:validate`. `mcp_rbac::gated_tools()` (`:114`) is the one enumeration; three consumers now
+  derive from it rather than restating it, the third having been added by #672 after the *second*
+  hand-typed copy — `EXPECTED_MCP_TOOLS` in `.docker/it/servers_it.py`, a Python file that cannot
+  import the crate — turned `main` red on merge. That guard reads the Python file from the Rust
+  side and fails loudly (not vacuously) if the block is ever renamed or reshaped.
+
 ### Two gates on the CRUD surface, in order
 
 The CRUD surface (`authz-api`) migrated to cratestack-generated RPC routing (see
@@ -480,6 +489,14 @@ API the operation is an RPC `op_id` (`POST /rpc/{op_id}`); the equivalent MCP to
 permission. cratestack's `op_id` scheme is `model.<Model>.<verb>` (verb ∈ `list|get|create|update|
 delete`) for generated model CRUD and `procedure.<name>` for the hand-written procedures.
 
+There are **37** permissions, and the list that decides is
+`Permission::ALL` at `crates/lightbridge-authz-core/src/authz.rs:196` — not this page. Five of them
+arrived on 2026-09-02/03 (32 → 37): `budget:schedule-manage` (#653), `session:read` and
+`session:read-own` (#657), `user:read` (#655), `rbac:manage` (#656). If you are adding one, add the
+variant, its `ALL` entry, its `as_str`, its `perm…` boolean on the schema's `auth Principal` block
+and its op-id row in `rpc_permission_map` — the `.claude/skills/authz-procedure` skill walks the
+whole set, and `schema_policy_sync_tests` fails CI if the schema's `@allow` clauses drift from it.
+
 This table is the source of truth for `rpc_authorize::required_permission`. **Any RPC `op_id` not
 listed here is denied unconditionally (fail closed).**
 
@@ -488,7 +505,7 @@ listed here is denied unconditionally (fail closed).**
 `model.User.*` verb is denied unconditionally by the rule above; no new entry was needed here or
 in `rpc_authorize.rs`. `federated_identities` has no RPC surface either, and never will through the
 generated CRUD path — it is deliberately absent from `authz.cstack` entirely (see
-[`docs/architecture/data-model.md`](./architecture/data-model.md#users-and-federated-identities-adr-0024)).
+[`docs/architecture/data-model.md`](./architecture/data-model.md#users-and-federated-identities-adr-0024-corrected-2026-08-25)).
 
 **Every `budget:*` row below is served at `POST /budget/rpc/{op_id}` on the separate
 `authz-budget` service, not `POST /rpc/{op_id}` on `authz-api`** (hard cutover — see
@@ -542,9 +559,9 @@ scope for #401.
 | `session:revoke-own`     | `procedure.revokeOwnSessions`, `procedure.revokeSession` | `revoke-own-sessions`, `revoke-session` |
 | `session:revoke`         | `procedure.revokeSubjectSessions` (and widens `procedure.revokeSession`; see below) | `revoke-subject-sessions` |
 | `usage:read-all`         | — (not an RPC op-id; see note below)                 | — (no MCP tool)                     |
-| `user:read`              | `procedure.resolveUserProfiles`, `procedure.resolveActorLabels`, `procedure.searchUsers` | `resolve-user-profiles`, `resolve-actor-labels`, `search-users` |
+| `user:read`              | `procedure.resolveUserProfiles`, `procedure.searchUsers` (and widens `procedure.resolveActorLabels`; see below) | `resolve-user-profiles`, `search-users` |
 | `rbac:manage`            | `procedure.listPlatformRoleGrants`, `procedure.grantPlatformRole`, `procedure.revokePlatformRole` | `list-platform-role-grants`, `grant-platform-role`, `revoke-platform-role` |
-| **none** (any authenticated caller) | `procedure.getMyAccess`, `procedure.getBuildInfo` — the two enumerated exceptions to "unmapped op-id is denied"; see [Platform roles are a table](#platform-roles-are-a-table-adr-0033) and [docs/build-info.md](build-info.md) | `get-my-access`, `get-build-info` |
+| **none** (any authenticated caller) | `procedure.getMyAccess`, `procedure.getBuildInfo`, `procedure.resolveActorLabels` — the three enumerated exceptions to "unmapped op-id is denied"; see [Platform roles are a table](#platform-roles-are-a-table-adr-0033), [docs/build-info.md](build-info.md) and [docs/admin-identity-resolution.md](admin-identity-resolution.md) | `get-my-access`, `get-build-info`, `resolve-actor-labels` |
 
 `read` covers both the list and get operations for a resource.
 
@@ -567,7 +584,7 @@ sequenceDiagram
     participant T as call_tool<br/>(mcp.rs)
     participant G as tool_gate<br/>(mcp_rbac.rs)
     participant M as required_permission<br/>(rpc_authorize.rs)
-    participant P as procedures::&lt;name&gt;::invoke_with_db<br/>(generated)
+    participant P as procedures::NAME::invoke_with_db<br/>(generated)
     participant R as Procedures<br/>(lightbridge-authz-rest/src/lib.rs)
 
     C->>B: POST /mcp tools/call {name, arguments}
@@ -640,17 +657,35 @@ comment) even though no `@allow`/`@@allow` clause reads it. Granted to `lightbri
 role's default `*` grant; an operator restricting `role_permissions` explicitly must add
 `usage:read-all` (or `usage:*`) back to whichever role should keep estate-wide usage access.
 
-`user:read` (#647) is the estate-wide identity-resolution permission: it gates the three admin
+`user:read` (#647) is the estate-wide identity-resolution permission: it gates the admin
 procedures that turn opaque `users.id`/`accounts.id`/`projects.id` values into human labels
-(`resolveUserProfiles`, `resolveActorLabels`, `searchUsers`). Those procedures apply **no ownership
-filter at all** — that is their purpose, and it is why this is its own permission rather than a
-reuse of `account:read`: they read `federated_identities` profile claims for subjects the caller
-has no relationship with. It is deliberately admin-only by default, granted to `lightbridge-admin`
-via that role's `*` and to neither `lightbridge-editor` nor `lightbridge-viewer`. The surface is
-bounded by design: batches are capped at 200 ids per kind and an over-cap batch is **rejected**
-rather than truncated, and free-text search requires a 2-character minimum query and returns at
-most 50 rows (20 by default). An unresolvable id is simply absent from the result — no procedure
-here ever fabricates a placeholder identity; the console renders its own sentinel.
+(`resolveUserProfiles`, `searchUsers`, and the three estate-wide kinds of `resolveActorLabels`).
+Those reads apply **no ownership filter at all** — that is their purpose, and it is why this is its
+own permission rather than a reuse of `account:read`: they read `federated_identities` profile
+claims for subjects the caller has no relationship with. It is deliberately admin-only by default,
+granted to `lightbridge-admin` via that role's `*` and to neither `lightbridge-editor` nor
+`lightbridge-viewer`. The surface is bounded by design: batches are capped at 200 ids per kind and
+an over-cap batch is **rejected** rather than truncated, and free-text search requires a
+2-character minimum query and returns at most 50 rows (20 by default). An unresolvable id is simply
+absent from the result — no procedure here ever fabricates a placeholder identity; the console
+renders its own sentinel.
+
+`resolveActorLabels` is the one procedure whose op-id is **not** mapped to `user:read`, and the
+distinction is worth stating precisely because it looks like a loosening and is not. Since the
+owner's 2026-09-03 feedback it answers a fourth kind, `apiKeyIds`, whose labels are **not**
+estate-wide PII: an API key's name is a label the caller's own project already shows them, and the
+panel that needs it ("Spend by API key") is read by ordinary members. A coarse op-id gate cannot
+express "three of these lists need a permission, the fourth needs a row check", so:
+
+- the op-id sits in `AUTHENTICATED_ONLY_OP_IDS` (any live bearer token gets past the gate);
+- `userIds`/`accountIds`/`projectIds` still **refuse** a caller without `user:read`, now in the
+  handler, with a `403` that names the reason — they do not quietly answer empty, because an empty
+  list already means "no row for that id";
+- `apiKeyIds` is scoped **per row** through `ApiKey`'s own `@@allow("read", …)` clause, read
+  through the generated `db.api_key()` delegate (the `listMyExpiringApiKeys` idiom), so a key the
+  caller may not see is simply **absent** — never a `403`, which would make key existence probeable.
+
+See [docs/admin-identity-resolution.md](admin-identity-resolution.md) for the full contract.
 
 ### Read verbs filter, they do not refuse (`POST /rpc/batch` only) — #401
 

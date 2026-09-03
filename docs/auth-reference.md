@@ -468,3 +468,5 @@ use `/v1/authorino/validate/introspect`. All three should be updated to match th
 - `docs/authorino-usage.md` — the Authorino `AuthConfig` wiring for `/v1/authorino/validate/introspect`.
 - `docs/oauth-oidc-standards-roadmap.md` — current OAuth/OIDC implementation status and standards
   conformance roadmap.
+- `docs/rfc-8252-loopback-redirects.md` — the exact rule by which `/authorize` admits a native
+  app's ephemeral-port loopback `redirect_uri`, and why `localhost` is refused.

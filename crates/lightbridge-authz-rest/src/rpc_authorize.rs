@@ -317,12 +317,17 @@ pub fn required_permission(op_id: &str) -> Option<Permission> {
         // comment on `getEffectiveResetSchedule`.
         "procedure.getEffectiveResetSchedule" => BudgetRead,
 
-        // Admin identity resolution (#647). All three read the SAME estate-wide, ownership-filter-
-        // free PII surface -- display claims for subjects the caller has no relationship with --
-        // so they share ONE permission rather than splitting "resolve" from "search": a caller who
-        // can batch-resolve arbitrary ids can already enumerate whatever a search would reveal.
+        // Admin identity resolution (#647). Both read the SAME estate-wide, ownership-filter-free
+        // PII surface -- display claims for subjects the caller has no relationship with -- so they
+        // share ONE permission rather than splitting "resolve" from "search": a caller who can
+        // batch-resolve arbitrary ids can already enumerate whatever a search would reveal.
+        //
+        // `resolveActorLabels` was the third member of this group and is deliberately NOT here any
+        // more: it is in `AUTHENTICATED_ONLY_OP_IDS`, because it now also answers a non-admin,
+        // row-scoped kind (`apiKeyIds`) that a coarse op-id gate cannot express. Its `user:read`
+        // requirement for the other three kinds moved into the handler, not away -- see that
+        // constant's doc comment and `identity_directory.rs`.
         "procedure.resolveUserProfiles" => UserRead,
-        "procedure.resolveActorLabels" => UserRead,
         "procedure.searchUsers" => UserRead,
 
         // Platform role grants (ADR-0033). All three share ONE permission for the same reason the
@@ -672,7 +677,6 @@ mod tests {
                 "procedure.revokeOwnSessions",
                 "procedure.revokeSubjectSessions",
                 "procedure.resolveUserProfiles",
-                "procedure.resolveActorLabels",
                 "procedure.searchUsers",
             ])
             .collect();
