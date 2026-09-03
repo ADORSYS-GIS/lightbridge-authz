@@ -861,6 +861,42 @@ nothing. Watch for a full period, minimum one week:
 Exit criteria: zero unexplained `budget_unavailable`; the would-refuse set is exactly the set of
 accounts the console also shows as exhausted; ingest lag measured.
 
+#### Where the p99 comes from
+
+§9 calls this route's p99 *hard*, so it is worth saying exactly how to read it — the criterion sat
+un-measurable for the first days of Stage 1 because nobody had.
+
+Two things had to be true, and neither was:
+
+1. **`authz-budget` had to emit telemetry at all.** `otel.enabled` was `false` for every
+   `lightbridge-authz` component. Turned on for `budget` alone in
+   [ai-helm-values#372](https://github.com/ADORSYS-GIS/ai-helm-values/pull/372) — at
+   `alloy.observability.svc.cluster.local:**4317**`, gRPC, because
+   `lightbridge-authz-core`'s exporter is `.with_tonic()` and the `Otel` config struct
+   (`{enabled, otlp_endpoint, service_name}`) has no protocol field. Alloy's 4318 is the HTTP
+   listener the Next.js apps use; pointed there, every export fails silently.
+2. **This route had to be instrumented.** It is a plain axum route, outside cratestack, and carried
+   no span until #680 — while cratestack's own `/rpc/procedure.*` spans arrived normally. So
+   "`lightbridge-authz-budget` is in Tempo with plenty of spans" was, for a while, compatible with
+   this criterion having no data. Check the route, not the service.
+
+The selector, once both hold:
+
+```traceql
+{ resource.service.name = "lightbridge-authz-budget" && span.http.route = "/budget/v1/remaining" }
+```
+
+⚠️ **Do not append `| quantile_over_time(duration, .99)` and trust the result.** On the deployed
+Tempo (v2.9.0) that returns `{"series":[],"metrics":{"completedJobs":1}}` — HTTP 200, no error —
+because the live `configmap/tempo` has `overrides.defaults: {}`, i.e. no
+`metrics_generator_processors`, so TraceQL metrics have no `local-blocks` to read. Verified
+2026-09-03: even `{} | count_over_time()` comes back empty while plain search returns traces. An
+empty p99 panel would read as "nothing is slow".
+
+Until that processor is enabled, compute the quantile from the search results. The runnable recipe —
+port-forward, query, and a status-code histogram for the 503 rate this same bullet asks for — is
+ai-helm-values `docs/runbooks/observability-endpoints.md` §6b.
+
 **Stage 3 — enforce.** One commit, on a 1st-of-month 00:00 UTC boundary:
 `shadowMode: false` **+** delete the monthly and weekly cost rule families **+** the exporter
 co-change. Announce the 402 contract to client owners first — a new terminal status on a
