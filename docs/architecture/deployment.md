@@ -3,6 +3,12 @@
 How code in this repository reaches production, and the one failure mode in that chain that is
 silent by design — everything reports green while prod keeps running old code.
 
+> **This page is the topology. The procedure is
+> [`docs/runbooks/release-and-rollout.md`](../runbooks/release-and-rollout.md)** — what to run, in
+> what order, to answer *"is my change live?"*, including the `/version` check, the live image list,
+> the ArgoCD destination, and the two currently-broken links in the chain (#666's chart publishing,
+> and ADR-0031 being accepted but not yet implemented).
+
 ## CI/CD chain
 
 ```mermaid
@@ -27,6 +33,13 @@ Source: `.github/workflows/ci.yml` (jobs `binaries`, `container-build`, `release
 - `binaries` and `container-build` run only on `push` to `main` (`if: github.ref ==
   'refs/heads/main' && github.event_name == 'push'`) — a branch's own CI never builds or publishes
   an image, only a merge does.
+- **`main` is one concurrency lane, and later pushes cancel earlier ones.** `ci.yml:21-23` declares
+  `group: ci-${{ … || github.ref_name }}` with `cancel-in-progress: true`; for `main` that key is
+  `ci-main`. Two merges in quick succession cancel the first merge's run, so `container-build` never
+  reaches `cosign sign` and **that commit gets no image at all**. Nothing goes red — the run is
+  `cancelled`. The *content* still ships inside the later commit's image, but `sha-<commit>` is not
+  a tag that exists for every commit on `main`; do not build a rollback procedure that assumes it
+  does.
 - `container-build` is a 3-way matrix, one image per deployable image target: `runtime` →
   `ghcr.io/adorsys-gis/lightbridge-authz` (serves both `authz-api` and `authz-opa`), `mcp-runtime`
   → `ghcr.io/adorsys-gis/lightbridge-authz-mcp`, `usage-runtime` →
@@ -39,6 +52,16 @@ Source: `.github/workflows/ci.yml` (jobs `binaries`, `container-build`, `release
   `token.actions.githubusercontent.com`).
 - `release-please` and `release` handle the GitHub Release (binary tarball attached to the tag) —
   they do not touch container images or the deploy repo at all.
+- **Charts are a third, separate clock, and it has been stopped since `v5.0.0`.**
+  `.github/workflows/helm-oci.yml` fires on `push: tags: ["v*"]` only, and release-please cuts that
+  tag with `secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN` (`ci.yml:311`). A tag created with
+  `GITHUB_TOKEN` does not fire a `push: tags` workflow (GitHub's recursive-workflow guard), so
+  `v6.0.0`–`v9.0.0` were tagged and **no chart was published for any of them** — prod sat on chart
+  `5.0.0`, four majors behind, with nothing red anywhere. `10.0.0` exists only because
+  `helm-oci.yml` was dispatched by hand.
+  [lightbridge-authz#666](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/666) is open;
+  the recovery procedure is in
+  [`runbooks/release-and-rollout.md` Step 7](../runbooks/release-and-rollout.md#step-7--the-chart-is-a-separate-currently-broken-pipeline).
 
 ## Continuous delivery to prod: the image-updater hop, and its silent-failure mode
 
@@ -88,11 +111,14 @@ curl -s -o /dev/null -w "%{http_code}\n" \
 `$GHCR_USER`/`$GHCR_PAT` need `read:packages` on the (private) GHCR packages — a GitHub Actions
 `GITHUB_TOKEN` scoped to this repo works for images this repo pushes.
 
-**Known gap, not fixed here:** `lightbridge-authz-usage`'s image is **not** covered by
-`argocd-image-updater` today — only the `authz`/`authz_mcp` image pins are wired into
-`ai-helm-values`. The usage service's prod pin is set by hand and has, in practice, drifted several
-releases behind what CI publishes. If you are adding a new deployable to the fleet, do not assume
-image-updater coverage extends to it automatically — check the `ImageUpdater` CR list explicitly.
+**On `lightbridge-authz-usage`'s pin:** this page previously recorded that the usage image was *not*
+covered by `argocd-image-updater` and drifted several releases behind. As of **2026-09-03** all
+three images are pinned at the same commit in production (`ab11479`), so either that gap has been
+closed or the pin was set by hand at the same value. Do not infer coverage from either statement —
+read the live list, per
+[`runbooks/release-and-rollout.md` Step 3](../runbooks/release-and-rollout.md#step-3--did-the-promotion-land-in-ai-helm-values).
+The underlying rule stands: **if you are adding a new deployable to the fleet, image-updater
+coverage does not extend to it automatically** — check the `ImageUpdater` CR list explicitly.
 
 ## Helm chart structure
 
@@ -109,6 +135,17 @@ dependencies, each aliased and independently toggleable:
 `api` and `opa` are two aliases of the **same** `lightbridge-authz` chart — consistent with them
 being the same image run with a different `args:` subcommand (see above), configured differently
 per alias in the umbrella chart's values.
+
+> **Migration mechanism — read this before ADR-0031.**
+> [`ADR-0031`](../adr/0031-migrations-run-in-init-containers.md) (2026-09-02, **Accepted**)
+> supersedes ADR-0016 on paper and says migrations run in an **init container** on every component.
+> **The chart has not been changed.** `charts/lightbridge-authz/values.yaml:129` still declares
+> `controllers.migrate` as a `type: job` on `sync-wave: "1"`, and production runs five such Jobs
+> (`lightbridge-{api,opa,idp,budget,usage}-migrate-*`, verified 2026-09-03) with zero init
+> containers on `lightbridge-api-main`. So the paragraph below describes what is deployed, and
+> ADR-0031's two failure classes are still reachable today. ADR-0031's *other* half —
+> expand/contract, where a migration may only add and code requiring the new shape ships one
+> release later — needs no chart change and should be followed now.
 
 Schema migrations run as `controllers.migrate` in `charts/lightbridge-authz/values.yaml` (built on
 the `bjw-s/common` v4 app-template library). Per ADR-0016
