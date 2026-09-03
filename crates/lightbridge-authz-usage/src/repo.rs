@@ -79,6 +79,11 @@ struct UsageQueryRow {
     latency_p50_ms: Option<f64>,
     latency_p95_ms: Option<f64>,
     latency_p99_ms: Option<f64>,
+    /// Whole-result-set fact, not a per-row one: `true` when more DISTINCT `bucket_start` values
+    /// matched than `input.limit` allowed and the oldest were dropped whole. Computed once by a
+    /// window function over the distinct bucket list and repeated on every row, which is what
+    /// lets the whole thing be ONE round trip instead of two (see [`build_usage_query`]).
+    truncated: bool,
 }
 
 impl StoreRepo {
@@ -90,7 +95,13 @@ impl StoreRepo {
         self.pool.pool()
     }
 
-    #[instrument(skip(self))]
+    // `skip_all` + an explicit count, for the same reason `handlers::ingest`'s handlers do it
+    // (owner report, 2026-09-03): `#[instrument(skip(self))]` recorded the `events` ARGUMENT into
+    // the span, and a `UsageEvent`'s `Debug` includes its whole `attributes` blob -- so every
+    // insert stamped the decoded contents of the export (account ids, user names, and whatever
+    // else the exporter put in the attributes) into the trace span. The count is the only part of
+    // that field anyone ever wanted.
+    #[instrument(skip_all, fields(events = events.len()))]
     pub async fn insert_usage_events(&self, events: &[UsageEvent]) -> Result<usize> {
         debug!("inserting {} usage events", events.len());
         if events.is_empty() {
@@ -102,7 +113,6 @@ impl StoreRepo {
         );
 
         builder.push_values(events, |mut row, event| {
-            debug!("inserting event {:?}", event);
             row.push_bind(event.observed_at)
                 .push_bind(&event.signal_type)
                 .push_bind(&event.account_id)
@@ -162,11 +172,10 @@ impl StoreRepo {
 
     /// Returns up to `input.limit` WHOLE buckets plus whether more existed (#578). `truncated` is
     /// derived from the count of DISTINCT `bucket_start` values that matched, never from row
-    /// count -- see this method's own doc comment below for why that distinction is load-bearing
-    /// whenever `group_by` is non-empty. `Vec<UsageSeriesPoint>` comes back in the same
-    /// ascending-`bucket_start` order this method has always returned.
+    /// count -- see below for why that distinction is load-bearing whenever `group_by` is
+    /// non-empty. `Vec<UsageSeriesPoint>` comes back in ascending `bucket_start` order.
     ///
-    /// ## #578 (and its own bucket-scoping correction): truncation is BUCKET-scoped, not row-scoped
+    /// ## #578: truncation is BUCKET-scoped, not row-scoped
     ///
     /// The query used to `ORDER BY bucket_start ASC LIMIT $n` directly -- for a series with more
     /// than `$n` buckets, an ascending sort followed by `LIMIT` keeps the buckets from the START
@@ -186,22 +195,37 @@ impl StoreRepo {
     /// tiebreaker on which rows survive at that cutoff, WHICH series got dropped from the boundary
     /// bucket was nondeterministic across otherwise-identical runs.
     ///
-    /// The actual fix: two queries, both scoped to distinct `bucket_start` values, never to rows.
-    /// [`Self::select_kept_buckets`] runs first and returns the newest `limit + 1` DISTINCT
-    /// `bucket_start` values (fetching one extra is what turns "were there more buckets" into an
-    /// observable fact); this method drops the single oldest one when more than `limit` came back
-    /// (`truncated: true`), then runs the full grouped aggregation FILTERED to exactly the kept
-    /// `bucket_start` values (`= ANY($kept_buckets)`) -- every bucket in the result set is
-    /// therefore either fully present (every series that has any row in it) or fully absent, never
-    /// partially present. The aggregation query's `ORDER BY` also names every dimension column
-    /// (grouped or constant-`NULL`) as an explicit tiebreaker after `bucket_start`, so which row
-    /// comes first within a bucket is deterministic run to run, not an artifact of Postgres' free
-    /// choice among ties.
+    /// ## The bucket-scoped fix used to cost a SECOND full scan (owner report, 2026-09-03)
+    ///
+    /// #578 implemented the bucket scoping as TWO queries: a `SELECT DISTINCT date_bin(...) ...
+    /// ORDER BY ... DESC LIMIT $n+1` to pick the surviving buckets, then the grouped aggregation
+    /// filtered to `= ANY($kept_buckets)`. Both carried the SAME `WHERE` clause, so both scanned
+    /// the same rows -- the estate-wide 30-day shape the console's overview page issues read the
+    /// whole table twice. Worse, the first query's `DISTINCT ... ORDER BY ... LIMIT` shape makes
+    /// Postgres pick `Sort -> Unique` rather than a hash aggregate, so it sorted every matching
+    /// row (933,494 of them, spilling ~11 MB to disk at `work_mem = 4MB`) purely to learn that 21
+    /// distinct days existed. Measured on production (`lightbridge-main-db`/`usage`, read-only
+    /// replica, 2026-09-03): 2,993 ms for that first query alone.
+    ///
+    /// [`build_usage_query`] now does the whole thing in ONE statement: the aggregation runs once,
+    /// and a `dense_rank()` window over its own output -- tens of rows, not a million -- does the
+    /// bucket ranking. Semantics are unchanged: the DISTINCT `bucket_start` values of the
+    /// aggregate are by construction exactly the DISTINCT `bucket_start` values of the matching
+    /// rows, because `bucket_start` is always a `GROUP BY` key.
+    ///
+    /// This is not a free lunch on production TODAY, and the PR that made the change says so: the
+    /// second scan was 2,993 ms of a 34,799 ms query, and the other 31,806 ms is raw heap I/O that
+    /// only `migrations-usage/20260903000002_usage_event_query_covering_index.sql` addresses.
     ///
     /// Known caveat (#586): a bucket that straddles the truncation boundary is dropped or kept as
-    /// a whole bucket, not split -- this fix does not attempt partial-bucket truncation, only
-    /// which whole buckets survive.
-    #[instrument(skip(self))]
+    /// a whole bucket, not split -- this does not attempt partial-bucket truncation, only which
+    /// whole buckets survive.
+    // `skip_all`: `input` carries `scope_id` and the whole `filters` set (user ids, api key ids,
+    // user names). `handlers::query::query_usage` already refuses to put those in ITS span for
+    // exactly that reason, and this span re-adding them would have undone that. The `debug!`
+    // immediately below names the four fields that are actually useful for correlating a slow
+    // query, and nothing else.
+    #[instrument(skip_all)]
     pub async fn query_usage(
         &self,
         input: &UsageQueryRequest,
@@ -212,145 +236,14 @@ impl StoreRepo {
         );
         validate_bucket_interval(&input.bucket)?;
 
-        let (kept_buckets, truncated) = self.select_kept_buckets(input).await?;
-        if kept_buckets.is_empty() {
-            return Ok((Vec::new(), truncated));
-        }
-
-        let mut group_set = HashSet::new();
-        for group in &input.group_by {
-            group_set.insert(group.clone());
-        }
-
-        let mut builder = QueryBuilder::<Postgres>::new("SELECT date_bin(CAST(");
-        builder.push_bind(&input.bucket).push(
-            " AS interval), observed_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS bucket_start",
-        );
-
-        let mut grouped_columns: Vec<&'static str> = Vec::new();
-        append_dimension(
-            &mut builder,
-            &mut grouped_columns,
-            &group_set,
-            UsageGroupBy::AccountId,
-            "account_id",
-        );
-        append_dimension(
-            &mut builder,
-            &mut grouped_columns,
-            &group_set,
-            UsageGroupBy::ProjectId,
-            "project_id",
-        );
-        append_dimension(
-            &mut builder,
-            &mut grouped_columns,
-            &group_set,
-            UsageGroupBy::ApiKeyId,
-            "api_key_id",
-        );
-        append_dimension(
-            &mut builder,
-            &mut grouped_columns,
-            &group_set,
-            UsageGroupBy::UserId,
-            "user_id",
-        );
-        append_dimension(
-            &mut builder,
-            &mut grouped_columns,
-            &group_set,
-            UsageGroupBy::UserName,
-            "user_name",
-        );
-        append_dimension(
-            &mut builder,
-            &mut grouped_columns,
-            &group_set,
-            UsageGroupBy::Model,
-            "model",
-        );
-        append_dimension(
-            &mut builder,
-            &mut grouped_columns,
-            &group_set,
-            UsageGroupBy::MetricName,
-            "metric_name",
-        );
-        append_dimension(
-            &mut builder,
-            &mut grouped_columns,
-            &group_set,
-            UsageGroupBy::SignalType,
-            "signal_type",
-        );
-        append_dimension(
-            &mut builder,
-            &mut grouped_columns,
-            &group_set,
-            UsageGroupBy::Azp,
-            "azp",
-        );
-        append_dimension(
-            &mut builder,
-            &mut grouped_columns,
-            &group_set,
-            UsageGroupBy::Operation,
-            "operation",
-        );
-        append_dimension(
-            &mut builder,
-            &mut grouped_columns,
-            &group_set,
-            UsageGroupBy::BillingPlan,
-            "billing_plan",
-        );
-
-        builder.push(", SUM(request_count)::bigint AS requests");
-        builder.push(", SUM(usage_value)::double precision AS usage_value");
-        builder.push(", SUM(prompt_tokens)::bigint AS prompt_tokens");
-        builder.push(", SUM(completion_tokens)::bigint AS completion_tokens");
-        builder.push(", SUM(total_tokens)::bigint AS total_tokens");
-        builder.push(", SUM(total_cost)::double precision AS total_cost");
-        builder.push(", COUNT(latency_ms)::bigint AS latency_samples");
-        builder.push(
-            ", percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms)::double precision AS latency_p50_ms",
-        );
-        builder.push(
-            ", percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)::double precision AS latency_p95_ms",
-        );
-        builder.push(
-            ", percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms)::double precision AS latency_p99_ms",
-        );
-
-        builder.push(" FROM usage_events WHERE ");
-        push_scope_filters(&mut builder, input);
-
-        // Bucket-scoped limit (#578 correction): restrict to exactly the buckets
-        // `select_kept_buckets` chose, so a bucket is either fully represented (every series with
-        // any matching row) or fully absent -- never a partial row subset.
-        builder.push(" AND date_bin(CAST(");
-        builder
-            .push_bind(&input.bucket)
-            .push(" AS interval), observed_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') = ANY(");
-        builder.push_bind(kept_buckets);
-        builder.push(")");
-
-        builder.push(" GROUP BY bucket_start");
-        for col in grouped_columns {
-            builder.push(", ");
-            builder.push(col);
-        }
-
-        // Deterministic tiebreaker: every dimension column, grouped or not (an ungrouped column is
-        // a `NULL` constant across every row, so ordering by it is free and changes nothing when
-        // it isn't grouped -- but it means the ORDER BY clause's shape never depends on `group_by`
-        // and a grouped dimension always gets a real, stable sort key).
-        builder.push(
-            " ORDER BY bucket_start ASC, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, signal_type, azp, operation, billing_plan",
-        );
-
+        let mut builder = build_usage_query(input);
         let rows: Vec<UsageQueryRow> = builder.build_query_as().fetch_all(self.pool()).await?;
+
+        // Every surviving row carries the same `truncated` flag (it is a whole-result-set fact
+        // computed by a window function over the distinct bucket list, not a per-row one), so the
+        // first row speaks for all of them. No rows at all means no buckets matched, which is
+        // never a truncation.
+        let truncated = rows.first().is_some_and(|row| row.truncated);
 
         let points = rows
             .into_iter()
@@ -382,44 +275,143 @@ impl StoreRepo {
 
         Ok((points, truncated))
     }
+}
 
-    /// The bucket-scoped half of #578's fix: returns the newest `input.limit` DISTINCT
-    /// `bucket_start` values matching `input`'s time range/scope/filters (ascending order, ready
-    /// to bind straight into the aggregation query's `= ANY(...)`), plus whether more than
-    /// `input.limit` distinct buckets existed at all. Deliberately ignores `group_by` entirely --
-    /// this is a `SELECT DISTINCT` over `bucket_start` alone, which is what makes the resulting
-    /// `truncated` flag and kept-bucket set BUCKET-scoped rather than row-scoped (see
-    /// `query_usage`'s own doc comment for the failure mode this replaces).
-    async fn select_kept_buckets(
-        &self,
-        input: &UsageQueryRequest,
-    ) -> Result<(Vec<DateTime<Utc>>, bool)> {
-        let mut builder = QueryBuilder::<Postgres>::new("SELECT DISTINCT date_bin(CAST(");
-        builder.push_bind(&input.bucket).push(
-            " AS interval), observed_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS bucket_start FROM usage_events WHERE ",
-        );
-        push_scope_filters(&mut builder, input);
+/// Every dimension column `usage_events` can be grouped by, in the fixed order the `SELECT` list
+/// and the `ORDER BY` tiebreaker both use. One list, so the two can never drift apart.
+const DIMENSION_COLUMNS: [(UsageGroupBy, &str); 11] = [
+    (UsageGroupBy::AccountId, "account_id"),
+    (UsageGroupBy::ProjectId, "project_id"),
+    (UsageGroupBy::ApiKeyId, "api_key_id"),
+    (UsageGroupBy::UserId, "user_id"),
+    (UsageGroupBy::UserName, "user_name"),
+    (UsageGroupBy::Model, "model"),
+    (UsageGroupBy::MetricName, "metric_name"),
+    (UsageGroupBy::SignalType, "signal_type"),
+    (UsageGroupBy::Azp, "azp"),
+    (UsageGroupBy::Operation, "operation"),
+    (UsageGroupBy::BillingPlan, "billing_plan"),
+];
 
-        let fetch_limit = i64::from(input.limit).saturating_add(1);
-        builder.push(" ORDER BY bucket_start DESC LIMIT ");
-        builder.push_bind(fetch_limit);
+/// Builds the single statement [`StoreRepo::query_usage`] runs: the grouped aggregation, the
+/// bucket-scoped truncation, and the `truncated` flag, in one pass over `usage_events`.
+///
+/// Extracted as a free function so the exact SQL this store emits can be asserted -- and
+/// `EXPLAIN`ed -- without a database. A query-plan review is only as good as the query it
+/// reviewed, and hand-transcribing a `QueryBuilder` into a test fixture is how the two silently
+/// drift apart.
+///
+/// ## Shape
+///
+/// ```sql
+/// SELECT <cols>, counted.bucket_count > $limit AS truncated
+/// FROM (SELECT ranked.*, max(ranked.bucket_rank) OVER () AS bucket_count
+///       FROM (SELECT agg.*, dense_rank() OVER (ORDER BY agg.bucket_start DESC) AS bucket_rank
+///             FROM (SELECT date_bin(...) AS bucket_start, <dims>, <sums> [, <percentiles>]
+///                   FROM usage_events WHERE <scope/time/filters>
+///                   GROUP BY bucket_start<, dims>) agg) ranked) counted
+/// WHERE counted.bucket_rank <= $limit
+/// ORDER BY counted.bucket_start ASC, <dims>
+/// ```
+///
+/// `dense_rank()` (not `row_number()`) is what makes truncation BUCKET-scoped rather than
+/// row-scoped: every row sharing a `bucket_start` gets the same rank, so `bucket_rank <= $limit`
+/// keeps or drops a bucket WHOLE -- every series that has any row in it, or none of them -- which
+/// is the property #578 exists to guarantee. The window is `DESC`, so the buckets that survive
+/// are the NEWEST ones and it is the oldest that get dropped. `max(bucket_rank) OVER ()` is the
+/// total number of distinct buckets that matched, evaluated BEFORE the `WHERE` filters any away,
+/// which is what makes `truncated` an honest "there were more" rather than a guess.
+///
+/// ## Why nested subqueries and not a `WITH` CTE
+///
+/// The obvious spelling is `WITH agg AS (...)` referenced twice. Measured back to back on a 2M-row
+/// production-width fixture (estate-wide, 30 days, 1-day buckets) the two forms are
+/// indistinguishable -- 652 ms / 279,627 buffers for the CTE against 669 ms / 279,627 buffers for
+/// this one without the covering index, 237 ms against 228 ms with it -- so this is not a
+/// performance claim.
+///
+/// It is a durability claim. The CTE form scans the base table once only because Postgres
+/// MATERIALISES a CTE that is referenced more than once; a CTE referenced once is inlined, and an
+/// inlined `agg` referenced from both the ranking and the final join would be evaluated twice --
+/// silently restoring the exact double-scan this change removed, with no visible edit to the
+/// query. The nested form has one `FROM usage_events` and one `dense_rank()` over its output, with
+/// no join back to the aggregate at all, so it cannot regress that way whatever the planner
+/// decides.
+///
+/// ## Why it is ONE statement at all
+///
+/// See [`StoreRepo::query_usage`]'s doc comment: this replaced two queries that carried the same
+/// `WHERE` clause and therefore scanned the same rows twice.
+fn build_usage_query(input: &UsageQueryRequest) -> QueryBuilder<Postgres> {
+    let group_set: HashSet<UsageGroupBy> = input.group_by.iter().cloned().collect();
+    let with_percentiles = input.wants_latency_percentiles();
+    let limit = i64::from(input.limit);
 
-        let mut buckets: Vec<(DateTime<Utc>,)> =
-            builder.build_query_as().fetch_all(self.pool()).await?;
-
-        let limit = input.limit as usize;
-        let truncated = buckets.len() > limit;
-        if truncated {
-            // DESC order means the single extra bucket (there can be at most one, since the
-            // query's own LIMIT caps `buckets.len()` at `limit + 1`) is the OLDEST -- drop it.
-            buckets.truncate(limit);
-        }
-
-        let mut kept: Vec<DateTime<Utc>> = buckets.into_iter().map(|(b,)| b).collect();
-        kept.reverse(); // ascending, matching this method's own doc comment.
-
-        Ok((kept, truncated))
+    // Level 0: the aggregation itself -- the only thing that touches `usage_events`.
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT counted.bucket_start, counted.account_id, counted.project_id, counted.api_key_id, counted.user_id, counted.user_name, counted.model, counted.metric_name, counted.signal_type, counted.azp, counted.operation, counted.billing_plan, counted.requests, counted.usage_value, counted.prompt_tokens, counted.completion_tokens, counted.total_tokens, counted.total_cost, counted.latency_samples, ",
+    );
+    if with_percentiles {
+        builder.push("counted.latency_percentiles[1]::double precision AS latency_p50_ms, counted.latency_percentiles[2]::double precision AS latency_p95_ms, counted.latency_percentiles[3]::double precision AS latency_p99_ms, ");
+    } else {
+        builder.push("NULL::double precision AS latency_p50_ms, NULL::double precision AS latency_p95_ms, NULL::double precision AS latency_p99_ms, ");
     }
+    builder.push("counted.bucket_count > ");
+    builder.push_bind(limit);
+    builder.push(" AS truncated FROM (SELECT ranked.*, max(ranked.bucket_rank) OVER () AS bucket_count FROM (SELECT agg.*, dense_rank() OVER (ORDER BY agg.bucket_start DESC) AS bucket_rank FROM (SELECT date_bin(CAST(");
+    builder
+        .push_bind(&input.bucket)
+        .push(" AS interval), observed_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS bucket_start");
+
+    let mut grouped_columns: Vec<&'static str> = Vec::new();
+    for (group_key, column) in DIMENSION_COLUMNS {
+        if group_set.contains(&group_key) {
+            builder.push(", ").push(column);
+            grouped_columns.push(column);
+        } else {
+            builder.push(", NULL::text AS ").push(column);
+        }
+    }
+
+    builder.push(", SUM(request_count)::bigint AS requests");
+    builder.push(", SUM(usage_value)::double precision AS usage_value");
+    builder.push(", SUM(prompt_tokens)::bigint AS prompt_tokens");
+    builder.push(", SUM(completion_tokens)::bigint AS completion_tokens");
+    builder.push(", SUM(total_tokens)::bigint AS total_tokens");
+    builder.push(", SUM(total_cost)::double precision AS total_cost");
+    builder.push(", COUNT(latency_ms)::bigint AS latency_samples");
+    if with_percentiles {
+        // ONE ordered-set aggregate returning all three quantiles, not three separate
+        // `percentile_cont` calls. Each ordered-set aggregate builds its OWN tuplesort of the
+        // group's values, so the three-call form sorted the same latencies three times over; the
+        // multi-quantile form sorts once. (The bigger cost is structural and is why
+        // `UsageMetric::LatencyPercentiles` exists at all -- see that type's docs.)
+        builder.push(
+            ", percentile_cont(ARRAY[0.5, 0.95, 0.99]) WITHIN GROUP (ORDER BY latency_ms) AS latency_percentiles",
+        );
+    }
+
+    builder.push(" FROM usage_events WHERE ");
+    push_scope_filters(&mut builder, input);
+
+    builder.push(" GROUP BY bucket_start");
+    for column in &grouped_columns {
+        builder.push(", ").push(column);
+    }
+
+    builder.push(") agg) ranked) counted WHERE counted.bucket_rank <= ");
+    builder.push_bind(limit);
+
+    // Deterministic tiebreaker: every dimension column, grouped or not. An ungrouped one is a
+    // constant `NULL` across every row, so ordering by it is free and changes nothing -- but it
+    // means the clause's shape never depends on `group_by`, and a grouped dimension always gets a
+    // real, stable sort key instead of Postgres' free choice among ties.
+    builder.push(" ORDER BY counted.bucket_start ASC");
+    for (_, column) in DIMENSION_COLUMNS {
+        builder.push(", counted.").push(column);
+    }
+
+    builder
 }
 
 /// Appends the shared time-range/scope/filter predicates both `StoreRepo::query_usage`'s
@@ -517,23 +509,6 @@ fn push_scope_filters(builder: &mut QueryBuilder<Postgres>, input: &UsageQueryRe
     }
 }
 
-fn append_dimension(
-    builder: &mut QueryBuilder<Postgres>,
-    grouped_columns: &mut Vec<&'static str>,
-    group_set: &HashSet<UsageGroupBy>,
-    group_key: UsageGroupBy,
-    column: &'static str,
-) {
-    if group_set.contains(&group_key) {
-        builder.push(", ");
-        builder.push(column);
-        grouped_columns.push(column);
-    } else {
-        builder.push(", NULL::text AS ");
-        builder.push(column);
-    }
-}
-
 fn validate_bucket_interval(bucket: &str) -> Result<()> {
     static BUCKET_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"^\d+\s+(second|seconds|minute|minutes|hour|hours|day|days)$")
@@ -566,5 +541,105 @@ mod tests {
         assert!(validate_bucket_interval("hour").is_err());
         assert!(validate_bucket_interval("1month").is_err());
         assert!(validate_bucket_interval("1 week").is_err());
+    }
+}
+
+#[cfg(test)]
+mod query_shape_tests {
+    use super::*;
+    use crate::models::{UsageMetric, UsageQueryFilters, UsageScope};
+    use chrono::TimeZone;
+
+    fn request(
+        group_by: Vec<UsageGroupBy>,
+        metrics: Option<Vec<UsageMetric>>,
+    ) -> UsageQueryRequest {
+        UsageQueryRequest {
+            scope: UsageScope::All,
+            scope_id: String::new(),
+            start_time: Utc.with_ymd_and_hms(2026, 8, 4, 0, 0, 0).unwrap(),
+            end_time: Utc.with_ymd_and_hms(2026, 9, 4, 0, 0, 0).unwrap(),
+            bucket: "1 day".to_string(),
+            filters: UsageQueryFilters::default(),
+            group_by,
+            limit: 1000,
+            metrics,
+        }
+    }
+
+    /// The single-statement shape is the whole point of the 2026-09-03 rewrite: two queries over
+    /// the same rows became one, with the bucket ranking running over the aggregate's own output.
+    /// A future edit that reintroduces a second `FROM usage_events` -- or that stops referencing
+    /// `agg` twice, which is what makes Postgres materialise it instead of inlining (and
+    /// re-scanning) it -- silently doubles the I/O of every console query, so it is asserted here
+    /// rather than left to a plan review nobody will re-run.
+    #[test]
+    fn usage_query_should_touch_the_base_table_exactly_once() {
+        let sql = build_usage_query(&request(vec![], None));
+        let sql = sql.sql();
+        let sql = sql.as_str();
+        assert_eq!(
+            sql.matches("FROM usage_events").count(),
+            1,
+            "the base table must be scanned once, got: {sql}"
+        );
+        assert!(
+            !sql.contains("WITH "),
+            "a CTE only avoids the double scan while Postgres chooses to materialise it; the \
+             nested form cannot regress that way -- got: {sql}"
+        );
+        assert!(sql.contains("dense_rank() OVER (ORDER BY agg.bucket_start DESC) AS bucket_rank"));
+        assert!(sql.contains("max(ranked.bucket_rank) OVER () AS bucket_count"));
+    }
+
+    /// `percentile_cont` is an ordered-set aggregate and cannot be hash-aggregated, so asking for
+    /// percentiles changes the PLAN (HashAggregate over a handful of groups -> GroupAggregate fed
+    /// by a full Sort of every matching row), not just its cost. Omitting the family must
+    /// therefore remove the call entirely, not merely discard its result.
+    #[test]
+    fn omitting_latency_percentiles_should_remove_the_ordered_set_aggregate() {
+        let with = build_usage_query(&request(vec![], None));
+        assert!(with.sql().as_str().contains("percentile_cont"));
+
+        let without = build_usage_query(&request(vec![], Some(vec![UsageMetric::Totals])));
+        let without = without.sql();
+        let without = without.as_str();
+        assert!(
+            !without.contains("percentile_cont"),
+            "the ordered-set aggregate must be gone, got: {without}"
+        );
+        // The columns still exist on the wire -- they are just honestly null.
+        assert!(without.contains("NULL::double precision AS latency_p50_ms"));
+        // `latency_samples` is part of `Totals` and stays a true count.
+        assert!(without.contains("COUNT(latency_ms)::bigint AS latency_samples"));
+    }
+
+    /// Three `percentile_cont` calls meant three tuplesorts of the same latencies. One
+    /// multi-quantile call sorts once.
+    #[test]
+    fn latency_percentiles_should_be_one_multi_quantile_aggregate() {
+        let sql = build_usage_query(&request(vec![], None));
+        let sql = sql.sql();
+        let sql = sql.as_str();
+        assert_eq!(sql.matches("percentile_cont").count(), 1, "got: {sql}");
+        assert!(sql.contains(
+            "percentile_cont(ARRAY[0.5, 0.95, 0.99]) WITHIN GROUP (ORDER BY latency_ms)"
+        ));
+    }
+
+    /// A grouped dimension is selected as itself; every other one stays a constant `NULL::text`
+    /// so the row shape -- and the `ORDER BY` tiebreaker -- never depends on `group_by`.
+    #[test]
+    fn grouped_dimensions_should_be_selected_and_the_rest_held_null() {
+        let sql = build_usage_query(&request(
+            vec![UsageGroupBy::AccountId, UsageGroupBy::Model],
+            None,
+        ));
+        let sql = sql.sql();
+        let sql = sql.as_str();
+        assert!(sql.contains(" GROUP BY bucket_start, account_id, model"));
+        assert!(sql.contains("NULL::text AS project_id"));
+        assert!(!sql.contains("NULL::text AS account_id"));
+        assert!(!sql.contains("NULL::text AS model"));
     }
 }

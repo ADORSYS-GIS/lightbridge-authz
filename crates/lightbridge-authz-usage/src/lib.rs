@@ -283,6 +283,7 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
             crate::models::UsageSeriesPoint,
             crate::models::UsageScope,
             crate::models::UsageGroupBy,
+            crate::models::UsageMetric,
             crate::models::SpendQueryRequest,
             crate::models::SpendQueryResponse
         )
@@ -366,6 +367,47 @@ mod tests {
         assert!(
             required.contains(&"latency_samples"),
             "latency_samples is always present and must be required, got {required:?}"
+        );
+    }
+
+    /// The 2026-09-03 query-cost work: `metrics` is the console's lever for skipping the
+    /// latency percentiles, so both halves of the contract -- the request field and the response
+    /// echo -- are pinned in the published schema. A caller that cannot see the field cannot use
+    /// it, and a caller that cannot see the echo cannot tell "no latency samples" from "I did not
+    /// ask for percentiles".
+    #[test]
+    fn usage_openapi_should_publish_the_metrics_selection_contract() {
+        let doc = usage_openapi();
+
+        let metrics: Vec<&str> = doc["components"]["schemas"]["UsageMetric"]["enum"]
+            .as_array()
+            .expect("UsageMetric should publish an enum")
+            .iter()
+            .map(|v| v.as_str().expect("enum values are strings"))
+            .collect();
+        assert_eq!(metrics, vec!["totals", "latency_percentiles"]);
+
+        assert!(
+            doc["components"]["schemas"]["UsageQueryRequest"]["properties"]["metrics"].is_object(),
+            "expected UsageQueryRequest.metrics in the published schema"
+        );
+        let required: Vec<&str> = doc["components"]["schemas"]["UsageQueryRequest"]["required"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert!(
+            !required.contains(&"metrics"),
+            "metrics must stay optional -- every caller written before it existed omits it"
+        );
+
+        assert!(
+            doc["components"]["schemas"]["UsageQueryResponse"]["properties"]["metrics"].is_object(),
+            "expected UsageQueryResponse.metrics in the published schema"
         );
     }
 

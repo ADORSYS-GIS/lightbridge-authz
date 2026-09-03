@@ -52,6 +52,87 @@ pub struct UsageQueryRequest {
     pub group_by: Vec<UsageGroupBy>,
     #[serde(default = "default_limit")]
     pub limit: u32,
+    /// Which metric families to COMPUTE (owner report, 2026-09-03: "requests made to the query
+    /// backend are very slow"). `None` -- the default, and what every caller written before this
+    /// field existed sends -- means all of them, so the wire contract is unchanged.
+    ///
+    /// The only family worth NOT computing is [`UsageMetric::LatencyPercentiles`]; see that
+    /// variant's docs for the measured reason. [`UsageMetric::Totals`] is computed unconditionally
+    /// and listing it is a documented no-op.
+    #[serde(default)]
+    pub metrics: Option<Vec<UsageMetric>>,
+}
+
+/// A family of metrics `/usage/v1/usage/query` can compute, selectable per request via
+/// [`UsageQueryRequest::metrics`].
+///
+/// This exists because the two families have wildly different costs and only one of them is
+/// optional in practice. The gap is STRUCTURAL, not incremental: `percentile_cont` is an
+/// ordered-set aggregate, and Postgres cannot hash-aggregate one. Asking for percentiles forces
+/// the planner out of a `HashAggregate` over a handful of groups and into a `GroupAggregate` fed
+/// by a full `Sort` of every matching row -- which at `work_mem = 4MB` spills to disk. Dropping
+/// the family does not shave a step off the plan; it changes the plan.
+///
+/// Measured on a 2M-row, production-width fixture (estate-wide, 30 days, 1-day buckets, no
+/// `group_by`, covering index present), same query, same rows, only `metrics` differing:
+///
+/// | request                      | plan                                          | execution |
+/// |------------------------------|-----------------------------------------------|-----------|
+/// | totals + latency percentiles | `GroupAggregate` <- `Sort` (32 MB to disk)    | 222 ms    |
+/// | totals only                  | `HashAggregate`, no sort at all               | 130 ms    |
+///
+/// On production (933,494 rows / 3,267 MB, read-only replica, 2026-09-03, BEFORE the covering
+/// index landed, where raw heap I/O still dominated everything else) the same pair measured
+/// 34,387 ms against 31,500 ms -- which is the honest shape of this lever: it is worth having,
+/// and it is not the main problem. The main problem was the heap width, and that is what
+/// `migrations-usage/20260903000002_usage_event_query_covering_index.sql` addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageMetric {
+    /// `requests`, `usage_value`, `prompt_tokens`, `completion_tokens`, `total_tokens`,
+    /// `total_cost` and `latency_samples`.
+    ///
+    /// ALWAYS computed, whatever `metrics` says, and always echoed back in
+    /// [`UsageQueryResponse::metrics`]. These are plain `SUM`/`COUNT` aggregates evaluated in the
+    /// same single pass that already has to read the row to apply the `WHERE` clause -- there is
+    /// no measurable saving available by dropping them, so offering to drop them would be an API
+    /// that lies about what it does. Listing this variant is accepted and is a no-op.
+    Totals,
+    /// `latency_p50_ms` / `latency_p95_ms` / `latency_p99_ms`.
+    ///
+    /// Omit this to skip the percentile computation entirely. When it is omitted the three
+    /// percentile fields come back `null` and [`UsageQueryResponse::metrics`] says why --
+    /// `latency_samples` is still a true count (it is part of `Totals` and costs nothing), so a
+    /// response with `latency_samples > 0` and `latency_p50_ms: null` means "not asked for", and
+    /// `latency_samples == 0` still means "no row in this bucket reported a latency at all".
+    LatencyPercentiles,
+}
+
+impl UsageMetric {
+    /// Every family, in the fixed order [`UsageQueryResponse::metrics`] echoes them.
+    pub const ALL: [UsageMetric; 2] = [UsageMetric::Totals, UsageMetric::LatencyPercentiles];
+}
+
+impl UsageQueryRequest {
+    /// Whether this request asked for `latency_p*_ms`. `metrics: None` (the pre-existing wire
+    /// shape) means "everything", so absence of the field is a YES -- a caller who never heard of
+    /// this field must keep getting exactly what they got before.
+    pub fn wants_latency_percentiles(&self) -> bool {
+        match &self.metrics {
+            None => true,
+            Some(metrics) => metrics.contains(&UsageMetric::LatencyPercentiles),
+        }
+    }
+
+    /// The metric families this request's response will actually carry, for
+    /// [`UsageQueryResponse::metrics`]. [`UsageMetric::Totals`] is unconditional (see its docs).
+    pub fn effective_metrics(&self) -> Vec<UsageMetric> {
+        if self.wants_latency_percentiles() {
+            UsageMetric::ALL.to_vec()
+        } else {
+            vec![UsageMetric::Totals]
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -168,6 +249,11 @@ pub struct UsageQueryResponse {
     /// oldest bucket, not the newest, why it must be bucket-scoped rather than row-scoped, and for
     /// the known mid-bucket-cut caveat tracked as #586.
     pub truncated: bool,
+    /// Which metric families this response actually carries, so a `null` percentile is never
+    /// ambiguous: `latency_percentiles` present here means the percentiles were computed (and a
+    /// `null` one means the bucket had no latency samples), absent means they were not asked for.
+    /// Always contains [`UsageMetric::Totals`].
+    pub metrics: Vec<UsageMetric>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
