@@ -37,6 +37,12 @@ pub struct UsageConfig {
 /// `raw_days` MUST be >= 90 to keep the full dashboard window queryable from raw (which is what
 /// keeps latency percentiles exact -- the rollup does not carry them). Budget spend reads the
 /// current billing period, which is always within the raw window, so it is never truncated.
+///
+/// The rollup table itself is also bounded: `rollup_days` (default 365) is how long a rolled-up day
+/// is kept before it too is deleted, so the long-term store does not grow without bound. Nothing
+/// reads the rollup today (the dashboard's 90-day window is served from raw, and budget spend reads
+/// the current period), so this bound is what keeps `usage_events_daily` from becoming the next
+/// write-only, unbounded table -- the exact anti-pattern #549 exists to remove.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RetentionConfig {
     /// Whether the retention/rollup background job runs. Default `true`.
@@ -46,6 +52,10 @@ pub struct RetentionConfig {
     /// max range (90 days). Default `90`.
     #[serde(default = "default_retention_raw_days")]
     pub raw_days: i64,
+    /// How long a rolled-up day is kept in `usage_events_daily` before it too is deleted. Must be
+    /// >= 1. Default `365` (one year of long-term retention).
+    #[serde(default = "default_retention_rollup_days")]
+    pub rollup_days: i64,
     /// How often the retention/rollup job runs, in seconds. Default `3600` (hourly).
     #[serde(default = "default_retention_interval_seconds")]
     pub interval_seconds: u64,
@@ -56,6 +66,7 @@ impl Default for RetentionConfig {
         Self {
             enabled: default_retention_enabled(),
             raw_days: default_retention_raw_days(),
+            rollup_days: default_retention_rollup_days(),
             interval_seconds: default_retention_interval_seconds(),
         }
     }
@@ -67,6 +78,10 @@ fn default_retention_enabled() -> bool {
 
 fn default_retention_raw_days() -> i64 {
     90
+}
+
+fn default_retention_rollup_days() -> i64 {
+    365
 }
 
 fn default_retention_interval_seconds() -> u64 {
@@ -134,7 +149,19 @@ pub struct UsageServer {
 
 pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<UsageConfig> {
     debug!("loading usage config from {:?}", path.as_ref());
-    let config = load_yaml_from_path(path)?;
+    let config: UsageConfig = load_yaml_from_path(path)?;
+    if config.retention.raw_days < 90 {
+        return Err(lightbridge_authz_core::Error::Server(format!(
+            "retention.raw_days must be >= 90 (got {})",
+            config.retention.raw_days
+        )));
+    }
+    if config.retention.rollup_days < 1 {
+        return Err(lightbridge_authz_core::Error::Server(format!(
+            "retention.rollup_days must be >= 1 (got {})",
+            config.retention.rollup_days
+        )));
+    }
     debug!("loaded usage config successfully");
     Ok(config)
 }
@@ -347,6 +374,10 @@ otel:
 
         assert!(cfg.retention.enabled, "retention must default to enabled");
         assert_eq!(cfg.retention.raw_days, 90, "raw_days must default to 90");
+        assert_eq!(
+            cfg.retention.rollup_days, 365,
+            "rollup_days must default to 365"
+        );
         assert_eq!(
             cfg.retention.interval_seconds, 3600,
             "interval_seconds must default to 3600"

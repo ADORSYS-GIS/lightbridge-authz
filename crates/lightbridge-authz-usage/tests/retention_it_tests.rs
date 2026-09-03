@@ -57,6 +57,7 @@ async fn rollup_and_purge_moves_old_rows_and_spend_is_unchanged(pool: PgPool) {
     let repo = build_repo(pool.clone());
     let now = Utc::now();
     let raw_days = 90;
+    let rollup_days = 365;
 
     // A COMPLETE day, well older than the retention window: its rows must be rolled up.
     let old_day = (now - Duration::days(raw_days + 10))
@@ -102,7 +103,7 @@ async fn rollup_and_purge_moves_old_rows_and_spend_is_unchanged(pool: PgPool) {
     assert_eq!(s_recent_before, Some(100.0));
 
     // Run the retention job.
-    let purged = rollup_and_purge(&pool, raw_days)
+    let purged = rollup_and_purge(&pool, raw_days, rollup_days)
         .await
         .expect("rollup should run");
     assert!(
@@ -173,6 +174,7 @@ async fn rollup_and_purge_is_idempotent(pool: PgPool) {
     let repo = build_repo(pool.clone());
     let now = Utc::now();
     let raw_days = 90;
+    let rollup_days = 365;
 
     let old_day = (now - Duration::days(raw_days + 10))
         .date_naive()
@@ -183,10 +185,14 @@ async fn rollup_and_purge_is_idempotent(pool: PgPool) {
         .await
         .expect("insert");
 
-    let first = rollup_and_purge(&pool, raw_days).await.expect("first run");
+    let first = rollup_and_purge(&pool, raw_days, rollup_days)
+        .await
+        .expect("first run");
     assert_eq!(first, 1, "first run purges the one old row");
 
-    let second = rollup_and_purge(&pool, raw_days).await.expect("second run");
+    let second = rollup_and_purge(&pool, raw_days, rollup_days)
+        .await
+        .expect("second run");
     assert_eq!(second, 0, "second run has nothing left to purge");
 
     let rollup_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_events_daily")
@@ -194,4 +200,114 @@ async fn rollup_and_purge_is_idempotent(pool: PgPool) {
         .await
         .expect("count rollup");
     assert_eq!(rollup_count, 1, "the day must be rolled up exactly once");
+}
+
+/// A late-arriving raw event -- one whose `observed_at` falls in a day a PREVIOUS run already
+/// rolled up -- must not wedge the retention job. Without `ON CONFLICT DO NOTHING` on the rollup
+/// INSERT, that event's `(bucket_start, dimensions)` group already exists in `usage_events_daily`,
+/// the INSERT raises a unique violation, the whole transaction rolls back, and every subsequent run
+/// fails forever without ever purging (raw growth resumes). With the fix, the duplicate group is
+/// skipped, the late raw row is still purged, and the job stays healthy.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn late_arriving_event_for_an_already_rolled_up_day_does_not_wedge_the_job(pool: PgPool) {
+    let repo = build_repo(pool.clone());
+    let now = Utc::now();
+    let raw_days = 90;
+    let rollup_days = 365;
+
+    let old_day = (now - Duration::days(raw_days + 10))
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("valid time")
+        .and_utc();
+
+    // First run: roll up + purge the old day.
+    repo.insert_usage_events(&[event_with_cost("acct_1", old_day, 10.0)])
+        .await
+        .expect("insert original");
+    let first = rollup_and_purge(&pool, raw_days, rollup_days)
+        .await
+        .expect("first run");
+    assert_eq!(first, 1, "first run purges the one old row");
+
+    // A late event for the SAME day arrives after that day was already rolled up.
+    repo.insert_usage_events(&[event_with_cost("acct_1", old_day, 99.0)])
+        .await
+        .expect("insert late event");
+
+    // Second run must SUCCEED (not raise a unique violation), purge the late raw row, and leave the
+    // rollup with exactly one row for the day -- the late cost is deliberately not folded back in.
+    let second = rollup_and_purge(&pool, raw_days, rollup_days)
+        .await
+        .expect("second run must not wedge on the late event");
+    assert_eq!(second, 1, "the late raw row must still be purged");
+
+    let late_raw: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM usage_events WHERE account_id = $1 AND observed_at >= $2 AND observed_at < $3",
+    )
+    .bind("acct_1")
+    .bind(old_day)
+    .bind(old_day + Duration::days(1))
+    .fetch_one(&pool)
+    .await
+    .expect("count late raw");
+    assert_eq!(
+        late_raw, 0,
+        "the late raw row must be deleted from usage_events"
+    );
+
+    let rollup_cost: Option<f64> = sqlx::query_scalar(
+        "SELECT SUM(total_cost) FROM usage_events_daily WHERE account_id = $1 AND bucket_start = $2",
+    )
+    .bind("acct_1")
+    .bind(old_day)
+    .fetch_one(&pool)
+    .await
+    .expect("sum rollup");
+    assert_eq!(
+        rollup_cost,
+        Some(10.0),
+        "the day's rollup must be unchanged -- the late cost is not folded back in"
+    );
+}
+
+/// The rollup table is itself bounded: a rolled-up day older than `rollup_days` is deleted from
+/// `usage_events_daily` too, so the long-term store does not grow without bound. A day that is
+/// both rolled up (past `raw_days`) and past `rollup_days` must leave BOTH tables.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn rollup_rows_older_than_rollup_days_are_purged_from_the_rollup(pool: PgPool) {
+    let repo = build_repo(pool.clone());
+    let now = Utc::now();
+    let raw_days = 90;
+    // A tiny rollup window so the rolled-up day is immediately past it.
+    let rollup_days = 1;
+
+    let old_day = (now - Duration::days(raw_days + 10))
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("valid time")
+        .and_utc();
+    repo.insert_usage_events(&[event_with_cost("acct_1", old_day, 10.0)])
+        .await
+        .expect("insert");
+
+    let purged = rollup_and_purge(&pool, raw_days, rollup_days)
+        .await
+        .expect("rollup should run");
+    assert_eq!(purged, 1, "the old raw row must be purged");
+
+    let raw_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_events")
+        .fetch_one(&pool)
+        .await
+        .expect("count raw");
+    assert_eq!(raw_count, 0, "the raw row must be gone");
+
+    let rollup_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_events_daily")
+        .fetch_one(&pool)
+        .await
+        .expect("count rollup");
+    assert_eq!(
+        rollup_count, 0,
+        "the rolled-up day must be purged from the rollup once it is past rollup_days"
+    );
 }

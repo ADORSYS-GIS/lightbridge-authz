@@ -155,6 +155,19 @@ impl StoreRepo {
     /// `total_cost` is NULL, yields `None`; any non-NULL cost yields `Some(sum)`. The current
     /// billing period is always within the raw window, so for the queries budget actually issues
     /// the rollup arm is empty and the result is identical to the pre-rollup query (AC3).
+    ///
+    /// ## Day-granularity of the rollup arm
+    ///
+    /// The rollup arm matches on `bucket_start` (the truncated day), not `observed_at`, because a
+    /// rolled-up day is stored as a single row keyed by its day boundary. A day is either entirely
+    /// raw or entirely rolled up (only complete days are rolled up), so there is no double-count
+    /// between the arms. The consequence is that a spend query whose `[start, end)` boundary falls
+    /// MID-DAY on a day that has aged into the rollup is **day-granular**: the rollup row for that
+    /// day is included only if its `bucket_start` is within `[start, end)`, so a sub-day slice of a
+    /// rolled-up day is not answered exactly. This never manifests for budget's real queries --
+    /// billing periods are month-aligned (day boundaries) and always within the raw window, so the
+    /// rollup arm is empty -- but callers should treat spend over a rolled-up period as
+    /// day-granular, not sub-day-exact.
     #[instrument(skip(self))]
     pub async fn spend_for_account(
         &self,

@@ -190,6 +190,18 @@ pub async fn start_usage_server(
     retention: &RetentionConfig,
 ) -> Result<()> {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(database).await?);
+
+    // Assert deploy sequencing: new schema (migrations 03 and 04) must exist before we serve traffic.
+    // Since SQLx handles queries dynamically, failing here prevents obscure runtime errors later.
+    let migration_check = sqlx::query("SELECT 1 FROM usage_events_daily LIMIT 1")
+        .fetch_optional(pool.pool())
+        .await;
+    if migration_check.is_err() {
+        return Err(Error::Database(
+            "usage_events_daily table missing. Ensure migrations 20260903000003 and 04 have run before starting.".to_string(),
+        ));
+    }
+
     let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool.clone()));
     let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
         BearerTokenService::new(oauth2.clone())

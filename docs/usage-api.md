@@ -423,7 +423,15 @@ the `usage_events_daily` aggregate table, then deletes them — in one transacti
   raw column: `SUM` over all-NULL rows is NULL ("unknown"), never 0, so the `Spend::Known` /
   `Spend::Unavailable` split is unchanged across the boundary.
 - **Only complete days are rolled up**, so the rollup is a plain `INSERT` with no `ON CONFLICT` and
-  a re-run is idempotent.
+  a re-run is idempotent. The INSERT carries `ON CONFLICT DO NOTHING` so a late-arriving event for
+  an already-rolled-up day cannot wedge the job (the duplicate group is skipped, the late raw row
+  is still purged).
+- **The rollup table is itself bounded.** A rolled-up day older than `retention.rollup_days`
+  (default **365**) is deleted from `usage_events_daily` too, so the long-term store does not grow
+  without bound. Nothing reads the rollup today (the dashboard's 90-day window is served from raw,
+  and budget spend reads the current period), so this bound is what keeps `usage_events_daily` from
+  becoming the next write-only, unbounded table.
 
 The `retention` config block is optional with safe defaults (`enabled: true`, `raw_days: 90`,
-`interval_seconds: 3600`). `raw_days` MUST stay >= 90 to keep the full dashboard window in raw.
+`rollup_days: 365`, `interval_seconds: 3600`). `raw_days` MUST stay >= 90 to keep the full dashboard
+window in raw; `rollup_days` MUST be >= 1.

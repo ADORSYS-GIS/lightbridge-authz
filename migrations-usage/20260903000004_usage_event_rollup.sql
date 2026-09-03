@@ -21,7 +21,9 @@
 -- token sums, `total_cost`, `latency_samples`). It deliberately does NOT carry latency percentiles
 -- -- an ordered-set aggregate cannot be exactly rolled up from daily sums -- so the dashboard's
 -- 90-day window is served from raw (which is kept for exactly that window), and the rollup serves
--- long-term retention and spend.
+-- long-term retention and spend. The rollup table is itself bounded: the retention job deletes
+-- rolled-up days older than `retention.rollup_days` (default 365), so this table does not grow
+-- without bound either.
 --
 -- ## Money semantics preserved
 --
@@ -33,10 +35,11 @@
 -- ## The unique index and NULLs
 --
 -- The natural key is `(bucket_start, <dimensions>)`, and every dimension column is nullable. A
--- plain unique index on nullable columns would treat NULLs as distinct. The unique index therefore 
--- maps NULL to the empty string via `COALESCE` -- safe because every real dimension value is 
--- non-empty (CUID2 ids, model names, the closed `operation` vocabulary). This prevents partial-day 
--- or duplicate insertions if the job is interrupted or modified.
+-- plain unique index on nullable columns would treat NULLs as distinct, so the same (day,
+-- dimensions) group with a NULL dimension could be inserted twice. The unique index therefore
+-- uses `NULLS NOT DISTINCT`, which makes NULLs compare equal for uniqueness purposes -- so a group
+-- whose dimensions are all NULL is still unique per `bucket_start`. This prevents partial-day or
+-- duplicate insertions if the job is interrupted or modified.
 CREATE TABLE IF NOT EXISTS usage_events_daily (
     bucket_start TIMESTAMPTZ NOT NULL,
     account_id TEXT,
@@ -63,18 +66,18 @@ CREATE TABLE IF NOT EXISTS usage_events_daily (
 CREATE UNIQUE INDEX IF NOT EXISTS usage_events_daily_natural_key
     ON usage_events_daily (
         bucket_start,
-        COALESCE(account_id, ''),
-        COALESCE(project_id, ''),
-        COALESCE(api_key_id, ''),
-        COALESCE(user_id, ''),
-        COALESCE(user_name, ''),
-        COALESCE(model, ''),
-        COALESCE(metric_name, ''),
-        COALESCE(signal_type, ''),
-        COALESCE(azp, ''),
-        COALESCE(operation, ''),
-        COALESCE(billing_plan, '')
-    );
+        account_id,
+        project_id,
+        api_key_id,
+        user_id,
+        user_name,
+        model,
+        metric_name,
+        signal_type,
+        azp,
+        operation,
+        billing_plan
+    ) NULLS NOT DISTINCT;
 
 CREATE INDEX IF NOT EXISTS idx_usage_events_daily_bucket_start
     ON usage_events_daily (bucket_start);
