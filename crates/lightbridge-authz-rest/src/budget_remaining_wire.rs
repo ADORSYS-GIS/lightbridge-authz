@@ -59,6 +59,37 @@ pub struct RemainingErrorResponse {
 /// the gateway's `budget_exhausted`: one is our outage, the other is the user's spending.
 pub const ERROR_BUDGET_UNAVAILABLE: &str = "budget_unavailable";
 
+/// Stable `error` token for "that id names no account". A third thing again: not our outage
+/// (`budget_unavailable`) and not the user's spending (`budget_exhausted`), but a **configuration
+/// fault upstream of us** — an identity mapping, a claim, or a probe naming an account the ledger
+/// has never seen.
+pub const ERROR_UNKNOWN_ACCOUNT: &str = "unknown_account";
+
+/// The `404` body. Carries `account_id` where the other error bodies do not, because this is the
+/// one error whose whole content *is* the id: an operator reading it is looking for the typo, and
+/// making them correlate the response with the request line to find it would be gratuitous.
+#[derive(Debug, Serialize)]
+pub struct UnknownAccountResponse {
+    pub error: &'static str,
+    /// Echoed back verbatim (trimmed), so the value that was actually looked up is visible.
+    pub account_id: String,
+    pub message: String,
+}
+
+/// Builds the `404`. Separate from [`error_response`] only because of the extra field; the `error`
+/// token is a stable machine string either way.
+pub fn unknown_account_response(account_id: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(UnknownAccountResponse {
+            error: ERROR_UNKNOWN_ACCOUNT,
+            account_id: account_id.to_string(),
+            message: "no budget account with this id exists".to_string(),
+        }),
+    )
+        .into_response()
+}
+
 /// Builds a non-`200` response. `error` is a stable machine token the gateway's Lua branches on;
 /// `message` is for a human reading logs and is never parsed.
 pub fn error_response(status: StatusCode, error: &'static str, message: String) -> Response {

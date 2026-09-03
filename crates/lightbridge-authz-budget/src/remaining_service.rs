@@ -87,6 +87,24 @@ impl RemainingReader for RemainingService {
         period: &Period,
         now: DateTime<Utc>,
     ) -> Result<Remaining, BudgetError> {
+        // FIRST, before the ceiling and before the spend read. `COALESCE(SUM(...), 0)` cannot tell
+        // a row-less account from a non-existent one, so without this probe an id nothing has ever
+        // heard of reports a perfectly ordinary zero balance and reaches the gateway as
+        // `402 budget_exhausted` for a phantom account (owner directive, 2026-09-03).
+        //
+        // Ordering matters in one direction only: an unknown id must answer `404` even while the
+        // usage service is down, so the existence check cannot sit behind the spend read. It sits
+        // in front of it, and its own failure is an `Err` -> `503`, never a `false` -> `404`.
+        if !crate::known_account::budget_account_exists(&self.repo, budget_account_id).await? {
+            tracing::warn!(
+                budget_account_id = %budget_account_id,
+                period = %period,
+                "remaining was asked for a budget account that does not exist; answering \
+                 unknown_account rather than a zero balance"
+            );
+            return Ok(Remaining::UnknownAccount);
+        }
+
         let ceiling_micros = self
             .repo
             .effective_balance(budget_account_id, period, now)

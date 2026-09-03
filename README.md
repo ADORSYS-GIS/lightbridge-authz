@@ -6,6 +6,18 @@
 **Find any document:** [`docs/README.md`](docs/README.md) is the navigation map for this
 repository's documentation — use it to jump straight to the guide, ADR, or runbook you need.
 
+## Roadmap
+
+**[`docs/ROADMAP.md`](docs/ROADMAP.md)** is the standing status matrix for this repository — every
+workstream, one row per item, each row carrying a state (*Done / Done, unverified in prod / Partial
+/ Missing / Broken / Flaky / Not future-proof / Decision needed*) and a citation. It is where to
+look before planning work: it names what is missing, what is flaky, what is broken, and what is
+waiting on an owner decision rather than on effort.
+
+**Update rule — this is not optional.** A merged PR **updates its own row in the same PR**. A
+roadmap maintained afterwards is a roadmap that lies; a row with no PR/issue/SHA/file citation is a
+rumour and should be deleted rather than believed.
+
 Lightbridge Authz is a multi-service backend for API key management and usage analytics:
 - `authz-api` and `authz-opa` handle key lifecycle and validation.
 - `authz-idp` is the OIDC broker for both the human plane (browser SSO, RFC 8628 device flow, token

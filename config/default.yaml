@@ -53,19 +53,31 @@ server:
     tls:
       cert_path: "./config/tls/budget.crt"
       key_path: "./config/tls/budget.key"
-  # authz-budget's SECOND listener (ADR-0034, lightbridge-authz#658): the mTLS-only internal read
-  # `GET /budget/v1/remaining` the gateway's Dynamic Budget Limiter calls through Authorino. A
-  # separate port, not a route on `budget` above, because client-certificate verification is
-  # enforced per LISTENER, not per route -- gating the RPC surface would lock out the console.
-  # `client_ca_bundle_path` is mandatory here: the server refuses to start without it, because
-  # mTLS is the ONLY access control in front of a cross-account balance read.
+  # authz-budget's SECOND listener (ADR-0034 + its 2026-09-03 amendment, lightbridge-authz#658):
+  # the internal read `GET /budget/v1/remaining` the gateway's Dynamic Budget Limiter calls
+  # through Authorino. A separate port, not a route on `budget` above, so the console's bearer-JWT
+  # surface is untouched and this route's credential cannot be bypassed by hitting a sibling route.
+  #
+  # The credential is a SHARED SECRET in a custom header, not mTLS. Authorino v0.24.0's
+  # `AuthConfig.spec.metadata.http` has no field that references a client key/certificate (checked
+  # with `kubectl explain` against the deployed CRD), so an mTLS-only listener is unreachable by
+  # the one caller it exists for. `shared_secret` is mandatory -- the server refuses to start
+  # without it, because it is the ONLY access control in front of a cross-account balance read --
+  # and `tls.client_ca_bundle_path` must stay UNSET here, or the handshake demands a certificate
+  # Authorino cannot present.
   budget_internal:
     address: "0.0.0.0"
     port: 3007
     tls:
       cert_path: "./config/tls/budget.crt"
       key_path: "./config/tls/budget.key"
-      client_ca_bundle_path: "./config/tls/ca.crt"
+    # Local-dev value, exactly like the OPA basic-auth password beside it. Real deployments
+    # interpolate it from a Kubernetes Secret -- the SAME Secret the AuthConfig's
+    # `metadata.http.sharedSecretRef` reads, so the two ends cannot drift.
+    shared_secret: "${BUDGET_INTERNAL_SHARED_SECRET:-local-dev-budget-secret}"
+    # Must equal the AuthConfig's `metadata.http.credentials.customHeader.name`. Deliberately not
+    # `Authorization` -- this route refuses that header outright.
+    shared_secret_header: "x-lightbridge-budget-token"
     # Seconds the last known spend reading may still be served after the usage service stops
     # answering, before the balance is reported as unknowable (503 budget_unavailable).
     remaining_grace_seconds: 120
