@@ -1,7 +1,9 @@
 # ADR-0034: The Dynamic Budget Limiter — the gateway reads the live balance, it does not trust the token
 
 - Status: Proposed
-- Date: 2026-09-03
+- Date: 2026-09-03 (amended the same day — §3.1/§4.1/§9/§14 re-grounded on the
+  **deployed** Authorino v0.24.0 CRD rather than upstream source, after `kubectl explain` against
+  prod contradicted the upstream Go types on `metadata.http.timeout`)
 - Decision owners: @stephane-segning
 - Story: [lightbridge-authz#658](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/658)
   (Phase 6a decision memo)
@@ -173,50 +175,72 @@ Four things about that payload are decisions, not details:
 
 ### 3.1 The AuthConfig side
 
+Verified against the **deployed** CRD, not upstream source — Authorino **v0.24.0**
+(`quay.io/kuadrant/authorino:v0.24.0`, operator `v0.23.1`), AuthConfig serving `v1beta2` + `v1beta3`
+with `v1beta3` as storage. Every `has()` guard below is load-bearing; see the notes after the block.
+
 ```yaml
 metadata:
   "budgetremaining":
     when:
       - predicate: |
-          auth.identity.iss == "https://auth.ai.camer.digital"
+          has(auth.identity.account_id) && auth.identity.account_id != ""
     cache:
       key:
         expression: |
-          "budget:" + string(auth.identity.account_id) + ":" + string(auth.identity.iss)
+          "budget:" + string(auth.identity.account_id)
       ttl: 10          # seconds — a value; see §5.4 for how it enters the overspend window
     http:
       urlExpression: |
         "https://authz-budget.converse.svc.cluster.local:3007/budget/v1/remaining?account_id="
           + string(auth.identity.account_id)
       method: GET
-      timeout: 300     # ms — MUST be well inside the SecurityPolicy's extAuth timeout
+      # NO `timeout:` — see below. Bound it at the SecurityPolicy's extAuth instead.
 response:
   success:
     dynamicMetadata:
       "budget":
         json:
           properties:
-            "remaining_micros": { expression: 'auth.metadata.budgetremaining.remaining_micros' }
-            "next_reset_at":    { expression: 'auth.metadata.budgetremaining.next_reset_at' }
+            # `enforced` distinguishes "this plane is out of scope" from "the chain is
+            # misconfigured". The INTERNAL AuthConfig publishes the same key with a constant
+            # `false`, exactly as it publishes a constant "" for x-quota-tier, so absence always
+            # means something is wrong rather than something is exempt.
+            "enforced":         { expression: 'true' }
+            # Every read is has()-guarded under && short-circuit: a failed metadata fetch leaves
+            # `auth.metadata.budgetremaining` ABSENT, and an unguarded expression over an absent
+            # value is the ADR-0047/0052 dropped-value failure mode.
+            "known":            { expression: 'has(auth.metadata.budgetremaining) && has(auth.metadata.budgetremaining.remaining_micros)' }
+            "remaining_micros": { expression: 'has(auth.metadata.budgetremaining) && has(auth.metadata.budgetremaining.remaining_micros) ? auth.metadata.budgetremaining.remaining_micros : 0' }
+            "next_reset_at":    { expression: 'has(auth.metadata.budgetremaining) && has(auth.metadata.budgetremaining.next_reset_at) ? string(auth.metadata.budgetremaining.next_reset_at) : ""' }
             "account_id":       { expression: 'string(auth.identity.account_id)' }
-            "known":            { expression: 'has(auth.metadata.budgetremaining.remaining_micros)' }
 ```
 
-Two verified facts this depends on, both worth re-checking against the deployed CRD before the
-enforce step (`kubectl explain authconfigs.spec.metadata.http`), because one of them contradicts a
-comment currently in prod:
+`remaining_micros` falls back to `0` rather than to something permissive, but that fallback is
+never *read*: the filter branches on `known` first and treats `known: false` as `503
+budget_unavailable`, not as an exhausted budget. The `0` exists only so the CEL expression has a
+type-correct value on the absent path.
 
-- `HttpEndpointSpec` **does** carry a `Timeout *int` field in `authorino.kuadrant.io/v1beta3`
-  (Authorino `api/v1beta3/auth_config_types.go`). `security-policies.yaml:305-309` asserts the
-  opposite — *"authorino.kuadrant.io/v1beta3 has NO metadata.http.timeout field (server-side apply
-  rejects it)"* — and the disabled `keycloakintrospection` block two stanzas above it uses
-  `timeout: 2000`. One of those two is wrong for the installed version (authorino-operator chart
-  **0.23.1**, `ai-helm/charts/apps/values.yaml:670-684`). **Resolve this by `kubectl explain`
-  before the shadow deploy, not by argument** — if the field really is rejected, the timeout must
-  be bounded at the SecurityPolicy's `extAuth.timeout` instead, and the ADR's latency budget (§9)
-  is enforced there rather than here.
-- Authorino's dynamic metadata lands in the Envoy namespace **`envoy.filters.http.ext_authz`**,
-  under a root key equal to the config name (`budget` above). That is the exact key the Lua reads.
+Three facts about the deployed CRD, all checked with `kubectl explain` against prod:
+
+- **`spec.metadata.http.timeout` does not exist in v0.24.0.**
+
+  ```console
+  $ kubectl explain authconfigs.spec.metadata.http.timeout --api-version=authorino.kuadrant.io/v1beta3
+  error: field "timeout" does not exist
+  ```
+
+  Upstream `main`'s `HttpEndpointSpec` carries a `Timeout *int`, so the Go types are **ahead of the
+  deployed release** — and prod's own comment (`security-policies.yaml:305-309`, *"v1beta3 has NO
+  metadata.http.timeout field"*) is **correct**, while the commented-out `keycloakintrospection`
+  block two stanzas above it (which uses `timeout: 2000`) was written against a version that never
+  ran here. The budget metadata call therefore cannot bound its own latency; it must be bounded at
+  the `SecurityPolicy`'s `extAuth`, which is also where `failOpen: false` is asserted.
+
+- **`response.unauthorized.body`/`message`/`headers` take CEL; `code` does not.** See §4.1.
+
+- **Dynamic metadata lands in the Envoy namespace `envoy.filters.http.ext_authz`**, under a root
+  key equal to the config name (`budget` above). That is the exact key the Lua reads.
 
 **A failed `metadata` fetch is non-fatal in Authorino**: `evaluateMetadataConfigs` logs and leaves
 the value **absent**, it does not deny (this is documented verbatim in prod's own AuthConfig at
@@ -248,16 +272,41 @@ type DenyWithSpec struct {
 ```
 
 `Message`, `Headers` and `Body` are `ValueOrSelector` — so a **per-request JSON body and dynamic
-headers are fully expressible in CEL**, and the owner's instinct there was right. `Code` is not:
-it is a bare `int64`, with no `value`/`selector`/`expression`. It is **one constant per
-AuthConfig**.
+headers are fully expressible in CEL**, and the instinct there was right. `Code` is not: it is a
+bare `int64`, with no `value`/`selector`/`expression`. It is **one constant per AuthConfig**.
+
+The deployed CRD says the same thing, which is what settles it:
+
+```console
+$ kubectl explain authconfigs.spec.response.unauthorized --api-version=authorino.kuadrant.io/v1beta3
+FIELDS:
+  body    <Object>              HTTP response body to override the default denial body.
+  code    <integer>             HTTP status code to override the default denial status code.
+  headers <map[string]Object>   HTTP response headers to override the default denial headers.
+  message <Object>              HTTP message to override the default denial message.
+
+$ kubectl explain authconfigs.spec.response.unauthorized.body --api-version=authorino.kuadrant.io/v1beta3
+FIELDS:
+  expression <string>   A Common Expression Language (CEL) expression that evaluates to a value.
+  selector   <string>   Simple path selector ...
+```
+
+`body` has `expression`. `code` is a plain `<integer>`.
 
 And there is exactly one `response.unauthorized` per AuthConfig — Authorino has no per-rule denial
-customisation. The prod `main` AuthConfig already denies for at least three unrelated reasons that
-must keep returning **403**: `model_policy: deny_all` / an unrecognised policy value, a revoked
-self-signed API key (`lightbridge-key-active`), and the RBAC/OPA authorization rules. Setting
-`code: 402` to make budget exhaustion a 402 would turn *"your key was revoked"* and *"that model
-is not allowed for this project"* into `402 Payment Required` as well. That is not a cosmetic
+customisation. The prod `main` AuthConfig already denies for **four** unrelated reasons, all of
+which return 403 today and must keep doing so
+(`ai-helm-values/environments/prod/values/security-policies.yaml`):
+
+| Rule | Denies when | Correct status |
+|---|---|---|
+| `repo-binding-allowed` (`:377`) | a GitHub token's repo is not bound to an account | 403 |
+| `keycloak-requires-email` (`:443`) | a `client_credentials` token reaches the human plane | 403 |
+| `lightbridge-key-active` (`:547`) | the presented API key has been **revoked** | 403 |
+| `lightbridge-model-allowed` (`:680`) | `model_policy: deny_all` / an unrecognised value | 403 |
+
+Setting `code: 402` to make budget exhaustion a 402 would turn *"your key was revoked"* and *"that
+model is not allowed for this project"* into `402 Payment Required` as well. That is not a cosmetic
 regression: 402 is the status the console and every client will be taught to interpret as "top up
 and retry", and it would then fire on conditions no payment can fix.
 
@@ -484,9 +533,19 @@ hit: Authorino answers from its own metadata cache.
 
 **On the request path (cold cache):** one HTTPS GET from Authorino to `authz-budget`, in-cluster,
 which performs one indexed `SUM` over `budget_grants` for a single `(account, period)` and one
-HTTPS POST to `authz-usage` for the spend `SUM`. Budget: **≤ 300 ms**, bounded by the metadata
-`timeout` (§3.1), itself well inside the SecurityPolicy's `extAuth` timeout. Expected p50 is a few
-milliseconds; the timeout exists for the tail, and the tail's outcome is a 503, not a 403.
+HTTPS POST to `authz-usage` for the spend `SUM`. Expected p50 is a few milliseconds.
+
+**The tail is the risk, and it cannot be bounded where it should be.** Authorino v0.24.0 has no
+`metadata.http.timeout` (§3.1), so a slow `authz-budget` is bounded only by the SecurityPolicy's
+`extAuth` timeout — and *that* budget is shared with everything else in the ext_authz step, whose
+overrun is a **403** (`failOpen: false`, `statusOnError` defaulting to 403), not the 503 this
+design wants. Two consequences, both stated rather than smoothed over:
+
+1. `authz-budget`'s own p99 on this route is a **hard** shadow-mode exit criterion, not a nice-to-
+   have. It is the only latency control that exists.
+2. The right long-term fix is an Authorino bump that has `metadata.http.timeout`, or a per-metadata
+   timeout upstream. Until then the mitigation is that the route does two indexed reads and nothing
+   else, and that its answer is cached per identity per TTL.
 
 **Call rate:** at most **one call per identity per TTL**. With a 10 s TTL that is `active_accounts
 / 10` requests per second against `authz-budget` — for a fleet of 200 concurrently active
@@ -701,9 +760,52 @@ being answered — that is the strongest argument for it. Recommendations, one l
   properties. It remains the cheapest path if the live-lookup shape ever proves unsafe under load,
   and shadow mode is what would tell us that.
 - **Authorino-native denial** (`authorization` rule + `response.unauthorized: {code: 402}`).
-  Rejected on a checkable fact: `DenyWithSpec.Code` is a bare `int64` with one value per
-  AuthConfig, and this AuthConfig already denies for three unrelated reasons that must stay 403
-  (§4.1). Revisit if Authorino makes `Code` a `ValueOrSelector`.
+  Rejected on a checkable fact: `code` is a plain integer with one value per AuthConfig, and this
+  AuthConfig already denies for **four** unrelated reasons that must stay 403 (§4.1). Everything
+  else about it works, so the YAML is kept here verbatim — the day Authorino makes `code` a
+  `ValueOrSelector` (or adds per-rule denial specs), this replaces the Lua filter and
+  `charts/core-gateway/files/budget-limiter.lua` is deleted:
+
+  ```yaml
+  authorization:
+    "budget-remaining-positive":
+      when:
+        - predicate: |
+            has(auth.metadata.budgetremaining) && has(auth.metadata.budgetremaining.remaining_micros)
+      patternMatching:
+        patterns:
+          - selector: auth.metadata.budgetremaining.remaining_micros
+            operator: gt
+            value: "0"
+  response:
+    unauthorized:
+      code: 402                       # ← the blocker: ONE constant for the whole AuthConfig
+      headers:
+        "content-type":
+          value: application/json
+        "x-budget-remaining-micros":
+          expression: |
+            has(auth.metadata.budgetremaining.remaining_micros)
+              ? string(auth.metadata.budgetremaining.remaining_micros) : ""
+        "x-budget-next-reset":
+          expression: |
+            has(auth.metadata.budgetremaining.next_reset_at)
+              ? string(auth.metadata.budgetremaining.next_reset_at) : ""
+      body:
+        expression: |
+          '{"error":"budget_exhausted","account_id":"' + string(auth.identity.account_id) +
+          '","remaining_micros":0,"next_reset_at":"' +
+          (has(auth.metadata.budgetremaining.next_reset_at)
+             ? string(auth.metadata.budgetremaining.next_reset_at) : "") +
+          '","refill_url":"https://console.ai.camer.digital/budget",' +
+          '"message":"This account has no budget left for the current period."}'
+  ```
+
+  Note what this version *cannot* do even so: distinguish `budget_exhausted` from
+  `budget_unavailable` by status, because both would be the same `code`. The `when:` guard above
+  keeps the rule from firing at all when the metadata is absent — which means an unknowable balance
+  would **pass**, i.e. fail open. That is a second, independent reason the native path is not a
+  drop-in today, and it is why the `when:` guard has to go the day `code` becomes an expression.
 - **ext_proc / a true Dynamic Budget Limiter component with reserve-and-settle.** Rejected: §4.2.
   It is the honest end state only if a *pre-request* cost estimate ever exists.
 - **Grants decrement the Redis counter** (`plans/lightbridge-dynamic-budget.md` option B).
