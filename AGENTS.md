@@ -1186,9 +1186,11 @@ hand-written SQL and direct `sqlx` dependencies.
   `docs/rbac.md`
 - API key approaching-expiry visibility (`listMyExpiringApiKeys`, window/threshold rationale, why
   there is no cross-tenant admin surface): `docs/api-key-expiry-visibility.md`
-- Admin identity resolution (`resolveUserProfiles`/`resolveActorLabels`/`searchUsers`, the
-  `user:read` permission, the never-fabricate-an-identity and reject-don't-truncate rules, and the
-  search index's honest limits): `docs/admin-identity-resolution.md`
+- Identity resolution (`resolveUserProfiles`/`resolveActorLabels`/`searchUsers`, the `user:read`
+  permission, why `resolveActorLabels` is gated PER KIND — three estate-wide kinds behind
+  `user:read`, `apiKeyIds` row-scoped through `ApiKey`'s own `@@allow("read", …)` — the
+  never-fabricate-an-identity and reject-don't-truncate rules, and the search index's honest
+  limits): `docs/admin-identity-resolution.md`
 - Governance data model + how quotas/allowlists are actually enforced at the gateway (accounts,
   projects, roster, keys; introspection, Authorino claim extraction, BackendTrafficPolicy rule
   families; worked scenarios and the gaps that remain): `docs/governance-model-and-enforcement.md`

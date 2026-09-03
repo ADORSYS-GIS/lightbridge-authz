@@ -12,6 +12,7 @@ use lightbridge_authz_core::{
     server::{dev_cors_enabled, serve_tls},
 };
 
+pub mod actor_api_key_labels;
 pub mod auth_provider;
 pub mod authorize;
 pub mod budget_convert;
@@ -451,6 +452,19 @@ fn subject_from_ctx(ctx: &CratestackContext) -> Option<String> {
         Some(Value::String(s)) => Some(s.clone()),
         _ => None,
     }
+}
+
+/// Whether the caller holds a given permission, read back out of the auth context
+/// `CratestackAuthProvider` populated once at authentication time (one boolean per
+/// `Permission::ALL` variant -- see `auth_provider.rs`). Absent or non-boolean reads as `false`:
+/// unknown is not a default, it routes to the strictest branch.
+///
+/// One copy, not one per module: it is a security predicate, and a second hand-written copy that
+/// forgot the `Bool(true)` match (or matched `Some(_)`) would fail OPEN. `field` is the
+/// `auth().perm*` name, which callers derive from [`rpc_permission_map::permission_field_name`]
+/// rather than typing.
+pub(crate) fn has_permission(ctx: &CratestackContext, field: &str) -> bool {
+    matches!(ctx.auth_field(field), Some(Value::Bool(true)))
 }
 
 /// The caller's raw access token, stashed into the context by [`CratestackAuthProvider`] so the
@@ -2522,9 +2536,14 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         }
     }
 
+    /// Unlike its two `user:read` siblings, this one DOES use `db`: its `apiKeyIds` kind is
+    /// row-scoped through the generated `db.api_key()` delegate rather than by a permission, the
+    /// same `listMyExpiringApiKeys` idiom and for the same reason (the model's own compiled
+    /// `@@allow("read", ...)` clause, not a second hand-written ownership join). See
+    /// `actor_api_key_labels.rs`.
     fn resolve_actor_labels(
         &self,
-        _db: &schema::Cratestack,
+        db: &schema::Cratestack,
         ctx: &CratestackContext,
         args: schema::procedures::resolve_actor_labels::Args,
         _authorized: schema::procedures::resolve_actor_labels::Authorized,
@@ -2534,9 +2553,11 @@ impl schema::procedures::ProcedureRegistry for Procedures {
             CratestackError,
         >,
     > + Send {
+        // `db`/`ctx` are BORROWED into the future rather than cloned, exactly as
+        // `list_my_expiring_api_keys` above does -- the only other procedure in this impl that
+        // reaches the generated delegate.
         let issuer = self.issuer.clone();
-        let ctx = ctx.clone();
-        async move { identity_directory::resolve_actor_labels(&issuer.repo, &ctx, args.args).await }
+        async move { identity_directory::resolve_actor_labels(db, &issuer.repo, ctx, args.args).await }
     }
 
     fn search_users(

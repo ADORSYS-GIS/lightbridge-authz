@@ -166,13 +166,19 @@ pub enum Permission {
     UsageReadAll,
 
     /// Resolve another person's display identity: the estate-wide, ownership-filter-free batch
-    /// reads `resolveUserProfiles`/`resolveActorLabels`/`searchUsers` serve so an admin console
-    /// can render "Stephane Segning - selast@example.com" instead of a bare cuid. Its own
-    /// permission, not a reuse of [`Permission::AccountRead`]: those procedures read
-    /// `federated_identities` profile claims for subjects the caller has no relationship with at
-    /// all, which is a PII surface of a different shape from "list the accounts I own". Included
-    /// in the default `lightbridge-admin`'s `*` grant (see [`default_role_permissions`]) and in
-    /// no other default role, so an unconfigured deployment keeps it admin-only out of the box.
+    /// reads `resolveUserProfiles`/`searchUsers` (and `resolveActorLabels`' user/account/project
+    /// kinds) serve so an admin console can render "Stephane Segning - selast@example.com" instead
+    /// of a bare cuid. Its own permission, not a reuse of [`Permission::AccountRead`]: those
+    /// procedures read `federated_identities` profile claims for subjects the caller has no
+    /// relationship with at all, which is a PII surface of a different shape from "list the
+    /// accounts I own". Included in the default `lightbridge-admin`'s `*` grant (see
+    /// [`default_role_permissions`]) and in no other default role, so an unconfigured deployment
+    /// keeps it admin-only out of the box.
+    ///
+    /// NOT what gates `resolveActorLabels`' `apiKeyIds` kind (owner feedback 2026-09-03): an API
+    /// key's NAME is not estate-wide PII, so it is scoped per row by `ApiKey`'s own
+    /// `@@allow("read", ...)` clause and readable by ordinary members. See
+    /// `docs/admin-identity-resolution.md`; do not fold that kind back under this permission.
     #[serde(rename = "user:read")]
     UserRead,
 
