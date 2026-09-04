@@ -6,6 +6,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use chrono::Utc;
 use lightbridge_authz_core::{Error, Permission, Result};
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
@@ -229,6 +230,14 @@ pub async fn query_usage(
     // a response with zero points still has to say whether percentiles were computed.
     let metrics = input.effective_metrics();
     let (points, truncated) = state.repo.query_usage(&input).await?;
+
+    // P1-5: `/usage/v1/usage/query` reads raw `usage_events` only (the rollup does not carry
+    // latency percentiles), so a request whose range extends before the raw retention window has
+    // silently no data there. `truncated` is the published field whose job (#578) is to say "we
+    // dropped data", so OR in a range-truncation flag rather than report `truncated: false` for a
+    // range the API cannot answer.
+    let range_truncated = input.start_time < Utc::now() - chrono::Duration::days(state.raw_days);
+    let truncated = truncated || range_truncated;
 
     Ok((
         StatusCode::OK,

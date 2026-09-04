@@ -162,6 +162,16 @@ pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<UsageConfig>
             config.retention.rollup_days
         )));
     }
+    // The rollup must retain data LONGER than the raw window, or a rolled-up day is deleted from
+    // `usage_events_daily` in the same transaction that wrote it (the rollup purge cutoff is
+    // `rollup_days`, and a day older than `raw_days` is already older than `rollup_days` when
+    // `rollup_days <= raw_days`). That would silently destroy every rolled-up day.
+    if config.retention.rollup_days <= config.retention.raw_days {
+        return Err(lightbridge_authz_core::Error::Server(format!(
+            "retention.rollup_days must be > retention.raw_days (got rollup_days={}, raw_days={})",
+            config.retention.rollup_days, config.retention.raw_days
+        )));
+    }
     debug!("loaded usage config successfully");
     Ok(config)
 }
@@ -381,6 +391,31 @@ otel:
         assert_eq!(
             cfg.retention.interval_seconds, 3600,
             "interval_seconds must default to 3600"
+        );
+    }
+
+    /// #549: `rollup_days` must be > `raw_days`, or a rolled-up day is deleted from the rollup in
+    /// the same transaction that wrote it (the rollup purge cutoff is `rollup_days`, and a day
+    /// older than `raw_days` is already older than `rollup_days` when `rollup_days <= raw_days`).
+    #[test]
+    fn config_rejects_rollup_days_not_greater_than_raw_days() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("usage-config-bad-rollup-{unique}.yaml"));
+        let content = format!(
+            "{}\noauth2:\n  type: external\n  jwks_url: \"http://keycloak:9100/realms/dev/protocol/openid-connect/certs\"\nscope_authority:\n  base_url: \"https://authz-opa:3001\"\n  username: \"authorino\"\n  password: \"change-me\"\nretention:\n  enabled: true\n  raw_days: 90\n  rollup_days: 30\n",
+            valid_server_and_logging_block()
+        );
+        fs::write(&path, content).expect("temp config should be written");
+
+        let result = load_from_path(&path);
+        fs::remove_file(&path).expect("temp config should be removed");
+
+        assert!(
+            result.is_err(),
+            "rollup_days <= raw_days must fail to load, not silently destroy rolled-up days"
         );
     }
 }

@@ -2424,6 +2424,7 @@ mod tests {
             repo: Arc::new(PartialInsertRepo { persisted: 1 }),
             bearer: Arc::new(RefuseEverythingBearer),
             scope_authority: Arc::new(RefuseEverythingScopeAuthority),
+            raw_days: 90,
         };
         let events = vec![base_usage_event(), base_usage_event()];
 

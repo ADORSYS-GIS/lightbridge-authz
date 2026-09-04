@@ -341,13 +341,15 @@ the `usage_events_daily` aggregate table, then deletes them — in one transacti
   `usage_events_daily`, so a spend query is correct whether its rows are still raw or have aged
   into the rollup. The current billing period is always within the raw window, so budget decisions
   do not shift as data ages (AC3).
-- **Money semantics are preserved.** `usage_events_daily.total_cost` is nullable, exactly like the
-  raw column: `SUM` over all-NULL rows is NULL ("unknown"), never 0, so the `Spend::Known` /
-  `Spend::Unavailable` split is unchanged across the boundary.
-- **Only complete days are rolled up**, so the rollup is a plain `INSERT` with no `ON CONFLICT` and
-  a re-run is idempotent. The INSERT carries `ON CONFLICT DO NOTHING` so a late-arriving event for
-  an already-rolled-up day cannot wedge the job (the duplicate group is skipped, the late raw row
-  is still purged).
+- **Money semantics are preserved.** `usage_events.total_cost` is `NOT NULL DEFAULT 0` and ingest
+  collapses an unknown cost to `0.0` at write time, so `SUM` over raw rows is never NULL. The
+  rollup column is nullable only defensively; the `Spend::Known` / `Spend::Unavailable` split is
+  unchanged across the boundary.
+- **Only complete days are rolled up**, so a re-run is idempotent. The rollup is a single
+  `DELETE ... RETURNING` feeding an `INSERT ... ON CONFLICT DO UPDATE` (one statement, so the
+  rollup and purge can never drift under READ COMMITTED), and a late-arriving event for an
+  already-rolled-up day is folded into the existing rollup row with a NULL-safe `COALESCE` add --
+  never dropped, so spend for a closed period is stable.
 - **The rollup table is itself bounded.** A rolled-up day older than `retention.rollup_days`
   (default **365**) is deleted from `usage_events_daily` too, so the long-term store does not grow
   without bound. Nothing reads the rollup today (the dashboard's 90-day window is served from raw,
@@ -356,4 +358,5 @@ the `usage_events_daily` aggregate table, then deletes them — in one transacti
 
 The `retention` config block is optional with safe defaults (`enabled: true`, `raw_days: 90`,
 `rollup_days: 365`, `interval_seconds: 3600`). `raw_days` MUST stay >= 90 to keep the full dashboard
-window in raw; `rollup_days` MUST be >= 1.
+window in raw; `rollup_days` MUST be > `raw_days` (otherwise a rolled-up day is deleted from the
+rollup in the same transaction that wrote it).

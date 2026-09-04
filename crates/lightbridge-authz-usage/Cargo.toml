@@ -62,3 +62,8 @@ required-features = ["it-tests"]
 name = "scope_ownership_it_tests"
 path = "tests/scope_ownership_it_tests.rs"
 required-features = ["it-tests"]
+
+[[test]]
+name = "retention_it_tests"
+path = "tests/retention_it_tests.rs"
+required-features = ["it-tests"]

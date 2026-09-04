@@ -13,22 +13,27 @@
 //! commit together) makes a re-run idempotent: a committed run leaves no raw rows for the days it
 //! rolled up, and a rolled-back run leaves no rollup rows at all.
 //!
-//! Rolling up only complete days also sidesteps the NULL-money trap: `total_cost` is nullable
-//! (`SUM` over all-NULL rows is NULL, "unknown", never 0), and because a day is aggregated in one
-//! shot there is never a partial-day `ON CONFLICT DO UPDATE` that would have to combine a NULL
-//! with a value.
+//! ## The rollup and the purge are ONE statement (no READ COMMITTED race)
 //!
-//! ## Late-arriving data and `ON CONFLICT DO NOTHING`
+//! The rollup and the raw purge are a single `DELETE ... RETURNING` feeding an `INSERT ... ON
+//! CONFLICT DO UPDATE` (see [`ROLLUP_AND_PURGE_SQL`]). Under READ COMMITTED each *statement* takes
+//! one snapshot, so a single statement can never delete a row it did not also roll up. If the two
+//! were separate statements, a backdated row committed by ingest between them -- a replayed OTLP
+//! export, a slow exporter flush -- would satisfy `observed_at < cutoff`, be invisible to the
+//! INSERT, and be deleted by the DELETE: billable spend gone, permanently, silently. The
+//! one-statement form closes that window: whatever the DELETE sees, the INSERT rolls up, and a row
+//! committed mid-statement is invisible to both and simply stays raw for the next run.
 //!
-//! The rollup INSERT carries `ON CONFLICT DO NOTHING` so a late-arriving raw event -- one whose
-//! `observed_at` falls in a day that a previous run already rolled up (a replayed export, or clock
-//! skew) -- cannot wedge the job. Without it, that event's `(bucket_start, dimensions)` group would
-//! already exist in `usage_events_daily` (the unique index treats NULLs as equal), the INSERT would
-//! raise a unique violation, the whole transaction would roll back, and the loop would log-and-retry
-//! forever without ever purging -- raw growth would resume. With `DO NOTHING`, the duplicate group
-//! is skipped, the purge still deletes the late raw row (its day is already represented in the
-//! rollup), and the job stays healthy. The late event's cost is not folded back into the rollup --
-//! an acceptable, deliberate trade for a day already past the retention window.
+//! ## Late-arriving data is FOLDED IN, never dropped
+//!
+//! The rollup INSERT carries `ON CONFLICT DO UPDATE`, so a late-arriving raw event -- one whose
+//! `observed_at` falls in a day a previous run already rolled up (a replayed export, or clock
+//! skew) -- is added to the existing rollup row rather than dropped. Without it, that event's
+//! `(bucket_start, dimensions)` group would already exist in `usage_events_daily` (the unique index
+//! treats NULLs as equal), the INSERT would either raise a unique violation (wedging the job) or,
+//! with `DO NOTHING`, silently discard the late event's cost. `DO UPDATE` folds the late cost in
+//! with a NULL-safe `COALESCE` add, so spend for a closed historical period is stable: it never
+//! jumps up while the late row is still raw and then collapses when the row is purged.
 //!
 //! ## The retention window vs. the dashboard
 //!
@@ -37,6 +42,13 @@
 //! the boundary day), so the full 90-day dashboard window is always served from raw -- which is
 //! what keeps latency percentiles exact (the rollup does not carry them). Budget spend reads the
 //! current billing period, which is always within the raw window, so it is never truncated.
+//!
+//! ## Bucketing is pinned to UTC
+//!
+//! `date_trunc('day', <timestamptz>)` truncates in the database session's `TimeZone`, so the day
+//! boundary -- and therefore the cutoff -- would shift with the session's zone. The transaction
+//! runs `SET LOCAL TimeZone = 'UTC'` as its first statement, pinning every day boundary in this
+//! transaction to UTC regardless of the session's configured zone.
 
 use lightbridge_authz_core::{Error, Result};
 use sqlx::PgPool;
@@ -75,8 +87,22 @@ pub async fn run_retention_loop(pool: Arc<PgPool>, config: RetentionConfig) {
 /// Rolls `usage_events` rows older than `raw_days` (rounded down to the day boundary, so only
 /// complete days) into `usage_events_daily`, deletes them from `usage_events`, and deletes rollup
 /// rows older than `rollup_days` -- one transaction. Returns the number of raw rows purged.
+///
+/// The rollup+purge runs in bounded batches ([`BATCH_SIZE`] rows per statement) so the FIRST run
+/// against a large pre-existing backlog does not aggregate and delete the whole table in one
+/// unbounded statement -- which would hold one advisory-locked transaction (and one pool
+/// connection) for the whole table, spike WAL, and burst dead tuples right before the #549 AC5
+/// reclaim. Each batch is idempotent (`ON CONFLICT DO UPDATE`), so a crash mid-way leaves partial
+/// progress that the next run continues.
 pub async fn rollup_and_purge(pool: &PgPool, raw_days: i64, rollup_days: i64) -> Result<u64> {
     let mut tx = pool.begin().await?;
+
+    // Pin day boundaries to UTC for the whole transaction (see module docs). Must be the first
+    // statement so both the rollup cutoff and the rollup-purge cutoff agree on the same zone.
+    sqlx::query("SET LOCAL TimeZone = 'UTC'")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::Database(format!("usage retention timezone pin failed: {e}")))?;
 
     // Acquire an exclusive advisory lock for the retention job to prevent concurrent rollups
     // across multiple replicas. The lock is tied to the transaction and released on commit/rollback.
@@ -91,17 +117,23 @@ pub async fn rollup_and_purge(pool: &PgPool, raw_days: i64, rollup_days: i64) ->
         return Ok(0);
     }
 
-    let inserted = sqlx::query(ROLLUP_SQL)
-        .bind(raw_days)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Error::Database(format!("usage retention rollup failed: {e}")))?;
-
-    let purged = sqlx::query(PURGE_SQL)
-        .bind(raw_days)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Error::Database(format!("usage retention purge failed: {e}")))?;
+    // One statement per batch: DELETE ... RETURNING feeds the INSERT, so the rollup and the raw
+    // purge share a single snapshot and can never drift (see module docs). Returns the number of
+    // raw rows deleted in this batch (the `deleted` CTE is materialised and counted). Loop until a
+    // batch deletes nothing, bounding the work per statement.
+    let mut total_purged: u64 = 0;
+    loop {
+        let batch: i64 = sqlx::query_scalar(ROLLUP_AND_PURGE_SQL)
+            .bind(raw_days)
+            .bind(BATCH_SIZE)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| Error::Database(format!("usage retention rollup failed: {e}")))?;
+        if batch <= 0 {
+            break;
+        }
+        total_purged += batch as u64;
+    }
 
     sqlx::query(ROLLUP_PURGE_SQL)
         .bind(rollup_days)
@@ -113,53 +145,72 @@ pub async fn rollup_and_purge(pool: &PgPool, raw_days: i64, rollup_days: i64) ->
         .await
         .map_err(|e| Error::Database(format!("usage retention commit failed: {e}")))?;
 
-    debug_assert!(
-        inserted.rows_affected() <= purged.rows_affected() || purged.rows_affected() == 0,
-        "rollup rows ({}) should not exceed purged raw rows ({})",
-        inserted.rows_affected(),
-        purged.rows_affected()
-    );
-
-    Ok(purged.rows_affected())
+    Ok(total_purged)
 }
 
-/// Aggregates raw rows older than the cutoff into `usage_events_daily`. The cutoff is computed in
-/// SQL from the database clock (`now()`), so it stays consistent with the data regardless of any
-/// clock skew between the app and the database. `date_trunc('day', observed_at)` is the bucket
-/// key, matching the cutoff's day boundary.
-const ROLLUP_SQL: &str = r#"
-INSERT INTO usage_events_daily (
-    bucket_start, account_id, project_id, api_key_id, user_id, user_name, model, metric_name,
-    signal_type, azp, operation, billing_plan, requests, usage_value, prompt_tokens,
-    completion_tokens, total_tokens, total_cost, latency_samples
-)
-SELECT
-    date_trunc('day', observed_at) AS bucket_start,
-    account_id, project_id, api_key_id, user_id, user_name, model, metric_name, signal_type,
-    azp, operation, billing_plan,
-    SUM(request_count)::bigint AS requests,
-    SUM(usage_value)::double precision AS usage_value,
-    SUM(prompt_tokens)::bigint AS prompt_tokens,
-    SUM(completion_tokens)::bigint AS completion_tokens,
-    SUM(total_tokens)::bigint AS total_tokens,
-    SUM(total_cost)::double precision AS total_cost,
-    COUNT(latency_ms)::bigint AS latency_samples
-FROM usage_events
-WHERE observed_at < date_trunc('day', now() - ($1 * interval '1 day'))
-GROUP BY bucket_start, account_id, project_id, api_key_id, user_id, user_name, model, metric_name,
-         signal_type, azp, operation, billing_plan
-ON CONFLICT DO NOTHING
-"#;
+/// Maximum number of raw rows rolled up and purged per statement, bounding the first run against a
+/// large backlog (see [`rollup_and_purge`]).
+const BATCH_SIZE: i64 = 50_000;
 
-/// Deletes the raw rows that were just rolled up. Same cutoff expression as [`ROLLUP_SQL`], so the
-/// two can never drift apart.
-const PURGE_SQL: &str = r#"
-DELETE FROM usage_events
-WHERE observed_at < date_trunc('day', now() - ($1 * interval '1 day'))
+/// Rolls raw rows older than the cutoff into `usage_events_daily` and deletes them from
+/// `usage_events`, in ONE statement. The cutoff is computed in SQL from the database clock
+/// (`now()`), so it stays consistent with the data regardless of any clock skew between the app
+/// and the database. `date_trunc('day', observed_at)` is the bucket key, matching the cutoff's day
+/// boundary; both are pinned to UTC by the transaction's `SET LOCAL TimeZone = 'UTC'`. `$2` bounds
+/// the batch (see [`BATCH_SIZE`]) so a large backlog is processed in bounded chunks.
+///
+/// The `DELETE ... RETURNING` and the `INSERT ... SELECT` share one statement snapshot, so a row
+/// is never deleted without being rolled up (no READ COMMITTED race). `ON CONFLICT DO UPDATE`
+/// folds a late-arriving row for an already-rolled-up day into the existing rollup row with a
+/// NULL-safe `COALESCE` add, so spend for a closed period is stable. The trailing `SELECT COUNT(*)`
+/// returns the number of raw rows deleted.
+const ROLLUP_AND_PURGE_SQL: &str = r#"
+WITH deleted AS (
+    DELETE FROM usage_events
+    WHERE ctid IN (
+        SELECT ctid FROM usage_events
+        WHERE observed_at < date_trunc('day', now() - ($1 * interval '1 day'))
+        LIMIT $2
+    )
+    RETURNING *
+),
+rolled AS (
+    INSERT INTO usage_events_daily (
+        bucket_start, account_id, project_id, api_key_id, user_id, user_name, model, metric_name,
+        signal_type, azp, operation, billing_plan, requests, usage_value, prompt_tokens,
+        completion_tokens, total_tokens, total_cost, latency_samples
+    )
+    SELECT
+        date_trunc('day', observed_at) AS bucket_start,
+        account_id, project_id, api_key_id, user_id, user_name, model, metric_name, signal_type,
+        azp, operation, billing_plan,
+        SUM(request_count)::bigint AS requests,
+        SUM(usage_value)::double precision AS usage_value,
+        SUM(prompt_tokens)::bigint AS prompt_tokens,
+        SUM(completion_tokens)::bigint AS completion_tokens,
+        SUM(total_tokens)::bigint AS total_tokens,
+        SUM(total_cost)::double precision AS total_cost,
+        COUNT(latency_ms)::bigint AS latency_samples
+    FROM deleted
+    GROUP BY bucket_start, account_id, project_id, api_key_id, user_id, user_name, model, metric_name,
+             signal_type, azp, operation, billing_plan
+    ON CONFLICT (bucket_start, account_id, project_id, api_key_id, user_id, user_name, model, metric_name,
+                 signal_type, azp, operation, billing_plan)
+    DO UPDATE SET
+        requests = usage_events_daily.requests + EXCLUDED.requests,
+        usage_value = usage_events_daily.usage_value + EXCLUDED.usage_value,
+        prompt_tokens = usage_events_daily.prompt_tokens + EXCLUDED.prompt_tokens,
+        completion_tokens = usage_events_daily.completion_tokens + EXCLUDED.completion_tokens,
+        total_tokens = usage_events_daily.total_tokens + EXCLUDED.total_tokens,
+        total_cost = COALESCE(usage_events_daily.total_cost, 0) + COALESCE(EXCLUDED.total_cost, 0),
+        latency_samples = usage_events_daily.latency_samples + EXCLUDED.latency_samples
+)
+SELECT COUNT(*) FROM deleted
 "#;
 
 /// Deletes rollup rows older than `rollup_days`, bounding the long-term store so it does not grow
-/// without bound. Same day-boundary cutoff shape as [`ROLLUP_SQL`]/[`PURGE_SQL`].
+/// without bound. Same day-boundary cutoff shape as [`ROLLUP_AND_PURGE_SQL`], and pinned to UTC by
+/// the transaction's `SET LOCAL TimeZone = 'UTC'`.
 const ROLLUP_PURGE_SQL: &str = r#"
 DELETE FROM usage_events_daily
 WHERE bucket_start < date_trunc('day', now() - ($1 * interval '1 day'))

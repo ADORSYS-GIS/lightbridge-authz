@@ -205,6 +205,19 @@ impl StoreRepo {
     /// count -- see below for why that distinction is load-bearing whenever `group_by` is
     /// non-empty. `Vec<UsageSeriesPoint>` comes back in ascending `bucket_start` order.
     ///
+    /// ## Query horizon = the raw retention window (#549)
+    ///
+    /// This query reads `usage_events` (raw) ONLY -- the `usage_events_daily` rollup does not carry
+    /// latency percentiles, so it cannot serve this endpoint's percentile contract. The raw table
+    /// is kept for `retention.raw_days` (default 90) before being rolled up and purged, so a
+    /// request whose `start_time` is older than that window has no data there. The dashboard's max
+    /// range is 90 days, so this is fine for every in-tree caller, but a caller asking for a longer
+    /// range gets only the raw window back. The handler (`handlers::query::query_usage`) ORs a
+    /// range-truncation flag into `truncated` when `start_time` is older than the raw window, so
+    /// the API never reports `truncated: false` for a range it cannot answer (P1-5). Reading the
+    /// rollup too (accepting that latency percentiles stop existing past the boundary) remains a
+    /// possible future reconciliation.
+    ///
     /// ## #578: truncation is BUCKET-scoped, not row-scoped
     ///
     /// The query used to `ORDER BY bucket_start ASC LIMIT $n` directly -- for a series with more

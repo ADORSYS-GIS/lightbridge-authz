@@ -54,13 +54,14 @@ scope_authority:
   username: "authorino"
   password: "change-me"
   insecure_skip_verify: true
-# #549 AC2: retention/rollup for usage_events. Optional with safe defaults -- this block is shown
-# commented out because the defaults are correct for most deployments. The background job rolls raw
-# rows older than raw_days into usage_events_daily and deletes them, and deletes rolled-up days
-# older than rollup_days, in one transaction. raw_days MUST be >= 90 (the dashboard's max range);
-# rollup_days MUST be >= 1.
-# retention:
-#   enabled: true
-#   raw_days: 90
-#   rollup_days: 365
-#   interval_seconds: 3600
+# #549 AC2: retention/rollup for usage_events. Shipped uncommented because the job is ON by default
+# (a destructive DELETE loop must never be invisible in the rendered config). The background job
+# rolls raw rows older than raw_days into usage_events_daily and deletes them, and deletes rolled-up
+# days older than rollup_days, in one transaction. raw_days MUST be >= 90 (the dashboard's max
+# range); rollup_days MUST be > raw_days (otherwise a rolled-up day is deleted in the same
+# transaction that wrote it).
+retention:
+  enabled: true
+  raw_days: 90
+  rollup_days: 365
+  interval_seconds: 3600

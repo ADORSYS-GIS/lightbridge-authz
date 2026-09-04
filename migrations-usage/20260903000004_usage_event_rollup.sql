@@ -27,10 +27,13 @@
 --
 -- ## Money semantics preserved
 --
--- `total_cost` is nullable here, exactly as in `usage_events`: `SUM(total_cost)` over all-NULL
--- rows is NULL ("unknown"), never 0. The rollup insert uses `SUM(total_cost)` (not
--- `COALESCE(..., 0)`), so a rolled-up day with no cost data stays NULL and `spend_for_account`'s
--- `Spend::Known`/`Spend::Unavailable` split is unchanged across the boundary.
+-- `usage_events.total_cost` is `NOT NULL DEFAULT 0` (since `20260320000001`), and ingest collapses
+-- an unknown cost to `0.0` at write time, so `SUM(total_cost)` over raw rows is never NULL. The
+-- rollup column is nullable only defensively (a rolled-up day with no raw rows would be NULL); the
+-- rollup insert uses `SUM(total_cost)` (not `COALESCE(..., 0)`), so a rolled-up day with no cost
+-- data stays NULL and `spend_for_account`'s `Spend::Known`/`Spend::Unavailable` split is unchanged
+-- across the boundary. The `ON CONFLICT DO UPDATE` fold-in adds costs with a NULL-safe `COALESCE`
+-- so a late row never turns a known sum into NULL.
 --
 -- ## The unique index and NULLs
 --

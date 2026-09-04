@@ -52,6 +52,11 @@ pub struct UsageState {
     pub bearer: Arc<dyn BearerTokenServiceTrait>,
     /// Ownership authority for `/usage/v1/usage/query`'s `account`/`project` scopes (#570).
     pub scope_authority: Arc<dyn ScopeAuthority>,
+    /// The raw `usage_events` retention window in days (#549). `/usage/v1/usage/query` reads raw
+    /// only (the rollup does not carry latency percentiles), so a request whose `start_time` is
+    /// older than this window silently has no data -- the handler ORs a range-truncation flag into
+    /// `truncated` so the API never reports `truncated: false` for a range it cannot answer (P1-5).
+    pub raw_days: i64,
 }
 
 #[async_trait]
@@ -193,14 +198,18 @@ pub async fn start_usage_server(
 
     // Assert deploy sequencing: new schema (migrations 03 and 04) must exist before we serve traffic.
     // Since SQLx handles queries dynamically, failing here prevents obscure runtime errors later.
-    let migration_check = sqlx::query("SELECT 1 FROM usage_events_daily LIMIT 1")
+    // The error is propagated (not collapsed to "table missing") so a real failure -- pool
+    // exhaustion, a connection blip, wrong credentials -- is reported as what it is, per this
+    // store's fail-loud migration doctrine.
+    sqlx::query("SELECT 1 FROM usage_events_daily LIMIT 1")
         .fetch_optional(pool.pool())
-        .await;
-    if migration_check.is_err() {
-        return Err(Error::Database(
-            "usage_events_daily table missing. Ensure migrations 20260903000003 and 04 have run before starting.".to_string(),
-        ));
-    }
+        .await
+        .map_err(|e| {
+            Error::Database(format!(
+                "usage_events_daily precondition check failed (ensure migrations 20260903000003 \
+                 and 04 have run before starting): {e}"
+            ))
+        })?;
 
     let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool.clone()));
     let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
@@ -213,6 +222,7 @@ pub async fn start_usage_server(
         repo,
         bearer,
         scope_authority,
+        raw_days: retention.raw_days,
     });
 
     // #549 AC2: the retention/rollup background job. It owns its own `PgPool` clone (the shared
