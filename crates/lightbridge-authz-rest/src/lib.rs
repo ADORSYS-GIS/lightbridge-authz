@@ -3438,13 +3438,12 @@ pub async fn start_api_server(
         .map_err(|e| Error::Server(format!("failed to open cratestack Postgres pool: {e}")))?;
     let cratestack_db = schema::Cratestack::builder(cratestack_pool.clone()).build();
 
-    // Idempotency store (Postgres-backed, cratestack sqlx); create its table before serving
-    // (ADR-0003, "Idempotency").
+    // Idempotency store (Postgres-backed, cratestack sqlx). Its table is created by
+    // `migrations/20260904000002_cratestack_bootstrap_tables.sql`, NOT by `ensure_schema()` here:
+    // that call issued `CREATE TABLE IF NOT EXISTS`, which is not atomic across sessions, so two
+    // replicas starting together against a fresh database could fail to start on a `23505` against
+    // `pg_type_typname_nsp_index` (#684). One owner, and it is the migration.
     let idempotency_store = Arc::new(SqlxIdempotencyStore::new(cratestack_pool.clone()));
-    idempotency_store
-        .ensure_schema()
-        .await
-        .map_err(|e| Error::Server(format!("failed to ensure idempotency schema: {e}")))?;
 
     // Redis-backed rate-limit store for multi-replica correctness (ADR-0003, "Rate limiting
     // (Redis-backed)"). `redis::Client::open` is lazy, so this does not block on a live Redis here.
@@ -4068,11 +4067,8 @@ pub async fn start_budget_server(
         .map_err(|e| Error::Server(format!("failed to open cratestack Postgres pool: {e}")))?;
     let cratestack_db = schema::Cratestack::builder(cratestack_pool.clone()).build();
 
+    // Same as `start_api_server`: the table is migration-owned (#684), never bootstrapped here.
     let idempotency_store = Arc::new(SqlxIdempotencyStore::new(cratestack_pool.clone()));
-    idempotency_store
-        .ensure_schema()
-        .await
-        .map_err(|e| Error::Server(format!("failed to ensure idempotency schema: {e}")))?;
 
     // Own key prefix ("authz-budget", not "authz-api") so the two services' token buckets never
     // share state, even though they may point at the same Redis instance.
