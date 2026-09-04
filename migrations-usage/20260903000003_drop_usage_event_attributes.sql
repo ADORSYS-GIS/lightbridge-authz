@@ -1,0 +1,33 @@
+-- AC1 (ADORSYS-GIS/lightbridge-authz#549): stop retaining the write-only `attributes` column.
+--
+-- ## The decision, recorded
+--
+-- `attributes` is 60% of this table (902 MB of 1508 MB on 2026-08-29, avg 1445-1461 B/row) and
+-- nothing ever reads it. Every reference in `crates/lightbridge-authz-usage/` is on the write
+-- path -- the INSERT in `repo.rs` and its construction from OTLP resource/span/log/metric
+-- attributes in `handlers/ingest.rs`. There is no SELECT that projects it, no WHERE that filters
+-- on it, no index on it. The two readers (`spend_for_account` and `query_usage`) both ignore it.
+-- It was a contributing factor in the 2026-08-29 volume-exhaustion outage (#549).
+--
+-- The decision is DROP AT INGEST: the column is removed from the schema and ingest stops writing
+-- it. This is the "dropped at ingest" arm of #549's AC1, and it aligns with #581's D7 ruling
+-- ("dropped at ingest beyond the allowlisted typed tail"). The three dimensions #648 promoted out
+-- of the blob (`azp`, `operation`, `billing_plan`) are already first-class columns and are
+-- unaffected; the #648 backfill (`20260902000002`) that read the blob already ran in production
+-- on 2026-09-02 and, on a fresh database, runs before this migration in the sequence -- so it is
+-- never starved of its input.
+--
+-- ## Why a plain `DROP COLUMN` and not `IF EXISTS`
+--
+-- The column is created unconditionally by `20260223000001_init_usage.sql`, so it is guaranteed
+-- to exist here. A plain drop fails loudly if the schema is in an unexpected state, matching this
+-- store's migration doctrine (#581: "no `EXCEPTION WHEN OTHERS`; the migration fails loudly").
+--
+-- ## What this does NOT do
+--
+-- `DROP COLUMN` is a catalog-only change on Postgres 11+ -- no table rewrite, no long lock. The
+-- ~900 MB of existing rows are not physically reclaimed by this migration; that is the separate
+-- one-off reclaim (#549 AC5, `VACUUM FULL` / `pg_repack`, scheduled under an exclusive lock). The
+-- covering index `idx_usage_events_query_cover` (`20260903000002`) deliberately never included
+-- `attributes`, so it is unaffected.
+ALTER TABLE usage_events DROP COLUMN attributes;

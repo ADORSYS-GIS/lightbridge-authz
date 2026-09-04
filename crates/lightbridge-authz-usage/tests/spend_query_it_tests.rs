@@ -39,6 +39,7 @@ async fn app(pool: PgPool) -> axum::Router {
         repo,
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: 90,
     });
     build_query_router(state, readiness_pool, false)
 }
@@ -64,7 +65,6 @@ fn sample_event(account_id: &str, observed_at: DateTime<Utc>, total_cost: f64) -
         total_tokens: None,
         total_cost: Some(total_cost),
         latency_ms: None,
-        attributes: json!({}),
     }
 }
 
@@ -228,6 +228,7 @@ async fn usage_query_endpoint_application_logic_is_unaffected_by_mtls(pool: PgPo
             &lightbridge_authz_usage_rest::models::UsageScope::Account,
             "acct_1",
         )),
+        raw_days: 90,
     });
     let router = build_query_router(state, readiness_pool, false);
 

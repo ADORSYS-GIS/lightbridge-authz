@@ -143,7 +143,8 @@ runs:
         CARGO_INCREMENTAL: "0"
 
     # lightbridge-authz-usage-rest's own ephemeral sqlx::test suite (repo_it_tests.rs,
-    # spend_query_it_tests.rs, scope_ownership_it_tests.rs -- #570/#578) against the SAME plain
+    # spend_query_it_tests.rs, scope_ownership_it_tests.rs, retention_it_tests.rs -- #570/#578/#549)
+    # against the SAME plain
     # Postgres container as the step above -- not a dedicated TimescaleDB.
     # `migrations-usage/20260829000001_usage_event_latency.sql` is
     # deliberately written to degrade on vanilla Postgres (no Timescale-only functions), and
@@ -217,6 +218,24 @@ runs:
         echo "scope_ownership_it_tests passed: ${passed:-0}"
         if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then
           echo "::error::scope_ownership_it_tests reported 0 passed tests -- a skip is not a pass."
+          exit 1
+        fi
+      env:
+        DATABASE_URL: ${{ inputs.database-url }}
+        CARGO_BUILD_JOBS: "2"
+        CARGO_INCREMENTAL: "0"
+
+    - name: Run it-tests (usage) - retention_it_tests
+      shell: bash
+      run: |
+        set -euo pipefail
+        log_file="$(mktemp)"
+        cargo test -p lightbridge-authz-usage-rest --features it-tests \
+          --test retention_it_tests 2>&1 | tee "${log_file}"
+        passed=$(grep -oE '[0-9]+ passed' "${log_file}" | grep -oE '^[0-9]+' | tail -1 || true)
+        echo "retention_it_tests passed: ${passed:-0}"
+        if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then
+          echo "::error::retention_it_tests reported 0 passed tests -- a skip is not a pass."
           exit 1
         fi
       env:

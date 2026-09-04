@@ -125,6 +125,17 @@ the story they're named under.
   replay/promotion path; until it lands, drops are unrecoverable, so the allowlist is seeded
   generously (9-of-55 is a floor, not a ceiling). Content and PII are never allowlisted.
 
+> **Interim deviation recorded (#549, 2026-09-04).** The #549 retention PR ships the *irreversible*
+> half of D7 (drop the `attributes` blob at ingest) **without** the D7 precondition (seed the
+> allowlist to at least the 9-of-55 floor): it keeps only the three #648 bridge columns (`azp`,
+> `operation`, `billing_plan`) and drops everything else from every new row, with no replay path
+> until #589 lands. It also hard-deletes rolled-up days at `rollup_days: 365` (≈12 months), which is
+> **shorter than D6's 13-month raw request grain** — after a day is purged from `usage_events_daily`,
+> `spend_for_account` returns `None` → `Spend::Unavailable` for a period that used to be answerable.
+> Both are deliberate interim bridges on a table #581's PR-1b will rewrite (the same status the #648
+> bridge columns carry); they are recorded here so the D6/D7 reconciliation is explicit, not assumed.
+> `usage_events_daily` itself is an interim table that PR-1b drops.
+
 ### Phase 2 decisions (authenticated door) — D8 ✅ ruled, D9–D13 open
 
 | # | Decision | Where |

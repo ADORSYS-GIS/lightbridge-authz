@@ -1089,7 +1089,7 @@ hand-written SQL and direct `sqlx` dependencies.
     code/client/redirect binding is an authentication boundary that generated CRUD cannot express
     (ADR-0019, #425; `consume_authorization_code` in
     `crates/lightbridge-authz-api-key/src/repo.rs`).
-  - `lightbridge-authz-usage`: dynamic `QueryBuilder` aggregates against the Timescale-backed
+  - `lightbridge-authz-usage`: dynamic `QueryBuilder` aggregates against the plain-Postgres
     `usage_events` table (`query_usage` in `crates/lightbridge-authz-usage/src/repo.rs`).
   - `federated_identities`: deliberately ABSENT from `authz.cstack` entirely, not merely
     `@@allow`-less -- it carries the sealed Keycloak token envelope, so a credential-bearing table

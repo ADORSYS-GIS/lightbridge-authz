@@ -35,11 +35,11 @@
   "crates/lightbridge-authz-rest/src/static_assets.rs": 269,
   "crates/lightbridge-authz-rest/src/token_exchange.rs": 1284,
   "crates/lightbridge-authz-rest/src/userinfo.rs": 202,
-  "crates/lightbridge-authz-usage/src/config.rs": 279,
+  "crates/lightbridge-authz-usage/src/config.rs": 386,
   "crates/lightbridge-authz-usage/src/handlers/ingest.rs": 2730,
   "crates/lightbridge-authz-usage/src/handlers/query.rs": 242,
-  "crates/lightbridge-authz-usage/src/lib.rs": 560,
+  "crates/lightbridge-authz-usage/src/lib.rs": 582,
   "crates/lightbridge-authz-usage/src/models/mod.rs": 381,
-  "crates/lightbridge-authz-usage/src/repo.rs": 645,
+  "crates/lightbridge-authz-usage/src/repo.rs": 675,
   "crates/lightbridge-authz-usage/src/scope_authority.rs": 373
 }

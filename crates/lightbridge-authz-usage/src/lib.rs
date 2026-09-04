@@ -20,10 +20,11 @@ pub mod handlers;
 pub mod instrumentation;
 pub mod models;
 pub mod repo;
+pub mod retention;
 pub mod routers;
 pub mod scope_authority;
 
-pub use config::{ScopeAuthorityConfig, UsageConfig, UsageServer, load_from_path};
+pub use config::{RetentionConfig, ScopeAuthorityConfig, UsageConfig, UsageServer, load_from_path};
 use models::{UsageQueryRequest, UsageSeriesPoint};
 use repo::{StoreRepo, UsageEvent};
 use scope_authority::{RemoteScopeAuthority, ScopeAuthority};
@@ -51,6 +52,11 @@ pub struct UsageState {
     pub bearer: Arc<dyn BearerTokenServiceTrait>,
     /// Ownership authority for `/usage/v1/usage/query`'s `account`/`project` scopes (#570).
     pub scope_authority: Arc<dyn ScopeAuthority>,
+    /// The raw `usage_events` retention window in days (#549). `/usage/v1/usage/query` reads raw
+    /// only (the rollup does not carry latency percentiles), so a request whose `start_time` is
+    /// older than this window silently has no data -- the handler ORs a range-truncation flag into
+    /// `truncated` so the API never reports `truncated: false` for a range it cannot answer (P1-5).
+    pub raw_days: i64,
 }
 
 #[async_trait]
@@ -186,8 +192,25 @@ pub async fn start_usage_server(
     database: &Database,
     oauth2: &Oauth2,
     scope_authority: &ScopeAuthorityConfig,
+    retention: &RetentionConfig,
 ) -> Result<()> {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(database).await?);
+
+    // Assert deploy sequencing: new schema (migrations 03 and 04) must exist before we serve traffic.
+    // Since SQLx handles queries dynamically, failing here prevents obscure runtime errors later.
+    // The error is propagated (not collapsed to "table missing") so a real failure -- pool
+    // exhaustion, a connection blip, wrong credentials -- is reported as what it is, per this
+    // store's fail-loud migration doctrine.
+    sqlx::query("SELECT 1 FROM usage_events_daily LIMIT 1")
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(|e| {
+            Error::Database(format!(
+                "usage_events_daily precondition check failed (ensure migrations 20260903000003 \
+                 and 04 have run before starting): {e}"
+            ))
+        })?;
+
     let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool.clone()));
     let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
         BearerTokenService::new(oauth2.clone())
@@ -199,7 +222,16 @@ pub async fn start_usage_server(
         repo,
         bearer,
         scope_authority,
+        raw_days: retention.raw_days,
     });
+
+    // #549 AC2: the retention/rollup background job. It owns its own `PgPool` clone (the shared
+    // pool is behind a `dyn DbPoolTrait`), and runs independently of both listeners -- a retention
+    // failure is logged and retried, never fatal.
+    tokio::spawn(retention::run_retention_loop(
+        Arc::new(pool.pool().clone()),
+        retention.clone(),
+    ));
 
     let dev_cors = dev_cors_enabled();
     if dev_cors {

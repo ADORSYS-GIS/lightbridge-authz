@@ -22,6 +22,70 @@ pub struct UsageConfig {
     /// `oauth2` above is: this is the one thing that turns "we validated a bearer token" into "and
     /// this user actually owns what they're asking about."
     pub scope_authority: ScopeAuthorityConfig,
+    /// Retention/rollup for `usage_events` (#549 AC2). Optional with safe defaults: the background
+    /// job is on by default, keeps 90 days of raw events, and rolls older rows into
+    /// `usage_events_daily` hourly. See [`RetentionConfig`].
+    #[serde(default)]
+    pub retention: RetentionConfig,
+}
+
+/// Retention/rollup configuration for `usage_events` (#549 AC2).
+///
+/// `usage_events` grows ~100 MB/day with no retention. This config drives a background job in the
+/// usage service that rolls rows older than `raw_days` into the `usage_events_daily` aggregate and
+/// deletes them from the raw table, in one transaction. The dashboard's max range is 90 days, so
+/// `raw_days` MUST be >= 90 to keep the full dashboard window queryable from raw (which is what
+/// keeps latency percentiles exact -- the rollup does not carry them). Budget spend reads the
+/// current billing period, which is always within the raw window, so it is never truncated.
+///
+/// The rollup table itself is also bounded: `rollup_days` (default 365) is how long a rolled-up day
+/// is kept before it too is deleted, so the long-term store does not grow without bound. Nothing
+/// reads the rollup today (the dashboard's 90-day window is served from raw, and budget spend reads
+/// the current period), so this bound is what keeps `usage_events_daily` from becoming the next
+/// write-only, unbounded table -- the exact anti-pattern #549 exists to remove.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetentionConfig {
+    /// Whether the retention/rollup background job runs. Default `true`.
+    #[serde(default = "default_retention_enabled")]
+    pub enabled: bool,
+    /// Days of raw `usage_events` to keep before rolling up + deleting. Must be >= the dashboard's
+    /// max range (90 days). Default `90`.
+    #[serde(default = "default_retention_raw_days")]
+    pub raw_days: i64,
+    /// How long a rolled-up day is kept in `usage_events_daily` before it too is deleted. Must be
+    /// >= 1. Default `365` (one year of long-term retention).
+    #[serde(default = "default_retention_rollup_days")]
+    pub rollup_days: i64,
+    /// How often the retention/rollup job runs, in seconds. Default `3600` (hourly).
+    #[serde(default = "default_retention_interval_seconds")]
+    pub interval_seconds: u64,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_retention_enabled(),
+            raw_days: default_retention_raw_days(),
+            rollup_days: default_retention_rollup_days(),
+            interval_seconds: default_retention_interval_seconds(),
+        }
+    }
+}
+
+fn default_retention_enabled() -> bool {
+    true
+}
+
+fn default_retention_raw_days() -> i64 {
+    90
+}
+
+fn default_retention_rollup_days() -> i64 {
+    365
+}
+
+fn default_retention_interval_seconds() -> u64 {
+    3600
 }
 
 /// HTTP client config for calling `authz-opa`'s `POST /idp/v1/authorize-usage-scope` (#570).
@@ -85,7 +149,29 @@ pub struct UsageServer {
 
 pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<UsageConfig> {
     debug!("loading usage config from {:?}", path.as_ref());
-    let config = load_yaml_from_path(path)?;
+    let config: UsageConfig = load_yaml_from_path(path)?;
+    if config.retention.raw_days < 90 {
+        return Err(lightbridge_authz_core::Error::Server(format!(
+            "retention.raw_days must be >= 90 (got {})",
+            config.retention.raw_days
+        )));
+    }
+    if config.retention.rollup_days < 1 {
+        return Err(lightbridge_authz_core::Error::Server(format!(
+            "retention.rollup_days must be >= 1 (got {})",
+            config.retention.rollup_days
+        )));
+    }
+    // The rollup must retain data LONGER than the raw window, or a rolled-up day is deleted from
+    // `usage_events_daily` in the same transaction that wrote it (the rollup purge cutoff is
+    // `rollup_days`, and a day older than `raw_days` is already older than `rollup_days` when
+    // `rollup_days <= raw_days`). That would silently destroy every rolled-up day.
+    if config.retention.rollup_days <= config.retention.raw_days {
+        return Err(lightbridge_authz_core::Error::Server(format!(
+            "retention.rollup_days must be > retention.raw_days (got rollup_days={}, raw_days={})",
+            config.retention.rollup_days, config.retention.raw_days
+        )));
+    }
     debug!("loaded usage config successfully");
     Ok(config)
 }
@@ -274,6 +360,62 @@ otel:
         assert!(
             result.is_err(),
             "a config omitting scope_authority must fail to load, not silently degrade"
+        );
+    }
+
+    /// #549 AC2: `retention` is optional with safe defaults -- a config that omits it must load
+    /// with the retention job enabled, 90 raw days, and an hourly interval, so retention is on by
+    /// default rather than silently absent.
+    #[test]
+    fn config_omitting_retention_gets_safe_defaults() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("usage-config-no-retention-{unique}.yaml"));
+        let content = format!(
+            "{}\noauth2:\n  type: external\n  jwks_url: \"http://keycloak:9100/realms/dev/protocol/openid-connect/certs\"\nscope_authority:\n  base_url: \"https://authz-opa:3001\"\n  username: \"authorino\"\n  password: \"change-me\"\n",
+            valid_server_and_logging_block()
+        );
+        fs::write(&path, content).expect("temp config should be written");
+
+        let cfg = load_from_path(&path).expect("config should load");
+        fs::remove_file(&path).expect("temp config should be removed");
+
+        assert!(cfg.retention.enabled, "retention must default to enabled");
+        assert_eq!(cfg.retention.raw_days, 90, "raw_days must default to 90");
+        assert_eq!(
+            cfg.retention.rollup_days, 365,
+            "rollup_days must default to 365"
+        );
+        assert_eq!(
+            cfg.retention.interval_seconds, 3600,
+            "interval_seconds must default to 3600"
+        );
+    }
+
+    /// #549: `rollup_days` must be > `raw_days`, or a rolled-up day is deleted from the rollup in
+    /// the same transaction that wrote it (the rollup purge cutoff is `rollup_days`, and a day
+    /// older than `raw_days` is already older than `rollup_days` when `rollup_days <= raw_days`).
+    #[test]
+    fn config_rejects_rollup_days_not_greater_than_raw_days() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("usage-config-bad-rollup-{unique}.yaml"));
+        let content = format!(
+            "{}\noauth2:\n  type: external\n  jwks_url: \"http://keycloak:9100/realms/dev/protocol/openid-connect/certs\"\nscope_authority:\n  base_url: \"https://authz-opa:3001\"\n  username: \"authorino\"\n  password: \"change-me\"\nretention:\n  enabled: true\n  raw_days: 90\n  rollup_days: 30\n",
+            valid_server_and_logging_block()
+        );
+        fs::write(&path, content).expect("temp config should be written");
+
+        let result = load_from_path(&path);
+        fs::remove_file(&path).expect("temp config should be removed");
+
+        assert!(
+            result.is_err(),
+            "rollup_days <= raw_days must fail to load, not silently destroy rolled-up days"
         );
     }
 }

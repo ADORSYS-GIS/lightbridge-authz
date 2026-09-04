@@ -2,7 +2,6 @@ use crate::models::{UsageGroupBy, UsageQueryRequest, UsageScope, UsageSeriesPoin
 use chrono::{DateTime, Utc};
 use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_core::{Error, Result};
-use serde_json::Value;
 use sqlx::{FromRow, PgPool, Postgres, QueryBuilder};
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
@@ -47,7 +46,6 @@ pub struct UsageEvent {
     /// `percentile_cont`. Query results surface that as `latency_samples == 0` for the affected
     /// series rather than as a zero.
     pub latency_ms: Option<f64>,
-    pub attributes: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -97,10 +95,12 @@ impl StoreRepo {
 
     // `skip_all` + an explicit count, for the same reason `handlers::ingest`'s handlers do it
     // (owner report, 2026-09-03): `#[instrument(skip(self))]` recorded the `events` ARGUMENT into
-    // the span, and a `UsageEvent`'s `Debug` includes its whole `attributes` blob -- so every
-    // insert stamped the decoded contents of the export (account ids, user names, and whatever
-    // else the exporter put in the attributes) into the trace span. The count is the only part of
-    // that field anyone ever wanted.
+    // the span, and a `UsageEvent`'s `Debug` used to include its whole `attributes` blob -- so
+    // every insert stamped the decoded contents of the export (account ids, user names, and
+    // whatever else the exporter put in the attributes) into the trace span. The count is the
+    // only part of that field anyone ever wanted. (`attributes` itself was dropped at ingest,
+    // #549 AC1, but the `skip_all` stays: the argument is still a slice of caller-supplied
+    // structs and its `Debug` is not something to echo into a span.)
     #[instrument(skip_all, fields(events = events.len()))]
     pub async fn insert_usage_events(&self, events: &[UsageEvent]) -> Result<usize> {
         debug!("inserting {} usage events", events.len());
@@ -109,7 +109,7 @@ impl StoreRepo {
         }
 
         let mut builder = QueryBuilder::<Postgres>::new(
-            "INSERT INTO usage_events (observed_at, signal_type, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, azp, operation, billing_plan, usage_value, request_count, prompt_tokens, completion_tokens, total_tokens, total_cost, latency_ms, attributes) ",
+            "INSERT INTO usage_events (observed_at, signal_type, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, azp, operation, billing_plan, usage_value, request_count, prompt_tokens, completion_tokens, total_tokens, total_cost, latency_ms) ",
         );
 
         builder.push_values(events, |mut row, event| {
@@ -131,8 +131,7 @@ impl StoreRepo {
                 .push_bind(event.completion_tokens)
                 .push_bind(event.total_tokens)
                 .push_bind(event.total_cost.unwrap_or(0.0))
-                .push_bind(event.latency_ms)
-                .push_bind(&event.attributes);
+                .push_bind(event.latency_ms);
         });
 
         let result = builder.build().execute(self.pool()).await?;
@@ -146,6 +145,29 @@ impl StoreRepo {
     /// this HTTP endpoint -- see `crates/lightbridge-authz-budget/src/spend.rs`. `None` means SQL
     /// `SUM` over zero matching rows (`NULL`), never collapsed to `0.0` here: that distinction is
     /// load-bearing for the budget domain's `Spend::Known`/`Spend::Unavailable` split.
+    ///
+    /// ## Reads raw UNION ALL rollup (#549 AC2)
+    ///
+    /// Since the retention job rolls rows older than `raw_days` out of `usage_events` into
+    /// `usage_events_daily`, a spend query must read both or it would silently under-count once
+    /// data ages past the boundary. The two arms are `UNION ALL`ed and summed as one set, which
+    /// preserves the exact `SUM`-over-NULL semantics: an empty combined set, or one where every
+    /// `total_cost` is NULL, yields `None`; any non-NULL cost yields `Some(sum)`. The current
+    /// billing period is always within the raw window, so for the queries budget actually issues
+    /// the rollup arm is empty and the result is identical to the pre-rollup query (AC3).
+    ///
+    /// ## Day-granularity of the rollup arm
+    ///
+    /// The rollup arm matches on `bucket_start` (the truncated day), not `observed_at`, because a
+    /// rolled-up day is stored as a single row keyed by its day boundary. A day is either entirely
+    /// raw or entirely rolled up (only complete days are rolled up), so there is no double-count
+    /// between the arms. The consequence is that a spend query whose `[start, end)` boundary falls
+    /// MID-DAY on a day that has aged into the rollup is **day-granular**: the rollup row for that
+    /// day is included only if its `bucket_start` is within `[start, end)`, so a sub-day slice of a
+    /// rolled-up day is not answered exactly. This never manifests for budget's real queries --
+    /// billing periods are month-aligned (day boundaries) and always within the raw window, so the
+    /// rollup arm is empty -- but callers should treat spend over a rolled-up period as
+    /// day-granular, not sub-day-exact.
     #[instrument(skip(self))]
     pub async fn spend_for_account(
         &self,
@@ -158,9 +180,17 @@ impl StoreRepo {
             account_id, start, end
         );
         let total_cost: Option<f64> = sqlx::query_scalar::<_, Option<f64>>(
-            "SELECT SUM(total_cost)::double precision FROM usage_events \
-             WHERE account_id = $1 AND observed_at >= $2 AND observed_at < $3",
+            "SELECT SUM(total_cost)::double precision FROM ( \
+                 SELECT total_cost FROM usage_events \
+                 WHERE account_id = $1 AND observed_at >= $2 AND observed_at < $3 \
+                 UNION ALL \
+                 SELECT total_cost FROM usage_events_daily \
+                 WHERE account_id = $1 AND bucket_start >= $2 AND bucket_start < $3 \
+             ) AS spend_rows",
         )
+        .bind(account_id)
+        .bind(start)
+        .bind(end)
         .bind(account_id)
         .bind(start)
         .bind(end)
@@ -174,6 +204,19 @@ impl StoreRepo {
     /// derived from the count of DISTINCT `bucket_start` values that matched, never from row
     /// count -- see below for why that distinction is load-bearing whenever `group_by` is
     /// non-empty. `Vec<UsageSeriesPoint>` comes back in ascending `bucket_start` order.
+    ///
+    /// ## Query horizon = the raw retention window (#549)
+    ///
+    /// This query reads `usage_events` (raw) ONLY -- the `usage_events_daily` rollup does not carry
+    /// latency percentiles, so it cannot serve this endpoint's percentile contract. The raw table
+    /// is kept for `retention.raw_days` (default 90) before being rolled up and purged, so a
+    /// request whose `start_time` is older than that window has no data there. The dashboard's max
+    /// range is 90 days, so this is fine for every in-tree caller, but a caller asking for a longer
+    /// range gets only the raw window back. The handler (`handlers::query::query_usage`) ORs a
+    /// range-truncation flag into `truncated` when `start_time` is older than the raw window, so
+    /// the API never reports `truncated: false` for a range it cannot answer (P1-5). Reading the
+    /// rollup too (accepting that latency percentiles stop existing past the boundary) remains a
+    /// possible future reconciliation.
     ///
     /// ## #578: truncation is BUCKET-scoped, not row-scoped
     ///

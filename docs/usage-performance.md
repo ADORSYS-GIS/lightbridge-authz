@@ -127,6 +127,15 @@ migration ends with `ANALYZE usage_events` (`:96`), because #648's backfill had 
 every row the day before and stale statistics are exactly how a plan that should be an index-only
 scan ends up sequential.
 
+**Since #549 (2026-09-04)** the `attributes` column is dropped from the schema (`20260903000003`,
+catalog-only, no rewrite) and no longer written at ingest, so Cause 2's 87%-of-heap column is gone
+from every new row; the physical reclaim of the ~900 MB of existing rows is the separate one-off
+#549 AC5 (`VACUUM FULL`/`pg_repack`). The retention job also rolls rows older than
+`retention.raw_days` (default 90) out of `usage_events` into `usage_events_daily`, so the raw table
+— and therefore `/usage/v1/usage/query`, which reads raw only — is bounded to the 90-day window; a
+query for a longer horizon returns only what still exists (see `docs/lightbridge-query-api.md`'s
+"Query horizon").
+
 `CREATE INDEX CONCURRENTLY` is **not** used, and the migration says why in its own header
 (`:66-69`): sqlx applies a file as one multi-statement simple query — an implicit transaction block,
 where `CONCURRENTLY` is rejected — and its failure mode leaves a silently-INVALID index that a

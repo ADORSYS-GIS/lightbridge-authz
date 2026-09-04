@@ -14,7 +14,7 @@ use lightbridge_authz_usage_rest::models::{
     UsageGroupBy, UsageMetric, UsageQueryFilters, UsageQueryRequest, UsageScope,
 };
 use lightbridge_authz_usage_rest::repo::{StoreRepo, UsageEvent};
-use serde_json::{Value, json};
+use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -44,7 +44,6 @@ fn sample_event(observed_at: chrono::DateTime<Utc>) -> UsageEvent {
         total_tokens: Some(10),
         total_cost: Some(0.05),
         latency_ms: Some(410.0),
-        attributes: json!({"k": "v"}),
     }
 }
 
@@ -352,6 +351,7 @@ async fn healthz_ready_reports_ok_against_a_live_database(pool: PgPool) {
         repo,
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: 90,
     });
     let app = build_ingest_router(state, readiness_pool, false);
 
@@ -1036,192 +1036,6 @@ async fn operation_in_never_matches_rows_with_a_null_operation(pool: PgPool) {
     );
 }
 
-/// #648: the backfill migration, exercised on a row that only ever had the JSONB blob -- exactly
-/// the shape of every row already in production. The row is written with `sqlx::query` against
-/// the raw table (NOT through `StoreRepo::insert_usage_events`, which now fills the columns
-/// itself and would prove nothing), the three columns are asserted NULL, then the backfill's own
-/// SQL is replayed and the columns must appear, derived identically to ingest -- with the
-/// `attributes` blob left byte-for-byte intact.
-///
-/// `sqlx::test` runs every migration on a fresh, EMPTY database, so the real migration's loop
-/// runs over zero rows; replaying its `UPDATE` here against a seeded row is what actually
-/// exercises the derivation. The SQL below is the same statement the migration's loop body holds.
-#[sqlx::test(migrations = "../../migrations-usage")]
-async fn backfill_derives_the_new_columns_from_the_attributes_blob(pool: PgPool) {
-    let rows = [
-        (
-            json!({
-                "azp": "converse-console",
-                "billing_plan": "pro",
-                "x-envoy-origin-path": "/v1/chat/completions?stream=true"
-            }),
-            Some("converse-console"),
-            Some("pro"),
-            Some("chat_completions"),
-        ),
-        (
-            json!({"x-oidc-azp": "cli", "x-billing-plan": "free", "url.path": "/v1/embeddings"}),
-            Some("cli"),
-            Some("free"),
-            Some("embeddings"),
-        ),
-        (
-            json!({"route_name": "openai-route"}),
-            None,
-            None,
-            Some("other"),
-        ),
-        (
-            // No path key at all -> operation stays NULL, never 'other'.
-            json!({"azp": "batch-job"}),
-            Some("batch-job"),
-            None,
-            None,
-        ),
-        (
-            // Empty strings are absent values, not values of "".
-            json!({"azp": "", "billing_plan": "", "x-envoy-origin-path": ""}),
-            None,
-            None,
-            None,
-        ),
-    ];
-
-    for (index, (attributes, _, _, _)) in rows.iter().enumerate() {
-        sqlx::query(
-            "INSERT INTO usage_events (id, observed_at, signal_type, usage_value, request_count, attributes) \
-             VALUES ($1, NOW(), 'log', 1, 1, $2)",
-        )
-        .bind(index as i64 + 1)
-        .bind(attributes)
-        .execute(&pool)
-        .await
-        .expect("seeding a pre-migration row must succeed");
-    }
-
-    let unfilled: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM usage_events WHERE azp IS NULL AND operation IS NULL AND billing_plan IS NULL",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("count should succeed");
-    assert_eq!(
-        unfilled, 5,
-        "a row inserted straight into the table must start with all three columns NULL"
-    );
-
-    let updated = sqlx::query(BACKFILL_BATCH_SQL)
-        .execute(&pool)
-        .await
-        .expect("the backfill statement must run");
-    assert_eq!(
-        updated.rows_affected(),
-        4,
-        "only rows the blob can actually derive something for are rewritten"
-    );
-
-    for (index, (attributes, azp, billing_plan, operation)) in rows.iter().enumerate() {
-        let row: (Option<String>, Option<String>, Option<String>, Value) = sqlx::query_as(
-            "SELECT azp, billing_plan, operation, attributes FROM usage_events WHERE id = $1",
-        )
-        .bind(index as i64 + 1)
-        .fetch_one(&pool)
-        .await
-        .expect("reading the backfilled row must succeed");
-
-        assert_eq!(row.0.as_deref(), *azp, "azp for row {}", index + 1);
-        assert_eq!(
-            row.1.as_deref(),
-            *billing_plan,
-            "billing_plan for row {}",
-            index + 1
-        );
-        assert_eq!(
-            row.2.as_deref(),
-            *operation,
-            "operation for row {}",
-            index + 1
-        );
-        assert_eq!(
-            &row.3, attributes,
-            "the backfill must leave the attributes blob untouched"
-        );
-    }
-
-    // Idempotent: a second pass rewrites nothing, which is what makes a resumed or re-run
-    // migration cheap instead of a full table rewrite.
-    let second_pass = sqlx::query(BACKFILL_BATCH_SQL)
-        .execute(&pool)
-        .await
-        .expect("the backfill statement must run again");
-    assert_eq!(second_pass.rows_affected(), 0);
-}
-
-/// The loop body of `migrations-usage/20260902000002_usage_event_dimensions_backfill.sql`, with
-/// the `id`-range bounds widened to the whole table (the migration bounds them per batch; the
-/// derivation is what is under test here). Kept verbatim otherwise -- if the migration's
-/// derivation and this string ever disagree, this test stops proving anything about the
-/// migration, so any edit to one must be made to the other.
-const BACKFILL_BATCH_SQL: &str = r#"
-UPDATE usage_events AS e
-SET azp = src.azp,
-    billing_plan = src.billing_plan,
-    operation = src.operation
-FROM (
-    SELECT
-        id,
-        COALESCE(
-            NULLIF(attributes ->> 'azp', ''),
-            NULLIF(attributes ->> 'x-oidc-azp', ''),
-            NULLIF(attributes ->> 'oauth.azp', ''),
-            NULLIF(attributes ->> 'client_id', '')
-        ) AS azp,
-        COALESCE(
-            NULLIF(attributes ->> 'billing_plan', ''),
-            NULLIF(attributes ->> 'x-billing-plan', '')
-        ) AS billing_plan,
-        CASE
-            WHEN COALESCE(
-                     NULLIF(attributes ->> 'x-envoy-origin-path', ''),
-                     NULLIF(attributes ->> 'http.route', ''),
-                     NULLIF(attributes ->> 'url.path', ''),
-                     NULLIF(attributes ->> 'route_name', '')
-                 ) LIKE '/v1/chat/completions%' THEN 'chat_completions'
-            WHEN COALESCE(
-                     NULLIF(attributes ->> 'x-envoy-origin-path', ''),
-                     NULLIF(attributes ->> 'http.route', ''),
-                     NULLIF(attributes ->> 'url.path', ''),
-                     NULLIF(attributes ->> 'route_name', '')
-                 ) LIKE '/v1/responses%' THEN 'responses'
-            WHEN COALESCE(
-                     NULLIF(attributes ->> 'x-envoy-origin-path', ''),
-                     NULLIF(attributes ->> 'http.route', ''),
-                     NULLIF(attributes ->> 'url.path', ''),
-                     NULLIF(attributes ->> 'route_name', '')
-                 ) LIKE '/v1/messages%' THEN 'messages'
-            WHEN COALESCE(
-                     NULLIF(attributes ->> 'x-envoy-origin-path', ''),
-                     NULLIF(attributes ->> 'http.route', ''),
-                     NULLIF(attributes ->> 'url.path', ''),
-                     NULLIF(attributes ->> 'route_name', '')
-                 ) LIKE '/v1/embeddings%' THEN 'embeddings'
-            WHEN COALESCE(
-                     NULLIF(attributes ->> 'x-envoy-origin-path', ''),
-                     NULLIF(attributes ->> 'http.route', ''),
-                     NULLIF(attributes ->> 'url.path', ''),
-                     NULLIF(attributes ->> 'route_name', '')
-                 ) IS NOT NULL THEN 'other'
-            ELSE NULL
-        END AS operation
-    FROM usage_events
-) AS src
-WHERE e.id = src.id
-  AND e.azp IS NULL
-  AND e.billing_plan IS NULL
-  AND e.operation IS NULL
-  AND (src.azp IS NOT NULL OR src.billing_plan IS NOT NULL OR src.operation IS NOT NULL)
-"#;
-
 /// #648: the three composite indexes the migration promises actually exist after migration --
 /// a group-by on an unindexed dimension over this table is a sequential scan, which is the
 /// difference between a dashboard and a timeout (#606).
@@ -1479,6 +1293,7 @@ async fn ingest_must_not_log_the_request_body_and_must_not_log_at_info(pool: PgP
         repo: Arc::new(build_repo(pool)),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: 90,
     });
     let app = build_ingest_router(state, readiness_pool, false);
 

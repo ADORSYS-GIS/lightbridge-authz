@@ -105,6 +105,7 @@ fn mock_state() -> Arc<UsageState> {
             &UsageScope::Project,
             "proj_1",
         )),
+        raw_days: 90,
     })
 }
 
@@ -373,6 +374,7 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
             &UsageScope::Project,
             "proj_1",
         )),
+        raw_days: 90,
     });
 
     let req = base_request();
@@ -384,6 +386,28 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
     assert_eq!(payload.points.len(), 1);
     assert_eq!(payload.points[0].project_id.as_deref(), Some("proj_1"));
     assert!(!payload.truncated);
+}
+
+/// P1-5: `/usage/v1/usage/query` reads raw `usage_events` only, so a request whose `start_time` is
+/// older than the raw retention window (`raw_days`, default 90) has no data there. The handler must
+/// set `truncated: true` for such a range rather than report `truncated: false` for a range it
+/// cannot answer.
+#[tokio::test]
+async fn query_usage_sets_truncated_when_start_time_predates_the_raw_retention_window() {
+    let state = mock_state();
+    let mut req = base_request();
+    // Older than the 90-day raw window.
+    req.start_time = Utc::now() - Duration::days(200);
+    req.end_time = Utc::now() - Duration::days(100);
+
+    let response = call_query_usage(state, authorized_headers(), req).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: UsageQueryResponse = serde_json::from_value(body_json(response).await)
+        .expect("response body must decode as UsageQueryResponse");
+    assert!(
+        payload.truncated,
+        "a range predating the raw retention window must be reported as truncated"
+    );
 }
 
 /// #570: no `Authorization` header at all -- 401, no data.
@@ -509,6 +533,7 @@ async fn query_usage_refuses_when_scope_authority_declines() {
         }),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: 90,
     });
 
     let response = call_query_usage(state, authorized_headers(), base_request()).await;
@@ -540,6 +565,7 @@ async fn query_usage_refuses_api_key_scope_unconditionally() {
         repo: Arc::new(MockUsageRepo::default()),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(AuthorizeEverything),
+        raw_days: 90,
     });
 
     let req = UsageQueryRequest {
@@ -570,6 +596,7 @@ async fn query_usage_allows_own_user_scope() {
         }),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: 90,
     });
 
     let req = UsageQueryRequest {
@@ -590,6 +617,7 @@ async fn query_usage_refuses_other_subjects_user_scope() {
         repo: Arc::new(MockUsageRepo::default()),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(AuthorizeEverything),
+        raw_days: 90,
     });
 
     let req = UsageQueryRequest {
@@ -611,6 +639,7 @@ async fn query_usage_refuses_all_scope_without_permission() {
         repo: Arc::new(MockUsageRepo::default()),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(AuthorizeEverything),
+        raw_days: 90,
     });
 
     let req = UsageQueryRequest {
@@ -638,6 +667,7 @@ async fn query_usage_allows_all_scope_with_permission() {
             ]),
         ),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: 90,
     });
 
     let req = UsageQueryRequest {
@@ -669,6 +699,7 @@ async fn query_usage_all_scope_does_not_require_scope_id() {
                 ]),
             ),
             scope_authority: support::refuse_everything_scope_authority(),
+            raw_days: 90,
         })),
         authorized_headers(),
         Json(req),
@@ -701,6 +732,7 @@ async fn ingest_logs_treats_noop_insert_as_success() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: 90,
     });
 
     let response = ingest_logs(
@@ -726,6 +758,7 @@ async fn ingest_logs_rejects_invalid_protobuf_as_bad_request() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: 90,
     });
 
     let result = ingest_logs(
@@ -868,6 +901,7 @@ async fn ingest_traces_treats_noop_insert_as_success() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: 90,
     });
 
     let response = ingest_traces(
@@ -893,6 +927,7 @@ async fn ingest_traces_rejects_invalid_protobuf_as_bad_request() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: 90,
     });
 
     let result = ingest_traces(
@@ -920,6 +955,7 @@ async fn ingest_metrics_treats_noop_insert_as_success() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: 90,
     });
 
     let response = ingest_metrics(
@@ -945,6 +981,7 @@ async fn ingest_metrics_rejects_invalid_protobuf_as_bad_request() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: 90,
     });
 
     let result = ingest_metrics(
@@ -972,6 +1009,7 @@ async fn ingest_logs_accepts_json_content_type_payload() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: 90,
     });
 
     let body = serde_json::json!({
@@ -1022,6 +1060,7 @@ async fn ingest_logs_accepts_gzip_encoded_body() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: 90,
     });
 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());

@@ -23,7 +23,8 @@ Lightbridge Authz is a multi-service backend for API key management and usage an
 - `authz-idp` is the OIDC broker for both the human plane (browser SSO, RFC 8628 device flow, token
   exchange) and the machine plane (RFC 6749 §4.4 `client_credentials`, M2M, ADR-0030). It renders
   no HTML of its own — see its entry under Services below.
-- `lightbridge-authz-usage` ingests OTEL traffic data and serves Timescale-backed usage analytics.
+- `lightbridge-authz-usage` ingests OTEL traffic data and serves usage analytics (plain Postgres in
+  production, not Timescale — see `docs/architecture.md`).
 - `lightbridge-mcp` exposes all `lightbridge-authz` endpoints as MCP tools over streamable HTTP (`/mcp`).
 
 See [`docs/architecture.md`](docs/architecture.md) for the service/caller topology, crate layering, and
