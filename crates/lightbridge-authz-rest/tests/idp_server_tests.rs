@@ -2054,7 +2054,9 @@ mod db {
             port: 0,
             tls: bad_tls(),
             snapshot_refresh_seconds: 15,
-            snapshot_active_window_minutes: 10,
+            snapshot_active_window_minutes: 1440,
+            snapshot_slow_lane_minutes: 10,
+            snapshot_seed_lookback_days: 30,
             snapshot_batch: 500,
             snapshot_concurrency: 8,
         };

@@ -33,12 +33,12 @@
 //! cheap, always-answerable read rather than for a fresh one — and says so in the payload, via
 //! [`BudgetSnapshot::age_seconds`], instead of implying a freshness it does not have.
 
-use std::time::Duration;
-
 use chrono::{DateTime, Utc};
 
 use crate::error::BudgetError;
 use crate::period::Period;
+
+pub use crate::snapshot_config::{CoverageCounts, RefreshReport, SnapshotRefreshConfig};
 
 /// One account's precomputed balance, exactly as `budget_remaining_snapshots` stores it.
 ///
@@ -106,52 +106,11 @@ pub trait BudgetSnapshotReader: Send + Sync + std::fmt::Debug {
     async fn read(&self, budget_account_id: &str) -> Result<Option<BudgetSnapshot>, BudgetError>;
 
     /// Records that the request path just asked about this account, so the refresher keeps its
-    /// reading warm. Creates the row (with no reading) when there is none.
+    /// reading in the fast lane. Creates the row (with no reading) when there is none.
     ///
-    /// Write-behind by contract: callers must not await this on the hot path. Its failure is
-    /// logged and swallowed by the caller — a missed touch costs one refresh cycle of freshness,
-    /// never a wrong answer.
+    /// Off the hot path by contract — the caller runs it on a bounded, spawned write, at most once
+    /// per account per touch interval. Its failure is **not** swallowed: §15.6 makes the caller
+    /// release its throttle claim and count the loss, because a touch that is silently dropped
+    /// every time is how an account's `last_seen_at` stops moving without anything saying so.
     async fn touch(&self, budget_account_id: &str) -> Result<(), BudgetError>;
-}
-
-/// How the loop is paced and bounded. Every field is operator-tunable config
-/// (`server.budget.snapshot_*`); the defaults are the values ADR-0034 §15 argues for.
-#[derive(Debug, Clone, Copy)]
-pub struct SnapshotRefreshConfig {
-    /// Time between ticks. The dominant term of the snapshot's staleness, and therefore of the
-    /// forgiven-overspend window.
-    pub interval: Duration,
-    /// How recently an account must have been seen to be worth refreshing.
-    pub active_window: Duration,
-    /// Most accounts one tick will refresh. Bounds a tick's wall time so a large active set cannot
-    /// make ticks overlap; the remainder is picked up next tick, oldest-reading-first.
-    pub batch: i64,
-    /// Most spend reads in flight at once. The spend read is an HTTPS round trip to `authz-usage`,
-    /// so this is the knob that decides whether the refresher is a polite background job or a
-    /// thundering herd against a service that is also serving the console.
-    pub concurrency: usize,
-}
-
-impl Default for SnapshotRefreshConfig {
-    fn default() -> Self {
-        Self {
-            interval: Duration::from_secs(15),
-            active_window: Duration::from_secs(600),
-            batch: 500,
-            concurrency: 8,
-        }
-    }
-}
-
-/// What one tick did. Returned rather than only logged so a test can assert on it.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct RefreshReport {
-    /// `false` when another replica held the advisory lock; every other count is then zero.
-    pub ran: bool,
-    pub considered: usize,
-    pub refreshed: usize,
-    /// Accounts whose spend source could not be asked — previous reading kept, `stale_since`
-    /// stamped.
-    pub kept_stale: usize,
-    pub failed: usize,
 }

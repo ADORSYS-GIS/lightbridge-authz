@@ -1332,3 +1332,185 @@ the Redis cost counter" is no longer a *blocking* measurement, because the owner
 overspend it measures. It stays on the watch list as an observation, not a gate. What remains hard:
 zero unexplained `budget_unavailable`, and the two uncovered planes from §15.3 given an explicit
 `enforced: false` before Stage 3.
+
+### 15.6 Coverage — the number Stage 2 needs before it starts (2026-09-04)
+
+**The measurement that forced this.** The Stage 1b rollout watch
+([ai-helm-values#390](https://github.com/ADORSYS-GIS/ai-helm-values/pull/390) /
+[#391](https://github.com/ADORSYS-GIS/ai-helm-values/pull/391)) counted snapshot rows against
+accounts that can send traffic and found roughly half:
+
+| Population (`hetzner-prod`, ns `converse`, 2026-09-04 16:1x UTC) | Count |
+|---|---|
+| distinct `account_id` in `usage_events`, last 30 days | 90 |
+| …of those, values shaped like an `accounts.id` | 46 |
+| …of those, actually present in `accounts` | 43 |
+| …of those, holding a `budget_grants` row | 33 |
+| rows in `budget_remaining_snapshots` | **23** |
+
+So **20 real accounts with recent usage had no snapshot row**, and every one of them read
+`known: false` at the gateway — a permanent fail-open under enforcement, and a category of "no
+decision" that swamps the shadow decision table.
+
+**Three distinct causes, and only one of them is fixable here.**
+
+1. **Lazy creation cannot converge on the right set.** §15 created a row only when an introspection
+   touched the account. Coverage was therefore "accounts that happened to send API-key traffic since
+   the table was deployed", which is a moving subset of the accounts that *can* send traffic and
+   never equals it. It also loses a race it is permanently in: an account returning after a quiet
+   spell gets its row from the touch but no *reading* until the next tick, so its first requests are
+   `known: false` regardless.
+2. **The ten-minute active window froze every idle account.** Rows were never deleted, but they
+   stopped being refreshed: in production every idle row carried `refreshed_at ≈ last_seen_at +
+   10 min`. The reading is then arbitrarily stale, and at 00:00 UTC on the 1st every one of them
+   becomes period-mismatched — i.e. **absent** — simultaneously.
+3. **The busiest traffic is on a plane that has no snapshot to miss.** The top `usage_events`
+   producers key on `account_id` values that are GitHub repo slugs (`ADORSYS-GIS/lightbridge-authz`,
+   `cratestack/cratestack`) and sentinels (`-`, `internal-key-lightbridge`) — 44 of the 90 distinct
+   values. That is §15.3's `repobinding` plane: no `lightbridgeintrospect` step, so no touch, and an
+   "account id" that is not an `accounts.id`, so the table's foreign key could not hold a row for it
+   even if one were written. **This is why the busiest account had no row, and it is not a bug in the
+   refresher.** It is the fail-open narrowing §15.3 already declares, and it remains a Stage 3
+   blocker: those planes must ship `enforced: false`, not `known: false`.
+
+Cause (b)'s "the spawned touch is being dropped" was checked and ruled out: zero
+`failed to touch the budget snapshot's last_seen_at` lines in six hours of `authz-opa` logs.
+
+**What changes.** The refresher gains a seed and a second lane, and reports coverage as a number
+rather than leaving it to be reconstructed by hand:
+
+- **Seed, on startup and every tick.** Every account that is a real budget account (`accounts` ⋈
+  `users`, [`known_account`]'s exact definition) **and** either has a `budget_grants` row or owns an
+  active, used API key inside `snapshot_seed_lookback_days` (30) gets a row. Idempotent upsert, off
+  the request path, driven from the two evidence sets rather than from `accounts`. `ON CONFLICT`
+  does **not** move `last_seen_at` on a row still inside the active window — that column means "when
+  the request path last asked" and the lane split reads it — but it *does* re-arm a row that has
+  aged out, because that account still qualifies.
+- **Two lanes instead of one window.** `snapshot_active_window_minutes` becomes the outer bound and
+  rises 10 min → **24 h**; an account seen within `snapshot_slow_lane_minutes` (10) is recomputed
+  every tick, and one seen longer ago than that is recomputed once per that interval. Idle accounts
+  are **demoted, never dropped**. One key is both the boundary and the slow cadence deliberately:
+  two knobs would let an operator configure a band belonging to neither lane.
+- **The touch is no longer silently lost.** It stays spawned (the hot path is unchanged: one PK
+  probe plus a throttled write, exactly as §15 promised), but it is bounded by a 2 s timeout, and a
+  failure or timeout **releases the throttle claim** — so the next request retries instead of waiting
+  out the 30 s interval — and increments `budget_snapshot_touch_dropped_total`.
+- **Coverage is counted, once per tick, and logged at `info`.**
+  `budget_snapshot_accounts_total`, `budget_snapshot_known_total`, `budget_snapshot_stale_total`,
+  and `budget_snapshot_uncovered_total` — the last being accounts the seed predicate says can send
+  traffic and that the introspection would still answer `known: false` for. **That is the number
+  that must be zero**, and it is what the rollout runbook cites. Every counter §15 had described the
+  work a tick did; all four can read healthy while half the estate has no row.
+
+**What this deliberately does not do.** It does not seed from the usage store. Spend is read over
+HTTPS from `authz-usage`, which exposes no "list the accounts that spent" surface, and adding one
+would put a second service inside the loop whose entire job is to keep working while that service is
+down. `api_keys.last_used_at` records the same fact on this side of the wire.
+
+#### Diagrams
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant O as authz-opa (introspection)
+    participant DB as budget_remaining_snapshots
+    participant B as authz-budget (refresher)
+    participant U as authz-usage
+
+    Note over B,DB: startup, then every snapshot_refresh_seconds
+    B->>DB: SEED — INSERT … SELECT accounts ⋈ users<br/>WHERE has a grant OR a used active key (≤ seed_lookback_days)<br/>ON CONFLICT DO UPDATE last_seen_at ONLY if aged out
+    DB-->>B: rows created / re-armed
+    B->>DB: SELECT due — fast lane (seen ≤ slow_lane_interval)<br/>+ slow lane (seen ≤ active_window, reading older than slow_lane_interval)
+    loop ≤ snapshot_concurrency in flight
+        B->>U: POST /usage/v1/spend/query
+        alt answered
+            U-->>B: SUM(total_cost)
+            B->>DB: UPDATE reading, clear stale_since
+        else unreachable
+            U--xB: —
+            B->>DB: stamp stale_since, KEEP previous reading
+        end
+    end
+    B->>DB: CENSUS — accounts_total / known_total / stale_total / uncovered_total
+    B-->>B: log info "budget remaining snapshot refresh tick"
+
+    Note over O,DB: request path — unchanged, one indexed read
+    O->>DB: SELECT … WHERE budget_account_id = $1
+    O--)DB: spawned, ≤1 / 30 s / account, ≤2 s: UPDATE last_seen_at
+    Note over O: on failure/timeout: release the claim, count it,<br/>never suppress the next request's retry
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> NoRow: account exists, nothing has written a snapshot
+
+    NoRow --> Seeded: refresher seed — has a grant, or a used active key
+    NoRow --> Seen: introspection touch (still the fast path for a new account)
+    note right of Seeded
+        remaining_micros IS NULL. Fields OMITTED ⇒ known:false ⇒ 503.
+        Lasts at most one tick — the same tick's refresh pass computes it.
+    end note
+
+    Seeded --> Fresh: refresh pass — spend answered
+    Seen --> Fresh: refresh pass — spend answered
+    Fresh --> Fresh: fast lane (seen ≤ slow_lane_interval), every tick
+    Fresh --> Fresh: grant booked (delta applied in the grant's own tx)
+
+    Fresh --> SlowLane: idle past slow_lane_interval, still inside active_window
+    SlowLane --> SlowLane: refreshed once per slow_lane_interval
+    SlowLane --> Fresh: the request path touches it again
+
+    Fresh --> Stale: spend unreachable (stale_since stamped, reading KEPT)
+    SlowLane --> Stale: spend unreachable
+    Stale --> Fresh: spend answered again (stale_since cleared)
+
+    SlowLane --> Lapsed: idle past active_window (24 h)
+    Lapsed --> Seeded: the seed re-arms it — still eligible
+    note right of Lapsed
+        The ONLY state §15.6 leaves un-refreshed, and it is
+        unreachable for any account that can still send traffic:
+        the seed re-arms every one of those on the next tick.
+        §15's version of this state was where 20 production
+        accounts sat indefinitely.
+    end note
+
+    Fresh --> RolledOver: UTC month boundary
+    SlowLane --> RolledOver: UTC month boundary
+    RolledOver --> Fresh: next refresh pass for the new period
+
+    Seeded --> NoRow: account deleted (FK cascade)
+    Fresh --> NoRow: account deleted (FK cascade)
+
+    note left of NoRow
+        Still no transition into a fabricated 0. Every path out of
+        "we do not know" leads to an ABSENT field (503), never to a
+        zero balance (402). §15.6 changes how FEW accounts sit in
+        those states, not what they render as.
+    end note
+```
+
+#### The consequence that must be watched during shadow
+
+Closing the coverage gap does not only turn `known: false` into `known: true, remaining > 0`. Seven
+of the forty eligible accounts in `hetzner-prod` today hold a used, active API key and **no
+`budget_grants` row this period**. Their honest ceiling is `0`, so their first computed reading is
+`remaining_micros = −spent` (or `0`), and the gateway will read them as `known: true, remaining ≤ 0`.
+
+That is not a fabricated zero and it is not new arithmetic: it is exactly what
+`GET /budget/v1/remaining` already answers for them, and what `known_account`'s doc comment has
+always declared correct — "zero grants this period" is a *known* account with a ceiling of zero, not
+an unknown one. What changes is the **population** it applies to, because those accounts previously
+had no snapshot row at all and therefore fell through as `known: false`.
+
+Under Stage 2 (shadow) this surfaces as seven accounts in the `would_block` column, which is the
+point of shadow mode. It must be looked at there — funded, or deliberately unfunded? — **before**
+Stage 3, because at enforce it is a `402 budget_exhausted` for each of them. Do not "fix" it by
+narrowing `snapshot_seed_lookback_days`; that hides the account rather than answering the question,
+and §15.6's whole argument is that a hidden account is the expensive kind.
+
+#### Out of scope, restated so it is not mistaken for coverage
+
+`uncovered_total` counts only accounts the seed predicate can see. The `repobinding` and legacy
+Keycloak planes of §15.3 are **not** in it and cannot be: their traffic is not keyed on an
+`accounts.id`. Their `enforced: false` remains the Stage 3 blocker §15.3 declared, and the gateway's
+own access-log measurement — not this counter — is what will confirm it.

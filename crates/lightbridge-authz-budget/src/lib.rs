@@ -31,8 +31,13 @@ pub mod reset_scheduler;
 pub mod review;
 pub mod rule_data;
 pub mod snapshot;
+pub mod snapshot_config;
+mod snapshot_coverage;
+mod snapshot_lanes;
+mod snapshot_refresh_loop;
 mod snapshot_refresh_one;
 pub mod snapshot_refresher;
+mod snapshot_seed;
 pub mod snapshot_store;
 pub mod source;
 pub mod spend;
@@ -66,7 +71,9 @@ pub use rule_data::{
     Condition, Field, Operator, Rule, RuleDataEngine, RuleSet, default_rule_set_json,
     validate_rule_data,
 };
-pub use snapshot::{BudgetSnapshot, BudgetSnapshotReader, RefreshReport, SnapshotRefreshConfig};
+pub use snapshot::{
+    BudgetSnapshot, BudgetSnapshotReader, CoverageCounts, RefreshReport, SnapshotRefreshConfig,
+};
 pub use snapshot_refresher::SnapshotRefresher;
 pub use snapshot_store::SnapshotStore;
 pub use source::GrantSource;

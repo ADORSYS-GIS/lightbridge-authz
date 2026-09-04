@@ -362,8 +362,13 @@ sharedConfig:
       # ADR-0034 section 15: the remaining-snapshot refresher's pacing. See the same keys in
       # config/default.yaml for what each one trades. `snapshot_refresh_seconds` is the dominant
       # term of the forgiven-overspend window.
+      # section 15.6 added the seed and the slow lane: every account with a budget grant or a
+      # used, active API key inside `snapshot_seed_lookback_days` gets a row every tick, and an
+      # idle account is demoted to `snapshot_slow_lane_minutes` rather than dropped.
       snapshot_refresh_seconds: 15
-      snapshot_active_window_minutes: 10
+      snapshot_active_window_minutes: 1440
+      snapshot_slow_lane_minutes: 10
+      snapshot_seed_lookback_days: 30
       snapshot_batch: 500
       snapshot_concurrency: 8
   otel:

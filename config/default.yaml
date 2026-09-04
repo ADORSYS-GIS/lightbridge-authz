@@ -64,8 +64,16 @@ server:
     # account's enforced balance is at worst this stale, plus the OTLP ingest lag, plus one
     # in-flight request. The owner accepted that window explicitly -- per-request latency wins,
     # over-consumption is forgiven.
+    #
+    # ADR-0034 section 15.6 (coverage): the loop also SEEDS. Every tick guarantees a snapshot row
+    # for every account that has a budget grant, or an active API key that has been used, inside
+    # `snapshot_seed_lookback_days` -- so coverage is a property of the estate, not of who happened
+    # to send a request since the table was created (the Stage 1b rollout watch measured ~50%
+    # before this existed). Idle accounts are demoted to a slow lane, never dropped.
     snapshot_refresh_seconds: 15
-    snapshot_active_window_minutes: 10
+    snapshot_active_window_minutes: 1440
+    snapshot_slow_lane_minutes: 10
+    snapshot_seed_lookback_days: 30
     snapshot_batch: 500
     snapshot_concurrency: 8
   # authz-budget's SECOND listener (ADR-0034 + its 2026-09-03 amendment, lightbridge-authz#658):
