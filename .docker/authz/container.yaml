@@ -45,6 +45,21 @@ server:
     tls:
       cert_path: "${BUDGET_TLS_CERT_PATH:-/tls/budget.crt}"
       key_path: "${BUDGET_TLS_KEY_PATH:-/tls/budget.key}"
+    # ADR-0034 section 15 (the single-call design, owner directive 2026-09-04): the background
+    # loop that precomputes every ACTIVE account's remaining balance into
+    # `budget_remaining_snapshots`, so `authz-opa`'s introspection can answer the gateway's budget
+    # question from ONE indexed read and the gateway needs one metadata call per request instead
+    # of two. Runs on this process only; `authz-api`/`lightbridge-mcp` share the service graph and
+    # do not start it.
+    #
+    # `snapshot_refresh_seconds` is the DOMINANT term of the forgiven-overspend window: an
+    # account's enforced balance is at worst this stale, plus the OTLP ingest lag, plus one
+    # in-flight request. The owner accepted that window explicitly -- per-request latency wins,
+    # over-consumption is forgiven.
+    snapshot_refresh_seconds: 15
+    snapshot_active_window_minutes: 10
+    snapshot_batch: 500
+    snapshot_concurrency: 8
   # authz-budget's SECOND listener (ADR-0034 + its 2026-09-03 amendment, lightbridge-authz#658):
   # the internal read `GET /budget/v1/remaining` the gateway's Dynamic Budget Limiter calls
   # through Authorino. A separate port, not a route on `budget` above, so the console's bearer-JWT

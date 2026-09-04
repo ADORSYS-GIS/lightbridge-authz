@@ -164,6 +164,8 @@ impl RemainingReader for RemainingService {
             remaining_micros: ceiling_micros.saturating_sub(spent_micros),
             next_reset_at,
             source_lag_seconds,
+            // Computed live, from the ledger and the spend source, for this call.
+            snapshot_age_seconds: None,
         })))
     }
 }

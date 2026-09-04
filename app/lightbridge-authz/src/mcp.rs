@@ -182,6 +182,9 @@ impl LightbridgeMcpHandler {
             api_key_audience,
             resolver: resolver.clone(),
             federation_issuer,
+            // MCP never serves the gateway's AuthConfig, so nothing here reads a budget snapshot;
+            // the throttle is inert and `MockOpaRepo`-style repos answer the trait default.
+            budget: Default::default(),
         });
 
         let mut tool_router = Self::tool_router();
@@ -3262,6 +3265,7 @@ mod tests {
             api_key_audience: None,
             resolver: test_resolver(),
             federation_issuer: "https://keycloak.example.test/realms/dev".to_string(),
+            budget: Default::default(),
         });
 
         let result = run_validate_api_key(
@@ -3288,6 +3292,7 @@ mod tests {
             api_key_audience: None,
             resolver: test_resolver(),
             federation_issuer: "https://keycloak.example.test/realms/dev".to_string(),
+            budget: Default::default(),
         });
 
         let result = run_validate_authorino(

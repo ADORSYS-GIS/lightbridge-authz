@@ -1525,6 +1525,7 @@ fn opa_state(core: Arc<dyn DbPoolTrait>) -> Arc<OpaState> {
         api_key_audience: None,
         resolver: common::test_resolver(),
         federation_issuer: "https://keycloak.example.test/realms/dev".to_string(),
+        budget: Default::default(),
     })
 }
 

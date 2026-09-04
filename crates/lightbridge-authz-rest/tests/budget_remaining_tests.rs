@@ -85,6 +85,7 @@ fn known() -> BudgetRemaining {
             .parse::<DateTime<Utc>>()
             .expect("valid timestamp"),
         source_lag_seconds: None,
+        snapshot_age_seconds: None,
     }
 }
 
@@ -569,4 +570,95 @@ async fn the_span_carries_the_404_and_the_account_that_caused_it() {
         "the id that matched nothing is the whole content of this failure: {:?}",
         span.fields
     );
+}
+
+// ── ADR-0034 §15: the snapshot-served answer, and the operator's escape hatch ─────────────────
+
+/// A reader that answers differently on the snapshot path and the live path, so a test can tell
+/// which one the handler took.
+#[derive(Debug)]
+struct TwoPathReader;
+
+#[lightbridge_authz_core::async_trait]
+impl RemainingReader for TwoPathReader {
+    async fn remaining_for_account(
+        &self,
+        _budget_account_id: &str,
+        period: &Period,
+        _now: DateTime<Utc>,
+    ) -> Result<Remaining, BudgetError> {
+        let mut remaining = known();
+        remaining.period = period.clone();
+        remaining.snapshot_age_seconds = Some(9);
+        Ok(Remaining::Known(Box::new(remaining)))
+    }
+
+    async fn remaining_for_account_live(
+        &self,
+        _budget_account_id: &str,
+        period: &Period,
+        _now: DateTime<Utc>,
+    ) -> Result<Remaining, BudgetError> {
+        let mut remaining = known();
+        remaining.period = period.clone();
+        remaining.remaining_micros = 1_234_567;
+        Ok(Remaining::Known(Box::new(remaining)))
+    }
+}
+
+fn two_path_app() -> Router {
+    let state = Arc::new(BudgetInternalState {
+        remaining: Arc::new(TwoPathReader),
+        shared_secret: SECRET.to_string(),
+        shared_secret_header: HeaderName::from_static(SECRET_HEADER),
+    });
+    budget_remaining_router(state.clone()).with_state(state)
+}
+
+#[tokio::test]
+async fn a_snapshot_served_answer_reports_how_old_it_is() {
+    let (status, body) = call(
+        two_path_app(),
+        "/budget/v1/remaining?account_id=acct_1",
+        false,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["remaining_micros"], 20_790_000);
+    assert_eq!(
+        body["snapshot_age_seconds"], 9,
+        "the single-call design trades freshness for one indexed read; the age is how that trade \
+         is made visible rather than hidden"
+    );
+}
+
+#[tokio::test]
+async fn fresh_true_bypasses_the_snapshot_and_recomputes_live() {
+    let (status, body) = call(
+        two_path_app(),
+        "/budget/v1/remaining?account_id=acct_1&fresh=true",
+        false,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["remaining_micros"], 1_234_567);
+    assert!(
+        body.get("snapshot_age_seconds").is_none(),
+        "a live answer has no snapshot age; reporting 0 would claim a freshness measurement that \
+         was never taken"
+    );
+}
+
+#[tokio::test]
+async fn a_live_answer_omits_the_snapshot_age_rather_than_reporting_zero() {
+    let (_, body) = call(
+        app(StubReader::Known(known())),
+        "/budget/v1/remaining?account_id=acct_1",
+        false,
+    )
+    .await;
+
+    assert!(body.get("snapshot_age_seconds").is_none());
 }

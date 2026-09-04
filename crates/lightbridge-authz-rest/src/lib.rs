@@ -1,4 +1,4 @@
-use axum::{Json, Router, http::StatusCode, routing::get};
+use axum::{Router, routing::get};
 use lightbridge_authz_core::{
     Account, AccountId, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
     RotateApiKey, async_trait,
@@ -7,7 +7,7 @@ use lightbridge_authz_core::{
         Federation, IdpServer, JwtSigning, ModelCatalog, Oauth2, OauthClient, OauthClientType,
         OpaServer, QuotaTiers, Redis, UsageServiceClient,
     },
-    db::{DbPoolTrait, is_database_ready},
+    db::DbPoolTrait,
     error::{Error, Result},
     server::{dev_cors_enabled, serve_tls},
 };
@@ -22,6 +22,13 @@ pub mod budget_remaining_auth;
 pub mod budget_remaining_router;
 pub mod budget_remaining_wire;
 pub mod budget_services;
+mod health_handlers;
+pub mod introspect_budget;
+mod opa_doc;
+use health_handlers::{
+    health_handler, readiness_handler, root_handler, startup_handler, version_handler,
+};
+use opa_doc::OpaDoc;
 pub mod claim_redeem;
 pub mod codec;
 pub mod end_session;
@@ -79,7 +86,6 @@ use cratestack::{
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait};
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::cors::CorsLayer;
@@ -148,12 +154,6 @@ pub const SERVICE_BUDGET: &str = "authz-budget";
 /// answer.
 pub const SERVICE_BUDGET_INTERNAL: &str = "authz-budget-internal";
 
-#[derive(Serialize, Deserialize)]
-struct RootResponse {
-    status: String,
-    message: String,
-}
-
 /// Shared state for the OPA server.
 pub struct OpaState {
     pub repo: Arc<dyn OpaRepoTrait>,
@@ -177,6 +177,10 @@ pub struct OpaState {
     /// `oauth2.federation.issuer` -- the default `handlers::idp::resolve_context` uses when the
     /// request body omits `issuer` (the legacy `lightbridge-keycloak-spi` adapter's shape).
     pub federation_issuer: String,
+    /// ADR-0034 §15: the budget half of the introspection response. `authz-opa` reads
+    /// `budget_remaining_snapshots` by primary key so the gateway needs ONE metadata call per
+    /// request instead of two — see [`crate::introspect_budget`] for what is and is not reported.
+    pub budget: introspect_budget::BudgetIntrospection,
 }
 
 #[async_trait]
@@ -212,6 +216,25 @@ pub trait OpaRepoTrait: Send + Sync {
     /// full `Ok(None)` vs `Err` distinction. Used by introspection to resolve the `quota_tier`
     /// field for a native RFC 8693 exchange session the same way `owner_quota_tier` already does
     /// for the API-key plane.
+    /// ADR-0034 §15: this account's precomputed remaining balance, or `None` when there is no row.
+    ///
+    /// Defaulted to `Ok(None)` — "this repository serves no budget snapshots" — so the mock repos
+    /// in this crate's and `lightbridge-mcp`'s tests stay honest without restating it. `StoreRepo`
+    /// overrides it with the real primary-key read, and `StoreRepo` is the only implementation any
+    /// server runs.
+    async fn budget_remaining_snapshot(
+        &self,
+        _budget_account_id: &str,
+    ) -> Result<Option<lightbridge_authz_budget::BudgetSnapshot>> {
+        Ok(None)
+    }
+
+    /// Records that the request path just asked about this account, so `authz-budget`'s refresher
+    /// keeps its reading warm. Called write-behind, never awaited on the hot path.
+    async fn touch_budget_remaining_snapshot(&self, _budget_account_id: &str) -> Result<()> {
+        Ok(())
+    }
+
     async fn project_member_quota_tier(
         &self,
         project_id: &str,
@@ -251,6 +274,27 @@ pub struct SessionStatusRow {
 
 #[async_trait]
 impl OpaRepoTrait for StoreRepo {
+    /// One primary-key probe of `budget_remaining_snapshots`, on the connection pool this repo
+    /// already holds — ADR-0034 §15's whole reason for existing (see `crate::introspect_budget`).
+    async fn budget_remaining_snapshot(
+        &self,
+        budget_account_id: &str,
+    ) -> Result<Option<lightbridge_authz_budget::BudgetSnapshot>> {
+        use lightbridge_authz_budget::BudgetSnapshotReader;
+        lightbridge_authz_budget::SnapshotStore::new(self.pool.clone())
+            .read(budget_account_id)
+            .await
+            .map_err(|err| Error::Server(err.to_string()))
+    }
+
+    async fn touch_budget_remaining_snapshot(&self, budget_account_id: &str) -> Result<()> {
+        use lightbridge_authz_budget::BudgetSnapshotReader;
+        lightbridge_authz_budget::SnapshotStore::new(self.pool.clone())
+            .touch(budget_account_id)
+            .await
+            .map_err(|err| Error::Server(err.to_string()))
+    }
+
     async fn record_api_key_usage(
         &self,
         key_id: &str,
@@ -3334,8 +3378,10 @@ pub async fn start_api_server(
         budget_repo,
         reset_scheduler,
         // ADR-0034's remaining reader is assembled and mounted only by `start_budget_server`, on
-        // its mTLS-only internal listener. `authz-api` shares the graph and drops this handle.
+        // its own internal listener; §15's snapshot refresher runs only there too. `authz-api`
+        // shares the graph and drops both handles.
         spend_reader: _,
+        snapshots: _,
     } = budget_services::build_budget_services(pool.clone(), usage_service).await?;
 
     let readiness_pool = pool.clone();
@@ -3484,6 +3530,7 @@ pub async fn start_opa_server(
         api_key_audience,
         resolver,
         federation_issuer: federation.issuer.clone(),
+        budget: introspect_budget::BudgetIntrospection::default(),
     });
 
     let app = build_opa_router(state, readiness_pool);
@@ -3962,6 +4009,11 @@ pub async fn start_budget_server(
     // The same shared `budget_services` graph `start_api_server` builds -- this server owns the
     // half of it that is actually reachable (`RpcScope::Budget`) and is the only one that spawns
     // the reset scheduler's interval task, below.
+    let services = budget_services::build_budget_services(pool.clone(), usage_service).await?;
+    // ADR-0034 §15, started HERE and only here: the loop that precomputes every active account's
+    // remaining balance, so `authz-opa`'s introspection can answer the gateway's budget question
+    // from one indexed read instead of a second metadata call.
+    budget_services::spawn_snapshot_refresher(&services, budget)?;
     let budget_services::BudgetServices {
         policy_store,
         refill_service,
@@ -3969,7 +4021,8 @@ pub async fn start_budget_server(
         budget_repo,
         reset_scheduler,
         spend_reader,
-    } = budget_services::build_budget_services(pool.clone(), usage_service).await?;
+        snapshots,
+    } = services;
 
     let readiness_pool = pool.clone();
     // Hand-written sqlx on the core `DbPool` (sqlx 0.9), same as `start_api_server` -- required to
@@ -4124,11 +4177,18 @@ pub async fn start_budget_server(
             ))
         })?,
     );
-    let remaining_service = Arc::new(lightbridge_authz_budget::RemainingService::with_grace(
+    let live_remaining = Arc::new(lightbridge_authz_budget::RemainingService::with_grace(
         budget_repo_for_remaining,
         spend_reader,
         reset_scheduler_for_remaining,
         grace,
+    ));
+    // ADR-0034 §15: snapshot first, live read as the fallback. The endpoint's 404/503 semantics
+    // are unchanged — they still live in the inner reader, which this layer delegates to whenever
+    // there is no usable stored reading (and whenever `?fresh=true` asks it to).
+    let remaining_service = Arc::new(lightbridge_authz_budget::SnapshotRemainingService::new(
+        snapshots,
+        live_remaining,
     ));
 
     let internal_state = Arc::new(budget_remaining::BudgetInternalState {
@@ -4162,68 +4222,10 @@ pub async fn start_budget_server(
     Ok(())
 }
 
-async fn root_handler() -> (StatusCode, Json<RootResponse>) {
-    let response = RootResponse {
-        status: "ok".to_string(),
-        message: "Welcome to Lightbridge Authz API".to_string(),
-    };
-    (StatusCode::OK, Json(response))
-}
-
-async fn health_handler() -> StatusCode {
-    StatusCode::OK
-}
-
-async fn startup_handler() -> StatusCode {
-    StatusCode::OK
-}
-
-/// `GET /version` (#573): the build stamp of the process answering, as JSON.
-///
-/// Always `200` — there is no failure mode. The stamp is assembled from compile-time constants
-/// plus three environment reads; nothing here touches the database, the network, or the caller's
-/// identity, which is why it is safe to leave unauthenticated next to `/healthz`.
-async fn version_handler(service: &'static str) -> Json<lightbridge_authz_core::BuildInfo> {
-    Json(lightbridge_authz_core::build_info(service))
-}
-
-async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
-    if is_database_ready(pool.as_ref()).await {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    }
-}
-
-#[derive(OpenApi)]
-#[openapi(
-    paths(
-        crate::handlers::introspect::introspect_api_key,
-        crate::handlers::idp::resolve_context,
-        crate::handlers::idp::authorize_usage_scope
-    ),
-    components(
-        schemas(
-            crate::models::IntrospectRequest,
-            crate::models::IntrospectResponse,
-            lightbridge_authz_core::ApiKey,
-            lightbridge_authz_core::Project,
-            lightbridge_authz_core::Account,
-            lightbridge_authz_core::ResolveContextRequest,
-            lightbridge_authz_core::ResolvedContext,
-            lightbridge_authz_core::AuthorizeUsageScopeRequest
-        )
-    ),
-    tags(
-        (name = "authorino", description = "Authorino integration"),
-        (name = "idp", description = "Identity request resolution")
-    )
-)]
-struct OpaDoc;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
     use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
     use lightbridge_authz_core::config::{Oauth2TokenExchange, Oauth2Type};
     use serde_json::Value;
