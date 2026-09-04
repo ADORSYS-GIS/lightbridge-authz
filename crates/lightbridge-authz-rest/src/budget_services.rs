@@ -46,6 +46,44 @@ pub struct BudgetServices {
     /// can never disagree with the number a refill decision or a reset tick would compute from
     /// identical state.
     pub spend_reader: Arc<dyn lightbridge_authz_budget::SpendReader>,
+    /// ADR-0034 §15: the store behind `budget_remaining_snapshots`, built here because the same
+    /// `BudgetRepo`/`SpendReader`/`ResetScheduler` graph is what fills it — a second graph over
+    /// the same pool is exactly how two components come to disagree about a number.
+    pub snapshots: Arc<lightbridge_authz_budget::SnapshotStore>,
+}
+
+/// Starts ADR-0034 §15's snapshot refresher on the `authz-budget` process, and only there.
+///
+/// Spawned, never awaited, like the reset scheduler's tick loop next to it: a refresher failure
+/// must not stop the RPC surface from serving. `authz-api`/`lightbridge-mcp` share the graph and
+/// do NOT call this.
+pub fn spawn_snapshot_refresher(
+    services: &BudgetServices,
+    budget: &lightbridge_authz_core::config::BudgetServer,
+) -> Result<()> {
+    if budget.snapshot_refresh_seconds == 0 {
+        return Err(Error::Server(
+            "server.budget.snapshot_refresh_seconds must be greater than zero -- a zero-second \
+             interval is a busy loop against the database, not a configuration"
+                .to_string(),
+        ));
+    }
+    let config = lightbridge_authz_budget::SnapshotRefreshConfig {
+        interval: std::time::Duration::from_secs(budget.snapshot_refresh_seconds),
+        active_window: std::time::Duration::from_secs(budget.snapshot_active_window_minutes * 60),
+        batch: i64::from(budget.snapshot_batch),
+        concurrency: usize::from(budget.snapshot_concurrency),
+    };
+    tracing::info!(?config, "starting the budget remaining-snapshot refresher");
+    Arc::new(lightbridge_authz_budget::SnapshotRefresher::new(
+        (*services.snapshots).clone(),
+        services.budget_repo.clone(),
+        services.spend_reader.clone(),
+        services.reset_scheduler.clone(),
+        config,
+    ))
+    .spawn();
+    Ok(())
 }
 
 /// The spend reader for `usage_service`, or the fail-closed stand-in when it is unconfigured.
@@ -144,6 +182,8 @@ pub async fn build_budget_services(
         spend_reader,
     ));
 
+    let snapshots = Arc::new(lightbridge_authz_budget::SnapshotStore::new(pool.clone()));
+
     Ok(BudgetServices {
         policy_store,
         refill_service,
@@ -151,5 +191,6 @@ pub async fn build_budget_services(
         budget_repo,
         reset_scheduler,
         spend_reader: spend_reader_for_remaining,
+        snapshots,
     })
 }

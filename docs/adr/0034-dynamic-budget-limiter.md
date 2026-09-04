@@ -6,7 +6,9 @@
   prod contradicted the upstream Go types on `metadata.http.timeout`; then **§3's transport
   changed from mTLS to a shared secret** during Stage 1, after the same `kubectl explain` showed
   Authorino cannot present a client certificate at all — see §3.2; then **an unknown account id
-  became a `404`** rather than a `200` with a zero balance, on the owner's directive — see §3.3)
+  became a `404`** rather than a `200` with a zero balance, on the owner's directive — see §3.3);
+  amended again 2026-09-04 — **the budget folded into the existing introspection, one metadata call
+  per request instead of two**, on the owner's performance directive, see §15)
 - Decision owners: @stephane-segning
 - Story: [lightbridge-authz#658](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/658)
   (Phase 6a decision memo)
@@ -776,7 +778,10 @@ owns. The two ids diverging is therefore not a migration; it is the design.
 
 ## 8. What this does *not* change
 
-- **`budget_tier` keeps being minted** (ADR-0014). Nothing here reads it, but it is a useful
+- **`budget_tier` keeps being minted** (ADR-0014, re-evaluated and reaffirmed by #430 --
+  it is the ONE claim that survived that ticket's removal of `quota_tier`/`model_policy`/
+  `allowed_models`, because `authz-opa` introspection has no budget-domain dependency to serve it
+  from). Nothing here reads it, but it is a useful
   audit/telemetry signal and removing it is a separate decision with its own blast radius.
   Consequently the memo's defects (a) and (b) — `current_tier` collapsing an off-ladder amount to
   `b-15`, and ADR-0032 `automatic` resets doing so systematically — stop being *enforcement* bugs
@@ -1120,3 +1125,210 @@ being answered — that is the strongest argument for it. Recommendations, one l
   what the ADR-0070 quota dashboard shows, and it means writing another service's key space.
 - **Publish the balance as a request header instead of dynamic metadata.** Rejected: D2. A header
   is client-visible and, on any path where Authorino fails to stamp it, client-*supplied*.
+
+---
+
+## 15. Amendment (2026-09-04, owner directive) — one call per request: the budget rides on the introspection
+
+**The directive, verbatim in substance.** *"Performance: ensure the call on the budget side is the
+fastest possible — all strategies are good to take. Correctness: over-consumption is fine, forgive
+it. We might have two introspections (OPA + budget) for the same request; guarantee performance per
+request."*
+
+**What changed.** The `budgetremaining` AuthConfig metadata step is **deleted**. The account's
+balance is now three new fields on the introspection `authz-opa` already serves —
+`budget_remaining_micros`, `budget_next_reset_at`, `budget_snapshot_age_seconds` — and the
+AuthConfig's `response.success.dynamicMetadata.budget` block sources them from
+`auth.metadata.lightbridgeintrospect` instead. The Lua filter's input contract is untouched: same
+namespace, same key, same five fields, same decision table.
+
+**Why this is faster, stated as arithmetic rather than as a claim.** Before, a metered model
+request on the API-key plane cost Authorino two metadata calls *in series* (§3.1's `priority: 1` is
+what forced the serialisation), and the second of them fanned out to a third service:
+
+```
+introspect(authz-opa)  →  remaining(authz-budget)  →  spend/query(authz-usage)
+```
+
+After, it costs one call, and that call's added work is **one primary-key probe of one table**:
+
+```
+introspect(authz-opa)  →  SELECT … FROM budget_remaining_snapshots WHERE budget_account_id = $1
+```
+
+**Measured, two ways, because they answer different questions.**
+
+*Server-side* — the honest measure of what the database now does per request, on a 500-row table
+(`EXPLAIN (ANALYZE, BUFFERS)`):
+
+```
+Index Scan using budget_remaining_snapshots_pkey  (cost=0.27..8.29 rows=1)
+                                                  (actual time=0.015..0.015 rows=1 loops=1)
+  Index Cond: (budget_account_id = 'bench_250'::text)
+  Buffers: shared hit=3
+Execution Time: 0.030 ms          (0.017 ms on a repeat, planning excluded)
+```
+
+**Three buffer hits and ~20 µs.** That is the entire added cost of the budget at the database.
+
+*Client-side* — the same probe driven end-to-end through `sqlx` from the test harness, 2 000
+samples (`crates/lightbridge-authz-budget/tests/snapshot_read_latency_tests.rs`): **p50 0.4–1.4 ms,
+p99 0.6–8 ms across runs.** That spread is the Docker-for-Mac loopback and whatever else the laptop
+is doing, not the query — which is exactly why the test **asserts the plan** (it must be an index
+scan on the primary key) and only *reports* the timings. A wall-clock assertion there would be a
+flaky test asserting the speed of a laptop.
+
+Compare either figure with what it replaced: a ledger `SUM` plus an HTTPS round trip to
+`authz-usage`, measured in prod at p50 10 ms with a 614 ms tail (ROADMAP §4, "cold-start latency
+tail"). The `last_seen_at` write is spawned rather than awaited and throttled to at most once per
+account per 30 s per process, so it is not on either measured path.
+
+**Where the work went.** `budget_remaining_snapshots` (migration `20260904000001`) holds one row
+per budget account. `authz-budget` runs a refresher (`snapshot_refresher.rs`) that recomputes every
+account the request path has touched inside `server.budget.snapshot_active_window_minutes`
+(default 10), every `server.budget.snapshot_refresh_seconds` (default 15), under one Postgres
+advisory lock so N replicas do not duplicate the work, with spend reads bounded to
+`snapshot_concurrency` (default 8) in flight.
+
+A **refill does not wait for a tick**: `BudgetRepo::grant` moves the snapshot by the grant amount
+inside the grant's own transaction, so a top-up is visible on the very next request. That is exact,
+not approximate — a grant moves the ceiling and never the spend.
+
+### 15.1 The forgiven overspend window (owner accepted)
+
+`§5.4`'s four terms become three, and one of them changes size:
+
+| Term | Before | After |
+|---|---|---|
+| Authorino metadata cache TTL | 10 s (the `budgetremaining` step) | **30 s** — the `lightbridgeintrospect` step's existing TTL, keyed on `jti` |
+| Snapshot age | — (the read was live) | **≤ `snapshot_refresh_seconds`**, 15 s by default |
+| OTLP ingest lag | unmeasured | unmeasured, unchanged |
+| One in-flight request | one request's cost | unchanged |
+
+So the window is `30 s + 15 s + ingest_lag + one request` rather than `10 s + ingest_lag + one
+request`. Against a $24 monthly budget and per-request costs in the low thousands of micro-USD,
+that is cents. **The owner has explicitly forgiven this**, and it is the price of the guarantee that
+matters more: no second network hop, no third service, and a bounded per-request cost that does not
+depend on `authz-usage` being up.
+
+Two knobs shrink it if the shadow data ever says it should be shrunk: the AuthConfig's
+`lightbridgeintrospect` TTL and `snapshot_refresh_seconds`. Both cost load linearly, neither
+changes any code.
+
+### 15.2 Unknown is still never zero
+
+Nothing about D5 relaxes. The three fields are **omitted** — not zeroed — when there is no snapshot
+row, when the row has no reading yet, when the stored reading describes a period that has since
+rolled over, or when the read itself fails. The AuthConfig's `known` expression is a `has()` over
+`budget_remaining_micros`, so absent ⇒ `known: false` ⇒ the Lua refuses with `503
+budget_unavailable`. A `0` there would be `402 budget_exhausted` for an account that may be fully
+funded — the single most expensive way to be wrong, and the whole reason these fields are `Option`
+all the way down to the wire.
+
+The refresher is fail-soft in the same direction: an unreachable `authz-usage` stamps `stale_since`
+and **keeps** the previous reading rather than erasing it. `budget_snapshot_age_seconds` is how a
+consumer sees that, and `GET /budget/v1/remaining` reports it too.
+
+### 15.3 What this narrows, and it must not be glossed over
+
+`lightbridgeintrospect` runs only for credentials carrying `api_key_id` on a non-Keycloak issuer —
+self-signed API keys and native RFC 8693 exchange sessions. The GitHub-Actions plane (`repobinding`)
+and the legacy Keycloak plane have **no introspection step**, so they carry no budget fields.
+
+Under the old two-call design `budgetremaining` covered all three planes. Under this one, the
+AuthConfig must publish `enforced: false` for the two uncovered planes — out of scope, allowed —
+rather than letting them read as `known: false` and 503, which would break CI on the GitHub plane.
+That is a **fail-open narrowing on two minority planes**, taken deliberately in exchange for the
+one-call guarantee, and it is a **blocker for Stage 3 (enforce), not for Stage 2 (shadow)**:
+extending coverage to those planes is tracked work, and shadow mode is where its absence shows up
+as a coverage gap in the decision counts rather than as refused traffic.
+
+### 15.4 Diagrams
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant E as Envoy (converse-gateway)
+    participant A as Authorino
+    participant O as authz-opa
+    participant DB as main DB
+    participant L as budget-limiter.lua
+    participant B as authz-budget (refresher)
+    participant U as authz-usage
+
+    Note over B,U: OFF the request path, every snapshot_refresh_seconds (15 s)
+    B->>DB: SELECT active accounts (last_seen_at >= now - 10 min)
+    B->>U: POST /usage/v1/spend/query  (bounded concurrency)
+    U-->>B: SUM(total_cost) | NULL | unreachable
+    B->>DB: UPDATE budget_remaining_snapshots (or stamp stale_since)
+
+    Note over C,L: ON the request path — ONE metadata call
+    C->>E: POST /v1/chat/completions
+    E->>A: ext_authz
+    A->>O: POST /v1/authorino/validate/introspect
+    O->>DB: api_key_validation view + project row
+    O->>DB: SELECT … budget_remaining_snapshots WHERE budget_account_id = $1
+    O--)DB: (spawned, ≤1 per 30 s per account) UPDATE last_seen_at
+    O-->>A: 200 {active, account_id, …, budget_remaining_micros?, budget_next_reset_at?, budget_snapshot_age_seconds?}
+    A-->>E: dynamicMetadata.budget {enforced, known, remaining_micros, next_reset_at, account_id}
+    E->>L: Lua filter (order 12+)
+    alt known && remaining <= 0 && !shadow
+        L-->>C: 402 budget_exhausted
+    else known && remaining > 0
+        L->>E: continue to the model backend
+    else not known
+        L-->>C: 503 budget_unavailable
+    end
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> NoRow: account never seen by the request path
+
+    NoRow --> Seen: introspection touches last_seen_at
+    note right of Seen
+        remaining_micros IS NULL.
+        Introspection OMITS the fields ⇒ known:false ⇒ 503.
+        Never 0, never 402.
+    end note
+
+    Seen --> Fresh: refresher tick — spend answered
+    Fresh --> Fresh: refresher tick — spend answered
+    Fresh --> Fresh: grant booked (delta applied in the grant's own tx)
+    Fresh --> Stale: refresher tick — spend unreachable (stale_since stamped, reading KEPT)
+    Stale --> Fresh: refresher tick — spend answered again (stale_since cleared)
+    Stale --> Stale: refresher tick — still unreachable
+
+    Fresh --> RolledOver: UTC month boundary
+    Stale --> RolledOver: UTC month boundary
+    note right of RolledOver
+        The stored period no longer matches the current one.
+        remaining_for() refuses it ⇒ fields omitted ⇒ 503,
+        until the next tick writes this month's reading.
+    end note
+    RolledOver --> Fresh: refresher tick for the new period
+
+    Seen --> NoRow: account deleted (FK cascade)
+    Fresh --> NoRow: account deleted (FK cascade)
+
+    note left of NoRow
+        UNREACHABLE by design: there is no transition into a state
+        where a fabricated 0 is served. Every path out of "we do not
+        know" leads to an ABSENT field, never to a zero balance.
+    end note
+```
+
+### 15.5 What Stage 1 now means
+
+Stage 1 (§10) is no longer "the endpoint ships and binds where configured". It is: **the snapshot
+table exists, the refresher runs on `authz-budget`, and the introspection carries the three budget
+fields.** `GET /budget/v1/remaining` remains — served from the snapshot, `O(1)`, reporting
+`snapshot_age_seconds`, with `?fresh=true` for an operator who wants the live recomputation — but
+nothing on the request path calls it any more.
+
+Stage 2's exit criteria are trimmed accordingly: "disagreement between the ledger's `remaining` and
+the Redis cost counter" is no longer a *blocking* measurement, because the owner has forgiven the
+overspend it measures. It stays on the watch list as an observation, not a gate. What remains hard:
+zero unexplained `budget_unavailable`, and the two uncovered planes from §15.3 given an explicit
+`enforced: false` before Stage 3.

@@ -380,6 +380,68 @@ Revisit cratestack-owned migrations once `cratestack migrate diff --backend post
 introspection/baselining against an existing schema without emitting conflicting `CREATE TABLE`
 statements, and once the `dbgenerated()` DDL emitter bug is fixed upstream.
 
+### 2026-09-04 addendum — the two cratestack-bootstrapped tables are migration-owned too
+
+The revised decision above named `accounts`/`projects`/`api_keys` as migration-owned. It missed two
+tables cratestack bootstraps itself at runtime: `cratestack_audit` (`ensure_audit_table`,
+cratestack-sqlx 0.11.0 `src/audit/schema.rs:53-69`, gated by a per-instance `AtomicBool` set up in
+`SqlxRuntime::new` at `src/descriptor.rs:60-66`) on the first audited write of each `SqlxRuntime`,
+and `cratestack_idempotency` (`SqlxIdempotencyStore::ensure_schema()`, same crate,
+`src/idempotency.rs:34-43`) at server startup, called from `start_api_server` and
+`start_budget_server` in `crates/lightbridge-authz-rest/src/lib.rs`.
+
+Both bootstrap with `CREATE TABLE IF NOT EXISTS`, which is **not atomic across Postgres sessions**:
+the existence check and the creation are separate steps, so two concurrent first-callers against a
+fresh database can both pass the check, and the loser dies on the system catalog's own unique index
+instead of skipping:
+
+```
+ERROR:  23505: duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+DETAIL:  Key (typname, typnamespace)=(cratestack_audit, 2200) already exists.
+```
+
+That reaches the caller as `CratestackError::Database`, whose `rpc_code` is `"internal"` and whose
+`public_message` is the fixed string "internal error" — nothing on the create path logs the actual
+cause. Only `Account`, `Project` (`@@audit` at
+`crates/lightbridge-authz-api/schema/authz.cstack:362`) and `ApiKey` declare `@@audit`, so only a
+write through one of those three models could hit the audit-table race; the idempotency table raced
+at process startup instead, so two replicas coming up together against a fresh database could fail
+to *boot* rather than serve a 500. Filed as
+[#684](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/684): 2 of 8 runs of
+`crates/lightbridge-authz-rest/tests/multi_account_ownership_it_tests.rs` failed against freshly
+migrated databases, both in tests that call `model.Project.create`; 30 of 30 runs passed after the
+fix below, with zero occurrences of the error in the Postgres server log.
+
+The upstream doc comment inside `ensure_audit_table` (`src/audit/schema.rs:58-62`) claims the block
+"stays safe under concurrent first-runs" because its sub-statements are `IF NOT EXISTS`; the log
+above is that claim failing, under the ordinary case of two sessions racing a catalog write, not an
+edge case.
+
+**Fix, applying this section's own decision to the two tables it didn't name**: a new migration,
+`migrations/20260904000002_cratestack_bootstrap_tables.sql`, creates both tables and their indexes,
+copied verbatim from cratestack's `AUDIT_TABLE_DDL` and `IDEMPOTENCY_TABLE_DDL` constants, every
+statement `IF NOT EXISTS` so it is a no-op against a database either runtime bootstrap already
+touched. Both runtime call sites — the `idempotency_store.ensure_schema()` calls in
+`start_api_server` and `start_budget_server` — are deleted in the same change, so there is exactly
+one owner of each table and no path left that can race. (`ensure_audit_table` itself is `pub(crate)`
+inside cratestack-sqlx and cannot be called from here at all; it now only ever runs against an
+already-bootstrapped table, so it is always a no-op.)
+
+**Drift guard, and its honest gap**: `app/lightbridge-authz/tests/cratestack_bootstrap_ddl_sync_tests.rs`
+asserts the migration reproduces `cratestack::AUDIT_TABLE_DDL` statement-for-statement, that both
+tables get created, and that every statement stays idempotent — confirmed to actually fail when the
+DDL is mutated (changing `attempts BIGINT` to `INT` turned it red). It covers only the audit half.
+`IDEMPOTENCY_TABLE_DDL` lives in `cratestack-sql`, which is not a direct dependency of this workspace
+(`Cargo.toml` pins only `cratestack-core`/`-axum`/`-redis`/`cratestack` (`cratestack-pg`)/`-codec-cbor`/
+`-codec-json`) and, unlike `AUDIT_TABLE_DDL`, is not re-exported through `cratestack-pg` — so there is
+no way to reach the constant from this workspace without adding a direct dependency on
+`cratestack-sql` itself. Doing that would put a seventh crate inside the version lockstep block
+`Cargo.toml` documents as load-bearing ("THE LOCKSTEP IS LOAD-BEARING, not stylistic", `Cargo.toml:332`,
+recording two real Dependabot-caused breakages from a partial bump). The idempotency half of this
+migration is therefore unguarded: a future cratestack bump that changes that table's shape would
+drift silently — the same silent drift both tables already tolerated on every database bootstrapped
+by an older cratestack version before this migration existed.
+
 ### Hard cutover
 
 Per repository convention, this lands as one PR that replaces the CRUD implementation in

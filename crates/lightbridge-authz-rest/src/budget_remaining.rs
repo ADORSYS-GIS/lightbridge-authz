@@ -28,7 +28,7 @@
 //!
 //! ```text
 //! 200  {"budget_account_id","period","ceiling_micros","spent_micros","remaining_micros",
-//!       "next_reset_at","source_lag_seconds"}
+//!       "next_reset_at","source_lag_seconds","snapshot_age_seconds"}
 //! 400  {"error":"bad_request","message":...}      malformed account id / period
 //! 401  {"error":"unauthorized","message":...}     the shared secret was missing or wrong
 //! 403  {"error":"forbidden","message":...}        an Authorization header was present
@@ -127,11 +127,19 @@ async fn remaining_response(
     span.record("budget_account_id", account_id);
     span.record("period", tracing::field::display(&period));
 
-    match state
-        .remaining
-        .remaining_for_account(account_id, &period, now)
-        .await
-    {
+    let answer = if query.fresh {
+        state
+            .remaining
+            .remaining_for_account_live(account_id, &period, now)
+            .await
+    } else {
+        state
+            .remaining
+            .remaining_for_account(account_id, &period, now)
+            .await
+    };
+
+    match answer {
         Ok(Remaining::Known(remaining)) => (
             StatusCode::OK,
             Json(RemainingResponse {
@@ -142,6 +150,7 @@ async fn remaining_response(
                 remaining_micros: remaining.remaining_micros,
                 next_reset_at: remaining.next_reset_at,
                 source_lag_seconds: remaining.source_lag_seconds,
+                snapshot_age_seconds: remaining.snapshot_age_seconds,
             }),
         )
             .into_response(),

@@ -2053,6 +2053,10 @@ mod db {
             address: "127.0.0.1".to_string(),
             port: 0,
             tls: bad_tls(),
+            snapshot_refresh_seconds: 15,
+            snapshot_active_window_minutes: 10,
+            snapshot_batch: 500,
+            snapshot_concurrency: 8,
         };
         let err = start_budget_server(
             &budget,

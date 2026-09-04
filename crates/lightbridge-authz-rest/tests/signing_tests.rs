@@ -922,15 +922,7 @@ mod db {
             name: Some("Dev User".to_string()),
         };
         let signed = signer
-            .sign(
-                &owner,
-                "key_1",
-                "proj_1",
-                "acct_1",
-                Some(vec!["gpt-4.1-mini".to_string()]),
-                Utc::now(),
-                None,
-            )
+            .sign(&owner, "key_1", "proj_1", "acct_1", Utc::now(), None)
             .await
             .unwrap();
 
@@ -946,10 +938,10 @@ mod db {
         assert_eq!(claims.name.as_deref(), Some("Dev User"));
         assert_eq!(claims.typ.as_deref(), Some("Bearer"));
         assert_eq!(claims.scope.as_deref(), Some("profile email"));
-        assert_eq!(
-            claims.allowed_models,
-            Some(vec!["gpt-4.1-mini".to_string()])
-        );
+        // #430: `allowed_models` is no longer minted onto ANY token -- `authz-opa` introspection
+        // (`introspect_api_key`, which reads the live `projects` row) is its sole source. Proven
+        // absent here even though the project this key belongs to has a real, non-empty list.
+        assert_eq!(claims.allowed_models, None);
         // #191/#216: every self-signed API-key JWT must carry this claim so
         // `requestBudgetRefill` can refuse API-key-derived callers by a real, intentional
         // signal rather than by JWKS separation happening to reject the token first.
@@ -984,7 +976,7 @@ mod db {
             name: None,
         };
         let signed = signer
-            .sign(&owner, "key_1", "proj_1", "acct_1", None, Utc::now(), None)
+            .sign(&owner, "key_1", "proj_1", "acct_1", Utc::now(), None)
             .await
             .unwrap();
 
@@ -1022,7 +1014,7 @@ mod db {
             ..Default::default()
         };
         let signed = signer
-            .sign(&owner, "key_1", "proj_1", "acct_1", None, Utc::now(), None)
+            .sign(&owner, "key_1", "proj_1", "acct_1", Utc::now(), None)
             .await
             .unwrap();
 
@@ -1068,7 +1060,7 @@ mod db {
             ..Default::default()
         };
         let signed = signer
-            .sign(&owner, "key_1", "proj_1", "acct_1", None, Utc::now(), None)
+            .sign(&owner, "key_1", "proj_1", "acct_1", Utc::now(), None)
             .await
             .unwrap();
 
@@ -1116,7 +1108,6 @@ mod db {
                 "proj_owned_by_someone_else",
                 // The CONTEXT claim: the project's owning account, a different person entirely.
                 "owner-account",
-                None,
                 Utc::now(),
                 None,
             )
@@ -1281,15 +1272,7 @@ mod db {
 
         let signer = ApiKeyJwtSigner::from_config(&signing_cfg(3600), repo.clone()).unwrap();
         let signed = signer
-            .sign(
-                &owner,
-                "key_1",
-                "proj_1",
-                "acct_1",
-                allowed_models,
-                now,
-                None,
-            )
+            .sign(&owner, "key_1", "proj_1", "acct_1", now, None)
             .await
             .unwrap();
         let new_claims = decode_untyped(&active.public_jwk, &signed.token);
@@ -1303,6 +1286,12 @@ mod db {
             // signing calls would always fail regardless of this signer swap; `iat`/`exp` differ
             // because `TokenManager` stamps its own internal `now()` (documented above).
             if matches!(key.as_str(), "jti" | "sid" | "iat" | "exp") {
+                continue;
+            }
+            // #430: `allowed_models` is the ONE claim the new signer deliberately DROPS. Its
+            // exact-key removal is asserted below; skipping the value comparison here keeps that
+            // one intentional change from reading as a regression of every other claim.
+            if key == "allowed_models" {
                 continue;
             }
             assert_eq!(
@@ -1324,6 +1313,21 @@ mod db {
             std::collections::BTreeSet::from(["identity", "nbf"]),
             "the new signer must add exactly `identity` + `nbf` and nothing else beyond the old \
              claim set -- any other addition/removal is an undocumented wire-contract change"
+        );
+
+        // #430: and it must REMOVE exactly `allowed_models`, nothing else. The old fixture is
+        // minted with a real, non-empty list, so this fails loudly if the claim ever comes back.
+        let removed: std::collections::BTreeSet<&str> =
+            old_keys.difference(&new_keys).copied().collect();
+        assert_eq!(
+            removed,
+            std::collections::BTreeSet::from(["allowed_models"]),
+            "the new signer must drop exactly `allowed_models` (resolved live by `authz-opa` \
+             introspection since #429/#430) and nothing else"
+        );
+        assert!(
+            !new_obj.contains_key("allowed_models"),
+            "allowed_models must be genuinely absent, not merely null: {new_obj:?}"
         );
 
         assert!(
