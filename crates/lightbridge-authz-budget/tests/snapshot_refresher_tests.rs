@@ -153,10 +153,10 @@ async fn a_second_replicas_tick_is_a_no_op_while_the_first_holds_the_lock(pool: 
     let (_, second) = build(&pool, Arc::new(FixedSpend(1)), config());
     store.touch(&id).await.expect("touch");
 
-    // A session-scoped advisory lock taken by hand on a connection we keep open stands in for the
-    // other replica: it is the same lock, taken the same way, from a different session.
-    let mut held = pool.acquire().await.expect("acquire");
-    let (taken,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+    // A transaction-scoped advisory lock taken by hand stands in for the other replica: it is the
+    // same lock, taken the same way, from a different session.
+    let mut held = pool.begin().await.expect("begin");
+    let (taken,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_xact_lock($1)")
         .bind(0x4255_4447_5F53_4E50_i64)
         .fetch_one(&mut *held)
         .await
@@ -169,17 +169,81 @@ async fn a_second_replicas_tick_is_a_no_op_while_the_first_holds_the_lock(pool: 
         "a replica that cannot take the lock must return immediately, not recompute the same rows"
     );
 
-    let (_,): (bool,) = sqlx::query_as("SELECT pg_advisory_unlock($1)")
-        .bind(0x4255_4447_5F53_4E50_i64)
-        .fetch_one(&mut *held)
-        .await
-        .expect("releasing the lock must succeed");
-    drop(held);
+    // Ending the transaction releases it -- which is the property this whole design rests on.
+    held.rollback().await.expect("rollback must succeed");
 
     assert!(
         first.tick(Utc::now()).await.expect("tick").ran,
         "once the lock is free the next tick runs normally"
     );
+}
+
+/// The reason the lock is transaction-scoped: a tick that is CANCELLED mid-flight must still leave
+/// the lock free **to another session**. A cancelled task and a panicking one drop the future at
+/// exactly the same place, and neither runs the explicit unlock that a session-scoped lock needs.
+///
+/// Two details make this a real test rather than a shape:
+///
+/// - The tick is made slow on purpose (`SlowSpend`), and the test waits until another session can
+///   *observe* the lock held before cancelling. Cancelling earlier would abort before the lock was
+///   ever taken and prove nothing — the first version of this test did exactly that and passed
+///   against the broken implementation.
+/// - The final assertion comes from a SEPARATE session. Postgres advisory locks are re-entrant
+///   within one session, and a dropped `PoolConnection` goes straight back to the pool, so with a
+///   session-scoped lock the very next tick can be handed the same connection and re-acquire its
+///   own leaked lock — passing while every OTHER replica is wedged.
+///
+/// **Negative control, run by hand:** reverting `tick` to `pg_try_advisory_lock` +
+/// `pg_advisory_unlock` makes this test fail on the final assertion.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_cancelled_tick_leaves_the_lock_free_for_other_replicas(pool: PgPool) {
+    let id = account(&pool).await;
+    let (store, refresher) = build(&pool, Arc::new(SlowSpend), config());
+    store.touch(&id).await.expect("touch");
+
+    let refresher = Arc::new(refresher);
+    let running = tokio::spawn({
+        let refresher = refresher.clone();
+        async move { refresher.tick(Utc::now()).await }
+    });
+
+    // Wait until the lock is genuinely held, from another session's point of view. Without this the
+    // cancellation below can land before `tick` ever reaches the lock.
+    let mut held = false;
+    for _ in 0..100 {
+        if !lock_is_free(&pool).await {
+            held = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        held,
+        "the tick must have taken the lock before it can be cancelled mid-flight"
+    );
+
+    running.abort();
+    let _ = running.await;
+
+    assert!(
+        lock_is_free(&pool).await,
+        "a cancelled tick must not leave the advisory lock held -- a session-scoped lock returned \
+         to the pool still held would silently stop every OTHER replica's refresher until that \
+         connection happened to be recycled"
+    );
+}
+
+/// Asks for the refresher's advisory lock from a fresh session and immediately gives it back.
+/// `true` means nobody holds it.
+async fn lock_is_free(pool: &PgPool) -> bool {
+    let mut probe = pool.begin().await.expect("begin");
+    let (free,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(0x4255_4447_5F53_4E50_i64)
+        .fetch_one(&mut *probe)
+        .await
+        .expect("asking for the lock must succeed");
+    probe.rollback().await.expect("rollback");
+    free
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -228,6 +292,31 @@ impl SpendReader for FixedSpend {
         _period: &Period,
     ) -> Result<SpendObservation, BudgetError> {
         Ok(SpendObservation::Answered(self.0))
+    }
+}
+
+/// A spend reader slow enough that a tick can be observed mid-flight and cancelled there.
+#[derive(Debug)]
+struct SlowSpend;
+
+#[lightbridge_authz_core::async_trait]
+impl SpendReader for SlowSpend {
+    async fn spend_for_account(
+        &self,
+        _account_id: &str,
+        _period: &Period,
+    ) -> Result<Spend, BudgetError> {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        Ok(Spend::Known(1))
+    }
+
+    async fn observe_spend_for_account(
+        &self,
+        _account_id: &str,
+        _period: &Period,
+    ) -> Result<SpendObservation, BudgetError> {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        Ok(SpendObservation::Answered(1))
     }
 }
 
