@@ -22,12 +22,18 @@ pub mod refill;
 pub mod remaining;
 mod remaining_cache;
 pub mod remaining_service;
+pub mod remaining_snapshot;
 pub mod repo;
+mod repo_grant_sql;
 pub mod reset_schedule;
 pub mod reset_schedule_validate;
 pub mod reset_scheduler;
 pub mod review;
 pub mod rule_data;
+pub mod snapshot;
+mod snapshot_refresh_one;
+pub mod snapshot_refresher;
+pub mod snapshot_store;
 pub mod source;
 pub mod spend;
 mod spend_units;
@@ -44,7 +50,9 @@ pub use facts::Facts;
 pub use period::Period;
 pub use policy_store::PolicyStore;
 pub use refill::{RefillRequest, RefillService, RefillStatus};
-pub use remaining::{BudgetRemaining, Remaining, RemainingReader, RemainingService};
+pub use remaining::{
+    BudgetRemaining, Remaining, RemainingReader, RemainingService, SnapshotRemainingService,
+};
 pub use reset_schedule::{
     BudgetResetSchedule, BudgetResetScheduleUpdate, Cadence, NewBudgetResetSchedule, ResetMode,
     ResetScheduleRepo, ScheduleScopeKind, first_window_after, next_window_after, parse_run_at_utc,
@@ -58,6 +66,9 @@ pub use rule_data::{
     Condition, Field, Operator, Rule, RuleDataEngine, RuleSet, default_rule_set_json,
     validate_rule_data,
 };
+pub use snapshot::{BudgetSnapshot, BudgetSnapshotReader, RefreshReport, SnapshotRefreshConfig};
+pub use snapshot_refresher::SnapshotRefresher;
+pub use snapshot_store::SnapshotStore;
 pub use source::GrantSource;
 pub use spend::{
     Spend, SpendObservation, SpendReader, UnavailableSpendReader, UsageServiceSpendReader,

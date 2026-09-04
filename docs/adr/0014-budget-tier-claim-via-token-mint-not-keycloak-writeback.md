@@ -9,6 +9,20 @@
   discrete-tiers decision are **unaffected and remain in force** -- see Decision 1 for exactly
   what changes and what does not.
 
+> **Re-evaluated and REAFFIRMED, 2026-09-03 (#430, PR #454).** #430 asked this question explicitly
+> rather than letting it be inherited: when `quota_tier`/`model_policy`/`allowed_models` leave the
+> token, does `budget_tier` go with them? **No -- `budget_tier` stays minted.** Wiring live
+> budget-tier resolution into `authz-opa` introspection would need `BudgetRepo`/`PolicyEngine`
+> plumbing into a server that holds no budget-domain dependency at all today (`OpaState` carries
+> `repo`/`basic_auth`/`billing` only), which PR #429 deliberately did not add. Removing the claim
+> without it would leave the budget domain with no signal anywhere on the human plane.
+>
+> ADR-0034 §12 independently reaches the same conclusion from the enforcement side and is the
+> controlling document there: the dynamic budget limiter reads the **live ledger balance** and
+> consults no budget claim at all, so `budget_tier` is now a display/telemetry claim rather than an
+> enforcement input -- kept, but no longer load-bearing. This ADR's mint-time delivery mechanism is
+> unchanged; only its *enforcement* role was superseded, by ADR-0034.
+
 ## Context
 
 Issue #196 (Phase 6b, epic #188) asks for the write-back half of ADR-0008's design: when a budget

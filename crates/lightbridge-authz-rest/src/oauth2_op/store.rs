@@ -27,7 +27,7 @@
 //! 2. Even setting (1) aside, `default_handle_token_exchange`'s returned `TokenResponse` does not
 //!    expose the `Identity`/claims it resolved internally -- only the final `scope` and the
 //!    already-signed `access_token`. Stamping `account_id`/`project_id`/`api_key_id`/
-//!    `allowed_models`/`at_hash`/`azp` requires those onto the token *at mint time*
+//!    `at_hash`/`azp` requires those onto the token *at mint time*
 //!    (`issue_user_token_with_extra`/`issue_id_token_with_extra`); a signed JWT cannot be
 //!    "post-processed" to add claims afterward. Doing this correctly means independently
 //!    resolving `resolve_context`/`get_project_by_id`/decoding the subject token -- i.e. most of
@@ -63,7 +63,6 @@ use lightbridge_authz_core::async_trait;
 use lightbridge_authz_core::config::{ClaimMapper, Oauth2TokenExchange};
 use lightbridge_authz_core::crypto::hash_api_key;
 use lightbridge_authz_core::cuid::cuid2;
-use lightbridge_authz_core::dto::ModelPolicy;
 use lightbridge_authz_core::error::Error;
 use lightbridge_authz_core::identity::AccountId;
 use serde_json::Value;
@@ -134,13 +133,16 @@ pub struct TokenExchangeOpStore {
     devices: DbDeviceCodeStore,
     assertions: RedisClientAssertionStore,
     repo: Arc<StoreRepo>,
-    /// The `project_members` handle [`Self::resolve_quota_tier`] (ADR-0017) reads from.
+    /// The `project_members` handle [`super::claim_mappers::resolve_mapped_claims`]'s
+    /// [`ClaimSource::ProjectRole`] (ADR-0033) reads from. It previously also fed the `quota_tier`
+    /// claim (ADR-0017); that claim is no longer minted (#430) but this injection seam survives it,
+    /// because the claim mapper needs exactly the same one.
     /// Production (`start_idp_server`) always constructs this as a clone of the same `repo`
     /// pointed at the same Postgres pool -- there is no operational separation, only a
     /// deliberately independent injection seam, mirroring exactly why `budget_repo` below is its
     /// own field rather than a method on `repo` (ADR-0014 Decision 2): it lets a test hold `repo`
     /// reachable (so `resolve_context` succeeds) while pointing `quota_repo` at an unreachable
-    /// pool, proving [`Self::resolve_quota_tier`]'s own fail-closed branch fires on its own
+    /// pool, proving the claim mapper's own fail-closed branch fires on its own
     /// dependency failing, not merely as a side effect of `resolve_context` failing first --
     /// `crates/lightbridge-authz-rest/tests/token_exchange_tests.rs`'s
     /// `quota_tier_lookup_failure_refuses_the_exchange_even_though_context_resolution_succeeds`
@@ -542,12 +544,15 @@ impl TokenExchangeOpStore {
             }
             Err(_) => return Err(oauth_err("server_error", "context resolution failed")),
         };
-        let project = match self
+        // Called for its REFUSAL, not its value: since #430 no minted claim is read off this
+        // project row any more, but the active-project/active-account cascade it enforces is still
+        // the gate that stops a suspended tenant from getting a token.
+        match self
             .repo
             .require_active_project_and_account(&context.project_id, &context.account_id)
             .await
         {
-            Ok(project) => project,
+            Ok(_) => {}
             // Deliberately uniform, not "project is inactive" vs. "account is inactive"
             // separately: which one applied is not something the caller needs to distinguish,
             // matching this repo's own "avoid leaking details in error responses" principle and
@@ -607,26 +612,15 @@ impl TokenExchangeOpStore {
         };
         let expires_in = self.cfg.access_ttl_seconds as u64;
         let budget_tier = self.resolve_budget_tier(&context.account_id, now).await;
-        let quota_tier = self
-            .resolve_quota_tier(&context.project_id, &account_id)
-            .await?;
         let mut extra = access_token_extra(
             &owner,
             &session.id,
             &session.id,
             &context.project_id,
             &context.account_id,
-            project.allowed_models,
             Some(client_id),
         );
         extra.insert("budget_tier".to_string(), Value::String(budget_tier));
-        if let Some(quota_tier) = quota_tier {
-            extra.insert("quota_tier".to_string(), Value::String(quota_tier));
-        }
-        extra.insert(
-            "model_policy".to_string(),
-            Value::String(project.model_policy.to_string()),
-        );
         for (claim, value) in self
             .resolve_mapped_claims(&context.project_id, &account_id, &context.account_id)
             .await?
@@ -806,96 +800,6 @@ impl TokenExchangeOpStore {
         }
     }
 
-    /// Resolves the `quota_tier` claim to stamp on a minted access token (ADR-0017, superseding
-    /// ADR-0011 Decision 7's "role/quota data stays out of both JWTs" specifically for
-    /// `quota_tier` -- see that ADR for the full rationale and why the general principle otherwise
-    /// still stands).
-    ///
-    /// **Deliberately NOT the same fail-closed shape as [`Self::resolve_budget_tier`].** That
-    /// method downgrades any lookup failure to a policy-configured floor because `budget_tier` has
-    /// one: a well-ordered ladder with a defined "most conservative" rung. `quota_tier` has no such
-    /// ladder -- it is an operator-defined, unordered catalogue (`QuotaTiers`) with no floor to
-    /// fall back to, and per `StoreRepo::project_member_quota_tier`'s own doc comment, `Ok(None)`
-    /// is ALREADY the resolved-and-legitimate "no per-member ceiling" answer (mirroring the
-    /// `api_key_validation` view's NULL semantics for the API-key plane). Reusing that same shape
-    /// for "the lookup failed" would make a database outage indistinguishable on the wire from
-    /// "this account genuinely has no per-member ceiling" -- silently trading an availability
-    /// failure for a quota bypass, exactly the failure mode this repository's review guidance
-    /// treats as the highest-yield question to ask of any code on this boundary.
-    ///
-    /// So this method refuses instead: any `Err` from the lookup is surfaced as `server_error` and
-    /// the token exchange/refresh fails outright -- no token is minted, and therefore no
-    /// `quota_tier` value (real, absent, or sentinel) ever reaches the wire for that request. This
-    /// is not a new failure philosophy invented here -- it is the exact one `resolve_context`'s own
-    /// `Err(_) => oauth_err("server_error", ...)` branches already apply to account/project
-    /// resolution failures a few lines above every call site of this method; this only extends the
-    /// same rule to the per-member tier lookup instead of quietly exempting it.
-    async fn resolve_quota_tier(
-        &self,
-        project_id: &str,
-        account_id: &AccountId,
-    ) -> Result<Option<String>, TokenErrorResponse> {
-        self.quota_repo
-            .project_member_quota_tier(project_id, account_id)
-            .await
-            .map_err(|err| {
-                tracing::error!(
-                    error = %err,
-                    project_id = %project_id,
-                    account_id = %account_id,
-                    "quota tier resolution failed; refusing to mint rather than omitting the \
-                     claim, which would be indistinguishable from a legitimate 'no per-member \
-                     ceiling' account"
-                );
-                oauth_err("server_error", "quota tier resolution failed")
-            })
-    }
-
-    /// Resolves `allowed_models` and `model_policy` (ADR-0018) from the SAME project row for the
-    /// token-exchange grant -- one query for both, generalizing the ADR's "same call, same row, no
-    /// new query" shape (stated there for introspection) to this call site too. Not used by
-    /// [`Self::handle_refresh_token`], which already loads `project` earlier for its own
-    /// re-validation and reads both fields directly off that value instead of calling this again.
-    ///
-    /// `allowed_models` keeps its pre-existing behavior, UNCHANGED by this method: any lookup
-    /// failure (not found, or a genuine error) resolves to `None`, same as before this ADR existed
-    /// -- not a decision this ticket revisits.
-    ///
-    /// `model_policy` is different, and deliberately NOT given that same fail-open shape: unlike
-    /// `allowed_models`'s `None` (a legitimate "no restriction" answer), there is no reading of "the
-    /// lookup failed" that safely maps to a permissive `model_policy`. So any lookup failure here
-    /// fails CLOSED to [`ModelPolicy::DenyAll`] (logged as an error) -- the claim is still always
-    /// minted, never omitted, and the exchange itself is never refused because of this lookup,
-    /// mirroring [`Self::resolve_budget_tier`]'s "downgrade to the safest value, don't fail the
-    /// mint" shape rather than [`Self::resolve_quota_tier`]'s "refuse the exchange" shape, because
-    /// -- like `budget_tier` and unlike `quota_tier` -- `model_policy` always has a well-defined
-    /// most-conservative value to fall back to.
-    async fn resolve_project_model_access(
-        &self,
-        project_id: &str,
-    ) -> (Option<Vec<String>>, ModelPolicy) {
-        match self.repo.get_project_by_id(project_id).await {
-            Ok(Some(project)) => (project.allowed_models, project.model_policy),
-            Ok(None) => {
-                tracing::error!(
-                    project_id = %project_id,
-                    "project not found while resolving model_policy claim; failing closed to \
-                     deny_all rather than defaulting to allow_all"
-                );
-                (None, ModelPolicy::DenyAll)
-            }
-            Err(err) => {
-                tracing::error!(
-                    error = %err,
-                    project_id = %project_id,
-                    "project lookup failed while resolving model_policy claim; failing closed to \
-                     deny_all rather than defaulting to allow_all"
-                );
-                (None, ModelPolicy::DenyAll)
-            }
-        }
-    }
-
     /// Loads the plaintext profile-claim snapshot (`email`/`email_verified`/`preferred_username`/
     /// `name`) for `account_id` from `federated_identities` -- see that table's own migration
     /// (`20260830000001_federated_identities_add_profile_claims.sql`) for why these four are
@@ -906,9 +810,8 @@ impl TokenExchangeOpStore {
     /// hand to decode claims from directly the way [`Self::handle_token_exchange`] does via
     /// `decode_profile_claims`.
     ///
-    /// Fail-OPEN, deliberately unlike this store's tenant/budget/quota resolvers
-    /// ([`Self::resolve_budget_tier`]/[`Self::resolve_quota_tier`]/
-    /// [`Self::resolve_project_model_access`]): these are cosmetic display claims, not an
+    /// Fail-OPEN, deliberately unlike this store's budget resolver
+    /// ([`Self::resolve_budget_tier`]): these are cosmetic display claims, not an
     /// authorization decision, so a lookup failure or a missing row degrades to "no profile claims
     /// on this mint" (a token with `sub` and full tenant context but no `name`/
     /// `preferred_username`/`email` -- the previous, unconditional behavior for every browser/
@@ -980,9 +883,6 @@ impl TokenExchangeOpStore {
         grant_label: &'static str,
         tokens: &TokenManager,
     ) -> Result<TokenResponse, TokenErrorResponse> {
-        let (allowed_models, model_policy) =
-            self.resolve_project_model_access(&context.project_id).await;
-
         let granted_scopes = grant_scopes(req_scope, &self.cfg.allowed_scopes, client_scopes);
         let offline = granted_scopes.iter().any(|s| s == OFFLINE_ACCESS_SCOPE);
         let openid = granted_scopes.iter().any(|s| s == OPENID_SCOPE);
@@ -1027,9 +927,6 @@ impl TokenExchangeOpStore {
         let session_id = session.id;
 
         let budget_tier = self.resolve_budget_tier(&context.account_id, now).await;
-        let quota_tier = self
-            .resolve_quota_tier(&context.project_id, account_id)
-            .await?;
         // ADR-0020 Decision 2 (#437's scoped-down interpretation, see `access_token_extra`'s doc
         // comment): `sid` and `api_key_id` carry the SAME real, persisted session id.
         let mut access_extra = access_token_extra(
@@ -1038,17 +935,9 @@ impl TokenExchangeOpStore {
             &session_id,
             &context.project_id,
             &context.account_id,
-            allowed_models,
             Some(client_id),
         );
         access_extra.insert("budget_tier".to_string(), Value::String(budget_tier));
-        if let Some(quota_tier) = quota_tier {
-            access_extra.insert("quota_tier".to_string(), Value::String(quota_tier));
-        }
-        access_extra.insert(
-            "model_policy".to_string(),
-            Value::String(model_policy.to_string()),
-        );
         for (claim, value) in self
             .resolve_mapped_claims(&context.project_id, account_id, &context.account_id)
             .await?
@@ -1652,12 +1541,13 @@ impl TokenExchangeOpStore {
             Err(Error::NotFound) => return Err(refuse_with_row("context_not_found")),
             Err(_) => return Err(unavailable("ctx_failed", "context resolution failed")),
         };
-        let project = match self
+        // Called for its REFUSAL, not its value -- see the same call in `issue_device_tokens`.
+        match self
             .repo
             .require_active_project_and_account(&context.project_id, &context.account_id)
             .await
         {
-            Ok(project) => project,
+            Ok(_) => {}
             Err(Error::Forbidden(_)) => return Err(refuse_with_row("account_suspended")),
             Err(_) => return Err(unavailable("status_failed", "suspension check failed")),
         };
@@ -1670,8 +1560,6 @@ impl TokenExchangeOpStore {
             preferred_username: old_row.preferred_username.clone(),
             name: old_row.name.clone(),
         };
-        let allowed_models = project.allowed_models;
-        let model_policy = project.model_policy;
         let openid = old_row
             .scope
             .as_deref()
@@ -1689,9 +1577,6 @@ impl TokenExchangeOpStore {
         let scope_str = old_row.scope.clone();
 
         let budget_tier = self.resolve_budget_tier(&context.account_id, now).await;
-        let quota_tier = self
-            .resolve_quota_tier(&context.project_id, &old_row_account_id)
-            .await?;
         // ADR-0020 Decision 2 (#437's scoped-down interpretation, see `access_token_extra`'s doc
         // comment): `sid` and `api_key_id` carry the SAME real, persisted (reused) session id.
         let mut access_extra = access_token_extra(
@@ -1700,17 +1585,9 @@ impl TokenExchangeOpStore {
             &session_id,
             &context.project_id,
             &context.account_id,
-            allowed_models,
             Some(&client_id),
         );
         access_extra.insert("budget_tier".to_string(), Value::String(budget_tier));
-        if let Some(quota_tier) = quota_tier {
-            access_extra.insert("quota_tier".to_string(), Value::String(quota_tier));
-        }
-        access_extra.insert(
-            "model_policy".to_string(),
-            Value::String(model_policy.to_string()),
-        );
         for (claim, value) in self
             .resolve_mapped_claims(
                 &context.project_id,

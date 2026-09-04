@@ -31,6 +31,7 @@ use crate::error::BudgetError;
 use crate::period::Period;
 
 pub use crate::remaining_service::RemainingService;
+pub use crate::remaining_snapshot::SnapshotRemainingService;
 
 /// A fully-known remaining-budget answer for one `(budget account, period)`.
 ///
@@ -72,6 +73,15 @@ pub struct BudgetRemaining {
     /// So: `Some(n)` is a **lower bound** on staleness (cache age, ingest lag on top), and `None`
     /// is "no cache age to report", not "current".
     pub source_lag_seconds: Option<u64>,
+    /// How old the precomputed snapshot this answer came from is, in seconds (ADR-0034 §15).
+    ///
+    /// `Some(n)` means the answer was served from `budget_remaining_snapshots` and was computed
+    /// `n` seconds ago; `None` means it was computed live for this call. It is reported rather
+    /// than hidden because the single-call design deliberately trades freshness for a per-request
+    /// cost of one indexed read, and a consumer acting on the number is entitled to see the
+    /// window it is acting inside. Like `source_lag_seconds`, it is a LOWER bound on staleness —
+    /// the OTLP ingest lag sits on top of it.
+    pub snapshot_age_seconds: Option<u64>,
 }
 
 /// The result of asking for an account's remaining budget.
@@ -113,6 +123,22 @@ pub trait RemainingReader: Send + Sync + std::fmt::Debug {
         period: &Period,
         now: DateTime<Utc>,
     ) -> Result<Remaining, BudgetError>;
+
+    /// The same answer, computed live rather than served from a precomputed snapshot — what
+    /// `GET /budget/v1/remaining?fresh=true` is for (ADR-0034 §15).
+    ///
+    /// The default is [`Self::remaining_for_account`], which is exactly right for every reader
+    /// that has no snapshot layer: for those two the words already mean the same thing. Only
+    /// `SnapshotRemainingService` overrides it, and it overrides it by *skipping* itself.
+    async fn remaining_for_account_live(
+        &self,
+        budget_account_id: &str,
+        period: &Period,
+        now: DateTime<Utc>,
+    ) -> Result<Remaining, BudgetError> {
+        self.remaining_for_account(budget_account_id, period, now)
+            .await
+    }
 }
 
 /// Midnight UTC on the 1st of the calendar month **after** `period` — when the ledger's period

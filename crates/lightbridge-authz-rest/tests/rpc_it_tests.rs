@@ -128,16 +128,6 @@ struct Ctx {
     reset_scheduler: Arc<lightbridge_authz_budget::ResetScheduler>,
 }
 
-// `SqlxIdempotencyStore::ensure_schema()` issues its `CREATE TYPE`/`CREATE TABLE` DDL without
-// `IF NOT EXISTS`-safe concurrency handling, so when every one of this file's ~16 tests calls it
-// from `setup()` against the same fresh (just-migrated) database under `cargo test`'s default
-// parallelism, several race and hit `duplicate key value violates unique constraint
-// "pg_type_typname_nsp_index"`. The schema is process-wide idempotent (identical DDL, no
-// per-test state), so it only needs to run once per test binary -- guarded by a `OnceCell` shared
-// across every `setup()` call; concurrent callers await the same in-flight future rather than
-// each issuing their own DDL.
-static IDEMPOTENCY_SCHEMA_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-
 /// Build the full `build_api_router` for `bearer`, connecting the cratestack CRUD client,
 /// Postgres-backed idempotency store, and Redis rate-limit store to the live backends.
 async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
@@ -162,15 +152,12 @@ async fn setup_with_resolver(
     let cpool = cratestack_pool().await;
     let cdb = schema::Cratestack::builder(cpool.clone()).build();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()).with_billing(billing()));
+    // No `ensure_schema()` here any more: `cratestack_idempotency` is created by
+    // `migrations/20260904000002_cratestack_bootstrap_tables.sql`, so the DDL race this file used
+    // to guard against with a per-binary `OnceCell` no longer exists to guard (#684). The same
+    // migration also owns `cratestack_audit`, which no test could guard because cratestack issues
+    // that DDL itself from inside the create path.
     let idempotency = Arc::new(SqlxIdempotencyStore::new(cpool.clone()));
-    IDEMPOTENCY_SCHEMA_READY
-        .get_or_init(|| async {
-            idempotency
-                .ensure_schema()
-                .await
-                .expect("ensure idempotency schema");
-        })
-        .await;
     // A per-`setup()`-call namespace, not a shared literal: `RateLimitLayer`'s default key hashes
     // the raw `Authorization` header value, and every test in this file authenticates with the
     // literal bearer token `"admin"` (or another fixed literal like `"owner"`/`"viewer"`) -- a
@@ -1525,6 +1512,7 @@ fn opa_state(core: Arc<dyn DbPoolTrait>) -> Arc<OpaState> {
         api_key_audience: None,
         resolver: common::test_resolver(),
         federation_issuer: "https://keycloak.example.test/realms/dev".to_string(),
+        budget: Default::default(),
     })
 }
 

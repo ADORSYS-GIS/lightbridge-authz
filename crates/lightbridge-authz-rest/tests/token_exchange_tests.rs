@@ -708,6 +708,7 @@ fn opa_state(repo: Arc<StoreRepo>) -> Arc<OpaState> {
         api_key_audience: None,
         resolver: Arc::new(TrustEverythingResolver),
         federation_issuer: GRANDFATHER_ISSUER.to_string(),
+        budget: Default::default(),
     })
 }
 
@@ -2452,7 +2453,6 @@ async fn azp_reliably_distinguishes_a_real_api_key_jwt_from_a_real_exchange_sess
             "key_1",
             PROJECT_ID,
             ACCOUNT_ID,
-            None,
             chrono::Utc::now(),
             None,
         )
@@ -2704,13 +2704,11 @@ async fn an_unfederated_subject_and_a_non_member_produce_byte_identical_error_re
 }
 
 // ============================================================================================
-// Tenant claims / role-quota exclusion (ADR-0011, Decision 7). `quota_tier` is narrower than the
-// test name now suggests: as of ADR-0017 it CAN appear on the access token when resolvable (see
-// the ADR-0017 test block later in this file) -- what this test actually pins is `seed`'s
-// specific fixture, where SUBJECT owns `PROJECT_ID` directly and therefore holds no
-// `project_members` row on it, the "resolved, legitimately absent" outcome ADR-0017 calls outcome
-// 2. `role`/`project_quota` remain unconditionally excluded from both tokens, unaffected by
-// ADR-0017 -- see that ADR's Decision 1 Context for why only `quota_tier` earns the carve-out.
+// Tenant claims / role-quota exclusion (ADR-0011, Decision 7) -- RESTORED IN FULL by #430. The
+// carve-outs ADR-0017 (`quota_tier`) and ADR-0018/#418 (`model_policy`/`allowed_models`) opened in
+// this rule are closed again: `authz-opa` introspection resolves all three live for the human
+// plane (`handlers::exchange_token::resolve_exchange_token_context`), so none of them ride the
+// token. `budget_tier` is the single remaining exception (ADR-0014, reaffirmed by ADR-0034 §12).
 // ============================================================================================
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -2738,12 +2736,26 @@ async fn tenant_claims_on_access_token_role_and_quota_absent_from_both(pool: PgP
     .await;
     assert_eq!(access_claims["project_id"], PROJECT_ID);
     assert_eq!(access_claims["account_id"], ACCOUNT_ID);
-    for role_claim in ["role", "quota_tier", "project_quota"] {
+    // #430: `allowed_models`/`model_policy`/`quota_tier` joined `role`/`project_quota` here --
+    // `authz-opa` introspection (`handlers::exchange_token`) is the sole live source of all five
+    // for the human plane, so none of them ride the token any more. `budget_tier` is the one
+    // deliberate exception and is asserted PRESENT by its own tests (ADR-0034 §12).
+    for role_claim in [
+        "role",
+        "quota_tier",
+        "project_quota",
+        "allowed_models",
+        "model_policy",
+    ] {
         assert!(
             access_claims.get(role_claim).is_none(),
             "access token must never carry {role_claim}: {access_claims}"
         );
     }
+    assert_eq!(
+        access_claims["budget_tier"], "b-15",
+        "budget_tier is #430's documented exception and must still be stamped: {access_claims}"
+    );
 
     let id_claims =
         verify_id_token(&repo, body["id_token"].as_str().unwrap(), PUBLIC_CLIENT_ID).await;
@@ -2754,6 +2766,8 @@ async fn tenant_claims_on_access_token_role_and_quota_absent_from_both(pool: PgP
         "role",
         "quota_tier",
         "project_quota",
+        "allowed_models",
+        "model_policy",
     ] {
         assert!(
             id_claims.get(tenant_claim).is_none(),
@@ -3197,10 +3211,10 @@ async fn exchange_mints_project_scoped_jwt_with_refresh(pool: PgPool) {
     assert_eq!(claims.sub, SUBJECT);
     assert_eq!(claims.project_id, PROJECT_ID);
     assert_eq!(claims.account_id, ACCOUNT_ID);
-    assert_eq!(
-        claims.allowed_models,
-        Some(vec!["gpt-4.1-mini".to_string()])
-    );
+    // #430: the project this exchange resolves DOES carry a real, non-empty `allowed_models`
+    // list (see `seed`), and the minted token still must not echo it -- `authz-opa` introspection
+    // is its only source now.
+    assert_eq!(claims.allowed_models, None);
     assert!(!claims.api_key_id.is_empty());
     assert_eq!(claims.email, None);
 }
@@ -6441,300 +6455,14 @@ async fn budget_tier_claim_survives_a_budget_ledger_outage_on_refresh(pool: PgPo
 }
 
 // ============================================================================================
-// ADR-0017: `quota_tier` is stamped on the access token at token-exchange/refresh mint time,
-// resolved live from `project_members` -- carving `quota_tier` (not `role`/`project_quota`) out
-// of ADR-0011 Decision 7's "role/quota data stays out of both JWTs".
-//
-// Three outcomes, kept deliberately distinct on the wire (this is the crux the ADR exists to get
-// right, see `TokenExchangeOpStore::resolve_quota_tier`'s own doc comment):
-//   1. resolved, tier present               -> claim stamped verbatim
-//   2. resolved, tier legitimately absent   -> claim OMITTED (a resolved, safe answer)
-//   3. could not resolve (lookup failed)    -> the WHOLE exchange/refresh is REFUSED, so no
-//      token -- and therefore no `quota_tier` value of any kind -- ever reaches the wire.
-// Outcome 3 must never look like outcome 2: that is exactly the "an outage becomes a quota
-// bypass" failure mode issue #385 and this ADR both call out by name.
+// ADR-0017 / ADR-0018 mint-time claim tests LIVED HERE and were deleted by #430, premise and all:
+// `quota_tier`/`model_policy`/`allowed_models` are no longer stamped on any minted token, so
+// "which of three wire outcomes did the mint produce" is no longer a question this service can
+// answer. Their live replacements are the introspection tests in `opa_tests.rs`
+// (`payload["quota_tier"]` / `payload["model_policy"]` / `payload["allowed_models"]`), which
+// assert exactly the same three-way distinction on the response that now carries it. The absence
+// side is pinned by `tenant_claims_on_access_token_role_and_quota_absent_from_both` above.
 // ============================================================================================
-
-/// Outcome 1: a resolvable, real per-member tier is stamped verbatim. Uses `seed_member_project`
-/// (SUBJECT is a plain roster *member* of `MEMBER_PROJECT_ID`, owned by `OWNER_ACCOUNT`) rather
-/// than `seed`'s own `PROJECT_ID` (which SUBJECT owns directly and therefore never gets a roster
-/// row for) -- this is deliberately the "person with an actual per-member ceiling" shape, not the
-/// "project owner" shape outcome-2's tests below cover.
-#[sqlx::test(migrations = "../../migrations")]
-async fn token_exchange_stamps_the_real_quota_tier_when_the_subject_has_one(pool: PgPool) {
-    let repo = repo(pool);
-    bootstrap_idp_signing_keys(&repo, &signing_cfg())
-        .await
-        .unwrap();
-    seed_member_project(&repo).await;
-    repo.set_project_member_quota_tier(
-        &AccountId::assert_already_resolved(OWNER_ACCOUNT),
-        MEMBER_PROJECT_ID,
-        SUBJECT,
-        Some("t-gold"),
-    )
-    .await
-    .expect("owner may set a roster member's quota tier");
-
-    let (status, body) = post_token(
-        state(repo.clone(), true),
-        &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={MEMBER_PROJECT_ID}"
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-
-    let claims = decode_access_token_claims(
-        &repo,
-        body["access_token"].as_str().unwrap(),
-        PUBLIC_CLIENT_ID,
-    )
-    .await;
-    assert_eq!(claims["quota_tier"], "t-gold", "claims: {claims:?}");
-}
-
-/// Outcome 2, second shape: SUBJECT holds a real `project_members` row on `MEMBER_PROJECT_ID`,
-/// but its `quota_tier` column is NULL (never set) -- a distinct code path from "no row at all"
-/// above (a real row is returned; `Option<String>` inside it is `None`), that
-/// `StoreRepo::project_member_quota_tier`'s `.flatten()` must collapse to the exact same "omit
-/// the claim" outcome. Proves the omission is not an accident of "no row found" specifically.
-#[sqlx::test(migrations = "../../migrations")]
-async fn token_exchange_omits_quota_tier_when_the_members_row_has_a_null_tier(pool: PgPool) {
-    let repo = repo(pool);
-    bootstrap_idp_signing_keys(&repo, &signing_cfg())
-        .await
-        .unwrap();
-    seed_member_project(&repo).await;
-
-    let (status, body) = post_token(
-        state(repo.clone(), true),
-        &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={MEMBER_PROJECT_ID}"
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-
-    let claims = decode_access_token_claims(
-        &repo,
-        body["access_token"].as_str().unwrap(),
-        PUBLIC_CLIENT_ID,
-    )
-    .await;
-    assert!(
-        claims.get("quota_tier").is_none(),
-        "a roster row with a NULL quota_tier must omit the claim, exactly like no row at all: \
-         {claims:?}"
-    );
-}
-
-/// The refresh grant re-mints through the SAME `resolve_quota_tier` call the exchange grant uses
-/// (verified here, not just trusted from the doc comment) -- mirrors
-/// `refresh_re_resolves_the_budget_tier_live_rather_than_copying_the_old_claim` exactly, on the
-/// `quota_tier` axis: a lead's tier edit made AFTER the original exchange must be visible on the
-/// NEXT refresh, proving refresh re-resolves live rather than copying the tier forward from the
-/// token it is replacing.
-#[sqlx::test(migrations = "../../migrations")]
-async fn refresh_re_resolves_the_quota_tier_live_rather_than_copying_the_old_claim(pool: PgPool) {
-    let repo = repo(pool);
-    bootstrap_idp_signing_keys(&repo, &signing_cfg())
-        .await
-        .unwrap();
-    seed_member_project(&repo).await;
-
-    let (status, body) = post_token(
-        state(repo.clone(), true),
-        &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x\
-             &project_id={MEMBER_PROJECT_ID}&scope=offline_access"
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    let claims = decode_access_token_claims(
-        &repo,
-        body["access_token"].as_str().unwrap(),
-        PUBLIC_CLIENT_ID,
-    )
-    .await;
-    assert!(
-        claims.get("quota_tier").is_none(),
-        "initial exchange claims (no tier set yet): {claims:?}"
-    );
-    let refresh_token = body["refresh_token"].as_str().unwrap().to_string();
-
-    // A lead sets the tier between the exchange and the refresh -- the claim must catch up on
-    // the next refresh (bounded by access-token TTL / refresh timing), not require a fresh login.
-    repo.set_project_member_quota_tier(
-        &AccountId::assert_already_resolved(OWNER_ACCOUNT),
-        MEMBER_PROJECT_ID,
-        SUBJECT,
-        Some("t-silver"),
-    )
-    .await
-    .expect("owner may set a roster member's quota tier");
-
-    let (status, body) = post_token(
-        state(repo.clone(), true),
-        &format!(
-            "grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={refresh_token}"
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    let claims = decode_access_token_claims(
-        &repo,
-        body["access_token"].as_str().unwrap(),
-        PUBLIC_CLIENT_ID,
-    )
-    .await;
-    assert_eq!(
-        claims["quota_tier"], "t-silver",
-        "refresh must re-resolve the tier live, not copy the prior token's (absent) claim \
-         forward: {claims:?}"
-    );
-}
-
-/// ADR-0018: `model_policy` has no dedicated write path yet (the schema field is `@readonly` --
-/// see `authz.cstack`'s own comment on `Project.modelPolicy`), so this test sets it directly
-/// against the real Postgres row rather than through `StoreRepo`, purely as test fixture setup --
-/// exactly the kind of direct-SQL test plumbing this file already uses for scenarios no
-/// application write path covers yet.
-async fn set_project_model_policy(repo: &StoreRepo, project_id: &str, policy: &str) {
-    sqlx::query("UPDATE projects SET model_policy = $1 WHERE id = $2")
-        .bind(policy)
-        .bind(project_id)
-        .execute(repo.pool.pool())
-        .await
-        .expect("direct model_policy update should succeed");
-}
-
-/// ADR-0018 acceptance criterion: a token-exchange call stamps `model_policy` on the minted access
-/// token, reflecting the project's current value at mint time -- default `allow_all` here (the
-/// value `seed()` leaves every project at, matching the migration's own backfill default).
-#[sqlx::test(migrations = "../../migrations")]
-async fn token_exchange_stamps_the_projects_model_policy_allow_all_by_default(pool: PgPool) {
-    let repo = repo(pool);
-    bootstrap_idp_signing_keys(&repo, &signing_cfg())
-        .await
-        .unwrap();
-    seed(&repo).await;
-
-    let (status, body) = post_token(
-        state(repo.clone(), true),
-        &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-
-    let claims = decode_access_token_claims(
-        &repo,
-        body["access_token"].as_str().unwrap(),
-        PUBLIC_CLIENT_ID,
-    )
-    .await;
-    assert_eq!(claims["model_policy"], "allow_all", "claims: {claims:?}");
-}
-
-/// Each of the three `model_policy` values round-trips onto the minted access-token claim,
-/// mirroring `introspect_round_trips_each_model_policy_value` on the human/OIDC plane.
-#[sqlx::test(migrations = "../../migrations")]
-async fn token_exchange_stamps_each_model_policy_value(pool: PgPool) {
-    let repo = repo(pool);
-    bootstrap_idp_signing_keys(&repo, &signing_cfg())
-        .await
-        .unwrap();
-    seed(&repo).await;
-
-    for wire_value in ["allow_all", "allowlist", "deny_all"] {
-        set_project_model_policy(&repo, PROJECT_ID, wire_value).await;
-
-        let (status, body) = post_token(
-            state(repo.clone(), true),
-            &format!(
-                "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={PROJECT_ID}"
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "body: {body}");
-
-        let claims = decode_access_token_claims(
-            &repo,
-            body["access_token"].as_str().unwrap(),
-            PUBLIC_CLIENT_ID,
-        )
-        .await;
-        assert_eq!(
-            claims["model_policy"], wire_value,
-            "stored value {wire_value:?} must round-trip onto the claim: {claims:?}"
-        );
-    }
-}
-
-/// The refresh grant re-mints through the SAME project lookup the exchange grant uses (verified
-/// here, not just trusted from the doc comment) -- mirrors
-/// `refresh_re_resolves_the_budget_tier_live_rather_than_copying_the_old_claim`/
-/// `refresh_re_resolves_the_quota_tier_live_rather_than_copying_the_old_claim` exactly, on the
-/// `model_policy` axis: an operator flipping the policy AFTER the original exchange must be
-/// visible on the NEXT refresh, proving refresh re-resolves live rather than copying the value
-/// forward from the token it is replacing.
-#[sqlx::test(migrations = "../../migrations")]
-async fn refresh_re_resolves_the_model_policy_live_rather_than_copying_the_old_claim(pool: PgPool) {
-    let repo = repo(pool);
-    bootstrap_idp_signing_keys(&repo, &signing_cfg())
-        .await
-        .unwrap();
-    seed(&repo).await;
-
-    let (status, body) = post_token(
-        state(repo.clone(), true),
-        &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x\
-             &project_id={PROJECT_ID}&scope=offline_access"
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    let claims = decode_access_token_claims(
-        &repo,
-        body["access_token"].as_str().unwrap(),
-        PUBLIC_CLIENT_ID,
-    )
-    .await;
-    assert_eq!(
-        claims["model_policy"], "allow_all",
-        "initial exchange claims: {claims:?}"
-    );
-    let refresh_token = body["refresh_token"].as_str().unwrap().to_string();
-
-    // The project is flipped to deny_all between the exchange and the refresh -- the claim must
-    // catch up on the next refresh (bounded by access-token TTL / refresh timing), not require a
-    // fresh login.
-    set_project_model_policy(&repo, PROJECT_ID, "deny_all").await;
-
-    let (status, body) = post_token(
-        state(repo.clone(), true),
-        &format!(
-            "grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={refresh_token}"
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    let claims = decode_access_token_claims(
-        &repo,
-        body["access_token"].as_str().unwrap(),
-        PUBLIC_CLIENT_ID,
-    )
-    .await;
-    assert_eq!(
-        claims["model_policy"], "deny_all",
-        "refresh must re-resolve model_policy live, not copy the prior token's claim forward: \
-         {claims:?}"
-    );
-}
 
 /// ADR-0018 acceptance criterion: "the migration backfills every existing row to `allow_all` and
 /// is verified against a pre-migration fixture, not just a fresh schema." Mirrors
@@ -6799,135 +6527,6 @@ async fn migration_backfills_a_pre_existing_project_row_to_allow_all(pool: PgPoo
         model_policy, "allow_all",
         "a pre-existing row must backfill to allow_all -- the value that reproduces its current \
          NULL-allowed_models 'all models allowed' behavior exactly"
-    );
-}
-
-/// **Outcome 3, the fail-closed test that matters most.** `repo` (subject/context resolution)
-/// stays a REAL, reachable Postgres -- `resolve_context` succeeds -- while `quota_repo` (the
-/// `project_members` lookup `resolve_quota_tier` reads) is pointed at an unreachable pool
-/// (`lazy_repo`, the same "dead Postgres" fixture `totally_unreachable_repo_...` tests elsewhere
-/// in this file already use). This is what proves the refusal is `resolve_quota_tier`'s OWN
-/// fail-closed branch firing, not merely `resolve_context` failing first: if `resolve_quota_tier`
-/// ever regressed to swallowing its error into `Ok(None)` (the exact bug this ADR exists to
-/// prevent), this test would flip from `500 server_error` to `200 OK` with the claim silently
-/// omitted -- indistinguishable, on the wire, from every genuinely-tierless account.
-#[sqlx::test(migrations = "../../migrations")]
-async fn quota_tier_lookup_failure_refuses_the_exchange_even_though_context_resolution_succeeds(
-    pool: PgPool,
-) {
-    let repo = repo(pool);
-    bootstrap_idp_signing_keys(&repo, &signing_cfg())
-        .await
-        .unwrap();
-    seed_member_project(&repo).await;
-    repo.set_project_member_quota_tier(
-        &AccountId::assert_already_resolved(OWNER_ACCOUNT),
-        MEMBER_PROJECT_ID,
-        SUBJECT,
-        Some("t-gold"),
-    )
-    .await
-    .expect("owner may set a roster member's quota tier");
-
-    let state = state_with_cfg_and_budget_repo(
-        repo.clone(),
-        lazy_repo(),
-        Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
-            repo.pool.clone(),
-        )),
-        default_policy_engine(),
-        Arc::new(MockBearer::new(true, vec![PUBLIC_CLIENT_ID.to_string()])),
-        vec![public_client(PUBLIC_CLIENT_ID)],
-        &redis_url(),
-        exchange_cfg(),
-    );
-
-    let (status, body) = post_token(
-        state,
-        &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x&project_id={MEMBER_PROJECT_ID}"
-        ),
-    )
-    .await;
-
-    assert_eq!(
-        status,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "an unresolvable quota-tier lookup must refuse the mint outright -- never mint a token \
-         with the claim silently omitted, which would be indistinguishable from a genuinely \
-         tierless account: {body}"
-    );
-    assert_eq!(body["error"], "server_error");
-    assert!(
-        body.get("access_token").is_none(),
-        "no token of any kind may be issued on this path: {body}"
-    );
-}
-
-/// Same fail-closed guarantee, on the refresh grant -- ADR-0011 re-mints both grants through the
-/// same signing calls, so this pins that the refusal applies there too, not only on the initial
-/// exchange. The refresh token itself is minted with a fully reachable `quota_repo` (proving the
-/// account had a resolvable roster once); only the lookup backing the *refresh* call is swapped
-/// to unreachable.
-#[sqlx::test(migrations = "../../migrations")]
-async fn quota_tier_lookup_failure_refuses_the_refresh_even_though_context_resolution_succeeds(
-    pool: PgPool,
-) {
-    let repo = repo(pool);
-    bootstrap_idp_signing_keys(&repo, &signing_cfg())
-        .await
-        .unwrap();
-    seed_member_project(&repo).await;
-    repo.set_project_member_quota_tier(
-        &AccountId::assert_already_resolved(OWNER_ACCOUNT),
-        MEMBER_PROJECT_ID,
-        SUBJECT,
-        Some("t-gold"),
-    )
-    .await
-    .expect("owner may set a roster member's quota tier");
-
-    let (status, body) = post_token(
-        state(repo.clone(), true),
-        &format!(
-            "grant_type={TOKEN_EXCHANGE_GRANT}&client_id={PUBLIC_CLIENT_ID}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&subject_token=x\
-             &project_id={MEMBER_PROJECT_ID}&scope=offline_access"
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    let refresh_token = body["refresh_token"].as_str().unwrap().to_string();
-
-    let state = state_with_cfg_and_budget_repo(
-        repo.clone(),
-        lazy_repo(),
-        Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
-            repo.pool.clone(),
-        )),
-        default_policy_engine(),
-        Arc::new(MockBearer::new(true, vec![PUBLIC_CLIENT_ID.to_string()])),
-        vec![public_client(PUBLIC_CLIENT_ID)],
-        &redis_url(),
-        exchange_cfg(),
-    );
-    let (status, body) = post_token(
-        state,
-        &format!(
-            "grant_type=refresh_token&client_id={PUBLIC_CLIENT_ID}&refresh_token={refresh_token}"
-        ),
-    )
-    .await;
-
-    assert_eq!(
-        status,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "an unresolvable quota-tier lookup must refuse the refresh outright, same as the \
-         exchange grant: {body}"
-    );
-    assert_eq!(body["error"], "server_error");
-    assert!(
-        body.get("access_token").is_none(),
-        "no token of any kind may be issued on this path: {body}"
     );
 }
 
@@ -7276,10 +6875,12 @@ async fn authorization_code_grant_stamps_the_same_enforcement_claims_as_the_othe
         "a session row must be created for a browser login, so the session is revocable: \
          {claims:?}"
     );
-    assert_eq!(
-        claims["model_policy"], "allow_all",
-        "model policy travels with every human-plane token: {claims:?}"
-    );
+    for absent in ["model_policy", "allowed_models", "quota_tier"] {
+        assert!(
+            claims.get(absent).is_none(),
+            "#430: {absent} is resolved live by introspection, never minted: {claims:?}"
+        );
+    }
     assert_eq!(
         claims["account_id"], SUBJECT,
         "tenant context must name the acting account: {claims:?}"
@@ -7843,6 +7444,7 @@ async fn client_credentials_claim_shape_matches_the_service_token_contract(pool:
         "budget_tier",
         "quota_tier",
         "allowed_models",
+        "model_policy",
     ] {
         assert!(
             claims.get(absent).is_none() || claims[absent].is_null(),

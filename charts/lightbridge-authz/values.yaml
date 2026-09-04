@@ -359,6 +359,13 @@ sharedConfig:
       tls:
         cert_path: /etc/lightbridge/tls/budget.crt
         key_path: /etc/lightbridge/tls/budget.key
+      # ADR-0034 section 15: the remaining-snapshot refresher's pacing. See the same keys in
+      # config/default.yaml for what each one trades. `snapshot_refresh_seconds` is the dominant
+      # term of the forgiven-overspend window.
+      snapshot_refresh_seconds: 15
+      snapshot_active_window_minutes: 10
+      snapshot_batch: 500
+      snapshot_concurrency: 8
   otel:
     enabled: true
     otlp_endpoint: "http://localhost:4317"

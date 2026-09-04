@@ -1,6 +1,6 @@
 # ADR-0017: `quota_tier` is also stamped at token-mint time for the human/OIDC plane, carving out one claim from ADR-0011 Decision 7
 
-- Status: Accepted
+- Status: **Superseded by #430** (2026-09-03) -- see the supersession note below.
 - Date: 2026-08-20
 - Decision owners: Stephane Segning Lambou
 - Supersedes (partially): ADR-0011's Decision 7 ("The id_token is not a second home for
@@ -10,6 +10,28 @@
   what upstream told us, and does not invent a second home for data that already has one — is
   **unaffected and remains in force**; see Decision 1 and "Alternatives considered" below for
   exactly why `quota_tier` earns the one carve-out and `project_quota`/`role` do not.
+
+> **Superseded, 2026-09-03 (#430, PR #454).** The `quota_tier` carve-out this ADR opened is
+> **closed**: `quota_tier` is no longer stamped on any minted token. This ADR's own argument is
+> what retires it. Decision 1 rests on the premise that the human/OIDC plane had *no live path* to
+> a per-member tier, so freezing one at mint was the only way to deliver it faster than a token
+> lifetime. PR #429 removed that premise -- `authz-opa` introspection
+> (`handlers::exchange_token::resolve_exchange_token_context`) now resolves `role` and `quota_tier`
+> live for an exchange session exactly as it always did for an API key, on the same 30s cache. The
+> carve-out therefore became redundant with the general rule it was an exception to, and
+> **ADR-0011 Decision 7 is restored in full**: `role`, `project_quota` AND `quota_tier` all ride
+> the introspection response, none of them the JWT.
+>
+> What is unaffected: the quota-tier DOMAIN itself -- the `project_members.quota_tier` column, the
+> `QuotaTiers` catalogue, `set_project_member_quota_tier`, and
+> `StoreRepo::project_member_quota_tier` (which kept its introspection caller and lost only its
+> mint-time one). Only *where the value is read from* changed.
+>
+> The gateway side is `ADORSYS-GIS/ai-helm-values#296`, which deletes the now-nonexistent
+> `auth.identity.quota_tier` fallback from `x-quota-tier`'s CEL. That fallback was already
+> structurally unreachable before this change -- it fires only when `has(auth.identity.api_key_id)`
+> is false, and every human-plane token this service mints carries `api_key_id` (= the session id,
+> ADR-0020 Decision 2) -- so no deployed behavior changes when the claim disappears.
 
 ## Context
 
