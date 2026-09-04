@@ -25,6 +25,12 @@ pub struct RemainingQuery {
     /// what every caller on the request path wants and what the ledger keys on.
     #[serde(default)]
     pub period: Option<String>,
+    /// `true` bypasses the precomputed snapshot and recomputes `ceiling − spend` live, paying the
+    /// ledger `SUM` and the spend query (ADR-0034 §15). For an operator checking a number by hand,
+    /// never for the request path — the gateway does not send it, and the point of the snapshot is
+    /// that it does not have to.
+    #[serde(default)]
+    pub fresh: bool,
 }
 
 /// The `200` body. Field names are snake_case, matching this domain's own wire convention
@@ -45,6 +51,11 @@ pub struct RemainingResponse {
     /// `null` when unknown — see `BudgetRemaining::source_lag_seconds`. Never `0` as a stand-in
     /// for "we did not measure it".
     pub source_lag_seconds: Option<u64>,
+    /// How old the precomputed snapshot this answer came from is, in seconds. `null` means the
+    /// answer was computed live for this call — either because `?fresh=true` asked for that, or
+    /// because no usable snapshot existed. Never `0` as a stand-in for "we did not measure it".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_age_seconds: Option<u64>,
 }
 
 /// The non-`200` body. `error` is a stable machine token the gateway's Lua branches on; `message`

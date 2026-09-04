@@ -111,20 +111,28 @@ stateDiagram-v2
 The gateway reads the live ledger balance instead of trusting a token claim. Stage 1 is live; the
 thing it exists to do is not.
 
+**Amended 2026-09-04 (ADR-0034 §15):** the budget is no longer a second Authorino metadata call. It
+is three fields on the introspection `authz-opa` already serves, read from a precomputed snapshot
+that a background refresher in `authz-budget` keeps warm. One call per request, one indexed read of
+added cost.
+
 | Item | State | Evidence | Notes |
 |---|---|---|---|
 | ADR-0034 + `GET /budget/v1/remaining` | Done | [#676](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/676) `adaab0a`, [ADR-0034](./adr/0034-dynamic-budget-limiter.md) | |
 | Transport is a shared secret, not mTLS | Done | [#679](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/679) `3a513e9`, ADR-0034 §3.2 | Authorino v0.24 cannot present a client certificate. Not a shortcut — a capability limit, cited. |
 | Unknown account id → `404`, not a zero balance | Done | [#681](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/681) `9341d7b`, ADR-0034 §3.3 | *Known* = a row in `accounts` whose `user_id` resolves to a row in `users`. Previously a typo'd account id arrived as "real user, out of money". |
 | The route has a span, so its p99 exists | Done | [#680](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/680) `b999bdc`, [#682](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/682) `6fe895b` | Plain axum route, outside cratestack — it carried no span while `/rpc/procedure.*` spans arrived normally. "The service is in Tempo" was compatible with this criterion having no data. |
-| Cold-start latency tail | **Not future-proof** | ADR-0034 §9, §10; measured p50 10 ms, one **614 ms** tail | The exact risk §9 names. Every request on the plane waits on this call once enforcement is on. |
+| **One call per request — the budget rides on the introspection** | Done | ADR-0034 §15; migration `20260904000001`; `crates/lightbridge-authz-budget/src/snapshot*.rs`; owner directive 2026-09-04 | The `budgetremaining` metadata step is deleted. `budget_remaining_micros` / `budget_next_reset_at` / `budget_snapshot_age_seconds` ride on `POST /v1/authorino/validate/introspect`, read from `budget_remaining_snapshots` by primary key. Absent still means UNKNOWN, never zero. |
+| Cold-start latency tail | **Resolved by §15** | `EXPLAIN (ANALYZE, BUFFERS)`: Index Scan on the pkey, **3 buffer hits, 0.017–0.030 ms**; end-to-end p50 0.4–1.4 ms over 2 000 samples (`snapshot_read_latency_tests.rs`, which asserts the *plan* and reports the timings) | Was: p50 10 ms with a 614 ms tail, because the request path did a ledger `SUM` plus an HTTPS hop to `authz-usage`. The request path now does one primary-key probe; the `SUM` and the spend query moved to a 15 s background refresher. |
+| Refill visible without waiting for a tick | Done | ADR-0034 §15; `BudgetRepo::grant` + `snapshot_store::APPLY_GRANT_DELTA_SQL` | A booked grant moves the snapshot by its own amount inside the grant's transaction. Exact, not approximate: a grant moves the ceiling and never the spend. |
+| Budget coverage on the `repobinding` / Keycloak planes | **Missing — blocks Stage 3** | ADR-0034 §15.3 | `lightbridgeintrospect` only runs for `api_key_id`-bearing, non-Keycloak credentials, so those two planes carry no budget fields and must be published as `enforced: false` (fail-open) until coverage is extended. Deliberate, and not acceptable at enforce. |
 | Gateway-side enforcement (Stage 2 shadow → Stage 3) | **Broken → reverted** | ai-helm-values #363 (Stage 1), #365/#366/#367 (revert), #368 (incident record) | Shadow mode was enabled and **reverted after two incidents** (16:13–16:18, 16:24–16:28 UTC 2026-09-03). A CEL precedence bug took the public plane down. |
 | Envoy Gateway v1.8.2 runs inline Lua in a gopher-lua sandbox that nils `rawget` | **Broken (root-caused, fixed)** | ai-helm #1098 `3f63b98`, helm-values #370 `5db5031` | The policy was rejected → **every route on both planes** rewritten to `direct_response 500`. A new `egctl translate` gate now catches it (negative control reproduces the prod error text). |
-| Exit criterion: ingest lag between ledger `remaining` and the Redis cost counter | **Missing** | ADR-0034 §10 Stage 2, §5.4 | Named as the direct measure of the overspend window; never measured. Stage 3 cannot honestly proceed without it. |
+| Exit criterion: ingest lag between ledger `remaining` and the Redis cost counter | **Downgraded to an observation** | ADR-0034 §15.1, §10 Stage 2 | Owner ruling 2026-09-04: over-consumption is forgiven. The window is now `30 s introspection TTL + ≤15 s snapshot age + ingest lag + one in-flight request`, stated rather than gated on. Still worth measuring; no longer blocks Stage 3. |
 | Exit criterion: Authorino p99 / ext_authz timeout at the gateway | **Missing** | ADR-0034 §10 Stage 2 | Authorino is unscraped. There is no series to read. |
 | §3.3 unknown-account → gateway mapping (what a `404` becomes at the edge) | **Decision needed** | ADR-0034 §3.3 | The endpoint's contract is settled; what the Lua does with a `404` is not. |
 | Stage 3 enforce date + cost-bucket deletion, on a 1st-of-month 00:00 UTC boundary | **Decision needed** | ADR-0034 §10 Stage 3; memo §5 D8 | One commit: `shadowMode: false` **+** delete the monthly and weekly cost rule families **+** the exporter co-change. A new terminal `402` on a previously-always-200 path is a client-visible API change and must be announced first. |
-| Runbook `budget-limiter-rollout.md` | **Missing** | referenced by [#680](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/680); file does not exist | A doc that cites a runbook that was never written. |
+| Runbook `budget-limiter-rollout.md` | **Missing here, written in the values repo** | `ai-helm-values docs/runbooks/budget-limiter-rollout.md` | The rollout is a values-repo operation (AuthConfig + `budgetLimiter` flags), so the runbook lives beside the values it drives. `docs/runbooks/budget-remaining-snapshot.md` in THIS repo covers the backend half. |
 
 ## 5. Usage store & query API
 

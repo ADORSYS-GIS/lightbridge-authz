@@ -56,9 +56,39 @@ Successful response (`200`, active key):
   "api_key_status": "active",
   "billing_plan": "free",
   "allowed_models": ["gpt-4.1-mini"],
-  "exp": 1767225600
+  "exp": 1767225600,
+  "budget_remaining_micros": 20790000,
+  "budget_next_reset_at": "2026-10-01T00:00:00Z",
+  "budget_snapshot_age_seconds": 9
 }
 ```
+
+### The three `budget_*` fields (ADR-0034 §15)
+
+They carry the account's ledger balance for the current period so the gateway needs **one**
+Authorino metadata call per request instead of two. They are read from `budget_remaining_snapshots`
+by primary key — a table `authz-budget` refreshes on a timer, off the request path — so this
+endpoint never sums a ledger and never calls `authz-usage`.
+
+**They are ABSENT, not zero, whenever the balance is not knowable**: no snapshot row yet, a row
+with no reading yet, a reading describing a period that has since rolled over, or a failed read.
+The AuthConfig's `known` expression is a `has()` over `budget_remaining_micros`, so an absent value
+becomes `known: false` and the gateway's Lua refuses with `503 budget_unavailable`. A `0` there
+would be `402 budget_exhausted` for an account that may be fully funded.
+
+- `budget_remaining_micros` — `ceiling − spend`, integer micro-USD, **signed and unclamped**. A
+  negative value means the account overshot; the gateway charges a request's cost only after the
+  response completes, so that is reachable by construction.
+- `budget_next_reset_at` — when the balance next changes on its own (the winning ADR-0032 reset
+  schedule's `next_run_at`, else midnight UTC on the 1st of the next month).
+- `budget_snapshot_age_seconds` — how old the figure is. Reported rather than hidden: the
+  single-call design trades freshness for a bounded per-request cost, and a consumer acting on the
+  number is entitled to see the window it is acting inside. It is a **lower bound** — the OTLP
+  ingest lag sits on top of it.
+
+Because `lightbridgeintrospect` is gated on a non-Keycloak credential carrying `api_key_id`, these
+fields reach the API-key plane and native RFC 8693 exchange sessions only. See ADR-0034 §15.3 for
+what the AuthConfig must publish for the two planes it does not cover.
 
 Deleted / revoked / expired / unknown key (canonical inactive form — still a `200`, per RFC 7662):
 

@@ -16,6 +16,9 @@ chrono.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The snapshot refresher owns its own interval loop and bounds its spend reads with a `JoinSet`
+# (ADR-0034 section 15), so this crate needs the runtime rather than borrowing the caller's.
+tokio.workspace = true
 tracing.workspace = true
 
 [dependencies.lightbridge-authz-core]
@@ -23,7 +26,6 @@ workspace = true
 
 [dev-dependencies]
 httpmock.workspace = true
-tokio.workspace = true
 axum.workspace = true
 axum-server.workspace = true
 rustls.workspace = true
@@ -89,3 +91,22 @@ required-features = ["it-tests"]
 name = "reset_schedule_tests"
 path = "tests/reset_schedule_tests.rs"
 required-features = ["it-tests"]
+
+[[test]]
+name = "snapshot_store_tests"
+path = "tests/snapshot_store_tests.rs"
+required-features = ["it-tests"]
+
+[[test]]
+name = "snapshot_refresher_tests"
+path = "tests/snapshot_refresher_tests.rs"
+required-features = ["it-tests"]
+
+[[test]]
+name = "snapshot_read_latency_tests"
+path = "tests/snapshot_read_latency_tests.rs"
+required-features = ["it-tests"]
+
+[[test]]
+name = "remaining_snapshot_tests"
+path = "tests/remaining_snapshot_tests.rs"

@@ -679,20 +679,6 @@ fn default_idp_static_dir() -> String {
     "/app/static".to_owned()
 }
 
-/// `authz-budget`'s server block. Shaped like [`IdpServer`] (address/port/TLS, no `basic_auth`):
-/// every route this server mounts is behind the same bearer-JWT `rpc_authorize` gate `authz-api`
-/// already uses, not Basic auth like [`OpaServer`]. Unlike `idp`, this server's RPC surface is
-/// mounted under a fixed `/budget` path prefix (`build_budget_router`) rather than at the
-/// configurable root `authz-api` uses — there is no `rpc_base_path` field here because the prefix
-/// is not optional, it is what makes the service reachable behind a shared gateway origin
-/// alongside `authz-api` (see `docs/architecture/budget.md`).
-#[derive(Debug, Clone, Deserialize)]
-pub struct BudgetServer {
-    pub address: String,
-    pub port: u16,
-    pub tls: Tls,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct Tls {
     pub cert_path: String,
@@ -1177,11 +1163,13 @@ pub struct JwtSigning {
 }
 
 pub mod budget_internal;
+pub mod budget_server;
 pub mod claim_mapper;
 
 /// Re-exported from [`crate::config::claim_mapper`], which holds both types. Split out only to
 /// keep this file inside its LoC-gate baseline; see that module's own doc comment.
 pub use budget_internal::BudgetInternalServer;
+pub use budget_server::BudgetServer;
 pub use claim_mapper::{ClaimMapper, ClaimSource};
 
 fn default_signing_ttl_seconds() -> i64 {

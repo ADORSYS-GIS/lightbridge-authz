@@ -708,6 +708,7 @@ fn opa_state(repo: Arc<StoreRepo>) -> Arc<OpaState> {
         api_key_audience: None,
         resolver: Arc::new(TrustEverythingResolver),
         federation_issuer: GRANDFATHER_ISSUER.to_string(),
+        budget: Default::default(),
     })
 }
 
