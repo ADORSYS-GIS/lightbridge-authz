@@ -22,6 +22,7 @@ pub mod budget_remaining_auth;
 pub mod budget_remaining_router;
 pub mod budget_remaining_wire;
 pub mod budget_services;
+pub mod budget_snapshot_refresher;
 mod health_handlers;
 pub mod introspect_budget;
 mod opa_doc;
@@ -4012,7 +4013,7 @@ pub async fn start_budget_server(
     // ADR-0034 §15, started HERE and only here: the loop that precomputes every active account's
     // remaining balance, so `authz-opa`'s introspection can answer the gateway's budget question
     // from one indexed read instead of a second metadata call.
-    budget_services::spawn_snapshot_refresher(&services, budget)?;
+    budget_snapshot_refresher::spawn_snapshot_refresher(&services, budget)?;
     let budget_services::BudgetServices {
         policy_store,
         refill_service,

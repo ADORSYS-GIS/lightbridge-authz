@@ -11,7 +11,8 @@
 //! |---|---|---|
 //! | `authz-opa` introspection | [`SnapshotStore::read`] — primary-key probe | **yes**, awaited |
 //! | `authz-opa` introspection | [`SnapshotStore::touch`] — one upsert | yes, but write-behind |
-//! | [`crate::snapshot_refresher`] | `active_accounts` + `store_reading` | no, background |
+//! | [`crate::snapshot_refresher`] | `seed` + `due_accounts` + `store_reading` | no, background |
+//! | [`crate::snapshot_refresher`] | `coverage` — the §15.6 census | no, background |
 //! | [`crate::repo::BudgetRepo::grant`] | [`SnapshotStore::apply_grant_delta_tx`] | no, ledger write |
 
 use std::sync::Arc;
@@ -34,14 +35,6 @@ const SELECT_SQL: &str = "SELECT budget_account_id, period, ceiling_micros, spen
 const TOUCH_SQL: &str = "INSERT INTO budget_remaining_snapshots (budget_account_id, last_seen_at) \
      VALUES ($1, now()) \
      ON CONFLICT (budget_account_id) DO UPDATE SET last_seen_at = now()";
-
-/// The refresher's work list: accounts the request path has asked about recently, oldest reading
-/// first so a starved row cannot stay starved. `LIMIT` bounds one tick's work — a tick that cannot
-/// finish the list leaves the remainder for the next one, which is the correct behaviour for a
-/// loop whose whole job is to stay cheap.
-const ACTIVE_SQL: &str = "SELECT budget_account_id FROM budget_remaining_snapshots \
-     WHERE last_seen_at >= $1 \
-     ORDER BY refreshed_at ASC NULLS FIRST LIMIT $2";
 
 const STORE_READING_SQL: &str = "UPDATE budget_remaining_snapshots SET \
      period = $2, ceiling_micros = $3, spent_micros = $4, remaining_micros = $5, \
@@ -80,28 +73,11 @@ impl SnapshotStore {
         Self { pool }
     }
 
-    fn pool(&self) -> &PgPool {
+    /// The live pool. `pub(crate)` rather than private because `impl SnapshotStore` is spread
+    /// across `snapshot_seed`/`snapshot_coverage`/`snapshot_lanes` to keep every one of those files
+    /// under the 200-LoC ceiling; they are the same type's own methods, not outside callers.
+    pub(crate) fn pool_ref(&self) -> &PgPool {
         self.pool.pool()
-    }
-
-    /// Budget accounts seen since `since`, oldest reading first, at most `limit` of them.
-    pub async fn active_accounts(
-        &self,
-        since: DateTime<Utc>,
-        limit: i64,
-    ) -> Result<Vec<String>, BudgetError> {
-        let rows = sqlx::query(ACTIVE_SQL)
-            .bind(since)
-            .bind(limit)
-            .fetch_all(self.pool())
-            .await
-            .map_err(|err| BudgetError::StorageFailed(err.to_string()))?;
-        rows.iter()
-            .map(|row| {
-                row.try_get::<String, _>("budget_account_id")
-                    .map_err(|err| BudgetError::StorageFailed(err.to_string()))
-            })
-            .collect()
     }
 
     /// Writes a fresh reading and clears any `stale_since`. A no-op when the row has since been
@@ -121,7 +97,7 @@ impl SnapshotStore {
             .bind(spent_micros)
             .bind(ceiling_micros.saturating_sub(spent_micros))
             .bind(next_reset_at)
-            .execute(self.pool())
+            .execute(self.pool_ref())
             .await
             .map_err(|err| BudgetError::StorageFailed(err.to_string()))?;
         Ok(())
@@ -132,7 +108,7 @@ impl SnapshotStore {
     pub async fn mark_stale(&self, budget_account_id: &str) -> Result<(), BudgetError> {
         sqlx::query(MARK_STALE_SQL)
             .bind(budget_account_id)
-            .execute(self.pool())
+            .execute(self.pool_ref())
             .await
             .map_err(|err| BudgetError::StorageFailed(err.to_string()))?;
         Ok(())
@@ -162,7 +138,7 @@ impl BudgetSnapshotReader for SnapshotStore {
     async fn read(&self, budget_account_id: &str) -> Result<Option<BudgetSnapshot>, BudgetError> {
         let row = sqlx::query(SELECT_SQL)
             .bind(budget_account_id)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.pool_ref())
             .await
             .map_err(|err| BudgetError::StorageFailed(err.to_string()))?;
 
@@ -188,7 +164,7 @@ impl BudgetSnapshotReader for SnapshotStore {
     async fn touch(&self, budget_account_id: &str) -> Result<(), BudgetError> {
         sqlx::query(TOUCH_SQL)
             .bind(budget_account_id)
-            .execute(self.pool())
+            .execute(self.pool_ref())
             .await
             .map_err(|err| BudgetError::StorageFailed(err.to_string()))?;
         Ok(())

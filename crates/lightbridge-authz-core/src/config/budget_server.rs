@@ -16,7 +16,7 @@ use super::Tls;
 /// because the prefix is not optional, it is what makes the service reachable behind a shared
 /// gateway origin alongside `authz-api` (see `docs/architecture/budget.md`).
 ///
-/// The four `snapshot_*` fields below pace the background loop that precomputes
+/// The six `snapshot_*` fields below pace the background loop that precomputes
 /// `budget_remaining_snapshots`. They live on THIS block rather than on
 /// [`super::BudgetInternalServer`] deliberately: the snapshot is read by `authz-opa`'s
 /// introspection, which is served whether or not this deployment configures the internal listener
@@ -40,14 +40,36 @@ pub struct BudgetServer {
     #[serde(default = "default_snapshot_refresh_seconds")]
     pub snapshot_refresh_seconds: u64,
     /// How many minutes an account stays in the refresher's work list after the request path last
-    /// asked about it. This is what makes the loop's cost scale with *concurrently active*
-    /// accounts rather than with the size of the estate.
+    /// asked about it — the OUTER bound, past which it is not refreshed at all.
     ///
-    /// Too short and a bursty account's snapshot goes cold between bursts, so its next request
-    /// pays the full live read (correct, just slower). Too long and the loop refreshes accounts
-    /// nobody is using. Ten minutes covers a coffee break without covering a working day.
+    /// **Raised from 10 minutes to 24 hours by ADR-0034 §15.6.** Ten minutes was chosen to make
+    /// the loop's cost scale with concurrently-active accounts; what it actually did was freeze
+    /// every idle account's balance ten minutes after its last request, so at the next UTC month
+    /// boundary all of them became period-mismatched — i.e. `known: false` — at once. Idle
+    /// accounts are now demoted to the slow lane below instead of being dropped, which costs one
+    /// spend query per idle account per `snapshot_slow_lane_minutes` and keeps the reading true.
     #[serde(default = "default_snapshot_active_window_minutes")]
     pub snapshot_active_window_minutes: u64,
+    /// ADR-0034 §15.6. The boundary between the refresher's two lanes, in minutes, and the cadence
+    /// of the slow one: an account seen within this window is recomputed every
+    /// `snapshot_refresh_seconds`; one seen longer ago than this (but inside
+    /// `snapshot_active_window_minutes`) is recomputed once per this interval.
+    ///
+    /// One key for both jobs deliberately — two would let an operator configure a band in which an
+    /// account belongs to neither lane and is silently dropped, which is the bug §15.6 removes.
+    #[serde(default = "default_snapshot_slow_lane_minutes")]
+    pub snapshot_slow_lane_minutes: u64,
+    /// ADR-0034 §15.6. How many days back the refresher's seed looks for evidence that an account
+    /// can send metered traffic — a booked budget grant, or an active API key that has been used.
+    /// Every such account gets a snapshot row whether or not it is sending traffic right now, so
+    /// coverage is a property of the estate rather than of who happened to make a request since
+    /// the table was created (the Stage 1b watch measured ~50 % before this existed).
+    ///
+    /// Raising it covers accounts that go quiet for longer, at one row and one slow-lane spend
+    /// query each. Lowering it narrows the population the coverage census reports on — it does not
+    /// delete rows already seeded.
+    #[serde(default = "default_snapshot_seed_lookback_days")]
+    pub snapshot_seed_lookback_days: u32,
     /// Most accounts one tick refreshes, so a large active set cannot make ticks overlap. The
     /// remainder is picked up on the next tick, oldest reading first, so nothing is starved.
     #[serde(default = "default_snapshot_batch")]
@@ -64,9 +86,19 @@ fn default_snapshot_refresh_seconds() -> u64 {
     15
 }
 
-/// Ten minutes. See [`BudgetServer::snapshot_active_window_minutes`].
+/// Twenty-four hours. See [`BudgetServer::snapshot_active_window_minutes`].
 fn default_snapshot_active_window_minutes() -> u64 {
+    24 * 60
+}
+
+/// Ten minutes. See [`BudgetServer::snapshot_slow_lane_minutes`].
+fn default_snapshot_slow_lane_minutes() -> u64 {
     10
+}
+
+/// Thirty days. See [`BudgetServer::snapshot_seed_lookback_days`].
+fn default_snapshot_seed_lookback_days() -> u32 {
+    30
 }
 
 /// See [`BudgetServer::snapshot_batch`].

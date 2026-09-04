@@ -14,6 +14,10 @@
 //! and `authz-api`/`lightbridge-mcp` hold an inert scheduler purely because
 //! [`crate::Procedures::new`] takes one unconditionally.
 //!
+//! ADR-0034 §15/§15.6's snapshot refresher is started from
+//! [`crate::budget_snapshot_refresher::spawn_snapshot_refresher`], a sibling module rather than a
+//! function here, purely to keep both files under this repo's 200-LoC ceiling.
+//!
 //! [`ResetScheduler`]: lightbridge_authz_budget::ResetScheduler
 
 use std::sync::Arc;
@@ -50,40 +54,6 @@ pub struct BudgetServices {
     /// `BudgetRepo`/`SpendReader`/`ResetScheduler` graph is what fills it — a second graph over
     /// the same pool is exactly how two components come to disagree about a number.
     pub snapshots: Arc<lightbridge_authz_budget::SnapshotStore>,
-}
-
-/// Starts ADR-0034 §15's snapshot refresher on the `authz-budget` process, and only there.
-///
-/// Spawned, never awaited, like the reset scheduler's tick loop next to it: a refresher failure
-/// must not stop the RPC surface from serving. `authz-api`/`lightbridge-mcp` share the graph and
-/// do NOT call this.
-pub fn spawn_snapshot_refresher(
-    services: &BudgetServices,
-    budget: &lightbridge_authz_core::config::BudgetServer,
-) -> Result<()> {
-    if budget.snapshot_refresh_seconds == 0 {
-        return Err(Error::Server(
-            "server.budget.snapshot_refresh_seconds must be greater than zero -- a zero-second \
-             interval is a busy loop against the database, not a configuration"
-                .to_string(),
-        ));
-    }
-    let config = lightbridge_authz_budget::SnapshotRefreshConfig {
-        interval: std::time::Duration::from_secs(budget.snapshot_refresh_seconds),
-        active_window: std::time::Duration::from_secs(budget.snapshot_active_window_minutes * 60),
-        batch: i64::from(budget.snapshot_batch),
-        concurrency: usize::from(budget.snapshot_concurrency),
-    };
-    tracing::info!(?config, "starting the budget remaining-snapshot refresher");
-    Arc::new(lightbridge_authz_budget::SnapshotRefresher::new(
-        (*services.snapshots).clone(),
-        services.budget_repo.clone(),
-        services.spend_reader.clone(),
-        services.reset_scheduler.clone(),
-        config,
-    ))
-    .spawn();
-    Ok(())
 }
 
 /// The spend reader for `usage_service`, or the fail-closed stand-in when it is unconfigured.
