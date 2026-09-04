@@ -1,6 +1,10 @@
 # ADR-0034: The Dynamic Budget Limiter — the gateway reads the live balance, it does not trust the token
 
-- Status: Proposed
+- Status: **Accepted — ENFORCING in production since 2026-09-04T19:41Z**
+  ([ai-helm-values#417](https://github.com/ADORSYS-GIS/ai-helm-values/pull/417) `991268b`,
+  `budgetLimiter.shadowMode: false`). Stages 0-3 are all shipped; the gateway cost buckets §10
+  Stage 3 also asks to delete are **not**, and two planes are deliberately fail-open. The
+  operational record — dates, PRs, census numbers, what did not ship — is **§15.7**.
 - Date: 2026-09-03 (amended three times the same day — first §3.1/§4.1/§9/§14 re-grounded on the
   **deployed** Authorino v0.24.0 CRD rather than upstream source, after `kubectl explain` against
   prod contradicted the upstream Go types on `metadata.http.timeout`; then **§3's transport
@@ -8,7 +12,10 @@
   Authorino cannot present a client certificate at all — see §3.2; then **an unknown account id
   became a `404`** rather than a `200` with a zero balance, on the owner's directive — see §3.3);
   amended again 2026-09-04 — **the budget folded into the existing introspection, one metadata call
-  per request instead of two**, on the owner's performance directive, see §15)
+  per request instead of two**, on the owner's performance directive, see §15; then §15.6 the same
+  afternoon, when the coverage census said half the estate had no snapshot row; and finally §15.7
+  the same evening, when **Stage 3 shipped** — two months ahead of §13 D8's "realistic" 2026-11-01,
+  and not on the 1st-of-month boundary §10 requires)
 - Decision owners: @stephane-segning
 - Story: [lightbridge-authz#658](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/658)
   (Phase 6a decision memo)
@@ -384,7 +391,7 @@ stateDiagram-v2
     Asked --> Exists: accounts row + owning users row
 
     ProbeFailed --> Http503: Err(StorageFailed)
-    Unknown --> Http404: Remaining::UnknownAccount
+    Unknown --> Http404: Remaining#colon;#colon;UnknownAccount
 
     Exists --> CeilingRead
     CeilingRead --> Http503: ledger read errored
@@ -842,6 +849,11 @@ request, and — for reserve-and-settle — a second one on the response. Reject
 
 ## 10. Rollout
 
+> **All four stages shipped on 2026-09-04.** Stage 3 (`shadowMode: false`) went live at
+> `19:41:27Z`. This section is kept as written — it is the plan the rollout is measured against,
+> and two of its clauses were deliberately not honoured. **[§15.7](#157-operational-record--enforcing-in-production-since-2026-09-04)
+> is what actually happened**, including which third of the Stage 3 commit shipped.
+
 **Stage 0 — merged now, inert.** The endpoint ships and binds only where `server.budget_internal`
 is configured. Prod does not configure it yet, so `authz-budget` logs that the read is not served
 and behaves exactly as before. Nothing at the gateway references it.
@@ -1243,6 +1255,9 @@ one-call guarantee, and it is a **blocker for Stage 3 (enforce), not for Stage 2
 extending coverage to those planes is tracked work, and shadow mode is where its absence shows up
 as a coverage gap in the decision counts rather than as refused traffic.
 
+**Update, 2026-09-04:** Stage 3 shipped anyway, with this narrowing accepted rather than closed. It
+is therefore **live in production**, not prospective — see §15.7.
+
 ### 15.4 Diagrams
 
 ```mermaid
@@ -1514,3 +1529,221 @@ and §15.6's whole argument is that a hidden account is the expensive kind.
 Keycloak planes of §15.3 are **not** in it and cannot be: their traffic is not keyed on an
 `accounts.id`. Their `enforced: false` remains the Stage 3 blocker §15.3 declared, and the gateway's
 own access-log measurement — not this counter — is what will confirm it.
+
+**Outcome, 2026-09-04:** `uncovered_total` went **17 → 0** at `18:10:20Z`, on the first tick after
+this shipped, and has read 0 on every tick since. The seven never-granted accounts it exposed were
+funded the same evening. §15.7 has the numbers.
+
+---
+
+### 15.7 Operational record — enforcing in production since 2026-09-04
+
+This section is the **record**, not a plan: what shipped, when, with which commit, and what the
+numbers were. Everything below is re-checkable from a PR, a merge SHA, a CI run id or a comment on
+one of them. Where a §10 promise was not kept, it says so.
+
+**Stage 3 went live at `2026-09-04T19:41:27Z`** — the merge of
+[ai-helm-values#417](https://github.com/ADORSYS-GIS/ai-helm-values/pull/417) (`991268b`), which set
+`budgetLimiter.shadowMode: false` on `environments/prod/values/core-gateway.yaml`. Shadow mode had
+been live for **three hours and twenty-four minutes**, not the "minimum one week" §10 Stage 2 asks
+for. That is a deliberate owner call, taken with the coverage census at `uncovered_total = 0` and
+the `would_block` set enumerated account by account (below), not an oversight — and it is recorded
+here rather than smoothed over, because §10 is the promise this deviates from.
+
+#### The day, one row per merge
+
+All times UTC, all on 2026-09-04. `lightbridge-authz` unless the repo is named.
+
+| Time | What | Evidence |
+|---|---|---|
+| 08:04:28 | **#685** — the budget folds into the introspection (§15). `budget_remaining_snapshots`, the refresher, the three introspection fields. | [#685](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/685) `2982884` |
+| 08:35:54 | **#689** — the refresher's advisory lock scoped to a transaction, so a panic or a cancelled task cannot wedge every other replica's refresher forever. | [#689](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/689) `2ad4a24` — **no image**, see the trap below |
+| 16:16:55 | ai-helm-values **#414** — `budgetLimiter.enabled: true`, `shadowMode: true`. Stage 2 begins. | [ai-helm-values#414](https://github.com/ADORSYS-GIS/ai-helm-values/pull/414) `f229917` |
+| 16:53:31 | ai-helm-values **#415** — the shadow rollout recorded: status, numbers, decision table. | [ai-helm-values#415](https://github.com/ADORSYS-GIS/ai-helm-values/pull/415) `8a23028` |
+| 17:41:41 | **#694** — the seed, the two lanes, the durable touch and the per-tick census (§15.6). | [#694](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/694) `e2501ea` |
+| 18:10:20 | Rolled on `hetzner-prod`; `uncovered_total` **17 → 0** on the first tick after the roll. | [#694 rollout comment](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/694#issuecomment-5544633644) |
+| 18:56:07 | **#696** — the lock-scope test stopped racing the thing it measures (two observer races). | [#696](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/696) `064debb` — **no image**, see the trap below |
+| 19:01:49 | **#695** — `lightbridge-authz budget grant`, the unattended write path a Job can drive. | [#695](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/695) `b0b7904`, CI run `33909006265` |
+| ~19:02–19:30 | The backfill Job: **7 accounts × $8**, period `2026-09`, `--source automatic`. | [#695 evidence comment](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/695#issuecomment-5545535000) |
+| 19:32:55 | Backfill verified: one ledger row each, snapshot agreeing with a live recompute field for field. | same comment |
+| 19:34:50 | **#697** filed — nothing books a *starting* grant at account creation. | [#697](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/697), open |
+| 19:41:27 | ai-helm-values **#417** — `shadowMode: false`. **Enforcing.** | [ai-helm-values#417](https://github.com/ADORSYS-GIS/ai-helm-values/pull/417) `991268b` |
+
+**Two of those five merges shipped no image**, and both times the *next* merge carried their code.
+`#689` (`2ad4a24`, 08:35:58Z) and `#696` (`064debb`, 18:56:10Z) each had their `CI/CD Pipeline` run
+end `cancelled` by the `ci-main` concurrency group, so `container-build` never reached `cosign` and
+no `sha-<commit>` tag exists for either — confirmed against GHCR, where `sha-2982884…`,
+`sha-e2501ea…`, `sha-f26aaf9…` and `sha-b0b7904…` are present and the two cancelled SHAs are not.
+That is not a defect in either PR; it is the known `main` concurrency behaviour, and it is why the
+enforce flip was verified against `sha-b0b7904…` rather than against "the latest commit". Procedure:
+[`docs/runbooks/release-and-rollout.md` → Step 1](../runbooks/release-and-rollout.md#step-1--did-a-ci-run-for-this-commit-survive).
+
+#### The numbers
+
+**Coverage**, measured the same way before and after #694 rolled — the §15.6 census restated as SQL,
+read-only against the CNPG primary:
+
+| | `accounts_total` | `known_total` | `stale_total` | `eligible_total` | `uncovered_total` |
+|---|---|---|---|---|---|
+| before, 18:04:47Z (`sha-f26aaf9`) | 24 | 24 | 0 | 40 | **17** |
+| after, 18:10:20Z (`sha-e2501ea`) | 41 | 41 | 0 | 40 | **0** |
+
+The refresher's own first tick logged `seeded=17 considered=41 refreshed=41 kept_stale=0 failed=0`.
+**`seeded` equals the pre-roll `uncovered_total` exactly** — two counts derived independently, in
+agreement. Subsequent ticks logged `considered=17`: the 24 idle accounts had dropped to the slow
+lane rather than out of the population, which is the §15.6 lane split doing its job.
+
+Do not confuse this **17** with §15.6's **20**. They are different measurements of the same gap:
+20 is `43 accounts with usage in 30 days − 23 snapshot rows`, counted by hand at 16:1x; 17 is
+`uncovered_total`, the census counter — accounts the seed predicate says can send traffic *and*
+that the introspection would answer `known: false` for. The counter is the one the gate is stated
+in, and the one to cite.
+
+**Funding.** Closing the coverage gap made the funding gap visible, exactly as §15.6's "consequence
+that must be watched" predicted: seven accounts with used, active API keys and **zero**
+`budget_grants` rows this period, which at enforce is a `402` each. They were funded through
+`budget grant` (#695) at **$8**, not the policy's `starting_amount_micros` of $15 — see
+[`docs/budget-cli.md`](../budget-cli.md#the-8-vs-15-rule-match-the-operative-schedule-not-the-policy-default)
+for why picking the larger number would have booked a negative `correction` row on 2026-09-07.
+After the backfill:
+
+```
+accounts_total=41  known_total=41  stale_total=0  eligible_total=40  uncovered_total=0
+would_block=2      unknown=0       would_pass=38
+```
+
+The residual `would_block=2` is **not** a coverage artifact — it is two genuinely overspent accounts
+(`eb06b31b`: ceiling 9 499 032, spent 10 059 441; `49534505`: ceiling 712 129, spent 726 022), which
+is precisely the population enforcement exists to refuse. A third (`b9b691d2`, ceiling 0, spent
+6 002 097) is also negative but sits outside the seed's eligible set: it holds no recently-used
+active key.
+
+#### The path as it runs now
+
+Both diagrams describe the **enforcing** configuration, not the design intent. Each participant
+cites the file that implements it.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant E as Envoy (converse-gateway)
+    participant A as Authorino v0.24.0<br/>ext_authz, failOpen:false
+    participant O as authz-opa<br/>handlers/introspect.rs
+    participant DB as main DB<br/>budget_remaining_snapshots
+    participant L as budget-limiter.lua<br/>EnvoyExtensionPolicy, shadow:false
+
+    C->>E: POST /v1/chat/completions  (API key)
+    E->>A: ext_authz
+    A->>O: POST /v1/authorino/validate/introspect<br/>(metadata step `lightbridgeintrospect`, TTL 30 s on jti)
+    O->>DB: api_key_validation view + project row
+    O->>DB: SELECT … WHERE budget_account_id = $1<br/>(PK index scan, 3 buffer hits, ~20 µs)
+    O--)DB: spawned, ≤1 / 30 s / account, ≤2 s timeout: UPDATE last_seen_at
+    O-->>A: 200 {active, account_id, …,<br/>budget_remaining_micros?, budget_next_reset_at?, budget_snapshot_age_seconds?}
+    A-->>E: response.success.dynamicMetadata.budget<br/>{enforced, known, remaining_micros, next_reset_at, account_id}
+    E->>L: Lua filter reads envoy.filters.http.ext_authz → budget
+    alt known && remaining_micros > 0
+        L->>E: continue to the model backend
+    else known && remaining_micros <= 0
+        L-->>C: 402 {"error":"budget_exhausted", account_id, next_reset_at, refill_url}
+    else not known  (fields ABSENT — never a fabricated 0)
+        L-->>C: 503 budget_unavailable
+    end
+    Note over A,L: enforced:false on the repobinding and legacy-Keycloak planes<br/>⇒ the Lua does not evaluate ⇒ fail-open, §15.3
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> NoRow: account exists, nothing has written a snapshot
+
+    NoRow --> Seeded: refresher SEED — a grant, or a used active key<br/>inside snapshot_seed_lookback_days (30)
+    NoRow --> Seen: introspection touch (still the fast path for a new account)
+    note right of Seeded
+        remaining_micros IS NULL ⇒ fields OMITTED ⇒ known:false ⇒ 503.
+        Lasts at most one tick: the same tick's refresh pass computes it.
+    end note
+
+    Seeded --> Fresh: refresh pass — spend answered
+    Seen --> Fresh: refresh pass — spend answered
+    Fresh --> Fresh: fast lane, every snapshot_refresh_seconds (15 s)
+    Fresh --> Fresh: grant booked — delta applied in the grant's own tx<br/>(a refill never waits for a tick)
+
+    Fresh --> SlowLane: idle past snapshot_slow_lane_minutes (10)
+    SlowLane --> SlowLane: recomputed once per that interval
+    SlowLane --> Fresh: the request path touches it again
+
+    Fresh --> Stale: authz-usage unreachable — stale_since stamped, reading KEPT
+    SlowLane --> Stale: authz-usage unreachable
+    Stale --> Fresh: spend answered again, stale_since cleared
+
+    SlowLane --> Lapsed: idle past snapshot_active_window_minutes (24 h)
+    Lapsed --> Seeded: the seed re-arms it — still eligible
+    note right of Lapsed
+        Unreachable for any account that can still send traffic.
+        Under §15 this state held 17 production accounts;
+        uncovered_total has read 0 on every tick since 18:10:20Z.
+    end note
+
+    Fresh --> RolledOver: UTC month boundary
+    SlowLane --> RolledOver: UTC month boundary
+    RolledOver --> Fresh: next refresh pass for the new period
+
+    Seeded --> NoRow: account deleted (FK cascade)
+    Fresh --> NoRow: account deleted (FK cascade)
+
+    note left of NoRow
+        Still no transition into a fabricated 0. Every path out of
+        "we do not know" leads to an ABSENT field (503), never to a
+        zero balance (402).
+    end note
+```
+
+#### What did NOT ship with the enforce flip, and must not be assumed live
+
+§10's Stage 3 is **one commit** doing three things. One of the three shipped.
+
+| §10 Stage 3 required | Shipped 2026-09-04? |
+|---|---|
+| `shadowMode: false` | **Yes** — ai-helm-values#417 `991268b` |
+| Delete the monthly and weekly cost rule families | **No.** The `BackendTrafficPolicy` cost buckets stay on the gateway until **2026-10-01** |
+| The `prometheus-redis-exporter` co-change | **No** — it moves with the buckets |
+| On a 1st-of-month 00:00 UTC boundary | **No.** It went out mid-month, at 19:41Z on the 4th |
+
+Two consequences follow, and neither is hypothetical:
+
+1. **`min(plan, ledger)` is the live enforcement semantics until the buckets are deleted**, which is
+   exactly the shape D5 (§13) argues against: a refill still buys nothing once the plan bucket for
+   the window is spent. Until 2026-10-01 a "my refill did nothing" report can be the *cost bucket*,
+   not the ledger — check the 429 before the 402.
+2. **Stage 3 → Stage 2 rollback is still `shadowMode: true`, and it is now cheaper than §10
+   describes**, because the counter renumbering §10 warns about cannot happen: the buckets were
+   never deleted, so nothing gets re-keyed.
+
+The **fail-open narrowing of §15.3 is now live in production**, not prospective. The `repobinding`
+(GitHub Actions) and legacy Keycloak planes have no `lightbridgeintrospect` step, therefore no
+budget fields, and their AuthConfigs publish `enforced: false`. Requests on those two planes are
+**not** budget-enforced today. The owner accepted this in exchange for the one-call guarantee; it
+is a gap in enforcement coverage, not a bug, and it stays open until those planes carry an account
+identity the snapshot table's foreign key can hold.
+
+#### Open questions from the first hours of enforcement
+
+- **`next_reset_at` echoed `2026-11-01` for the owner's account.** The field is not computed from a
+  cadence at read time: `snapshot_refresh_one.rs:51-54` takes
+  `reset_scheduler.effective_schedule(&account_id).next_run_at` verbatim when a schedule wins, and
+  falls back to `next_period_start_utc(&period)` — which for period `2026-09` is `2026-10-01`, not
+  `2026-11-01` — when none does. So the value came from a **stored `budget_reset_schedules.next_run_at`
+  column** on whichever schedule wins for that account (`reset_scheduler.rs:309-330`,
+  `winning_schedule`: account > billing_plan > global). The two checkable hypotheses are a forced
+  `nextRunAt` (ADR-0032 A8, [#669](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/669)) and a
+  winning schedule that is not the weekly `"Refill $8"` one (whose `next_run_at` was `2026-09-07`).
+  This is **not cosmetic**: `next_reset_at` is a field of the `402 budget_exhausted` body, so a
+  wrong value tells a refused user to wait two months. Settle it with
+  `getEffectiveResetSchedule` for that account — gated at `budget:read`, so no schedule-management
+  permission is needed — and record the answer here.
+- **Nothing books a starting grant at account creation** —
+  [#697](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/697), open. Under enforcement a new
+  account reads `remaining = 0` and gets a `402` until the next weekly reset covers it: up to seven
+  days. The seven accounts backfilled on 2026-09-04 are the symptom; the ticket is the cure.
+- **Authorino's own p99 and ext_authz timeout rate are still unmeasured** (§10 Stage 2's third
+  bullet). Authorino is unscraped; there is no series to read. Enforcement shipped without it.

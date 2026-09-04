@@ -64,6 +64,7 @@ All but the usage service share one Postgres database (`authz`); usage has its o
 | Why a usage query is slow, what the covering index and `metrics` buy, how to re-measure on the replica | [`usage-performance.md`](./usage-performance.md) |
 | Which build a service is running (`GET /version`, `getBuildInfo`, `--version`) | [`build-info.md`](./build-info.md) |
 | One `sharedConfig` object instead of five copies of `config.yaml` (chart contract) | [`single-source-config.md`](./single-source-config.md) |
+| Book a budget grant from a Job or an exec — `budget grant` flags, idempotency, the $8-vs-$15 rule, why never raw SQL | [`budget-cli.md`](./budget-cli.md) |
 | Budget refill decision contract (`Facts`/`Decision`/`PolicyEngine`) | [`budget-decision-contract.md`](./budget-decision-contract.md) |
 | Budget refill UI contract (RPC shapes, for the frontend team) | [`budget-refill-ui-contract.md`](./budget-refill-ui-contract.md) |
 | Manual end-to-end protocol (OAuth2 + OPA) | [`test-protocol.md`](./test-protocol.md) |
