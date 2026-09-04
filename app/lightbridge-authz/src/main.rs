@@ -3,12 +3,13 @@ mod migrate;
 mod utils;
 
 use clap::Parser;
-use lightbridge_authz_core::{Error, Result};
-use lightbridge_authz_rest::{start_api_server, start_budget_server, start_opa_server};
+use lightbridge_authz_core::Result;
+use lightbridge_authz_rest::{start_api_server, start_opa_server};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+mod budget_dispatch;
 mod rbac_dispatch;
 
 use crate::utils::banner::BANNER;
@@ -33,7 +34,7 @@ async fn main() -> Result<()> {
         Some(Commands::Api { config_path }) => Some(config_path),
         Some(Commands::Opa { config_path }) => Some(config_path),
         Some(Commands::Idp { config_path, .. }) => Some(config_path),
-        Some(Commands::Budget { config_path }) => Some(config_path),
+        Some(Commands::Budget { config_path, .. }) => Some(config_path),
         Some(Commands::Migrate { config_path }) => Some(config_path),
         Some(Commands::Rbac { config_path, .. }) => Some(config_path),
         Some(Commands::Config { config_path }) => Some(config_path),
@@ -146,32 +147,10 @@ async fn main() -> Result<()> {
             config_path,
             command,
         }) => idp_cmd::run(config_path, command).await,
-        Some(Commands::Budget { config_path }) => {
-            info!("{}", BANNER);
-
-            let config = load_from_path(&config_path)?;
-
-            info!("Connecting to DB...");
-            let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(&config.database).await?);
-
-            let budget = config.server.budget.as_ref().ok_or_else(|| {
-                Error::Server("server.budget config is required to run the budget command".into())
-            })?;
-            start_budget_server(
-                budget,
-                config.server.budget_internal.as_ref(),
-                pool,
-                &config.oauth2,
-                &config.billing,
-                &config.quota_tiers,
-                &config.models,
-                &config.api_key_expiry,
-                &config.redis,
-                &config.usage_service,
-            )
-            .await?;
-            Ok(())
-        }
+        Some(Commands::Budget {
+            config_path,
+            command,
+        }) => budget_dispatch::run(config_path, command).await,
         Some(Commands::Rbac {
             config_path,
             command,
