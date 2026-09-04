@@ -33,6 +33,7 @@ All but the usage service share one Postgres database (`authz`); usage has its o
 
 | Want to… | Open |
 | --- | --- |
+| Know what is done, missing, broken, flaky or waiting on a decision | [`ROADMAP.md`](./ROADMAP.md) |
 | Understand the whole system's shape and callers | [`architecture/README.md`](./architecture/README.md) |
 | Run the full platform locally and test end to end | [`local-testing.md`](./local-testing.md) |
 | Get build/test commands, conventions, and house rules | [`../AGENTS.md`](../AGENTS.md) |

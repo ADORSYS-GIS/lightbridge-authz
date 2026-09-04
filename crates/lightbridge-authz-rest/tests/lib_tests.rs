@@ -529,24 +529,24 @@ mod db {
         );
     }
 
-    /// ADR-0034: `server.budget_internal` is optional, but a configured internal listener without
-    /// a client-CA trust anchor is a hard startup failure, never a listener served without mTLS.
-    /// `GET /budget/v1/remaining` answers a cross-account balance question with no per-caller
-    /// ownership check of any kind; the client-certificate requirement is the only thing in front
-    /// of it, and forgetting it must be loud rather than silently permissive.
+    /// ADR-0034 + its 2026-09-03 amendment: `server.budget_internal` is optional, but a configured
+    /// internal listener with an EMPTY `shared_secret` is a hard startup failure, never a listener
+    /// served with no credential at all. `GET /budget/v1/remaining` answers a cross-account
+    /// balance question with no per-caller ownership check of any kind; the shared secret is the
+    /// only thing in front of it, and forgetting it must be loud rather than silently permissive.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn start_budget_server_refuses_an_internal_listener_without_mtls(pool: PgPool) {
+    async fn start_budget_server_refuses_an_internal_listener_without_a_shared_secret(
+        pool: PgPool,
+    ) {
         let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
         let internal = BudgetInternalServer {
             address: "127.0.0.1".to_string(),
             port: 0,
             tls: bad_tls(),
+            shared_secret: "   ".to_string(),
+            shared_secret_header: "x-lightbridge-budget-token".to_string(),
             remaining_grace_seconds: 120,
         };
-        assert!(
-            internal.tls.client_ca_bundle_path.is_none(),
-            "this test's premise is an internal listener with no client CA bundle"
-        );
 
         let err = lightbridge_authz_rest::start_budget_server(
             &budget_server(),
@@ -561,16 +561,63 @@ mod db {
             &None,
         )
         .await
-        .expect_err("a budget_internal listener without client_ca_bundle_path must not start");
+        .expect_err("a budget_internal listener without a shared secret must not start");
 
         let message = format!("{err}");
         assert!(
-            message.contains("client_ca_bundle_path"),
-            "the error must name the missing trust anchor: got {message}"
+            message.contains("shared_secret"),
+            "the error must name the missing credential: got {message}"
         );
         assert!(
             message.contains("/budget/v1/remaining"),
             "the error must name the route it protects: got {message}"
+        );
+    }
+
+    /// The other half of the amendment, and the one that would otherwise be discovered in
+    /// production: a client-CA bundle here is not a *stricter* configuration, it is a broken one.
+    /// Authorino v0.24.0's `metadata.http` cannot present a client certificate, so requiring one
+    /// makes the route unreachable by its only caller — every metadata fetch fails the handshake
+    /// and the gateway reads `budget_unavailable` on every request. Refuse at startup instead.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_budget_server_refuses_an_internal_listener_that_demands_a_client_certificate(
+        pool: PgPool,
+    ) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let mut tls = bad_tls();
+        tls.client_ca_bundle_path = Some("/etc/lightbridge/tls/ca.crt".to_string());
+        let internal = BudgetInternalServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls,
+            shared_secret: "a-real-secret".to_string(),
+            shared_secret_header: "x-lightbridge-budget-token".to_string(),
+            remaining_grace_seconds: 120,
+        };
+
+        let err = lightbridge_authz_rest::start_budget_server(
+            &budget_server(),
+            Some(&internal),
+            db_pool,
+            &external_oauth2_with_issuance(),
+            &sample_billing(),
+            &sample_quota_tiers(),
+            &sample_models(),
+            &sample_api_key_expiry(),
+            &unreachable_redis(),
+            &None,
+        )
+        .await
+        .expect_err("a budget_internal listener demanding mTLS must not start");
+
+        let message = format!("{err}");
+        assert!(
+            message.contains("client_ca_bundle_path"),
+            "the error must name the offending key: got {message}"
+        );
+        assert!(
+            message.contains("Authorino"),
+            "the error must say WHY it is refused: got {message}"
         );
     }
 

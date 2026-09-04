@@ -599,10 +599,12 @@ pub struct Server {
     /// values-gated off in the same state, so the two halves cannot be enabled independently by
     /// accident.
     ///
-    /// When it IS present, `tls.client_ca_bundle_path` is **mandatory** and startup fails without
-    /// it (`start_budget_server`). This listener answers a cross-account balance question with no
-    /// per-caller ownership check at all; serving it without mTLS because a key was forgotten is
-    /// exactly the silent-degrade this codebase's fail-closed rule forbids.
+    /// When it IS present, `shared_secret` is **mandatory** and startup fails without it. This
+    /// listener answers a cross-account balance question with no per-caller ownership check at
+    /// all; serving it without a credential is exactly the silent degrade this codebase's
+    /// fail-closed rule forbids. The credential is a shared secret in a custom header, **not**
+    /// mTLS -- Authorino v0.24.0 cannot present a client certificate, so the shape ADR-0034 first
+    /// specified is unreachable by its only caller. See [`BudgetInternalServer`].
     #[serde(default)]
     pub budget_internal: Option<BudgetInternalServer>,
 }
