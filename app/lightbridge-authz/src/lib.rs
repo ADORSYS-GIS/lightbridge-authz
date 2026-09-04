@@ -1,3 +1,4 @@
+pub mod budget_cmd;
 pub mod jwk_cmd;
 pub mod mcp;
 pub(crate) mod mcp_oauth_metadata;

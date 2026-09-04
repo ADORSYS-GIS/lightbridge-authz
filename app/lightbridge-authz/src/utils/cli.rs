@@ -1,4 +1,6 @@
 use clap::{Parser, Subcommand};
+
+pub use super::cli_budget::BudgetSubcommand;
 use lightbridge_authz::jwk_cmd::KeyPurpose;
 use std::sync::LazyLock;
 
@@ -59,6 +61,12 @@ pub enum Commands {
     Budget {
         #[arg(long, short, env = "CONFIG_PATH")]
         config_path: String,
+        /// Book a budget grant directly against the configured database instead of starting the
+        /// server — the `idp jwk` / `rbac` one-shot pattern. Exists because the `grantBudget` RPC
+        /// requires a human platform role (ADR-0030: a `client_credentials` token holds no
+        /// permissions), so an unattended Job has no credential that can call it.
+        #[command(subcommand)]
+        command: Option<BudgetSubcommand>,
     },
     /// Manage PLATFORM role grants (`platform_role_grants`, ADR-0033) directly against the
     /// configured database. One-shot, no server -- the `idp jwk` pattern. This is how the FIRST
