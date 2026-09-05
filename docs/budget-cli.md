@@ -6,6 +6,17 @@ with **no server, no bearer token and no raw SQL**. Added in
 same evening to backfill seven production accounts — see
 [ADR-0034 §15.7](./adr/0034-dynamic-budget-limiter.md#157-operational-record--enforcing-in-production-since-2026-09-04).
 
+> **Since [#697](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/697), this command is for
+> LEGACY accounts and operator repairs only.** Account creation now books its own starting grant —
+> one `automatic` grant for the current period, worth what `effective_schedule(account)` would
+> reset the account to, idempotent on `budget-start-<period>-<account id>` — so no account created
+> after that change needs a backfill. See
+> [ADR-0015 Decision 9](./adr/0015-refill-amounts-are-admin-configured-policy-ranges.md#amendment-2026-09-05--decision-9-the-starting-grant-is-booked-at-account-creation).
+> What is still this command's job: accounts created before it, an account whose creation-time
+> booking failed (the handler logs `error!` and returns the account rather than orphaning a second
+> one — reuse the SAME `budget-start-<period>-<id>` key to repair it exactly once), and any
+> deliberate operator grant.
+
 Read this beside, not instead of:
 
 - [`docs/rbac.md` → Bootstrap runbook](./rbac.md#bootstrap-runbook-the-first-admin) — the same
@@ -116,6 +127,11 @@ Before you pick a number:
 2. If it is in `mode: reset`, grant **its** `amount_micros` and pass `--source automatic`.
 3. If no schedule covers the account, the policy default is the right number and `--source admin`
    is the honest label.
+
+The creation-time starting grant applies the *same* three steps in code
+(`lightbridge_authz_budget::starting_grant`), so a hand-run grant and an automatic one can never
+disagree about the amount. If you find yourself picking a different number here than
+`getEffectiveResetSchedule` reports, one of the two is wrong — settle that before writing.
 
 ---
 

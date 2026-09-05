@@ -148,6 +148,133 @@ behalf.
   reasons that still hold (it would change what the ADR-0070 quota dashboard means); this ADR
   takes no new position on it.
 
+## Amendment, 2026-09-05 — Decision 9: the starting grant is booked at account creation
+
+[#697](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/697). Decision 5 named the number a
+brand-new account starts with. It did not say **who books it, or when** — and nobody did. An
+account was funded only when a reset schedule with a matching predicate next ran (ADR-0032), which
+is weekly. Seven free-plan accounts created between June and August 2026 held zero grant rows until
+the 2026-09-04 backfill, invisible only because the gateway read them as `known: false` and failed
+open. Under the enforcing limiter (ADR-0034 §15.7, enforcing since 2026-09-04) the same gap is up
+to **seven days of `402 budget_exhausted` for every new signup**.
+
+**Decision 9. Account creation books the starting grant, in the same call, before it returns.**
+
+- **Trigger:** every path that writes an `accounts` row. That is exactly one place —
+  `StoreRepo::create_account` — reached through `AuthzStoreImpl::create_account`, which the RPC
+  `createAccount` procedure, the MCP `create-account` tool and the console's bootstrap flow all
+  delegate to. The grant is booked there, not at first API-key issuance.
+- **Amount — the rule, and it is not Decision 5 by default:** the grant equals what
+  `effective_schedule(account)` would reset the account to, i.e. the winning enabled reset
+  schedule's `amount_micros`. **Decision 5's `starting_amount_micros` is the fallback, and only
+  when no enabled schedule covers the account at all.** The reset scheduler in `mode: reset` books
+  `delta = target − remaining`, so any other amount is clawed back by a negative `correction` row
+  on the next window — the `$8`-vs-`$15` trap `docs/budget-cli.md` documents. Granting the
+  schedule's own target makes that window a no-op (`delta = 0`, and a zero-amount row is rejected
+  by `budget_grants_amount_sign_chk` anyway).
+- **Source `automatic`, not `admin`:** the grant stands in for the schedule run that would
+  otherwise have funded the account, so `budget_balances` must bucket it that way.
+- **Idempotent on `budget-start-<period>-<account_id>`**, through `BudgetRepo::grant` and never raw
+  SQL (ADR-0009: a double grant has no undo).
+- **Not in the account insert's transaction.** `accounts` is written by
+  `lightbridge-authz-api-key`, which does not and should not depend on the budget crate — the
+  budget domain is downstream of tenancy, not beside it. The grant is booked immediately after the
+  insert commits, with the idempotency key as the retry guard.
+- **A failure to book is logged (`error!`), not propagated.** The `accounts` row is already
+  committed, and since ADR-0026 a retried `createAccount` mints a *second* account rather than
+  re-running the first — so failing the procedure would turn one unfunded account into two. The
+  repair path is `lightbridge-authz budget grant --idempotency-key budget-start-<period>-<id>`,
+  which is exactly once by construction.
+- **The snapshot is touched** (ADR-0034 §15's existing `touch` path), so the account joins the
+  refresher's working set immediately and the gateway reads `known: true` on the next tick rather
+  than on the account's first metered request.
+
+### The consequence to keep in view
+
+An account carries no `billing_plan` of its own; a plan reaches it through its projects
+(`projects.billing_plan`) and their API keys. At `createAccount` an account has neither, so a
+`billing_plan`-scoped schedule — which is what production runs (`"Refill $8"`, scope
+`billing_plan=free`) — does **not** cover it yet, and Decision 5's policy amount is what fires.
+**Keep `starting_amount_micros` aligned with the operative plan schedule's `amount_micros`**, or
+the first weekly window after the account acquires a free-plan project books the difference as a
+`correction`. A `global`-scoped schedule matches from the first second and has no such gap. Both
+branches are pinned by tests (`starting_grant_tests.rs`).
+
+### Create → grant → snapshot
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Caller (console / RPC / MCP)
+    participant H as AuthzStoreImpl::create_account
+    participant T as StoreRepo (tenancy, own tx)
+    participant S as StartingGrantService
+    participant SCH as effective_schedule
+    participant PG as BudgetRepo::grant (one tx)
+    participant SNAP as budget_remaining_snapshots
+    participant GW as Gateway (Authorino)
+
+    U->>H: createAccount { defaultQuota?, name? }
+    H->>T: BEGIN — INSERT accounts (+ users via trigger) — COMMIT
+    T-->>H: account { id }
+    H->>S: book(account.id, now)
+    S->>SCH: winning enabled schedule for this account?
+    alt a schedule covers it
+        SCH-->>S: EffectiveSchedule { amount_micros = target }
+    else nothing covers it
+        SCH-->>S: none
+        S->>PG: read the active policy revision
+        PG-->>S: starting_amount_micros (ADR-0015 Decision 5)
+    end
+    S->>PG: BEGIN — INSERT budget_grants (source=automatic,<br/>idempotency_key=budget-start-PERIOD-ACCOUNT)<br/>+ UPDATE budget_balances — COMMIT
+    Note over PG: a replay resolves to the grant that already exists;<br/>apply_grant_delta is a no-op — there is no reading to move yet
+    S->>SNAP: touch(account.id) — row created, last_seen_at = now()
+    S-->>H: booked grant
+    H-->>U: account
+    Note over SNAP,GW: the refresher fills the reading on its next tick,<br/>so the gateway reads known: true, remaining = grant
+```
+
+### An account's budget, as a lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Created: INSERT accounts committed
+    note right of Created
+        Pre-#697 this state was TERMINAL until the next weekly
+        window: ceiling 0, remaining 0, and under enforcement a
+        402 on every request. It is now transient by construction.
+    end note
+
+    Created --> Granted: starting grant booked (automatic, schedule target)
+    Created --> Unfunded: booking failed — error! logged, account still returned
+    note left of Unfunded
+        The ONLY way to still reach the old behaviour. Repaired
+        forward by `budget grant --idempotency-key
+        budget-start-PERIOD-ACCOUNT`, or by the account's own
+        reset schedule when one covers it.
+    end note
+    Unfunded --> Granted: operator or schedule funds it
+
+    Granted --> Enforced: refresher fills the snapshot — known: true
+    Enforced --> Spending: metered requests debit spend
+    Spending --> Exhausted: remaining reaches zero — 402 budget_exhausted
+    Spending --> Enforced: refill or admin grant moves the ceiling
+
+    Enforced --> Reset: the winning schedule's window fires
+    Spending --> Reset: the winning schedule's window fires
+    Exhausted --> Reset: the winning schedule's window fires
+    note right of Reset
+        delta = target - remaining. For an account granted at
+        creation with no spend this is 0, so NOTHING is written —
+        no automatic row, and no negative correction. That
+        no-op is the acceptance criterion #697 is measured by.
+    end note
+    Reset --> Enforced: delta > 0, a fresh automatic grant
+    Reset --> Enforced: delta = 0, no row at all
+
+    Exhausted --> [*]
+```
+
 ## Related
 
 - ADR-0007 (the decision contract this reuses unchanged), ADR-0008 (superseded on the points
@@ -157,6 +284,9 @@ behalf.
   reverses, and why)
 - `lightbridge-authz` PR #381 (`feat/budget-tier-jwt-claim`, open — fallback needs Decision 6
   applied)
+- [#697](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/697) (Decision 9 above),
+  ADR-0032 (reset schedules, `effective_schedule`), ADR-0034 §15/§15.6/§15.7 (the snapshot and the
+  enforcing limiter), `docs/budget-cli.md` (the `$8`-vs-`$15` rule this reuses)
 - `ai-helm#877`, `ai-helm` ADR-0084, ADR-0110 (the gateway constraint this ADR's Context
   verifies does not currently bind, and the cross-repo doc drift this ADR flags but does not
   fix)

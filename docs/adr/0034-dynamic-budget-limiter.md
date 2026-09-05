@@ -346,7 +346,11 @@ distinguishes the two.
 Decision 5) materialises **only when a grant is actually booked** — `RefillService` writes a
 `budget_grants` row, and nothing about the policy is readable from the ledger until it does. This
 endpoint reports the ledger. A brand-new account therefore reads `ceiling_micros: 0` here until
-its base grant lands, and that is the honest number, not an omission.
+its base grant lands, and that is the honest number, not an omission. **Since #697 that window is
+the width of one `createAccount` call rather than up to a week**: the handler books the starting
+grant before it returns (ADR-0015 Decision 9), so the row exists by the time anyone can hold an API
+key for the account. The endpoint's contract is unchanged — it still fabricates nothing, and an
+account whose booking failed still honestly reads `0`.
 
 **Ordering is load-bearing in one direction.** The existence probe runs *in front of* both the
 ceiling read and the spend read, so an unknown id answers `404` even while the usage service is
@@ -1741,9 +1745,18 @@ identity the snapshot table's foreign key can hold.
   wrong value tells a refused user to wait two months. Settle it with
   `getEffectiveResetSchedule` for that account — gated at `budget:read`, so no schedule-management
   permission is needed — and record the answer here.
-- **Nothing books a starting grant at account creation** —
-  [#697](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/697), open. Under enforcement a new
-  account reads `remaining = 0` and gets a `402` until the next weekly reset covers it: up to seven
-  days. The seven accounts backfilled on 2026-09-04 are the symptom; the ticket is the cure.
+- ~~**Nothing books a starting grant at account creation.**~~ **Closed 2026-09-05** by
+  [#697](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/697) /
+  [ADR-0015 Decision 9](./0015-refill-amounts-are-admin-configured-policy-ranges.md#amendment-2026-09-05--decision-9-the-starting-grant-is-booked-at-account-creation):
+  `createAccount` books one `automatic` grant for the current period, worth what
+  `effective_schedule(account)` would reset the account to, idempotent on
+  `budget-start-<period>-<account id>`, and touches the snapshot so the gateway reads
+  `known: true` on the next refresher tick. The seven accounts backfilled on 2026-09-04 were the
+  symptom of the gap; nothing created after this needs a backfill. **One residual, documented not
+  hidden:** an account has no `billing_plan` until it has a project, so the production
+  `billing_plan=free` schedule does not cover it *at creation* and the policy
+  `starting_amount_micros` is what fires — keep that number equal to the plan schedule's
+  `amount_micros` or the first window after the account gets a free-plan project books the
+  difference as a `correction`.
 - **Authorino's own p99 and ext_authz timeout rate are still unmeasured** (§10 Stage 2's third
   bullet). Authorino is unscraped; there is no series to read. Enforcement shipped without it.
