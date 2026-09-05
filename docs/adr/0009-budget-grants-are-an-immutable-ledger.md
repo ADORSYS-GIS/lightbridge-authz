@@ -68,6 +68,35 @@ Amounts are integer micro-USD. No floats.
 - **Event sourcing the whole domain** -- rejected as disproportionate. The ledger gives the
   auditability we need for the one thing that needs it.
 
+## Amendment, 2026-09-05 — the one DELETE the trigger permits
+
+[#697](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/697). Since accounts are funded at
+creation ([ADR-0015 Decision 9](./0015-refill-amounts-are-admin-configured-policy-ranges.md#amendment-2026-09-05--decision-9-the-starting-grant-is-booked-at-account-creation)),
+"an account with no `budget_grants` row" no longer exists — so `deleteAccountPermanently`, which
+had only ever been exercised against unfunded accounts, started failing on
+`budget_grants_budget_account_id_fkey` and surfacing as an opaque `500`. That was a latent bug this
+change made universal: any account that had ever been granted was already undeletable.
+
+`budget_grants_forbid_mutation()` now permits **exactly one** DELETE: one whose owning `accounts`
+row is already gone inside the same transaction
+(`migrations/20260905000001_budget_rows_cascade_on_account_delete.sql`), which in Postgres is
+precisely and only the signature of a referential-action cascade — the parent is deleted first, the
+child DELETE follows as its own command. The budget tables cascade from `accounts` accordingly,
+`budget_balances` in lockstep with `budget_grants` so the replay proof below still holds for what
+remains.
+
+**This is erasure, not an edit, and the distinction is the whole rule.** A hand-written `DELETE`
+against a living account's ledger still raises, and `UPDATE` still raises unconditionally — both
+pinned by `budget_grants_migration_tests.rs`. The only way to remove a ledger row is to destroy the
+entire tenant it keys on. This ADR forbids rewriting a living account's history; it was never a
+promise to keep a deleted tenant's money rows forever, and a ledger whose `budget_account_id`
+names nothing is not history, it is a dangling id.
+
+The rejected alternative was dropping `budget_grants`' foreign key to `accounts` so the ledger
+simply outlives the tenant. That key is what turns a typo'd `grantBudget` into a loud error instead
+of an unreadable orphan row, and `known_account`'s own doc comment names it as part of the
+definition of "a budget account exists".
+
 ## Related
 
 - ADR-0007 (how a refill is decided), ADR-0008 (how it is enforced at the gateway)

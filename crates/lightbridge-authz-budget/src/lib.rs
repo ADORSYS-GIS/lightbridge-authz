@@ -12,6 +12,7 @@
 pub mod amount;
 pub mod augmentation;
 pub mod decision;
+pub mod effective_schedule;
 pub mod error;
 pub mod facts;
 mod known_account;
@@ -42,6 +43,8 @@ pub mod snapshot_store;
 pub mod source;
 pub mod spend;
 mod spend_units;
+pub mod starting_grant;
+pub mod starting_grant_amount;
 pub mod tier;
 
 pub use amount::AmountMicros;
@@ -50,6 +53,7 @@ pub use augmentation::{
     NewAugmentationRequest, RecordedDecision, UnapprovedDecision,
 };
 pub use decision::{Decision, Effect, Obligations, PolicyEngine};
+pub use effective_schedule::EffectiveSchedule;
 pub use error::BudgetError;
 pub use facts::Facts;
 pub use period::Period;
@@ -63,9 +67,7 @@ pub use reset_schedule::{
     ResetScheduleRepo, ScheduleScopeKind, first_window_after, next_window_after, parse_run_at_utc,
     render_run_at_utc,
 };
-pub use reset_scheduler::{
-    EffectiveSchedule, PlannedGrant, ResetScheduler, ScheduleRunOutcome, TickReport,
-};
+pub use reset_scheduler::{PlannedGrant, ResetScheduler, ScheduleRunOutcome, TickReport};
 pub use review::ReviewService;
 pub use rule_data::{
     Condition, Field, Operator, Rule, RuleDataEngine, RuleSet, default_rule_set_json,
@@ -80,4 +82,6 @@ pub use source::GrantSource;
 pub use spend::{
     Spend, SpendObservation, SpendReader, UnavailableSpendReader, UsageServiceSpendReader,
 };
+pub use starting_grant::StartingGrantService;
+pub use starting_grant_amount::{StartingAmount, starting_grant_idempotency_key};
 pub use tier::BudgetTier;
