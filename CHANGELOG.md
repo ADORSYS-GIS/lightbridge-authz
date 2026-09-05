@@ -1,5 +1,55 @@
 # Changelog
 
+## [11.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v10.0.0...v11.0.0) (2026-09-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* **deps:** responses the rate-limit and idempotency middleware emit themselves (the 429, an identity refusal, a store-failure refusal, an idempotency conflict) now carry the codec-negotiated error envelope instead of a bare text/plain body, and a store outage refuses with 503 rather than 500. `CratestackError` gained an additive `TooManyRequests` variant. Clients that parsed those bodies as text must decode the envelope; the console's authz-rpc runtime moves with this in converse-frontends.
+
+### Features
+
+* **authz:** build-info surface on every service, RPC, CLI and startup log ([#663](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/663)) ([509005e](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/509005ede47ed13cd2fbb3be0f7bb5bfbf029039)), closes [#573](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/573)
+* **budget:** add `budget schedule create|list` so a Job can author a reset schedule ([#703](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/703)) ([cfe24bd](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/cfe24bdba7edaea9cd28467c370d0be4a4b4eb49))
+* **budget:** ADR-0034 + the mTLS-only GET /budget/v1/remaining read ([#676](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/676)) ([adaab0a](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/adaab0a2cc5b783a1a37770516ff24e19fee955e))
+* **budget:** book a starting grant when an account is created ([#701](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/701)) ([851e8c1](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/851e8c14a0c7cff1f894f38b78f39780cddfc133))
+* **budget:** fold the gateway's budget read into the existing introspection ([#685](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/685)) ([2982884](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/2982884f5de7297bfe8cec91ee81132e642dc2e1))
+* **budget:** give GET /budget/v1/remaining a span, so its p99 exists ([#680](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/680)) ([b999bdc](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/b999bdc919178be45eace3ca3e623a47705055c6))
+* **budget:** let an operator force a reset schedule's next execution onto a date ([#669](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/669)) ([0d993c5](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/0d993c5da4ea10eb72e5e8e801f3a66131e53b7c))
+* **cli:** add `lightbridge-authz budget grant` for unattended grants ([#695](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/695)) ([b0b7904](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/b0b790487026ee9b14cfebed508266be5b1611e8))
+* **deps:** upgrade cratestack 0.10.0 -&gt; 0.11.0, keeping rate limiting fail-closed ([#675](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/675)) ([faa21ac](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/faa21accff37d0391d3c9e10cf51c1119c34b2d3))
+* **identity:** resolve API-key names in resolveActorLabels, row-scoped ([#674](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/674)) ([9f03f74](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/9f03f742a94f988145466af39bb9e871e2df2f59))
+* **mcp:** bring the MCP tool surface to parity with the api/budget RPC surfaces ([#670](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/670)) ([74c1713](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/74c1713d2f5cac64fed55ec54a9cab3dad220a7e)), closes [#122](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/122)
+* **oauth2:** remove allowed_models/model_policy/quota_tier claims from minted tokens ([#430](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/430)) ([#454](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/454)) ([6261693](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/6261693fca37699ab8c544ce219f20f9cc5bd8ed))
+* **oauth2:** RFC 8252 §7.3 loopback redirect URIs for public native-app clients ([#539](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/539)) ([4096c47](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/4096c4799e89490c321d400b804e7d373c103e50))
+
+
+### Bug Fixes
+
+* **budget:** an unknown account id on /budget/v1/remaining is a 404, not a zero balance ([#681](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/681)) ([9341d7b](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/9341d7b1c408749b40c964afb6bed85d1cb6c49c))
+* **budget:** scope the snapshot refresher's advisory lock to a transaction ([#689](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/689)) ([2ad4a24](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/2ad4a241498f075ddfd45638b11758d8f98f4ab0))
+* **budget:** seed and slow-lane the remaining-snapshot refresher (ADR-0034 §15.6) ([#694](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/694)) ([e2501ea](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/e2501ea176ac13a47b751c5dc934e7b070134f64))
+* **budget:** stop the lock-scope test from racing the thing it measures ([#696](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/696)) ([064debb](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/064debba98bebc4f12556586eaf1a73f88e119ff))
+* **budget:** the remaining read takes a shared secret, because Authorino cannot present a client certificate ([#679](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/679)) ([3a513e9](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/3a513e983a8d22bca6e75ac1caba3fa7996f149b))
+* **ci:** pin Helm and unbreak the Helm chart tests job ([#668](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/668)) ([617a09f](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/617a09fff9a58c21f54523bd40c8d02ae39e0ce2))
+* **it:** unbreak it-servers, and make its MCP tool list machine-checked ([#672](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/672)) ([ab11479](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/ab11479ad2f94efb3f949cdad3e2e35b18f70a91)), closes [#645](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/645)
+* **migrations,rest:** migration-own cratestack's bootstrap tables ([#684](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/684)) ([#686](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/686)) ([f26aaf9](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/f26aaf9bb6fc5ee6abcd11d952f42f5fb76ec631))
+
+
+### Performance Improvements
+
+* **usage:** one-scan usage query, a covering index, and quiet ingest logs ([#665](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/665)) ([96f675b](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/96f675b00531030e336447954c3f97dd9f52babd))
+
+
+### Documentation
+
+* **adr:** re-ground ADR-0034 on the deployed Authorino CRD, not upstream source ([#677](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/677)) ([0aab88d](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/0aab88d103b607695d60e57f1ab71f731201e3f3))
+* **adr:** say where §10's p99 exit criterion actually comes from ([#682](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/682)) ([6fe895b](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/6fe895bdc166df2e35ee47eb78f2a8f50d051a0d))
+* **agents:** document 2026-09-02/03, add skills and agents, and link every harness ([#673](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/673)) ([0d913ba](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/0d913ba2d2a038aec51e90b0d74fdf61573e8a41))
+* **budget:** record the Dynamic Budget Limiter enforcing in production ([#698](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/698)) ([3cd02fb](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/3cd02fba1aaefc5d957efd849e70fc4bf0194b27))
+* **roadmap:** [#684](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/684)'s row claims CI never ran it; CI has since run it ([#691](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/691)) ([43f0a52](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/43f0a5274da387ac0a891a3bf33d3db449effd1d))
+* **roadmap:** a standing status matrix for every workstream ([#683](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/683)) ([8d55d6a](https://github.com/ADORSYS-GIS/lightbridge-authz/commit/8d55d6af20cfafbab3b507bfaeb8e36c391da0b2))
+
 ## [10.0.0](https://github.com/ADORSYS-GIS/lightbridge-authz/compare/v9.0.0...v10.0.0) (2026-09-03)
 
 
