@@ -189,6 +189,17 @@ to **seven days of `402 budget_exhausted` for every new signup**.
   refresher's working set immediately and the gateway reads `known: true` on the next tick rather
   than on the account's first metered request.
 
+### The consequence for `deleteAccountPermanently`
+
+Funding every account at creation meant every account now holds `budget_grants` rows, and those
+rows' foreign key to `accounts` is `NO ACTION` while ADR-0009's trigger forbids `DELETE` outright —
+so a hard delete began failing as an opaque `500`. That was a latent bug (any granted account was
+already undeletable), and it is fixed here rather than left:
+[ADR-0009's 2026-09-05 amendment](./0009-budget-grants-are-an-immutable-ledger.md#amendment-2026-09-05--the-one-delete-the-trigger-permits)
+gives the append-only trigger exactly one exemption — a DELETE whose owning account row is already
+gone in the same transaction, i.e. an FK cascade and nothing else — and the budget tables cascade
+from `accounts`. Erasing a deleted tenant is not editing a living account's history.
+
 ### The consequence to keep in view
 
 An account carries no `billing_plan` of its own; a plan reaches it through its projects

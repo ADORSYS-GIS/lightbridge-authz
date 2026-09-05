@@ -166,3 +166,65 @@ async fn a_second_account_for_the_same_identity_is_funded_as_well(pool: PgPool) 
         assert_eq!(total, POLICY_STARTING_AMOUNT_MICROS, "account {account_id}");
     }
 }
+
+/// Regression guard for the consequence of funding every account: `deleteAccountPermanently` used
+/// to succeed on a brand-new account only because it had no ledger rows. Now it always has one, so
+/// the budget tables' `NO ACTION` foreign keys would have turned every hard delete into an opaque
+/// `500`. `migrations/20260905000001_budget_rows_cascade_on_account_delete.sql` makes them cascade,
+/// the way the tenancy tables and `budget_remaining_snapshots` already did.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_funded_account_is_still_hard_deletable_and_its_ledger_goes_with_it(pool: PgPool) {
+    let store = AuthzStoreImpl::with_pool(core_pool(pool.clone()));
+    let subject = cuid2();
+
+    let account = store
+        .create_account(
+            &subject,
+            CreateAccount {
+                default_quota: None,
+                name: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (before,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM budget_grants WHERE budget_account_id = $1")
+            .bind(&account.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, 1, "the account is funded, which is the premise");
+
+    store
+        .delete_account(&subject, &account.id)
+        .await
+        .expect("a funded account must still be permanently deletable");
+
+    // Three separate literals rather than a loop over `format!`: sqlx 0.9 takes only
+    // `&'static str`, and a table name is not something to hand a runtime string anyway.
+    let (grants,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM budget_grants WHERE budget_account_id = $1")
+            .bind(&account.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let (balances,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM budget_balances WHERE budget_account_id = $1")
+            .bind(&account.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let (snapshots,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM budget_remaining_snapshots WHERE budget_account_id = $1",
+    )
+    .bind(&account.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (grants, balances, snapshots),
+        (0, 0, 0),
+        "no budget row may outlive the account it belongs to"
+    );
+}
