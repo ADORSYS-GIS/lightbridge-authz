@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 
-pub use super::cli_budget::BudgetSubcommand;
+pub use super::cli_budget::{BudgetSubcommand, ScheduleSubcommand};
 use lightbridge_authz::jwk_cmd::KeyPurpose;
 use std::sync::LazyLock;
 

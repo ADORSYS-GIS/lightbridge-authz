@@ -43,6 +43,8 @@ use lightbridge_authz_core::config::load_from_path;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_core::error::{Error, Result};
 
+use crate::budget_schedule_cmd::{self, ScheduleAction};
+
 /// The `budget` operations, decoupled from `cli.rs`'s clap `Subcommand` shape so this module's
 /// public API does not depend on how the binary happens to parse its arguments.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +59,11 @@ pub enum BudgetAction {
         reason: Option<String>,
         idempotency_key: Option<String>,
     },
+    /// Author or enable a `budget_reset_schedules` row. Delegates to
+    /// [`crate::budget_schedule_cmd`], which owns the parsing and the idempotency-on-name rule;
+    /// this variant only carries it, so `budget grant` and `budget schedule` share one entry
+    /// point, one config load and one pool.
+    Schedule(ScheduleAction),
 }
 
 /// The same `accounts ⋈ users` predicate `lightbridge_authz_budget::known_account` applies before
@@ -96,6 +103,12 @@ pub async fn dispatch(pool: Arc<dyn DbPoolTrait>, action: BudgetAction) -> Resul
                 idempotency_key,
             )
             .await
+        }
+        // The clock is read once, here, and handed down: everything the schedule path decides
+        // (the derived first window, the "strictly in the future" check on a forced one) is a
+        // function of `now`, and this is the one place in the CLI entitled to sample it.
+        BudgetAction::Schedule(action) => {
+            budget_schedule_cmd::dispatch(pool, action, chrono::Utc::now()).await
         }
     }
 }

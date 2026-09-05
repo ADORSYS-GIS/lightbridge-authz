@@ -9,13 +9,14 @@
 use std::sync::Arc;
 
 use lightbridge_authz::budget_cmd::{self, BudgetAction};
+use lightbridge_authz::budget_schedule_cmd::{CreateSchedule, ScheduleAction};
 use lightbridge_authz_core::config::load_from_path;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_core::{Error, Result};
 use lightbridge_authz_rest::start_budget_server;
 use tracing::info;
 
-use crate::utils::cli::BudgetSubcommand;
+use crate::utils::cli::{BudgetSubcommand, ScheduleSubcommand};
 
 /// `budget` with no subcommand starts the server; with one, it runs that one-shot and exits.
 /// Both arms live here rather than in `main.rs` so that file stays under its committed LoC-gate
@@ -71,6 +72,41 @@ async fn dispatch(config_path: String, command: BudgetSubcommand) -> Result<()> 
             reason,
             idempotency_key,
         },
+        BudgetSubcommand::Schedule { command } => BudgetAction::Schedule(schedule(command)),
     };
     budget_cmd::run(&config_path, action).await
+}
+
+/// The clap shape of `budget schedule`, translated into the action the lib target owns. Every
+/// value stays a string here: parsing `--scope`/`--cadence`/`--mode` belongs to
+/// `budget_schedule_cmd`, so one module holds every refusal message an operator can hit.
+fn schedule(command: ScheduleSubcommand) -> ScheduleAction {
+    match command {
+        ScheduleSubcommand::List => ScheduleAction::List,
+        ScheduleSubcommand::Create {
+            name,
+            scope,
+            scope_id,
+            cadence,
+            anchor,
+            run_at_utc,
+            amount_micros,
+            mode,
+            next_run_at,
+            enable,
+            dry_run,
+        } => ScheduleAction::Create(Box::new(CreateSchedule {
+            name,
+            scope,
+            scope_id,
+            cadence,
+            anchor,
+            run_at_utc,
+            amount_micros,
+            mode,
+            next_run_at,
+            enable,
+            dry_run,
+        })),
+    }
 }
