@@ -414,3 +414,103 @@ async fn booking_puts_the_account_in_the_snapshot_working_set(pool: PgPool) {
     // tick" contract. What matters here is that the row exists to be picked up at all.
     assert!(snapshot.remaining_micros.is_none());
 }
+
+/// **The production shape after #702.** Both a `global` schedule and the narrower
+/// `billing_plan=free` one are enabled at DIFFERENT amounts, so this cannot pass by coincidence:
+///
+/// - an account on the free plan is still governed by the plan schedule (`account > billing_plan
+///   > global`, ADR-0032, resolved by `effective_schedule::winning_schedule`), so adding the
+///   global row does not change what an established free-plan account is worth — the explicit
+///   Out-of-Scope line in #702;
+/// - a projectless account — every account between `createAccount` and its first project — has no
+///   `billing_plan` at all and therefore falls through to the global row, which is the entire
+///   reason the global row is being added.
+///
+/// The global amount here is deliberately the ODD one ($9): if precedence inverted, the free-plan
+/// account's assertion would fail with a number no other constant in this file carries.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_plan_schedule_still_wins_and_global_is_only_the_fallback(pool: PgPool) {
+    let free_plan_account = cuid2();
+    insert_account(&pool, &free_plan_account).await;
+    insert_project(&pool, &free_plan_account, "free").await;
+    let projectless_account = cuid2();
+    insert_account(&pool, &projectless_account).await;
+
+    // Oldest first, matching `list_enabled`'s `created_at ASC` ordering: the global schedule is
+    // authored FIRST, so a naive "last match wins" would also produce the right answer for the
+    // free-plan account. Ordering the seeds this way makes the test depend on specificity alone.
+    let global_id = seed_schedule(
+        &pool,
+        "Global refill $8",
+        ScheduleScopeKind::Global,
+        None,
+        9_000_000,
+        at(7, 0),
+    )
+    .await;
+    let plan_id = seed_schedule(
+        &pool,
+        "Refill $8",
+        ScheduleScopeKind::BillingPlan,
+        Some("free"),
+        SCHEDULE_AMOUNT_MICROS,
+        at(7, 0),
+    )
+    .await;
+
+    let (_core, service) = service(&pool);
+    assert_eq!(
+        service.resolve_amount(&free_plan_account).await.unwrap(),
+        StartingAmount::Schedule {
+            schedule_id: plan_id,
+            schedule_name: "Refill $8".to_string(),
+            amount_micros: SCHEDULE_AMOUNT_MICROS,
+        },
+        "a free-plan account must stay on the plan schedule, not be captured by the global one"
+    );
+    assert_eq!(
+        service.resolve_amount(&projectless_account).await.unwrap(),
+        StartingAmount::Schedule {
+            schedule_id: global_id,
+            schedule_name: "Global refill $8".to_string(),
+            amount_micros: 9_000_000,
+        },
+        "an account with no project has no billing plan, so the global schedule is what covers it"
+    );
+}
+
+/// #702's acceptance criterion, end to end: once a `global` schedule exists, the ADR-0015 policy
+/// `starting_amount_micros` fallback is unreachable for a brand-new account — the branch that
+/// produced the $15-then-−$7-correction sequence cannot be entered at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_global_schedule_makes_the_policy_fallback_unreachable_for_a_new_account(pool: PgPool) {
+    let account_id = cuid2();
+    insert_account(&pool, &account_id).await;
+    seed_schedule(
+        &pool,
+        "Global refill $8",
+        ScheduleScopeKind::Global,
+        None,
+        SCHEDULE_AMOUNT_MICROS,
+        at(7, 0),
+    )
+    .await;
+
+    let (_core, service) = service(&pool);
+    let grant = service.book(&account_id, at(4, 12)).await.unwrap();
+
+    assert_eq!(grant.amount_micros, SCHEDULE_AMOUNT_MICROS);
+    assert_ne!(
+        grant.amount_micros, POLICY_STARTING_AMOUNT_MICROS,
+        "the policy default must not be what a new account is funded with any more"
+    );
+    assert!(
+        grant
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Global refill $8"),
+        "the ledger row must name the schedule that produced its amount, got {:?}",
+        grant.reason
+    );
+}

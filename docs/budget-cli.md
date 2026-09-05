@@ -1,4 +1,4 @@
-# `lightbridge-authz budget grant` — booking a grant without a browser
+# `lightbridge-authz budget` — moving money, and the rules that move it, without a browser
 
 The operator surface for putting money into one account's ledger from a Job or a `kubectl exec`,
 with **no server, no bearer token and no raw SQL**. Added in
@@ -16,6 +16,13 @@ same evening to backfill seven production accounts — see
 > booking failed (the handler logs `error!` and returns the account rather than orphaning a second
 > one — reuse the SAME `budget-start-<period>-<id>` key to repair it exactly once), and any
 > deliberate operator grant.
+
+Two commands live here:
+
+| Command | Writes | Read |
+|---|---|---|
+| `budget grant` | one `budget_grants` row for **one** account | this page, top to bottom |
+| `budget schedule create` / `list` | one `budget_reset_schedules` row, governing **many** accounts | [the schedule section](#budget-schedule--authoring-the-rule-instead-of-the-money) |
 
 Read this beside, not instead of:
 
@@ -133,6 +140,19 @@ The creation-time starting grant applies the *same* three steps in code
 disagree about the amount. If you find yourself picking a different number here than
 `getEffectiveResetSchedule` reports, one of the two is wrong — settle that before writing.
 
+> **Amendment, 2026-09-05 ([#702](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/702)).**
+> Step 3 — "if no schedule covers the account, the policy default is the right number" — is now
+> **unreachable in production**, because a `global`-scoped `mode: reset` schedule at $8
+> (`"Global refill $8"`, weekly, ISO weekday 1, `next_run_at` on the same 2026-09-07 tick as
+> `"Refill $8"`) covers every account from its first second. That closes the gap this section
+> warns about at its root: a brand-new account has no `billing_plan`, so the plan-scoped schedule
+> could not cover it and $15 fired, to be clawed back by a −$7 `correction` the first window after
+> it acquired a free-plan project. The policy `starting_amount_micros` is deliberately **left at
+> $15**: it is the answer to "what if there is no schedule at all", which is the state the estate
+> returns to the moment somebody disables the global row, and lowering it would also lower the
+> `fail_closed_floor_micros <= starting_amount_micros` headroom `rule_data::validate` enforces.
+> See [`budget schedule`](#budget-schedule--authoring-the-rule-instead-of-the-money) below.
+
 ---
 
 ## The Job pattern
@@ -219,6 +239,168 @@ Four properties of that Job that are not incidental:
   goes away on its own.
 
 ---
+
+## `budget schedule` — authoring the rule instead of the money
+
+Added in [#702](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/702). Same argument as
+`grant`, one level up: `createBudgetResetSchedule` and `updateBudgetResetSchedule` are
+`@allow`-gated on `auth().permBudgetScheduleManage`, a permission that reaches a subject through a
+platform role on a **human** identity, and [ADR-0030](./adr/0030-client-credentials-is-a-first-class-authz-idp-grant.md)
+gives a `client_credentials` service token no `roles` claim at all. A Job has no credential that
+can call either procedure — so the CLI adds a caller to `ResetScheduleRepo`, never a second writer.
+Same `validate_shape`, same window derivation (`reset_schedule_resolve::resolve_next_run_at`, which
+`ResetScheduleRepo::create` itself calls), same `INSERT`/`UPDATE`.
+
+```bash
+lightbridge-authz budget --config-path /etc/lightbridge/config.yaml schedule create \
+  --name 'Global refill $8' \
+  --scope global \
+  --cadence weekly --anchor 1 --run-at-utc 00:00 \
+  --amount-micros 8000000 \
+  --mode reset \
+  --next-run-at 2026-09-07T00:00:00Z \
+  --enable
+```
+
+```
+created id=<cuid2> name="Global refill $8" scope=global scope_id=- cadence=weekly anchor=1 run_at_utc=00:00 amount_micros=8000000 mode=reset enabled=false next_run_at=2026-09-07T00:00:00+00:00 last_run_at=-
+enabled id=<cuid2> name="Global refill $8" scope=global scope_id=- cadence=weekly anchor=1 run_at_utc=00:00 amount_micros=8000000 mode=reset enabled=true  next_run_at=2026-09-07T00:00:00+00:00 last_run_at=-
+```
+
+**Two lines, not one, and that is the contract.** The domain layer creates every schedule
+**disabled** (ADR-0032 D8, and the migration's own `DEFAULT FALSE`): a misconfigured `global` row
+grants across the entire estate, so authoring and enabling are separate writes. `--enable` performs
+the second one explicitly, through the same `ResetScheduleRepo::update` the RPC uses. Omit it and
+the row sits inert until a human enables it in the console.
+
+`budget schedule list` prints every row, enabled or not, oldest first — the read-only check to run
+before and after. It writes nothing.
+
+| Flag | Required | Meaning |
+|---|---|---|
+| `--name` | yes | Also the **idempotency key** on this path (see below). |
+| `--scope` | yes | `global` \| `billing_plan` \| `account`. |
+| `--scope-id` | for the two scoped kinds | A `projects.billing_plan` value, or an `accounts.id`. Must be **absent** for `global`; supplying it is refused. |
+| `--cadence` | yes | `daily` \| `weekly` \| `monthly`. |
+| `--anchor` | for `weekly`/`monthly` | ISO weekday `1..=7` (Monday = 1), or day-of-month `1..=28` (28, so no month silently skips). Absent for `daily`. |
+| `--run-at-utc` | no (`00:00`) | `HH:MM`, UTC. |
+| `--amount-micros` | yes | Integer micro-USD. `reset` clamps **to** it (`0` is meaningful); `top_up` adds it and must be positive. |
+| `--mode` | yes | `reset` \| `top_up`. |
+| `--next-run-at` | no | RFC 3339, strictly in the future. Forces the **first** window instead of deriving it from the cadence, then the schedule returns to its own grid. |
+| `--enable` | no | The explicit second write. |
+| `--dry-run` | no | Resolve and print; write nothing. |
+
+### Idempotency is on `--name`, and a disagreement is a refusal
+
+`budget_reset_schedules` has no `idempotency_key` column — a schedule is a configured policy, not
+a ledger entry — so the **name** is the natural key here. Three outcomes, all exit-`0`-or-not:
+
+- **No row with that name** → create (disabled), then enable if asked. Prints `created` (+ `enabled`).
+- **A row with that name and the same shape** → prints `exists`, writes nothing, converges `enabled`
+  only if `--enable` was passed and the row is off. A retried Job and a re-applied manifest land here.
+- **A row with that name and a *different* shape** → **exits non-zero**, naming the field and both
+  values (`amount_micros is 8000000, wanted 15000000`). "Already done" must mean the same thing was
+  done, or the check is theatre. Nothing is rewritten: `create` never mutates an existing schedule's
+  scope, cadence, amount or mode. Changing one of those is a console/RPC edit, deliberately.
+
+The shape compared is scope, scope id, cadence, anchor, run time, amount and mode — not
+`enabled`, `next_run_at` or `last_run_at`, which are state rather than configuration.
+
+### Precedence: what a `global` schedule does and does not take over
+
+`account > billing_plan > global`, ties broken by the oldest enabled schedule
+(`effective_schedule::winning_schedule`). So adding a `global` row is **additive at the bottom**:
+
+- an account on the `free` plan keeps being governed by `"Refill $8"`
+  (`scope billing_plan=free`) — the global row never displaces it;
+- an account with **no project** has no `billing_plan` at all (a plan reaches an account through
+  `projects.billing_plan` and `api_keys.billing_plan`; there is no `accounts.billing_plan` column),
+  so the global row is what covers it — from its first second, which is the point.
+
+Both halves are pinned by `starting_grant_tests::the_plan_schedule_still_wins_and_global_is_only_the_fallback`,
+deliberately with two *different* amounts so the test cannot pass by coincidence.
+
+The consequence for [ADR-0015 Decision 5](./adr/0015-refill-amounts-are-admin-configured-policy-ranges.md):
+once an enabled `global` schedule exists, `effective_schedule` returns `Some` for **every** account,
+so `PolicyEngine::starting_amount_micros` — whose only production reader is
+`starting_grant.rs`'s `StartingAmount::PolicyDefault` branch — becomes unreachable. It stays in the
+policy as the answer to "what if there is no schedule at all", which is exactly the state the estate
+returns to if somebody disables the global row.
+
+### The two-step, drawn
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Op as Operator
+    participant K as Job (2 sequential initContainers)
+    participant CLI as lightbridge-authz budget schedule
+    participant PG as Postgres
+    participant S as ResetScheduler (60s tick)
+
+    Op->>K: kubectl apply -f budget-schedule-global-refill.yaml
+    Note over K: image = the live workload's sha-<commit><br/>backoffLimit: 0, credentials by secretKeyRef only<br/>distroless: args, never a shell
+    K->>CLI: schedule create --name … --scope global --enable
+    CLI->>PG: SELECT … FROM budget_reset_schedules (by name)
+    alt a row with that name, different shape
+        PG-->>CLI: the disagreeing row
+        CLI-->>K: exit != 0 — nothing written, the field is named
+    else no row
+        CLI->>PG: INSERT … enabled = FALSE, next_run_at = resolved
+        CLI->>PG: UPDATE … SET enabled = TRUE
+        PG-->>CLI: the enabled row
+    else a row with that name, same shape
+        PG-->>CLI: the existing row
+        CLI-->>K: exit 0 — "exists", no write
+    end
+    K->>CLI: schedule list
+    CLI->>PG: SELECT … ORDER BY created_at ASC
+    CLI-->>Op: every row, for the evidence comment
+    Note over S,PG: at next_run_at the scheduler claims the row<br/>(WHERE enabled AND next_run_at <= now() FOR UPDATE SKIP LOCKED)<br/>and books one grant per matched account
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Resolving: schedule create
+
+    Resolving --> Refused: scope/cadence/anchor/amount invalid
+    Resolving --> Refused: --next-run-at not strictly in the future
+    note right of Refused
+        validate_shape + validate_forced_next_run, the same two
+        the RPC runs. Nothing is written; exit != 0.
+    end note
+
+    Resolving --> Previewed: --dry-run
+    Previewed --> [*]: exit 0, nothing written
+
+    Resolving --> Matching: resolved
+    Matching --> Conflicted: a same-named row with a different shape
+    Conflicted --> [*]: exit != 0, the field and both values named
+    Matching --> Existing: a same-named row, same shape
+    Matching --> Authored: no such name — INSERT, always enabled = FALSE
+
+    Authored --> Enabled: --enable (a second UPDATE)
+    Existing --> Enabled: --enable and the row was off
+    Existing --> [*]: already as asked
+    Authored --> [*]: no --enable — inert until a human enables it
+
+    Enabled --> Fired: the 60s tick claims it at next_run_at
+    Fired --> Enabled: next_run_at advances one cadence step
+    note left of Fired
+        `mode: reset` books delta = target - remaining:
+        positive as `automatic`, negative as `correction`,
+        and NOTHING when delta = 0 (the sign check rejects a
+        zero row). An account already on target is a no-op.
+    end note
+```
+
+### What it does not do
+
+- **It never deletes or re-shapes a schedule.** Both are console/RPC operations with a human behind
+  them; a Job that could silently re-price the estate's weekly refill is a worse tool than no tool.
+- **It never writes `budget_grants`.** Enabling a schedule does not backfill anything — the first
+  money moves at `next_run_at`. Repairing an account *now* is `budget grant`, above.
+- **It prints no secret.** A schedule row carries none.
 
 ## Verifying a grant landed
 

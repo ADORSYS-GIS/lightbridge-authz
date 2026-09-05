@@ -27,6 +27,7 @@ pub mod remaining_snapshot;
 pub mod repo;
 mod repo_grant_sql;
 pub mod reset_schedule;
+pub mod reset_schedule_resolve;
 pub mod reset_schedule_validate;
 pub mod reset_scheduler;
 pub mod review;
@@ -67,6 +68,7 @@ pub use reset_schedule::{
     ResetScheduleRepo, ScheduleScopeKind, first_window_after, next_window_after, parse_run_at_utc,
     render_run_at_utc,
 };
+pub use reset_schedule_resolve::resolve_next_run_at;
 pub use reset_scheduler::{PlannedGrant, ResetScheduler, ScheduleRunOutcome, TickReport};
 pub use review::ReviewService;
 pub use rule_data::{

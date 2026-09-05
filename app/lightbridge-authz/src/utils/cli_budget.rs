@@ -3,6 +3,8 @@
 
 use clap::Subcommand;
 
+pub use super::cli_budget_schedule::ScheduleSubcommand;
+
 #[derive(Subcommand)]
 pub enum BudgetSubcommand {
     /// Book one grant through `BudgetRepo::grant` — the same transactional ledger write the
@@ -33,5 +35,15 @@ pub enum BudgetSubcommand {
         /// Supply it for anything that can be retried, which is every Job.
         #[arg(long)]
         idempotency_key: Option<String>,
+    },
+    /// Author and enable `budget_reset_schedules` rows through the same domain code the
+    /// `createBudgetResetSchedule`/`updateBudgetResetSchedule` RPCs use. Same argument as
+    /// `grant`: those procedures require `auth().permBudgetScheduleManage`, which comes from a
+    /// platform role on a HUMAN subject, and a `client_credentials` service token carries no
+    /// `roles` claim at all (ADR-0030) — so an unattended Job has no credential that can call
+    /// them.
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleSubcommand,
     },
 }
