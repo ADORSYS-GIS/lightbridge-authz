@@ -7,9 +7,17 @@
 //!
 //! Four properties, and each is a decision rather than an implementation detail:
 //!
-//! - **It only refreshes ACTIVE accounts** — those the request path touched inside
-//!   [`SnapshotRefreshConfig::active_window`], oldest reading first. Cost scales with
-//!   concurrently-active accounts, not with the size of the estate.
+//! - **It SEEDS, then refreshes in two lanes** (§15.6). Every tick first guarantees a row for
+//!   every account that can send metered traffic ([`crate::snapshot_seed`]) — coverage is a
+//!   property of the estate, not of who happened to send a request since the table was created —
+//!   then recomputes the fast lane in full and whichever slow-lane accounts are due
+//!   ([`crate::snapshot_lanes`]), oldest reading first. §15's single ten-minute window is gone:
+//!   an idle account is demoted, never dropped.
+//! - **It reports coverage, not just work** (§15.6). `budget_snapshot_accounts_total` /
+//!   `budget_snapshot_known_total` / `budget_snapshot_stale_total` /
+//!   `budget_snapshot_uncovered_total` are counted from the table once per tick and logged, because
+//!   every per-tick counter can read healthy while half the estate has no row at all — which is
+//!   exactly what the Stage 1b watch found (~50 % coverage).
 //! - **It is replica-safe by exclusion, not by partitioning.** One transaction-scoped Postgres
 //!   advisory lock guards a whole tick (see [`SnapshotRefresher::tick`]). A second replica's tick
 //!   finds it held and returns immediately rather than recomputing the same rows — simpler than
@@ -34,6 +42,7 @@ use crate::period::Period;
 use crate::repo::BudgetRepo;
 use crate::reset_scheduler::ResetScheduler;
 use crate::snapshot::{RefreshReport, SnapshotRefreshConfig};
+use crate::snapshot_lanes::to_chrono;
 use crate::snapshot_refresh_one::refresh_one_account;
 use crate::snapshot_store::SnapshotStore;
 use crate::spend::SpendReader;
@@ -51,7 +60,9 @@ pub struct SnapshotRefresher {
     repo: Arc<BudgetRepo>,
     spend_reader: Arc<dyn SpendReader>,
     reset_scheduler: Arc<ResetScheduler>,
-    config: SnapshotRefreshConfig,
+    /// `pub(crate)` only so the timer loop in `snapshot_refresh_loop` can read `interval`; that
+    /// module is this type's own `spawn`, split out under the LoC gate.
+    pub(crate) config: SnapshotRefreshConfig,
 }
 
 impl SnapshotRefresher {
@@ -69,34 +80,6 @@ impl SnapshotRefresher {
             reset_scheduler,
             config,
         }
-    }
-
-    /// Drives [`Self::tick`] forever on the configured interval. Spawned, never awaited, by
-    /// `authz-budget`: a refresher failure must not take the RPC surface down, and a failed tick
-    /// retries on the next interval with nothing lost. `MissedTickBehavior::Delay`, like the reset
-    /// scheduler's loop: an overrunning tick must not queue a backlog of catch-up ticks behind it.
-    pub fn spawn(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(self.config.interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                ticker.tick().await;
-                match self.tick(Utc::now()).await {
-                    Ok(report) if !report.ran || report.considered == 0 => {}
-                    Ok(report) => tracing::debug!(
-                        considered = report.considered,
-                        refreshed = report.refreshed,
-                        kept_stale = report.kept_stale,
-                        failed = report.failed,
-                        "budget remaining snapshot refresh tick"
-                    ),
-                    Err(err) => tracing::error!(
-                        error = %err,
-                        "budget snapshot refresh tick failed; retrying on the next interval"
-                    ),
-                }
-            }
-        })
     }
 
     /// One pass over the active set, under the advisory lock.
@@ -150,17 +133,20 @@ impl SnapshotRefresher {
     }
 
     async fn refresh_active(&self, now: DateTime<Utc>) -> Result<RefreshReport, BudgetError> {
-        let cutoff = now
-            - chrono::Duration::from_std(self.config.active_window)
-                .unwrap_or_else(|_| chrono::Duration::seconds(600));
-        let accounts = self
+        let lookback_cutoff = now - self.seed_lookback();
+        let seeded = self
             .store
-            .active_accounts(cutoff, self.config.batch)
+            .seed(
+                lookback_cutoff,
+                now - to_chrono(self.config.active_window, 24 * 60 * 60),
+            )
             .await?;
+        let accounts = self.store.due_accounts(now, &self.config).await?;
         let period = Period::current(now);
 
         let mut report = RefreshReport {
             ran: true,
+            seeded,
             considered: accounts.len(),
             ..RefreshReport::default()
         };
@@ -194,6 +180,16 @@ impl SnapshotRefresher {
             }
         }
 
+        report.coverage = self.store.coverage(&period, lookback_cutoff).await?;
         Ok(report)
+    }
+
+    /// The seed's lookback as a `chrono::Duration`. Days rather than a `Duration` in config
+    /// because that is the unit the question is asked in ("has this account been used this
+    /// month?"), and the fallback keeps a nonsense value from producing a zero-width window that
+    /// would seed nothing at all.
+    fn seed_lookback(&self) -> chrono::Duration {
+        chrono::Duration::try_days(i64::from(self.config.seed_lookback_days))
+            .unwrap_or_else(|| chrono::Duration::days(30))
     }
 }

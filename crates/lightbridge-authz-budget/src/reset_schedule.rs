@@ -24,6 +24,7 @@ use lightbridge_authz_core::db::DbPoolTrait;
 use sqlx::PgPool;
 
 use crate::error::BudgetError;
+use crate::reset_schedule_resolve::resolve_next_run_at;
 use crate::reset_schedule_validate::{validate_forced_next_run, validate_shape};
 
 /// Which budget accounts a schedule targets. Ordered most-general to most-specific so
@@ -551,26 +552,11 @@ impl ResetScheduleRepo {
         created_by: Option<&str>,
         now: DateTime<Utc>,
     ) -> Result<BudgetResetSchedule, BudgetError> {
-        validate_shape(
-            &input.name,
-            input.scope_kind,
-            input.scope_id.as_deref(),
-            input.cadence,
-            input.anchor,
-            input.amount_micros,
-            input.mode,
-        )?;
-
-        // An operator-forced window is stored verbatim; the cadence only picks the first one
-        // when the caller did not. Either way the row is still created DISABLED (ADR-0032 D8), so a
-        // forced date cannot fire before a human has dry-run it and enabled it.
-        let next_run_at = match input.next_run_at {
-            Some(forced) => {
-                validate_forced_next_run(forced, now)?;
-                forced
-            }
-            None => first_window_after(now, input.cadence, input.anchor, input.run_at_utc)?,
-        };
+        // Validation and the window decision both live in `reset_schedule_resolve`, so
+        // `budget schedule create --dry-run` prints exactly the row this write would produce
+        // rather than a second, drift-prone copy of the same rules. The row is still created
+        // DISABLED (ADR-0032 D8), so even a forced date cannot fire before a human enables it.
+        let next_run_at = resolve_next_run_at(&input, now)?;
 
         let row: ScheduleRow = sqlx::query_as(concat!(
             "INSERT INTO budget_reset_schedules ",

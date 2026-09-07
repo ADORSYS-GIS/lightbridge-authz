@@ -1,3 +1,4 @@
+pub mod accounts;
 pub mod exchange_token;
 pub mod idp;
 pub mod introspect;
@@ -14,8 +15,8 @@ use lightbridge_authz_core::config::{
 };
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::{
-    Account, AccountId, ApiKey, ApiKeySecret, ApiKeyStatus, CreateAccount, CreateApiKey,
-    ModelPolicy, Project, ProjectMember, ResourceStatus, RotateApiKey, hash_api_key,
+    Account, AccountId, ApiKey, ApiKeySecret, ApiKeyStatus, CreateApiKey, ModelPolicy, Project,
+    ProjectMember, ResourceStatus, RotateApiKey, hash_api_key,
 };
 use lightbridge_authz_core::{
     db::DbPoolTrait,
@@ -44,6 +45,24 @@ pub struct AuthzStoreImpl {
     /// `models` above, but unlike those, absent config still resolves to a real value (90 days),
     /// never to "no ceiling" -- see `ApiKeyExpiry`'s own doc comment.
     api_key_expiry: Arc<ApiKeyExpiry>,
+    /// #697: books a new account's starting grant, so an account is funded at creation instead of
+    /// at the next weekly reset. NOT optional and NOT overridable — a construction path without
+    /// one is exactly the bug this field exists to close, so it is derived from the pool in every
+    /// constructor rather than injected by some callers and defaulted by others.
+    starting_grant: Arc<lightbridge_authz_budget::StartingGrantService>,
+}
+
+/// The starting-grant service every [`AuthzStoreImpl`] carries (#697), over the same pool the
+/// handler already holds. The policy set id and evaluation budget are this crate's own, so the
+/// budget crate needs no second copy of either — see `budget_services`.
+fn build_starting_grant_service(
+    pool: Arc<dyn DbPoolTrait>,
+) -> lightbridge_authz_budget::StartingGrantService {
+    lightbridge_authz_budget::StartingGrantService::new(
+        pool,
+        crate::budget_services::BUDGET_POLICY_SET_ID,
+        crate::budget_services::BUDGET_POLICY_EVALUATION_BUDGET,
+    )
 }
 
 impl std::fmt::Debug for AuthzStoreImpl {
@@ -54,7 +73,7 @@ impl std::fmt::Debug for AuthzStoreImpl {
 
 impl AuthzStoreImpl {
     pub fn with_pool(pool: Arc<dyn DbPoolTrait>) -> Self {
-        let repo = StoreRepo::new(pool);
+        let repo = StoreRepo::new(pool.clone());
         Self {
             repo: Arc::new(repo),
             token_issuer: None,
@@ -63,6 +82,7 @@ impl AuthzStoreImpl {
             quota_tiers: Arc::new(QuotaTiers::default()),
             models: Arc::new(ModelCatalog::default()),
             api_key_expiry: Arc::new(ApiKeyExpiry::default()),
+            starting_grant: Arc::new(build_starting_grant_service(pool)),
         }
     }
 
@@ -105,6 +125,7 @@ impl AuthzStoreImpl {
         api_key_expiry: &ApiKeyExpiry,
     ) -> Result<Self> {
         use lightbridge_authz_core::config::Oauth2Type;
+        let starting_grant = Arc::new(build_starting_grant_service(pool.clone()));
         let repo = Arc::new(StoreRepo::new(pool));
         let (jwt_signer, token_issuer) = match oauth2.oauth2_type {
             Oauth2Type::SelfSigned => {
@@ -124,6 +145,7 @@ impl AuthzStoreImpl {
             quota_tiers: Arc::new(quota_tiers.clone()),
             models: Arc::new(models.clone()),
             api_key_expiry: Arc::new(api_key_expiry.clone()),
+            starting_grant,
         })
     }
 
@@ -423,131 +445,13 @@ fn validate_expires_at(
     Ok(expires_at)
 }
 
-/// The four write operations the RPC procedures delegate to (ADR-0003 item 4). Everything else the
+/// The write operations the RPC procedures delegate to (ADR-0003 item 4). Everything else the
 /// old `AuthzStore` trait exposed (account/project/api-key list/read/create/update/delete) now runs
 /// through the generated cratestack CRUD client, so only these survive — as inherent methods, no
-/// trait. They reuse the hand-written sqlx in `StoreRepo` (tenant-scoped by account ownership or a
+/// trait. The account-scoped ones live in the sibling [`accounts`] module (LoC ceiling). They reuse the hand-written sqlx in `StoreRepo` (tenant-scoped by account ownership or a
 /// `project_members` row, ADR-0006); none use cratestack's `run_in_tx`, per the deadlock finding in
 /// ADR-0003 ("Known cratestack-pg 0.4.9 bugs", item 1).
 impl AuthzStoreImpl {
-    /// Create the caller's account. Backs the `createAccount` procedure. Since ADR-0006 the account
-    /// id **is** the caller's JWT subject — one account per person — so no id is generated and none
-    /// may be supplied: the generic `model.Account.create` verb stays denied precisely because a
-    /// caller-chosen id would let one subject create an account keyed to another. Calling this twice
-    /// for the same subject is a `Conflict`, not a second account.
-    ///
-    /// `input.default_quota` is validated against the operator-configured quota-tier catalogue
-    /// (#177) before any DB write, same pattern and error shape as `create_api_key`'s
-    /// `billing_plan` check below: `None` always passes, and an empty/absent catalogue accepts
-    /// any value (see `QuotaTiers::is_allowed`).
-    pub async fn create_account(&self, subject: &str, input: CreateAccount) -> Result<Account> {
-        if !self.quota_tiers.is_allowed(input.default_quota.as_deref()) {
-            let tier = input.default_quota.as_deref().unwrap_or_default();
-            return Err(Error::BadRequest(format!(
-                "unknown defaultQuota '{tier}': must be one of the configured tiers [{}]",
-                self.quota_tiers.tier_ids().join(", ")
-            )));
-        }
-        let input = CreateAccount {
-            name: Self::normalize_account_name(input.name.as_deref()).map(str::to_owned),
-            ..input
-        };
-        let account = self
-            .repo
-            .create_account(&AccountId::assert_already_resolved(subject), input)
-            .await?;
-        tracing::info!(
-            operation = "create_account",
-            subject = %subject,
-            account_id = %account.id,
-            "account created"
-        );
-        Ok(account)
-    }
-
-    /// Updates `Account.defaultQuota` post-creation. Backs `updateAccountDefaultQuota` (#379,
-    /// completing #177/#375): `Account.defaultQuota` is now `@readonly` on the generic
-    /// `model.Account.update` verb (which has no hook for a runtime-configured catalogue check),
-    /// so this procedure is the only write path left. Same catalogue check, same pattern/error
-    /// shape, as `create_account`'s `default_quota` check above -- see that method's doc comment
-    /// for the full contract (`None` always passes, an empty/absent catalogue accepts any value).
-    pub async fn update_account_default_quota(
-        &self,
-        subject: &str,
-        account_id: &str,
-        default_quota: Option<&str>,
-    ) -> Result<Account> {
-        if !self.quota_tiers.is_allowed(default_quota) {
-            return Err(Error::BadRequest(format!(
-                "unknown defaultQuota '{}': must be one of the configured tiers [{}]",
-                default_quota.unwrap_or_default(),
-                self.quota_tiers.tier_ids().join(", ")
-            )));
-        }
-        let account = self
-            .repo
-            .update_account_default_quota(
-                &AccountId::assert_already_resolved(subject),
-                account_id,
-                default_quota,
-            )
-            .await?;
-        tracing::info!(
-            operation = "update_account_default_quota",
-            subject = %subject,
-            account_id = %account.id,
-            "account defaultQuota updated"
-        );
-        Ok(account)
-    }
-
-    /// Collapses a blank or whitespace-only account name to "no name". `NULL` is the single
-    /// representation of unnamed everywhere below this point -- in the DTO, in the column, and in
-    /// what a console reads back -- so an empty string must never survive as a *set* name; if it
-    /// did, a console could no longer distinguish "named" from "not named yet" and could not
-    /// offer a name-me affordance. Trimming is normalisation, not validation: a name is free text
-    /// with no catalogue behind it, so surrounding whitespace is silently dropped rather than
-    /// rejected, and anything non-blank is stored verbatim. The DB
-    /// `CHECK (name IS NULL OR btrim(name) <> '')`
-    /// (`migrations/20260829000001_accounts_add_name.sql`) is the backstop that keeps this true
-    /// for any future write path, not the primary enforcement.
-    fn normalize_account_name(name: Option<&str>) -> Option<&str> {
-        name.map(str::trim).filter(|trimmed| !trimmed.is_empty())
-    }
-
-    /// Sets `Account.name` post-creation. Backs `updateAccountName` -- the sole write path for that
-    /// field: it is `@readonly` in the schema and `model.Account.update` was removed outright by
-    /// #398, so there is no generic verb it could ride. Shaped like
-    /// `update_account_default_quota` above, minus the catalogue check: a name is free text with
-    /// nothing to validate it against. `None` (and, via [`Self::normalize_account_name`], a blank
-    /// string) clears it back to unnamed; this always writes, it is not a PATCH.
-    ///
-    /// The name itself is deliberately NOT logged. It is user-supplied free text on a tenant row,
-    /// and the account id already identifies the row for any audit purpose.
-    pub async fn update_account_name(
-        &self,
-        subject: &str,
-        account_id: &str,
-        name: Option<&str>,
-    ) -> Result<Account> {
-        let account = self
-            .repo
-            .update_account_name(
-                &AccountId::assert_already_resolved(subject),
-                account_id,
-                Self::normalize_account_name(name),
-            )
-            .await?;
-        tracing::info!(
-            operation = "update_account_name",
-            subject = %subject,
-            account_id = %account.id,
-            cleared = account.name.is_none(),
-            "account name updated"
-        );
-        Ok(account)
-    }
-
     /// Create an API key: validate the requested `billing_plan` against the operator-configured
     /// catalogue and `expires_at` against the operator-configured `ApiKeyExpiry` ceiling (both
     /// before any DB write), issue a fresh secret (generation/hashing unchanged from before the

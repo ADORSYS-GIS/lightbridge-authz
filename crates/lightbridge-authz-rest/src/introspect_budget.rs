@@ -19,25 +19,35 @@
 //!   budget_unavailable` — never `402 budget_exhausted`, which would bill a user for our own
 //!   latency. A `0` here would be exactly that bug.
 //! - **The hot path stays read-mostly.** The account's `last_seen_at` has to move so the refresher
-//!   keeps its reading warm, but a write per request would put WAL on the critical path of every
-//!   model call. So the touch is *write-behind*: fire-and-forget, and at most once per account per
-//!   [`TOUCH_INTERVAL`] in this process. A missed touch costs one refresh cycle of freshness and
-//!   can never cost correctness.
+//!   keeps its reading in the fast lane, but a write per request would put WAL on the critical path
+//!   of every model call. So the touch stays off the response: spawned, bounded by a timeout, and
+//!   at most once per account per touch interval in this process.
+//!
+//! ## What §15.6 changed here
+//!
+//! §15's touch was fire-and-forget in the strong sense: the throttle claim was taken *before* the
+//! write, so a write that failed suppressed the next attempt for a full interval and vanished
+//! without a trace. Two consequences the Stage 1b coverage watch had to rule out by hand — a
+//! systematically failing write looked identical to an account that was simply not sending traffic,
+//! and a bounded pool under load could drop the very touches that matter most. The write is now
+//! bounded by [`touch::TOUCH_TIMEOUT`], and a failure or timeout **releases the claim** (so the very
+//! next request retries instead of waiting out the interval) and is counted into
+//! `budget_snapshot_touch_dropped_total`. Nothing is silently lost.
+//!
+//! Row *existence* no longer depends on this write at all: `authz-budget`'s refresher seeds a row
+//! for every account that can send traffic (ADR-0034 §15.6, `crate::snapshot_seed` in the budget
+//! crate), so the touch's only job is keeping a busy account in the fast lane.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use chrono::Utc;
 use lightbridge_authz_budget::Period;
 
 use crate::OpaRepoTrait;
 
-/// How often one account's `last_seen_at` is refreshed from this process. Well below the
-/// refresher's own active window (10 minutes by default), so an account in continuous use never
-/// falls out of the work list, and far above the request rate, so the write is amortised to
-/// nothing.
-const TOUCH_INTERVAL: Duration = Duration::from_secs(30);
+pub mod touch;
 
 /// The three fields an introspection response gains when the balance is known. Absent as a whole
 /// (`None` from [`BudgetIntrospection::read_and_touch`]) whenever it is not — see the module doc.
@@ -58,10 +68,16 @@ pub struct BudgetFields {
 /// disagree with the first.
 #[derive(Debug, Default)]
 pub struct BudgetIntrospection {
-    /// Last time this process touched each account, so the write-behind can be throttled without a
-    /// round trip. Per-process by design: N replicas each touch at most once per interval, which
-    /// is N writes per interval per hot account — negligible, and it needs no coordination.
-    touched: Mutex<HashMap<String, Instant>>,
+    /// Last time this process touched each account, so the throttle needs no round trip.
+    /// Per-process by design: N replicas each touch at most once per interval, which is N writes
+    /// per interval per hot account — negligible, and it needs no coordination.
+    /// `Arc` so the spawned write can hold it for the release-on-failure path without borrowing
+    /// `self` into a `'static` task.
+    pub(crate) touched: Arc<Mutex<HashMap<String, Instant>>>,
+    /// `budget_snapshot_touch_dropped_total` for this process: touches that failed or timed out.
+    /// Steady state is zero; a climbing value means `last_seen_at` is not moving for some accounts
+    /// and the refresher's fast lane is working from stale recency (ADR-0034 §15.6).
+    pub(crate) dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl BudgetIntrospection {
@@ -109,49 +125,10 @@ impl BudgetIntrospection {
         })
     }
 
-    /// Fires the `last_seen_at` write in the background when this account is due one.
-    ///
-    /// Deliberately not awaited: the caller is on the critical path of every metered model
-    /// request, and the value of this write is entirely to the *next* refresher tick.
-    fn schedule_touch(&self, repo: &Arc<dyn OpaRepoTrait>, budget_account_id: &str) {
-        if !self.claim_touch(budget_account_id) {
-            return;
-        }
-        let repo = repo.clone();
-        let account_id = budget_account_id.to_string();
-        tokio::spawn(async move {
-            if let Err(err) = repo.touch_budget_remaining_snapshot(&account_id).await {
-                tracing::warn!(
-                    budget_account_id = %account_id,
-                    error = %err,
-                    "failed to touch the budget snapshot's last_seen_at; this account may fall \
-                     out of the refresher's active set"
-                );
-            }
-        });
-    }
-
-    /// `true` when this process has not touched `budget_account_id` within [`TOUCH_INTERVAL`],
-    /// recording the claim as it goes. Entries older than the interval are dropped on the same
-    /// pass — the only eviction this map has, and enough: an entry past the interval can never
-    /// suppress a touch again, so keeping it would be pure leak.
-    fn claim_touch(&self, budget_account_id: &str) -> bool {
-        let now = Instant::now();
-        let mut touched = self.lock();
-        touched.retain(|_, at| now.duration_since(*at) < TOUCH_INTERVAL);
-        if touched.contains_key(budget_account_id) {
-            return false;
-        }
-        touched.insert(budget_account_id.to_string(), now);
-        true
-    }
-
-    /// A poisoned mutex here means a previous caller panicked holding a map of ids and instants —
-    /// there is no invariant to have been broken, so the guard is recovered rather than
-    /// propagated as a panic that would take introspection down for every later request.
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, Instant>> {
-        self.touched
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// `budget_snapshot_touch_dropped_total` for this process — see [`Self::dropped`]. Exposed so a
+    /// test can assert the counter moves, and so an operator reading a heap dump or a future
+    /// metrics surface has one place to read it from.
+    pub fn dropped_touches(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 }

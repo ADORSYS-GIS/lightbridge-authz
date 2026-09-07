@@ -988,6 +988,15 @@ the original completely visible and unchanged. The correction's idempotency key 
 target `grantId` server-side, so calling `revokeBudgetGrant` twice for the same grant is idempotent
 rather than double-negating.
 
+**There is no `budget:grant` an unattended Job can hold.** `grantBudget`'s `@allow` needs
+`auth().permBudgetGrant`, which comes from a platform role on a *human* subject, and ADR-0030 mints
+`client_credentials` tokens with no `roles` claim at all — so a service token holds zero permissions
+against this op-id, as against every other. Funding an account from a Job therefore goes through the
+CLI, `lightbridge-authz budget grant`, which calls the *same* `BudgetRepo::grant` transaction rather
+than writing SQL around it. This is the [bootstrap-runbook](#bootstrap-runbook-the-first-admin)
+argument applied to money. Flags, refusals, the idempotency key, the Job manifest shape and the
+`$8`-vs-`$15` rule: [`docs/budget-cli.md`](./budget-cli.md).
+
 **Authoring a policy revision** (`procedure.createBudgetPolicyRevision`, gated at
 **`budget:policy-write`**) is deliberately kept separate from `activateBudgetPolicy`
 (`budget:policy-activate`) per ADR-0007: with arbitrary rule data, writing a policy means shipping

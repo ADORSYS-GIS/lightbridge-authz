@@ -40,7 +40,7 @@
 //! header, until Phase 6a lands. See `docs/adr/0032-budget-reset-schedules.md` and
 //! `docs/governance-model-and-enforcement.md`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
@@ -48,6 +48,7 @@ use lightbridge_authz_core::db::DbPoolTrait;
 use sqlx::PgPool;
 use sqlx::Row;
 
+use crate::effective_schedule::{billing_plans_for_accounts, winning_schedule};
 use crate::error::BudgetError;
 use crate::period::Period;
 use crate::repo::{BudgetRepo, GrantRequest};
@@ -108,13 +109,10 @@ pub struct TickReport {
     pub grants_written: usize,
 }
 
-/// The winning schedule for one budget account, plus when it next fires — the answer
-/// `getEffectiveResetSchedule` returns.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EffectiveSchedule {
-    pub schedule: BudgetResetSchedule,
-    pub next_run_at: DateTime<Utc>,
-}
+/// Re-exported so `reset_scheduler::EffectiveSchedule` keeps naming the same type after the
+/// precedence resolution moved to [`crate::effective_schedule`] (#697), where a caller that has no
+/// `SpendReader` — the starting grant — can reach it too.
+pub use crate::effective_schedule::EffectiveSchedule;
 
 fn storage_failed(err: sqlx::Error) -> BudgetError {
     BudgetError::StorageFailed(err.to_string())
@@ -302,31 +300,18 @@ impl ResetScheduler {
         Ok(outcome)
     }
 
-    /// The winning schedule for one budget account: the most specific ENABLED schedule that matches
-    /// it (account > billing_plan > global), or `None` when nothing does. Gated at `budget:read`,
-    /// not `budget:schedule-manage`, so an account's budget card can render "next reset: <date> →
-    /// $X" without granting the caller the ability to author schedules.
+    /// The winning schedule for one budget account — see [`crate::effective_schedule`]. Kept as a
+    /// method because the RPC surface reaches it through the scheduler handle it already holds.
     pub async fn effective_schedule(
         &self,
         budget_account_id: &str,
     ) -> Result<Option<EffectiveSchedule>, BudgetError> {
-        let enabled = self.schedules.list_enabled().await?;
-        if enabled.is_empty() {
-            return Ok(None);
-        }
-        let ids = vec![budget_account_id.to_string()];
-        let plans = self.billing_plans_for_accounts(&ids).await?;
-        let empty = HashSet::new();
-        let account_plans = plans.get(budget_account_id).unwrap_or(&empty);
-
-        Ok(
-            winning_schedule(budget_account_id, account_plans, &enabled).map(|schedule| {
-                EffectiveSchedule {
-                    next_run_at: schedule.next_run_at,
-                    schedule: schedule.clone(),
-                }
-            }),
+        crate::effective_schedule::effective_schedule(
+            self.pool(),
+            &self.schedules,
+            budget_account_id,
         )
+        .await
     }
 
     /// Resolves the accounts a schedule covers, applies precedence, computes each delta, and (when
@@ -341,7 +326,7 @@ impl ResetScheduler {
         dry_run: bool,
     ) -> Result<ScheduleRunOutcome, BudgetError> {
         let candidates = self.matching_accounts(schedule).await?;
-        let plans = self.billing_plans_for_accounts(&candidates).await?;
+        let plans = billing_plans_for_accounts(self.pool(), &candidates).await?;
         let period = Period::current(now);
         let empty = HashSet::new();
 
@@ -513,40 +498,6 @@ impl ResetScheduler {
             .map(|row| row.get::<String, _>("id"))
             .collect())
     }
-
-    /// Every billing plan each of `account_ids` touches, through its projects and their API keys.
-    /// One query for the whole candidate set, not one per account — a `global` schedule over the
-    /// estate would otherwise issue an N+1 storm just to answer "is a plan schedule more specific
-    /// than me here".
-    async fn billing_plans_for_accounts(
-        &self,
-        account_ids: &[String],
-    ) -> Result<HashMap<String, HashSet<String>>, BudgetError> {
-        if account_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let rows = sqlx::query(
-            "SELECT p.account_id AS account_id, p.billing_plan AS billing_plan \
-             FROM projects p WHERE p.account_id = ANY($1) \
-             UNION \
-             SELECT p.account_id AS account_id, k.billing_plan AS billing_plan \
-             FROM api_keys k JOIN projects p ON p.id = k.project_id \
-             WHERE p.account_id = ANY($1)",
-        )
-        .bind(account_ids)
-        .fetch_all(self.pool())
-        .await
-        .map_err(storage_failed)?;
-
-        let mut out: HashMap<String, HashSet<String>> = HashMap::new();
-        for row in rows {
-            out.entry(row.get::<String, _>("account_id"))
-                .or_default()
-                .insert(row.get::<String, _>("billing_plan"));
-        }
-        Ok(out)
-    }
 }
 
 /// `"<schedule_id>:<window_start>:<budget_account_id>"` — see the module doc for why the account id
@@ -560,42 +511,6 @@ pub fn trigger_key(
         "{schedule_id}:{}:{budget_account_id}",
         window_start.to_rfc3339()
     )
-}
-
-/// The most specific schedule in `enabled` that matches `account_id`, or `None`.
-///
-/// `enabled` is expected in `ResetScheduleRepo::list_enabled`'s order (`created_at ASC, name ASC`),
-/// which makes the tie-break at equal specificity "the oldest schedule wins" without a second sort
-/// here: a later candidate only displaces the incumbent on a STRICTLY greater specificity.
-fn winning_schedule<'a>(
-    account_id: &str,
-    account_plans: &HashSet<String>,
-    enabled: &'a [BudgetResetSchedule],
-) -> Option<&'a BudgetResetSchedule> {
-    let mut best: Option<&BudgetResetSchedule> = None;
-    for candidate in enabled {
-        let matches = match candidate.scope_kind {
-            ScheduleScopeKind::Account => candidate.scope_id.as_deref() == Some(account_id),
-            ScheduleScopeKind::BillingPlan => candidate
-                .scope_id
-                .as_ref()
-                .is_some_and(|plan| account_plans.contains(plan)),
-            ScheduleScopeKind::Global => true,
-        };
-        if !matches {
-            continue;
-        }
-        let wins = match best {
-            None => true,
-            Some(incumbent) => {
-                candidate.scope_kind.specificity() > incumbent.scope_kind.specificity()
-            }
-        };
-        if wins {
-            best = Some(candidate);
-        }
-    }
-    best
 }
 
 #[cfg(test)]

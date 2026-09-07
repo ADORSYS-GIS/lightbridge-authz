@@ -12,7 +12,7 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use lightbridge_authz_budget::period::Period;
 use lightbridge_authz_budget::repo::{BudgetRepo, GrantRequest};
-use lightbridge_authz_budget::snapshot::BudgetSnapshotReader;
+use lightbridge_authz_budget::snapshot::{BudgetSnapshotReader, SnapshotRefreshConfig};
 use lightbridge_authz_budget::snapshot_store::SnapshotStore;
 use lightbridge_authz_budget::source::GrantSource;
 use lightbridge_authz_core::cuid::cuid2;
@@ -247,6 +247,10 @@ async fn a_grant_against_an_account_with_no_reading_fabricates_nothing(pool: PgP
     );
 }
 
+/// The work list is bounded by `active_window` — the OUTER bound since ADR-0034 §15.6, which is
+/// what an account has to fall past before it stops being refreshed at all. Both accounts here
+/// carry no reading, so both are due in whichever lane they land in; the one an hour outside a
+/// ten-minute window is the only one excluded.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_active_set_is_bounded_by_recency_and_ordered_oldest_reading_first(pool: PgPool) {
     let store = store(&pool);
@@ -262,10 +266,14 @@ async fn the_active_set_is_bounded_by_recency_and_ordered_oldest_reading_first(p
         .await
         .expect("backdating last_seen_at must succeed");
 
+    let config = SnapshotRefreshConfig {
+        active_window: std::time::Duration::from_secs(600),
+        ..SnapshotRefreshConfig::default()
+    };
     let active = store
-        .active_accounts(Utc::now() - Duration::minutes(10), 100)
+        .due_accounts(Utc::now(), &config)
         .await
-        .expect("active_accounts must succeed");
+        .expect("due_accounts must succeed");
 
     assert_eq!(
         active,

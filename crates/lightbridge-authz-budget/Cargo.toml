@@ -93,6 +93,11 @@ path = "tests/reset_schedule_tests.rs"
 required-features = ["it-tests"]
 
 [[test]]
+name = "starting_grant_tests"
+path = "tests/starting_grant_tests.rs"
+required-features = ["it-tests"]
+
+[[test]]
 name = "snapshot_store_tests"
 path = "tests/snapshot_store_tests.rs"
 required-features = ["it-tests"]

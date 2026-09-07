@@ -19,7 +19,8 @@ sequenceDiagram
     participant U as authz-usage
 
     Note over B,U: background, every server.budget.snapshot_refresh_seconds
-    B->>DB: SELECT accounts with last_seen_at >= now() - active_window
+    B->>DB: SEED — a row for every account with a grant or a used active key (§15.6)
+    B->>DB: SELECT due — fast lane, plus slow-lane accounts whose reading has aged
     B->>U: POST /usage/v1/spend/query (≤ snapshot_concurrency in flight)
     alt spend answered
         B->>DB: UPDATE period/ceiling/spent/remaining/next_reset_at, clear stale_since
@@ -27,22 +28,32 @@ sequenceDiagram
         B->>DB: stamp stale_since, KEEP the previous reading
     end
 
+    B->>DB: CENSUS — accounts_total / known_total / stale_total / uncovered_total
+
     Note over O,DB: request path — one indexed read
     O->>DB: SELECT … WHERE budget_account_id = $1
-    O--)DB: (spawned, ≤1 / 30 s / account) UPDATE last_seen_at
+    O--)DB: (spawned, ≤1 / 30 s / account, ≤2 s) UPDATE last_seen_at
 ```
 
 ```mermaid
 stateDiagram-v2
     [*] --> NoRow
+    NoRow --> Seeded: refresher seed (§15.6) — grant, or used active key
     NoRow --> Seen: introspection touch
+    Seeded --> Fresh: same tick's refresh pass, spend answered
     Seen --> Fresh: tick, spend answered
+    Fresh --> SlowLane: idle past slow_lane_minutes, inside active_window
+    SlowLane --> Fresh: touched again, or refreshed on its slower cadence
     Fresh --> Stale: tick, spend unreachable (reading KEPT)
+    SlowLane --> Stale: tick, spend unreachable
     Stale --> Fresh: tick, spend answered
+    SlowLane --> Lapsed: idle past active_window (24 h)
+    Lapsed --> Seeded: seed re-arms it — still eligible
     Fresh --> RolledOver: UTC month boundary
+    SlowLane --> RolledOver: UTC month boundary
     RolledOver --> Fresh: tick for the new period
-    note right of Seen
-        Seen / RolledOver / NoRow all render as ABSENT
+    note right of Seeded
+        Seeded / Seen / RolledOver / NoRow all render as ABSENT
         introspection fields ⇒ known:false ⇒ 503.
         There is no transition that produces a fabricated 0.
     end note
@@ -62,10 +73,13 @@ Work down this list; each step distinguishes one cause from the next.
    SELECT budget_account_id, period, remaining_micros, refreshed_at, stale_since, last_seen_at
    FROM budget_remaining_snapshots WHERE budget_account_id = '<acct>';
    ```
-   - **No row** → the request path has never touched this account, or the account was just created.
-     The next introspection creates it and the next tick fills it. If requests *are* arriving and no
-     row appears, the touch is failing — grep `authz-opa` for `failed to touch the budget
-     snapshot's last_seen_at`.
+   - **No row** → since §15.6 this should be rare: the seed gives a row to every account with a
+     budget grant or a used, active API key inside `snapshot_seed_lookback_days`. No row means the
+     account matches neither (check `budget_grants` and `api_keys.last_used_at`), or it is not a
+     budget account at all (`accounts` ⋈ `users`), or the refresher is not running (go to 2). The
+     next introspection also creates it. If requests *are* arriving and no row appears, the touch
+     is failing — grep `authz-opa` for `failed to touch the budget snapshot's last_seen_at` and
+     read the `budget_snapshot_touch_dropped_total` field on that line.
    - **Row with `remaining_micros IS NULL`** → seen, never successfully refreshed. Go to 2.
    - **Row whose `period` is not the current `YYYY-MM`** → the month rolled over and no tick has run
      since. Go to 2.
@@ -138,13 +152,64 @@ All on `server.budget` (`config/default.yaml`, `charts/lightbridge-authz/values.
 
 | Key | Default | Raising it | Lowering it |
 |---|---|---|---|
-| `snapshot_refresh_seconds` | 15 | less load on `authz-usage`; more forgiven overspend | fresher balances; one spend query per active account per tick |
-| `snapshot_active_window_minutes` | 10 | bursty accounts stay warm between bursts | less background work; a returning account pays one live read |
+| `snapshot_refresh_seconds` | 15 | less load on `authz-usage`; more forgiven overspend | fresher balances; one spend query per fast-lane account per tick |
+| `snapshot_active_window_minutes` | 1440 | idle accounts stay covered for longer | less background work; an account idle past it is only kept alive by the seed |
+| `snapshot_slow_lane_minutes` | 10 | a bigger fast lane boundary AND a slower slow lane | more accounts recomputed every tick |
+| `snapshot_seed_lookback_days` | 30 | covers accounts that go quiet for longer | narrows the census population; does not delete already-seeded rows |
 | `snapshot_batch` | 500 | a bigger active set is covered per tick | shorter, more predictable ticks |
 | `snapshot_concurrency` | 8 | ticks finish faster | gentler on `authz-usage`, which also serves the console |
 
-`snapshot_refresh_seconds: 0` is refused at startup — a zero-second interval is a busy loop against
-the database, not a configuration.
+`snapshot_refresh_seconds: 0` and `snapshot_slow_lane_minutes: 0` are both refused at startup — a
+zero-second interval is a busy loop against the database, and a zero-minute lane boundary puts every
+account in the fast lane permanently.
+
+---
+
+## 7. Symptom: the gateway reports `known: false` for accounts that should be funded
+
+This is a **coverage** question, and since ADR-0034 §15.6 the refresher answers it itself. Every
+tick logs, at `info`:
+
+```
+budget remaining snapshot refresh tick
+  budget_snapshot_accounts_total=41 budget_snapshot_known_total=41
+  budget_snapshot_stale_total=0 budget_snapshot_uncovered_total=0
+  seeded=0 considered=6 refreshed=6 kept_stale=0 failed=0
+```
+
+`budget_snapshot_uncovered_total` is the one that matters: accounts that can send metered traffic
+and that the introspection would still answer `known: false` for. **Steady state is zero.** Read it
+straight off the deployment:
+
+```bash
+kubectl -n converse logs deploy/lightbridge-budget-main --tail=200   | grep 'snapshot refresh tick' | tail -1
+```
+
+Confirm it against the database (read-only) when you need the number in a report:
+
+```sql
+SELECT count(*) AS snapshot_rows FROM budget_remaining_snapshots;
+
+SELECT count(*) AS eligible_accounts
+FROM accounts a JOIN users u ON u.id = a.user_id
+WHERE a.id IN (
+    SELECT budget_account_id FROM budget_grants WHERE created_at >= now() - interval '30 days'
+    UNION
+    SELECT owner_account_id FROM api_keys
+     WHERE deleted_at IS NULL AND status = 'active' AND last_used_at >= now() - interval '30 days'
+);
+```
+
+A non-zero `uncovered_total` that does not fall to zero within one tick means the seed ran but the
+refresh pass did not reach those rows — check `considered` against `snapshot_batch`, and §2 above.
+
+**What this counter does NOT cover.** ADR-0034 §15.3's `repobinding` (GitHub Actions) and legacy
+Keycloak planes do not carry an introspection step and are not keyed on an `accounts.id` — the
+busiest `usage_events` producers in production are repo slugs like `ADORSYS-GIS/lightbridge-authz`,
+which by construction can never hold a snapshot row. They must ship `enforced: false` at the
+AuthConfig; a `known: false` there is not a coverage regression and raising
+`snapshot_seed_lookback_days` will not change it. See `ai-helm-values
+docs/runbooks/budget-limiter-rollout.md`.
 
 ---
 

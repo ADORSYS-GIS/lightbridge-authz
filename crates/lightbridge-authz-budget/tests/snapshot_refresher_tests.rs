@@ -193,8 +193,18 @@ async fn a_second_replicas_tick_is_a_no_op_while_the_first_holds_the_lock(pool: 
 ///   session-scoped lock the very next tick can be handed the same connection and re-acquire its
 ///   own leaked lock — passing while every OTHER replica is wedged.
 ///
-/// **Negative control, run by hand:** reverting `tick` to `pg_try_advisory_lock` +
-/// `pg_advisory_unlock` makes this test fail on the final assertion.
+/// **What this does and does not discriminate — measured, 2026-09-04.** Under *cancellation* the
+/// aborted task's connection is destroyed rather than returned to the pool, and destroying the
+/// session releases a session-scoped advisory lock too. So both scopes end up free here; they
+/// differ only in how fast (xact 1-6 ms, session 21-23 ms, measured locally). A ~20 ms margin is
+/// not something a loaded CI runner respects, and asserting it *instantly* — as this test did until
+/// lightbridge-authz#695's `test` job went red — was asserting the scheduler, not the lock.
+///
+/// The cancellation half is therefore bounded-poll only: it pins "a cancelled tick does not wedge
+/// the lock", which is the property an operator cares about, and would still catch a leak measured
+/// in seconds. The **deterministic** scope check is the second half below, on a tick that runs to
+/// completion: there is no teardown to mask anything, so a session-scoped lock whose explicit
+/// unlock was skipped stays held and the assertion fails every time. Verified by hand both ways.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_cancelled_tick_leaves_the_lock_free_for_other_replicas(pool: PgPool) {
     let id = account(&pool).await;
@@ -226,24 +236,86 @@ async fn a_cancelled_tick_leaves_the_lock_free_for_other_replicas(pool: PgPool) 
     let _ = running.await;
 
     assert!(
-        lock_is_free(&pool).await,
+        lock_becomes_free(&pool).await,
         "a cancelled tick must not leave the advisory lock held -- a session-scoped lock returned \
          to the pool still held would silently stop every OTHER replica's refresher until that \
          connection happened to be recycled"
     );
+
+    // The deterministic half. This tick runs to COMPLETION, so its connection goes back to the
+    // pool healthy and no teardown can mask a leak: the lock is free here only because `tick` took
+    // it with `pg_try_advisory_xact_lock` and its own rollback released it. Probed instantly and
+    // without a poll, on purpose -- there is no race left to tolerate.
+    let (_, quick) = build(&pool, Arc::new(FixedSpend(1)), config());
+    quick
+        .tick(Utc::now())
+        .await
+        .expect("a completed tick must succeed");
+    assert!(
+        lock_is_free(&pool).await,
+        "a COMPLETED tick must leave the advisory lock free with no explicit unlock -- this is the \
+         assertion that fails outright if the lock is ever made session-scoped again"
+    );
 }
 
-/// Asks for the refresher's advisory lock from a fresh session and immediately gives it back.
-/// `true` means nobody holds it.
+/// Polls [`lock_is_free`] for up to two seconds.
+///
+/// The wait is not slack in the property; it is what makes the property observable at all.
+/// `sqlx::Transaction::drop` does **not** issue `ROLLBACK` synchronously — it marks the connection
+/// so the rollback runs before that connection is used again. So between `abort()` returning and
+/// the queued rollback actually executing there is a window, and a probe on a *different* pool
+/// connection can land inside it and see the lock still held. Asserting instantly therefore tested
+/// the scheduler's timing as much as the lock's scope, and went red on a loaded CI runner
+/// (lightbridge-authz#695's `test` job) while passing 15/15 locally.
+///
+/// What is being asserted is unchanged: the lock is released **promptly and without anyone calling
+/// `pg_advisory_unlock`**. The negative control still fails exactly as the doc comment above
+/// claims — a session-scoped `pg_try_advisory_lock` whose explicit unlock was skipped stays held
+/// for as long as that connection sits in the pool, which is far longer than this bound.
+/// Polls [`lock_is_free`] for up to two seconds.
+///
+/// The wait is not slack in the property, it is what makes the property observable at all.
+/// `sqlx::Transaction::drop` does **not** issue `ROLLBACK` synchronously -- it marks the connection
+/// so the rollback runs before that connection is used again. Between `abort()` returning and that
+/// queued work executing there is a window, and a probe on a *different* pool connection can land
+/// inside it. Two seconds is far above the 1-6 ms this takes in practice and far below any leak
+/// worth calling a leak.
+async fn lock_becomes_free(pool: &PgPool) -> bool {
+    for _ in 0..100 {
+        if lock_is_free(pool).await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// `true` when nobody holds the refresher's advisory lock, read from `pg_locks`.
+///
+/// **This must not acquire the lock to find out.** The previous version asked with
+/// `pg_try_advisory_xact_lock` and rolled back, which made the observer a *competitor*: the
+/// observation loop below probes ~50 times a second, `SnapshotRefresher::tick` makes exactly ONE
+/// `try` attempt and gives up for the whole tick if it loses, so a probe landing on the same
+/// instant made the tick return `ran: false` and the lock was then never held at all. That is the
+/// mechanism behind both halves of this test going red intermittently (2 of 25 local runs, and
+/// lightbridge-authz#695's `test` job on a loaded runner).
+///
+/// Reading `pg_locks` takes no lock and cannot perturb what it measures. A 64-bit advisory key is
+/// split across two columns: `classid` is the high 32 bits, `objid` the low 32 — the same split
+/// the `budget-remaining-snapshot` runbook's diagnostic query uses.
 async fn lock_is_free(pool: &PgPool) -> bool {
-    let mut probe = pool.begin().await.expect("begin");
-    let (free,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_xact_lock($1)")
-        .bind(0x4255_4447_5F53_4E50_i64)
-        .fetch_one(&mut *probe)
-        .await
-        .expect("asking for the lock must succeed");
-    probe.rollback().await.expect("rollback");
-    free
+    const LOCK_CLASSID: i32 = 1_112_884_295;
+    const LOCK_OBJID: i32 = 1_599_295_056;
+    let (held,): (i64,) = sqlx::query_as(
+        "SELECT count(*)::bigint FROM pg_locks \
+         WHERE locktype = 'advisory' AND classid = $1 AND objid = $2 AND granted",
+    )
+    .bind(LOCK_CLASSID)
+    .bind(LOCK_OBJID)
+    .fetch_one(pool)
+    .await
+    .expect("reading pg_locks must succeed");
+    held == 0
 }
 
 #[sqlx::test(migrations = "../../migrations")]

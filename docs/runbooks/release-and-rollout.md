@@ -101,6 +101,37 @@ zsh -i -c 'gh run list -R ADORSYS-GIS/lightbridge-authz --branch main -L 10 \
 A `cancelled` line against your SHA is the answer: nothing was published for it. Re-run it
 (`gh run rerun <id>`) or merge a follow-up.
 
+### Seen again on 2026-09-04, twice, during the budget-limiter enforce push
+
+Not a historical footnote — this fired twice in one day on the merges that took the Dynamic Budget
+Limiter to enforcement:
+
+| Commit | PR | Merged (UTC) | `CI/CD Pipeline` | Image |
+|---|---|---|---|---|
+| `2ad4a24` | [#689](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/689) | 08:35:54 | run `33854212947` — **cancelled** | none |
+| `f26aaf9` | [#686](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/686) | 08:42:22 | run `33854721821` — success | `sha-f26aaf9b…` |
+| `064debb` | [#696](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/696) | 18:56:07 | run `33908520551` — **cancelled** | none |
+| `b0b7904` | [#695](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/695) | 19:01:49 | run `33909006265` — success | `sha-b0b79048…` |
+
+Confirmed the way this step says to confirm it, against the registry rather than against the run
+list alone:
+
+```console
+$ zsh -i -c 'gh api "/orgs/ADORSYS-GIS/packages/container/lightbridge-authz/versions?per_page=30"     --jq ".[].metadata.container.tags[]"' | grep -E "2ad4a241|064debba|b0b79048|e2501ea1"
+sha-b0b790487026ee9b14cfebed508266be5b1611e8
+sha-e2501ea176ac13a47b751c5dc934e7b070134f64
+```
+
+Two tags asked for, two absent. Each cancelled commit's **code** shipped inside the next commit's
+image five to six minutes later, which is why nothing looked wrong — and it is exactly why a
+production verification must name the SHA it actually checked. The 2026-09-04 enforce flip was
+verified against `sha-b0b7904…`, not against "the latest commit on `main`", for this reason
+([ADR-0034 §15.7](../adr/0034-dynamic-budget-limiter.md#157-operational-record--enforcing-in-production-since-2026-09-04)).
+
+**Before you write a Job manifest that pins `sha-<commit>`** — a backfill, a bootstrap, a migration
+by hand — check the tag exists. A manifest pinned to a cancelled commit's SHA fails to pull, and the
+error names an image, not a CI run.
+
 ## Step 2 — were all three images pushed and signed?
 
 `container-build` is a three-leg matrix — `runtime` → `lightbridge-authz` (serves `authz-api`,

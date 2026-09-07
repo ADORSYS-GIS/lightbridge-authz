@@ -24,6 +24,9 @@ serde_json.workspace = true
 lightbridge-authz-api.workspace = true
 lightbridge-authz-api-key.workspace = true
 lightbridge-authz-bearer.workspace = true
+# `budget grant` books through `BudgetRepo::grant` -- the domain layer, never a direct
+# `budget_balances` update (ADR-0009). Production dependency since #694's follow-up, not just dev.
+lightbridge-authz-budget.workspace = true
 lightbridge-authz-core = { workspace = true, features = ["axum"] }
 lightbridge-authz-rest.workspace = true
 mimalloc.workspace = true
@@ -37,10 +40,6 @@ cratestack.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 tower.workspace = true
-# Handler-shape tests build the same `Procedures` registry the server does (lightbridge-authz#645),
-# which means naming the budget domain's own service types. Production code here never does: it
-# receives them already built from `lightbridge_authz_rest::budget_services`.
-lightbridge-authz-budget.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true

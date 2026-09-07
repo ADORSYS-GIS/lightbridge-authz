@@ -1215,6 +1215,9 @@ hand-written SQL and direct `sqlx` dependencies.
   policy engine, self-service refill, discrete tiers): `docs/rfc/0001-budget-refill.md`
 - Budget refill decision contract (the `Facts`/`Decision`/`PolicyEngine` seam a rule-data
   evaluator and, later, an OPA-Wasm evaluator both sit behind; the fail-closed rule): `docs/budget-decision-contract.md`
+- **Booking a grant unattended** (`lightbridge-authz budget grant`: flags, what it refuses, the
+  idempotency key, the Job pattern, the $8-vs-$15 rule that keeps the reset scheduler from booking a
+  clawback, and why the ledger is never written with raw SQL): `docs/budget-cli.md`
 - Budget refill UI contract (RPC shapes for self-service refill and the admin review queue, the
   reset-not-add and token-refresh-delay behaviors, status values, oriented for the `lightbridge-ss`
   frontend team): `docs/budget-refill-ui-contract.md`
