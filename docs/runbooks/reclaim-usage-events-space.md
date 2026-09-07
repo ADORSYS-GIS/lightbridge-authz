@@ -1,7 +1,7 @@
 # Runbook: reclaim space from `usage_events` (#549 AC5)
 
 **Open it when:** the `usage` database on `lightbridge-main-db` is consuming more volume than the
-retention window should allow — in particular, right after the `attributes` column was dropped
+retention window should allow — in particular, right after the `attributes` column is dropped
 (`20260903000003`, #549 AC1), because `DROP COLUMN` is a catalog-only change and does **not**
 physically reclaim the ~900 MB of dropped `attributes` data, or after the retention/rollup job
 (#549 AC2) has been running long enough that the raw table's dead tuples need reclaiming.
@@ -11,7 +11,9 @@ physically reclaim the ~900 MB of dropped `attributes` data, or after the retent
 `usage_events` was a contributing factor in the 2026-08-29 volume-exhaustion outage (#549). The
 structural fixes are:
 
-- **AC1** — the write-only `attributes` column is dropped at ingest (`20260903000003`).
+- **AC1** — the write-only `attributes` column is no longer written at ingest (this PR), and is
+  dropped from the schema in a **follow-up release** (`20260903000003`, per ADR-0031's
+  expand/contract rule — the drop ships separately from the code that stops writing it).
 - **AC2** — a background job rolls rows older than 90 days into `usage_events_daily` and deletes
   them, bounding the raw table's growth.
 

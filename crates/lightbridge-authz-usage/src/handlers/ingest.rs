@@ -1634,8 +1634,8 @@ mod tests {
     /// #648, end to end over the real wire shape: a gateway access-log record carrying the exact
     /// attribute names `ai-helm`'s `charts/core-gateway/templates/envoy-proxy.yaml` emits must
     /// come out of `extract_log_events` with all three dimensions populated as COLUMNS. (The
-    /// `attributes` blob itself is no longer retained at all -- #549 AC1 drops it at ingest -- so
-    /// the columns are the only place these dimensions live.)
+    /// `attributes` blob is no longer written at ingest -- #549 AC1 -- so the columns are the only
+    /// place these dimensions live.)
     #[test]
     fn extract_log_events_should_promote_azp_billing_plan_and_operation_to_columns() {
         let payload: ExportLogsServiceRequest = serde_json::from_value(json!({

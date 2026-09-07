@@ -196,18 +196,18 @@ pub async fn start_usage_server(
 ) -> Result<()> {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(database).await?);
 
-    // Assert deploy sequencing: new schema (migrations 03 and 04) must exist before we serve traffic.
-    // Since SQLx handles queries dynamically, failing here prevents obscure runtime errors later.
-    // The error is propagated (not collapsed to "table missing") so a real failure -- pool
-    // exhaustion, a connection blip, wrong credentials -- is reported as what it is, per this
+    // Assert deploy sequencing: the rollup schema (migration 20260903000004) must exist before we
+    // serve traffic. Since SQLx handles queries dynamically, failing here prevents obscure runtime
+    // errors later. The error is propagated (not collapsed to "table missing") so a real failure --
+    // pool exhaustion, a connection blip, wrong credentials -- is reported as what it is, per this
     // store's fail-loud migration doctrine.
     sqlx::query("SELECT 1 FROM usage_events_daily LIMIT 1")
         .fetch_optional(pool.pool())
         .await
         .map_err(|e| {
             Error::Database(format!(
-                "usage_events_daily precondition check failed (ensure migrations 20260903000003 \
-                 and 04 have run before starting): {e}"
+                "usage_events_daily precondition check failed (ensure migration 20260903000004 \
+                 has run before starting): {e}"
             ))
         })?;
 

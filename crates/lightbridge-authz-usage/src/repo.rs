@@ -98,8 +98,8 @@ impl StoreRepo {
     // the span, and a `UsageEvent`'s `Debug` used to include its whole `attributes` blob -- so
     // every insert stamped the decoded contents of the export (account ids, user names, and
     // whatever else the exporter put in the attributes) into the trace span. The count is the
-    // only part of that field anyone ever wanted. (`attributes` itself was dropped at ingest,
-    // #549 AC1, but the `skip_all` stays: the argument is still a slice of caller-supplied
+    // only part of that field anyone ever wanted. (`attributes` itself is no longer written at
+    // ingest, #549 AC1, but the `skip_all` stays: the argument is still a slice of caller-supplied
     // structs and its `Debug` is not something to echo into a span.)
     #[instrument(skip_all, fields(events = events.len()))]
     pub async fn insert_usage_events(&self, events: &[UsageEvent]) -> Result<usize> {

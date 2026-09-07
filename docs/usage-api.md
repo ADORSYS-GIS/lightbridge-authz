@@ -222,7 +222,7 @@ sequenceDiagram
     GW->>IN: OTLP LogRecord attributes<br/>azp, billing_plan, x-envoy-origin-path
     Note over IN: extract_string(&attrs, &AZP_KEYS)<br/>extract_string(&attrs, &BILLING_PLAN_KEYS)<br/>derive_operation(&attrs) -- ingest.rs
     IN->>DB: INSERT ... (azp, operation, billing_plan)<br/>repo.rs::insert_usage_events
-    Note over DB: the raw attributes blob is dropped at ingest (#549 AC1);<br/>the columns are the only place these dimensions live
+    Note over DB: the raw attributes blob is no longer written at ingest (#549 AC1);<br/>the columns are the only place these dimensions live
     C->>Q: {scope, group_by:["azp"],<br/>filters:{operation_in:[...]}}
     Q->>Q: filters.validate() -- closed vocabulary, else 400
     Q->>Q: bearer + ownership, or the usage:read-all bypass (#648)
@@ -306,11 +306,13 @@ the extension being available and no-ops.
 alternative that was measured and rejected.
 
 `20260903000003_drop_usage_event_attributes.sql` drops the write-only `attributes` column (#549
-AC1). It was 60% of the table and nothing ever read it; ingest no longer writes it. The drop is a
-catalog-only change (no rewrite); the ~900 MB of existing rows are reclaimed separately by a
-scheduled `VACUUM FULL` / `pg_repack` (#549 AC5). The #648 backfill (`20260902000002`) that read
-the blob already ran in production and, on a fresh database, runs before this migration in the
-sequence.
+AC1). It was 60% of the table and nothing ever read it; ingest no longer writes it. **The drop is
+deferred to a follow-up release** — per ADR-0031's expand/contract rule, the migration that drops
+the column ships separately from (and after) the release that stops writing it, so an old pod still
+serving during the rollout never targets a column that no longer exists. The drop is a catalog-only
+change (no rewrite); the ~900 MB of existing rows are reclaimed separately by a scheduled
+`VACUUM FULL` / `pg_repack` (#549 AC5). The #648 backfill (`20260902000002`) that read the blob
+already ran in production and, on a fresh database, runs before this migration in the sequence.
 
 #648's bridge is three files, in this order and for this reason: columns added
 nullable first (`20260902000001`, catalog-only, no rewrite), then the backfill
