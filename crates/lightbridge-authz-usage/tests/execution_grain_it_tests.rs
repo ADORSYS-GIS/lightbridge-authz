@@ -105,7 +105,7 @@ async fn insert_tool_call(
         ON CONFLICT (started_at, trace_id, span_id) DO NOTHING
         "#,
     )
-    .bind(format!("{child_span_id}:tc:0"))
+    .bind(format!("{child_span_id}:tc"))
     .bind(started_at)
     .bind(SOURCE)
     .bind(execution_id)
@@ -430,37 +430,33 @@ async fn usage_identities_mint_dedup_and_single_update_erasure(pool: PgPool) {
     let started_at = Utc::now() - Duration::minutes(5);
     let trace_id = "trace-identity";
     let exec_span = "span-identity";
-    let identity_id = "identity_ada_0001";
+    let identity_a = "identity_ada_0001";
+    let identity_b = "identity_bob_0001";
+
+    async fn mint(pool: &PgPool, id: &str, subject_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO usage_identities (id, source, subject_kind, subject_id)
+            VALUES ($1, $2, 'user', $3)
+            ON CONFLICT (source, subject_kind, subject_id) DO NOTHING
+            "#,
+        )
+        .bind(id)
+        .bind(SOURCE)
+        .bind(subject_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
 
     // Mint: insert an identity, then re-assert the same (source, subject_kind, subject_id)
     // with ON CONFLICT DO NOTHING -- must not mint a duplicate.
-    sqlx::query(
-        r#"
-        INSERT INTO usage_identities (id, source, subject_kind, subject_id)
-        VALUES ($1, $2, 'user', $3)
-        ON CONFLICT (source, subject_kind, subject_id) DO NOTHING
-        "#,
-    )
-    .bind(identity_id)
-    .bind(SOURCE)
-    .bind("ada@example.com")
-    .execute(&pool)
-    .await
-    .expect("mint identity");
-
-    sqlx::query(
-        r#"
-        INSERT INTO usage_identities (id, source, subject_kind, subject_id)
-        VALUES ($1, $2, 'user', $3)
-        ON CONFLICT (source, subject_kind, subject_id) DO NOTHING
-        "#,
-    )
-    .bind("identity_ada_0002")
-    .bind(SOURCE)
-    .bind("ada@example.com")
-    .execute(&pool)
-    .await
-    .expect("re-assert identity");
+    mint(&pool, identity_a, "ada@example.com")
+        .await
+        .expect("mint identity A");
+    mint(&pool, "identity_ada_0002", "ada@example.com")
+        .await
+        .expect("re-assert identity A");
 
     let identity_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM usage_identities WHERE subject_id = 'ada@example.com'",
@@ -473,13 +469,13 @@ async fn usage_identities_mint_dedup_and_single_update_erasure(pool: PgPool) {
         "re-asserting the same identity must not mint a duplicate"
     );
 
-    // Reference it from an execution (exercises the FK).
+    // Reference identity A from an execution (exercises the FK).
     insert_execution(
         &pool,
         started_at,
         trace_id,
         exec_span,
-        Some(identity_id),
+        Some(identity_a),
         Some(5000),
     )
     .await
@@ -498,12 +494,25 @@ async fn usage_identities_mint_dedup_and_single_update_erasure(pool: PgPool) {
     );
 
     // Single-UPDATE erasure: one UPDATE on usage_identities removes the PII everywhere,
-    // because every grain table references this row by id, not by the PII value.
-    sqlx::query("UPDATE usage_identities SET subject_id = 'erased' WHERE id = $1")
-        .bind(identity_id)
+    // because every grain table references this row by id, not by the PII value. The sentinel
+    // embeds the row's own id (`erased:<id>`) so erasing a SECOND identity of the same
+    // (source, subject_kind) does not collide with the UNIQUE natural key.
+    sqlx::query("UPDATE usage_identities SET subject_id = 'erased:' || id WHERE id = $1")
+        .bind(identity_a)
         .execute(&pool)
         .await
-        .expect("erase identity");
+        .expect("erase identity A");
+
+    // Mint a second identity of the same (source, subject_kind) and erase it too -- a constant
+    // sentinel would collide here (23505); the row-unique sentinel must not.
+    mint(&pool, identity_b, "bob@example.com")
+        .await
+        .expect("mint identity B");
+    sqlx::query("UPDATE usage_identities SET subject_id = 'erased:' || id WHERE id = $1")
+        .bind(identity_b)
+        .execute(&pool)
+        .await
+        .expect("erasing a second identity of the same (source, subject_kind) must not collide");
 
     let erased: String = sqlx::query_scalar(
         "SELECT ui.subject_id FROM usage_executions e JOIN usage_identities ui ON ui.id = e.identity_id WHERE e.trace_id = $1",
@@ -513,7 +522,8 @@ async fn usage_identities_mint_dedup_and_single_update_erasure(pool: PgPool) {
     .await
     .expect("resolve erased identity");
     assert_eq!(
-        erased, "erased",
+        erased,
+        format!("erased:{identity_a}"),
         "one UPDATE on usage_identities must erase the PII everywhere"
     );
 }

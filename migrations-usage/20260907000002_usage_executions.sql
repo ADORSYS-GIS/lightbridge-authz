@@ -47,3 +47,10 @@ CREATE TABLE usage_executions (
         CHECK (estimated_cost_micro_usd IS NULL OR estimated_cost_micro_usd > 0),
     UNIQUE (started_at, trace_id, span_id)
 );
+
+-- Postgres does not auto-index FK columns. These support the natural access patterns of the
+-- grain: joining an execution to its identity, and looking an execution up by its trace/span.
+-- NOTE for a future hypertable conversion: Timescale requires every index to include the
+-- partition column (`started_at`), so these would need `started_at` prepended then.
+CREATE INDEX idx_usage_executions_identity_id ON usage_executions (identity_id);
+CREATE INDEX idx_usage_executions_trace_span ON usage_executions (trace_id, span_id);

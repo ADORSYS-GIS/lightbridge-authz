@@ -18,9 +18,14 @@
 --   * dedup is `ON CONFLICT (source, subject_kind, subject_id) DO NOTHING` -- the natural key
 --     is the (source, subject_kind, subject_id) triple, so re-asserting the same identity
 --     reuses the existing row instead of minting a duplicate.
---   * erasure is a single `UPDATE usage_identities SET subject_id = <sentinel> WHERE id = $1`:
+--   * erasure is a single `UPDATE usage_identities SET subject_id = 'erased:' || id WHERE id = $1`:
 --     every grain table references this row by id, so one UPDATE removes the PII everywhere
---     (ADR-0028 D7).
+--     (ADR-0028 D7). The sentinel embeds the row's own id (`erased:<id>`) so it is unique per
+--     row: a constant sentinel (e.g. `'erased'`) would collide with the
+--     UNIQUE (source, subject_kind, subject_id) natural key the moment a second identity of the
+--     same (source, subject_kind) is erased, failing the UPDATE with 23505. After erasure the
+--     row no longer matches the original natural key, so a later re-assertion of the same
+--     identity mints a fresh row.
 CREATE TABLE usage_identities (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,

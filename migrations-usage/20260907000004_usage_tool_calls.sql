@@ -8,7 +8,9 @@
 -- `span_id` is the TOOL CALL'S OWN span (each tool call is its own OTLP span), NOT the
 -- parent execution's span. That is what lets one execution carry M tool calls: each has a
 -- distinct `span_id`, so the dedup key `UNIQUE (started_at, trace_id, span_id)` does not
--- collide. The id is derived from this span (`{span_id}:tc:{idx}`).
+-- collide. Tool calls are strictly one-per-span, so the id is derived from the span alone
+-- (`{span_id}:tc`), matching model calls' `{span_id}:mc` -- there is no `{idx}` component,
+-- because a second tool call sharing a span would be silently absorbed by the dedup key.
 --
 -- ADR-0038 persistence exception, same class as `secret_claims`: a grain-partitioned
 -- time-series with CAS/upsert (ON CONFLICT) semantics that generated CRUD cannot express.
@@ -29,3 +31,10 @@ CREATE TABLE usage_tool_calls (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (started_at, trace_id, span_id)
 );
+
+-- Postgres does not auto-index FK columns. These support the natural access patterns of the
+-- grain: joining tool calls to their parent execution, and looking them up by trace/span.
+-- NOTE for a future hypertable conversion: Timescale requires every index to include the
+-- partition column (`started_at`), so these would need `started_at` prepended then.
+CREATE INDEX idx_usage_tool_calls_execution_id ON usage_tool_calls (execution_id);
+CREATE INDEX idx_usage_tool_calls_trace_span ON usage_tool_calls (trace_id, span_id);
