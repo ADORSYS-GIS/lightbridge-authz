@@ -342,6 +342,18 @@ format each column holds. The budget domain reads spend directly from this table
 (`crates/lightbridge-authz-budget/src/spend.rs`); see `budget.md`'s "spend dependency" section for
 what happens when this database is unavailable or unconfigured.
 
+The execution grain (#582) adds three further tables to the same usage database —
+`usage_executions`, `usage_model_calls`, `usage_tool_calls` — ported from
+`lightbridge-governance`'s proven `executions`/`model_calls`/`tool_calls` shape. Each carries a
+`source TEXT NOT NULL` origin dimension and a `started_at` time column, dedups on
+`(started_at, trace_id, span_id)`, and stores money as nullable `BIGINT` micro-USD (`NULL` =
+unknown, never `0`; a `CHECK` rejects `0` outright). `id` is the sole primary key (globally
+unique, so a join on `execution_id` is unambiguous); each model/tool call is its own OTLP span
+with its own `span_id`, so one execution can carry many children. Identity is a reference into
+the `usage_identities` side table, not an embedded email (ADR-0028 D7). Like `usage_events`,
+these are plain Postgres tables today — TimescaleDB is not deployed on the usage tenant (see the
+migration headers).
+
 ## Two cross-cutting rules that have each already caused a production bug
 
 ### CUID2 ids (ADR-0039)
