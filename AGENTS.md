@@ -538,16 +538,17 @@ read, never rewritten, never regenerated into our own format.
 - **Store as `TEXT`**; no native `uuid` columns, no `DEFAULT gen_random_uuid()`.
 
 **One deliberate exception, documented here so it is not "fixed" by accident:** the execution
-grain's ids in the usage store (`usage_executions.id = exec_{trace_id}_{span_id}`,
-`usage_model_calls.id = {trace_id}_{span_id}:mc`, `usage_tool_calls.id = {trace_id}_{span_id}:tc`,
-#582) are **span-derived, not CUID2**. This is required, not a lapse: OTLP exports child spans
-before their parent execution span, so ingest must be able to derive a child's `execution_id` from
-the child's `parent_span_id` *before the parent row exists* — a minted CUID2 would be unknowable to
-the child. The span-derived id is what makes the child-before-parent link (and the stub-execution
-contract) work. The id embeds BOTH `trace_id` and `span_id` (an OTLP `span_id` is only unique
-within a trace, not globally), and the dedup key `UNIQUE (trace_id, span_id)` is deliberately
-bijective with it. Do not "fix" these to `cuid2()` without first solving the child-before-parent
-linking problem; see the `20260907000002_usage_executions.sql` header.
+grain's ids in the usage store (`usage_executions.id = exec_{source}_{trace_id}_{span_id}`,
+`usage_model_calls.id = {source}_{trace_id}_{span_id}:mc`,
+`usage_tool_calls.id = {source}_{trace_id}_{span_id}:tc`, #582) are **span-derived, not CUID2**.
+This is required, not a lapse: OTLP exports child spans before their parent execution span, so
+ingest must be able to derive a child's `execution_id` from the child's `parent_span_id` *before
+the parent row exists* — a minted CUID2 would be unknowable to the child. The span-derived id is
+what makes the child-before-parent link (and the stub-execution contract) work. The id embeds
+`source`, `trace_id` AND `span_id` (an OTLP `span_id` is only unique within a trace, and
+`trace_id` only within a source), and the dedup key `UNIQUE (source, trace_id, span_id)` is
+deliberately bijective with it. Do not "fix" these to `cuid2()` without first solving the
+child-before-parent linking problem; see the `20260907000002_usage_executions.sql` header.
 
 ### Service Responsibilities
 

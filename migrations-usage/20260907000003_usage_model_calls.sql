@@ -7,10 +7,11 @@
 --
 -- `span_id` is the MODEL CALL'S OWN span (each model call is its own OTLP span), NOT the
 -- parent execution's span. That is what lets one execution carry N model calls: each has a
--- distinct `span_id`, so the dedup key `UNIQUE (trace_id, span_id)` does not collide. The id
--- is derived from `trace_id` + this span (`{trace_id}_{span_id}:mc`), bijective with the dedup
--- key -- the `trace_id` is embedded so the id is globally unique (an OTLP `span_id` is only
--- unique within a trace), matching `usage_executions`.
+-- distinct `span_id`, so the dedup key `UNIQUE (source, trace_id, span_id)` does not collide.
+-- The id is derived from `source` + `trace_id` + this span (`{source}_{trace_id}_{span_id}:mc`),
+-- bijective with the dedup key -- `source` and `trace_id` are embedded so the id is globally
+-- unique (an OTLP `span_id` is only unique within a trace, and `trace_id` only within a
+-- source), matching `usage_executions`.
 --
 -- The `execution_id` FK is `DEFERRABLE INITIALLY DEFERRED` because OTLP exports child spans
 -- (model calls) before the parent execution span when an agent run outlives a single
@@ -42,7 +43,11 @@ CREATE TABLE usage_model_calls (
     cost_micro_usd BIGINT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (trace_id, span_id)
+    -- See `20260907000002_usage_executions.sql` -- the `_` separator must never appear in a
+    -- component or the derived id stops being injective.
+    CONSTRAINT usage_model_calls_id_components_no_separator
+        CHECK (position('_' in trace_id) = 0 AND position('_' in span_id) = 0),
+    UNIQUE (source, trace_id, span_id)
 );
 
 -- Postgres does not auto-index FK columns. This supports the natural access pattern of the
