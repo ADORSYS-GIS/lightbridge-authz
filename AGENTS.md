@@ -1134,6 +1134,11 @@ hand-written SQL and direct `sqlx` dependencies.
     generated CRUD cannot express -- the same exception class as `authorization_codes`
     (`migrations/20260827000001_secret_claims.sql`; `consume_secret_claim` in
     `crates/lightbridge-authz-api-key/src/repo.rs`).
+  - the execution grain (`usage_executions`, `usage_model_calls`, `usage_tool_calls`, plus the
+    `usage_identities` side table, #582): grain-partitioned time-series with CAS/upsert
+    (`ON CONFLICT`) semantics that generated CRUD cannot express, in the usage DB which is
+    already hand-written SQL (see `usage_events`). Same exception class as `secret_claims`;
+    justified in each migration header under `migrations-usage/2026090700000{1,2,3,4}_*.sql`.
 - This repo runs cratestack (`cratestack-pg`) `=0.10.0` (pinned exactly in the root `Cargo.toml`,
   which also documents why the pin cannot float past it -- see that file's `cratestack-core =
   "=0.10.0"` block); ADR-0038's capability findings were verified against 0.7.8. Re-verify any

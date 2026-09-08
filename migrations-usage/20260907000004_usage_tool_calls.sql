@@ -2,15 +2,18 @@
 --
 -- Ported from lightbridge-governance's proven `tool_calls` table
 -- (governance-core/migrations/postgres/20260803000001_telemetry_models), adapted to the
--- usage store's conventions: `source TEXT NOT NULL` (the origin dimension) and `started_at`
--- as the grain's time/partition column, inherited from the parent execution.
+-- usage store's conventions: `source TEXT NOT NULL` (the origin dimension) and `observed_at`
+-- as the grain's time column, inherited from the parent execution.
 --
 -- `span_id` is the TOOL CALL'S OWN span (each tool call is its own OTLP span), NOT the
 -- parent execution's span. That is what lets one execution carry M tool calls: each has a
--- distinct `span_id`, so the dedup key `UNIQUE (started_at, trace_id, span_id)` does not
--- collide. Tool calls are strictly one-per-span, so the id is derived from the span alone
--- (`{span_id}:tc`), matching model calls' `{span_id}:mc` -- there is no `{idx}` component,
--- because a second tool call sharing a span would be silently absorbed by the dedup key.
+-- distinct `span_id`, so the dedup key `UNIQUE (trace_id, span_id)` does not collide. Tool
+-- calls are strictly one-per-span, so the id is derived from the span alone (`{span_id}:tc`),
+-- matching model calls' `{span_id}:mc` -- there is no `{idx}` component, because a second tool
+-- call sharing a span would be silently absorbed by the dedup key.
+--
+-- The `execution_id` FK is `DEFERRABLE INITIALLY DEFERRED` for the same child-before-parent
+-- OTLP export reason as `usage_model_calls` (see that migration's header).
 --
 -- ADR-0038 persistence exception, same class as `secret_claims`: a grain-partitioned
 -- time-series with CAS/upsert (ON CONFLICT) semantics that generated CRUD cannot express.
@@ -20,21 +23,20 @@
 -- TimescaleDB is not deployed on the usage tenant and is not required; this is a plain table.
 CREATE TABLE usage_tool_calls (
     id TEXT PRIMARY KEY,
-    started_at TIMESTAMPTZ NOT NULL,
+    observed_at TIMESTAMPTZ NOT NULL,
     source TEXT NOT NULL,
-    execution_id TEXT NOT NULL REFERENCES usage_executions (id),
+    execution_id TEXT NOT NULL
+        REFERENCES usage_executions (id) DEFERRABLE INITIALLY DEFERRED,
     trace_id TEXT NOT NULL,
     span_id TEXT NOT NULL,
     tool_name TEXT NOT NULL,
     duration_ms BIGINT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (started_at, trace_id, span_id)
+    UNIQUE (trace_id, span_id)
 );
 
--- Postgres does not auto-index FK columns. These support the natural access patterns of the
--- grain: joining tool calls to their parent execution, and looking them up by trace/span.
--- NOTE for a future hypertable conversion: Timescale requires every index to include the
--- partition column (`started_at`), so these would need `started_at` prepended then.
+-- Postgres does not auto-index FK columns. This supports the natural access pattern of the
+-- grain: joining tool calls to their parent execution. (trace_id, span_id) is covered by the
+-- UNIQUE constraint above.
 CREATE INDEX idx_usage_tool_calls_execution_id ON usage_tool_calls (execution_id);
-CREATE INDEX idx_usage_tool_calls_trace_span ON usage_tool_calls (trace_id, span_id);

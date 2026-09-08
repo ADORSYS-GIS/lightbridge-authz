@@ -7,11 +7,11 @@
 //! tests exercise the tables directly through SQL. They prove the properties the ticket and
 //! the schema make load-bearing:
 //!   * one execution can carry N model calls and M tool calls (each child is its own span);
-//!   * idempotent replay -- replaying the same batch (same `started_at`, `trace_id`,
-//!     `span_id`) changes no counts (AC #4), while a later priced cost fills a NULL (the
+//!   * idempotent replay -- replaying the same batch (same `trace_id`, `span_id`) changes no
+//!     counts (AC #4), while a later priced cost fills a NULL (the
 //!     `ON CONFLICT DO UPDATE ... COALESCE` correction path);
-//!   * NULL-cost round-trip -- a NULL money column survives a write/read as NULL, never 0
-//!     (AC #3), and 0 is rejected outright by the CHECK constraint;
+//!   * NULL-cost round-trip -- a NULL money column survives a write/read as NULL, and a
+//!     genuine 0 (a truly free run) is storable and distinct from NULL (AC #3);
 //!   * `usage_identities` mint/dedup and single-UPDATE erasure (ADR-0028 D7).
 //!
 //! The hypertable-assertion sabotage test from the ticket's Test Expectations is deliberately
@@ -26,7 +26,7 @@ const SOURCE: &str = "claude_code";
 
 async fn insert_execution(
     pool: &PgPool,
-    started_at: chrono::DateTime<Utc>,
+    observed_at: chrono::DateTime<Utc>,
     trace_id: &str,
     span_id: &str,
     identity_id: Option<&str>,
@@ -35,14 +35,14 @@ async fn insert_execution(
     sqlx::query(
         r#"
         INSERT INTO usage_executions
-            (id, started_at, source, provider, trace_id, span_id, identity_id, duration_ms, raw_schema_version, estimated_cost_micro_usd)
+            (id, observed_at, source, provider, trace_id, span_id, identity_id, duration_ms, raw_schema_version, estimated_cost_micro_usd)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        ON CONFLICT (started_at, trace_id, span_id) DO UPDATE SET
+        ON CONFLICT (trace_id, span_id) DO UPDATE SET
             estimated_cost_micro_usd = COALESCE(EXCLUDED.estimated_cost_micro_usd, usage_executions.estimated_cost_micro_usd)
         "#,
     )
     .bind(format!("exec_{span_id}"))
-    .bind(started_at)
+    .bind(observed_at)
     .bind(SOURCE)
     .bind("anthropic")
     .bind(trace_id)
@@ -58,7 +58,7 @@ async fn insert_execution(
 
 async fn insert_model_call(
     pool: &PgPool,
-    started_at: chrono::DateTime<Utc>,
+    observed_at: chrono::DateTime<Utc>,
     trace_id: &str,
     child_span_id: &str,
     execution_id: &str,
@@ -68,14 +68,14 @@ async fn insert_model_call(
     sqlx::query(
         r#"
         INSERT INTO usage_model_calls
-            (id, started_at, source, execution_id, trace_id, span_id, model, input_tokens, output_tokens, cost_micro_usd)
+            (id, observed_at, source, execution_id, trace_id, span_id, model, input_tokens, output_tokens, cost_micro_usd)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        ON CONFLICT (started_at, trace_id, span_id) DO UPDATE SET
+        ON CONFLICT (trace_id, span_id) DO UPDATE SET
             cost_micro_usd = COALESCE(EXCLUDED.cost_micro_usd, usage_model_calls.cost_micro_usd)
         "#,
     )
     .bind(format!("{child_span_id}:mc"))
-    .bind(started_at)
+    .bind(observed_at)
     .bind(SOURCE)
     .bind(execution_id)
     .bind(trace_id)
@@ -91,7 +91,7 @@ async fn insert_model_call(
 
 async fn insert_tool_call(
     pool: &PgPool,
-    started_at: chrono::DateTime<Utc>,
+    observed_at: chrono::DateTime<Utc>,
     trace_id: &str,
     child_span_id: &str,
     execution_id: &str,
@@ -100,13 +100,13 @@ async fn insert_tool_call(
     sqlx::query(
         r#"
         INSERT INTO usage_tool_calls
-            (id, started_at, source, execution_id, trace_id, span_id, tool_name, duration_ms)
+            (id, observed_at, source, execution_id, trace_id, span_id, tool_name, duration_ms)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (started_at, trace_id, span_id) DO NOTHING
+        ON CONFLICT (trace_id, span_id) DO NOTHING
         "#,
     )
     .bind(format!("{child_span_id}:tc"))
-    .bind(started_at)
+    .bind(observed_at)
     .bind(SOURCE)
     .bind(execution_id)
     .bind(trace_id)
@@ -141,19 +141,19 @@ async fn count_tool_calls(pool: &PgPool) -> i64 {
 
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn one_execution_can_carry_multiple_model_and_tool_calls(pool: PgPool) {
-    let started_at = Utc::now() - Duration::minutes(5);
+    let observed_at = Utc::now() - Duration::minutes(5);
     let trace_id = "trace-multi";
     let exec_span = "span-exec-multi";
     let exec_id = format!("exec_{exec_span}");
 
-    insert_execution(&pool, started_at, trace_id, exec_span, None, Some(5000))
+    insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(5000))
         .await
         .expect("insert execution");
 
     // Two model calls, each its own span.
     insert_model_call(
         &pool,
-        started_at,
+        observed_at,
         trace_id,
         "span-mc-1",
         &exec_id,
@@ -164,7 +164,7 @@ async fn one_execution_can_carry_multiple_model_and_tool_calls(pool: PgPool) {
     .expect("insert model call 1");
     insert_model_call(
         &pool,
-        started_at,
+        observed_at,
         trace_id,
         "span-mc-2",
         &exec_id,
@@ -175,10 +175,10 @@ async fn one_execution_can_carry_multiple_model_and_tool_calls(pool: PgPool) {
     .expect("insert model call 2");
 
     // Two tool calls, each its own span.
-    insert_tool_call(&pool, started_at, trace_id, "span-tc-1", &exec_id, "bash")
+    insert_tool_call(&pool, observed_at, trace_id, "span-tc-1", &exec_id, "bash")
         .await
         .expect("insert tool call 1");
-    insert_tool_call(&pool, started_at, trace_id, "span-tc-2", &exec_id, "grep")
+    insert_tool_call(&pool, observed_at, trace_id, "span-tc-2", &exec_id, "grep")
         .await
         .expect("insert tool call 2");
 
@@ -189,17 +189,17 @@ async fn one_execution_can_carry_multiple_model_and_tool_calls(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn replaying_the_same_batch_twice_changes_no_counts(pool: PgPool) {
-    let started_at = Utc::now() - Duration::minutes(5);
+    let observed_at = Utc::now() - Duration::minutes(5);
     let trace_id = "trace-replay-1";
     let exec_span = "span-replay-1";
     let exec_id = format!("exec_{exec_span}");
 
-    insert_execution(&pool, started_at, trace_id, exec_span, None, Some(5000))
+    insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(5000))
         .await
         .expect("first insert should succeed");
     insert_model_call(
         &pool,
-        started_at,
+        observed_at,
         trace_id,
         "span-replay-1-mc",
         &exec_id,
@@ -210,7 +210,7 @@ async fn replaying_the_same_batch_twice_changes_no_counts(pool: PgPool) {
     .expect("first model call");
     insert_tool_call(
         &pool,
-        started_at,
+        observed_at,
         trace_id,
         "span-replay-1-tc",
         &exec_id,
@@ -224,13 +224,13 @@ async fn replaying_the_same_batch_twice_changes_no_counts(pool: PgPool) {
     let tc_before = count_tool_calls(&pool).await;
     assert_eq!((exec_before, mc_before, tc_before), (1, 1, 1));
 
-    // Replay the exact same batch (same started_at, trace_id, span_id).
-    insert_execution(&pool, started_at, trace_id, exec_span, None, Some(5000))
+    // Replay the exact same batch (same trace_id, span_id).
+    insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(5000))
         .await
         .expect("replay should be absorbed, not error");
     insert_model_call(
         &pool,
-        started_at,
+        observed_at,
         trace_id,
         "span-replay-1-mc",
         &exec_id,
@@ -241,7 +241,7 @@ async fn replaying_the_same_batch_twice_changes_no_counts(pool: PgPool) {
     .expect("replay model call");
     insert_tool_call(
         &pool,
-        started_at,
+        observed_at,
         trace_id,
         "span-replay-1-tc",
         &exec_id,
@@ -262,18 +262,50 @@ async fn replaying_the_same_batch_twice_changes_no_counts(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations-usage")]
+async fn replay_with_drifted_observed_at_is_still_absorbed(pool: PgPool) {
+    // The dedup key is (trace_id, span_id), bijective with the span-derived id, so a
+    // redelivery with a different observed_at must be absorbed -- not a 23505 on the PK.
+    let trace_id = "trace-drift";
+    let exec_span = "span-drift";
+
+    insert_execution(
+        &pool,
+        Utc::now() - Duration::minutes(5),
+        trace_id,
+        exec_span,
+        None,
+        Some(5000),
+    )
+    .await
+    .expect("first delivery");
+
+    insert_execution(
+        &pool,
+        Utc::now() - Duration::minutes(4),
+        trace_id,
+        exec_span,
+        None,
+        Some(5000),
+    )
+    .await
+    .expect("redelivery with a drifted observed_at must be absorbed, not a 23505");
+
+    assert_eq!(count_executions(&pool).await, 1);
+}
+
+#[sqlx::test(migrations = "../../migrations-usage")]
 async fn null_cost_survives_round_trip_as_unknown_never_zero(pool: PgPool) {
-    let started_at = Utc::now() - Duration::minutes(5);
+    let observed_at = Utc::now() - Duration::minutes(5);
     let trace_id = "trace-null-cost";
     let exec_span = "span-null-cost";
     let exec_id = format!("exec_{exec_span}");
 
-    insert_execution(&pool, started_at, trace_id, exec_span, None, None)
+    insert_execution(&pool, observed_at, trace_id, exec_span, None, None)
         .await
         .expect("insert execution with NULL cost");
     insert_model_call(
         &pool,
-        started_at,
+        observed_at,
         trace_id,
         "span-null-cost-mc",
         &exec_id,
@@ -312,64 +344,61 @@ async fn null_cost_survives_round_trip_as_unknown_never_zero(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations-usage")]
-async fn zero_cost_is_rejected_by_the_check_constraint(pool: PgPool) {
-    let started_at = Utc::now() - Duration::minutes(5);
+async fn genuine_zero_cost_is_storable_and_distinct_from_null(pool: PgPool) {
+    // A truly free run (cost rounds to 0 micro-USD) is a legitimate value and must be storable
+    // -- the NULL-vs-0 discipline is about unknown being written as NULL, not about forbidding
+    // a real 0. The donor ships no CHECK for this reason.
+    let observed_at = Utc::now() - Duration::minutes(5);
 
-    let exec_err = insert_execution(
-        &pool,
-        started_at,
-        "trace-zero-exec",
-        "span-zero-exec",
-        None,
-        Some(0),
+    insert_execution(&pool, observed_at, "trace-zero", "span-zero", None, Some(0))
+        .await
+        .expect("a genuine 0 cost must be storable");
+
+    let zero_cost: Option<i64> = sqlx::query_scalar(
+        "SELECT estimated_cost_micro_usd FROM usage_executions WHERE trace_id = 'trace-zero'",
     )
-    .await;
-    assert!(
-        exec_err.is_err(),
-        "a 0 execution cost must be rejected, not silently read as 'free'"
-    );
+    .fetch_one(&pool)
+    .await
+    .expect("read zero cost");
+    assert_eq!(zero_cost, Some(0), "a genuine 0 must round-trip as Some(0)");
 
-    let exec_id = "exec_span-zero-mc";
+    // And it stays distinct from NULL (unknown).
     insert_execution(
         &pool,
-        started_at,
-        "trace-zero-mc",
-        "span-zero-mc",
+        observed_at,
+        "trace-unknown",
+        "span-unknown",
         None,
-        Some(1000),
+        None,
     )
     .await
-    .expect("seed execution for model-call check");
-    let mc_err = insert_model_call(
-        &pool,
-        started_at,
-        "trace-zero-mc",
-        "span-zero-mc-child",
-        exec_id,
-        "claude-sonnet-4-5",
-        Some(0),
+    .expect("insert unknown cost");
+    let unknown_cost: Option<i64> = sqlx::query_scalar(
+        "SELECT estimated_cost_micro_usd FROM usage_executions WHERE trace_id = 'trace-unknown'",
     )
-    .await;
-    assert!(
-        mc_err.is_err(),
-        "a 0 model-call cost must be rejected, not silently read as 'free'"
+    .fetch_one(&pool)
+    .await
+    .expect("read unknown cost");
+    assert_eq!(
+        unknown_cost, None,
+        "unknown must round-trip as None, distinct from Some(0)"
     );
 }
 
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn later_priced_cost_fills_a_null_on_replay(pool: PgPool) {
-    let started_at = Utc::now() - Duration::minutes(5);
+    let observed_at = Utc::now() - Duration::minutes(5);
     let trace_id = "trace-correction";
     let exec_span = "span-correction";
     let exec_id = format!("exec_{exec_span}");
 
     // First report: cost unknown (NULL).
-    insert_execution(&pool, started_at, trace_id, exec_span, None, None)
+    insert_execution(&pool, observed_at, trace_id, exec_span, None, None)
         .await
         .expect("first report with NULL cost");
     insert_model_call(
         &pool,
-        started_at,
+        observed_at,
         trace_id,
         "span-correction-mc",
         &exec_id,
@@ -380,12 +409,12 @@ async fn later_priced_cost_fills_a_null_on_replay(pool: PgPool) {
     .expect("first model call with NULL cost");
 
     // Later report: the priced cost arrives. DO UPDATE ... COALESCE must fill the NULL.
-    insert_execution(&pool, started_at, trace_id, exec_span, None, Some(7777))
+    insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(7777))
         .await
         .expect("later report with priced cost");
     insert_model_call(
         &pool,
-        started_at,
+        observed_at,
         trace_id,
         "span-correction-mc",
         &exec_id,
@@ -427,7 +456,7 @@ async fn later_priced_cost_fills_a_null_on_replay(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn usage_identities_mint_dedup_and_single_update_erasure(pool: PgPool) {
-    let started_at = Utc::now() - Duration::minutes(5);
+    let observed_at = Utc::now() - Duration::minutes(5);
     let trace_id = "trace-identity";
     let exec_span = "span-identity";
     let identity_a = "identity_ada_0001";
@@ -472,7 +501,7 @@ async fn usage_identities_mint_dedup_and_single_update_erasure(pool: PgPool) {
     // Reference identity A from an execution (exercises the FK).
     insert_execution(
         &pool,
-        started_at,
+        observed_at,
         trace_id,
         exec_span,
         Some(identity_a),

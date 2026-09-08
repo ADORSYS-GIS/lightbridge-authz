@@ -345,14 +345,16 @@ what happens when this database is unavailable or unconfigured.
 The execution grain (#582) adds three further tables to the same usage database —
 `usage_executions`, `usage_model_calls`, `usage_tool_calls` — ported from
 `lightbridge-governance`'s proven `executions`/`model_calls`/`tool_calls` shape. Each carries a
-`source TEXT NOT NULL` origin dimension and a `started_at` time column, dedups on
-`(started_at, trace_id, span_id)`, and stores money as nullable `BIGINT` micro-USD (`NULL` =
-unknown, never `0`; a `CHECK` rejects `0` outright). `id` is the sole primary key (globally
-unique, so a join on `execution_id` is unambiguous); each model/tool call is its own OTLP span
-with its own `span_id`, so one execution can carry many children. Identity is a reference into
-the `usage_identities` side table, not an embedded email (ADR-0028 D7). Like `usage_events`,
-these are plain Postgres tables today — TimescaleDB is not deployed on the usage tenant (see the
-migration headers).
+`source TEXT NOT NULL` origin dimension and an `observed_at` time column (the usage-store
+convention, matching `usage_events`), dedups on `(trace_id, span_id)` (bijective with the
+span-derived id, so a redelivery with a drifted timestamp is still absorbed), and stores money
+as nullable `BIGINT` micro-USD (`NULL` = unknown, never `0`; a genuine `0` is storable). `id` is
+the sole primary key (globally unique, so a join on `execution_id` is unambiguous); each
+model/tool call is its own OTLP span with its own `span_id`, so one execution can carry many
+children, and the child `execution_id` FK is deferrable for OTLP's child-before-parent export
+ordering. Identity is a reference into the `usage_identities` side table, not an embedded email
+(ADR-0028 D7). Like `usage_events`, these are plain Postgres tables today — TimescaleDB is not
+deployed on the usage tenant (see the migration headers).
 
 ## Two cross-cutting rules that have each already caused a production bug
 
