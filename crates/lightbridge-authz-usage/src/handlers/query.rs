@@ -236,7 +236,18 @@ pub async fn query_usage(
     // silently no data there. `truncated` is the published field whose job (#578) is to say "we
     // dropped data", so OR in a range-truncation flag rather than report `truncated: false` for a
     // range the API cannot answer.
-    let range_truncated = input.start_time < Utc::now() - chrono::Duration::days(state.raw_days);
+    //
+    // The retention cutoff is day-truncated (`date_trunc('day', now() - raw_days)` in
+    // `retention.rs`), so compare against the same day-truncated instant. Comparing against the
+    // un-rounded `now() - raw_days` would report `truncated: true` for a window whose raw data is
+    // still fully present whenever `start_time` falls between the day boundary and the un-rounded
+    // instant.
+    let cutoff = (Utc::now() - chrono::Duration::days(state.raw_days))
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid time")
+        .and_utc();
+    let range_truncated = input.start_time < cutoff;
     let truncated = truncated || range_truncated;
 
     Ok((

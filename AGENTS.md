@@ -1090,7 +1090,11 @@ hand-written SQL and direct `sqlx` dependencies.
     (ADR-0019, #425; `consume_authorization_code` in
     `crates/lightbridge-authz-api-key/src/repo.rs`).
   - `lightbridge-authz-usage`: dynamic `QueryBuilder` aggregates against the plain-Postgres
-    `usage_events` table (`query_usage` in `crates/lightbridge-authz-usage/src/repo.rs`).
+    `usage_events` table (`query_usage` in `crates/lightbridge-authz-usage/src/repo.rs`), plus the
+    hand-written retention/rollup statements in `crates/lightbridge-authz-usage/src/retention.rs`
+    (`ROLLUP_AND_PURGE_SQL`/`ROLLUP_PURGE_SQL` -- a `DELETE ... RETURNING` feeding an
+    `INSERT ... SELECT ... ON CONFLICT DO UPDATE` that generated CRUD cannot express) and the
+    `spend_for_account` UNION ALL over `usage_events`/`usage_events_daily` (same file).
   - `federated_identities`: deliberately ABSENT from `authz.cstack` entirely, not merely
     `@@allow`-less -- it carries the sealed Keycloak token envelope, so a credential-bearing table
     must be unreachable from any generated read path, not just gated behind the coarse-RBAC check

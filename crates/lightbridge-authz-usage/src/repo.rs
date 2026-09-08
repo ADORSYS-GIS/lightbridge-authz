@@ -191,9 +191,6 @@ impl StoreRepo {
         .bind(account_id)
         .bind(start)
         .bind(end)
-        .bind(account_id)
-        .bind(start)
-        .bind(end)
         .fetch_one(self.pool())
         .await?;
 
