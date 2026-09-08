@@ -15,11 +15,18 @@
 --
 -- Identity rule (governance#185): `provider_user_id` is the join key, NEVER `user_login`.
 -- `assignee_login` is stored for display only — it must not be used as a join key across providers.
+-- recorded decision (2026-09-08 review): the login is part of the provider's seat report itself
+-- (the snapshot literally is per-login state), so it stays embedded as a display column here;
+-- identity *joins* for attribution go through `usage_identities` (lands with #582 / PR-1b) via
+-- `provider_user_id`, and the PII-erasure surface remains the identities table.
+--
+-- No surrogate id: ADR-0039 bans minting ids outside `cuid2()`, `DEFAULT gen_random_uuid()` is a
+-- banned call site, and the natural key IS the row identity — it is the PRIMARY KEY, so the dedup
+-- constraint and the upsert conflict target are the key itself.
 --
 -- No `EXCEPTION WHEN OTHERS` anywhere (authz-migration skill Rule 5). Fail loud.
 
 CREATE TABLE usage_seat_snapshots (
-    id              TEXT        NOT NULL DEFAULT gen_random_uuid()::text,
     source          TEXT        NOT NULL,
     snapshot_day    DATE        NOT NULL,
     subject_kind    TEXT        NOT NULL,
@@ -33,6 +40,9 @@ CREATE TABLE usage_seat_snapshots (
 
     -- Seat state columns — typed, nullable, from GitHub Copilot seat shape as the initial occupant.
     -- A source that does not report a given field leaves it NULL.
+    -- `seat_state` is the only NOT NULL state column: the provider's own vocabulary, stored
+    -- verbatim (opaque — closed at the normalizer, not here, same rationale as D4 for `source`).
+    seat_state                  TEXT NOT NULL,
     assignee_login              TEXT,
     assignee_team               TEXT,
     seat_created_at             TIMESTAMPTZ,
@@ -46,7 +56,9 @@ CREATE TABLE usage_seat_snapshots (
 
     ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    PRIMARY KEY (snapshot_day, id),
+    -- The natural key IS the primary key (ADR-0028 D22), includes `snapshot_day` (the partition
+    -- column). One seat row per user per subject per day per source.
+    PRIMARY KEY (source, snapshot_day, subject_kind, subject_id, provider_user_id),
 
     CONSTRAINT chk_usage_seat_snapshots_subject_kind
         CHECK (subject_kind IN ('org', 'user', 'repo', 'user_team')),
@@ -85,15 +97,17 @@ COMMENT ON COLUMN usage_seat_snapshots.last_activity_at IS
 COMMENT ON COLUMN usage_seat_snapshots.pending_cancellation_date IS
     'If the seat is pending cancellation, the date it will be cancelled. NULL if not cancelling.';
 
--- Natural-key unique constraint (ADR-0028 D22). `snapshot_day` is the partition column.
--- One seat row per user per subject per day per source. Reprocessing the same snapshot is safe.
-CREATE UNIQUE INDEX idx_usage_seat_snapshots_natural_key
-    ON usage_seat_snapshots (source, snapshot_day, subject_kind, subject_id, provider_user_id);
+COMMENT ON COLUMN usage_seat_snapshots.seat_state IS
+    'The provider''s own seat-state token, stored verbatim (e.g. GitHub Copilot seat states). '
+    'Opaque, closed at the normalizer — not CHECKed here, for the same reason `source` is TEXT: '
+    'a new state in a provider report must never be a migration.';
 
--- Query indexes.
-CREATE INDEX idx_usage_seat_snapshots_source_day
-    ON usage_seat_snapshots (source, snapshot_day DESC);
+-- Upsert idempotency rides the PRIMARY KEY itself (ADR-0028 D22): reprocessing the same snapshot
+-- conflicts on it and replaces the state columns in place, changing no counts. No separate unique
+-- index is needed.
 
+-- Query index: per-user seat history. There is deliberately NO (source, snapshot_day) index —
+-- the primary key's leading (source, snapshot_day) prefix serves per-source daily range scans.
 CREATE INDEX idx_usage_seat_snapshots_provider_user
     ON usage_seat_snapshots (provider_user_id, snapshot_day DESC);
 

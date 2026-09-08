@@ -19,7 +19,12 @@
 --
 -- Money columns: `BIGINT` micro-USD, NULL = unknown, NEVER zero (ADR-0028 D0). The governance
 -- store's `net_cost_micro_usd NOT NULL` is deliberately NOT copied — the NULL-means-unknown rule
--- applies universally in this store.
+-- applies universally here: a known-free cost is `0`, an unreported one is `NULL`.
+--
+-- No surrogate id. ADR-0039 bans minting ids outside `lightbridge_authz_core::cuid::cuid2()`, and
+-- `DEFAULT gen_random_uuid()` is a banned call site. The natural key IS the row identity — the
+-- dedup constraint and the upsert conflict target are the primary key itself, so no surrogate is
+-- needed and none is minted (#583 review 2026-09-08: dropped `id DEFAULT gen_random_uuid()`).
 --
 -- No `EXCEPTION WHEN OTHERS` anywhere. A migration that swallows its own error reports success
 -- against a schema it did not produce; every later `IF NOT EXISTS` agrees. The service refusing
@@ -30,15 +35,14 @@
 -- subject_kind is refused at ingest, not written with a guessed or NULL value.
 
 CREATE TABLE usage_day_facts (
-    id          TEXT        NOT NULL DEFAULT gen_random_uuid()::text,
     source      TEXT        NOT NULL,
     day         DATE        NOT NULL,
     subject_kind TEXT       NOT NULL,
     subject_id  TEXT        NOT NULL,
 
     -- Provider-scoped subject identity. Opaque string — never shape-validated, never joined across
-    -- providers except through `usage_identities` (which ships with PR-1b). The join key per
-    -- governance#185 is `provider_user_id`, never `user_login`.
+    -- providers except through `usage_identities` (owned by #582, `20260907000001`). The join key
+    -- per governance#185 is `provider_user_id`, never `user_login`.
     provider_user_id TEXT,
 
     -- Typed measure columns — allowlist seeded from the known GitHub Copilot Metrics API shapes
@@ -74,7 +78,10 @@ CREATE TABLE usage_day_facts (
 
     ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    PRIMARY KEY (day, id),
+    -- The natural key IS the primary key (ADR-0028 D22: the dedup constraint and the upsert
+    -- conflict target). The set includes `day`, the partition column, so TimescaleDB accepts it
+    -- as the hypertable's unique constraint. Leading `source` keeps per-source scans on the PK.
+    PRIMARY KEY (source, day, subject_kind, subject_id),
 
     CONSTRAINT chk_usage_day_facts_subject_kind
         CHECK (subject_kind IN ('org', 'user', 'repo', 'user_team')),
@@ -107,24 +114,20 @@ COMMENT ON COLUMN usage_day_facts.provider_user_id IS
 
 COMMENT ON COLUMN usage_day_facts.cost_micro_usd IS
     'Cost in integer micro-USD (1 USD = 1,000,000). NULL = unknown, NEVER zero. '
-    'A source that does not report cost leaves this NULL; a free operation is also NULL.';
+    'A source that does not report cost leaves this NULL; a known-free operation is 0.';
 
 COMMENT ON COLUMN usage_day_facts.is_aggregate_only IS
     'TRUE when this row comes from an aggregate-only source (e.g. GitHub Copilot Metrics API ''s '
     '5-seat floor). These rows must not be averaged into per-user breakdowns.';
 
--- Natural-key unique constraint for upsert idempotency (ADR-0028 D22).
--- Includes `day` (the partition column) — a hypertable cannot carry a unique index that omits it.
--- Reprocessing the same (source, day, subject_kind, subject_id) tuple is safe: ON CONFLICT updates
--- the measures in place, changing no counts.
-CREATE UNIQUE INDEX idx_usage_day_facts_natural_key
-    ON usage_day_facts (source, day, subject_kind, subject_id);
+-- Upsert idempotency rides the PRIMARY KEY itself (ADR-0028 D22): reprocessing the same
+-- (source, day, subject_kind, subject_id) tuple conflicts on it and replaces the measures in
+-- place, changing no counts. No separate unique index is needed.
 
--- Query indexes: (source, day) for per-source daily range scans; (subject_kind, day) for
--- cross-source breakdowns by subject type.
-CREATE INDEX idx_usage_day_facts_source_day
-    ON usage_day_facts (source, day DESC);
-
+-- Query index: (subject_kind, day) for cross-source breakdowns by subject type. There is
+-- deliberately NO (source, day) index — the primary key's leading (source, day) prefix serves
+-- per-source daily range scans (it-test review 2026-09-08: duplicates of a PK prefix are
+-- maintained on every chunk for nothing).
 CREATE INDEX idx_usage_day_facts_subject_day
     ON usage_day_facts (subject_kind, day DESC);
 

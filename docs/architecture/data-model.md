@@ -331,22 +331,26 @@ actually live versus merely implemented — is in [`budget.md`](./budget.md).
 
 ## The usage side: a separate database
 
-The usage database (`lightbridge-authz-usage`'s own `DATABASE_URL`) holds four grain families, each
-a TimescaleDB hypertable with `source TEXT NOT NULL` as a filterable/group-by-able dimension column
-(ADR-0027 Decision 2 — grain partitions storage, vendor never does):
+The usage database (`lightbridge-authz-usage`'s own `DATABASE_URL`) hosts one hypertable family per
+grain of ADR-0027's four-grain taxonomy, each with `source TEXT NOT NULL` as a
+filterable/group-by-able dimension column (ADR-0027 Decision 2 — grain partitions storage, vendor
+never does). The execution grain (#582) and the request-grain rewrite are their own stories:
 
 | Table | Grain | Partition column | Retention | Status |
 |---|---|---|---|---|
 | `usage_events` | request (legacy) | `observed_at TIMESTAMPTZ` | 30d (non-functional, #549) | **Disposable** — replaced by `usage_request_events` in PR-1b (#491) |
-| `usage_day_facts` | day | `day DATE` | 25 months | **Live** (#583) |
-| `usage_seat_snapshots` | seat | `snapshot_day DATE` | 25 months | **Live** (#583) |
+| `usage_day_facts` | day | `day DATE` | 25 months | **Merged (#583)** — target-cluster `timescaledb_information.*` evidence pending PR-1a (#489 image) |
+| `usage_seat_snapshots` | seat | `snapshot_day DATE` | 25 months | **Merged (#583)** — target-cluster evidence pending as above |
 
 `usage_day_facts` and `usage_seat_snapshots` are the generalized replacements for the governance
 store's vendor-named `copilot_*_daily` tables. Adding a source requires no schema change — only a
 normalizer and a registry row (governance#167's acceptance criterion). Both are hypertables
 **asserted not assumed**: the migration calls `create_hypertable` with no `EXCEPTION WHEN OTHERS`
 fallback, and the DB-backed integration tests verify the tables appear in
-`timescaledb_information.hypertables`.
+`timescaledb_information.hypertables`. Both carry **no surrogate id** — the natural key
+`(source, day[, subject_kind, subject_id[...]])` is the primary key and therefore the dedup/upsert
+target (ADR-0028 D22; ADR-0039 bans `gen_random_uuid()` defaults), and a D22 test proves a replay
+into an already-compressed chunk is still absorbed by it.
 
 All tables share no foreign keys back into `accounts`/`projects` — plain `TEXT` columns with
 the shared convention of which id format each holds. The budget domain reads spend directly

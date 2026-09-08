@@ -7,12 +7,18 @@
 //!
 //! 1. Both tables exist as hypertables in `timescaledb_information.hypertables`.
 //! 2. Retention and compression policies are present in `timescaledb_information.jobs`.
-//! 3. Upsert on the natural key is idempotent — reprocessing a day changes no counts.
+//! 3. Upsert on the natural key **is the primary key** — replaying a day changes no counts.
 //! 4. Money columns survive a NULL round-trip exactly as NULL, never 0.
 //! 5. A second source (`m365-copilot`) lands with zero DDL changes (governance#167's criterion).
 //! 6. Aggregate-only rows are stored and distinguishable from per-entity rows.
+//! 7. Every `SubjectKind` variant round-trips serde ↔ `as_str()` ↔ a live INSERT (the parity the
+//!    SQL CHECK constraints, the serde names, and `SubjectKind` must keep).
+//! 8. Seat-state columns round-trip (AC1: seat *state* and *activity* columns).
+//! 9. D22's compressed-chunk replay: a row replayed into a chunk that has already been compressed
+//!    is absorbed by the PK conflict — still exactly one row, never a duplicate.
 
 use chrono::NaiveDate;
+use lightbridge_authz_usage_rest::models::SubjectKind;
 use sqlx::PgPool;
 
 fn copilot_day() -> NaiveDate {
@@ -113,8 +119,10 @@ async fn both_tables_have_compression_policies(pool: PgPool) {
 
 /// Upsert on the natural key (`source`, `day`, `subject_kind`, `subject_id`) is idempotent.
 ///
-/// Inserting the same fact twice must produce ONE row, not two. The test proves the UNIQUE index
-/// `idx_usage_day_facts_natural_key` and the `ON CONFLICT DO UPDATE` path both work.
+/// Inserting the same fact twice must produce ONE row, not two. The natural key IS the primary
+/// key (`PRIMARY KEY (source, day, subject_kind, subject_id)`), so the `ON CONFLICT` here
+/// targets the PK. The sabotage condition: widen the PK (e.g. add `total_suggestions_count`) or
+/// drop any of its columns — the insert must then FAIL to conflict and double instead.
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn insert_day_fact_is_idempotent_on_natural_key(pool: PgPool) {
     let day = copilot_day();
@@ -169,17 +177,19 @@ async fn insert_day_fact_is_idempotent_on_natural_key(pool: PgPool) {
     );
 }
 
-/// Upsert on the natural key for `usage_seat_snapshots`.
+/// Upsert on the natural key for `usage_seat_snapshots` — which is that table's primary key,
+/// including the seat-state column's NOT NULL host.
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn insert_seat_snapshot_is_idempotent_on_natural_key(pool: PgPool) {
     let day = copilot_day();
 
     let insert = r"
         INSERT INTO usage_seat_snapshots
-            (source, snapshot_day, subject_kind, subject_id, provider_user_id, assignee_login, plan_type)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+            (source, snapshot_day, subject_kind, subject_id, provider_user_id, seat_state, assignee_login, plan_type)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (source, snapshot_day, subject_kind, subject_id, provider_user_id)
         DO UPDATE SET
+            seat_state = EXCLUDED.seat_state,
             assignee_login = EXCLUDED.assignee_login,
             plan_type = EXCLUDED.plan_type
     ";
@@ -191,6 +201,7 @@ async fn insert_seat_snapshot_is_idempotent_on_natural_key(pool: PgPool) {
             .bind("org")
             .bind("org-42")
             .bind("user-999")
+            .bind("assigned")
             .bind("ada")
             .bind("business")
             .execute(&pool)
@@ -422,8 +433,8 @@ async fn unknown_subject_kind_is_rejected_in_seat_snapshots(pool: PgPool) {
 
     let result = sqlx::query(
         "INSERT INTO usage_seat_snapshots
-            (source, snapshot_day, subject_kind, subject_id, provider_user_id)
-         VALUES ('github-copilot', $1, 'enterprise', 'ent-1', 'user-1')",
+            (source, snapshot_day, subject_kind, subject_id, provider_user_id, seat_state)
+         VALUES ('github-copilot', $1, 'enterprise', 'ent-1', 'user-1', 'assigned')",
     )
     .bind(day)
     .execute(&pool)
@@ -451,5 +462,192 @@ async fn empty_source_is_rejected(pool: PgPool) {
     assert!(
         result.is_err(),
         "an empty source string must be rejected by the CHECK constraint"
+    );
+}
+
+/// Test 7a: every `SubjectKind` variant is accepted by the CHECK constraint — via a live INSERT.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn all_subject_kind_variants_are_accepted(pool: PgPool) {
+    let day = copilot_day();
+
+    for (i, kind) in SubjectKind::ALL.iter().enumerate() {
+        let subject = format!("subject-{i}");
+        let row_kind = kind.as_str().to_string();
+
+        sqlx::query(
+            "INSERT INTO usage_day_facts (source, day, subject_kind, subject_id)
+             VALUES ('github-copilot', $1, $2, $3)",
+        )
+        .bind(day)
+        .bind(&row_kind)
+        .bind(&subject)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("variant {row_kind} must be accepted by the CHECK: {e}"));
+    }
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_day_facts WHERE source = 'github-copilot'")
+            .fetch_one(&pool)
+            .await
+            .expect("count query should succeed");
+
+    assert_eq!(count, 4, "all four subject_kind variants must land");
+}
+
+/// Test 7b: the three presentations of the vocabulary cannot drift apart — the enum's `as_str()`
+/// tokens, the CHECK-constraint body as read back from the LIVE database, and
+/// `SubjectKind::check_vocabulary()` must be the same four tokens in the same order. Adding a
+/// variant to the enum without amending the migrations' CHECK (or vice versa) fails here, at
+/// test time, not at first ingest.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn subject_kind_vocabulary_stays_in_lockstep_with_the_live_check(pool: PgPool) {
+    let def: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(c.oid)
+         FROM pg_constraint c
+         JOIN pg_class t ON t.oid = c.conrelid
+         WHERE c.conname = 'chk_usage_day_facts_subject_kind'
+           AND t.relname = 'usage_day_facts'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the CHECK constraint must exist on the live table");
+
+    for kind in SubjectKind::ALL {
+        let token = kind.as_str();
+        assert!(
+            def.contains(token),
+            "CHECK definition {def:?} must contain the enum token {token:?}"
+        );
+    }
+
+    for token in SubjectKind::check_vocabulary() {
+        assert!(
+            def.contains(token),
+            "CHECK vocabulary {token:?} must be in the live definition {def:?}"
+        );
+    }
+
+    assert_eq!(
+        SubjectKind::ALL
+            .iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>(),
+        SubjectKind::check_vocabulary().to_vec(),
+        "enum as_str() order and check_vocabulary() must agree — they are two copies of the \
+         schema-side tokens and must never drift"
+    );
+}
+
+/// Test 8: AC1's "seat state *and* activity columns" — seat_state round-trips verbatim, and the
+/// state column is distinct from the activity columns. A source that reports some other state
+/// token must store it, not guess.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn seat_state_round_trips_verbatim(pool: PgPool) {
+    let day = copilot_day();
+
+    sqlx::query(
+        "INSERT INTO usage_seat_snapshots
+            (source, snapshot_day, subject_kind, subject_id, provider_user_id, seat_state, last_activity_at)
+         VALUES ('github-copilot', $1, 'org', 'org-1', 'user-77', $2, NOW())",
+    )
+    .bind(day)
+    .bind("pending_cancellation")
+    .execute(&pool)
+    .await
+    .expect("insert should succeed");
+
+    let state: String = sqlx::query_scalar(
+        "SELECT seat_state FROM usage_seat_snapshots WHERE source = 'github-copilot' AND snapshot_day = $1",
+    )
+    .bind(day)
+    .fetch_one(&pool)
+    .await
+    .expect("select should succeed");
+
+    assert_eq!(
+        state, "pending_cancellation",
+        "seat_state must round-trip verbatim"
+    );
+}
+
+/// Test 9 (D22): a row replayed into a chunk that has already compressed must be absorbed by the
+/// natural-key PK — never a silent duplicate. Compress the chunk holding a past month manually,
+/// then re-send the same fact through the upsert and assert the table still holds exactly one
+/// row with the replayed values.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn dedup_holds_when_replaying_into_a_compressed_chunk(pool: PgPool) {
+    let day = NaiveDate::from_ymd_opt(2026, 1, 15).expect("valid date");
+
+    sqlx::query(
+        "INSERT INTO usage_day_facts
+            (source, day, subject_kind, subject_id, total_suggestions_count, cost_micro_usd)
+         VALUES ('github-copilot', $1, 'org', 'org-old', 10, 1_000)",
+    )
+    .bind(day)
+    .execute(&pool)
+    .await
+    .expect("initial insert should succeed");
+
+    sqlx::query(
+        "SELECT compress_chunk(c)
+         FROM show_chunks('usage_day_facts') AS c",
+    )
+    .execute(&pool)
+    .await
+    .expect("manual chunk compression should succeed");
+
+    let compressed = sqlx::query_scalar::<_, bool>(
+        "SELECT is_compressed
+         FROM timescaledb_information.chunks
+         WHERE hypertable_name = 'usage_day_facts'
+           AND chunk_name = (SELECT chunk_name
+                             FROM timescaledb_information.chunks
+                             WHERE hypertable_name = 'usage_day_facts'
+                             ORDER BY range_start
+                             LIMIT 1)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("chunk lookup should succeed");
+
+    assert!(
+        compressed,
+        "the January chunk must be compressed for this test to be meaningful"
+    );
+
+    sqlx::query(
+        "INSERT INTO usage_day_facts
+            (source, day, subject_kind, subject_id, total_suggestions_count, cost_micro_usd)
+         VALUES ('github-copilot', $1, 'org', 'org-old', 900, 2_000)
+         ON CONFLICT (source, day, subject_kind, subject_id)
+         DO UPDATE SET total_suggestions_count = EXCLUDED.total_suggestions_count,
+                       cost_micro_usd = EXCLUDED.cost_micro_usd",
+    )
+    .bind(day)
+    .execute(&pool)
+    .await
+    .expect(
+        "replay into the compressed chunk must succeed — if TimescaleDB refuses an \
+             ON CONFLICT DO UPDATE against a compressed chunk, D22's dedup contract must be \
+             carried by a decompress-replay-refuse policy, not silently",
+    );
+
+    let rows: (i64, Option<i64>) = sqlx::query_as(
+        "SELECT COUNT(*), MIN(total_suggestions_count) FROM usage_day_facts WHERE day = $1",
+    )
+    .bind(day)
+    .fetch_one(&pool)
+    .await
+    .expect("count query should succeed");
+
+    assert_eq!(
+        rows.0, 1,
+        "replay into a compressed chunk must not duplicate the row"
+    );
+    assert_eq!(
+        rows.1,
+        Some(900),
+        "the replayed measures must replace the stored ones"
     );
 }
