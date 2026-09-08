@@ -76,34 +76,6 @@ async fn insert_execution(
     Ok(())
 }
 
-// A stub execution: minted by ingest on first sight of a child span, before the real execution
-// span arrives (OTLP exports children before their parent). `duration_ms`/`raw_schema_version`
-// are NULL because a stub has neither; the real execution span fills them via the upsert.
-async fn insert_execution_stub(
-    pool: &PgPool,
-    observed_at: chrono::DateTime<Utc>,
-    trace_id: &str,
-    span_id: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        INSERT INTO usage_executions
-            (id, observed_at, source, provider, trace_id, span_id, duration_ms, raw_schema_version)
-        VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL)
-        ON CONFLICT (source, trace_id, span_id) DO NOTHING
-        "#,
-    )
-    .bind(format!("exec_{SOURCE}_{trace_id}_{span_id}"))
-    .bind(observed_at)
-    .bind(SOURCE)
-    .bind("anthropic")
-    .bind(trace_id)
-    .bind(span_id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 #[expect(
     clippy::too_many_arguments,
     reason = "test helper binding the fixed set of usage_model_calls columns"
@@ -435,34 +407,64 @@ async fn same_trace_and_span_across_different_sources_does_not_collide(pool: PgP
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn child_can_be_inserted_before_its_parent_execution(pool: PgPool) {
     // OTLP exports child spans before the parent execution span (a child ends before its
-    // parent, and BatchSpanProcessor flushes every ~5s). Ingest mints a STUB usage_executions
-    // row (id from the child's parent_span_id, duration_ms/raw_schema_version NULL) on first
-    // sight of a child, in the same transaction, so the NOT NULL execution_id FK is
-    // satisfiable. The real execution span later fills the stub via the upsert.
+    // parent, and BatchSpanProcessor flushes every ~5s). Within a single ingest transaction
+    // the child is inserted BEFORE the parent row exists, and the DEFERRABLE INITIALLY
+    // DEFERRED execution_id FK defers the check to commit time -- so a child can reference a
+    // parent that is only created later in the same transaction. This is the actual wire
+    // ordering, and it is what the deferrable FK exists to permit.
     let observed_at = Utc::now() - Duration::minutes(5);
     let trace_id = "trace-child-first";
     let exec_span = "span-child-first-exec";
     let exec_id = format!("exec_{SOURCE}_{trace_id}_{exec_span}");
 
-    // Child arrives first: ingest creates the stub execution, then the model call.
-    insert_execution_stub(&pool, observed_at, trace_id, exec_span)
-        .await
-        .expect("stub execution on first sight of a child");
-    insert_model_call(
-        &pool,
-        observed_at,
-        trace_id,
-        "span-child-first-mc",
-        &exec_id,
-        "claude-sonnet-4-5",
-        Some(1200),
-        Some(400),
-        Some(1000),
-    )
-    .await
-    .expect("model call referencing the stub execution");
+    let mut tx = pool.begin().await.expect("begin transaction");
 
-    // The stub has no duration or schema version yet.
+    // Child first: the model call references an execution that does not exist yet. The
+    // DEFERRABLE INITIALLY DEFERRED FK must not reject this until commit.
+    sqlx::query(
+        r#"
+        INSERT INTO usage_model_calls
+            (id, observed_at, source, execution_id, trace_id, span_id, model, input_tokens, output_tokens, cost_micro_usd)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        "#,
+    )
+    .bind(format!("{SOURCE}_{trace_id}_span-child-first-mc:mc"))
+    .bind(observed_at)
+    .bind(SOURCE)
+    .bind(&exec_id)
+    .bind(trace_id)
+    .bind("span-child-first-mc")
+    .bind("claude-sonnet-4-5")
+    .bind(1200i64)
+    .bind(400i64)
+    .bind(1000i64)
+    .execute(&mut *tx)
+    .await
+    .expect("model call referencing a not-yet-existing execution");
+
+    // The stub execution (parent) is created later in the same transaction. It is a stub, so
+    // provider/duration_ms/raw_schema_version are NULL (a tool-call-first stub has no model
+    // provider to set).
+    sqlx::query(
+        r#"
+        INSERT INTO usage_executions
+            (id, observed_at, source, provider, trace_id, span_id, duration_ms, raw_schema_version)
+        VALUES ($1, $2, $3, NULL, $4, $5, NULL, NULL)
+        "#,
+    )
+    .bind(&exec_id)
+    .bind(observed_at)
+    .bind(SOURCE)
+    .bind(trace_id)
+    .bind(exec_span)
+    .execute(&mut *tx)
+    .await
+    .expect("stub execution created after the child");
+
+    // Commit: the deferred FK check now passes because the stub exists.
+    tx.commit().await.expect("commit transaction");
+
+    // The stub has no duration or provider yet.
     let stub_duration: Option<i64> = sqlx::query_scalar(
         "SELECT duration_ms FROM usage_executions WHERE trace_id = $1 AND span_id = $2",
     )
@@ -472,6 +474,15 @@ async fn child_can_be_inserted_before_its_parent_execution(pool: PgPool) {
     .await
     .expect("read stub duration");
     assert_eq!(stub_duration, None, "a stub execution has no duration yet");
+    let stub_provider: Option<String> = sqlx::query_scalar(
+        "SELECT provider FROM usage_executions WHERE trace_id = $1 AND span_id = $2",
+    )
+    .bind(trace_id)
+    .bind(exec_span)
+    .fetch_one(&pool)
+    .await
+    .expect("read stub provider");
+    assert_eq!(stub_provider, None, "a stub execution has no provider yet");
 
     // The real execution span arrives later and fills the stub via the upsert.
     insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(5000))
@@ -490,6 +501,19 @@ async fn child_can_be_inserted_before_its_parent_execution(pool: PgPool) {
         filled_duration,
         Some(1200),
         "the real execution must fill the stub's duration"
+    );
+    let filled_provider: Option<String> = sqlx::query_scalar(
+        "SELECT provider FROM usage_executions WHERE trace_id = $1 AND span_id = $2",
+    )
+    .bind(trace_id)
+    .bind(exec_span)
+    .fetch_one(&pool)
+    .await
+    .expect("read filled provider");
+    assert_eq!(
+        filled_provider.as_deref(),
+        Some("anthropic"),
+        "the real execution must fill the stub's provider"
     );
 
     assert_eq!(

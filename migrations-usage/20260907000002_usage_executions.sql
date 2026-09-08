@@ -31,10 +31,10 @@
 --     and BatchSpanProcessor flushes every ~5s, so for any run longer than one flush the
 --     children arrive in an earlier export than the execution that parents them. Ingest
 --     therefore mints a STUB `usage_executions` row (id derived from the child's
---     `source` + `trace_id` + `parent_span_id`, `duration_ms`/`raw_schema_version` NULL) on
---     first sight of any child, in the SAME transaction as the child, so the NOT NULL
---     `execution_id` FK on the child tables is satisfiable. The real execution span later
---     fills the stub via the upsert
+--     `source` + `trace_id` + `parent_span_id`, `provider`/`duration_ms`/`raw_schema_version`
+--     NULL -- a tool-call-first stub has no model provider to set) on first sight of any
+--     child, in the SAME transaction as the child, so the NOT NULL `execution_id` FK on the
+--     child tables is satisfiable. The real execution span later fills the stub via the upsert
 --     (`ON CONFLICT DO UPDATE`). A stub whose execution never ends (agent killed mid-run) is
 --     honest: the children are kept, the execution is recorded as never-completed. The
 --     `execution_id` FK is `DEFERRABLE INITIALLY DEFERRED` so parent and children may be
@@ -53,7 +53,10 @@ CREATE TABLE usage_executions (
     id TEXT PRIMARY KEY,
     observed_at TIMESTAMPTZ NOT NULL,
     source TEXT NOT NULL,
-    provider TEXT NOT NULL,
+    -- NULL = a stub execution (created on first sight of a child, before the real execution
+    -- span arrives). A stub derived from a tool-call-first child has no model provider to
+    -- set (tool calls carry no provider); the real execution span fills it via the upsert.
+    provider TEXT,
     trace_id TEXT NOT NULL,
     span_id TEXT NOT NULL,
     identity_id TEXT REFERENCES usage_identities (id),
