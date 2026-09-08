@@ -38,6 +38,11 @@
 -- subject_kind closed vocabulary via CHECK: org, user, repo, user_team. Extensible via a forward
 -- migration adding a new value to the constraint (no DB enum per D4's rationale). An unknown
 -- subject_kind is refused at ingest, not written with a guessed or NULL value.
+--
+-- Every PK member that is an opaque string (`source`, `subject_id`) is empty-string-guarded via a
+-- `CHECK (... <> '')`. `NOT NULL` alone would still admit `''`, and two distinct entities that
+-- both collapse to `''` would collide onto the same PK tuple and be silently merged by the
+-- natural-key `ON CONFLICT ... DO UPDATE` (#714 review: Stephane).
 
 CREATE TABLE usage_day_facts (
     source      TEXT        NOT NULL,
@@ -92,7 +97,10 @@ CREATE TABLE usage_day_facts (
         CHECK (subject_kind IN ('org', 'user', 'repo', 'user_team')),
 
     CONSTRAINT chk_usage_day_facts_source_not_empty
-        CHECK (source <> '')
+        CHECK (source <> ''),
+
+    CONSTRAINT chk_usage_day_facts_subject_id_not_empty
+        CHECK (subject_id <> '')
 );
 
 COMMENT ON TABLE usage_day_facts IS

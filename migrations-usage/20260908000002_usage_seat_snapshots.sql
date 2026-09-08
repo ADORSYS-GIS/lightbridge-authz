@@ -30,6 +30,12 @@
 -- unassigned seats will need a forward migration to represent them (PK changes to an applied
 -- migration are forbidden); the decision to stay per-user is explicit now rather than silent.
 --
+-- Every PK/identity member that is an opaque string (`source`, `subject_id`, `provider_user_id`)
+-- is empty-string-guarded via a `CHECK (... <> '')`. `NOT NULL` alone would still admit `''`, and
+-- two distinct seats that both collapse to `''` for `provider_user_id` (or `subject_id`) would
+-- collide onto one PK tuple and be silently merged by the natural-key `ON CONFLICT ... DO UPDATE`,
+-- corrupting seat state with no constraint violation (#714 review: Stephane).
+--
 -- No `EXCEPTION WHEN OTHERS` anywhere (authz-migration skill Rule 5). Fail loud.
 
 CREATE TABLE usage_seat_snapshots (
@@ -70,7 +76,13 @@ CREATE TABLE usage_seat_snapshots (
         CHECK (subject_kind IN ('org', 'user', 'repo', 'user_team')),
 
     CONSTRAINT chk_usage_seat_snapshots_source_not_empty
-        CHECK (source <> '')
+        CHECK (source <> ''),
+
+    CONSTRAINT chk_usage_seat_snapshots_subject_id_not_empty
+        CHECK (subject_id <> ''),
+
+    CONSTRAINT chk_usage_seat_snapshots_provider_user_id_not_empty
+        CHECK (provider_user_id <> '')
 );
 
 COMMENT ON TABLE usage_seat_snapshots IS

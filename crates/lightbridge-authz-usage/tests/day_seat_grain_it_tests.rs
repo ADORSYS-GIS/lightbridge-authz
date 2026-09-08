@@ -451,6 +451,67 @@ async fn empty_source_is_rejected(pool: PgPool) {
     );
 }
 
+/// Empty `subject_id` is rejected — it is part of the natural-key PK, so `NOT NULL` alone would
+/// still admit `''` and let two distinct entities collapse onto one tuple.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn empty_subject_id_is_rejected(pool: PgPool) {
+    let day = copilot_day();
+
+    let result = sqlx::query(
+        "INSERT INTO usage_day_facts (source, day, subject_kind, subject_id)
+         VALUES ('github-copilot', $1, 'org', '')",
+    )
+    .bind(day)
+    .execute(&pool)
+    .await;
+
+    assert!(
+        result.is_err(),
+        "an empty subject_id must be rejected by the CHECK constraint"
+    );
+}
+
+/// Same for `usage_seat_snapshots` — empty `subject_id` is a PK member.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn empty_subject_id_is_rejected_in_seat_snapshots(pool: PgPool) {
+    let day = copilot_day();
+
+    let result = sqlx::query(
+        "INSERT INTO usage_seat_snapshots
+            (source, snapshot_day, subject_kind, subject_id, provider_user_id, seat_state)
+         VALUES ('github-copilot', $1, 'org', '', 'user-1', 'assigned')",
+    )
+    .bind(day)
+    .execute(&pool)
+    .await;
+
+    assert!(
+        result.is_err(),
+        "an empty subject_id in usage_seat_snapshots must be rejected by the CHECK constraint"
+    );
+}
+
+/// Empty `provider_user_id` is rejected in `usage_seat_snapshots` — it is both a PK member and the
+/// governance#185 join key, so two seats that both collapse to `''` would silently merge.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn empty_provider_user_id_is_rejected_in_seat_snapshots(pool: PgPool) {
+    let day = copilot_day();
+
+    let result = sqlx::query(
+        "INSERT INTO usage_seat_snapshots
+            (source, snapshot_day, subject_kind, subject_id, provider_user_id, seat_state)
+         VALUES ('github-copilot', $1, 'org', 'org-1', '', 'assigned')",
+    )
+    .bind(day)
+    .execute(&pool)
+    .await;
+
+    assert!(
+        result.is_err(),
+        "an empty provider_user_id in usage_seat_snapshots must be rejected by the CHECK constraint"
+    );
+}
+
 /// Test 7a: every `SubjectKind` variant is accepted by the CHECK constraint — via a live INSERT.
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn all_subject_kind_variants_are_accepted(pool: PgPool) {
