@@ -331,16 +331,27 @@ actually live versus merely implemented — is in [`budget.md`](./budget.md).
 
 ## The usage side: a separate database
 
-`usage_events` (`migrations-usage/`) is **not** in the schema above — it lives in its own
-Timescale-compatible database (`lightbridge-authz-usage`'s own `DATABASE_URL`, provisioned
-independently from the authz Postgres instance), ingested via unprotected OTLP/HTTP
-(`/v1/otel/traces`, `/v1/otel/metrics`, `/v1/otel/logs`) and queried via
-`/usage/v1/usage/query` (mTLS + Bearer JWT + ownership since #570/#603). It carries
-`account_id`/`project_id` as plain `TEXT` columns with no foreign key back into `accounts`/
-`projects` — there is no live referential relationship, only a shared convention of which id
-format each column holds. The budget domain reads spend directly from this table
+The usage database (`lightbridge-authz-usage`'s own `DATABASE_URL`) holds four grain families, each
+a TimescaleDB hypertable with `source TEXT NOT NULL` as a filterable/group-by-able dimension column
+(ADR-0027 Decision 2 — grain partitions storage, vendor never does):
+
+| Table | Grain | Partition column | Retention | Status |
+|---|---|---|---|---|
+| `usage_events` | request (legacy) | `observed_at TIMESTAMPTZ` | 30d (non-functional, #549) | **Disposable** — replaced by `usage_request_events` in PR-1b (#491) |
+| `usage_day_facts` | day | `day DATE` | 25 months | **Live** (#583) |
+| `usage_seat_snapshots` | seat | `snapshot_day DATE` | 25 months | **Live** (#583) |
+
+`usage_day_facts` and `usage_seat_snapshots` are the generalized replacements for the governance
+store's vendor-named `copilot_*_daily` tables. Adding a source requires no schema change — only a
+normalizer and a registry row (governance#167's acceptance criterion). Both are hypertables
+**asserted not assumed**: the migration calls `create_hypertable` with no `EXCEPTION WHEN OTHERS`
+fallback, and the DB-backed integration tests verify the tables appear in
+`timescaledb_information.hypertables`.
+
+All tables share no foreign keys back into `accounts`/`projects` — plain `TEXT` columns with
+the shared convention of which id format each holds. The budget domain reads spend directly
 (`crates/lightbridge-authz-budget/src/spend.rs`); see `budget.md`'s "spend dependency" section for
-what happens when this database is unavailable or unconfigured.
+what happens when this database is unavailable.
 
 ## Two cross-cutting rules that have each already caused a production bug
 
@@ -395,6 +406,7 @@ scratch:
 | `exchange_refresh_tokens` | Refresh-token rotation is a compare-and-swap (`SELECT ... FOR UPDATE`), not a plain CRUD write. |
 | `federated_identities` (ADR-0024) | Carries a sealed credential (`token_envelope`); must be structurally unreachable from any generated read path, same class as `signing_keys` — modelling it, even `@@allow`-less, would still leave it reachable as a relation target. |
 | `lightbridge-authz-usage`'s `usage_events` queries | Dynamic `QueryBuilder`-assembled aggregates against the Timescale-backed table, driven by caller-selected dimensions/filters. |
+| `usage_day_facts` / `usage_seat_snapshots` (#583) | Same class as `usage_events`: TimescaleDB hypertables with upsert-on-natural-key semantics. Cratestack's generated CRUD cannot express `create_hypertable`, `add_retention_policy`, `add_compression_policy`, or `ON CONFLICT (composite, including partition column) DO UPDATE`. Justified in the migration headers as an ADR-0038 exception per the grain-partitioned time-series + CAS/upsert exception class. |
 
 This repo runs `cratestack-pg` 0.5.1; ADR-0038's own capability findings were verified against
 0.7.8 — re-verify any capability claim against 0.5.1 before relying on it here. The two-major
