@@ -50,6 +50,38 @@ fn event_with_cost(
     }
 }
 
+/// Like [`event_with_cost`] but with non-NULL token counts, so a rollup fold-in can be exercised
+/// against a day that already accumulated real token totals.
+fn event_with_tokens(
+    account_id: &str,
+    observed_at: chrono::DateTime<Utc>,
+    prompt: i64,
+    completion: i64,
+    total: i64,
+) -> UsageEvent {
+    UsageEvent {
+        observed_at,
+        signal_type: "trace".to_string(),
+        account_id: Some(account_id.to_string()),
+        project_id: Some("proj_1".to_string()),
+        api_key_id: None,
+        user_id: None,
+        user_name: None,
+        model: Some("gpt-4.1".to_string()),
+        metric_name: None,
+        azp: None,
+        operation: None,
+        billing_plan: None,
+        usage_value: 1.0,
+        request_count: 1,
+        prompt_tokens: Some(prompt),
+        completion_tokens: Some(completion),
+        total_tokens: Some(total),
+        total_cost: Some(0.0),
+        latency_ms: None,
+    }
+}
+
 /// The rollup moves old rows out of `usage_events` into `usage_events_daily`, leaves recent rows
 /// alone, and `spend_for_account` is unchanged across the boundary (AC3).
 #[sqlx::test(migrations = "../../migrations-usage")]
@@ -521,4 +553,71 @@ async fn concurrent_backdated_insert_is_not_lost_by_the_rollup(pool: PgPool) {
         Some(2777.0),
         "no row may be lost by the rollup under a concurrent backdated insert"
     );
+}
+
+/// The fold-in's NULL-safety: a late-arriving event whose token counts are NULL must NOT zero out
+/// the already-accumulated non-NULL token totals of an already-rolled-up day. Regression for the
+/// `ON CONFLICT DO UPDATE` fold-in, which used plain `col + EXCLUDED.col` for the nullable token
+/// columns -- `non_null + NULL = NULL` would silently wipe the accumulated totals. The existing
+/// fold-in test only exercises `prompt_tokens: None` on BOTH sides, so it cannot catch this.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn late_null_tokens_do_not_zero_out_accumulated_rollup_tokens(pool: PgPool) {
+    let repo = build_repo(pool.clone());
+    let now = Utc::now();
+    let raw_days = 90;
+    let rollup_days = 365;
+
+    let old_day = (now - Duration::days(raw_days + 10))
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("valid time")
+        .and_utc();
+
+    // First run: roll up a day that accumulated real token totals (500 prompt / 300 completion /
+    // 800 total).
+    repo.insert_usage_events(&[event_with_tokens("acct_1", old_day, 500, 300, 800)])
+        .await
+        .expect("insert original");
+    let first = rollup_and_purge(&pool, raw_days, rollup_days)
+        .await
+        .expect("first run");
+    assert_eq!(first, 1, "first run purges the one old row");
+
+    // A late event for the SAME day arrives with NULL token counts (a signal that carried no
+    // token usage). Its cost folds in, but its NULL tokens must not wipe the accumulated totals.
+    repo.insert_usage_events(&[event_with_cost("acct_1", old_day, 99.0)])
+        .await
+        .expect("insert late event");
+    let second = rollup_and_purge(&pool, raw_days, rollup_days)
+        .await
+        .expect("second run");
+    assert_eq!(second, 1, "the late raw row must still be purged");
+
+    let (prompt, completion, total, cost): (Option<i64>, Option<i64>, Option<i64>, Option<f64>) =
+        sqlx::query_as(
+            "SELECT prompt_tokens, completion_tokens, total_tokens, total_cost \
+             FROM usage_events_daily WHERE account_id = $1 AND bucket_start = $2",
+        )
+        .bind("acct_1")
+        .bind(old_day)
+        .fetch_one(&pool)
+        .await
+        .expect("read rollup row");
+
+    assert_eq!(
+        prompt,
+        Some(500),
+        "NULL late prompt_tokens must not zero out the accumulated 500"
+    );
+    assert_eq!(
+        completion,
+        Some(300),
+        "NULL late completion_tokens must not zero out the accumulated 300"
+    );
+    assert_eq!(
+        total,
+        Some(800),
+        "NULL late total_tokens must not zero out the accumulated 800"
+    );
+    assert_eq!(cost, Some(99.0), "the late cost must still fold in");
 }

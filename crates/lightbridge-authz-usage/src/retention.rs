@@ -70,9 +70,16 @@ pub async fn run_retention_loop(pool: Arc<PgPool>, config: RetentionConfig) {
         "usage retention/rollup enabled: raw_days={}, rollup_days={}, interval={}s",
         config.raw_days, config.rollup_days, config.interval_seconds
     );
-    let interval = std::time::Duration::from_secs(config.interval_seconds.max(1));
+    // `tokio::time::interval` (not a bare `sleep` loop) so the cadence does not drift by however
+    // long each run takes, and `MissedTickBehavior::Skip` so a run that overruns the interval
+    // does not queue a burst of catch-up ticks. The first tick fires immediately, so the first
+    // run happens at startup and then every `interval_seconds`.
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+        config.interval_seconds.max(1),
+    ));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        tokio::time::sleep(interval).await;
+        ticker.tick().await;
         match rollup_and_purge(&pool, config.raw_days, config.rollup_days).await {
             Ok(purged) => {
                 if purged > 0 {
@@ -86,64 +93,74 @@ pub async fn run_retention_loop(pool: Arc<PgPool>, config: RetentionConfig) {
 
 /// Rolls `usage_events` rows older than `raw_days` (rounded down to the day boundary, so only
 /// complete days) into `usage_events_daily`, deletes them from `usage_events`, and deletes rollup
-/// rows older than `rollup_days` -- one transaction. Returns the number of raw rows purged.
+/// rows older than `rollup_days`. Returns the number of raw rows purged.
 ///
-/// The rollup+purge runs in bounded batches ([`BATCH_SIZE`] rows per statement) so the FIRST run
-/// against a large pre-existing backlog does not aggregate and delete the whole table in one
-/// unbounded statement -- which would hold one advisory-locked transaction (and one pool
-/// connection) for the whole table, spike WAL, and burst dead tuples right before the #549 AC5
-/// reclaim. Each batch is idempotent (`ON CONFLICT DO UPDATE`), so a crash mid-way leaves partial
-/// progress that the next run continues.
+/// The rollup+purge runs in bounded batches ([`BATCH_SIZE`] rows per statement), and **each batch
+/// commits in its own transaction**, so the FIRST run against a large pre-existing backlog does
+/// not aggregate and delete the whole table in one unbounded statement -- which would hold one
+/// advisory-locked transaction (and one pool connection) for the whole table, spike WAL, and burst
+/// dead tuples right before the #549 AC5 reclaim. Committing per batch bounds the advisory-lock
+/// and transaction lifetime to a single batch rather than the whole run, and makes a crash mid-way
+/// leave partial progress that the next run continues. Each batch is idempotent (`ON CONFLICT DO
+/// UPDATE`), so a batch re-run after a crash, or a concurrent run on another replica, folds in
+/// rather than double-counts.
 pub async fn rollup_and_purge(pool: &PgPool, raw_days: i64, rollup_days: i64) -> Result<u64> {
-    let mut tx = pool.begin().await?;
-
-    // Pin day boundaries to UTC for the whole transaction (see module docs). Must be the first
-    // statement so both the rollup cutoff and the rollup-purge cutoff agree on the same zone.
-    sqlx::query("SET LOCAL TimeZone = 'UTC'")
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Error::Database(format!("usage retention timezone pin failed: {e}")))?;
-
-    // Acquire an exclusive advisory lock for the retention job to prevent concurrent rollups
-    // across multiple replicas. The lock is tied to the transaction and released on commit/rollback.
-    let lock_acquired =
-        sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_xact_lock(549000001)")
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| Error::Database(format!("usage retention lock failed: {e}")))?;
-
-    if !lock_acquired {
-        // Another replica is currently running the rollup, gracefully skip this run.
-        return Ok(0);
-    }
-
-    // One statement per batch: DELETE ... RETURNING feeds the INSERT, so the rollup and the raw
-    // purge share a single snapshot and can never drift (see module docs). Returns the number of
-    // raw rows deleted in this batch (the `deleted` CTE is materialised and counted). Loop until a
-    // batch deletes nothing, bounding the work per statement.
     let mut total_purged: u64 = 0;
     loop {
+        let mut tx = pool.begin().await?;
+
+        // Pin day boundaries to UTC for this batch's transaction (see module docs). Must be the
+        // first statement so both the rollup cutoff and the rollup-purge cutoff agree on the same
+        // zone.
+        sqlx::query("SET LOCAL TimeZone = 'UTC'")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Database(format!("usage retention timezone pin failed: {e}")))?;
+
+        // Acquire an exclusive advisory lock for the retention job to prevent concurrent rollups
+        // across multiple replicas. The lock is tied to the transaction and released on commit.
+        let lock_acquired =
+            sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_xact_lock(549000001)")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| Error::Database(format!("usage retention lock failed: {e}")))?;
+
+        if !lock_acquired {
+            // Another replica is currently running the rollup, gracefully skip this run.
+            return Ok(total_purged);
+        }
+
+        // One statement per batch: DELETE ... RETURNING feeds the INSERT, so the rollup and the raw
+        // purge share a single snapshot and can never drift (see module docs). Returns the number of
+        // raw rows deleted in this batch (the `deleted` CTE is materialised and counted). Loop until
+        // a batch deletes nothing, bounding the work per statement.
         let batch: i64 = sqlx::query_scalar(ROLLUP_AND_PURGE_SQL)
             .bind(raw_days)
             .bind(BATCH_SIZE)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| Error::Database(format!("usage retention rollup failed: {e}")))?;
+
         if batch <= 0 {
+            // No more raw rows to roll up; run the rollup purge in this same transaction and finish.
+            sqlx::query(ROLLUP_PURGE_SQL)
+                .bind(rollup_days)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    Error::Database(format!("usage retention rollup purge failed: {e}"))
+                })?;
+            tx.commit()
+                .await
+                .map_err(|e| Error::Database(format!("usage retention commit failed: {e}")))?;
             break;
         }
+
         total_purged += batch as u64;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Database(format!("usage retention commit failed: {e}")))?;
     }
-
-    sqlx::query(ROLLUP_PURGE_SQL)
-        .bind(rollup_days)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Error::Database(format!("usage retention rollup purge failed: {e}")))?;
-
-    tx.commit()
-        .await
-        .map_err(|e| Error::Database(format!("usage retention commit failed: {e}")))?;
 
     Ok(total_purged)
 }
@@ -197,13 +214,13 @@ rolled AS (
     ON CONFLICT (bucket_start, account_id, project_id, api_key_id, user_id, user_name, model, metric_name,
                  signal_type, azp, operation, billing_plan)
     DO UPDATE SET
-        requests = usage_events_daily.requests + EXCLUDED.requests,
-        usage_value = usage_events_daily.usage_value + EXCLUDED.usage_value,
-        prompt_tokens = usage_events_daily.prompt_tokens + EXCLUDED.prompt_tokens,
-        completion_tokens = usage_events_daily.completion_tokens + EXCLUDED.completion_tokens,
-        total_tokens = usage_events_daily.total_tokens + EXCLUDED.total_tokens,
+        requests = COALESCE(usage_events_daily.requests, 0) + COALESCE(EXCLUDED.requests, 0),
+        usage_value = COALESCE(usage_events_daily.usage_value, 0) + COALESCE(EXCLUDED.usage_value, 0),
+        prompt_tokens = COALESCE(usage_events_daily.prompt_tokens, 0) + COALESCE(EXCLUDED.prompt_tokens, 0),
+        completion_tokens = COALESCE(usage_events_daily.completion_tokens, 0) + COALESCE(EXCLUDED.completion_tokens, 0),
+        total_tokens = COALESCE(usage_events_daily.total_tokens, 0) + COALESCE(EXCLUDED.total_tokens, 0),
         total_cost = COALESCE(usage_events_daily.total_cost, 0) + COALESCE(EXCLUDED.total_cost, 0),
-        latency_samples = usage_events_daily.latency_samples + EXCLUDED.latency_samples
+        latency_samples = COALESCE(usage_events_daily.latency_samples, 0) + COALESCE(EXCLUDED.latency_samples, 0)
 )
 SELECT COUNT(*) FROM deleted
 "#;
