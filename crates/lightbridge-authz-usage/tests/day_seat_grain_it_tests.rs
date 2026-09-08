@@ -29,45 +29,31 @@ fn m365_day() -> NaiveDate {
     NaiveDate::from_ymd_opt(2026, 9, 2).expect("valid date")
 }
 
-/// Asserts that `usage_day_facts` is registered as a hypertable.
+/// Asserts that both grain tables are registered as hypertables.
 ///
 /// If `create_hypertable` is removed or silently falls back, this test fails with a clear message
 /// rather than silently leaving a plain Postgres table that looks like it works until retention
 /// never drops a chunk. The sabotage condition: comment out `SELECT create_hypertable(...)` in
 /// the migration and run this test — it must go red for this exact assertion.
 #[sqlx::test(migrations = "../../migrations-usage")]
-async fn usage_day_facts_is_a_hypertable(pool: PgPool) {
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM timescaledb_information.hypertables
-         WHERE hypertable_name = 'usage_day_facts'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query should succeed");
+async fn both_grain_tables_are_hypertables(pool: PgPool) {
+    for table in ["usage_day_facts", "usage_seat_snapshots"] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM timescaledb_information.hypertables
+             WHERE hypertable_name = $1",
+        )
+        .bind(table)
+        .fetch_one(&pool)
+        .await
+        .expect("query should succeed");
 
-    assert_eq!(
-        count, 1,
-        "usage_day_facts must be registered as a hypertable in timescaledb_information.hypertables; \
-         if this is 0, the create_hypertable call in the migration did not fire — \
-         check that the Timescale extension is loaded and that the migration has no EXCEPTION WHEN OTHERS"
-    );
-}
-
-/// Same assertion for `usage_seat_snapshots`.
-#[sqlx::test(migrations = "../../migrations-usage")]
-async fn usage_seat_snapshots_is_a_hypertable(pool: PgPool) {
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM timescaledb_information.hypertables
-         WHERE hypertable_name = 'usage_seat_snapshots'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query should succeed");
-
-    assert_eq!(
-        count, 1,
-        "usage_seat_snapshots must be registered as a hypertable in timescaledb_information.hypertables"
-    );
+        assert_eq!(
+            count, 1,
+            "{table} must be registered as a hypertable in timescaledb_information.hypertables; \
+             if this is 0, the create_hypertable call in the migration did not fire — \
+             check that the Timescale extension is loaded and that the migration has no EXCEPTION WHEN OTHERS"
+        );
+    }
 }
 
 /// Asserts that both tables have a retention policy attached (ADR-0028 D6: 25 months).
@@ -470,21 +456,18 @@ async fn empty_source_is_rejected(pool: PgPool) {
 async fn all_subject_kind_variants_are_accepted(pool: PgPool) {
     let day = copilot_day();
 
-    for (i, kind) in SubjectKind::ALL.iter().enumerate() {
-        let subject = format!("subject-{i}");
-        let row_kind = kind.as_str().to_string();
-
-        sqlx::query(
-            "INSERT INTO usage_day_facts (source, day, subject_kind, subject_id)
-             VALUES ('github-copilot', $1, $2, $3)",
-        )
-        .bind(day)
-        .bind(&row_kind)
-        .bind(&subject)
-        .execute(&pool)
-        .await
-        .unwrap_or_else(|e| panic!("variant {row_kind} must be accepted by the CHECK: {e}"));
-    }
+    sqlx::query(
+        "INSERT INTO usage_day_facts (source, day, subject_kind, subject_id)
+         VALUES
+            ('github-copilot', $1, 'org', 'subject-0'),
+            ('github-copilot', $1, 'user', 'subject-1'),
+            ('github-copilot', $1, 'repo', 'subject-2'),
+            ('github-copilot', $1, 'user_team', 'subject-3')",
+    )
+    .bind(day)
+    .execute(&pool)
+    .await
+    .expect("all four subject_kind variants must be accepted by the CHECK");
 
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM usage_day_facts WHERE source = 'github-copilot'")
@@ -572,9 +555,10 @@ async fn seat_state_round_trips_verbatim(pool: PgPool) {
 }
 
 /// Test 9 (D22): a row replayed into a chunk that has already compressed must be absorbed by the
-/// natural-key PK — never a silent duplicate. Compress the chunk holding a past month manually,
-/// then re-send the same fact through the upsert and assert the table still holds exactly one
-/// row with the replayed values.
+/// natural-key PK — never a silent duplicate. Several co-located rows (same `source`/`subject_kind`
+/// segment) are inserted first so `compress_segmentby`/`compress_orderby` are actually exercised,
+/// the chunk holding the past month is compressed manually, then one fact is re-sent through the
+/// upsert and the table still holds the original row count with the replayed values.
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn dedup_holds_when_replaying_into_a_compressed_chunk(pool: PgPool) {
     let day = NaiveDate::from_ymd_opt(2026, 1, 15).expect("valid date");
@@ -582,12 +566,15 @@ async fn dedup_holds_when_replaying_into_a_compressed_chunk(pool: PgPool) {
     sqlx::query(
         "INSERT INTO usage_day_facts
             (source, day, subject_kind, subject_id, total_suggestions_count, cost_micro_usd)
-         VALUES ('github-copilot', $1, 'org', 'org-old', 10, 1_000)",
+         VALUES
+            ('github-copilot', $1, 'org', 'org-a', 10, 1_000),
+            ('github-copilot', $1, 'org', 'org-b', 20, 2_000),
+            ('github-copilot', $1, 'org', 'org-c', 30, 3_000)",
     )
     .bind(day)
     .execute(&pool)
     .await
-    .expect("initial insert should succeed");
+    .expect("initial multi-row insert should succeed");
 
     sqlx::query(
         "SELECT compress_chunk(c)
@@ -619,7 +606,7 @@ async fn dedup_holds_when_replaying_into_a_compressed_chunk(pool: PgPool) {
     sqlx::query(
         "INSERT INTO usage_day_facts
             (source, day, subject_kind, subject_id, total_suggestions_count, cost_micro_usd)
-         VALUES ('github-copilot', $1, 'org', 'org-old', 900, 2_000)
+         VALUES ('github-copilot', $1, 'org', 'org-b', 900, 2_000)
          ON CONFLICT (source, day, subject_kind, subject_id)
          DO UPDATE SET total_suggestions_count = EXCLUDED.total_suggestions_count,
                        cost_micro_usd = EXCLUDED.cost_micro_usd",
@@ -642,12 +629,30 @@ async fn dedup_holds_when_replaying_into_a_compressed_chunk(pool: PgPool) {
     .expect("count query should succeed");
 
     assert_eq!(
-        rows.0, 1,
-        "replay into a compressed chunk must not duplicate the row"
+        rows.0,
+        3,
+        "replay into a compressed chunk must not duplicate the row — expected the original 3 \
+         co-located rows to survive, got {rows_count}",
+        rows_count = rows.0
     );
     assert_eq!(
         rows.1,
+        Some(10),
+        "the untouched segment rows must survive; only the replayed subject is updated"
+    );
+
+    let replayed: Option<i64> = sqlx::query_scalar(
+        "SELECT total_suggestions_count FROM usage_day_facts
+         WHERE source = 'github-copilot' AND day = $1 AND subject_id = 'org-b'",
+    )
+    .bind(day)
+    .fetch_one(&pool)
+    .await
+    .expect("replayed row lookup should succeed");
+
+    assert_eq!(
+        replayed,
         Some(900),
-        "the replayed measures must replace the stored ones"
+        "the replayed measures must replace the stored ones for the replayed subject only"
     );
 }

@@ -3,7 +3,7 @@ use lightbridge_authz_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-pub use day_seat::{SubjectKind, UsageDayFact, UsageSeatSnapshot};
+pub use day_seat::SubjectKind;
 
 mod day_seat;
 

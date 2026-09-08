@@ -26,6 +26,11 @@
 -- dedup constraint and the upsert conflict target are the primary key itself, so no surrogate is
 -- needed and none is minted (#583 review 2026-09-08: dropped `id DEFAULT gen_random_uuid()`).
 --
+-- The hypertable/compression/retention boilerplate below is duplicated near-verbatim in the seat
+-- migration by design: each migration is an immutable, self-contained file (sqlx applies them
+-- independently, and an applied migration's bytes are frozen), so a shared SQL routine could not
+-- be factored across files without editing an applied migration.
+--
 -- No `EXCEPTION WHEN OTHERS` anywhere. A migration that swallows its own error reports success
 -- against a schema it did not produce; every later `IF NOT EXISTS` agrees. The service refusing
 -- to start is the correct outcome (authz-migration skill Rule 5).

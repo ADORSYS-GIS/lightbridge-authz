@@ -24,6 +24,12 @@
 -- banned call site, and the natural key IS the row identity — it is the PRIMARY KEY, so the dedup
 -- constraint and the upsert conflict target are the key itself.
 --
+-- Recorded decision (2026-09-08 review): `provider_user_id` is NOT NULL and part of the primary
+-- key — "every seat is per-user". That is true of the initial occupant (GitHub Copilot) and of the
+-- natural key semantics. A future pooled/floating-license vendor (Cursor, JetBrains) that reports
+-- unassigned seats will need a forward migration to represent them (PK changes to an applied
+-- migration are forbidden); the decision to stay per-user is explicit now rather than silent.
+--
 -- No `EXCEPTION WHEN OTHERS` anywhere (authz-migration skill Rule 5). Fail loud.
 
 CREATE TABLE usage_seat_snapshots (
