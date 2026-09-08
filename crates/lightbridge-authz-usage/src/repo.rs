@@ -67,7 +67,6 @@ struct UsageQueryRow {
     model: Option<String>,
     metric_name: Option<String>,
     signal_type: Option<String>,
-    source: Option<String>,
     azp: Option<String>,
     operation: Option<String>,
     billing_plan: Option<String>,

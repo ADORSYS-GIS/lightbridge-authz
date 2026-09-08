@@ -596,10 +596,10 @@ fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec
                     span.start_time_unix_nano
                 };
 
-                let latency_ms = norm.latency_ms.or_else(|| {
+                let latency_ms =
                     span_duration_ms(span.start_time_unix_nano, span.end_time_unix_nano)
-                        .or_else(|| extract_latency_ms(&attrs))
-                });
+                        .or(norm.latency_ms)
+                        .or_else(|| extract_latency_ms(&attrs));
 
                 events.push(UsageEvent {
                     observed_at: nanos_to_datetime(observed_nanos),

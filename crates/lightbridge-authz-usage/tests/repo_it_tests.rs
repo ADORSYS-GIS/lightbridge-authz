@@ -27,6 +27,7 @@ fn sample_event(observed_at: chrono::DateTime<Utc>) -> UsageEvent {
     UsageEvent {
         observed_at,
         signal_type: "trace".to_string(),
+        source: Some("eaig".to_string()),
         account_id: Some("acct_1".to_string()),
         project_id: Some("proj_1".to_string()),
         api_key_id: Some("key_1".to_string()),
@@ -98,6 +99,21 @@ async fn insert_usage_events_is_a_noop_for_empty_batch(pool: PgPool) {
         .expect("empty insert should succeed");
 
     assert_eq!(persisted, 0);
+}
+
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn insert_usage_events_persists_source_dimension(pool: PgPool) {
+    let repo = build_repo(pool);
+    let now = Utc::now();
+    let mut opencode = sample_event(now);
+    opencode.source = Some("opencode".to_string());
+
+    let persisted = repo
+        .insert_usage_events(&[sample_event(now), opencode])
+        .await
+        .expect("insert with source should succeed");
+
+    assert_eq!(persisted, 2);
 }
 
 #[sqlx::test(migrations = "../../migrations-usage")]
@@ -1504,6 +1520,7 @@ async fn ingest_must_not_log_the_request_body_and_must_not_log_at_info(pool: PgP
                 .method("POST")
                 .uri("/v1/otel/logs")
                 .header("content-type", "application/json")
+                .header("x-source", "eaig")
                 .body(Body::from(body.clone()))
                 .unwrap(),
         )

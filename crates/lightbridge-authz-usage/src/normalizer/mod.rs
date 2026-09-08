@@ -32,6 +32,12 @@ pub struct SpanMeta {
 }
 
 /// The normalized output from a source-specific normalizer.
+///
+/// `trace_id`/`span_id` are carried as the `(trace_id, span_id)` dedup key (AC5, #584), but they
+/// are not yet persisted to the request-grain `usage_events` table and double-delivery is not yet
+/// idempotent there -- the ON CONFLICT replay contract lives with the execution-grain tables of
+/// #582/#708. This struct deliberately keeps the key so a normalizer can be re-targeted there
+/// without changing its signature.
 #[derive(Debug, Clone, Default)]
 pub struct NormalizedRecord {
     pub trace_id: Option<String>,
@@ -75,7 +81,12 @@ impl NormalizerRegistry {
 pub static REGISTRY: LazyLock<NormalizerRegistry> = LazyLock::new(NormalizerRegistry::build);
 
 /// Extracts and validates the trusted source from the authenticated channel.
-/// Currently reads `X-Source` as a provisional implementation pending #585.
+///
+/// AC4 status (#584): the source is read from the `X-Source` HTTP header, never from payload
+/// resource attributes a caller could forge. Because the ingest listener is itself still
+/// unauthenticated (#585), the header is provisional -- any client can currently set any known
+/// value. This is the acknowledged interim until #585 lands; the payload-identity-mismatch
+/// "alert, never overwrite" half of AC4 is deferred to that story too.
 pub fn resolve_source(headers: &HeaderMap) -> Result<&'static str> {
     let source_header = headers
         .get("x-source")
@@ -144,5 +155,43 @@ pub fn combine_token_total(
         (Some(prompt), None) => Some(prompt),
         (None, Some(completion)) => Some(completion),
         (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn headers_with_source(source: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-source", source.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn resolve_source_accepts_a_known_source() {
+        for known in KNOWN_SOURCES {
+            let headers = headers_with_source(known);
+            assert_eq!(resolve_source(&headers).unwrap(), known);
+        }
+    }
+
+    #[test]
+    fn resolve_source_refuses_an_unknown_source() {
+        let headers = headers_with_source("not-a-real-source");
+        assert!(matches!(
+            resolve_source(&headers),
+            Err(Error::BadRequest(m)) if m.contains("unknown source")
+        ));
+    }
+
+    #[test]
+    fn resolve_source_refuses_a_missing_header() {
+        let headers = HeaderMap::new();
+        assert!(matches!(
+            resolve_source(&headers),
+            Err(Error::BadRequest(m)) if m.contains("missing x-source")
+        ));
     }
 }
