@@ -8,7 +8,9 @@
 -- `span_id` is the MODEL CALL'S OWN span (each model call is its own OTLP span), NOT the
 -- parent execution's span. That is what lets one execution carry N model calls: each has a
 -- distinct `span_id`, so the dedup key `UNIQUE (trace_id, span_id)` does not collide. The id
--- is derived from this span (`{span_id}:mc`), bijective with the dedup key.
+-- is derived from `trace_id` + this span (`{trace_id}_{span_id}:mc`), bijective with the dedup
+-- key -- the `trace_id` is embedded so the id is globally unique (an OTLP `span_id` is only
+-- unique within a trace), matching `usage_executions`.
 --
 -- The `execution_id` FK is `DEFERRABLE INITIALLY DEFERRED` because OTLP exports child spans
 -- (model calls) before the parent execution span when an agent run outlives a single

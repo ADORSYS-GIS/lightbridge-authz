@@ -8,9 +8,11 @@
 -- `span_id` is the TOOL CALL'S OWN span (each tool call is its own OTLP span), NOT the
 -- parent execution's span. That is what lets one execution carry M tool calls: each has a
 -- distinct `span_id`, so the dedup key `UNIQUE (trace_id, span_id)` does not collide. Tool
--- calls are strictly one-per-span, so the id is derived from the span alone (`{span_id}:tc`),
--- matching model calls' `{span_id}:mc` -- there is no `{idx}` component, because a second tool
--- call sharing a span would be silently absorbed by the dedup key.
+-- calls are strictly one-per-span, so the id is derived from `trace_id` + the span
+-- (`{trace_id}_{span_id}:tc`), matching model calls' `{trace_id}_{span_id}:mc` -- there is no
+-- `{idx}` component, because a second tool call sharing a span would be silently absorbed by
+-- the dedup key. The `trace_id` is embedded so the id is globally unique (an OTLP `span_id` is
+-- only unique within a trace), matching `usage_executions`.
 --
 -- The `execution_id` FK is `DEFERRABLE INITIALLY DEFERRED` for the same child-before-parent
 -- OTLP export reason as `usage_model_calls` (see that migration's header).

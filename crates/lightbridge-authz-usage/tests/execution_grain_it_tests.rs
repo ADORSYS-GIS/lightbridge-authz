@@ -45,6 +45,7 @@ async fn insert_execution(
         ON CONFLICT (trace_id, span_id) DO UPDATE SET
             observed_at = EXCLUDED.observed_at,
             provider = EXCLUDED.provider,
+            identity_id = COALESCE(EXCLUDED.identity_id, usage_executions.identity_id),
             duration_ms = COALESCE(EXCLUDED.duration_ms, usage_executions.duration_ms),
             raw_backend = COALESCE(EXCLUDED.raw_backend, usage_executions.raw_backend),
             raw_schema_version = COALESCE(EXCLUDED.raw_schema_version, usage_executions.raw_schema_version),
@@ -52,7 +53,7 @@ async fn insert_execution(
             updated_at = now()
         "#,
     )
-    .bind(format!("exec_{span_id}"))
+    .bind(format!("exec_{trace_id}_{span_id}"))
     .bind(observed_at)
     .bind(SOURCE)
     .bind("anthropic")
@@ -84,7 +85,7 @@ async fn insert_execution_stub(
         ON CONFLICT (trace_id, span_id) DO NOTHING
         "#,
     )
-    .bind(format!("exec_{span_id}"))
+    .bind(format!("exec_{trace_id}_{span_id}"))
     .bind(observed_at)
     .bind(SOURCE)
     .bind("anthropic")
@@ -122,7 +123,7 @@ async fn insert_model_call(
             updated_at = now()
         "#,
     )
-    .bind(format!("{child_span_id}:mc"))
+    .bind(format!("{trace_id}_{child_span_id}:mc"))
     .bind(observed_at)
     .bind(SOURCE)
     .bind(execution_id)
@@ -153,7 +154,7 @@ async fn insert_tool_call(
         ON CONFLICT (trace_id, span_id) DO NOTHING
         "#,
     )
-    .bind(format!("{child_span_id}:tc"))
+    .bind(format!("{trace_id}_{child_span_id}:tc"))
     .bind(observed_at)
     .bind(SOURCE)
     .bind(execution_id)
@@ -192,7 +193,7 @@ async fn one_execution_can_carry_multiple_model_and_tool_calls(pool: PgPool) {
     let observed_at = Utc::now() - Duration::minutes(5);
     let trace_id = "trace-multi";
     let exec_span = "span-exec-multi";
-    let exec_id = format!("exec_{exec_span}");
+    let exec_id = format!("exec_{trace_id}_{exec_span}");
 
     insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(5000))
         .await
@@ -244,7 +245,7 @@ async fn replaying_the_same_batch_twice_changes_no_counts(pool: PgPool) {
     let observed_at = Utc::now() - Duration::minutes(5);
     let trace_id = "trace-replay-1";
     let exec_span = "span-replay-1";
-    let exec_id = format!("exec_{exec_span}");
+    let exec_id = format!("exec_{trace_id}_{exec_span}");
 
     insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(5000))
         .await
@@ -350,6 +351,24 @@ async fn replay_with_drifted_observed_at_is_still_absorbed(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations-usage")]
+async fn same_span_id_across_different_traces_does_not_collide(pool: PgPool) {
+    // An OTLP span_id is only unique within a trace, not globally. The id embeds BOTH
+    // trace_id and span_id (`exec_{trace_id}_{span_id}`), so two executions that happen to
+    // share a span_id across unrelated traces must both insert -- not a 23505 on the PK.
+    let observed_at = Utc::now() - Duration::minutes(5);
+    let shared_span = "span-shared";
+
+    insert_execution(&pool, observed_at, "trace-a", shared_span, None, Some(1000))
+        .await
+        .expect("execution in trace-a");
+    insert_execution(&pool, observed_at, "trace-b", shared_span, None, Some(2000))
+        .await
+        .expect("execution in trace-b with the same span_id must not collide on the PK");
+
+    assert_eq!(count_executions(&pool).await, 2);
+}
+
+#[sqlx::test(migrations = "../../migrations-usage")]
 async fn child_can_be_inserted_before_its_parent_execution(pool: PgPool) {
     // OTLP exports child spans before the parent execution span (a child ends before its
     // parent, and BatchSpanProcessor flushes every ~5s). Ingest mints a STUB usage_executions
@@ -359,7 +378,7 @@ async fn child_can_be_inserted_before_its_parent_execution(pool: PgPool) {
     let observed_at = Utc::now() - Duration::minutes(5);
     let trace_id = "trace-child-first";
     let exec_span = "span-child-first-exec";
-    let exec_id = format!("exec_{exec_span}");
+    let exec_id = format!("exec_{trace_id}_{exec_span}");
 
     // Child arrives first: ingest creates the stub execution, then the model call.
     insert_execution_stub(&pool, observed_at, trace_id, exec_span)
@@ -422,7 +441,7 @@ async fn null_cost_survives_round_trip_as_unknown_never_zero(pool: PgPool) {
     let observed_at = Utc::now() - Duration::minutes(5);
     let trace_id = "trace-null-cost";
     let exec_span = "span-null-cost";
-    let exec_id = format!("exec_{exec_span}");
+    let exec_id = format!("exec_{trace_id}_{exec_span}");
 
     insert_execution(&pool, observed_at, trace_id, exec_span, None, None)
         .await
@@ -516,7 +535,7 @@ async fn later_priced_cost_fills_a_null_on_replay(pool: PgPool) {
     let observed_at = Utc::now() - Duration::minutes(5);
     let trace_id = "trace-correction";
     let exec_span = "span-correction";
-    let exec_id = format!("exec_{exec_span}");
+    let exec_id = format!("exec_{trace_id}_{exec_span}");
 
     // First report: cost unknown (NULL).
     insert_execution(&pool, observed_at, trace_id, exec_span, None, None)
@@ -593,7 +612,7 @@ async fn later_report_corrects_a_non_null_cost_and_tokens(pool: PgPool) {
     let observed_at = Utc::now() - Duration::minutes(5);
     let trace_id = "trace-correct-fields";
     let exec_span = "span-correct-fields";
-    let exec_id = format!("exec_{exec_span}");
+    let exec_id = format!("exec_{trace_id}_{exec_span}");
 
     // First report: a wrong (too-low) cost and partial token count.
     insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(1000))
