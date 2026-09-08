@@ -34,6 +34,14 @@ pub struct RetentionConfig {
     /// remaining-balance decisions. Per ADR-0031's expand/contract rule, the job therefore
     /// defaults to OFF: an operator must explicitly opt in (and accept that enabling it makes the
     /// release non-revertible for aged data) before the destructive loop runs.
+    ///
+    /// There is **no grace period for a pre-existing backlog**. The first run rolls up EVERYTHING
+    /// older than `raw_days` -- including rows far older than `rollup_days` -- and then, in the
+    /// same run, purges any rollup row older than `rollup_days`. So on a fresh cutover against a
+    /// service that has been running unretained for longer than `rollup_days`, the slice of the
+    /// backlog older than `rollup_days` is rolled up and immediately deleted in that same first
+    /// run: gone for good, with no window to inspect or export it first. If you need that history,
+    /// export it BEFORE enabling the job.
     #[serde(default = "default_retention_enabled")]
     pub enabled: bool,
     /// Days of raw `usage_events` to keep before rolling up + deleting. Must be >= the dashboard's

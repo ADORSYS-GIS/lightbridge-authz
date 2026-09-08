@@ -94,3 +94,27 @@ the permissive direction for `authz-budget`'s refill and remaining-balance decis
 ADR-0031's expand/contract rule, only enable it when you accept that the release is no longer
 revertible for aged data (a `git revert` of the image-updater commit restores the binary, not the
 rows).
+
+### There is no grace period for a pre-existing backlog
+
+This is a separate, sharper risk from the rollback-safety one above, and it is **not** recoverable
+by not rolling back. The first run rolls up **everything** older than `raw_days` -- including rows
+far older than `rollup_days` -- and then, in the same run, purges any rollup row older than
+`rollup_days`. So if the service has been running unretained for longer than `rollup_days` (the
+default 365 days), the slice of that backlog older than `rollup_days` is rolled up and immediately
+deleted in the very first run: gone for good, with no window to inspect or export it first.
+
+Before you flip `retention.enabled: true` on a service that has been running unretained for over a
+year, decide whether you need that history. If you do, export it first -- for example, dump the
+rows older than `rollup_days` out of `usage_events` before enabling the job:
+
+```sql
+-- export the slice the first run will destroy, before enabling retention
+COPY (
+  SELECT * FROM usage_events
+  WHERE observed_at < date_trunc('day', now() - interval '365 days')
+) TO '/tmp/usage_events_pre_retention.csv' WITH (FORMAT csv, HEADER);
+```
+
+Once the job is enabled, that slice is gone from both `usage_events` and `usage_events_daily`
+permanently.

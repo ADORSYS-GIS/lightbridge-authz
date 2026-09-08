@@ -6,6 +6,17 @@
 //! rollup table is itself bounded by `rollup_days`, so the long-term store does not grow without
 //! bound either.
 //!
+//! ## Cutover against a pre-existing backlog has no grace period
+//!
+//! The steady-state picture above -- a day spends `rollup_days - raw_days` visible in the rollup
+//! before being purged -- assumes the job has been running since the data was ingested. It does
+//! NOT hold for a fresh cutover against a backlog older than `rollup_days`: the first run rolls up
+//! everything older than `raw_days` (including rows far older than `rollup_days`) and then, in the
+//! same run, purges any rollup row older than `rollup_days`. That slice is rolled up and deleted
+//! in the same run, with zero grace period and no way to inspect or export it first. See
+//! [`RetentionConfig::enabled`] and `docs/runbooks/reclaim-usage-events-space.md` for the operator
+//! warning.
+//!
 //! ## Why only COMPLETE days are rolled up
 //!
 //! The cutoff is `date_trunc('day', now() - raw_days)` -- the start of the day that is `raw_days`
