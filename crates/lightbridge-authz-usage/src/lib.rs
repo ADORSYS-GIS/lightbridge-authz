@@ -19,6 +19,7 @@ pub mod config;
 pub mod handlers;
 pub mod instrumentation;
 pub mod models;
+pub mod normalizer;
 pub mod repo;
 pub mod routers;
 pub mod scope_authority;

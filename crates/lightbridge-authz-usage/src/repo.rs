@@ -12,6 +12,7 @@ use tracing::{debug, instrument};
 pub struct UsageEvent {
     pub observed_at: DateTime<Utc>,
     pub signal_type: String,
+    pub source: Option<String>,
     pub account_id: Option<String>,
     pub project_id: Option<String>,
     pub api_key_id: Option<String>,
@@ -66,6 +67,7 @@ struct UsageQueryRow {
     model: Option<String>,
     metric_name: Option<String>,
     signal_type: Option<String>,
+    source: Option<String>,
     azp: Option<String>,
     operation: Option<String>,
     billing_plan: Option<String>,
@@ -109,12 +111,13 @@ impl StoreRepo {
         }
 
         let mut builder = QueryBuilder::<Postgres>::new(
-            "INSERT INTO usage_events (observed_at, signal_type, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, azp, operation, billing_plan, usage_value, request_count, prompt_tokens, completion_tokens, total_tokens, total_cost, latency_ms, attributes) ",
+            "INSERT INTO usage_events (observed_at, signal_type, source, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, azp, operation, billing_plan, usage_value, request_count, prompt_tokens, completion_tokens, total_tokens, total_cost, latency_ms, attributes) ",
         );
 
         builder.push_values(events, |mut row, event| {
             row.push_bind(event.observed_at)
                 .push_bind(&event.signal_type)
+                .push_bind(&event.source)
                 .push_bind(&event.account_id)
                 .push_bind(&event.project_id)
                 .push_bind(&event.api_key_id)

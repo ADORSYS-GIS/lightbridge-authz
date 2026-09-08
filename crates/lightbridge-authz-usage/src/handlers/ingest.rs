@@ -245,8 +245,9 @@ pub async fn ingest_traces(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
+    let source = crate::normalizer::resolve_source(&headers)?;
     let payload = decode_trace_request(&headers, &body)?;
-    let events = extract_trace_events(payload);
+    let events = extract_trace_events(payload, source);
     let accepted_events = persist_events(&state, "trace", &events).await?;
 
     debug!("accepted {} trace events", accepted_events);
@@ -273,8 +274,9 @@ pub async fn ingest_metrics(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
+    let source = crate::normalizer::resolve_source(&headers)?;
     let payload = decode_metrics_request(&headers, &body)?;
-    let events = extract_metric_events(payload);
+    let events = extract_metric_events(payload, source);
     let accepted_events = persist_events(&state, "metric", &events).await?;
 
     debug!("accepted {} metric events", accepted_events);
@@ -301,8 +303,9 @@ pub async fn ingest_logs(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
+    let source = crate::normalizer::resolve_source(&headers)?;
     let payload = decode_logs_request(&headers, &body)?;
-    let events = extract_log_events(payload);
+    let events = extract_log_events(payload, source);
     let accepted_events = persist_events(&state, "log", &events).await?;
 
     debug!("accepted {} log events", accepted_events);
@@ -418,8 +421,9 @@ fn validate_events(events: &[UsageEvent]) -> Result<()> {
     Ok(())
 }
 
-fn extract_log_events(payload: ExportLogsServiceRequest) -> Vec<UsageEvent> {
+fn extract_log_events(payload: ExportLogsServiceRequest, source: &str) -> Vec<UsageEvent> {
     let mut events = Vec::new();
+    let normalizer = crate::normalizer::REGISTRY.get(source);
 
     for resource_logs in payload.resource_logs {
         let resource_attrs = resource_logs
@@ -440,32 +444,56 @@ fn extract_log_events(payload: ExportLogsServiceRequest) -> Vec<UsageEvent> {
                     0
                 };
 
-                let prompt_tokens = extract_i64(&attrs, &PROMPT_TOKENS_KEYS);
-                let completion_tokens = extract_i64(&attrs, &COMPLETION_TOKENS_KEYS);
-                let total_tokens = extract_i64(&attrs, &TOTAL_TOKENS_KEYS)
+                let span_meta = crate::normalizer::SpanMeta {
+                    trace_id: (!log_record.trace_id.is_empty())
+                        .then(|| hex::encode(&log_record.trace_id)),
+                    span_id: (!log_record.span_id.is_empty())
+                        .then(|| hex::encode(&log_record.span_id)),
+                    start_time_unix_nano: observed_nanos,
+                    end_time_unix_nano: observed_nanos,
+                    name: log_record.severity_text.clone(),
+                };
+                let norm = normalizer
+                    .map(|f| f(&attrs, &span_meta))
+                    .unwrap_or_default();
+
+                let prompt_tokens = norm
+                    .prompt_tokens
+                    .or_else(|| extract_i64(&attrs, &PROMPT_TOKENS_KEYS));
+                let completion_tokens = norm
+                    .completion_tokens
+                    .or_else(|| extract_i64(&attrs, &COMPLETION_TOKENS_KEYS));
+                let total_tokens = norm
+                    .total_tokens
+                    .or_else(|| extract_i64(&attrs, &TOTAL_TOKENS_KEYS))
                     .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
 
                 let usage_value = extract_f64(&attrs, &USAGE_VALUE_KEYS)
                     .or_else(|| total_tokens.map(|v| v as f64))
                     .unwrap_or(1.0);
 
-                let total_cost = extract_f64(&attrs, &COST_KEYS);
+                let total_cost = norm
+                    .cost_micros
+                    .map(|c| c as f64 / 1_000_000.0)
+                    .or_else(|| extract_f64(&attrs, &COST_KEYS));
+                let latency_ms = norm.latency_ms.or_else(|| extract_latency_ms(&attrs));
 
                 events.push(UsageEvent {
                     observed_at: nanos_to_datetime(observed_nanos),
                     signal_type: "log".to_string(),
+                    source: Some(source.to_string()),
                     account_id: extract_string(&attrs, &ACCOUNT_KEYS),
                     project_id: extract_string(&attrs, &PROJECT_KEYS),
                     api_key_id: extract_string(&attrs, &API_KEY_KEYS),
                     user_id: extract_string(&attrs, &USER_KEYS),
                     user_name: extract_string(&attrs, &USER_NAME_KEYS),
-                    model: extract_string(&attrs, &MODEL_KEYS),
+                    model: norm.model.or_else(|| extract_string(&attrs, &MODEL_KEYS)),
                     azp: extract_string(&attrs, &AZP_KEYS),
                     operation: derive_operation(&attrs),
                     billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
                     metric_name: non_empty(Some(log_record.severity_text)),
                     usage_value,
-                    latency_ms: extract_latency_ms(&attrs),
+                    latency_ms,
                     request_count: 1,
                     prompt_tokens,
                     completion_tokens,
@@ -481,13 +509,14 @@ fn extract_log_events(payload: ExportLogsServiceRequest) -> Vec<UsageEvent> {
 }
 
 fn decode_trace_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportTraceServiceRequest> {
+    let body = decode_maybe_gzip(headers, body)?;
     if is_json_content(headers) {
-        serde_json::from_slice(body).map_err(|e| {
+        serde_json::from_slice(&body).map_err(|e| {
             warn!("invalid OTLP trace JSON payload: {e}");
             Error::BadRequest(format!("invalid OTLP trace JSON payload: {e}"))
         })
     } else {
-        ExportTraceServiceRequest::decode(body).map_err(|e| {
+        ExportTraceServiceRequest::decode(body.as_slice()).map_err(|e| {
             warn!("invalid OTLP trace protobuf payload: {e}");
             Error::BadRequest(format!("invalid OTLP trace protobuf payload: {e}"))
         })
@@ -495,13 +524,14 @@ fn decode_trace_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportTraceS
 }
 
 fn decode_metrics_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportMetricsServiceRequest> {
+    let body = decode_maybe_gzip(headers, body)?;
     if is_json_content(headers) {
-        serde_json::from_slice(body).map_err(|e| {
+        serde_json::from_slice(&body).map_err(|e| {
             warn!("invalid OTLP metrics JSON payload: {e}");
             Error::BadRequest(format!("invalid OTLP metrics JSON payload: {e}"))
         })
     } else {
-        ExportMetricsServiceRequest::decode(body).map_err(|e| {
+        ExportMetricsServiceRequest::decode(body.as_slice()).map_err(|e| {
             warn!("invalid OTLP metrics protobuf payload: {e}");
             Error::BadRequest(format!("invalid OTLP metrics protobuf payload: {e}"))
         })
@@ -515,8 +545,9 @@ fn is_json_content(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.contains("json"))
 }
 
-fn extract_trace_events(payload: ExportTraceServiceRequest) -> Vec<UsageEvent> {
+fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec<UsageEvent> {
     let mut events = Vec::new();
+    let normalizer = crate::normalizer::REGISTRY.get(source);
 
     for resource_spans in payload.resource_spans {
         let resource_attrs = resource_spans
@@ -528,16 +559,36 @@ fn extract_trace_events(payload: ExportTraceServiceRequest) -> Vec<UsageEvent> {
             for span in scope_spans.spans {
                 let attrs = merge_attr_maps(&resource_attrs, &key_values_to_map(&span.attributes));
 
-                let prompt_tokens = extract_i64(&attrs, &PROMPT_TOKENS_KEYS);
-                let completion_tokens = extract_i64(&attrs, &COMPLETION_TOKENS_KEYS);
-                let total_tokens = extract_i64(&attrs, &TOTAL_TOKENS_KEYS)
+                let span_meta = crate::normalizer::SpanMeta {
+                    trace_id: (!span.trace_id.is_empty()).then(|| hex::encode(&span.trace_id)),
+                    span_id: (!span.span_id.is_empty()).then(|| hex::encode(&span.span_id)),
+                    start_time_unix_nano: span.start_time_unix_nano,
+                    end_time_unix_nano: span.end_time_unix_nano,
+                    name: span.name.clone(),
+                };
+                let norm = normalizer
+                    .map(|f| f(&attrs, &span_meta))
+                    .unwrap_or_default();
+
+                let prompt_tokens = norm
+                    .prompt_tokens
+                    .or_else(|| extract_i64(&attrs, &PROMPT_TOKENS_KEYS));
+                let completion_tokens = norm
+                    .completion_tokens
+                    .or_else(|| extract_i64(&attrs, &COMPLETION_TOKENS_KEYS));
+                let total_tokens = norm
+                    .total_tokens
+                    .or_else(|| extract_i64(&attrs, &TOTAL_TOKENS_KEYS))
                     .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
 
                 let usage_value = extract_f64(&attrs, &USAGE_VALUE_KEYS)
                     .or_else(|| total_tokens.map(|v| v as f64))
                     .unwrap_or(1.0);
 
-                let total_cost = extract_f64(&attrs, &COST_KEYS);
+                let total_cost = norm
+                    .cost_micros
+                    .map(|c| c as f64 / 1_000_000.0)
+                    .or_else(|| extract_f64(&attrs, &COST_KEYS));
 
                 let observed_nanos = if span.end_time_unix_nano > 0 {
                     span.end_time_unix_nano
@@ -545,19 +596,21 @@ fn extract_trace_events(payload: ExportTraceServiceRequest) -> Vec<UsageEvent> {
                     span.start_time_unix_nano
                 };
 
-                let latency_ms =
+                let latency_ms = norm.latency_ms.or_else(|| {
                     span_duration_ms(span.start_time_unix_nano, span.end_time_unix_nano)
-                        .or_else(|| extract_latency_ms(&attrs));
+                        .or_else(|| extract_latency_ms(&attrs))
+                });
 
                 events.push(UsageEvent {
                     observed_at: nanos_to_datetime(observed_nanos),
                     signal_type: "trace".to_string(),
+                    source: Some(source.to_string()),
                     account_id: extract_string(&attrs, &ACCOUNT_KEYS),
                     project_id: extract_string(&attrs, &PROJECT_KEYS),
                     api_key_id: extract_string(&attrs, &API_KEY_KEYS),
                     user_id: extract_string(&attrs, &USER_KEYS),
                     user_name: extract_string(&attrs, &USER_NAME_KEYS),
-                    model: extract_string(&attrs, &MODEL_KEYS),
+                    model: norm.model.or_else(|| extract_string(&attrs, &MODEL_KEYS)),
                     azp: extract_string(&attrs, &AZP_KEYS),
                     operation: derive_operation(&attrs),
                     billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
@@ -578,7 +631,7 @@ fn extract_trace_events(payload: ExportTraceServiceRequest) -> Vec<UsageEvent> {
     events
 }
 
-fn extract_metric_events(payload: ExportMetricsServiceRequest) -> Vec<UsageEvent> {
+fn extract_metric_events(payload: ExportMetricsServiceRequest, source: &str) -> Vec<UsageEvent> {
     let mut events = Vec::new();
 
     for resource_metrics in payload.resource_metrics {
@@ -601,6 +654,7 @@ fn extract_metric_events(payload: ExportMetricsServiceRequest) -> Vec<UsageEvent
                                     &metric_attrs,
                                     metric_name.clone(),
                                     point,
+                                    source,
                                 ));
                             }
                         }
@@ -610,6 +664,7 @@ fn extract_metric_events(payload: ExportMetricsServiceRequest) -> Vec<UsageEvent
                                     &metric_attrs,
                                     metric_name.clone(),
                                     point,
+                                    source,
                                 ));
                             }
                         }
@@ -619,6 +674,7 @@ fn extract_metric_events(payload: ExportMetricsServiceRequest) -> Vec<UsageEvent
                                     &metric_attrs,
                                     metric_name.clone(),
                                     point,
+                                    source,
                                 ));
                             }
                         }
@@ -628,6 +684,7 @@ fn extract_metric_events(payload: ExportMetricsServiceRequest) -> Vec<UsageEvent
                                     &metric_attrs,
                                     metric_name.clone(),
                                     point,
+                                    source,
                                 ));
                             }
                         }
@@ -637,6 +694,7 @@ fn extract_metric_events(payload: ExportMetricsServiceRequest) -> Vec<UsageEvent
                                     &metric_attrs,
                                     metric_name.clone(),
                                     point,
+                                    source,
                                 ));
                             }
                         }
@@ -653,8 +711,10 @@ fn number_data_point_to_event(
     metric_attrs: &HashMap<String, Value>,
     metric_name: Option<String>,
     point: NumberDataPoint,
+    source: &str,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    let normalizer = crate::normalizer::REGISTRY.get(source);
 
     let value = match point.value {
         Some(number_data_point::Value::AsDouble(v)) => v,
@@ -662,25 +722,48 @@ fn number_data_point_to_event(
         None => 0.0,
     };
 
-    let total_cost = extract_f64(&attrs, &COST_KEYS);
-    let prompt_tokens = extract_i64(&attrs, &PROMPT_TOKENS_KEYS);
-    let completion_tokens = extract_i64(&attrs, &COMPLETION_TOKENS_KEYS);
-    let total_tokens = extract_i64(&attrs, &TOTAL_TOKENS_KEYS)
+    let span_meta = crate::normalizer::SpanMeta {
+        trace_id: None,
+        span_id: None,
+        start_time_unix_nano: point.start_time_unix_nano,
+        end_time_unix_nano: point.time_unix_nano,
+        name: metric_name.clone().unwrap_or_default(),
+    };
+    let norm = normalizer
+        .map(|f| f(&attrs, &span_meta))
+        .unwrap_or_default();
+
+    let total_cost = norm
+        .cost_micros
+        .map(|c| c as f64 / 1_000_000.0)
+        .or_else(|| extract_f64(&attrs, &COST_KEYS));
+    let prompt_tokens = norm
+        .prompt_tokens
+        .or_else(|| extract_i64(&attrs, &PROMPT_TOKENS_KEYS));
+    let completion_tokens = norm
+        .completion_tokens
+        .or_else(|| extract_i64(&attrs, &COMPLETION_TOKENS_KEYS));
+    let total_tokens = norm
+        .total_tokens
+        .or_else(|| extract_i64(&attrs, &TOTAL_TOKENS_KEYS))
         .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
 
     UsageEvent {
         observed_at: nanos_to_datetime(point.time_unix_nano),
         signal_type: "metric".to_string(),
+        source: Some(source.to_string()),
         account_id: extract_string(&attrs, &ACCOUNT_KEYS),
         project_id: extract_string(&attrs, &PROJECT_KEYS),
         api_key_id: extract_string(&attrs, &API_KEY_KEYS),
         user_id: extract_string(&attrs, &USER_KEYS),
         user_name: extract_string(&attrs, &USER_NAME_KEYS),
-        model: extract_string(&attrs, &MODEL_KEYS),
+        model: norm.model.or_else(|| extract_string(&attrs, &MODEL_KEYS)),
         azp: extract_string(&attrs, &AZP_KEYS),
         operation: derive_operation(&attrs),
         billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
-        latency_ms: extract_latency_ms(&attrs)
+        latency_ms: norm
+            .latency_ms
+            .or_else(|| extract_latency_ms(&attrs))
             .or_else(|| duration_metric_value_to_ms(metric_name.as_deref(), value)),
         metric_name,
         usage_value: value,
@@ -697,32 +780,61 @@ fn histogram_data_point_to_event(
     metric_attrs: &HashMap<String, Value>,
     metric_name: Option<String>,
     point: HistogramDataPoint,
+    source: &str,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    let normalizer = crate::normalizer::REGISTRY.get(source);
+
     let count = u64_to_i64(point.count);
     let usage_value = point.sum.unwrap_or(count as f64);
-    let total_cost = extract_f64(&attrs, &COST_KEYS);
+
+    let span_meta = crate::normalizer::SpanMeta {
+        trace_id: None,
+        span_id: None,
+        start_time_unix_nano: point.start_time_unix_nano,
+        end_time_unix_nano: point.time_unix_nano,
+        name: metric_name.clone().unwrap_or_default(),
+    };
+    let norm = normalizer
+        .map(|f| f(&attrs, &span_meta))
+        .unwrap_or_default();
+
+    let total_cost = norm
+        .cost_micros
+        .map(|c| c as f64 / 1_000_000.0)
+        .or_else(|| extract_f64(&attrs, &COST_KEYS));
+    let prompt_tokens = norm
+        .prompt_tokens
+        .or_else(|| extract_i64(&attrs, &PROMPT_TOKENS_KEYS));
+    let completion_tokens = norm
+        .completion_tokens
+        .or_else(|| extract_i64(&attrs, &COMPLETION_TOKENS_KEYS));
+    let total_tokens = norm
+        .total_tokens
+        .or_else(|| extract_i64(&attrs, &TOTAL_TOKENS_KEYS))
+        .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
 
     UsageEvent {
         observed_at: nanos_to_datetime(point.time_unix_nano),
         signal_type: "metric".to_string(),
+        source: Some(source.to_string()),
         account_id: extract_string(&attrs, &ACCOUNT_KEYS),
         project_id: extract_string(&attrs, &PROJECT_KEYS),
         api_key_id: extract_string(&attrs, &API_KEY_KEYS),
         user_id: extract_string(&attrs, &USER_KEYS),
         user_name: extract_string(&attrs, &USER_NAME_KEYS),
-        model: extract_string(&attrs, &MODEL_KEYS),
+        model: norm.model.or_else(|| extract_string(&attrs, &MODEL_KEYS)),
         azp: extract_string(&attrs, &AZP_KEYS),
         operation: derive_operation(&attrs),
         billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
         metric_name,
         usage_value,
         total_cost,
-        latency_ms: extract_latency_ms(&attrs),
+        latency_ms: norm.latency_ms.or_else(|| extract_latency_ms(&attrs)),
         request_count: count.max(1),
-        prompt_tokens: extract_i64(&attrs, &PROMPT_TOKENS_KEYS),
-        completion_tokens: extract_i64(&attrs, &COMPLETION_TOKENS_KEYS),
-        total_tokens: extract_i64(&attrs, &TOTAL_TOKENS_KEYS),
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
         attributes: Value::Object(attrs.into_iter().collect()),
     }
 }
@@ -731,32 +843,61 @@ fn exponential_histogram_data_point_to_event(
     metric_attrs: &HashMap<String, Value>,
     metric_name: Option<String>,
     point: ExponentialHistogramDataPoint,
+    source: &str,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    let normalizer = crate::normalizer::REGISTRY.get(source);
+
     let count = u64_to_i64(point.count);
     let usage_value = point.sum.unwrap_or(count as f64);
-    let total_cost = extract_f64(&attrs, &COST_KEYS);
+
+    let span_meta = crate::normalizer::SpanMeta {
+        trace_id: None,
+        span_id: None,
+        start_time_unix_nano: point.start_time_unix_nano,
+        end_time_unix_nano: point.time_unix_nano,
+        name: metric_name.clone().unwrap_or_default(),
+    };
+    let norm = normalizer
+        .map(|f| f(&attrs, &span_meta))
+        .unwrap_or_default();
+
+    let total_cost = norm
+        .cost_micros
+        .map(|c| c as f64 / 1_000_000.0)
+        .or_else(|| extract_f64(&attrs, &COST_KEYS));
+    let prompt_tokens = norm
+        .prompt_tokens
+        .or_else(|| extract_i64(&attrs, &PROMPT_TOKENS_KEYS));
+    let completion_tokens = norm
+        .completion_tokens
+        .or_else(|| extract_i64(&attrs, &COMPLETION_TOKENS_KEYS));
+    let total_tokens = norm
+        .total_tokens
+        .or_else(|| extract_i64(&attrs, &TOTAL_TOKENS_KEYS))
+        .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
 
     UsageEvent {
         observed_at: nanos_to_datetime(point.time_unix_nano),
         signal_type: "metric".to_string(),
+        source: Some(source.to_string()),
         account_id: extract_string(&attrs, &ACCOUNT_KEYS),
         project_id: extract_string(&attrs, &PROJECT_KEYS),
         api_key_id: extract_string(&attrs, &API_KEY_KEYS),
         user_id: extract_string(&attrs, &USER_KEYS),
         user_name: extract_string(&attrs, &USER_NAME_KEYS),
-        model: extract_string(&attrs, &MODEL_KEYS),
+        model: norm.model.or_else(|| extract_string(&attrs, &MODEL_KEYS)),
         azp: extract_string(&attrs, &AZP_KEYS),
         operation: derive_operation(&attrs),
         billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
         metric_name,
         usage_value,
         total_cost,
-        latency_ms: extract_latency_ms(&attrs),
+        latency_ms: norm.latency_ms.or_else(|| extract_latency_ms(&attrs)),
         request_count: count.max(1),
-        prompt_tokens: extract_i64(&attrs, &PROMPT_TOKENS_KEYS),
-        completion_tokens: extract_i64(&attrs, &COMPLETION_TOKENS_KEYS),
-        total_tokens: extract_i64(&attrs, &TOTAL_TOKENS_KEYS),
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
         attributes: Value::Object(attrs.into_iter().collect()),
     }
 }
@@ -765,31 +906,60 @@ fn summary_data_point_to_event(
     metric_attrs: &HashMap<String, Value>,
     metric_name: Option<String>,
     point: SummaryDataPoint,
+    source: &str,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    let normalizer = crate::normalizer::REGISTRY.get(source);
+
     let count = u64_to_i64(point.count);
-    let total_cost = extract_f64(&attrs, &COST_KEYS);
+
+    let span_meta = crate::normalizer::SpanMeta {
+        trace_id: None,
+        span_id: None,
+        start_time_unix_nano: point.start_time_unix_nano,
+        end_time_unix_nano: point.time_unix_nano,
+        name: metric_name.clone().unwrap_or_default(),
+    };
+    let norm = normalizer
+        .map(|f| f(&attrs, &span_meta))
+        .unwrap_or_default();
+
+    let total_cost = norm
+        .cost_micros
+        .map(|c| c as f64 / 1_000_000.0)
+        .or_else(|| extract_f64(&attrs, &COST_KEYS));
+    let prompt_tokens = norm
+        .prompt_tokens
+        .or_else(|| extract_i64(&attrs, &PROMPT_TOKENS_KEYS));
+    let completion_tokens = norm
+        .completion_tokens
+        .or_else(|| extract_i64(&attrs, &COMPLETION_TOKENS_KEYS));
+    let total_tokens = norm
+        .total_tokens
+        .or_else(|| extract_i64(&attrs, &TOTAL_TOKENS_KEYS))
+        .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
 
     UsageEvent {
         observed_at: nanos_to_datetime(point.time_unix_nano),
         signal_type: "metric".to_string(),
+        source: Some(source.to_string()),
         account_id: extract_string(&attrs, &ACCOUNT_KEYS),
         project_id: extract_string(&attrs, &PROJECT_KEYS),
         api_key_id: extract_string(&attrs, &API_KEY_KEYS),
         user_id: extract_string(&attrs, &USER_KEYS),
         user_name: extract_string(&attrs, &USER_NAME_KEYS),
-        model: extract_string(&attrs, &MODEL_KEYS),
+        model: norm.model.or_else(|| extract_string(&attrs, &MODEL_KEYS)),
         azp: extract_string(&attrs, &AZP_KEYS),
         operation: derive_operation(&attrs),
         billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
         metric_name,
         total_cost,
-        latency_ms: extract_latency_ms(&attrs),
+        latency_ms: norm.latency_ms.or_else(|| extract_latency_ms(&attrs)),
         usage_value: point.sum,
         request_count: count.max(1),
-        prompt_tokens: extract_i64(&attrs, &PROMPT_TOKENS_KEYS),
-        completion_tokens: extract_i64(&attrs, &COMPLETION_TOKENS_KEYS),
-        total_tokens: extract_i64(&attrs, &TOTAL_TOKENS_KEYS),
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
         attributes: Value::Object(attrs.into_iter().collect()),
     }
 }
@@ -1039,7 +1209,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload);
+        let events = extract_trace_events(payload, "eaig");
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1156,7 +1326,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload);
+        let events = extract_metric_events(payload, "eaig");
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1277,7 +1447,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(payload);
+        let events = extract_log_events(payload, "eaig");
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1383,7 +1553,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(payload);
+        let events = extract_log_events(payload, "eaig");
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1436,7 +1606,7 @@ mod tests {
         }))
         .expect("valid log payload");
 
-        let events = extract_log_events(payload);
+        let events = extract_log_events(payload, "eaig");
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1485,7 +1655,7 @@ mod tests {
         request.encode(&mut encoded).expect("should encode");
 
         let decoded = ExportLogsServiceRequest::decode(encoded.as_slice()).expect("should decode");
-        let events = extract_log_events(decoded);
+        let events = extract_log_events(decoded, "eaig");
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1667,7 +1837,7 @@ mod tests {
         }))
         .expect("valid log payload");
 
-        let events = extract_log_events(payload);
+        let events = extract_log_events(payload, "eaig");
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1715,7 +1885,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let trace_events = extract_trace_events(traces);
+        let trace_events = extract_trace_events(traces, "eaig");
         assert_eq!(trace_events.len(), 1);
         assert_eq!(trace_events[0].azp.as_deref(), Some("cli"));
         assert_eq!(trace_events[0].billing_plan.as_deref(), Some("free"));
@@ -1751,7 +1921,7 @@ mod tests {
         }))
         .expect("valid metric payload");
 
-        let metric_events = extract_metric_events(metrics);
+        let metric_events = extract_metric_events(metrics, "eaig");
         assert_eq!(metric_events.len(), 1);
         assert_eq!(metric_events[0].azp.as_deref(), Some("batch-job"));
         assert_eq!(metric_events[0].billing_plan.as_deref(), Some("enterprise"));
@@ -1760,9 +1930,10 @@ mod tests {
 
     fn base_usage_event() -> UsageEvent {
         UsageEvent {
-            observed_at: Utc::now(),
+            observed_at: nanos_to_datetime(1_600_000_000_000_000_000),
             latency_ms: None,
-            signal_type: "trace".to_string(),
+            signal_type: "log".to_string(),
+            source: Some("eaig".to_string()),
             account_id: None,
             project_id: None,
             api_key_id: None,
@@ -1804,7 +1975,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload);
+        let events = extract_trace_events(payload, "eaig");
 
         assert_eq!(events.len(), 1);
         assert_eq!(
@@ -1836,7 +2007,7 @@ mod tests {
         }))
         .expect("valid log payload");
 
-        let events = extract_log_events(payload);
+        let events = extract_log_events(payload, "eaig");
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1874,7 +2045,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload);
+        let events = extract_metric_events(payload, "eaig");
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].usage_value, 3.5);
@@ -1911,7 +2082,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload);
+        let events = extract_metric_events(payload, "eaig");
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1949,7 +2120,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload);
+        let events = extract_metric_events(payload, "eaig");
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1984,7 +2155,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload);
+        let events = extract_metric_events(payload, "eaig");
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2010,7 +2181,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload);
+        let events = extract_metric_events(payload, "eaig");
 
         assert!(events.is_empty());
     }
@@ -2463,7 +2634,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload);
+        let events = extract_trace_events(payload, "eaig");
 
         assert_eq!(events[0].latency_ms, Some(412.0));
     }
@@ -2488,7 +2659,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload);
+        let events = extract_trace_events(payload, "eaig");
 
         assert_eq!(events[0].latency_ms, Some(412.0));
     }
@@ -2512,7 +2683,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload);
+        let events = extract_trace_events(payload, "eaig");
 
         assert_eq!(events[0].latency_ms, Some(51_042.0));
     }
@@ -2539,7 +2710,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(request);
+        let events = extract_log_events(request, "eaig");
 
         assert_eq!(events[0].latency_ms, Some(51_042.0));
     }
@@ -2563,7 +2734,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(request);
+        let events = extract_log_events(request, "eaig");
 
         assert_eq!(events[0].latency_ms, Some(50_011.0));
     }
@@ -2587,7 +2758,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(request);
+        let events = extract_log_events(request, "eaig");
 
         assert_eq!(events[0].latency_ms, None);
     }
@@ -2663,6 +2834,7 @@ mod tests {
             &HashMap::new(),
             Some("gen_ai.server.request.duration".to_string()),
             point,
+            "eaig",
         );
 
         assert_eq!(event.latency_ms, None);
@@ -2681,6 +2853,7 @@ mod tests {
             &HashMap::new(),
             Some("gen_ai.server.request.duration".to_string()),
             point,
+            "eaig",
         );
 
         assert_eq!(event.latency_ms, None);
@@ -2698,6 +2871,7 @@ mod tests {
             &HashMap::new(),
             Some("gen_ai.server.request.duration".to_string()),
             point,
+            "eaig",
         );
 
         assert_eq!(event.latency_ms, Some(412.0));
