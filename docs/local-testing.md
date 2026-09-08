@@ -367,7 +367,43 @@ Both surface as an inline "unwired"/offline status line, never a fake zero — t
 does **not** produce usage/budget charts either, for the same "no query client" reason — there is
 nothing in that repo today for wiremock to stand in for on that surface.
 
-## 7. Automated suites
+## 7. Seeding usage data
+
+`usage_events` is empty on a fresh stack, so even a correctly wired chart renders nothing. Seed it
+with realistic multi-day, multi-project data (lightbridge-authz#528):
+
+```bash
+just seed-usage
+```
+
+This brings up `timescaledb` + `authz-usage-migrate` + `authz-usage`, then runs
+`scripts/seed-usage-events.py`, which:
+
+- **Truncates `usage_events` first** — re-running never doubles figures (idempotent).
+- **Drives the real OTLP ingest endpoint** (`POST /v1/otel/traces`), so seeding exercises the true
+  extraction + validation + insert write path, not a direct row insert.
+- **Spreads data over 14 days** (configurable via `--days`) so every bucket interval the query API
+  supports (seconds/minutes/hours/days) has data.
+- **Covers 3 projects, 2 accounts, 2 users, 2 API keys, and 5 models** so `group_by` is exercised.
+- **Uses production-semantics magnitudes**: token counts in the hundreds-to-thousands, costs in
+  micro-USD (the gateway's `llm_custom_total_cost` unit — `spend_units.rs`, #488; the console
+  divides by 1e6 for display, so dollars in the column would render as 10^-6 dollars), latency in
+  milliseconds.
+
+The script takes optional flags:
+
+```bash
+python3 scripts/seed-usage-events.py --ingest-url https://localhost:13002 --days 7
+```
+
+Requires `psycopg2` (`pip install psycopg2-binary`) for the truncate step.
+
+The automated proof that seeding + querying round-trips correctly is
+`seed_it_tests` (`crates/lightbridge-authz-usage/tests/seed_it_tests.rs`), which drives the real
+ingest handler with a deterministic dataset and asserts the query API returns totals equal to what
+was seeded. It runs as part of `just it-tests` and in CI (`.github/actions/tests/action.yml`).
+
+## 8. Automated suites
 
 From `justfile`:
 
@@ -422,7 +458,7 @@ machine's memory"):
 CARGO_BUILD_JOBS=4 cargo check --all-targets
 ```
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
