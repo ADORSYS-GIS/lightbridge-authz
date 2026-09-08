@@ -3,7 +3,7 @@ use crate::models::{UsageErrorResponse, UsageQueryRequest, UsageQueryResponse, U
 use axum::{
     Json,
     extract::State,
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use chrono::Utc;
@@ -11,48 +11,9 @@ use lightbridge_authz_core::{Error, Permission, Result};
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
-/// Extracts a bearer token from `Authorization: Bearer <token>` (case-insensitive on `Bearer`,
-/// mirroring `lightbridge_authz_rest::middleware::bearer_auth`'s own extraction so the two
-/// services parse the same header shape identically). `None` for a missing header, an empty
-/// value, or a value that is not a `Bearer` credential.
-fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
-    let value = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())?
-        .trim();
-    if value.is_empty() {
-        return None;
-    }
-    let lower = value.to_ascii_lowercase();
-    if !lower.starts_with("bearer ") {
-        return None;
-    }
-    let token = value[7..].trim();
-    if token.is_empty() {
-        return None;
-    }
-    Some(token.to_string())
-}
-
-/// `401` with a `WWW-Authenticate: Bearer` challenge, exactly as `bearer_auth` middleware on the
-/// authz-api side responds. Deliberately opaque -- no distinction between "missing header" and
-/// "token failed validation" is surfaced.
-fn unauthorized() -> Response {
-    let mut response = (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
-    response
-        .headers_mut()
-        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-    response
-}
-
-/// `403` with a deliberately opaque body (#570's acceptance criteria) -- unlike
-/// `handlers::idp::authorize_usage_scope`'s uniform-`404` convention on the authz-opa side (which
-/// exists to avoid leaking whether a `scope_id` exists at all), this endpoint's caller already
-/// knows exactly which scope/scope_id they asked for, so there is no oracle to protect; `403` is
-/// the correct, standard "authenticated but not authorized" status here, not a borrowed 404.
-fn forbidden() -> Response {
-    (StatusCode::FORBIDDEN, "Forbidden").into_response()
-}
+// The bearer-token extraction and auth-failure helpers live in `handlers::auth` (split out by the
+// LoC gate); re-export them here so `query.rs`'s existing callers and public surface are unchanged.
+pub use crate::handlers::auth::{extract_bearer_token, forbidden, unauthorized};
 
 #[utoipa::path(
     post,
@@ -237,17 +198,26 @@ pub async fn query_usage(
     // dropped data", so OR in a range-truncation flag rather than report `truncated: false` for a
     // range the API cannot answer.
     //
+    // P2: the flag must reflect what the retention job actually did, not the config value alone.
+    // `state.raw_days` is `None` when the job is disabled (`retention.enabled: false`) -- nothing
+    // is ever purged, so `usage_events` holds everything ingested and no range is truncated by
+    // retention; stamping `truncated: true` on a complete answer would disclaim whole data during
+    // a billing dispute. Only when the job is enabled is a range older than the raw window
+    // genuinely truncated.
+    //
     // The retention cutoff is day-truncated (`date_trunc('day', now() - raw_days)` in
     // `retention.rs`), so compare against the same day-truncated instant. Comparing against the
     // un-rounded `now() - raw_days` would report `truncated: true` for a window whose raw data is
     // still fully present whenever `start_time` falls between the day boundary and the un-rounded
     // instant.
-    let cutoff = (Utc::now() - chrono::Duration::days(state.raw_days))
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is a valid time")
-        .and_utc();
-    let range_truncated = input.start_time < cutoff;
+    let range_truncated = state.raw_days.is_some_and(|raw_days| {
+        let cutoff = (Utc::now() - chrono::Duration::days(raw_days))
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is a valid time")
+            .and_utc();
+        input.start_time < cutoff
+    });
     let truncated = truncated || range_truncated;
 
     Ok((

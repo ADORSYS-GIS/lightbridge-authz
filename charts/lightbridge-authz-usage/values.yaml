@@ -91,11 +91,14 @@ config:
     # query failing closed to 403 at request time.
     caBundlePath: "/etc/lightbridge/tls/ca.crt"
   retention:
-    # #549 AC2: retention/rollup for usage_events. The job is ON by default (a destructive DELETE
-    # loop must never be invisible in the rendered config), so these knobs exist to tune it, not
-    # to enable it. `rawDays` MUST be >= 90 (the dashboard's max range); `rollupDays` MUST be >
-    # `rawDays` (otherwise a rolled-up day is deleted in the same transaction that wrote it).
-    enabled: true
+    # #549 AC2: retention/rollup for usage_events. The job is OFF by default: it MOVES rows out of
+    # `usage_events` into `usage_events_daily` and deletes them, which the previous image's
+    # `spend_for_account` cannot read -- so enabling it makes the release non-revertible for aged
+    # data (ADR-0031 expand/contract). Set `enabled: true` to turn the destructive loop on, and
+    # accept that a rollback after it runs silently under-reports spend for aged windows.
+    # `rawDays` MUST be >= 90 (the dashboard's max range); `rollupDays` MUST be > `rawDays`
+    # (otherwise a rolled-up day is deleted in the same transaction that wrote it).
+    enabled: false
     rawDays: 90
     rollupDays: 365
     intervalSeconds: 3600
@@ -326,15 +329,18 @@ configMaps:
           {{- with .Values.config.scopeAuthority.caBundlePath }}
           ca_bundle_path: {{ . | quote }}
           {{- end }}
-        # #549 AC2: retention/rollup for usage_events. Shipped uncommented because the job is ON by
-        # default (a destructive DELETE loop must never be invisible in the rendered config). The
+        # #549 AC2: retention/rollup for usage_events. Shipped uncommented so the knob is visible
+        # in the rendered config. The job is OFF by default (rollback safety -- it moves rows out
+        # of usage_events into usage_events_daily, which the previous image's spend_for_account
+        # cannot read, so enabling it makes the release non-revertible for aged data). The
         # background job rolls raw rows older than raw_days into usage_events_daily and deletes
-        # them, and deletes rolled-up days older than rollup_days, in one transaction. raw_days
+        # them, and deletes rolled-up days older than rollup_days, in one transaction per batch.
+        # raw_days
         # MUST be >= 90 (the dashboard's max range); rollup_days MUST be > raw_days (otherwise a
         # rolled-up day is deleted in the same transaction that wrote it). Override via
         # `.Values.config.retention` (see the `config.retention` block above).
         retention:
-          enabled: {{ .Values.config.retention.enabled | default true }}
+          enabled: {{ .Values.config.retention.enabled | default false }}
           raw_days: {{ .Values.config.retention.rawDays | default 90 }}
           rollup_days: {{ .Values.config.retention.rollupDays | default 365 }}
           interval_seconds: {{ .Values.config.retention.intervalSeconds | default 3600 }}

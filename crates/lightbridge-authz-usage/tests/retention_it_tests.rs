@@ -450,11 +450,19 @@ async fn boundary_day_is_not_partially_rolled_up(pool: PgPool) {
 /// Day bucketing is pinned to UTC: `date_trunc('day', <timestamptz>)` is session-timezone-dependent,
 /// so without the transaction's `SET LOCAL TimeZone = 'UTC'` a non-UTC session would shift the day
 /// boundary. This test sets a non-UTC session and asserts the rollup still buckets by the UTC day.
+///
+/// The session zone is pinned by acquiring ONE connection and running both the `SET TimeZone` and
+/// the rollup on it -- `rollup_and_purge_on` -- so the rollup genuinely runs on a Sao Paulo session
+/// and the test exercises the transaction's `SET LOCAL TimeZone = 'UTC'` rather than passing
+/// vacuously because the pool handed the rollup a different, UTC-default connection.
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn rollup_buckets_by_utc_regardless_of_session_timezone(pool: PgPool) {
-    // Set the session to a non-UTC zone (UTC-3). The pool may hand this connection to the rollup.
+    use lightbridge_authz_usage_rest::retention::rollup_and_purge_on;
+
+    // Acquire one connection and set its session to a non-UTC zone (UTC-3).
+    let mut conn = pool.acquire().await.expect("acquire connection");
     sqlx::query("SET TimeZone = 'America/Sao_Paulo'")
-        .execute(&pool)
+        .execute(&mut *conn)
         .await
         .expect("set session timezone");
     let repo = build_repo(pool.clone());
@@ -471,7 +479,7 @@ async fn rollup_buckets_by_utc_regardless_of_session_timezone(pool: PgPool) {
         .await
         .expect("insert");
 
-    rollup_and_purge(&pool, 90, 365)
+    rollup_and_purge_on(&mut conn, 90, 365)
         .await
         .expect("rollup should run");
 
@@ -492,14 +500,22 @@ async fn rollup_buckets_by_utc_regardless_of_session_timezone(pool: PgPool) {
     );
 }
 
-/// P0-1 regression guard: a backdated row committed by a CONCURRENT ingest while the rollup runs
-/// must never be lost. The rollup+purge is a single statement (DELETE ... RETURNING feeding the
-/// INSERT), so the two share one snapshot: a concurrent row is either rolled up (if visible to the
-/// statement) or stays raw (if committed after) -- never deleted without being rolled up. If the
-/// two were separate statements, a row committed between them would be deleted but not rolled up,
-/// and spend would silently drop. This test asserts total spend is preserved across the race.
+/// Conservation smoke test (NOT a race-window guard): a backdated row committed by a CONCURRENT
+/// ingest while the rollup runs must never be lost -- total spend is preserved whether the row is
+/// rolled up or stays raw.
+///
+/// The rollup+purge is a single statement (DELETE ... RETURNING feeding the INSERT), so the two
+/// share one snapshot: a concurrent row is either rolled up (if visible to the statement) or stays
+/// raw (if committed after) -- never deleted without being rolled up. This test asserts that
+/// conservation property holds.
+///
+/// It is deliberately NOT claimed as a regression guard for the split-statement form. The window
+/// a split form would lose a row in is the gap between the two statements, which is sub-millisecond
+/// and unsynchronised; a fixed sleep cannot target it, so this test would pass on the buggy split
+/// form too. It is a smoke test that the conservation invariant holds under concurrency, not a
+/// proof that the single-statement form is what preserves it.
 #[sqlx::test(migrations = "../../migrations-usage")]
-async fn concurrent_backdated_insert_is_not_lost_by_the_rollup(pool: PgPool) {
+async fn concurrent_backdated_insert_preserves_total_spend(pool: PgPool) {
     let repo = build_repo(pool.clone());
     let now = Utc::now();
     let old_day = (now - Duration::days(100))

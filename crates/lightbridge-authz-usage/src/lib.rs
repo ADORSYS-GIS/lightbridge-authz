@@ -1,8 +1,7 @@
 use axum::{Json, Router, http::StatusCode, routing::get};
-use chrono::{DateTime, Utc};
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait};
 use lightbridge_authz_core::{
-    Error, Result, async_trait,
+    Error, Result,
     build_info::log_build_info,
     config::{Database, Oauth2},
     db::{DbPool, DbPoolTrait, is_database_ready},
@@ -21,12 +20,15 @@ pub mod instrumentation;
 pub mod models;
 pub mod repo;
 pub mod retention;
+pub mod retention_config;
+pub mod rollup_sql;
 pub mod routers;
 pub mod scope_authority;
+pub mod spend;
+pub mod state;
 
 pub use config::{RetentionConfig, ScopeAuthorityConfig, UsageConfig, UsageServer, load_from_path};
-use models::{UsageQueryRequest, UsageSeriesPoint};
-use repo::{StoreRepo, UsageEvent};
+use repo::StoreRepo;
 use scope_authority::{RemoteScopeAuthority, ScopeAuthority};
 
 #[derive(Serialize, Deserialize)]
@@ -46,56 +48,7 @@ struct RootResponse {
 /// end-user bearer token (#570, `handlers::query::query_usage`) -- `bearer`/`scope_authority`
 /// below back that check. `/usage/v1/spend/query` (`handlers::spend::query_spend`) stays exempt
 /// (mTLS-only, no bearer -- it is `authz-budget`'s legitimate cross-account service reader).
-pub struct UsageState {
-    pub repo: Arc<dyn UsageRepoTrait>,
-    /// Validates the end-user bearer token `/usage/v1/usage/query` requires (#570).
-    pub bearer: Arc<dyn BearerTokenServiceTrait>,
-    /// Ownership authority for `/usage/v1/usage/query`'s `account`/`project` scopes (#570).
-    pub scope_authority: Arc<dyn ScopeAuthority>,
-    /// The raw `usage_events` retention window in days (#549). `/usage/v1/usage/query` reads raw
-    /// only (the rollup does not carry latency percentiles), so a request whose `start_time` is
-    /// older than this window silently has no data -- the handler ORs a range-truncation flag into
-    /// `truncated` so the API never reports `truncated: false` for a range it cannot answer (P1-5).
-    pub raw_days: i64,
-}
-
-#[async_trait]
-pub trait UsageRepoTrait: Send + Sync {
-    async fn insert_usage_events(&self, events: &[UsageEvent]) -> Result<usize>;
-    /// Returns `(points, truncated)` -- see `StoreRepo::query_usage`'s doc comment for the #578
-    /// truncation contract `truncated` documents.
-    async fn query_usage(&self, input: &UsageQueryRequest)
-    -> Result<(Vec<UsageSeriesPoint>, bool)>;
-    async fn spend_for_account(
-        &self,
-        account_id: &str,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    ) -> Result<Option<f64>>;
-}
-
-#[async_trait]
-impl UsageRepoTrait for StoreRepo {
-    async fn insert_usage_events(&self, events: &[UsageEvent]) -> Result<usize> {
-        StoreRepo::insert_usage_events(self, events).await
-    }
-
-    async fn query_usage(
-        &self,
-        input: &UsageQueryRequest,
-    ) -> Result<(Vec<UsageSeriesPoint>, bool)> {
-        StoreRepo::query_usage(self, input).await
-    }
-
-    async fn spend_for_account(
-        &self,
-        account_id: &str,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    ) -> Result<Option<f64>> {
-        StoreRepo::spend_for_account(self, account_id, start, end).await
-    }
-}
+pub use crate::state::{UsageRepoTrait, UsageState};
 
 /// Service names reported by `GET /version` and the `service.build` startup log line (#573).
 ///
@@ -222,7 +175,7 @@ pub async fn start_usage_server(
         repo,
         bearer,
         scope_authority,
-        raw_days: retention.raw_days,
+        raw_days: retention.enabled.then_some(retention.raw_days),
     });
 
     // #549 AC2: the retention/rollup background job. It owns its own `PgPool` clone (the shared

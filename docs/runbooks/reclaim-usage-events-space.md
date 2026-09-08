@@ -82,3 +82,15 @@ SELECT SUM(total_cost) FROM usage_events WHERE account_id = '<an-active-account>
 - The `usage_events_daily` rollup table is small and does not need this treatment.
 - This is a one-off; going forward the retention job (#549 AC2) keeps the raw table bounded, so
   this runbook should not need to be repeated on a schedule.
+
+## Enabling the retention job makes the release non-revertible
+
+The retention/rollup job is **off by default** (`retention.enabled: false`). Turning it on is an
+explicit opt-in with a real cost: the job **moves** rows out of `usage_events` into
+`usage_events_daily` and deletes them, and the previous image's `spend_for_account` reads
+`usage_events` only (the `UNION ALL` rollup arm exists only in the binary that ships the job). So
+once a run commits, rolling the image back silently under-reports spend for every aged window --
+the permissive direction for `authz-budget`'s refill and remaining-balance decisions. Per
+ADR-0031's expand/contract rule, only enable it when you accept that the release is no longer
+revertible for aged data (a `git revert` of the image-updater commit restores the binary, not the
+rows).
