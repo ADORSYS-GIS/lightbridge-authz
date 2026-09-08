@@ -18,6 +18,18 @@
 --     that bijection (a drifted timestamp would miss the conflict target and collide on the
 --     span-derived id), so it is left out; the hypertable partition-column-in-key rule
 --     (ADR-0028 D22) is deferred with the Timescale work below.
+--   * `duration_ms` and `raw_schema_version` are NULLABLE because OTLP exports child spans
+--     (model/tool calls) BEFORE the parent execution span -- a child ends before its parent,
+--     and BatchSpanProcessor flushes every ~5s, so for any run longer than one flush the
+--     children arrive in an earlier export than the execution that parents them. Ingest
+--     therefore mints a STUB `usage_executions` row (id derived from the child's
+--     `parent_span_id`, `duration_ms`/`raw_schema_version` NULL) on first sight of any child,
+--     in the SAME transaction as the child, so the NOT NULL `execution_id` FK on the child
+--     tables is satisfiable. The real execution span later fills the stub via the upsert
+--     (`ON CONFLICT DO UPDATE`). A stub whose execution never ends (agent killed mid-run) is
+--     honest: the children are kept, the execution is recorded as never-completed. The
+--     `execution_id` FK is `DEFERRABLE INITIALLY DEFERRED` so parent and children may be
+--     inserted in any order within one transaction.
 --
 -- ADR-0038 persistence exception, same class as `secret_claims`: a grain-partitioned
 -- time-series with CAS/upsert (ON CONFLICT) semantics that generated CRUD cannot express.
@@ -36,7 +48,10 @@ CREATE TABLE usage_executions (
     trace_id TEXT NOT NULL,
     span_id TEXT NOT NULL,
     identity_id TEXT REFERENCES usage_identities (id),
-    duration_ms BIGINT NOT NULL,
+    -- NULL = a stub execution (created on first sight of a child, before the real execution
+    -- span arrives); the real span fills it via the upsert. A completed execution always has
+    -- a duration.
+    duration_ms BIGINT,
     -- NULL = cost unknown (no pricing row, or unknown token counts). Unknown is honest: a
     -- zero would read as "free" on a dashboard, so unknown is written as NULL, never 0. A
     -- genuine 0 (a run that truly cost nothing) is a legitimate value and is storable -- the
@@ -44,7 +59,8 @@ CREATE TABLE usage_executions (
     -- (the donor ships no CHECK for the same reason).
     estimated_cost_micro_usd BIGINT,
     raw_backend TEXT,
-    raw_schema_version BIGINT NOT NULL,
+    -- NULL = a stub execution (see duration_ms); the real execution span fills it.
+    raw_schema_version BIGINT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (trace_id, span_id)
@@ -54,3 +70,8 @@ CREATE TABLE usage_executions (
 -- grain: joining an execution to its identity. (trace_id, span_id) is covered by the UNIQUE
 -- constraint above.
 CREATE INDEX idx_usage_executions_identity_id ON usage_executions (identity_id);
+
+-- The grain is a time-series; its defining access pattern is a time-range read
+-- (`WHERE observed_at >= ... AND observed_at < ...`). Index the time column so those reads do
+-- not seq-scan as the (unbounded, see the TIMESCALE DEVIATION note) table grows.
+CREATE INDEX idx_usage_executions_observed_at ON usage_executions (observed_at);

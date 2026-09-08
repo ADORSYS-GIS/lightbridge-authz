@@ -40,3 +40,7 @@ CREATE TABLE usage_tool_calls (
 -- grain: joining tool calls to their parent execution. (trace_id, span_id) is covered by the
 -- UNIQUE constraint above.
 CREATE INDEX idx_usage_tool_calls_execution_id ON usage_tool_calls (execution_id);
+
+-- The grain is a time-series; index the time column for time-range reads (see the note in
+-- `20260907000002_usage_executions.sql`).
+CREATE INDEX idx_usage_tool_calls_observed_at ON usage_tool_calls (observed_at);

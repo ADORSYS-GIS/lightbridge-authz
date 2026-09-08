@@ -10,6 +10,11 @@
 //!   * idempotent replay -- replaying the same batch (same `trace_id`, `span_id`) changes no
 //!     counts (AC #4), while a later priced cost fills a NULL (the
 //!     `ON CONFLICT DO UPDATE ... COALESCE` correction path);
+//!   * a later report CORRECTS a wrong non-NULL cost and token count (the upsert updates the
+//!     mutable fields, not just NULLs);
+//!   * child-before-parent -- OTLP exports children before their parent, so ingest mints a
+//!     stub `usage_executions` row (NULL `duration_ms`/`raw_schema_version`) on first sight of
+//!     a child; the real execution span later fills the stub via the upsert;
 //!   * NULL-cost round-trip -- a NULL money column survives a write/read as NULL, and a
 //!     genuine 0 (a truly free run) is storable and distinct from NULL (AC #3);
 //!   * `usage_identities` mint/dedup and single-UPDATE erasure (ADR-0028 D7).
@@ -38,7 +43,13 @@ async fn insert_execution(
             (id, observed_at, source, provider, trace_id, span_id, identity_id, duration_ms, raw_schema_version, estimated_cost_micro_usd)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (trace_id, span_id) DO UPDATE SET
-            estimated_cost_micro_usd = COALESCE(EXCLUDED.estimated_cost_micro_usd, usage_executions.estimated_cost_micro_usd)
+            observed_at = EXCLUDED.observed_at,
+            provider = EXCLUDED.provider,
+            duration_ms = COALESCE(EXCLUDED.duration_ms, usage_executions.duration_ms),
+            raw_backend = COALESCE(EXCLUDED.raw_backend, usage_executions.raw_backend),
+            raw_schema_version = COALESCE(EXCLUDED.raw_schema_version, usage_executions.raw_schema_version),
+            estimated_cost_micro_usd = COALESCE(EXCLUDED.estimated_cost_micro_usd, usage_executions.estimated_cost_micro_usd),
+            updated_at = now()
         "#,
     )
     .bind(format!("exec_{span_id}"))
@@ -56,6 +67,38 @@ async fn insert_execution(
     Ok(())
 }
 
+// A stub execution: minted by ingest on first sight of a child span, before the real execution
+// span arrives (OTLP exports children before their parent). `duration_ms`/`raw_schema_version`
+// are NULL because a stub has neither; the real execution span fills them via the upsert.
+async fn insert_execution_stub(
+    pool: &PgPool,
+    observed_at: chrono::DateTime<Utc>,
+    trace_id: &str,
+    span_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO usage_executions
+            (id, observed_at, source, provider, trace_id, span_id, duration_ms, raw_schema_version)
+        VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL)
+        ON CONFLICT (trace_id, span_id) DO NOTHING
+        "#,
+    )
+    .bind(format!("exec_{span_id}"))
+    .bind(observed_at)
+    .bind(SOURCE)
+    .bind("anthropic")
+    .bind(trace_id)
+    .bind(span_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test helper binding the fixed set of usage_model_calls columns"
+)]
 async fn insert_model_call(
     pool: &PgPool,
     observed_at: chrono::DateTime<Utc>,
@@ -63,6 +106,8 @@ async fn insert_model_call(
     child_span_id: &str,
     execution_id: &str,
     model: &str,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
     cost: Option<i64>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -71,7 +116,10 @@ async fn insert_model_call(
             (id, observed_at, source, execution_id, trace_id, span_id, model, input_tokens, output_tokens, cost_micro_usd)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (trace_id, span_id) DO UPDATE SET
-            cost_micro_usd = COALESCE(EXCLUDED.cost_micro_usd, usage_model_calls.cost_micro_usd)
+            input_tokens = COALESCE(EXCLUDED.input_tokens, usage_model_calls.input_tokens),
+            output_tokens = COALESCE(EXCLUDED.output_tokens, usage_model_calls.output_tokens),
+            cost_micro_usd = COALESCE(EXCLUDED.cost_micro_usd, usage_model_calls.cost_micro_usd),
+            updated_at = now()
         "#,
     )
     .bind(format!("{child_span_id}:mc"))
@@ -81,8 +129,8 @@ async fn insert_model_call(
     .bind(trace_id)
     .bind(child_span_id)
     .bind(model)
-    .bind(1200i64)
-    .bind(400i64)
+    .bind(input_tokens)
+    .bind(output_tokens)
     .bind(cost)
     .execute(pool)
     .await?;
@@ -158,6 +206,8 @@ async fn one_execution_can_carry_multiple_model_and_tool_calls(pool: PgPool) {
         "span-mc-1",
         &exec_id,
         "claude-sonnet-4-5",
+        Some(1200),
+        Some(400),
         Some(1000),
     )
     .await
@@ -169,6 +219,8 @@ async fn one_execution_can_carry_multiple_model_and_tool_calls(pool: PgPool) {
         "span-mc-2",
         &exec_id,
         "claude-opus-4-1",
+        Some(1200),
+        Some(400),
         Some(2000),
     )
     .await
@@ -204,6 +256,8 @@ async fn replaying_the_same_batch_twice_changes_no_counts(pool: PgPool) {
         "span-replay-1-mc",
         &exec_id,
         "claude-sonnet-4-5",
+        Some(1200),
+        Some(400),
         Some(1000),
     )
     .await
@@ -235,6 +289,8 @@ async fn replaying_the_same_batch_twice_changes_no_counts(pool: PgPool) {
         "span-replay-1-mc",
         &exec_id,
         "claude-sonnet-4-5",
+        Some(1200),
+        Some(400),
         Some(1000),
     )
     .await
@@ -294,6 +350,74 @@ async fn replay_with_drifted_observed_at_is_still_absorbed(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations-usage")]
+async fn child_can_be_inserted_before_its_parent_execution(pool: PgPool) {
+    // OTLP exports child spans before the parent execution span (a child ends before its
+    // parent, and BatchSpanProcessor flushes every ~5s). Ingest mints a STUB usage_executions
+    // row (id from the child's parent_span_id, duration_ms/raw_schema_version NULL) on first
+    // sight of a child, in the same transaction, so the NOT NULL execution_id FK is
+    // satisfiable. The real execution span later fills the stub via the upsert.
+    let observed_at = Utc::now() - Duration::minutes(5);
+    let trace_id = "trace-child-first";
+    let exec_span = "span-child-first-exec";
+    let exec_id = format!("exec_{exec_span}");
+
+    // Child arrives first: ingest creates the stub execution, then the model call.
+    insert_execution_stub(&pool, observed_at, trace_id, exec_span)
+        .await
+        .expect("stub execution on first sight of a child");
+    insert_model_call(
+        &pool,
+        observed_at,
+        trace_id,
+        "span-child-first-mc",
+        &exec_id,
+        "claude-sonnet-4-5",
+        Some(1200),
+        Some(400),
+        Some(1000),
+    )
+    .await
+    .expect("model call referencing the stub execution");
+
+    // The stub has no duration or schema version yet.
+    let stub_duration: Option<i64> = sqlx::query_scalar(
+        "SELECT duration_ms FROM usage_executions WHERE trace_id = $1 AND span_id = $2",
+    )
+    .bind(trace_id)
+    .bind(exec_span)
+    .fetch_one(&pool)
+    .await
+    .expect("read stub duration");
+    assert_eq!(stub_duration, None, "a stub execution has no duration yet");
+
+    // The real execution span arrives later and fills the stub via the upsert.
+    insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(5000))
+        .await
+        .expect("real execution fills the stub");
+
+    let filled_duration: Option<i64> = sqlx::query_scalar(
+        "SELECT duration_ms FROM usage_executions WHERE trace_id = $1 AND span_id = $2",
+    )
+    .bind(trace_id)
+    .bind(exec_span)
+    .fetch_one(&pool)
+    .await
+    .expect("read filled duration");
+    assert_eq!(
+        filled_duration,
+        Some(1200),
+        "the real execution must fill the stub's duration"
+    );
+
+    assert_eq!(
+        count_executions(&pool).await,
+        1,
+        "stub + real execution must be one row"
+    );
+    assert_eq!(count_model_calls(&pool).await, 1);
+}
+
+#[sqlx::test(migrations = "../../migrations-usage")]
 async fn null_cost_survives_round_trip_as_unknown_never_zero(pool: PgPool) {
     let observed_at = Utc::now() - Duration::minutes(5);
     let trace_id = "trace-null-cost";
@@ -310,6 +434,8 @@ async fn null_cost_survives_round_trip_as_unknown_never_zero(pool: PgPool) {
         "span-null-cost-mc",
         &exec_id,
         "claude-sonnet-4-5",
+        Some(1200),
+        Some(400),
         None,
     )
     .await
@@ -403,6 +529,8 @@ async fn later_priced_cost_fills_a_null_on_replay(pool: PgPool) {
         "span-correction-mc",
         &exec_id,
         "claude-sonnet-4-5",
+        Some(1200),
+        Some(400),
         None,
     )
     .await
@@ -419,6 +547,8 @@ async fn later_priced_cost_fills_a_null_on_replay(pool: PgPool) {
         "span-correction-mc",
         &exec_id,
         "claude-sonnet-4-5",
+        Some(1200),
+        Some(400),
         Some(3333),
     )
     .await
@@ -451,6 +581,90 @@ async fn later_priced_cost_fills_a_null_on_replay(pool: PgPool) {
         mc_cost,
         Some(3333),
         "a later priced cost must fill a NULL model-call cost"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn later_report_corrects_a_non_null_cost_and_tokens(pool: PgPool) {
+    // A later report must be able to CORRECT a wrong non-NULL cost and token count, not just
+    // fill a NULL. The upsert updates the mutable fields (COALESCE: a non-NULL EXCLUDED value
+    // wins; a NULL EXCLUDED value preserves the existing one, so a partial replay never wipes
+    // a priced cost).
+    let observed_at = Utc::now() - Duration::minutes(5);
+    let trace_id = "trace-correct-fields";
+    let exec_span = "span-correct-fields";
+    let exec_id = format!("exec_{exec_span}");
+
+    // First report: a wrong (too-low) cost and partial token count.
+    insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(1000))
+        .await
+        .expect("first execution report");
+    insert_model_call(
+        &pool,
+        observed_at,
+        trace_id,
+        "span-correct-mc",
+        &exec_id,
+        "claude-sonnet-4-5",
+        Some(100),
+        Some(50),
+        Some(500),
+    )
+    .await
+    .expect("first model-call report");
+
+    // Later report: the corrected cost and full token count arrive.
+    insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(2000))
+        .await
+        .expect("corrected execution report");
+    insert_model_call(
+        &pool,
+        observed_at,
+        trace_id,
+        "span-correct-mc",
+        &exec_id,
+        "claude-sonnet-4-5",
+        Some(200),
+        Some(100),
+        Some(900),
+    )
+    .await
+    .expect("corrected model-call report");
+
+    let exec_cost: Option<i64> = sqlx::query_scalar(
+        "SELECT estimated_cost_micro_usd FROM usage_executions WHERE trace_id = $1",
+    )
+    .bind(trace_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read corrected execution cost");
+    assert_eq!(
+        exec_cost,
+        Some(2000),
+        "a later priced cost must correct a non-NULL execution cost"
+    );
+
+    let (mc_cost, mc_in, mc_out): (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT cost_micro_usd, input_tokens, output_tokens FROM usage_model_calls WHERE trace_id = $1",
+    )
+    .bind(trace_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read corrected model-call fields");
+    assert_eq!(
+        mc_cost,
+        Some(900),
+        "a later priced cost must correct a non-NULL model-call cost"
+    );
+    assert_eq!(
+        mc_in,
+        Some(200),
+        "a later report must correct the input token count"
+    );
+    assert_eq!(
+        mc_out,
+        Some(100),
+        "a later report must correct the output token count"
     );
 }
 

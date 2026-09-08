@@ -47,3 +47,7 @@ CREATE TABLE usage_model_calls (
 -- grain: joining model calls to their parent execution. (trace_id, span_id) is covered by the
 -- UNIQUE constraint above.
 CREATE INDEX idx_usage_model_calls_execution_id ON usage_model_calls (execution_id);
+
+-- The grain is a time-series; index the time column for time-range reads (see the note in
+-- `20260907000002_usage_executions.sql`).
+CREATE INDEX idx_usage_model_calls_observed_at ON usage_model_calls (observed_at);

@@ -351,10 +351,16 @@ span-derived id, so a redelivery with a drifted timestamp is still absorbed), an
 as nullable `BIGINT` micro-USD (`NULL` = unknown, never `0`; a genuine `0` is storable). `id` is
 the sole primary key (globally unique, so a join on `execution_id` is unambiguous); each
 model/tool call is its own OTLP span with its own `span_id`, so one execution can carry many
-children, and the child `execution_id` FK is deferrable for OTLP's child-before-parent export
-ordering. Identity is a reference into the `usage_identities` side table, not an embedded email
-(ADR-0028 D7). Like `usage_events`, these are plain Postgres tables today — TimescaleDB is not
-deployed on the usage tenant (see the migration headers).
+children, and the child `execution_id` FK is `DEFERRABLE INITIALLY DEFERRED` for OTLP's
+child-before-parent export ordering. Because OTLP exports children before their parent, ingest
+mints a **stub** `usage_executions` row (id derived from the child's `parent_span_id`, with
+`duration_ms`/`raw_schema_version` NULL) on first sight of a child, in the same transaction; the
+real execution span later fills the stub via the upsert — so `duration_ms` and
+`raw_schema_version` are nullable, and a stub whose execution never ends (agent killed mid-run)
+keeps its children while recording the execution as never-completed. Identity is a reference
+into the `usage_identities` side table, not an embedded email (ADR-0028 D7). Like `usage_events`,
+these are plain Postgres tables today — TimescaleDB is not deployed on the usage tenant (see the
+migration headers).
 
 ## Two cross-cutting rules that have each already caused a production bug
 
