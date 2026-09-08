@@ -37,17 +37,6 @@ struct RootResponse {
     message: String,
 }
 
-/// Shared between both listeners `start_usage_server` binds (#347): the unauthenticated ingest
-/// listener (`UsageServerGroup::usage`) and the mTLS-required query listener
-/// (`UsageServerGroup::query`, `/usage/v1/usage/query` + `/usage/v1/spend/query`).
-///
-/// The ingest listener carries no auth gate of its own beyond the ClusterIP-only mitigation
-/// (`AGENTS.md`'s Security Notes) -- it never reads `bearer`/`scope_authority`. The query
-/// listener's mTLS requirement is enforced at the TLS layer (`Tls::client_ca_bundle_path`) before
-/// any handler here runs, but `/usage/v1/usage/query` additionally requires and validates an
-/// end-user bearer token (#570, `handlers::query::query_usage`) -- `bearer`/`scope_authority`
-/// below back that check. `/usage/v1/spend/query` (`handlers::spend::query_spend`) stays exempt
-/// (mTLS-only, no bearer -- it is `authz-budget`'s legitimate cross-account service reader).
 pub use crate::state::{UsageRepoTrait, UsageState};
 
 /// Service names reported by `GET /version` and the `service.build` startup log line (#573).
