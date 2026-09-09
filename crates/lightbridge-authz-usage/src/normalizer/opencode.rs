@@ -1,9 +1,11 @@
+use std::collections::HashMap;
+
+use serde_json::Value;
+
 use super::{
     NormalizedRecord, SpanMeta, combine_token_total, extract_f64, extract_i64, extract_string,
     usd_to_micros,
 };
-use serde_json::Value;
-use std::collections::HashMap;
 
 pub const OPENCODE_MODEL_KEYS: [&str; 1] = ["gen_ai.request.model"];
 pub const OPENCODE_PROMPT_TOKENS_KEYS: [&str; 1] = ["gen_ai.usage.input_tokens"];
@@ -23,8 +25,17 @@ pub fn normalize(attrs: &HashMap<String, Value>, meta: &SpanMeta) -> NormalizedR
 
     let cost_usd = extract_f64(attrs, &OPENCODE_COST_KEYS).or_else(|| {
         let m = model.as_deref()?;
-        let p_tok = prompt_tokens.unwrap_or(0) as f64;
-        let c_tok = completion_tokens.unwrap_or(0) as f64;
+        // Missing token counts mean "cost unknown", not "cost zero" -- a data point that
+        // carries `model` but not the usage metric (e.g. the `gen_ai.client.operation.duration`
+        // histogram, which OpenCode emits on a separate metric from
+        // `gen_ai.client.token.usage`) must not fall through to `0 * rate = 0.0` and be
+        // reported as a free run. Mirrors the `_ => return None` unknown-model branch below.
+        let (Some(prompt_tokens), Some(completion_tokens)) = (prompt_tokens, completion_tokens)
+        else {
+            return None;
+        };
+        let p_tok = prompt_tokens as f64;
+        let c_tok = completion_tokens as f64;
 
         let (in_cost, out_cost) = match m {
             "meta-llama/llama-3.1-405b-instruct" => (2.75, 2.75),

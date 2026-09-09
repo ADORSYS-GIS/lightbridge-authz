@@ -1,29 +1,29 @@
-use crate::UsageState;
-use crate::models::IngestResponse;
-use crate::repo::UsageEvent;
-use axum::http::header::CONTENT_ENCODING;
+use std::{collections::HashMap, io::Read, sync::Arc};
+
 use axum::{
     Json,
     body::Bytes,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::CONTENT_ENCODING},
 };
 use chrono::{DateTime, Utc};
 use lightbridge_authz_core::{Error, Result};
-use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
-use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
-use opentelemetry_proto::tonic::metrics::v1::{
-    ExponentialHistogramDataPoint, HistogramDataPoint, NumberDataPoint, SummaryDataPoint,
-    metric::Data, number_data_point,
+use opentelemetry_proto::tonic::{
+    collector::{
+        logs::v1::ExportLogsServiceRequest, metrics::v1::ExportMetricsServiceRequest,
+        trace::v1::ExportTraceServiceRequest,
+    },
+    common::v1::{AnyValue, KeyValue, any_value},
+    metrics::v1::{
+        ExponentialHistogramDataPoint, HistogramDataPoint, NumberDataPoint, SummaryDataPoint,
+        metric::Data, number_data_point,
+    },
 };
 use prost::Message;
 use serde_json::{Map, Value, json};
-use std::collections::HashMap;
-use std::io::Read;
-use std::sync::Arc;
 use tracing::{debug, instrument, warn};
+
+use crate::{UsageState, models::IngestResponse, repo::UsageEvent};
 
 const ACCOUNT_KEYS: [&str; 5] = [
     "account_id",
@@ -331,6 +331,15 @@ fn decode_logs_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportLogsSer
     }
 }
 
+/// Bounds how much a single gzip-encoded request may inflate to. This PR extends gzip
+/// decompression from `/v1/otel/logs` (its original, single call site) to traces and metrics
+/// too, tripling the surface for a gzip-bomb: a few KB of compressed input can otherwise expand
+/// to gigabytes with no check before or during inflation. 64 MiB comfortably covers a large
+/// legitimate OTLP batch (this endpoint's payloads are per-export batches, not bulk uploads)
+/// while bounding the worst case; a body that needs more than this is rejected, not silently
+/// truncated.
+const MAX_DECOMPRESSED_BODY_BYTES: u64 = 64 * 1024 * 1024;
+
 fn decode_maybe_gzip(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>> {
     let encoding = headers
         .get(CONTENT_ENCODING)
@@ -345,12 +354,24 @@ fn decode_maybe_gzip(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>> {
         return Ok(body.to_vec());
     }
 
-    let mut decoder = flate2::read::GzDecoder::new(body);
+    // Read one byte past the cap so an oversized body is distinguishable from one that lands
+    // exactly on the limit: `take(N)` never yields more than N bytes, so `out.len() >
+    // MAX_DECOMPRESSED_BODY_BYTES` can only happen by reading N+1 bytes as decoder's
+    // Read::take bound, one wider than the cap itself.
+    let decoder = flate2::read::GzDecoder::new(body);
+    let mut bounded = decoder.take(MAX_DECOMPRESSED_BODY_BYTES + 1);
     let mut out = Vec::new();
-    decoder.read_to_end(&mut out).map_err(|e| {
+    bounded.read_to_end(&mut out).map_err(|e| {
         warn!("invalid gzip body: {e}");
         Error::BadRequest(format!("invalid gzip body: {e}"))
     })?;
+    if out.len() as u64 > MAX_DECOMPRESSED_BODY_BYTES {
+        let message = format!(
+            "gzip body exceeds the {MAX_DECOMPRESSED_BODY_BYTES}-byte decompressed size cap"
+        );
+        warn!("{message}");
+        return Err(Error::BadRequest(message));
+    }
     Ok(out)
 }
 
@@ -457,25 +478,17 @@ fn extract_log_events(payload: ExportLogsServiceRequest, source: &str) -> Vec<Us
                     .map(|f| f(&attrs, &span_meta))
                     .unwrap_or_default();
 
-                let prompt_tokens = norm
-                    .prompt_tokens
-                    .or_else(|| extract_i64(&attrs, &PROMPT_TOKENS_KEYS));
-                let completion_tokens = norm
-                    .completion_tokens
-                    .or_else(|| extract_i64(&attrs, &COMPLETION_TOKENS_KEYS));
-                let total_tokens = norm
-                    .total_tokens
-                    .or_else(|| extract_i64(&attrs, &TOTAL_TOKENS_KEYS))
-                    .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
+                let NormalizedTokensAndCost {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    total_cost,
+                } = merge_norm_tokens_and_cost(&norm, &attrs);
 
                 let usage_value = extract_f64(&attrs, &USAGE_VALUE_KEYS)
                     .or_else(|| total_tokens.map(|v| v as f64))
                     .unwrap_or(1.0);
 
-                let total_cost = norm
-                    .cost_micros
-                    .map(|c| c as f64 / 1_000_000.0)
-                    .or_else(|| extract_f64(&attrs, &COST_KEYS));
                 let latency_ms = norm.latency_ms.or_else(|| extract_latency_ms(&attrs));
 
                 events.push(UsageEvent {
@@ -570,25 +583,16 @@ fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec
                     .map(|f| f(&attrs, &span_meta))
                     .unwrap_or_default();
 
-                let prompt_tokens = norm
-                    .prompt_tokens
-                    .or_else(|| extract_i64(&attrs, &PROMPT_TOKENS_KEYS));
-                let completion_tokens = norm
-                    .completion_tokens
-                    .or_else(|| extract_i64(&attrs, &COMPLETION_TOKENS_KEYS));
-                let total_tokens = norm
-                    .total_tokens
-                    .or_else(|| extract_i64(&attrs, &TOTAL_TOKENS_KEYS))
-                    .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
+                let NormalizedTokensAndCost {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    total_cost,
+                } = merge_norm_tokens_and_cost(&norm, &attrs);
 
                 let usage_value = extract_f64(&attrs, &USAGE_VALUE_KEYS)
                     .or_else(|| total_tokens.map(|v| v as f64))
                     .unwrap_or(1.0);
-
-                let total_cost = norm
-                    .cost_micros
-                    .map(|c| c as f64 / 1_000_000.0)
-                    .or_else(|| extract_f64(&attrs, &COST_KEYS));
 
                 let observed_nanos = if span.end_time_unix_nano > 0 {
                     span.end_time_unix_nano
@@ -733,20 +737,12 @@ fn number_data_point_to_event(
         .map(|f| f(&attrs, &span_meta))
         .unwrap_or_default();
 
-    let total_cost = norm
-        .cost_micros
-        .map(|c| c as f64 / 1_000_000.0)
-        .or_else(|| extract_f64(&attrs, &COST_KEYS));
-    let prompt_tokens = norm
-        .prompt_tokens
-        .or_else(|| extract_i64(&attrs, &PROMPT_TOKENS_KEYS));
-    let completion_tokens = norm
-        .completion_tokens
-        .or_else(|| extract_i64(&attrs, &COMPLETION_TOKENS_KEYS));
-    let total_tokens = norm
-        .total_tokens
-        .or_else(|| extract_i64(&attrs, &TOTAL_TOKENS_KEYS))
-        .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
+    let NormalizedTokensAndCost {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        total_cost,
+    } = merge_norm_tokens_and_cost(&norm, &attrs);
 
     UsageEvent {
         observed_at: nanos_to_datetime(point.time_unix_nano),
@@ -799,20 +795,12 @@ fn histogram_data_point_to_event(
         .map(|f| f(&attrs, &span_meta))
         .unwrap_or_default();
 
-    let total_cost = norm
-        .cost_micros
-        .map(|c| c as f64 / 1_000_000.0)
-        .or_else(|| extract_f64(&attrs, &COST_KEYS));
-    let prompt_tokens = norm
-        .prompt_tokens
-        .or_else(|| extract_i64(&attrs, &PROMPT_TOKENS_KEYS));
-    let completion_tokens = norm
-        .completion_tokens
-        .or_else(|| extract_i64(&attrs, &COMPLETION_TOKENS_KEYS));
-    let total_tokens = norm
-        .total_tokens
-        .or_else(|| extract_i64(&attrs, &TOTAL_TOKENS_KEYS))
-        .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
+    let NormalizedTokensAndCost {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        total_cost,
+    } = merge_norm_tokens_and_cost(&norm, &attrs);
 
     UsageEvent {
         observed_at: nanos_to_datetime(point.time_unix_nano),
@@ -862,20 +850,12 @@ fn exponential_histogram_data_point_to_event(
         .map(|f| f(&attrs, &span_meta))
         .unwrap_or_default();
 
-    let total_cost = norm
-        .cost_micros
-        .map(|c| c as f64 / 1_000_000.0)
-        .or_else(|| extract_f64(&attrs, &COST_KEYS));
-    let prompt_tokens = norm
-        .prompt_tokens
-        .or_else(|| extract_i64(&attrs, &PROMPT_TOKENS_KEYS));
-    let completion_tokens = norm
-        .completion_tokens
-        .or_else(|| extract_i64(&attrs, &COMPLETION_TOKENS_KEYS));
-    let total_tokens = norm
-        .total_tokens
-        .or_else(|| extract_i64(&attrs, &TOTAL_TOKENS_KEYS))
-        .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
+    let NormalizedTokensAndCost {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        total_cost,
+    } = merge_norm_tokens_and_cost(&norm, &attrs);
 
     UsageEvent {
         observed_at: nanos_to_datetime(point.time_unix_nano),
@@ -924,20 +904,12 @@ fn summary_data_point_to_event(
         .map(|f| f(&attrs, &span_meta))
         .unwrap_or_default();
 
-    let total_cost = norm
-        .cost_micros
-        .map(|c| c as f64 / 1_000_000.0)
-        .or_else(|| extract_f64(&attrs, &COST_KEYS));
-    let prompt_tokens = norm
-        .prompt_tokens
-        .or_else(|| extract_i64(&attrs, &PROMPT_TOKENS_KEYS));
-    let completion_tokens = norm
-        .completion_tokens
-        .or_else(|| extract_i64(&attrs, &COMPLETION_TOKENS_KEYS));
-    let total_tokens = norm
-        .total_tokens
-        .or_else(|| extract_i64(&attrs, &TOTAL_TOKENS_KEYS))
-        .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
+    let NormalizedTokensAndCost {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        total_cost,
+    } = merge_norm_tokens_and_cost(&norm, &attrs);
 
     UsageEvent {
         observed_at: nanos_to_datetime(point.time_unix_nano),
@@ -970,6 +942,45 @@ fn combine_token_total(prompt_tokens: Option<i64>, completion_tokens: Option<i64
         (Some(prompt), None) => Some(prompt),
         (None, Some(completion)) => Some(completion),
         (None, None) => None,
+    }
+}
+
+/// The token/cost merge every event-extraction function derives the same way: the normalizer's
+/// value wins when present, falling back to the generic attribute-extraction keys. Shared by
+/// `extract_log_events`, `extract_trace_events`, and all four `*_data_point_to_event` functions
+/// -- this ~10-line block used to be hand-copied six times, which is exactly the shape of drift
+/// risk a fix applied to one call site and not another produces silently.
+struct NormalizedTokensAndCost {
+    prompt_tokens: Option<i64>,
+    completion_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    total_cost: Option<f64>,
+}
+
+fn merge_norm_tokens_and_cost(
+    norm: &crate::normalizer::NormalizedRecord,
+    attrs: &HashMap<String, Value>,
+) -> NormalizedTokensAndCost {
+    let prompt_tokens = norm
+        .prompt_tokens
+        .or_else(|| extract_i64(attrs, &PROMPT_TOKENS_KEYS));
+    let completion_tokens = norm
+        .completion_tokens
+        .or_else(|| extract_i64(attrs, &COMPLETION_TOKENS_KEYS));
+    let total_tokens = norm
+        .total_tokens
+        .or_else(|| extract_i64(attrs, &TOTAL_TOKENS_KEYS))
+        .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
+    let total_cost = norm
+        .cost_micros
+        .map(|c| c as f64 / 1_000_000.0)
+        .or_else(|| extract_f64(attrs, &COST_KEYS));
+
+    NormalizedTokensAndCost {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        total_cost,
     }
 }
 
@@ -1228,13 +1239,14 @@ mod tests {
 
     #[test]
     fn extract_metric_events_should_capture_number_data_points() {
-        use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
-        use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueValue;
-        use opentelemetry_proto::tonic::metrics::v1::{
-            AggregationTemporality, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
-            metric,
+        use opentelemetry_proto::tonic::{
+            common::v1::{InstrumentationScope, any_value::Value as AnyValueValue},
+            metrics::v1::{
+                AggregationTemporality, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+                Sum, metric,
+            },
+            resource::v1::Resource,
         };
-        use opentelemetry_proto::tonic::resource::v1::Resource;
 
         let payload = ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
@@ -1347,12 +1359,11 @@ mod tests {
 
     #[test]
     fn extract_log_events_should_capture_dimensions_and_tokens() {
-        use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
-        use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueValue;
-        use opentelemetry_proto::tonic::logs::v1::{
-            LogRecord, ResourceLogs, ScopeLogs, SeverityNumber,
+        use opentelemetry_proto::tonic::{
+            common::v1::{InstrumentationScope, any_value::Value as AnyValueValue},
+            logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber},
+            resource::v1::Resource,
         };
-        use opentelemetry_proto::tonic::resource::v1::Resource;
 
         let payload = ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
@@ -1468,12 +1479,11 @@ mod tests {
 
     #[test]
     fn extract_log_events_should_read_envoy_ai_gateway_custom_cost() {
-        use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
-        use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueValue;
-        use opentelemetry_proto::tonic::logs::v1::{
-            LogRecord, ResourceLogs, ScopeLogs, SeverityNumber,
+        use opentelemetry_proto::tonic::{
+            common::v1::{InstrumentationScope, any_value::Value as AnyValueValue},
+            logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber},
+            resource::v1::Resource,
         };
-        use opentelemetry_proto::tonic::resource::v1::Resource;
 
         // This test verifies that the cost written by the Envoy AI Gateway extproc
         // (io.envoy.ai_gateway.llm_custom_total_cost) is correctly extracted.
@@ -2436,9 +2446,9 @@ mod tests {
 
     #[test]
     fn decode_maybe_gzip_should_decompress_gzip_encoded_bodies() {
-        use flate2::Compression;
-        use flate2::write::GzEncoder;
         use std::io::Write;
+
+        use flate2::{Compression, write::GzEncoder};
 
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder
@@ -2463,6 +2473,54 @@ mod tests {
             .expect_err("invalid gzip body should be rejected");
 
         assert!(matches!(err, Error::BadRequest(m) if m.contains("invalid gzip body")));
+    }
+
+    #[test]
+    fn decode_maybe_gzip_should_reject_a_body_that_decompresses_past_the_cap() {
+        use std::io::Write;
+
+        use flate2::{Compression, write::GzEncoder};
+
+        // A gzip bomb: highly repetitive input compresses to a tiny payload but inflates far
+        // past MAX_DECOMPRESSED_BODY_BYTES. Sized at cap + 1 MiB so the test is unambiguous
+        // (never depends on the exact boundary byte) while staying fast -- all-zero input
+        // compresses to a few KB regardless of size.
+        let oversized_len = (MAX_DECOMPRESSED_BODY_BYTES + 1024 * 1024) as usize;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder
+            .write_all(&vec![0u8; oversized_len])
+            .expect("write should succeed");
+        let compressed = encoder.finish().expect("gzip encoding should succeed");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+
+        let err = decode_maybe_gzip(&headers, &compressed)
+            .expect_err("a body exceeding the decompressed size cap must be rejected");
+
+        assert!(matches!(err, Error::BadRequest(m) if m.contains("decompressed size cap")));
+    }
+
+    #[test]
+    fn decode_maybe_gzip_should_accept_a_body_at_exactly_the_cap() {
+        use std::io::Write;
+
+        use flate2::{Compression, write::GzEncoder};
+
+        let exact_len = MAX_DECOMPRESSED_BODY_BYTES as usize;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder
+            .write_all(&vec![0u8; exact_len])
+            .expect("write should succeed");
+        let compressed = encoder.finish().expect("gzip encoding should succeed");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+
+        let out = decode_maybe_gzip(&headers, &compressed)
+            .expect("a body exactly at the cap must not be rejected");
+
+        assert_eq!(out.len() as u64, MAX_DECOMPRESSED_BODY_BYTES);
     }
 
     #[test]

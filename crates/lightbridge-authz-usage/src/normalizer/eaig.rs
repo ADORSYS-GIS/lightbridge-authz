@@ -1,10 +1,16 @@
-use super::{
-    NormalizedRecord, SpanMeta, combine_token_total, extract_f64, extract_i64, extract_string,
-    usd_to_micros,
-};
-use serde_json::Value;
 use std::collections::HashMap;
 
+use serde_json::Value;
+
+use super::{
+    NormalizedRecord, SpanMeta, combine_token_total, extract_f64, extract_i64, extract_string,
+};
+
+// This is already micro-USD on the wire (docs/research/2026-08-25-genai-usage-ingestion.md
+// "F1: Cost is off by 1,000,000x" -- the gateway's llm_custom_total_cost CEL emits micro-USD,
+// ai-helm ADR-0051/ADR-0058), NOT dollars. Read it as an integer directly -- do NOT run it
+// through usd_to_micros, which would reproduce F1 by multiplying an already-micro value by
+// 1,000,000 a second time.
 pub const EAIG_COST_KEYS: [&str; 1] = ["io.envoy.ai_gateway.llm_custom_total_cost"];
 pub const EAIG_MODEL_KEYS: [&str; 3] = ["model", "llm.model", "gen_ai.request.model"];
 pub const EAIG_PROMPT_TOKENS_KEYS: [&str; 4] = [
@@ -27,8 +33,7 @@ pub const EAIG_TOTAL_TOKENS_KEYS: [&str; 3] = [
 pub const EAIG_LATENCY_MS_KEYS: [&str; 2] = ["duration", "x-envoy-upstream-service-time"];
 
 pub fn normalize(attrs: &HashMap<String, Value>, meta: &SpanMeta) -> NormalizedRecord {
-    let cost_usd = extract_f64(attrs, &EAIG_COST_KEYS);
-    let cost_micros = cost_usd.and_then(usd_to_micros);
+    let cost_micros = extract_i64(attrs, &EAIG_COST_KEYS);
 
     let prompt_tokens = extract_i64(attrs, &EAIG_PROMPT_TOKENS_KEYS);
     let completion_tokens = extract_i64(attrs, &EAIG_COMPLETION_TOKENS_KEYS);
