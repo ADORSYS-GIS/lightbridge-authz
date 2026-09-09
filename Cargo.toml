@@ -652,16 +652,16 @@ mimalloc = "0"
 # `@@allow`/`@allow` policy evaluation, `LenientCborCodec`/the `undefined`-vs-`null` CBOR
 # normalization, `push_scoped_conditions`, `AuthProvider`/`CachedAuthProvider`, the `rpc_router`/
 # `model_router` signatures, and `/rpc/batch` dispatch -- the RPC-batch-auth seam remains untouched.
-cratestack-core = "=0.11.0"
+cratestack-core = "=0.11.1"
 cratestack-axum = "=0.11.0"
-cratestack-redis = "=0.11.0"
+cratestack-redis = "=0.11.1"
 # Server facade (schema codegen + sqlx/axum runtime). Renamed to `cratestack` because the
 # `include_server_schema!` macro emits `::cratestack::*` paths (see cratestack-pg lib docs). The
 # generated schema module lives in `lightbridge-authz-api`; `lightbridge-authz-rest` also depends on
 # it to build the RPC router (ADR-0003).
 cratestack = { package = "cratestack-pg", version = "=0.11.0" }
-cratestack-codec-cbor = "=0.11.0"
-cratestack-codec-json = "=0.11.0"
+cratestack-codec-cbor = "=0.11.1"
+cratestack-codec-json = "=0.11.1"
 # Direct dep (also pulled in transitively via cratestack-codec-cbor -> minicbor-serde) so
 # `lightbridge-authz-rest::codec::LenientCborCodec` can walk/rewrite CBOR frames at the token
 # level via `minicbor::data::Token`/`minicbor::decode::Tokenizer` (both gated behind the "half"
