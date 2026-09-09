@@ -1104,6 +1104,11 @@ hand-written SQL and direct `sqlx` dependencies.
     `crates/lightbridge-authz-api-key/src/repo.rs`).
   - `lightbridge-authz-usage`: dynamic `QueryBuilder` aggregates against the Timescale-backed
     `usage_events` table (`query_usage` in `crates/lightbridge-authz-usage/src/repo.rs`).
+  - `usage_day_facts` / `usage_seat_snapshots` (#583): same class as `usage_events` — TimescaleDB
+    hypertables with upsert-on-natural-key semantics. Cratestack's generated CRUD cannot express
+    `create_hypertable`, `add_retention_policy`, `add_compression_policy`, or `ON CONFLICT
+    (composite, including partition column) DO UPDATE`. Justified in the migration headers as an
+    ADR-0038 exception per the grain-partitioned time-series + CAS/upsert exception class.
   - `federated_identities`: deliberately ABSENT from `authz.cstack` entirely, not merely
     `@@allow`-less -- it carries the sealed Keycloak token envelope, so a credential-bearing table
     must be unreachable from any generated read path, not just gated behind the coarse-RBAC check
