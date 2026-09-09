@@ -143,8 +143,9 @@ runs:
         CARGO_INCREMENTAL: "0"
 
     # lightbridge-authz-usage-rest's own ephemeral sqlx::test suite (repo_it_tests.rs,
-    # spend_query_it_tests.rs, scope_ownership_it_tests.rs -- #570/#578) against the SAME plain
-    # Postgres container as the step above -- not a dedicated TimescaleDB.
+    # spend_query_it_tests.rs, scope_ownership_it_tests.rs, execution_grain_it_tests.rs --
+    # #570/#578/#582) against the SAME plain Postgres container as the step above -- not a
+    # dedicated TimescaleDB.
     # `migrations-usage/20260829000001_usage_event_latency.sql` is
     # deliberately written to degrade on vanilla Postgres (no Timescale-only functions), and
     # production runs plain Postgres today (#549 Finding 2); a real Timescale image produced an
@@ -156,13 +157,13 @@ runs:
     # the shared `lightbridge_authz` database the step above uses nor with itself across the two
     # binaries.
     #
-    # Test targets are named explicitly (one `--test` flag per binary, run as three SEPARATE
+    # Test targets are named explicitly (one `--test` flag per binary, run as four SEPARATE
     # `cargo test` invocations below) rather than `--tests`, for three reasons: it avoids
     # re-running the 88 non-DB-gated tests in this crate's lib target and `usage_tests.rs` that
     # `cargo test --workspace` already ran above; it makes a broken `--features`/
     # `required-features` wiring a hard `cargo` error (exit 101, "requires the features:
     # `it-tests`") instead of cargo silently matching zero targets; and running each binary as its
-    # own invocation makes the `0 passed` guard PER-BINARY, not aggregated across all three. An
+    # own invocation makes the `0 passed` guard PER-BINARY, not aggregated across all four. An
     # aggregate guard is unsound the moment there are 2+ binaries: one binary silently reporting
     # "0 tests, exit 0" (the residual silent-skip case a hard cargo error can't catch -- an inner
     # `#![cfg(feature = "it-tests")]` guard surviving after `required-features` is removed from
@@ -217,6 +218,24 @@ runs:
         echo "scope_ownership_it_tests passed: ${passed:-0}"
         if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then
           echo "::error::scope_ownership_it_tests reported 0 passed tests -- a skip is not a pass."
+          exit 1
+        fi
+      env:
+        DATABASE_URL: ${{ inputs.database-url }}
+        CARGO_BUILD_JOBS: "2"
+        CARGO_INCREMENTAL: "0"
+
+    - name: Run it-tests (usage) - execution_grain_it_tests
+      shell: bash
+      run: |
+        set -euo pipefail
+        log_file="$(mktemp)"
+        cargo test -p lightbridge-authz-usage-rest --features it-tests \
+          --test execution_grain_it_tests 2>&1 | tee "${log_file}"
+        passed=$(grep -oE '[0-9]+ passed' "${log_file}" | grep -oE '^[0-9]+' | tail -1 || true)
+        echo "execution_grain_it_tests passed: ${passed:-0}"
+        if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then
+          echo "::error::execution_grain_it_tests reported 0 passed tests -- a skip is not a pass."
           exit 1
         fi
       env:

@@ -342,6 +342,28 @@ format each column holds. The budget domain reads spend directly from this table
 (`crates/lightbridge-authz-budget/src/spend.rs`); see `budget.md`'s "spend dependency" section for
 what happens when this database is unavailable or unconfigured.
 
+The execution grain (#582) adds three further tables to the same usage database —
+`usage_executions`, `usage_model_calls`, `usage_tool_calls` — ported from
+`lightbridge-governance`'s proven `executions`/`model_calls`/`tool_calls` shape. Each carries a
+`source TEXT NOT NULL` origin dimension and an `observed_at` time column (the usage-store
+convention, matching `usage_events`), dedups on `(source, trace_id, span_id)` (bijective with the
+span-derived id, so a redelivery with a drifted timestamp is still absorbed), and stores money
+as nullable `BIGINT` micro-USD (`NULL` = unknown, never `0`; a genuine `0` is storable). `id` is
+the sole primary key (globally unique — it embeds `source`, `trace_id` and `span_id`, since an
+OTLP `span_id` is only unique within a trace and `trace_id` only within a source — so a join on
+`execution_id` is unambiguous); each model/tool call is its own OTLP span with its own `span_id`,
+so one execution can carry many children, and the child `execution_id` FK is `DEFERRABLE
+INITIALLY DEFERRED` for OTLP's child-before-parent export ordering. Because OTLP exports children
+before their parent, ingest mints a **stub** `usage_executions` row (id derived from the child's
+`source` + `trace_id` + `parent_span_id`, with `duration_ms`/`raw_schema_version` NULL) on first
+sight of a child, in the same transaction; the real execution span later fills the stub via the
+upsert — so `duration_ms` and `raw_schema_version` are nullable, and a stub whose execution never
+ends (agent killed mid-run) keeps its children while recording the execution as never-completed.
+Identity is a reference into the `usage_identities` side table, not an embedded email (ADR-0028
+D7). Like `usage_events`, these are plain Postgres tables today — TimescaleDB is not deployed on
+the usage tenant (see the
+migration headers).
+
 ## Two cross-cutting rules that have each already caused a production bug
 
 ### CUID2 ids (ADR-0039)
