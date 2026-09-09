@@ -246,7 +246,7 @@ pub async fn ingest_traces(
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let source = crate::normalizer::resolve_source(&headers)?;
-    let payload = decode_trace_request(&headers, &body)?;
+    let payload = decode_trace_request_async(headers.clone(), body.clone()).await?;
     let events = extract_trace_events(payload, source);
     let accepted_events = persist_events(&state, "trace", &events).await?;
 
@@ -275,7 +275,7 @@ pub async fn ingest_metrics(
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let source = crate::normalizer::resolve_source(&headers)?;
-    let payload = decode_metrics_request(&headers, &body)?;
+    let payload = decode_metrics_request_async(headers.clone(), body.clone()).await?;
     let events = extract_metric_events(payload, source);
     let accepted_events = persist_events(&state, "metric", &events).await?;
 
@@ -304,7 +304,7 @@ pub async fn ingest_logs(
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let source = crate::normalizer::resolve_source(&headers)?;
-    let payload = decode_logs_request(&headers, &body)?;
+    let payload = decode_logs_request_async(headers.clone(), body.clone()).await?;
     let events = extract_log_events(payload, source);
     let accepted_events = persist_events(&state, "log", &events).await?;
 
@@ -314,6 +314,33 @@ pub async fn ingest_logs(
         StatusCode::ACCEPTED,
         Json(IngestResponse { accepted_events }),
     ))
+}
+
+async fn decode_logs_request_async(
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<ExportLogsServiceRequest> {
+    tokio::task::spawn_blocking(move || decode_logs_request(&headers, &body))
+        .await
+        .map_err(|e| Error::Server(format!("logs decode task failed: {e}")))?
+}
+
+async fn decode_trace_request_async(
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<ExportTraceServiceRequest> {
+    tokio::task::spawn_blocking(move || decode_trace_request(&headers, &body))
+        .await
+        .map_err(|e| Error::Server(format!("trace decode task failed: {e}")))?
+}
+
+async fn decode_metrics_request_async(
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<ExportMetricsServiceRequest> {
+    tokio::task::spawn_blocking(move || decode_metrics_request(&headers, &body))
+        .await
+        .map_err(|e| Error::Server(format!("metrics decode task failed: {e}")))?
 }
 
 fn decode_logs_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportLogsServiceRequest> {

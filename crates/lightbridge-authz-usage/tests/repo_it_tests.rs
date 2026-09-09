@@ -302,6 +302,7 @@ async fn query_usage_applies_every_optional_filter(pool: PgPool) {
             model: Some("gpt-4.1".to_string()),
             metric_name: Some("chat.completion".to_string()),
             signal_type: Some("trace".to_string()),
+            source: Some("eaig".to_string()),
             azp: Some("console-web".to_string()),
             operation: Some("chat_completions".to_string()),
             billing_plan: Some("pro".to_string()),
@@ -823,6 +824,13 @@ fn dimension_event(
     }
 }
 
+fn source_event(observed_at: chrono::DateTime<Utc>, source: &str) -> UsageEvent {
+    UsageEvent {
+        source: Some(source.to_string()),
+        ..sample_event(observed_at)
+    }
+}
+
 /// #648: each of the three new dimensions must group independently, and each returned point must
 /// echo the value it was grouped by (the console renders the echo, not the request it sent).
 #[sqlx::test(migrations = "../../migrations-usage")]
@@ -953,6 +961,81 @@ async fn query_usage_filters_on_each_new_dimension(pool: PgPool) {
         assert_eq!(points[0].azp.as_deref(), Some("cli"));
         assert_eq!(points[0].requests, 1);
     }
+}
+
+/// #584: `source` is a groupable dimension -- grouping splits the series per emitter, and each
+/// point echoes the `source` it was grouped by.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn query_usage_groups_by_source(pool: PgPool) {
+    let repo = build_repo(pool);
+    let now = Utc::now();
+    repo.insert_usage_events(&[
+        source_event(now, "eaig"),
+        source_event(now, "eaig"),
+        source_event(now, "claude-code"),
+    ])
+    .await
+    .expect("insert should succeed");
+
+    let request = UsageQueryRequest {
+        group_by: vec![UsageGroupBy::Source],
+        ..base_query(now)
+    };
+
+    let (points, _truncated) = repo
+        .query_usage(&request)
+        .await
+        .expect("query should succeed");
+
+    let mut seen: Vec<(String, i64)> = points
+        .iter()
+        .map(|point| {
+            (
+                point
+                    .source
+                    .clone()
+                    .expect("a grouped source must be echoed on the point"),
+                point.requests,
+            )
+        })
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![("claude-code".to_string(), 1), ("eaig".to_string(), 2)],
+        "grouping by source must split the series per emitter"
+    );
+}
+
+/// #584: an equality filter on `source` narrows the series to that emitter alone.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn query_usage_filters_on_source(pool: PgPool) {
+    let repo = build_repo(pool);
+    let now = Utc::now();
+    repo.insert_usage_events(&[
+        source_event(now, "eaig"),
+        source_event(now, "claude-code"),
+    ])
+    .await
+    .expect("insert should succeed");
+
+    let request = UsageQueryRequest {
+        filters: UsageQueryFilters {
+            source: Some("eaig".to_string()),
+            ..Default::default()
+        },
+        group_by: vec![UsageGroupBy::Source],
+        ..base_query(now)
+    };
+
+    let (points, _truncated) = repo
+        .query_usage(&request)
+        .await
+        .expect("query should succeed");
+
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].source.as_deref(), Some("eaig"));
+    assert_eq!(points[0].requests, 1);
 }
 
 /// #648's headline acceptance criterion: `operation_in` matches several operations in a SINGLE

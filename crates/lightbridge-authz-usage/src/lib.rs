@@ -496,6 +496,7 @@ mod tests {
                 "model",
                 "metric_name",
                 "signal_type",
+                "source",
                 "azp",
                 "operation",
                 "billing_plan",
@@ -504,7 +505,7 @@ mod tests {
         );
 
         let filters = &doc["components"]["schemas"]["UsageQueryFilters"]["properties"];
-        for field in ["azp", "operation", "billing_plan", "operation_in"] {
+        for field in ["source", "azp", "operation", "billing_plan", "operation_in"] {
             assert!(
                 filters.get(field).is_some(),
                 "expected UsageQueryFilters.{field} in the published schema"
@@ -516,7 +517,7 @@ mod tests {
         );
 
         let point = &doc["components"]["schemas"]["UsageSeriesPoint"]["properties"];
-        for field in ["azp", "operation", "billing_plan"] {
+        for field in ["source", "azp", "operation", "billing_plan"] {
             assert!(
                 point.get(field).is_some(),
                 "expected UsageSeriesPoint.{field} in the published schema"

@@ -1,7 +1,46 @@
 use std::collections::HashMap;
 
-use lightbridge_authz_usage_rest::normalizer::{KNOWN_SOURCES, REGISTRY, SpanMeta, usd_to_micros};
+use axum::http::{HeaderMap, HeaderValue};
+use lightbridge_authz_core::Error;
+use lightbridge_authz_usage_rest::normalizer::{
+    KNOWN_SOURCES, REGISTRY, SpanMeta, resolve_source, usd_to_micros,
+};
 use serde_json::{Value, json};
+
+fn headers_with_source(source: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-source",
+        HeaderValue::from_str(source).expect("static source parses as a header value"),
+    );
+    headers
+}
+
+#[test]
+fn resolve_source_accepts_a_known_source() {
+    for known in KNOWN_SOURCES {
+        let headers = headers_with_source(known);
+        assert_eq!(resolve_source(&headers).unwrap(), known);
+    }
+}
+
+#[test]
+fn resolve_source_refuses_an_unknown_source() {
+    let headers = headers_with_source("not-a-real-source");
+    assert!(matches!(
+        resolve_source(&headers),
+        Err(Error::BadRequest(m)) if m.contains("unknown source")
+    ));
+}
+
+#[test]
+fn resolve_source_refuses_a_missing_header() {
+    let headers = HeaderMap::new();
+    assert!(matches!(
+        resolve_source(&headers),
+        Err(Error::BadRequest(m)) if m.contains("missing x-source")
+    ));
+}
 
 #[test]
 fn test_opencode_normalizer_cost_conversion() {

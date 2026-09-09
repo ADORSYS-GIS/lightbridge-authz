@@ -359,6 +359,7 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
                 model: Some("gpt-4.1".to_string()),
                 metric_name: Some("gen_ai.usage.total_tokens".to_string()),
                 signal_type: Some("metric".to_string()),
+                source: Some("eaig".to_string()),
                 azp: Some("console-web".to_string()),
                 operation: Some("chat_completions".to_string()),
                 billing_plan: Some("pro".to_string()),
@@ -499,6 +500,7 @@ async fn query_usage_refuses_when_scope_authority_declines() {
                 model: None,
                 metric_name: None,
                 signal_type: None,
+                source: None,
                 azp: None,
                 operation: None,
                 billing_plan: None,
@@ -752,6 +754,63 @@ async fn ingest_logs_rejects_invalid_protobuf_as_bad_request() {
     ));
 }
 
+#[tokio::test]
+async fn ingest_logs_rejects_unknown_source() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+            spend: None,
+            truncated: false,
+        }),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
+    });
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-source", "not-a-real-source".parse().unwrap());
+
+    let result = ingest_logs(
+        axum::extract::State(state),
+        headers,
+        encoded_log_request(),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(Error::BadRequest(message))
+            if message.contains("unknown source")
+    ));
+}
+
+#[tokio::test]
+async fn ingest_logs_rejects_missing_source_header() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+            spend: None,
+            truncated: false,
+        }),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
+    });
+
+    let result = ingest_logs(
+        axum::extract::State(state),
+        HeaderMap::new(),
+        encoded_log_request(),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(Error::BadRequest(message))
+            if message.contains("missing x-source")
+    ));
+}
+
 /// `resolve_source` now requires a known `X-Source` header on every ingest request (#584); these
 /// handler-level tests predate that requirement, so they need it added explicitly.
 ///
@@ -933,6 +992,36 @@ async fn ingest_traces_rejects_invalid_protobuf_as_bad_request() {
 }
 
 #[tokio::test]
+async fn ingest_traces_rejects_unknown_source() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+            spend: None,
+            truncated: false,
+        }),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
+    });
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-source", "not-a-real-source".parse().unwrap());
+
+    let result = ingest_traces(
+        axum::extract::State(state),
+        headers,
+        encoded_trace_request(),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(Error::BadRequest(message))
+            if message.contains("unknown source")
+    ));
+}
+
+#[tokio::test]
 async fn ingest_metrics_treats_noop_insert_as_success() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
@@ -981,6 +1070,36 @@ async fn ingest_metrics_rejects_invalid_protobuf_as_bad_request() {
         result,
         Err(Error::BadRequest(message))
             if message.contains("invalid OTLP metrics protobuf payload")
+    ));
+}
+
+#[tokio::test]
+async fn ingest_metrics_rejects_unknown_source() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+            spend: None,
+            truncated: false,
+        }),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
+    });
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-source", "not-a-real-source".parse().unwrap());
+
+    let result = ingest_metrics(
+        axum::extract::State(state),
+        headers,
+        encoded_metrics_request(),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(Error::BadRequest(message))
+            if message.contains("unknown source")
     ));
 }
 

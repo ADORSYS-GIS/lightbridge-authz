@@ -67,6 +67,7 @@ struct UsageQueryRow {
     model: Option<String>,
     metric_name: Option<String>,
     signal_type: Option<String>,
+    source: Option<String>,
     azp: Option<String>,
     operation: Option<String>,
     billing_plan: Option<String>,
@@ -259,6 +260,7 @@ impl StoreRepo {
                 model: row.model,
                 metric_name: row.metric_name,
                 signal_type: row.signal_type,
+                source: row.source,
                 azp: row.azp,
                 operation: row.operation,
                 billing_plan: row.billing_plan,
@@ -281,7 +283,7 @@ impl StoreRepo {
 
 /// Every dimension column `usage_events` can be grouped by, in the fixed order the `SELECT` list
 /// and the `ORDER BY` tiebreaker both use. One list, so the two can never drift apart.
-const DIMENSION_COLUMNS: [(UsageGroupBy, &str); 11] = [
+const DIMENSION_COLUMNS: [(UsageGroupBy, &str); 12] = [
     (UsageGroupBy::AccountId, "account_id"),
     (UsageGroupBy::ProjectId, "project_id"),
     (UsageGroupBy::ApiKeyId, "api_key_id"),
@@ -290,6 +292,7 @@ const DIMENSION_COLUMNS: [(UsageGroupBy, &str); 11] = [
     (UsageGroupBy::Model, "model"),
     (UsageGroupBy::MetricName, "metric_name"),
     (UsageGroupBy::SignalType, "signal_type"),
+    (UsageGroupBy::Source, "source"),
     (UsageGroupBy::Azp, "azp"),
     (UsageGroupBy::Operation, "operation"),
     (UsageGroupBy::BillingPlan, "billing_plan"),
@@ -351,7 +354,7 @@ fn build_usage_query(input: &UsageQueryRequest) -> QueryBuilder<Postgres> {
 
     // Level 0: the aggregation itself -- the only thing that touches `usage_events`.
     let mut builder = QueryBuilder::<Postgres>::new(
-        "SELECT counted.bucket_start, counted.account_id, counted.project_id, counted.api_key_id, counted.user_id, counted.user_name, counted.model, counted.metric_name, counted.signal_type, counted.azp, counted.operation, counted.billing_plan, counted.requests, counted.usage_value, counted.prompt_tokens, counted.completion_tokens, counted.total_tokens, counted.total_cost, counted.latency_samples, ",
+        "SELECT counted.bucket_start, counted.account_id, counted.project_id, counted.api_key_id, counted.user_id, counted.user_name, counted.model, counted.metric_name, counted.signal_type, counted.source, counted.azp, counted.operation, counted.billing_plan, counted.requests, counted.usage_value, counted.prompt_tokens, counted.completion_tokens, counted.total_tokens, counted.total_cost, counted.latency_samples, ",
     );
     if with_percentiles {
         builder.push("counted.latency_percentiles[1]::double precision AS latency_p50_ms, counted.latency_percentiles[2]::double precision AS latency_p95_ms, counted.latency_percentiles[3]::double precision AS latency_p99_ms, ");
@@ -485,6 +488,10 @@ fn push_scope_filters(builder: &mut QueryBuilder<Postgres>, input: &UsageQueryRe
     if let Some(signal_type) = &input.filters.signal_type {
         builder.push(" AND signal_type = ");
         builder.push_bind(signal_type);
+    }
+    if let Some(source) = &input.filters.source {
+        builder.push(" AND source = ");
+        builder.push_bind(source);
     }
     if let Some(azp) = &input.filters.azp {
         builder.push(" AND azp = ");
