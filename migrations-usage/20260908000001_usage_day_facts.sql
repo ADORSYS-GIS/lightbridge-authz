@@ -33,7 +33,10 @@
 --
 -- No `EXCEPTION WHEN OTHERS` anywhere. A migration that swallows its own error reports success
 -- against a schema it did not produce; every later `IF NOT EXISTS` agrees. The service refusing
--- to start is the correct outcome (authz-migration skill Rule 5).
+-- to start is the correct outcome (authz-migration skill Rule 5) -- on a target where Timescale
+-- is supposed to be present. See the hypertable block below for the one exception this migration
+-- makes: skipping the block entirely when `timescaledb` is not even installable, which is the
+-- documented, standing state of production and CI today, not a failure to swallow.
 --
 -- subject_kind closed vocabulary via CHECK: org, user, repo, user_team. Extensible via a forward
 -- migration adding a new value to the constraint (no DB enum per D4's rationale). An unknown
@@ -144,9 +147,24 @@ COMMENT ON COLUMN usage_day_facts.is_aggregate_only IS
 CREATE INDEX idx_usage_day_facts_subject_day
     ON usage_day_facts (subject_kind, day DESC);
 
--- Assert hypertable. NO fallback, NO `EXCEPTION WHEN OTHERS`. If this fails, the migration fails
--- loudly and the service refuses to start — which is the correct outcome. The current init
--- migration's silent-fallback pattern is explicitly banned by authz-migration skill Rule 5.
+-- Assert hypertable -- gated on the extension actually being installed (2026-09-09 review, #714).
+-- `migrations-usage/` is a deliberately plain-Postgres-safe directory: production and CI both run
+-- vanilla Postgres today (#549 Finding 2; `.github/actions/tests/action.yml` defers Timescale-shaped
+-- CI to the #581 D1 image decision and explicitly says not to reintroduce a Timescale container
+-- here before that lands), and `20260223000001_init_usage.sql` / `20260829000001_usage_event_latency.sql`
+-- both hold that line already. An earlier version of this migration called `create_hypertable`
+-- unconditionally, which is exactly what those files warn against: it made `migrations-usage`
+-- fail to apply at all on plain Postgres, breaking every `#[sqlx::test]` in this crate (including
+-- `repo_it_tests`/`spend_query_it_tests`/`scope_ownership_it_tests`, which already run in CI) and
+-- any real `just migrate` against production.
+--
+-- This is NOT the silent-fallback pattern authz-migration skill Rule 5 bans: Rule 5 is about
+-- swallowing a genuine failure on a Timescale-capable database (a real misconfiguration should
+-- fail loud). This guard only skips the block when `timescaledb` is not even installable
+-- (`pg_available_extensions` has no row for it) -- the documented, standing state of prod/CI
+-- today, not a transient error. If the extension IS available, everything inside this block still
+-- runs with NO exception handler: a genuine failure on a Timescale-capable target still aborts the
+-- migration loudly, exactly as the rest of this file's design intends.
 --
 -- Chunk interval: 1 month. Day-grain facts accumulate ~10^4–10^5 rows/year, not 10^7 — monthly
 -- chunks are the right granularity for data this sparse (a daily chunk would have O(100) rows and
@@ -154,28 +172,37 @@ CREATE INDEX idx_usage_day_facts_subject_day
 --
 -- `by_range('day', INTERVAL '1 month')` is the TS 2.x API. The legacy positional API
 -- (`create_hypertable('t', 'col')`) is also available but the keyword form is unambiguous.
-SELECT create_hypertable(
-    'usage_day_facts',
-    by_range('day', INTERVAL '1 month')
-);
-
+--
 -- Compression: segment by source and subject_kind for per-origin and per-entity-type chunk pruning.
 -- Order by day DESC inside each segment so range scans over recent days decompress the fewest
 -- segments. Column order inside `segmentby` carries no semantic weight in Timescale — pruning comes
 -- from the column being segmented at all (ADR-0028 D5 note).
-ALTER TABLE usage_day_facts SET (
-    timescaledb.compress = true,
-    timescaledb.compress_segmentby = 'source, subject_kind',
-    timescaledb.compress_orderby = 'day DESC, subject_id'
-);
-
+--
 -- Compress completed chunks older than 30 days. Day/seat facts are small and long-lived; a
 -- completed month is cold immediately after the reporting period closes.
-SELECT add_compression_policy('usage_day_facts', INTERVAL '30 days');
-
+--
 -- Retention: 25 months. ADR-0028 D6 rationale — enterprise year-over-year budgeting requires two
 -- complete fiscal years (24 months) plus the current billing month (= 25 months total). This is
 -- the same +1 logic as 13 months for raw request grain (12 months + current). Day/seat facts are
 -- tiny compared to raw request grain, so the longer window is a rounding error in storage terms
 -- (see ADR-0028 storage sizing section).
-SELECT add_retention_policy('usage_day_facts', INTERVAL '25 months');
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'timescaledb') THEN
+        CREATE EXTENSION IF NOT EXISTS timescaledb;
+
+        PERFORM create_hypertable(
+            'usage_day_facts',
+            by_range('day', INTERVAL '1 month')
+        );
+
+        EXECUTE 'ALTER TABLE usage_day_facts SET (
+            timescaledb.compress = true,
+            timescaledb.compress_segmentby = ''source, subject_kind'',
+            timescaledb.compress_orderby = ''day DESC, subject_id''
+        )';
+
+        PERFORM add_compression_policy('usage_day_facts', INTERVAL '30 days');
+        PERFORM add_retention_policy('usage_day_facts', INTERVAL '25 months');
+    END IF;
+END $$;

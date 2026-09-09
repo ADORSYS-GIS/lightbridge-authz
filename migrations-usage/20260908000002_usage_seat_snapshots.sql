@@ -36,7 +36,10 @@
 -- collide onto one PK tuple and be silently merged by the natural-key `ON CONFLICT ... DO UPDATE`,
 -- corrupting seat state with no constraint violation (#714 review: Stephane).
 --
--- No `EXCEPTION WHEN OTHERS` anywhere (authz-migration skill Rule 5). Fail loud.
+-- No `EXCEPTION WHEN OTHERS` anywhere (authz-migration skill Rule 5). Fail loud -- on a target
+-- where Timescale is supposed to be present. See the hypertable block below for the one
+-- exception: skipping it entirely when `timescaledb` isn't even installable, the documented,
+-- standing state of production and CI today.
 
 CREATE TABLE usage_seat_snapshots (
     source          TEXT        NOT NULL,
@@ -129,22 +132,33 @@ COMMENT ON COLUMN usage_seat_snapshots.seat_state IS
 CREATE INDEX idx_usage_seat_snapshots_provider_user
     ON usage_seat_snapshots (provider_user_id, snapshot_day DESC);
 
--- Assert hypertable. Fail loud, no fallback.
+-- Assert hypertable -- gated on the extension being installed, same reasoning and same guard
+-- shape as `usage_day_facts.sql` (2026-09-09 review, #714): production/CI are plain Postgres
+-- today (#549 Finding 2), so this skips gracefully when `timescaledb` isn't even available
+-- rather than failing `migrations-usage` to apply at all. No exception handler once inside the
+-- `IF` -- a genuine failure on a Timescale-capable target still fails loud.
 -- Chunk interval: 1 month (same rationale as usage_day_facts — seat data is sparse).
-SELECT create_hypertable(
-    'usage_seat_snapshots',
-    by_range('snapshot_day', INTERVAL '1 month')
-);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'timescaledb') THEN
+        CREATE EXTENSION IF NOT EXISTS timescaledb;
 
--- Compression: segment by source and subject_kind.
-ALTER TABLE usage_seat_snapshots SET (
-    timescaledb.compress = true,
-    timescaledb.compress_segmentby = 'source, subject_kind',
-    timescaledb.compress_orderby = 'snapshot_day DESC, provider_user_id'
-);
+        PERFORM create_hypertable(
+            'usage_seat_snapshots',
+            by_range('snapshot_day', INTERVAL '1 month')
+        );
 
--- Compress completed chunks older than 30 days.
-SELECT add_compression_policy('usage_seat_snapshots', INTERVAL '30 days');
+        -- Compression: segment by source and subject_kind.
+        EXECUTE 'ALTER TABLE usage_seat_snapshots SET (
+            timescaledb.compress = true,
+            timescaledb.compress_segmentby = ''source, subject_kind'',
+            timescaledb.compress_orderby = ''snapshot_day DESC, provider_user_id''
+        )';
 
--- Retention: 25 months (ADR-0028 D6 — same rationale as usage_day_facts).
-SELECT add_retention_policy('usage_seat_snapshots', INTERVAL '25 months');
+        -- Compress completed chunks older than 30 days.
+        PERFORM add_compression_policy('usage_seat_snapshots', INTERVAL '30 days');
+
+        -- Retention: 25 months (ADR-0028 D6 — same rationale as usage_day_facts).
+        PERFORM add_retention_policy('usage_seat_snapshots', INTERVAL '25 months');
+    END IF;
+END $$;
