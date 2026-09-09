@@ -537,6 +537,19 @@ read, never rewritten, never regenerated into our own format.
 - **Never sort or paginate by id** — CUID2 has no ordering. Use `created_at`.
 - **Store as `TEXT`**; no native `uuid` columns, no `DEFAULT gen_random_uuid()`.
 
+**One deliberate exception, documented here so it is not "fixed" by accident:** the execution
+grain's ids in the usage store (`usage_executions.id = exec_{source}_{trace_id}_{span_id}`,
+`usage_model_calls.id = {source}_{trace_id}_{span_id}:mc`,
+`usage_tool_calls.id = {source}_{trace_id}_{span_id}:tc`, #582) are **span-derived, not CUID2**.
+This is required, not a lapse: OTLP exports child spans before their parent execution span, so
+ingest must be able to derive a child's `execution_id` from the child's `parent_span_id` *before
+the parent row exists* — a minted CUID2 would be unknowable to the child. The span-derived id is
+what makes the child-before-parent link (and the stub-execution contract) work. The id embeds
+`source`, `trace_id` AND `span_id` (an OTLP `span_id` is only unique within a trace, and
+`trace_id` only within a source), and the dedup key `UNIQUE (source, trace_id, span_id)` is
+deliberately bijective with it. Do not "fix" these to `cuid2()` without first solving the
+child-before-parent linking problem; see the `20260907000002_usage_executions.sql` header.
+
 ### Service Responsibilities
 
 - CRUD API (`authz-api`)
@@ -1139,6 +1152,11 @@ hand-written SQL and direct `sqlx` dependencies.
     generated CRUD cannot express -- the same exception class as `authorization_codes`
     (`migrations/20260827000001_secret_claims.sql`; `consume_secret_claim` in
     `crates/lightbridge-authz-api-key/src/repo.rs`).
+  - the execution grain (`usage_executions`, `usage_model_calls`, `usage_tool_calls`, plus the
+    `usage_identities` side table, #582): grain-partitioned time-series with CAS/upsert
+    (`ON CONFLICT`) semantics that generated CRUD cannot express, in the usage DB which is
+    already hand-written SQL (see `usage_events`). Same exception class as `secret_claims`;
+    justified in each migration header under `migrations-usage/2026090700000{1,2,3,4}_*.sql`.
 - This repo runs cratestack (`cratestack-pg`) `=0.10.0` (pinned exactly in the root `Cargo.toml`,
   which also documents why the pin cannot float past it -- see that file's `cratestack-core =
   "=0.10.0"` block); ADR-0038's capability findings were verified against 0.7.8. Re-verify any
