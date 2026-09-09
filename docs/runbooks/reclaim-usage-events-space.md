@@ -110,6 +110,9 @@ rows older than `rollup_days` out of `usage_events` before enabling the job:
 
 ```sql
 -- export the slice the first run will destroy, before enabling retention
+-- substitute your own retention.rollup_days value for 365 below -- the default is 365, but any
+-- deployment that overrides it (e.g. rollup_days: 180) must use ITS value here, or the rows aged
+-- between that value and 365 days will be destroyed by the first run without ever being exported.
 COPY (
   SELECT * FROM usage_events
   WHERE observed_at < date_trunc('day', now() - interval '365 days')
