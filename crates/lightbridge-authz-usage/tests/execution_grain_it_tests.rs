@@ -37,6 +37,7 @@ async fn insert_execution(
     trace_id: &str,
     span_id: &str,
     identity_id: Option<&str>,
+    provider: Option<&str>,
     cost: Option<i64>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -52,7 +53,10 @@ async fn insert_execution(
                 WHEN usage_executions.duration_ms IS NULL THEN EXCLUDED.observed_at
                 ELSE usage_executions.observed_at
             END,
-            provider = EXCLUDED.provider,
+            -- provider is nullable (for the tool-call-first stub path), so it gets the same
+            -- COALESCE guard as every other correctable column: a delivery that cannot
+            -- resolve a provider must never wipe one already known on a completed execution.
+            provider = COALESCE(EXCLUDED.provider, usage_executions.provider),
             identity_id = COALESCE(EXCLUDED.identity_id, usage_executions.identity_id),
             duration_ms = COALESCE(EXCLUDED.duration_ms, usage_executions.duration_ms),
             raw_backend = COALESCE(EXCLUDED.raw_backend, usage_executions.raw_backend),
@@ -64,7 +68,7 @@ async fn insert_execution(
     .bind(format!("exec_{SOURCE}_{trace_id}_{span_id}"))
     .bind(observed_at)
     .bind(SOURCE)
-    .bind("anthropic")
+    .bind(provider)
     .bind(trace_id)
     .bind(span_id)
     .bind(identity_id)
@@ -175,9 +179,17 @@ async fn one_execution_can_carry_multiple_model_and_tool_calls(pool: PgPool) {
     let exec_span = "span-exec-multi";
     let exec_id = format!("exec_{SOURCE}_{trace_id}_{exec_span}");
 
-    insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(5000))
-        .await
-        .expect("insert execution");
+    insert_execution(
+        &pool,
+        observed_at,
+        trace_id,
+        exec_span,
+        None,
+        Some("anthropic"),
+        Some(5000),
+    )
+    .await
+    .expect("insert execution");
 
     // Two model calls, each its own span.
     insert_model_call(
@@ -227,9 +239,17 @@ async fn replaying_the_same_batch_twice_changes_no_counts(pool: PgPool) {
     let exec_span = "span-replay-1";
     let exec_id = format!("exec_{SOURCE}_{trace_id}_{exec_span}");
 
-    insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(5000))
-        .await
-        .expect("first insert should succeed");
+    insert_execution(
+        &pool,
+        observed_at,
+        trace_id,
+        exec_span,
+        None,
+        Some("anthropic"),
+        Some(5000),
+    )
+    .await
+    .expect("first insert should succeed");
     insert_model_call(
         &pool,
         observed_at,
@@ -260,9 +280,17 @@ async fn replaying_the_same_batch_twice_changes_no_counts(pool: PgPool) {
     assert_eq!((exec_before, mc_before, tc_before), (1, 1, 1));
 
     // Replay the exact same batch (same trace_id, span_id).
-    insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(5000))
-        .await
-        .expect("replay should be absorbed, not error");
+    insert_execution(
+        &pool,
+        observed_at,
+        trace_id,
+        exec_span,
+        None,
+        Some("anthropic"),
+        Some(5000),
+    )
+    .await
+    .expect("replay should be absorbed, not error");
     insert_model_call(
         &pool,
         observed_at,
@@ -314,6 +342,7 @@ async fn replay_with_drifted_observed_at_is_still_absorbed(pool: PgPool) {
         trace_id,
         exec_span,
         None,
+        Some("anthropic"),
         Some(5000),
     )
     .await
@@ -325,6 +354,7 @@ async fn replay_with_drifted_observed_at_is_still_absorbed(pool: PgPool) {
         trace_id,
         exec_span,
         None,
+        Some("anthropic"),
         Some(5000),
     )
     .await
@@ -357,12 +387,28 @@ async fn same_span_id_across_different_traces_does_not_collide(pool: PgPool) {
     let observed_at = Utc::now() - Duration::minutes(5);
     let shared_span = "span-shared";
 
-    insert_execution(&pool, observed_at, "trace-a", shared_span, None, Some(1000))
-        .await
-        .expect("execution in trace-a");
-    insert_execution(&pool, observed_at, "trace-b", shared_span, None, Some(2000))
-        .await
-        .expect("execution in trace-b with the same span_id must not collide on the PK");
+    insert_execution(
+        &pool,
+        observed_at,
+        "trace-a",
+        shared_span,
+        None,
+        Some("anthropic"),
+        Some(1000),
+    )
+    .await
+    .expect("execution in trace-a");
+    insert_execution(
+        &pool,
+        observed_at,
+        "trace-b",
+        shared_span,
+        None,
+        Some("anthropic"),
+        Some(2000),
+    )
+    .await
+    .expect("execution in trace-b with the same span_id must not collide on the PK");
 
     assert_eq!(count_executions(&pool).await, 2);
 }
@@ -377,9 +423,17 @@ async fn same_trace_and_span_across_different_sources_does_not_collide(pool: PgP
     let span_id = "span-shared";
 
     // source = claude_code (the helper's SOURCE constant).
-    insert_execution(&pool, observed_at, trace_id, span_id, None, Some(1000))
-        .await
-        .expect("execution from claude_code");
+    insert_execution(
+        &pool,
+        observed_at,
+        trace_id,
+        span_id,
+        None,
+        Some("anthropic"),
+        Some(1000),
+    )
+    .await
+    .expect("execution from claude_code");
 
     // source = opencode, same (trace_id, span_id) -- must be a distinct row.
     sqlx::query(
@@ -485,9 +539,17 @@ async fn child_can_be_inserted_before_its_parent_execution(pool: PgPool) {
     assert_eq!(stub_provider, None, "a stub execution has no provider yet");
 
     // The real execution span arrives later and fills the stub via the upsert.
-    insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(5000))
-        .await
-        .expect("real execution fills the stub");
+    insert_execution(
+        &pool,
+        observed_at,
+        trace_id,
+        exec_span,
+        None,
+        Some("anthropic"),
+        Some(5000),
+    )
+    .await
+    .expect("real execution fills the stub");
 
     let filled_duration: Option<i64> = sqlx::query_scalar(
         "SELECT duration_ms FROM usage_executions WHERE trace_id = $1 AND span_id = $2",
@@ -531,9 +593,17 @@ async fn null_cost_survives_round_trip_as_unknown_never_zero(pool: PgPool) {
     let exec_span = "span-null-cost";
     let exec_id = format!("exec_{SOURCE}_{trace_id}_{exec_span}");
 
-    insert_execution(&pool, observed_at, trace_id, exec_span, None, None)
-        .await
-        .expect("insert execution with NULL cost");
+    insert_execution(
+        &pool,
+        observed_at,
+        trace_id,
+        exec_span,
+        None,
+        Some("anthropic"),
+        None,
+    )
+    .await
+    .expect("insert execution with NULL cost");
     insert_model_call(
         &pool,
         observed_at,
@@ -583,9 +653,17 @@ async fn genuine_zero_cost_is_storable_and_distinct_from_null(pool: PgPool) {
     // a real 0. The donor ships no CHECK for this reason.
     let observed_at = Utc::now() - Duration::minutes(5);
 
-    insert_execution(&pool, observed_at, "trace-zero", "span-zero", None, Some(0))
-        .await
-        .expect("a genuine 0 cost must be storable");
+    insert_execution(
+        &pool,
+        observed_at,
+        "trace-zero",
+        "span-zero",
+        None,
+        Some("anthropic"),
+        Some(0),
+    )
+    .await
+    .expect("a genuine 0 cost must be storable");
 
     let zero_cost: Option<i64> = sqlx::query_scalar(
         "SELECT estimated_cost_micro_usd FROM usage_executions WHERE trace_id = 'trace-zero'",
@@ -602,6 +680,7 @@ async fn genuine_zero_cost_is_storable_and_distinct_from_null(pool: PgPool) {
         "trace-unknown",
         "span-unknown",
         None,
+        Some("anthropic"),
         None,
     )
     .await
@@ -626,9 +705,17 @@ async fn later_priced_cost_fills_a_null_on_replay(pool: PgPool) {
     let exec_id = format!("exec_{SOURCE}_{trace_id}_{exec_span}");
 
     // First report: cost unknown (NULL).
-    insert_execution(&pool, observed_at, trace_id, exec_span, None, None)
-        .await
-        .expect("first report with NULL cost");
+    insert_execution(
+        &pool,
+        observed_at,
+        trace_id,
+        exec_span,
+        None,
+        Some("anthropic"),
+        None,
+    )
+    .await
+    .expect("first report with NULL cost");
     insert_model_call(
         &pool,
         observed_at,
@@ -644,9 +731,17 @@ async fn later_priced_cost_fills_a_null_on_replay(pool: PgPool) {
     .expect("first model call with NULL cost");
 
     // Later report: the priced cost arrives. DO UPDATE ... COALESCE must fill the NULL.
-    insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(7777))
-        .await
-        .expect("later report with priced cost");
+    insert_execution(
+        &pool,
+        observed_at,
+        trace_id,
+        exec_span,
+        None,
+        Some("anthropic"),
+        Some(7777),
+    )
+    .await
+    .expect("later report with priced cost");
     insert_model_call(
         &pool,
         observed_at,
@@ -703,9 +798,17 @@ async fn later_report_corrects_a_non_null_cost_and_tokens(pool: PgPool) {
     let exec_id = format!("exec_{SOURCE}_{trace_id}_{exec_span}");
 
     // First report: a wrong (too-low) cost and partial token count.
-    insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(1000))
-        .await
-        .expect("first execution report");
+    insert_execution(
+        &pool,
+        observed_at,
+        trace_id,
+        exec_span,
+        None,
+        Some("anthropic"),
+        Some(1000),
+    )
+    .await
+    .expect("first execution report");
     insert_model_call(
         &pool,
         observed_at,
@@ -721,9 +824,17 @@ async fn later_report_corrects_a_non_null_cost_and_tokens(pool: PgPool) {
     .expect("first model-call report");
 
     // Later report: the corrected cost and full token count arrive.
-    insert_execution(&pool, observed_at, trace_id, exec_span, None, Some(2000))
-        .await
-        .expect("corrected execution report");
+    insert_execution(
+        &pool,
+        observed_at,
+        trace_id,
+        exec_span,
+        None,
+        Some("anthropic"),
+        Some(2000),
+    )
+    .await
+    .expect("corrected execution report");
     insert_model_call(
         &pool,
         observed_at,
@@ -772,6 +883,58 @@ async fn later_report_corrects_a_non_null_cost_and_tokens(pool: PgPool) {
         mc_out,
         Some(100),
         "a later report must correct the output token count"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn null_provider_replay_does_not_erase_a_known_provider(pool: PgPool) {
+    // provider is nullable (for the tool-call-first stub path), so the upsert must guard it
+    // with COALESCE like every other correctable column: a delivery that cannot resolve a
+    // provider (a retry, a duplicate export, or a payload where provider resolution failed)
+    // must never wipe a provider already known on a completed execution.
+    let observed_at = Utc::now() - Duration::minutes(5);
+    let trace_id = "trace-provider";
+    let span_id = "span-provider";
+
+    // First delivery: provider known.
+    insert_execution(
+        &pool,
+        observed_at,
+        trace_id,
+        span_id,
+        None,
+        Some("anthropic"),
+        Some(5000),
+    )
+    .await
+    .expect("first delivery with provider");
+
+    // Replay with provider = NULL (provider resolution failed on this delivery), same
+    // (source, trace_id, span_id). The upsert must keep 'anthropic'.
+    insert_execution(
+        &pool,
+        observed_at,
+        trace_id,
+        span_id,
+        None,
+        None,
+        Some(5000),
+    )
+    .await
+    .expect("replay with NULL provider");
+
+    let provider: Option<String> = sqlx::query_scalar(
+        "SELECT provider FROM usage_executions WHERE trace_id = $1 AND span_id = $2",
+    )
+    .bind(trace_id)
+    .bind(span_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read provider");
+    assert_eq!(
+        provider.as_deref(),
+        Some("anthropic"),
+        "a NULL-provider replay must not erase a known provider"
     );
 }
 
@@ -826,6 +989,7 @@ async fn usage_identities_mint_dedup_and_single_update_erasure(pool: PgPool) {
         trace_id,
         exec_span,
         Some(identity_a),
+        Some("anthropic"),
         Some(5000),
     )
     .await
