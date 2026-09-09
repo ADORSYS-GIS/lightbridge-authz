@@ -1,0 +1,95 @@
+-- usage_executions: the execution grain of the usage store (ADR-0027/0028, #582).
+--
+-- Ported from lightbridge-governance's proven `executions` table
+-- (governance-core/migrations/postgres/20260803000001_telemetry_models), adapted to the
+-- usage store's conventions:
+--   * `source TEXT NOT NULL` -- the usage-store origin dimension (gateway, claude_code,
+--     codex, opencode, ...), replacing governance's tenant_id/integration_id split.
+--   * identity via a `usage_identities` reference, not embedded user_email/internal_user_id
+--     (ADR-0028 D7 -- PII is joined, erasable with one UPDATE).
+--   * `observed_at` is the grain's time column (the usage-store convention -- `usage_events`
+--     and ADR-0028 D3/D22 both use `observed_at`), kept as a plain column, not in the key.
+--   * `id` is the sole PRIMARY KEY -- globally unique, matching governance -- so a downstream
+--     join on `execution_id` alone is unambiguous.
+--   * the dedup key is `UNIQUE (source, trace_id, span_id)`. It is deliberately bijective with
+--     the derived id (`exec_{source}_{trace_id}_{span_id}`): a redelivery of the same logical
+--     span -- even with a drifted `observed_at` -- hits the same key and is absorbed by
+--     `ON CONFLICT`, never a 23505 on the PK. Putting the time column in the key would break
+--     that bijection (a drifted timestamp would miss the conflict target and collide on the
+--     derived id), so it is left out; the hypertable partition-column-in-key rule
+--     (ADR-0028 D22) is deferred with the Timescale work below.
+--   * the id embeds `source`, `trace_id` AND `span_id` because none of the three is globally
+--     unique on its own: an OTLP `span_id` is only unique within a trace, and `trace_id` is
+--     only unique within a source -- two origins (e.g. a multi-tenant gateway and a CLI) can
+--     legitimately emit the same `(trace_id, span_id)`. A key/id that omitted `source` would
+--     silently absorb or overwrite one origin's row with another's. `source` is a controlled
+--     vocabulary and `trace_id`/`span_id` are hex-encoded, so the `_` separator is
+--     unambiguous -- and a CHECK constraint below enforces that `trace_id`/`span_id` never
+--     contain `_`, so the concatenation stays injective even for a malformed source.
+--   * `duration_ms` and `raw_schema_version` are NULLABLE because OTLP exports child spans
+--     (model/tool calls) BEFORE the parent execution span -- a child ends before its parent,
+--     and BatchSpanProcessor flushes every ~5s, so for any run longer than one flush the
+--     children arrive in an earlier export than the execution that parents them. Ingest
+--     therefore mints a STUB `usage_executions` row (id derived from the child's
+--     `source` + `trace_id` + `parent_span_id`, `provider`/`duration_ms`/`raw_schema_version`
+--     NULL -- a tool-call-first stub has no model provider to set) on first sight of any
+--     child, in the SAME transaction as the child, so the NOT NULL `execution_id` FK on the
+--     child tables is satisfiable. The real execution span later fills the stub via the upsert
+--     (`ON CONFLICT DO UPDATE`). A stub whose execution never ends (agent killed mid-run) is
+--     honest: the children are kept, the execution is recorded as never-completed. The
+--     `execution_id` FK is `DEFERRABLE INITIALLY DEFERRED` so parent and children may be
+--     inserted in any order within one transaction.
+--
+-- ADR-0038 persistence exception, same class as `secret_claims`: a grain-partitioned
+-- time-series with CAS/upsert (ON CONFLICT) semantics that generated CRUD cannot express.
+-- The usage DB is already hand-written SQL (see `usage_events`); this table follows it.
+--
+-- TIMESCALE DEVIATION (2026-09-07): the ticket's acceptance criteria call for this to be a
+-- hypertable with compression + retention policies. TimescaleDB is NOT deployed on the usage
+-- CNPG tenant (#489/D1) and is not required for this grain -- production is plain Postgres,
+-- exactly as lightbridge-governance's donor `executions` table runs. This migration therefore
+-- creates a plain table. See the ticket note.
+CREATE TABLE usage_executions (
+    id TEXT PRIMARY KEY,
+    observed_at TIMESTAMPTZ NOT NULL,
+    source TEXT NOT NULL,
+    -- NULL = a stub execution (created on first sight of a child, before the real execution
+    -- span arrives). A stub derived from a tool-call-first child has no model provider to
+    -- set (tool calls carry no provider); the real execution span fills it via the upsert.
+    provider TEXT,
+    trace_id TEXT NOT NULL,
+    span_id TEXT NOT NULL,
+    identity_id TEXT REFERENCES usage_identities (id),
+    -- NULL = a stub execution (created on first sight of a child, before the real execution
+    -- span arrives); the real span fills it via the upsert. A completed execution always has
+    -- a duration.
+    duration_ms BIGINT,
+    -- NULL = cost unknown (no pricing row, or unknown token counts). Unknown is honest: a
+    -- zero would read as "free" on a dashboard, so unknown is written as NULL, never 0. A
+    -- genuine 0 (a run that truly cost nothing) is a legitimate value and is storable -- the
+    -- NULL-vs-0 discipline is enforced by the ingest writing NULL for unknown, not by a CHECK
+    -- (the donor ships no CHECK for the same reason).
+    estimated_cost_micro_usd BIGINT,
+    raw_backend TEXT,
+    -- NULL = a stub execution (see duration_ms); the real execution span fills it.
+    raw_schema_version BIGINT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- The id is `exec_{source}_{trace_id}_{span_id}`, so the `_` separator must never appear
+    -- in a component or the concatenation stops being injective (a `_` in a trace_id would
+    -- reintroduce a PK collision across otherwise-distinct rows). Real OTLP ids are hex; this
+    -- CHECK makes the invariant enforced rather than assumed.
+    CONSTRAINT usage_executions_id_components_no_separator
+        CHECK (position('_' in trace_id) = 0 AND position('_' in span_id) = 0),
+    UNIQUE (source, trace_id, span_id)
+);
+
+-- Postgres does not auto-index FK columns. This supports the natural access pattern of the
+-- grain: joining an execution to its identity. (trace_id, span_id) is covered by the UNIQUE
+-- constraint above.
+CREATE INDEX idx_usage_executions_identity_id ON usage_executions (identity_id);
+
+-- The grain is a time-series; its defining access pattern is a time-range read
+-- (`WHERE observed_at >= ... AND observed_at < ...`). Index the time column so those reads do
+-- not seq-scan as the (unbounded, see the TIMESCALE DEVIATION note) table grows.
+CREATE INDEX idx_usage_executions_observed_at ON usage_executions (observed_at);
