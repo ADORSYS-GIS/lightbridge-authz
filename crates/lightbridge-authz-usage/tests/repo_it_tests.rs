@@ -1012,12 +1012,9 @@ async fn query_usage_groups_by_source(pool: PgPool) {
 async fn query_usage_filters_on_source(pool: PgPool) {
     let repo = build_repo(pool);
     let now = Utc::now();
-    repo.insert_usage_events(&[
-        source_event(now, "eaig"),
-        source_event(now, "claude-code"),
-    ])
-    .await
-    .expect("insert should succeed");
+    repo.insert_usage_events(&[source_event(now, "eaig"), source_event(now, "claude-code")])
+        .await
+        .expect("insert should succeed");
 
     let request = UsageQueryRequest {
         filters: UsageQueryFilters {

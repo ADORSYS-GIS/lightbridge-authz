@@ -770,12 +770,7 @@ async fn ingest_logs_rejects_unknown_source() {
     let mut headers = HeaderMap::new();
     headers.insert("x-source", "not-a-real-source".parse().unwrap());
 
-    let result = ingest_logs(
-        axum::extract::State(state),
-        headers,
-        encoded_log_request(),
-    )
-    .await;
+    let result = ingest_logs(axum::extract::State(state), headers, encoded_log_request()).await;
 
     assert!(matches!(
         result,
